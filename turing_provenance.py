@@ -32,6 +32,11 @@ import dataclasses
 from typing import Any, Callable, Dict, List, Tuple
 from turing import Hooks, BitstringProtocol, BackendMissing  # type: ignore
 
+try:  # optional dependency
+    import networkx as nx  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    nx = None  # type: ignore
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Provenance graph datastructures
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,6 +64,7 @@ class ProvenanceGraph:
         self._next_idx = itertools.count().__next__  # cheap auto‑increment
         # map object id -> last producer node idx
         self._producer: Dict[int, int] = {}
+        self.nx = nx.MultiDiGraph() if nx is not None else None
 
     # ----- public API ---------------------------------------------------------
 
@@ -76,12 +82,17 @@ class ProvenanceGraph:
         out_id  = id(result)
         node    = ProvNode(idx, op, arg_ids, kwargs, out_id)
         self._nodes.append(node)
+        if self.nx is not None:
+            self.nx.add_node(idx, op=op, args=arg_ids, kwargs=kwargs, out_obj_id=out_id)
 
         # build edges arg -> this node
         for pos, a in enumerate(args):
             src = self._producer.get(id(a))
             if src is not None:
-                self._edges.append(ProvEdge(src, idx, pos))
+                edge = ProvEdge(src, idx, pos)
+                self._edges.append(edge)
+                if self.nx is not None:
+                    self.nx.add_edge(src, idx, arg_pos=pos)
         # mark result as produced by this node
         self._producer[out_id] = idx
         return result  # pass through
