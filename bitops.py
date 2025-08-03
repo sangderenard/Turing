@@ -11,8 +11,14 @@ from enum import Enum, auto
 import hashlib
 import random
 from uuid import uuid4
-from memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch
-from flask import json
+try:
+    from memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
+    from flask import json  # type: ignore
+except Exception:  # pragma: no cover - optional deps
+    BitTensorMemoryGraph = NodeEntry = EdgeEntry = GraphSearch = None  # type: ignore
+    json = None  # type: ignore
+
+from bitops_translator import BitOpsTranslator
 
 class BitStructType(Enum):
     INTEGER = auto()
@@ -409,6 +415,8 @@ class BitOps:
         self.bit_width = bit_width
         self.encoding = encoding
         self.mask = (1 << bit_width) - 1
+        # Translator that expands operations into Turing primitives
+        self.translator = BitOpsTranslator(bit_width)
 
     # ─────────────────────────────────────────────
     # Gray code conversions
@@ -432,39 +440,54 @@ class BitOps:
     def bit_add(self, x, y):
         self._validate_value(x)
         self._validate_value(y)
-        return (x + y) & self.mask
+        return self.translator.bit_add(x, y) & self.mask
 
     def bit_sub(self, x, y):
         self._validate_value(x)
         self._validate_value(y)
-        return (x - y) & self.mask
+        return self.translator.bit_sub(x, y) & self.mask
 
     def bit_and(self, x, y):
         self._validate_value(x)
         self._validate_value(y)
-        return (x & y) & self.mask
+        return self.translator.bit_and(x, y)
 
     def bit_or(self, x, y):
         self._validate_value(x)
         self._validate_value(y)
-        return (x | y) & self.mask
+        return self.translator.bit_or(x, y)
 
     def bit_xor(self, x, y):
         self._validate_value(x)
         self._validate_value(y)
-        return (x ^ y) & self.mask
+        return self.translator.bit_xor(x, y)
+
+    def bit_mul(self, x, y):
+        self._validate_value(x)
+        self._validate_value(y)
+        return self.translator.bit_mul(x, y) & self.mask
+
+    def bit_div(self, x, y):
+        self._validate_value(x)
+        self._validate_value(y)
+        return self.translator.bit_div(x, y) & self.mask
+
+    def bit_mod(self, x, y):
+        self._validate_value(x)
+        self._validate_value(y)
+        return self.translator.bit_mod(x, y) & self.mask
 
     def bit_not(self, x):
         self._validate_value(x)
-        return (~x) & self.mask
+        return self.translator.bit_not(x)
 
     def bit_shift_left(self, x, shift):
         self._validate_value(x)
-        return (x << shift) & self.mask
+        return self.translator.bit_shift_left(x, shift)
 
     def bit_shift_right(self, x, shift):
         self._validate_value(x)
-        return (x >> shift) & ((1 << (self.bit_width - shift)) - 1 if shift < self.bit_width else 0)
+        return self.translator.bit_shift_right(x, shift)
 
     # ─────────────────────────────────────────────
     # Brutal validator
