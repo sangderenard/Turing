@@ -24,6 +24,13 @@ so a media‑encoder board can consume it without ever materialising PCM.
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Protocol, Tuple
+import threading
+import queue
+
+try:  # optional real-time playback
+    import sounddevice as _sd  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - missing audio library
+    _sd = None
 
 try:
     import numpy as np
@@ -71,6 +78,19 @@ class CassetteTapeBackend(TapeHook):
 
     analogue_mode: bool = False
 
+    # Sine coefficient tables per operation (freq_hz -> amplitude)
+    op_sine_coeffs: Dict[str, Dict[float, float]] = field(
+        default_factory=lambda: {
+            "read": {440.0: 1.0},
+            "write": {880.0: 1.0},
+            "motor": {220.0: 0.5},
+        }
+    )
+
+    # Frequency bins committed to the data and instruction buses
+    data_bus_bins: List[int] = field(default_factory=list)
+    instr_bus_bins: List[int] = field(default_factory=list)
+
     # -------------------------- runtime -------------------------------- #
     _tape: _Vec | List[int] = None  # type: ignore
     _head: int = 0
@@ -81,6 +101,12 @@ class CassetteTapeBackend(TapeHook):
 
     _env: _Vec | None = None  # ADSR vector * 1.0 (unit)
     _carriers: Dict[int, _Vec] = field(default_factory=dict)  # lane→carrier
+    _data_bus_wave: _Vec | None = None
+    _instr_bus_wave: _Vec | None = None
+
+    _audio_queue: "queue.Queue[_Vec | None]" | None = None
+    _audio_thread: threading.Thread | None = None
+    _audio_frames: List[_Vec] | None = None
 
     # ------------------------------------------------------------------ #
     def __post_init__(self):
@@ -90,6 +116,14 @@ class CassetteTapeBackend(TapeHook):
             self._build_env()
             for lane in self.lane_band_gains:
                 self._build_carrier(lane)
+            self._build_bus_wave("data")
+            self._build_bus_wave("instr")
+            self._audio_frames = []
+            self._audio_queue = queue.Queue()
+            self._audio_thread = threading.Thread(
+                target=self._audio_worker, daemon=True
+            )
+            self._audio_thread.start()
 
     # -------------------------- properties ----------------------------- #
     @property
@@ -205,11 +239,39 @@ class CassetteTapeBackend(TapeHook):
         self._ensure_capacity(end * 2)
         # motor track
         self._motor[self._cursor:end] = motor_v if motor_v is not None else self.motor_idle_v
-        # lane tracks: envelope × carrier when gate active (read or write)
+        op = "read" if read else "write" if write else "motor"
+        op_wave = self._generate_op_wave(op)
+        bus_wave = 1.0
         if read or write:
+            if self._data_bus_wave is not None:
+                bus_wave = self._data_bus_wave
             for lane, car in self._carriers.items():
-                pkt = self._env * car
+                pkt = self._env * car * op_wave * bus_wave
                 self._lanes[lane, self._cursor:end] = pkt
+        audio_mix = self._env * op_wave * bus_wave
+        if self._audio_queue is not None:
+            self._audio_queue.put(audio_mix.copy())
+        self._cursor = end
+
+    # Instruction bus emit -------------------------------------------------
+    def execute_instruction(self):
+        if self.analogue_mode:
+            self._emit_instr()
+
+    def _emit_instr(self):
+        if np is None:
+            return
+        end = self._cursor + self.frame_samples
+        self._ensure_capacity(end * 2)
+        self._motor[self._cursor:end] = self.motor_idle_v
+        op_wave = self._generate_op_wave("instr")
+        bus_wave = self._instr_bus_wave if self._instr_bus_wave is not None else 1.0
+        audio_mix = self._env * op_wave * bus_wave
+        for lane, car in self._carriers.items():
+            pkt = self._env * car * op_wave * bus_wave
+            self._lanes[lane, self._cursor:end] = pkt
+        if self._audio_queue is not None:
+            self._audio_queue.put(audio_mix.copy())
         self._cursor = end
 
     # -------------------------- helpers ------------------------------- #
@@ -225,3 +287,71 @@ class CassetteTapeBackend(TapeHook):
 
     def set_lane_eq(self, lane: int, eq_params: Dict[str, float]):
         self.lane_eq_params[lane] = eq_params
+
+    def configure_bus_width(self, data_bins: List[int], instr_bins: List[int]):
+        self.data_bus_bins = list(data_bins)
+        self.instr_bus_bins = list(instr_bins)
+        if self.analogue_mode and np is not None:
+            self._build_bus_wave("data")
+            self._build_bus_wave("instr")
+
+    # -------------------------- op waveform --------------------------- #
+    def _generate_op_wave(self, op: str) -> _Vec:
+        if np is None:
+            return []  # pragma: no cover - pure python fallback
+        coeffs = self.op_sine_coeffs.get(op, {})
+        t = np.arange(self.frame_samples, dtype="f4") / self.sample_rate_hz
+        wave = np.zeros(self.frame_samples, dtype="f4")
+        for freq, amp in coeffs.items():
+            wave += amp * np.sin(2 * np.pi * freq * t)
+        peak = np.max(np.abs(wave)) or 1.0
+        return (wave / peak).astype("f4")
+
+    # -------------------------- bus wave ------------------------------- #
+    def _build_bus_wave(self, which: str):
+        if np is None:
+            return
+        bins = self.data_bus_bins if which == "data" else self.instr_bus_bins
+        if not bins:
+            if which == "data":
+                self._data_bus_wave = None
+            else:
+                self._instr_bus_wave = None
+            return
+        n = self.frame_samples
+        spec = np.zeros(n, dtype=np.complex64)
+        for k in bins:
+            spec[k % n] = 1.0
+            if k != 0:
+                spec[-k % n] = 1.0
+        wave = np.fft.ifft(spec).real
+        peak = np.max(np.abs(wave)) or 1.0
+        if which == "data":
+            self._data_bus_wave = (wave / peak).astype("f4")
+        else:
+            self._instr_bus_wave = (wave / peak).astype("f4")
+
+    # -------------------------- audio thread ------------------------- #
+    def _audio_worker(self):  # pragma: no cover - realtime side effect
+        if np is None:
+            return
+        while True:
+            frame = self._audio_queue.get()
+            if frame is None:
+                break
+            if self._audio_frames is not None:
+                self._audio_frames.append(frame)
+            if _sd is not None:
+                try:
+                    _sd.play(frame, self.sample_rate_hz, blocking=True)
+                except Exception:
+                    pass
+
+    def close(self):
+        if self._audio_queue is not None:
+            self._audio_queue.put(None)
+        if self._audio_thread is not None:
+            self._audio_thread.join(timeout=1.0)
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        self.close()
