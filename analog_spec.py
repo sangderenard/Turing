@@ -35,7 +35,7 @@ def lane_frequency(lane: int) -> float:
     return BASE_FREQ * (SEMI_RATIO ** lane)
 
 
-def generate_bit_wave(bit: int, lane: int) -> np.ndarray:
+def generate_bit_wave(bit: int, lane: int, phase: float = 0.0) -> np.ndarray:
     """Generate a placeholder PCM frame for a single bit on the given lane."""
     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
     if bit:
@@ -57,7 +57,7 @@ def generate_bit_wave(bit: int, lane: int) -> np.ndarray:
                 np.linspace(sustain_level, 0.0, r_n, endpoint=True),
             ]
         )
-        sine = np.sin(2 * np.pi * freq * t)
+        sine = np.sin(2 * np.pi * freq * t + phase)
         return (sine * env).astype("f4")
     return np.zeros_like(t, dtype="f4")
 
@@ -185,47 +185,46 @@ class Register:
 
 
 def nand_wave(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Analogue NAND based on per-lane spectral combination.
+    """Analogue NAND combining lane spectra.
 
-    This implementation operates in the frequency domain to perform NAND
-    operations on each of the 32 frequency lanes independently.
-
-    1.  Decomposes input signals ``x`` and ``y`` into their spectra using FFT.
-    2.  For each lane, it determines the logical state ('1' or '0') based on
-        the spectral energy around the lane's characteristic frequency.
-    3.  It computes the NAND logic for each lane.
-    4.  A new output spectrum is constructed: if a lane's NAND result is '1',
-        the spectral components from both inputs for that lane are summed. If
-        '0', the lane is silent in the output spectrum.
-    5.  The final PCM waveform is reconstructed via an inverse FFT.
+    For each lane the function inspects the spectral energy of ``x`` and
+    ``y`` at the lane's base frequency.  If both inputs present a '1' the
+    result is silence for that lane.  If exactly one input is '1' the
+    corresponding spectral component (with its phase) is copied to the output.
+    When both inputs are '0' a canonical ``generate_bit_wave`` tone is
+    inserted for that lane.  Only the lane bins are manipulated; all other
+    spectral content is discarded.
     """
     fft_x = np.fft.rfft(x)
     fft_y = np.fft.rfft(y)
     freqs = np.fft.rfftfreq(len(x), 1 / FS)
-    output_spectrum = np.zeros_like(fft_x)
 
-    # Define a threshold for detecting a '1' based on amplitude.
-    # This threshold is converted to the FFT magnitude domain.
     amp_threshold = 0.1
     mag_threshold = amp_threshold * FRAME_SAMPLES / 2.0
 
+    output_spectrum = np.zeros_like(fft_x)
+    active_any = False
     for lane in range(LANES):
-        target_freq = lane_frequency(lane)
-        # Find the FFT bin index closest to the lane's frequency.
-        freq_idx = np.argmin(np.abs(freqs - target_freq))
+        freq_idx = np.argmin(np.abs(freqs - lane_frequency(lane)))
+        mag_x = np.abs(fft_x[freq_idx])
+        mag_y = np.abs(fft_y[freq_idx])
+        x_is_1 = mag_x > mag_threshold
+        y_is_1 = mag_y > mag_threshold
+        if x_is_1 or y_is_1:
+            active_any = True
+            if x_is_1 and y_is_1:
+                continue
+            if x_is_1:
+                output_spectrum[freq_idx] = fft_x[freq_idx]
+            elif y_is_1:
+                output_spectrum[freq_idx] = fft_y[freq_idx]
+        # lanes with both 0 are ignored unless no lane is active at all
 
-        # Determine if the lane is active ('1') for each input.
-        x_is_1 = np.abs(fft_x[freq_idx]) > mag_threshold
-        y_is_1 = np.abs(fft_y[freq_idx]) > mag_threshold
+    if not active_any:
+        idx0 = np.argmin(np.abs(freqs - lane_frequency(0)))
+        base_fft0 = np.fft.rfft(generate_bit_wave(1, 0))
+        output_spectrum[idx0] = base_fft0[idx0]
 
-        # NAND logic: output is '0' (silent) only if both inputs are '1'.
-        if not (x_is_1 and y_is_1):
-            # If NAND result is '1', combine the spectra from both inputs
-            # for this lane. This preserves the original phase and amplitude
-            # information from both signals.
-            output_spectrum[freq_idx] = fft_x[freq_idx] + fft_y[freq_idx]
-
-    # Reconstruct the time-domain signal from the combined spectrum.
     return np.fft.irfft(output_spectrum, n=FRAME_SAMPLES).astype("f4")
 
 

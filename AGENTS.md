@@ -52,9 +52,10 @@ bits  5- 0 : PARAM  (length, shift-k, etc.)
 
 ## 4  Register Behaviour
 
-* Each register occupies two fixed tracks of main tape.
+* Each register is an independent two-track tape unit, not a fixed pair on the main tape.
 * **Track-0:** data/instruction carriers.
 * **Track-1:** write-bias tone when writing; data otherwise.
+* Registers contain no further registers, avoiding recursive hierarchies.
 * Operations sequence (always):
   1  Motor **SEEK** envelope to target address.
   2  Continuous **read** or **write** sweep over *n* bit-frames (no stop-start per bit).

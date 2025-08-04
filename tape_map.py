@@ -6,7 +6,7 @@ This module defines helpers that derive the fixed BIOS, instruction table
 and data zone layout of virtual tapes.  Registers are modelled as **fully
 independent tape systems** rather than as mere track pairs on the main tape,
 reflecting the design where the CPU can drive multiple devices in
-simultaneity.
+simultaneity.  Each register stands alone and contains no nested registers.
 
 Only the structural addressing rules are modelled here; no analogue physics
 is emulated.  The intention is to provide deterministic digital maps that
@@ -78,8 +78,9 @@ def create_register_tapes(bios: BiosHeader, n: int = REGISTERS) -> Dict[int, Tap
     """Return independent ``TapeMap`` objects for ``n`` registers.
 
     Each register is modelled as its own two-track tape with a BIOS header and
-    data region but no instruction table.  This mirrors the original hardware
-    concept where the CPU can play directly into multiple devices at once.
+    data region but no instruction table.  Register tapes contain no
+    subordinate registers, mirroring the original hardware concept where the
+    CPU can play directly into multiple devices at once.
     """
 
     return {i: TapeMap(bios, instruction_frames=0) for i in range(n)}
