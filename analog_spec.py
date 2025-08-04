@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List
 import numpy as np
-import math
 
 # ---------------------------------------------------------------------------
 # 1. Global Parameters
@@ -59,6 +58,34 @@ def generate_bit_wave(bit: int, lane: int) -> np.ndarray:
         return (sine * env).astype("f4")
     return np.zeros_like(t, dtype="f4")
 
+
+@dataclass
+class DominantTone:
+    """Result of analysing a wave's strongest FFT bin."""
+
+    bin: int
+    freq: float
+    vector: complex
+    amp: float
+
+
+def dominant_tone(wave: np.ndarray) -> DominantTone:
+    """Return the dominant FFT bin and its complex vector for ``wave``.
+
+    ``amp`` is reconstructed from the FFT magnitude to match the original
+    peak amplitude.  Silence defaults to lane ``0``'s frequency and zero vector.
+    """
+    fft = np.fft.rfft(wave)
+    mags = np.abs(fft)
+    mags[0] = 0.0  # ignore DC component
+    idx = int(np.argmax(mags))
+    vector = complex(fft[idx])
+    amp = float(2 * np.abs(vector) / len(wave))
+    if amp == 0.0:
+        return DominantTone(0, lane_frequency(0), 0j, 0.0)
+    freqs = np.fft.rfftfreq(len(wave), 1 / FS)
+    return DominantTone(idx, float(freqs[idx]), vector, amp)
+
 # ---------------------------------------------------------------------------
 # 3. Instruction Word
 
@@ -103,19 +130,28 @@ class Register:
 def nand_wave(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Analogue NAND operator using amplitude summing.
 
-    The two input waves are summed and the peak amplitude is measured.  A
-    result of ``0`` is represented by a silent frame when the summed peak
-    exceeds the 1.5A threshold (both inputs high).  Otherwise a unity sine wave
-    is emitted as a placeholder for a logical ``1``.  The lane frequency is
-    currently fixed to lane ``0``; future work must analyse the actual carrier
-    of ``x``/``y`` and reproduce it exactly.
+    Both operands are assumed to occupy the same carrier lane.  Their waves are
+    summed and the peak amplitude of the result is compared against ``1.5A``
+    where ``A`` is the larger operand amplitude.  Crossing this threshold means
+    both inputs were high and the NAND output is silence.  Otherwise a waveform
+    for logical ``1`` is reconstructed from the louder input's dominant FFT
+    vector, preserving its frequency, amplitude, and phase.  This remains a
+    placeholder and ignores proper envelopes.
     """
     summed = x + y
-    peak = float(np.max(np.abs(summed)))
-    if peak >= 1.5:
+    peak_sum = float(np.max(np.abs(summed)))
+    tone_x = dominant_tone(x)
+    tone_y = dominant_tone(y)
+    A = max(tone_x.amp, tone_y.amp)
+    if A > 0.0 and peak_sum >= 1.5 * A:
         return np.zeros_like(x)
-    # TODO: preserve original lane frequency and amplitude
-    return generate_bit_wave(1, 0)
+    if A == 0.0:
+        t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
+        return np.sin(2 * np.pi * lane_frequency(0) * t).astype("f4")
+    tone = tone_x if tone_x.amp >= tone_y.amp else tone_y
+    spectrum = np.zeros(FRAME_SAMPLES // 2 + 1, dtype=complex)
+    spectrum[tone.bin] = tone.vector
+    return np.fft.irfft(spectrum, n=FRAME_SAMPLES).astype("f4")
 
 
 def sigma_L(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
