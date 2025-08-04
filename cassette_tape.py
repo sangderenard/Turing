@@ -59,6 +59,7 @@ class CassetteTapeBackend:
     op_sine_coeffs: Dict[str, Dict[float, float]] = field(default_factory=dict)
     motor_speed_pitch_coeff: float = 0.05 # How much speed affects pitch
     motor_direction_coeff: float = 1.02 # Slight pitch change for reverse
+    motor_friction_coeff: float = 0.02 # Fractional drag per second
 
     # -------------------------- Runtime State ---------------------------------- #
     _head_pos_inches: float = 0.0
@@ -147,66 +148,64 @@ class CassetteTapeBackend:
     def write_bit(self, bit_idx: int, value: int):
         frame = generate_bit_wave(1 if value else 0, 0)
         self.write_wave(bit_idx, frame)
-        
+
+    # ------------------------------------------------------------------
+    def _generate_speed_profile(self, distance: float, target_speed: float) -> _Vec:
+        """Return an instantaneous speed profile for the given travel distance."""
+        dt = 1.0 / self.sample_rate_hz
+        accel = self.motor_acceleration_ips2
+        speed = 0.0
+        pos = 0.0
+        speeds: List[float] = []
+        while True:
+            remaining = distance - pos
+            braking = (speed ** 2) / (2 * accel)
+            if remaining <= 0 and speed <= 0:
+                break
+            if remaining <= braking:
+                speed = max(0.0, speed - accel * dt)
+            else:
+                speed = min(target_speed, speed + accel * dt)
+            speed *= 1.0 - self.motor_friction_coeff * dt
+            pos += speed * dt
+            speeds.append(speed)
+            if len(speeds) > 10_000_000:
+                # Safety break in pathological cases
+                break
+        return np.array(speeds, dtype="f4")
+
     def _simulate_movement(self, distance_inches: float, target_speed_ips: float, direction: int, op_name: str):
-        # --- 1. Calculate Time and Speed Profile ---
-        time_to_accel = target_speed_ips / self.motor_acceleration_ips2
-        dist_accel = 0.5 * self.motor_acceleration_ips2 * (time_to_accel ** 2)
-
-        if 2 * dist_accel >= distance_inches:
-            time_to_accel = (distance_inches / self.motor_acceleration_ips2) ** 0.5
-            time_coast = 0.0
-            total_time_sec = 2 * time_to_accel
-        else:
-            dist_coast = distance_inches - 2 * dist_accel
-            time_coast = dist_coast / target_speed_ips
-            total_time_sec = 2 * time_to_accel + time_coast
-
-        scaled_time_sec = total_time_sec * self.time_scale_factor
-        num_samples = int(scaled_time_sec * self.sample_rate_hz)
-        if num_samples == 0: return
+        # Generate speed profile via physical integration
+        speed_profile = self._generate_speed_profile(distance_inches, target_speed_ips)
+        num_samples = len(speed_profile)
+        if num_samples == 0:
+            return
         self._ensure_audio_capacity(num_samples)
-        
-        # --- 2. Generate Continuous Instruction Track ---
+
         t = np.arange(num_samples) / self.sample_rate_hz
         instruction_track = np.zeros(num_samples, dtype="f4")
         op_coeffs = self.op_sine_coeffs.get(op_name, {})
         for freq, amp in op_coeffs.items():
             instruction_track += amp * np.sin(2 * np.pi * freq * t)
 
-        # --- 3. Generate Dynamic Motor Hum based on Speed Profile ---
         motor_hum = np.zeros(num_samples, dtype="f4")
         motor_base_coeffs = self.op_sine_coeffs.get('motor', {60.0: 0.5})
-        
-        # Create a vector of instantaneous speed over the movement duration
-        speed_profile = np.zeros(num_samples, dtype="f4")
-        n_accel = int(time_to_accel * self.time_scale_factor * self.sample_rate_hz)
-        n_coast = int(time_coast * self.time_scale_factor * self.sample_rate_hz)
-        if n_accel > 0:
-            accel_speeds = np.linspace(0, target_speed_ips, n_accel)
-            speed_profile[:n_accel] = accel_speeds
-            speed_profile[num_samples-n_accel:] = accel_speeds[::-1]
-        if n_coast > 0:
-            speed_profile[n_accel : n_accel + n_coast] = target_speed_ips
-
-        # Generate audio sample by sample based on speed
         for i in range(num_samples):
             speed = speed_profile[i]
             for base_freq, amp in motor_base_coeffs.items():
                 dir_coeff = self.motor_direction_coeff if direction == -1 else 1.0
                 freq = base_freq * dir_coeff * (1 + speed * self.motor_speed_pitch_coeff)
-                motor_hum[i] += amp * np.sin(2 * np.pi * freq * t[i])
+                amp_mod = amp * (0.5 + 0.5 * (speed / max(target_speed_ips, 1e-6)))
+                motor_hum[i] += amp_mod * np.sin(2 * np.pi * freq * t[i])
 
-        # --- 4. Mix and Store ---
         final_mix = instruction_track + motor_hum
-        
-        # Apply a master ADSR envelope to the entire operation
-        master_env = self._get_adsr_envelope(scaled_time_sec, num_samples)
+        duration_sec = num_samples / self.sample_rate_hz
+        master_env = self._get_adsr_envelope(duration_sec, num_samples)
         final_mix *= master_env
 
         self._audio_buffer[self._audio_cursor : self._audio_cursor + num_samples] += final_mix
         self._audio_cursor += num_samples
-        time.sleep(scaled_time_sec)
+        time.sleep(duration_sec * self.time_scale_factor)
 
     def _get_adsr_envelope(self, duration_s: float, n_samples: int) -> _Vec:
         env = np.zeros(n_samples, dtype="f4")
