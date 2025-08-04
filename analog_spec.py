@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import List
+import struct
+
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -25,6 +27,7 @@ MOTOR_CARRIER = 60.0
 WRITE_BIAS = 150.0
 DATA_ADSR = (50, 50, 0.8, 100)  # attack, decay, sustain, release in ms
 FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
+MOTOR_RAMP_MS = 250  # up/down ramp duration for SEEK envelopes
 
 
 def lane_frequency(lane: int) -> float:
@@ -85,6 +88,60 @@ def dominant_tone(wave: np.ndarray) -> DominantTone:
         return DominantTone(0, lane_frequency(0), 0j, 0.0)
     freqs = np.fft.rfftfreq(len(wave), 1 / FS)
     return DominantTone(idx, float(freqs[idx]), vector, amp)
+
+
+# ---------------------------------------------------------------------------
+# 7. Motor Control Simulation
+
+
+@dataclass
+class MotorCalibration:
+    """Calibration constants for the motor system."""
+
+    fast_wind_ms: float
+    read_speed_ms: float
+    drift_ms: float
+
+
+def trapezoidal_motor_envelope(
+    distance_frames: int, calib: MotorCalibration, speed: str = "read"
+) -> np.ndarray:
+    """Return a trapezoidal motor gain envelope for a SEEK movement.
+
+    ``distance_frames`` is the number of bit frames to traverse.  ``calib``
+    provides the calibration times from the BIOS block.  ``speed`` selects
+    the plateau amplitude: ``"read"`` for nominal speed (amplitude=1.0) or
+    ``"fast"`` for the fast-wind factor derived from calibration.
+
+    The envelope ramps up and down over ``MOTOR_RAMP_MS`` and keeps a constant
+    plateau so that the integral of the envelope equals the travel time at the
+    chosen speed.  When the distance is too short for a full plateau the peak
+    amplitude is scaled instead, yielding a triangular profile.
+    """
+
+    distance_ms = distance_frames * BIT_FRAME_MS
+    up_ms = MOTOR_RAMP_MS
+    dn_ms = MOTOR_RAMP_MS
+    plateau_amp = 1.0
+    if speed == "fast" and calib.fast_wind_ms > 0.0:
+        plateau_amp = calib.read_speed_ms / calib.fast_wind_ms
+    unit_area = 0.5 * (up_ms + dn_ms)
+    max_tri_area = plateau_amp * unit_area
+    if distance_ms <= max_tri_area:
+        amp = distance_ms / unit_area
+        up_n = int(FS * (up_ms / 1000.0))
+        dn_n = int(FS * (dn_ms / 1000.0))
+        env_up = np.linspace(0.0, amp, up_n, endpoint=False)
+        env_dn = np.linspace(amp, 0.0, dn_n, endpoint=True)
+        return np.concatenate([env_up, env_dn]).astype("f4")
+    coast_ms = max(distance_ms / plateau_amp - unit_area, 0.0)
+    up_n = int(FS * (up_ms / 1000.0))
+    coast_n = int(FS * (coast_ms / 1000.0))
+    dn_n = int(FS * (dn_ms / 1000.0))
+    env_up = np.linspace(0.0, plateau_amp, up_n, endpoint=False)
+    env_coast = np.full(coast_n, plateau_amp)
+    env_dn = np.linspace(plateau_amp, 0.0, dn_n, endpoint=True)
+    return np.concatenate([env_up, env_coast, env_dn]).astype("f4")
 
 # ---------------------------------------------------------------------------
 # 3. Instruction Word
@@ -225,5 +282,68 @@ class ExecMode(Enum):
 
 
 # ---------------------------------------------------------------------------
-# 7 & 10 – Motor control and headers are left for future work.
-# TODO: Implement motor envelopes and binary header packing.
+# 10. Header & Metadata
+
+
+MAGIC_ID = b"TURINGv1"
+
+
+@dataclass
+class BiosHeader:
+    """Fixed-length BIOS header as per AGENTS.md."""
+
+    calib_fast_ms: float
+    calib_read_ms: float
+    drift_ms: float
+    inputs: List[int]
+    outputs: List[int]
+    instr_start_addr: int
+
+
+BIOS_HEADER_STRUCT = struct.Struct("<8sfffB32sB32sI6s")
+
+
+def pack_bios_header(h: BiosHeader, magic: bytes = MAGIC_ID) -> bytes:
+    """Pack ``h`` into a fixed-length binary header."""
+
+    inputs = bytes(h.inputs + [0xFF] * (32 - len(h.inputs)))
+    outputs = bytes(h.outputs + [0xFF] * (32 - len(h.outputs)))
+    return BIOS_HEADER_STRUCT.pack(
+        magic,
+        float(h.calib_fast_ms),
+        float(h.calib_read_ms),
+        float(h.drift_ms),
+        len(h.inputs),
+        inputs,
+        len(h.outputs),
+        outputs,
+        int(h.instr_start_addr),
+        b"\x00" * 6,
+    )
+
+
+def unpack_bios_header(data: bytes) -> BiosHeader:
+    """Unpack a ``BiosHeader`` from ``data``."""
+
+    unpacked = BIOS_HEADER_STRUCT.unpack(data)
+    _, fast_ms, read_ms, drift_ms, n_in, in_bytes, n_out, out_bytes, addr, _ = unpacked
+    inputs = [b for b in in_bytes[:n_in]]
+    outputs = [b for b in out_bytes[:n_out]]
+    return BiosHeader(fast_ms, read_ms, drift_ms, inputs, outputs, addr)
+
+
+def header_frames(h: BiosHeader) -> List[List[int]]:
+    """Serialise ``h`` across lanes as parallel frames of bits."""
+
+    packed = pack_bios_header(h)
+    bits = []
+    for byte in packed:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+    frames: List[List[int]] = []
+    for i in range(0, len(bits), LANES):
+        frame = bits[i : i + LANES]
+        if len(frame) < LANES:
+            frame += [0] * (LANES - len(frame))
+        frames.append(frame)
+    return frames
