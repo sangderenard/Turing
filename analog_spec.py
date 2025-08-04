@@ -38,8 +38,25 @@ def generate_bit_wave(bit: int, lane: int) -> np.ndarray:
     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
     if bit:
         freq = lane_frequency(lane)
-        # TODO: apply full ADSR envelope instead of unity gain
-        return np.sin(2 * np.pi * freq * t).astype("f4")
+        a_ms, d_ms, sustain_level, r_ms = DATA_ADSR
+        a_n = int(FS * (a_ms / 1000.0))
+        d_n = int(FS * (d_ms / 1000.0))
+        r_n = int(FS * (r_ms / 1000.0))
+        s_n = FRAME_SAMPLES - (a_n + d_n + r_n)
+        # ADSR envelope: attack 0→1 over ``a_ms``, decay to ``sustain_level`` over
+        # ``d_ms``, sustain constant for ``s_n`` samples, then release to 0 over
+        # ``r_ms``.  Durations and level come directly from AGENTS.md's
+        # ``DATA_ADSR`` and fill the full ``BIT_FRAME_MS`` of 500 ms.
+        env = np.concatenate(
+            [
+                np.linspace(0.0, 1.0, a_n, endpoint=False),
+                np.linspace(1.0, sustain_level, d_n, endpoint=False),
+                np.full(s_n, sustain_level),
+                np.linspace(sustain_level, 0.0, r_n, endpoint=True),
+            ]
+        )
+        sine = np.sin(2 * np.pi * freq * t)
+        return (sine * env).astype("f4")
     return np.zeros_like(t, dtype="f4")
 
 # ---------------------------------------------------------------------------
