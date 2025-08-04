@@ -138,7 +138,7 @@ class CassetteTapeBackend:
             bit_width_inches = 1.0 / self.bits_per_inch
             self._head.enqueue_read(track, lane, bit_idx)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'read')
-            frame = self._head.activate('read', self.read_write_speed_ips)
+            frame = self._head.activate(track, 'read', self.read_write_speed_ips)
             self._head_pos_inches += bit_width_inches
             if frame is None:
                 raise RuntimeError("read head not engaged at correct speed")
@@ -154,7 +154,7 @@ class CassetteTapeBackend:
             bit_width_inches = 1.0 / self.bits_per_inch
             self._head.enqueue_write(track, lane, bit_idx, frame)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
-            self._head.activate('write', self.read_write_speed_ips)
+            self._head.activate(track, 'write', self.read_write_speed_ips)
             self._head_pos_inches += bit_width_inches
 
     # Digital convenience wrappers ------------------------------------------------ #

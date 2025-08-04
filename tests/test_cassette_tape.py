@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 
 from cassette_tape import CassetteTapeBackend
-from analog_spec import generate_bit_wave
+from analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS
 
 
 def test_read_write_emits_audio():
@@ -44,8 +44,21 @@ def test_head_gates_on_speed():
     tape.move_head_to_bit(0)
     tape._head.enqueue_read(0, 0, 0)
     # incorrect speed -> queue remains
-    assert tape._head.activate('read', 0.5) is None
+    assert tape._head.activate(0, 'read', 0.5) is None
     # correct speed unlocks transfer
-    out = tape._head.activate('read', tape.read_write_speed_ips)
+    out = tape._head.activate(0, 'read', tape.read_write_speed_ips)
     assert np.max(np.abs(out)) > 0
+    tape.close()
+
+
+def test_write_adds_bias_tone():
+    tape = CassetteTapeBackend(tape_length_inches=0.02)
+    frame = generate_bit_wave(1, 0)
+    tape.write_wave(0, 0, 0, frame)
+    out = tape.read_wave(0, 0, 0)
+    t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
+    bias_wave = 0.1 * np.sin(2 * np.pi * WRITE_BIAS * t)
+    diff = out - frame
+    assert np.max(np.abs(diff)) > 0.0
+    assert abs(np.dot(diff, bias_wave)) > 100.0
     tape.close()
