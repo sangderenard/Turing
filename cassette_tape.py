@@ -17,7 +17,7 @@ Upgrades:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import threading
 import queue
 import time
@@ -61,6 +61,9 @@ class CassetteTapeBackend:
     motor_direction_coeff: float = 1.02 # Slight pitch change for reverse
     motor_friction_coeff: float = 0.02 # Fractional drag per second
 
+    # If provided, override computed bits; otherwise derive from tape_length_inches
+    tape_length: Optional[int] = None  # Total bits on tape (optional override)
+
     # -------------------------- Runtime State ---------------------------------- #
     _head_pos_inches: float = 0.0
     _tape_frames: Dict[int, _Vec] = field(default_factory=dict)
@@ -77,11 +80,26 @@ class CassetteTapeBackend:
         self._attack_s = self.attack_ms / 1000.0 * self.time_scale_factor
         self._decay_s = self.decay_ms / 1000.0 * self.time_scale_factor
         self._release_s = self.release_ms / 1000.0 * self.time_scale_factor
+        # If total bits override provided, infer missing physical properties
+        if self.tape_length is not None:
+            # default tape_length_inches constant
+            default_inches = 3600.0 * 12
+            if self.tape_length_inches == default_inches:
+                # infer physical length from bits and density
+                self.tape_length_inches = self.tape_length / self.bits_per_inch
+            else:
+                # infer density from bits and physical length
+                self.bits_per_inch = int(round(self.tape_length / self.tape_length_inches))
         self._init_audio_system()
         self._head = TapeHead(self)
 
     @property
     def total_bits(self) -> int:
+        """
+        Total bits on tape. Use override if provided, otherwise compute from physical length.
+        """
+        if self.tape_length is not None:
+            return int(self.tape_length)
         return int(self.tape_length_inches * self.bits_per_inch)
 
     def _init_audio_system(self):

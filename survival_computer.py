@@ -34,7 +34,8 @@ class GraphExecutor:
         self.graph = graph
         self.cassette = cassette
         self.bit_width = bit_width
-        self.tape_len = cassette.tape_length
+        # Determine tape capacity in bits (override or physical length)
+        self.tape_len = cassette.total_bits
         self.memory_map: MemoryMap = {}
         self._tape_cursor = 0 # Next available tape address
 
