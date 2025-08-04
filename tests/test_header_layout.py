@@ -12,6 +12,7 @@ from analog_spec import (
     unpack_bios_header,
     LANES,
 )
+from tape_map import TapeMap, create_register_tapes
 
 
 def make_header():
@@ -53,3 +54,28 @@ def test_header_serialization_bits():
     assert frames and all(len(frame) == LANES for frame in frames)
     reconstructed = bits_to_bytes(frames)[: len(MAGIC_ID)]
     assert reconstructed == MAGIC_ID
+
+
+def test_tape_map_layout():
+    h = make_header()
+    tmap = TapeMap(h, instruction_frames=10)
+    assert tmap.instr_start == len(header_frames(h))
+    assert tmap.data_start == tmap.instr_start + 10
+
+
+def test_tape_map_bios_roundtrip():
+    h = make_header()
+    tmap = TapeMap(h, instruction_frames=0)
+    frames = tmap.encode_bios()
+    decoded = TapeMap.decode_bios(frames)
+    assert decoded.instr_start_addr == h.instr_start_addr
+
+
+def test_register_tapes_independent():
+    h = make_header()
+    regs = create_register_tapes(h)
+    assert set(regs.keys()) == {0, 1, 2}
+    for r in regs.values():
+        assert r.instr_start == len(header_frames(h))
+        assert r.data_start == r.instr_start
+
