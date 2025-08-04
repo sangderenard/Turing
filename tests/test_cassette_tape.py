@@ -13,10 +13,14 @@ def test_read_write_emits_audio():
         tape_length_inches=0.02,
         op_sine_coeffs={"read": {440.0: 1.0}, "write": {880.0: 1.0}, "motor": {60.0: 0.5}},
     )
-    frame = generate_bit_wave(1, 0)
-    tape.write_wave(0, frame)
-    out = tape.read_wave(0)
-    assert np.max(np.abs(out)) > 0.0
+    frame0 = generate_bit_wave(1, 0)
+    tape.write_wave(0, 0, 0, frame0)
+    out0 = tape.read_wave(0, 0, 0)
+    frame1 = generate_bit_wave(1, 1)
+    tape.write_wave(0, 1, 1, frame1)
+    out1 = tape.read_wave(0, 1, 1)
+    assert np.max(np.abs(out0)) > 0.0
+    assert np.max(np.abs(out1)) > 0.0
     assert tape._audio_cursor > 0
     tape.close()
 
@@ -24,8 +28,11 @@ def test_read_write_emits_audio():
 def test_move_head_to_bit_and_write_wrapper():
     tape = CassetteTapeBackend(tape_length_inches=0.02)
     tape.move_head_to_bit(5)
-    tape.write_bit(5, 1)
-    assert tape.read_bit(5) == 1
+    tape.write_bit(0, 0, 5, 1)
+    assert tape.read_bit(0, 0, 5) == 1
+    tape.write_bit(0, 1, 6, 1)
+    assert tape.read_bit(0, 1, 6) == 1
+    assert tape.read_bit(0, 0, 6) == 0
     tape.close()
 
 
@@ -33,9 +40,9 @@ def test_head_gates_on_speed():
     tape = CassetteTapeBackend(tape_length_inches=0.02)
     # prepare data and head position
     frame = generate_bit_wave(1, 0)
-    tape._tape_frames[0] = frame
+    tape._tape_frames[(0, 0, 0)] = frame
     tape.move_head_to_bit(0)
-    tape._head.enqueue_read(0)
+    tape._head.enqueue_read(0, 0, 0)
     # incorrect speed -> queue remains
     assert tape._head.activate('read', 0.5) is None
     # correct speed unlocks transfer
