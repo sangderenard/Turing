@@ -22,6 +22,9 @@ import threading
 import queue
 import time
 
+from analog_spec import generate_bit_wave, FRAME_SAMPLES
+from tape_head import TapeHead
+
 try:
     import numpy as np
     _Vec = np.ndarray
@@ -59,7 +62,8 @@ class CassetteTapeBackend:
 
     # -------------------------- Runtime State ---------------------------------- #
     _head_pos_inches: float = 0.0
-    _tape_data: Dict[int, int] = field(default_factory=dict)
+    _tape_frames: Dict[int, _Vec] = field(default_factory=dict)
+    _gate: threading.Lock = field(default_factory=threading.Lock)
 
     _audio_cursor: int = 0
     _audio_buffer: _Vec | None = None
@@ -73,6 +77,7 @@ class CassetteTapeBackend:
         self._decay_s = self.decay_ms / 1000.0 * self.time_scale_factor
         self._release_s = self.release_ms / 1000.0 * self.time_scale_factor
         self._init_audio_system()
+        self._head = TapeHead(self)
 
     @property
     def total_bits(self) -> int:
@@ -102,19 +107,46 @@ class CassetteTapeBackend:
         self._simulate_movement(abs(distance_inches), self.seek_speed_ips, direction, 'seek')
         self._head_pos_inches = target_pos_inches
 
+    # ---------------------------- Bit / Frame Access --------------------------- #
+
+    def read_wave(self, bit_idx: int) -> _Vec:
+        """Return the PCM frame at ``bit_idx`` after physical seek and scan."""
+        with self._gate:
+            self.move_head_to_bit(bit_idx)
+            current_idx = int(round(self._head_pos_inches * self.bits_per_inch))
+            if current_idx != bit_idx:
+                raise RuntimeError("head misaligned for read")
+            bit_width_inches = 1.0 / self.bits_per_inch
+            self._head.enqueue_read(bit_idx)
+            self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'read')
+            frame = self._head.activate('read', self.read_write_speed_ips)
+            self._head_pos_inches += bit_width_inches
+            if frame is None:
+                raise RuntimeError("read head not engaged at correct speed")
+            return frame
+
+    def write_wave(self, bit_idx: int, frame: _Vec):
+        """Write a PCM frame to ``bit_idx`` respecting head movement."""
+        with self._gate:
+            self.move_head_to_bit(bit_idx)
+            current_idx = int(round(self._head_pos_inches * self.bits_per_inch))
+            if current_idx != bit_idx:
+                raise RuntimeError("head misaligned for write")
+            bit_width_inches = 1.0 / self.bits_per_inch
+            self._head.enqueue_write(bit_idx, frame)
+            self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
+            self._head.activate('write', self.read_write_speed_ips)
+            self._head_pos_inches += bit_width_inches
+
+    # Digital convenience wrappers ------------------------------------------------ #
+
     def read_bit(self, bit_idx: int) -> int:
-        self.move_head_to_bit(bit_idx)
-        bit_width_inches = 1.0 / self.bits_per_inch
-        self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'read')
-        self._head_pos_inches += bit_width_inches
-        return self._tape_data.get(bit_idx, 0)
+        wave = self.read_wave(bit_idx)
+        return 1 if float(np.max(np.abs(wave))) > 0.5 else 0
 
     def write_bit(self, bit_idx: int, value: int):
-        self.move_head_to_bit(bit_idx)
-        bit_width_inches = 1.0 / self.bits_per_inch
-        self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
-        self._head_pos_inches += bit_width_inches
-        self._tape_data[bit_idx] = 1 if value else 0
+        frame = generate_bit_wave(1 if value else 0, 0)
+        self.write_wave(bit_idx, frame)
         
     def _simulate_movement(self, distance_inches: float, target_speed_ips: float, direction: int, op_name: str):
         # --- 1. Calculate Time and Speed Profile ---
@@ -174,6 +206,7 @@ class CassetteTapeBackend:
 
         self._audio_buffer[self._audio_cursor : self._audio_cursor + num_samples] += final_mix
         self._audio_cursor += num_samples
+        time.sleep(scaled_time_sec)
 
     def _get_adsr_envelope(self, duration_s: float, n_samples: int) -> _Vec:
         env = np.zeros(n_samples, dtype="f4")

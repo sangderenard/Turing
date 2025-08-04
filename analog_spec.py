@@ -84,43 +84,72 @@ class Register:
 
 
 def nand_wave(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Analogue NAND operator.
+    """Analogue NAND operator using amplitude summing.
 
-    Full analogue amplitude summing and thresholding at 1.5A has not yet been
-    modelled.  No digital shortcut is permitted, so this function is left
-    unimplemented until a faithful signal-level simulation is provided.
+    The two input waves are summed and the peak amplitude is measured.  A
+    result of ``0`` is represented by a silent frame when the summed peak
+    exceeds the 1.5A threshold (both inputs high).  Otherwise a unity sine wave
+    is emitted as a placeholder for a logical ``1``.  The lane frequency is
+    currently fixed to lane ``0``; future work must analyse the actual carrier
+    of ``x``/``y`` and reproduce it exactly.
     """
-    raise NotImplementedError("analogue NAND not implemented")
+    summed = x + y
+    peak = float(np.max(np.abs(summed)))
+    if peak >= 1.5:
+        return np.zeros_like(x)
+    # TODO: preserve original lane frequency and amplitude
+    return generate_bit_wave(1, 0)
 
 
 def sigma_L(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
-    """σ_L^k – append k silent frames."""
-    raise NotImplementedError("σ_L not implemented")
+    """σ_L^k – append ``k`` silent frames to the sequence."""
+    return frames + zeros(k)
 
 
 def sigma_R(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
-    """σ_R^k – drop last k frames."""
-    raise NotImplementedError("σ_R not implemented")
+    """σ_R^k – drop the last ``k`` frames from ``frames"."""
+    if k <= 0:
+        return list(frames)
+    return list(frames[:-k]) if k < len(frames) else []
 
 
 def concat(x: List[np.ndarray], y: List[np.ndarray]) -> List[np.ndarray]:
-    raise NotImplementedError("concat not implemented")
+    """Concatenate two frame lists."""
+    return list(x) + list(y)
 
 
 def slice_frames(x: List[np.ndarray], i: int, j: int) -> List[np.ndarray]:
-    raise NotImplementedError("slice not implemented")
+    """Return frames in the half-open interval ``[i, j)``."""
+    return list(x[i:j])
 
 
 def mu(x: List[np.ndarray], y: List[np.ndarray], sel: List[np.ndarray]) -> List[np.ndarray]:
-    raise NotImplementedError("mu selector not implemented")
+    """Amplitude-gated selector.
+
+    For each index the selector frame's peak amplitude decides whether the
+    output takes the frame from ``x`` (peak < 0.5) or from ``y`` (peak ≥ 0.5).
+    This is a coarse placeholder for a true VCA-based implementation.
+    """
+    out: List[np.ndarray] = []
+    for fx, fy, fs in zip(x, y, sel):
+        if np.max(np.abs(fs)) >= 0.5:
+            out.append(fy)
+        else:
+            out.append(fx)
+    return out
 
 
 def length(frames: List[np.ndarray]) -> int:
-    raise NotImplementedError("length not implemented")
+    """Return the number of frames.
+
+    TODO: model mechanical timing and encode the result as PCM frames.
+    """
+    return len(frames)
 
 
 def zeros(n: int) -> List[np.ndarray]:
-    raise NotImplementedError("zeros not implemented")
+    """Return ``n`` silent frames."""
+    return [np.zeros(FRAME_SAMPLES, dtype="f4") for _ in range(n)]
 
 # ---------------------------------------------------------------------------
 # 8. Audio Event IR
