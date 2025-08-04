@@ -185,30 +185,48 @@ class Register:
 
 
 def nand_wave(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Analogue NAND operator using amplitude summing.
+    """Analogue NAND based on per-lane spectral combination.
 
-    Both operands are assumed to occupy the same carrier lane.  Their waves are
-    summed and the peak amplitude of the result is compared against ``1.5A``
-    where ``A`` is the larger operand amplitude.  Crossing this threshold means
-    both inputs were high and the NAND output is silence.  Otherwise a waveform
-    for logical ``1`` is reconstructed from the louder input's dominant FFT
-    vector, preserving its frequency, amplitude, and phase.  This remains a
-    placeholder and ignores proper envelopes.
+    This implementation operates in the frequency domain to perform NAND
+    operations on each of the 32 frequency lanes independently.
+
+    1.  Decomposes input signals ``x`` and ``y`` into their spectra using FFT.
+    2.  For each lane, it determines the logical state ('1' or '0') based on
+        the spectral energy around the lane's characteristic frequency.
+    3.  It computes the NAND logic for each lane.
+    4.  A new output spectrum is constructed: if a lane's NAND result is '1',
+        the spectral components from both inputs for that lane are summed. If
+        '0', the lane is silent in the output spectrum.
+    5.  The final PCM waveform is reconstructed via an inverse FFT.
     """
-    summed = x + y
-    peak_sum = float(np.max(np.abs(summed)))
-    tone_x = dominant_tone(x)
-    tone_y = dominant_tone(y)
-    A = max(tone_x.amp, tone_y.amp)
-    if A > 0.0 and peak_sum >= 1.5 * A:
-        return np.zeros_like(x)
-    if A == 0.0:
-        t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
-        return np.sin(2 * np.pi * lane_frequency(0) * t).astype("f4")
-    tone = tone_x if tone_x.amp >= tone_y.amp else tone_y
-    spectrum = np.zeros(FRAME_SAMPLES // 2 + 1, dtype=complex)
-    spectrum[tone.bin] = tone.vector
-    return np.fft.irfft(spectrum, n=FRAME_SAMPLES).astype("f4")
+    fft_x = np.fft.rfft(x)
+    fft_y = np.fft.rfft(y)
+    freqs = np.fft.rfftfreq(len(x), 1 / FS)
+    output_spectrum = np.zeros_like(fft_x)
+
+    # Define a threshold for detecting a '1' based on amplitude.
+    # This threshold is converted to the FFT magnitude domain.
+    amp_threshold = 0.1
+    mag_threshold = amp_threshold * FRAME_SAMPLES / 2.0
+
+    for lane in range(LANES):
+        target_freq = lane_frequency(lane)
+        # Find the FFT bin index closest to the lane's frequency.
+        freq_idx = np.argmin(np.abs(freqs - target_freq))
+
+        # Determine if the lane is active ('1') for each input.
+        x_is_1 = np.abs(fft_x[freq_idx]) > mag_threshold
+        y_is_1 = np.abs(fft_y[freq_idx]) > mag_threshold
+
+        # NAND logic: output is '0' (silent) only if both inputs are '1'.
+        if not (x_is_1 and y_is_1):
+            # If NAND result is '1', combine the spectra from both inputs
+            # for this lane. This preserves the original phase and amplitude
+            # information from both signals.
+            output_spectrum[freq_idx] = fft_x[freq_idx] + fft_y[freq_idx]
+
+    # Reconstruct the time-domain signal from the combined spectrum.
+    return np.fft.irfft(output_spectrum, n=FRAME_SAMPLES).astype("f4")
 
 
 def sigma_L(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
