@@ -63,24 +63,24 @@ class GraphExecutor:
         # --- Translate each primitive into physical R/W/Move operations ---
         if op == "zeros":
             for i in range(self.bit_width):
-                self.cassette.write_bit(output_addr + i, 0)
+                self.cassette.write_bit(0, 0, output_addr + i, 0)
         
         elif op == "nand":
             addr_x, addr_y = input_addrs
             for i in range(self.bit_width):
-                bit_x = self.cassette.read_bit(addr_x + i)
-                bit_y = self.cassette.read_bit(addr_y + i)
+                bit_x = self.cassette.read_bit(0, 0, addr_x + i)
+                bit_y = self.cassette.read_bit(0, 0, addr_y + i)
                 result = 1 - (bit_x & bit_y)
-                self.cassette.write_bit(output_addr + i, result)
+                self.cassette.write_bit(0, 0, output_addr + i, result)
         
         elif op == "mu":
             addr_x, addr_y, addr_sel = input_addrs
             for i in range(self.bit_width):
-                bit_x = self.cassette.read_bit(addr_x + i)
-                bit_y = self.cassette.read_bit(addr_y + i)
-                sel = self.cassette.read_bit(addr_sel + i)
+                bit_x = self.cassette.read_bit(0, 0, addr_x + i)
+                bit_y = self.cassette.read_bit(0, 0, addr_y + i)
+                sel = self.cassette.read_bit(0, 0, addr_sel + i)
                 result = bit_y if sel else bit_x
-                self.cassette.write_bit(output_addr + i, result)
+                self.cassette.write_bit(0, 0, output_addr + i, result)
 
         elif op == "concat":
             # This is a simplified model: we assume concat inputs are smaller

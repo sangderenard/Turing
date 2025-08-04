@@ -66,7 +66,7 @@ class CassetteTapeBackend:
 
     # -------------------------- Runtime State ---------------------------------- #
     _head_pos_inches: float = 0.0
-    _tape_frames: Dict[int, _Vec] = field(default_factory=dict)
+    _tape_frames: Dict[Tuple[int, int, int], _Vec] = field(default_factory=dict)
     _gate: threading.Lock = field(default_factory=threading.Lock)
 
     _audio_cursor: int = 0
@@ -128,15 +128,15 @@ class CassetteTapeBackend:
 
     # ---------------------------- Bit / Frame Access --------------------------- #
 
-    def read_wave(self, bit_idx: int) -> _Vec:
-        """Return the PCM frame at ``bit_idx`` after physical seek and scan."""
+    def read_wave(self, track: int, lane: int, bit_idx: int) -> _Vec:
+        """Return the PCM frame at ``(track, lane, bit_idx)`` after seek and scan."""
         with self._gate:
             self.move_head_to_bit(bit_idx)
             current_idx = int(round(self._head_pos_inches * self.bits_per_inch))
             if current_idx != bit_idx:
                 raise RuntimeError("head misaligned for read")
             bit_width_inches = 1.0 / self.bits_per_inch
-            self._head.enqueue_read(bit_idx)
+            self._head.enqueue_read(track, lane, bit_idx)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'read')
             frame = self._head.activate('read', self.read_write_speed_ips)
             self._head_pos_inches += bit_width_inches
@@ -144,28 +144,28 @@ class CassetteTapeBackend:
                 raise RuntimeError("read head not engaged at correct speed")
             return frame
 
-    def write_wave(self, bit_idx: int, frame: _Vec):
-        """Write a PCM frame to ``bit_idx`` respecting head movement."""
+    def write_wave(self, track: int, lane: int, bit_idx: int, frame: _Vec):
+        """Write a PCM frame to ``(track, lane, bit_idx)`` respecting movement."""
         with self._gate:
             self.move_head_to_bit(bit_idx)
             current_idx = int(round(self._head_pos_inches * self.bits_per_inch))
             if current_idx != bit_idx:
                 raise RuntimeError("head misaligned for write")
             bit_width_inches = 1.0 / self.bits_per_inch
-            self._head.enqueue_write(bit_idx, frame)
+            self._head.enqueue_write(track, lane, bit_idx, frame)
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
             self._head.activate('write', self.read_write_speed_ips)
             self._head_pos_inches += bit_width_inches
 
     # Digital convenience wrappers ------------------------------------------------ #
 
-    def read_bit(self, bit_idx: int) -> int:
-        wave = self.read_wave(bit_idx)
+    def read_bit(self, track: int, lane: int, bit_idx: int) -> int:
+        wave = self.read_wave(track, lane, bit_idx)
         return 1 if float(np.max(np.abs(wave))) > 0.5 else 0
 
-    def write_bit(self, bit_idx: int, value: int):
-        frame = generate_bit_wave(1 if value else 0, 0)
-        self.write_wave(bit_idx, frame)
+    def write_bit(self, track: int, lane: int, bit_idx: int, value: int):
+        frame = generate_bit_wave(1 if value else 0, lane)
+        self.write_wave(track, lane, bit_idx, frame)
 
     # ------------------------------------------------------------------
     def _generate_speed_profile(self, distance: float, target_speed: float) -> _Vec:
