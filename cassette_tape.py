@@ -122,9 +122,9 @@ class CassetteTapeBackend:
         dist_accel = 0.5 * self.motor_acceleration_ips2 * (time_to_accel ** 2)
 
         if 2 * dist_accel >= distance_inches:
-            time_to_peak = (distance_inches / self.motor_acceleration_ips2)**0.5
-            total_time_sec = 2 * time_to_peak
+            time_to_accel = (distance_inches / self.motor_acceleration_ips2) ** 0.5
             time_coast = 0.0
+            total_time_sec = 2 * time_to_accel
         else:
             dist_coast = distance_inches - 2 * dist_accel
             time_coast = dist_coast / target_speed_ips
