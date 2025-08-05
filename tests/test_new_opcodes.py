@@ -3,6 +3,9 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.operators
 
 from src.hardware.analog_spec import (
     BiosHeader,
