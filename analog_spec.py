@@ -14,6 +14,8 @@ import struct
 
 import numpy as np
 
+from nand_wave import nand_wave  # use full implementation
+
 # ---------------------------------------------------------------------------
 # 1. Global Parameters
 LANES = 32
@@ -182,50 +184,6 @@ class Register:
 
 # ---------------------------------------------------------------------------
 # 6. Primitive Operator Stubs
-
-
-def nand_wave(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Analogue NAND combining lane spectra.
-
-    For each lane the function inspects the spectral energy of ``x`` and
-    ``y`` at the lane's base frequency.  If both inputs present a '1' the
-    result is silence for that lane.  If exactly one input is '1' the
-    corresponding spectral component (with its phase) is copied to the output.
-    When both inputs are '0' a canonical ``generate_bit_wave`` tone is
-    inserted for that lane.  Only the lane bins are manipulated; all other
-    spectral content is discarded.
-    """
-    fft_x = np.fft.rfft(x)
-    fft_y = np.fft.rfft(y)
-    freqs = np.fft.rfftfreq(len(x), 1 / FS)
-
-    amp_threshold = 0.1
-    mag_threshold = amp_threshold * FRAME_SAMPLES / 2.0
-
-    output_spectrum = np.zeros_like(fft_x)
-    active_any = False
-    for lane in range(LANES):
-        freq_idx = np.argmin(np.abs(freqs - lane_frequency(lane)))
-        mag_x = np.abs(fft_x[freq_idx])
-        mag_y = np.abs(fft_y[freq_idx])
-        x_is_1 = mag_x > mag_threshold
-        y_is_1 = mag_y > mag_threshold
-        if x_is_1 or y_is_1:
-            active_any = True
-            if x_is_1 and y_is_1:
-                continue
-            if x_is_1:
-                output_spectrum[freq_idx] = fft_x[freq_idx]
-            elif y_is_1:
-                output_spectrum[freq_idx] = fft_y[freq_idx]
-        # lanes with both 0 are ignored unless no lane is active at all
-
-    if not active_any:
-        idx0 = np.argmin(np.abs(freqs - lane_frequency(0)))
-        base_fft0 = np.fft.rfft(generate_bit_wave(1, 0))
-        output_spectrum[idx0] = base_fft0[idx0]
-
-    return np.fft.irfft(output_spectrum, n=FRAME_SAMPLES).astype("f4")
 
 
 def sigma_L(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
