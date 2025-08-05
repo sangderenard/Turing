@@ -17,7 +17,7 @@ Upgrades:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Tuple, Optional
 import threading
 import queue
 import time
@@ -88,6 +88,11 @@ class CassetteTapeBackend:
     _audio_queue: Optional[queue.Queue] = None
     _audio_thread: threading.Thread | None = None
 
+    # Optional callback for visualizers (e.g., reel demos) to receive
+    # updates on tape position and activity. The callable should accept
+    # ``(tape_position_tuple, head_pos_inches, reading, writing)``.
+    status_callback: Callable[[Tuple[int, int], float, bool, bool], None] | None = None
+
     def __post_init__(self):
         if np is None:
             raise ImportError("Numpy is required for the physical simulation.")
@@ -109,6 +114,7 @@ class CassetteTapeBackend:
                 self.bits_per_inch = int(round(self.tape_length / self.tape_length_inches))
         self._init_audio_system()
         self._head = TapeHead(self)
+        self._notify_status("seek")
 
     @property
     def total_bits(self) -> int:
@@ -127,6 +133,20 @@ class CassetteTapeBackend:
         self._buffer_cursor = 0
         self._audio_cursor = 0
 
+    def _notify_status(self, op_name: str) -> None:
+        """Send tape position and activity to the status callback if present."""
+        if self.status_callback is None:
+            return
+        current_bit = int(round(self._head_pos_inches * self.bits_per_inch))
+        left = max(self.total_bits - current_bit, 0)
+        right = min(current_bit, self.total_bits)
+        reading = op_name == "read"
+        writing = op_name == "write"
+        try:
+            self.status_callback((left, right), self._head_pos_inches, reading, writing)
+        except Exception:
+            pass
+
     def _ensure_audio_capacity(self, required_samples: int):
         if self._buffer_cursor + required_samples > len(self._audio_buffer):
             self._audio_queue.put(self._audio_buffer[:self._buffer_cursor].copy())
@@ -139,11 +159,13 @@ class CassetteTapeBackend:
         target_pos_inches = target_bit_idx / self.bits_per_inch
         distance_inches = target_pos_inches - self._head_pos_inches
         if abs(distance_inches) < 1e-6:
+            self._notify_status("seek")
             return
         
         direction = 1 if distance_inches > 0 else -1
         self._simulate_movement(abs(distance_inches), self.seek_speed_ips, direction, 'seek')
         self._head_pos_inches = target_pos_inches
+        self._notify_status("seek")
 
     # ---------------------------- Bit / Frame Access --------------------------- #
 
@@ -161,6 +183,7 @@ class CassetteTapeBackend:
             self._head_pos_inches += bit_width_inches
             if frame is None:
                 raise RuntimeError("read head not engaged at correct speed")
+            self._notify_status("read")
             return frame
 
     def write_wave(self, track: int, lane: int, bit_idx: int, frame: ndarray):
@@ -175,6 +198,7 @@ class CassetteTapeBackend:
             self._simulate_movement(bit_width_inches, self.read_write_speed_ips, 1, 'write')
             self._head.activate(track, 'write', self.read_write_speed_ips)
             self._head_pos_inches += bit_width_inches
+            self._notify_status("write")
 
     # Digital convenience wrappers ------------------------------------------------ #
 
