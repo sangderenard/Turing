@@ -7,11 +7,16 @@ import random
 import re
 import sys
 import threading
-from ..cells.linear_cells import LinearCells
 from uuid import uuid4
 
+from ..cells.cell_pressure import Simulator
+from ..cells.cell_pressure_region_manager import CellPressureRegionManager
+from ..cells.cell_consts import Cell
 
-from flask import json
+import json
+
+# Mirror LinearCells flag used by older region manager
+IMMUTABLE = 1 << 5
 class BitTensorMemoryDAGHelper:
     def __init__(self, bit_tensor_memory, chunk_size=8, bit_width=32):
         self.bit_tensor_memory = bit_tensor_memory
@@ -148,13 +153,21 @@ class BitTensorMemory: #sizes in bytes
         
 
         self.active_regions = []
-        
+
         self.extra_data_size = 0
         self.set_cache = set()
-        self.region_manager = LinearCells(self.get_specs(), self.graph)
-        self.region_manager.relax()
-        print(f"[BitTensorMemory] Region Manager Manifest:")
-        print(self.region_manager.manifest())
+
+        specs = self.get_specs()
+        cells = [
+            Cell(stride=s["stride"], left=s["left"], right=s["right"],
+                 len=s["len"], label=s["label"])
+            for s in specs
+        ]
+        self.region_simulator = Simulator(cells)
+        self.region_manager = CellPressureRegionManager(
+            self.region_simulator.bitbuffer, cells
+        )
+
         
     def pull_full_set_from_memory(self):
         pass
@@ -169,8 +182,8 @@ class BitTensorMemory: #sizes in bytes
         for entry in self.set_cache:
             if self.unit_helper.bitmap[self.unit_helper.bitmap.MASK_BITMAP, offset // self.chunk_size, ((offset % self.chunk_size) * self.unit_helper.bitmap_depth) // self.unit_helper.bitmap_depth] == 1:
                 break
-            if offset < self.region_manager.boundaries[-3][1][1]:
-                break
+            # Legacy LinearCells boundary check removed; CellPressureRegionManager
+            # does not expose fixed boundaries.
             # write the entry
             ctypes.memmove(ctypes.addressof(self.data) + offset, ctypes.byref(entry), stride)
             offset -= stride
@@ -183,26 +196,16 @@ class BitTensorMemory: #sizes in bytes
     def reset_region_manager(self, boundaries=None, strides=None, insertion=False):
         # Recreate region manager with new specs
         specs = self.get_specs(boundaries, strides)
-        self.region_manager = LinearCells(specs, self.graph)
-        self.region_manager.register_object_maps()
-        # Initialize injection history map per cell
-        # each entry will hold injected IDs for that cell
-        self.inject_map = [[] for _ in range(len(self.region_manager.cells))]
-        # Perform insertion if requested: insertion is a label name
-        if insertion:
-            try:
-                idx = self.region_manager.labels.index(insertion)
-            except ValueError:
-                raise ValueError(f"Unknown region label for insertion: {insertion}")
-            # inject one item into the specified region
-            self.region_manager.inject_item(self.region_manager.cells, self.inject_map, idx)
-        # Relax new configuration
-        self.region_manager.relax()
-        results = self.region_manager.get_state()
-        print(results)
-        print(f"[BitTensorMemory] Region Manager Manifest:")
-        print(f"{self.region_manager.manifest()}")
-        return self.region_manager.manifest()
+        cells = [
+            Cell(stride=s["stride"], left=s["left"], right=s["right"],
+                 len=s["len"], label=s["label"])
+            for s in specs
+        ]
+        self.region_simulator = Simulator(cells)
+        self.region_manager = CellPressureRegionManager(
+            self.region_simulator.bitbuffer, cells
+        )
+        return self.region_manager.cells
 
 
     def read(self, offset, size, clear_delta_map=False):
@@ -278,7 +281,7 @@ class BitTensorMemory: #sizes in bytes
             {"left": boundaries[3], "right": boundaries[4], "label": 4, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
             {"left": boundaries[4], "right": boundaries[5], "label": 5, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
             {"left": boundaries[5], "right": boundaries[6], "label": 6, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
-            {"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size, "flags": LinearCells.IMMUTABLE},
+            {"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size, "flags": IMMUTABLE},
         ]
     def mark_free(self, offset, size):
         # mark free bits and reset delta
@@ -303,7 +306,8 @@ class BitTensorMemory: #sizes in bytes
         """
         Return the address of the tightest-fit hole for `bytes_needed` bytes.
 
-        Falls back to LinearCells.inject_item() until the hole exists.
+        Falls back to enqueueing a zeroed quantum via the pressure simulator
+        until the hole exists.
         Raises RuntimeError if nothing can be made to fit (immutable cells, etc.).
         """
         # ── 0. label → cell index ------------------------------------------------
@@ -319,7 +323,7 @@ class BitTensorMemory: #sizes in bytes
 
         while True:
             # ── 1. current layout snapshot --------------------------------------
-            snap = LinearCells.dump_cells(self.region_manager)
+            snap = CellPressureRegionManager.dump_cells(self.region_manager)
             free  = snap["free_spaces"]                 # [(label, addr, size), …]
 
             # collect holes that fit
@@ -333,11 +337,12 @@ class BitTensorMemory: #sizes in bytes
                 # NOTE: nothing is written yet; write()/mark_used() will record it
                 return addr
 
-            # ── 3. no hole ⇒ ask LinearCells to inject one quantum --------------
-            inject_map = getattr(self, "inject_map", [[] for _ in self.region_manager.cells])
-            self.region_manager.inject_item(self.region_manager.cells,
-                                            inject_map, cell_idx)
-            self.region_manager.relax()
+            # ── 3. no hole ⇒ enqueue one empty stride to force expansion -----
+            cell = self.region_manager.cells[cell_idx]
+            stride_bits = cell.stride * self.region_simulator.bitbuffer.bitsforbits
+            payload = b"\0" * ((stride_bits + 7) // 8)
+            self.region_simulator.write_data(cell.label, payload)
+            self.region_simulator.evolution_tick(self.region_manager.cells)
             # loop retries with the now-larger cell
 
 
@@ -624,7 +629,8 @@ class MetaGraphEdge(ctypes.Structure):
         # ─── Preallocated transfer buffer ───
         ('transfer_buffer', ctypes.c_uint64 * META_GRAPH_TRANSFER_BUFFER_SIZE),   # actual data being passed
     ]
-print(ctypes.sizeof(NodeEntry), ctypes.sizeof(EdgeEntry), ctypes.sizeof(MetaGraphEdge))
+# Avoid noisy output during import; retain statement for manual debugging only.
+# print(ctypes.sizeof(NodeEntry), ctypes.sizeof(EdgeEntry), ctypes.sizeof(MetaGraphEdge))
 assert ctypes.sizeof(MetaGraphEdge) == 512, "MetaGraphEdge must be exactly 512 bytes"
 class BTGraphHeader(ctypes.Structure):
     _pack_ = 1
@@ -660,7 +666,7 @@ class BTGraphHeader(ctypes.Structure):
         ("32_4_pad",     ctypes.c_uint32 * 4),
         ("64_2_pad",     ctypes.c_uint64 * 3)
     ]
-print("BTGraphHeader size:", ctypes.sizeof(BTGraphHeader))
+# print("BTGraphHeader size:", ctypes.sizeof(BTGraphHeader))
 assert ctypes.sizeof(BTGraphHeader) == 128, "BTGraphHeader must be exactly 128 bytes"
 
 
@@ -1931,8 +1937,8 @@ class BitTensorMemoryGraph:
             active_regions = self.initialize_regions()
         print(f"Debugging: Active regions found: {len(active_regions)}")
 
-        # ── 1.  Fresh quanta-level dump from LinearCells
-        cell_dump = LinearCells.dump_cells(self.hard_memory.region_manager)
+        # ── 1.  Fresh quanta-level dump from pressure-based manager
+        cell_dump = CellPressureRegionManager.dump_cells(self.hard_memory.region_manager)
 
 
         def group_by_cell(ranges):
