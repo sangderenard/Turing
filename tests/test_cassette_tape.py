@@ -62,3 +62,16 @@ def test_write_adds_bias_tone():
     assert np.max(np.abs(diff)) > 0.0
     assert abs(np.dot(diff, bias_wave)) > 100.0
     tape.close()
+
+
+def test_index_accessor_coordinates_seek_and_play():
+    tape = CassetteTapeBackend(
+        tape_length_inches=0.02,
+        op_sine_coeffs={"read": {440.0: 1.0}, "write": {880.0: 1.0}, "motor": {60.0: 0.5}},
+    )
+    frame = generate_bit_wave(1, 0)
+    tape[0, 0, 0] = frame
+    out = tape[0, 0, 0]
+    assert np.max(np.abs(out)) > 0.0
+    assert tape._audio_cursor > 0
+    tape.close()
