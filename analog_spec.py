@@ -241,13 +241,21 @@ def sigma_R(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
 
 
 def concat(x: List[np.ndarray], y: List[np.ndarray]) -> List[np.ndarray]:
-    """Concatenate two frame lists."""
-    return list(x) + list(y)
+    """Concatenate two frame lists with envelope cleanup."""
+    reg = Register([f.copy() for f in x] + [f.copy() for f in y])
+    if reg.frames:
+        reg.frames[0] *= _start_envelope()
+        reg.frames[-1] *= _end_envelope()
+    return reg.frames
 
 
 def slice_frames(x: List[np.ndarray], i: int, j: int) -> List[np.ndarray]:
-    """Return frames in the half-open interval ``[i, j)``."""
-    return list(x[i:j])
+    """Return frames in the half-open interval ``[i, j)`` with envelope cleanup."""
+    reg = Register([f.copy() for f in x[i:j]])
+    if reg.frames:
+        reg.frames[0] *= _start_envelope()
+        reg.frames[-1] *= _end_envelope()
+    return reg.frames
 
 
 def mu(x: List[np.ndarray], y: List[np.ndarray], sel: List[np.ndarray]) -> List[np.ndarray]:
@@ -259,19 +267,38 @@ def mu(x: List[np.ndarray], y: List[np.ndarray], sel: List[np.ndarray]) -> List[
     """
     out: List[np.ndarray] = []
     for fx, fy, fs in zip(x, y, sel):
-        if np.max(np.abs(fs)) >= 0.5:
+        # Use RMS of selector frame to decide gating
+        if track_rms(fs) >= 0.5:
             out.append(fy)
         else:
             out.append(fx)
     return out
 
 
-def length(frames: List[np.ndarray]) -> int:
-    """Return the number of frames.
+def length(frames: List[np.ndarray], mode: str = "parallel") -> List[np.ndarray]:
+    """Encode the frame count as a list of PCM bit-wave frames.
 
-    TODO: model mechanical timing and encode the result as PCM frames.
+    In parallel mode, represent count across TRACKS lanes simultaneously (requires count < 2**TRACKS).
+    In serial mode, represent count bit-by-bit on lane 0 one after another.
     """
-    return len(frames)
+    count = len(frames)
+    if mode == "parallel":
+        max_val = 2 ** TRACKS
+        if count >= max_val:
+            raise ValueError(f"Length {count} too large for parallel width {TRACKS}")
+        bits = [(count >> i) & 1 for i in range(TRACKS)]
+        return [generate_bit_wave(bit, lane=i) for i, bit in enumerate(bits)]
+    elif mode == "serial":
+        bits: list[int] = []
+        tmp = count
+        while tmp > 0:
+            bits.append(tmp & 1)
+            tmp >>= 1
+        if not bits:
+            bits = [0]
+        return [generate_bit_wave(bit, lane=0) for bit in bits]
+    else:
+        raise ValueError("mode must be 'parallel' or 'serial'")
 
 
 def zeros(n: int) -> List[np.ndarray]:
