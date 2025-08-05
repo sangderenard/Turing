@@ -5,7 +5,7 @@
 
 import math
 import pygame
-from ..reel_math import tape_radius, tangent_points
+from .reel_math import tape_radius, tangent_points
 
 BROWN = (150, 75, 0)
 GREY = (220, 220, 220)

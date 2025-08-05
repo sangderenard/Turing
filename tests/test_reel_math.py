@@ -1,6 +1,6 @@
 import math
 
-from src.reel_math import tape_radius, tangent_points
+from src.visualizations.reel_math import tape_radius, tangent_points
 
 
 def test_tape_radius_linear():
