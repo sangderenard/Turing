@@ -1,7 +1,7 @@
 import pytest
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from bitops import BitOps
+from src.compiler.bitops import BitOps
 
 # basic sanity checks for translated operations
 @pytest.mark.parametrize("a,b,width", [(0b1010, 0b0110, 4)])

@@ -1,4 +1,4 @@
-from turing_ssa import ProvenanceTM, SSAView
+from src.turing_machine.turing_ssa import ProvenanceTM, SSAView
 
 
 def test_tape_and_head_views_and_patch():

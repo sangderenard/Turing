@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from turing import Hooks, Turing
-from turing_provenance import ProvenanceGraph, instrument_hooks
+from ..turing_machine.turing import Hooks, Turing
+from ..turing_machine.turing_provenance import ProvenanceGraph, instrument_hooks
 
 BitStr = list  # simple list-of-bits backend
 

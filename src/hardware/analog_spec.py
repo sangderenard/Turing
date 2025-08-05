@@ -39,7 +39,7 @@ def lane_frequency(lane: int) -> float:
     """Return the base frequency for a lane."""
     return BASE_FREQ * (SEMI_RATIO ** lane)
 
-from analog_helpers import (
+from .analog_helpers import (
     extract_lane, lane_band, lane_rms, track_rms, replay_envelope,
     mix_fft_lane,
 )

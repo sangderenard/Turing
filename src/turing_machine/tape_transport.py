@@ -18,13 +18,12 @@ where data is only available while the tape is in motion beneath the head.
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
-from cassette_tape import CassetteTapeBackend
-
-try:  # pragma: no cover - numpy may be absent during import analysis
+from ..hardware.cassette_tape import CassetteTapeBackend
+try:
     import numpy as np
-    _Vec = np.ndarray
-except ModuleNotFoundError:  # pragma: no cover
-    _Vec = List[float]
+    from numpy import ndarray
+except ModuleNotFoundError:
+    np = None
 
 
 @dataclass
@@ -72,7 +71,7 @@ class TapeTransport:
             if step <= 0:
                 raise ValueError("negative or zero step not supported")
             self._advance_to(start)
-            frames: List[_Vec] = []
+            frames: List[ndarray] = []
             for bit in range(start, stop):
                 frames.append(self.tape.read_wave(self.track, self.lane, bit))
                 self._cursor = bit + 1
@@ -88,7 +87,7 @@ class TapeTransport:
             return frame
 
     # ------------------------------------------------------------------
-    def __setitem__(self, idx, data: Iterable[_Vec] | _Vec) -> None:
+    def __setitem__(self, idx, data: Iterable[ndarray] | ndarray) -> None:
         if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step <= 0:

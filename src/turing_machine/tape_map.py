@@ -16,7 +16,7 @@ other components can consult.
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from analog_spec import (
+from ..hardware.analog_spec import (
     BiosHeader,
     BIOS_HEADER_STRUCT,
     REGISTERS,

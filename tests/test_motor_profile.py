@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from cassette_tape import CassetteTapeBackend
-from analog_spec import trapezoidal_motor_envelope, MotorCalibration, BIT_FRAME_MS, FS
+from src.hardware.cassette_tape import CassetteTapeBackend
+from src.hardware.analog_spec import trapezoidal_motor_envelope, MotorCalibration, BIT_FRAME_MS, FS
 
 
 def test_motor_envelope_integrates_time():

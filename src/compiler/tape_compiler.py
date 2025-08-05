@@ -12,9 +12,9 @@ from __future__ import annotations
 import struct
 from typing import Dict, List, Tuple
 
-from analog_spec import BiosHeader, InstructionWord, Opcode, LANES
-from tape_map import TapeMap
-from turing_provenance import ProvenanceGraph, ProvNode
+from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode, LANES
+from ..turing_machine.tape_map import TapeMap
+from ..turing_machine.turing_provenance import ProvenanceGraph, ProvNode
 
 # Type aliases for clarity
 TapeAddress = int

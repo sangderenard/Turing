@@ -3,7 +3,7 @@ import sys
 import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from analog_spec import (
+from src.hardware.analog_spec import (
     BiosHeader,
     BIOS_HEADER_STRUCT,
     MAGIC_ID,
@@ -12,7 +12,7 @@ from analog_spec import (
     unpack_bios_header,
     LANES,
 )
-from tape_map import TapeMap, create_register_tapes
+from src.turing_machine.tape_map import TapeMap, create_register_tapes
 
 
 def make_header():

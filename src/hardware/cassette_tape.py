@@ -22,7 +22,7 @@ import threading
 import queue
 import time
 
-from analog_spec import (
+from .analog_spec import (
     generate_bit_wave,
     FRAME_SAMPLES,
     MotorCalibration,
@@ -31,15 +31,18 @@ from analog_spec import (
     MOTOR_CARRIER,
     BIAS_AMP,
 )
-from analog_helpers import lane_rms
-from tape_head import TapeHead
+from .analog_helpers import lane_rms
+from ..turing_machine.tape_head import TapeHead
+
+
 
 try:
     import numpy as np
-    _Vec = np.ndarray
+    from numpy import ndarray
 except ModuleNotFoundError: # pragma: no cover
     np = None
-    _Vec = List[float]
+
+
 
 try:
     import sounddevice as _sd
@@ -75,12 +78,12 @@ class CassetteTapeBackend:
 
     # -------------------------- Runtime State ---------------------------------- #
     _head_pos_inches: float = 0.0
-    _tape_frames: Dict[Tuple[int, int, int], _Vec] = field(default_factory=dict)
+    _tape_frames: Dict[Tuple[int, int, int], ndarray] = field(default_factory=dict)
     _gate: threading.Lock = field(default_factory=threading.Lock)
 
     _audio_cursor: int = 0
-    _audio_buffer: _Vec | None = None
-    _audio_queue: "queue.Queue[_Vec | None]" | None = None
+    _audio_buffer: Optional[ndarray] = None
+    _audio_queue: Optional[queue.Queue] = None
     _audio_thread: threading.Thread | None = None
 
     def __post_init__(self):
@@ -137,7 +140,7 @@ class CassetteTapeBackend:
 
     # ---------------------------- Bit / Frame Access --------------------------- #
 
-    def read_wave(self, track: int, lane: int, bit_idx: int) -> _Vec:
+    def read_wave(self, track: int, lane: int, bit_idx: int) -> ndarray:
         """Return the PCM frame at ``(track, lane, bit_idx)`` after seek and scan."""
         with self._gate:
             self.move_head_to_bit(bit_idx)
@@ -153,7 +156,7 @@ class CassetteTapeBackend:
                 raise RuntimeError("read head not engaged at correct speed")
             return frame
 
-    def write_wave(self, track: int, lane: int, bit_idx: int, frame: _Vec):
+    def write_wave(self, track: int, lane: int, bit_idx: int, frame: ndarray):
         """Write a PCM frame to ``(track, lane, bit_idx)`` respecting movement."""
         with self._gate:
             self.move_head_to_bit(bit_idx)
@@ -212,7 +215,7 @@ class CassetteTapeBackend:
         self._audio_cursor += num_samples
         time.sleep(duration_sec * self.time_scale_factor)
 
-    def _get_adsr_envelope(self, duration_s: float, n_samples: int) -> _Vec:
+    def _get_adsr_envelope(self, duration_s: float, n_samples: int) -> ndarray:
         env = np.zeros(n_samples, dtype="f4")
         n_atk = min(n_samples, int(self._attack_s * self.sample_rate_hz))
         n_dec = min(n_samples - n_atk, int(self._decay_s * self.sample_rate_hz))

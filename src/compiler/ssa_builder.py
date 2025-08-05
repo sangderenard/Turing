@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from turing_provenance import ProvenanceGraph
-from loop_structure import LoopStructureAnalyzer, LoopInfo
+from ..turing_machine.turing_provenance import ProvenanceGraph
+from ..turing_machine.loop_structure import LoopStructureAnalyzer, LoopInfo
 
 
 def insert_phi_nodes(pg: ProvenanceGraph, loops: List[LoopInfo]) -> Dict[int, List[Tuple[int, int, int]]]:

@@ -1,5 +1,5 @@
 import numpy as np
-from analog_spec import (
+from src.hardware.analog_spec import (
     FRAME_SAMPLES,
     generate_bit_wave,
     sigma_L,
@@ -14,13 +14,13 @@ from analog_spec import (
     BIT_FRAME_MS,
     WRITE_BIAS,
 )
-from tape_map import TapeMap, create_register_tapes
-from cassette_tape import CassetteTapeBackend
-from bitops import BitOps
-from turing_provenance import ProvenanceGraph, ProvNode, ProvEdge
-from ssa_builder import graph_to_ssa_with_loops
-import nand_wave as nw
-from turing_ssa import ProvenanceTM, SSAView
+from src.turing_machine.tape_map import TapeMap, create_register_tapes
+from src.hardware.cassette_tape import CassetteTapeBackend
+from src.compiler.bitops import BitOps
+from src.turing_machine.turing_provenance import ProvenanceGraph, ProvNode, ProvEdge
+from src.compiler.ssa_builder import graph_to_ssa_with_loops
+import src.hardware.nand_wave as nw
+from src.turing_machine.turing_ssa import ProvenanceTM, SSAView
 
 
 def run_test(name, func):

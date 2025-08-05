@@ -17,9 +17,9 @@ from analog_spec import (
     apply_operator,
     mu,
 )
-from cassette_tape import CassetteTapeBackend
-from tape_map import TapeMap
-from tape_transport import TapeTransport
+from ..hardware.cassette_tape import CassetteTapeBackend
+from .tape_map import TapeMap
+from .tape_transport import TapeTransport
 
 class TapeMachine:
     """

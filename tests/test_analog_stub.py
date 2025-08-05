@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pytest
-from analog_spec import FRAME_SAMPLES, generate_bit_wave, sigma_L, sigma_R
+from src.hardware.analog_spec import FRAME_SAMPLES, generate_bit_wave, sigma_L, sigma_R
 
 
 def test_generate_bit_wave_shapes():

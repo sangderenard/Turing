@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import numpy as np
 import pytest
 
-import nand_wave as nw
+import src.hardware.nand_wave as nw
 
 
 ENERGY_THRESH = 0.01

@@ -1,5 +1,5 @@
 # cassette_compat.py  —  keep for as long as older code needs it
-from cassette_tape import CassetteTapeBackend as _Core
+from .cassette_tape import CassetteTapeBackend as _Core
 
 class CassetteTapeBackend(_Core):
     """Legacy façade around the v2 physical simulator."""

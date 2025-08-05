@@ -15,10 +15,10 @@ from __future__ import annotations
 import time
 
 # Core components
-from bitops_translator import BitOpsTranslator
-from cassette_tape import CassetteTapeBackend
-from tape_compiler import TapeCompiler
-from tape_machine import TapeMachine
+from ..compiler.bitops_translator import BitOpsTranslator
+from ..hardware.cassette_tape import CassetteTapeBackend
+from ..compiler.tape_compiler import TapeCompiler
+from .tape_machine import TapeMachine
 
 
 def prime_tape_with_program(cassette: CassetteTapeBackend, tape_map, instructions_binary):

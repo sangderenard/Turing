@@ -1,9 +1,9 @@
 import pytest
 import numpy as np
 
-from cassette_tape import CassetteTapeBackend
-from analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS, BIAS_AMP
-from tape_transport import TapeTransport
+from src.hardware.cassette_tape import CassetteTapeBackend
+from src.hardware.analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS, BIAS_AMP
+from src.turing_machine.tape_transport import TapeTransport
 
 
 def test_read_write_emits_audio():

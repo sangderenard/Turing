@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple
 
-from turing_provenance import ProvenanceGraph, ProvEdge, ProvNode
+from .turing_provenance import ProvenanceGraph, ProvEdge, ProvNode
 
 
 @dataclass

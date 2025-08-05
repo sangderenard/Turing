@@ -11,14 +11,15 @@ from enum import Enum, auto
 import hashlib
 import random
 from uuid import uuid4
+
 try:
     from memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
-    from flask import json  # type: ignore
+    import json  # use standard library json
 except Exception:  # pragma: no cover - optional deps
     BitTensorMemoryGraph = NodeEntry = EdgeEntry = GraphSearch = None  # type: ignore
     json = None  # type: ignore
 
-from bitops_translator import BitOpsTranslator
+from .bitops_translator import BitOpsTranslator
 
 class BitStructType(Enum):
     INTEGER = auto()
@@ -526,7 +527,7 @@ class BitOps:
             packed >>= self.bit_width
         return values
 # test_bitops.py
-from bitops import BitOps
+from .bitops import BitOps
 
 def validate_ops(bit_width, encoding="gray"):
     ops = BitOps(bit_width=bit_width, encoding=encoding)
@@ -875,7 +876,7 @@ class GrayTableOps:
             shift += 1
         return n
 # Put this at the end of your bitops.py, or as a separate test script
-from bitops import BitTensor
+from .bitops import BitTensor
 
 def main():
     print("Testing BitTensor...")

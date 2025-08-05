@@ -13,14 +13,12 @@ from dataclasses import dataclass, field
 import queue
 from typing import Dict, Optional, Tuple
 
-from analog_spec import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS, BIAS_AMP
-
-try:  # pragma: no cover - numpy may be absent during import analysis
+from ..hardware.analog_spec import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS, BIAS_AMP
+try:
     import numpy as np
-    _Vec = np.ndarray
-except ModuleNotFoundError:  # pragma: no cover
+    from numpy import ndarray
+except ModuleNotFoundError:
     np = None
-    _Vec = list
 
 
 @dataclass
@@ -28,17 +26,17 @@ class TapeHead:
     tape: "CassetteTapeBackend"
     speed_tolerance: float = 1e-3
     _read_queues: Dict[int, queue.Queue[Tuple[int, int]]] = field(default_factory=dict)
-    _write_queues: Dict[int, queue.Queue[Tuple[int, int, _Vec]]] = field(default_factory=dict)
+    _write_queues: Dict[int, queue.Queue[Tuple[int, int, ndarray]]] = field(default_factory=dict)
     mode: Optional[str] = None
 
     def enqueue_read(self, track: int, lane: int, bit_idx: int) -> None:
         self._read_queues.setdefault(track, queue.Queue()).put((lane, bit_idx))
 
-    def enqueue_write(self, track: int, lane: int, bit_idx: int, frame: _Vec) -> None:
+    def enqueue_write(self, track: int, lane: int, bit_idx: int, frame: ndarray) -> None:
         self._write_queues.setdefault(track, queue.Queue()).put((lane, bit_idx, frame))
 
     # ------------------------------------------------------------------
-    def activate(self, track: int, mode: str, speed: float) -> Optional[_Vec]:
+    def activate(self, track: int, mode: str, speed: float) -> Optional[ndarray]:
         """Execute queued transfers if ``speed`` matches read/write speed.
 
         Returns the PCM frame for the processed read, or ``None`` otherwise.

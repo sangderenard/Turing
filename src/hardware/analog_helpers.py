@@ -1,6 +1,6 @@
 """Analog helper functions for per-lane FFT operations."""
 import numpy as np
-from analog_spec import FS, FRAME_SAMPLES, lane_frequency, LANES, DATA_ADSR
+from .analog_spec import FS, FRAME_SAMPLES, lane_frequency, LANES, DATA_ADSR
 
 # Precompute FFT bin map for lanes
 FREQS = np.fft.rfftfreq(FRAME_SAMPLES, 1 / FS)

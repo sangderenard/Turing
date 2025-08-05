@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Dict, Optional, Union
 
-from turing import Turing, Hooks
-from turing_provenance import ProvenanceGraph, instrument_hooks
+from .turing import Turing, Hooks
+from .turing_provenance import ProvenanceGraph, instrument_hooks
 
 # Simple list-of-bits backend reused from bitops_translator
 BitStr = List[int]

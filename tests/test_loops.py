@@ -1,5 +1,5 @@
-from turing_provenance import ProvenanceGraph, ProvNode, ProvEdge
-from ssa_builder import graph_to_ssa_with_loops
+from src.turing_machine.turing_provenance import ProvenanceGraph, ProvNode, ProvEdge
+from src.compiler.ssa_builder import graph_to_ssa_with_loops
 
 
 def _make_node(idx, op):
