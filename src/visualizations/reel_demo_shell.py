@@ -2,7 +2,7 @@
 Shell visualization for the reel demo, receiving status updates from the cassette simulator.
 """
 import pygame
-from reel_demo import ReelGraphics
+from .reel_demo import ReelGraphics
 
 class ReelDemoShell:
     def __init__(self, rect):
