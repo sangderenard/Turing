@@ -22,7 +22,16 @@ import threading
 import queue
 import time
 
-from analog_spec import generate_bit_wave, FRAME_SAMPLES
+from analog_spec import (
+    generate_bit_wave,
+    FRAME_SAMPLES,
+    MotorCalibration,
+    BIT_FRAME_MS,
+    trapezoidal_motor_envelope,
+    MOTOR_CARRIER,
+    BIAS_AMP,
+)
+from analog_helpers import lane_rms
 from tape_head import TapeHead
 
 try:
@@ -161,41 +170,25 @@ class CassetteTapeBackend:
 
     def read_bit(self, track: int, lane: int, bit_idx: int) -> int:
         wave = self.read_wave(track, lane, bit_idx)
-        return 1 if float(np.max(np.abs(wave))) > 0.5 else 0
+        amp = lane_rms(wave, lane)
+        return 1 if amp > BIAS_AMP * 2 else 0
 
     def write_bit(self, track: int, lane: int, bit_idx: int, value: int):
         frame = generate_bit_wave(1 if value else 0, lane)
         self.write_wave(track, lane, bit_idx, frame)
 
     # ------------------------------------------------------------------
-    def _generate_speed_profile(self, distance: float, target_speed: float) -> _Vec:
-        """Return an instantaneous speed profile for the given travel distance."""
-        dt = 1.0 / self.sample_rate_hz
-        accel = self.motor_acceleration_ips2
-        speed = 0.0
-        pos = 0.0
-        speeds: List[float] = []
-        while True:
-            remaining = distance - pos
-            braking = (speed ** 2) / (2 * accel)
-            if remaining <= 0 and speed <= 0:
-                break
-            if remaining <= braking:
-                speed = max(0.0, speed - accel * dt)
-            else:
-                speed = min(target_speed, speed + accel * dt)
-            speed *= 1.0 - self.motor_friction_coeff * dt
-            pos += speed * dt
-            speeds.append(speed)
-            if len(speeds) > 10_000_000:
-                # Safety break in pathological cases
-                break
-        return np.array(speeds, dtype="f4")
-
     def _simulate_movement(self, distance_inches: float, target_speed_ips: float, direction: int, op_name: str):
-        # Generate speed profile via physical integration
-        speed_profile = self._generate_speed_profile(distance_inches, target_speed_ips)
-        num_samples = len(speed_profile)
+        """Simulate movement using a trapezoidal motor envelope."""
+        distance_frames = int(round(distance_inches * self.bits_per_inch))
+        calib = MotorCalibration(
+            fast_wind_ms=BIT_FRAME_MS * (self.read_write_speed_ips / self.seek_speed_ips),
+            read_speed_ms=BIT_FRAME_MS,
+            drift_ms=0.0,
+        )
+        mode = "read" if target_speed_ips == self.read_write_speed_ips else "fast"
+        env = trapezoidal_motor_envelope(distance_frames, calib, mode)
+        num_samples = len(env)
         if num_samples == 0:
             return
         self._ensure_audio_capacity(num_samples)
@@ -206,20 +199,14 @@ class CassetteTapeBackend:
         for freq, amp in op_coeffs.items():
             instruction_track += amp * np.sin(2 * np.pi * freq * t)
 
-        motor_hum = np.zeros(num_samples, dtype="f4")
-        motor_base_coeffs = self.op_sine_coeffs.get('motor', {60.0: 0.5})
-        for i in range(num_samples):
-            speed = speed_profile[i]
-            for base_freq, amp in motor_base_coeffs.items():
-                dir_coeff = self.motor_direction_coeff if direction == -1 else 1.0
-                freq = base_freq * dir_coeff * (1 + speed * self.motor_speed_pitch_coeff)
-                amp_mod = amp * (0.5 + 0.5 * (speed / max(target_speed_ips, 1e-6)))
-                motor_hum[i] += amp_mod * np.sin(2 * np.pi * freq * t[i])
-
-        final_mix = instruction_track + motor_hum
+        motor = env * np.sin(2 * np.pi * MOTOR_CARRIER * t) * (1.0 if direction == 1 else -1.0)
+        final_mix = instruction_track + motor
         duration_sec = num_samples / self.sample_rate_hz
         master_env = self._get_adsr_envelope(duration_sec, num_samples)
         final_mix *= master_env
+        peak = float(np.max(np.abs(final_mix)))
+        if peak > 1.0:
+            final_mix *= 1.0 / peak
 
         self._audio_buffer[self._audio_cursor : self._audio_cursor + num_samples] += final_mix
         self._audio_cursor += num_samples

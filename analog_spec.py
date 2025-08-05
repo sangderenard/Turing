@@ -30,6 +30,11 @@ DATA_ADSR = (50, 50, 0.8, 100)  # attack, decay, sustain, release in ms
 FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
 MOTOR_RAMP_MS = 250  # up/down ramp duration for SEEK envelopes
 
+# Baseline RF noise floor and derived bias amplitude per noise source
+NOISE_FLOOR_DB = -60.0
+NOISE_SOURCES = 3  # write head, read head, motor
+BIAS_AMP = float(10 ** ((NOISE_FLOOR_DB - 10 * np.log10(NOISE_SOURCES)) / 20))
+
 def lane_frequency(lane: int) -> float:
     """Return the base frequency for a lane."""
     return BASE_FREQ * (SEMI_RATIO ** lane)
