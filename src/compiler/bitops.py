@@ -13,7 +13,7 @@ import random
 from uuid import uuid4
 
 try:
-    from memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
+    from ..transmogrifier.memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
     import json  # use standard library json
 except Exception:  # pragma: no cover - optional deps
     BitTensorMemoryGraph = NodeEntry = EdgeEntry = GraphSearch = None  # type: ignore
