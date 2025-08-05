@@ -20,6 +20,7 @@ from analog_spec import (
     BiosHeader,
     BIOS_HEADER_STRUCT,
     REGISTERS,
+    LANES,
     header_frames,
     unpack_bios_header,
 )
@@ -72,6 +73,14 @@ class TapeMap:
             if len(byte_arr) >= BIOS_HEADER_STRUCT.size:
                 break
         return unpack_bios_header(bytes(byte_arr[: BIOS_HEADER_STRUCT.size]))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_bios_frame_count() -> int:
+        """Return the number of frames occupied by a BIOS header."""
+
+        bits = BIOS_HEADER_STRUCT.size * 8
+        return (bits + LANES - 1) // LANES
 
 
 def create_register_tapes(bios: BiosHeader, n: int = REGISTERS) -> Dict[int, TapeMap]:

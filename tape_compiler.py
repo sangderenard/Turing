@@ -118,6 +118,7 @@ class TapeCompiler:
 
         # The TapeMap will calculate the final layout
         tape_map = TapeMap(bios, instruction_frames=len(instructions))
+        tape_map.bios.instr_start_addr = tape_map.instr_start
         
         print(f"Compilation successful. Generated {len(instructions)} instructions.")
         return tape_map, instructions
