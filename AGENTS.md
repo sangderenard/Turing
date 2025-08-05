@@ -153,5 +153,20 @@ All modes must share the same primitive op definitions; only orchestration diffe
 
 ---
 
+## 13  Repository Layout
+
+* **backend.py** — entry point that runs the test suite and a small NAND demo tape.
+* **src/common** — shared utilities such as adaptive type aliases.
+* **src/compiler** — provenance tracing, SSA tools and a compiler that emits tape-ready instruction streams.
+* **src/hardware** — analogue simulation pieces including `analog_spec`, the high‑fidelity `cassette_tape` backend, lane tuning helpers and a legacy `cassette_adapter` façade.
+* **src/turing_machine** — tape mapping, transport mechanics, the `TapeMachine` execution loop and the high-level `survival_computer` driver.
+* **src/transmogrifier** — experimental graph and optimisation research (ILP scheduler, graph express, SSA registry).
+* **src/visualizations** — reel and cassette playback demos.
+* **tests** — pytest suite covering analogue fidelity, compiler features and machine behaviour.
+
+Always run `pytest` before committing; new code must emit audible PCM and honour §§6–7.
+
+---
+
 ### **Deliver this plan to any agent altering the repo. Deviation = total failure.**
 
