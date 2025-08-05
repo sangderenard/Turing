@@ -167,6 +167,36 @@ class CassetteTapeBackend:
         frame = generate_bit_wave(1 if value else 0, lane)
         self.write_wave(track, lane, bit_idx, frame)
 
+    # Centralised index access -------------------------------------------------- #
+
+    def __getitem__(self, key: Tuple[int, int, int]) -> _Vec:
+        """Return the PCM frame at ``key`` using sequential seek and play.
+
+        ``key`` is a tuple ``(track, lane, bit_idx)``.  Accessing through this
+        operator coordinates the physical seek to ``bit_idx`` and plays the
+        frame at the calibrated read speed before returning the resulting
+        waveform.  It allows callers to simply reference ``tape[track, lane,
+        bit_idx]`` while the analogue motion and audio rendering are handled
+        here.
+        """
+
+        track, lane, bit_idx = key
+        return self.read_wave(track, lane, bit_idx)
+
+    def __setitem__(self, key: Tuple[int, int, int], value: _Vec | int) -> None:
+        """Write ``value`` to ``key`` coordinating seek and motor motion.
+
+        ``value`` may be an integer bit (0/1) or a PCM frame.  The method
+        converts bit values to their waveform representation so that physics
+        simulation and bias tones are still applied.
+        """
+
+        track, lane, bit_idx = key
+        if isinstance(value, (int, np.integer)):
+            self.write_bit(track, lane, bit_idx, int(value))
+        else:
+            self.write_wave(track, lane, bit_idx, value)
+
     # ------------------------------------------------------------------
     def _generate_speed_profile(self, distance: float, target_speed: float) -> _Vec:
         """Return an instantaneous speed profile for the given travel distance."""
