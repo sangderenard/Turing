@@ -22,18 +22,21 @@ LANES = 32
 TRACKS = 2
 REGISTERS = 3
 BIT_FRAME_MS = 50
+# Reference frame duration for legacy calibration
+REFERENCE_BIT_FRAME_MS = 500.0
 FS = 44_100
 BASE_FREQ = 110.0
 SEMI_RATIO = 2 ** (1 / 12)
 MOTOR_CARRIER = 60.0
 WRITE_BIAS = 150.0
-# Envelope: attack_ms, decay_ms, sustain_ms, release_ms, attack_level, sustain_level
-DATA_ADSR = (1, 2, 5, 1, 1.0, 0.8)  # ms, ms, ms, ms, level, level
+# Envelope: attack_ratio, decay_ratio, sustain_ratio, release_ratio, attack_level, sustain_level
+DATA_ADSR = (1, 2, 5, 1, 1.0, 0.8)
 FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
-MOTOR_RAMP_MS = 250  # up/down ramp duration for SEEK envelopes
+MOTOR_RAMP_MS = 75  # up/down ramp duration for SEEK envelopes
 
 # Global motor plateau amplitude (scales current available to motor)
 PLATEAU_AMP = 10.0
+SIMULATION_VOLUME = 0.8  # Master volume scaling for audio playback
 
 # Global envelope levels
 ATTACK_LEVEL = DATA_ADSR[4]
@@ -59,42 +62,27 @@ def generate_bit_wave(bit: int, lane: int, phase: float = 0.0) -> np.ndarray:
     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
     if bit:
         freq = lane_frequency(lane)
-        a_ms, d_ms, s_ms, r_ms, attack_level, sustain_level = DATA_ADSR
-        # Calculate requested envelope segment durations in samples
-        a_n = int(FS * (a_ms / 1000.0))
-        d_n = int(FS * (d_ms / 1000.0))
-        s_n = int(FS * (s_ms / 1000.0))
-        r_n = int(FS * (r_ms / 1000.0))
-        # Normalize and scale all segments to fit FRAME_SAMPLES
-        total_env = a_n + d_n + s_n + r_n
-        if total_env != FRAME_SAMPLES:
-            scale = FRAME_SAMPLES / total_env if total_env > 0 else 0
-            a_n = int(a_n * scale)
-            d_n = int(d_n * scale)
-            s_n = int(s_n * scale)
-            r_n = int(r_n * scale)
-            # Log the scaling for transparency
-            import warnings
-            warnings.warn(f"ADSR envelope segments ({a_ms}ms, {d_ms}ms, {s_ms}ms, {r_ms}ms) do not fit BIT_FRAME_MS={BIT_FRAME_MS}ms; all segments scaled by {scale:.3f} to fit frame.")
-        # Recalculate total to fill any rounding error
-        total_scaled = a_n + d_n + s_n + r_n
-        if total_scaled < FRAME_SAMPLES:
-            s_n += FRAME_SAMPLES - total_scaled
-        elif total_scaled > FRAME_SAMPLES:
-            s_n = max(s_n - (total_scaled - FRAME_SAMPLES), 0)
-        env = np.concatenate([
-            np.linspace(0.0, attack_level, a_n, endpoint=False) if a_n > 0 else np.array([], dtype="f4"),
-            np.linspace(attack_level, sustain_level, d_n, endpoint=False) if d_n > 0 else np.array([], dtype="f4"),
-            np.full(s_n, sustain_level, dtype="f4") if s_n > 0 else np.array([], dtype="f4"),
-            np.linspace(sustain_level, 0.0, r_n, endpoint=True) if r_n > 0 else np.array([], dtype="f4"),
-        ])
-        # Pad or trim envelope to match FRAME_SAMPLES
-        if len(env) < FRAME_SAMPLES:
-            env = np.pad(env, (0, FRAME_SAMPLES - len(env)), mode="constant", constant_values=0.0)
-        elif len(env) > FRAME_SAMPLES:
-            env = env[:FRAME_SAMPLES]
+        a_ratio, d_ratio, s_ratio, r_ratio, attack_level, sustain_level = DATA_ADSR
+        total = a_ratio + d_ratio + s_ratio + r_ratio
+        if total <= 0:
+            env = np.zeros(FRAME_SAMPLES, dtype="f4")
+        else:
+            a_n = int(FRAME_SAMPLES * (a_ratio / total))
+            d_n = int(FRAME_SAMPLES * (d_ratio / total))
+            s_n = int(FRAME_SAMPLES * (s_ratio / total))
+            r_n = FRAME_SAMPLES - (a_n + d_n + s_n)
+            env = np.concatenate([
+                np.linspace(0.0, attack_level, a_n, endpoint=False) if a_n > 0 else np.array([], dtype="f4"),
+                np.linspace(attack_level, sustain_level, d_n, endpoint=False) if d_n > 0 else np.array([], dtype="f4"),
+                np.full(s_n, sustain_level, dtype="f4") if s_n > 0 else np.array([], dtype="f4"),
+                np.linspace(sustain_level, 0.0, r_n, endpoint=True) if r_n > 0 else np.array([], dtype="f4"),
+            ])
+            if len(env) < FRAME_SAMPLES:
+                env = np.pad(env, (0, FRAME_SAMPLES - len(env)), mode="constant")
+            elif len(env) > FRAME_SAMPLES:
+                env = env[:FRAME_SAMPLES]
         sine = np.sin(2 * np.pi * freq * t + phase)
-        return (sine * env).astype("f4")
+        return (sine * env / LANES).astype("f4")
     return np.zeros_like(t, dtype="f4")
 
 
@@ -421,15 +409,12 @@ def nand_wave(
     y_on = track_rms(y) > energy_thresh
     if x_on and y_on:
         out = np.zeros(FRAME_SAMPLES, dtype="f4")
-    elif x_on and not y_on:
-        rms_vals = [lane_rms(x, ln) for ln in range(LANES)]
-        strongest = int(np.argmax(rms_vals))
-        env = extract_lane(x, strongest)
-        out = replay_envelope(env, target_lane)
-    elif y_on and not x_on:
-        rms_vals = [lane_rms(y, ln) for ln in range(LANES)]
-        strongest = int(np.argmax(rms_vals))
-        env = extract_lane(y, strongest)
+    elif x_on or y_on:
+        source = x if x_on else y
+        tone = dominant_tone(source)
+        lane_est = int(round(np.log(tone.freq / BASE_FREQ) / np.log(SEMI_RATIO)))
+        lane_est = max(0, min(LANES - 1, lane_est))
+        env = extract_lane(source, lane_est)
         out = replay_envelope(env, target_lane)
     else:
         out = generate_bit_wave(1, target_lane)

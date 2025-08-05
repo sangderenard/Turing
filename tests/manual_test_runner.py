@@ -249,9 +249,9 @@ def test_motor_profile():
     print("Testing simulate movement writes audio.")
     tape = CassetteTapeBackend(time_scale_factor=0.0)
     tape._simulate_movement(1.0, tape.seek_speed_ips, 1, 'seek')
-    print(f"audio cursor {tape._audio_cursor}, any audio {np.any(tape._audio_buffer[:tape._audio_cursor])}")
+    print(f"audio cursor {tape._audio_cursor}, any audio {np.any(tape._audio_buffer[:tape._buffer_cursor])}")
     assert tape._audio_cursor > 0
-    assert np.any(tape._audio_buffer[:tape._audio_cursor])
+    assert np.any(tape._audio_buffer[:tape._buffer_cursor])
     tape.close()
 
 

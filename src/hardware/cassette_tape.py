@@ -30,6 +30,7 @@ from .analog_spec import (
     trapezoidal_motor_envelope,
     MOTOR_CARRIER,
     BIAS_AMP,
+    SIMULATION_VOLUME,
 )
 from .analog_helpers import lane_rms
 from ..turing_machine.tape_head import TapeHead
@@ -81,7 +82,8 @@ class CassetteTapeBackend:
     _tape_frames: Dict[Tuple[int, int, int], ndarray] = field(default_factory=dict)
     _gate: threading.Lock = field(default_factory=threading.Lock)
 
-    _audio_cursor: int = 0
+    _audio_cursor: int = 0  # total samples generated
+    _buffer_cursor: int = 0
     _audio_buffer: Optional[ndarray] = None
     _audio_queue: Optional[queue.Queue] = None
     _audio_thread: threading.Thread | None = None
@@ -119,12 +121,14 @@ class CassetteTapeBackend:
         self._audio_queue = queue.Queue()
         self._audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self._audio_thread.start()
+        self._buffer_cursor = 0
+        self._audio_cursor = 0
 
     def _ensure_audio_capacity(self, required_samples: int):
-        if self._audio_cursor + required_samples > len(self._audio_buffer):
-            self._audio_queue.put(self._audio_buffer[:self._audio_cursor].copy())
+        if self._buffer_cursor + required_samples > len(self._audio_buffer):
+            self._audio_queue.put(self._audio_buffer[:self._buffer_cursor].copy())
             self._audio_buffer.fill(0)
-            self._audio_cursor = 0
+            self._buffer_cursor = 0
             if required_samples > len(self._audio_buffer):
                  self._audio_buffer = np.zeros(required_samples * 2, dtype="f4")
 
@@ -211,7 +215,8 @@ class CassetteTapeBackend:
         if peak > 1.0:
             final_mix *= 1.0 / peak
 
-        self._audio_buffer[self._audio_cursor : self._audio_cursor + num_samples] += final_mix
+        self._audio_buffer[self._buffer_cursor : self._buffer_cursor + num_samples] += final_mix
+        self._buffer_cursor += num_samples
         self._audio_cursor += num_samples
         time.sleep(duration_sec * self.time_scale_factor)
 
@@ -228,8 +233,8 @@ class CassetteTapeBackend:
         return env
 
     def close(self):
-        if self._audio_cursor > 0:
-            self._audio_queue.put(self._audio_buffer[:self._audio_cursor].copy())
+        if self._buffer_cursor > 0:
+            self._audio_queue.put(self._audio_buffer[:self._buffer_cursor].copy())
         self._audio_queue.put(None)
         if self._audio_thread is not None:
             self.op_sine_coeffs = {}
@@ -240,5 +245,5 @@ class CassetteTapeBackend:
             chunk = self._audio_queue.get()
             if chunk is None: break
             if _sd is not None:
-                try: _sd.play(chunk, self.sample_rate_hz, blocking=True)
+                try: _sd.play(chunk * SIMULATION_VOLUME, self.sample_rate_hz, blocking=True)
                 except Exception as e: print(f"Audio playback error: {e}")
