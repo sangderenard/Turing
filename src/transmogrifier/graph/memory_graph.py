@@ -7,7 +7,7 @@ import random
 import re
 import sys
 import threading
-from .linear_cells import LinearCells
+from ..cells.linear_cells import LinearCells
 from uuid import uuid4
 
 
@@ -116,7 +116,6 @@ class StructView:
 
         return _Proxy()
 
-from linear_cells import LinearCells
 
 class BitTensorMemory: #sizes in bytes
     ALLOCATION_FAILURE = -1

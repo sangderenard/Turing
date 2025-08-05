@@ -13,7 +13,7 @@ import random
 from uuid import uuid4
 
 try:
-    from ..transmogrifier.memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
+    from ..transmogrifier.graph.memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch  # type: ignore
     import json  # use standard library json
 except Exception:  # pragma: no cover - optional deps
     BitTensorMemoryGraph = NodeEntry = EdgeEntry = GraphSearch = None  # type: ignore
@@ -995,7 +995,7 @@ def foo(x):
     return
     print("\n==== ProcessGraph from file ====")
     # If you want to build from the file, use bitops.py or any file
-    from graph_express2 import ProcessGraph
+    from ..transmogrifier.graph.graph_express2 import ProcessGraph
     pg = ProcessGraph()
     pg.build_from_ast('./bitops.py')  # assumes relative path
     pg.finalize_graph_with_outputs()

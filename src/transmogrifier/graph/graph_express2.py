@@ -3,11 +3,11 @@ import sympy
 import numpy as np
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
-from ..compiler.bitops import BitTensorMemoryGraph
+from ...compiler.bitops import BitTensorMemoryGraph
 from colorama import Fore, Style, init
-from .solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
-from .operator_defs import default_funcs, operator_signatures, role_schemas
-from .ilpscheduler import ILPScheduler
+from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
+from ..operator_defs import default_funcs, operator_signatures, role_schemas
+from ..ilpscheduler import ILPScheduler
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import colorsys

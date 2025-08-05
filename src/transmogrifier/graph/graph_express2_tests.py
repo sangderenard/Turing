@@ -1,7 +1,7 @@
 import sympy
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 import numpy as np
-from .physics import (
+from ..physics import (
     vis_viva_eq,
     sch_eq,
     efe,
@@ -14,8 +14,8 @@ from .physics import (
     wave_eq,
     dirac_eq,
 )
-from .dec import DEC
-from .orbital import Orbit
+from ..dec import DEC
+from ..orbital import Orbit
 from .graph_express_chalkboard_problem import chalkboard_problem
 
 M_val, N_val, K_val = 3, 6, 9

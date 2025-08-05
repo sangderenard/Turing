@@ -142,6 +142,13 @@ class LinearCells:
 
         return self.cells
 
+    def apply_cell_pressure(self):
+        """Invoke the pressure simulator to rebalance cell widths."""
+        from .cell_pressure import Simulator
+        sim = Simulator(self.cells)
+        sim.evolution_tick(self.cells)
+        return self.cells
+
     def manifest(self):
         manifest = []
         for i, label in enumerate(self.labels):

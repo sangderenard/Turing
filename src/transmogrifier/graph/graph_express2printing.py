@@ -1,7 +1,7 @@
 import colorsys
 import networkx as nx
 import matplotlib.pyplot as plt
-from .solver_types import Operation
+from ..solver_types import Operation
 from matplotlib.animation import FuncAnimation
 try:
     from colorama import Style
