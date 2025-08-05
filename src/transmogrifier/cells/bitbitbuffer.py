@@ -240,7 +240,8 @@ class PIDBuffer:
     def __repr__(self):
         return repr(self.pids)
     
-from cell_consts import Cell
+# Use a relative import to access the package-local definition.
+from .cell_consts import Cell
 class CellProposal(Cell):
     def __init__(self, cell):
                 

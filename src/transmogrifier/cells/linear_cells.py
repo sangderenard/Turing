@@ -870,78 +870,79 @@ LinearCells.micro_tick = _vis_micro
 # ========================================================================
 #  DEMO HARNESS  – no helper overrides, uses real inject_item()
 # ========================================================================
-import ctypes, pygame, sys, time, random
+if __name__ == "__main__":
+    import ctypes, pygame, sys, time, random
 
-# ------------------------------------------------------------------------
-# 1. create spec, solver, empty obj_maps (all solvent)
-# ------------------------------------------------------------------------
-specs = [
-    dict(left=0,   right=128,  label=0, len=128, stride=128, flags=0, min=0, max=128),
-    dict(left=128, right=256,  label=1, len=128, stride=64 , flags=0),
-    dict(left=256, right=512,  label=2, len=256, stride=32 , flags=0),
-    dict(left=512, right=768,  label=3, len=256, stride=16 , flags=0),
-    dict(left=768, right=896,  label=4, len=128, stride=8  , flags=0),
-    dict(left=896, right=1024, label=5, len=128, stride=8  , flags=0),
-    dict(left=1024,right=1024, label=6, len=0  , stride=1  , flags=0),
-    dict(left=1024,right=1024, label=7, len=0  , stride=0  , flags=32),
-]
+    # --------------------------------------------------------------------
+    # 1. create spec, solver, empty obj_maps (all solvent)
+    # --------------------------------------------------------------------
+    specs = [
+        dict(left=0,   right=128,  label=0, len=128, stride=128, flags=0, min=0, max=128),
+        dict(left=128, right=256,  label=1, len=128, stride=64 , flags=0),
+        dict(left=256, right=512,  label=2, len=256, stride=32 , flags=0),
+        dict(left=512, right=768,  label=3, len=256, stride=16 , flags=0),
+        dict(left=768, right=896,  label=4, len=128, stride=8  , flags=0),
+        dict(left=896, right=1024, label=5, len=128, stride=8  , flags=0),
+        dict(left=1024,right=1024, label=6, len=0  , stride=1  , flags=0),
+        dict(left=1024,right=1024, label=7, len=0  , stride=0  , flags=32),
+    ]
 
-lc = LinearCells(specs)
+    lc = LinearCells(specs)
 
-# ------------------------------------------------------------------------
-# 1-bis. allocate ONE shared bitmap that spans the whole address space
-# ------------------------------------------------------------------------
-# give empty cells at least one quantum so .right is > .left
-for c in lc.cells:
-    if c.len == 0:
-        c.len   = max(1, c.stride)
-        c.right = c.left + c.len
+    # --------------------------------------------------------------------
+    # 1-bis. allocate ONE shared bitmap that spans the whole address space
+    # --------------------------------------------------------------------
+    # give empty cells at least one quantum so .right is > .left
+    for c in lc.cells:
+        if c.len == 0:
+            c.len   = max(1, c.stride)
+            c.right = c.left + c.len
 
-max_extent = max(c.right for c in lc.cells)          # right-most byte
-SharedBuf  = (ctypes.c_ubyte * max_extent)
-shared_buf = SharedBuf()                             # zero-filled solvent
+    max_extent = max(c.right for c in lc.cells)          # right-most byte
+    SharedBuf  = (ctypes.c_ubyte * max_extent)
+    shared_buf = SharedBuf()                             # zero-filled solvent
 
-# keep a reference alive so the buffer isn’t GC’d
-lc._shared_bitmap = shared_buf
+    # keep a reference alive so the buffer isn’t GC’d
+    lc._shared_bitmap = shared_buf
 
-for c in lc.cells:
-    # obj_map = address of the first byte that belongs to this cell
-    offset = c.left
-    c.obj_map = ctypes.c_void_p(ctypes.addressof(shared_buf) + offset)
+    for c in lc.cells:
+        # obj_map = address of the first byte that belongs to this cell
+        offset = c.left
+        c.obj_map = ctypes.c_void_p(ctypes.addressof(shared_buf) + offset)
 
-inject_map = [[] for _ in specs]         # history for inject_item()
+    inject_map = [[] for _ in specs]         # history for inject_item()
 
-# ------------------------------------------------------------------------
-# 2. visualiser
-# ------------------------------------------------------------------------
-vis = _LCVisual(lc.cells)
-lc.relax()                               # settle once before UI
+    # --------------------------------------------------------------------
+    # 2. visualiser
+    # --------------------------------------------------------------------
+    vis = _LCVisual(lc.cells)
+    lc.relax()                               # settle once before UI
 
-KEY_TO_CELL = {
-    pygame.K_0: 0, pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
-    pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6, pygame.K_7: 7,
-}
+    KEY_TO_CELL = {
+        pygame.K_0: 0, pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
+        pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6, pygame.K_7: 7,
+    }
 
-AUTO_EVERY  = 3.0
-next_auto   = time.time() + AUTO_EVERY
+    AUTO_EVERY  = 3.0
+    next_auto   = time.time() + AUTO_EVERY
 
-while True:
-    now = time.time()
+    while True:
+        now = time.time()
 
-    # handle window / keyboard
-    for ev in pygame.event.get():
-        if ev.type == pygame.QUIT:
-            pygame.quit(); sys.exit()
-        if ev.type == pygame.KEYDOWN and ev.key in KEY_TO_CELL:
-            idx = KEY_TO_CELL[ev.key]
-            lc.inject_item(lc.cells, inject_map, idx)   # real call
+        # handle window / keyboard
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key in KEY_TO_CELL:
+                idx = KEY_TO_CELL[ev.key]
+                lc.inject_item(lc.cells, inject_map, idx)   # real call
+                lc.relax()
+
+        # auto-inject (optional)
+        if now >= next_auto:
+            tgt = random.randint(0, len(specs) - 2)         # skip sentinel 7
+            lc.inject_item(lc.cells, inject_map, tgt)
             lc.relax()
+            next_auto = now + AUTO_EVERY
 
-    # auto-inject (optional)
-    if now >= next_auto:
-        tgt = random.randint(0, len(specs) - 2)         # skip sentinel 7
-        lc.inject_item(lc.cells, inject_map, tgt)
-        lc.relax()
-        next_auto = now + AUTO_EVERY
-
-    vis.draw()
+        vis.draw()
