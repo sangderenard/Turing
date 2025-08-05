@@ -1,3 +1,5 @@
+# Move reel_demo.py to visualizations folder for organization
+# This is the same code as before, just relocated.
 
 """Composable ReelGraphics class for Pygame UI integration."""
 
@@ -134,4 +136,3 @@ class ReelGraphics:
         status = "PLAY" if self.playing else "REC" if self.recording else "SEEK" if self.seeking else "STOP"
         text = font.render(f"{status} | Tape: {self.left_tape:.1f} / {self.total_tape}", True, (255,255,255))
         surface.blit(text, (self.rect.left + 10, self.rect.top + 10))
-
