@@ -7,14 +7,17 @@ and data zone layout of virtual tapes.  Registers are modelled as **fully
 independent tape systems** rather than as mere track pairs on the main tape,
 reflecting the design where the CPU can drive multiple devices in
 simultaneity.  Each register stands alone and contains no nested registers.
+They remain fully fledged tape units with motor simulation and noise handled
+elsewhere in the hardware stack; this module only describes their digital
+addressing layout.
 
 Only the structural addressing rules are modelled here; no analogue physics
-is emulated.  The intention is to provide deterministic digital maps that
-other components can consult.
+is emulated.  The intention is to provide deterministic maps that other
+components can consult.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ..hardware.analog_spec import (
     BiosHeader,
@@ -40,22 +43,30 @@ class TapeMap:
     separate ``TapeMap`` instances to represent their own external tapes.
     """
 
-    bios: BiosHeader
+    bios: Optional[BiosHeader]
     instruction_frames: int
+    is_register: bool = False
 
     bios_start: int = 0
     instr_start: int = field(init=False)
     data_start: int = field(init=False)
 
     def __post_init__(self) -> None:
-        bios_frame_count = len(header_frames(self.bios))
-        self.instr_start = self.bios_start + bios_frame_count
+        if self.bios:
+            bios_frame_count = len(header_frames(self.bios))
+            self.instr_start = self.bios_start + bios_frame_count
+        else:
+            # When no BIOS is present the tape begins directly with the
+            # instruction area which, for registers, is empty.
+            self.instr_start = self.bios_start
         self.data_start = self.instr_start + self.instruction_frames
 
     # ------------------------------------------------------------------
     def encode_bios(self) -> List[List[int]]:
         """Return the BIOS header as parallel bit frames."""
-        return header_frames(self.bios)
+        if self.bios:
+            return header_frames(self.bios)
+        return []
 
     @staticmethod
     def decode_bios(frames: List[List[int]]) -> BiosHeader:
@@ -83,14 +94,17 @@ class TapeMap:
         return (bits + LANES - 1) // LANES
 
 
-def create_register_tapes(bios: BiosHeader, n: int = REGISTERS) -> Dict[int, TapeMap]:
+def create_register_tapes(n: int = REGISTERS) -> Dict[int, TapeMap]:
     """Return independent ``TapeMap`` objects for ``n`` registers.
 
-    Each register is modelled as its own two-track tape with a BIOS header and
-    data region but no instruction table.  Register tapes contain no
-    subordinate registers, mirroring the original hardware concept where the
-    CPU can play directly into multiple devices at once.
+    Registers are modelled as simple data tapes with **no BIOS header** and no
+    instruction area.  They still represent fully featured tape devices with
+    motor simulation and noise sources, but structurally they expose only a
+    data region beginning at frame ``0``.  ``is_register`` is marked so that
+    higher layers can lock access until a valid operator sequence is supplied.
     """
 
-    return {i: TapeMap(bios, instruction_frames=0) for i in range(n)}
+    return {
+        i: TapeMap(bios=None, instruction_frames=0, is_register=True) for i in range(n)
+    }
 

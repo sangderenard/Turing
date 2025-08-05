@@ -72,10 +72,11 @@ def test_tape_map_bios_roundtrip():
 
 
 def test_register_tapes_independent():
-    h = make_header()
-    regs = create_register_tapes(h)
+    """Registers are pure data tapes with no BIOS or instruction table."""
+    regs = create_register_tapes()
     assert set(regs.keys()) == {0, 1, 2}
     for r in regs.values():
-        assert r.instr_start == len(header_frames(h))
-        assert r.data_start == r.instr_start
+        assert r.instr_start == 0
+        assert r.data_start == 0
+        assert r.is_register
 

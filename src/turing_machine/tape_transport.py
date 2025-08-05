@@ -15,7 +15,7 @@ for each bit passed.  This mirrors the behaviour of a magnetic tape pickup
 where data is only available while the tape is in motion beneath the head.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, List, Sequence
 
 from ..hardware.cassette_tape import CassetteTapeBackend
@@ -41,6 +41,34 @@ class TapeTransport:
     track: int = 0
     lane: int = 0
     _cursor: int = 0
+    register_mode: bool = False
+    _locked: bool = field(init=False)
+    _op_queue: List[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._locked = self.register_mode
+
+    # ------------------------------------------------------------------
+    def queue_operators(self, ops: Sequence[int]) -> None:
+        """Provide operator codes that unlock the transport once consumed.
+
+        The codes themselves are placeholders for future analog mixing
+        instructions.  For now they merely serve to gate access so that tests
+        can verify the register lockout behaviour.
+        """
+
+        self._op_queue.extend(int(o) for o in ops)
+        if ops:
+            self._locked = False
+
+    def _consume_op(self) -> None:
+        if not self.register_mode:
+            return
+        if self._locked or not self._op_queue:
+            raise PermissionError("register tape locked; operator code required")
+        self._op_queue.pop(0)
+        if not self._op_queue:
+            self._locked = True
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -66,6 +94,7 @@ class TapeTransport:
 
     # ------------------------------------------------------------------
     def __getitem__(self, idx):
+        self._consume_op()
         if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step <= 0:
@@ -88,6 +117,7 @@ class TapeTransport:
 
     # ------------------------------------------------------------------
     def __setitem__(self, idx, data: Iterable[ndarray] | ndarray) -> None:
+        self._consume_op()
         if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step <= 0:

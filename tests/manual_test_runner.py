@@ -195,12 +195,13 @@ def test_header_layout():
     print(f"decoded instr_start_addr {decoded.instr_start_addr}")
     assert decoded.instr_start_addr == h.instr_start_addr
 
-    regs = create_register_tapes(h)
+    regs = create_register_tapes()
     print(f"register keys {regs.keys()}")
     assert set(regs.keys()) == {0,1,2}
     for r in regs.values():
-        assert r.instr_start == len(header_frames(h))
-        assert r.data_start == r.instr_start
+        assert r.instr_start == 0
+        assert r.data_start == 0
+        assert r.is_register
 
 
 def test_loops():
