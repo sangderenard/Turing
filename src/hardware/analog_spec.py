@@ -310,6 +310,32 @@ def zeros(n: int) -> List[np.ndarray]:
     """Return ``n`` silent frames."""
     return [np.zeros(FRAME_SAMPLES, dtype="f4") for _ in range(n)]
 
+
+# Placeholder implementations for I/O style opcodes
+# TODO: model full motor physics for seek/read/write behaviours
+DEFAULT_MOTOR_CALIB = MotorCalibration(1.0, 1.0, 0.0)
+
+
+def seek_op(_a: List[np.ndarray], _b: List[np.ndarray], distance: int) -> List[np.ndarray]:
+    """Return a trapezoidal motor envelope for a SEEK over ``distance`` frames."""
+    env = trapezoidal_motor_envelope(distance, DEFAULT_MOTOR_CALIB)
+    return [env]
+
+
+def read_op(x: List[np.ndarray], _b: List[np.ndarray], n: int) -> List[np.ndarray]:
+    """Copy ``n`` frames from ``x`` into a new list (placeholder for READ)."""
+    return [f.copy() for f in x[:n]]
+
+
+def write_op(_a: List[np.ndarray], y: List[np.ndarray], n: int) -> List[np.ndarray]:
+    """Copy ``n`` frames from ``y`` (placeholder for WRITE)."""
+    return [f.copy() for f in y[:n]]
+
+
+def halt_op(_a: List[np.ndarray], _b: List[np.ndarray], _p: int) -> List[np.ndarray]:
+    """HALT produces no frames but is included for dispatch completeness."""
+    return []
+
 # ---------------------------------------------------------------------------
 # 5. NAND Operator
 def nand_wave(
@@ -392,6 +418,9 @@ OperatorFn = Callable[[FrameList, FrameList, int], FrameList]
 
 
 PRIMITIVE_OPS: Dict[Opcode, OperatorFn] = {
+    Opcode.SEEK: lambda a, b, p: seek_op(a, b, p),
+    Opcode.READ: lambda a, b, p: read_op(a, b, p),
+    Opcode.WRITE: lambda a, b, p: write_op(a, b, p),
     Opcode.NAND: lambda a, b, p: nand_frames(a, b),
     Opcode.SIGL: lambda a, b, p: sigma_L(a, p),
     Opcode.SIGR: lambda a, b, p: sigma_R(a, p),
@@ -399,6 +428,7 @@ PRIMITIVE_OPS: Dict[Opcode, OperatorFn] = {
     Opcode.SLICE: lambda a, b, p: slice_frames(a, 0, p),
     Opcode.LENGTH: lambda a, b, p: length(a),
     Opcode.ZEROS: lambda a, b, p: zeros(p),
+    Opcode.HALT: lambda a, b, p: halt_op(a, b, p),
 }
 
 

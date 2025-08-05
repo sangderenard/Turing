@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from analog_spec import (
+from ..hardware.analog_spec import (
     LANES,
     Opcode,
     apply_operator,
@@ -33,6 +33,7 @@ class TapeMachine:
         self.tape_map: TapeMap | None = None
         self.instruction_pointer = 0
         self.data_registers: Dict[int, int] = {}
+        self.halted = False
 
     def _boot(self, instruction_count: int) -> None:
         """Read BIOS and initialise register map."""
@@ -78,6 +79,31 @@ class TapeMachine:
         addr_a = self.data_registers[reg_a]
         addr_b = self.data_registers[reg_b]
 
+        if opcode == Opcode.SEEK:
+            target = addr_a + param
+            distance = abs(target - self.transport._cursor)
+            apply_operator(opcode, [], [], distance)
+            self.transport.seek(target)
+            self.data_registers[dest] = target
+            return
+
+        if opcode == Opcode.HALT:
+            apply_operator(opcode, [], [], param)
+            self.halted = True
+            return
+
+        if opcode == Opcode.READ:
+            frames = self.transport[addr_a : addr_a + param]
+            out = apply_operator(opcode, frames, [], param)
+            self.transport[addr_dest : addr_dest + len(out)] = out
+            return
+
+        if opcode == Opcode.WRITE:
+            frames = self.transport[addr_b : addr_b + param]
+            out = apply_operator(opcode, [], frames, param)
+            self.transport[addr_dest : addr_dest + len(out)] = out
+            return
+
         wave_a = self.transport[addr_a : addr_a + self.bit_width]
         wave_b = self.transport[addr_b : addr_b + self.bit_width]
 
@@ -96,9 +122,14 @@ class TapeMachine:
 
         self._boot(instruction_count)
         print("TapeMachine: Starting execution loop...")
-        for i in range(instruction_count):
-            print(f"  Executing instruction {i+1}/{instruction_count}", end="\r")
+        executed = 0
+        while executed < instruction_count and not self.halted:
+            print(f"  Executing instruction {executed + 1}/{instruction_count}", end="\r")
             opcode, dest, reg_a, reg_b, param = self._fetch_decode()
             self._execute(opcode, dest, reg_a, reg_b, param)
-        print("\nExecution finished.")
+            executed += 1
+        if self.halted:
+            print("\nExecution halted.")
+        else:
+            print("\nExecution finished.")
 
