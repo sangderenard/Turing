@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import queue
 from typing import Dict, Optional, Tuple
 
-from analog_spec import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS
+from analog_spec import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS, BIAS_AMP
 
 try:  # pragma: no cover - numpy may be absent during import analysis
     import numpy as np
@@ -67,8 +67,8 @@ class TapeHead:
                     raise RuntimeError("head misaligned during write activation")
                 if np is not None:
                     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
-                    # TODO: refine bias amplitude based on real hardware measurements
-                    bias = 0.1 * np.sin(2 * np.pi * WRITE_BIAS * t)
+                    # Bias tone sits at the RF noise floor divided across sources
+                    bias = BIAS_AMP * np.sin(2 * np.pi * WRITE_BIAS * t)
                     frame = frame + bias.astype("f4")
                 self.tape._tape_frames[(track, lane, bit_idx)] = frame.astype("f4") if np is not None else frame
                 return frame

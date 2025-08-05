@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 
 from cassette_tape import CassetteTapeBackend
-from analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS
+from analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS, BIAS_AMP
 from tape_transport import TapeTransport
 
 
@@ -55,10 +55,10 @@ def test_write_adds_bias_tone():
     tape.write_wave(0, 0, 0, frame)
     out = tape.read_wave(0, 0, 0)
     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
-    bias_wave = 0.1 * np.sin(2 * np.pi * WRITE_BIAS * t)
+    bias_wave = BIAS_AMP * np.sin(2 * np.pi * WRITE_BIAS * t)
     diff = out - frame
     assert np.max(np.abs(diff)) > 0.0
-    assert abs(np.dot(diff, bias_wave)) > 100.0
+    assert abs(np.dot(diff, bias_wave)) > 1e-5
     tape.close()
 
 
