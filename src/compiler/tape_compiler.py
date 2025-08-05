@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import struct
 from typing import Dict, List, Tuple
+import numpy as np
 
 from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode, LANES
 from ..turing_machine.tape_map import TapeMap
@@ -59,7 +60,7 @@ class TapeCompiler:
             raise ValueError(f"Unknown graph operation: {op_name}")
         return opcode_map[op_name]
 
-    def compile(self) -> Tuple[TapeMap, InstructionStream]:
+    def compile(self) -> Tuple[TapeMap, InstructionStream, List[List[np.ndarray]]]:
         """
         Compiles the graph into a tape map and a stream of instructions.
         """
@@ -121,7 +122,20 @@ class TapeCompiler:
         tape_map.bios.instr_start_addr = tape_map.instr_start
         
         print(f"Compilation successful. Generated {len(instructions)} instructions.")
-        return tape_map, instructions
+        # Convert BIOS header and instructions to PCM bit waves
+        from ..hardware.analog_spec import generate_bit_wave, LANES
+        bios_bit_frames = tape_map.encode_bios()  # List[List[int]]
+        bios_pcm_frames: List[List[np.ndarray]] = []
+        for frame in bios_bit_frames:
+            pcm_lanes = [generate_bit_wave(bit, lane) for lane, bit in enumerate(frame)]
+            bios_pcm_frames.append(pcm_lanes)
+        instr_bit_frames = self.binarize_instructions(instructions)  # List[List[int]]
+        instr_pcm_frames: List[List[np.ndarray]] = []
+        for frame in instr_bit_frames:
+            pcm_lanes = [generate_bit_wave(bit, lane) for lane, bit in enumerate(frame)]
+            instr_pcm_frames.append(pcm_lanes)
+        tape_pcm = bios_pcm_frames + instr_pcm_frames
+        return tape_map, instructions, tape_pcm
 
     @staticmethod
     def binarize_instructions(instructions: InstructionStream) -> List[List[int]]:

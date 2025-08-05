@@ -15,20 +15,29 @@ import numpy as np
 
 # nand_wave is now implemented below in this module
 
+
 # ---------------------------------------------------------------------------
 # 1. Global Parameters
 LANES = 32
 TRACKS = 2
 REGISTERS = 3
-BIT_FRAME_MS = 500
+BIT_FRAME_MS = 50
 FS = 44_100
 BASE_FREQ = 110.0
 SEMI_RATIO = 2 ** (1 / 12)
 MOTOR_CARRIER = 60.0
 WRITE_BIAS = 150.0
-DATA_ADSR = (50, 50, 0.8, 100)  # attack, decay, sustain, release in ms
+# Envelope: attack_ms, decay_ms, sustain_ms, release_ms, attack_level, sustain_level
+DATA_ADSR = (1, 2, 5, 1, 1.0, 0.8)  # ms, ms, ms, ms, level, level
 FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
 MOTOR_RAMP_MS = 250  # up/down ramp duration for SEEK envelopes
+
+# Global motor plateau amplitude (scales current available to motor)
+PLATEAU_AMP = 10.0
+
+# Global envelope levels
+ATTACK_LEVEL = DATA_ADSR[4]
+SUSTAIN_LEVEL = DATA_ADSR[5]
 
 # Baseline RF noise floor and derived bias amplitude per noise source
 NOISE_FLOOR_DB = -60.0
@@ -50,23 +59,40 @@ def generate_bit_wave(bit: int, lane: int, phase: float = 0.0) -> np.ndarray:
     t = np.linspace(0, BIT_FRAME_MS / 1000.0, FRAME_SAMPLES, endpoint=False)
     if bit:
         freq = lane_frequency(lane)
-        a_ms, d_ms, sustain_level, r_ms = DATA_ADSR
+        a_ms, d_ms, s_ms, r_ms, attack_level, sustain_level = DATA_ADSR
+        # Calculate requested envelope segment durations in samples
         a_n = int(FS * (a_ms / 1000.0))
         d_n = int(FS * (d_ms / 1000.0))
+        s_n = int(FS * (s_ms / 1000.0))
         r_n = int(FS * (r_ms / 1000.0))
-        s_n = FRAME_SAMPLES - (a_n + d_n + r_n)
-        # ADSR envelope: attack 0→1 over ``a_ms``, decay to ``sustain_level`` over
-        # ``d_ms``, sustain constant for ``s_n`` samples, then release to 0 over
-        # ``r_ms``.  Durations and level come directly from AGENTS.md's
-        # ``DATA_ADSR`` and fill the full ``BIT_FRAME_MS`` of 500 ms.
-        env = np.concatenate(
-            [
-                np.linspace(0.0, 1.0, a_n, endpoint=False),
-                np.linspace(1.0, sustain_level, d_n, endpoint=False),
-                np.full(s_n, sustain_level),
-                np.linspace(sustain_level, 0.0, r_n, endpoint=True),
-            ]
-        )
+        # Normalize and scale all segments to fit FRAME_SAMPLES
+        total_env = a_n + d_n + s_n + r_n
+        if total_env != FRAME_SAMPLES:
+            scale = FRAME_SAMPLES / total_env if total_env > 0 else 0
+            a_n = int(a_n * scale)
+            d_n = int(d_n * scale)
+            s_n = int(s_n * scale)
+            r_n = int(r_n * scale)
+            # Log the scaling for transparency
+            import warnings
+            warnings.warn(f"ADSR envelope segments ({a_ms}ms, {d_ms}ms, {s_ms}ms, {r_ms}ms) do not fit BIT_FRAME_MS={BIT_FRAME_MS}ms; all segments scaled by {scale:.3f} to fit frame.")
+        # Recalculate total to fill any rounding error
+        total_scaled = a_n + d_n + s_n + r_n
+        if total_scaled < FRAME_SAMPLES:
+            s_n += FRAME_SAMPLES - total_scaled
+        elif total_scaled > FRAME_SAMPLES:
+            s_n = max(s_n - (total_scaled - FRAME_SAMPLES), 0)
+        env = np.concatenate([
+            np.linspace(0.0, attack_level, a_n, endpoint=False) if a_n > 0 else np.array([], dtype="f4"),
+            np.linspace(attack_level, sustain_level, d_n, endpoint=False) if d_n > 0 else np.array([], dtype="f4"),
+            np.full(s_n, sustain_level, dtype="f4") if s_n > 0 else np.array([], dtype="f4"),
+            np.linspace(sustain_level, 0.0, r_n, endpoint=True) if r_n > 0 else np.array([], dtype="f4"),
+        ])
+        # Pad or trim envelope to match FRAME_SAMPLES
+        if len(env) < FRAME_SAMPLES:
+            env = np.pad(env, (0, FRAME_SAMPLES - len(env)), mode="constant", constant_values=0.0)
+        elif len(env) > FRAME_SAMPLES:
+            env = env[:FRAME_SAMPLES]
         sine = np.sin(2 * np.pi * freq * t + phase)
         return (sine * env).astype("f4")
     return np.zeros_like(t, dtype="f4")
@@ -132,9 +158,9 @@ def trapezoidal_motor_envelope(
     distance_ms = distance_frames * BIT_FRAME_MS
     up_ms = MOTOR_RAMP_MS
     dn_ms = MOTOR_RAMP_MS
-    plateau_amp = 1.0
+    plateau_amp = PLATEAU_AMP
     if speed == "fast" and calib.fast_wind_ms > 0.0:
-        plateau_amp = calib.read_speed_ms / calib.fast_wind_ms
+        plateau_amp *= calib.read_speed_ms / calib.fast_wind_ms
     unit_area = 0.5 * (up_ms + dn_ms)
     max_tri_area = plateau_amp * unit_area
     if distance_ms <= max_tri_area:
@@ -196,21 +222,31 @@ class Register:
 
 def _start_envelope() -> np.ndarray:
     """Return the attack/decay/sustain envelope for a frame start."""
-    a_ms, d_ms, sustain_level, _ = DATA_ADSR
-    a_n = int(FS * (a_ms / 1000.0))
-    d_n = int(FS * (d_ms / 1000.0))
+    a_ms, d_ms, _, _, attack_level, sustain_level = DATA_ADSR
+    a_n = max(int(FS * (a_ms / 1000.0)), 0)
+    d_n = max(int(FS * (d_ms / 1000.0)), 0)
+    total_env = a_n + d_n
+    if total_env > FRAME_SAMPLES:
+        scale = FRAME_SAMPLES / total_env if total_env > 0 else 0
+        a_n = int(a_n * scale)
+        d_n = int(d_n * scale)
     env = np.full(FRAME_SAMPLES, sustain_level, dtype="f4")
-    env[:a_n] = np.linspace(0.0, 1.0, a_n, endpoint=False)
-    env[a_n : a_n + d_n] = np.linspace(1.0, sustain_level, d_n, endpoint=False)
+    if a_n > 0:
+        env[:a_n] = np.linspace(0.0, attack_level, a_n, endpoint=False)
+    if d_n > 0:
+        env[a_n : a_n + d_n] = np.linspace(attack_level, sustain_level, d_n, endpoint=False)
     return env
 
 
 def _end_envelope() -> np.ndarray:
     """Return the sustain/release envelope for a frame end."""
-    _, _, sustain_level, r_ms = DATA_ADSR
-    r_n = int(FS * (r_ms / 1000.0))
+    _, _, _, r_ms, _, sustain_level = DATA_ADSR
+    r_n = max(int(FS * (r_ms / 1000.0)), 0)
+    if r_n > FRAME_SAMPLES:
+        r_n = FRAME_SAMPLES
     env = np.full(FRAME_SAMPLES, sustain_level, dtype="f4")
-    env[-r_n:] = np.linspace(sustain_level, 0.0, r_n, endpoint=True)
+    if r_n > 0:
+        env[-r_n:] = np.linspace(sustain_level, 0.0, r_n, endpoint=True)
     return env
 
 
