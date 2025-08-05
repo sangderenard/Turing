@@ -1,13 +1,17 @@
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pytest
 
 import src.hardware.nand_wave as nw
+from src.hardware.analog_spec import BIT_FRAME_MS, REFERENCE_BIT_FRAME_MS
 
 
-ENERGY_THRESH = 0.01
+BASE_ENERGY_THRESH = 0.01
+ENERGY_THRESH = max(BASE_ENERGY_THRESH * (BIT_FRAME_MS / REFERENCE_BIT_FRAME_MS), 1e-5)
 
 
 def test_parallel_xor_copy():

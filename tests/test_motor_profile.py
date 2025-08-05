@@ -23,6 +23,6 @@ def test_simulate_movement_writes_audio():
     tape = CassetteTapeBackend(time_scale_factor=0.0)
     tape._simulate_movement(1.0, tape.seek_speed_ips, 1, "seek")
     assert tape._audio_cursor > 0
-    assert np.any(tape._audio_buffer[:tape._audio_cursor])
+    assert np.any(tape._audio_buffer[:tape._buffer_cursor])
     tape.close()
 

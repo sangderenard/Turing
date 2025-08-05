@@ -25,7 +25,7 @@ def extract_lane(frame: np.ndarray, lane: int) -> np.ndarray:
     bin_idx = _lane_bin(lane)
     single = np.zeros_like(fft)
     single[bin_idx] = fft[bin_idx]
-    wave = np.fft.irfft(single)
+    wave = np.fft.irfft(single, n=len(frame))
     return wave.astype(frame.dtype)
  
 def lane_rms(wave: np.ndarray, lane: int, half_bw: int = 3) -> float:
@@ -51,25 +51,33 @@ def mix_fft_lane(orig: np.ndarray, new: np.ndarray, lane: int) -> np.ndarray:
 def replay_envelope(env_wave: np.ndarray, lane: int) -> np.ndarray:
     """Replay ``env_wave``'s envelope on ``lane`` starting at phase 0."""
     env = np.abs(env_wave)
+    if len(env) != FRAME_SAMPLES:
+        env = np.pad(env, (0, max(0, FRAME_SAMPLES - len(env))))[:FRAME_SAMPLES]
     t = np.arange(FRAME_SAMPLES, dtype="f4") / FS
     carrier = np.sin(2 * np.pi * lane_frequency(lane) * t)
     return (env * carrier).astype("f4")
 
 def generate_bit_wave(lane: int) -> np.ndarray:
-    """Return a 500 ms ADSR tone for ``lane`` starting at phase 0."""
-    a_ms, d_ms, sustain_level, r_ms = DATA_ADSR
-    a_n = int(FS * (a_ms / 1000.0))
-    d_n = int(FS * (d_ms / 1000.0))
-    r_n = int(FS * (r_ms / 1000.0))
-    s_n = FRAME_SAMPLES - (a_n + d_n + r_n)
-    env = np.concatenate(
-        [
-            np.linspace(0.0, 1.0, a_n, endpoint=False),
-            np.linspace(1.0, sustain_level, d_n, endpoint=False),
-            np.full(s_n, sustain_level),
-            np.linspace(sustain_level, 0.0, r_n, endpoint=True),
-        ]
-    )
+    """Return an ADSR tone for ``lane`` spanning one frame."""
+    a_ratio, d_ratio, s_ratio, r_ratio, attack_level, sustain_level = DATA_ADSR
+    total = a_ratio + d_ratio + s_ratio + r_ratio
+    if total <= 0:
+        env = np.zeros(FRAME_SAMPLES, dtype="f4")
+    else:
+        a_n = int(FRAME_SAMPLES * (a_ratio / total))
+        d_n = int(FRAME_SAMPLES * (d_ratio / total))
+        s_n = int(FRAME_SAMPLES * (s_ratio / total))
+        r_n = FRAME_SAMPLES - (a_n + d_n + s_n)
+        env = np.concatenate([
+            np.linspace(0.0, attack_level, a_n, endpoint=False) if a_n > 0 else np.array([], dtype="f4"),
+            np.linspace(attack_level, sustain_level, d_n, endpoint=False) if d_n > 0 else np.array([], dtype="f4"),
+            np.full(s_n, sustain_level, dtype="f4") if s_n > 0 else np.array([], dtype="f4"),
+            np.linspace(sustain_level, 0.0, r_n, endpoint=True) if r_n > 0 else np.array([], dtype="f4"),
+        ])
+        if len(env) < FRAME_SAMPLES:
+            env = np.pad(env, (0, FRAME_SAMPLES - len(env)), mode="constant")
+        elif len(env) > FRAME_SAMPLES:
+            env = env[:FRAME_SAMPLES]
     t = np.arange(FRAME_SAMPLES) / FS
     carrier = np.sin(2 * np.pi * lane_frequency(lane) * t)
-    return (env * carrier).astype("f4")
+    return (env * carrier / LANES).astype("f4")
