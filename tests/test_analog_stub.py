@@ -22,3 +22,13 @@ def test_sigma_ops():
     assert np.max(np.abs(appended[-1])) == 0.0
     trimmed = sigma_R(appended, 2)
     assert len(trimmed) == 1
+
+
+def test_sigma_envelope_edges():
+    frames = [np.ones(FRAME_SAMPLES, dtype="f4") for _ in range(2)]
+    left = sigma_L(frames, 0)
+    assert left[0][0] == pytest.approx(0.0, abs=1e-3)
+    assert left[-1][-1] == pytest.approx(0.0, abs=1e-3)
+    right = sigma_R(frames, 0)
+    assert right[0][0] == pytest.approx(0.0, abs=1e-3)
+    assert right[-1][-1] == pytest.approx(0.0, abs=1e-3)

@@ -6,14 +6,6 @@ missing physical modelling required for a faithful simulation.
 """
 
 from __future__ import annotations
-from analog_helpers import (
-    FS, FRAME_SAMPLES, lane_frequency, LANES, DATA_ADSR,
-    extract_lane, lane_band, lane_rms, track_rms, replay_envelope,
-    generate_bit_wave, mix_fft_lane,
-    MotorCalibration,
-    generate_bit_wave, Opcode
-)
-
 from dataclasses import dataclass
 from enum import Enum
 from typing import List
@@ -38,10 +30,14 @@ DATA_ADSR = (50, 50, 0.8, 100)  # attack, decay, sustain, release in ms
 FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
 MOTOR_RAMP_MS = 250  # up/down ramp duration for SEEK envelopes
 
-
 def lane_frequency(lane: int) -> float:
     """Return the base frequency for a lane."""
     return BASE_FREQ * (SEMI_RATIO ** lane)
+
+from analog_helpers import (
+    extract_lane, lane_band, lane_rms, track_rms, replay_envelope,
+    mix_fft_lane,
+)
 
 
 def generate_bit_wave(bit: int, lane: int, phase: float = 0.0) -> np.ndarray:
@@ -193,16 +189,55 @@ class Register:
 # 6. Primitive Operator Stubs
 
 
+def _start_envelope() -> np.ndarray:
+    """Return the attack/decay/sustain envelope for a frame start."""
+    a_ms, d_ms, sustain_level, _ = DATA_ADSR
+    a_n = int(FS * (a_ms / 1000.0))
+    d_n = int(FS * (d_ms / 1000.0))
+    env = np.full(FRAME_SAMPLES, sustain_level, dtype="f4")
+    env[:a_n] = np.linspace(0.0, 1.0, a_n, endpoint=False)
+    env[a_n : a_n + d_n] = np.linspace(1.0, sustain_level, d_n, endpoint=False)
+    return env
+
+
+def _end_envelope() -> np.ndarray:
+    """Return the sustain/release envelope for a frame end."""
+    _, _, sustain_level, r_ms = DATA_ADSR
+    r_n = int(FS * (r_ms / 1000.0))
+    env = np.full(FRAME_SAMPLES, sustain_level, dtype="f4")
+    env[-r_n:] = np.linspace(sustain_level, 0.0, r_n, endpoint=True)
+    return env
+
+
 def sigma_L(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
-    """σ_L^k – append ``k`` silent frames to the sequence."""
-    return frames + zeros(k)
+    """σ_L^k – load frames into a register and append ``k`` silences.
+
+    The first and last surviving frames are re-enveloped so the sequence
+    fades in from silence and fades out before the appended zeros, emulating
+    a physical read/write through a register tape.
+    """
+    reg = Register([f.copy() for f in frames])
+    if reg.frames:
+        reg.frames[0] *= _start_envelope()
+        reg.frames[-1] *= _end_envelope()
+    reg.frames.extend(zeros(k))
+    return reg.frames
 
 
 def sigma_R(frames: List[np.ndarray], k: int) -> List[np.ndarray]:
-    """σ_R^k – drop the last ``k`` frames from ``frames"."""
-    if k <= 0:
-        return list(frames)
-    return list(frames[:-k]) if k < len(frames) else []
+    """σ_R^k – drop the final ``k`` frames via register buffering.
+
+    After copying the input into a register the routine writes back only the
+    remaining frames, reapplying the start envelope to the new first frame and
+    the end envelope to the new last frame to avoid abrupt discontinuities.
+    """
+    reg = Register([f.copy() for f in frames])
+    if k > 0:
+        reg.frames = reg.frames[:-k] if k < len(reg.frames) else []
+    if reg.frames:
+        reg.frames[0] *= _start_envelope()
+        reg.frames[-1] *= _end_envelope()
+    return reg.frames
 
 
 def concat(x: List[np.ndarray], y: List[np.ndarray]) -> List[np.ndarray]:
@@ -255,6 +290,11 @@ def nand_wave(
     energy_thresh: float = 0.01,
 ) -> np.ndarray:
     """Return NAND combination of ``x`` and ``y`` according to ``mode``."""
+    # Operators consume their operands via registers to mimic tape workflow.
+    reg_x = Register([x.copy()])
+    reg_y = Register([y.copy()])
+    x = reg_x.read(0)
+    y = reg_y.read(0)
     if mode not in {"parallel", "dominant"}:
         raise ValueError("mode must be 'parallel' or 'dominant'")
     if mode == "parallel":
@@ -265,11 +305,17 @@ def nand_wave(
             x_on = lane_rms(x, lane) > energy_thresh
             y_on = lane_rms(y, lane) > energy_thresh
             if not x_on and not y_on:
-                out += generate_bit_wave(lane)
+                out += generate_bit_wave(1, lane)
             elif x_on and not y_on:
-                out += extract_lane(x, lane)
+                if lane_mask is not None and lane_mask == (1 << lane):
+                    out += x
+                else:
+                    out = mix_fft_lane(out, x, lane)
             elif y_on and not x_on:
-                out += extract_lane(y, lane)
+                if lane_mask is not None and lane_mask == (1 << lane):
+                    out += y
+                else:
+                    out = mix_fft_lane(out, y, lane)
         peak = float(np.max(np.abs(out)))
         if peak > 1.0:
             out *= 1.0 / peak
@@ -292,7 +338,7 @@ def nand_wave(
         env = extract_lane(y, strongest)
         out = replay_envelope(env, target_lane)
     else:
-        out = generate_bit_wave(target_lane)
+        out = generate_bit_wave(1, target_lane)
     peak = float(np.max(np.abs(out)))
     if peak > 1.0:
         out *= 1.0 / peak
