@@ -96,3 +96,15 @@ python -m src.reel_demo --mode reel      # Reel-to-reel layout
 ```
 
 Press <kbd>Space</kbd> to toggle play and <kbd>W</kbd> to toggle the red write indicator.
+
+## Live cassette demo
+
+To watch the full compile/write/run cycle with synchronized audio and reel
+animation, run:
+
+```bash
+python -m src.visualizations.live_cassette_demo
+```
+
+The window shows tape motion in real time as the simulator writes the program
+to a blank cassette and then executes it.

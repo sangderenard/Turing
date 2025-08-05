@@ -62,6 +62,22 @@ def test_write_adds_bias_tone():
     tape.close()
 
 
+def test_status_callback_receives_updates():
+    updates = []
+
+    def cb(tape_pos, motor_pos, reading, writing):
+        updates.append((tape_pos, reading, writing))
+
+    tape = CassetteTapeBackend(tape_length_inches=0.02, status_callback=cb)
+    frame = generate_bit_wave(1, 0)
+    tape.write_wave(0, 0, 0, frame)
+    assert updates, "callback was not invoked"
+    tape_pos, reading_flag, writing_flag = updates[-1]
+    assert writing_flag and not reading_flag
+    assert tape_pos[1] > 0
+    tape.close()
+
+
 def test_transport_pythonic_index_and_slice():
     tape = CassetteTapeBackend(tape_length_inches=0.02)
     transport = TapeTransport(tape, track=0, lane=0)
