@@ -9,7 +9,7 @@ computations.
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 from ..hardware.analog_spec import (
     LANES,
@@ -26,14 +26,15 @@ class TapeMachine:
     A simulated machine that reads instructions from a tape and executes them
     using analog wave-based operations.
     """
-    def __init__(self, cassette: CassetteTapeBackend, bit_width: int):
+    def __init__(self, cassette: CassetteTapeBackend, bit_width: int, register_mode: bool = False):
         self.cassette = cassette
         self.bit_width = bit_width
-        self.transport = TapeTransport(cassette)
+        self.transport = TapeTransport(cassette, register_mode=register_mode)
         self.tape_map: TapeMap | None = None
         self.instruction_pointer = 0
         self.data_registers: Dict[int, int] = {}
         self.halted = False
+        self.register_mode = register_mode
 
     def _boot(self, instruction_count: int) -> None:
         """Read BIOS and initialise register map."""
@@ -132,4 +133,12 @@ class TapeMachine:
             print("\nExecution halted.")
         else:
             print("\nExecution finished.")
+
+    # ------------------------------------------------------------------
+    def queue_register_ops(self, ops: Sequence[int]) -> None:
+        """Forward operator codes to the underlying transport when in register mode."""
+
+        if not self.register_mode:
+            raise RuntimeError("machine not initialised for register mode")
+        self.transport.queue_operators(ops)
 
