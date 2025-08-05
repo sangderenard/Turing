@@ -8,7 +8,7 @@ missing physical modelling required for a faithful simulation.
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import List
+from typing import List, Dict, Callable
 import struct
 
 import numpy as np
@@ -309,7 +309,7 @@ def length(frames: List[np.ndarray], mode: str = "parallel") -> List[np.ndarray]
 def zeros(n: int) -> List[np.ndarray]:
     """Return ``n`` silent frames."""
     return [np.zeros(FRAME_SAMPLES, dtype="f4") for _ in range(n)]
- 
+
 # ---------------------------------------------------------------------------
 # 5. NAND Operator
 def nand_wave(
@@ -375,6 +375,39 @@ def nand_wave(
     if peak > 1.0:
         out *= 1.0 / peak
     return out.astype("f4")
+
+
+# ---------------------------------------------------------------------------
+# 6. Primitive Operator Dispatch
+
+FrameList = List[np.ndarray]
+
+
+def nand_frames(x: FrameList, y: FrameList) -> FrameList:
+    """Apply :func:`nand_wave` across lists of frames."""
+    return [nand_wave(fx, fy) for fx, fy in zip(x, y)]
+
+
+OperatorFn = Callable[[FrameList, FrameList, int], FrameList]
+
+
+PRIMITIVE_OPS: Dict[Opcode, OperatorFn] = {
+    Opcode.NAND: lambda a, b, p: nand_frames(a, b),
+    Opcode.SIGL: lambda a, b, p: sigma_L(a, p),
+    Opcode.SIGR: lambda a, b, p: sigma_R(a, p),
+    Opcode.CONCAT: lambda a, b, p: concat(a, b),
+    Opcode.SLICE: lambda a, b, p: slice_frames(a, 0, p),
+    Opcode.LENGTH: lambda a, b, p: length(a),
+    Opcode.ZEROS: lambda a, b, p: zeros(p),
+}
+
+
+def apply_operator(opcode: Opcode, x: FrameList, y: FrameList, param: int) -> FrameList:
+    """Dispatch ``opcode`` to its analogue implementation."""
+    func = PRIMITIVE_OPS.get(opcode)
+    if func is None:
+        raise NotImplementedError(f"Opcode {opcode.name} not implemented")
+    return func(x, y, param)
 
 # ---------------------------------------------------------------------------
 # 8. Audio Event IR

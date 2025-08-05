@@ -13,47 +13,27 @@ Simulates a physical tape-based "survival computer" using a compile-and-run mode
 from __future__ import annotations
 
 import time
-import numpy as np
 
 # Core components
 from bitops_translator import BitOpsTranslator
 from cassette_tape import CassetteTapeBackend
 from tape_compiler import TapeCompiler
 from tape_machine import TapeMachine
-from analog_spec import generate_bit_wave, LANES
+
 
 def prime_tape_with_program(cassette: CassetteTapeBackend, tape_map, instructions_binary):
-    """Writes the entire compiled program (BIOS, instructions) to the virtual tape."""
+    """Write BIOS and instruction frames directly onto the cassette."""
+
     print("Priming tape with compiled program...")
-    
-    # Get BIOS frames from the tape map
-    bios_frames_binary = tape_map.encode_bios()
-    
-    # Convert all binary data (lists of bits) to actual waveforms
-    bios_waves = [generate_bit_wave(bit, lane) for frame in bios_frames_binary for lane, bit in enumerate(frame)]
-    instr_waves = [generate_bit_wave(bit, lane) for frame in instructions_binary for lane, bit in enumerate(frame)]
+    bios_frames = tape_map.encode_bios()
+    for i, frame in enumerate(bios_frames):
+        for lane, bit in enumerate(frame):
+            cassette.write_bit(0, lane, tape_map.bios_start + i, bit)
 
-    # A helper to write frames directly to the tape's internal storage
-    # This bypasses the physical simulation for the initial "programming" of the tape
-    def write_frames_direct(start_addr, waves):
-        # This is a conceptual simplification. A real system would need to write bit-by-bit.
-        # We'll simulate this by placing frames at their intended locations.
-        # Each "wave" here is a single bit's waveform. We need to group them by frame.
-        
-        num_frames = len(waves) // LANES
-        for i in range(num_frames):
-            frame_start_index = i * LANES
-            # This logic is simplified; a full implementation would be more complex.
-            # For now, we just place the first bit of each frame to represent it.
-            cassette._tape_frames[(0, 0, start_addr + i)] = waves[frame_start_index]
+    for i, frame in enumerate(instructions_binary):
+        for lane, bit in enumerate(frame):
+            cassette.write_bit(0, lane, tape_map.instr_start + i, bit)
 
-
-    # For this skeleton, we'll represent the tape priming conceptually.
-    # In a full implementation, we would need a robust way to write the initial state.
-    # Let's just place a marker for the BIOS and instructions for now.
-    cassette._tape_frames[(0, 0, tape_map.bios_start)] = generate_bit_wave(1, 0) # Mark BIOS start
-    cassette._tape_frames[(0, 0, tape_map.instr_start)] = generate_bit_wave(1, 1) # Mark instruction start
-    
     print("Tape priming complete.")
 
 
