@@ -83,3 +83,16 @@ Execution finished.
 ```
 
 These commands prime a virtual tape, boot the `TapeMachine`, and run the program end-to-end, emitting PCM audio as it goes.
+
+## Reel animation demo
+
+For a visual illustration of tape motion, a small Pygame program renders
+cassette or reel-to-reel spools that scale with tape usage and draw the
+tape path through a read/write head.
+
+```bash
+python -m src.reel_demo --mode cassette  # Cassette layout
+python -m src.reel_demo --mode reel      # Reel-to-reel layout
+```
+
+Press <kbd>Space</kbd> to toggle play and <kbd>W</kbd> to toggle the red write indicator.
