@@ -1,11 +1,9 @@
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
 import pytest
 import numpy as np
 
 from cassette_tape import CassetteTapeBackend
 from analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS
+from tape_transport import TapeTransport
 
 
 def test_read_write_emits_audio():
@@ -61,4 +59,23 @@ def test_write_adds_bias_tone():
     diff = out - frame
     assert np.max(np.abs(diff)) > 0.0
     assert abs(np.dot(diff, bias_wave)) > 100.0
+    tape.close()
+
+
+def test_transport_pythonic_index_and_slice():
+    tape = CassetteTapeBackend(tape_length_inches=0.02)
+    transport = TapeTransport(tape, track=0, lane=0)
+    frame = generate_bit_wave(1, 0)
+    data = [frame, frame, frame]
+    # Pure slice assignment writes the frames sequentially
+    transport[:3] = data
+    before = tape._audio_cursor
+    first = transport[0]
+    rest = transport[1:3]
+    after = tape._audio_cursor
+    assert np.max(np.abs(first)) > 0.0
+    assert len(rest) == 2 and np.max(np.abs(rest[1])) > 0.0
+    # audio cursor advanced as the tape traversed bits 0-2
+    assert after > before
+    assert transport._cursor == 3
     tape.close()
