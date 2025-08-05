@@ -10,6 +10,7 @@ computations.
 from __future__ import annotations
 
 from typing import Dict, List, Sequence
+import os
 
 from ..hardware.analog_spec import (
     LANES,
@@ -20,6 +21,7 @@ from ..hardware.analog_spec import (
 from ..hardware.cassette_tape import CassetteTapeBackend
 from .tape_map import TapeMap
 from .tape_transport import TapeTransport
+from .tape_visualizer import TapeVisualizer
 
 class TapeMachine:
     """
@@ -35,6 +37,9 @@ class TapeMachine:
         self.data_registers: Dict[int, int] = {}
         self.halted = False
         self.register_mode = register_mode
+        self.visualizer: TapeVisualizer | None = None
+        if os.environ.get("TAPE_VIZ"):
+            self.visualizer = TapeVisualizer(self)
 
     def _boot(self, instruction_count: int) -> None:
         """Read BIOS and initialise register map."""
@@ -125,14 +130,20 @@ class TapeMachine:
         print("TapeMachine: Starting execution loop...")
         executed = 0
         while executed < instruction_count and not self.halted:
-            print(f"  Executing instruction {executed + 1}/{instruction_count}", end="\r")
+            print(
+                f"  Executing instruction {executed + 1}/{instruction_count}",
+                end="\r",
+            )
             opcode, dest, reg_a, reg_b, param = self._fetch_decode()
             self._execute(opcode, dest, reg_a, reg_b, param)
+            if self.visualizer:
+                self.visualizer.draw()
             executed += 1
+        print()
         if self.halted:
-            print("\nExecution halted.")
+            print("Execution halted.")
         else:
-            print("\nExecution finished.")
+            print("Execution finished.")
 
     # ------------------------------------------------------------------
     def queue_register_ops(self, ops: Sequence[int]) -> None:

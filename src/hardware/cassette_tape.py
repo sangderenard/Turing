@@ -95,9 +95,12 @@ class CassetteTapeBackend:
         self._decay_s = self.decay_ms / 1000.0 * self.time_scale_factor
         self._release_s = self.release_ms / 1000.0 * self.time_scale_factor
         # If total bits override provided, infer missing physical properties
-        if self.tape_length is not None:
-            # default tape_length_inches constant
-            default_inches = 3600.0 * 12
+        default_inches = 3600.0 * 12
+        if self.tape_length is None and self.tape_length_inches == default_inches:
+            # shorten the default tape to encourage visible head movement
+            self.tape_length = 1024
+            self.tape_length_inches = self.tape_length / self.bits_per_inch
+        elif self.tape_length is not None:
             if self.tape_length_inches == default_inches:
                 # infer physical length from bits and density
                 self.tape_length_inches = self.tape_length / self.bits_per_inch
