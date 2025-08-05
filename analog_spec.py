@@ -6,6 +6,13 @@ missing physical modelling required for a faithful simulation.
 """
 
 from __future__ import annotations
+from analog_helpers import (
+    FS, FRAME_SAMPLES, lane_frequency, LANES, DATA_ADSR,
+    extract_lane, lane_band, lane_rms, track_rms, replay_envelope,
+    generate_bit_wave, mix_fft_lane,
+    MotorCalibration,
+    generate_bit_wave, Opcode
+)
 
 from dataclasses import dataclass
 from enum import Enum
@@ -14,7 +21,7 @@ import struct
 
 import numpy as np
 
-from nand_wave import nand_wave  # use full implementation
+# nand_wave is now implemented below in this module
 
 # ---------------------------------------------------------------------------
 # 1. Global Parameters
@@ -235,6 +242,61 @@ def length(frames: List[np.ndarray]) -> int:
 def zeros(n: int) -> List[np.ndarray]:
     """Return ``n`` silent frames."""
     return [np.zeros(FRAME_SAMPLES, dtype="f4") for _ in range(n)]
+ 
+# ---------------------------------------------------------------------------
+# 5. NAND Operator
+def nand_wave(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    mode: str = "parallel",
+    target_lane: int | None = None,
+    lane_mask: int | None = None,
+    energy_thresh: float = 0.01,
+) -> np.ndarray:
+    """Return NAND combination of ``x`` and ``y`` according to ``mode``."""
+    if mode not in {"parallel", "dominant"}:
+        raise ValueError("mode must be 'parallel' or 'dominant'")
+    if mode == "parallel":
+        out = np.zeros(FRAME_SAMPLES, dtype="f4")
+        for lane in range(LANES):
+            if lane_mask is not None and not (lane_mask & (1 << lane)):
+                continue
+            x_on = lane_rms(x, lane) > energy_thresh
+            y_on = lane_rms(y, lane) > energy_thresh
+            if not x_on and not y_on:
+                out += generate_bit_wave(lane)
+            elif x_on and not y_on:
+                out += extract_lane(x, lane)
+            elif y_on and not x_on:
+                out += extract_lane(y, lane)
+        peak = float(np.max(np.abs(out)))
+        if peak > 1.0:
+            out *= 1.0 / peak
+        return out.astype("f4")
+    # dominant mode
+    if target_lane is None:
+        raise ValueError("target_lane required for dominant mode")
+    x_on = track_rms(x) > energy_thresh
+    y_on = track_rms(y) > energy_thresh
+    if x_on and y_on:
+        out = np.zeros(FRAME_SAMPLES, dtype="f4")
+    elif x_on and not y_on:
+        rms_vals = [lane_rms(x, ln) for ln in range(LANES)]
+        strongest = int(np.argmax(rms_vals))
+        env = extract_lane(x, strongest)
+        out = replay_envelope(env, target_lane)
+    elif y_on and not x_on:
+        rms_vals = [lane_rms(y, ln) for ln in range(LANES)]
+        strongest = int(np.argmax(rms_vals))
+        env = extract_lane(y, strongest)
+        out = replay_envelope(env, target_lane)
+    else:
+        out = generate_bit_wave(target_lane)
+    peak = float(np.max(np.abs(out)))
+    if peak > 1.0:
+        out *= 1.0 / peak
+    return out.astype("f4")
 
 # ---------------------------------------------------------------------------
 # 8. Audio Event IR
