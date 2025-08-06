@@ -125,7 +125,7 @@ class StructView:
 class BitTensorMemory: #sizes in bytes
     ALLOCATION_FAILURE = -1
     DEFAULT_BLOCK = 4096  # default block size for memory allocation
-    DEFAULT_GRAIN = 128  # default granular size for bitmap allocation
+    DEFAULT_GRAIN = 512  # default granular size for bitmap allocation
 
     def __init__(self, size, graph=None, dynamic=True):
 
@@ -167,6 +167,9 @@ class BitTensorMemory: #sizes in bytes
         self.region_manager = CellPressureRegionManager(
             self.region_simulator.bitbuffer, cells
         )
+        # Initialise the hydraulic model upfront so equilibrium fractions and
+        # buffer expansion are resolved before any writes occur.
+        self.region_simulator.run_saline_sim()
 
         
     def pull_full_set_from_memory(self):
@@ -205,6 +208,8 @@ class BitTensorMemory: #sizes in bytes
         self.region_manager = CellPressureRegionManager(
             self.region_simulator.bitbuffer, cells
         )
+        # Ensure hydraulic model is primed on reset as well
+        self.region_simulator.run_saline_sim()
         return self.region_manager.cells
 
 
@@ -313,16 +318,19 @@ class BitTensorMemory: #sizes in bytes
             # Provide a sane default so the simulator never sees a zero-width LCM
             min_stride = 512
         else:
-            min_stride = min(non_zero_strides)
+            # Enforce a minimum stride of 512 for any zero-width regions
+            min_stride = max(min(non_zero_strides), 512)
 
         for s in specs:
-            if s["right"] <= s["left"]:
+            if s["right"] <= s["left"] and s["left"] < self.size:
                 s["stride"] = min_stride
-                s["right"] = s["left"] + min_stride
+                s["right"] = min(s["left"] + min_stride, self.size)
 
-        if max(s["right"] for s in specs) > self.size:
+        max_right = max(s["right"] for s in specs)
+        if max_right > self.size:
             raise ValueError("Expanded regions exceed memory size")
 
+        specs = [s for s in specs if s["right"] > s["left"]]
         return specs
     def mark_free(self, offset, size):
         # mark free bits and reset delta
@@ -383,7 +391,11 @@ class BitTensorMemory: #sizes in bytes
             stride_bits = cell.stride * self.region_simulator.bitbuffer.bitsforbits
             payload = b"\0" * ((stride_bits + 7) // 8)
             self.region_simulator.write_data(cell.label, payload)
-            self.region_simulator.evolution_tick(self.region_manager.cells)
+            self.region_simulator.run_saline_sim()
+            # discard the placeholder write used to trigger expansion
+            self.region_simulator.input_queues.pop(cell.label, None)
+            cell.injection_queue = 0
+            cell.salinity = 0
             # loop retries with the now-larger cell
 
 
