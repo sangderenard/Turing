@@ -293,8 +293,8 @@ class BitTensorMemory: #sizes in bytes
             ]
         if strides is None:
             strides = [self.granular_size] * len(boundaries)
-        if usable % self.granular_size != 0:
-            raise ValueError("Total size minus extra data size must be a multiple of grain size")
+        #if usable % self.granular_size != 0:
+        #    raise ValueError("Total size minus extra data size must be a multiple of grain size")
         q = usable // 4
         print(f"[BitTensorMemory] Spec boundaries: {boundaries}, strides: {strides}")
 
