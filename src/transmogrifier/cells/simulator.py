@@ -13,6 +13,7 @@ class Simulator:
     FORCE_THRESH = .5
     LOCK = 0x1
     ELASTIC = 0x2
+    SALINE_BUFFER = 0.1  # fraction of capacity reserved before expansion
     snap_cell_walls = snap_cell_walls
     build_metadata = build_metadata
     expand = expand
@@ -63,7 +64,9 @@ class Simulator:
     def push_cell_mask(self, cell):
         self.set_cell_mask(cell, cell._buf)
 
-    def evolution_tick(self, cells, max_iters: int = 10):
+
+    def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
+
         """Advance the hydraulic model until cell widths stabilise."""
         proposals = []
         prev_widths = [c.right - c.left for c in cells]
@@ -87,9 +90,9 @@ class Simulator:
             if new_widths == prev_widths:
                 break
             prev_widths = new_widths
-        # Only write data after the model has settled
-        self.flush_pending_writes()
-        self.print_system()
+        if flush:
+            self.flush_pending_writes()
+
         return proposals
 
     def flush_pending_writes(self):
@@ -119,6 +122,14 @@ class Simulator:
             )
         self.input_queues.setdefault(cell_label, []).append((payload, stride))
         cell.injection_queue = getattr(cell, "injection_queue", 0) + 1
+
+        # Track queued bits as salinity and trigger expansion if nearing capacity
+        queued_bits = sum(s for _, s in self.input_queues[cell_label])
+        cell.salinity = queued_bits
+        available_bits = cell.right - cell.left
+        threshold = int(available_bits * (1 - self.SALINE_BUFFER))
+        if queued_bits > threshold:
+            self.run_saline_sim()
 
     def injection(self, queue, known_gaps, gap_pids, left_offset=0):
         consumed_gaps = []
@@ -371,7 +382,12 @@ class Simulator:
                 
 
                 cell.pressure = pressure
-                cell.salinity = len(self.input_queues[cell.label]) if cell.label in self.input_queues else 0
+                if cell.label in self.input_queues:
+                    cell.salinity = sum(
+                        stride for _, stride in self.input_queues[cell.label]
+                    )
+                else:
+                    cell.salinity = 0
                 system_pressure += pressure
                 if cell.label in self.input_queues and len(self.input_queues[cell.label]) > 0 and cell.label in self.assignable_gaps and len(self.assignable_gaps[cell.label]) > 0:
                     #print(f"Injecting data into cell {cell.label} with injection queue: {cell.injection_queue} and queue: {self.input_queues[cell.label]}")

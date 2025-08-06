@@ -322,13 +322,15 @@ class BitTensorMemory: #sizes in bytes
             min_stride = max(min(non_zero_strides), 512)
 
         for s in specs:
-            if s["right"] <= s["left"]:
+            if s["right"] <= s["left"] and s["left"] < self.size:
                 s["stride"] = min_stride
-                s["right"] = s["left"] + min_stride
+                s["right"] = min(s["left"] + min_stride, self.size)
 
-        if max(s["right"] for s in specs) > self.size:
+        max_right = max(s["right"] for s in specs)
+        if max_right > self.size:
             raise ValueError("Expanded regions exceed memory size")
 
+        specs = [s for s in specs if s["right"] > s["left"]]
         return specs
     def mark_free(self, offset, size):
         # mark free bits and reset delta
@@ -389,7 +391,11 @@ class BitTensorMemory: #sizes in bytes
             stride_bits = cell.stride * self.region_simulator.bitbuffer.bitsforbits
             payload = b"\0" * ((stride_bits + 7) // 8)
             self.region_simulator.write_data(cell.label, payload)
-            self.region_simulator.evolution_tick(self.region_manager.cells)
+            self.region_simulator.run_saline_sim()
+            # discard the placeholder write used to trigger expansion
+            self.region_simulator.input_queues.pop(cell.label, None)
+            cell.injection_queue = 0
+            cell.salinity = 0
             # loop retries with the now-larger cell
 
 
