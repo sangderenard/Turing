@@ -1,7 +1,7 @@
 import random
 import os
 import pytest
-from src.transmogrifier.cells.sim.simulator import Simulator
+from src.transmogrifier.cells.simulator import Simulator
 from src.transmogrifier.cells.cell_consts import Cell
 from src.transmogrifier.cells.bitbitbuffer import BitBitBuffer
 
@@ -41,7 +41,7 @@ def test_injection_mixed_prime7():
         sim.write_data(cells[0].label, p)
     for _ in range(10):
         sp, _ = sim.step(cells)
-    sim.print_system(cells)
+    sim.print_system()
     assert cells[0].injection_queue == 0
 
 def test_sustained_random_injection():
