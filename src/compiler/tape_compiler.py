@@ -65,13 +65,17 @@ class TapeCompiler:
         Compiles the graph into a tape map and a stream of instructions.
         """
         print("Compiler Step 1: Allocating registers for all graph objects...")
-        # First pass: Allocate a "register" for every output object in the graph
         from ..transmogrifier.graph.graph_express2 import ProcessGraph
-        self.graph = ProcessGraph(self.graph)
+        from .process_graph_helper import ProcessGraphLinearizer
+
+        if isinstance(self.graph, ProcessGraph):
+            linear_nodes = ProcessGraphLinearizer(self.graph).linear_nodes()
+        else:
+            linear_nodes = self.graph.nodes
 
         print("Compiler Step 2: Generating instruction stream from graph...")
         instructions: InstructionStream = []
-        for node in self.graph.nodes:
+        for node in linear_nodes:
             opcode = self._op_to_opcode(node.op)
             
             # Assign registers for inputs and outputs
