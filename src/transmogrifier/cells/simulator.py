@@ -60,16 +60,9 @@ class Simulator:
         self.set_cell_mask(cell, cell._buf)
 
     def evolution_tick(self, cells):
-        self.engine.s_funcs = [
-            (lambda _t, s=cell.salinity: s)
-            for cell in cells
-        ]
-        self.engine.p_funcs = [
-            (lambda _t, p=cell.pressure: p)
-            for cell in cells
-        ]
+        update_s_p_expressions(self, cells)
         proposals = []
-        fractions = self.engine.equilibrium_fracs(0.0)
+        fractions = equilibrium_fracs(self, 0.0)
         total_space = self.bitbuffer.mask_size
         for cell, frac in zip(cells, fractions):
             new_width = max(self.bitbuffer.intceil(cell.salinity,cell.stride), self.bitbuffer.intceil(int(total_space * frac), cell.stride))
@@ -357,22 +350,28 @@ class Simulator:
                     #print(f"Cell {cell.label} assignable gaps: {self.assignable_gaps[cell.label]}")
                     #print(f"data size: self.bitbuffer.data_size: {self.bitbuffer.data_size}, self.bitbuffer.bittobyte(self.bitbuffer.data_size): {self.bitbuffer.bittobyte(self.bitbuffer.data_size)}, self.bitbuffer.data_size:{self.bitbuffer.data_size}, self.bitbuffer.mask_size:{self.bitbuffer.mask_size}")
                     #print(f"left pattern: {left_pattern}, right pattern: {right_pattern}")
-                    relative_consumed_gaps, consumed_gaps, self.input_queues[cell.label] = self.injection(self.input_queues[cell.label], self.assignable_gaps[cell.label], gap_pids, 0)
+                    # Copy the original input queue to track consumed payloads
+                    original_queue = self.input_queues[cell.label].copy()
+                    # Perform injection, updating the queue returned
+                    relative_consumed_gaps, consumed_gaps, queue = self.injection(
+                        self.input_queues[cell.label], self.assignable_gaps[cell.label], gap_pids, 0
+                    )
+                    # Store back the possibly updated queue
+                    self.input_queues[cell.label] = queue
                     pids = gap_pids[:len(relative_consumed_gaps)]
-                    for i, pid in enumerate(pids):
+                    # Remove consumed entries by their original queue index
+                    for idx, pid in enumerate(pids):
                         gap_idx = self.bitbuffer.get_by_pid(cell.label, pid)
                         print(f"Trying to retrieve data in cell {cell.label} with pid {pid} at gap index {gap_idx}")
-                        stride  = cell.stride              # or store this with the PID tuple
-                        payload = self.bitbuffer._data_access[gap_idx : gap_idx + stride]
+                        stride = cell.stride
+                        data_payload = self.bitbuffer._data_access[gap_idx : gap_idx + stride]
                         print(f"Cell {cell.label} injecting data with pid {pid} at relative gaps {relative_consumed_gaps} and absolute gaps {consumed_gaps}")
-                        print(f"Data: {payload.hex()}")
-                        for item in self.input_queues[cell.label]:
-                            if item[0] == payload and item[1] == stride:
-                                i = self.input_queues[cell.label].index(item)
-                                break
-                        print(f"Original data: {self.input_queues[cell.label][i][0].hex()}")
-
-                        self.input_queues[cell.label].remove((payload, stride)) # remove the consumed gaps from the input queue
+                        print(f"Data: {data_payload.hex()}")
+                        # Retrieve and print original payload from the copied queue
+                        orig_payload, _ = original_queue[idx]
+                        print(f"Original data: {orig_payload.hex()}")
+                        # Remove the first entry from the live queue
+                        queue.pop(0)
                     relative_consumed_gaps = [gap - cell.left for gap in relative_consumed_gaps]
 
 
@@ -469,38 +468,13 @@ class Simulator:
 
 
 # Attach pressure-model helpers
-from .pressure_model import run_saline_sim, update_s_p_expressions
+from .pressure_model import run_saline_sim, update_s_p_expressions, equilibrium_fracs
 from .cell_walls import snap_cell_walls
 
 Simulator.run_saline_sim = run_saline_sim
 Simulator.update_s_p_expressions = update_s_p_expressions
 Simulator.snap_cell_walls = snap_cell_walls
 
-
-# Basic data-path helpers -------------------------------------------------
-def _write_data_basic(self, cell_label: str, payload: bytes) -> None:
-    """Queue ``payload`` for the cell identified by ``cell_label``."""
-    cell = next(c for c in self.cells if c.label == cell_label)
-    expected = (cell.stride * self.bitbuffer.bitsforbits + 7) // 8
-    if len(payload) != expected:
-        raise ValueError("length mismatch")
-    self.input_queues.setdefault(cell_label, []).append(payload)
-    cell.injection_queue = getattr(cell, "injection_queue", 0) + 1
-
-
-def _step_basic(self, cells):
-    """Process pending writes for ``cells`` and report system pressure."""
-    for cell in cells:
-        queue = self.input_queues.get(cell.label, [])
-        while queue:
-            payload = queue.pop(0)
-            start = cell.left
-            span = len(payload) * 8 // self.bitbuffer.bitsforbits
-            end = start + span
-            self.bitbuffer._data_access[start:end] = payload
-            cell.injection_queue -= 1
-    system_pressure = sum(getattr(c, "injection_queue", 0) for c in cells)
-    return system_pressure, self.bitbuffer.mask
 
 
 def _print_system_basic(self, width: int = 80):  # pragma: no cover - debug helper

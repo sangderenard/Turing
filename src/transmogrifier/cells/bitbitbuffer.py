@@ -65,22 +65,32 @@ class BitBitItem:
         return (raw[0] >> 7) & 1
 
     def __getitem__(self, key):
-        # Allow default plane indexing with int or slice
-        second_key = None
-        if isinstance(key, (slice, int)):
-            second_key = key
-            key = self.data_or_mask
-        # Determine index for spec
-        idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
-        if key == 'mask':
-            spec = BitBitIndex(self, idx, mode='get')
-            # return bit value as int for mask
-            raw = self.buffer.indexer.access(spec)
-            return int(raw[0] >> 7) if isinstance(raw, (bytes, bytearray)) else int(raw)
-        if key == 'data':
-            spec = BitBitIndex(self.buffer._data_access, idx, mode='get')
-            return self.buffer.indexer.access(spec)
-        raise KeyError("Expected 'mask' or 'data'")
+            # Allow default plane indexing with int or slice
+            second_key = None
+            if isinstance(key, (slice, int)):
+                second_key = key
+                key = self.data_or_mask
+            # Determine index for spec
+            idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
+            mode = 'view' if isinstance(idx, slice) else 'get'
+            
+            if key == 'mask':
+                spec = BitBitIndex(self, idx, mode=mode)
+                result = self.buffer.indexer.access(spec)
+                
+                # If the mode was 'get' (for an integer index), process and return the bit value.
+                if mode == 'get':
+                    return int(result[0] >> 7) if isinstance(result, (bytes, bytearray)) else int(result)
+                
+                # Otherwise (for 'view' mode), return the new slice object directly.
+                return result
+
+            if key == 'data':
+                spec = BitBitIndex(self.buffer._data_access, idx, mode=mode)
+                return self.buffer.indexer.access(spec)
+                
+            raise KeyError("Expected 'mask' or 'data'")
+
 
     def __setitem__(self, key, value):
         # Allow default plane setting with int or slice
@@ -90,12 +100,20 @@ class BitBitItem:
             key = self.data_or_mask
         # Determine index for spec
         idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
+        
+        # FIX: Explicitly set the mode based on the index type.
+        mode = 'view' if isinstance(idx, slice) else 'get' # This line isn't strictly necessary for setitem,
+                                                             # but the spec requires a mode. We'll use 'set'.
+
         if key == 'mask':
+            # Always use 'set' mode for __setitem__
             spec = BitBitIndex(self, idx, mode='set', value=value)
             return self.buffer.indexer.access(spec)
         if key == 'data':
+            # Always use 'set' mode for __setitem__
             spec = BitBitIndex(self.buffer._data_access, idx, mode='set', value=value)
             return self.buffer.indexer.access(spec)
+            
         raise KeyError("Expected 'mask' or 'data'")
 
     def hex(self):
@@ -207,9 +225,19 @@ class PIDBuffer:
         else:
             logging.debug(f"[PIDBuffer.get_by_pid] cache hit, active_set_size={len(self.active_set)}")
             for active_pid, gap in self.active_set:
-                if int.from_bytes(active_pid, 'big') == pid.int:
-                    logging.debug(f"[PIDBuffer.get_by_pid] returning cached index={gap}")
-                    return (gap + BitBitBuffer._intceil(self.domain_left, self.domain_stride))
+                # Handle cached raw bytes or UUID objects
+                if isinstance(active_pid, uuid.UUID):
+                    if active_pid == pid:
+                        logging.debug(f"[PIDBuffer.get_by_pid] returning cached index={gap}")
+                        return (gap + BitBitBuffer._intceil(self.domain_left, self.domain_stride))
+                else:
+                    try:
+                        if int.from_bytes(active_pid, 'big') == pid.int:
+                            logging.debug(f"[PIDBuffer.get_by_pid] returning cached index={gap}")
+                            return (gap + BitBitBuffer._intceil(self.domain_left, self.domain_stride))
+                    except (TypeError, ValueError):
+                        # Skip invalid entries
+                        continue
 
     def get_pids(self, gaps):
         logging.debug(f"[PIDBuffer.get_pids] gaps={gaps}")
@@ -693,7 +721,7 @@ class BitBitBuffer:
 
     def tuplepattern(self, src, end, length, direction='left'):
         if direction == 'left' or direction == 'bi':
-            reversed = self[src:end]["data"][::-1][:length]
+            reversed = self[src:end][::-1][:length]
             right_pattern = self._count_runs(reversed)
 
         if direction == 'right' or direction == 'bi':
