@@ -263,26 +263,66 @@ class BitTensorMemory: #sizes in bytes
         offset, size = self._clip_offset(offset, size)
         self.unit_helper.delta(offset, size, "alloc")
     def get_specs(self, boundaries=None, strides=None):
-        even_size = self.size - self.extra_data_size
+        """Return region specifications for the underlying simulator.
+
+        Zero-width regions are expanded to a minimal non-zero stride so that
+        the pressure simulator always receives valid ``left < right`` domains.
+        If no region provides a stride from which to derive this width, a
+        ``ValueError`` is raised.
+        """
+
+        usable = max(0, self.size - self.header_size - self.extra_data_size)
         if boundaries is None:
-            boundaries = [0, 128, even_size // 4, even_size // 2, even_size * 3 // 4, even_size, self.size - self.extra_data_size, self.size]
+            start = self.header_size
+            q = usable // 4
+            end_usable = start + usable
+            boundaries = [
+                start,
+                start,
+                start + q,
+                start + 2 * q,
+                start + 3 * q,
+                end_usable,
+                self.size - self.extra_data_size,
+                self.size,
+            ]
         if strides is None:
             strides = [self.granular_size] * len(boundaries)
-        if even_size % self.granular_size != 0:
+        if usable % self.granular_size != 0:
             raise ValueError("Total size minus extra data size must be a multiple of grain size")
-        even_size = even_size // 4
+        q = usable // 4
         print(f"[BitTensorMemory] Spec boundaries: {boundaries}, strides: {strides}")
-        
-        return [
+
+        specs = [
             {"left": 0, "right": boundaries[0], "label": 0, "min": None, "max": ctypes.sizeof(BTGraphHeader), "len": ctypes.sizeof(BTGraphHeader), "stride": self.granular_size, "flags": 0},
             {"left": boundaries[0], "right": boundaries[1], "label": 1, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
-            {"left": boundaries[1], "right": boundaries[2], "label": 2, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(NodeEntry), "flags": 0},
-            {"left": boundaries[2], "right": boundaries[3], "label": 3, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(EdgeEntry), "flags": 0},
-            {"left": boundaries[3], "right": boundaries[4], "label": 4, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
-            {"left": boundaries[4], "right": boundaries[5], "label": 5, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
+            {"left": boundaries[1], "right": boundaries[2], "label": 2, "min": None, "max": None, "len": q, "stride": ctypes.sizeof(NodeEntry), "flags": 0},
+            {"left": boundaries[2], "right": boundaries[3], "label": 3, "min": None, "max": None, "len": q, "stride": ctypes.sizeof(EdgeEntry), "flags": 0},
+            {"left": boundaries[3], "right": boundaries[4], "label": 4, "min": None, "max": None, "len": q, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
+            {"left": boundaries[4], "right": boundaries[5], "label": 5, "min": None, "max": None, "len": q, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
             {"left": boundaries[5], "right": boundaries[6], "label": 6, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
-            {"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size, "flags": IMMUTABLE},
         ]
+        if self.extra_data_size > 0:
+            specs.append({"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size or 1, "flags": IMMUTABLE})
+
+        non_zero_strides = [
+            s["stride"] for s in specs if s["right"] > s["left"] and s["stride"] > 0
+        ]
+        if not non_zero_strides:
+            # Provide a sane default so the simulator never sees a zero-width LCM
+            min_stride = 512
+        else:
+            min_stride = min(non_zero_strides)
+
+        for s in specs:
+            if s["right"] <= s["left"]:
+                s["stride"] = min_stride
+                s["right"] = s["left"] + min_stride
+
+        if max(s["right"] for s in specs) > self.size:
+            raise ValueError("Expanded regions exceed memory size")
+
+        return specs
     def mark_free(self, offset, size):
         # mark free bits and reset delta
         offset, size = self._clip_offset(offset, size)
@@ -1075,30 +1115,45 @@ class BitTensorMemoryGraph:
         self.chunk_size = 8
         self.hard_memory_size = ctypes.sizeof(BTGraphHeader)
         self.header_size = self.hard_memory_size
-        self.envelope_domain = (self.header_size, size)
+
+        # Provide a minimal payload when no explicit size is requested so
+        # downstream region specifications always have space to expand.
+        if size <= 0:
+            size = 512
+
+        # Envelope spans the bytes after the header.  Ensure it always
+        # represents a valid non-negative range even when ``size`` is 0.
+        self.hard_memory_size += size
+        min_payload = (
+            ctypes.sizeof(NodeEntry)
+            + ctypes.sizeof(EdgeEntry)
+            + ctypes.sizeof(MetaGraphEdge)
+        )
+        if self.hard_memory_size < self.header_size + min_payload:
+            self.hard_memory_size = self.header_size + min_payload
+
+        if self.hard_memory_size % self.chunk_size != 0:
+            self.hard_memory_size += self.chunk_size - (
+                self.hard_memory_size % self.chunk_size
+            )
+
+        self.envelope_domain = (self.header_size, self.hard_memory_size)
         self.envelope_size = self.envelope_domain[1] - self.envelope_domain[0]
         self.envelope_config = {"type": "greedy"}
         self.l_start = self.header_size
-        self.r_start = size + self.header_size
-        self.x_start = size + self.header_size
+        self.r_start = self.envelope_domain[1]
+        self.x_start = self.envelope_domain[1]
         self.n_rational = 1
         self.e_rational = 1
         self.p_rational = 1
         self.c_rational = 1
         total_ratio_sum = self.n_rational + self.e_rational + self.p_rational + self.c_rational
-        self.n_start = self.envelope_size // ( total_ratio_sum ) * self.n_rational
-        self.e_start = self.envelope_size // ( total_ratio_sum ) * self.e_rational
-        self.p_start = self.envelope_size // ( total_ratio_sum ) * self.p_rational
-        self.c_start = self.envelope_size // ( total_ratio_sum ) * self.c_rational
-        
+        quantum = self.envelope_size // total_ratio_sum if total_ratio_sum else 0
+        self.n_start = self.envelope_domain[0]
+        self.e_start = self.n_start + quantum * self.n_rational
+        self.p_start = self.e_start + quantum * self.e_rational
+        self.c_start = self.p_start + quantum * self.p_rational
 
-        self.hard_memory_size += size
-        if self.hard_memory_size < self.header_size + ctypes.sizeof(NodeEntry) + ctypes.sizeof(EdgeEntry) + ctypes.sizeof(MetaGraphEdge):
-            size = ctypes.sizeof(NodeEntry) + ctypes.sizeof(EdgeEntry) + ctypes.sizeof(MetaGraphEdge)
-            self.hard_memory_size = self.header_size + size
-        if self.hard_memory_size % self.chunk_size != 0:
-            size_also = self.chunk_size - (self.hard_memory_size % self.chunk_size)
-            self.hard_memory_size += size_also
         self.hard_memory = BitTensorMemory(self.hard_memory_size, self)  # default memory size
         self.hard_memory.region_manager.register_object_maps()
         self.meta_graph_root = meta_graph_root  # root of the meta graph

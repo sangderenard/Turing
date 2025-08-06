@@ -32,6 +32,17 @@ class CellPressureRegionManager:
         self.cells = list(cells)
 
     # ------------------------------------------------------------------
+    def register_object_maps(self):
+        """Compatibility shim for legacy region managers.
+
+        The pressure-based manager tracks occupancy directly in the underlying
+        :class:`BitBitBuffer`, so there are no separate object maps to
+        initialise.  The method is kept to honour the call sites expecting it
+        to exist.
+        """
+        return {}
+
+    # ------------------------------------------------------------------
     def quanta_map(self, *, coalesce_free: bool = True) -> List[Dict]:
         """Build a detailed occupancy map for every cell.
 
