@@ -66,8 +66,8 @@ class TapeCompiler:
         """
         print("Compiler Step 1: Allocating registers for all graph objects...")
         # First pass: Allocate a "register" for every output object in the graph
-        for node in self.graph.nodes:
-            self._allocate_register(node.out_obj_id)
+        from ..transmogrifier.graph.graph_express2 import ProcessGraph
+        self.graph = ProcessGraph(self.graph)
 
         print("Compiler Step 2: Generating instruction stream from graph...")
         instructions: InstructionStream = []
@@ -75,8 +75,14 @@ class TapeCompiler:
             opcode = self._op_to_opcode(node.op)
             
             # Assign registers for inputs and outputs
-            dest_reg = self._allocate_register(node.out_obj_id)
+            #dest_reg = self._allocate_register(node.out_obj_id)
             
+            #we want no longer to allocate registers for nodes,
+            #the correct action is to write sequentially
+            #so operations occur on the main tape
+            #this means registers are fully off the table
+            dest_reg = None
+
             # Handle operands based on operation type
             reg_a = 0
             reg_b_or_param = 0

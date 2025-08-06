@@ -3,7 +3,7 @@ import sympy
 import numpy as np
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
-from compiler.bitops import BitTensorMemoryGraph
+from ...compiler.bitops import BitTensorMemoryGraph
 from colorama import Fore, Style, init
 from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
 from ..operator_defs import default_funcs, operator_signatures, role_schemas
@@ -678,6 +678,13 @@ class ProcessGraph:
         return {'nodes': nodes, 'levels': levels_map, 'roots': list(self.roots)}
 
     def build_from_expression(self, expr_or_tensor, *domain_dims):
+        # bypass SymPy path for a recorded ProvenanceGraph
+        from src.turing_machine.turing_provenance import ProvenanceGraph
+        if isinstance(expr_or_tensor, ProvenanceGraph):
+            # wrap each ProvNode into an adapter exposing .args and .op for build_graph
+            self.build_graph(expr_or_tensor)
+            
+
         if isinstance(expr_or_tensor, tuple) and isinstance(expr_or_tensor[1], ExpressionTensor):
             registry, et = expr_or_tensor
             #print(registry)
