@@ -8,9 +8,7 @@ def snap_cell_walls(self, cells, proposals):
     2. Execution Pass: Expands the buffer once (triggering the desired global distribution)
     and then applies the new boundaries to the cells.
     """
-    self.expand = expand
-
-    import math
+    # ``expand`` is provided by :class:`Simulator`; no rebinding needed here.
     self.bar()
     print("Snapping cell walls...")
         

@@ -4,6 +4,7 @@ from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT, RIGHT_WALL, L
 from .salinepressure import SalineHydraulicSystem
 from .bitbitbuffer import BitBitBuffer, CellProposal
 from .bitstream_search import BitStreamSearch
+from .cell_walls import snap_cell_walls, build_metadata, expand
 import math
 import random
 import os
@@ -12,6 +13,9 @@ class Simulator:
     FORCE_THRESH = .5
     LOCK = 0x1
     ELASTIC = 0x2
+    snap_cell_walls = snap_cell_walls
+    build_metadata = build_metadata
+    expand = expand
 
     def __init__(self, cells):
         self.assignable_gaps = {}
@@ -70,8 +74,7 @@ class Simulator:
             assert cell.stride > 0
             proposal = CellProposal(cell)
             proposals.append(proposal)
-        from .cell_walls import snap_cell_walls
-        snap_cell_walls(self, cells, proposals)
+        self.snap_cell_walls(cells, proposals)
         self.print_system()
         return proposals
 
@@ -469,11 +472,9 @@ class Simulator:
 
 # Attach pressure-model helpers
 from .pressure_model import run_saline_sim, update_s_p_expressions, equilibrium_fracs
-from .cell_walls import snap_cell_walls
 
 Simulator.run_saline_sim = run_saline_sim
 Simulator.update_s_p_expressions = update_s_p_expressions
-Simulator.snap_cell_walls = snap_cell_walls
 
 
 
