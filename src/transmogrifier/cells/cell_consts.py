@@ -35,8 +35,8 @@ class SystemFlags(IntFlag):
 
 # New Cell class definition for testing
 class Cell:
-    def __init__(self, stride, left, right, len, profile='default', leftmost=None, rightmost=None, label=None):
-        self.len = len
+    def __init__(self, stride, left, right, len=None, profile='default', leftmost=None, rightmost=None, label=None):
+        self.len = len if len is not None else right - left
         self.label = f"cell_{id(self)}" if label is None else label
         self.salinity = 0
         self.temperature = 0

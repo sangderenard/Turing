@@ -503,14 +503,31 @@ def _step_basic(self, cells):
     return system_pressure, self.bitbuffer.mask
 
 
-# Override heavy methods with basic versions for the current test environment
-Simulator.write_data = _write_data_basic
-Simulator.step = _step_basic
-
-
 def _print_system_basic(self, width: int = 80):  # pragma: no cover - debug helper
     from .visualization import print_system as _print_system
     _print_system(self, width)
 
 
 Simulator.print_system = _print_system_basic
+
+def main():
+    """
+    A simple demonstration of the cell simulation.
+    This function is intended to be run as a script.
+    """
+    from .cell_consts import Cell
+    cells = [
+        Cell(label='A', left=0, right=16, stride=4),
+        Cell(label='B', left=16, right=32, stride=4),
+    ]
+    sim = Simulator(cells)
+
+    for _ in range(5):
+        sim.write_data('A', b'\\xde\\xad')
+        sim.write_data('B', b'\\xbe\\xef')
+
+        sim.step(cells)
+        sim.print_system()
+
+if __name__ == "__main__":
+    main()

@@ -46,6 +46,11 @@ class BitBitItem:
             self.data_index = None
     def __len__(self):
         return self.useful_length
+    
+    @property
+    def data_or_mask(self):
+        """Default plane when indexing with slice or int."""
+        return self._plane
 
 
     def __bytes__(self):
@@ -60,21 +65,36 @@ class BitBitItem:
         return (raw[0] >> 7) & 1
 
     def __getitem__(self, key):
+        # Allow default plane indexing with int or slice
+        second_key = None
+        if isinstance(key, (slice, int)):
+            second_key = key
+            key = self.data_or_mask
+        # Determine index for spec
+        idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
         if key == 'mask':
-            spec = BitBitIndex(self, 0, mode='get')
-            return int(self.buffer.indexer.access(spec))
+            spec = BitBitIndex(self, idx, mode='get')
+            # return bit value as int for mask
+            raw = self.buffer.indexer.access(spec)
+            return int(raw[0] >> 7) if isinstance(raw, (bytes, bytearray)) else int(raw)
         if key == 'data':
-            # build index-object on the data accessor
-            spec = BitBitIndex(self.buffer._data_access, self.mask_index, mode='get')
+            spec = BitBitIndex(self.buffer._data_access, idx, mode='get')
             return self.buffer.indexer.access(spec)
         raise KeyError("Expected 'mask' or 'data'")
 
     def __setitem__(self, key, value):
+        # Allow default plane setting with int or slice
+        second_key = None
+        if isinstance(key, (slice, int)):
+            second_key = key
+            key = self.data_or_mask
+        # Determine index for spec
+        idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
         if key == 'mask':
-            spec = BitBitIndex(self, 0, mode='set', value=value)
+            spec = BitBitIndex(self, idx, mode='set', value=value)
             return self.buffer.indexer.access(spec)
         if key == 'data':
-            spec = BitBitIndex(self.buffer._data_access, self.mask_index, mode='set', value=value)
+            spec = BitBitIndex(self.buffer._data_access, idx, mode='set', value=value)
             return self.buffer.indexer.access(spec)
         raise KeyError("Expected 'mask' or 'data'")
 
@@ -673,7 +693,7 @@ class BitBitBuffer:
 
     def tuplepattern(self, src, end, length, direction='left'):
         if direction == 'left' or direction == 'bi':
-            reversed = self[src:end][::-1][:length]
+            reversed = self[src:end]["data"][::-1][:length]
             right_pattern = self._count_runs(reversed)
 
         if direction == 'right' or direction == 'bi':
