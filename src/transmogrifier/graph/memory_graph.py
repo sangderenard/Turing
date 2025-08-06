@@ -303,6 +303,7 @@ class BitTensorMemory: #sizes in bytes
             {"left": boundaries[5], "right": boundaries[6], "label": 6, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
         ]
         if self.extra_data_size > 0:
+
             specs.append({"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size or 1, "flags": IMMUTABLE})
 
         non_zero_strides = [
