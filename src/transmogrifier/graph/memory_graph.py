@@ -125,7 +125,7 @@ class StructView:
 class BitTensorMemory: #sizes in bytes
     ALLOCATION_FAILURE = -1
     DEFAULT_BLOCK = 4096  # default block size for memory allocation
-    DEFAULT_GRAIN = 128  # default granular size for bitmap allocation
+    DEFAULT_GRAIN = 512  # default granular size for bitmap allocation
 
     def __init__(self, size, graph=None, dynamic=True):
 
@@ -167,6 +167,9 @@ class BitTensorMemory: #sizes in bytes
         self.region_manager = CellPressureRegionManager(
             self.region_simulator.bitbuffer, cells
         )
+        # Initialise the hydraulic model upfront so equilibrium fractions and
+        # buffer expansion are resolved before any writes occur.
+        self.region_simulator.run_saline_sim()
 
         
     def pull_full_set_from_memory(self):
@@ -205,6 +208,8 @@ class BitTensorMemory: #sizes in bytes
         self.region_manager = CellPressureRegionManager(
             self.region_simulator.bitbuffer, cells
         )
+        # Ensure hydraulic model is primed on reset as well
+        self.region_simulator.run_saline_sim()
         return self.region_manager.cells
 
 
@@ -313,7 +318,8 @@ class BitTensorMemory: #sizes in bytes
             # Provide a sane default so the simulator never sees a zero-width LCM
             min_stride = 512
         else:
-            min_stride = min(non_zero_strides)
+            # Enforce a minimum stride of 512 for any zero-width regions
+            min_stride = max(min(non_zero_strides), 512)
 
         for s in specs:
             if s["right"] <= s["left"]:
