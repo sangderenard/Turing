@@ -9,7 +9,7 @@ import sys
 import threading
 from uuid import uuid4
 
-from ..cells.cell_pressure import Simulator
+from ..cells.simulator import Simulator
 from ..cells.cell_pressure_region_manager import CellPressureRegionManager
 from ..cells.cell_consts import Cell
 

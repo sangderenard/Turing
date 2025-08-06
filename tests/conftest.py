@@ -31,3 +31,16 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "operators" in item.keywords:
             item.add_marker(skip)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for cell pressure tests
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+@pytest.fixture(params=[7, 11, 13, 17])
+def stride(request):
+    """Provide a selection of prime strides for pressure simulations."""
+    return request.param

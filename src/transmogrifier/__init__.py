@@ -1,4 +1,11 @@
-from .cells.linear_cells import LinearCells
+from .cells import CellPressureRegionManager, Simulator
 from .graph.memory_graph import BitTensorMemoryGraph, NodeEntry, EdgeEntry, GraphSearch
 
-__all__ = ["LinearCells", "BitTensorMemoryGraph", "NodeEntry", "EdgeEntry", "GraphSearch"]
+__all__ = [
+    "CellPressureRegionManager",
+    "Simulator",
+    "BitTensorMemoryGraph",
+    "NodeEntry",
+    "EdgeEntry",
+    "GraphSearch",
+]
