@@ -273,7 +273,7 @@ class BitTensorMemory: #sizes in bytes
         even_size = even_size // 4
         print(f"[BitTensorMemory] Spec boundaries: {boundaries}, strides: {strides}")
         
-        return [
+        specs = [
             {"left": 0, "right": boundaries[0], "label": 0, "min": None, "max": ctypes.sizeof(BTGraphHeader), "len": ctypes.sizeof(BTGraphHeader), "stride": self.granular_size, "flags": 0},
             {"left": boundaries[0], "right": boundaries[1], "label": 1, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
             {"left": boundaries[1], "right": boundaries[2], "label": 2, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(NodeEntry), "flags": 0},
@@ -281,8 +281,10 @@ class BitTensorMemory: #sizes in bytes
             {"left": boundaries[3], "right": boundaries[4], "label": 4, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
             {"left": boundaries[4], "right": boundaries[5], "label": 5, "min": None, "max": None, "len": even_size, "stride": ctypes.sizeof(MetaGraphEdge), "flags": 0},
             {"left": boundaries[5], "right": boundaries[6], "label": 6, "min": None, "max": None, "len": 0, "stride": 1, "flags": 0},
-            {"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size, "flags": IMMUTABLE},
         ]
+        if self.extra_data_size > 0:
+            specs.append({"left": boundaries[6], "right": boundaries[7], "label": 7, "min": self.size - self.extra_data_size, "max": self.size, "len": self.extra_data_size, "stride": self.extra_data_size, "flags": IMMUTABLE})
+        return specs
     def mark_free(self, offset, size):
         # mark free bits and reset delta
         offset, size = self._clip_offset(offset, size)
