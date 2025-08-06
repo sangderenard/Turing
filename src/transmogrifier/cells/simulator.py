@@ -63,20 +63,47 @@ class Simulator:
     def push_cell_mask(self, cell):
         self.set_cell_mask(cell, cell._buf)
 
-    def evolution_tick(self, cells):
-        update_s_p_expressions(self, cells)
+    def evolution_tick(self, cells, max_iters: int = 10):
+        """Advance the hydraulic model until cell widths stabilise."""
         proposals = []
-        fractions = equilibrium_fracs(self, 0.0)
-        total_space = self.bitbuffer.mask_size
-        for cell, frac in zip(cells, fractions):
-            new_width = max(self.bitbuffer.intceil(cell.salinity,cell.stride), self.bitbuffer.intceil(int(total_space * frac), cell.stride))
-            assert new_width % cell.stride == 0
-            assert cell.stride > 0
-            proposal = CellProposal(cell)
-            proposals.append(proposal)
-        self.snap_cell_walls(cells, proposals)
+        prev_widths = [c.right - c.left for c in cells]
+        for _ in range(max_iters):
+            update_s_p_expressions(self, cells)
+            fractions = equilibrium_fracs(self, 0.0)
+            total_space = self.bitbuffer.mask_size
+            proposals = []
+            new_widths = []
+            for cell, frac in zip(cells, fractions):
+                new_width = max(
+                    self.bitbuffer.intceil(cell.salinity, cell.stride),
+                    self.bitbuffer.intceil(int(total_space * frac), cell.stride),
+                )
+                assert new_width % cell.stride == 0
+                proposal = CellProposal(cell)
+                proposal.right = proposal.left + new_width
+                proposals.append(proposal)
+                new_widths.append(new_width)
+            self.snap_cell_walls(cells, proposals)
+            if new_widths == prev_widths:
+                break
+            prev_widths = new_widths
+        # Only write data after the model has settled
+        self.flush_pending_writes()
         self.print_system()
         return proposals
+
+    def flush_pending_writes(self):
+        """Commit enqueued payloads after cell sizes have stabilised."""
+        for cell in self.cells:
+            queue = self.input_queues.get(cell.label)
+            if not queue:
+                continue
+            offset = cell.left
+            for payload, stride in queue:
+                self.actual_data_hook(payload, offset, stride)
+                offset += stride
+            queue.clear()
+            cell.injection_queue = 0
 
     def write_data(self, cell_label: str, payload: bytes):
         try:
@@ -116,9 +143,9 @@ class Simulator:
         self.bitbuffer._data_access[dst_bits : dst_bits + length_bits] = payload
 
     def step(self, cells):
-        sp, mask = self.minimize(cells)
+        """Run one simulation step with size resolution preceding writes."""
         self.evolution_tick(cells)
-        return sp, mask
+        return self.minimize(cells)
 
     def minimize(self, cells):
         
