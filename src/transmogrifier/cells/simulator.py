@@ -34,6 +34,20 @@ class Simulator:
         self.fractions = None
         self.run_saline_sim()
 
+    # ------------------------------------------------------------------
+    # Visualisation helpers
+    # ------------------------------------------------------------------
+    def print_system(self, width=80):
+        """Print the current memory layout using :mod:`visualization`."""
+        from .visualization import print_system as _print_system
+
+        _print_system(self, width)
+
+    def bar(self, number=2, width=80):
+        from .visualization import bar as _bar
+
+        _bar(self, number, width)
+
     def get_cell_mask(self, cell: Cell) -> bytearray:
         return self.bitbuffer[cell.left:cell.right]
 
@@ -65,8 +79,7 @@ class Simulator:
             proposals.append(proposal)
         from .cell_walls import snap_cell_walls
         snap_cell_walls(self, cells, proposals)
-        from .visualization import print_system
-        print_system(self, cells)
+        self.print_system()
         return proposals
 
     def write_data(self, cell_label: str, payload: bytes):

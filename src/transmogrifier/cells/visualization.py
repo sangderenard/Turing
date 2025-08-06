@@ -1,10 +1,15 @@
-def print_system(self, cells, width=80):
+import string
+
+
+def print_system(sim, width=80):
+    """Print a textual overview of the simulator's cell layout.
+
+    The rendering scales the complete address space to ``width`` characters.
+    Whenever a column intersects ``N`` cells, ``N`` glyphs are emitted—
+    lower‑case if the slice holds no data and ramp‑mapped otherwise.
     """
-        Draw the entire address space scaled to `width` characters,
-        but whenever a column has N cells in it, emit N glyphs—
-        lower‐case if no data in that slice, ramp‐mapped if data.
-    """
-    total_bits = self.bitbuffer.mask_size
+    cells = sim.cells
+    total_bits = sim.bitbuffer.mask_size
     if total_bits == 0:
         print("<empty>")
         return
@@ -17,7 +22,7 @@ def print_system(self, cells, width=80):
             if cell.left <= b < cell.right:
                 cell_idx = idx
                 break
-        mask_bit = bool(int(self.bitbuffer[b]))
+        mask_bit = bool(int(sim.bitbuffer[b]))
         bit_info.append((b, cell_idx, mask_bit))
 
     # 2) Fragmentation (unchanged)
@@ -34,7 +39,7 @@ def print_system(self, cells, width=80):
 
     size_string = (
         f"Total size: {total_bits} bits "
-        f"({total_bits/8:.2f} bytes, mask bits: {self.bitbuffer.mask_size})"
+        f"({total_bits/8:.2f} bytes, mask bits: {sim.bitbuffer.mask_size})"
     )
     free_string = f"Free: {free_bits} bits; fragmentation: {frag_pct:.2f}%"
 
@@ -92,16 +97,21 @@ def print_system(self, cells, width=80):
     print(size_string, free_string)
 
 def bar(sim, number=2, width=80):
+    """Emit ``number`` rows of ``#`` characters for quick visual separators."""
     for _ in range(number):
         print("#" * width)
 
 
 # ────────────────────────────────────────────────────────────────
-# Live Pygame Visualiser for LinearCells
+# Live Pygame Visualiser driven by the Simulator
 # ----------------------------------------------------------------
-import pygame, sys, time
-
-VISUALISE   = True          # master toggle
+try:  # pragma: no cover - optional dependency
+    import pygame, sys, time, ctypes
+    VISUALISE = True
+except Exception:  # pragma: no cover - pygame not available
+    pygame = None  # type: ignore
+    sys = time = ctypes = None  # type: ignore
+    VISUALISE = False
 SCALE_X     = 1.0           # pixels per byte  (auto-scaled below)
 ROW_H       = 28            # pixels per cell row
 GRID_COLOUR = (180,180,180) # light grey grid lines
@@ -118,7 +128,11 @@ AUTO_INJECT_EVERY = 0.10          # seconds (set 0 to disable)
 
 
 class _LCVisual:
-    def __init__(self, cells):
+    """Simple pygame-based visualiser for the simulator's cells."""
+
+    def __init__(self, sim):
+        self.sim = sim
+        cells = sim.cells
         tot_span = max(c.right for c in cells) - min(c.left for c in cells)
         global SCALE_X
         SCALE_X = 1200 / max(1, tot_span)       # fit into ~1200 px window
@@ -127,15 +141,15 @@ class _LCVisual:
 
         pygame.init()
         self.screen = pygame.display.set_mode((w, h))
-        pygame.display.set_caption("LinearCells memory layout")
+        pygame.display.set_caption("Simulator memory layout")
         self.clock  = pygame.time.Clock()
-        self.cells  = cells
 
     def draw(self):
+        cells = self.sim.cells
         self.screen.fill((0, 0, 0))
-        base_left = min(c.left for c in self.cells)
+        base_left = min(c.left for c in cells)
 
-        for row, c in enumerate(self.cells):
+        for row, c in enumerate(cells):
             y0 = 10 + row * ROW_H
             stride = max(1, c.stride)          # avoid div-by-zero
 
@@ -153,8 +167,11 @@ class _LCVisual:
                 w  = max(1, x1 - x0)
 
                 colour = COL_DATA if (raw and raw[q * stride] != 0) else COL_SOLVENT
-                pygame.draw.rect(self.screen, colour,
-                                 pygame.Rect(x0, y0 + 4, w, ROW_H - 8))
+                pygame.draw.rect(
+                    self.screen,
+                    colour,
+                    pygame.Rect(x0, y0 + 4, w, ROW_H - 8),
+                )
 
             # cell boundary lines (after quanta so they stay visible)
             xL = 10 + int((c.left  - base_left) * SCALE_X)
@@ -173,8 +190,10 @@ class _LCVisual:
 
             # label at left edge
             font = pygame.font.Font(None, 18)
-            self.screen.blit(font.render(str(c.label), True, (255, 255, 255)),
-                             (xL + 4, y0 + 4))
+            self.screen.blit(
+                font.render(str(c.label), True, (255, 255, 255)),
+                (xL + 4, y0 + 4),
+            )
 
         pygame.display.flip()
         self.clock.tick(FPS)
@@ -182,102 +201,63 @@ class _LCVisual:
 
 _vis = None
 
-# ----------- wrap micro_tick so every real solver step is painted ----------
-_orig_micro = LinearCells.micro_tick
-def _vis_micro(self, cells):
+
+def visualise_step(sim, cells):
+    """Wrapper for ``Simulator.step`` that updates the pygame window."""
     global _vis
     if VISUALISE and _vis is None:
-        _vis = _LCVisual(cells)
+        _vis = _LCVisual(sim)
 
-    # let the solver move things first
-    res = _orig_micro(self, cells)
+    sp, mask = sim.step(cells)
 
     if VISUALISE:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
+                pygame.quit()
+                sys.exit()
         _vis.draw()
 
-    return res
-LinearCells.micro_tick = _vis_micro
-# ---------------------------------------------------------------------------
+    return sp, mask
 
-# ========================================================================
-#  DEMO HARNESS  – no helper overrides, uses real inject_item()
-# ========================================================================
+    # --------------------------------------------------------------------
+    # DEMO HARNESS – basic pygame loop using the Simulator
+    # --------------------------------------------------------------------
 if __name__ == "__main__":
-    import ctypes, pygame, sys, time, random
+    import os
+    import random
+    from .cell_consts import Cell
+    from .simulator import Simulator
 
-    # --------------------------------------------------------------------
-    # 1. create spec, solver, empty obj_maps (all solvent)
-    # --------------------------------------------------------------------
     specs = [
-        dict(left=0,   right=128,  label=0, len=128, stride=128, flags=0, min=0, max=128),
-        dict(left=128, right=256,  label=1, len=128, stride=64 , flags=0),
-        dict(left=256, right=512,  label=2, len=256, stride=32 , flags=0),
-        dict(left=512, right=768,  label=3, len=256, stride=16 , flags=0),
-        dict(left=768, right=896,  label=4, len=128, stride=8  , flags=0),
-        dict(left=896, right=1024, label=5, len=128, stride=8  , flags=0),
-        dict(left=1024,right=1024, label=6, len=0  , stride=1  , flags=0),
-        dict(left=1024,right=1024, label=7, len=0  , stride=0  , flags=32),
+        dict(left=0,   right=128,  label="0", len=128, stride=128),
+        dict(left=128, right=256,  label="1", len=128, stride=64),
+        dict(left=256, right=512,  label="2", len=256, stride=32),
+        dict(left=512, right=768,  label="3", len=256, stride=16),
     ]
 
-    lc = LinearCells(specs)
+    cells = [Cell(**s) for s in specs]
+    sim = Simulator(cells)
 
-    # --------------------------------------------------------------------
-    # 1-bis. allocate ONE shared bitmap that spans the whole address space
-    # --------------------------------------------------------------------
-    # give empty cells at least one quantum so .right is > .left
-    for c in lc.cells:
-        if c.len == 0:
-            c.len   = max(1, c.stride)
-            c.right = c.left + c.len
+    vis = _LCVisual(sim)
 
-    max_extent = max(c.right for c in lc.cells)          # right-most byte
-    SharedBuf  = (ctypes.c_ubyte * max_extent)
-    shared_buf = SharedBuf()                             # zero-filled solvent
-
-    # keep a reference alive so the buffer isn’t GC’d
-    lc._shared_bitmap = shared_buf
-
-    for c in lc.cells:
-        # obj_map = address of the first byte that belongs to this cell
-        offset = c.left
-        c.obj_map = ctypes.c_void_p(ctypes.addressof(shared_buf) + offset)
-
-    inject_map = [[] for _ in specs]         # history for inject_item()
-
-    # --------------------------------------------------------------------
-    # 2. visualiser
-    # --------------------------------------------------------------------
-    vis = _LCVisual(lc.cells)
-    lc.relax()                               # settle once before UI
-
-    KEY_TO_CELL = {
-        pygame.K_0: 0, pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
-        pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6, pygame.K_7: 7,
-    }
-
-    AUTO_EVERY  = 3.0
-    next_auto   = time.time() + AUTO_EVERY
+    next_auto = time.time() + AUTO_INJECT_EVERY if AUTO_INJECT_EVERY else None
 
     while True:
         now = time.time()
-
-        # handle window / keyboard
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if ev.type == pygame.KEYDOWN and ev.key in KEY_TO_CELL:
-                idx = KEY_TO_CELL[ev.key]
-                lc.inject_item(lc.cells, inject_map, idx)   # real call
-                lc.relax()
+                pygame.quit()
+                sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key in INJECT_KEYS:
+                idx = INJECT_KEYS[ev.key]
+                target = cells[idx]
+                data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
+                sim.write_data(target.label, os.urandom(data_len))
+        if next_auto and now >= next_auto:
+            idx = random.randrange(len(cells))
+            target = cells[idx]
+            data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
+            sim.write_data(target.label, os.urandom(data_len))
+            next_auto = now + AUTO_INJECT_EVERY
 
-        # auto-inject (optional)
-        if now >= next_auto:
-            tgt = random.randint(0, len(specs) - 2)         # skip sentinel 7
-            lc.inject_item(lc.cells, inject_map, tgt)
-            lc.relax()
-            next_auto = now + AUTO_EVERY
-
-        vis.draw()
+        visualise_step(sim, cells)
