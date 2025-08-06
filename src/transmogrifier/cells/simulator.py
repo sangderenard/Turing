@@ -64,7 +64,9 @@ class Simulator:
     def push_cell_mask(self, cell):
         self.set_cell_mask(cell, cell._buf)
 
+
     def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
+
         """Advance the hydraulic model until cell widths stabilise."""
         proposals = []
         prev_widths = [c.right - c.left for c in cells]
@@ -90,6 +92,7 @@ class Simulator:
             prev_widths = new_widths
         if flush:
             self.flush_pending_writes()
+
         return proposals
 
     def flush_pending_writes(self):
