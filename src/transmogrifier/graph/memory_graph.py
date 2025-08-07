@@ -1902,16 +1902,15 @@ class BitTensorMemoryGraph:
         return finalize(new_capsid_node)
 
     def compute_region_boundaries(self):
-        """
-        Initialise the Region-Manager with the canonical layout *without* grabbing
-        any space.  Returns a dict with detailed per-cell information:
+        """Initialise the Region-Manager with the canonical layout.
 
-            {
-            'active_regions' : ... ,            # raw structure from RegionMgr
-            'free_spaces'    : {cell: [(addr, size), …], …},
-            'occupied_spaces': {cell: [(addr, size), …], …},
-            'best_free_space': {cell: (addr, size) | None, …}
-            }
+        The classic ``memory_graph`` implementation expected ``region_layout``
+        to be a simple list of 4-tuples ``(label, start, end, stride)``.  Recent
+        experiments wrapped this information in a dictionary to expose additional
+        bookkeeping data, but much of the surrounding code still assumes the
+        original list structure.  To keep the harmoniser simple and avoid
+        brittle type‑checks in hot paths, we compute the extra maps but store the
+        tuple list on the instance and return it directly.
         """
 
         # ── 1. declarative layout ─────────────────────────────────────────────
@@ -1945,21 +1944,19 @@ class BitTensorMemoryGraph:
         free_by_cell,
         occupied_by_cell) = self.process_active_regions(raw_regions)
 
-        self.active_regions = active_regions        # keep instance in sync
+        # keep instance in sync
+        self.active_regions = active_regions
+        self.free_spaces_by_cell = free_by_cell
+        self.occupied_spaces_by_cell = occupied_by_cell
 
-        # ── 4. pre-compute “best fit” per cell ───────────────────────────────
-        best = {}
+        # pre-compute “best fit” per cell for later allocation helpers
+        self.best_free_space = {}
         for cell_idx, holes in free_by_cell.items():
-            best[cell_idx] = (min(holes, key=lambda t: (t[1], t[0]))
-                            if holes else None)
-            # t = (addr, size)  →  sort by size then address
+            self.best_free_space[cell_idx] = (
+                min(holes, key=lambda t: (t[1], t[0])) if holes else None
+            )
 
-        return {
-            "active_regions" : active_regions,
-            "free_spaces"    : free_by_cell,
-            "occupied_spaces": occupied_by_cell,
-            "best_free_space": best,
-        }
+        return active_regions
 
     def initialize_regions(self):
         """
@@ -1996,7 +1993,7 @@ class BitTensorMemoryGraph:
         self.l_start = active_regions[0][1]
         self.r_start = active_regions[-2][2]
         self.x_start = active_regions[-1][2]
-        return {"active_regions": self.region_layout}
+        return self.region_layout
 
     def process_active_regions(self, active_regions):
         # ── 0.  Book-keeping & old debug — keep whatever you still need
@@ -2005,22 +2002,36 @@ class BitTensorMemoryGraph:
             active_regions = self.initialize_regions()
         print(f"Debugging: Active regions found: {len(active_regions)}")
 
+        # Convert ``Cell`` objects (from the region manager) into 4-tuples so the
+        # rest of the code can treat them uniformly.
+        region_tuples = []
+        for region in active_regions:
+            if region is None:
+                continue
+            region_tuples.append(
+                (
+                    getattr(region, "label", ""),
+                    getattr(region, "left", 0),
+                    getattr(region, "right", 0),
+                    getattr(region, "stride", 0),
+                )
+            )
+
         # ── 1.  Fresh quanta-level dump from pressure-based manager
         cell_dump = CellPressureRegionManager.dump_cells(self.hard_memory.region_manager)
-
 
         def group_by_cell(ranges):
             buckets = collections.defaultdict(list)
             for label, addr, size in ranges:
                 buckets[label].append((addr, size))
             for vals in buckets.values():
-                vals.sort(key=lambda t: t[1])          # sort each cell’s list by size
+                vals.sort(key=lambda t: t[1])  # sort each cell’s list by size
             return buckets
 
-        free_spaces_by_cell     = group_by_cell(cell_dump["free_spaces"])
+        free_spaces_by_cell = group_by_cell(cell_dump["free_spaces"])
         occupied_spaces_by_cell = group_by_cell(cell_dump["occupied_spaces"])
 
-        return active_regions, free_spaces_by_cell, occupied_spaces_by_cell
+        return region_tuples, free_spaces_by_cell, occupied_spaces_by_cell
 
 
     def find_in_span(self, delta_band, entry_size, return_objects=False):
@@ -2028,18 +2039,20 @@ class BitTensorMemoryGraph:
         # Ensure harmonization is always up-to-date before each operation:
         print(f"Debugging: Finding in span {delta_band} with entry size {entry_size}")
         if not hasattr(self, "region_layout") or not self.region_layout:
-            self.compute_region_boundaries()
+            # Cache the full layout information from the region manager.
+            self.region_layout = self.compute_region_boundaries()
+
         active_regions = self.region_layout
         print(f"Debugging: Active regions after harmonization: {active_regions}")
         # Find the region in the layout that matches this entry_size and delta_band
-        for label, start, end, stride in [((region[0],region[1][0],region[1][1],region[1][2]) for region in active_regions if region is not None)]:
+        for label, start, end, stride in active_regions:
             print(f"Debugging: Checking region {label}, {start}-{end} with stride {stride}")
             if stride == entry_size and start <= delta_band[0] < end:
                 region_start = max(start, delta_band[0])
                 region_end = min(end, delta_band[1])
                 break
         else:
-            # fallback to original (but only if you want undefined behavior!)
+            # Fallback to original (but only if you want undefined behavior!)
             region_start, region_end, stride = delta_band[0], delta_band[1], entry_size
 
         flight_zone = []
