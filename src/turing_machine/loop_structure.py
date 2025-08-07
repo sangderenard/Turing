@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Iterator, List, Set, Tuple
 
 from .turing_provenance import ProvenanceGraph, ProvEdge, ProvNode
 
@@ -49,33 +49,47 @@ class LoopStructureAnalyzer:
         lowlink: Dict[int, int] = {}
         result: List[Set[int]] = []
 
-        def strongconnect(v: int) -> None:
-            nonlocal index
+        for v in self.succ.keys():
+            if v in indices:
+                continue
+
             indices[v] = index
             lowlink[v] = index
             index += 1
             stack.append(v)
             on_stack.add(v)
-            for w in self.succ[v]:
-                if w not in indices:
-                    strongconnect(w)
-                    lowlink[v] = min(lowlink[v], lowlink[w])
-                elif w in on_stack:
-                    lowlink[v] = min(lowlink[v], indices[w])
-            # root of SCC
-            if lowlink[v] == indices[v]:
-                scc: Set[int] = set()
-                while True:
-                    w = stack.pop()
-                    on_stack.remove(w)
-                    scc.add(w)
-                    if w == v:
-                        break
-                result.append(scc)
 
-        for v in self.succ.keys():
-            if v not in indices:
-                strongconnect(v)
+            call_stack: List[Tuple[int, Iterator[int]]] = [(v, iter(self.succ[v]))]
+            while call_stack:
+                node, it = call_stack[-1]
+                try:
+                    w = next(it)
+                except StopIteration:
+                    call_stack.pop()
+                    if call_stack:
+                        parent, _ = call_stack[-1]
+                        lowlink[parent] = min(lowlink[parent], lowlink[node])
+                    if lowlink[node] == indices[node]:
+                        scc: Set[int] = set()
+                        while True:
+                            w = stack.pop()
+                            on_stack.remove(w)
+                            scc.add(w)
+                            if w == node:
+                                break
+                        result.append(scc)
+                    continue
+
+                if w not in indices:
+                    indices[w] = index
+                    lowlink[w] = index
+                    index += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    call_stack.append((w, iter(self.succ[w])))
+                elif w in on_stack:
+                    lowlink[node] = min(lowlink[node], indices[w])
+
         return result
 
     # ------------------------------------------------------------------

@@ -79,7 +79,12 @@ def multi_sort(collection, key_funcs):
     items_with_keys.sort(key=lambda x: x[1])
     return [item for item, _ in items_with_keys]
 
-import torch
+# `torch` is an optional heavy dependency. Import lazily so that tests and
+# environments without PyTorch can still import this module.
+try:  # optional heavy dependency
+    import torch  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    torch = None  # type: ignore
 
 class ExpressionTensor:
     def __init__(self, data, contexts=None, sequence_length=1, domain_shape=None, function_index=None):
@@ -812,9 +817,13 @@ class ProcessGraph:
 
         nested_list_indices = rebuild_nested_list(self.domain_shape, flat_indices.copy())
 
-        # --- Convert to torch tensor ---
-        indices_tensor = torch.tensor(nested_list_indices, dtype=torch.long)
-        expr_tensor_data = indices_tensor.unsqueeze(0).unsqueeze(0)  # add context and sequence dims
+        # --- Convert indices to tensor/array ---
+        if torch is not None:
+            indices_tensor = torch.tensor(nested_list_indices, dtype=torch.long)
+            expr_tensor_data = indices_tensor.unsqueeze(0).unsqueeze(0)  # add context and sequence dims
+        else:
+            indices_tensor = np.array(nested_list_indices, dtype=int)
+            expr_tensor_data = np.expand_dims(np.expand_dims(indices_tensor, 0), 0)
 
         # --- Build ExpressionTensor ---
         et = ExpressionTensor(
@@ -1493,7 +1502,7 @@ def main():
                 numeric_result = func(*values)
                 assert np.allclose(numeric_result, expected), \
                     f"Graph symbolic did not match expected: {numeric_result} vs {expected}"
-            elif isinstance(result, torch.Tensor):
+            elif torch is not None and isinstance(result, torch.Tensor):
                 # If tensor, convert to numpy and compare
                 result_np = result.numpy()
                 expected_np = np.array(expected)
