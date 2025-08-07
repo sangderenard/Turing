@@ -1157,8 +1157,17 @@ class BitTensorMemoryGraph:
     """
     A class representing a metamemory graph for bit tensors.
     """
-    def __init__(self, size=0, bit_width=32, encoding="gray", meta_graph_root=0, generative_parent=0):
-        self.capsid_id = ( 1 + id(generative_parent) + uuid4().int) % 2**32
+    def __init__(
+        self,
+        size=0,
+        bit_width=32,
+        encoding="gray",
+        meta_graph_root=0,
+        generative_parent=0,
+        *,
+        dynamic=False,
+    ):
+        self.capsid_id = (1 + id(generative_parent) + uuid4().int) % 2**32
         self.chunk_size = 8
         self.hard_memory_size = ctypes.sizeof(BTGraphHeader)
         self.header_size = self.hard_memory_size
@@ -1201,14 +1210,18 @@ class BitTensorMemoryGraph:
         self.p_start = self.e_start + quantum * self.e_rational
         self.c_start = self.p_start + quantum * self.p_rational
 
-        self.hard_memory = BitTensorMemory(self.hard_memory_size, self)  # default memory size
+        # Initial dynamic state must align between the graph and its backing
+        # memory.  Set ``_dynamic`` prior to memory construction and propagate
+        # the flag into the BitTensorMemory instance.
+        self._dynamic = bool(dynamic)
+        self.hard_memory = BitTensorMemory(
+            self.hard_memory_size, self, dynamic=self._dynamic
+        )  # default memory size
         self.hard_memory.region_manager.register_object_maps()
         self.meta_graph_root = meta_graph_root  # root of the meta graph
         self.generative_parent = generative_parent
         self.lock_manager = None  # placeholder for lock manager
 
-        
-        self.dynamic = False
         self.emergency_reference = BitTensorMemory.ALLOCATION_FAILURE
         
 
@@ -1221,15 +1234,27 @@ class BitTensorMemoryGraph:
         self.bit_width = bit_width
         self.encoding = encoding
         self.capsid = True
-        
-        
+
+
         self.G = NetworkxEmulation(self)
         self.concurrency_dag = None
 
         self.struct_viewer = StructView()
 
-        self.region_layout = self.compute_region_boundaries()   
+        self.region_layout = self.compute_region_boundaries()
         self.encapsidate_capsid()
+
+    # -- Dynamic flag synchronisation ---------------------------------
+    @property
+    def dynamic(self):
+        """Whether this graph may grow/shrink at runtime."""
+        return self._dynamic
+
+    @dynamic.setter
+    def dynamic(self, value):
+        self._dynamic = bool(value)
+        if getattr(self, "hard_memory", None) is not None:
+            self.hard_memory.dynamic = self._dynamic
     # -- Nodes ----------------------------------------------------------
     def _node_offset(self, node_id) -> int|None:
         """Return byte-offset of the NodeEntry whose node_id matches, else None."""
