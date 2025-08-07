@@ -459,11 +459,45 @@ class NodeEntry(ctypes.Structure):
         
     ]
 
-    def __init__(self, *arg, **kwargs):
-        super().__init__(*arg, **kwargs)
-        self.node_id = 0
+    def __init__(self, node_id=0, node_data=None, **kwargs):
+        """Create a new ``NodeEntry``.
 
-        pass
+        Parameters
+        ----------
+        node_id:
+            Numeric identifier for the node.  The previous implementation
+            unconditionally reset this field to ``0`` after construction,
+            which meant any ID supplied by callers was lost.  That in turn
+            caused lookups to fail because every node appeared to have an ID
+            of zero.
+        node_data:
+            Optional blob to copy into the ``node_data`` field.  Only the
+            first 256 bytes are retained.
+        **kwargs:
+            Additional structure field overrides.
+        """
+        # Initialise the base structure with any recognised fields from
+        # ``kwargs``.  Unknown keys are ignored to preserve ``ctypes``
+        # behaviour, but we still set ``node_id`` explicitly afterwards so it
+        # is never overwritten.
+        super().__init__(**{k: v for k, v in kwargs.items() if k in
+                            {f[0] for f in self._fields_}})
+
+        self.node_id = node_id
+
+        if node_data is not None:
+            if isinstance(node_data, str):
+                data = node_data.encode("utf-8")
+            elif isinstance(node_data, (bytes, bytearray)):
+                data = bytes(node_data)
+            else:
+                data = str(node_data).encode("utf-8")
+
+            # Copy at most 256 bytes into the fixed-size ``node_data`` field.
+            data = data[:256]
+            dest = ctypes.addressof(self) + self.__class__.node_data.offset
+            ctypes.memset(dest, 0, 256)
+            ctypes.memmove(dest, data, len(data))
 
 
     def __getattr__(self, key):
@@ -2091,7 +2125,7 @@ class BitTensorMemoryGraph:
         An isolated node is one that has no edges connected to it.
         """
 
-        nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry))
+        nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry), return_objects=True)
         edges = self.find_in_span((self.e_start, self.p_start), ctypes.sizeof(EdgeEntry))
 
         if nodes == BitTensorMemoryGraph.NOTHING_TO_FLY:
@@ -2275,6 +2309,7 @@ class BitTensorMemoryGraph:
         Returns None if the node is not found.
         """
         nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry), return_objects=True)
+        print(f"Found {len(nodes)} nodes in the memory graph.")
         
         if nodes == BitTensorMemoryGraph.NOTHING_TO_FLY:
             print(f"Node with ID: {node_id} not found.")
@@ -2293,55 +2328,50 @@ class BitTensorMemoryGraph:
     
     def add_node(self, node_entry=None, node_id=None, *args, **kwargs):
         print(f"Adding node with args: {args}, kwargs: {kwargs}, node_entry: {node_entry}, node_id: {node_id}")
-        #prepare a byte string of args and kwargs
-        bytes_args = b''.join([bytes(arg) for arg in args])
-        bytes_kwargs = b''.join([f"{k}={v}".encode('utf-8') for k, v in kwargs.items()])
-        
+
+        # Prepare a byte string from any positional/keyword arguments to store
+        # in ``node_data`` when a struct isn't explicitly provided.
+        bytes_args = b"".join(bytes(arg) for arg in args)
+        bytes_kwargs = b"".join(f"{k}={v}".encode("utf-8") for k, v in kwargs.items())
+
         if node_entry is None:
             node_entry = bytes_args + bytes_kwargs
-        
-        if not isinstance(node_entry, (NodeEntry, ctypes.Array)) and node_id is None:
-            node_id = uuid4().int % 2**32
+
+        def _to_bytes(obj):
+            if isinstance(obj, bytes):
+                return obj
+            if isinstance(obj, str):
+                return obj.encode("utf-8")
+            if isinstance(obj, ctypes.Array):
+                return bytes(obj)
+            if isinstance(obj, list):
+                return bytes(obj)
+            return str(obj).encode("utf-8")
 
         if isinstance(node_entry, NodeEntry):
-            if node_id is None:
-                node_id = node_entry.node_id
-            else:
-                node_entry = NodeEntry.from_buffer_copy(node_entry)
+            # Ensure the provided node has the desired ID
+            if node_id is not None:
                 node_entry.node_id = node_id
+            node_id = node_entry.node_id
+            node_bytes = ctypes.string_at(ctypes.addressof(node_entry), ctypes.sizeof(NodeEntry))
         else:
             if node_id is None:
-                raise ValueError("node_id must be provided when node_entry is not a NodeEntry instance")
-            new_node_entry = NodeEntry(node_id=node_id, data=node_entry)
-            
-            if not isinstance(node_entry, ctypes.Array):
-                # get compact serial representation of the node entry
-                # to put in node_data limited to 256 bytes
-
-                if isinstance(node_entry, list):
-                    node_entry = ctypes.create_string_buffer(bytes(node_entry))[:256]
-                elif isinstance(node_entry, str):
-                    node_entry = ctypes.create_string_buffer(node_entry.encode('utf-8'))[:256]
-                elif isinstance(node_entry, bytes):
-                    node_entry = ctypes.create_string_buffer(node_entry)[:256]
-                else:
-                    node_entry = ctypes.create_string_buffer(str(node_entry).encode('utf-8'))[:256]
-            
-            
-            new_node_entry.node_data = node_entry
-            node_entry = ctypes.string_at(ctypes.addressof(new_node_entry), ctypes.sizeof(NodeEntry))
+                node_id = uuid4().int % 2**32
+            node_data = _to_bytes(node_entry)
+            new_node_entry = NodeEntry(node_id=node_id, node_data=node_data)
+            node_bytes = ctypes.string_at(ctypes.addressof(new_node_entry), ctypes.sizeof(NodeEntry))
 
         new_node_slot = self.hard_memory.find_free_space("node", ctypes.sizeof(NodeEntry))
         if new_node_slot == BitTensorMemory.ALLOCATION_FAILURE:
             raise MemoryError("Failed to add node: no free space available")
-        
+
         if new_node_slot is None:
             raise MemoryError("Allocation returned None")
-        
-        status = self.hard_memory.write(new_node_slot, node_entry)
+
+        status = self.hard_memory.write(new_node_slot, node_bytes)
         if status == BitTensorMemory.ALLOCATION_FAILURE:
             raise MemoryError("Failed to write node entry to hard memory")
-        
+
         self.node_count += 1
 
         return node_id
