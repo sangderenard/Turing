@@ -1,56 +1,57 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, TYPE_CHECKING
 
-from ..turing_machine.turing_provenance import ProvenanceGraph
-from ..turing_machine.loop_structure import LoopStructureAnalyzer, LoopInfo
+from ..transmogrifier.ssa import SSAValue, Instr
 
-
-def insert_phi_nodes(pg: ProvenanceGraph, loops: List[LoopInfo]) -> Dict[int, List[Tuple[int, int, int]]]:
-    """Return mapping ``header -> [(arg_pos, init_src, back_src), ...]``."""
-    phi_map: Dict[int, List[Tuple[int, int, int]]] = {}
-    for info in loops:
-        if info.loop_vars:
-            phi_map[info.header] = list(info.loop_vars)
-    return phi_map
+if TYPE_CHECKING:  # pragma: no cover - optional heavy deps
+    from ..transmogrifier.graph.graph_express2 import ProcessGraph
 
 
-def rename_to_ssa(pg: ProvenanceGraph, phi_map: Dict[int, List[Tuple[int, int, int]]]) -> Dict[int, str]:
-    """Assign human readable names to all node results and φ-nodes."""
-    names: Dict[int, str] = {n.idx: f"%n{n.idx}" for n in pg.nodes}
-    for header, vars in phi_map.items():
-        for arg_pos, _, _ in vars:
-            names[(header << 16) + arg_pos] = f"%n{header}.phi{arg_pos}"
-    return names
+def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> List[Instr]:
+    """Convert a ProcessGraph into a linear SSA instruction list.
 
+    The graph's embedded scheduler is executed using ``schedule`` ("alap" by
+    default) and nodes are emitted in the resulting level order. This preserves
+    any memory/storage nodes inserted by the scheduler and mirrors the intended
+    execution order.
 
-def graph_to_ssa_with_loops(pg: ProvenanceGraph) -> str:
-    """Emit a tiny LLVM-like textual SSA for ``pg`` handling natural loops."""
-    analyzer = LoopStructureAnalyzer(pg)
-    loops = analyzer.find_loops()
-    phi_map = insert_phi_nodes(pg, loops)
-    names = rename_to_ssa(pg, phi_map)
+    Loop analysis is intentionally omitted – ProcessGraphs are expected to be
+    acyclic once scheduled. Cyclic behaviour must be resolved prior to invoking
+    this helper.
+    """
 
-    # Precompute incoming edges per node
-    incoming: Dict[int, Dict[int, int]] = {n.idx: {} for n in pg.nodes}
-    for e in pg.edges:
-        incoming[e.dst_idx][e.arg_pos] = e.src_idx
+    # Run the embedded scheduler. ``compute_levels`` populates ``pg.levels`` and
+    # performs side effects such as inserting memory nodes or interference
+    # graphs.  It returns ``None`` in the full implementation, but our minimal
+    # stub used in tests may return the level mapping directly.  We honour both
+    # behaviours.
+    ret = pg.compute_levels(method=schedule, order="dependency")
+    levels = ret if ret is not None else pg.levels
+    order = sorted(levels, key=lambda n: levels[n])
 
-    lines: List[str] = []
-    for node in pg.nodes:
-        # emit φ-nodes if this is a loop header
-        if node.idx in phi_map:
-            for arg_pos, init_src, back_src in phi_map[node.idx]:
-                phi_name = names[(node.idx << 16) + arg_pos]
-                init_name = names.get(init_src, f"%n{init_src}" if init_src >= 0 else "undef")
-                back_name = names[back_src]
-                lines.append(
-                    f"{phi_name} = phi [{init_name}, %{init_src if init_src >= 0 else 'pre'}], [{back_name}, %{back_src}]"
-                )
-        # now emit the actual operation
-        args = []
-        for idx in range(len(node.args)):
-            src = incoming[node.idx].get(idx)
-            args.append(names.get(src, f"%n{src}" if src is not None else "undef"))
-        lines.append(f"{names[node.idx]} = {node.op} {', '.join(args)}")
-    return "\n".join(lines)
+    values: Dict[int, SSAValue] = {}
+    instrs: List[Instr] = []
+
+    for nid in order:
+        data = pg.G.nodes[nid]
+        op = data.get("label")
+        expr_obj = data.get("expr_obj")
+        if op is None and expr_obj is not None:
+            op = type(expr_obj).__name__
+        parents = [p for p, _ in data.get("parents", [])]
+        res = values.setdefault(nid, SSAValue(nid))
+
+        # Detect back-edges (loop-carried dependencies).  Any parent scheduled
+        # at the same or a later level feeds a previous iteration and must be
+        # merged via a ``phi`` node before the actual operation executes.
+        back_parents = [p for p in parents if levels.get(p, -1) >= levels[nid]]
+        if back_parents:
+            phi_args = [values.setdefault(p, SSAValue(p)) for p in back_parents]
+            instrs.append(Instr("phi", phi_args, res))
+            parents = [p for p in parents if p not in back_parents]
+
+        args = [values.setdefault(p, SSAValue(p)) for p in parents]
+        instrs.append(Instr(op, args, res))
+
+    return instrs

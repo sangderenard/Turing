@@ -1,6 +1,10 @@
 import numpy as np
 import sympy
-import torch            # ← new
+
+try:  # optional heavy dependency
+    import torch  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    torch = None  # type: ignore
 
 SIMD_DEFAULT_CONCURRENCY = 4
 numpy_funcs, torch_funcs, numpy_sigs, torch_sigs = {}, {}, {}, {}

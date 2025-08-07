@@ -136,7 +136,12 @@ class Correlator:
 # This module defines the canonical data structures for the compiler’s
 # pre-SSA stage and builds a registry of operator definitions.
 
-from .operator_defs import operator_signatures, role_schemas, default_funcs
+try:  # heavy optional dependency
+    from .operator_defs import operator_signatures, role_schemas, default_funcs
+except Exception:  # pragma: no cover - optional
+    operator_signatures = {}
+    role_schemas = {}
+    default_funcs = {}
 
 @dataclass
 class RoleSchema:

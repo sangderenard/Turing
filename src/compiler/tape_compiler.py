@@ -13,14 +13,15 @@ import struct
 from typing import Dict, List, Tuple
 import numpy as np
 
-from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode, LANES
+from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode, LANES, REGISTERS
 from ..turing_machine.tape_map import TapeMap
 from ..turing_machine.turing_provenance import ProvenanceGraph, ProvNode
+from ..transmogrifier.ssa import Instr
 
 # Type aliases for clarity
 TapeAddress = int
 ObjectID = int
-MemoryMap = Dict[ObjectID, int] # Maps graph object ID to a "register" index (0-15)
+MemoryMap = Dict[ObjectID, int]  # Maps object IDs to register indices
 InstructionStream = List[InstructionWord]
 
 class TapeCompiler:
@@ -31,15 +32,21 @@ class TapeCompiler:
     def __init__(self, graph: ProvenanceGraph, bit_width: int):
         self.graph = graph
         self.bit_width = bit_width
+        # ``memory_map`` tracks values resident in the limited register file.
+        # ``data_map`` records values that live in the tape's data section when
+        # register pressure forces us to spill.
         self.memory_map: MemoryMap = {}
+        self.data_map: Dict[ObjectID, TapeAddress] = {}
         self._next_reg_idx = 0
 
     def _allocate_register(self, obj_id: ObjectID) -> int:
-        """Assigns a unique register index (0-15) to a graph object ID."""
+        """Assign a register to ``obj_id`` or spill it to tape if none remain."""
         if obj_id not in self.memory_map:
-            if self._next_reg_idx >= 16:
-                # In a real compiler, this would spill to memory. Here, we error out.
-                raise MemoryError("Out of registers (max 16 supported)")
+            if self._next_reg_idx >= REGISTERS:
+                # Register file is exhausted – cache the value in data space.
+                addr = self.data_map.setdefault(obj_id, len(self.data_map))
+                # Returning zero reserves R0 as a staging area for later loads.
+                return 0
             self.memory_map[obj_id] = self._next_reg_idx
             self._next_reg_idx += 1
         return self.memory_map[obj_id]
@@ -60,92 +67,139 @@ class TapeCompiler:
             raise ValueError(f"Unknown graph operation: {op_name}")
         return opcode_map[op_name]
 
-    def compile(self) -> Tuple[TapeMap, InstructionStream, List[List[np.ndarray]]]:
+    def compile_ssa(
+        self,
+        ssa_instrs: List[Instr],
+        process_graph: "ProcessGraph" | None = None,
+        schedule_mode: str = "alap",
+    ) -> Tuple[TapeMap, InstructionStream, List[List[np.ndarray]]]:
+        """Compile a sequence of SSA instructions into tape format.
+
+        If a :class:`ProcessGraph` is supplied it is first scheduled using the
+        requested mode (``"alap"`` by default).  The resulting concurrency map
+        guides register allocation so temporaries only consume registers while
+        live. φ-instructions reuse the register of their first operand and do
+        not emit machine words. All other instructions map 1:1 to the minimal
+        Opcode set defined in :mod:`analog_spec`.
         """
-        Compiles the graph into a tape map and a stream of instructions.
-        """
-        print("Compiler Step 1: Allocating registers for all graph objects...")
-        from ..transmogrifier.graph.graph_express2 import ProcessGraph
-        from .process_graph_helper import ProcessGraphLinearizer
 
-        if isinstance(self.graph, ProcessGraph):
-            linear_nodes = ProcessGraphLinearizer(self.graph).linear_nodes()
-        else:
-            linear_nodes = self.graph.nodes
+        self.memory_map = {}
+        self.data_map = {}
+        self._next_reg_idx = 0
 
-        print("Compiler Step 2: Generating instruction stream from graph...")
-        instructions: InstructionStream = []
-        for node in linear_nodes:
-            opcode = self._op_to_opcode(node.op)
-            
-            # Assign registers for inputs and outputs
-            #dest_reg = self._allocate_register(node.out_obj_id)
-            
-            #we want no longer to allocate registers for nodes,
-            #the correct action is to write sequentially
-            #so operations occur on the main tape
-            #this means registers are fully off the table
-            dest_reg = None
+        if process_graph is not None:
+            import networkx as nx
 
-            # Handle operands based on operation type
-            reg_a = 0
-            reg_b_or_param = 0
-
-            if node.args:
-                reg_a = self.memory_map.get(node.args[0], 0)
-            if len(node.args) > 1:
-                # If the arg is an integer, it's a parameter (like for shifts)
-                if isinstance(node.args[1], int):
-                    reg_b_or_param = node.args[1]
-                else: # Otherwise it's a register
-                    reg_b_or_param = self.memory_map.get(node.args[1], 0)
-            if len(node.args) > 2:
-                # Special handling for mu, which has a third register argument
-                # We can pack it into the param field for this simple ISA
-                if opcode == Opcode.MU:
-                    # This is a simplification; a real ISA would need more space
-                    # Here we'll just use reg_b for the selector
-                    reg_b_or_param = self.memory_map.get(node.args[2], 0)
-
-
-            instr = InstructionWord(
-                opcode=opcode,
-                dest=dest_reg,
-                reg_a=reg_a,
-                reg_b=reg_b_or_param,
-                param=reg_b_or_param # For clarity, param and reg_b are the same field
+            # ``compute_levels`` performs scheduling *and* interference analysis.
+            # Its side effects populate ``proc_interference_graph`` and memory
+            # graphs which we then colour to assign registers.  Calling separate
+            # interference helpers would double work and risk diverging from the
+            # ProcessGraph's own view of concurrency.
+            process_graph.compute_levels(
+                method=schedule_mode, order="dependency", interference_mode="asap-maxslack"
             )
-            instructions.append(instr)
 
-        # Create a default BIOS header
+            ig = getattr(process_graph, "proc_interference_graph", None)
+            if ig is None:
+                ig = nx.Graph()
+                ig.add_nodes_from(process_graph.G.nodes)
+
+            colouring = nx.algorithms.coloring.greedy_color(ig, strategy="largest_first")
+            mem_nodes = set(getattr(getattr(process_graph, "mG", None), "nodes", []))
+            for nid, colour in colouring.items():
+                if nid in mem_nodes or colour >= REGISTERS:
+                    self.data_map.setdefault(nid, len(self.data_map))
+                else:
+                    self.memory_map[nid] = colour
+            if self.memory_map:
+                self._next_reg_idx = min(max(self.memory_map.values()) + 1, REGISTERS)
+
+        instructions: InstructionStream = []
+
+        def _ensure(val_id: int) -> int:
+            if val_id < 0:
+                return 0
+            if val_id in self.data_map:
+                return 0  # will require explicit LOAD/STORE in a later pass
+            if val_id not in self.memory_map:
+                return self._allocate_register(val_id)
+            return self.memory_map[val_id]
+
+        for inst in ssa_instrs:
+            if inst.op == "phi":
+                # Reuse the first operand's register for the φ-result
+                reg = _ensure(inst.args[0].id)
+                self.memory_map[inst.res.id] = reg
+                continue
+
+            opcode = self._op_to_opcode(inst.op)
+            dest_reg = _ensure(inst.res.id)
+            reg_a = _ensure(inst.args[0].id) if inst.args else 0
+            reg_b = _ensure(inst.args[1].id) if len(inst.args) > 1 else 0
+
+            instructions.append(
+                InstructionWord(
+                    opcode=opcode,
+                    dest=dest_reg,
+                    reg_a=reg_a,
+                    reg_b=reg_b,
+                    param=reg_b,
+                )
+            )
+
+        # Build BIOS and PCM frames identical to ``compile``
         bios = BiosHeader(
             calib_fast_ms=10.0,
             calib_read_ms=50.0,
             drift_ms=1.0,
             inputs=[],
             outputs=[],
-            instr_start_addr=0 # This will be set by TapeMap
+            instr_start_addr=0,
         )
 
-        # The TapeMap will calculate the final layout
         tape_map = TapeMap(bios, instruction_frames=len(instructions))
         tape_map.bios.instr_start_addr = tape_map.instr_start
-        
-        print(f"Compilation successful. Generated {len(instructions)} instructions.")
-        # Convert BIOS header and instructions to PCM bit waves
-        from ..hardware.analog_spec import generate_bit_wave, LANES
-        bios_bit_frames = tape_map.encode_bios()  # List[List[int]]
+
+        from ..hardware.analog_spec import generate_bit_wave
+
+        bios_bit_frames = tape_map.encode_bios()
         bios_pcm_frames: List[List[np.ndarray]] = []
         for frame in bios_bit_frames:
             pcm_lanes = [generate_bit_wave(bit, lane) for lane, bit in enumerate(frame)]
             bios_pcm_frames.append(pcm_lanes)
-        instr_bit_frames = self.binarize_instructions(instructions)  # List[List[int]]
+
+        instr_bit_frames = self.binarize_instructions(instructions)
         instr_pcm_frames: List[List[np.ndarray]] = []
         for frame in instr_bit_frames:
             pcm_lanes = [generate_bit_wave(bit, lane) for lane, bit in enumerate(frame)]
             instr_pcm_frames.append(pcm_lanes)
+
         tape_pcm = bios_pcm_frames + instr_pcm_frames
         return tape_map, instructions, tape_pcm
+
+    def compile(self) -> Tuple[TapeMap, InstructionStream, List[List[np.ndarray]]]:
+        """Compile ``self.graph`` by funnelling it through SSA first.
+
+        Historically ``TapeCompiler`` duplicated logic for ProvenanceGraph and
+        ProcessGraph inputs, emitting machine words directly from whichever
+        structure it was handed.  That made optimisation difficult and
+        discouraged experimentation – any new transformation had to be re
+        implemented twice.  The modern pipeline always converts to SSA and then
+        reuses :meth:`compile_ssa` for the final lowering step.  This keeps the
+        book‑keeping in one place and gives the SSA stage maximal freedom to
+        optimise and schedule without worrying about tape details.
+        """
+
+        from .process_graph_helper import provenance_to_process_graph, reduce_cycles_to_mu
+        from .ssa_builder import process_graph_to_ssa_instrs
+
+        # Normalise the provenance graph by rewriting feedback edges into
+        # explicit ``mu`` nodes so subsequent scheduling operates on an acyclic
+        # structure.
+        reduce_cycles_to_mu(self.graph)
+        proc = provenance_to_process_graph(self.graph)
+        instrs = process_graph_to_ssa_instrs(proc)
+        return self.compile_ssa(instrs, process_graph=proc)
 
     @staticmethod
     def binarize_instructions(instructions: InstructionStream) -> List[List[int]]:
