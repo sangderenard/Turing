@@ -24,10 +24,10 @@ def run_saline_sim(sim):
     )
     for cell in sim.cells:
         if cell.leftmost is None:
-            print(f"Line 67: Cell {cell.label} leftmost is None, setting to left {cell.left}")
+            #print(f"Line 67: Cell {cell.label} leftmost is None, setting to left {cell.left}")
             cell.leftmost = cell.left
         if cell.rightmost is None:
-            print(f"Line 70: Cell {cell.label} rightmost is None, setting to right - 1: {cell.right - 1}")
+            #print(f"Line 70: Cell {cell.label} rightmost is None, setting to right - 1: {cell.right - 1}")
             cell.rightmost = cell.right - 1
     # 2) Ask for the equilibrium fractions at t=0
     sim.fractions = sim.engine.equilibrium_fracs(0.0)

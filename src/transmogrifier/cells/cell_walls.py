@@ -2,42 +2,51 @@ import math
 from .cell_consts import LEFT_WALL, RIGHT_WALL
 
 def snap_cell_walls(self, cells, proposals):
-    """
-    Determines and applies new cell boundaries using a stable, two-pass approach.
-    1. Calculation Pass: Determines all new boundaries and the total required buffer size.
-    2. Execution Pass: Expands the buffer once (triggering the desired global distribution)
-    and then applies the new boundaries to the cells.
-    """
+    for i, (cell, proposal) in enumerate(zip(cells, proposals)):
+        if proposal == cell:
+            # If the proposal is the same as the cell, we can snap the walls
+            if cell.leftmost == proposal.leftmost and cell.rightmost == proposal.rightmost:
+                if i == len(cells) - 1:
+                    return
+                
+                continue
+            else:
+                break
+        else:
+            break
+
+
+
     # ``expand`` is provided by :class:`Simulator`; no rebinding needed here.
-    self.bar()
-    print("Snapping cell walls...")
+    #self.bar()
+    #print("Snapping cell walls...")
         
     # Initialize fixed extents if they don't exist
     for cell in cells:
         if not hasattr(cell, 'leftmost') or cell.leftmost is None:
-            print(f"Line 648: Cell {cell.label} leftmost is None, setting to left {cell.left}")
+            #print(f"Line 648: Cell {cell.label} leftmost is None, setting to left {cell.left}")
             cell.leftmost = cell.left
         if not hasattr(cell, 'rightmost') or cell.rightmost is None:
-            print(f"Line 651: Cell {cell.label} rightmost is None, setting to right - 1: {cell.right - 1}")
+            #print(f"Line 651: Cell {cell.label} rightmost is None, setting to right - 1: {cell.right - 1}")
             cell.rightmost = cell.right - 1  # rightmost is inclusive, so we subtract 1 to make it exclusive
 
     # Initialize fixed extents if they don't exist
     for proposal in proposals:
         if not hasattr(proposal, 'leftmost') or proposal.leftmost is None:
-            print(f"Line 657: Proposal {proposal.label} leftmost is None, setting to left {proposal.left}")
+            #print(f"Line 657: Proposal {proposal.label} leftmost is None, setting to left {proposal.left}")
             proposal.leftmost = proposal.left
         if not hasattr(proposal, 'rightmost') or proposal.rightmost is None:
                 
             # it's this one:
-            print(f"Line 662: Proposal {proposal.label} rightmost is None, setting to right - 1: {proposal.right - 1}")
+            #print(f"Line 662: Proposal {proposal.label} rightmost is None, setting to right - 1: {proposal.right - 1}")
             proposal.rightmost = proposal.right - 1
 
     for c in [LEFT_WALL, RIGHT_WALL]:
         if getattr(c, "leftmost", None) is None:
-            print(f"Line 667: Wall {c.label} leftmost is None, setting to left {c.left}")
+            #print(f"Line 667: Wall {c.label} leftmost is None, setting to left {c.left}")
             c.leftmost = c.left
         if getattr(c, "rightmost", None) is None:
-            print(f"Line 670: Wall {c.label} rightmost is None, setting to right - 1: {c.right - 1}")
+            #print(f"Line 670: Wall {c.label} rightmost is None, setting to right - 1: {c.right - 1}")
             c.rightmost = c.right - 1
 
     # filter empty cells and proposals
@@ -106,12 +115,12 @@ def snap_cell_walls(self, cells, proposals):
         b_best = update['b']
 
         # enforce prev.right ≥ prev.left, and curr.left ≤ curr.right
-        print(f'Line 743: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
-        print(f'Line 744: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
+        #print(f'Line 743: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
+        #print(f'Line 744: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
         prev.right = max((curr.leftmost - prev.stride)//prev.stride * prev.stride, max(prev.rightmost+1, a_best))
         curr.left  = min(curr.leftmost, min(curr.right, b_best))
-        print(f'Line 747: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
-        print(f'Line 748: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
+        #print(f'Line 747: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
+        #print(f'Line 748: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
 
         # Recompute proportional pressures based on new sub-lengths
         new_a_len = prev.right - prev.left
@@ -134,21 +143,21 @@ def snap_cell_walls(self, cells, proposals):
 
     # destribute empty cells and proposals into empty space
 
-    self.bar()
-    print("Snapping empty cells and proposals to leftmost/rightmost boundaries...")
+    #self.bar()
+    #print("Snapping empty cells and proposals to leftmost/rightmost boundaries...")
 
 
     for empty_proposal in empty_proposals:
-        print(f"Snapping empty proposal {empty_proposal.label} to left {max_needed} and right {max_needed + empty_proposal.stride}")
+        #print(f"Snapping empty proposal {empty_proposal.label} to left {max_needed} and right {max_needed + empty_proposal.stride}")
         empty_proposal.left = max_needed
         empty_proposal.right = max_needed + empty_proposal.stride
         empty_proposal.leftmost = empty_proposal.left
-        print(f"Line 773: Empty proposal {empty_proposal.label} leftmost set to {empty_proposal.leftmost}")
+        #print(f"Line 773: Empty proposal {empty_proposal.label} leftmost set to {empty_proposal.leftmost}")
         empty_proposal.rightmost = empty_proposal.right - 1
         max_needed += empty_proposal.stride
 
-    print("Done snapping empty cells and proposals.")
-    self.bar()
+    #print("Done snapping empty cells and proposals.")
+    #self.bar()
     # Diagnostic print
     #print(f"Snapped cell walls: {[f'{cell.label}: {cell.left}-{cell.right} (stride {cell.stride})' for cell in proposals]}")
 
@@ -171,8 +180,8 @@ def snap_cell_walls(self, cells, proposals):
         #print(f"System pressure after snapping cell walls: {self.system_pressure}")
         self.expand(self.bitbuffer.mask_size, self.bitbuffer.intceil(self.system_pressure, system_lcm), cells, proposals, warp=False)
 
-    print("Done snapping cell walls.")
-    self.bar()
+    #print("Done snapping cell walls.")
+    #self.bar()
 def build_metadata(self, offset_bits, size_bits, cells):
         
     events = []
