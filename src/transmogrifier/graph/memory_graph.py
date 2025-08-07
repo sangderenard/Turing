@@ -2349,13 +2349,17 @@ class BitTensorMemoryGraph:
             return str(obj).encode("utf-8")
 
         if isinstance(node_entry, NodeEntry):
-            # Ensure the provided node has the desired ID
-            if node_id is not None:
-                node_entry.node_id = node_id
-            node_id = node_entry.node_id
+            # ``node_entry`` may already carry an ID, but treat ``0`` as
+            # "unset" so we always emit a usable identifier.  Callers can
+            # still override via the explicit ``node_id`` parameter.
+            if node_id in (None, 0):
+                node_id = node_entry.node_id
+            if node_id in (None, 0):
+                node_id = uuid4().int % 2**32
+            node_entry.node_id = node_id
             node_bytes = ctypes.string_at(ctypes.addressof(node_entry), ctypes.sizeof(NodeEntry))
         else:
-            if node_id is None:
+            if node_id in (None, 0):
                 node_id = uuid4().int % 2**32
             node_data = _to_bytes(node_entry)
             new_node_entry = NodeEntry(node_id=node_id, node_data=node_data)
