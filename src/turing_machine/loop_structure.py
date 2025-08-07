@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Set, Tuple
 
 from .turing_provenance import ProvenanceGraph, ProvEdge, ProvNode
+import networkx as nx
+from collections import defaultdict
 
 
 @dataclass
@@ -93,38 +95,97 @@ class LoopStructureAnalyzer:
         return result
 
     # ------------------------------------------------------------------
-    # Dominators (simple iterative algorithm)
+    # Self-contained Lengauer–Tarjan dominator algorithm
     # ------------------------------------------------------------------
-    def _dominators(self, start: int = 0) -> Dict[int, Set[int]]:
-        nodes = list(self.succ.keys())
-        dom: Dict[int, Set[int]] = {n: set(nodes) for n in nodes}
-        dom[start] = {start}
-        changed = True
-        while changed:
-            changed = False
-            for n in nodes:
-                if n == start:
-                    continue
-                preds = self.pred[n]
-                if not preds:
-                    new_dom = {n}
-                else:
-                    it = iter(preds)
-                    new_dom = dom[next(it)].copy()
-                    for p in it:
-                        new_dom &= dom[p]
-                    new_dom.add(n)
-                if new_dom != dom[n]:
-                    dom[n] = new_dom
-                    changed = True
+    def _lengauer_tarjan(self, start: int = 0) -> Dict[int, int]:
+        """
+        Compute immediate dominators using the Lengauer-Tarjan algorithm.
+        Returns a dict mapping each node to its immediate dominator (None for start).
+        """
+        # initialization
+        semi: Dict[int, int] = {}
+        parent: Dict[int, int] = {}
+        vertex: Dict[int, int] = {}
+        bucket: Dict[int, List[int]] = defaultdict(list)
+        pred: Dict[int, List[int]] = defaultdict(list)
+        ancestor: Dict[int, int] = {}
+        label: Dict[int, int] = {}
+        dom: Dict[int, int] = {}
+        N = 0
+        # Step 1: DFS numbering
+        def dfs(v: int):
+            nonlocal N
+            N += 1
+            semi[v] = N
+            vertex[N] = v
+            label[v] = v
+            ancestor[v] = None
+            for w in self.succ.get(v, []):
+                if w not in semi:
+                    parent[w] = v
+                    dfs(w)
+                pred[w].append(v)
+        dfs(start)
+        # helper functions
+        def compress(u: int):
+            if ancestor.get(ancestor.get(u)) is not None:
+                compress(ancestor[u])
+                if semi[label[ancestor[u]]] < semi[label[u]]:
+                    label[u] = label[ancestor[u]]
+                ancestor[u] = ancestor[ancestor[u]]
+        def eval(u: int) -> int:
+            if ancestor.get(u) is None:
+                return label[u]
+            compress(u)
+            if semi[label[u]] >= semi[label[ancestor[u]]]:
+                return label[ancestor[u]]
+            return label[u]
+        # Step 2: compute semidominators
+        for i in range(N, 1, -1):
+            w = vertex[i]
+            for v in pred[w]:
+                u = eval(v)
+                semi[w] = min(semi[w], semi[u])
+            bucket[vertex[semi[w]]].append(w)
+            ancestor[w] = parent[w]
+            for v in bucket[parent[w]]:
+                u = eval(v)
+                dom[v] = u if semi[u] < semi[v] else parent[w]
+            bucket[parent[w]].clear()
+        # Step 3: explicit dominator assignment
+        for i in range(2, N+1):
+            w = vertex[i]
+            if dom[w] != vertex[semi[w]]:
+                dom[w] = dom[dom[w]]
+        dom[start] = None
         return dom
+
+    def _compute_idoms(self, start: int = 0) -> Dict[int, int]:
+        """Return mapping node->immediate dominator using self-contained LT."""
+        return self._lengauer_tarjan(start)
 
     # ------------------------------------------------------------------
     def find_loops(self) -> List[LoopInfo]:
+        # debug logging: graph size
+        total_nodes = len(self.succ)
+        total_edges = sum(len(v) for v in self.succ.values())
+        print(
+            f"[LoopStructureAnalyzer] find_loops start: total_nodes={total_nodes}, total_edges={total_edges}"
+        )
         loops: List[LoopInfo] = []
         sccs = self._tarjan()
-        dom = self._dominators(0 if self.graph.nodes else 0)
-        for scc in sccs:
+        # Only compute dominators when loops exist
+        nontrivial = [scc for scc in sccs if len(scc) > 1 or any(n in self.succ[n] for n in scc)]
+        if not nontrivial:
+            return []
+        idom = self._compute_idoms(0 if self.graph.nodes else 0)
+        # helper: check if 'a' dominates 'b'
+        def dominates(a: int, b: int) -> bool:
+            while b != a and b in idom and idom[b] != b:
+                b = idom[b]
+            return b == a
+
+        for scc in nontrivial:
             if len(scc) == 1:
                 n = next(iter(scc))
                 if n not in self.succ[n]:
@@ -133,7 +194,7 @@ class LoopStructureAnalyzer:
             backedges: List[Tuple[int, int]] = []
             for u in scc:
                 for v in self.succ[u]:
-                    if v in scc and v in dom[u]:
+                    if v in scc and dominates(v, u):
                         backedges.append((u, v))
             for latch, header in backedges:
                 preds = self.pred[header]
