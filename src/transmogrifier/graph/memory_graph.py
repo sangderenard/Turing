@@ -10,6 +10,7 @@ import threading
 from uuid import uuid4
 
 from ..cells.simulator import Simulator
+from ..cells.pressure_model import run_saline_sim
 from ..cells.cell_pressure_region_manager import CellPressureRegionManager
 from ..cells.cell_consts import Cell
 
@@ -370,33 +371,16 @@ class BitTensorMemory: #sizes in bytes
         if bytes_needed == 0:
             bytes_needed = stride                       # “one quantum” default
 
-        while True:
-            # ── 1. current layout snapshot --------------------------------------
-            snap = CellPressureRegionManager.dump_cells(self.region_manager)
-            free  = snap["free_spaces"]                 # [(label, addr, size), …]
+        snap = CellPressureRegionManager.dump_cells(self.region_manager)
+        free  = snap["free_spaces"]
+        candidates = [(addr, size) for lbl, addr, size in free
+                    if size >= bytes_needed and (lbl == cell_idx or allow_drift)]
+        if candidates:
+            addr, size = min(candidates, key=lambda p: (p[1], p[0]))
+            return addr
 
-            # collect holes that fit
-            candidates = [(addr, size) for lbl, addr, size in free
-                        if size >= bytes_needed and
-                            (lbl == cell_idx or allow_drift)]
-
-            # ── 2. choose the best hole, if any ---------------------------------
-            if candidates:
-                addr, size = min(candidates, key=lambda p: (p[1], p[0]))  # smallest first
-                # NOTE: nothing is written yet; write()/mark_used() will record it
-                return addr
-
-            # ── 3. no hole ⇒ enqueue one empty stride to force expansion -----
-            cell = self.region_manager.cells[cell_idx]
-            stride_bits = cell.stride * self.region_simulator.bitbuffer.bitsforbits
-            payload = b"\0" * ((stride_bits + 7) // 8)
-            self.region_simulator.write_data(cell.label, payload)
-            self.region_simulator.run_saline_sim()
-            # discard the placeholder write used to trigger expansion
-            self.region_simulator.input_queues.pop(cell.label, None)
-            cell.injection_queue = 0
-            cell.salinity = 0
-            # loop retries with the now-larger cell
+        # If no space, raise immediately. Salinity and balancing must be handled before calling this function.
+        raise RuntimeError(f"Unable to allocate {bytes_needed} bytes for label '{label}': no free space found after balancing.")
 
 
     def allocate_block(self, block_size, allowed_range):
@@ -412,6 +396,9 @@ class BitTensorMemory: #sizes in bytes
         candidates = [self.unit_helper.bytes_for_chunks(c) for c in candidates]
         for candidate in candidates:
 
+            # System adaptation: set salinity and balance before allocation
+            self.region_manager.cells[candidate].salinity += block_size
+            self.region_manager.run_saline_sim()
             offset = self.find_free_space(candidate, block_size)
             if offset is not None:
                 self.mark_used(offset, block_size)
@@ -1406,10 +1393,16 @@ class BitTensorMemoryGraph:
 
     def add_edge(self, src, dst, **kwargs):
         edge = EdgeEntry(src, dst, **kwargs)
-        free_space = self.hard_memory.find_free_space("edge", ctypes.sizeof(EdgeEntry))
+        # System adaptation: set salinity and balance before allocation
+        edge_size = ctypes.sizeof(EdgeEntry)
+        self.hard_memory.region_manager.cells[3].salinity += edge_size  # 3 = 'edge'
+        run_saline_sim(self.hard_memory.region_manager)
+        free_space = self.hard_memory.find_free_space("edge", edge_size)
 
         if free_space is not None:
-            self.hard_memory.write(free_space, ctypes.string_at(ctypes.addressof(edge), ctypes.sizeof(edge)))
+            self.hard_memory.write(free_space, ctypes.string_at(ctypes.addressof(edge), edge_size))
+        else:
+            raise MemoryError("Failed to allocate space for edge after balancing.")
         self.edge_count += 1
 
         return (src, dst)
@@ -1421,27 +1414,22 @@ class BitTensorMemoryGraph:
         """
         Add a meta parent node to the graph.
         """
-        space = self.hard_memory.find_free_space("parent")
-        
+        # System adaptation: set salinity and balance before allocation
+        parent_size = ctypes.sizeof(MetaGraphEdge)
+        self.hard_memory.region_manager.cells[4].salinity += parent_size  # 4 = 'parent'
+        run_saline_sim(self.hard_memory.region_manager)
+        space = self.hard_memory.find_free_space("parent", parent_size)
         if space is None:
-            self.emergency_reference = self.hard_memory.allocate_block(ctypes.sizeof(MetaGraphEdge), (self.LINE_P, self.LINE_C))
+            self.emergency_reference = self.hard_memory.allocate_block(parent_size, (self.LINE_P, self.LINE_C))
             if self.emergency_reference == BitTensorMemory.ALLOCATION_FAILURE:
                 raise MemoryError("Failed to allocate emergency reference for parent node")
+            space = self.emergency_reference
         edge = MetaGraphEdge()
         edge.local_capsid_ref = self.capsid_id
         edge.remote_capsid_ref = parent_id
-        
-        # THESE ARE NOT THE SAME AS THE NODES AND EDGES IN THE GRAPH
-        # THESE ARE META GRAPH CONNECTIONS FOR THE GRAPH OF GRAPH
-        # THEY ONLY EXIST AS NO-SIBLING TABLE RELATIONSHIPS
-
 
         self.parent_count += 1
-        self.hard_memory.write(space, ctypes.string_at(ctypes.addressof(edge), ctypes.sizeof(edge)))
-
-        # THESE ARE NOT THE SAME AS THE NODES AND EDGES IN THE GRAPH
-        # THESE ARE META GRAPH CONNECTIONS FOR THE GRAPH OF GRAPH
-        # THEY ONLY EXIST AS NO-SIBLING TABLE RELATIONSHIPS
+        self.hard_memory.write(space, ctypes.string_at(ctypes.addressof(edge), parent_size))
         return
 
     def serialize_header(self):
@@ -1565,13 +1553,17 @@ class BitTensorMemoryGraph:
                 self.start_n = ((self.header_size + self.hard_memory.granular_size - 1) // self.hard_memory.granular_size) * self.hard_memory.granular_size
             else:
                 print(f"Debugging: Dirty memory found, reallocating hard memory.")
-                free_space = self.hard_memory.find_free_space("header")
+                # System adaptation: set salinity and balance before allocation
+                header_size = self.header_size
+                self.hard_memory.region_manager.cells[0].salinity += header_size  # 0 = 'header'
+                run_saline_sim(self.hard_memory.region_manager)
+                free_space = self.hard_memory.find_free_space("header", header_size)
                 print(f"Debugging: Free space for header serialization: {free_space}")
                 if free_space is None:
-                    assert False, "currently unhandled lack of memory for header"
+                    raise MemoryError("currently unhandled lack of memory for header after balancing")
                 print(f"Debugging: Found free space at {free_space} for header serialization.")
                 self.hard_memory.write(free_space, self.serialize_header())
-                self.n_start = free_space + self.header_size
+                self.n_start = free_space + header_size
 
                 # add this later, sweep the space before for entries, use heuristic
                 # building in graph search for an easy way out, in fact, do do that.
@@ -1631,7 +1623,11 @@ class BitTensorMemoryGraph:
     def add_child(self, free_space=None, child_id=None, meta_graph_node=None, byref=False):
         global meta_nodes
         if free_space is None:
-            free_space = self.hard_memory.find_free_space("child")
+            # System adaptation: set salinity and balance before allocation
+            child_size = ctypes.sizeof(MetaGraphEdge)
+            self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
+            run_saline_sim(self.hard_memory.region_manager)
+            free_space = self.hard_memory.find_free_space("child", child_size)
         if not byref:
             new_child_entry = MetaGraphEdge()
         else:
@@ -1815,7 +1811,11 @@ class BitTensorMemoryGraph:
         # relative to capacity and density of the memory graph.
         # 
         print(self.hard_memory.size, self.header_size, self.hard_memory.size - self.header_size)
-        free_space = self.hard_memory.find_free_space("child")
+        # System adaptation: set salinity and balance before allocation
+        child_size = ctypes.sizeof(MetaGraphEdge)
+        self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
+        run_saline_sim(self.hard_memory.region_manager)
+        free_space = self.hard_memory.find_free_space("child", child_size)
         new_child = None
         if free_space == BitTensorMemory.ALLOCATION_FAILURE or free_space is None:
             if self.emergency_reference == BitTensorMemory.ALLOCATION_FAILURE:
@@ -2391,11 +2391,16 @@ class BitTensorMemoryGraph:
             node_bytes = ctypes.string_at(ctypes.addressof(new_node_entry), ctypes.sizeof(NodeEntry))
 
         new_node_slot = self.hard_memory.find_free_space("node", ctypes.sizeof(NodeEntry))
+        # System adaptation: set salinity and balance before allocation
+        node_size = ctypes.sizeof(NodeEntry)
+        self.hard_memory.region_manager.cells[2].salinity += node_size  # 2 = 'node'
+        run_saline_sim(self.hard_memory.region_manager)
+        new_node_slot = self.hard_memory.find_free_space("node", node_size)
         if new_node_slot == BitTensorMemory.ALLOCATION_FAILURE:
-            raise MemoryError("Failed to add node: no free space available")
+            raise MemoryError("Failed to add node: no free space available after balancing")
 
         if new_node_slot is None:
-            raise MemoryError("Allocation returned None")
+            raise MemoryError("Allocation returned None after balancing")
 
         status = self.hard_memory.write(new_node_slot, node_bytes)
         if status == BitTensorMemory.ALLOCATION_FAILURE:

@@ -2,22 +2,45 @@ from sympy import Integer, Float
 from .cell_consts import CELL_COUNT
 from .salinepressure import SalineHydraulicSystem
 
-def balance_system(cells, mode='open'):
-    """Balance salinity and pressure across the whole system."""
-    if not cells or mode not in ('open', 'closed'):
+def balance_system(cells, bitbuffer,
+                   mode='open',
+                   C_ext=0.0, p_ext=0.0,
+                   Lp=1.0, A=1.0, sigma=1.0,
+                   R=8.314, T=298.15,
+                   dt=1.0, max_steps=1000):
+    """
+    Balance container via iterative Kedem–Katchalsky:
+    ΔV = Lp·A·[ΔP – σ·R·T·ΔC]·dt, step until |ΔV|→0 or runaway.
+    - cells: list of Cell with .pressure and .salinity
+    - bitbuffer: BitBitBuffer instance to expand
+    """
+    if not cells or mode != 'open':
         return
-    if mode == 'open':
-        total_s = sum(c.salinity for c in cells) or 1
-        total_p = sum(c.pressure for c in cells) or 1
-        for c in cells:
-            c.salinity = c.salinity / total_s
-            c.pressure = c.pressure / total_p
-    else:  # closed system – zero-sum
-        avg_s = sum(c.salinity for c in cells) / len(cells)
+    prev_delta = None
+    for step in range(max_steps):
+        # compute averages
         avg_p = sum(c.pressure for c in cells) / len(cells)
-        for c in cells:
-            c.salinity -= avg_s
-            c.pressure -= avg_p
+        avg_C = sum(c.salinity for c in cells) / len(cells)
+        # differences
+        dP = p_ext - avg_p
+        dC = C_ext - avg_C
+        # osmotic pressure ΔΠ = R·T·ΔC
+        dPi = R * T * dC
+        # volumetric flow rate (bits per time)
+        Jv = Lp * A * (dP - sigma * dPi)
+        delta = int(Jv * dt)
+        # check equilibrium
+        if delta == 0:
+            print(f"Equilibrium in {step} steps")
+            break
+        # check runaway
+        if prev_delta is not None and abs(delta) > abs(prev_delta):
+            print(f"Runaway at step {step}, ΔV={delta}")
+            break
+        # apply volume change
+        if delta > 0:
+            bitbuffer.expand([bitbuffer.mask_size], delta, cells, cells)
+        prev_delta = delta
 
 def update_s_p_expressions(sim, cells, *, as_float=False):
     if as_float:
