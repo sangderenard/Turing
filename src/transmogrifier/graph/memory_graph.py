@@ -1347,7 +1347,7 @@ class BitTensorMemoryGraph:
 
     def add_edge(self, src, dst, **kwargs):
         edge = EdgeEntry(src, dst, **kwargs)
-        free_space = self.hard_memory.find_free_space(self.e_start, ctypes.sizeof(EdgeEntry))
+        free_space = self.hard_memory.find_free_space("edge", ctypes.sizeof(EdgeEntry))
 
         if free_space is not None:
             self.hard_memory.write(free_space, ctypes.string_at(ctypes.addressof(edge), ctypes.sizeof(edge)))
@@ -2274,14 +2274,17 @@ class BitTensorMemoryGraph:
         Retrieve a NodeEntry by its node_id.
         Returns None if the node is not found.
         """
-        nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry))
-        print(f"Found {len(nodes)} nodes in the memory graph.")
+        nodes = self.find_in_span((self.n_start, self.c_start), ctypes.sizeof(NodeEntry), return_objects=True)
         
         if nodes == BitTensorMemoryGraph.NOTHING_TO_FLY:
             print(f"Node with ID: {node_id} not found.")
             return None
+        
+        print(f"Found {len(nodes)} nodes in the memory graph.")
+        
         for node in nodes:
             node_entry = NodeEntry.from_buffer_copy(node)
+            print(f"node: {node}, node_entry: {node_entry}")
             if node_entry.node_id == node_id:
                 print(f"Node with ID: {node_id} found in memory graph.")
                 return node_entry

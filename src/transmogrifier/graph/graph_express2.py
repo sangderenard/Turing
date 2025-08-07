@@ -269,7 +269,7 @@ class ProcessGraph:
 
             new_nid = self.deduplicate_node(self.G, nid)
             if new_nid != nid:
-                
+                del self.node_map[nid]
                 return new_nid, True
             return nid, False
         else:
