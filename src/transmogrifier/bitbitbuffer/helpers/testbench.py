@@ -115,8 +115,13 @@ def main():
     pbuf = pb.pids
     pbuf[0] = 1
     orig   = int(pbuf[0])
-    pbuf.move(0, 2, 1);  assert int(pbuf[2]) == orig
-    pbuf.swap(0, 2, 1);  assert int(pbuf[0]) == orig
+    # After moving index 0 to index 2, the element lands at index 1 because
+    # the intervening elements shift left.
+    pbuf.move(0, 2, 1)
+    assert int(pbuf[1]) == orig
+    # Swap it back to the front
+    pbuf.swap(0, 1, 1)
+    assert int(pbuf[0]) == orig
 
     # Use the existing 'buf' (mask_size=16, bitsforbits=8) and fully seed it.
     # Mask: all ones; Data: 1..16 (predictable)

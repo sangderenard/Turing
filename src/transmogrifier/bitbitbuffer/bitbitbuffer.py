@@ -141,25 +141,60 @@ class BitBitBuffer:
             yield self[i]
 
     def move(self, src, dst, length):
-        # 1) perform the primary shift
-        self[dst:dst + length] = self[src:src + length]
+        """Move a contiguous block of bits from ``src`` to ``dst``.
+
+        This mirrors Python's list semantics: the block is removed from its
+        original location and inserted at the destination index.  Both mask and
+        data planes are shifted accordingly so that they remain coupled.
+        """
+        if length <= 0 or src == dst:
+            return
+
+        # Work on mirror Python lists for clarity then write back
+        mask_list = [int(self[i]) for i in range(self.mask_size)]
+        data_list = list(self._data_access[0:self.mask_size])
+
+        block_mask = mask_list[src:src + length]
+        block_data = data_list[src:src + length]
+        del mask_list[src:src + length]
+        del data_list[src:src + length]
+        if dst > src:
+            dst -= length
+        mask_list[dst:dst] = block_mask
+        data_list[dst:dst] = block_data
+
+        self[0:self.mask_size] = mask_list
+        self._data_access[0:self.mask_size] = bytes(data_list)
+
         if self._make_pid is False:
             return
-        # 2) mirror in any PID that covers this range
+        # mirror in any PID that covers this range
         for pid in self.pid_buffers.values():
             L, R = pid.domain_left, pid.domain_right
-            if src >= L and src + length <= R:
+            if src >= L and src + length <= R and dst >= L and dst <= R:
                 local_src = src - L
                 local_dst = dst - L
                 pid.pids.move(local_src, local_dst, length)
 
     def swap(self, src, dst, length):
-        # 1) perform the primary swap
-        src_bits = self[src:src + length]
-        dst_bits = self[dst:dst + length]
-        self[dst:dst + length] = src_bits
-        self[src:src + length] = dst_bits
-        # 2) mirror in any PID that covers both ranges
+        """Swap two bit ranges, keeping mask and data coupled."""
+        if length <= 0 or src == dst:
+            return
+
+        # Element-wise swap to handle overlapping ranges identically to
+        # the Python reference implementation used in tests.
+        for k in range(length):
+            s = src + k
+            d = dst + k
+            s_mask = int(self[s])
+            d_mask = int(self[d])
+            s_data = bytes(self._data_access[s:s + 1])
+            d_data = bytes(self._data_access[d:d + 1])
+            self[s] = d_mask
+            self[d] = s_mask
+            self._data_access[s:s + 1] = d_data
+            self._data_access[d:d + 1] = s_data
+
         if self._make_pid is False:
             return
         for pid in self.pid_buffers.values():
