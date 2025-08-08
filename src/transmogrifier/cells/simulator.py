@@ -1,9 +1,8 @@
-
 from typing import Union
 from sympy import Integer
 from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT, RIGHT_WALL, LEFT_WALL
 from .simulator_methods.salinepressure import SalineHydraulicSystem
-from .bitbitbuffer import BitBitBuffer, CellProposal
+from ..bitbitbuffer import BitBitBuffer, CellProposal
 from .bitstream_search import BitStreamSearch
 from .cell_walls import snap_cell_walls, build_metadata, expand
 import math
@@ -68,7 +67,10 @@ Simulator.dump_cells = dump_cells
 Simulator.lcm = lcm
 Simulator.minimize = minimize
 Simulator.run_saline_sim = SalineHydraulicSystem.run_saline_sim
-
+Simulator.run_balanced_saline_sim = SalineHydraulicSystem.run_balanced_saline_sim
+Simulator.update_s_p_expressions = SalineHydraulicSystem.update_s_p_expressions
+Simulator.equilibrium_fracs = SalineHydraulicSystem.equilibrium_fracs
+Simulator.balance_system = SalineHydraulicSystem.balance_system
 
 
 
@@ -86,8 +88,8 @@ def main():
     sim = Simulator(cells)
 
     for _ in range(5):
-        sim.write_data('A', b'\\xde\\xad')
-        sim.write_data('B', b'\\xbe\\xef')
+        sim.write_data('A', b'\xde\xad')
+        sim.write_data('B', b'\xbe\xef')
 
         sim.step(cells)
         sim.print_system()

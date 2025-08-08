@@ -2,20 +2,6 @@ import math
 from .cell_consts import LEFT_WALL, RIGHT_WALL
 
 def snap_cell_walls(self, cells, proposals):
-    for i, (cell, proposal) in enumerate(zip(cells, proposals)):
-        if proposal == cell:
-            # If the proposal is the same as the cell, we can snap the walls
-            if cell.leftmost == proposal.leftmost and cell.rightmost == proposal.rightmost:
-                if i == len(cells) - 1:
-                    return
-                
-                continue
-            else:
-                break
-        else:
-            break
-
-
 
     # ``expand`` is provided by :class:`Simulator`; no rebinding needed here.
     #self.bar()
@@ -50,10 +36,11 @@ def snap_cell_walls(self, cells, proposals):
             c.rightmost = c.right - 1
 
     # filter empty cells and proposals
-    cells = [c for c in cells if c.leftmost < c.rightmost and c.left < c.right or c == LEFT_WALL or c == RIGHT_WALL]
-    empty_cells = [c for c in cells if c.leftmost > c.rightmost or c.left >= c.right and c != LEFT_WALL and c != RIGHT_WALL]
-    proposals = [p for p in proposals if p.leftmost < p.rightmost and p.left < p.right or p == LEFT_WALL or p == RIGHT_WALL]
-    empty_proposals = [p for p in proposals if p.leftmost > p.rightmost or p.left >= p.right and p != LEFT_WALL and p != RIGHT_WALL]
+    cells = [c for c in cells if ((c.leftmost < c.rightmost) and (c.left < c.right)) or (c in (LEFT_WALL, RIGHT_WALL))]
+    empty_cells = [c for c in cells if ((c.leftmost >= c.rightmost) or (c.left >= c.right)) and (c not in (LEFT_WALL, RIGHT_WALL))]
+
+    proposals = [p for p in proposals if ((p.leftmost < p.rightmost) and (p.left < p.right)) or (p in (LEFT_WALL, RIGHT_WALL))]
+    empty_proposals = [p for p in proposals if ((p.leftmost >= p.rightmost) or (p.left >= p.right)) and (p not in (LEFT_WALL, RIGHT_WALL))]
     sorted_cells = sorted(cells, key=lambda c: c.leftmost)
     sorted_proposals = sorted(proposals, key=lambda p: p.leftmost)
     cells = [LEFT_WALL] + sorted_cells + [RIGHT_WALL]
@@ -61,79 +48,69 @@ def snap_cell_walls(self, cells, proposals):
 
 
 
-    # --- Pass 1: Calculate all desired changes ---
+    # --- Pass 1: Calculate LCM-aligned boundaries ---
+    # Invariant: The beginning (left) of every cell MUST be aligned to the system LCM grid.
+    # The right of the previous cell is snapped to the same grid line.
     boundary_updates = []
     max_needed = self.bitbuffer.mask_size
     system_lcm = self.lcm(proposals)
+    self.system_lcm = system_lcm  # ensure metadata uses the same grid
 
-    for i in range(len(proposals) + 1):
-        prev = proposals[i - 1] if i > 0 else LEFT_WALL
-        curr = proposals[i]     if i < len(proposals) else RIGHT_WALL
+    # Keep RIGHT_WALL tracking the current mask extent to start, it may move right
+    RIGHT_WALL.leftmost = RIGHT_WALL.right = RIGHT_WALL.left = self.bitbuffer.mask_size
 
-        if i == len(proposals):
-            # push RIGHT_WALL to the very end
-            RIGHT_WALL.leftmost = RIGHT_WALL.right = RIGHT_WALL.left = self.bitbuffer.mask_size
+    # Build LCM-aligned boundary for each adjacent pair (including LEFT_WALL->first and last->RIGHT_WALL)
+    for i in range(1, len(proposals)):
+        prev = proposals[i - 1]
+        curr = proposals[i]
 
-        # envelope [low, high]
-        low  = min(prev.right, curr.leftmost)
-        high = max(prev.right, curr.leftmost)
+        # base constraint: cannot violate fixed insides (prev.rightmost, curr.leftmost)
+        # and must not move boundary left of what already exists (prev.right)
+        base = max(
+            prev.right,
+            getattr(prev, 'rightmost', prev.right) + 1,
+            curr.leftmost,
+        )
+        b = ((base + system_lcm - 1) // system_lcm) * system_lcm
 
-        # ----- START ROBUST FIX -----
-        # First, determine the ideal right boundary for the previous cell ('a0').
-        # It's clamped within the [low, high] envelope and aligned to its own stride.
-        s_prev = prev.stride
-        k_min = math.ceil(low / s_prev)
-        k_max = math.floor(high / s_prev)
-        k0 = prev.right // s_prev
-        k_best = min(max(k0, k_min), k_max)
-        a0 = k_best * s_prev
-
-        # Now, determine the left boundary for the current cell ('b0').
-        # It MUST be at or after 'a0'. We find the first position >= a0 that
-        # is correctly aligned to the current cell's stride.
-        s_curr = curr.stride
-        b0 = ((a0 + s_curr - 1) // s_curr) * s_curr
-        # ----- END ROBUST FIX -----
-        boundary_updates.append({'index': i, 'a': a0, 'b': b0})
-
-        #boundary_updates.append({'index': i, 'a': a0, 'b': b0})
-        max_needed = max(max_needed, a0, b0)
+        boundary_updates.append({'index': i, 'b': b})
+        max_needed = max(max_needed, b)
 
 
 
     # --- Pass 2: Apply all calculated changes ---
     for update in boundary_updates:
         i = update['index']
-        prev = proposals[i - 1] if i > 0 else LEFT_WALL
-        curr = proposals[i] if i < len(proposals) else RIGHT_WALL
-        # now safe to compute pressure adjustments
+        prev = proposals[i - 1]
+        curr = proposals[i]
+
+        # preserve original lengths for pressure reweighting
         orig_a_len = prev.right - prev.left
         orig_b_len = curr.right - curr.left
-            
-        # Apply the new boundaries, but clamp so width ≥ 0
-        a_best = update['a']
-        b_best = update['b']
 
-        # enforce prev.right ≥ prev.left, and curr.left ≤ curr.right
-        #print(f'Line 743: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
-        #print(f'Line 744: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
-        prev.right = max((curr.leftmost - prev.stride)//prev.stride * prev.stride, max(prev.rightmost+1, a_best))
-        curr.left  = min(curr.leftmost, min(curr.right, b_best))
-        #print(f'Line 747: Updating cell {prev.label} from left {prev.left} to right {prev.right} with new leftmost {prev.leftmost}, stride {prev.stride}, and pressure {prev.pressure}')
-        #print(f'Line 748: Updating cell {curr.label} from left {curr.left} to right {curr.right} with new leftmost {curr.leftmost}, stride {curr.stride}, and pressure {curr.pressure}')
+        b = update['b']
+
+        # Ensure non-negative widths while enforcing boundary on the LCM grid
+        if b > curr.right:
+            curr.right = b
+        prev.right = b
+        curr.left = b
 
         # Recompute proportional pressures based on new sub-lengths
         new_a_len = prev.right - prev.left
         new_b_len = curr.right - curr.left
-            
-        # Prevent division by zero
-            
+
         new_p_a = (prev.pressure * new_a_len) // orig_a_len if orig_a_len > 0 else 0
         new_p_b = (curr.pressure * new_b_len) // orig_b_len if orig_b_len > 0 else 0
-            
+
         self.system_pressure += (new_p_a + new_p_b) - (prev.pressure + curr.pressure)
         prev.pressure = new_p_a
         curr.pressure = new_p_b
+
+        # If the boundary is against RIGHT_WALL, keep it a zero-width wall at that grid line
+        if curr is RIGHT_WALL:
+            curr.left = curr.leftmost = curr.right = b
+            curr.rightmost = b - 1
 
 
     cells.pop()
@@ -182,6 +159,7 @@ def snap_cell_walls(self, cells, proposals):
 
     #print("Done snapping cell walls.")
     #self.bar()
+
 def build_metadata(self, offset_bits, size_bits, cells):
         
     events = []
@@ -224,6 +202,7 @@ def build_metadata(self, offset_bits, size_bits, cells):
     return sorted(final, key=lambda e: e[1])
     
     
+
 def expand(self, offset_bits, size_bits, cells, proposals, warp=True):
     """
     Build the event list exactly as before, then hand it off to BitBitBuffer.
@@ -235,6 +214,10 @@ def expand(self, offset_bits, size_bits, cells, proposals, warp=True):
         assert isinstance(offset, int), f"Offset {offset} is not an integer"
         assert offset >= 0, f"Offset {offset} is negative, must be non-negative"
         assert offset <= self.bitbuffer.mask_size, f"Offset {offset} exceeds mask size {self.bitbuffer.mask_size}"
+
+    # Ensure metadata alignment grid is always current
+    self.system_lcm = self.lcm(proposals)
+
     events = self.build_metadata(offset_bits, size_bits, cells)
     #for label, pos, share in events:
         #print(f"Expanding cell {label} at position {pos} with share {share} bits")

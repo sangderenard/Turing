@@ -1,4 +1,6 @@
-from ..bitbitbuffer import CellProposal
+from ...bitbitbuffer import CellProposal
+
+
 def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
     """Advance the hydraulic model until cell widths stabilise."""
     proposals = []
@@ -26,6 +28,7 @@ def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
     if flush:
         self.flush_pending_writes()
     return proposals
+
 
 def step(self, cells):
     """Run one simulation step with size resolution preceding writes."""
