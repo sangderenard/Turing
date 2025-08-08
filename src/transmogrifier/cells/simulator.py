@@ -26,6 +26,8 @@ class Simulator:
         self.input_queues = {}
         self.system_pressure = 0
         self.elastic_coeff = 0.1
+        self.epsilon = 1e-6
+        self.N = len(cells)
         self.system_lcm   = self.lcm(cells)
         required_end = max(c.right for c in cells)
         mask_size    = BitBitBuffer._intceil(required_end, self.system_lcm)

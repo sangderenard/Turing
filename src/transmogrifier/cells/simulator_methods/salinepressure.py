@@ -108,6 +108,10 @@ class SalineHydraulicSystem:
           sum_r = sum(r_i), fallback to uniform if too small
           frac_i = r_i/sum_r
         """
+        if not hasattr(self, 's_funcs') or not hasattr(self, 'p_funcs'):
+            self.t       = symbols('t')
+            self.s_funcs = [lambdify(self.t, expr, 'math') for expr in self.s_exprs]
+            self.p_funcs = [lambdify(self.t, expr, 'math') for expr in self.p_exprs]
         s_vals = [f(t) for f in self.s_funcs]
         p_vals = [f(t) for f in self.p_funcs]
         # safe ratios
