@@ -12,7 +12,11 @@ from uuid import uuid4
 from ....cells.simulator import Simulator
 from ....cells.simulator_methods.salinepressure import SalineHydraulicSystem
 from ....cells.cell_consts import Cell
-from ...memory_graph import BitTensorMemory
+# Avoid importing via the parent ``memory_graph`` package to prevent
+# circular initialisation when ``memory_graph`` itself imports helpers.
+# ``BitTensorMemory`` lives alongside this module, so we can import it
+# directly from the local helper package.
+from .bit_tensor_memory import BitTensorMemory
 
 import json
 
