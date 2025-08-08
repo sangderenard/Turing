@@ -7,14 +7,14 @@ import os
 # Add src to path to allow imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
-from src.transmogrifier.cells.pressure_model import (
+from src.transmogrifier.cells.simulator_methods.pressure_model import (
     balance_system,
     update_s_p_expressions,
     equilibrium_fracs,
     run_saline_sim,
     run_balanced_saline_sim,
 )
-from src.transmogrifier.cells.salinepressure import SalineHydraulicSystem
+from src.transmogrifier.cells.simulator_methods.salinepressure import SalineHydraulicSystem
 
 class MockCell:
     def __init__(self, salinity, pressure, left=None, right=None, leftmost=None, rightmost=None, label=''):

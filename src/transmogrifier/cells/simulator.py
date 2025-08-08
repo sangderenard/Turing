@@ -1,8 +1,8 @@
-from .pressure_model import run_saline_sim
+
 from typing import Union
 from sympy import Integer
 from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT, RIGHT_WALL, LEFT_WALL
-from .salinepressure import SalineHydraulicSystem
+from .simulator_methods.salinepressure import SalineHydraulicSystem
 from .bitbitbuffer import BitBitBuffer, CellProposal
 from .bitstream_search import BitStreamSearch
 from .cell_walls import snap_cell_walls, build_metadata, expand
@@ -27,7 +27,7 @@ class Simulator:
         self.input_queues = {}
         self.system_pressure = 0
         self.elastic_coeff = 0.1
-        self.system_lcm   = Simulator.lcm(self, cells)
+        self.system_lcm   = self.lcm(cells)
         required_end = max(c.right for c in cells)
         mask_size    = BitBitBuffer._intceil(required_end, self.system_lcm)
         self.bitbuffer = BitBitBuffer(mask_size=mask_size, caster=bytes,
@@ -47,7 +47,7 @@ from .simulator_methods.cell_mask import get_cell_mask, set_cell_mask, pull_cell
 from .simulator_methods.data_io import write_data, flush_pending_writes, actual_data_hook
 from .simulator_methods.evolution import evolution_tick, step
 from .simulator_methods.injection import injection
-
+from .simulator_methods.quanta_map_and_dump_cells import quanta_map, dump_cells
 from .simulator_methods.lcm import lcm
 from .simulator_methods.minimize import minimize
 
@@ -63,11 +63,11 @@ Simulator.actual_data_hook = actual_data_hook
 Simulator.evolution_tick = evolution_tick
 Simulator.step = step
 Simulator.injection = injection
-
-
+Simulator.quanta_map = quanta_map
+Simulator.dump_cells = dump_cells
 Simulator.lcm = lcm
 Simulator.minimize = minimize
-Simulator.run_saline_sim = run_saline_sim
+Simulator.run_saline_sim = SalineHydraulicSystem.run_saline_sim
 
 
 

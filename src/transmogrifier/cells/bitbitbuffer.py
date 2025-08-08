@@ -576,7 +576,13 @@ class BitBitBuffer:
             ratioed_plans = []
             if abs(plan_ratio - 1.0) > 0.0001:
                 for orig_off, adj_off, gap_bits in plans:
-                    if orig_off >= plan_offset:
+                    low_off = 0
+                    high_off = mask_size
+                    if hasattr(src_buffer, 'domain_left') and hasattr(src_buffer, 'domain_right'):
+                        low_off = src_buffer.domain_left
+                        high_off = src_buffer.domain_right
+                    
+                    if high_off > orig_off >= low_off:
                         ratioed_plans.append(((orig_off - plan_offset) // plan_ratio, (adj_off - plan_offset) // plan_ratio, gap_bits // plan_ratio))
 
 

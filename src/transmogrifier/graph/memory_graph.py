@@ -10,8 +10,7 @@ import threading
 from uuid import uuid4
 
 from ..cells.simulator import Simulator
-from ..cells.pressure_model import run_saline_sim
-from ..cells.cell_pressure_region_manager import CellPressureRegionManager
+from ..cells.simulator_methods.salinepressure import SalineHydraulicSystem
 from ..cells.cell_consts import Cell
 
 import json
@@ -164,13 +163,11 @@ class BitTensorMemory: #sizes in bytes
                  len=s["len"], label=s["label"])
             for s in specs
         ]
-        self.region_simulator = Simulator(cells)
-        self.region_manager = CellPressureRegionManager(
-            self.region_simulator.bitbuffer, cells
-        )
+        self.region_manager = Simulator(cells)
+
         # Initialise the hydraulic model upfront so equilibrium fractions and
         # buffer expansion are resolved before any writes occur.
-        self.region_simulator.run_saline_sim()
+        self.region_manager.run_saline_sim()
 
         
     def pull_full_set_from_memory(self):
@@ -205,12 +202,10 @@ class BitTensorMemory: #sizes in bytes
                  len=s["len"], label=s["label"])
             for s in specs
         ]
-        self.region_simulator = Simulator(cells)
-        self.region_manager = CellPressureRegionManager(
-            self.region_simulator.bitbuffer, cells
-        )
+        self.region_manager = Simulator(cells)
+
         # Ensure hydraulic model is primed on reset as well
-        self.region_simulator.run_saline_sim()
+        self.region_manager.run_saline_sim()
         return self.region_manager.cells
 
 
@@ -371,7 +366,7 @@ class BitTensorMemory: #sizes in bytes
         if bytes_needed == 0:
             bytes_needed = stride                       # “one quantum” default
 
-        snap = CellPressureRegionManager.dump_cells(self.region_manager)
+        snap = self.region_manager.dump_cells()
         free  = snap["free_spaces"]
         candidates = [(addr, size) for lbl, addr, size in free
                     if size >= bytes_needed and (lbl == cell_idx or allow_drift)]
@@ -1204,7 +1199,7 @@ class BitTensorMemoryGraph:
         self.hard_memory = BitTensorMemory(
             self.hard_memory_size, self, dynamic=self._dynamic
         )  # default memory size
-        self.hard_memory.region_manager.register_object_maps()
+        #self.hard_memory.region_manager.register_object_maps()
         self.meta_graph_root = meta_graph_root  # root of the meta graph
         self.generative_parent = generative_parent
         self.lock_manager = None  # placeholder for lock manager
@@ -1396,7 +1391,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         edge_size = ctypes.sizeof(EdgeEntry)
         self.hard_memory.region_manager.cells[3].salinity += edge_size  # 3 = 'edge'
-        run_saline_sim(self.hard_memory.region_manager)
+        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("edge", edge_size)
 
         if free_space is not None:
@@ -1417,7 +1412,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         parent_size = ctypes.sizeof(MetaGraphEdge)
         self.hard_memory.region_manager.cells[4].salinity += parent_size  # 4 = 'parent'
-        run_saline_sim(self.hard_memory.region_manager)
+        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
         space = self.hard_memory.find_free_space("parent", parent_size)
         if space is None:
             self.emergency_reference = self.hard_memory.allocate_block(parent_size, (self.LINE_P, self.LINE_C))
@@ -1556,7 +1551,7 @@ class BitTensorMemoryGraph:
                 # System adaptation: set salinity and balance before allocation
                 header_size = self.header_size
                 self.hard_memory.region_manager.cells[0].salinity += header_size  # 0 = 'header'
-                run_saline_sim(self.hard_memory.region_manager)
+                SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
                 free_space = self.hard_memory.find_free_space("header", header_size)
                 print(f"Debugging: Free space for header serialization: {free_space}")
                 if free_space is None:
@@ -1626,7 +1621,7 @@ class BitTensorMemoryGraph:
             # System adaptation: set salinity and balance before allocation
             child_size = ctypes.sizeof(MetaGraphEdge)
             self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-            run_saline_sim(self.hard_memory.region_manager)
+            SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
             free_space = self.hard_memory.find_free_space("child", child_size)
         if not byref:
             new_child_entry = MetaGraphEdge()
@@ -1814,7 +1809,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         child_size = ctypes.sizeof(MetaGraphEdge)
         self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-        run_saline_sim(self.hard_memory.region_manager)
+        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("child", child_size)
         new_child = None
         if free_space == BitTensorMemory.ALLOCATION_FAILURE or free_space is None:
@@ -2077,7 +2072,7 @@ class BitTensorMemoryGraph:
             )
 
         # ── 1.  Fresh quanta-level dump from pressure-based manager
-        cell_dump = CellPressureRegionManager.dump_cells(self.hard_memory.region_manager)
+        cell_dump = self.hard_memory.region_manager.dump_cells()
 
         def group_by_cell(ranges):
             buckets = collections.defaultdict(list)
@@ -2394,7 +2389,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         node_size = ctypes.sizeof(NodeEntry)
         self.hard_memory.region_manager.cells[2].salinity += node_size  # 2 = 'node'
-        run_saline_sim(self.hard_memory.region_manager)
+        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
         new_node_slot = self.hard_memory.find_free_space("node", node_size)
         if new_node_slot == BitTensorMemory.ALLOCATION_FAILURE:
             raise MemoryError("Failed to add node: no free space available after balancing")
