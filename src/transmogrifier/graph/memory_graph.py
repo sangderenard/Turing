@@ -327,6 +327,17 @@ class BitTensorMemory: #sizes in bytes
             raise ValueError("Expanded regions exceed memory size")
 
         specs = [s for s in specs if s["right"] > s["left"]]
+
+        # Convert byte-based positions and strides to bit offsets for the simulator
+        for s in specs:
+            s["left"] *= 8
+            s["right"] *= 8
+            s["len"] *= 8
+            s["stride"] *= 8
+            if s["min"] is not None:
+                s["min"] *= 8
+            if s["max"] is not None:
+                s["max"] *= 8
         return specs
     def mark_free(self, offset, size):
         # mark free bits and reset delta
