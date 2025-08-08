@@ -219,6 +219,14 @@ class BitBitIndexer:
             return result
         else:
             if spec.plane == 'mask':
+                if isinstance(spec.value, (BitBitSlice, BitBitItem)):
+                    # mirror the data plane from the source view first
+                    v = spec.value
+                    v_idxs = list(range(len(idxs)))
+                    raw = BitBitIndexer._get_data(v.buffer, v.mask_index, v_idxs, v.buffer.bitsforbits, v.cast)
+                    if getattr(v, 'reversed', False):
+                        raw = raw[::-1]
+                    BitBitIndexer._set_data(buf, spec.base_offset, idxs, spec.bitsforbits, raw)
                 if BitBitIndexer.logging_enabled:
                     logging.debug(f"[access] set↔_set_mask value={spec.value}")
                 BitBitIndexer._set_mask(buf, spec.base_offset, idxs, spec.value)
