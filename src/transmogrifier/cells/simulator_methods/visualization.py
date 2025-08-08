@@ -242,7 +242,7 @@ if __name__ == "__main__":
 
     cells = [Cell(**s) for s in specs]
     sim = Simulator(cells)
-    sim.run_balanced_saline_sim(cells)
+    sim.run_balanced_saline_sim()
 
     vis = _LCVisual(sim)
 
