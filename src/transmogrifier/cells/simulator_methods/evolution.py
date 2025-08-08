@@ -7,7 +7,9 @@ def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
     prev_widths = [c.right - c.left for c in cells]
     for _ in range(max_iters):
         self.update_s_p_expressions(cells)
-        fractions = self.equilibrium_fracs(0.0)
+        if self.engine is None:
+            raise AttributeError("Saline engine not initialized; call run_saline_sim first")
+        fractions = self.engine.equilibrium_fracs(0.0)
         total_space = self.bitbuffer.mask_size
         proposals = []
         new_widths = []

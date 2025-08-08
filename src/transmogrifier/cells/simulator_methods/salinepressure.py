@@ -87,10 +87,11 @@ class SalineHydraulicSystem:
         sim.snap_cell_walls(sim.cells, sim.cells)
 
 
-    def run_balanced_saline_sim(self, sim, mode='open'):
+    @staticmethod
+    def run_balanced_saline_sim(sim, mode='open'):
         """Balance the system then run the standard saline simulation."""
-        self.balance_system(sim.cells, mode)
-        self.run_saline_sim(sim, as_float=True)
+        sim.balance_system(sim.cells, sim.bitbuffer, mode=mode)
+        SalineHydraulicSystem.run_saline_sim(sim, as_float=True)
     def reset_state(self):
         """Start at t=0 with equal volumes."""
         self.current_t = 0.0

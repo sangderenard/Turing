@@ -208,6 +208,7 @@ def visualise_step(sim, cells):
     if VISUALISE and _vis is None:
         _vis = _LCVisual(sim)
 
+    sim.run_saline_sim()
     sp, mask = sim.step(cells)
 
     if VISUALISE:
@@ -225,8 +226,12 @@ def visualise_step(sim, cells):
 if __name__ == "__main__":
     import os
     import random
-    from ..cell_consts import Cell
-    from ..simulator import Simulator
+    try:
+        from ..helpers.cell_consts import Cell
+        from ..helpers.simulator import Simulator
+    except Exception:  # pragma: no cover - fallback for legacy layout
+        from ..cell_consts import Cell
+        from ..simulator import Simulator
 
     specs = [
         dict(left=0,   right=128,  label="0", len=128, stride=128),
@@ -237,6 +242,7 @@ if __name__ == "__main__":
 
     cells = [Cell(**s) for s in specs]
     sim = Simulator(cells)
+    sim.run_balanced_saline_sim()
 
     vis = _LCVisual(sim)
 

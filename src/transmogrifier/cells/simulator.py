@@ -69,7 +69,12 @@ Simulator.minimize = minimize
 Simulator.run_saline_sim = SalineHydraulicSystem.run_saline_sim
 Simulator.run_balanced_saline_sim = SalineHydraulicSystem.run_balanced_saline_sim
 Simulator.update_s_p_expressions = SalineHydraulicSystem.update_s_p_expressions
-Simulator.equilibrium_fracs = SalineHydraulicSystem.equilibrium_fracs
+# Delegate equilibrium fraction queries to the active hydraulic engine.
+def _equilibrium_fracs(self, t):
+    if self.engine is None:
+        raise AttributeError("Saline engine not initialized; call run_saline_sim first")
+    return self.engine.equilibrium_fracs(t)
+Simulator.equilibrium_fracs = _equilibrium_fracs
 Simulator.balance_system = SalineHydraulicSystem.balance_system
 
 
