@@ -90,7 +90,9 @@ class SalineHydraulicSystem:
     def run_balanced_saline_sim(self, mode="open"):
         """Balance the system then run the standard saline simulation."""
         self.balance_system(self.cells, self.bitbuffer, mode)
-        self.run_saline_sim(self, as_float=True)
+
+        self.run_saline_sim(as_float=True)
+
     def reset_state(self):
         """Start at t=0 with equal volumes."""
         self.current_t = 0.0
