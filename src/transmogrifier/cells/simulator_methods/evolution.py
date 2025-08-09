@@ -1,7 +1,7 @@
 from ...bitbitbuffer import CellProposal
 
 
-def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
+def evolution_tick(self, cells, max_iters: int = 10):
     """Advance the hydraulic model until cell widths stabilise."""
     proposals = []
     prev_widths = [c.right - c.left for c in cells]
@@ -25,12 +25,14 @@ def evolution_tick(self, cells, max_iters: int = 10, *, flush: bool = True):
         if new_widths == prev_widths:
             break
         prev_widths = new_widths
-    if flush:
-        self.flush_pending_writes()
+
     return proposals
 
 
 def step(self, cells):
     """Run one simulation step with size resolution preceding writes."""
-    self.evolution_tick(cells)
+    proposals = self.evolution_tick(cells)
+    for cell, proposal in zip(cells, proposals):
+        cell.left = proposal.left
+        cell.right = proposal.right
     return self.minimize(cells)

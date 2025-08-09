@@ -23,18 +23,6 @@ def write_data(self, cell_label: str, payload: bytes):
         print(f"Cell '{cell_label}' nearing capacity ({queued_bits}/{available_bits} bits). Expanding...")
         self.run_saline_sim()
 
-def flush_pending_writes(self):
-    """Commit enqueued payloads after cell sizes have stabilised."""
-    for cell in self.cells:
-        queue = self.input_queues.get(cell.label)
-        if not queue:
-            continue
-        offset = cell.left
-        for payload, stride in queue:
-            self.actual_data_hook(payload, offset, stride)
-            offset += stride
-        queue.clear()
-        cell.injection_queue = 0
 
 def actual_data_hook(self, payload: bytes, dst_bits: int, length_bits: int):
     self.bitbuffer._data_access[dst_bits : dst_bits + length_bits] = payload
