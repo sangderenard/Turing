@@ -92,6 +92,9 @@ class PIDBuffer:
         value = uuid_id.int.to_bytes(self.pids.bitsforbits // 8, byteorder='big')
         logging.debug(f"[PIDBuffer.create_id] writing uuid={uuid_id} at data_index={data_index}, bytes={value.hex()}")
         self.pids._data_access[data_index : data_index + 1] = value
+        # mark this stride slot as occupied in the PID mask so that
+        # visualisers and subsequent lookups see the entry immediately
+        self.pids[data_index] = 1
         return uuid_id
 
     def __getitem__(self, key):
