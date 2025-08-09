@@ -239,7 +239,7 @@ def expand(self, offset_bits, size_bits, cells, proposals, warp=True):
         assert offset <= self.bitbuffer.mask_size, f"Offset {offset} exceeds mask size {self.bitbuffer.mask_size}"
 
     # Ensure metadata alignment grid is always current
-    self.system_lcm = self.lcm(proposals)
+    #self.system_lcm = self.lcm(proposals)
 
     events = self.build_metadata(offset_bits, size_bits, cells)
     #for label, pos, share in events:
