@@ -49,6 +49,7 @@ class BitBitIndex:
         assert start >= 0, "Index out of range"
         assert stop <= mask_size, "Index out of range"
         assert step != 0, "Slice step cannot be zero"
+        assert stop != start, "Slice start and stop cannot be equal"
         return start, stop, step
 
     def indices(self) -> List[int]:

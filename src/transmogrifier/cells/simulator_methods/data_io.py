@@ -15,11 +15,11 @@ def write_data(self, cell_label: str, payload: bytes):
 
     # Track queued bits as salinity and trigger expansion if nearing capacity
     queued_bits = sum(s for _, s in self.input_queues[cell_label])
-    cell.salinity = queued_bits
-    available_bits = cell.right - cell.left
+    cell.salinity += queued_bits
+    available_bits = cell.right - cell.left - cell.salinity
     threshold = int(available_bits * (1 - self.SALINE_BUFFER))
     print(f"Cell '{cell_label}' queued bits: {queued_bits}/{available_bits} (threshold: {threshold})")
-    if queued_bits > threshold:
+    if cell.salinity > threshold:
         print(f"Cell '{cell_label}' nearing capacity ({queued_bits}/{available_bits} bits). Expanding...")
         self.run_saline_sim()
 
