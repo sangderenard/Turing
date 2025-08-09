@@ -283,12 +283,18 @@ if __name__ == "__main__":
                 idx = INJECT_KEYS[ev.key]
                 target = cells[idx]
                 data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
-                sim.write_data(target.label, os.urandom(data_len))
+                # queue the payload
+                sim.input_queues.setdefault(target.label, []).append((os.urandom(data_len), target.stride))
+                # tell the system there’s one more item to inject
+                target.injection_queue += 1
         if next_auto and now >= next_auto:
             idx = random.randrange(len(cells))
             target = cells[idx]
             data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
-            sim.write_data(target.label, os.urandom(data_len))
+            # queue the payload
+            sim.input_queues.setdefault(target.label, []).append((os.urandom(data_len), target.stride))
+            # tell the system there’s one more item to inject
+            target.injection_queue += 1
             next_auto = now + AUTO_INJECT_EVERY
 
         visualise_step(sim, cells)

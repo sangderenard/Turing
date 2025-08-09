@@ -45,7 +45,7 @@ class Simulator:
 # Attach modularized methods from simulator_methods
 from .simulator_methods.visualization import print_system, bar
 from .simulator_methods.cell_mask import get_cell_mask, set_cell_mask, pull_cell_mask, push_cell_mask
-from .simulator_methods.data_io import write_data, actual_data_hook
+from .simulator_methods.data_io import actual_data_hook
 from .simulator_methods.evolution import evolution_tick, step
 from .simulator_methods.injection import injection
 from .simulator_methods.quanta_map_and_dump_cells import quanta_map, dump_cells
@@ -58,8 +58,8 @@ Simulator.get_cell_mask = get_cell_mask
 Simulator.set_cell_mask = set_cell_mask
 Simulator.pull_cell_mask = pull_cell_mask
 Simulator.push_cell_mask = push_cell_mask
-Simulator.write_data = write_data
 #this was an inapropriate bypass
+#Simulator.write_data = write_data
 #Simulator.flush_pending_writes = flush_pending_writes
 Simulator.actual_data_hook = actual_data_hook
 Simulator.evolution_tick = evolution_tick
