@@ -208,7 +208,7 @@ def visualise_step(sim, cells):
     if VISUALISE and _vis is None:
         _vis = _LCVisual(sim)
 
-    sim.run_saline_sim(cells)
+    sim.run_saline_sim()
     sp, mask = sim.step(cells)
 
     if VISUALISE:
@@ -242,7 +242,7 @@ if __name__ == "__main__":
 
     cells = [Cell(**s) for s in specs]
     sim = Simulator(cells)
-    sim.run_balanced_saline_sim(cells)
+    sim.run_balanced_saline_sim()
 
     vis = _LCVisual(sim)
 
