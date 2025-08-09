@@ -12,10 +12,11 @@ def evolution_tick(self, cells, max_iters: int = 10):
         proposals = []
         new_widths = []
         for cell, frac in zip(cells, fractions):
-            new_width = max(
+            new_width = self.bitbuffer.intceil(1+max(
                 self.bitbuffer.intceil(cell.salinity, cell.stride),
                 self.bitbuffer.intceil(int(total_space * frac), cell.stride),
-            )
+            ), self.system_lcm)
+            print(f"Line 18: Cell {cell.label} with stride: {cell.stride} new_width is {new_width}")
             assert new_width % cell.stride == 0
             proposal = CellProposal(cell)
             proposal.right = proposal.left + new_width
