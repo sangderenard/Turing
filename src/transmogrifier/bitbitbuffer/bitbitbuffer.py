@@ -43,6 +43,8 @@ class BitBitBuffer:
         return self.indexer.access(spec)
 
     def hex(self):
+        if self is None or not isinstance(self, BitBitBuffer):
+            return "Empty Buffer"
         return bytes(self).hex()
 
     def get_by_pid(self, buffer, pid):
@@ -474,7 +476,8 @@ class BitBitBuffer:
         return runs
 
     def tuplepattern(self, src, end, length, direction='left'):
-        
+        if f"{self}" == "Empty Buffer":
+            return [], []
         if self is None or not isinstance(self, BitBitBuffer):
             raise TypeError("Invalid BitBitBuffer")
         print(self)
@@ -483,9 +486,17 @@ class BitBitBuffer:
         print(length)
         print(direction)
         print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
-        if length == 0 or src >= end or src < 0 or end > len(self) or length < 0 or src == end:
+        if src is None or end is None or length == 0 or src >= end or src < 0 or end > len(self) or length < 0 or src == end:
             return [], []
         if direction == 'left' or direction == 'bi':
+            print(self)
+            print(src)
+            print(end)
+            print(length)
+            print(direction)
+            
+            print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
+            exit()
             reversed = self[src:end][::-1][:length]
             right_pattern = self._count_runs(reversed)
 
