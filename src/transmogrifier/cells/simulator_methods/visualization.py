@@ -132,20 +132,38 @@ class _LCVisual:
 
     def __init__(self, sim):
         self.sim = sim
-        cells = sim.cells
+        pygame.init()
+        self.clock = pygame.time.Clock()
+
+        # geometry is derived from the cell layout and may change as cells
+        # expand/shrink; keep a cached copy and recalc when needed
+        self._prev_span = None
+        self._prev_rows = None
+        self.screen = None  # assigned by _recalc_geometry()
+        self._recalc_geometry()
+
+    def _recalc_geometry(self) -> None:
+        """Recompute scale factors and window size based on current cells."""
+        cells = self.sim.cells
         tot_span = max(c.right for c in cells) - min(c.left for c in cells)
         global SCALE_X
         SCALE_X = 1200 / max(1, tot_span)       # fit into ~1200 px window
         w = int(tot_span * SCALE_X) + 20
         h = len(cells) * ROW_H + 20
-
-        pygame.init()
         self.screen = pygame.display.set_mode((w, h))
         pygame.display.set_caption("Simulator memory layout")
-        self.clock  = pygame.time.Clock()
+        self._prev_span = tot_span
+        self._prev_rows = len(cells)
 
     def draw(self):
         cells = self.sim.cells
+        # if any cell moved/expanded, recompute scaling and window size so
+        # content stays within view.  This keeps the visualisation responsive
+        # to dynamic layout changes.
+        span = max(c.right for c in cells) - min(c.left for c in cells)
+        if span != self._prev_span or len(cells) != self._prev_rows:
+            self._recalc_geometry()
+
         self.screen.fill((0, 0, 0))
         base_left = min(c.left for c in cells)
 
