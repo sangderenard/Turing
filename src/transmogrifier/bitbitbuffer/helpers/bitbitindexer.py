@@ -61,7 +61,7 @@ class BitBitIndexer:
 
     @staticmethod
     def access(spec: BitBitIndex) -> Any:
-        print(f"accessed {spec.index} with spec: {spec}")
+        #print(f"accessed {spec.index} with spec: {spec}")
         if spec.empty:
             return None
         if spec.index_hook is not None:

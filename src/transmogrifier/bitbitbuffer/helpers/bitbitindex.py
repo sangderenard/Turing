@@ -24,7 +24,7 @@ class BitBitIndex:
                 self.empty = True
 
     def __repr__(self):
-        print(self.empty)
+        #print(self.empty)
         return depth_guarded_repr(self)
         
 
