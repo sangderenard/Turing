@@ -3,11 +3,18 @@ from ..bitstream_search import BitStreamSearch
 def minimize(self, cells):
     system_pressure = 0
     raws = {}
+
+    print("Cell stat table")
+    print(f"{'Index':<5} {'Label':<10} {'Left':<10} {'Right':<10} {'Raw':<10}")
+    print("=" * 55)
+
     for i, cell in enumerate(cells):
         self.pull_cell_mask(cell)  # Ensure the cell's mask is up-to-date
         print(f"Mask state at the beginning of minimize: {self.bitbuffer.mask.hex()}")
+        
+        
         raw = self.bitbuffer[cell.left:cell.right]
-        assert not (raw is None or len(raw) == 0), f"Line 10: Cell {cell.label} raw is None or empty, sort this out before calling"
+        assert not (raw is None), f"Line 10: Cell {cell.label} raw is None or empty, sort this out before calling"
 
         print(f"raw state at the beginning of minimize: {raw.hex()}")
         known_gaps = []
@@ -27,7 +34,9 @@ def minimize(self, cells):
         assert cell.right - right_flat_length >= cell.left, f"Cell {cell.label} right - right_flat_length {cell.right - right_flat_length} is less than left {cell.left}, this should not happen"
         assert left_flat_length + right_flat_length <= (cell.right - cell.left), f"Cell {cell.label} left_flat_length + right_flat_length {left_flat_length + right_flat_length} exceeds right - left {cell.right - cell.left}, this should not happen"
         if cell.left != cell.right:
+            print(f"Cell {cell.label} left: {cell.left}, right: {cell.right}, stride: {cell.stride}, raw length: {len(raw)}")
             left_pattern, right_pattern = self.bitbuffer.tuplepattern(cell.left, cell.right, left_flat_length, "bi")
+            print(f"Cell {cell.label} left pattern: {left_pattern}, right pattern: {right_pattern}")
             if not (len(left_pattern) + len(right_pattern) == 0):
                 
                 assert len(left_pattern) > 0, f"Left pattern for cell {cell.label} is empty, this should not happen"

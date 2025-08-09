@@ -158,6 +158,7 @@ class BitBitIndexer:
             try:
                 from ..bitbitbuffer import BitBitBuffer
             except Exception:
+                print("Failed to import BitBitBuffer")
                 BitBitBuffer = None
             if BitBitBuffer is not None and isinstance(spec.caller, BitBitBuffer):
                 full_mask = BitBitIndexer._get_mask(buf, 0, list(range(buf.mask_size)))
@@ -166,7 +167,8 @@ class BitBitIndexer:
                     logging.debug(f"[access] repr result={result}")
                 return result
             elif BitBitBuffer is None:
-                return f"Empty Buffer"
+                print("BitBitBuffer is None (indexer access)")
+                return f"Empty Buffer (indexer access)"
             # BitBitSlice repr
             if isinstance(spec.caller, BitBitSlice):
                 mraw = BitBitIndexer._get_mask(buf, spec.base_offset, spec.indices())
