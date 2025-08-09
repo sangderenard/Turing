@@ -53,7 +53,15 @@ def snap_cell_walls(self, cells, proposals):
     # The right of the previous cell is snapped to the same grid line.
     boundary_updates = []
     max_needed = self.bitbuffer.mask_size
-    system_lcm = self.lcm(proposals)
+    print(f"strides are:")
+    for cell in sorted_cells + empty_cells:
+        print(f"Cell {cell.label} stride: {cell.stride}")
+    system_lcm = self.lcm(sorted_cells)
+    print(f"System LCM is: {system_lcm}")
+    assert system_lcm > 0, "System LCM must be greater than zero"
+    assert system_lcm % 2 == 0, "System LCM must be even for proper alignment"
+    for cell in sorted_cells:
+        assert system_lcm % cell.stride == 0, f"Cell {cell.label} stride {cell.stride} must align with system LCM {system_lcm}"
     self.system_lcm = system_lcm  # ensure metadata uses the same grid
 
     # Keep RIGHT_WALL tracking the current mask extent to start, it may move right
