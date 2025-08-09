@@ -37,9 +37,11 @@ def print_system(sim, width=80):
     max_run = max(runs) if runs else 0
     frag_pct = (1 - max_run / free_bits) * 100 if free_bits else 0.0
 
+    data_bits = sim.bitbuffer.data_size
+    mask_bits = sim.bitbuffer.mask_size
     size_string = (
-        f"Total size: {total_bits} bits "
-        f"({total_bits/8:.2f} bytes, mask bits: {sim.bitbuffer.mask_size})"
+        f"Total size: {data_bits + mask_bits} bits "
+        f"({data_bits / 8:.2f} bytes data; {mask_bits} bits mask)"
     )
     free_string = f"Free: {free_bits} bits; fragmentation: {frag_pct:.2f}%"
 
