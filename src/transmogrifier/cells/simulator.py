@@ -40,6 +40,7 @@ class Simulator:
         self.p_exprs = [Integer(1) for _ in range(CELL_COUNT)]
         self.engine = None
         self.fractions = None
+        self.closed = False
         # Call ``run_saline_sim`` to enable the full saline pressure model.
 
 # Attach modularized methods from simulator_methods
