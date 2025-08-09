@@ -122,8 +122,19 @@ FPS         = 60
 # ────────────────────────────────────────────────────────────────
 # Live injection driver (manual keys 0-7 or auto every N seconds)
 # ----------------------------------------------------------------
-INJECT_KEYS = {pygame.K_0: 0, pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
-               pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6, pygame.K_7: 7}
+if VISUALISE:  # pragma: no branch - trivial runtime guard
+    INJECT_KEYS = {
+        pygame.K_0: 0,
+        pygame.K_1: 1,
+        pygame.K_2: 2,
+        pygame.K_3: 3,
+        pygame.K_4: 4,
+        pygame.K_5: 5,
+        pygame.K_6: 6,
+        pygame.K_7: 7,
+    }
+else:
+    INJECT_KEYS = {}
 AUTO_INJECT_EVERY = 0.10          # seconds (set 0 to disable)
 
 
@@ -279,7 +290,7 @@ if __name__ == "__main__":
             if ev.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-            if ev.type == pygame.KEYDOWN and ev.key in INJECT_KEYS:
+            if INJECT_KEYS and ev.type == pygame.KEYDOWN and ev.key in INJECT_KEYS:
                 idx = INJECT_KEYS[ev.key]
                 target = cells[idx]
                 data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
