@@ -98,23 +98,15 @@ def print_system(sim, width=80):
     print(''.join(output))
     print(size_string, free_string)
 
-def bar(sim, number=2, width=80):
-    """Emit ``number`` rows of ``#`` characters for quick visual separators."""
-    for _ in range(number):
-        print("#" * width)
-
-
 # ────────────────────────────────────────────────────────────────
 # Live Pygame Visualiser driven by the Simulator
 # ----------------------------------------------------------------
-import sys
-import time
-
 try:  # pragma: no cover - optional dependency
-    import pygame
+    import pygame, sys, time
     VISUALISE = True
-except ImportError:  # pragma: no cover - pygame not available
+except Exception:  # pragma: no cover - pygame not available
     pygame = None  # type: ignore
+    sys = time = None  # type: ignore
     VISUALISE = False
 SCALE_X     = 1.0           # pixels per byte  (auto-scaled below)
 ROW_H       = 28            # pixels per cell row
@@ -126,19 +118,8 @@ FPS         = 60
 # ────────────────────────────────────────────────────────────────
 # Live injection driver (manual keys 0-7 or auto every N seconds)
 # ----------------------------------------------------------------
-if VISUALISE:  # pragma: no branch - trivial runtime guard
-    INJECT_KEYS = {
-        pygame.K_0: 0,
-        pygame.K_1: 1,
-        pygame.K_2: 2,
-        pygame.K_3: 3,
-        pygame.K_4: 4,
-        pygame.K_5: 5,
-        pygame.K_6: 6,
-        pygame.K_7: 7,
-    }
-else:
-    INJECT_KEYS = {}
+INJECT_KEYS = {pygame.K_0: 0, pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
+               pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6, pygame.K_7: 7}
 AUTO_INJECT_EVERY = 0.10          # seconds (set 0 to disable)
 
 
@@ -149,7 +130,6 @@ class _LCVisual:
         self.sim = sim
         pygame.init()
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font(None, 18)
 
         # geometry is derived from the cell layout and may change as cells
         # expand/shrink; keep a cached copy and recalc when needed
@@ -233,8 +213,9 @@ class _LCVisual:
                     x += int(stride * SCALE_X)
 
             # label at left edge
+            font = pygame.font.Font(None, 18)
             self.screen.blit(
-                self.font.render(str(c.label), True, (255, 255, 255)),
+                font.render(str(c.label), True, (255, 255, 255)),
                 (xL + 4, y0 + 4),
             )
 
@@ -294,7 +275,7 @@ if __name__ == "__main__":
             if ev.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-            if INJECT_KEYS and ev.type == pygame.KEYDOWN and ev.key in INJECT_KEYS:
+            if ev.type == pygame.KEYDOWN and ev.key in INJECT_KEYS:
                 idx = INJECT_KEYS[ev.key]
                 target = cells[idx]
                 data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
