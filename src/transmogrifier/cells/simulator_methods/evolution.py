@@ -11,6 +11,9 @@ def evolution_tick(self, cells, max_iters: int = 10):
         total_space = self.bitbuffer.mask_size
         proposals = []
         new_widths = []
+        print(f"Fractions: {[float(frac) for frac in fractions]}")
+        print(f"LCM: {self.system_lcm}")
+        print(f"Total space: {total_space}")
         for cell, frac in zip(cells, fractions):
             new_width = self.bitbuffer.intceil(1+max(
                 self.bitbuffer.intceil(cell.salinity, cell.stride),

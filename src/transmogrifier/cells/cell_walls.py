@@ -36,11 +36,25 @@ def snap_cell_walls(self, cells, proposals):
             c.rightmost = c.right - 1
 
     # filter empty cells and proposals
-    cells = [c for c in cells if ((c.leftmost < c.rightmost) and (c.left < c.right)) or (c in (LEFT_WALL, RIGHT_WALL))]
-    empty_cells = [c for c in cells if ((c.leftmost >= c.rightmost) or (c.left >= c.right)) and (c not in (LEFT_WALL, RIGHT_WALL))]
+    # Note: rightmost is inclusive. A single-width cell has leftmost == rightmost and is valid.
+    empty_cells = [
+        c for c in cells
+        if ((c.leftmost > c.rightmost) or (c.left >= c.right)) and (c not in (LEFT_WALL, RIGHT_WALL))
+    ]
 
-    proposals = [p for p in proposals if ((p.leftmost < p.rightmost) and (p.left < p.right)) or (p in (LEFT_WALL, RIGHT_WALL))]
-    empty_proposals = [p for p in proposals if ((p.leftmost >= p.rightmost) or (p.left >= p.right)) and (p not in (LEFT_WALL, RIGHT_WALL))]
+    cells = [
+        c for c in cells
+        if ((c.leftmost <= c.rightmost) and (c.left < c.right)) or (c in (LEFT_WALL, RIGHT_WALL))
+    ]
+    empty_proposals = [
+        p for p in proposals
+        if ((p.leftmost > p.rightmost) or (p.left >= p.right)) and (p not in (LEFT_WALL, RIGHT_WALL))
+    ]
+    
+    proposals = [
+        p for p in proposals
+        if ((p.leftmost <= p.rightmost) and (p.left < p.right)) or (p in (LEFT_WALL, RIGHT_WALL))
+    ]
     sorted_cells = sorted(cells, key=lambda c: c.leftmost)
     sorted_proposals = sorted(proposals, key=lambda p: p.leftmost)
     cells = [LEFT_WALL] + sorted_cells + [RIGHT_WALL]
@@ -56,7 +70,7 @@ def snap_cell_walls(self, cells, proposals):
     print(f"strides are:")
     for cell in sorted_cells + empty_cells:
         print(f"Cell {cell.label} stride: {cell.stride}")
-    system_lcm = self.lcm(sorted_cells)
+    system_lcm = self.lcm(sorted_cells + empty_cells)
     print(f"System LCM is: {system_lcm}")
     assert system_lcm > 0, "System LCM must be greater than zero"
     assert system_lcm % 2 == 0, "System LCM must be even for proper alignment"
