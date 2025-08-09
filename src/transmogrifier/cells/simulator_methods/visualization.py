@@ -175,17 +175,25 @@ class _LCVisual:
             pb = self.sim.bitbuffer.pid_buffers.get(c.label)
             if pb:
                 mask = pb.pids
-                slots = mask.mask_size
+                mask_slots = mask.mask_size
             else:
                 mask = None
-                slots = 0
+                mask_slots = 0
 
-            for slot_idx in range(slots):
-                x0 = 10 + int((c.left + slot_idx * stride - base_left) * SCALE_X)
-                x1 = 10 + int((c.left + (slot_idx + 1) * stride - base_left) * SCALE_X)
+            # Number of stride buckets that cover the cell's span
+            cell_slots = ((c.right - c.left) + stride - 1) // stride
+
+            for slot_idx in range(cell_slots):
+                slot_left = c.left + slot_idx * stride
+                if slot_left >= c.right:
+                    break
+                slot_right = min(slot_left + stride, c.right)
+
+                x0 = 10 + int((slot_left - base_left) * SCALE_X)
+                x1 = 10 + int((slot_right - base_left) * SCALE_X)
                 w = max(1, x1 - x0)
 
-                bit_active = int(mask[slot_idx])
+                bit_active = int(mask[slot_idx]) if mask and slot_idx < mask_slots else 0
                 colour = COL_DATA if bit_active else COL_SOLVENT
                 pygame.draw.rect(
                     self.screen,
