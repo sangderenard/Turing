@@ -61,6 +61,9 @@ class BitBitIndexer:
 
     @staticmethod
     def access(spec: BitBitIndex) -> Any:
+        print(f"accessed {spec.index} with spec: {spec}")
+        if spec.empty:
+            return None
         if spec.index_hook is not None:
             translated_index = spec.index_hook(spec.index)
             if translated_index is None:
@@ -162,6 +165,8 @@ class BitBitIndexer:
                 if BitBitIndexer.logging_enabled:
                     logging.debug(f"[access] repr result={result}")
                 return result
+            elif BitBitBuffer is None:
+                return f"Empty Buffer"
             # BitBitSlice repr
             if isinstance(spec.caller, BitBitSlice):
                 mraw = BitBitIndexer._get_mask(buf, spec.base_offset, spec.indices())

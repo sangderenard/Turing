@@ -16,9 +16,18 @@ class BitBitIndex:
         self.value = value
         self.inverted = inverted
         self.index_hook = index_hook
+        self.empty = False
+        if isinstance(index, slice):
+            if index.start is None and index.stop is None:
+                self.empty = True
+            elif index.start == index.stop:
+                self.empty = True
 
     def __repr__(self):
+        print(self.empty)
         return depth_guarded_repr(self)
+        
+
     def normalize(self) -> tuple[int,int,int]:
         """
         Normalize raw index into (start, stop, step) following native Python slice rules.
@@ -49,7 +58,8 @@ class BitBitIndex:
         assert start >= 0, "Index out of range"
         assert stop <= mask_size, "Index out of range"
         assert step != 0, "Slice step cannot be zero"
-        assert stop != start, "Slice start and stop cannot be equal"
+        if stop == start:
+            self.empty = True
         return start, stop, step
 
     def indices(self) -> List[int]:

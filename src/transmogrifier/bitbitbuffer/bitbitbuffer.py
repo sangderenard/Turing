@@ -134,7 +134,13 @@ class BitBitBuffer:
 
     def __repr__(self):
         spec = BitBitIndex(self, slice(None), mode='repr')
-        return self.indexer.access(spec)
+        return_val = self.indexer.access(spec)
+        if return_val is not None:
+            return return_val
+        return "Empty Buffer"
+
+    def __str__(self):
+        return self.__repr__()
 
     def __iter__(self):
         for i in range(self.mask_size):
@@ -468,6 +474,17 @@ class BitBitBuffer:
         return runs
 
     def tuplepattern(self, src, end, length, direction='left'):
+        
+        if self is None or not isinstance(self, BitBitBuffer):
+            raise TypeError("Invalid BitBitBuffer")
+        print(self)
+        print(src)
+        print(end)
+        print(length)
+        print(direction)
+        print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
+        if length == 0 or src >= end or src < 0 or end > len(self) or length < 0 or src == end:
+            return [], []
         if direction == 'left' or direction == 'bi':
             reversed = self[src:end][::-1][:length]
             right_pattern = self._count_runs(reversed)
