@@ -105,12 +105,14 @@ def bar(sim, number=2, width=80):
 # ────────────────────────────────────────────────────────────────
 # Live Pygame Visualiser driven by the Simulator
 # ----------------------------------------------------------------
+import sys
+import time
+
 try:  # pragma: no cover - optional dependency
-    import pygame, sys, time
+    import pygame
     VISUALISE = True
-except Exception:  # pragma: no cover - pygame not available
+except ImportError:  # pragma: no cover - pygame not available
     pygame = None  # type: ignore
-    sys = time = None  # type: ignore
     VISUALISE = False
 SCALE_X     = 1.0           # pixels per byte  (auto-scaled below)
 ROW_H       = 28            # pixels per cell row
