@@ -106,11 +106,11 @@ def bar(sim, number=2, width=80):
 # Live Pygame Visualiser driven by the Simulator
 # ----------------------------------------------------------------
 try:  # pragma: no cover - optional dependency
-    import pygame, sys, time, ctypes
+    import pygame, sys, time
     VISUALISE = True
 except Exception:  # pragma: no cover - pygame not available
     pygame = None  # type: ignore
-    sys = time = ctypes = None  # type: ignore
+    sys = time = None  # type: ignore
     VISUALISE = False
 SCALE_X     = 1.0           # pixels per byte  (auto-scaled below)
 ROW_H       = 28            # pixels per cell row
@@ -169,22 +169,19 @@ class _LCVisual:
 
         for row, c in enumerate(cells):
             y0 = 10 + row * ROW_H
-            stride = max(1, c.stride)          # avoid div-by-zero
+            stride = max(1, c.stride)  # avoid div-by-zero
 
-            # paint each quantum separately so solvent/data differ
-            if c.obj_map and c.len:
-                raw = (ctypes.c_ubyte * c.len).from_address(c.obj_map)
-            else:
-                raw = None
+            # Fetch the PID mask for this cell and draw each stride slot
+            pb = self.sim.bitbuffer.pid_buffers.get(c.label)
+            mask = pb.pids.mask if pb else []
+            slots = pb.pids.mask_size if pb else 0
 
-            n_q = c.len // stride if stride else 0
-            for q in range(n_q):
-                byte_off = c.left + q * stride
-                x0 = 10 + int((byte_off - base_left) * SCALE_X)
-                x1 = 10 + int((byte_off + stride - base_left) * SCALE_X)
-                w  = max(1, x1 - x0)
+            for slot_idx in range(slots):
+                x0 = 10 + int((c.left + slot_idx * stride - base_left) * SCALE_X)
+                x1 = 10 + int((c.left + (slot_idx + 1) * stride - base_left) * SCALE_X)
+                w = max(1, x1 - x0)
 
-                colour = COL_DATA if (raw and raw[q * stride] != 0) else COL_SOLVENT
+                colour = COL_DATA if mask[slot_idx] else COL_SOLVENT
                 pygame.draw.rect(
                     self.screen,
                     colour,
