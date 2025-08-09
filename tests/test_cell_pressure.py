@@ -38,7 +38,8 @@ def test_injection_mixed_prime7():
         b'\x55' * data_bytes_per_stride
     ]
     for p in payloads:
-        sim.write_data(cells[0].label, p)
+        sim.input_queues[cells[0].label] = sim.input_queues.get(cells[0].label, []) + [p]
+        cells[0].injection_queue += 1
     for _ in range(10):
         sp, _ = sim.step(cells)
     sim.print_system()
@@ -66,7 +67,8 @@ def test_sustained_random_injection():
             target_cell = random.choice(cells)
             data_bytes = (target_cell.stride * sim.bitbuffer.bitsforbits + 7) // 8
             payload = os.urandom(data_bytes)
-            sim.write_data(target_cell.label, payload)
+            sim.input_queues[target_cell.label] = sim.input_queues.get(target_cell.label, []) + [payload]
+            target_cell.injection_queue += 1
         sim.step(cells)
     total_remaining_items = 0
     for cell in cells:

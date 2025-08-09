@@ -1,5 +1,5 @@
 from sympy import Integer
-from transmogrifier.cells.salinepressure import SalineHydraulicSystem
+from src.transmogrifier.cells.simulator_methods.salinepressure import SalineHydraulicSystem
 
 
 def test_equilibrium_fracs_sum_to_one():

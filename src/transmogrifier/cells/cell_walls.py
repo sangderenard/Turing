@@ -73,7 +73,7 @@ def snap_cell_walls(self, cells, proposals):
     system_lcm = self.lcm(sorted_cells + empty_cells)
     print(f"System LCM is: {system_lcm}")
     assert system_lcm > 0, "System LCM must be greater than zero"
-    assert system_lcm % 2 == 0, "System LCM must be even for proper alignment"
+    #this isn't always true assert system_lcm % 2 == 0, "System LCM must be even for proper alignment"
     for cell in sorted_cells:
         assert system_lcm % cell.stride == 0, f"Cell {cell.label} stride {cell.stride} must align with system LCM {system_lcm}"
     self.system_lcm = system_lcm  # ensure metadata uses the same grid

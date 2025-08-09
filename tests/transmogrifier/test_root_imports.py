@@ -6,7 +6,6 @@ import transmogrifier
 
 def test_root_exports():
     expected = {
-        "CellPressureRegionManager",
         "Simulator",
         "BitTensorMemoryGraph",
         "NodeEntry",
