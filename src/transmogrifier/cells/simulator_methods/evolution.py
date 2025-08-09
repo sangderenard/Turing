@@ -19,6 +19,7 @@ def evolution_tick(self, cells, max_iters: int = 10):
             assert new_width % cell.stride == 0
             proposal = CellProposal(cell)
             proposal.right = proposal.left + new_width
+            assert proposal.right > proposal.left, "Invalid cell proposal"
             proposals.append(proposal)
             new_widths.append(new_width)
         self.snap_cell_walls(cells, proposals)

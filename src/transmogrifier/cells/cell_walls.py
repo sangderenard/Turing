@@ -92,7 +92,7 @@ def snap_cell_walls(self, cells, proposals):
 
         # Ensure non-negative widths while enforcing boundary on the LCM grid
         if b > curr.right:
-            curr.right = b
+            curr.right = b + orig_b_len
         prev.right = b
         curr.left = b
 

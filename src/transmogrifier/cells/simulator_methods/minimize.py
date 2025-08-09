@@ -7,16 +7,8 @@ def minimize(self, cells):
         self.pull_cell_mask(cell)  # Ensure the cell's mask is up-to-date
         print(f"Mask state at the beginning of minimize: {self.bitbuffer.mask.hex()}")
         raw = self.bitbuffer[cell.left:cell.right]
-        if raw is None or len(raw) == 0:
-            if cell.injection_queue > 0:
-                if cell.salinity < cell.injection_queue * cell.stride:
-                    print(f"Cell {cell.label} has injection queue but insufficient salinity")
-                    print(f"Insert salinity and balance system before minimizing.")
-                    cell.salinity = cell.injection_queue * cell.stride
-                    continue
-            else:
-                print(f"Line 10: Cell {cell.label} raw is None or empty")
-                continue
+        assert not (raw is None or len(raw) == 0), f"Line 10: Cell {cell.label} raw is None or empty, sort this out before calling"
+
         print(f"raw state at the beginning of minimize: {raw.hex()}")
         known_gaps = []
         left_resistive_force = 0
