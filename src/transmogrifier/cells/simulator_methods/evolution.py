@@ -37,7 +37,5 @@ def evolution_tick(self, cells, max_iters: int = 10):
 def step(self, cells):
     """Run one simulation step with size resolution preceding writes."""
     proposals = self.evolution_tick(cells)
-    for cell, proposal in zip(cells, proposals):
-        cell.left = proposal.left
-        cell.right = proposal.right
+
     return self.minimize(cells)
