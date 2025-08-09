@@ -18,7 +18,9 @@ def write_data(self, cell_label: str, payload: bytes):
     cell.salinity = queued_bits
     available_bits = cell.right - cell.left
     threshold = int(available_bits * (1 - self.SALINE_BUFFER))
+    print(f"Cell '{cell_label}' queued bits: {queued_bits}/{available_bits} (threshold: {threshold})")
     if queued_bits > threshold:
+        print(f"Cell '{cell_label}' nearing capacity ({queued_bits}/{available_bits} bits). Expanding...")
         self.run_saline_sim()
 
 def flush_pending_writes(self):

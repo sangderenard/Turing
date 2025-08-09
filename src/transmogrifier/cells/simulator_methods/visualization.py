@@ -209,7 +209,7 @@ def visualise_step(sim, cells):
         _vis = _LCVisual(sim)
 
     sim.run_saline_sim()
-    sp, mask = sim.step(cells)
+    #sp, mask = sim.step(cells)
 
     if VISUALISE:
         for ev in pygame.event.get():
@@ -218,7 +218,7 @@ def visualise_step(sim, cells):
                 sys.exit()
         _vis.draw()
 
-    return sp, mask
+    #return sp, mask
 
     # --------------------------------------------------------------------
     # DEMO HARNESS – basic pygame loop using the Simulator
@@ -226,12 +226,9 @@ def visualise_step(sim, cells):
 if __name__ == "__main__":
     import os
     import random
-    try:
-        from ..helpers.cell_consts import Cell
-        from ..helpers.simulator import Simulator
-    except Exception:  # pragma: no cover - fallback for legacy layout
-        from ..cell_consts import Cell
-        from ..simulator import Simulator
+    
+    from ..cell_consts import Cell
+    from ..simulator import Simulator
 
     specs = [
         dict(left=0,   right=128,  label="0", len=128, stride=128),
@@ -268,89 +265,9 @@ if __name__ == "__main__":
 
         visualise_step(sim, cells)
 
-    for b in range(total_bits):
-        cell_idx = None
-        for idx, cell in enumerate(cells):
-            if cell.left <= b < cell.right:
-                cell_idx = idx
-                break
-        mask_bit = bool(int(sim.bitbuffer[b]))
-        bit_info.append((b, cell_idx, mask_bit))
 
-    # 2) Fragmentation (unchanged)
-    free_bits = sum(1 for _, idx, m in bit_info if idx is not None and not m)
-    runs, run = [], 0
-    for _, idx, m in bit_info:
-        if idx is not None and not m:
-            run += 1
-        elif run:
-            runs.append(run); run = 0
-    if run: runs.append(run)
-    max_run = max(runs) if runs else 0
-    frag_pct = (1 - max_run / free_bits) * 100 if free_bits else 0.0
-
-    size_string = (
-        f"Total size: {total_bits} bits "
-        f"({total_bits/8:.2f} bytes, mask bits: {sim.bitbuffer.mask_size})"
-    )
-    free_string = f"Free: {free_bits} bits; fragmentation: {frag_pct:.2f}%"
-
-    # 3) Prepare labels & ramp
-    labels     = string.ascii_lowercase
-    alpha_len  = len(labels)
-    glyph_bases = [
-            ord('a'),    # level 1
-            ord('A'),    # level 2
-            0x03B1,      # level 3 α
-            0x0391,      # level 4 Α
-            0x0430,      # level 5 а
-            0x0410,      # level 6 А
-    ]
-    max_level = len(glyph_bases)
-
-    # 4) Columnize
-    bits_per_col = (total_bits + width - 1) // width
-    output = []
-    for col in range(width):
-        start = col * bits_per_col
-        end   = min(start + bits_per_col, total_bits)
-
-        # track which cells appear, and how many data‐hits each has
-        cell_presence = set()
-        cell_counts   = {}
-        for b, idx, m in bit_info[start:end]:
-            if idx is None:
-                continue
-            cell_presence.add(idx)
-            # only count “data” at stride‐anchor positions
-            cell = cells[idx]
-            if m and ((b - cell.left) % cell.stride) == 0:
-                cell_counts[idx] = cell_counts.get(idx, 0) + 1
-
-        if not cell_presence:
-            # entirely outside all cells
-            output.append('.')
-        else:
-            # for each cell in this column, emit one glyph
-            for idx in sorted(cell_presence):
-                cnt = cell_counts.get(idx, 0)
-                if cnt == 0:
-                    # inside a cell but no data → lower‐case label
-                    ch = labels[idx % alpha_len]
-                else:
-                    # data present → map 1→level1, 2→level2, ..., clamp
-                    level = min(cnt, max_level) - 1
-                    base  = glyph_bases[level]
-                    ch    = chr(base + (idx % alpha_len))
-                output.append(ch)
-
-    # 5) Print map + stats
-    print(''.join(output))
-    print(size_string, free_string)
 
 def bar(sim, number=2, width=80):
     """Emit ``number`` rows of ``#`` characters for quick visual separators."""
     for _ in range(number):
         print("#" * width)
-
-# ...rest of visualization.py omitted for brevity, but should be included in the actual file...

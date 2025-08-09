@@ -32,7 +32,7 @@ class SystemFlags(IntFlag):
     PRESERVE_LOCKS = auto()
     LOG_EVENTS     = auto()
     TRACK_FRAG     = auto()
-
+import ctypes
 # New Cell class definition for testing
 class Cell:
     def __init__(self, stride, left, right, len=None, profile='default', leftmost=None, rightmost=None, label=None):
@@ -42,8 +42,8 @@ class Cell:
         self.temperature = 0
         self.leftmost = leftmost
         self.rightmost = rightmost
-        #buf = ctypes.create_string_buffer((self.len + 7)// 8)
-        #self.obj_map = ctypes.addressof(buf)
+        buf = ctypes.create_string_buffer((self.len + 7)// 8)
+        self.obj_map = ctypes.addressof(buf)
         self.left = left
         self.right = right
         self.compressible = 1

@@ -252,6 +252,8 @@ class SalineHydraulicSystem:
             # compute averages
             avg_p = sum(c.pressure for c in cells) / len(cells)
             avg_C = sum(c.salinity for c in cells) / len(cells)
+
+            print(f"average pressure: {avg_p}, average salinity: {avg_C}")
             # differences
             dP = p_ext - avg_p
             dC = C_ext - avg_C
@@ -259,10 +261,11 @@ class SalineHydraulicSystem:
             dPi = R * T * dC
             # volumetric flow rate (bits per time)
             Jv = Lp * A * (dP - sigma * dPi)
-            delta = int(Jv * dt)
+            delta = Jv * dt
             # check equilibrium
-            if delta == 0:
+            if delta == 0.0:
                 print(f"Equilibrium in {step} steps")
+
                 break
             # check runaway
             if prev_delta is not None and abs(delta) > abs(prev_delta):
