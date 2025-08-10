@@ -149,7 +149,7 @@ def minimize(self, cells):
                 cell.pressure = pressure
                 if cell.label in self.input_queues:
                     cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
-                
+                print(f"Checking cell {cell.label}:")
                 system_pressure += pressure
                 if cell.label in self.input_queues and len(self.input_queues[cell.label]) > 0 and cell.label in self.assignable_gaps and len(self.assignable_gaps[cell.label]) > 0:
                     original_queue = self.input_queues[cell.label].copy()
@@ -201,7 +201,7 @@ def minimize(self, cells):
                     if self.assignable_gaps.get(cell.label):
                         assert False, "Cell has assignable gaps but injection queue is not empty"
         else:
-            cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
+            cell.salinity += sum(stride for _, stride in self.input_queues[cell.label] if cell.label in self.input_queues)
             print(f"Cell {cell.label} has no left/right distinction, skipping.")
             continue
         self.push_cell_mask(cell)
