@@ -108,7 +108,6 @@ except Exception:  # pragma: no cover - pygame not available
     pygame = None  # type: ignore
     sys = time = None  # type: ignore
     VISUALISE = False
-SCALE_X     = 1.0           # pixels per byte  (auto-scaled below)
 ROW_H       = 28            # pixels per cell row
 GRID_COLOUR = (180,180,180) # light grey grid lines
 COL_SOLVENT = (200,225,255) # pale blue
@@ -136,15 +135,15 @@ class _LCVisual:
         self._prev_span = None
         self._prev_rows = None
         self.screen = None  # assigned by _recalc_geometry()
+        self.scale_x = 1.0  # pixels per byte (auto-scaled below)
         self._recalc_geometry()
 
     def _recalc_geometry(self) -> None:
         """Recompute scale factors and window size based on current cells."""
         cells = self.sim.cells
         tot_span = max(c.right for c in cells) - min(c.left for c in cells)
-        global SCALE_X
-        SCALE_X = 1200 / max(1, tot_span)       # fit into ~1200 px window
-        w = int(tot_span * SCALE_X) + 20
+        self.scale_x = 1200 / max(1, tot_span)       # fit into ~1200 px window
+        w = int(tot_span * self.scale_x) + 20
         h = len(cells) * ROW_H + 20
         self.screen = pygame.display.set_mode((w, h))
         pygame.display.set_caption("Simulator memory layout")
@@ -185,8 +184,8 @@ class _LCVisual:
                     break
                 slot_right = min(slot_left + stride, c.right)
 
-                x0 = 10 + int((slot_left - base_left) * SCALE_X)
-                x1 = 10 + int((slot_right - base_left) * SCALE_X)
+                x0 = 10 + int((slot_left - base_left) * self.scale_x)
+                x1 = 10 + int((slot_right - base_left) * self.scale_x)
                 w = max(1, x1 - x0)
 
                 bit_active = int(mask[slot_idx]) if mask and slot_idx < mask_slots else 0
@@ -198,19 +197,19 @@ class _LCVisual:
                 )
 
             # cell boundary lines (after quanta so they stay visible)
-            xL = 10 + int((c.left  - base_left) * SCALE_X)
-            xR = 10 + int((c.right - base_left) * SCALE_X)
+            xL = 10 + int((c.left  - base_left) * self.scale_x)
+            xR = 10 + int((c.right - base_left) * self.scale_x)
             pygame.draw.line(self.screen, GRID_COLOUR, (xL, y0), (xL, y0 + ROW_H - 1))
             pygame.draw.line(self.screen, GRID_COLOUR, (xR, y0), (xR, y0 + ROW_H - 1))
 
             # optional: light stride grid inside region
             # comment out if busy
-            if stride and stride * SCALE_X > 4:
-                x = xL + int(stride * SCALE_X)
+            if stride and stride * self.scale_x > 4:
+                x = xL + int(stride * self.scale_x)
                 while x < xR - 1:
                     pygame.draw.line(self.screen, (60, 60, 60),
                                      (x, y0 + 4), (x, y0 + ROW_H - 5))
-                    x += int(stride * SCALE_X)
+                    x += int(stride * self.scale_x)
 
             # label at left edge
             font = pygame.font.Font(None, 18)
