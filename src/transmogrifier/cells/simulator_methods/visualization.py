@@ -297,7 +297,7 @@ if __name__ == "__main__":
 
 
 
-def bar(sim, number=2, width=80):
+def bar(number=2, width=80):
     """Emit ``number`` rows of ``#`` characters for quick visual separators."""
     for _ in range(number):
         print("#" * width)
