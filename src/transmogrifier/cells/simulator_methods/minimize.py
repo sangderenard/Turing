@@ -27,6 +27,9 @@ def minimize(self, cells):
         self.padding = raw.padding            # bits of alignment filler
         assert self.padding >= 0, "negative padding is impossible"
         right_flat_length = left_flat_length = self.bitbuffer.intceil(self.bitbuffer.intceil(cell.right - cell.left,4)//4, cell.stride)
+        if right_flat_length + left_flat_length > cell.right-cell.left:
+            right_flat_length = (right_flat_length - cell.stride + 1)//cell.stride*cell.stride
+            left_flat_length = (left_flat_length + cell.stride - 1)//cell.stride*cell.stride
         assert left_flat_length % cell.stride == 0, f"Left flat length {left_flat_length} for cell {cell.label} is not aligned with stride {cell.stride}"
         assert left_flat_length >= 0, f"Left flat length {left_flat_length} for cell {cell.label} is negative, this should not happen"
         assert right_flat_length >= 0, f"Right flat length {right_flat_length} for cell {cell.label} is negative, this should not happen"
