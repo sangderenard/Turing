@@ -301,7 +301,9 @@ if __name__ == "__main__":
             target = cells[idx]
             data_len = (target.stride * sim.bitbuffer.bitsforbits + 7) // 8
             # queue the payload
-            sim.input_queues.setdefault(target.label, []).append((os.urandom(data_len), target.stride))
+            if target.label not in sim.input_queues:
+                sim.input_queues[target.label] = []
+            sim.input_queues[target.label].append((os.urandom(data_len), target.stride))
             # tell the system there’s one more item to inject
             target.injection_queue += 1
             next_auto = now + AUTO_INJECT_EVERY

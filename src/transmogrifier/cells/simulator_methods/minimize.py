@@ -49,6 +49,7 @@ def minimize(self, cells):
                 assert cell.right % cell.stride == 0, f"Cell {cell.label} right {cell.right} is not aligned with stride {cell.stride}"
                 right_gaps = [cell.right - (gap + cell.stride) for gap in right_gaps] # +1 is for the fact that just the stride puts us at the end of another stride
                 print(f"Cell {cell.label} left pattern: {left_pattern}, right pattern: {right_pattern}")
+                print(f"left gaps: {left_gaps}, right gaps: {right_gaps}")
                 for i, pattern in enumerate(left_pattern):
                     assert pattern[1] % cell.stride == 0, f"Left pattern {pattern} for cell {cell.label} is not aligned with stride {cell.stride}"
                 for i, pattern in enumerate(right_pattern):
@@ -94,6 +95,7 @@ def minimize(self, cells):
                 for left_gap, right_gap in gap_pairs[::-1]:
                     known_gaps.append(left_gap)
                     known_gaps.append(right_gap)
+                print(f"known_gaps: {known_gaps}")
                 indices_to_zero = set()
                 contiguating = False
                 if contiguating:
@@ -140,6 +142,7 @@ def minimize(self, cells):
                 relative_gaps = [gap - cell.left for gap in known_gaps]
                 gap_pids = []
                 best_gaps = known_gaps[:cell.injection_queue] if cell.injection_queue > 0 else []
+                print(f"Best gaps for cell {cell.label}: {best_gaps}")
                 if len(best_gaps) > 0:
                     if cell.label not in self.assignable_gaps:
                         self.assignable_gaps[cell.label] = []
@@ -151,7 +154,10 @@ def minimize(self, cells):
                     cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
                 print(f"Checking cell {cell.label}:")
                 system_pressure += pressure
+                print(f"input_queues: {self.input_queues}")
+
                 if cell.label in self.input_queues and len(self.input_queues[cell.label]) > 0 and cell.label in self.assignable_gaps and len(self.assignable_gaps[cell.label]) > 0:
+                    print(f"Cell {cell.label} has input queues and assignable gaps, proceeding with injection.")
                     original_queue = self.input_queues[cell.label].copy()
                     relative_consumed_gaps, consumed_gaps, queue = self.injection(
                         self.input_queues[cell.label], self.assignable_gaps[cell.label], gap_pids, 0

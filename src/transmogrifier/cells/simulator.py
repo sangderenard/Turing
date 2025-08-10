@@ -92,10 +92,12 @@ def main():
     sim = Simulator(cells)
 
     for _ in range(5):
-        sim.write_data('A', b'\xde\xad')
-        sim.write_data('B', b'\xbe\xef')
-
-        sim.step(cells)
+        
+        sim.input_queues['A'] = [(b'\xde\xad' * 4, 4)]
+        sim.input_queues['B'] = [(b'\xbe\xef' * 4, 4)]
+        cells[0].injection_queue = 1
+        cells[1].injection_queue = 1
+        sim.minimize(sim.cells)
         sim.print_system()
 
 if __name__ == "__main__":
