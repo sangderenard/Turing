@@ -148,7 +148,8 @@ def minimize(self, cells):
                         self.assignable_gaps[cell.label] = []
                     self.assignable_gaps[cell.label].extend(best_gaps)
                     cell.injection_queue -= len(best_gaps)
-                    gap_pids = self.bitbuffer.pid_buffers[cell.label].get_pids(best_gaps)
+                    pid_gaps = [gap - cell.left for gap in best_gaps]
+                    gap_pids = self.bitbuffer.pid_buffers[cell.label].get_pids(pid_gaps)
                 cell.pressure = pressure
                 if cell.label in self.input_queues:
                     cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])

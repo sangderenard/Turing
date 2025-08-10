@@ -42,10 +42,18 @@ def snap_cell_walls(self, cells, proposals):
         if ((c.leftmost > c.rightmost) or (c.left >= c.right)) and (c not in (LEFT_WALL, RIGHT_WALL))
     ]
 
+
+    print("Empty Cell Report:")
+    for c in empty_cells:
+        print(f" - Cell {c.label}: {c.leftmost} to {c.rightmost} data in {c.left} to {c.right} (stride {c.stride})")
+
     cells = [
         c for c in cells
         if ((c.leftmost <= c.rightmost) and (c.left < c.right)) or (c in (LEFT_WALL, RIGHT_WALL))
     ]
+    
+
+    
     empty_proposals = [
         p for p in proposals
         if ((p.leftmost > p.rightmost) or (p.left >= p.right)) and (p not in (LEFT_WALL, RIGHT_WALL))
@@ -141,6 +149,8 @@ def snap_cell_walls(self, cells, proposals):
     proposals.pop()
     proposals.pop(0)  # Remove LEFT_WALL and RIGHT_WALL from the proposals
 
+
+
     # destribute empty cells and proposals into empty space
 
     #self.bar()
@@ -157,10 +167,13 @@ def snap_cell_walls(self, cells, proposals):
         max_needed += empty_proposal.stride
 
     #print("Done snapping empty cells and proposals.")
-    #self.bar()
+    self.bar()
     # Diagnostic print
-    #print(f"Snapped cell walls: {[f'{cell.label}: {cell.left}-{cell.right} (stride {cell.stride})' for cell in proposals]}")
+    print(f"Snapped cell walls: {[f'{cell.label}: {cell.left}-{cell.right} (stride {cell.stride})' for cell in proposals]}")
 
+
+    proposals = proposals# + empty_proposals
+    cells = cells# + empty_cells
 
     # --- Intermission: Perform a single, system-wide expansion if needed ---
     if max_needed > self.bitbuffer.mask_size:
@@ -184,7 +197,7 @@ def snap_cell_walls(self, cells, proposals):
     #self.bar()
 
 def build_metadata(self, offset_bits, size_bits, cells):
-        
+    assert len(cells) > 0, "No cells provided to build_metadata"
     events = []
     # make sure these are lists
     offs = offset_bits if isinstance(offset_bits, (list,tuple)) else [offset_bits]
@@ -244,5 +257,13 @@ def expand(self, offset_bits, size_bits, cells, proposals, warp=True):
     events = self.build_metadata(offset_bits, size_bits, cells)
     #for label, pos, share in events:
         #print(f"Expanding cell {label} at position {pos} with share {share} bits")
-    self.bitbuffer.expand(events, cells, proposals)
+    proposals = self.bitbuffer.expand(events, cells, proposals)
 
+    for new_cell in proposals:
+        for cell in cells:
+            if cell.label == new_cell.label:
+                cell.left = new_cell.left
+                cell.right = new_cell.right
+                cell.leftmost = new_cell.leftmost
+                cell.rightmost = new_cell.rightmost
+                break

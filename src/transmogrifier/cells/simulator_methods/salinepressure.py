@@ -1,5 +1,7 @@
 from sympy import symbols, sin, lambdify, Integer, Float
 from math import pi, ceil, floor
+
+from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
 from ..cell_consts import CELL_COUNT
 class SalineHydraulicSystem:
     """
@@ -83,8 +85,8 @@ class SalineHydraulicSystem:
             size_and_offsets = sorted(list(zip(sizes, offsets)), reverse=True, key=lambda x: x[1])
             for size, offset in size_and_offsets:
                 sim.expand([offset], sim.bitbuffer.intceil(size, sim.lcm(sim.cells)), sim.cells, sim.cells)
-
-        sim.snap_cell_walls(sim.cells, sim.cells)
+        proposals = [CellProposal(cell) for cell in sim.cells]
+        sim.snap_cell_walls(sim.cells, proposals)
 
 
     def run_balanced_saline_sim(self, mode="open"):

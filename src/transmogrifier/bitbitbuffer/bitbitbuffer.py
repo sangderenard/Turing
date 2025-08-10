@@ -279,6 +279,7 @@ class BitBitBuffer:
                 # a) copy block before this gap
                 chunk = orig_off - src_cursor                    # mask-bits
                 if chunk:
+                    print(f"[feature_spreader] copying {chunk} units from src={src_cursor} to dst={dst_cursor}")
                     chunk_bits = chunk * stride
                     logging.debug(f"[feature_spreader] copying {chunk} units ({chunk_bits} bits) from src={src_cursor} to dst={dst_cursor}")
                     segment = self.extract_bit_region(src_plane,
@@ -364,7 +365,7 @@ class BitBitBuffer:
 
         for label, pid in self.pid_buffers.items():
             logging.debug(f"[_insert_bits] updating PIDBuffer '{label}': old mask_size={pid.pids.mask_size}, old data_size={pid.pids.data_size}")
-            new_pid_mask, new_pid_view, new_pid_bits, new_pid_data, new_pid_data_view, new_pid_data_bits =                     mask_and_data_spreader(pid.pids, pid.pids.mask_size, pid.pids.bitsforbits,
+            new_pid_mask, new_pid_view, new_pid_bits, new_pid_data, new_pid_data_view, new_pid_data_bits = mask_and_data_spreader(pid.pids, pid.pids.mask_size, pid.pids.bitsforbits,
                                        insertion_plans, plan_ratio=pid.domain_stride, plan_offset=pid.domain_left)
             logging.debug(f"[_insert_bits] updating PIDBuffer '{label}': new mask_size={new_pid_bits}, new data_size={new_pid_data_bits}")
             pid.pids.mask, pid.pids.mask_size = new_pid_mask, new_pid_bits

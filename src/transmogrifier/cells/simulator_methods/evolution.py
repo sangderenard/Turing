@@ -26,6 +26,8 @@ def evolution_tick(self, cells, max_iters: int = 10):
             assert proposal.right > proposal.left, "Invalid cell proposal"
             proposals.append(proposal)
             new_widths.append(new_width)
+        assert len(cells) > 0, "No cells provided to snap walls"
+        assert len(proposals) > 0, "No proposals provided to snap walls"
         self.snap_cell_walls(cells, proposals)
         if new_widths == prev_widths:
             break
