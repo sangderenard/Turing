@@ -108,16 +108,8 @@ DEFAULT_FLAG_PROFILES = {
     },
 }
 
-LEFT_WALL = Cell(
-    stride=1, left=0, right=0, len=0, profile='rigid_partition', rightmost=0, leftmost=0
-)
-RIGHT_WALL = Cell(
-    stride=1, left=0, right=0, len=0, profile='rigid_partition'
-)
-
 STRIDE = 12
 CELL_COUNT = 1
 MASK_BITS_TO_DATA_BITS = 16
-TEST_SIZE_STRIDE_TIMES_UNITS = (STRIDE ** 2 * 8 * STRIDE * CELL_COUNT) // ( 8 * STRIDE * CELL_COUNT)
+TEST_SIZE_STRIDE_TIMES_UNITS = (STRIDE ** 2 * 8 * STRIDE * CELL_COUNT) // (8 * STRIDE * CELL_COUNT)
 assert TEST_SIZE_STRIDE_TIMES_UNITS % STRIDE == 0
-# Simulator class to coordinate simulation steps

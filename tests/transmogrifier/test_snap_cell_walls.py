@@ -1,7 +1,7 @@
 import pytest
 import random
 from src.transmogrifier.cells.simulator import Simulator  # Adjust this import to your project structure
-from src.transmogrifier.cells.cell_consts import Cell, LEFT_WALL, RIGHT_WALL
+from src.transmogrifier.cells.cell_consts import Cell
 from src.transmogrifier.bitbitbuffer import CellProposal
 
 def _build_cells(config: str, variant: str, seed: int | None = None):
@@ -273,15 +273,13 @@ def test_boundary_contiguity(sim_and_cells):
         assert isinstance(sim._fixture_error, exc_types)
         assert any(s.lower() in msg.lower() for s in substrs)
         return
-    if _maybe_expect_exception(sim, lambda: sim.snap_cell_walls(cells, proposals)):
+    if _maybe_expect_exception(sim, lambda: sim.snap_cell_walls(cells, proposals, left_boundary=0, right_boundary=sim.bitbuffer.mask_size)):
         return
 
     # --- Assertions ---
-    # Check contiguity from LEFT_WALL up to the last proposal
-    all_boundaries = [LEFT_WALL] + proposals
-    for i in range(len(all_boundaries) - 1):
-        prev_cell = all_boundaries[i]
-        curr_cell = all_boundaries[i+1]
+    for i in range(len(proposals) - 1):
+        prev_cell = proposals[i]
+        curr_cell = proposals[i + 1]
         assert prev_cell.right == curr_cell.left, \
             f"Gap or overlap found: Cell '{prev_cell.label}' ends at {prev_cell.right} but Cell '{curr_cell.label}' starts at {curr_cell.left}."
 
