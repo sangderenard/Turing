@@ -49,12 +49,12 @@ def print_system(sim, width=80):
     labels     = string.ascii_lowercase
     alpha_len  = len(labels)
     glyph_bases = [
-            ord('a'),    # level 1
-            ord('A'),    # level 2
-            0x03B1,      # level 3 α
-            0x0391,      # level 4 Α
-            0x0430,      # level 5 а
-            0x0410,      # level 6 А
+            ord('A'),    # level 1
+            0x03B1,      # level 2 α
+            0x0391,      # level 3 Α
+            0x0430,      # level 4 а
+            0x0410,      # level 5 А
+            0x24B6,      # level 6 Ⓐ
     ]
     max_level = len(glyph_bases)
 
