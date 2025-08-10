@@ -85,6 +85,11 @@ class PIDBuffer:
                         continue
 
     def get_pids(self, gaps):
+        """Return UUIDs for the given absolute bit positions ``gaps``.
+
+        Each gap must lie within the PIDBuffer's domain boundaries; callers
+        are responsible for providing system-relative (absolute) coordinates.
+        """
         logging.debug(f"[PIDBuffer.get_pids] gaps={gaps}")
         assert isinstance(gaps, (list, tuple)), "gaps must be a list or tuple"
         return_vals = []
