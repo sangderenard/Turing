@@ -54,7 +54,7 @@ from .simulator_methods.lcm import lcm
 from .simulator_methods.minimize import minimize
 
 Simulator.print_system = print_system
-Simulator.bar = bar
+Simulator.bar = staticmethod(bar)
 Simulator.get_cell_mask = get_cell_mask
 Simulator.set_cell_mask = set_cell_mask
 Simulator.pull_cell_mask = pull_cell_mask
