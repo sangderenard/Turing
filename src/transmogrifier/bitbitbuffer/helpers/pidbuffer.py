@@ -54,18 +54,32 @@ class PIDBuffer:
         else:
             logging.debug(f"[PIDBuffer.get_by_pid] cache hit, active_set_size={len(self.active_set)}")
             for active_pid, gap in self.active_set:
-                # Handle cached raw bytes or UUID objects
+                # `gap` is the stride index within the domain.  Convert back to
+                # an absolute bit position by scaling with the domain stride and
+                # offsetting by the domain left boundary.
                 if isinstance(active_pid, uuid.UUID):
                     if active_pid == pid:
-                        logging.debug(f"[PIDBuffer.get_by_pid] returning cached index={gap}")
                         from ..bitbitbuffer import BitBitBuffer
-                        return (gap + BitBitBuffer._intceil(self.domain_left, self.domain_stride))
+                        logging.debug(
+                            f"[PIDBuffer.get_by_pid] returning cached index={gap}"
+                        )
+                        return (
+                            BitBitBuffer._intceil(self.domain_left, self.domain_stride)
+                            + (gap * self.domain_stride)
+                        )
                 else:
                     try:
-                        if int.from_bytes(active_pid, 'big') == pid.int:
-                            logging.debug(f"[PIDBuffer.get_by_pid] returning cached index={gap}")
+                        if int.from_bytes(active_pid, "big") == pid.int:
                             from ..bitbitbuffer import BitBitBuffer
-                            return (gap + BitBitBuffer._intceil(self.domain_left, self.domain_stride))
+                            logging.debug(
+                                f"[PIDBuffer.get_by_pid] returning cached index={gap}"
+                            )
+                            return (
+                                BitBitBuffer._intceil(
+                                    self.domain_left, self.domain_stride
+                                )
+                                + (gap * self.domain_stride)
+                            )
                     except (TypeError, ValueError):
                         # Skip invalid entries
                         continue
@@ -74,13 +88,19 @@ class PIDBuffer:
         logging.debug(f"[PIDBuffer.get_pids] gaps={gaps}")
         assert isinstance(gaps, (list, tuple)), "gaps must be a list or tuple"
         return_vals = []
+        from ..bitbitbuffer import BitBitBuffer
         for gap in gaps:
             pid = self.create_id(gap)
             logging.debug(f"[PIDBuffer.get_pids] created pid={pid} for gap={gap}")
             return_vals.append(pid)
             if self.active_set is None:
                 self.active_set = set()
-            self.active_set.add((pid, gap))
+            # Store the stride index within the domain rather than the absolute
+            # bit position so that cached lookups mirror the cold-path logic.
+            data_index = (
+                gap - BitBitBuffer._intceil(self.domain_left, self.domain_stride)
+            ) // self.domain_stride
+            self.active_set.add((pid, data_index))
         return return_vals
 
     def create_id(self, location):
