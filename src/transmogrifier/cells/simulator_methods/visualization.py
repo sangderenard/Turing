@@ -137,6 +137,7 @@ class _LCVisual:
         self.sim = sim
         pygame.init()
         self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 18)
 
         # geometry is derived from the cell layout and may change as cells
         # expand/shrink; keep a cached copy and recalc when needed
@@ -222,9 +223,8 @@ class _LCVisual:
                     x += int(stride * self.scale_x)
 
             # label at left edge
-            font = pygame.font.Font(None, 18)
             self.screen.blit(
-                font.render(str(c.label), True, (255, 255, 255)),
+                self.font.render(str(c.label), True, (255, 255, 255)),
                 (xL + 4, y0 + 4),
             )
 
