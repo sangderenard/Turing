@@ -63,6 +63,15 @@ class BitBitIndexer:
     def access(spec: BitBitIndex) -> Any:
         #print(f"accessed {spec.index} with spec: {spec}")
         if spec.empty:
+            buf = spec.caller.buffer if hasattr(spec.caller, 'buffer') else spec.caller
+            if isinstance(spec.index, slice) and spec.mode == 'view':
+                start, stop, step = spec.normalize()
+                reversed_ = step < 0
+                return BitBitSlice(buf, start, 0, reversed=reversed_, plane=spec.plane)
+            if spec.mode in ('hex', 'data_hex'):
+                return ''
+            if spec.mode == 'get':
+                return b''
             return None
         if spec.index_hook is not None:
             translated_index = spec.index_hook(spec.index)
