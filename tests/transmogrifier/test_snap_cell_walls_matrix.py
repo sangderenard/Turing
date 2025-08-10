@@ -2,7 +2,7 @@ import random
 import pytest
 
 from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.cell_consts import Cell, LEFT_WALL, RIGHT_WALL
+from src.transmogrifier.cells.cell_consts import Cell
 from src.transmogrifier.bitbitbuffer import CellProposal
 
 
@@ -111,9 +111,9 @@ def test_snap_cell_walls_matrix(config, variant, seed):
     sprops = shrink_proposals(sim, cells)
     if exc_types:
         with pytest.raises(exc_types):
-            sim.snap_cell_walls(cells, sprops)
+            sim.snap_cell_walls(cells, sprops, left_boundary=0, right_boundary=sim.bitbuffer.mask_size)
     else:
-        sim.snap_cell_walls(cells, sprops)
+        sim.snap_cell_walls(cells, sprops, left_boundary=0, right_boundary=sim.bitbuffer.mask_size)
         for p in sprops:
             assert p.right - p.left >= p.stride > 0
 
@@ -121,18 +121,17 @@ def test_snap_cell_walls_matrix(config, variant, seed):
     props = widen_proposals(cells)
     if exc_types:
         with pytest.raises(exc_types):
-            sim.snap_cell_walls(cells, props)
+            sim.snap_cell_walls(cells, props, left_boundary=0, right_boundary=sim.bitbuffer.mask_size)
         return
 
-    sim.snap_cell_walls(cells, props)
+    sim.snap_cell_walls(cells, props, left_boundary=0, right_boundary=sim.bitbuffer.mask_size)
     lcm = sim.system_lcm
     for p in props:
         assert p.left % lcm == 0
         assert p.right % lcm == 0
 
-    chain = [LEFT_WALL] + props
-    for i in range(len(chain) - 1):
-        assert chain[i].right == chain[i+1].left
+    for i in range(len(props) - 1):
+        assert props[i].right == props[i+1].left
 
 
 if __name__ == "__main__":

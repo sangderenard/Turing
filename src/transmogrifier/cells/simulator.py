@@ -1,6 +1,6 @@
 from typing import Union
 from sympy import Integer
-from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT, RIGHT_WALL, LEFT_WALL
+from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT
 from .simulator_methods.salinepressure import SalineHydraulicSystem
 from ..bitbitbuffer import BitBitBuffer, CellProposal
 from .bitstream_search import BitStreamSearch
