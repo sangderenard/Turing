@@ -48,15 +48,15 @@ def print_system(sim, width=80):
     # 3) Prepare labels & ramp
     labels     = string.ascii_lowercase
     alpha_len  = len(labels)
-    glyph_bases = [
-            ord('A'),    # level 1
-            0x03B1,      # level 2 α
-            0x0391,      # level 3 Α
-            0x0430,      # level 4 а
-            0x0410,      # level 5 А
-            0x24B6,      # level 6 Ⓐ
+    glyph_levels = [
+        list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        list("\u03b1\u03b2\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03b9\u03ba\u03bb\u03bc\u03bd\u03be\u03bf\u03c0\u03c1\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9"),
+        list("\u0391\u0392\u0393\u0394\u0395\u0396\u0397\u0398\u0399\u039a\u039b\u039c\u039d\u039e\u039f\u03a0\u03a1\u03a3\u03a4\u03a5\u03a6\u03a7\u03a8\u03a9"),
+        list("\u0430\u0431\u0432\u0433\u0434\u0435\u0451\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f"),
+        list("\u0410\u0411\u0412\u0413\u0414\u0415\u0401\u0416\u0417\u0418\u0419\u041a\u041b\u041c\u041d\u041e\u041f\u0420\u0421\u0422\u0423\u0424\u0425\u0426\u0427\u0428\u0429\u042a\u042b\u042c\u042d\u042e\u042f"),
+        list("\u24b6\u24b7\u24b8\u24b9\u24ba\u24bb\u24bc\u24bd\u24be\u24bf\u24c0\u24c1\u24c2\u24c3\u24c4\u24c5\u24c6\u24c7\u24c8\u24c9\u24ca\u24cb\u24cc\u24cd\u24ce\u24cf")
     ]
-    max_level = len(glyph_bases)
+    max_level = len(glyph_levels)
 
     # 4) Columnize
     bits_per_col = (total_bits + width - 1) // width
@@ -89,9 +89,9 @@ def print_system(sim, width=80):
                     ch = labels[idx % alpha_len]
                 else:
                     # data present → map 1→level1, 2→level2, ..., clamp
-                    level = min(cnt, max_level) - 1
-                    base  = glyph_bases[level]
-                    ch    = chr(base + (idx % alpha_len))
+                    level  = min(cnt, max_level) - 1
+                    glyphs = glyph_levels[level]
+                    ch     = glyphs[idx % len(glyphs)]
                 output.append(ch)
 
     # 5) Print map + stats
