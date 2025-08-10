@@ -169,7 +169,7 @@ class _LCVisual:
 
             # Fetch the PID mask for this cell and draw each stride slot
             pb = self.sim.bitbuffer.pid_buffers.get(c.label)
-            if pb:
+            if pb is not None:
                 mask = pb.pids
                 mask_slots = mask.mask_size
             else:
@@ -189,7 +189,9 @@ class _LCVisual:
                 x1 = 10 + int((slot_right - base_left) * SCALE_X)
                 w = max(1, x1 - x0)
 
-                bit_active = int(mask[slot_idx]) if mask and slot_idx < mask_slots else 0
+                bit_active = int(mask[slot_idx]) if (
+                    mask is not None and slot_idx < mask_slots
+                ) else 0
                 colour = COL_DATA if bit_active else COL_SOLVENT
                 pygame.draw.rect(
                     self.screen,
