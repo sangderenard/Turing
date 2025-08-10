@@ -139,7 +139,6 @@ def minimize(self, cells):
                     assert gap >= 0, f"Gap {gap} in cell {cell.label} is negative, this should not happen"
                     assert cell.left <= gap < cell.right - cell.stride + 1, f"Gap {gap} in cell {cell.label} is out of bounds, should be between {cell.left} and {cell.right}"
                 pressure += cell.injection_queue
-                relative_gaps = [gap - cell.left for gap in known_gaps]
                 gap_pids = []
                 best_gaps = known_gaps[:cell.injection_queue] if cell.injection_queue > 0 else []
                 print(f"Best gaps for cell {cell.label}: {best_gaps}")
@@ -148,8 +147,9 @@ def minimize(self, cells):
                         self.assignable_gaps[cell.label] = []
                     self.assignable_gaps[cell.label].extend(best_gaps)
                     cell.injection_queue -= len(best_gaps)
-                    pid_gaps = [gap - cell.left for gap in best_gaps]
-                    gap_pids = self.bitbuffer.pid_buffers[cell.label].get_pids(pid_gaps)
+                    # PIDBuffer expects absolute bit positions; pass the system-level
+                    # gaps directly rather than cell-relative offsets.
+                    gap_pids = self.bitbuffer.pid_buffers[cell.label].get_pids(best_gaps)
                 cell.pressure = pressure
                 if cell.label in self.input_queues:
                     cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
