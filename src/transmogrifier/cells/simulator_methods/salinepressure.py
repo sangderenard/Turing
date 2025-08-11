@@ -241,7 +241,7 @@ class SalineHydraulicSystem:
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
-                    C_ext=1500.0, p_ext=100.0,
+                    C_ext=1500.0, p_ext=10000.0,
                     Lp=1.0, A=1.0, sigma=1.0,
                     R=8.314, T=298.15,
                     dt=1.0, max_steps=10):
