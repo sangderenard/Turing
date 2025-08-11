@@ -35,12 +35,17 @@ def snap_cell_walls(self, cells, proposals, left_boundary=0, right_boundary=None
         p.rightmost += delta
         current = p.right
 
-    for cell, prop in zip(sorted(cells, key=lambda c: c.left), sorted_props):
-        cell.left, cell.right = prop.left, prop.right
-
     final_extent = max(p.right for p in sorted_props) if sorted_props else right_boundary
     if final_extent > self.bitbuffer.mask_size:
         self.expand(self.bitbuffer.mask_size, final_extent - self.bitbuffer.mask_size, cells, sorted_props)
+
+    for cell, prop in zip(sorted(cells, key=lambda c: c.left), sorted_props):
+        cell.left = prop.left
+        cell.right = prop.right
+        cell.leftmost = prop.leftmost
+        cell.rightmost = prop.rightmost
+
+    return sorted_props
 
     
 def build_metadata(self, offset_bits, size_bits, cells):
