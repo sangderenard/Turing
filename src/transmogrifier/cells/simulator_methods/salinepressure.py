@@ -241,78 +241,215 @@ class SalineHydraulicSystem:
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
-                    C_ext=1500.0, p_ext=10000.0,
-                    R=8.314, T=298.15,
-                    dt=0.1, max_steps=50,
-                    sigma=1.0, Ps=1.0):
+                    bath=None,                 # object with .volume, .solute (dict), .pressure, .temperature, .compressibility(optional)
+                    dt=1e-3,                   # small base step; we adapt down as needed
+                    max_steps=200000,
+                    tol_vol=1e-9, tol_conc=1e-9,
+                    species=("Na", "K", "Cl", "Imp"),  # Imp = impermeant anion
+                    R=8.314):
         """
-        Balance container via iterative Kedem–Katchalsky with additional
-        feedback terms.  Each cell tracks its own volume ``V_i`` and solute
-        quantity ``S_i``.  Concentration ``C_i`` is updated as ``S_i / V_i`` and
-        the internal pressure uses a simple turgor model::
+        Dream-grade mechano–osmotic balance with conservation and feedbacks.
 
-            P_i = P0 + k_i (V_i/V0_i - 1)
+        Water:  Jv = Lp(A,T) * A * ( (P_ext - P_i - ΔP_tension) - Σ_i σ_i RT φ_i (C_ext_i - C_i) )
+        Solute: Js_i = Ps_i(A,T) * A * (C_ext_i - C_i) + (1-σ_i) * C_i * Jv    # solvent drag
 
-        Water and solute fluxes are integrated over ``dt`` until volumes stop
-        changing or ``max_steps`` is reached.  The external bath accumulates the
-        displaced volume and solute, enforcing mass conservation.
+        Mechanics:
+        A(V) from sphere: R = (3V/4π)^(1/3),  A = 4πR^2
+        strain ε = A/A0 - 1
+        Tension T = k_s * ε + η_s * dε/dt
+        ΔP_tension = 2T / R   (Laplace)
+
+        Active transport (optional):
+        Na/K pump: Jpump_Na = -3*J_pump, Jpump_K = +2*J_pump (A·conc/time), depends on ATP/Tension.
+
+        Bath:
+        Finite reservoir; updates volume/solute by -Σ Δ; optional compressibility for pressure updates.
         """
-        if not cells or mode != 'open':
+        if mode != 'open' or not cells:
             return [CellProposal(c) for c in cells]
 
-        # Treat the external bath as a finite reservoir
-        bath_volume = sum(c.volume for c in cells)
-        bath_solute = C_ext * bath_volume
+        # ---- Utilities (no external deps) ----------------------------------------
+        from math import pi
 
+        def sphere_R(V):  # radius from volume
+            return (3.0*V/(4.0*pi))**(1.0/3.0)
+
+        def sphere_A(V):
+            Rv = sphere_R(V)
+            return 4.0*pi*Rv*Rv, Rv
+
+        def arrhenius(P0, Ea, T):
+            # If Ea not supplied, return P0
+            return P0 if Ea is None else P0 * (2.718281828)**(-Ea/(R*T))
+
+        # ---- Initialise missing fields ------------------------------------------
+        # One-time default wiring if upstream hasn’t set these yet.
+        for c in cells:
+            if not hasattr(c, "volume"):
+                c.volume = float(c.right - c.left)
+            if not hasattr(c, "initial_volume"):
+                c.initial_volume = float(c.volume)
+            if not hasattr(c, "A0"):
+                c.A0, _ = sphere_A(c.initial_volume)
+            if not hasattr(c, "base_pressure"):
+                c.base_pressure = float(getattr(c, "pressure", 0.0))
+            if not hasattr(c, "elastic_k"):
+                c.elastic_k = 0.1
+            if not hasattr(c, "visc_eta"):
+                c.visc_eta = 0.0  # set >0 for viscoelastic damping
+            if not hasattr(c, "Lp0"):
+                # fall back to wall permeabilities if present
+                lp_l = float(getattr(c, "l_solvent_permiability", 1.0))
+                lp_r = float(getattr(c, "r_solvent_permiability", 1.0))
+                c.Lp0 = 0.5*(lp_l + lp_r)
+            if not hasattr(c, "sigma"):
+                c.sigma = {sp: (1.0 if sp in ("Imp",) else 0.9) for sp in species}
+            if not hasattr(c, "Ps0"):
+                c.Ps0 = {sp: (0.0 if sp == "Imp" else 0.01) for sp in species}
+            if not hasattr(c, "Ea_Ps"):
+                c.Ea_Ps = {sp: None for sp in species}
+            if not hasattr(c, "Ea_Lp"):
+                c.Ea_Lp = None
+            if not hasattr(c, "solute"):
+                # Map legacy salinity into one bucket if needed
+                S = float(getattr(c, "salinity", 0.0))
+                c.solute = {sp: (S if sp == "Imp" else 0.0) for sp in species}
+
+            # keep previous strain for viscous term
+            c._prev_eps = 0.0
+
+        # Bath defaults
+        if bath is None:
+            # Finite bath equal to total cell volume, with given C_ext for a single lumped species
+            V_bath = sum(c.volume for c in cells)
+            T_bath = float(getattr(self, "temperature", 298.15))
+            P_bath = float(getattr(self, "external_pressure", 1e4))
+            # If caller provided a single C_ext earlier, put it in Na for demo
+            Cext_single = float(getattr(self, "external_concentration", 1500.0))
+            S_bath = {sp: (Cext_single*V_bath if sp == "Na" else 0.0) for sp in species}
+            bath = type("Bath", (), {})()
+            bath.volume = V_bath
+            bath.temperature = T_bath
+            bath.pressure = P_bath
+            bath.solute = S_bath
+            bath.compressibility = 0.0  # 0 = fixed pressure
+        else:
+            # sanity fills
+            for sp in species:
+                bath.solute.setdefault(sp, 0.0)
+            if not hasattr(bath, "compressibility"):
+                bath.compressibility = 0.0
+
+        # ---- Integrate -----------------------------------------------------------
         proposals = [CellProposal(c) for c in cells]
-        for _ in range(max_steps):
-            bath_conc = bath_solute / bath_volume if bath_volume > 0 else 0.0
-            max_delta = 0.0
-            total_delta = 0.0
-            for cell in cells:
-                # Permeability and elastic parameters are cell specific
-                Lp = (cell.l_solvent_permiability + cell.r_solvent_permiability) / 2.0
-                Ps_cell = Ps if Ps is not None else Lp
-                k = getattr(cell, 'elastic_coeff', 0.0)
-                V0 = getattr(cell, 'reference_volume', cell.volume)
 
-                # Update pressure and concentration based on current state
-                cell.concentration = cell.salinity / cell.volume
-                cell.pressure = cell.base_pressure + k * (cell.volume / V0 - 1.0)
+        t = 0.0
+        for step in range(max_steps):
+            T_bath = bath.temperature
+            # Concentrations
+            Cext = {sp: (bath.solute[sp]/bath.volume if bath.volume > 0 else 0.0) for sp in species}
 
-                dP = p_ext - cell.pressure
-                dC = bath_conc - cell.concentration
+            max_rel = 0.0
+            sum_dV = 0.0
 
-                Jv = Lp * (dP - sigma * R * T * dC)
-                deltaV = Jv * dt
+            for c in cells:
+                # Geometry, strain and tension
+                A, Rv = sphere_A(c.volume)
+                eps = (A / c.A0) - 1.0
+                deps_dt = (eps - c._prev_eps) / dt
+                Tension = c.elastic_k * eps + c.visc_eta * deps_dt
+                dP_tension = (2.0 * Tension / max(Rv, 1e-12))  # Laplace
+                c._prev_eps = eps
 
-                Cavg = 0.5 * (bath_conc + cell.concentration)
-                Js = Ps_cell * (dC - (1 - sigma) * Cavg * dP / (R * T))
-                deltaS = Js * dt
+                # Internal hydrostatic pressure (turgor + base)
+                P_i = c.base_pressure + dP_tension
 
-                cell.volume += deltaV
-                cell.salinity += deltaS
-                cell.concentration = cell.salinity / cell.volume
-                cell.pressure = cell.base_pressure + k * (cell.volume / V0 - 1.0)
+                # Osmotic term: Σ σ_i RT (Cext_i - C_i)
+                Cint = {}
+                for sp in species:
+                    Cint[sp] = c.solute[sp] / max(c.volume, 1e-18)
+                osm_term = 0.0
+                for sp in species:
+                    sigma_i = c.sigma.get(sp, 1.0)
+                    osm_term += sigma_i * R * T_bath * (Cext[sp] - Cint[sp])
 
-                bath_volume -= deltaV
-                bath_solute -= deltaS
+                # Permeabilities (tension & temperature dependence)
+                Lp = arrhenius(c.Lp0, c.Ea_Lp, T_bath) * (1.0 + 0.3*max(eps, 0.0))  # mild tension boost
+                dP = bath.pressure - P_i
+                Jv = Lp * A * (dP - osm_term)                # m^3/s (units relative)
+                dV = Jv * dt
 
-                max_delta = max(max_delta, abs(deltaV))
-                total_delta += deltaV
-            if max_delta < 1e-6:
-                break
+                # Solute fluxes (with solvent drag)
+                dS = {}
+                for sp in species:
+                    Ps0 = c.Ps0.get(sp, 0.0)
+                    Ps = arrhenius(Ps0, c.Ea_Ps.get(sp), T_bath) * (1.0 + 0.5*max(eps, 0.0))
+                    Cavg = 0.5*(Cext[sp] + Cint[sp])
+                    sigma_i = c.sigma.get(sp, 1.0)
+                    Js = Ps * A * (Cext[sp] - Cint[sp]) + (1.0 - sigma_i) * Cint[sp] * Jv
+                    dS[sp] = Js * dt
 
-        # Expand bitbuffer if total volume increased
-        if total_delta > 0:
+                # (Optional) Na/K pump (tiny stabiliser; set to 0 to disable)
+                J_pump = getattr(c, "J_pump", 0.0)  # mol/s across membrane
+                if J_pump:
+                    dS["Na"] = dS.get("Na", 0.0) - 3.0 * J_pump * dt
+                    dS["K"]  = dS.get("K", 0.0)  + 2.0 * J_pump * dt
+
+                # Update cell and bath, enforce positivity
+                c.volume = max(c.volume + dV, 1e-18)
+                for sp in species:
+                    c.solute[sp] = max(c.solute[sp] + dS[sp], 0.0)
+
+                bath.volume = max(bath.volume - dV, 1e-18)
+                for sp in species:
+                    bath.solute[sp] = max(bath.solute[sp] - dS[sp], 0.0)
+
+                # Relative step size for adaptive dt
+                rel = abs(dV) / max(c.volume, 1e-18)
+                if rel > max_rel:
+                    max_rel = rel
+                sum_dV += dV
+
+            # Bath pressure model (optional compressibility)
+            if bath.compressibility and bath.compressibility > 0.0:
+                # dP = -K * dV / V  (very rough bulk modulus-like)
+                bath.pressure += -bath.compressibility * (sum_dV / max(bath.volume, 1e-18))
+
+            # Convergence check
+            if max_rel < tol_vol:
+                # also check concentration change
+                max_dc = 0.0
+                for c in cells:
+                    for sp in species:
+                        Ci = c.solute[sp]/max(c.volume,1e-18)
+                        Ce = bath.solute[sp]/max(bath.volume,1e-18)
+                        max_dc = max(max_dc, abs(Ce - Ci))
+                if max_dc < tol_conc:
+                    break
+
+            # Adaptive dt to keep |ΔV|/V small (explicit stability)
+            if max_rel > 1e-3:
+                dt *= 0.5
+            elif max_rel < 1e-5:
+                dt *= 1.1
+
+            t += dt
+
+        # Map net expansion into bitbuffer event (keep your alignment logic)
+        proposals = [CellProposal(c) for c in cells]
+        if sum_dV > 0:
             system_lcm = self.lcm(cells)
-            delta_bits = bitbuffer.intceil(bitbuffer.round(total_delta), system_lcm)
+            delta_bits = bitbuffer.intceil(bitbuffer.round(sum_dV), system_lcm)
             if delta_bits > 0:
                 manual_event = (None, bitbuffer.mask_size, delta_bits)
                 proposals = bitbuffer.expand([manual_event], cells, proposals)
 
-        return proposals
+        # For downstream visualisations, keep convenient scalars
+        for c in cells:
+            c.pressure = c.base_pressure + (2.0*(c.elastic_k*max((sphere_A(c.volume)[0]/c.A0-1.0),0.0))/max(sphere_R(c.volume),1e-12))
+            c.concentration = {sp: c.solute[sp]/c.volume for sp in species}
 
+        return proposals
     @staticmethod
     def update_s_p_expressions(sim, cells, *, as_float=False):
         if as_float:
