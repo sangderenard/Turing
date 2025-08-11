@@ -136,6 +136,13 @@ class CellSim:
             raise ReferenceError(f"CellSim[{self.label}] underlying cell was GC’d or lost.")
         return c
 
+    # Delegate attribute access to the underlying cell for any fields the
+    # wrapper does not override.  This lets a CellSim instance act like the
+    # original cell when passed into existing algorithms that expect a plain
+    # cell object (e.g. `balance_system`).
+    def __getattr__(self, name):
+        return getattr(self.cell, name)
+
     # ----- Synchronisation -----
     def pull_from_cell(self) -> None:
         """Refresh geometry/basic fields from cell (after proposals/expansion)."""
