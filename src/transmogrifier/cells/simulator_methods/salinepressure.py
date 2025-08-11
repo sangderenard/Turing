@@ -1,7 +1,8 @@
 from sympy import symbols, sin, lambdify, Integer, Float
-from math import pi, ceil, floor
+from math import pi, ceil, floor, isfinite
 
 from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
+from ..cell_sim import CellSim
 from ..cell_consts import CELL_COUNT
 class SalineHydraulicSystem:
     """
@@ -93,9 +94,35 @@ class SalineHydraulicSystem:
 
     def run_balanced_saline_sim(self, mode="open"):
         """Balance the system then run the standard saline simulation."""
-        proposals = self.balance_system(self.cells, self.bitbuffer, mode)
-        for cell, proposal in zip(self.cells, proposals):
+        # Wrap incoming cells so the pressure balancer operates on CellSim
+        # objects.  This preserves the underlying Cell state until we explicitly
+        # push updates back after balancing.
+        wrapped = [CellSim.get(cell) for cell in self.cells]
+        for w in wrapped:
+            w.pull_from_cell()
+
+        proposals = self.balance_system(wrapped, self.bitbuffer, mode)
+
+        # Synchronise wrapper results back onto the original cells
+        for w in wrapped:
+            w.push_to_cell()
+
+        # The proposals returned reference the wrappers; rebuild them so they
+        # point at the underlying cells before applying.
+        unwrapped = []
+        for w, prop in zip(wrapped, proposals):
+            new_prop = CellProposal(w.cell)
+            new_prop.left = prop.left
+            new_prop.right = prop.right
+            new_prop.leftmost = prop.leftmost
+            new_prop.rightmost = prop.rightmost
+            new_prop.salinity = getattr(prop, "salinity", getattr(w.cell, "salinity", 0))
+            new_prop.pressure = getattr(prop, "pressure", getattr(w.cell, "pressure", 0))
+            unwrapped.append(new_prop)
+
+        for cell, proposal in zip(self.cells, unwrapped):
             cell.apply_proposal(proposal)
+
         proposals = self.run_saline_sim(as_float=True)
         # this run saline sim eventually calls snap, which adjusts cell boundaries
         return proposals
@@ -241,6 +268,7 @@ class SalineHydraulicSystem:
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
+                    C_ext=None, p_ext=None,
                     bath=None,                 # object with .volume, .solute (dict), .pressure, .temperature, .compressibility(optional)
                     dt=1e-3,                   # small base step; we adapt down as needed
                     max_steps=200000,
@@ -323,9 +351,9 @@ class SalineHydraulicSystem:
             # Finite bath equal to total cell volume, with given C_ext for a single lumped species
             V_bath = sum(c.volume for c in cells)
             T_bath = float(getattr(self, "temperature", 298.15))
-            P_bath = float(getattr(self, "external_pressure", 1e4))
+            P_bath = float(p_ext if p_ext is not None else getattr(self, "external_pressure", 1e4))
             # If caller provided a single C_ext earlier, put it in Na for demo
-            Cext_single = float(getattr(self, "external_concentration", 1500.0))
+            Cext_single = float(C_ext if C_ext is not None else getattr(self, "external_concentration", 1500.0))
             S_bath = {sp: (Cext_single*V_bath if sp == "Na" else 0.0) for sp in species}
             bath = type("Bath", (), {})()
             bath.volume = V_bath
@@ -437,17 +465,22 @@ class SalineHydraulicSystem:
 
         # Map net expansion into bitbuffer event (keep your alignment logic)
         proposals = [CellProposal(c) for c in cells]
-        if sum_dV > 0:
+        if sum_dV > 0 and isfinite(sum_dV):
             system_lcm = self.lcm(cells)
             delta_bits = bitbuffer.intceil(bitbuffer.round(sum_dV), system_lcm)
-            if delta_bits > 0:
+            if 0 < delta_bits < 10**12:
                 manual_event = (None, bitbuffer.mask_size, delta_bits)
                 proposals = bitbuffer.expand([manual_event], cells, proposals)
 
         # For downstream visualisations, keep convenient scalars
         for c in cells:
-            c.pressure = c.base_pressure + (2.0*(c.elastic_k*max((sphere_A(c.volume)[0]/c.A0-1.0),0.0))/max(sphere_R(c.volume),1e-12))
-            c.concentration = {sp: c.solute[sp]/c.volume for sp in species}
+            # Use membrane tension from geometric strain to derive pressure
+            A_curr, R_curr = sphere_A(c.volume)
+            strain = max(A_curr / c.A0 - 1.0, 0.0)
+            c.pressure = c.base_pressure + (2.0 * (c.elastic_k * strain) / max(R_curr, 1e-12))
+            conc_dict = {sp: c.solute[sp]/c.volume for sp in species}
+            c.concentration = conc_dict.get('Imp', 0.0)
+            c.concentrations = conc_dict
 
         return proposals
     @staticmethod
