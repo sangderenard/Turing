@@ -236,13 +236,14 @@ _vis = None
 
 
 def visualise_step(sim, cells):
-    """Wrapper for ``Simulator.step`` that updates the pygame window."""
+    """Wrapper for ``Simulator.run_balanced_saline_sim`` that updates the pygame window."""
     global _vis
     if VISUALISE and _vis is None:
         _vis = _LCVisual(sim)
 
     
     sim.minimize(sim.cells)
+    sim.run_balanced_saline_sim()
 
     if VISUALISE:
         for ev in pygame.event.get():
