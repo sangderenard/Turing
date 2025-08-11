@@ -93,10 +93,12 @@ class SalineHydraulicSystem:
 
     def run_balanced_saline_sim(self, mode="open"):
         """Balance the system then run the standard saline simulation."""
-        self.balance_system(self.cells, self.bitbuffer, mode)
-
-        self.run_saline_sim(as_float=True)
-
+        proposals = self.balance_system(self.cells, self.bitbuffer, mode)
+        for cell, proposal in zip(self.cells, proposals):
+            cell.apply_proposal(proposal)
+        proposals = self.run_saline_sim(as_float=True)
+        # this run saline sim eventually calls snap, which adjusts cell boundaries
+        return proposals
     def reset_state(self):
         """Start at t=0 with equal volumes."""
         self.current_t = 0.0
@@ -239,10 +241,10 @@ class SalineHydraulicSystem:
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
-                    C_ext=1.0, p_ext=1.0,
+                    C_ext=1500.0, p_ext=100.0,
                     Lp=1.0, A=1.0, sigma=1.0,
                     R=8.314, T=298.15,
-                    dt=1.0, max_steps=1000):
+                    dt=1.0, max_steps=10):
         """
         Balance container via iterative Kedem–Katchalsky:
         ΔV = Lp·A·[ΔP – σ·R·T·ΔC]·dt, step until |ΔV|→0 or runaway.
@@ -252,6 +254,7 @@ class SalineHydraulicSystem:
         if not cells or mode != 'open':
             return
         prev_delta = None
+        accumulated_delta = 0
         for step in range(max_steps):
             # compute averages
             avg_p = sum(c.pressure for c in cells) / len(cells)
@@ -276,9 +279,22 @@ class SalineHydraulicSystem:
                 print(f"Runaway at step {step}, ΔV={delta}")
                 break
             # apply volume change
-            if delta > 0:
-                bitbuffer.expand((bitbuffer.mask_size, delta), cells, cells)
             prev_delta = delta
+            accumulated_delta += delta
+            # apply volume change
+        proposals = [CellProposal(c) for c in cells]
+        if accumulated_delta > 0:
+            # Create a properly shaped manual event to add free space at the end.
+            # BitBitBuffer.expand expects events as (label, offset, size) and gaps should
+            # be aligned to the system LCM/stride so PID buffers update correctly.
+            system_lcm = self.lcm(cells)
+            # Round the delta to an integer count of bits, then align to system LCM.
+            delta_bits = bitbuffer.intceil(bitbuffer.round(accumulated_delta), system_lcm)
+            if delta_bits > 0:
+                manual_event = (None, bitbuffer.mask_size, delta_bits)
+                
+                proposals = bitbuffer.expand([manual_event], cells, proposals)
+        return proposals
 
     @staticmethod
     def update_s_p_expressions(sim, cells, *, as_float=False):

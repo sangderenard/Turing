@@ -7,7 +7,7 @@ def minimize(self, cells):
     print("Cell stat table")
     print(f"{'Index':<5} {'Label':<10} {'Left':<10} {'Right':<10} {'Raw':<10}")
     print("=" * 55)
-
+    self.run_balanced_saline_sim()
     for i, cell in enumerate(cells):
         self.pull_cell_mask(cell)  # Ensure the cell's mask is up-to-date
         #print(f"Mask state at the beginning of minimize: {self.bitbuffer.mask.hex()}")
@@ -133,6 +133,8 @@ def minimize(self, cells):
                     center_slice = raw[center_start_bit : center_start_bit + center_bit_length]
                     _, center_gaps = self.search.detect_stride_gaps(center_slice, cell.stride, sort_order='center-out')
                     center_gaps = [gap + center_alignment_offset for gap in center_gaps if gap < center_bit_length]
+                print(f"Center gaps for cell {cell.label}: {center_gaps}")
+                print(f"Known gaps for cell {cell.label}: {known_gaps}")
                 known_gaps = center_gaps + known_gaps
                 for gap in known_gaps:
                     assert gap % cell.stride == 0, f"Gap {gap} in cell {cell.label} is not aligned with stride {cell.stride}"
@@ -149,6 +151,7 @@ def minimize(self, cells):
                     cell.injection_queue -= len(best_gaps)
                     # PIDBuffer expects absolute bit positions; pass the system-level
                     # gaps directly rather than cell-relative offsets.
+                    
                     gap_pids = self.bitbuffer.pid_buffers[cell.label].get_pids(best_gaps)
                 cell.pressure = pressure
                 if cell.label in self.input_queues:
@@ -160,7 +163,7 @@ def minimize(self, cells):
                 if cell.label in self.input_queues and len(self.input_queues[cell.label]) > 0 and cell.label in self.assignable_gaps and len(self.assignable_gaps[cell.label]) > 0:
                     print(f"Cell {cell.label} has input queues and assignable gaps, proceeding with injection.")
                     original_queue = self.input_queues[cell.label].copy()
-                    self.run_balanced_saline_sim()
+                    
                     relative_consumed_gaps, consumed_gaps, queue = self.injection(
                         self.input_queues[cell.label], self.assignable_gaps[cell.label], gap_pids, 0
                     )

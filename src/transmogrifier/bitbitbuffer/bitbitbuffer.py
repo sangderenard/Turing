@@ -231,6 +231,32 @@ class BitBitBuffer:
         whether it stays 0 or gets stamped later.
         """
 
+        # Collect a before/after snapshot for a compact summary at EXIT
+        total_gap_bits = sum(sz for _, _, sz in (insertion_plans or []))
+        _summary = {
+            'plans': list(insertion_plans or []),
+            'total_gap_bits': total_gap_bits,
+            'main_before': {
+                'mask_bits': self.mask_size,
+                'data_bits': self.data_size,
+                'mask_bytes': self.bittobyte(self.mask_size),
+                'data_bytes': self.bittobyte(self.data_size),
+                'bitsforbits': self.bitsforbits,
+            },
+            'pids_before': {},
+        }
+        if self._make_pid:
+            for label, pid in self.pid_buffers.items():
+                _summary['pids_before'][label] = {
+                    'domain': (pid.domain_left, pid.domain_right),
+                    'stride': pid.domain_stride,
+                    'mask_bits': pid.pids.mask_size,
+                    'data_bits': pid.pids.data_size,
+                    'mask_bytes': self.bittobyte(pid.pids.mask_size),
+                    'data_bytes': self.bittobyte(pid.pids.data_size),
+                    'bitsforbits': getattr(pid.pids, 'bitsforbits', self.bitsforbits),
+                }
+
 
         # -------- mask plane --------------------------------------------------
         def feature_spreader(src_plane: bytearray,
@@ -359,10 +385,33 @@ class BitBitBuffer:
 
         self.mask, mask_view, self.mask_size, self.data, data_view, self.data_size =                 mask_and_data_spreader(self, self.mask_size, self.bitsforbits, insertion_plans)
 
+        # Capture main after
+        _summary['main_after'] = {
+            'mask_bits': self.mask_size,
+            'data_bits': self.data_size,
+            'mask_bytes': self.bittobyte(self.mask_size),
+            'data_bytes': self.bittobyte(self.data_size),
+            'bitsforbits': self.bitsforbits,
+        }
+
         # 3) update the pid buffers
         if self._make_pid is False:
+            # Emit the summary for MAIN only
+            try:
+                mb = _summary['main_before']
+                ma = _summary['main_after']
+                logging.warning(
+                    "[_insert_bits][SUMMARY] main mask_bits %s->%s (bytes %s->%s), "
+                    "data_bits %s->%s (bytes %s->%s), bitsforbits=%s, total_gap_bits=%s, plans=%s",
+                    mb['mask_bits'], ma['mask_bits'], mb['mask_bytes'], ma['mask_bytes'],
+                    mb['data_bits'], ma['data_bits'], mb['data_bytes'], ma['data_bytes'],
+                    ma['bitsforbits'], _summary['total_gap_bits'], _summary['plans']
+                )
+            except Exception:
+                pass
             return
 
+        _summary['pids_after'] = {}
         for label, pid in self.pid_buffers.items():
             logging.debug(f"[_insert_bits] updating PIDBuffer '{label}': old mask_size={pid.pids.mask_size}, old data_size={pid.pids.data_size}")
             new_pid_mask, new_pid_view, new_pid_bits, new_pid_data, new_pid_data_view, new_pid_data_bits = mask_and_data_spreader(pid.pids, pid.pids.mask_size, pid.pids.bitsforbits,
@@ -385,6 +434,42 @@ class BitBitBuffer:
                               f"orig_off={orig_off}, adj_off={adj_off}, sz={sz}, running_adj={running_adj}")
 
                 running_adj += sz
+            # Record after for this PID
+            _summary['pids_after'][label] = {
+                'domain': (pid.domain_left, pid.domain_right),
+                'stride': pid.domain_stride,
+                'mask_bits': pid.pids.mask_size,
+                'data_bits': pid.pids.data_size,
+                'mask_bytes': self.bittobyte(pid.pids.mask_size),
+                'data_bytes': self.bittobyte(pid.pids.data_size),
+                'bitsforbits': getattr(pid.pids, 'bitsforbits', self.bitsforbits),
+            }
+        # Emit compact summary for main and all PID buffers
+        try:
+            mb = _summary['main_before']
+            ma = _summary['main_after']
+            lines = []
+            lines.append("[_insert_bits][SUMMARY]")
+            lines.append(
+                f"  MAIN: mask_bits {mb['mask_bits']}->{ma['mask_bits']} (bytes {mb['mask_bytes']}->{ma['mask_bytes']}), "
+                f"data_bits {mb['data_bits']}->{ma['data_bits']} (bytes {mb['data_bytes']}->{ma['data_bytes']}), "
+                f"bitsforbits={ma['bitsforbits']}"
+            )
+            if _summary.get('pids_before'):
+                for label in self.pid_buffers.keys():
+                    pb = _summary['pids_before'].get(label, {})
+                    pa = _summary['pids_after'].get(label, {})
+                    lines.append(
+                        f"  PID[{label}]: domain {pb.get('domain')}->{pa.get('domain')}, stride={pa.get('stride', pb.get('stride'))}; "
+                        f"mask_bits {pb.get('mask_bits')}->{pa.get('mask_bits')} (bytes {pb.get('mask_bytes')}->{pa.get('mask_bytes')}), "
+                        f"data_bits {pb.get('data_bits')}->{pa.get('data_bits')} (bytes {pb.get('data_bytes')}->{pa.get('data_bytes')})"
+                    )
+            lines.append(f"  GAPS: total_bits={_summary['total_gap_bits']}, plans={_summary['plans']}")
+            # Use WARNING so it shows up with default logging configuration
+            logging.warning("\n".join(lines))
+        except Exception:
+            # Never let summary formatting break the operation
+            pass
         logging.debug(f"[_insert_bits] EXIT: mask_size={self.mask_size}, data_size={self.data_size}")
 
     # -- public façade --------------------------------------------------------
@@ -404,7 +489,7 @@ class BitBitBuffer:
         .leftmost/.rightmost and an optional cached slice ._buf.
         """
         if not events:
-            return
+            return proposals
 
         # 1) sort by the user-supplied offsets (ascending)
         events = sorted(events, key=lambda t: t[1])

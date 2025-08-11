@@ -110,7 +110,7 @@ class PIDBuffer:
 
     def create_id(self, location):
         logging.debug(f"[PIDBuffer.create_id] location={location}")
-        assert self.domain_left <= location < self.domain_right, "location out of domain bounds"
+        assert self.domain_left <= location < self.domain_right, f"location: {location} out of domain bounds: {self.domain_left} - {self.domain_right}"
         uuid_id = uuid.uuid4()
         from ..bitbitbuffer import BitBitBuffer
         data_index = (location - BitBitBuffer._intceil(self.domain_left, self.domain_stride)) // self.domain_stride

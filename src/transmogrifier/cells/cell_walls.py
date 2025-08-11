@@ -42,7 +42,7 @@ def snap_cell_walls(self, cells, proposals, left_boundary=0, right_boundary=None
     if final_extent > self.bitbuffer.mask_size:
         self.expand(self.bitbuffer.mask_size, final_extent - self.bitbuffer.mask_size, cells, sorted_props)
 
-
+    
 def build_metadata(self, offset_bits, size_bits, cells):
     
     """Compute metadata placement events.

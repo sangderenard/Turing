@@ -66,7 +66,11 @@ class Cell:
     def bitview(self, buffer):
         return bytes(buffer[self.left:self.right])
 
-
+    def apply_proposal(self, proposal):
+        self.left = proposal.left
+        self.right = proposal.right
+        self.leftmost = proposal.leftmost
+        self.rightmost = proposal.rightmost
 
 # ─── Default flag‑profiles ─────────────────────────────────────────────────────
 DEFAULT_FLAG_PROFILES = {
