@@ -2,6 +2,7 @@ from sympy import symbols, sin, lambdify, Integer, Float
 from math import pi, ceil, floor, isfinite
 
 from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
+from .logutil import logger
 from ..cell_sim import CellSim
 from ..cell_consts import CELL_COUNT
 class SalineHydraulicSystem:
@@ -257,14 +258,14 @@ class SalineHydraulicSystem:
     def run_equilibrium(self, steps=20):
         for k in range(steps+1):
             tt = 2*pi*k/steps
-            print(f"t={tt:5.2f} → {self.equilibrium_bar(tt)}")
+            logger.info(f"t={tt:5.2f} → {self.equilibrium_bar(tt)}")
 
     def run_dynamics(self, steps=20, total_time=2*pi):
         self.reset_state()
         dt = total_time/steps
         for _ in range(steps+1):
             bar = self.step(dt)
-            print(f"t={self.current_t:5.2f} → {bar}")
+            logger.info(f"t={self.current_t:5.2f} → {bar}")
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
@@ -515,7 +516,6 @@ if __name__ == '__main__':
     dt = (2 * pi) / 40
     for _ in range(4000):
         bar = sys_int.step(dt)
-        print(f'\r{bar}', end='\n', flush=True)
+        logger.info(bar)
         time.sleep(0.1)
-
-    print() 
+    logger.info("")

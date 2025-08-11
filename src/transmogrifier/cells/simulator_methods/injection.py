@@ -4,7 +4,7 @@ def injection(self, queue, known_gaps, gap_pids, left_offset=0):
     data_copy = queue.copy()
     for i, (payload, stride) in enumerate(data_copy):
         if len(known_gaps) > 0:
-            gap = known_gaps.pop()
+            gap = known_gaps.pop(0)
             if gap >= self.bitbuffer.data_size:
                 exit()
             relative_consumed_gaps.append(gap)

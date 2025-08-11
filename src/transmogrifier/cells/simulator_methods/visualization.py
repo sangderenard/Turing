@@ -1,4 +1,6 @@
+
 import string
+from .logutil import logger
 
 
 def print_system(sim, width=80):
@@ -11,7 +13,7 @@ def print_system(sim, width=80):
     cells = sim.cells
     total_bits = sim.bitbuffer.mask_size
     if total_bits == 0:
-        print("<empty>")
+        logger.info("<empty>")
         return
 
     # 1) Build bit_info: (bit_index, cell_idx_or_None, mask_bit)
@@ -95,8 +97,8 @@ def print_system(sim, width=80):
                 output.append(ch)
 
     # 5) Print map + stats
-    print(''.join(output))
-    print(size_string, free_string)
+    logger.info(''.join(output))
+    logger.info(f"{size_string} {free_string}")
 
 # ────────────────────────────────────────────────────────────────
 # Live Pygame Visualiser driven by the Simulator
@@ -198,12 +200,17 @@ class _LCVisual:
                 w = max(1, x1 - x0)
 
                 if mask is not None:
-                    first_slot = self.sim.bitbuffer.intceil(pb.domain_left, pb.domain_stride)
-                    mask_idx = (slot_left - first_slot) // pb.domain_stride
+                    anchor   = pb.domain_left
+                    mask_idx = (slot_left - anchor) // pb.domain_stride
                     bit_active = int(mask[mask_idx]) if 0 <= mask_idx < mask_slots else 0
                 else:
                     bit_active = 0
                 colour = COL_DATA if bit_active else COL_SOLVENT
+                # Active development: log grid/data placement and PID search
+                logger.debug(
+                    f"[GRID] Drawing cell {c.label} slot {slot_idx}: "
+                    f"left={slot_left}, right={slot_right}, x0={x0}, x1={x1}, bit_active={bit_active}"
+                )
                 pygame.draw.rect(
                     self.screen,
                     colour,
@@ -318,4 +325,4 @@ if __name__ == "__main__":
 def bar(number=2, width=80):
     """Emit ``number`` rows of ``#`` characters for quick visual separators."""
     for _ in range(number):
-        print("#" * width)
+        logger.info("#" * width)
