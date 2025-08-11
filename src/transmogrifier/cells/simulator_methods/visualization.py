@@ -193,13 +193,16 @@ class _LCVisual:
                     break
                 slot_right = min(slot_left + stride, c.right)
 
-                x0 = 10 + int((slot_left - base_left) * self.scale_x)
-                x1 = 10 + int((slot_right - base_left) * self.scale_x)
+                x0 = 10 + round((slot_left - base_left) * self.scale_x)
+                x1 = 10 + round((slot_right - base_left) * self.scale_x)
                 w = max(1, x1 - x0)
 
-                bit_active = int(mask[slot_idx]) if (
-                    mask is not None and slot_idx < mask_slots
-                ) else 0
+                if mask is not None:
+                    first_slot = self.sim.bitbuffer.intceil(pb.domain_left, pb.domain_stride)
+                    mask_idx = (slot_left - first_slot) // pb.domain_stride
+                    bit_active = int(mask[mask_idx]) if 0 <= mask_idx < mask_slots else 0
+                else:
+                    bit_active = 0
                 colour = COL_DATA if bit_active else COL_SOLVENT
                 pygame.draw.rect(
                     self.screen,
@@ -208,8 +211,8 @@ class _LCVisual:
                 )
 
             # cell boundary lines (after quanta so they stay visible)
-            xL = 10 + int((c.left  - base_left) * self.scale_x)
-            xR = 10 + int((c.right - base_left) * self.scale_x)
+            xL = 10 + round((c.left  - base_left) * self.scale_x)
+            xR = 10 + round((c.right - base_left) * self.scale_x)
             pygame.draw.line(self.screen, GRID_COLOUR, (xL, y0), (xL, y0 + ROW_H - 1))
             pygame.draw.line(self.screen, GRID_COLOUR, (xR, y0), (xR, y0 + ROW_H - 1))
 
