@@ -58,9 +58,20 @@ class Cell:
         self.resize_queue = 0
         self.stride = stride
 
+        # --- Biophysical properties --------------------------------------
+        # Treat ``salinity`` as the total solute quantity S_i.
+        # ``volume`` tracks the current cell volume V_i and defaults to the
+        # initial length of the region.  ``reference_volume`` (V0) is used for
+        # turgor pressure calculations.  ``elastic_coeff`` (k) models the
+        # Hookean response of the cell wall.  ``base_pressure`` (P0) represents
+        # any baseline hydrostatic pressure in the system.
+        self.volume = float(self.len)
+        self.reference_volume = float(self.len)
+        self.elastic_coeff = 0.1
+        self.base_pressure = 0.0
+        self.pressure = 0.0
+        self.concentration = 0.0
 
-        
-        self.pressure = 0
         # Retain reference to avoid garbage collection
         self._buf = None#buf
     def bitview(self, buffer):
