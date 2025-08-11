@@ -1,4 +1,4 @@
-from transmogrifier.graph.memory_graph import BitTensorMemoryGraph
+from src.transmogrifier.graph.memory_graph import BitTensorMemoryGraph
 
 
 def test_dynamic_flag_syncs_with_memory():

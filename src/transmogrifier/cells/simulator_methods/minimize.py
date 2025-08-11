@@ -10,13 +10,13 @@ def minimize(self, cells):
 
     for i, cell in enumerate(cells):
         self.pull_cell_mask(cell)  # Ensure the cell's mask is up-to-date
-        print(f"Mask state at the beginning of minimize: {self.bitbuffer.mask.hex()}")
+        #print(f"Mask state at the beginning of minimize: {self.bitbuffer.mask.hex()}")
         
         
         raw = self.bitbuffer[cell.left:cell.right]
         assert not (raw is None), f"Line 10: Cell {cell.label} raw is None or empty, sort this out before calling"
 
-        print(f"raw state at the beginning of minimize: {raw.hex()}")
+        #print(f"raw state at the beginning of minimize: {raw.hex()}")
         known_gaps = []
         left_resistive_force = 0
         right_resistive_force = 0
@@ -160,6 +160,7 @@ def minimize(self, cells):
                 if cell.label in self.input_queues and len(self.input_queues[cell.label]) > 0 and cell.label in self.assignable_gaps and len(self.assignable_gaps[cell.label]) > 0:
                     print(f"Cell {cell.label} has input queues and assignable gaps, proceeding with injection.")
                     original_queue = self.input_queues[cell.label].copy()
+                    self.run_balanced_saline_sim()
                     relative_consumed_gaps, consumed_gaps, queue = self.injection(
                         self.input_queues[cell.label], self.assignable_gaps[cell.label], gap_pids, 0
                     )

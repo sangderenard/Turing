@@ -482,22 +482,22 @@ class BitBitBuffer:
             return [], []
         if self is None or not isinstance(self, BitBitBuffer):
             raise TypeError("Invalid BitBitBuffer")
-        print(self)
+        #print(self)
         print(src)
         print(end)
         print(length)
         print(direction)
-        print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
+        #print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
         if src is None or end is None or length == 0 or src >= end or src < 0 or end > len(self) or length < 0 or src == end:
             return [], []
         if direction == 'left' or direction == 'bi':
-            print(self)
+            #print(self)
             print(src)
             print(end)
             print(length)
             print(direction)
             
-            print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
+            #print(f"tuplepattern called on {self} with src={src}, end={end}, length={length}, direction={direction}")
             
             reversed = self[src:end][::-1][:length]
             right_pattern = self._count_runs(reversed)

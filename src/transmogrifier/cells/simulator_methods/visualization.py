@@ -242,7 +242,7 @@ def visualise_step(sim, cells):
         _vis = _LCVisual(sim)
 
     sim.run_saline_sim()
-    sp, mask = sim.step(cells)
+    sim.minimize(sim.cells)
 
     if VISUALISE:
         for ev in pygame.event.get():
@@ -251,7 +251,7 @@ def visualise_step(sim, cells):
                 sys.exit()
         _vis.draw()
 
-    return sp, mask
+    
 
     # --------------------------------------------------------------------
     # DEMO HARNESS – basic pygame loop using the Simulator

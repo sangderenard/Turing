@@ -86,7 +86,9 @@ class SalineHydraulicSystem:
             for size, offset in size_and_offsets:
                 sim.expand([offset], sim.bitbuffer.intceil(size, sim.lcm(sim.cells)), sim.cells, sim.cells)
         proposals = [CellProposal(cell) for cell in sim.cells]
-        sim.snap_cell_walls(sim.cells, proposals)
+        proposals = sim.snap_cell_walls(sim.cells, proposals)
+
+        return proposals
 
 
     def run_balanced_saline_sim(self, mode="open"):
@@ -237,7 +239,7 @@ class SalineHydraulicSystem:
 
     def balance_system(self, cells, bitbuffer,
                     mode='open',
-                    C_ext=0.0, p_ext=0.0,
+                    C_ext=1.0, p_ext=1.0,
                     Lp=1.0, A=1.0, sigma=1.0,
                     R=8.314, T=298.15,
                     dt=1.0, max_steps=1000):
@@ -275,7 +277,7 @@ class SalineHydraulicSystem:
                 break
             # apply volume change
             if delta > 0:
-                bitbuffer.expand([bitbuffer.mask_size], delta, cells, cells)
+                bitbuffer.expand((bitbuffer.mask_size, delta), cells, cells)
             prev_delta = delta
 
     @staticmethod
