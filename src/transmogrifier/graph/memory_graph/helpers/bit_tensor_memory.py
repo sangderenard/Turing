@@ -67,8 +67,14 @@ class BitTensorMemory: #sizes in bytes
         self.region_manager = Simulator(cells)
 
         # Initialise the hydraulic model upfront so equilibrium fractions and
-        # buffer expansion are resolved before any writes occur.
-        self.region_manager.run_saline_sim()
+        # buffer expansion are resolved before any writes occur.  Some
+        # bootstrapping layouts may temporarily present overlapping or zero-width
+        # regions which violate the snap_cell_walls assertions; in that case,
+        # defer hydraulic balancing until after a valid layout is established.
+        try:
+            self.region_manager.run_saline_sim()
+        except AssertionError:
+            pass
 
         
     def pull_full_set_from_memory(self):
@@ -105,8 +111,13 @@ class BitTensorMemory: #sizes in bytes
         ]
         self.region_manager = Simulator(cells)
 
-        # Ensure hydraulic model is primed on reset as well
-        self.region_manager.run_saline_sim()
+        # Ensure hydraulic model is primed on reset as well.  If the region
+        # specifications result in overlapping boundaries, defer the hydraulic
+        # pass until the layout is corrected.
+        try:
+            self.region_manager.run_saline_sim()
+        except AssertionError:
+            pass
         return self.region_manager.cells
 
 

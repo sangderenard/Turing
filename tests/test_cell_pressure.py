@@ -15,7 +15,7 @@ def test_simulation_stride_basic(stride):
                   right=i * WIDTH + WIDTH)
              for i in range(CELL_COUNT)]
     sim = Simulator(cells)
-    sp, _ = sim.step(cells)
+    sp, _ = sim.minimize(cells)
     assert isinstance(sp, (int, float))
     for c in cells:
         assert len(sim.get_cell_mask(c)) == c.right - c.left
@@ -43,7 +43,7 @@ def test_injection_mixed_prime7():
         )
         cells[0].injection_queue += 1
     for _ in range(10):
-        sp, _ = sim.step(cells)
+        sim.minimize(cells)
     sim.print_system()
     assert cells[0].injection_queue == 0
 
@@ -74,7 +74,7 @@ def test_sustained_random_injection():
                 sim.input_queues.get(target_cell.label, []) + [(payload, target_cell.stride)]
             )
             target_cell.injection_queue += 1
-        sim.step(cells)
+        sim.minimize(cells)
     total_remaining_items = 0
     for cell in cells:
         assert cell.injection_queue == 0

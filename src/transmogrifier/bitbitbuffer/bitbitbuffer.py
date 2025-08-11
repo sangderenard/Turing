@@ -101,7 +101,8 @@ class BitBitBuffer:
                     domain_left=cell.left,
                     domain_right=cell.right,
                     domain_stride=cell.stride,
-                    label=getattr(cell, "label", None) or f"pid_{cell.left}_{cell.right}"
+                    label=getattr(cell, "label", None) or f"pid_{cell.left}_{cell.right}",
+                    cell=cell
                 )
                 registered.append(_do_register(pb))
             return registered
@@ -413,27 +414,27 @@ class BitBitBuffer:
 
         _summary['pids_after'] = {}
         for label, pid in self.pid_buffers.items():
-            logging.debug(f"[_insert_bits] updating PIDBuffer '{label}': old mask_size={pid.pids.mask_size}, old data_size={pid.pids.data_size}")
-            new_pid_mask, new_pid_view, new_pid_bits, new_pid_data, new_pid_data_view, new_pid_data_bits = mask_and_data_spreader(pid.pids, pid.pids.mask_size, pid.pids.bitsforbits,
-                                       insertion_plans, plan_ratio=pid.domain_stride, plan_offset=pid.domain_left)
-            logging.debug(f"[_insert_bits] updating PIDBuffer '{label}': new mask_size={new_pid_bits}, new data_size={new_pid_data_bits}")
+            logging.debug(
+                f"[_insert_bits] updating PIDBuffer '{label}': old mask_size={pid.pids.mask_size}, old data_size={pid.pids.data_size}"
+            )
+            new_pid_mask, new_pid_view, new_pid_bits, new_pid_data, new_pid_data_view, new_pid_data_bits = mask_and_data_spreader(
+                pid.pids,
+                pid.pids.mask_size,
+                pid.pids.bitsforbits,
+                insertion_plans,
+                plan_ratio=pid.domain_stride,
+                plan_offset=pid.domain_left,
+            )
+            logging.debug(
+                f"[_insert_bits] updating PIDBuffer '{label}': new mask_size={new_pid_bits}, new data_size={new_pid_data_bits}"
+            )
             pid.pids.mask, pid.pids.mask_size = new_pid_mask, new_pid_bits
             pid.pids.data, pid.pids.data_size = new_pid_data, new_pid_data_bits
 
-            running_adj = 0
-            # update the pid boundaries
-            for orig_off, adj_off, sz in insertion_plans:
+            # Any expansion invalidates cached PID lookups; clear them so they
+            # will be lazily rebuilt on next access.
+            pid.active_set = None
 
-                if pid.domain_left >= orig_off + running_adj:
-                    pid.domain_left += sz
-                    pid.domain_right += sz
-                elif pid.domain_right >= orig_off + running_adj:
-                    pid.domain_right += sz
-
-                logging.debug(f"[_insert_bits] updating PIDBuffer {label}: domain=({pid.domain_left},{pid.domain_right}), "
-                              f"orig_off={orig_off}, adj_off={adj_off}, sz={sz}, running_adj={running_adj}")
-
-                running_adj += sz
             # Record after for this PID
             _summary['pids_after'][label] = {
                 'domain': (pid.domain_left, pid.domain_right),
@@ -509,32 +510,94 @@ class BitBitBuffer:
         # 3) Shift coordinates for every tracked span
         affected = proposals
         logging.debug(f"[expand] shifting coordinates for affected={affected!r}")
-        if affected:
-            for off, _, sz in plan:
-                for c in affected:
-                    old_left, old_right = c.left, c.right
-                    if off <= c.left:                     # gap before cell
-                        c.left += sz
-                        c.right += sz
-                        if hasattr(c, "leftmost")  and c.leftmost  is not None:
-                            c.leftmost  += sz
-                        if hasattr(c, "rightmost") and c.rightmost is not None:
-                            c.rightmost += sz
-                    elif c.left <= off < c.right:          # gap inside cell
-                        c.right += sz
-                        if (hasattr(c, "rightmost") and c.rightmost is not None
-                                and off < c.rightmost):
-                            c.rightmost += sz
-                        if hasattr(c, "leftmost") and c.leftmost is not None:
-                            if off <= c.leftmost:
-                                c.leftmost += sz
+        for off, _, sz in plan:
+            for c in affected:
+                old_left, old_right = c.left, c.right
+                if off <= c.left:                     # gap before cell
+                    c.left += sz
+                    c.right += sz
+                    if hasattr(c, "leftmost")  and c.leftmost  is not None:
+                        c.leftmost  += sz
+                    if hasattr(c, "rightmost") and c.rightmost is not None:
+                        c.rightmost += sz
+                elif c.left <= off < c.right:          # gap inside cell
+                    c.right += sz
+                    if (hasattr(c, "rightmost") and c.rightmost is not None
+                            and off < c.rightmost):
+                        c.rightmost += sz
+                    if hasattr(c, "leftmost") and c.leftmost is not None:
+                        if off <= c.leftmost:
+                            c.leftmost += sz
 
-                    logging.debug(f"[expand] cell={getattr(c,'label',repr(c))}, off={off}, sz={sz}, "
-                                  f"old=({old_left},{old_right}) new=({c.left},{c.right})")
+                logging.debug(
+                    f"[expand] cell={getattr(c,'label',repr(c))}, off={off}, sz={sz}, "
+                    f"old=({old_left},{old_right}) new=({c.left},{c.right})"
+                )
+
+        # Clear any cached PID lookups.  PIDBuffer domains that retain a live
+        # link to their cells mirror the updated coordinates automatically, so
+        # no explicit domain adjustment is required here.
+        for pb in self.pid_buffers.values():
+            pb.active_set = None
 
         logging.debug(f"[expand] EXIT")
 
         return proposals
+
+    # -- public façade --------------------------------------------------------
+    def roll(self, cell, offset, size, direction='left'):
+        """Roll a segment within *cell* to the opposite edge.
+
+        ``offset`` is the absolute bit index where the segment ends (for
+        ``direction='left'``) or starts (for ``direction='right'``).  ``size``
+        is the width of the segment to move.
+
+        The segment is removed from its original position, a gap of the same
+        size is inserted at the far edge of the cell using ``_insert_bits`` and
+        the data/mask are copied over.  Cell boundaries are expanded to cover
+        the new region.
+        """
+        if size <= 0:
+            return
+        if direction not in ('left', 'right'):
+            raise ValueError("direction must be 'left' or 'right'")
+
+        if direction == 'left':
+            cut_start = offset - size
+            cut_end = offset
+            if cut_start < cell.left or cut_end > cell.right:
+                raise ValueError("segment out of cell bounds")
+            block_mask = [int(self[i]) for i in range(cut_start, cut_end)]
+            block_data = bytes(self._data_access[cut_start:cut_end])
+            # remove the block
+            self.move(cut_end, cut_start, cell.right - cut_end)
+            insert_pos = cell.right - size
+            self._insert_bits([(insert_pos, insert_pos, size)])
+            for i, bit in enumerate(block_mask):
+                self[insert_pos + i] = bit
+            self._data_access[insert_pos:insert_pos + size] = block_data
+            cell.right += size
+            if hasattr(cell, 'rightmost') and cell.rightmost is not None:
+                cell.rightmost += size
+        else:  # direction == 'right'
+            cut_start = offset
+            cut_end = offset + size
+            if cut_start < cell.left or cut_end > cell.right:
+                raise ValueError("segment out of cell bounds")
+            block_mask = [int(self[i]) for i in range(cut_start, cut_end)]
+            block_data = bytes(self._data_access[cut_start:cut_end])
+            self.move(cut_start, cut_end, cell.right - cut_end)
+            insert_pos = cell.left
+            self._insert_bits([(insert_pos, insert_pos, size)])
+            for i, bit in enumerate(block_mask):
+                self[insert_pos + i] = bit
+            self._data_access[insert_pos:insert_pos + size] = block_data
+            cell.left -= size
+            if hasattr(cell, 'leftmost') and cell.leftmost is not None:
+                cell.leftmost -= size
+            cell.right += size
+            if hasattr(cell, 'rightmost') and cell.rightmost is not None:
+                cell.rightmost += size
 
     def _count_runs(self, optional_data=None):
         """Count consecutive runs of a specific value in the data."""

@@ -6,10 +6,13 @@ from .data_access import BitBitBufferDataAccess  # not used here, but keeps pari
 from .bitbititem import BitBitItem  # parity
 
 class PIDBuffer:
-    def __init__(self, domain_left, domain_right, domain_stride, label, pid_depth=128): #128 for uuid4
+    def __init__(self, domain_left, domain_right, domain_stride, label, pid_depth=128, cell=None):  # 128 for uuid4
         self.parent = None
-        self.domain_left = domain_left
-        self.domain_right = domain_right
+        # Optionally retain a live link back to a cell; this allows domain
+        # coordinates to follow the cell's walls without manual updates.
+        self.cell = cell
+        self._domain_left = domain_left
+        self._domain_right = domain_right
         self.domain_stride = domain_stride
 
         # Local import to avoid circular dependency at module import time
@@ -24,9 +27,29 @@ class PIDBuffer:
 
         self.label = label
         self.active_set = None
-        logging.debug(f"[PIDBuffer.__init__] domain=({domain_left},{domain_right}), stride={domain_stride}, label={label}, depth={pid_depth}")
+        logging.debug(
+            f"[PIDBuffer.__init__] domain=({domain_left},{domain_right}), stride={domain_stride}, label={label}, depth={pid_depth}"
+        )
         assert domain_left < domain_right, "domain_left must be < domain_right"
         assert domain_stride > 0, "domain_stride must be positive"
+
+    @property
+    def domain_left(self):
+        return self.cell.left if self.cell is not None else self._domain_left
+
+    @domain_left.setter
+    def domain_left(self, value):
+        # When linked to a cell we treat the cell's coordinates as the source of
+        # truth; updating the PIDBuffer's domain does not mutate the cell.
+        self._domain_left = value
+
+    @property
+    def domain_right(self):
+        return self.cell.right if self.cell is not None else self._domain_right
+
+    @domain_right.setter
+    def domain_right(self, value):
+        self._domain_right = value
     @property
     def plane(self):
         return 'pidref'
