@@ -242,58 +242,75 @@ class SalineHydraulicSystem:
     def balance_system(self, cells, bitbuffer,
                     mode='open',
                     C_ext=1500.0, p_ext=10000.0,
-                    Lp=1.0, A=1.0, sigma=1.0,
                     R=8.314, T=298.15,
-                    dt=1.0, max_steps=10):
+                    dt=0.1, max_steps=50,
+                    sigma=1.0, Ps=1.0):
         """
-        Balance container via iterative Kedem–Katchalsky:
-        ΔV = Lp·A·[ΔP – σ·R·T·ΔC]·dt, step until |ΔV|→0 or runaway.
-        - cells: list of Cell with .pressure and .salinity
-        - bitbuffer: BitBitBuffer instance to expand
+        Balance container via iterative Kedem–Katchalsky with additional
+        feedback terms.  Each cell tracks its own volume ``V_i`` and solute
+        quantity ``S_i``.  Concentration ``C_i`` is updated as ``S_i / V_i`` and
+        the internal pressure uses a simple turgor model::
+
+            P_i = P0 + k_i (V_i/V0_i - 1)
+
+        Water and solute fluxes are integrated over ``dt`` until volumes stop
+        changing or ``max_steps`` is reached.  The external bath accumulates the
+        displaced volume and solute, enforcing mass conservation.
         """
         if not cells or mode != 'open':
-            return
-        prev_delta = None
-        accumulated_delta = 0
-        for step in range(max_steps):
-            # compute averages
-            avg_p = sum(c.pressure for c in cells) / len(cells)
-            avg_C = sum(c.salinity for c in cells) / len(cells)
+            return [CellProposal(c) for c in cells]
 
-            print(f"average pressure: {avg_p}, average salinity: {avg_C}")
-            # differences
-            dP = p_ext - avg_p
-            dC = C_ext - avg_C
-            # osmotic pressure ΔΠ = R·T·ΔC
-            dPi = R * T * dC
-            # volumetric flow rate (bits per time)
-            Jv = Lp * A * (dP - sigma * dPi)
-            delta = Jv * dt
-            # check equilibrium
-            if delta == 0.0:
-                print(f"Equilibrium in {step} steps")
+        # Treat the external bath as a finite reservoir
+        bath_volume = sum(c.volume for c in cells)
+        bath_solute = C_ext * bath_volume
 
-                break
-            # check runaway
-            if prev_delta is not None and abs(delta) > abs(prev_delta):
-                print(f"Runaway at step {step}, ΔV={delta}")
-                break
-            # apply volume change
-            prev_delta = delta
-            accumulated_delta += delta
-            # apply volume change
         proposals = [CellProposal(c) for c in cells]
-        if accumulated_delta > 0:
-            # Create a properly shaped manual event to add free space at the end.
-            # BitBitBuffer.expand expects events as (label, offset, size) and gaps should
-            # be aligned to the system LCM/stride so PID buffers update correctly.
+        for _ in range(max_steps):
+            bath_conc = bath_solute / bath_volume if bath_volume > 0 else 0.0
+            max_delta = 0.0
+            total_delta = 0.0
+            for cell in cells:
+                # Permeability and elastic parameters are cell specific
+                Lp = (cell.l_solvent_permiability + cell.r_solvent_permiability) / 2.0
+                Ps_cell = Ps if Ps is not None else Lp
+                k = getattr(cell, 'elastic_coeff', 0.0)
+                V0 = getattr(cell, 'reference_volume', cell.volume)
+
+                # Update pressure and concentration based on current state
+                cell.concentration = cell.salinity / cell.volume
+                cell.pressure = cell.base_pressure + k * (cell.volume / V0 - 1.0)
+
+                dP = p_ext - cell.pressure
+                dC = bath_conc - cell.concentration
+
+                Jv = Lp * (dP - sigma * R * T * dC)
+                deltaV = Jv * dt
+
+                Cavg = 0.5 * (bath_conc + cell.concentration)
+                Js = Ps_cell * (dC - (1 - sigma) * Cavg * dP / (R * T))
+                deltaS = Js * dt
+
+                cell.volume += deltaV
+                cell.salinity += deltaS
+                cell.concentration = cell.salinity / cell.volume
+                cell.pressure = cell.base_pressure + k * (cell.volume / V0 - 1.0)
+
+                bath_volume -= deltaV
+                bath_solute -= deltaS
+
+                max_delta = max(max_delta, abs(deltaV))
+                total_delta += deltaV
+            if max_delta < 1e-6:
+                break
+
+        # Expand bitbuffer if total volume increased
+        if total_delta > 0:
             system_lcm = self.lcm(cells)
-            # Round the delta to an integer count of bits, then align to system LCM.
-            delta_bits = bitbuffer.intceil(bitbuffer.round(accumulated_delta), system_lcm)
+            delta_bits = bitbuffer.intceil(bitbuffer.round(total_delta), system_lcm)
             if delta_bits > 0:
                 manual_event = (None, bitbuffer.mask_size, delta_bits)
-                
                 proposals = bitbuffer.expand([manual_event], cells, proposals)
+
         return proposals
 
     @staticmethod
