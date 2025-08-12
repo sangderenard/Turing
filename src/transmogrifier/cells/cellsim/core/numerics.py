@@ -1,3 +1,5 @@
+from tqdm.auto import tqdm  # type: ignore
+
 def clamp_nonneg(x: float, eps: float=1e-18) -> float:
     return x if x > eps else eps
 
@@ -18,7 +20,7 @@ def imex_euler(y, f_explicit, f_implicit, dt, max_iter=8, tol=1e-8):
     y_new = y + dt * f_explicit(y)
     if f_implicit is None:
         return y_new
-    for _ in range(max_iter):
+    for _ in tqdm(range(max_iter), desc="imex", leave=False):
         y_prev = y_new
         y_new = y + dt * (f_explicit(y) + f_implicit(y_new))
         if abs(y_new - y_prev) < tol:

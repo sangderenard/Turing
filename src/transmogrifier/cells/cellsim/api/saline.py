@@ -8,6 +8,7 @@ import numpy as np
 from ..engine.saline import SalineEngine
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
+from tqdm.auto import tqdm  # type: ignore
 
 @dataclass
 class IntegerAllocatorCfg:
@@ -49,7 +50,7 @@ class SalinePressureAPI:
         self.p_funcs = [lambdify(self.t, e, 'math') for e in self.p_exprs]
 
         # init engine
-        for c in self.cells:
+        for c in tqdm(self.cells, desc="cells", leave=False):
             if c.A0 <= 0.0:
                 A0, _ = sphere_area_from_volume(c.V); c.A0 = A0
         self.engine = SalineEngine(self.cells, self.bath, species=self.species)
@@ -60,7 +61,7 @@ class SalinePressureAPI:
         p_vals = [f(t) for f in self.p_funcs]
         r = []
         eps = self.epsilon
-        for si, pi in zip(s_vals, p_vals):
+        for si, pi in tqdm(list(zip(s_vals, p_vals)), desc="exprs", leave=False):
             denom = pi if abs(pi) > eps else eps
             r.append(si/denom)
         s = sum(r); 
@@ -83,13 +84,13 @@ class SalinePressureAPI:
         K = sum(ceilings) - W
         if K <= 0: return ceilings
         costs = []
-        for i, q in enumerate(quotas):
+        for i, q in tqdm(list(enumerate(quotas)), desc="quotas", leave=False):
             if q <= 1.0 and self.int_alloc.protect_under_one:
                 cost = float('inf')
             else:
                 cost = 1 - (q - floor(q))
             costs.append((cost, i))
-        for _, idx in sorted(costs, key=lambda x: x[0])[:K]:
+        for _, idx in tqdm(sorted(costs, key=lambda x: x[0])[:K], desc="ceilings", leave=False):
             ceilings[idx] -= 1
         return ceilings
 
@@ -100,13 +101,13 @@ class SalinePressureAPI:
         K = sum(ceilings) - W
         if K <= 0: return ceilings
         costs = []
-        for i, q in enumerate(quotas):
+        for i, q in tqdm(list(enumerate(quotas)), desc="quotas", leave=False):
             if q < 1.0 and self.int_alloc.protect_under_one:
                 cost = float('inf')
             else:
                 cost = 1 - (q - floor(q))
             costs.append((cost, i))
-        for _, idx in sorted(costs, key=lambda x: x[0])[:K]:
+        for _, idx in tqdm(sorted(costs, key=lambda x: x[0])[:K], desc="ceilings", leave=False):
             ceilings[idx] -= 1
         return ceilings
 
@@ -120,7 +121,7 @@ class SalinePressureAPI:
     def from_legacy(cls, sim) -> "SalinePressureAPI":
         # Map legacy cells → Cell; salinity → Imp; pressure → base_pressure
         cells = []
-        for legacy in sim.cells:
+        for legacy in tqdm(sim.cells, desc="cells", leave=False):
             V = float(legacy.right - legacy.left)
             cell = Cell(V=V,
                         n={"Imp": float(getattr(legacy, "salinity", 0.0)),
@@ -130,7 +131,7 @@ class SalinePressureAPI:
                         visc_eta=float(getattr(legacy, "visc_eta", 0.0)))
             # organelles if present
             if hasattr(legacy, "organelles"):
-                for o in legacy.organelles:
+                for o in tqdm(legacy.organelles, desc="organelles", leave=False):
                     cell.organelles.append(
                         Organelle(volume_total=float(o.volume_total),
                                   lumen_fraction=float(getattr(o, "lumen_fraction", 0.7)),
@@ -168,7 +169,7 @@ def run_saline_sim(sim, *, as_float: bool = False):
     sim.engine_cs = api.engine
 
     # ensure leftmost/rightmost are defaulted for snapping
-    for cell in sim.cells:
+    for cell in tqdm(sim.cells, desc="cells", leave=False):
         if getattr(cell, "leftmost", None) is None:
             cell.leftmost = cell.left
         if getattr(cell, "rightmost", None) is None:
@@ -178,7 +179,7 @@ def run_saline_sim(sim, *, as_float: bool = False):
 
     # Legacy flow returned proposals after a snap to boundaries
     from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
-    proposals = [CellProposal(c) for c in sim.cells]
+    proposals = [CellProposal(c) for c in tqdm(sim.cells, desc="cells", leave=False)]
     proposals = sim.snap_cell_walls(sim.cells, proposals)
     return proposals
 
@@ -186,11 +187,11 @@ def run_saline_sim(sim, *, as_float: bool = False):
 def update_s_p_expressions(sim, cells, *, as_float: bool = False):
     from sympy import Float, Integer
     if as_float:
-        sim.s_exprs = [Float(getattr(cell, "salinity", 0.0)) for cell in cells]
-        sim.p_exprs = [Float(getattr(cell, "pressure", 0.0)) for cell in cells]
+        sim.s_exprs = [Float(getattr(cell, "salinity", 0.0)) for cell in tqdm(cells, desc="cells", leave=False)]
+        sim.p_exprs = [Float(getattr(cell, "pressure", 0.0)) for cell in tqdm(cells, desc="cells", leave=False)]
     else:
-        sim.s_exprs = [Integer(getattr(cell, "salinity", 0)) for cell in cells]
-        sim.p_exprs = [Integer(getattr(cell, "pressure", 0)) for cell in cells]
+        sim.s_exprs = [Integer(getattr(cell, "salinity", 0)) for cell in tqdm(cells, desc="cells", leave=False)]
+        sim.p_exprs = [Integer(getattr(cell, "pressure", 0)) for cell in tqdm(cells, desc="cells", leave=False)]
 
 
 def equilibrium_fracs(sim, t: float):
@@ -209,7 +210,7 @@ def balance_system(sim, cells, bitbuffer, *args, **kwargs):
         R = (3.0 * V / (4.0 * pi)) ** (1.0 / 3.0)
         return 4.0 * pi * R * R, R
 
-    for c in cells:
+    for c in tqdm(cells, desc="cells", leave=False):
         # establish basic geometric/mech fields if missing
         if not hasattr(c, "volume"):
             c.volume = float(c.right - c.left)
@@ -234,7 +235,7 @@ def balance_system(sim, cells, bitbuffer, *args, **kwargs):
         strain = max(A_curr / c.A0 - 1.0, 0.0)
         c.pressure = c.base_pressure + (2.0 * (c.elastic_k * strain) / max(R_curr, 1e-12))
 
-    return [CellProposal(c) for c in cells]
+    return [CellProposal(c) for c in tqdm(cells, desc="cells", leave=False)]
 
 
 def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_steps: int = 20000,
@@ -261,7 +262,7 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_st
     dt_curr = float(dt)
     species = tuple(api.species)
     species_list = list(species)
-    for step in range(int(max_steps)):
+    for step in tqdm(range(int(max_steps)), desc="steps", leave=False):
         vols_before = np.array([c.V for c in api.cells])
         dt_curr = api.engine.step(dt_curr)
         vols_after = np.array([c.V for c in api.cells])
@@ -282,7 +283,7 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_st
             break
 
     # Sync derived state back to legacy cells
-    for legacy, cs in zip(sim.cells, api.cells):
+    for legacy, cs in tqdm(zip(sim.cells, api.cells), desc="cells", total=len(sim.cells), leave=False):
         # volumes are useful for downstream bookkeeping
         legacy.volume = cs.V
         # pressure computed during engine step (from mechanics)
@@ -316,7 +317,7 @@ def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
     label_to_cs = {getattr(leg, "label", f"c{i}"): cs for i, (leg, cs) in enumerate(zip(sim.cells, api.cells))}
     relocation_events = []
 
-    for cell in sim.cells:
+    for cell in tqdm(sim.cells, desc="cells", leave=False):
         pb = bitbuf.pid_buffers.get(cell.label)
         if pb is None:
             continue
@@ -326,7 +327,7 @@ def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
         slots = width // stride if stride > 0 else 0
         # Scan pid mask plane for set bits within this domain
         set_slots = []
-        for i in range(slots):
+        for i in tqdm(range(slots), desc="slots", leave=False):
             abs_bit = left + i * stride
             # Map abs_bit to pid-index space
             idx = (abs_bit - pb.domain_left) // stride
@@ -337,7 +338,7 @@ def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
         groups = []
         start = None
         prev = None
-        for s in set_slots:
+        for s in tqdm(set_slots, desc="set", leave=False):
             if start is None:
                 start = prev = s
             elif s == prev + 1:
@@ -350,7 +351,7 @@ def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
 
         # Create organelles and craft relocation intents
         cs_cell = label_to_cs.get(cell.label)
-        for g0, g1 in groups:
+        for g0, g1 in tqdm(groups, desc="groups", leave=False):
             slot_count = g1 - g0 + 1
             vol = float(slot_count * stride)
             if cs_cell is not None:
