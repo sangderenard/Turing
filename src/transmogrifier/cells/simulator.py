@@ -61,7 +61,7 @@ class Simulator:
         # Call ``run_saline_sim`` to enable the full saline pressure model.
 
 # Attach modularized methods from simulator_methods
-from .simulator_methods.visualization import print_system, bar
+from .simulator_methods.visualization import print_system, bar, crosscheck
 from .simulator_methods.cell_mask import get_cell_mask, set_cell_mask, pull_cell_mask, push_cell_mask
 from .simulator_methods.data_io import actual_data_hook
 
@@ -86,6 +86,7 @@ Simulator.quanta_map = quanta_map
 Simulator.dump_cells = dump_cells
 Simulator.lcm = lcm
 Simulator.minimize = minimize
+Simulator.crosscheck = crosscheck
 if _USE_CELLSIM:
     Simulator.run_saline_sim = cs_run_saline_sim
     Simulator.run_balanced_saline_sim = cs_run_balanced
