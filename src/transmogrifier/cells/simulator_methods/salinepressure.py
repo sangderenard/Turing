@@ -3,8 +3,8 @@ from math import pi, ceil, floor, isfinite
 
 from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
 from .logutil import logger
-from ..cell_sim import CellSim
 from ..cell_consts import CELL_COUNT
+from ..cellsim.api.saline import run_balanced_saline_sim as cs_run_balanced
 from dataclasses import dataclass, field
 
 @dataclass
@@ -118,39 +118,8 @@ class SalineHydraulicSystem:
 
 
     def run_balanced_saline_sim(self, mode="open"):
-        """Balance the system then run the standard saline simulation."""
-        # Wrap incoming cells so the pressure balancer operates on CellSim
-        # objects.  This preserves the underlying Cell state until we explicitly
-        # push updates back after balancing.
-        wrapped = [CellSim.get(cell) for cell in self.cells]
-        for w in wrapped:
-            w.pull_from_cell()
-
-        proposals = self.balance_system(wrapped, self.bitbuffer, mode)
-
-        # Synchronise wrapper results back onto the original cells
-        for w in wrapped:
-            w.push_to_cell()
-
-        # The proposals returned reference the wrappers; rebuild them so they
-        # point at the underlying cells before applying.
-        unwrapped = []
-        for w, prop in zip(wrapped, proposals):
-            new_prop = CellProposal(w.cell)
-            new_prop.left = prop.left
-            new_prop.right = prop.right
-            new_prop.leftmost = prop.leftmost
-            new_prop.rightmost = prop.rightmost
-            new_prop.salinity = getattr(prop, "salinity", getattr(w.cell, "salinity", 0))
-            new_prop.pressure = getattr(prop, "pressure", getattr(w.cell, "pressure", 0))
-            unwrapped.append(new_prop)
-
-        for cell, proposal in zip(self.cells, unwrapped):
-            cell.apply_proposal(proposal)
-
-        proposals = self.run_saline_sim(as_float=True)
-        # this run saline sim eventually calls snap, which adjusts cell boundaries
-        return proposals
+        """Balance the system then run the standard saline simulation via cellsim."""
+        return cs_run_balanced(self, mode=mode)
     def reset_state(self):
         """Start at t=0 with equal volumes."""
         self.current_t = 0.0

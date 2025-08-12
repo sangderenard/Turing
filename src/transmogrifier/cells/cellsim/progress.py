@@ -31,7 +31,8 @@ class ProgressBar:
                 yield item
             return
 
-        bar = tqdm(iterable, position=self._level, leave=True, **kwargs)
+        kwargs.setdefault("leave", True)
+        bar = tqdm(iterable, position=self._level, **kwargs)
         self._level += 1
         try:
             for item in bar:
