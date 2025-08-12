@@ -185,6 +185,83 @@ class BitBitBuffer:
                 local_dst = dst - L
                 pid.pids.move(local_src, local_dst, length)
 
+    def relocate(self, sources: Sequence[int], destinations: Sequence[int]):
+        """Relocate payload at mask indices `sources` to `destinations`.
+
+        - Both lists must be the same length. Each entry moves a single mask slot
+          (and its associated data chunk) to a new index.
+        - No insertion/removal: this is a permutation/move within the existing buffer.
+        - Handles overlapping moves and cycles by staging a full read, then clearing
+          sources, then writing to destinations.
+        - Mirrors changes into any registered PIDBuffer domains when the indices lie
+          within those domains and are stride-aligned.
+        """
+        import logging
+        if not sources and not destinations:
+            return
+        if len(sources) != len(destinations):
+            raise ValueError("sources and destinations must be the same length")
+        n = len(sources)
+        # Validate bounds
+        for idx in list(sources) + list(destinations):
+            if not (0 <= idx < self.mask_size):
+                raise IndexError(f"index {idx} out of mask bounds [0,{self.mask_size})")
+        logging.debug(f"[relocate] ENTER: pairs={list(zip(sources, destinations))!r}")
+
+        # Stage read of all source mask bits and data chunks
+        staged_mask: list[int] = [int(self[s]) for s in sources]
+        staged_data: list[bytes] = [bytes(self._data_access[s:s+1]) for s in sources]
+
+        # Clear all sources (mask=0, data zeros)
+        zero_chunk = bytes(self.bittobyte(self.bitsforbits))  # over-alloc; we'll slice on write
+        for s in sources:
+            self[s] = 0
+            # zero the associated data chunk
+            self._data_access[s:s+1] = zero_chunk[: self.bitsforbits // 8]
+
+        # Write to destinations from staged values
+        for i in range(n):
+            dst = destinations[i]
+            self[dst] = staged_mask[i]
+            self._data_access[dst:dst+1] = staged_data[i]
+
+        # Mirror into PID buffers where applicable
+        if self._make_pid:
+            for label, pid in self.pid_buffers.items():
+                L, R, stride = pid.domain_left, pid.domain_right, pid.domain_stride
+                # Stage local copies for indices that fall in this domain and are aligned
+                local_pairs: list[tuple[int,int]] = []
+                local_mask: list[int] = []
+                local_data: list[bytes] = []
+                for i in range(n):
+                    s = sources[i]
+                    d = destinations[i]
+                    if not (L <= s < R and L <= d < R):
+                        continue
+                    if ((s - L) % stride) != 0 or ((d - L) % stride) != 0:
+                        continue  # ignore non-aligned indices for this PID domain
+                    ls = (s - L) // stride
+                    ld = (d - L) // stride
+                    local_pairs.append((ls, ld))
+                if not local_pairs:
+                    continue
+                # Stage reads (from pid.pids planes)
+                for ls, _ in local_pairs:
+                    local_mask.append(int(pid.pids.mask[ls]))
+                    local_data.append(bytes(pid.pids._data_access[ls:ls+1]))
+                # Clear sources
+                zero_pid_chunk = bytes(pid.pids.bitsforbits // 8)
+                for (ls, _dst) in local_pairs:
+                    pid.pids.mask[ls] = 0
+                    pid.pids._data_access[ls:ls+1] = zero_pid_chunk
+                # Write to destinations
+                for i2, (_ls, ld) in enumerate(local_pairs):
+                    pid.pids.mask[ld] = local_mask[i2]
+                    pid.pids._data_access[ld:ld+1] = local_data[i2]
+                # Invalidate PID cache
+                pid.active_set = None
+        logging.debug("[relocate] EXIT")
+
     def swap(self, src, dst, length):
         """Swap two bit ranges, keeping mask and data coupled."""
         if length <= 0 or src == dst:

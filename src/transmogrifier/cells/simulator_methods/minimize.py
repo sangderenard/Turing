@@ -1,6 +1,6 @@
 import logging
 from itertools import zip_longest
-from ..bitstream_search import BitStreamSearch
+from ...bitbitbuffer.helpers.bitstream_search import BitStreamSearch
 from .logutil import logger, analysis_logger
 
 def minimize(self, cells, verify=False):

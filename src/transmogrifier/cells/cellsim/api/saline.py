@@ -2,6 +2,9 @@
 from __future__ import annotations
 import math
 from dataclasses import dataclass
+import logging
+import json
+import sys
 from typing import Iterable, List, Sequence, Optional
 from sympy import lambdify, symbols, Integer, Float
 import numpy as np
@@ -9,6 +12,15 @@ from ..engine.saline import SalineEngine
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
 from tqdm.auto import tqdm  # type: ignore
+
+# Module logger (DEBUG by default so logs appear without extra setup)
+logger = logging.getLogger("cellsim.api.saline")
+if not logger.handlers:
+    _h = logging.StreamHandler(stream=sys.stdout)
+    _h.setLevel(logging.DEBUG)
+    _h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(logging.DEBUG)
 
 @dataclass
 class IntegerAllocatorCfg:
@@ -54,6 +66,68 @@ class SalinePressureAPI:
             if c.A0 <= 0.0:
                 A0, _ = sphere_area_from_volume(c.V); c.A0 = A0
         self.engine = SalineEngine(self.cells, self.bath, species=self.species)
+
+    # ---- debug helpers ----
+    def _compartment_snapshot(self, comp, species: List[str]):
+        V = float(getattr(comp, "V", 0.0))
+        n = {sp: float(comp.n.get(sp, 0.0)) for sp in species}
+        conc = getattr(comp, "conc", None)
+        concs = conc(species) if callable(conc) else {sp: (n.get(sp, 0.0)/max(V, 1e-18)) for sp in species}
+        snap = {
+            "V": V,
+            "n": n,
+            "conc": {sp: float(concs.get(sp, 0.0)) for sp in species},
+        }
+        # Bath extras
+        for extra in ("pressure", "temperature", "compressibility"):
+            if hasattr(comp, extra):
+                snap[extra] = float(getattr(comp, extra))
+        # Cell extras
+        for extra in ("A0", "elastic_k", "visc_eta", "Lp0", "base_pressure"):
+            if hasattr(comp, extra):
+                snap[extra] = float(getattr(comp, extra))
+        # Mechanics (may be populated by engine)
+        if hasattr(comp, "pressure"):
+            try:
+                snap["pressure"] = float(getattr(comp, "pressure"))
+            except Exception:
+                pass
+        return snap
+
+    def snapshot_system(self, legacy_sim) -> dict:
+        species = list(self.species)
+        # Bath
+        bath_snap = self._compartment_snapshot(self.bath, species)
+        # Cells
+        cells = []
+        for i, (leg, cs) in enumerate(zip(getattr(legacy_sim, "cells", []), self.cells)):
+            cell_snap = self._compartment_snapshot(cs, species)
+            # label/geometry from legacy for traceability
+            for k in ("label", "left", "right", "leftmost", "rightmost"):
+                if hasattr(leg, k):
+                    try:
+                        cell_snap[k] = getattr(leg, k)
+                    except Exception:
+                        pass
+            # organelles
+            organelles = []
+            for o in getattr(cs, "organelles", []) or []:
+                o_snap = {
+                    "volume_total": float(getattr(o, "volume_total", 0.0)),
+                    "lumen_fraction": float(getattr(o, "lumen_fraction", 0.0)),
+                    "V_lumen": float(o.V if hasattr(o, "V") else 0.0),
+                    "n": {sp: float(o.n.get(sp, 0.0)) for sp in species},
+                    "conc": {sp: float((o.n.get(sp, 0.0) / max(o.V, 1e-18))) for sp in species},
+                }
+                organelles.append(o_snap)
+            if organelles:
+                cell_snap["organelles"] = organelles
+            cells.append(cell_snap)
+        return {
+            "species": species,
+            "bath": bath_snap,
+            "cells": cells,
+        }
 
     # ---- legacy “view”: equilibrium fractions & bar ----
     def equilibrium_fracs(self, t: float) -> List[float]:
@@ -238,7 +312,7 @@ def balance_system(sim, cells, bitbuffer, *args, **kwargs):
     return [CellProposal(c) for c in tqdm(cells, desc="cells", leave=False)]
 
 
-def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_steps: int = 20000,
+def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1, max_steps: int = 20,
                             tol_vol: float = 1e-9, tol_conc: float = 1e-9) -> list:
     """Step cellsim engine to equilibrium, sync derived state back, then return proposals.
 
@@ -253,10 +327,25 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_st
     sim.cs_api = api
     sim.engine_cs = api.engine
 
-    # 0) Preprocess: convert PID mask placements into organelles and relocation plan
-    relocation_plan = preprocess_pid_masks_to_organelles(sim, api)
+    # 0) Preprocess: convert PID mask placements into organelles and a dynamic relocation mapping
+    relocation_map = build_dynamic_pid_relocation(sim, api)
     # Communicate plan to caller; applying it is caller-controlled
-    sim.relocation_plan = relocation_plan
+    sim.relocation_map = relocation_map
+
+    # Debug: pre-run snapshot (after organelle preprocessing), include relocation plan
+    try:
+        pre = api.snapshot_system(sim)
+        if getattr(sim, "relocation_map", None):
+            pre["relocation_map"] = {
+                k: {
+                    "sources": v.get("sources", []),
+                    "destinations": v.get("destinations", []),
+                }
+                for k, v in sim.relocation_map.items()
+            }
+        logger.debug("saline pre-run system status:\n%s", json.dumps(pre, indent=2))
+    except Exception as e:
+        logger.debug("failed to build pre-run snapshot: %s", e)
 
     # Iterate to equilibrium
     dt_curr = float(dt)
@@ -298,24 +387,37 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_st
     sim.fractions = api.equilibrium_fracs(0.0)
     proposals = [CellProposal(c) for c in sim.cells]
     proposals = sim.snap_cell_walls(sim.cells, proposals)
+    # Debug: post-run snapshot (include relocation plan for traceability)
+    try:
+        post = api.snapshot_system(sim)
+        if getattr(sim, "relocation_map", None):
+            post["relocation_map"] = {
+                k: {
+                    "sources": v.get("sources", []),
+                    "destinations": v.get("destinations", []),
+                }
+                for k, v in sim.relocation_map.items()
+            }
+        logger.debug("saline post-run system status:\n%s", json.dumps(post, indent=2))
+    except Exception as e:
+        logger.debug("failed to build post-run snapshot: %s", e)
     # Return the relocation plan alongside proposals for upstream preservation if desired
     return proposals
 
 
-def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
-    """Create organelles from PID masks and produce a stride-aligned relocation plan.
+def build_dynamic_pid_relocation(sim, api: SalinePressureAPI):
+    """Create organelles from PID masks and propose dynamic index relocation per cell.
 
-    - For each cell, read PIDBuffer mask bits as stride slots
-    - Group contiguous set bits into organelle candidates (each 1 stride wide per slot)
-    - Create Organelle entries on the corresponding cellsim Cell with volume_total proportional to stride count
-    - Build a relocation plan list of tuples (label, offset, size_bits) where size_bits can be negative to shrink
-    - The calling code is responsible for applying the plan using build_metadata/expand.
+    Returns a dict keyed by cell.label with:
+      { 'sources': [abs_indices...], 'destinations': [abs_indices...] }
+
+    This mirrors current PID mask placements (set bits) to the compacted left side
+    of each cell, preserving relative order. It's a placeholder policy that moves
+    objects based on organelle occupancy without static gap insertions.
     """
     bitbuf = sim.bitbuffer
-    stride_map = {c.label: c.stride for c in sim.cells}
-    # Ensure each legacy cell maps to its cellsim partner by index
     label_to_cs = {getattr(leg, "label", f"c{i}"): cs for i, (leg, cs) in enumerate(zip(sim.cells, api.cells))}
-    relocation_events = []
+    mapping: dict[str, dict[str, list[int]]] = {}
 
     for cell in tqdm(sim.cells, desc="cells", leave=False):
         pb = bitbuf.pid_buffers.get(cell.label)
@@ -323,42 +425,34 @@ def preprocess_pid_masks_to_organelles(sim, api: SalinePressureAPI):
             continue
         stride = max(1, getattr(cell, "stride", pb.domain_stride))
         left = cell.left
-        width = (cell.right - cell.left)
-        slots = width // stride if stride > 0 else 0
-        # Scan pid mask plane for set bits within this domain
-        set_slots = []
+        right = cell.right
+        slots = (right - left) // stride if stride > 0 else 0
+
+        set_abs_indices: list[int] = []
+        # Scan for set mask bits (occupied slots)
         for i in tqdm(range(slots), desc="slots", leave=False):
             abs_bit = left + i * stride
-            # Map abs_bit to pid-index space
             idx = (abs_bit - pb.domain_left) // stride
             if 0 <= idx < pb.pids.mask_size and int(pb.pids[idx]) == 1:
-                set_slots.append(i)
+                set_abs_indices.append(abs_bit)
 
-        # Group contiguous slots
-        groups = []
-        start = None
-        prev = None
-        for s in tqdm(set_slots, desc="set", leave=False):
-            if start is None:
-                start = prev = s
-            elif s == prev + 1:
-                prev = s
-            else:
-                groups.append((start, prev))
-                start = prev = s
-        if start is not None:
-            groups.append((start, prev))
-
-        # Create organelles and craft relocation intents
+        # Create organelles sized by occupancy fraction (still useful to engine)
         cs_cell = label_to_cs.get(cell.label)
-        for g0, g1 in tqdm(groups, desc="groups", leave=False):
-            slot_count = g1 - g0 + 1
-            vol = float(slot_count * stride)
-            if cs_cell is not None:
-                cs_cell.organelles.append(Organelle(volume_total=vol, lumen_fraction=0.0, n={"Imp": 0.0}))
-            # Intent: reserve space for organelle movement; here we record as contraction (negative) at the left edge of group,
-            # to be respected by upstream planner if it chooses to relocate payload before expansion
-            abs_off = left + g0 * stride
-            relocation_events.append((cell.label, abs_off, -slot_count * stride))
+        if cs_cell is not None and set_abs_indices:
+            # approximate: one organelle spanning occupied count
+            occ_slots = len(set_abs_indices)
+            vol = float(occ_slots * stride)
+            cs_cell.organelles.append(Organelle(volume_total=vol, lumen_fraction=0.0, n={"Imp": 0.0}))
 
-    return relocation_events
+        # Build a simple left-pack relocation: move occupied slots to the left edge
+        dst_indices: list[int] = []
+        for k, _abs in enumerate(set_abs_indices):
+            dst_indices.append(left + k * stride)
+
+        if set_abs_indices:
+            mapping[cell.label] = {
+                "sources": set_abs_indices,
+                "destinations": dst_indices,
+            }
+
+    return mapping

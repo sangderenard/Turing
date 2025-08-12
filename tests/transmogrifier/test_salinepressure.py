@@ -1,6 +1,6 @@
 from sympy import Integer
 import pytest
-from src.transmogrifier.cells.simulator_methods.salinepressure import SalineHydraulicSystem
+from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
 from src.transmogrifier.cells.simulator import Simulator
 from src.transmogrifier.cells.cell_consts import Cell
 

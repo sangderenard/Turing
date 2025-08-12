@@ -10,7 +10,7 @@ import threading
 from uuid import uuid4
 
 from ...cells.simulator import Simulator
-from ...cells.simulator_methods.salinepressure import SalineHydraulicSystem
+from ...cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
 from ...cells.cell_consts import Cell
 from .helpers.meta_graph_edge import META_GRAPH_TRANSFER_BUFFER_SIZE
 
@@ -1190,7 +1190,7 @@ class BitTensorMemoryGraph:
         
         # --- Hungarian assignment (O(n³) but n is small here) -------
         try:
-            from scipy.optimize import linear_sum_assignment as hungarian
+            from scipy.optimize import linear_sum_assignment as hungarian # type: ignore
             rows, cols = hungarian(cost)          # scipy returns numpy arrays
             assign     = list(zip(rows.tolist(), cols.tolist()))
         except ImportError:                       # tiny pure-python fallback

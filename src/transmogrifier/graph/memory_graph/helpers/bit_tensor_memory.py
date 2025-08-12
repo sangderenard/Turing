@@ -10,7 +10,7 @@ import threading
 from uuid import uuid4
 
 from ....cells.simulator import Simulator
-from ....cells.simulator_methods.salinepressure import SalineHydraulicSystem
+from ....cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
 from ....cells.cell_consts import Cell
 from .bt_graph_header import BTGraphHeader
 from .bit_tensor_memory_units import BitTensorMemoryUnits
