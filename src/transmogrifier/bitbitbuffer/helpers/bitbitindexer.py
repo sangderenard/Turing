@@ -105,8 +105,12 @@ class BitBitIndexer:
         # ───────────────────────────────────────────────────────
         if spec.mode == 'view':
             idxs = spec.indices()
+            parent = spec.caller
+            parent_reversed = isinstance(parent, BitBitSlice) and getattr(parent, 'reversed', False)
             # single‑bit view  → BitBitItem
             if isinstance(spec.index, int):
+                if parent_reversed:
+                    idxs[0] = parent.useful_length - 1 - idxs[0]
                 mask_index = spec.base_offset + idxs[0]
                 return BitBitItem(
                     buffer = buf,
@@ -115,11 +119,13 @@ class BitBitIndexer:
                     cast = spec.caster,
                     plane = spec.plane
                 )
-            # slice view → BitBitSlice (handle reverse step)
-            step      = spec.index.step or 1
-            reversed_ = step < 0
-            start_idx = idxs[0] if step > 0 else idxs[-1]
-            start_bit = spec.base_offset + start_idx
+            # slice view → BitBitSlice (handle reverse step and parent orientation)
+            step     = spec.index.step or 1
+            if parent_reversed:
+                idxs = [parent.useful_length - 1 - i for i in idxs]
+            logical_rev = step < 0
+            reversed_  = parent_reversed ^ logical_rev
+            start_bit  = spec.base_offset + min(idxs)
             return BitBitSlice(
                 buffer   = buf,
                 start_bit= start_bit,
