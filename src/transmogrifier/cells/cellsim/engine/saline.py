@@ -13,6 +13,7 @@ from ..transport.pumps import (
     na_k_atpase_saturating,
     apply_na_k_pump_to_left_changes,
 )
+from ..progress import progress
 
 class SalineEngine:
     def __init__(
@@ -49,16 +50,15 @@ class SalineEngine:
         max_rel = 0.0
         sum_dV = 0.0
         totals_before = {}
-        for sp in self.species:
+        for sp in progress.iterate(self.species, desc="species"):
             total = self.bath.n.get(sp, 0.0)
-            for c in self.cells:
+            for c in progress.iterate(self.cells, desc="cells", leave=False):
                 total += c.n.get(sp, 0.0)
                 for o in getattr(c, "organelles", []):
                     total += o.n.get(sp, 0.0)
             totals_before[sp] = total
         species_list = list(self.species)
-
-        for c in self.cells:
+        for c in progress.iterate(self.cells, desc="cells"):
             Cext = self.bath.conc(species_list)
             # 1) inner organelle exchange (does not touch c.V)
             inner_exchange(c, T, dt, self.species, Rgas=RGAS)
@@ -66,7 +66,7 @@ class SalineEngine:
             # 2) mechanics + anchoring
             dP_tension, eps = laplace_pressure(c.A0, c.V, c.elastic_k, c.visc_eta, c._prev_eps, dt)
             dP_anchor = 0.0
-            for o in c.organelles:
+            for o in progress.iterate(c.organelles, desc="organelles", leave=False):
                 if o.anchor_stiffness > 0.0 and math.isfinite(o.anchor_stiffness):
                     dP_anchor += o.anchor_stiffness * (eps - o.eps_ref)
             c._prev_eps = eps
@@ -132,7 +132,8 @@ class SalineEngine:
             self.bath.V = clamp_nonneg(self.bath.V - dV_cell)
 
             rel = abs(dV_cell) / max(c.V, 1e-18)
-            if rel > max_rel: max_rel = rel
+            if rel > max_rel:
+                max_rel = rel
             sum_dV += dV_cell
 
             # record a convenient derived pressure (for UI)

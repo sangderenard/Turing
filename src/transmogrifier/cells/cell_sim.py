@@ -5,6 +5,8 @@ import uuid
 import weakref
 import math
 
+from .cellsim.progress import progress
+
 # ---- Minimal "Bath" so the wrapper has a counterpart -------------------------
 @dataclass
 class Bath:
@@ -104,7 +106,7 @@ class CellSim:
             raw = {sp: 0.0 for sp in self.species}
             raw["Imp"] = float(getattr(c, "salinity", 0.0))
         # ensure all species exist
-        for sp in self.species:
+        for sp in progress.iterate(self.species, desc="init species", leave=False):
             raw.setdefault(sp, 0.0)
         self.solute: Dict[str,float] = raw
 
@@ -204,8 +206,12 @@ class CellSim:
         """
         T = bath.temperature
         # concentrations
-        Cext = {sp: bath.solute[sp]/bath.volume for sp in self.species}
-        Cint = {sp: self.solute[sp]/self.volume for sp in self.species}
+        Cext = {}
+        for sp in progress.iterate(self.species, desc="bath conc", leave=False):
+            Cext[sp] = bath.solute[sp]/bath.volume
+        Cint = {}
+        for sp in progress.iterate(self.species, desc="cell conc", leave=False):
+            Cint[sp] = self.solute[sp]/self.volume
 
         # mechanics & permeabilities
         dP_tension, eps, deps_dt = self._dP_tension(self.volume, dt)
@@ -216,14 +222,14 @@ class CellSim:
         P_i = self.base_pressure + dP_tension
         dP  = bath.pressure - P_i
         osm = 0.0
-        for sp in self.species:
+        for sp in progress.iterate(self.species, desc="osm", leave=False):
             osm += self.sigma[sp] * self.R * T * (Cext[sp] - Cint[sp])
 
         Jv = Lp * A * (dP - osm)         # volume flux
         dV = Jv * dt
 
         dS: Dict[str,float] = {}
-        for sp in self.species:
+        for sp in progress.iterate(self.species, desc="flux", leave=False):
             Ps = self._arrhenius(self.Ps0[sp], self.Ea_Ps[sp], T) * (1.0 + self.ps_tension_boost*max(eps, 0.0))
             Js = Ps * A * (Cext[sp] - Cint[sp]) + (1.0 - self.sigma[sp]) * Cint[sp] * Jv
             dS[sp] = Js * dt
