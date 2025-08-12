@@ -257,9 +257,9 @@ def minimize(self, cells, verify=False):
                 analysis_logger.analysis(
                     f"Cell {cell.label} pids — gap_pids: {gap_pids} for assignable {best_gaps}"
                 )
-            cell.pressure = pressure
-            if cell.label in self.input_queues:
-                cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
+            #cell.pressure = pressure
+            #if cell.label in self.input_queues:
+                #cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
             logger.debug(f"Checking cell {cell.label}:")
             system_pressure += pressure
             logger.debug(f"input_queues: {self.input_queues}")
@@ -316,12 +316,12 @@ def minimize(self, cells, verify=False):
                 assert cell.rightmost < cell.right, f"Cell {cell.label} rightmost {cell.rightmost} is not less than right {cell.right}"
                 assert (cell.rightmost + 1) % cell.stride == 0, f"Cell {cell.label} rightmost {cell.rightmost} is not aligned with stride {cell.stride}"
             raw = self.bitbuffer.stamp(raw, relative_consumed_gaps, cell.stride, 1)
-        else:
-            if cell.label in self.input_queues:
-                cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
+        #else:
+            #if cell.label in self.input_queues:
+            #    cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
 
-                logger.debug(f"Cell {cell.label} has no left/right distinction, skipping.")
-            continue
+            #    logger.debug(f"Cell {cell.label} has no left/right distinction, skipping.")
+            #continue
         # AFTER snapshot once stamping/injection for this cell is applied
         if logger.isEnabledFor(logging.DEBUG):
             after_snap = _build_snapshot(raw)

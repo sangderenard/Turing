@@ -299,7 +299,7 @@ def balance_system(sim, cells, bitbuffer, *args, **kwargs):
         if not hasattr(c, "visc_eta"):
             c.visc_eta = 0.0
         if not hasattr(c, "base_pressure"):
-            c.base_pressure = float(getattr(c, "pressure", 0.0))
+            c.base_pressure = 1e4#float(getattr(c, "pressure", 0.0))
 
         # concentration bookkeeping from legacy salinity
         sal = float(getattr(c, "salinity", 0.0))
