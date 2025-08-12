@@ -100,6 +100,21 @@ def print_system(sim, width=80):
     logger.info(''.join(output))
     logger.info(f"{size_string} {free_string}")
 
+
+def crosscheck(sim) -> None:
+    """Assert that PID and bit masks agree for every cell anchor."""
+    for c in sim.cells:
+        stride = c.stride
+        pb = sim.bitbuffer.pid_buffers.get(c.label)
+        for a in range(c.left, c.right, stride):
+            pid_occupied = 0
+            if pb is not None:
+                idx = (a - pb.domain_left) // pb.domain_stride
+                if 0 <= idx < pb.pids.mask_size:
+                    pid_occupied = int(pb.pids[idx])
+            bit_occupied = any(int(sim.bitbuffer[b]) for b in range(a, min(a + stride, sim.bitbuffer.mask_size)))
+            assert bool(pid_occupied) == bool(bit_occupied), f"Mismatch at anchor {a}"
+
 # ────────────────────────────────────────────────────────────────
 # Live Pygame Visualiser driven by the Simulator
 # ----------------------------------------------------------------
@@ -199,17 +214,18 @@ class _LCVisual:
                 x1 = 10 + round((slot_right - base_left) * self.scale_x)
                 w = max(1, x1 - x0)
 
+                pid_occupied = 0
                 if mask is not None:
                     anchor   = pb.domain_left
                     mask_idx = (slot_left - anchor) // pb.domain_stride
-                    bit_active = int(mask[mask_idx]) if 0 <= mask_idx < mask_slots else 0
-                else:
-                    bit_active = 0
-                colour = COL_DATA if bit_active else COL_SOLVENT
+                    pid_occupied = int(mask[mask_idx]) if 0 <= mask_idx < mask_slots else 0
+                bit_occupied = any(int(self.sim.bitbuffer[b]) for b in range(slot_left, min(slot_left + stride, self.sim.bitbuffer.mask_size)))
+                assert pid_occupied == bit_occupied, f"mask mismatch at {slot_left}"
+                colour = COL_DATA if pid_occupied else COL_SOLVENT
                 # Active development: log grid/data placement and PID search
                 logger.debug(
                     f"[GRID] Drawing cell {c.label} slot {slot_idx}: "
-                    f"left={slot_left}, right={slot_right}, x0={x0}, x1={x1}, bit_active={bit_active}"
+                    f"left={slot_left}, right={slot_right}, x0={x0}, x1={x1}, pid_occupied={pid_occupied}"
                 )
                 pygame.draw.rect(
                     self.screen,

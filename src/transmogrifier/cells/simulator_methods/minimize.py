@@ -332,4 +332,5 @@ def minimize(self, cells):
 
     self.system_pressure = system_pressure
     logger.info(f"Mask state at the end of minimize: {self.bitbuffer.mask.hex()}")
+    self.crosscheck()
     return system_pressure, raws
