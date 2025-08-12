@@ -1,3 +1,4 @@
+import logging
 from itertools import zip_longest
 from ..bitstream_search import BitStreamSearch
 from .logutil import logger, analysis_logger
@@ -102,8 +103,10 @@ def minimize(self, cells, verify=False):
                 }
             return snap
 
-        before_snap = _build_snapshot(raw)
-        analysis_logger.analysis(f"Cell {cell.label} SNAPSHOT BEFORE → {before_snap}")
+        # Build/log snapshots only when debug logging is enabled (no longer active analysis)
+        if logger.isEnabledFor(logging.DEBUG):
+            before_snap = _build_snapshot(raw)
+            logger.debug(f"Cell {cell.label} SNAPSHOT BEFORE → {before_snap}")
         assert left_flat_length % cell.stride == 0, f"Left flat length {left_flat_length} for cell {cell.label} is not aligned with stride {cell.stride}"
         assert left_flat_length >= 0, f"Left flat length {left_flat_length} for cell {cell.label} is negative, this should not happen"
         assert right_flat_length >= 0, f"Right flat length {right_flat_length} for cell {cell.label} is negative, this should not happen"
@@ -320,8 +323,9 @@ def minimize(self, cells, verify=False):
                 logger.debug(f"Cell {cell.label} has no left/right distinction, skipping.")
             continue
         # AFTER snapshot once stamping/injection for this cell is applied
-        after_snap = _build_snapshot(raw)
-        analysis_logger.analysis(f"Cell {cell.label} SNAPSHOT AFTER  → {after_snap}")
+        if logger.isEnabledFor(logging.DEBUG):
+            after_snap = _build_snapshot(raw)
+            logger.debug(f"Cell {cell.label} SNAPSHOT AFTER  → {after_snap}")
 
         raws[cell.label] = raw
         byte_len = len(cell._buf)
