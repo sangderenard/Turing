@@ -1,6 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
 from ..core.geometry import sphere_area_from_volume
+from ..constants import (
+    DEFAULT_ELASTIC_K,
+    DEFAULT_LP0,
+    SALINITY_PER_DATA_UNIT,
+)
 
 @dataclass
 class Compartment:
@@ -17,7 +22,7 @@ class Organelle:
     volume_total: float
     lumen_fraction: float = 0.7
     n: Dict[str, float] = field(default_factory=dict)
-    Lp0: float = 0.01
+    Lp0: float = DEFAULT_LP0
     Ps0: Dict[str, float] = field(default_factory=lambda: {"Na":0.01,"K":0.01,"Cl":0.01,"Imp":0.0})
     sigma: Dict[str, float] = field(default_factory=lambda: {"Na":0.9,"K":0.9,"Cl":0.9,"Imp":1.0})
     Ea_Lp: float | None = None
@@ -34,6 +39,9 @@ class Organelle:
         if self.V_solid <= 0.0:
             self.V_solid = self.volume_total - self._V_lumen
         self.volume_total = self.V_solid + self._V_lumen
+        # Seed a standard impermeant solute load if missing.
+        if "Imp" not in self.n:
+            self.n["Imp"] = self.V_lumen() * SALINITY_PER_DATA_UNIT
 
     def V_lumen(self) -> float:
         return max(self._V_lumen, 0.0)
@@ -54,9 +62,9 @@ class Organelle:
 @dataclass
 class Cell(Compartment):
     A0: float = 0.0
-    elastic_k: float = 0.1
+    elastic_k: float = DEFAULT_ELASTIC_K
     visc_eta: float = 0.0
-    Lp0: float = 1.0
+    Lp0: float = DEFAULT_LP0
     Ps0: Dict[str, float] = field(default_factory=lambda: {"Na":0.01,"K":0.01,"Cl":0.01,"Imp":0.0})
     sigma: Dict[str, float] = field(default_factory=lambda: {"Na":0.9,"K":0.9,"Cl":0.9,"Imp":1.0})
     Ea_Lp: float | None = None

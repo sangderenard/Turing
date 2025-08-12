@@ -1,5 +1,10 @@
 
 from enum import IntFlag, auto
+from .cellsim.constants import (
+    DEFAULT_ELASTIC_K,
+    DEFAULT_LP0,
+    SALINITY_PER_DATA_UNIT,
+)
 
 
 
@@ -52,8 +57,8 @@ class Cell:
         self.r_wall_flags = flags['right_wall']
         self.c_flags      = flags['cell']
         self.system_flags = flags['system']
-        self.l_solvent_permiability = 1
-        self.r_solvent_permiability = 1
+        self.l_solvent_permiability = DEFAULT_LP0
+        self.r_solvent_permiability = DEFAULT_LP0
         self.injection_queue = 0
         self.resize_queue = 0
         self.stride = stride
@@ -67,10 +72,11 @@ class Cell:
         # any baseline hydrostatic pressure in the system.
         self.volume = float(self.len)
         self.reference_volume = float(self.len)
-        self.elastic_coeff = 0.1
-        self.base_pressure = 10.0
-        self.pressure = 1.0
-        self.concentration = 1.0
+        self.elastic_coeff = DEFAULT_ELASTIC_K
+        self.salinity_per_data_unit = SALINITY_PER_DATA_UNIT
+        self.base_pressure = 0.0
+        self.pressure = 0.0
+        self.concentration = 0.0
 
         # Retain reference to avoid garbage collection
         self._buf = None#buf
