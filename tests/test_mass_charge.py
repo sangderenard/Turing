@@ -1,0 +1,29 @@
+import math
+from src.transmogrifier.cells.cellsim.engine.saline import SalineEngine
+from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
+from src.transmogrifier.cells.cellsim.core.geometry import sphere_area_from_volume
+
+
+def test_mass_conserved_without_pump():
+    cell = Cell(V=10.0, n={"Na":10.0, "K":5.0})
+    bath = Bath(V=100.0, n={"Na":100.0, "K":50.0})
+    eng = SalineEngine([cell], bath, species=("Na","K"), pump_rate=0.0)
+    before = {sp: cell.n[sp] + bath.n[sp] for sp in ("Na","K")}
+    eng.step(1.0)
+    after = {sp: cell.n[sp] + bath.n[sp] for sp in ("Na","K")}
+    assert math.isclose(after["Na"], before["Na"], rel_tol=1e-6)
+    assert math.isclose(after["K"], before["K"], rel_tol=1e-6)
+
+
+def test_pump_stoichiometry():
+    cell = Cell(V=10.0, n={"Na":10.0, "K":5.0})
+    bath = Bath(V=100.0, n={"Na":100.0, "K":50.0})
+    rate = 1e-3
+    eng = SalineEngine([cell], bath, species=("Na","K"), pump_rate=rate)
+    area, _ = sphere_area_from_volume(cell.V)
+    eng.step(1.0)
+    expected = rate * area * 1.0
+    assert math.isclose(cell.n["Na"], 10.0 - 3*expected, rel_tol=1e-6)
+    assert math.isclose(bath.n["Na"], 100.0 + 3*expected, rel_tol=1e-6)
+    assert math.isclose(cell.n["K"], 5.0 + 2*expected, rel_tol=1e-6)
+    assert math.isclose(bath.n["K"], 50.0 - 2*expected, rel_tol=1e-6)
