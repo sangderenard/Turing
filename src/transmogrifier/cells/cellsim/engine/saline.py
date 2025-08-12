@@ -56,11 +56,10 @@ class SalineEngine:
                 for o in getattr(c, "organelles", []):
                     total += o.n.get(sp, 0.0)
             totals_before[sp] = total
-
-        # Precompute bath concentrations
-        Cext = self.bath.conc(list(self.species))
+        species_list = list(self.species)
 
         for c in self.cells:
+            Cext = self.bath.conc(species_list)
             # 1) inner organelle exchange (does not touch c.V)
             inner_exchange(c, T, dt, self.species, Rgas=RGAS)
 
@@ -87,7 +86,7 @@ class SalineEngine:
             elif getattr(c, "pump_enabled", False):
                 J_pump = na_k_atpase_saturating(
                     C_Nai=Cint.get("Na", 0.0),
-                    C_Ko=self.bath.conc(list(self.species)).get("K", 0.0),
+                    C_Ko=Cext.get("K", 0.0),
                     A=A,
                     Jmax=getattr(c, "pump_Jmax", 0.0),
                     Km_Nai=getattr(c, "pump_Km_Nai", 10.0),
