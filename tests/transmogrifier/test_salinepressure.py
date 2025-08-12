@@ -1,12 +1,14 @@
-from sympy import Integer
 import pytest
 from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
 from src.transmogrifier.cells.simulator import Simulator
 from src.transmogrifier.cells.cell_consts import Cell
+from src.transmogrifier.cells.cellsim.data.state import Cell as SimCell, Bath
 
 
 def test_equilibrium_fracs_sum_to_one():
-    system = SalineHydraulicSystem([Integer(1), Integer(1)], [Integer(1), Integer(1)], width=10)
+    cells = [SimCell(V=1.0, n={"Imp": 1.0}), SimCell(V=1.0, n={"Imp": 1.0})]
+    bath = Bath(V=1.0, n={"Imp": 1.0})
+    system = SalineHydraulicSystem(cells, bath, width=10)
     fracs = system.equilibrium_fracs(0.0)
     assert abs(sum(fracs) - 1.0) < 1e-6
 
