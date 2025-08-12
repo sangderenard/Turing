@@ -1,4 +1,9 @@
+"""Transport equations implemented with vectorised NumPy operations."""
+
 from typing import Dict, Iterable, Tuple
+
+import numpy as np
+
 from ..core.units import R as RGAS
 from ..core.units import EPS
 
@@ -8,30 +13,57 @@ def arrhenius(P0: float, Ea: float | None, T: float) -> float:
     # crude Arrhenius with base e
     return P0 * (2.718281828)**(-Ea/(RGAS*T))
 
-def fluxes(comp_left, comp_right, species: Iterable[str], Lp: float, Ps: Dict[str,float], sigma: Dict[str,float], A: float, T: float, Rgas: float = RGAS, C_left_override: dict | None = None, C_right_override: dict | None = None, Jv_pressure_term: float = 0.0) -> Tuple[float, Dict[str,float]]:
-    """Return (dV_left, dS_left) using Kedem–Katchalsky with solvent drag.
-    comp_left/right: have V and n[sp].
-    If concentration overrides are provided, use them (for cytosol free-volume case).
-    Jv_pressure_term is (P_right - P_left) if caller wants hydrostatic contribution.
+def _arr_from(obj, species: list[str], *, default: float = 0.0) -> np.ndarray:
+    """Return a 1D array for ``species`` from ``obj`` which may be a dict or array."""
+
+    if isinstance(obj, dict):
+        return np.array([obj.get(sp, default) for sp in species], dtype=float)
+    arr = np.asarray(obj, dtype=float)
+    if arr.shape != (len(species),):
+        raise ValueError("array inputs must match species length")
+    return arr
+
+
+def fluxes(
+    comp_left,
+    comp_right,
+    species: Iterable[str],
+    Lp: float,
+    Ps: Dict[str, float] | np.ndarray,
+    sigma: Dict[str, float] | np.ndarray,
+    A: float,
+    T: float,
+    Rgas: float = RGAS,
+    C_left_override: dict | np.ndarray | None = None,
+    C_right_override: dict | np.ndarray | None = None,
+    Jv_pressure_term: float = 0.0,
+) -> Tuple[float, Dict[str, float]]:
+    """Return ``(dV_left, dS_left)`` using Kedem–Katchalsky with solvent drag.
+
+    Heavy arithmetic is delegated to NumPy to allow broadcasting across many
+    species simultaneously.  The returned species flux is still provided as a
+    mapping for compatibility with existing callers.
     """
-    V_L = max(comp_left.V, 1e-18); V_R = max(comp_right.V, 1e-18)
-    C_L = (comp_left.conc(list(species)) if C_left_override is None else C_left_override)
-    C_R = (comp_right.conc(list(species)) if C_right_override is None else C_right_override)
+
+    species = list(species)
+    C_L = (
+        comp_left.conc(species) if C_left_override is None else C_left_override
+    )
+    C_R = (
+        comp_right.conc(species) if C_right_override is None else C_right_override
+    )
+
+    C_L_arr = _arr_from(C_L, species)
+    C_R_arr = _arr_from(C_R, species)
+    sigma_arr = _arr_from(sigma, species, default=1.0)
+    P_arr = _arr_from(Ps, species)
 
     # Osmotic term Σ σ_i R T (C_R - C_L)
-    osm = 0.0
-    for sp in species:
-        s = sigma.get(sp, 1.0)
-        osm += s * Rgas * T * (C_R[sp] - C_L[sp])
+    osm = np.sum(sigma_arr * Rgas * T * (C_R_arr - C_L_arr))
 
-    Jv = Lp * A * (Jv_pressure_term - osm)  # volume flux left->right positive if pressure/osm pushes that way
-    dV_L = -Jv  # left volume decreases if flux to right is positive
+    Jv = Lp * A * (Jv_pressure_term - osm)  # left->right positive
+    dV_L = -Jv
 
-    dS_L: Dict[str,float] = {}
-    for sp in species:
-        P = Ps.get(sp, 0.0)
-        s = sigma.get(sp, 1.0)
-        # solvent drag uses donor conc; pick left as donor for left->right sign convention
-        Js = P * A * (C_R[sp] - C_L[sp]) + (1.0 - s) * C_L[sp] * Jv
-        dS_L[sp] = -Js  # species move with Js from L to R; left loses Js
+    Js = P_arr * A * (C_R_arr - C_L_arr) + (1.0 - sigma_arr) * C_L_arr * Jv
+    dS_L = {sp: -Js[i] for i, sp in enumerate(species)}
     return dV_L, dS_L
