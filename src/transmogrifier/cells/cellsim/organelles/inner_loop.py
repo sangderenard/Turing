@@ -1,4 +1,9 @@
+"""Inner organelle ↔ cytosol exchange using vectorised math."""
+
 from typing import Iterable
+
+import numpy as np
+
 from ..core.geometry import sphere_area_from_volume
 from ..transport.kedem_katchalsky import arrhenius, fluxes
 from ..core.units import R as RGAS
@@ -14,35 +19,44 @@ def inner_exchange(cell, T: float, dt: float, species: Iterable[str], Rgas: floa
     - Updates organelle volume_total (via lumen change).
     """
     # cytosolic "compartment" view with free volume override
+    species = list(species)
     V_free = cytosol_free_volume(cell)
-    Ccyt = {sp: (cell.n.get(sp,0.0)/V_free) for sp in species}
+    n_cyt = np.array([cell.n.get(sp, 0.0) for sp in species], dtype=float)
+    Ccyt = n_cyt / V_free
 
     for o in getattr(cell, "organelles", []):
         V_lum = max(o.V_lumen(), 1e-18)
-        A_o, R_o = sphere_area_from_volume(V_lum)
+        A_o, _ = sphere_area_from_volume(V_lum)
 
-        Corg = {sp: (o.n.get(sp,0.0)/V_lum) for sp in species}
+        n_org = np.array([o.n.get(sp, 0.0) for sp in species], dtype=float)
+        Corg = n_org / V_lum
 
         # tension coupling proxy from overall cell strain could be added upstream; keep mild here
         Lp = arrhenius(o.Lp0, o.Ea_Lp, T)
-        Ps = {sp: arrhenius(o.Ps0.get(sp,0.0), o.Ea_Ps.get(sp), T) for sp in species}
-        sigma = {sp: o.sigma.get(sp,1.0) for sp in species}
+        Ps = np.array([
+            arrhenius(o.Ps0.get(sp, 0.0), o.Ea_Ps.get(sp), T) for sp in species
+        ], dtype=float)
+        sigma = np.array([o.sigma.get(sp, 1.0) for sp in species], dtype=float)
 
-        # zero hydrostatic across organelle by default
         dV_cyt, dS_cyt = fluxes(
-            comp_left=cell, comp_right=o,
+            comp_left=cell,
+            comp_right=o,
             species=species,
-            Lp=Lp, Ps=Ps, sigma=sigma, A=A_o, T=T, Rgas=Rgas,
-            C_left_override=Ccyt, C_right_override=Corg,
-            Jv_pressure_term=0.0
+            Lp=Lp,
+            Ps=Ps,
+            sigma=sigma,
+            A=A_o,
+            T=T,
+            Rgas=Rgas,
+            C_left_override=Ccyt,
+            C_right_override=Corg,
+            Jv_pressure_term=0.0,
         )
-        # Apply equal&opposite to conserve cell totals
-        # left is cytosol: dV_cyt is change in cytosol volume; we translate into organelle lumen change
-        dV_lum = -dV_cyt  # lumen gains what cytosol loses
+
+        # Apply equal & opposite to conserve totals
+        dV_lum = -dV_cyt
         o.volume_total = max(o.volume_total + dV_lum, 1e-18)
 
-        # species
         for sp, dS in dS_cyt.items():
-            # cytosol change is dS_cyt[sp]; organelle opposite
-            cell.n[sp] = max(cell.n.get(sp,0.0) + dS, 0.0)
-            o.n[sp]    = max(o.n.get(sp,0.0)    - dS, 0.0)
+            cell.n[sp] = max(cell.n.get(sp, 0.0) + dS, 0.0)
+            o.n[sp] = max(o.n.get(sp, 0.0) - dS, 0.0)
