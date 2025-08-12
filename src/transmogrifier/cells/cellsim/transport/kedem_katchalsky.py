@@ -58,12 +58,13 @@ def fluxes(
     sigma_arr = _arr_from(sigma, species, default=1.0)
     P_arr = _arr_from(Ps, species)
 
-    # Osmotic term Σ σ_i R T (C_R - C_L)
-    osm = np.sum(sigma_arr * Rgas * T * (C_R_arr - C_L_arr))
+    # Osmotic term Σ σ_i R T (C_L - C_R)
+    osm = np.sum(sigma_arr * Rgas * T * (C_L_arr - C_R_arr))
 
-    Jv = Lp * A * (Jv_pressure_term - osm)  # left->right positive
+    # Jv is positive for flow from left→right
+    Jv = Lp * A * (Jv_pressure_term - osm)
     dV_L = -Jv
 
-    Js = P_arr * A * (C_R_arr - C_L_arr) + (1.0 - sigma_arr) * C_L_arr * Jv
+    Js = P_arr * A * (C_L_arr - C_R_arr) + (1.0 - sigma_arr) * C_L_arr * Jv
     dS_L = {sp: -Js[i] for i, sp in enumerate(species)}
     return dV_L, dS_L

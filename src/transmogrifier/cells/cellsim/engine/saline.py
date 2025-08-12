@@ -112,7 +112,7 @@ class SalineEngine:
                 Rgas=RGAS,
                 C_left_override=Cint,
                 C_right_override=Cext,
-                Jv_pressure_term=(self.bath.pressure - P_i),
+                Jv_pressure_term=(P_i - self.bath.pressure),
             )
 
             if J_pump > 0.0:
@@ -149,7 +149,8 @@ class SalineEngine:
 
         # optional bath pressure update via compressibility
         if getattr(self.bath, "compressibility", 0.0) > 0.0:
-            self.bath.pressure += -self.bath.compressibility * (sum_dV / max(self.bath.V, 1e-18))
+            # compressibility κ: ΔV = κ·V·ΔP  ⇒  ΔP = ΔV / (κ·V)
+            self.bath.pressure += -(sum_dV / (self.bath.compressibility * max(self.bath.V, 1e-18)))
 
         # invariant checks
         if self.enable_checks:
