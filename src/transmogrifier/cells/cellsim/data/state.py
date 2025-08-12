@@ -79,6 +79,6 @@ class Cell(Compartment):
 
 @dataclass
 class Bath(Compartment):
-    pressure: float = 1e4
+    pressure: float = 10
     temperature: float = 298.15
     compressibility: float = 0.0

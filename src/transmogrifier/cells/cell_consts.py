@@ -68,9 +68,9 @@ class Cell:
         self.volume = float(self.len)
         self.reference_volume = float(self.len)
         self.elastic_coeff = 0.1
-        self.base_pressure = 0.0
-        self.pressure = 0.0
-        self.concentration = 0.0
+        self.base_pressure = 10.0
+        self.pressure = 1.0
+        self.concentration = 1.0
 
         # Retain reference to avoid garbage collection
         self._buf = None#buf
