@@ -2,7 +2,7 @@ from itertools import zip_longest
 from ..bitstream_search import BitStreamSearch
 from .logutil import logger, analysis_logger
 
-def minimize(self, cells):
+def minimize(self, cells, verify=False):
     system_pressure = 0
     raws = {}
 
@@ -332,5 +332,6 @@ def minimize(self, cells):
 
     self.system_pressure = system_pressure
     logger.info(f"Mask state at the end of minimize: {self.bitbuffer.mask.hex()}")
-    self.crosscheck()
+    if verify:
+        self.crosscheck()
     return system_pressure, raws

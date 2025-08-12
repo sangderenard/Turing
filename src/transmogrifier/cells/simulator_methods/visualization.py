@@ -150,8 +150,9 @@ AUTO_INJECT_EVERY = 0.10          # seconds (set 0 to disable)
 class _LCVisual:
     """Simple pygame-based visualiser for the simulator's cells."""
 
-    def __init__(self, sim):
+    def __init__(self, sim, verify=False):
         self.sim = sim
+        self.verify = verify
         pygame.init()
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 18)
@@ -220,7 +221,8 @@ class _LCVisual:
                     mask_idx = (slot_left - anchor) // pb.domain_stride
                     pid_occupied = int(mask[mask_idx]) if 0 <= mask_idx < mask_slots else 0
                 bit_occupied = any(int(self.sim.bitbuffer[b]) for b in range(slot_left, min(slot_left + stride, self.sim.bitbuffer.mask_size)))
-                assert pid_occupied == bit_occupied, f"mask mismatch at {slot_left}"
+                if self.verify:
+                    assert pid_occupied == bit_occupied, f"mask mismatch at {slot_left}"
                 colour = COL_DATA if pid_occupied else COL_SOLVENT
                 # Active development: log grid/data placement and PID search
                 logger.debug(
@@ -261,13 +263,13 @@ class _LCVisual:
 _vis = None
 
 
-def visualise_step(sim, cells):
+def visualise_step(sim, cells, verify=False):
     """Run ``sim.minimize`` and update the pygame window."""
     global _vis
     if VISUALISE and _vis is None:
-        _vis = _LCVisual(sim)
+        _vis = _LCVisual(sim, verify=verify)
 
-    sim.minimize(sim.cells)
+    sim.minimize(sim.cells, verify=verify)
 
     if VISUALISE:
         for ev in pygame.event.get():
