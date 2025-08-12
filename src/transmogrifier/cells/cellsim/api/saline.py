@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Optional
 from sympy import lambdify, symbols, Integer, Float
+import numpy as np
 from ..engine.saline import SalineEngine
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
@@ -236,7 +237,7 @@ def balance_system(sim, cells, bitbuffer, *args, **kwargs):
     return [CellProposal(c) for c in cells]
 
 
-def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_steps: int = 200000,
+def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_steps: int = 20000,
                             tol_vol: float = 1e-9, tol_conc: float = 1e-9) -> list:
     """Step cellsim engine to equilibrium, sync derived state back, then return proposals.
 
@@ -258,29 +259,25 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1e-3, max_st
 
     # Iterate to equilibrium
     dt_curr = float(dt)
-    species = api.species
+    species = tuple(api.species)
+    species_list = list(species)
     for step in range(int(max_steps)):
-        vols_before = [c.V for c in api.cells]
+        vols_before = np.array([c.V for c in api.cells])
         dt_curr = api.engine.step(dt_curr)
-        vols_after = [c.V for c in api.cells]
-        # max relative volume change
-        max_rel = 0.0
-        for vb, va in zip(vols_before, vols_after):
-            denom = va if abs(va) > 1e-18 else 1e-18
-            rel = abs(va - vb) / denom
-            if rel > max_rel:
-                max_rel = rel
-        # max concentration mismatch with bath
-        Cext = api.bath.conc(list(species))
-        max_dc = 0.0
-        for c in api.cells:
-            V_free = max(c.V, 1e-18)
-            for sp in species:
-                Ci = c.n.get(sp, 0.0) / V_free
-                Ce = Cext.get(sp, 0.0)
-                diff = abs(Ce - Ci)
-                if diff > max_dc:
-                    max_dc = diff
+        vols_after = np.array([c.V for c in api.cells])
+        Cext = api.bath.conc(species_list)
+        Cext_vec = np.array([Cext.get(sp, 0.0) for sp in species])
+
+        # max relative volume change (vectorized)
+        denom = np.where(np.abs(vols_after) > 1e-18, vols_after, 1e-18)
+        max_rel = np.max(np.abs(vols_after - vols_before) / denom)
+
+        # max concentration mismatch with bath (vectorized)
+        V_free = np.maximum(vols_after, 1e-18)
+        n_matrix = np.array([[c.n.get(sp, 0.0) for sp in species] for c in api.cells])
+        Ci = n_matrix / V_free[:, None]
+        max_dc = np.max(np.abs(Cext_vec - Ci))
+
         if max_rel < tol_vol and max_dc < tol_conc:
             break
 
