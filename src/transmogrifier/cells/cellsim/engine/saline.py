@@ -124,7 +124,13 @@ class SalineEngine:
                 )
 
             # Apply
-            c.V = clamp_nonneg(c.V + dV_cell)
+            V_occ = sum(getattr(o, "V_solid", 0.0) + o.V_lumen() for o in c.organelles)
+            V_min = max(V_occ, 1e-18)
+            V_next = c.V + dV_cell
+            if V_next < V_min:
+                dV_cell = V_min - c.V
+                V_next = V_min
+            c.V = clamp_nonneg(V_next)
             for sp, dS in dS_cell.items():
                 curr = c.n.get(sp, 0.0)
                 new = curr + dS
@@ -133,7 +139,8 @@ class SalineEngine:
                     new = 0.0
                 c.n[sp] = clamp_nonneg(new)
                 self.bath.n[sp] = clamp_nonneg(self.bath.n.get(sp,0.0) - dS)
-            self.bath.V = clamp_nonneg(self.bath.V - dV_cell)
+            if getattr(self.bath, "compressibility", 0.0) > 0.0:
+                self.bath.V = clamp_nonneg(self.bath.V - dV_cell)
 
             rel = abs(dV_cell) / max(c.V, 1e-18)
             if rel > max_rel:
@@ -146,6 +153,8 @@ class SalineEngine:
                 sp: c.n.get(sp, 0.0) / max(c.V, 1e-18) for sp in self.species
             }
             c.concentration = c.concentrations.get("Imp", 0.0)
+            occ_post = sum(getattr(o, "V_solid", 0.0) + o.V_lumen() for o in c.organelles)
+            assert c.V + 1e-18 >= occ_post
 
         # optional bath pressure update via compressibility
         if getattr(self.bath, "compressibility", 0.0) > 0.0:

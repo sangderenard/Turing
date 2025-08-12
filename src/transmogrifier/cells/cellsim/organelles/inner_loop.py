@@ -10,14 +10,14 @@ from ..core.units import R as RGAS
 from tqdm.auto import tqdm  # type: ignore
 
 def cytosol_free_volume(cell) -> float:
-    occ = sum(o.volume_total for o in getattr(cell, "organelles", []))
+    occ = sum(getattr(o, "V_solid", 0.0) + o.V_lumen() for o in getattr(cell, "organelles", []))
     return max(cell.V - occ, 1e-18)
 
 def inner_exchange(cell, T: float, dt: float, species: Iterable[str], Rgas: float = RGAS):
     """Cytosol ↔ organelle lumen exchange for one cell.
     - Uses excluded volume for cytosolic concentrations (V_free).
     - Conserves cell total volume and moles in this inner step.
-    - Updates organelle volume_total (via lumen change).
+    - Updates organelle lumen volume only.
     """
     # cytosolic "compartment" view with free volume override
     species = list(species)
@@ -26,6 +26,8 @@ def inner_exchange(cell, T: float, dt: float, species: Iterable[str], Rgas: floa
     Ccyt = n_cyt / V_free
 
     for o in tqdm(getattr(cell, "organelles", []), desc="organelles", leave=False):
+        if getattr(o, "incompressible", False) or o.V_lumen() <= 0.0:
+            continue
         V_lum = max(o.V_lumen(), 1e-18)
         A_o, _ = sphere_area_from_volume(V_lum)
 
@@ -56,7 +58,7 @@ def inner_exchange(cell, T: float, dt: float, species: Iterable[str], Rgas: floa
 
         # Apply equal & opposite to conserve totals
         dV_lum = -dV_cyt
-        o.volume_total = max(o.volume_total + dV_lum, 1e-18)
+        o.set_V_lumen(max(V_lum + dV_lum, 0.0))
 
         for sp, dS in tqdm(dS_cyt.items(), desc="species", leave=False):
             cell.n[sp] = max(cell.n.get(sp, 0.0) + dS, 0.0)

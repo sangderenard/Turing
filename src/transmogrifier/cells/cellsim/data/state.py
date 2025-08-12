@@ -24,9 +24,23 @@ class Organelle:
     Ea_Ps: Dict[str, float] = field(default_factory=lambda: {"Na":None,"K":None,"Cl":None,"Imp":None})
     anchor_stiffness: float = float("inf")
     eps_ref: float = 0.0
+    V_solid: float = 0.0
+    incompressible: bool = False
+    _V_lumen: float | None = None
+
+    def __post_init__(self):
+        if self._V_lumen is None:
+            self._V_lumen = self.volume_total * self.lumen_fraction
+        if self.V_solid <= 0.0:
+            self.V_solid = self.volume_total - self._V_lumen
+        self.volume_total = self.V_solid + self._V_lumen
 
     def V_lumen(self) -> float:
-        return max(self.volume_total * self.lumen_fraction, 1e-18)
+        return max(self._V_lumen, 0.0)
+
+    def set_V_lumen(self, v: float):
+        self._V_lumen = v
+        self.volume_total = max(self.V_solid + self.V_lumen(), 0.0)
 
     # Provide a Compartment-like interface for transport code
     @property

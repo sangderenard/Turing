@@ -116,6 +116,8 @@ class SalinePressureAPI:
                     "volume_total": float(getattr(o, "volume_total", 0.0)),
                     "lumen_fraction": float(getattr(o, "lumen_fraction", 0.0)),
                     "V_lumen": float(o.V if hasattr(o, "V") else 0.0),
+                    "V_solid": float(getattr(o, "V_solid", 0.0)),
+                    "incompressible": bool(getattr(o, "incompressible", False)),
                     "n": {sp: float(o.n.get(sp, 0.0)) for sp in species},
                     "conc": {sp: float((o.n.get(sp, 0.0) / max(o.V, 1e-18))) for sp in species},
                 }
@@ -442,7 +444,7 @@ def build_dynamic_pid_relocation(sim, api: SalinePressureAPI):
             # approximate: one organelle spanning occupied count
             occ_slots = len(set_abs_indices)
             vol = float(occ_slots * stride)
-            cs_cell.organelles.append(Organelle(volume_total=vol, lumen_fraction=0.0, n={"Imp": 0.0}))
+            cs_cell.organelles.append(Organelle(volume_total=vol, lumen_fraction=0.0, n={"Imp": 0.0}, V_solid=vol, incompressible=True))
 
         # Build a simple left-pack relocation: move occupied slots to the left edge
         dst_indices: list[int] = []
