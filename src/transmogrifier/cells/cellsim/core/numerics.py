@@ -1,7 +1,16 @@
 from tqdm.auto import tqdm  # type: ignore
 
-def clamp_nonneg(x: float, eps: float=1e-18) -> float:
-    return x if x > eps else eps
+
+def clamp_nonneg(x: float, eps: float = 1e-18) -> float:
+    """Clamp negative values to zero without inserting a floor concentration.
+
+    Previously this helper returned ``eps`` for non-positive inputs which meant
+    that a compartment with ``n=0`` moles and ``V=0`` volume would report a
+    concentration of 1 mol/m³.  That artificial osmotic term could flip the sign
+    of fluxes in edge cases.  Returning ``0.0`` keeps quantities non-negative
+    without sneaking in extra solute.
+    """
+    return x if x > 0.0 else 0.0
 
 def adapt_dt(dt: float, rel: float) -> float:
     if rel > 1e-3:   # too big: halve
