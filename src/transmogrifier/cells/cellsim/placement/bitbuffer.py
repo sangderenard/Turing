@@ -1,6 +1,7 @@
 from __future__ import annotations
 from math import gcd
 from typing import Sequence, Iterable
+from tqdm.auto import tqdm  # type: ignore
 
 class BitBufferAdapter:
     """Lightweight bridge to BitBitBuffer.expand.
@@ -20,7 +21,7 @@ class BitBufferAdapter:
 
     def _lcm(self, cells: Sequence) -> int:
         L = 1
-        for c in cells:
+        for c in tqdm(cells, desc="cells", leave=False):
             s = max(1, getattr(c, "stride", 1))
             L = L * s // gcd(L, s)
         return L
@@ -36,7 +37,7 @@ class BitBufferAdapter:
             return proposals
         lcm = self._lcm(cells)
         events = []
-        for cell, dV in zip(cells, dV_total):
+        for cell, dV in tqdm(zip(cells, dV_total), desc="expand", total=len(cells), leave=False):
             if dV <= 0:
                 continue
             size = self.intceil(dV, lcm)

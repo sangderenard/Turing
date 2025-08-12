@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
+from tqdm.auto import tqdm  # type: ignore
 
 @dataclass
 class Reaction:
@@ -10,7 +11,7 @@ class Reaction:
 
     def rate(self, conc: Dict[str, float]) -> float:
         v = self.k
-        for sp, sto in self.nu_react.items():
+        for sp, sto in tqdm(self.nu_react.items(), desc="reactants", leave=False):
             v *= conc.get(sp, 0.0) ** sto
         return v
 
@@ -21,9 +22,9 @@ class CRN:
 
     def v(self, conc: Dict[str,float]) -> Dict[str,float]:
         prod = {sp: 0.0 for sp in self.species}
-        for rxn in self.reactions:
+        for rxn in tqdm(self.reactions, desc="reactions", leave=False):
             r = rxn.rate(conc)
-            for sp in self.species:
+            for sp in tqdm(self.species, desc="species", leave=False):
                 nu = rxn.nu_prod.get(sp,0) - rxn.nu_react.get(sp,0)
                 if nu != 0:
                     prod[sp] += nu * r
