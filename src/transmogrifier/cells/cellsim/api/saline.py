@@ -199,12 +199,17 @@ class SalinePressureAPI:
         cells = []
         for legacy in tqdm(sim.cells, desc="cells", leave=False):
             V = float(legacy.right - legacy.left)
-            cell = Cell(V=V,
-                        n={"Imp": float(getattr(legacy, "salinity", 0.0)),
-                           "Na": 0.0, "K": 0.0, "Cl": 0.0},
-                        base_pressure=float(getattr(legacy, "pressure", 0.0)),
-                        elastic_k=float(getattr(legacy, "elastic_k", 0.1)),
-                        visc_eta=float(getattr(legacy, "visc_eta", 0.0)))
+            cell = Cell(
+                V=V,
+                n={"Imp": float(getattr(legacy, "salinity", 0.0)),
+                   "Na": 0.0, "K": 0.0, "Cl": 0.0},
+                # Preserve the legacy cell's immutable baseline pressure
+                base_pressure=float(
+                    getattr(legacy, "base_pressure", getattr(legacy, "pressure", 0.0))
+                ),
+                elastic_k=float(getattr(legacy, "elastic_k", 0.1)),
+                visc_eta=float(getattr(legacy, "visc_eta", 0.0)),
+            )
             # organelles if present
             if hasattr(legacy, "organelles"):
                 for o in tqdm(legacy.organelles, desc="organelles", leave=False):
