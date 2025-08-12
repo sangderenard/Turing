@@ -5,17 +5,28 @@ from ..core.numerics import clamp_nonneg, adapt_dt
 from ..core.units import R as RGAS
 from ..mechanics.tension import laplace_pressure
 from ..transport.kedem_katchalsky import arrhenius, fluxes
-from ..transport.pumps import na_k_pump_flux
 from ..organelles.inner_loop import inner_exchange, cytosol_free_volume
 from ..core import checks
 from ..data.state import Cell, Bath
+from ..transport.pumps import (
+    na_k_atpase_constant,
+    na_k_atpase_saturating,
+    apply_na_k_pump_to_left_changes,
+)
 
 class SalineEngine:
-    def __init__(self, cells: List[Cell], bath: Bath, species: Iterable[str] = ("Na","K","Cl","Imp"), *, pump_rate: float = 0.0, enable_energy_check: bool = False, enable_checks: bool = False):
+    def __init__(
+        self,
+        cells: List[Cell],
+        bath: Bath,
+        species: Iterable[str] = ("Na", "K", "Cl", "Imp"),
+        *,
+        enable_energy_check: bool = False,
+        enable_checks: bool = False,
+    ):
         self.cells = cells
         self.bath = bath
         self.species = tuple(species)
-        self.pump_rate = float(pump_rate)
         self.enable_energy_check = enable_energy_check
         self.enable_checks = enable_checks
 
@@ -69,21 +80,45 @@ class SalineEngine:
             A, R_c = sphere_area_from_volume(c.V)
             Lp = arrhenius(c.Lp0, c.Ea_Lp, T)
 
+            # --- Na/K pump (electrogenic 3:2) ---------------------------------
+            J_pump = 0.0
+            if getattr(c, "J_pump", 0.0) > 0.0:
+                J_pump = na_k_atpase_constant(c.J_pump)
+            elif getattr(c, "pump_enabled", False):
+                J_pump = na_k_atpase_saturating(
+                    C_Nai=Cint.get("Na", 0.0),
+                    C_Ko=self.bath.conc(list(self.species)).get("K", 0.0),
+                    A=A,
+                    Jmax=getattr(c, "pump_Jmax", 0.0),
+                    Km_Nai=getattr(c, "pump_Km_Nai", 10.0),
+                    Km_Ko=getattr(c, "pump_Km_Ko", 1.5),
+                    eps=eps,
+                    alpha_tension=getattr(c, "pump_alpha_tension", 0.0),
+                )
+            # -------------------------------------------------------------------
+
             dV_cell, dS_cell = fluxes(
-                comp_left=c, comp_right=self.bath, species=self.species,
-                Lp=Lp, Ps=c.Ps0, sigma=c.sigma, A=A, T=T, Rgas=RGAS,
-                C_left_override=Cint, C_right_override=Cext,
-                Jv_pressure_term=(self.bath.pressure - P_i)
+                comp_left=c,
+                comp_right=self.bath,
+                species=self.species,
+                Lp=Lp,
+                Ps=c.Ps0,
+                sigma=c.sigma,
+                A=A,
+                T=T,
+                Rgas=RGAS,
+                C_left_override=Cint,
+                C_right_override=Cext,
+                Jv_pressure_term=(self.bath.pressure - P_i),
             )
 
-            # pump contribution (affects species only)
-            if self.pump_rate > 0.0:
-                pf = na_k_pump_flux(c, self.bath, A=A, rate=self.pump_rate, dt=dt)
-                for sp, dS in pf.items():
-                    dS_cell[sp] = dS_cell.get(sp, 0.0) + dS
+            if J_pump > 0.0:
+                apply_na_k_pump_to_left_changes(dS_cell, J_pump, dt)
 
-            if self.enable_energy_check and self.pump_rate <= 0.0:
-                checks.assert_passive_no_energy(c, self.bath, dS_cell, Cint, Cext, self.species, T)
+            if self.enable_energy_check and J_pump <= 0.0:
+                checks.assert_passive_no_energy(
+                    c, self.bath, dS_cell, Cint, Cext, self.species, T
+                )
 
             # Apply
             c.V = clamp_nonneg(c.V + dV_cell)
@@ -103,6 +138,10 @@ class SalineEngine:
 
             # record a convenient derived pressure (for UI)
             c.pressure = P_i
+            c.concentrations = {
+                sp: c.n.get(sp, 0.0) / max(c.V, 1e-18) for sp in self.species
+            }
+            c.concentration = c.concentrations.get("Imp", 0.0)
 
         # optional bath pressure update via compressibility
         if getattr(self.bath, "compressibility", 0.0) > 0.0:

@@ -50,6 +50,13 @@ class Cell(Compartment):
     organelles: List[Organelle] = field(default_factory=list)
     base_pressure: float = 1e4
     _prev_eps: float = 0.0  # runtime
+    # Na/K pump controls
+    pump_enabled: bool = False
+    pump_Jmax: float = 0.0
+    pump_Km_Nai: float = 10.0
+    pump_Km_Ko: float = 1.5
+    pump_alpha_tension: float = 0.0
+    J_pump: float = 0.0
 
     def set_initial_A0_if_missing(self):
         if self.A0 <= 0.0:
