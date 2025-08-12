@@ -92,16 +92,10 @@ class SalineHydraulicSystem:
         )
         for cell in sim.cells:
             if cell.leftmost is None:
-                #print(f"Line 67: Cell {cell.label} leftmost is None, setting to left {cell.left}")
                 cell.leftmost = cell.left
             if cell.rightmost is None:
-                #print(f"Line 70: Cell {cell.label} rightmost is None, setting to right - 1: {cell.right - 1}")
                 cell.rightmost = cell.right - 1
-        # 2) Ask for the equilibrium fractions at t=0
         sim.fractions = sim.engine.equilibrium_fracs(0.0)
-        #for cell in sim.cells:
-            #if cell.salinity == 0:
-                #cell.salinity = 1
 
         necessary_size = sim.bitbuffer.intceil(sum(cell.salinity for cell in sim.cells if hasattr(cell, 'salinity') and cell.salinity > 0), sim.system_lcm)
 
@@ -119,21 +113,15 @@ class SalineHydraulicSystem:
 
     def run_balanced_saline_sim(self, mode="open"):
         """Balance the system then run the standard saline simulation."""
-        # Wrap incoming cells so the pressure balancer operates on CellSim
-        # objects.  This preserves the underlying Cell state until we explicitly
-        # push updates back after balancing.
         wrapped = [CellSim.get(cell) for cell in self.cells]
         for w in wrapped:
             w.pull_from_cell()
 
         proposals = self.balance_system(wrapped, self.bitbuffer, mode)
 
-        # Synchronise wrapper results back onto the original cells
         for w in wrapped:
             w.push_to_cell()
 
-        # The proposals returned reference the wrappers; rebuild them so they
-        # point at the underlying cells before applying.
         unwrapped = []
         for w, prop in zip(wrapped, proposals):
             new_prop = CellProposal(w.cell)
@@ -149,7 +137,6 @@ class SalineHydraulicSystem:
             cell.apply_proposal(proposal)
 
         proposals = self.run_saline_sim(as_float=True)
-        # this run saline sim eventually calls snap, which adjusts cell boundaries
         return proposals
     def reset_state(self):
         """Start at t=0 with equal volumes."""
@@ -157,24 +144,16 @@ class SalineHydraulicSystem:
         if self.math_type=='float':
             self.volumes = [self.width/self.N]*self.N
         else:
-            # use the integer allocation method even at reset
             fracs = [1/self.N]*self.N
             self.volumes = self._integer_allocate(fracs)
 
     def equilibrium_fracs(self, t):
-        """
-        Compute equilibrium fractions safely:
-          r_i = s_i/max(p_i,ε)
-          sum_r = sum(r_i), fallback to uniform if too small
-          frac_i = r_i/sum_r
-        """
         if not hasattr(self, 's_funcs') or not hasattr(self, 'p_funcs'):
             self.t       = symbols('t')
             self.s_funcs = [lambdify(self.t, expr, 'math') for expr in self.s_exprs]
             self.p_funcs = [lambdify(self.t, expr, 'math') for expr in self.p_exprs]
         s_vals = [f(t) for f in self.s_funcs]
         p_vals = [f(t) for f in self.p_funcs]
-        # safe ratios
         r_vals = []
         for si, pi in zip(s_vals, p_vals):
             denom = pi if abs(pi)>self.epsilon else self.epsilon
@@ -188,49 +167,37 @@ class SalineHydraulicSystem:
     def _integer_allocate(self, fracs):
         W = self.width
         if self.int_method=='truncate':
-            # 1) compute raw quotas
             quotas   = [frac * W for frac in fracs]
-            # 2) take ceilings
             ceilings = [ceil(q) for q in quotas]
             S        = sum(ceilings)
-            # 3) how many too many
             K = S - W
             if K <= 0:
                 return ceilings
 
-            # 4) build cost list — but treat quotas < 1 as "too expensive to remove"
             costs = []
             for i, q in enumerate(quotas):
                 if q <= 1.0:
                     cost = float('inf')
                 else:
-                    # cost = 1 − frac(q)
                     cost = 1 - (q - floor(q))
                 costs.append((cost, i))
 
-            # 5) remove from the K smallest‐cost entries
             to_remove = sorted(costs, key=lambda x: x[0])[:K]
             for _, idx in to_remove:
                 ceilings[idx] -= 1
 
             return ceilings
  
-        # --- Adams + zero‑sum ---
-        # 1) raw quotas
         quotas = [frac*W for frac in fracs]
-        # 2) preliminary ceilings
         if self.bump_under_one:
             ceilings = [max(1, ceil(q)) for q in quotas]
         else:
             ceilings = [ceil(q) for q in quotas]
         S = sum(ceilings)
-        # 3) overshoot
         K = S - W
         if K <= 0:
             return ceilings
  
-        # 4) compute removal "cost"
-        #    if protect_under_one, any q<1 is too expensive to remove
         costs = []
         for i, q in enumerate(quotas):
             if q < 1.0 and self.protect_under_one:
@@ -239,14 +206,12 @@ class SalineHydraulicSystem:
                 cost = 1 - (q - floor(q))
             costs.append((cost, i))
  
-        # remove from those with smallest cost (largest fractional parts)
         to_remove = sorted(costs, key=lambda x: x[0])[:K]
         for _, idx in to_remove:
             ceilings[idx] -= 1
         return ceilings
 
     def equilibrium_bar(self, t):
-        """ASCII‐bar at exact equilibrium (no dynamics)."""
         fracs = self.equilibrium_fracs(t)
         if self.math_type=='float':
             segs = [int(frac*self.width) for frac in fracs]
@@ -256,22 +221,17 @@ class SalineHydraulicSystem:
         return ''.join(self.chars[i]*segs[i] for i in range(self.N))
 
     def step(self, dt=1.0):
-        """
-        One Euler‐step of dV/dt = (V_eq - V)/τ
-        """
         fracs = self.equilibrium_fracs(self.current_t)
         if self.math_type=='float':
             targets = [frac*self.width for frac in fracs]
             for i in range(self.N):
                 self.volumes[i] += (targets[i]-self.volumes[i])*(dt/self.tau)
         else:
-            # compute integer targets by chosen method
             targets = self._integer_allocate(fracs)
             for i in range(self.N):
                 delta = targets[i] - self.volumes[i]
                 self.volumes[i] += (delta + 1)//self.tau
 
-        # fix any drift
         diff = self.width - sum(self.volumes)
         self.volumes[-1] += diff
 
@@ -300,31 +260,12 @@ class SalineHydraulicSystem:
                     tol_vol=1e-9, tol_conc=1e-9,
                     species=("Na", "K", "Cl", "Imp"),  # Imp = impermeant anion
                     R=8.314):
-        """
-        Dream-grade mechano–osmotic balance with conservation and feedbacks.
-
-        Water:  Jv = Lp(A,T) * A * ( (P_ext - P_i - ΔP_tension) - Σ_i σ_i RT φ_i (C_ext_i - C_i) )
-        Solute: Js_i = Ps_i(A,T) * A * (C_ext_i - C_i) + (1-σ_i) * C_i * Jv    # solvent drag
-
-        Mechanics:
-        A(V) from sphere: R = (3V/4π)^(1/3),  A = 4πR^2
-        strain ε = A/A0 - 1
-        Tension T = k_s * ε + η_s * dε/dt
-        ΔP_tension = 2T / R   (Laplace)
-
-        Active transport (optional):
-        Na/K pump: Jpump_Na = -3*J_pump, Jpump_K = +2*J_pump (A·conc/time), depends on ATP/Tension.
-
-        Bath:
-        Finite reservoir; updates volume/solute by -Σ Δ; optional compressibility for pressure updates.
-        """
         if mode != 'open' or not cells:
             return [CellProposal(c) for c in cells]
 
-        # ---- Utilities (no external deps) ----------------------------------------
         from math import pi
 
-        def sphere_R(V):  # radius from volume
+        def sphere_R(V):
             return (3.0*V/(4.0*pi))**(1.0/3.0)
 
         def sphere_A(V):
@@ -332,11 +273,8 @@ class SalineHydraulicSystem:
             return 4.0*pi*Rv*Rv, Rv
 
         def arrhenius(P0, Ea, T):
-            # If Ea not supplied, return P0
             return P0 if Ea is None else P0 * (2.718281828)**(-Ea/(R*T))
 
-        # ---- Initialise missing fields ------------------------------------------
-        # One-time default wiring if upstream hasn’t set these yet.
         for c in cells:
             if not hasattr(c, "volume"):
                 c.volume = float(c.right - c.left)
@@ -349,9 +287,8 @@ class SalineHydraulicSystem:
             if not hasattr(c, "elastic_k"):
                 c.elastic_k = 0.1
             if not hasattr(c, "visc_eta"):
-                c.visc_eta = 0.0  # set >0 for viscoelastic damping
+                c.visc_eta = 0.0
             if not hasattr(c, "Lp0"):
-                # fall back to wall permeabilities if present
                 lp_l = float(getattr(c, "l_solvent_permiability", 1.0))
                 lp_r = float(getattr(c, "r_solvent_permiability", 1.0))
                 c.Lp0 = 0.5*(lp_l + lp_r)
@@ -364,23 +301,16 @@ class SalineHydraulicSystem:
             if not hasattr(c, "Ea_Lp"):
                 c.Ea_Lp = None
             if not hasattr(c, "solute"):
-                # Map legacy salinity into one bucket if needed
                 S = float(getattr(c, "salinity", 0.0))
                 c.solute = {sp: (S if sp == "Imp" else 0.0) for sp in species}
-            # initialize organelles list
             if not hasattr(c, "organelles"):
                 c.organelles = []
-
-            # keep previous strain for viscous term
             c._prev_eps = 0.0
 
-        # Bath defaults
         if bath is None:
-            # Finite bath equal to total cell volume, with given C_ext for a single lumped species
             V_bath = sum(c.volume for c in cells)
             T_bath = float(getattr(self, "temperature", 298.15))
             P_bath = float(p_ext if p_ext is not None else getattr(self, "external_pressure", 1e4))
-            # If caller provided a single C_ext earlier, put it in Na for demo
             Cext_single = float(C_ext if C_ext is not None else getattr(self, "external_concentration", 1500.0))
             S_bath = {sp: (Cext_single*V_bath if sp == "Na" else 0.0) for sp in species}
             bath = type("Bath", (), {})()
@@ -388,21 +318,18 @@ class SalineHydraulicSystem:
             bath.temperature = T_bath
             bath.pressure = P_bath
             bath.solute = S_bath
-            bath.compressibility = 0.0  # 0 = fixed pressure
+            bath.compressibility = 0.0
         else:
-            # sanity fills
             for sp in species:
                 bath.solute.setdefault(sp, 0.0)
             if not hasattr(bath, "compressibility"):
                 bath.compressibility = 0.0
 
-        # ---- Organelle utilities: free volume and exchange step ----
         def cytosol_free_volume(c):
             occ = sum(o.volume_total for o in getattr(c, "organelles", []))
             return max(c.volume - occ, 1e-18)
 
         def organelle_exchange_step(c, T_bath, dt):
-            """One explicit inner step: cytosol ↔ each organelle lumen."""
             V_free = cytosol_free_volume(c)
             Ccyt = {sp: c.solute[sp] / V_free for sp in species}
             for o in getattr(c, "organelles", []):
@@ -428,31 +355,26 @@ class SalineHydraulicSystem:
                     o.solute[sp] = max(o.solute[sp] + dS[sp], 0.0)
                     c.solute[sp] = max(c.solute[sp] - dS[sp], 0.0)
 
-        # ---- Integrate -----------------------------------------------------------
         proposals = [CellProposal(c) for c in cells]
 
         t = 0.0
         for step in range(max_steps):
             T_bath = bath.temperature
-            # Concentrations
             Cext = {sp: (bath.solute[sp]/bath.volume if bath.volume > 0 else 0.0) for sp in species}
 
             max_rel = 0.0
             sum_dV = 0.0
 
             for c in cells:
-                # Geometry, strain and tension
                 A, Rv = sphere_A(c.volume)
                 eps = (A / c.A0) - 1.0
                 deps_dt = (eps - c._prev_eps) / dt
                 Tension = c.elastic_k * eps + c.visc_eta * deps_dt
-                dP_tension = (2.0 * Tension / max(Rv, 1e-12))  # Laplace
+                dP_tension = (2.0 * Tension / max(Rv, 1e-12))
                 c._prev_eps = eps
 
-                # Internal hydrostatic pressure (turgor + base)
                 P_i = c.base_pressure + dP_tension
 
-                # Osmotic term: Σ σ_i RT (Cext_i - C_i)
                 Cint = {}
                 for sp in species:
                     Cint[sp] = c.solute[sp] / max(c.volume, 1e-18)
@@ -461,13 +383,11 @@ class SalineHydraulicSystem:
                     sigma_i = c.sigma.get(sp, 1.0)
                     osm_term += sigma_i * R * T_bath * (Cext[sp] - Cint[sp])
 
-                # Permeabilities (tension & temperature dependence)
-                Lp = arrhenius(c.Lp0, c.Ea_Lp, T_bath) * (1.0 + 0.3*max(eps, 0.0))  # mild tension boost
+                Lp = arrhenius(c.Lp0, c.Ea_Lp, T_bath) * (1.0 + 0.3*max(eps, 0.0))
                 dP = bath.pressure - P_i
-                Jv = Lp * A * (dP - osm_term)                # m^3/s (units relative)
+                Jv = Lp * A * (dP - osm_term)
                 dV = Jv * dt
 
-                # Solute fluxes (with solvent drag)
                 dS = {}
                 for sp in species:
                     Ps0 = c.Ps0.get(sp, 0.0)
@@ -477,13 +397,11 @@ class SalineHydraulicSystem:
                     Js = Ps * A * (Cext[sp] - Cint[sp]) + (1.0 - sigma_i) * Cint[sp] * Jv
                     dS[sp] = Js * dt
 
-                # (Optional) Na/K pump (tiny stabiliser; set to 0 to disable)
-                J_pump = getattr(c, "J_pump", 0.0)  # mol/s across membrane
+                J_pump = getattr(c, "J_pump", 0.0)
                 if J_pump:
                     dS["Na"] = dS.get("Na", 0.0) - 3.0 * J_pump * dt
                     dS["K"]  = dS.get("K", 0.0)  + 2.0 * J_pump * dt
 
-                # Update cell and bath, enforce positivity
                 c.volume = max(c.volume + dV, 1e-18)
                 for sp in species:
                     c.solute[sp] = max(c.solute[sp] + dS[sp], 0.0)
@@ -492,20 +410,15 @@ class SalineHydraulicSystem:
                 for sp in species:
                     bath.solute[sp] = max(bath.solute[sp] - dS[sp], 0.0)
 
-                # Relative step size for adaptive dt
                 rel = abs(dV) / max(c.volume, 1e-18)
                 if rel > max_rel:
                     max_rel = rel
                 sum_dV += dV
 
-            # Bath pressure model (optional compressibility)
             if bath.compressibility and bath.compressibility > 0.0:
-                # dP = -K * dV / V  (very rough bulk modulus-like)
                 bath.pressure += -bath.compressibility * (sum_dV / max(bath.volume, 1e-18))
 
-            # Convergence check
             if max_rel < tol_vol:
-                # also check concentration change
                 max_dc = 0.0
                 for c in cells:
                     for sp in species:
@@ -515,7 +428,6 @@ class SalineHydraulicSystem:
                 if max_dc < tol_conc:
                     break
 
-            # Adaptive dt to keep |ΔV|/V small (explicit stability)
             if max_rel > 1e-3:
                 dt *= 0.5
             elif max_rel < 1e-5:
@@ -523,7 +435,6 @@ class SalineHydraulicSystem:
 
             t += dt
 
-        # Map net expansion into bitbuffer event (keep your alignment logic)
         proposals = [CellProposal(c) for c in cells]
         if sum_dV > 0 and isfinite(sum_dV):
             system_lcm = self.lcm(cells)
@@ -532,9 +443,7 @@ class SalineHydraulicSystem:
                 manual_event = (None, bitbuffer.mask_size, delta_bits)
                 proposals = bitbuffer.expand([manual_event], cells, proposals)
 
-        # For downstream visualisations, keep convenient scalars
         for c in cells:
-            # Use membrane tension from geometric strain to derive pressure
             A_curr, R_curr = sphere_A(c.volume)
             strain = max(A_curr / c.A0 - 1.0, 0.0)
             c.pressure = c.base_pressure + (2.0 * (c.elastic_k * strain) / max(R_curr, 1e-12))
@@ -554,32 +463,26 @@ class SalineHydraulicSystem:
 
 import time
 if __name__ == '__main__':
-    # ASCII animation demo: vary salinity and pressure sinusoidally with distinct
-    # amplitudes, frequencies, and phases per cell and property.
     try:
         import shutil
     except Exception:
         shutil = None
 
-    # --- Config ---
-    n = 10  # number of cells
+    n = 10
     t = symbols('t')
 
-    # Vary per-cell with different amplitude, frequency, and phase
-    # Keep amplitudes <= 0.9 to stay positive since baseline is 1.0
     s_exprs = []
     p_exprs = []
     for i in range(n):
-        amp_s = 0.55 + 0.35*((i % 3)/2)           # 0.55, 0.725, 0.9
-        amp_p = 0.35 + 0.25*((i % 4)/3)           # 0.35..0.6
-        freq_s = 1.0 + 0.2*((i % 3) - 1)          # 0.8, 1.0, 1.2
-        freq_p = 1.5 + 0.15*((i % 4) - 1.5)       # 1.275 .. 1.725
-        phase_s = 2*pi*i/n                        # distributed around circle
-        phase_p = pi/4 + pi*i/(n//2 if n>1 else 1)  # staggered differently
+        amp_s = 0.55 + 0.35*((i % 3)/2)
+        amp_p = 0.35 + 0.25*((i % 4)/3)
+        freq_s = 1.0 + 0.2*((i % 3) - 1)
+        freq_p = 1.5 + 0.15*((i % 4) - 1.5)
+        phase_s = 2*pi*i/n
+        phase_p = pi/4 + pi*i/(n//2 if n>1 else 1)
         s_exprs.append(1 + amp_s * sin(freq_s*t + phase_s))
         p_exprs.append(1 + amp_p * sin(freq_p*t + phase_p))
 
-    # Terminal width or fallback
     term_width = 100
     if shutil is not None:
         try:
@@ -587,10 +490,9 @@ if __name__ == '__main__':
         except Exception:
             pass
 
-    # Instantiate system
     sys_int = SalineHydraulicSystem(
         s_exprs, p_exprs,
-        width=term_width - 2,  # leave padding
+        width=term_width - 2,
         chars=[chr(97+i) for i in range(n)],
         tau=5, math_type='float',
         int_method='adams',
@@ -598,17 +500,14 @@ if __name__ == '__main__':
         bump_under_one=True
     )
 
-    # Animation params
     sys_int.reset_state()
-    dt = (2 * pi) / 60  # ~60 steps per fundamental cycle
+    dt = (2 * pi) / 60
     fps = 20
     delay = 1.0 / fps
 
-    # Precompile lambdas for readout (already lambdified in __init__)
     s_funcs = sys_int.s_funcs
     p_funcs = sys_int.p_funcs
 
-    # ANSI helpers
     def hide_cursor():
         print('\x1b[?25l', end='', flush=True)
 
@@ -616,29 +515,21 @@ if __name__ == '__main__':
         print('\x1b[?25h', end='', flush=True)
 
     def clear_to_top():
-        # Clear screen and move cursor home
         print('\x1b[2J\x1b[H', end='')
 
-    # Render
     try:
         hide_cursor()
         start = time.time()
         while True:
-            # Step simulation and build bar
             bar = sys_int.step(dt)
-
-            # Sample current s, p for readout at this time
             tt = sys_int.current_t
             s_vals = [f(tt) for f in s_funcs]
             p_vals = [f(tt) for f in p_funcs]
-
-            # Frame
             clear_to_top()
             title = f"SalineHydraulicSystem demo  t={tt:5.2f}  math={sys_int.math_type}  (Ctrl+C to exit)"
             print(title)
             print('|' + bar + '|')
 
-            # Compact per-cell stats line (wrap if needed)
             lines = []
             line = []
             for i, (sv, pv) in enumerate(zip(s_vals, p_vals)):
@@ -653,12 +544,10 @@ if __name__ == '__main__':
             for ln in lines:
                 print(ln)
 
-            # Pace to target FPS
             elapsed = time.time() - start
-            # Keep it simple: constant delay
             time.sleep(delay)
     except KeyboardInterrupt:
         pass
     finally:
         show_cursor()
-        print()  # move to next line for clean prompt
+        print()

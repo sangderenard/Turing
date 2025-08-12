@@ -1,7 +1,19 @@
 from typing import Union
 from sympy import Integer
 from .cell_consts import Cell, MASK_BITS_TO_DATA_BITS, CELL_COUNT
-from .simulator_methods.salinepressure import SalineHydraulicSystem
+# Prefer the new cellsim API; fall back to legacy if needed
+try:
+    from .cellsim.api.saline import (
+        run_saline_sim as cs_run_saline_sim,
+        balance_system as cs_balance_system,
+        update_s_p_expressions as cs_update_s_p_expressions,
+        equilibrium_fracs as cs_equilibrium_fracs,
+    run_balanced_saline_sim as cs_run_balanced,
+    )
+    _USE_CELLSIM = True
+except Exception:
+    from .simulator_methods.salinepressure import SalineHydraulicSystem
+    _USE_CELLSIM = False
 from ..bitbitbuffer import BitBitBuffer, CellProposal
 from .bitstream_search import BitStreamSearch
 from .cell_walls import snap_cell_walls, build_metadata, expand
@@ -36,11 +48,16 @@ class Simulator:
         self.bitbuffer.register_pid_buffer(cells=self.cells)
         self.locked_data_regions = []
         self.search = BitStreamSearch()
+        # Initial sympy expressions for legacy view
         self.s_exprs = [Integer(0) for _ in range(CELL_COUNT)]
         self.p_exprs = [Integer(1) for _ in range(CELL_COUNT)]
+        # Engine handles and state
         self.engine = None
         self.fractions = None
         self.closed = False
+        # Preprocessing: allow caller to request relocation before expand
+        self.enable_relocation_preprocessing = False
+        self.relocation_plan = None
         # Call ``run_saline_sim`` to enable the full saline pressure model.
 
 # Attach modularized methods from simulator_methods
@@ -69,11 +86,39 @@ Simulator.quanta_map = quanta_map
 Simulator.dump_cells = dump_cells
 Simulator.lcm = lcm
 Simulator.minimize = minimize
-Simulator.run_saline_sim = SalineHydraulicSystem.run_saline_sim
-Simulator.run_balanced_saline_sim = SalineHydraulicSystem.run_balanced_saline_sim
-Simulator.update_s_p_expressions = SalineHydraulicSystem.update_s_p_expressions
-Simulator.equilibrium_fracs = SalineHydraulicSystem.equilibrium_fracs
-Simulator.balance_system = SalineHydraulicSystem.balance_system
+if _USE_CELLSIM:
+    Simulator.run_saline_sim = cs_run_saline_sim
+    Simulator.run_balanced_saline_sim = cs_run_balanced
+    Simulator.update_s_p_expressions = cs_update_s_p_expressions
+    Simulator.equilibrium_fracs = cs_equilibrium_fracs
+    Simulator.balance_system = cs_balance_system
+else:
+    Simulator.run_saline_sim = SalineHydraulicSystem.run_saline_sim
+    Simulator.run_balanced_saline_sim = SalineHydraulicSystem.run_balanced_saline_sim
+    Simulator.update_s_p_expressions = SalineHydraulicSystem.update_s_p_expressions
+    Simulator.equilibrium_fracs = SalineHydraulicSystem.equilibrium_fracs
+    Simulator.balance_system = SalineHydraulicSystem.balance_system
+
+# Optional: apply relocation preprocessing plan (stride-aligned moves and contractions)
+def _apply_relocation_preprocessing(self):
+    plan = getattr(self, 'relocation_plan', None)
+    if not getattr(self, 'enable_relocation_preprocessing', False) or not plan:
+        return
+    # Translate plan directly to bitbuffer events. Negative sizes contract.
+    proposals = [CellProposal(c) for c in self.cells]
+    proposals = self.bitbuffer.expand(plan, self.cells, proposals)
+    # Sync back
+    for new_cell in proposals:
+        for cell in self.cells:
+            if cell.label == new_cell.label:
+                cell.left = new_cell.left
+                cell.right = new_cell.right
+                cell.leftmost = new_cell.leftmost
+                cell.rightmost = new_cell.rightmost
+                break
+
+# expose on Simulator (not called by default)
+Simulator.apply_relocation_preprocessing = _apply_relocation_preprocessing
 
 
 

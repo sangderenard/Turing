@@ -376,10 +376,19 @@ class BitBitIndexer:
                     else:
                         chunks.append(bytes(v))
                 raw = b''.join(chunks)
-            # single splice into the data plane
-            first = idxs[0]
-            byte_off = (base + first) * byte_w
-            buf.data[byte_off : byte_off + len(raw)] = raw
+            # fast path only if indices are contiguous ascending
+            is_contig = (idxs == list(range(idxs[0], idxs[0] + len(idxs))))
+            if is_contig:
+                # single splice into the data plane
+                first = idxs[0]
+                byte_off = (base + first) * byte_w
+                buf.data[byte_off : byte_off + len(raw)] = raw
+                return
+            # non-contiguous or reversed: write per-index to preserve ordering
+            for k, i in enumerate(idxs):
+                byte_off = (base + i) * byte_w
+                seg = raw[k*byte_w:(k+1)*byte_w]
+                buf.data[byte_off:byte_off+byte_w] = seg
             return
 
         # 2) sub‑byte stride → fall back to generic bit writer
@@ -413,9 +422,10 @@ class BitBitIndexer:
 
         referring_buffer = buf._origin if hasattr(buf, '_origin') else buf
 
-
-        absolute_start = base + idxs[0]
-        absolute_end = absolute_start + total_bits
+        # PID tagging/clipping should be in mask-index units, not bit-length
+        absolute_start = base + idxs[0]           # mask index units
+        count = len(idxs)                         # number of elements written
+        absolute_end = absolute_start + count     # still mask index units
 
         for pids in referring_buffer.pid_buffers.values():
             # Skip buffers whose domain is fully outside the modified range

@@ -18,9 +18,7 @@ class BitBitIndex:
         self.index_hook = index_hook
         self.empty = False
         if isinstance(index, slice):
-            if index.start is None and index.stop is None and (index.step is None or index.step == 1):
-                self.empty = True
-            elif index.start is not None and index.stop is not None and index.start == index.stop:
+            if index.start is not None and index.stop is not None and index.start == index.stop:
                 self.empty = True
 
     def __repr__(self):

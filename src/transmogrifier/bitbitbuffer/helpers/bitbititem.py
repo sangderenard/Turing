@@ -73,10 +73,6 @@ class BitBitItem:
         # Determine index for spec
         idx = second_key if second_key is not None else (self.mask_index if key == 'data' else 0)
 
-        # FIX: Explicitly set the mode based on the index type.
-        mode = 'view' if isinstance(idx, slice) else 'get' # This line isn't strictly necessary for setitem,
-                                                             # but the spec requires a mode. We'll use 'set'.
-
         if key == 'mask':
             # Always use 'set' mode for __setitem__
             spec = BitBitIndex(self, idx, mode='set', value=value)

@@ -496,16 +496,32 @@ class BitBitBuffer:
         events = sorted(events, key=lambda t: t[1])
         logging.debug(f"[expand] sorted events={events!r}")
 
-        plan, shift = [], 0
-        for _lbl, orig_off, sz in events:
-            adj_off = orig_off + shift
-            plan.append((orig_off, adj_off, sz))
-            shift += sz
-        logging.debug(f"[expand] plan={plan!r}")
+        # Split into contractions (negative sizes) and insertions (positive sizes)
+        neg_events = [(lbl, off, sz) for (lbl, off, sz) in events if sz < 0]
+        pos_events = [(lbl, off, sz) for (lbl, off, sz) in events if sz > 0]
 
-        logging.debug(f"[expand] invoking _insert_bits")
-        self._insert_bits(plan)
-        logging.debug(f"[expand] _insert_bits complete")
+        # 2) contractions first so subsequent insert offsets remain valid
+        if neg_events:
+            neg_plan, neg_shift = [], 0
+            for _lbl, orig_off, sz in neg_events:
+                # sz < 0, build plan with positive removal size
+                adj_off = orig_off + neg_shift
+                neg_plan.append((orig_off, adj_off, -sz))
+                neg_shift += sz  # accumulate negative shift
+            logging.debug(f"[expand] invoking _remove_bits with plan={neg_plan!r}")
+            self._remove_bits(neg_plan)
+            logging.debug(f"[expand] _remove_bits complete")
+
+        # 3) insertions next
+        if pos_events:
+            plan, shift = [], 0
+            for _lbl, orig_off, sz in pos_events:
+                adj_off = orig_off + shift
+                plan.append((orig_off, adj_off, sz))
+                shift += sz
+            logging.debug(f"[expand] invoking _insert_bits with plan={plan!r}")
+            self._insert_bits(plan)
+            logging.debug(f"[expand] _insert_bits complete")
 
         # 3) Shift coordinates for every tracked span
         affected = proposals
@@ -543,6 +559,70 @@ class BitBitBuffer:
         logging.debug(f"[expand] EXIT")
 
         return proposals
+
+    def _remove_bits(self, removal_plans: list[tuple[int, int, int]]):
+        """Remove bits according to (orig_off, adj_off, remove_bits) plans.
+
+        Mirrors _insert_bits but shrinks the mask and data planes.
+        Also updates PID buffers and clears their caches.
+        """
+        logging.debug(f"[_remove_bits] ENTER: removal_plans={removal_plans!r}")
+        if not removal_plans:
+            return
+
+        def shrink_plane(src_plane: bytearray, old_bits: int, stride: int,
+                         plans: list[tuple[int,int,int]]) -> tuple[bytearray, int]:
+            # Compute new size
+            total_rem = sum(rem for _, _, rem in plans)
+            new_bits = (old_bits - total_rem) * stride
+            new_bytes = self.bittobyte(new_bits)
+            dst_plane = bytearray(new_bytes)
+            # Copy all except removed spans
+            src_cursor = 0
+            dst_cursor = 0
+            for orig_off, _adj_off, rem_bits in plans:
+                # copy region before removal
+                chunk = orig_off - src_cursor
+                if chunk:
+                    chunk_bits = chunk * stride
+                    segment = self.extract_bit_region(src_plane, src_cursor * stride, chunk_bits)
+                    self.write_bit_region(dst_plane, dst_cursor * stride, segment, chunk_bits)
+                    src_cursor += chunk
+                    dst_cursor += chunk
+                # skip rem_bits
+                src_cursor += rem_bits
+            # tail
+            if src_cursor < old_bits:
+                tail = old_bits - src_cursor
+                tail_bits = tail * stride
+                segment = self.extract_bit_region(src_plane, src_cursor * stride, tail_bits)
+                self.write_bit_region(dst_plane, dst_cursor * stride, segment, tail_bits)
+            return dst_plane, new_bits
+
+        # main planes
+        self.mask, self.mask_size = shrink_plane(self.mask, self.mask_size, 1, removal_plans)
+        self.data, self.data_size = shrink_plane(self.data, self.mask_size, self.bitsforbits, [])  # data shrinks proportionally already with mask changes above
+
+        # update pid buffers
+        for label, pid in self.pid_buffers.items():
+            # Scale plans into PID plane coordinates using domain mapping
+            ratio = pid.domain_stride
+            offset = pid.domain_left
+            # Filter and scale removals intersecting this PID domain
+            local_plans: list[tuple[int,int,int]] = []
+            for orig_off, adj_off, rem in removal_plans:
+                if not (offset <= orig_off < pid.domain_right):
+                    continue
+                local_orig = (orig_off - offset) // ratio
+                local_adj = (adj_off - offset) // ratio
+                local_rem = rem // ratio
+                if local_rem > 0:
+                    local_plans.append((local_orig, local_adj, local_rem))
+            if local_plans:
+                pid.pids.mask, pid.pids.mask_size = shrink_plane(pid.pids.mask, pid.pids.mask_size, 1, local_plans)
+                pid.pids.data, pid.pids.data_size = shrink_plane(pid.pids.data, pid.pids.mask_size, pid.pids.bitsforbits, [])
+                pid.active_set = None
+        logging.debug(f"[_remove_bits] EXIT: mask_size={self.mask_size}, data_size={self.data_size}")
 
     # -- public façade --------------------------------------------------------
     def roll(self, cell, offset, size, direction='left'):

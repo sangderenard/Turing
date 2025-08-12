@@ -77,6 +77,7 @@ def minimize(self, cells):
                 samples = []
                 if pb is not None and hasattr(pb, 'pids') and anchors:
                     for a in anchors:
+                        # Translate absolute bit position 'a' to PID mask index without stride rounding
                         try:
                             idx = (a - pb.domain_left) // max(1, getattr(pb, 'domain_stride', cell.stride))
                             bit_on = int(pb.pids[idx]) if 0 <= idx < pb.pids.mask_size else 0
@@ -84,13 +85,12 @@ def minimize(self, cells):
                             bit_on = 0
                         pid_mask_count += bit_on
                         if bit_on and len(samples) < 3:
+                            # Sample the main data payload at this anchor without creating new PIDs
                             try:
-                                pid_list = pb.get_pids([a])
-                                if pid_list:
-                                    data_idx = self.bitbuffer.get_by_pid(cell.label, pid_list[0])
-                                    payload  = self.bitbuffer._data_access[data_idx : data_idx + cell.stride]
-                                    samples.append(payload.hex())
+                                payload = self.bitbuffer._data_access[a : a + cell.stride]
+                                samples.append(payload.hex())
                             except Exception:
+                                # Best-effort sampling; continue on failure
                                 pass
 
                 snap[name] = {
@@ -316,6 +316,7 @@ def minimize(self, cells):
         else:
             if cell.label in self.input_queues:
                 cell.salinity += sum(stride for _, stride in self.input_queues[cell.label])
+
                 logger.debug(f"Cell {cell.label} has no left/right distinction, skipping.")
             continue
         # AFTER snapshot once stamping/injection for this cell is applied
@@ -328,6 +329,7 @@ def minimize(self, cells):
             if self.assignable_gaps.get(cell.label):
                 assert False, "Cell has assignable gaps but injection queue is not empty"
         self.push_cell_mask(cell)
+
     self.system_pressure = system_pressure
     logger.info(f"Mask state at the end of minimize: {self.bitbuffer.mask.hex()}")
     return system_pressure, raws
