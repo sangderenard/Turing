@@ -107,9 +107,10 @@ class BitBitIndexer:
             idxs = spec.indices()
             # single‑bit view  → BitBitItem
             if isinstance(spec.index, int):
+                mask_index = spec.base_offset + idxs[0]
                 return BitBitItem(
                     buffer = buf,
-                    mask_index = idxs[0],
+                    mask_index = mask_index,
                     length = 1,
                     cast = spec.caster,
                     plane = spec.plane
@@ -117,7 +118,8 @@ class BitBitIndexer:
             # slice view → BitBitSlice (handle reverse step)
             step      = spec.index.step or 1
             reversed_ = step < 0
-            start_bit = idxs[0] if step > 0 else idxs[-1]
+            start_idx = idxs[0] if step > 0 else idxs[-1]
+            start_bit = spec.base_offset + start_idx
             return BitBitSlice(
                 buffer   = buf,
                 start_bit= start_bit,
