@@ -1,7 +1,5 @@
 """Cell simulation package exposing shared utilities."""
 
-from .progress import progress
-
 __all__ = [
     "core",
     "data",
@@ -14,5 +12,4 @@ __all__ = [
     "chemistry",
     "viz",
     "placement",
-    "progress",
 ]
