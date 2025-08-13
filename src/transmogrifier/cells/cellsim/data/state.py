@@ -63,6 +63,7 @@ class Organelle:
 class Cell(Compartment):
     A0: float = 0.0
     elastic_k: float = DEFAULT_ELASTIC_K
+    bulk_modulus: float = 1e5
     visc_eta: float = 0.0
     Lp0: float = DEFAULT_LP0
     Ps0: Dict[str, float] = field(default_factory=lambda: {"Na":0.01,"K":0.01,"Cl":0.01,"Imp":0.0})

@@ -12,6 +12,11 @@ from .provider import MechanicsProvider, MechanicsSnapshot
 from src.transmogrifier.softbody.engine.params import EngineParams
 from src.transmogrifier.softbody.engine.hierarchy import Hierarchy, build_cell
 from src.transmogrifier.softbody.engine.xpbd_core import XPBDSolver
+from src.transmogrifier.softbody.engine.coupling import (
+    harmonized_update,
+    laplace_from_Ka,
+    cell_area,
+)
 
 
 @dataclass
@@ -37,9 +42,13 @@ class Softbody0DProvider(MechanicsProvider):
         self._h: Optional[Hierarchy] = None
         self._params: Optional[EngineParams] = None
         self._ids: List[str] = []
+        self._cells: Optional[List[Cell]] = None
+        self._bath: Optional[Bath] = None
 
     # MechanicsProvider -----------------------------------------------------
     def sync(self, cells: List[Cell], bath: Bath) -> None:
+        self._cells = cells
+        self._bath = bath
         # (Re)build world if needed or cell count changed
         if self._h is None or len(self._ids) != len(cells):
             self._build_world(cells)
@@ -57,11 +66,8 @@ class Softbody0DProvider(MechanicsProvider):
             return (4.0 / 3.0) * math.pi * (r ** 3)
 
         for i, (c, sbc) in enumerate(zip(cells, self._h.cells)):
-            # set target volume and qualitative membrane/osmotic pressures
             sbc.constraints["volume"].target = map_volume(float(c.V))
-            # map elasticity to an effective membrane tension proxy
             sbc.membrane_tension = float(c.elastic_k)
-            # osmotic proxy from cytosol concentration of "Imp" (if present)
             ci_imp = 0.0
             if "Imp" in c.n:
                 ci_imp = float(c.n.get("Imp", 0.0) / max(c.V, 1e-18))
@@ -69,24 +75,37 @@ class Softbody0DProvider(MechanicsProvider):
             sbc.external_pressure = float(getattr(bath, "pressure", 0.0))
 
     def step(self, dt: float) -> MechanicsSnapshot:
-        if self._h is None:
+        if self._h is None or self._cells is None or self._bath is None:
             return {}
         p = self._h.params
-        # Substep with provider timestep; ignore incoming dt magnitude for stability
         sub_dt = self.cfg.dt_provider / max(1, int(self.cfg.substeps))
         for _ in range(self.cfg.substeps):
+            for c0d, sbc in zip(self._cells, self._h.cells):
+                harmonized_update(
+                    sbc,
+                    float(c0d.elastic_k),
+                    float(getattr(c0d, "bulk_modulus", 1e5)),
+                    float(getattr(sbc, "osmotic_pressure", 0.0)),
+                    float(getattr(self._bath, "pressure", 0.0)),
+                )
             self._h.integrate(sub_dt)
             self._h.project_constraints(sub_dt)
             self._h.update_organelle_modes(sub_dt)
 
-        # Collect aggregates
         pressures: List[float] = []
         areas: List[float] = []
         vols: List[float] = []
-        for sbc in self._h.cells:
-            pressures.append(self.cfg.pressure_scale * float(sbc.contact_pressure_estimate()))
-            areas.append(self.cfg.area_scale * float(sbc.surface_area()))
-            vols.append(abs(float(sbc.enclosed_volume())))
+        for c0d, sbc in zip(self._cells, self._h.cells):
+            V = abs(float(sbc.enclosed_volume()))
+            A = cell_area(sbc)
+            gamma, dP_L = laplace_from_Ka(sbc, float(c0d.elastic_k))
+            P_internal = float(getattr(self._bath, "pressure", 0.0)) + dP_L
+            pressures.append(self.cfg.pressure_scale * P_internal)
+            areas.append(self.cfg.area_scale * A)
+            vols.append(V)
+            c0d.membrane_tension = gamma
+            c0d.internal_pressure = P_internal
+            c0d.measured_volume = V
         return {"pressures": pressures, "areas": areas, "volumes": vols}
 
     # Internals -------------------------------------------------------------

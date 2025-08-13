@@ -110,7 +110,7 @@ class SalinePressureAPI:
             if hasattr(comp, extra):
                 snap[extra] = float(getattr(comp, extra))
         # Cell extras
-        for extra in ("A0", "elastic_k", "visc_eta", "Lp0", "base_pressure"):
+        for extra in ("A0", "elastic_k", "bulk_modulus", "visc_eta", "Lp0", "base_pressure"):
             if hasattr(comp, extra):
                 snap[extra] = float(getattr(comp, extra))
         # Mechanics (may be populated by engine)
