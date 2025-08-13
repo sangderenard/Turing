@@ -33,11 +33,9 @@ class Cell:
         return mesh_volume(self.X, self.faces)
 
     def surface_area(self) -> float:
-        A = 0.0
-        for tri in self.faces:
-            a,b,c = self.X[tri[0]], self.X[tri[1]], self.X[tri[2]]
-            A += 0.5*np.linalg.norm(np.cross(b-a, c-a))
-        return A
+        tris = self.X[self.faces]
+        cross = np.cross(tris[:,1] - tris[:,0], tris[:,2] - tris[:,0])
+        return 0.5 * np.linalg.norm(cross, axis=1).sum()
 
     def contact_pressure_estimate(self) -> float:
         V = abs(self.enclosed_volume())
