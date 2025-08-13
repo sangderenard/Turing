@@ -177,7 +177,7 @@ class Softbody0DProvider(MechanicsProvider):
                 r = V_to_r(V_list[idx])
                 X, F, V, invm, edges, bends, constraints = build_cell(
                     id_str=f"cell{idx}", center=(cx, cy, 0.01), radius=r,
-                    params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
+                    params=self._params, subdiv=2, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
                 )
                 # Build minimal shim that Hierarchy expects
                 from src.transmogrifier.softbody.engine.hierarchy import Cell as SBC

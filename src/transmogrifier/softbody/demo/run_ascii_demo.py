@@ -52,52 +52,126 @@ def colorize(ch, rgb, mode="auto"):
         return f"{_rgb256_from_24(r,g,b)}{ch}{RESET}"
 
 
-def world_to_grid(h: Hierarchy, api=None, nx=120, ny=36):
-    grid = [[('.', (110,110,130)) for _ in range(nx)] for _ in range(ny)]
+def world_to_grid(
+    h: Hierarchy,
+    api=None,
+    nx=120,
+    ny=36,
+    render_mode: str = "edges",
+    face_stride: int = 8,
+    draw_points: bool = True,
+):
+    """
+    Rasterize the actual softbody mesh onto an ASCII grid using an XY orthographic projection.
+
+    render_mode: 'edges' | 'fill' (fill currently treated as edges for performance)
+    face_stride: draw every Nth face to limit cost (icosphere subdiv=5 is very dense)
+    draw_points: also stamp vertex points to thicken silhouettes
+    """
+    grid = [[('.', (110, 110, 130)) for _ in range(nx)] for _ in range(ny)]
     cells = h.cells
-    centers = [np.mean(c.X, axis=0) for c in cells]
-    vols = [abs(c.enclosed_volume()) for c in cells]
-    radii = [((3.0*V)/(4.0*math.pi))**(1.0/3.0) for V in vols]
+
+    # Per-cell color channels (R: mass/solute proxy, G: identity, B: pressure)
     pressures = [c.contact_pressure_estimate() for c in cells]
-    pmax = max(1e-8, max(pressures))
-    # total solubles (sum of species counts) from API if available
+    pmax = max(1e-8, max(pressures) if pressures else 0.0)
     masses = []
     if api is not None and getattr(api, "cells", None):
         for i in range(len(cells)):
             nd = getattr(api.cells[i], "n", None)
             masses.append(sum(nd.values()) if isinstance(nd, dict) else 0.0)
     else:
-        # fallback to osmotic pressure proxy if API missing
         masses = [getattr(c, "osmotic_pressure", 0.0) for c in cells]
     mmax = max(1e-8, max(masses) if masses else 0.0)
 
-    for iy in range(ny):
-        y = (iy+0.5)/ny
-        for ix in range(nx):
-            x = (ix+0.5)/nx
-            occup = None
-            # organelles
-            for j,c in enumerate(cells):
-                for o in c.organelles:
-                    dx = x - float(o.pos[0]); dy = y - float(o.pos[1])
-                    if dx*dx + dy*dy <= (o.radius*o.radius):
-                        occup=('o', j); break
-                if occup: break
-            if not occup:
-                # cell body proxy
-                for j,(ctr,r) in enumerate(zip(centers, radii)):
-                    dx = x - float(ctr[0]); dy = y - float(ctr[1])
-                    if dx*dx + dy*dy <= r*r:
-                        occup=('#', j); break
-            if occup:
-                ch, ci = occup
-                cell = cells[ci]
-                # distinct greens spaced far apart; prefer explicit identity set on API cell
-                default_g = 64 + (ci % 3) * 80  # [64,144,224]
-                G = getattr(cell, "_identity_green", getattr(getattr(api, "cells", [None]*len(cells))[ci], "_identity_green", default_g))
-                B = int(255 * (pressures[ci]/pmax)) if pmax>0 else 0
-                R = int(255 * (masses[ci]/mmax)) if mmax>0 else 0
-                grid[iy][ix] = (ch, (R,int(G),B))
+    # Helpers --------------------------------------------------------------
+    def clamp_ixy(x: float, y: float):
+        ix = max(0, min(nx - 1, int(x * nx)))
+        iy = max(0, min(ny - 1, int(y * ny)))
+        return ix, iy
+
+    def put(ix: int, iy: int, ci: int, ch: str):
+        cell = cells[ci]
+        default_g = 64 + (ci % 3) * 80  # [64,144,224]
+        G = getattr(
+            cell,
+            "_identity_green",
+            getattr(getattr(api, "cells", [None] * len(cells))[ci], "_identity_green", default_g),
+        )
+        B = int(255 * (pressures[ci] / pmax)) if pmax > 0 else 0
+        R = int(255 * (masses[ci] / mmax)) if mmax > 0 else 0
+        grid[iy][ix] = (ch, (R, int(G), B))
+
+    def draw_line(ix0: int, iy0: int, ix1: int, iy1: int, ci: int, ch: str = '#'):
+        # Bresenham's line algorithm on grid indices
+        dx = abs(ix1 - ix0)
+        dy = -abs(iy1 - iy0)
+        sx = 1 if ix0 < ix1 else -1
+        sy = 1 if iy0 < iy1 else -1
+        err = dx + dy
+        x, y = ix0, iy0
+        while True:
+            if 0 <= x < nx and 0 <= y < ny:
+                put(x, y, ci, ch)
+            if x == ix1 and y == iy1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
+    # Rasterize meshes -----------------------------------------------------
+    stride = max(1, int(face_stride))
+    for ci, c in enumerate(cells):
+        X = np.asarray(c.X)
+        F = np.asarray(c.faces, dtype=np.int32)
+        if X.ndim != 2 or X.shape[1] < 2 or F.size == 0:
+            continue
+
+        # Draw vertices as points
+        if draw_points:
+            # Subsample vertices to avoid overdraw: step by k based on grid size
+            k = max(1, int(len(X) / (nx * 0.75)))
+            for vi in range(0, len(X), k):
+                x, y = float(X[vi, 0]), float(X[vi, 1])
+                ix, iy = clamp_ixy(x, y)
+                put(ix, iy, ci, '.')
+
+        # Draw triangle edges (subsample faces for speed)
+        if render_mode in ("edges", "fill"):
+            for fi in range(0, len(F), stride):
+                a, b, d = F[fi]
+                # Triangle is (a, b, d) in our face layout
+                ax, ay = float(X[a, 0]), float(X[a, 1])
+                bx, by = float(X[b, 0]), float(X[b, 1])
+                dx_, dy_ = float(X[d, 0]), float(X[d, 1])
+                iax, iay = clamp_ixy(ax, ay)
+                ibx, iby = clamp_ixy(bx, by)
+                idx, idy = clamp_ixy(dx_, dy_)
+                draw_line(iax, iay, ibx, iby, ci, '#')
+                draw_line(ibx, iby, idx, idy, ci, '#')
+                draw_line(idx, idy, iax, iay, ci, '#')
+
+        # Draw organelles as small discs
+        for o in getattr(c, 'organelles', []) or []:
+            cx, cy = float(o.pos[0]), float(o.pos[1])
+            # Radius in world units -> pixels
+            pr = max(1, int(o.radius * max(nx, ny)))
+            icx, icy = clamp_ixy(cx, cy)
+            rr = pr * pr
+            for dy in range(-pr, pr + 1):
+                py = icy + dy
+                if py < 0 or py >= ny:
+                    continue
+                for dx in range(-pr, pr + 1):
+                    px = icx + dx
+                    if px < 0 or px >= nx:
+                        continue
+                    if dx * dx + dy * dy <= rr:
+                        put(px, py, ci, 'o')
+
     return grid
 
 def print_grid(grid, color_mode="auto", clear_each_line=False):
@@ -118,6 +192,12 @@ def main():
                         help="ANSI color output mode (default: auto)")
     parser.add_argument("--frames", type=int, default=8000,
                         help="Number of frames to render (default: 8000)")
+    parser.add_argument("--render-mode", choices=["edges", "fill"], default="edges",
+                        help="ASCII render mode: project mesh edges (default) or fill (edges only for now)")
+    parser.add_argument("--face-stride", type=int, default=8,
+                        help="Draw every Nth face to control cost (default: 8)")
+    parser.add_argument("--no-points", action="store_true",
+                        help="Disable drawing vertex points to lighten output")
     args = parser.parse_args()
     color_mode = args.color
 
@@ -149,7 +229,15 @@ def main():
         if h is None:
             continue
 
-        grid = world_to_grid(h, api=api, nx=120, ny=36)
+        grid = world_to_grid(
+            h,
+            api=api,
+            nx=120,
+            ny=36,
+            render_mode=args.render_mode,
+            face_stride=args.face_stride,
+            draw_points=not args.no_points,
+        )
 
         if _is_tty():
             if prev_lines:
