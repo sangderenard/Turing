@@ -1,6 +1,8 @@
 import argparse
 from typing import Sequence
 
+import numpy as np
+
 from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
 from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
 from src.transmogrifier.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
@@ -62,9 +64,11 @@ def parse_args():
     parser.add_argument("--bath-cl", type=float, default=1000.0)
     parser.add_argument("--bath-pressure", type=float, default=1e4)
     parser.add_argument("--substeps", type=int, default=2)
-    parser.add_argument("--dt-provider", type=float, default=0.01)
+    parser.add_argument("--dt-provider", type=float, default=0.01,
+                        help="internal softbody timestep; scale to speed up motion")
     parser.add_argument("--frames", type=int, default=80)
-    parser.add_argument("--dt", type=float, default=1e-3)
+    parser.add_argument("--dt", type=float, default=1e-3,
+                        help="base integrator step; increase to amplify drift")
     return parser.parse_args()
 
 
@@ -82,11 +86,15 @@ def main():
         dt_provider=args.dt_provider,
     )
     dt = args.dt
+    prev_vols = [float(c.V) for c in api.cells]
     for frame in range(int(args.frames)):
         dt = step_cellsim(api, dt)
         vols = [float(c.V) for c in api.cells]
+        vels = [(v - pv) / dt for v, pv in zip(vols, prev_vols)]
+        assert all(np.isfinite(v) for v in vels), "non-finite velocity encountered"
         osm = [getattr(c, "osmotic_pressure", 0.0) for c in api.cells]
-        print(f"frame {frame}: vols {vols} osm {osm}")
+        print(f"frame {frame}: vols {vols} vel {vels} osm {osm}")
+        prev_vols = vols
 
 
 if __name__ == "__main__":
