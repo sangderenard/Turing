@@ -7,6 +7,9 @@ from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
+from src.transmogrifier.cells.cellsim.membranes.membrane import (
+    Membrane, MembraneConfig, MembraneHooks,
+)
 
 @dataclass
 class Organelle:
@@ -54,6 +57,9 @@ class Hierarchy:
     solver: XPBDSolver
     params: object
     fields: FieldStack = field(default_factory=FieldStack)
+    # Membrane surface physics toggle (replaces XPBD stretch+bending)
+    use_membrane_surface_physics: bool = True
+    membranes: List[Membrane] = field(default_factory=list)
 
     def integrate(self, dt):
         if not self.cells:
@@ -67,6 +73,35 @@ class Hierarchy:
             c.X[:] = X[start:end]
             c.V[:] = V[start:end]
 
+    # -- membrane wiring --------------------------------------------------
+    def _ensure_membranes(self):
+        """Create/refresh one Membrane per cell when enabled."""
+        if not self.use_membrane_surface_physics:
+            self.membranes = []
+            return
+        if self.membranes and len(self.membranes) == len(self.cells):
+            return
+        self.membranes = []
+        for c in self.cells:
+            # Membrane owns area + bending. Keep XPBD volume for mild correction.
+            cfg = MembraneConfig(
+                bending_kappa=8e-20,
+                area_k_local=2e-1,
+                area_k_global=5e-2,
+                preferred_shape_k=0.0,
+                drag_coefficient=0.0,
+                ib_mode="none",
+                xpbd_compliance_area_local=0.0,
+                xpbd_compliance_area_global=0.0,
+                xpbd_compliance_volume=0.0,
+            )
+            def _deltaP(V, A, t, _c=c):
+                pin = float(getattr(_c, "osmotic_pressure", 0.0) + getattr(_c, "internal_pressure", 0.0))
+                pext = float(getattr(_c, "external_pressure", 0.0))
+                return pin - pext
+            hooks = MembraneHooks(deltaP=_deltaP)
+            self.membranes.append(Membrane(F=c.faces, X0=c.X.copy(), cfg=cfg, hooks=hooks))
+
     # softbody/engine/hierarchy.py
     def project_constraints(self, dt):
         if not self.cells:
@@ -77,20 +112,21 @@ class Hierarchy:
         X       = np.vstack([c.X   for c in self.cells])
         invm    = np.concatenate([c.invm for c in self.cells])
 
-        # ---- Batch stretch with offsets
+        # ---- Batch stretch/bending only if membrane physics is OFF
         st_idx, st_rest, st_comp, st_lamb = [], [], [], []
-        # ---- Batch bending with offsets
         bn_idx, bn_rest, bn_comp, bn_lamb = [], [], [], []
 
         for off, c in zip(offsets[:-1], self.cells):
-            s = c.constraints.get("stretch")
+            s = None
+            b = None
+            if not self.use_membrane_surface_physics:
+                s = c.constraints.get("stretch")
+                b = c.constraints.get("bending")
             if s is not None and len(s["indices"]):
                 st_idx.append(s["indices"] + off)                # <— offset
                 st_rest.append(s["rest"])
                 st_comp.append(s["compliance"])
                 st_lamb.append(s["lamb"])
-
-            b = c.constraints.get("bending")
             if b is not None and len(b["indices"]):
                 bn_idx.append(b["indices"] + off)                # <— offset
                 bn_rest.append(b["rest"])
@@ -206,6 +242,16 @@ class Hierarchy:
                 fields.apply(self.cells, dt, t, self, stage="prepredict")
             except Exception:
                 pass  # tolerate absence / different API
+
+        # 1.5) membrane surface forces (area + bending + pressure) -> accelerations
+        if self.use_membrane_surface_physics:
+            self._ensure_membranes()
+            for c, m in zip(self.cells, self.membranes):
+                F_mem, parts, geom = m.forces(c.X, c.V, t)
+                # a = F/m = F * invm
+                c.V[:] += (F_mem * c.invm[:, None]) * dt
+                c._measured_volume = geom["V"]
+                c._measured_area = geom["A_total"]
 
         # 2) predictor (damps V, advances X)
         self.integrate(dt)
