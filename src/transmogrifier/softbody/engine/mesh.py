@@ -48,21 +48,32 @@ def make_icosphere(subdiv=1, radius=0.1, center=(0,0,0)):
     return v, f
 
 def mesh_volume(verts, faces):
-    V = 0.0
-    for tri in faces:
-        i,j,k = tri
-        a,b,c = verts[i],verts[j],verts[k]
-        V += np.dot(a, np.cross(b, c))
-    return V/6.0
+    """Compute enclosed volume of a closed triangle mesh.
+
+    Previous implementation iterated triangle-by-triangle in Python. By
+    indexing vertex arrays with NumPy and using ``np.cross``/``np.einsum`` we
+    evaluate the scalar triple product for all faces at once, letting NumPy's
+    vectorised C loops handle the heavy lifting.
+    """
+    a = verts[faces[:, 0]]
+    b = verts[faces[:, 1]]
+    c = verts[faces[:, 2]]
+    V = np.einsum("ij,ij->i", a, np.cross(b, c))
+    return V.sum() / 6.0
 
 def volume_gradients(verts, faces):
+    """Gradient of ``mesh_volume`` w.r.t. vertex positions.
+
+    Uses ``np.add.at`` to accumulate per-face contributions without explicit
+    Python loops.
+    """
     grads = np.zeros_like(verts)
-    for tri in faces:
-        i,j,k = tri
-        a,b,c = verts[i],verts[j],verts[k]
-        grads[i] += np.cross(b,c)
-        grads[j] += np.cross(c,a)
-        grads[k] += np.cross(a,b)
+    a = verts[faces[:, 0]]
+    b = verts[faces[:, 1]]
+    c = verts[faces[:, 2]]
+    np.add.at(grads, faces[:, 0], np.cross(b, c))
+    np.add.at(grads, faces[:, 1], np.cross(c, a))
+    np.add.at(grads, faces[:, 2], np.cross(a, b))
     grads /= 6.0
     return grads
 
