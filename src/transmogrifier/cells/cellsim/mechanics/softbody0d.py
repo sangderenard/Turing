@@ -53,59 +53,81 @@ class Softbody0DProvider(MechanicsProvider):
         if self._h is None or len(self._ids) != len(cells):
             self._build_world(cells)
 
-        # Map cell state onto provider controls
+        # Map cell state onto provider controls using vectorized operations
         assert self._h is not None
-        V_list = [max(1e-18, float(c.V)) for c in cells]
-        V_min, V_max = min(V_list), max(V_list)
-        # Normalize target volumes to a reasonable range in provider units
-        def map_volume(V: float) -> float:
-            if V_max <= V_min:
-                return (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3)
+        V = np.maximum(1e-18, np.array([float(c.V) for c in cells], dtype=float))
+        elastic_k = np.array([float(c.elastic_k) for c in cells], dtype=float)
+        imp = np.array([float(c.n.get("Imp", 0.0)) for c in cells], dtype=float)
+        P_ext = float(getattr(bath, "pressure", 0.0))
+
+        V_min, V_max = float(np.min(V)), float(np.max(V))
+        if V_max <= V_min:
+            mapped_vols = np.full_like(
+                V, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3)
+            )
+        else:
             alpha = (V - V_min) / max(1e-18, (V_max - V_min))
             r = self.cfg.r_min * (1 - alpha) + self.cfg.r_max * alpha
-            return (4.0 / 3.0) * math.pi * (r ** 3)
+            mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
+        osmotic = imp / np.maximum(V, 1e-18)
 
-        for i, (c, sbc) in enumerate(zip(cells, self._h.cells)):
-            sbc.constraints["volume"].target = map_volume(float(c.V))
-            sbc.membrane_tension = float(c.elastic_k)
-            ci_imp = 0.0
-            if "Imp" in c.n:
-                ci_imp = float(c.n.get("Imp", 0.0) / max(c.V, 1e-18))
-            sbc.osmotic_pressure = ci_imp
-            sbc.external_pressure = float(getattr(bath, "pressure", 0.0))
+        for sbc, V_t, k, osm in zip(self._h.cells, mapped_vols, elastic_k, osmotic):
+            sbc.constraints["volume"].target = float(V_t)
+            sbc.membrane_tension = float(k)
+            sbc.osmotic_pressure = float(osm)
+            sbc.external_pressure = P_ext
 
     def step(self, dt: float) -> MechanicsSnapshot:
         if self._h is None or self._cells is None or self._bath is None:
             return {}
-        p = self._h.params
         sub_dt = self.cfg.dt_provider / max(1, int(self.cfg.substeps))
+
+        cells_arr = np.array(self._h.cells, dtype=object)
+        Ka_arr = np.array([float(c.elastic_k) for c in self._cells], dtype=float)
+        Kb_arr = np.array(
+            [float(getattr(c, "bulk_modulus", 1e5)) for c in self._cells],
+            dtype=float,
+        )
+        P_osm_arr = np.array(
+            [float(getattr(sbc, "osmotic_pressure", 0.0)) for sbc in cells_arr],
+            dtype=float,
+        )
+        P_ext = float(getattr(self._bath, "pressure", 0.0))
+        P_ext_arr = np.full(len(cells_arr), P_ext, dtype=float)
+
+        def _harmonized_update_batch():
+            vec = np.vectorize(
+                lambda sbc, ka, kb, po, pe: harmonized_update(
+                    sbc, ka, kb, po, pe
+                ),
+                otypes=[object],
+            )
+            vec(cells_arr, Ka_arr, Kb_arr, P_osm_arr, P_ext_arr)
+
         for _ in range(self.cfg.substeps):
-            for c0d, sbc in zip(self._cells, self._h.cells):
-                harmonized_update(
-                    sbc,
-                    float(c0d.elastic_k),
-                    float(getattr(c0d, "bulk_modulus", 1e5)),
-                    float(getattr(sbc, "osmotic_pressure", 0.0)),
-                    float(getattr(self._bath, "pressure", 0.0)),
-                )
+            _harmonized_update_batch()
             self._h.integrate(sub_dt)
             self._h.project_constraints(sub_dt)
             self._h.update_organelle_modes(sub_dt)
 
-        pressures: List[float] = []
-        areas: List[float] = []
-        vols: List[float] = []
-        for c0d, sbc in zip(self._cells, self._h.cells):
-            V = abs(float(sbc.enclosed_volume()))
-            A = cell_area(sbc)
-            gamma, dP_L = laplace_from_Ka(sbc, float(c0d.elastic_k))
-            P_internal = float(getattr(self._bath, "pressure", 0.0)) + dP_L
-            pressures.append(self.cfg.pressure_scale * P_internal)
-            areas.append(self.cfg.area_scale * A)
-            vols.append(V)
-            c0d.membrane_tension = gamma
-            c0d.internal_pressure = P_internal
-            c0d.measured_volume = V
+        V = np.array([abs(float(sbc.enclosed_volume())) for sbc in cells_arr])
+        A = np.array([cell_area(sbc) for sbc in cells_arr])
+        laplace = np.array(
+            [laplace_from_Ka(sbc, ka) for sbc, ka in zip(cells_arr, Ka_arr)],
+            dtype=float,
+        )
+        gamma = laplace[:, 0]
+        dP_L = laplace[:, 1]
+        P_internal = P_ext + dP_L
+        pressures = self.cfg.pressure_scale * P_internal
+        areas = self.cfg.area_scale * A
+        vols = V
+
+        for c0d, g, P_i, vol in zip(self._cells, gamma, P_internal, V):
+            c0d.membrane_tension = float(g)
+            c0d.internal_pressure = float(P_i)
+            c0d.measured_volume = float(vol)
+
         return {"pressures": pressures, "areas": areas, "volumes": vols}
 
     # Internals -------------------------------------------------------------
