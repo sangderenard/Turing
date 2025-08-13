@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import queue
 from typing import Dict, Optional, Tuple
 
-from ..hardware.analog_spec import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS, BIAS_AMP
+from ..hardware.constants import FRAME_SAMPLES, BIT_FRAME_MS, WRITE_BIAS, BIAS_AMP
 try:
     import numpy as np
     from numpy import ndarray

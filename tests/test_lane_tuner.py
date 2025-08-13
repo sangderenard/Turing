@@ -1,7 +1,7 @@
 import numpy as np
 
 from src.hardware.lane_tuner import LaneTuner
-from src.hardware.analog_spec import BASE_FREQ, SEMI_RATIO
+from src.hardware.constants import BASE_FREQ, SEMI_RATIO
 
 
 def test_c_major_middle_region():

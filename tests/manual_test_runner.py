@@ -1,6 +1,5 @@
 import numpy as np
 from src.hardware.analog_spec import (
-    FRAME_SAMPLES,
     generate_bit_wave,
     sigma_L,
     sigma_R,
@@ -10,6 +9,9 @@ from src.hardware.analog_spec import (
     header_frames,
     pack_bios_header,
     unpack_bios_header,
+)
+from src.hardware.constants import (
+    FRAME_SAMPLES,
     LANES,
     BIT_FRAME_MS,
     WRITE_BIAS,

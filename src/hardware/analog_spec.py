@@ -8,53 +8,45 @@ missing physical modelling required for a faithful simulation.
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Dict, Callable
+from typing import Dict, List, Callable, TYPE_CHECKING
 import struct
 
-import numpy as np
+from .constants import (
+    LANES,
+    TRACKS,
+    REGISTERS,
+    BIT_FRAME_MS,
+    REFERENCE_BIT_FRAME_MS,
+    FS,
+    BASE_FREQ,
+    SEMI_RATIO,
+    MOTOR_CARRIER,
+    WRITE_BIAS,
+    DATA_ADSR,
+    FRAME_SAMPLES,
+    MOTOR_RAMP_MS,
+    PLATEAU_AMP,
+    SIMULATION_VOLUME,
+    ATTACK_LEVEL,
+    SUSTAIN_LEVEL,
+    NOISE_FLOOR_DB,
+    NOISE_SOURCES,
+    BIAS_AMP,
+    lane_frequency,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np
+else:  # lazy import to reduce startup cost
+    class _LazyNumpy:
+        def __getattr__(self, name):
+            import numpy as _np  # type: ignore
+            globals()["np"] = _np
+            return getattr(_np, name)
+
+    np = _LazyNumpy()  # type: ignore
 
 # nand_wave is now implemented below in this module
-
-
-# ---------------------------------------------------------------------------
-# 1. Global Parameters
-LANES = 32
-TRACKS = 2
-REGISTERS = 3
-BIT_FRAME_MS = 50
-# Reference frame duration for legacy calibration
-REFERENCE_BIT_FRAME_MS = 500.0
-FS = 44_100
-BASE_FREQ = 110.0
-SEMI_RATIO = 2 ** (1 / 12)
-MOTOR_CARRIER = 60.0
-WRITE_BIAS = 150.0
-# Envelope: attack_ratio, decay_ratio, sustain_ratio, release_ratio, attack_level, sustain_level
-DATA_ADSR = (1, 2, 5, 1, 1.0, 0.8)
-FRAME_SAMPLES = int(FS * (BIT_FRAME_MS / 1000.0))
-MOTOR_RAMP_MS = 75  # up/down ramp duration for SEEK envelopes
-
-# Global motor plateau amplitude (scales current available to motor)
-PLATEAU_AMP = 10.0
-SIMULATION_VOLUME = 0.8  # Master volume scaling for audio playback
-
-# Global envelope levels
-ATTACK_LEVEL = DATA_ADSR[4]
-SUSTAIN_LEVEL = DATA_ADSR[5]
-
-# Baseline RF noise floor and derived bias amplitude per noise source
-NOISE_FLOOR_DB = -60.0
-NOISE_SOURCES = 3  # write head, read head, motor
-BIAS_AMP = float(10 ** ((NOISE_FLOOR_DB - 10 * np.log10(NOISE_SOURCES)) / 20))
-
-def lane_frequency(lane: int) -> float:
-    """Return the base frequency for a lane."""
-    return BASE_FREQ * (SEMI_RATIO ** lane)
-
-from .analog_helpers import (
-    extract_lane, lane_band, lane_rms, track_rms, replay_envelope,
-    mix_fft_lane,
-)
 
 
 def generate_bit_wave(bit: int, lane: int, phase: float = 0.0) -> np.ndarray:
@@ -294,10 +286,12 @@ def mu(x: List[np.ndarray], y: List[np.ndarray], sel: List[np.ndarray]) -> List[
     output takes the frame from ``x`` (peak < 0.5) or from ``y`` (peak ≥ 0.5).
     This is a coarse placeholder for a true VCA-based implementation.
     """
+    from . import analog_helpers as ah
+
     out: List[np.ndarray] = []
     for fx, fy, fs in zip(x, y, sel):
         # Use RMS of selector frame to decide gating
-        if track_rms(fs) >= 0.5:
+        if ah.track_rms(fs) >= 0.5:
             out.append(fy)
         else:
             out.append(fx)
@@ -372,6 +366,8 @@ def nand_wave(
     energy_thresh: float = 0.01,
 ) -> np.ndarray:
     """Return NAND combination of ``x`` and ``y`` according to ``mode``."""
+    from . import analog_helpers as ah
+
     # Operators consume their operands via registers to mimic tape workflow.
     reg_x = Register([x.copy()])
     reg_y = Register([y.copy()])
@@ -384,20 +380,20 @@ def nand_wave(
         for lane in range(LANES):
             if lane_mask is not None and not (lane_mask & (1 << lane)):
                 continue
-            x_on = lane_rms(x, lane) > energy_thresh
-            y_on = lane_rms(y, lane) > energy_thresh
+            x_on = ah.lane_rms(x, lane) > energy_thresh
+            y_on = ah.lane_rms(y, lane) > energy_thresh
             if not x_on and not y_on:
                 out += generate_bit_wave(1, lane)
             elif x_on and not y_on:
                 if lane_mask is not None and lane_mask == (1 << lane):
                     out += x
                 else:
-                    out = mix_fft_lane(out, x, lane)
+                    out = ah.mix_fft_lane(out, x, lane)
             elif y_on and not x_on:
                 if lane_mask is not None and lane_mask == (1 << lane):
                     out += y
                 else:
-                    out = mix_fft_lane(out, y, lane)
+                    out = ah.mix_fft_lane(out, y, lane)
         peak = float(np.max(np.abs(out)))
         if peak > 1.0:
             out *= 1.0 / peak
@@ -405,8 +401,8 @@ def nand_wave(
     # dominant mode
     if target_lane is None:
         raise ValueError("target_lane required for dominant mode")
-    x_on = track_rms(x) > energy_thresh
-    y_on = track_rms(y) > energy_thresh
+    x_on = ah.track_rms(x) > energy_thresh
+    y_on = ah.track_rms(y) > energy_thresh
     if x_on and y_on:
         out = np.zeros(FRAME_SAMPLES, dtype="f4")
     elif x_on or y_on:
@@ -414,8 +410,8 @@ def nand_wave(
         tone = dominant_tone(source)
         lane_est = int(round(np.log(tone.freq / BASE_FREQ) / np.log(SEMI_RATIO)))
         lane_est = max(0, min(LANES - 1, lane_est))
-        env = extract_lane(source, lane_est)
-        out = replay_envelope(env, target_lane)
+        env = ah.extract_lane(source, lane_est)
+        out = ah.replay_envelope(env, target_lane)
     else:
         out = generate_bit_wave(1, target_lane)
     peak = float(np.max(np.abs(out)))
