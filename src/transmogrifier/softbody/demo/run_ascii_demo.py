@@ -5,13 +5,8 @@ import numpy as np
 # Keep local XPBD types for rendering helpers only
 from ..engine.hierarchy import Hierarchy
 
-# Use cellsim with the softbody 0D mechanics provider behind the demo
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
-from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
-from src.transmogrifier.cells.cellsim.mechanics.softbody0d import (
-    Softbody0DProvider,
-    SoftbodyProviderCfg,
-)
+# Reuse the numpy-based backend so all demos share identical math
+from .run_numpy_demo import make_cellsim_backend, step_cellsim
 
 # ---- color helpers ---------------------------------------------------------
 try:
@@ -56,34 +51,6 @@ def colorize(ch, rgb, mode="auto"):
     else:
         return f"{_rgb256_from_24(r,g,b)}{ch}{RESET}"
 
-def make_cellsim_backend():
-    """Build a tiny cellsim system and attach the softbody 0D provider.
-
-    Returns (api, provider). Use provider._h (Hierarchy) only for rendering.
-    """
-    # Three toy cells with simple solute loads
-    vols = [1.6, 1.2, 0.9]
-    cells = []
-    for i, V in enumerate(vols):
-        cells.append(
-            Cell(
-                V=float(V),
-                n={"Imp": 100.0 + 30*i, "Na": 0.0, "K": 0.0, "Cl": 0.0},
-                elastic_k=0.6 + 0.1*i,
-            )
-        )
-    bath = Bath(
-        V=sum(vols) * 5.0,
-        n={"Na": 1000.0, "K": 0.0, "Cl": 1000.0, "Imp": 0.0},
-        pressure=1e4,
-    )
-    api = SalinePressureAPI(cells, bath)
-    provider = api.attach_softbody_mechanics(SoftbodyProviderCfg(substeps=2, dt_provider=0.01))
-    return api, provider
-
-def step_cellsim(api: SalinePressureAPI, dt: float) -> float:
-    """Advance cellsim; returns suggested next dt."""
-    return api.step(dt)
 
 def world_to_grid(h: Hierarchy, nx=120, ny=36):
     grid = [[('.', (110,110,130)) for _ in range(nx)] for _ in range(ny)]
@@ -138,7 +105,17 @@ def main():
     args = parser.parse_args()
     color_mode = args.color
 
-    api, provider = make_cellsim_backend()
+    api, provider = make_cellsim_backend(
+        cell_vols=[1.6, 1.2, 0.9],
+        cell_imps=[100.0 + 30 * i for i in range(3)],
+        cell_elastic_k=[0.6 + 0.1 * i for i in range(3)],
+        bath_na=1000.0,
+        bath_cl=1000.0,
+        bath_pressure=1e4,
+        bath_volume_factor=5.0,
+        substeps=2,
+        dt_provider=0.01,
+    )
     dt = 1e-3
 
     for frame in range(int(args.frames)):

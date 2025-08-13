@@ -3,38 +3,20 @@ import ctypes
 import numpy as np
 
 # ----- Cellsim backend (uses your code) -------------------------------------
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
-from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
-from src.transmogrifier.cells.cellsim.mechanics.softbody0d import (
-    SoftbodyProviderCfg,
-)
+from .run_numpy_demo import make_cellsim_backend as base_make_cellsim_backend, step_cellsim
+
+
 def make_cellsim_backend():
-    vols = [0.8, 0.8, 0.8]  # start a little smaller; they’ll swell
-    cells = []
-    for i, V in enumerate(vols):
-        cells.append(
-            Cell(
-                V=float(V),
-                # More impermeant solute inside -> water influx (swelling)
-                n={"Imp": 600.0 + 80*i, "Na": 0.0, "K": 0.0, "Cl": 0.0},
-                # So membrane doesn’t fight expansion too hard
-                elastic_k=0.2
-            )
-        )
-
-    # Hypotonic & low external pressure -> encourages swelling
-    bath = Bath(
-        V=sum(vols) * 3.0,                # roomy bath; not the limiter here
-        n={"Na": 5.0, "K": 0.0, "Cl": 5.0, "Imp": 0.0},  # dilute outside
-        pressure=0.0                      # no extra squeeze from the bath
-    )
-
-    api = SalinePressureAPI(cells, bath)
-    provider = api.attach_softbody_mechanics(
-        SoftbodyProviderCfg(
-            substeps=5,        # more stable when swelling
-            dt_provider=0.005  # smaller dt for XPBD/0D coupling
-        )
+    api, provider = base_make_cellsim_backend(
+        cell_vols=[0.8, 0.8, 0.8],
+        cell_imps=[600.0 + 80 * i for i in range(3)],
+        cell_elastic_k=[0.2, 0.2, 0.2],
+        bath_na=5.0,
+        bath_cl=5.0,
+        bath_pressure=0.0,
+        bath_volume_factor=3.0,
+        substeps=5,
+        dt_provider=0.005,
     )
 
     # color identity (rendering only)
@@ -43,10 +25,6 @@ def make_cellsim_backend():
         setattr(c, "_identity_green", levels[i % len(levels)])
 
     return api, provider
-
-
-def step_cellsim(api: SalinePressureAPI, dt: float) -> float:
-    return api.step(dt)
 
 # ----- OpenGL minimal renderer (pygame + PyOpenGL) --------------------------
 try:
