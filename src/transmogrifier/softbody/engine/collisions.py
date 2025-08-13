@@ -42,6 +42,89 @@ def _resolve_pair(v: np.ndarray, tri_verts: List[np.ndarray], normal: np.ndarray
     v += -depth * normal
 
 
+def build_self_contacts_spatial_hash(
+    X: np.ndarray, faces: np.ndarray, cell_ids: np.ndarray, voxel_size: float
+) -> np.ndarray:
+    """Return potential vertex–triangle pairs using a 3‑D hash grid.
+
+    Parameters
+    ----------
+    X : (n, 3) array
+        Vertex positions.
+    faces : (m, 3) array
+        Triangle vertex indices.
+    cell_ids : (n,) array
+        Cell identifier per vertex.  Faces are assumed to belong to the cell of
+        their first vertex.  Contacts are only generated within a cell.
+    voxel_size : float
+        Edge length of spatial hash voxels.
+
+    Returns
+    -------
+    np.ndarray
+        Array of ``(vertex_index, face_index)`` pairs that may collide.  The
+        function performs only a broad‑phase search and does *not* check actual
+        penetration depths.
+    """
+
+    if X.size == 0 or faces.size == 0:
+        return np.empty((0, 2), dtype=np.int32)
+
+    inv_vox = 1.0 / max(voxel_size, 1e-12)
+
+    # --- Build per-face adjacency to exclude neighbour triangles -------------
+    n_faces = len(faces)
+    adjacency = [set(f) for f in faces]  # start with the face's own vertices
+    edge2faces = {}
+    for fi, (i, j, k) in enumerate(faces):
+        for e in ((i, j), (j, k), (k, i)):
+            key = tuple(sorted(e))
+            edge2faces.setdefault(key, []).append(fi)
+
+    for tris in edge2faces.values():
+        if len(tris) < 2:
+            continue
+        verts = set()
+        for fi in tris:
+            verts.update(faces[fi])
+        for fi in tris:
+            adjacency[fi].update(verts)
+
+    # --- Hash triangles into voxel grid -------------------------------------
+    tri_hash = {}
+    for fi in range(n_faces):
+        pts = X[faces[fi]]
+        mn = np.floor(pts.min(axis=0) * inv_vox).astype(int)
+        mx = np.floor(pts.max(axis=0) * inv_vox).astype(int)
+        for ix in range(mn[0], mx[0] + 1):
+            for iy in range(mn[1], mx[1] + 1):
+                for iz in range(mn[2], mx[2] + 1):
+                    tri_hash.setdefault((ix, iy, iz), []).append(fi)
+
+    face_cell = cell_ids[faces[:, 0]]
+    pairs = set()
+    for vi, v in enumerate(X):
+        cell = cell_ids[vi]
+        voxel = np.floor(v * inv_vox).astype(int)
+        for ix in range(voxel[0] - 1, voxel[0] + 2):
+            for iy in range(voxel[1] - 1, voxel[1] + 2):
+                for iz in range(voxel[2] - 1, voxel[2] + 2):
+                    tris = tri_hash.get((ix, iy, iz))
+                    if not tris:
+                        continue
+                    for fi in tris:
+                        if face_cell[fi] != cell:
+                            continue
+                        if vi in adjacency[fi]:
+                            continue
+                        pairs.add((vi, fi))
+
+    if not pairs:
+        return np.empty((0, 2), dtype=np.int32)
+    out = np.array(sorted(pairs), dtype=np.int32)
+    return out
+
+
 def resolve_membrane_collisions(
     cells: List["Cell"], min_separation: float = 0.0, iters: int = 10
 ):

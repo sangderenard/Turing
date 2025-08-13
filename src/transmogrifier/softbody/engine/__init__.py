@@ -9,7 +9,7 @@ from .constraints import (
     PlaneContact,
 )
 from .hierarchy import Cell, Organelle
-from .collisions import resolve_membrane_collisions
+from .collisions import resolve_membrane_collisions, build_self_contacts_spatial_hash
 
 __all__ = [
     "EngineParams",
@@ -21,4 +21,5 @@ __all__ = [
     "Cell",
     "Organelle",
     "resolve_membrane_collisions",
+    "build_self_contacts_spatial_hash",
 ]
