@@ -4,11 +4,11 @@ import math
 
 def cell_area(cell):
     """Compute total surface area of a softbody cell."""
-    A = 0.0
-    X, F = cell.X, cell.faces
-    for tri in F:
-        a, b, c = X[tri[0]], X[tri[1]], X[tri[2]]
-        A += 0.5 * np.linalg.norm(np.cross(b - a, c - a))
+    X = np.asarray(cell.X, dtype=np.float64)
+    F = np.asarray(cell.faces, dtype=np.int32)
+    AB = X[F[:, 1]] - X[F[:, 0]]
+    AC = X[F[:, 2]] - X[F[:, 0]]
+    A = 0.5 * np.linalg.norm(np.cross(AB, AC), axis=1).sum()
     return float(A)
 
 
@@ -18,21 +18,28 @@ def _prep_refs(cell):
     if not hasattr(cell, "_V0"):
         cell._V0 = abs(cell.enclosed_volume())
     if not hasattr(cell, "_edge_dual_area"):
-        dual = {}
-        for (i, j) in cell.edges:
-            dual[(int(i), int(j))] = 0.0
-            dual[(int(j), int(i))] = 0.0
-        for (i, j, k) in cell.faces:
-            a = 0.5 * np.linalg.norm(
-                np.cross(cell.X[j] - cell.X[i], cell.X[k] - cell.X[i])
-            )
-            for e in [(int(i), int(j)), (int(j), int(k)), (int(k), int(i))]:
-                dual[e] += a / 3.0
-        cell._edge_dual_area = {
-            tuple(sorted(e)): (dual[e] + dual[(e[1], e[0])])
-            for e in dual
-            if e[0] < e[1]
-        }
+        F = np.asarray(cell.faces, dtype=np.int32)
+        X = np.asarray(cell.X, dtype=np.float64)
+        edges = np.asarray(cell.edges, dtype=np.int32)
+        n_verts = X.shape[0]
+        n_edges = edges.shape[0]
+
+        AB = X[F[:, 1]] - X[F[:, 0]]
+        AC = X[F[:, 2]] - X[F[:, 0]]
+        A = 0.5 * np.linalg.norm(np.cross(AB, AC), axis=1)
+
+        edge_map = -np.ones((n_verts, n_verts), dtype=np.int32)
+        idx = np.arange(n_edges, dtype=np.int32)
+        edge_map[edges[:, 0], edges[:, 1]] = idx
+        edge_map[edges[:, 1], edges[:, 0]] = idx
+
+        face_edges = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+        edge_idx = edge_map[face_edges[:, 0], face_edges[:, 1]]
+        dual = np.zeros(n_edges, dtype=np.float64)
+        np.add.at(dual, edge_idx, np.repeat(A / 3.0, 3))
+
+        cell._edge_dual_area = dual
+        cell._edge_lookup = edge_map
 
 
 def _set_stretch_from_Ka(cell, Ka):
@@ -41,14 +48,11 @@ def _set_stretch_from_Ka(cell, Ka):
     sc = cell.constraints.get("stretch")
     if sc is None:
         return
-    idx = sc["indices"]
-    Adual = np.array(
-        [cell._edge_dual_area.get(tuple(sorted((int(i), int(j)))), 0.0) for i, j in idx]
-    )
-    Adual = np.maximum(eps, Adual)
+    idx = np.asarray(sc["indices"], dtype=np.int32)
+    i, j = idx[:, 0], idx[:, 1]
+    Adual = np.maximum(eps, cell._edge_dual_area[cell._edge_lookup[i, j]])
     L0 = np.maximum(eps, sc["rest"])
-    k_edge = Ka * (Adual / L0)
-    sc["compliance"][:] = 1.0 / np.maximum(eps, k_edge)
+    sc["compliance"][:] = 1.0 / np.maximum(eps, Ka * (Adual / L0))
     sc["lamb"][:] = 0.0
 
 
