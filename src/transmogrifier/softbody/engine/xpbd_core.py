@@ -121,7 +121,41 @@ class XPBDSolver:
         np.add.at(X, k, dP[:, 2])
         np.add.at(X, l, dP[:, 3])
 
-    def project(self, constraints, X, invm, faces, vol_func, vol_grads_func, dt, iters, box_min, box_max):
+    def project(
+        self,
+        constraints,
+        X,
+        invm,
+        faces,
+        vol_func,
+        vol_grads_func,
+        dt,
+        iters,
+        box_min,
+        box_max,
+        contacts=None,
+    ):
+        """Project XPBD constraints and optional contacts.
+
+        Parameters
+        ----------
+        contacts: dict, optional
+            Narrow-phase contact information with keys ``indices`` (vertex
+            indices), ``normals`` (outward unit normals), ``depth`` (signed
+            distance at the start of the step) and ``lamb`` (XPBD multipliers).
+        """
+
+        c_idx = c_normals = c_lamb = c_offset = None
+        if contacts is not None and len(contacts.get("indices", [])):
+            c_idx = contacts["indices"]
+            c_normals = contacts["normals"]
+            c_lamb = contacts["lamb"]
+            # Store plane offsets so penetration depth can be re-evaluated
+            # after each projection iteration.
+            c_offset = contacts["depth"] - np.einsum(
+                "ij,ij->i", X[c_idx], c_normals
+            )
+
         for _ in range(iters):
             sc = constraints.get("stretch")
             if sc is not None:
@@ -132,6 +166,17 @@ class XPBDSolver:
             vc = constraints.get("volume", None)
             if vc is not None:
                 vc.project(X, invm, faces, vol_func, vol_grads_func, dt)
+
+            if c_idx is not None and len(c_idx):
+                w = invm[c_idx]
+                C = np.einsum("ij,ij->i", X[c_idx], c_normals) + c_offset
+                mask = w > 0.0
+                if np.any(mask):
+                    alpha = self.p.contact_compliance / (dt * dt)
+                    dl = np.zeros_like(c_lamb)
+                    dl[mask] = -(C[mask] + alpha * c_lamb[mask]) / (w[mask] + alpha)
+                    c_lamb += dl
+                    X[c_idx] += (w * dl)[:, None] * c_normals
 
             # Vectorised contact projection against the bounding box
             idx, normals, C = self.build_contacts(X, box_min, box_max)
@@ -146,3 +191,5 @@ class XPBDSolver:
                     alpha = self.p.contact_compliance / (dt * dt)
                     dl = -C / (w + alpha)
                     X[idx] += (w * dl)[:, None] * normals
+
+        return c_lamb
