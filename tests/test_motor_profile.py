@@ -5,7 +5,8 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.hardware.cassette_tape import CassetteTapeBackend
-from src.hardware.analog_spec import trapezoidal_motor_envelope, MotorCalibration, BIT_FRAME_MS, FS
+from src.hardware.analog_spec import trapezoidal_motor_envelope, MotorCalibration
+from src.hardware.constants import BIT_FRAME_MS, FS
 
 
 def test_motor_envelope_integrates_time():

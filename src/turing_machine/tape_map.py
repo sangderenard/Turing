@@ -22,11 +22,10 @@ from typing import Dict, List, Optional
 from ..hardware.analog_spec import (
     BiosHeader,
     BIOS_HEADER_STRUCT,
-    REGISTERS,
-    LANES,
     header_frames,
     unpack_bios_header,
 )
+from ..hardware.constants import REGISTERS, LANES
 
 
 @dataclass

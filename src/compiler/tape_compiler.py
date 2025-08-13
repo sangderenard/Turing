@@ -13,7 +13,8 @@ import struct
 from typing import Dict, List, Tuple
 import numpy as np
 
-from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode, LANES, REGISTERS
+from ..hardware.analog_spec import BiosHeader, InstructionWord, Opcode
+from ..hardware.constants import LANES, REGISTERS
 from ..turing_machine.tape_map import TapeMap
 from ..turing_machine.turing_provenance import ProvenanceGraph, ProvNode
 from ..transmogrifier.ssa import Instr

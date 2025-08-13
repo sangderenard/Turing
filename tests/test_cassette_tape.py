@@ -2,7 +2,8 @@ import pytest
 import numpy as np
 
 from src.hardware.cassette_tape import CassetteTapeBackend
-from src.hardware.analog_spec import generate_bit_wave, BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS, BIAS_AMP
+from src.hardware.analog_spec import generate_bit_wave
+from src.hardware.constants import BIT_FRAME_MS, FRAME_SAMPLES, WRITE_BIAS, BIAS_AMP
 from src.turing_machine.tape_transport import TapeTransport
 
 

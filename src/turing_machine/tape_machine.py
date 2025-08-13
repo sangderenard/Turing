@@ -13,11 +13,11 @@ from typing import Dict, List, Sequence
 import os
 
 from ..hardware.analog_spec import (
-    LANES,
     Opcode,
     apply_operator,
     mu,
 )
+from ..hardware.constants import LANES
 from ..hardware.cassette_tape import CassetteTapeBackend
 from .tape_map import TapeMap
 from .tape_transport import TapeTransport

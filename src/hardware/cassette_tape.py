@@ -24,10 +24,12 @@ import time
 
 from .analog_spec import (
     generate_bit_wave,
-    FRAME_SAMPLES,
     MotorCalibration,
-    BIT_FRAME_MS,
     trapezoidal_motor_envelope,
+)
+from .constants import (
+    FRAME_SAMPLES,
+    BIT_FRAME_MS,
     MOTOR_CARRIER,
     BIAS_AMP,
     SIMULATION_VOLUME,

@@ -10,8 +10,8 @@ from src.hardware.analog_spec import (
     header_frames,
     pack_bios_header,
     unpack_bios_header,
-    LANES,
 )
+from src.hardware.constants import LANES
 from src.turing_machine.tape_map import TapeMap, create_register_tapes
 
 

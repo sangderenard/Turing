@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Union
 
-from .analog_spec import BASE_FREQ, SEMI_RATIO, LANES
+from .constants import BASE_FREQ, SEMI_RATIO, LANES
 
 
 @dataclass

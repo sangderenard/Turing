@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import src.hardware.nand_wave as nw
-from src.hardware.analog_spec import BIT_FRAME_MS, REFERENCE_BIT_FRAME_MS
+from src.hardware.constants import BIT_FRAME_MS, REFERENCE_BIT_FRAME_MS
 
 
 BASE_ENERGY_THRESH = 0.01
