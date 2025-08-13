@@ -9,6 +9,7 @@ from .constraints import (
     PlaneContact,
 )
 from .hierarchy import Cell, Organelle
+from .collisions import resolve_membrane_collisions
 
 __all__ = [
     "EngineParams",
@@ -19,4 +20,5 @@ __all__ = [
     "PlaneContact",
     "Cell",
     "Organelle",
+    "resolve_membrane_collisions",
 ]
