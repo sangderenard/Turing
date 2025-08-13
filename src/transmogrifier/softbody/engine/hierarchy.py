@@ -6,6 +6,7 @@ from typing import List
 from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
+from .fields import FieldStack
 
 @dataclass
 class Organelle:
@@ -52,6 +53,7 @@ class Hierarchy:
     cells: List[Cell]
     solver: XPBDSolver
     params: object
+    fields: FieldStack = field(default_factory=FieldStack)
 
     def integrate(self, dt):
         if not self.cells:

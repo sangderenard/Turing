@@ -17,6 +17,7 @@ from src.transmogrifier.softbody.engine.coupling import (
     laplace_from_Ka,
     cell_area,
 )
+from src.transmogrifier.softbody.engine.fields import FieldStack
 
 
 @dataclass
@@ -197,8 +198,15 @@ class Softbody0DProvider(MechanicsProvider):
             solver=solver,
             params=self._params,
         )
-        # after self._h = Hierarchy(...)
-        from src.transmogrifier.softbody.resources.field_library import uniform_flow, shear_flow, fluid_noise, gravity
+        # Attach a field stack for optional environmental forces/noise
+        self._h.fields = FieldStack()
+
+        from src.transmogrifier.softbody.resources.field_library import (
+            uniform_flow,
+            shear_flow,
+            fluid_noise,
+            gravity,
+        )
 
         # whole-system drift to +X
         self._h.fields.add(uniform_flow(u=(0.03, 0.0, 0.0), dim=3))
@@ -207,7 +215,9 @@ class Softbody0DProvider(MechanicsProvider):
         # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
 
         # gentle Brownian jiggle (no COM drift)
-        #self._h.fields.add(fluid_noise(sigma=5e-4, com_neutral=True, dim=3))
+        # self._h.fields.add(fluid_noise(sigma=5e-4, com_neutral=True, dim=3))
 
         # gravity on a subset (example: only cell0 & cell2)
-        # self._h.fields.add(gravity(g=(0,-0.4,0), selector=lambda c: c.id in {"cell0","cell2"}, dim=3))
+        # self._h.fields.add(
+        #     gravity(g=(0, -0.4, 0), selector=lambda c: c.id in {"cell0", "cell2"}, dim=3)
+        # )
