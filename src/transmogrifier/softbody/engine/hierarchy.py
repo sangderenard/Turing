@@ -116,10 +116,25 @@ class Hierarchy:
         # Faces are per-cell for volume; don’t try to batch volume unless you
         # also build a batched face array + per-constraint face ranges.
         faces_dummy = np.empty((0, 3), dtype=np.int32)
+        # XPBDSolver.project expects explicit bounding box limits.  The
+        # previous call passed ``self`` which was interpreted as ``box_min``
+        # and left ``box_max`` unset, effectively turning the projection step
+        # into a no-op and preventing velocities from being rebuilt from the
+        # advected positions.  Supplying both limits ensures constraint
+        # projection (including contact with the world box) runs correctly and
+        # produces non-zero velocities when fields like uniform_flow are
+        # applied.
         self.solver.project(
-            cons, X, invm, faces_dummy,  # faces unused for stretch/bending
-            mesh_volume, volume_gradients,
-            dt, self.params.iterations, self
+            cons,
+            X,
+            invm,
+            faces_dummy,  # faces unused for stretch/bending
+            mesh_volume,
+            volume_gradients,
+            dt,
+            self.params.iterations,
+            self.box_min,
+            self.box_max,
         )
 
         # Scatter back
