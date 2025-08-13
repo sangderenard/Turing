@@ -1,4 +1,4 @@
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 import math
 from ..core.geometry import sphere_area_from_volume
 from ..core.numerics import clamp_nonneg, adapt_dt
@@ -8,6 +8,7 @@ from ..transport.kedem_katchalsky import arrhenius, fluxes
 from ..organelles.inner_loop import inner_exchange, cytosol_free_volume
 from ..core import checks
 from ..data.state import Cell, Bath
+from ..mechanics.provider import MechanicsProvider, MechanicsSnapshot
 from ..transport.pumps import (
     na_k_atpase_constant,
     na_k_atpase_saturating,
@@ -24,12 +25,14 @@ class SalineEngine:
         *,
         enable_energy_check: bool = False,
         enable_checks: bool = False,
-    ):
+        mechanics_provider: Optional[MechanicsProvider] = None,
+        ):
         self.cells = cells
         self.bath = bath
         self.species = tuple(species)
         self.enable_energy_check = enable_energy_check
         self.enable_checks = enable_checks
+        self.mechanics_provider = mechanics_provider
 
         for c in self.cells:
             c.set_initial_A0_if_missing()
@@ -60,6 +63,15 @@ class SalineEngine:
                     total += o.n.get(sp, 0.0)
             totals_before[sp] = total
         species_list = list(self.species)
+        # Optional: obtain mechanics aggregates from provider
+        mech: Optional[MechanicsSnapshot] = None
+        if self.mechanics_provider is not None:
+            try:
+                self.mechanics_provider.sync(self.cells, self.bath)
+                mech = self.mechanics_provider.step(dt)
+            except Exception:
+                mech = None
+
         # Top-level step: iterate cells
         for c in tqdm(self.cells, desc="cells", leave=False):
             Cext = self.bath.conc(species_list)
@@ -75,12 +87,26 @@ class SalineEngine:
                     dP_anchor += o.anchor_stiffness * (eps - o.eps_ref)
             c._prev_eps = eps
             P_i = c.base_pressure + dP_tension + dP_anchor
+            # If provider supplies pressures, override P_i
+            if mech is not None and isinstance(mech, dict):
+                try:
+                    idx = self.cells.index(c)
+                    P_i = float(mech.get("pressures", [])[idx]) if idx < len(mech.get("pressures", [])) else P_i
+                except Exception:
+                    pass
 
             # 3) outer flux (cell ↔ bath): use cytosol free volume for Cint
             V_free = cytosol_free_volume(c)
             Cint = {sp: c.n.get(sp,0.0)/V_free for sp in self.species}
 
             A, R_c = sphere_area_from_volume(c.V)
+            # If provider supplies membrane area, prefer it
+            if mech is not None and isinstance(mech, dict):
+                try:
+                    idx = self.cells.index(c)
+                    A = float(mech.get("areas", [])[idx]) if idx < len(mech.get("areas", [])) else A
+                except Exception:
+                    pass
             Lp = arrhenius(c.Lp0, c.Ea_Lp, T)
 
             # --- Na/K pump (electrogenic 3:2) ---------------------------------

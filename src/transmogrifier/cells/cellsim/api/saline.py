@@ -9,6 +9,7 @@ from typing import Iterable, List, Sequence, Optional
 from sympy import lambdify, symbols, Integer, Float
 import numpy as np
 from ..engine.saline import SalineEngine
+from ..mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
 from tqdm.auto import tqdm  # type: ignore
@@ -67,16 +68,42 @@ class SalinePressureAPI:
                 A0, _ = sphere_area_from_volume(c.V); c.A0 = A0
         self.engine = SalineEngine(self.cells, self.bath, species=self.species)
 
+    def attach_softbody_mechanics(self, cfg: SoftbodyProviderCfg | None = None):
+        """Attach the softbody-backed 0D mechanics provider to the engine."""
+        provider = Softbody0DProvider(cfg)
+        # Recreate engine with provider to avoid mutating internals mid-run
+        self.engine = SalineEngine(
+            self.cells,
+            self.bath,
+            species=self.species,
+            mechanics_provider=provider,
+        )
+        return provider
+
     # ---- debug helpers ----
     def _compartment_snapshot(self, comp, species: List[str]):
         V = float(getattr(comp, "V", 0.0))
         n = {sp: float(comp.n.get(sp, 0.0)) for sp in species}
         conc = getattr(comp, "conc", None)
+        # Concentrations using total volume (existing behavior)
         concs = conc(species) if callable(conc) else {sp: (n.get(sp, 0.0)/max(V, 1e-18)) for sp in species}
+        # Cytosolic concentrations using free volume (exclude organelle solids per request)
+        try:
+            organelles = getattr(comp, "organelles", None)
+            if organelles:
+                freeV = float(V) - sum(float(getattr(o, "volume_total", 0.0)) * (1.0 - float(getattr(o, "lumen_fraction", 0.0))) for o in organelles)
+                freeV = freeV if abs(freeV) > 1e-18 else 1e-18
+            else:
+                freeV = V if abs(V) > 1e-18 else 1e-18
+        except Exception:
+            freeV = V if abs(V) > 1e-18 else 1e-18
+        concs_free = {sp: (n.get(sp, 0.0) / max(freeV, 1e-18)) for sp in species}
         snap = {
             "V": V,
             "n": n,
             "conc": {sp: float(concs.get(sp, 0.0)) for sp in species},
+            # Additional cytosolic concentration view (free volume): excludes organelle solids
+            "conc_free": {sp: float(concs_free.get(sp, 0.0)) for sp in species},
         }
         # Bath extras
         for extra in ("pressure", "temperature", "compressibility"):
