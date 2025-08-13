@@ -7,7 +7,7 @@ from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
-from .collisions import resolve_membrane_collisions
+from .collisions import build_self_contacts_spatial_hash
 from src.transmogrifier.cells.cellsim.membranes.membrane import (
     Membrane, MembraneConfig, MembraneHooks,
 )
@@ -150,9 +150,24 @@ class Hierarchy:
                 "lamb":        np.concatenate(bn_lamb),
             }
 
-        # Faces are per-cell for volume; don’t try to batch volume unless you
-        # also build a batched face array + per-constraint face ranges.
-        faces_dummy = np.empty((0, 3), dtype=np.int32)
+        # Broad-phase self-contact detection.
+        cell_ids = np.concatenate(
+            [np.full(len(c.X), i, dtype=np.int32) for i, c in enumerate(self.cells)]
+        )
+        all_faces = (
+            np.vstack([c.faces + off for c, off in zip(self.cells, offsets[:-1])])
+            if self.cells
+            else np.empty((0, 3), dtype=np.int32)
+        )
+        voxel_size = getattr(self.params, "contact_voxel_size", 0.05)
+        pairs = build_self_contacts_spatial_hash(X, all_faces, cell_ids, voxel_size)
+        if len(pairs):
+            cons["contacts"] = {
+                "pairs": pairs,
+                "compliance": np.full(len(pairs), self.params.contact_compliance, dtype=np.float64),
+                "lamb": np.zeros(len(pairs), dtype=np.float64),
+            }
+
         # XPBDSolver.project expects explicit bounding box limits.  The
         # previous call passed ``self`` which was interpreted as ``box_min``
         # and left ``box_max`` unset, effectively turning the projection step
@@ -165,7 +180,7 @@ class Hierarchy:
             cons,
             X,
             invm,
-            faces_dummy,  # faces unused for stretch/bending
+            all_faces,
             mesh_volume,
             volume_gradients,
             dt,
@@ -183,9 +198,6 @@ class Hierarchy:
             vc = c.constraints.get("volume")
             if vc is not None:
                 vc.project(c.X, c.invm, c.faces, mesh_volume, volume_gradients, dt)
-
-        # Ensure membranes do not intersect themselves or other membranes
-        resolve_membrane_collisions(self.cells)
 
     def update_organelle_modes(self, dt):
         counts = [len(c.organelles) for c in self.cells]
