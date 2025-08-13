@@ -300,6 +300,17 @@ def gather_organelles(h):
         return None, None
     return np.array(pts, dtype=np.float32), np.array(cols, dtype=np.float32)
 
+def gather_vertices(h):
+    """Collect all vertex positions from all cells as a single Nx3 array (float32)."""
+    cells = getattr(h, 'cells', [])
+    if not cells:
+        return None
+    try:
+        allX = np.concatenate([c.X for c in cells], axis=0).astype(np.float32)
+        return allX
+    except Exception:
+        return None
+
 class PointsGL:
     def __init__(self, pts, cols):
         self.n = len(pts)
@@ -358,6 +369,8 @@ def main():
     parser = argparse.ArgumentParser(parents=[build_numpy_parser(add_help=False)], conflict_handler='resolve')
     parser.add_argument("--frames", type=int, default=0,
                         help="Frame cap (0 runs until window close)")
+    parser.add_argument("--render", choices=["points", "mesh"], default="points",
+                        help="Rendering mode: 'points' shows white vertex point cloud (default); 'mesh' shows shaded meshes.")
     args = parser.parse_args()
 
     # ---------- init sim ----------
@@ -383,8 +396,8 @@ def main():
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     glEnable(GL_PROGRAM_POINT_SIZE)
-    glEnable(GL_CULL_FACE)
-    glCullFace(GL_BACK)
+#    glEnable(GL_CULL_FACE)
+#    glCullFace(GL_BACK)
 
     mesh_prog = link_program(MESH_VS, MESH_FS)
     mesh_u_mvp = glGetUniformLocation(mesh_prog, "uMVP")
@@ -395,10 +408,19 @@ def main():
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
 
-    # build GL objects per cell
-    gl_cells = _rebuild_gl_cells(h)
-    pts, cols = gather_organelles(h)
-    gl_pts = PointsGL(pts, cols) if pts is not None else None
+    # build GL objects depending on render mode
+    gl_cells = []
+    gl_pts = None           # organelles (mesh mode only)
+    gl_vtx_pts = None       # vertex point cloud (points mode)
+    if args.render == "mesh":
+        gl_cells = _rebuild_gl_cells(h)
+        pts, cols = gather_organelles(h)
+        gl_pts = PointsGL(pts, cols) if pts is not None else None
+    else:
+        vtx = gather_vertices(h)
+        if vtx is not None:
+            gl_vtx_pts = PointsGL(vtx, None)
+            gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
     # camera (initialized to look near the initial cell cluster)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
@@ -434,22 +456,37 @@ def main():
         # Reacquire hierarchy each tick (provider may replace _h)
         h = getattr(provider, "_h", h)
 
-        # Keep GL cells bound to the latest hierarchy cells; rebuild if needed
-        gl_cells, rebuilt = _sync_gl_cells(gl_cells, h)
-
-        # update buffers from XPBD positions
-        for cg in gl_cells:
-            cg.upload()
-        if gl_pts is not None:
-            pts, _ = gather_organelles(h)
-            if pts is None:
-                gl_pts = None
-            else:
-                # rebuild if point count changed drastically (or GL object missing)
-                if gl_pts is None or gl_pts.n != len(pts):
-                    gl_pts = PointsGL(pts, cols)
+        # Update GL resources per render mode
+        if args.render == "mesh":
+            # Keep GL cells bound to the latest hierarchy cells; rebuild if needed
+            gl_cells, _ = _sync_gl_cells(gl_cells, h)
+            # update meshes from XPBD positions
+            for cg in gl_cells:
+                cg.upload()
+            # organelles as points (optional)
+            if gl_pts is not None:
+                pts, _ = gather_organelles(h)
+                if pts is None:
+                    gl_pts = None
                 else:
-                    gl_pts.upload(pts)
+                    if gl_pts.n != len(pts):
+                        gl_pts = PointsGL(pts, None)
+                    else:
+                        gl_pts.upload(pts)
+        else:
+            # points mode: update vertex point cloud
+            vtx = gather_vertices(h)
+            if vtx is None:
+                gl_vtx_pts = None
+            else:
+                if gl_vtx_pts is None:
+                    gl_vtx_pts = PointsGL(vtx, None)
+                    gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                elif gl_vtx_pts.n != len(vtx):
+                    gl_vtx_pts = PointsGL(vtx, None)
+                    gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                else:
+                    gl_vtx_pts.upload(vtx)
 
         # Auto-frame camera: fit to current geometry (and smooth it)
         new_center = compute_cells_center_of_mass(h)
@@ -489,49 +526,49 @@ def main():
         glClearColor(0.06, 0.07, 0.10, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        # rough back-to-front sort by view depth (centroid)
-        view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
-        depths = []
-        for cg in gl_cells:
-            c = cg.cell
-            ctr = np.mean(c.X, axis=0).astype(np.float32)
-            # apply same world rotation to centroid for depth sorting
-            ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
-            ctr_rot = (M @ ctr_h)[:3]
-            d = np.dot(ctr_rot - eye, view_dir)
-            depths.append((d, cg))
-        # back (more negative d) to front for correct blending
-        depths.sort(key=lambda x: x[0])  # ascending
+        if args.render == "mesh":
+            # rough back-to-front sort by view depth (centroid)
+            view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+            depths = []
+            for cg in gl_cells:
+                c = cg.cell
+                ctr = np.mean(c.X, axis=0).astype(np.float32)
+                # apply same world rotation to centroid for depth sorting
+                ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
+                ctr_rot = (M @ ctr_h)[:3]
+                d = np.dot(ctr_rot - eye, view_dir)
+                depths.append((d, cg))
+            depths.sort(key=lambda x: x[0])  # ascending
 
-        # draw semi-transparent meshes
-        # --- compute per-cell color from base + pressure/mass ---
-        pressures, masses, greens255 = _measure_pressure_mass(h, api)
-        pN = _normalize_vec(pressures)
-        mN = _normalize_vec(masses)
+            # draw semi-transparent meshes with simple color mapping
+            pressures, masses, greens255 = _measure_pressure_mass(h, api)
+            pN = _normalize_vec(pressures)
+            mN = _normalize_vec(masses)
 
-        glUseProgram(mesh_prog)
-        glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUseProgram(mesh_prog)
+            glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
 
-        glDepthMask(GL_FALSE)  # blending-friendly
-        for _, cg in depths:
-            # index of this cell
-            i = h.cells.index(cg.cell)  # (3 cells -> fine; optimize later if you want)
+            glDepthMask(GL_FALSE)  # blending-friendly
+            for _, cg in depths:
+                i = h.cells.index(cg.cell)
+                G = float(greens255[i]) / 255.0
+                R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
+                B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
+                cg.color = np.array([R, G, B, BASE_A], dtype=np.float32)
+                cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+            glDepthMask(GL_TRUE)
 
-            G = float(greens255[i]) / 255.0
-            R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
-            B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
-
-            cg.color = np.array([R, G, B, BASE_A], dtype=np.float32)
-            cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
-
-        glDepthMask(GL_TRUE)
-
-
-        # draw organelles (points)
-        if gl_pts is not None and gl_pts.n > 0:
-            glUseProgram(pt_prog)
-            glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-            gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+            # optional organelles overlay
+            if gl_pts is not None and gl_pts.n > 0:
+                glUseProgram(pt_prog)
+                glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+        else:
+            # points mode: draw white vertex cloud
+            if gl_vtx_pts is not None and gl_vtx_pts.n > 0:
+                glUseProgram(pt_prog)
+                glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                gl_vtx_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
 
         pygame.display.flip()
         clock.tick(60)  # ~60 FPS cap

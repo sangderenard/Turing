@@ -22,7 +22,7 @@ from src.transmogrifier.softbody.engine.fields import FieldStack
 
 @dataclass
 class SoftbodyProviderCfg:
-    substeps: int = 4
+    substeps: int = 5
     dt_provider: float = 1.0 / 60.0
     pressure_scale: float = 1.0
     area_scale: float = 1.0
@@ -97,13 +97,11 @@ class Softbody0DProvider(MechanicsProvider):
         P_ext = float(getattr(self._bath, "pressure", 0.0))
         P_ext_arr = np.full(len(cells_arr), P_ext, dtype=float)
 
-        # 0D → softbody parameter harmonization (vectorized)
+        # 0D → softbody parameter harmonization (batched over arrays using a tight Python loop).
+        # np.vectorize doesn't offer speedups; keep scalar function but drive with arrays.
         def _harmonized_update_batch():
-            vec = np.vectorize(
-                lambda sbc, ka, kb, po, pe: harmonized_update(sbc, ka, kb, po, pe),
-                otypes=[object],
-            )
-            vec(cells_arr, Ka_arr, Kb_arr, P_osm_arr, P_ext_arr)
+            for sbc, ka, kb, po, pe in zip(cells_arr, Ka_arr, Kb_arr, P_osm_arr, P_ext_arr):
+                harmonized_update(sbc, ka, kb, po, pe)
 
         # World time (lazy-init)
         t_now = getattr(self, "_t", 0.0)
@@ -125,8 +123,8 @@ class Softbody0DProvider(MechanicsProvider):
         self._t = t_now
 
         # Observables (vectorized)
-        V = np.array([abs(float(sbc.enclosed_volume())) for sbc in cells_arr], dtype=float)
-        A = np.array([cell_area(sbc) for sbc in cells_arr], dtype=float)
+        V = np.fromiter((abs(float(sbc.enclosed_volume())) for sbc in cells_arr), count=len(cells_arr), dtype=float)
+        A = np.fromiter((cell_area(sbc) for sbc in cells_arr), count=len(cells_arr), dtype=float)
         laplace = np.array([laplace_from_Ka(sbc, ka) for sbc, ka in zip(cells_arr, Ka_arr)], dtype=float)
         gamma = laplace[:, 0]
         dP_L = laplace[:, 1]
@@ -177,7 +175,7 @@ class Softbody0DProvider(MechanicsProvider):
                 r = V_to_r(V_list[idx])
                 X, F, V, invm, edges, bends, constraints = build_cell(
                     id_str=f"cell{idx}", center=(cx, cy, 0.01), radius=r,
-                    params=self._params, subdiv=2, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
+                    params=self._params, subdiv=5, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
                 )
                 # Build minimal shim that Hierarchy expects
                 from src.transmogrifier.softbody.engine.hierarchy import Cell as SBC
@@ -192,8 +190,8 @@ class Softbody0DProvider(MechanicsProvider):
                 idx += 1
 
         self._h = Hierarchy(
-            box_min=np.array([0.0, 0.0, 0.0]),
-            box_max=np.array([1.0, 1.0, 0.02]),
+            box_min=np.array([0.0, 0.0, -0.25]),
+            box_max=np.array([1.0, 1.0, 0.25]),
             cells=sb_cells,
             solver=solver,
             params=self._params,

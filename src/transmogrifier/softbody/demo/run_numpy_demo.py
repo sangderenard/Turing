@@ -123,12 +123,12 @@ def main():
         dt_provider=args.dt_provider,
     )
     dt = args.dt
-    prev_vols = [float(c.V) for c in api.cells]
+    prev_vols = np.array([float(c.V) for c in api.cells], dtype=float)
     for frame in range(int(args.frames)):
         dt = step_cellsim(api, dt)
-        vols = [float(c.V) for c in api.cells]
+        vols = np.array([float(c.V) for c in api.cells], dtype=float)
         # dV (change in volume), kept as its own stat (not velocity)
-        dV = [v - pv for v, pv in zip(vols, prev_vols)]
+        dV = vols - prev_vols
         # Compute COM velocities from softbody provider
         h = getattr(provider, "_h", None)
         v_out = None
@@ -139,11 +139,11 @@ def main():
                 v_out = [tuple(float(x) for x in v) for v in vcoms]
             except Exception:
                 v_out = None
-        osm = [getattr(c, "osmotic_pressure", 0.0) for c in api.cells]
+        osm = np.array([getattr(c, "osmotic_pressure", 0.0) for c in api.cells], dtype=float)
         if v_out is None:
-            print(f"frame {frame}: vols {vols} dV {dV} osm {osm}")
+            print(f"frame {frame}: vols {vols.tolist()} dV {dV.tolist()} osm {osm.tolist()}")
         else:
-            print(f"frame {frame}: vols {vols} dV {dV} com_vel {v_out} osm {osm}")
+            print(f"frame {frame}: vols {vols.tolist()} dV {dV.tolist()} com_vel {v_out} osm {osm.tolist()}")
         prev_vols = vols
 
 
