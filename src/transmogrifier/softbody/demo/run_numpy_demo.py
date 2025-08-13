@@ -54,6 +54,28 @@ def step_cellsim(api: SalinePressureAPI, dt: float) -> float:
     return api.step(dt)
 
 
+def _com_and_com_vel(cell):
+    """Compute COM position and COM velocity for a softbody cell.
+
+    Returns (com: np.ndarray shape (3,), vcom: np.ndarray shape (3,)).
+    Uses mass weighting from inverse masses (ignores pinned verts where invm==0).
+    """
+    invm = getattr(cell, "invm", None)
+    X = getattr(cell, "X", None)
+    V = getattr(cell, "V", None)
+    if invm is None or X is None or V is None:
+        # Fallback to zeros if structure is unexpected
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
+    m = np.where(invm > 0, 1.0 / invm, 0.0)
+    if m.sum() == 0:
+        w = np.full(len(invm), 1.0 / max(1, len(invm)))
+    else:
+        w = m / m.sum()
+    com = (X * w[:, None]).sum(axis=0)
+    vcom = (V * w[:, None]).sum(axis=0)
+    return com, vcom
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run softbody cellsim with numpy-only backend")
     parser.add_argument("--cell-vols", type=float, nargs="+", default=[1.6, 1.2, 0.9])
@@ -74,7 +96,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    api, _provider = make_cellsim_backend(
+    api, provider = make_cellsim_backend(
         cell_vols=args.cell_vols,
         cell_imps=args.cell_imps,
         cell_elastic_k=args.cell_elastic_k,
@@ -90,10 +112,23 @@ def main():
     for frame in range(int(args.frames)):
         dt = step_cellsim(api, dt)
         vols = [float(c.V) for c in api.cells]
-        vels = [(v - pv) / dt for v, pv in zip(vols, prev_vols)]
-        assert all(np.isfinite(v) for v in vels), "non-finite velocity encountered"
+        # dV (change in volume), kept as its own stat (not velocity)
+        dV = [v - pv for v, pv in zip(vols, prev_vols)]
+        # Compute COM velocities from softbody provider
+        h = getattr(provider, "_h", None)
+        v_out = None
+        if h is not None and getattr(h, "cells", None):
+            try:
+                coms_vcoms = [_com_and_com_vel(c) for c in h.cells]
+                _, vcoms = zip(*coms_vcoms) if coms_vcoms else ([], [])
+                v_out = [tuple(float(x) for x in v) for v in vcoms]
+            except Exception:
+                v_out = None
         osm = [getattr(c, "osmotic_pressure", 0.0) for c in api.cells]
-        print(f"frame {frame}: vols {vols} vel {vels} osm {osm}")
+        if v_out is None:
+            print(f"frame {frame}: vols {vols} dV {dV} osm {osm}")
+        else:
+            print(f"frame {frame}: vols {vols} dV {dV} com_vel {v_out} osm {osm}")
         prev_vols = vols
 
 
