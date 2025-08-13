@@ -90,18 +90,21 @@ def world_to_grid(h: Hierarchy, nx=120, ny=36):
                 grid[iy][ix] = (ch, (R,G,B))
     return grid
 
-def print_grid(grid, color_mode="auto"):
-    lines = []
+def print_grid(grid, color_mode="auto", clear_each_line=False):
+    """Print the grid and return the number of lines printed (no clearing)."""
+    count = 0
     for row in grid:
         line = ''.join([colorize(ch, (r, g, b), mode=color_mode) for ch,(r,g,b) in row])
-        lines.append(line)
-    print('\n'.join(lines))
+    # Ensure we start at column 1 of the current line without clearing
+    print("\x1b[G" + line)
+    count += 1
+    return count
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
             help="ANSI color output mode (default: auto)")
-    parser.add_argument("--frames", type=int, default=80)
+    parser.add_argument("--frames", type=int, default=8000)
     args = parser.parse_args()
     color_mode = args.color
 
@@ -117,21 +120,50 @@ def main():
         dt_provider=0.01,
     )
     dt = 1e-3
+    prev_lines = 0
 
     for frame in range(int(args.frames)):
         dt = step_cellsim(api, dt)
         h = getattr(provider, "_h", None)
         if h is None:
             continue
+
         grid = world_to_grid(h, nx=120, ny=36)
+
         if _is_tty():
-            print("\x1b[2J\x1b[H", end='')
-        print(f"Frame {frame}")
-        print_grid(grid, color_mode=color_mode)
-        try:
-            time.sleep(0.03)
-        except Exception:
-            pass
+            if prev_lines:
+                # move to start of the previously printed block (NO newline)
+                sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
+
+            # header
+            sys.stdout.write(f"Frame {frame}\n")
+
+            # write every row, as-is, one per line (no clearing anywhere)
+            if isinstance(grid, (list, tuple)):
+                for row in grid:
+                    if isinstance(row, str):
+                        sys.stdout.write(row + "\n")
+                    else:
+                        # tolerate row as iterable of chars/tuples
+                        sys.stdout.write(''.join(
+                            (x if isinstance(x, str) else x[0]) for x in row
+                        ) + "\n")
+            else:
+                # tolerate a single string grid
+                sys.stdout.write(str(grid) + "\n")
+
+            sys.stdout.flush()
+            prev_lines = 1 + (len(grid) if hasattr(grid, "__len__") else 1)
+        else:
+            print(f"Frame {frame}")
+            if isinstance(grid, (list, tuple)):
+                for row in grid:
+                    print(row if isinstance(row, str) else ''.join(
+                        (x if isinstance(x, str) else x[0]) for x in row))
+                prev_lines = 1 + len(grid)
+            else:
+                print(grid)
+                prev_lines = 2
 
 if __name__ == '__main__':
     main()

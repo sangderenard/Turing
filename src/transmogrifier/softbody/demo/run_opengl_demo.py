@@ -9,7 +9,7 @@ from .run_numpy_demo import make_cellsim_backend as base_make_cellsim_backend, s
 def make_cellsim_backend():
     api, provider = base_make_cellsim_backend(
         cell_vols=[0.8, 0.8, 0.8],
-        cell_imps=[600.0 + 80 * i for i in range(3)],
+        cell_imps=[6000.0 + 80 * i for i in range(3)],
         cell_elastic_k=[0.2, 0.2, 0.2],
         bath_na=5.0,
         bath_cl=5.0,
@@ -25,6 +25,43 @@ def make_cellsim_backend():
         setattr(c, "_identity_green", levels[i % len(levels)])
 
     return api, provider
+def _normalize_vec(x):
+    x = np.asarray(x, dtype=np.float64)
+    m = float(np.max(x)) if x.size else 0.0
+    return (x / m) if m > 1e-12 else np.zeros_like(x, dtype=np.float64)
+
+def _measure_pressure_mass(h, api):
+    """Return (pressures, masses, greens255) per cell index."""
+    pressures, masses, greens = [], [], []
+    for i, c in enumerate(h.cells):
+        # --- pressure ---
+        p = 0.0
+        if hasattr(c, "contact_pressure_estimate"):
+            try:
+                p = float(c.contact_pressure_estimate())
+            except Exception:
+                p = 0.0
+        elif hasattr(api.cells[i], "internal_pressure"):
+            p = float(getattr(api.cells[i], "internal_pressure", 0.0))
+        else:
+            # Laplace fallback from tension + radius (if available)
+            try:
+                V = abs(c.enclosed_volume()); R = ((3.0*V)/(4.0*math.pi))**(1.0/3.0)
+                gamma = float(getattr(api.cells[i], "membrane_tension", getattr(c, "membrane_tension", 0.0)))
+                p = 2.0 * gamma / max(R, 1e-6)
+            except Exception:
+                p = 0.0
+
+        # --- total dissolved mass ---
+        n = getattr(api.cells[i], "n", None)
+        masses.append(sum(n.values()) if isinstance(n, dict) else 0.0)
+
+        # --- identity green (0..255) ---
+        g = getattr(api.cells[i], "_identity_green", getattr(c, "_identity_green", 128))
+        greens.append(int(g))
+
+        pressures.append(p)
+    return np.array(pressures), np.array(masses), np.array(greens, dtype=np.int32)
 
 # ----- OpenGL minimal renderer (pygame + PyOpenGL) --------------------------
 try:
@@ -104,6 +141,13 @@ def link_program(vs_src, fs_src):
         raise RuntimeError(f"Program link failed: {log}")
     glDeleteShader(vs); glDeleteShader(fs)
     return pid
+# ---- color mapping knobs (globals) -----------------------------------------
+PRESSURE_GAIN = 0.75  # how strongly pressure boosts blue (0..1+)
+MASS_GAIN     = 0.75  # how strongly total dissolved mass boosts red (0..1+)
+
+BASE_R = 0.15         # base red component for every cell (0..1)
+BASE_B = 0.25         # base blue component for every cell (0..1)
+BASE_A = 0.35         # mesh alpha (0..1)
 
 MESH_VS = """
 #version 330 core
@@ -359,14 +403,28 @@ def main():
         depths.sort(key=lambda x: x[0])  # ascending
 
         # draw semi-transparent meshes
+        # --- compute per-cell color from base + pressure/mass ---
+        pressures, masses, greens255 = _measure_pressure_mass(h, api)
+        pN = _normalize_vec(pressures)
+        mN = _normalize_vec(masses)
+
         glUseProgram(mesh_prog)
-        # IMPORTANT: NumPy is row-major; GLSL expects column-major.
-        # Send the transpose so the shader sees the correct transform.
         glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-        glDepthMask(GL_FALSE)  # do not write depth when blending
+
+        glDepthMask(GL_FALSE)  # blending-friendly
         for _, cg in depths:
+            # index of this cell
+            i = h.cells.index(cg.cell)  # (3 cells -> fine; optimize later if you want)
+
+            G = float(greens255[i]) / 255.0
+            R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
+            B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
+
+            cg.color = np.array([R, G, B, BASE_A], dtype=np.float32)
             cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+
         glDepthMask(GL_TRUE)
+
 
         # draw organelles (points)
         if gl_pts is not None and gl_pts.n > 0:

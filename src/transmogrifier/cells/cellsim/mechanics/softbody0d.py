@@ -80,49 +80,63 @@ class Softbody0DProvider(MechanicsProvider):
     def step(self, dt: float) -> MechanicsSnapshot:
         if self._h is None or self._cells is None or self._bath is None:
             return {}
-        sub_dt = self.cfg.dt_provider / max(1, int(self.cfg.substeps))
 
-        cells_arr = np.array(self._h.cells, dtype=object)
+        # Substep sizing: prefer caller's dt, fall back to provider default
+        nsub = max(1, int(self.cfg.substeps))
+        base_dt = float(dt) if (dt is not None and dt > 0.0) else float(self.cfg.dt_provider)
+        sub_dt = base_dt / nsub
+
+        h = self._h
+
+        # Batch views (no copies of vertex data)
+        cells_arr = np.array(h.cells, dtype=object)
         Ka_arr = np.array([float(c.elastic_k) for c in self._cells], dtype=float)
-        Kb_arr = np.array(
-            [float(getattr(c, "bulk_modulus", 1e5)) for c in self._cells],
-            dtype=float,
-        )
-        P_osm_arr = np.array(
-            [float(getattr(sbc, "osmotic_pressure", 0.0)) for sbc in cells_arr],
-            dtype=float,
-        )
+        Kb_arr = np.array([float(getattr(c, "bulk_modulus", 1e5)) for c in self._cells], dtype=float)
+        P_osm_arr = np.array([float(getattr(sbc, "osmotic_pressure", 0.0)) for sbc in cells_arr], dtype=float)
         P_ext = float(getattr(self._bath, "pressure", 0.0))
         P_ext_arr = np.full(len(cells_arr), P_ext, dtype=float)
 
+        # 0D → softbody parameter harmonization (vectorized)
         def _harmonized_update_batch():
             vec = np.vectorize(
-                lambda sbc, ka, kb, po, pe: harmonized_update(
-                    sbc, ka, kb, po, pe
-                ),
+                lambda sbc, ka, kb, po, pe: harmonized_update(sbc, ka, kb, po, pe),
                 otypes=[object],
             )
             vec(cells_arr, Ka_arr, Kb_arr, P_osm_arr, P_ext_arr)
 
-        for _ in range(self.cfg.substeps):
-            _harmonized_update_batch()
-            self._h.integrate(sub_dt)
-            self._h.project_constraints(sub_dt)
-            self._h.update_organelle_modes(sub_dt)
+        # World time (lazy-init)
+        t_now = getattr(self, "_t", 0.0)
 
-        V = np.array([abs(float(sbc.enclosed_volume())) for sbc in cells_arr])
-        A = np.array([cell_area(sbc) for sbc in cells_arr])
-        laplace = np.array(
-            [laplace_from_Ka(sbc, ka) for sbc, ka in zip(cells_arr, Ka_arr)],
-            dtype=float,
-        )
+        for _ in range(nsub):
+            _harmonized_update_batch()
+
+            # Single canonical softbody step (predict → fields → project → rebuild V)
+            # Pass fields stack if you've attached one on the hierarchy (optional).
+            h.step(sub_dt, t=t_now, fields=getattr(h, "fields", None))
+
+            # Organelle mode updates (your existing hook)
+            h.update_organelle_modes(sub_dt)
+
+            # Advance provider time
+            t_now += sub_dt
+
+        # Persist time back to provider
+        self._t = t_now
+
+        # Observables (vectorized)
+        V = np.array([abs(float(sbc.enclosed_volume())) for sbc in cells_arr], dtype=float)
+        A = np.array([cell_area(sbc) for sbc in cells_arr], dtype=float)
+        laplace = np.array([laplace_from_Ka(sbc, ka) for sbc, ka in zip(cells_arr, Ka_arr)], dtype=float)
         gamma = laplace[:, 0]
         dP_L = laplace[:, 1]
         P_internal = P_ext + dP_L
-        pressures = self.cfg.pressure_scale * P_internal
-        areas = self.cfg.area_scale * A
-        vols = V
 
+        # Scaled outputs
+        pressures = self.cfg.pressure_scale * P_internal
+        areas     = self.cfg.area_scale * A
+        vols      = V
+
+        # Write back aggregates to 0D cells
         for c0d, g, P_i, vol in zip(self._cells, gamma, P_internal, V):
             c0d.membrane_tension = float(g)
             c0d.internal_pressure = float(P_i)
@@ -183,3 +197,17 @@ class Softbody0DProvider(MechanicsProvider):
             solver=solver,
             params=self._params,
         )
+        # after self._h = Hierarchy(...)
+        from src.transmogrifier.softbody.resources.field_library import uniform_flow, shear_flow, fluid_noise, gravity
+
+        # whole-system drift to +X
+        self._h.fields.add(uniform_flow(u=(0.03, 0.0, 0.0), dim=3))
+
+        # visible shear (u_x = rate * y)
+        # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
+
+        # gentle Brownian jiggle (no COM drift)
+        #self._h.fields.add(fluid_noise(sigma=5e-4, com_neutral=True, dim=3))
+
+        # gravity on a subset (example: only cell0 & cell2)
+        # self._h.fields.add(gravity(g=(0,-0.4,0), selector=lambda c: c.id in {"cell0","cell2"}, dim=3))
