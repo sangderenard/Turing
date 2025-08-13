@@ -147,6 +147,24 @@ def link_program(vs_src, fs_src):
         raise RuntimeError(f"Program link failed: {log}")
     glDeleteShader(vs); glDeleteShader(fs)
     return pid
+
+# --- model/world transforms -------------------------------------------------
+def translate(tvec):
+    """Return a 4x4 translation matrix for tvec (x,y,z)."""
+    m = np.identity(4, dtype=np.float32)
+    m[0, 3] = float(tvec[0])
+    m[1, 3] = float(tvec[1])
+    m[2, 3] = float(tvec[2])
+    return m
+
+def rotate_y(angle_rad):
+    """Return a 4x4 rotation matrix around +Y axis."""
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    m = np.identity(4, dtype=np.float32)
+    m[0, 0] =  c; m[0, 2] = s
+    m[2, 0] = -s; m[2, 2] = c
+    return m
 # ---- color mapping knobs (globals) -----------------------------------------
 PRESSURE_GAIN = 0.75  # how strongly pressure boosts blue (0..1+)
 MASS_GAIN     = 0.75  # how strongly total dissolved mass boosts red (0..1+)
@@ -397,7 +415,8 @@ def main():
     clock = pygame.time.Clock()
     running = True
     dt = float(getattr(args, "dt", 1e-3))
-    t = 0.0
+    t = 0.0  # simulation time (kept for sim; not used for rotation)
+    t0 = time.perf_counter()  # wall-clock start for steady rotation
 
     frame = 0
     while running:
@@ -452,7 +471,18 @@ def main():
         far  = max(10.0, cam_dist + 3.0*radius)
         P = perspective(fovy, aspect, near, far)
         V = look_at(eye, center, up)
-        MVP = (P @ V).astype(np.float32)
+        # scene/world rotation around the smoothed center (do not move camera)
+        # slow, steady Y-rotation to reveal all sides (use wall-clock time)
+        rot_speed = 0.25  # radians per second (adjust for taste)
+        t_wall = time.perf_counter() - t0
+        theta = rot_speed * t_wall
+        # Model matrix that rotates about the scene center: T(center) * R * T(-center)
+        T_neg = translate(-center)
+        R_y  = rotate_y(theta)
+        T_pos = translate(center)
+        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+
+        MVP = (P @ V @ M).astype(np.float32)
 
         # clear
         glViewport(0, 0, viewport[0], viewport[1])
@@ -465,7 +495,10 @@ def main():
         for cg in gl_cells:
             c = cg.cell
             ctr = np.mean(c.X, axis=0).astype(np.float32)
-            d = np.dot(ctr - eye, view_dir)
+            # apply same world rotation to centroid for depth sorting
+            ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
+            ctr_rot = (M @ ctr_h)[:3]
+            d = np.dot(ctr_rot - eye, view_dir)
             depths.append((d, cg))
         # back (more negative d) to front for correct blending
         depths.sort(key=lambda x: x[0])  # ascending
