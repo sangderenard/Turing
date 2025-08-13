@@ -1,10 +1,10 @@
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List
 
 from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
-from .constraints import StretchConstraint, VolumeConstraint, DihedralBendingConstraint
+from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 
 @dataclass
@@ -21,8 +21,8 @@ class Cell:
     V: np.ndarray
     invm: np.ndarray
     faces: np.ndarray
-    edges: List[Tuple[int,int]]
-    bends: List[Tuple[int,int,int,int]]
+    edges: np.ndarray
+    bends: np.ndarray
     constraints: dict
     organelles: List[Organelle]
     membrane_tension: float = 0.0
@@ -76,21 +76,34 @@ class Hierarchy:
 def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, target_volume=None):
     X, F = make_icosphere(subdiv=subdiv, radius=radius, center=center)
     V = np.zeros_like(X)
-    invm = np.full(X.shape[0], 1.0/mass_per_vertex, dtype=np.float64)
+    invm = np.full(X.shape[0], 1.0 / mass_per_vertex, dtype=np.float64)
     edges, bends = build_adjacency(F)
 
-    stretch = []
-    for (i,j) in edges:
-        rest = np.linalg.norm(X[j]-X[i])
-        stretch.append(StretchConstraint(i=i,j=j,rest=rest,compliance=params.stretch_compliance))
+    edges = np.asarray(edges, dtype=np.int32)
+    e_rest = np.linalg.norm(X[edges[:, 1]] - X[edges[:, 0]], axis=1)
+    stretch = {
+        "indices": edges,
+        "rest": e_rest,
+        "compliance": np.full(len(edges), params.stretch_compliance, dtype=np.float64),
+        "lamb": np.zeros(len(edges), dtype=np.float64),
+    }
 
-    bending = []
-    for (i,j,k,l) in bends:
-        a,b,c,d = X[i],X[j],X[k],X[l]
-        n1 = np.cross(c-a, b-a); n2 = np.cross(b-d, a-d)
-        n1/= (np.linalg.norm(n1)+1e-12); n2/= (np.linalg.norm(n2)+1e-12)
-        rest = float(np.arccos(np.clip(np.dot(n1,n2), -1.0, 1.0)))
-        bending.append(DihedralBendingConstraint(i=i,j=j,k=k,l=l,rest_angle=rest,compliance=params.bending_compliance))
+    bends = np.asarray(bends, dtype=np.int32)
+    if bends.size:
+        a, b, c, d = X[bends[:, 0]], X[bends[:, 1]], X[bends[:, 2]], X[bends[:, 3]]
+        n1 = np.cross(c - a, b - a)
+        n2 = np.cross(b - d, a - d)
+        n1 /= np.linalg.norm(n1, axis=1, keepdims=True) + 1e-12
+        n2 /= np.linalg.norm(n2, axis=1, keepdims=True) + 1e-12
+        rest = np.arccos(np.clip(np.sum(n1 * n2, axis=1), -1.0, 1.0))
+    else:
+        rest = np.zeros(0, dtype=np.float64)
+    bending = {
+        "indices": bends,
+        "rest": rest,
+        "compliance": np.full(len(bends), params.bending_compliance, dtype=np.float64),
+        "lamb": np.zeros(len(bends), dtype=np.float64),
+    }
 
     V0 = abs(mesh_volume(X, F)) if target_volume is None else float(target_volume)
     volc = VolumeConstraint(target=V0, compliance=params.volume_compliance)
