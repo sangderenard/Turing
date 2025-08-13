@@ -65,13 +65,23 @@ class Hierarchy:
 
     def update_organelle_modes(self, dt):
         for c in self.cells:
-            centroid = np.mean(c.X, axis=0)
+            if not c.organelles:
+                continue
+
             v_adv = np.mean(c.V, axis=0)
-            for o in c.organelles:
-                alpha = float(np.clip(o.viscosity, 0.0, 1.0))
-                o.vel = (1-alpha)*o.vel + alpha*v_adv
-                o.pos += dt * o.vel
-                o.pos[:] = np.minimum(np.maximum(o.pos, self.box_min), self.box_max)
+
+            pos = np.array([o.pos for o in c.organelles], dtype=np.float64)
+            vel = np.array([o.vel for o in c.organelles], dtype=np.float64)
+            visc = np.array([o.viscosity for o in c.organelles], dtype=np.float64)[:, None]
+            alpha = np.clip(visc, 0.0, 1.0)
+
+            vel = (1.0 - alpha) * vel + alpha * v_adv
+            pos = pos + dt * vel
+            pos = np.clip(pos, self.box_min, self.box_max)
+
+            for i, o in enumerate(c.organelles):
+                o.vel = vel[i]
+                o.pos[:] = pos[i]
 
 def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, target_volume=None):
     X, F = make_icosphere(subdiv=subdiv, radius=radius, center=center)
