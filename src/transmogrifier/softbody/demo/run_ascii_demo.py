@@ -6,7 +6,7 @@ import numpy as np
 from ..engine.hierarchy import Hierarchy
 
 # Reuse the numpy-based backend so all demos share identical math
-from .run_numpy_demo import make_cellsim_backend, step_cellsim
+from .run_numpy_demo import make_cellsim_backend, step_cellsim, build_numpy_parser
 
 # ---- color helpers ---------------------------------------------------------
 try:
@@ -111,23 +111,27 @@ def print_grid(grid, color_mode="auto", clear_each_line=False):
     return count
 
 def main():
-    parser = argparse.ArgumentParser()
+    # Build CLI that inherits all numpy demo params, plus ASCII-only flags
+    parent = build_numpy_parser(add_help=False)
+    parser = argparse.ArgumentParser(parents=[parent], conflict_handler='resolve')
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto",
-            help="ANSI color output mode (default: auto)")
-    parser.add_argument("--frames", type=int, default=8000)
+                        help="ANSI color output mode (default: auto)")
+    parser.add_argument("--frames", type=int, default=8000,
+                        help="Number of frames to render (default: 8000)")
     args = parser.parse_args()
     color_mode = args.color
 
+    # Use the exact same backend parameters as the numpy demo, via args
     api, provider = make_cellsim_backend(
-        cell_vols=[1.6, 1.2, 0.9],
-        cell_imps=[100.0 + 30 * i for i in range(3)],
-        cell_elastic_k=[0.6 + 0.1 * i for i in range(3)],
-        bath_na=1000.0,
-        bath_cl=1000.0,
-        bath_pressure=1e4,
-        bath_volume_factor=5.0,
-        substeps=2,
-        dt_provider=0.01,
+        cell_vols=args.cell_vols,
+        cell_imps=args.cell_imps,
+        cell_elastic_k=args.cell_elastic_k,
+        bath_na=args.bath_na,
+        bath_cl=args.bath_cl,
+        bath_pressure=args.bath_pressure,
+        bath_volume_factor=args.bath_volume_factor,
+        substeps=args.substeps,
+        dt_provider=args.dt_provider,
     )
     # Assign clear identity greens for cells (rendering only)
     try:
@@ -136,7 +140,7 @@ def main():
             setattr(c, "_identity_green", levels[i % len(levels)])
     except Exception:
         pass
-    dt = 1e-3
+    dt = float(getattr(args, "dt", 1e-3))
     prev_lines = 0
 
     for frame in range(int(args.frames)):

@@ -1,5 +1,6 @@
 
 import numpy as np
+from ..geometry.geodesic import geodesic_sphere
 
 def icosahedron():
     t = (1.0 + 5 ** 0.5) / 2.0
@@ -41,11 +42,42 @@ def subdivide(verts, faces):
     return verts2, faces2
 
 def make_icosphere(subdiv=1, radius=0.1, center=(0,0,0)):
-    v, f = icosahedron()
-    for _ in range(max(0, int(subdiv))):
-        v, f = subdivide(v, f)
-    v = v * radius + np.array(center, dtype=np.float64)
+    """Build a geodesic sphere using the new NumPy geodesic generator.
+
+    Keeps the existing API (subdiv, radius, center) but internally routes to
+    geometry.geodesic.geodesic_sphere with triangulated topology. Returns
+    (verts, faces) as float64/int32 NumPy arrays.
+    """
+    # Match legacy subdiv semantics where each step quarters triangles:
+    # geodesic frequency f produces f^2 triangles per base face, so f=2**subdiv
+    freq = int(2 ** max(0, int(subdiv)))
+    out = geodesic_sphere(
+        freq=freq,
+        radius=float(radius),
+        center=tuple(center),
+        topology="tri",
+    )
+    v = np.asarray(out["verts"], dtype=np.float64)
+    f = np.asarray(out["faces"], dtype=np.int32)
     return v, f
+
+def make_goldberg_sphere(subdiv=1, radius=0.1, center=(0,0,0)):
+    """Build a dual (Goldberg) sphere and return a triangulated fan.
+
+    Useful if you prefer the dual hex-dominant layout but need triangles for
+    the XPBD pipeline. Returns (verts, faces_tri).
+    """
+    freq = int(2 ** max(0, int(subdiv)))
+    out = geodesic_sphere(
+        freq=freq,
+        radius=float(radius),
+        center=tuple(center),
+        topology="hex",
+        return_tri_from_hex=True,
+    )
+    v = np.asarray(out["verts"], dtype=np.float64)
+    ftri = np.asarray(out["faces_tri"], dtype=np.int32)
+    return v, ftri
 
 def mesh_volume(verts, faces):
     """Compute enclosed volume of a closed triangle mesh.

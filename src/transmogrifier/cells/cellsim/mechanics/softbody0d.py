@@ -209,13 +209,13 @@ class Softbody0DProvider(MechanicsProvider):
         )
 
         # whole-system drift to +X
-        #self._h.fields.add(uniform_flow(u=(0.03, 0.0, 0.0), dim=3))
+        #self._h.fields.add(uniform_flow(u=(10.03, 0.0, 0.0), dim=3))
 
         # visible shear (u_x = rate * y)
         # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
 
         # gentle Brownian jiggle (no COM drift)
-        #self._h.fields.add(fluid_noise(sigma=5e-8, com_neutral=True, dim=3))
+        #self._h.fields.add(fluid_noise(sigma=5e-3, com_neutral=True, dim=3))
 
         # gravity on a subset (example: only cell0 & cell2)
         # self._h.fields.add(

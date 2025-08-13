@@ -76,8 +76,15 @@ def _com_and_com_vel(cell):
     return com, vcom
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run softbody cellsim with numpy-only backend")
+def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
+    """Create an ArgumentParser with shared sim parameters for all demos.
+
+    Use add_help=False when composing this as a parent parser in other demos.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run softbody cellsim with numpy-only backend",
+        add_help=add_help,
+    )
     parser.add_argument("--cell-vols", type=float, nargs="+", default=[1.6, 1.2, 0.9])
     parser.add_argument("--cell-imps", type=float, nargs="+", default=[100.0, 130.0, 160.0])
     parser.add_argument("--cell-elastic-k", type=float, nargs="+", default=[0.6, 0.7, 0.8])
@@ -86,12 +93,20 @@ def parse_args():
     parser.add_argument("--bath-cl", type=float, default=1000.0)
     parser.add_argument("--bath-pressure", type=float, default=1e4)
     parser.add_argument("--substeps", type=int, default=2)
-    parser.add_argument("--dt-provider", type=float, default=0.01,
-                        help="internal softbody timestep; scale to speed up motion")
+    parser.add_argument(
+        "--dt-provider", type=float, default=0.01,
+        help="internal softbody timestep; scale to speed up motion",
+    )
     parser.add_argument("--frames", type=int, default=80)
-    parser.add_argument("--dt", type=float, default=1e-3,
-                        help="base integrator step; increase to amplify drift")
-    return parser.parse_args()
+    parser.add_argument(
+        "--dt", type=float, default=1e-10,
+        help="base integrator step; increase to amplify drift",
+    )
+    return parser
+
+
+def parse_args():
+    return build_numpy_parser(add_help=True).parse_args()
 
 
 def main():

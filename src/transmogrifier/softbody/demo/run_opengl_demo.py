@@ -1,22 +1,28 @@
 import os, sys, time, math, random
+import argparse
 import ctypes
 import numpy as np
 
 # ----- Cellsim backend (uses your code) -------------------------------------
-from .run_numpy_demo import make_cellsim_backend as base_make_cellsim_backend, step_cellsim
+from .run_numpy_demo import (
+    make_cellsim_backend as base_make_cellsim_backend,
+    step_cellsim,
+    build_numpy_parser,
+)
 
 
-def make_cellsim_backend():
+def make_cellsim_backend_from_args(args):
+    """Construct backend using shared numpy parameters from CLI args."""
     api, provider = base_make_cellsim_backend(
-        cell_vols=[0.8, 0.8, 0.8],
-        cell_imps=[6000.0 + 80 * i for i in range(3)],
-        cell_elastic_k=[0.2, 0.2, 0.2],
-        bath_na=5.0,
-        bath_cl=5.0,
-        bath_pressure=0.0,
-        bath_volume_factor=3.0,
-        substeps=5,
-        dt_provider=0.005,
+        cell_vols=args.cell_vols,
+        cell_imps=args.cell_imps,
+        cell_elastic_k=args.cell_elastic_k,
+        bath_na=args.bath_na,
+        bath_cl=args.bath_cl,
+        bath_pressure=args.bath_pressure,
+        bath_volume_factor=args.bath_volume_factor,
+        substeps=args.substeps,
+        dt_provider=args.dt_provider,
     )
 
     # color identity (rendering only)
@@ -195,11 +201,13 @@ class CellGL:
         self.vao = glGenVertexArrays(1)
         self.vbo = glGenBuffers(1)
         self.ebo = glGenBuffers(1)
-        self.count = cell.faces.shape[0] * 3
+        self.count = int(cell.faces.shape[0] * 3)
+        self._last_vbytes = 0
         glBindVertexArray(self.vao)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         X32 = cell.X.astype(np.float32, copy=False)
         glBufferData(GL_ARRAY_BUFFER, X32.nbytes, X32, GL_DYNAMIC_DRAW)
+        self._last_vbytes = int(X32.nbytes)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo)
         I = cell.faces.astype(np.uint32, copy=False).ravel()
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, I.nbytes, I, GL_STATIC_DRAW)
@@ -211,16 +219,55 @@ class CellGL:
         base = np.array([0.3, g, 0.45, 0.35], dtype=np.float32)  # semi-transparent
         self.color = base
 
-    def upload_vertices(self):
+    def upload(self):
+        # Bind VAO so EBO binding applies to the right VAO
+        glBindVertexArray(self.vao)
+        # Update vertex buffer (positions)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         X32 = self.cell.X.astype(np.float32, copy=False)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, X32.nbytes, X32)
+        nbytes = int(X32.nbytes)
+        if nbytes != self._last_vbytes:
+            glBufferData(GL_ARRAY_BUFFER, nbytes, X32, GL_DYNAMIC_DRAW)
+            self._last_vbytes = nbytes
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, nbytes, X32)
+        # Update element buffer (indices) unconditionally; topology may change
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        I = self.cell.faces.astype(np.uint32, copy=False).ravel()
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, I.nbytes, I, GL_STATIC_DRAW)
+        glBindVertexArray(0)
 
     def draw(self, prog, u_mvp, u_color):
         glBindVertexArray(self.vao)
         glUniform4fv(u_color, 1, self.color)
         glDrawElements(GL_TRIANGLES, self.count, GL_UNSIGNED_INT, ctypes.c_void_p(0))
         glBindVertexArray(0)
+
+def _rebuild_gl_cells(h):
+    """Build GL wrappers for the current hierarchy cells."""
+    return [CellGL(c) for c in getattr(h, 'cells', [])]
+
+def _sync_gl_cells(gl_cells, h):
+    """Ensure GL cells match the current hierarchy.
+
+    If topology or count changed, rebuild GL objects. Otherwise, rebind cell
+    references so we always upload the latest positions.
+    Returns (gl_cells, rebuilt: bool)
+    """
+    cells = getattr(h, 'cells', [])
+    if len(gl_cells) != len(cells):
+        return _rebuild_gl_cells(h), True
+    # Check topology consistency (faces shape)
+    for i, (cg, c) in enumerate(zip(gl_cells, cells)):
+        try:
+            if cg.cell.faces.shape != c.faces.shape:
+                return _rebuild_gl_cells(h), True
+        except Exception:
+            return _rebuild_gl_cells(h), True
+    # Rebind to current cell objects
+    for i, cg in enumerate(gl_cells):
+        cg.cell = cells[i]
+    return gl_cells, False
 
 def gather_organelles(h):
     pts = []
@@ -251,7 +298,12 @@ class PointsGL:
 
     def upload(self, pts):
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, pts.nbytes, pts)
+        # If size changed, reallocate buffer
+        if len(pts) != self.n:
+            glBufferData(GL_ARRAY_BUFFER, pts.nbytes, pts, GL_DYNAMIC_DRAW)
+            self.n = len(pts)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, pts.nbytes, pts)
 
     def draw(self, prog, u_mvp, u_color, u_psize):
         glUniform4fv(u_color, 1, self.color)
@@ -284,8 +336,14 @@ def compute_cells_center_of_mass(h):
     return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
 def main():
+    # CLI: share numpy demo params and add any GL-specific knobs later
+    parser = argparse.ArgumentParser(parents=[build_numpy_parser(add_help=False)], conflict_handler='resolve')
+    parser.add_argument("--frames", type=int, default=0,
+                        help="Frame cap (0 runs until window close)")
+    args = parser.parse_args()
+
     # ---------- init sim ----------
-    api, provider = make_cellsim_backend()
+    api, provider = make_cellsim_backend_from_args(args)
     # Prime mechanics so hierarchy exists before rendering (provider builds _h on first step)
     api.step(1e-3)
     h = getattr(provider, "_h", None)
@@ -320,7 +378,7 @@ def main():
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
 
     # build GL objects per cell
-    gl_cells = [CellGL(c) for c in h.cells]
+    gl_cells = _rebuild_gl_cells(h)
     pts, cols = gather_organelles(h)
     gl_pts = PointsGL(pts, cols) if pts is not None else None
 
@@ -338,9 +396,10 @@ def main():
 
     clock = pygame.time.Clock()
     running = True
-    dt = 1e-3
+    dt = float(getattr(args, "dt", 1e-3))
     t = 0.0
 
+    frame = 0
     while running:
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
@@ -349,20 +408,29 @@ def main():
                 if e.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
 
-        # step cellsim (keep dt sane)
-        dt = min(max(step_cellsim(api, dt), 1e-4), 5e-2)
+        # step cellsim (match numpy/ASCII behavior; no extra clamping here)
+        dt = step_cellsim(api, dt)
         t += dt
-
-        # update buffers from XPBD positions
-        for cg in gl_cells:
-            cg.upload_vertices()
-        if gl_pts is not None:
-            pts, _ = gather_organelles(h)
-            if pts is not None:
-                gl_pts.upload(pts)
 
         # Reacquire hierarchy each tick (provider may replace _h)
         h = getattr(provider, "_h", h)
+
+        # Keep GL cells bound to the latest hierarchy cells; rebuild if needed
+        gl_cells, rebuilt = _sync_gl_cells(gl_cells, h)
+
+        # update buffers from XPBD positions
+        for cg in gl_cells:
+            cg.upload()
+        if gl_pts is not None:
+            pts, _ = gather_organelles(h)
+            if pts is None:
+                gl_pts = None
+            else:
+                # rebuild if point count changed drastically (or GL object missing)
+                if gl_pts is None or gl_pts.n != len(pts):
+                    gl_pts = PointsGL(pts, cols)
+                else:
+                    gl_pts.upload(pts)
 
         # Auto-frame camera: fit to current geometry (and smooth it)
         new_center = compute_cells_center_of_mass(h)
@@ -434,6 +502,9 @@ def main():
 
         pygame.display.flip()
         clock.tick(60)  # ~60 FPS cap
+        frame += 1
+        if getattr(args, "frames", 0) and frame >= args.frames:
+            break
 
     pygame.quit()
 
