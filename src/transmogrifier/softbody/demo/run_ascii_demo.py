@@ -52,7 +52,7 @@ def colorize(ch, rgb, mode="auto"):
         return f"{_rgb256_from_24(r,g,b)}{ch}{RESET}"
 
 
-def world_to_grid(h: Hierarchy, nx=120, ny=36):
+def world_to_grid(h: Hierarchy, api=None, nx=120, ny=36):
     grid = [[('.', (110,110,130)) for _ in range(nx)] for _ in range(ny)]
     cells = h.cells
     centers = [np.mean(c.X, axis=0) for c in cells]
@@ -60,8 +60,16 @@ def world_to_grid(h: Hierarchy, nx=120, ny=36):
     radii = [((3.0*V)/(4.0*math.pi))**(1.0/3.0) for V in vols]
     pressures = [c.contact_pressure_estimate() for c in cells]
     pmax = max(1e-8, max(pressures))
-    concs = [c.osmotic_pressure for c in cells]
-    cmax = max(1e-8, max(concs))
+    # total solubles (sum of species counts) from API if available
+    masses = []
+    if api is not None and getattr(api, "cells", None):
+        for i in range(len(cells)):
+            nd = getattr(api.cells[i], "n", None)
+            masses.append(sum(nd.values()) if isinstance(nd, dict) else 0.0)
+    else:
+        # fallback to osmotic pressure proxy if API missing
+        masses = [getattr(c, "osmotic_pressure", 0.0) for c in cells]
+    mmax = max(1e-8, max(masses) if masses else 0.0)
 
     for iy in range(ny):
         y = (iy+0.5)/ny
@@ -84,10 +92,12 @@ def world_to_grid(h: Hierarchy, nx=120, ny=36):
             if occup:
                 ch, ci = occup
                 cell = cells[ci]
-                G = getattr(cell, "_identity_green", 20 + ci * 20)
+                # distinct greens spaced far apart; prefer explicit identity set on API cell
+                default_g = 64 + (ci % 3) * 80  # [64,144,224]
+                G = getattr(cell, "_identity_green", getattr(getattr(api, "cells", [None]*len(cells))[ci], "_identity_green", default_g))
                 B = int(255 * (pressures[ci]/pmax)) if pmax>0 else 0
-                R = int(255 * (concs[ci]/cmax)) if cmax>0 else 0
-                grid[iy][ix] = (ch, (R,G,B))
+                R = int(255 * (masses[ci]/mmax)) if mmax>0 else 0
+                grid[iy][ix] = (ch, (R,int(G),B))
     return grid
 
 def print_grid(grid, color_mode="auto", clear_each_line=False):
@@ -119,6 +129,13 @@ def main():
         substeps=2,
         dt_provider=0.01,
     )
+    # Assign clear identity greens for cells (rendering only)
+    try:
+        levels = [64, 144, 208]
+        for i, c in enumerate(getattr(api, "cells", []) or []):
+            setattr(c, "_identity_green", levels[i % len(levels)])
+    except Exception:
+        pass
     dt = 1e-3
     prev_lines = 0
 
@@ -128,7 +145,7 @@ def main():
         if h is None:
             continue
 
-        grid = world_to_grid(h, nx=120, ny=36)
+        grid = world_to_grid(h, api=api, nx=120, ny=36)
 
         if _is_tty():
             if prev_lines:
@@ -138,16 +155,21 @@ def main():
             # header
             sys.stdout.write(f"Frame {frame}\n")
 
-            # write every row, as-is, one per line (no clearing anywhere)
+            # write every row, colorized per cell (no clearing anywhere)
             if isinstance(grid, (list, tuple)):
                 for row in grid:
                     if isinstance(row, str):
                         sys.stdout.write(row + "\n")
                     else:
-                        # tolerate row as iterable of chars/tuples
-                        sys.stdout.write(''.join(
-                            (x if isinstance(x, str) else x[0]) for x in row
-                        ) + "\n")
+                        # row is iterable of (ch,(r,g,b)) tuples
+                        parts = []
+                        for x in row:
+                            if isinstance(x, str):
+                                parts.append(x)
+                            else:
+                                ch, rgb = x
+                                parts.append(colorize(ch, rgb, mode=color_mode))
+                        sys.stdout.write(''.join(parts) + "\n")
             else:
                 # tolerate a single string grid
                 sys.stdout.write(str(grid) + "\n")
