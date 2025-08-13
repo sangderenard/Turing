@@ -198,8 +198,37 @@ def main():
                         help="Draw every Nth face to control cost (default: 8)")
     parser.add_argument("--no-points", action="store_true",
                         help="Disable drawing vertex points to lighten output")
+    parser.add_argument("--stream-npz", type=str, default="",
+                        help="If provided, read a prerendered ASCII NPZ stream and play it.")
     args = parser.parse_args()
     color_mode = args.color
+
+    # If streaming from NPZ, bypass simulation entirely
+    if getattr(args, "stream_npz", ""):
+        data = np.load(args.stream_npz)
+        stype = data['stream_type'].item() if ('stream_type' in getattr(data, 'files', [])) else None
+        if stype != "ascii_v1":
+            print(f"Unsupported stream type: {stype}")
+            return
+        chars = data["chars"]  # (F, ny, nx) uint8
+        rgb = data["rgb"]      # (F, ny, nx, 3) uint8
+        frames = chars.shape[0]
+        prev_lines = 0
+        for frame in range(frames):
+            if _is_tty() and prev_lines:
+                sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
+            sys.stdout.write(f"Frame {frame}\n")
+            ny, nx = chars.shape[1], chars.shape[2]
+            for iy in range(ny):
+                parts = []
+                for ix in range(nx):
+                    ch = chr(int(chars[frame, iy, ix]))
+                    col = tuple(int(x) for x in rgb[frame, iy, ix])
+                    parts.append(colorize(ch, col, mode=color_mode))
+                sys.stdout.write(''.join(parts) + "\n")
+            sys.stdout.flush()
+            prev_lines = 1 + ny
+        return
 
     # Use the exact same backend parameters as the numpy demo, via args
     api, provider = make_cellsim_backend(

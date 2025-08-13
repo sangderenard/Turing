@@ -371,17 +371,22 @@ def main():
                         help="Frame cap (0 runs until window close)")
     parser.add_argument("--render", choices=["points", "mesh"], default="points",
                         help="Rendering mode: 'points' shows white vertex point cloud (default); 'mesh' shows shaded meshes.")
+    parser.add_argument("--stream-npz", type=str, default="",
+                        help="If provided, play a pre-rendered NPZ stream (points or mesh)")
     args = parser.parse_args()
 
-    # ---------- init sim ----------
-    api, provider = make_cellsim_backend_from_args(args)
-    # Prime mechanics so hierarchy exists before rendering (provider builds _h on first step)
-    api.step(1e-3)
-    h = getattr(provider, "_h", None)
-    if h is None:
-        print("Softbody mechanics provider did not initialize its hierarchy (_h) after a step.\n"
-              "This likely means the provider wasn't attached or the engine didn't call sync().")
-        return
+    # If streaming mode, we still init pygame/GL, but won't step the sim.
+    streaming = bool(getattr(args, "stream_npz", ""))
+    if not streaming:
+        # ---------- init sim ----------
+        api, provider = make_cellsim_backend_from_args(args)
+        # Prime mechanics so hierarchy exists before rendering (provider builds _h on first step)
+        api.step(1e-3)
+        h = getattr(provider, "_h", None)
+        if h is None:
+            print("Softbody mechanics provider did not initialize its hierarchy (_h) after a step.\n"
+                  "This likely means the provider wasn't attached or the engine didn't call sync().")
+            return
 
     # ---------- init pygame + GL ----------
     pygame.init()
@@ -408,23 +413,55 @@ def main():
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
 
-    # build GL objects depending on render mode
+    # build GL objects depending on render mode or stream type
     gl_cells = []
     gl_pts = None           # organelles (mesh mode only)
     gl_vtx_pts = None       # vertex point cloud (points mode)
-    if args.render == "mesh":
-        gl_cells = _rebuild_gl_cells(h)
-        pts, cols = gather_organelles(h)
-        gl_pts = PointsGL(pts, cols) if pts is not None else None
-    else:
-        vtx = gather_vertices(h)
-        if vtx is not None:
-            gl_vtx_pts = PointsGL(vtx, None)
+    stream = None
+    if streaming:
+        stream = np.load(args.stream_npz)
+        stype = stream['stream_type'].item() if ('stream_type' in getattr(stream, 'files', [])) else None
+        if stype not in ('opengl_points_v1', 'opengl_mesh_v1'):
+            print(f"Unsupported stream type: {stype}")
+            return
+        # No GL buffers to allocate up-front for points; for mesh we still need VAOs/EBOs per cell topology
+        if stype == 'opengl_mesh_v1':
+            # Create dummy cells just to hold EBO topology and VBO size; we'll upload positions per-frame
+            n_cells = int(stream['n_cells'])
+            # We emulate CellGL using a minimal shim with faces array; we'll create one CellGL per cell with initial dummy X
+            class _CellShim:
+                pass
+            vtx_counts = stream['vtx_counts'].astype(np.int32)
+            faces_concat = stream['faces_concat'].astype(np.uint32)
+            face_counts = stream['face_counts'].astype(np.int32)
+            faces_per_cell = []
+            off = 0
+            for i in range(n_cells):
+                nf = int(face_counts[i])
+                F = faces_concat[off*3:(off+nf)*3].reshape(nf, 3)
+                off += nf
+                # build cell shim
+                cs = _CellShim()
+                cs.X = np.zeros((int(vtx_counts[i]), 3), dtype=np.float32)
+                cs.faces = F
+                gl_cells.append(CellGL(cs))
+        else:
+            gl_vtx_pts = PointsGL(np.zeros((1,3), dtype=np.float32), None)
             gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    else:
+        if args.render == "mesh":
+            gl_cells = _rebuild_gl_cells(h)
+            pts, cols = gather_organelles(h)
+            gl_pts = PointsGL(pts, cols) if pts is not None else None
+        else:
+            vtx = gather_vertices(h)
+            if vtx is not None:
+                gl_vtx_pts = PointsGL(vtx, None)
+                gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
     # camera (initialized to look near the initial cell cluster)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
-    center = compute_cells_center_of_mass(h)
+    center = compute_cells_center_of_mass(h) if not streaming else np.array([0.0, 0.0, 0.0], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     fovy = 45.0
     # lock initial view direction; we’ll track COM and adapt distance
@@ -449,129 +486,163 @@ def main():
                 if e.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
 
-        # step cellsim (match numpy/ASCII behavior; no extra clamping here)
-        dt = step_cellsim(api, dt)
-        t += dt
+        # step or stream
+        if not streaming:
+            dt = step_cellsim(api, dt)
+            t += dt
+            # Reacquire hierarchy each tick (provider may replace _h)
+            h = getattr(provider, "_h", h)
 
-        # Reacquire hierarchy each tick (provider may replace _h)
-        h = getattr(provider, "_h", h)
-
-        # Update GL resources per render mode
-        if args.render == "mesh":
-            # Keep GL cells bound to the latest hierarchy cells; rebuild if needed
-            gl_cells, _ = _sync_gl_cells(gl_cells, h)
-            # update meshes from XPBD positions
-            for cg in gl_cells:
-                cg.upload()
-            # organelles as points (optional)
-            if gl_pts is not None:
-                pts, _ = gather_organelles(h)
-                if pts is None:
-                    gl_pts = None
-                else:
-                    if gl_pts.n != len(pts):
-                        gl_pts = PointsGL(pts, None)
+        if not streaming:
+            # Update GL resources per render mode
+            if args.render == "mesh":
+                # Keep GL cells bound to the latest hierarchy cells; rebuild if needed
+                gl_cells, _ = _sync_gl_cells(gl_cells, h)
+                # update meshes from XPBD positions
+                for cg in gl_cells:
+                    cg.upload()
+                # organelles as points (optional)
+                if gl_pts is not None:
+                    pts, _ = gather_organelles(h)
+                    if pts is None:
+                        gl_pts = None
                     else:
-                        gl_pts.upload(pts)
-        else:
-            # points mode: update vertex point cloud
-            vtx = gather_vertices(h)
-            if vtx is None:
-                gl_vtx_pts = None
+                        if gl_pts.n != len(pts):
+                            gl_pts = PointsGL(pts, None)
+                        else:
+                            gl_pts.upload(pts)
             else:
-                if gl_vtx_pts is None:
-                    gl_vtx_pts = PointsGL(vtx, None)
-                    gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-                elif gl_vtx_pts.n != len(vtx):
-                    gl_vtx_pts = PointsGL(vtx, None)
-                    gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                # points mode: update vertex point cloud
+                vtx = gather_vertices(h)
+                if vtx is None:
+                    gl_vtx_pts = None
                 else:
-                    gl_vtx_pts.upload(vtx)
+                    if gl_vtx_pts is None:
+                        gl_vtx_pts = PointsGL(vtx, None)
+                        gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                    elif gl_vtx_pts.n != len(vtx):
+                        gl_vtx_pts = PointsGL(vtx, None)
+                        gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                    else:
+                        gl_vtx_pts.upload(vtx)
 
-        # Auto-frame camera: fit to current geometry (and smooth it)
-        new_center = compute_cells_center_of_mass(h)
-        allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
-        bmin, bmax = allX.min(0), allX.max(0)
-        radius = 0.5 * np.linalg.norm(bmax - bmin)
-        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
-        alpha = 0.15  # smoothing factor
-        center_s = (1.0 - alpha) * center_s + alpha * new_center
-        dist_s   = (1.0 - alpha) * dist_s   + alpha * desired_dist
-        center   = center_s
-        cam_dist = float(dist_s)
-        eye      = center - cam_dir * cam_dist
-
-        # view/proj
+        # view/proj and model (either from stream or computed)
         viewport = pygame.display.get_surface().get_size()
         aspect = viewport[0] / max(1, viewport[1])
-        near = 0.05
-        far  = max(10.0, cam_dist + 3.0*radius)
-        P = perspective(fovy, aspect, near, far)
-        V = look_at(eye, center, up)
-        # scene/world rotation around the smoothed center (do not move camera)
-        # slow, steady Y-rotation to reveal all sides (use wall-clock time)
-        rot_speed = 0.25  # radians per second (adjust for taste)
-        t_wall = time.perf_counter() - t0
-        theta = rot_speed * t_wall
-        # Model matrix that rotates about the scene center: T(center) * R * T(-center)
-        T_neg = translate(-center)
-        R_y  = rotate_y(theta)
-        T_pos = translate(center)
-        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+        if streaming:
+            # Pull MVP from stream for current frame index
+            fidx = frame
+            if 'mvps' not in getattr(stream, 'files', []):
+                print('Stream missing mvps')
+                return
+            MVP = stream['mvps'][fidx].astype(np.float32)
+        else:
+            # Auto-frame camera: fit to current geometry (and smooth it)
+            new_center = compute_cells_center_of_mass(h)
+            allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
+            bmin, bmax = allX.min(0), allX.max(0)
+            radius = 0.5 * np.linalg.norm(bmax - bmin)
+            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+            alpha = 0.15  # smoothing factor
+            center_s = (1.0 - alpha) * center_s + alpha * new_center
+            dist_s   = (1.0 - alpha) * dist_s   + alpha * desired_dist
+            center   = center_s
+            cam_dist = float(dist_s)
+            eye      = center - cam_dir * cam_dist
 
-        MVP = (P @ V @ M).astype(np.float32)
+            # view/proj
+            near = 0.05
+            far  = max(10.0, cam_dist + 3.0*radius)
+            P = perspective(fovy, aspect, near, far)
+            V = look_at(eye, center, up)
+            # scene/world rotation using wall-clock
+            rot_speed = 0.25
+            t_wall = time.perf_counter() - t0
+            theta = rot_speed * t_wall
+            T_neg = translate(-center)
+            R_y  = rotate_y(theta)
+            T_pos = translate(center)
+            M = (T_pos @ R_y @ T_neg).astype(np.float32)
+            MVP = (P @ V @ M).astype(np.float32)
 
         # clear
         glViewport(0, 0, viewport[0], viewport[1])
         glClearColor(0.06, 0.07, 0.10, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        if args.render == "mesh":
-            # rough back-to-front sort by view depth (centroid)
-            view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
-            depths = []
-            for cg in gl_cells:
-                c = cg.cell
-                ctr = np.mean(c.X, axis=0).astype(np.float32)
-                # apply same world rotation to centroid for depth sorting
-                ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
-                ctr_rot = (M @ ctr_h)[:3]
-                d = np.dot(ctr_rot - eye, view_dir)
-                depths.append((d, cg))
-            depths.sort(key=lambda x: x[0])  # ascending
-
-            # draw semi-transparent meshes with simple color mapping
-            pressures, masses, greens255 = _measure_pressure_mass(h, api)
-            pN = _normalize_vec(pressures)
-            mN = _normalize_vec(masses)
-
+        if (streaming and stype == 'opengl_mesh_v1') or (not streaming and args.render == "mesh"):
             glUseProgram(mesh_prog)
             glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
 
-            glDepthMask(GL_FALSE)  # blending-friendly
-            for _, cg in depths:
-                i = h.cells.index(cg.cell)
-                G = float(greens255[i]) / 255.0
-                R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
-                B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
-                cg.color = np.array([R, G, B, BASE_A], dtype=np.float32)
-                cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
-            glDepthMask(GL_TRUE)
+            if streaming:
+                # Upload per-frame vertices and colors; draw in precomputed order
+                fidx = frame
+                vtx_concat = stream['vtx_concat'][fidx]
+                draw_order = stream['draw_order'][fidx]
+                colors = stream['colors'][fidx]
+                vtx_counts = stream['vtx_counts']
+                vtx_offsets = stream['vtx_offsets']
+                for draw_i in draw_order:
+                    i = int(draw_i)
+                    cg = gl_cells[i]
+                    off = int(vtx_offsets[i]); n = int(vtx_counts[i])
+                    cg.cell.X = vtx_concat[off:off+n, :]
+                    cg.color = colors[i]
+                    cg.upload()
+                    cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+            else:
+                # back-to-front sort by view depth (centroid)
+                view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+                depths = []
+                for cg in gl_cells:
+                    c = cg.cell
+                    ctr = np.mean(c.X, axis=0).astype(np.float32)
+                    ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
+                    ctr_rot = (M @ ctr_h)[:3]
+                    d = np.dot(ctr_rot - eye, view_dir)
+                    depths.append((d, cg))
+                depths.sort(key=lambda x: x[0])
 
-            # optional organelles overlay
-            if gl_pts is not None and gl_pts.n > 0:
-                glUseProgram(pt_prog)
-                glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-                gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+                pressures, masses, greens255 = _measure_pressure_mass(h, api)
+                pN = _normalize_vec(pressures)
+                mN = _normalize_vec(masses)
+
+                glDepthMask(GL_FALSE)
+                for _, cg in depths:
+                    i = h.cells.index(cg.cell)
+                    G = float(greens255[i]) / 255.0
+                    R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
+                    B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
+                    cg.color = np.array([R, G, B, BASE_A], dtype=np.float32)
+                    cg.draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+                glDepthMask(GL_TRUE)
+
+                if gl_pts is not None and gl_pts.n > 0:
+                    glUseProgram(pt_prog)
+                    glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                    gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
         else:
-            # points mode: draw white vertex cloud
-            if gl_vtx_pts is not None and gl_vtx_pts.n > 0:
-                glUseProgram(pt_prog)
-                glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            # points mode
+            glUseProgram(pt_prog)
+            glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            if streaming:
+                fidx = frame
+                pts_offsets = stream['pts_offsets']
+                pts_concat = stream['pts_concat']
+                start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
+                pts = pts_concat[start:end]
+                if gl_vtx_pts is None or gl_vtx_pts.n != len(pts):
+                    gl_vtx_pts = PointsGL(pts, None)
+                    gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                else:
+                    gl_vtx_pts.upload(pts)
                 gl_vtx_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+            else:
+                if gl_vtx_pts is not None and gl_vtx_pts.n > 0:
+                    gl_vtx_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
 
         pygame.display.flip()
-        clock.tick(60)  # ~60 FPS cap
+        clock.tick(60)
         frame += 1
         if getattr(args, "frames", 0) and frame >= args.frames:
             break
