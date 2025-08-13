@@ -7,6 +7,7 @@ from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
+from .collisions import resolve_membrane_collisions
 from src.transmogrifier.cells.cellsim.membranes.membrane import (
     Membrane, MembraneConfig, MembraneHooks,
 )
@@ -183,6 +184,8 @@ class Hierarchy:
             if vc is not None:
                 vc.project(c.X, c.invm, c.faces, mesh_volume, volume_gradients, dt)
 
+        # Ensure membranes do not intersect themselves or other membranes
+        resolve_membrane_collisions(self.cells)
 
     def update_organelle_modes(self, dt):
         counts = [len(c.organelles) for c in self.cells]
