@@ -20,11 +20,13 @@ def _prep_refs(cell):
     if not hasattr(cell, "_edge_dual_area"):
         dual = {}
         for (i, j) in cell.edges:
-            dual[(i, j)] = 0.0
-            dual[(j, i)] = 0.0
+            dual[(int(i), int(j))] = 0.0
+            dual[(int(j), int(i))] = 0.0
         for (i, j, k) in cell.faces:
-            a = 0.5 * np.linalg.norm(np.cross(cell.X[j] - cell.X[i], cell.X[k] - cell.X[i]))
-            for e in [(i, j), (j, k), (k, i)]:
+            a = 0.5 * np.linalg.norm(
+                np.cross(cell.X[j] - cell.X[i], cell.X[k] - cell.X[i])
+            )
+            for e in [(int(i), int(j)), (int(j), int(k)), (int(k), int(i))]:
                 dual[e] += a / 3.0
         cell._edge_dual_area = {
             tuple(sorted(e)): (dual[e] + dual[(e[1], e[0])])
@@ -36,13 +38,18 @@ def _prep_refs(cell):
 def _set_stretch_from_Ka(cell, Ka):
     _prep_refs(cell)
     eps = 1e-12
-    for sc in cell.constraints.get("stretch", []):
-        i, j = sc.i, sc.j
-        Adual = max(eps, cell._edge_dual_area.get(tuple(sorted((i, j))), 0.0))
-        L0 = max(eps, sc.rest)
-        k_edge = Ka * (Adual / L0)
-        sc.compliance = 1.0 / max(eps, k_edge)
-        sc.lamb = 0.0
+    sc = cell.constraints.get("stretch")
+    if sc is None:
+        return
+    idx = sc["indices"]
+    Adual = np.array(
+        [cell._edge_dual_area.get(tuple(sorted((int(i), int(j)))), 0.0) for i, j in idx]
+    )
+    Adual = np.maximum(eps, Adual)
+    L0 = np.maximum(eps, sc["rest"])
+    k_edge = Ka * (Adual / L0)
+    sc["compliance"][:] = 1.0 / np.maximum(eps, k_edge)
+    sc["lamb"][:] = 0.0
 
 
 def laplace_from_Ka(cell, Ka, gamma0=0.0):
