@@ -945,7 +945,7 @@ def run_fluid_demo(args):
         fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
 
         def gather():
-            return fluid.export_vertices(), None
+            return fluid.export_positions_vectors()
 
         step = fluid.step
     elif args.fluid == "voxel":

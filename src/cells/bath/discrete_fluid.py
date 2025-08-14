@@ -234,6 +234,10 @@ class DiscreteFluid:
         """Return a copy of particle positions for visualization."""
         return self.p.copy()
 
+    def export_positions_vectors(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return copies of particle positions and velocity vectors."""
+        return self.p.copy(), self.v.copy()
+
     def apply_sources(self, centers: np.ndarray, dM: np.ndarray, dS_mass: np.ndarray,
                       radius: float) -> Dict[str, np.ndarray]:
         """
