@@ -167,6 +167,10 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--dt", type=float, default=1e-10,
         help="base integrator step; increase to amplify drift",
     )
+    parser.add_argument(
+        "--fluid", choices=["", "discrete", "voxel"], default="",
+        help="Run stand-alone fluid demo (discrete or voxel) instead of cellsim",
+    )
     # Export/stream options
     parser.add_argument("--export-npz", type=str, default="",
                         help="If set, write a prerendered NPZ stream to this path.")
@@ -276,6 +280,16 @@ def _log_hierarchy_state(h, frame: int, api: SalinePressureAPI | None = None, *,
 def _compute_center_radius(h) -> Tuple[np.ndarray, float]:
     allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
     bmin, bmax = allX.min(0), allX.max(0)
+    center = (bmin + bmax) * 0.5
+    radius = 0.5 * float(np.linalg.norm(bmax - bmin))
+    return center.astype(np.float32), radius
+
+
+def _compute_center_radius_pts(pts: np.ndarray) -> Tuple[np.ndarray, float]:
+    if pts.size == 0:
+        return np.zeros(3, dtype=np.float32), 1.0
+    pts = pts.astype(np.float32, copy=False)
+    bmin, bmax = pts.min(0), pts.max(0)
     center = (bmin + bmax) * 0.5
     radius = 0.5 * float(np.linalg.norm(bmax - bmin))
     return center.astype(np.float32), radius
@@ -820,10 +834,151 @@ def stream_opengl_mesh(args, api, provider):
         fps=float(args.fps),
     )
 
+
+def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+
+    pts_offsets = np.zeros(frames + 1, dtype=np.int64)
+    pts_concat_list = []
+    mvps = np.zeros((frames, 4, 4), dtype=np.float32)
+
+    pts0, _ = gather_func()
+    center, radius = _compute_center_radius_pts(pts0)
+    eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    cam_dir = center - eye; cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+    cam_dist = float(np.linalg.norm(center - eye))
+    center_s = center.copy(); dist_s = cam_dist
+    aspect = w / max(1, h)
+
+    t_sim = 0.0
+    pts_offsets[0] = 0
+    for f in range(frames):
+        pts, _ = gather_func()
+        pts_concat_list.append(pts.astype(np.float32, copy=False))
+        pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
+
+        new_center, radius = _compute_center_radius_pts(pts)
+        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+        alpha = 0.15
+        center_s = (1.0 - alpha) * center_s + alpha * new_center
+        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+        center = center_s; cam_dist = float(dist_s)
+        eye = center - cam_dir * cam_dist
+
+        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+        V = _look_at(eye, center, up)
+        theta = rot_speed * t_sim if dim == 3 else 0.0
+        T_neg = _translate(-center)
+        R_y = _rotate_y(theta)
+        T_pos = _translate(center)
+        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+        mvps[f] = (P @ V @ M).astype(np.float32)
+
+        step_func(dt)
+        t_sim += dt
+
+    pts_concat = np.concatenate(pts_concat_list, axis=0) if pts_concat_list else np.zeros((0, 3), dtype=np.float32)
+    meta = dict(stream_type='opengl_points_v1', frames=frames, viewport_w=w, viewport_h=h)
+    np.savez_compressed(args.export_npz, **meta, pts_offsets=pts_offsets, pts_concat=pts_concat, mvps=mvps)
+
+
+def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
+    from .run_opengl_demo import play_points_stream
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+
+    pts_offsets = np.zeros(frames + 1, dtype=np.int64)
+    pts_concat_list = []
+    mvps = np.zeros((frames, 4, 4), dtype=np.float32)
+
+    pts0, _ = gather_func()
+    center, radius = _compute_center_radius_pts(pts0)
+    eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    cam_dir = center - eye; cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+    cam_dist = float(np.linalg.norm(center - eye))
+    center_s = center.copy(); dist_s = cam_dist
+    aspect = w / max(1, h)
+
+    t_sim = 0.0
+    pts_offsets[0] = 0
+    for f in range(frames):
+        pts, _ = gather_func()
+        pts_concat_list.append(pts.astype(np.float32, copy=False))
+        pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
+
+        new_center, radius = _compute_center_radius_pts(pts)
+        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+        alpha = 0.15
+        center_s = (1.0 - alpha) * center_s + alpha * new_center
+        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+        center = center_s; cam_dist = float(dist_s)
+        eye = center - cam_dir * cam_dist
+
+        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+        V = _look_at(eye, center, up)
+        theta = rot_speed * t_sim if dim == 3 else 0.0
+        T_neg = _translate(-center)
+        R_y = _rotate_y(theta)
+        T_pos = _translate(center)
+        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+        mvps[f] = (P @ V @ M).astype(np.float32)
+
+        step_func(dt)
+        t_sim += dt
+
+    pts_concat = np.concatenate(pts_concat_list, axis=0) if pts_concat_list else np.zeros((0, 3), dtype=np.float32)
+    play_points_stream(pts_offsets, pts_concat, mvps, viewport_w=w, viewport_h=h, loop_mode=args.loop, fps=float(args.fps))
+
+
+def run_fluid_demo(args):
+    if args.fluid == "discrete":
+        from src.cells.bath.discrete_fluid import DiscreteFluid
+        fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
+
+        def gather():
+            return fluid.export_vertices(), None
+
+        step = fluid.step
+    elif args.fluid == "voxel":
+        from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
+        fluid = VoxelMACFluid(VoxelFluidParams(nx=8, ny=8, nz=8))
+
+        def gather():
+            return fluid.export_vector_field()
+
+        step = fluid.step
+    else:
+        raise SystemExit("Unknown fluid engine")
+
+    if getattr(args, "export_npz", "") and args.export_kind == "opengl-points":
+        export_fluid_points_stream(args, gather, step)
+        return
+
+    if getattr(args, "stream", "") == "opengl-points":
+        stream_fluid_points(args, gather, step)
+        return
+
+    dt = float(getattr(args, "dt", 1e-3))
+    for _ in range(int(args.frames)):
+        step(dt)
+
 def main():
     args = parse_args()
     level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=level)
+    if getattr(args, "fluid", ""):
+        run_fluid_demo(args)
+        return
+
     api, provider = make_cellsim_backend(
         cell_vols=args.cell_vols,
         cell_imps=args.cell_imps,

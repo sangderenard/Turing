@@ -43,6 +43,10 @@ class BathAdapter:
         """Advance the underlying simulator by ``dt`` seconds."""
         raise NotImplementedError
 
+    def visualization_state(self) -> Dict[str, np.ndarray]:
+        """Return data useful for visualization (positions, vectors, etc.)."""
+        raise NotImplementedError
+
 
 @dataclass
 class SPHAdapter(BathAdapter):
@@ -74,6 +78,9 @@ class SPHAdapter(BathAdapter):
     def step(self, dt: float) -> None:
         self.sim.step(dt)
 
+    def visualization_state(self) -> Dict[str, np.ndarray]:
+        return {"vertices": self.sim.export_vertices()}
+
 
 @dataclass
 class MACAdapter(BathAdapter):
@@ -98,3 +105,7 @@ class MACAdapter(BathAdapter):
 
     def step(self, dt: float) -> None:
         self.sim.step(dt)
+
+    def visualization_state(self) -> Dict[str, np.ndarray]:
+        pos, vec = self.sim.export_vector_field()
+        return {"positions": pos, "vectors": vec}
