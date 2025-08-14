@@ -23,15 +23,8 @@ class Bath:
         return {sp: self.n.get(sp, 0.0) / V for sp in species}
 
 
-def update_pressure(bath: Bath, sum_dV: float) -> None:
-    """Update bath pressure based on total volume change.
 
-    If bath has finite compressibility ``kappa`` then ``ΔV = kappa · V · ΔP``
-    so ``ΔP = ΔV / (kappa · V)``.
-    """
-
-    if bath.compressibility and bath.compressibility > 0.0:
-        bath.pressure += -(sum_dV / (bath.compressibility * max(bath.V, 1e-18)))
 
 
 __all__ = ["Bath", "update_pressure"]
+

@@ -2,6 +2,16 @@
 
 This project simulates a cassette-driven "survival computer" using a compile and run flow.
 
+## Table of contents
+
+- [Compiling a program](#compiling-a-program)
+- [Priming a tape and executing with TapeMachine](#priming-a-tape-and-executing-with-tapemachine)
+- [Reel animation demo](#reel-animation-demo)
+- [Live cassette demo](#live-cassette-demo)
+- [Modules & capabilities](#modules--capabilities)
+- [Tests](#tests)
+- [Full module index](MODULES.md)
+
 ## Compiling a program
 
 The quickest way to build and execute a demo program is to run the driver script:
@@ -91,11 +101,11 @@ cassette or reel-to-reel spools that scale with tape usage and draw the
 tape path through a read/write head.
 
 ```bash
-python -m src.reel_demo --mode cassette  # Cassette layout
-python -m src.reel_demo --mode reel      # Reel-to-reel layout
+python -m src.visualizations.reel_demo --mode cassette  # Cassette layout
+python -m src.visualizations.reel_demo --mode reel      # Reel-to-reel layout
 ```
 
-Press <kbd>Space</kbd> to toggle play and <kbd>W</kbd> to toggle the red write indicator.
+Press Space to toggle play and W to toggle the red write indicator.
 
 ## Live cassette demo
 
@@ -108,3 +118,123 @@ python -m src.visualizations.live_cassette_demo
 
 The window shows tape motion in real time as the simulator writes the program
 to a blank cassette and then executes it.
+
+## Modules & capabilities
+
+Below is a current inventory of the repository’s Python modules, grouped by package, to reflect the full breadth of capability.
+
+### Top-level
+
+- `backend.py` — entry point that runs tests and a NAND demo tape
+- `generated_ssa_helpers.py` — generated helper table for SSA
+- `count_loc.py` — line-of-code counter utility
+
+### src/common
+
+- `types.py` — shared types and aliases
+
+### src/compiler
+
+- `__init__.py`
+- `bitops.py` — primitive bitwise ops on graphs
+- `bitops_translator.py` — translates bit-ops into provenance/SSA
+- `process_graph_helper.py` — utility helpers for process graphs
+- `ssa_builder.py` — SSA construction utilities
+- `tape_compiler.py` — compiles graphs into tape instruction streams
+
+### src/hardware
+
+- `__init__.py`
+- `analog_spec.py` — analog operator specifications (see ANALOG_SPEC.md)
+- `analog_helpers.py` — helpers for analog simulation
+- `cassette_adapter.py` — legacy façade for cassette operations
+- `cassette_tape.py` — high‑fidelity cassette backend
+- `constants.py` — hardware constants
+- `lane_tuner.py` — frequency lane tuning and helpers
+- `nand_wave.py` — NAND tone synthesis/decoding
+
+### src/turing_machine
+
+- `__init__.py`
+- `docstrings_math.py` — docstring-backed math helpers
+- `loop_structure.py` — loop constructs for the machine
+- `survival_computer.py` — high-level compile/prime/run driver
+- `tape_head.py`, `tape_transport.py` — transport mechanics
+- `tape_machine.py` — execution loop
+- `tape_map.py` — mapping between instructions and frames
+- `tape_visualizer.py` — visualizations helpers
+- `turing.py`, `turing_ssa.py`, `turing_provenance.py` — core logic and provenance
+
+### src/transmogrifier (core)
+
+- `__init__.py`
+- `dec.py` — decoding utilities
+- `ilpscheduler.py` — ILP-based scheduling experiments
+- `operator_defs.py` — operator definitions
+- `orbital.py`, `orbital_transfer.py` — orbital optimization models
+- `physics.py` — physics helpers
+- `ssa.py`, `ssa_registry.py` — SSA and registry
+- `solver_types.py` — solver/data types
+
+#### src/transmogrifier/graph
+
+- `__init__.py`
+- `graph_express2.py`, `graph_express2printing.py`, `graph_express2_tests.py`
+- `graph_express_chalkboard_problem.py`
+- `memory_graph/`
+  - `__init__.py`, `memory_graph.py`
+  - `helpers/`: `bt_graph_header.py`, `deque3_d.py`, `edge_entry.py`, `graph_search.py`, `mask_consolidation.py`, `meta_graph_edge.py`, `networkx_emulation.py`, `node_entry.py`, `node_region.py`, `set_micrograin_entry.py`, `struct_view.py`, `bit_tensor_memory.py`, `bit_tensor_memory_dag_helper.py`, `bit_tensor_memory_units.py`
+
+#### src/transmogrifier/bitbitbuffer
+
+- `__init__.py`, `bitbitbuffer.py`
+- helpers/: `__init__.py`, `utils.py`, `testbench.py`, `rawspan.py`, `pidbuffer.py`, `data_access.py`, `cell_proposal.py`, `bitbitslice.py`, `bitbititem.py`, `bitbitindex.py`, `bitbitindexer.py`, `bitstream_search.py`
+
+#### src/transmogrifier/cells
+
+- `__init__.py`, `cell_consts.py`, `cell_walls.py`, `simulator.py`
+- `cellsim/`
+  - `__init__.py`, `constants.py`
+  - api/: `saline.py`
+  - bath/: `reservoir.py`
+  - chemistry/: `crn.py`, `electrochem.py`
+  - core/: `units.py`, `numerics.py`, `geometry.py`, `checks.py`
+  - data/: `state.py`, `species.py`, `proposals.py`
+  - engine/: `saline.py`
+  - membranes/: `membrane.py`, `gates.py`
+  - mechanics/: `provider.py`, `softbody0d.py`, `tension.py`
+  - transport/: `pumps.py`, `kedem_katchalsky.py`, `ghk.py`
+  - placement/: `bitbuffer.py`, `sync.py`
+  - organelles/: `inner_loop.py`
+  - viz/: `ascii.py`
+  - examples/: `demo_sim.py`
+
+#### src/transmogrifier/softbody
+
+- `__init__.py`
+- engine/: `__init__.py`, `xpbd_core.py`, `params.py`, `mesh.py`, `hierarchy.py`, `fields.py`, `coupling.py`, `constraints.py`, `collisions.py`
+- geometry/: `primitives.py`, `geodesic.py`
+- bridge/: `__init__.py`, `state_io.py`
+- resources/: `field_library.py`
+- demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`, `run_opengl_demo.py`
+
+### src/visualizations
+
+- `live_cassette_demo.py`
+- `reel_demo.py`, `reel_demo_shell.py`, `reel_math.py`
+
+### tests
+
+- End-to-end and unit tests under `tests/` covering: analog fidelity, lane tuning, NAND wave, compiler and SSA, tape machine, cellsim (API/engine/physics/transport), bitbitbuffer utilities, visualization scaling, soft-body contacts, memory graph dynamics, and more.
+
+For a clickable, hyperlinked index, see MODULES.md.
+
+## Tests
+
+- Run the whole suite with `pytest` from repo root. The suite includes:
+  - Turing machine core: `test_turing_reference.py`, `test_turing_ssa.py`, loops, new opcodes
+  - Hardware/analog: `test_nand_wave.py`, `test_lane_tuner.py`, header layout
+  - Visuals: `test_visualization_no_pygame.py`, `test_visualization_scaling.py`
+  - bitbitbuffer: slicing/indexing/search and PID buffer
+  - Cellsim: API/engine, pressure/mass/charge, membranes/collisions, organelle exclusion
+  - Transmogrifier graphs and memory graph dynamics

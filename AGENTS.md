@@ -1,22 +1,40 @@
 # Zero-Ambiguity Action Plan
 
-*(Everything below is mandatory. Any omission, digital shortcut, or silent deviation is "total failure." Agent = the person or program that will edit the existing repo.)*
+(Everything below is mandatory. Any omission, digital shortcut, or silent deviation is "total failure." Agent = the person or program that will edit the existing repo.)
+
+---
+
+## Table of contents
+
+- [1  Global Parameters — set once before any run](#1--global-parameters--set-once-before-any-run)
+- [2  Tape Structure (immutable contract)](#2--tape-structure-immutable-contract)
+- [3  Instruction Word (16 bits, one frame, parallel-encoded)](#3--instruction-word-16-bits-one-frame-parallel-encoded)
+- [4  Register Behaviour](#4--register-behaviour)
+- [5  Lane & Frame Encoding Rules](#5--lane--frame-encoding-rules)
+- [6  Analog Implementation of ALL Primitive Operators](#6--analog-implementation-of-all-primitive-operators)
+- [7  Motor Control Simulation](#7--motor-control-simulation)
+- [8  Audio Event Intermediate Representation (MIDI-centric)](#8--audio-event-intermediate-representation-midi-centric)
+- [9  Execution Modes](#9--execution-modes)
+- [10  Header & Metadata (no JSON)](#10--header--metadata-no-json)
+- [11  Testing & Failure Criteria](#11--testing--failure-criteria)
+- [12  Stub Policy](#12--stub-policy)
+- [13  Repository Layout](#13--repository-layout)
 
 ---
 
 ## 1  Global Parameters — set **once** before any run
 
-* **LANES:** 32 (32 carrier bins)
-* **TRACKS:** 2 (per tape or register; L = data+instr, R = data+bias)
-* **REGISTERS:** 3 (default IDs = R0 R1 R2, each a 2-track tape-sim)
-* **BIT_FRAME:** 500 ms (complete ADSR per bit)
-* **FS:** 44 100 Hz
-* **BASE_FREQ:** 110 Hz (lane 0)
-* **SEMI_RATIO:** 2^(1/12) (lane i = BASE × ratio^i)
-* **MOTOR_CARRIER:** 60 Hz
-* **WRITE_BIAS:** 150 Hz
-* **DATA_ADSR:** (50 A, 50 D, 0.8 S, 100 R ms)
-* **MOTOR_ENV_UP/DN:** 250 ms ramp (each direction)
+- **LANES:** 32 (32 carrier bins)
+- **TRACKS:** 2 (per tape or register; L = data+instr, R = data+bias)
+- **REGISTERS:** 3 (default IDs = R0 R1 R2, each a 2-track tape-sim)
+- **BIT_FRAME:** 500 ms (complete ADSR per bit)
+- **FS:** 44 100 Hz
+- **BASE_FREQ:** 110 Hz (lane 0)
+- **SEMI_RATIO:** 2^(1/12) (lane i = BASE × ratio^i)
+- **MOTOR_CARRIER:** 60 Hz
+- **WRITE_BIAS:** 150 Hz
+- **DATA_ADSR:** (50 A, 50 D, 0.8 S, 100 R ms)
+- **MOTOR_ENV_UP/DN:** 250 ms ramp (each direction)
 
 ---
 
@@ -24,20 +42,23 @@
 
 1. **BIOS header** (always at physical start, duplicated every *N* feet on loop media)
 
-   * magic 8-byte ID
-   * motor-calibration block (fast-wind time, read-speed time, drift)
-   * **inputs** — parallel frames (all active lanes)
-   * **outputs** — mirrors inputs, pre-filled with silence
-   * start address of instruction table
-2. **Instruction table** — sequence of 16-bit *machine words*; each word appears in **one parallel frame** across lanes 0-15 of Track-0.
-3. **Data zones** — arbitrarily allocated bit-frame ranges, mutable at runtime.
-4. **End-stop marker** — continuous silence then fixed “stop” tone on MOTOR lane; reaching it cuts motor gain to 0 until a new SEEK is commanded.
+- magic 8-byte ID
+- motor-calibration block (fast-wind time, read-speed time, drift)
+- **inputs** — parallel frames (all active lanes)
+- **outputs** — mirrors inputs, pre-filled with silence
+- start address of instruction table
+
+1. **Instruction table** — sequence of 16-bit *machine words*; each word appears in **one parallel frame** across lanes 0-15 of Track-0.
+
+2. **Data zones** — arbitrarily allocated bit-frame ranges, mutable at runtime.
+
+3. **End-stop marker** — continuous silence then fixed “stop” tone on MOTOR lane; reaching it cuts motor gain to 0 until a new SEEK is commanded.
 
 ---
 
 ## 3  Instruction Word (16 bits, one frame, parallel-encoded)
 
-```
+```text
 bits 15-12 : OPCODE
 bits 11-10 : REG-A   (00 R0  01 R1  10 R2  11 reserved)
 bits  9- 8 : REG-B
@@ -52,11 +73,12 @@ bits  5- 0 : PARAM  (length, shift-k, etc.)
 
 ## 4  Register Behaviour
 
-* Each register is an independent two-track tape unit, not a fixed pair on the main tape.
-* **Track-0:** data/instruction carriers.
-* **Track-1:** write-bias tone when writing; data otherwise.
-* Registers contain no further registers, avoiding recursive hierarchies.
-* Operations sequence (always):
+- Each register is an independent two-track tape unit, not a fixed pair on the main tape.
+- **Track-0:** data/instruction carriers.
+- **Track-1:** write-bias tone when writing; data otherwise.
+
+- Registers contain no further registers, avoiding recursive hierarchies.
+- Operations sequence (always):
   1  Motor **SEEK** envelope to target address.
   2  Continuous **read** or **write** sweep over *n* bit-frames (no stop-start per bit).
   3  Optional rewind if media is end-to-end type.
@@ -67,11 +89,12 @@ Registers persist across instructions; nothing is auto-cleared. All register mov
 
 ## 5  Lane & Frame Encoding Rules
 
-* **Bit 1:** tone at lane-freq with DATA_ADSR in full 500 ms frame.
-* **Bit 0:** absolute silence on that lane in same frame.
-* **Parallel mode:** multiple lanes active simultaneously in one frame → whole word.
-* **Serial mode:** one active lane per successive frame → bit stream.
-* Frames align exactly to sample boundaries so FFT(N = FS·BIT_FRAME) yields perfect bin peaks.
+- **Bit 1:** tone at lane-freq with DATA_ADSR in full 500 ms frame.
+- **Bit 0:** absolute silence on that lane in same frame.
+- **Parallel mode:** multiple lanes active simultaneously in one frame → whole word.
+- **Serial mode:** one active lane per successive frame → bit stream.
+
+- Frames align exactly to sample boundaries so FFT(N = FS·BIT_FRAME) yields perfect bin peaks.
 
 ---
 
@@ -96,21 +119,21 @@ Registers persist across instructions; nothing is auto-cleared. All register mov
 
 ## 7  Motor Control Simulation
 
-* **Dedicated MOTOR lane** (Track-0) carries 1 kHz carrier; envelope amplitude = motor gain.
-* Equation: gain(t) → integrate τ_motor → speed(t) → integrate → position(t).
-* Calibration: run full-length wind & read-speed crawl at start-up; store times in BIOS calibration block.
-* All SEEK envelopes must be trapezoidal (accel-coast-decel) derived from calibration constants.
-* End-stop kills motor; restart requires fresh SEEK instruction.
+- **Dedicated MOTOR lane** (Track-0) carries 1 kHz carrier; envelope amplitude = motor gain.
+- Equation: gain(t) → integrate τ_motor → speed(t) → integrate → position(t).
+- Calibration: run full-length wind & read-speed crawl at start-up; store times in BIOS calibration block.
+- All SEEK envelopes must be trapezoidal (accel-coast-decel) derived from calibration constants.
+- End-stop kills motor; restart requires fresh SEEK instruction.
 
 ---
 
 ## 8  Audio Event Intermediate Representation (**MIDI-centric**)
 
-* Every action (data tone, motor envelope, bias tone, logic-result tone) = **MidiEvent**
+- Every action (data tone, motor envelope, bias tone, logic-result tone) = **MidiEvent**
   `(start_ms, duration_ms, channel=track#, note=MIDI_from_freq, velocity, ADSR, pan)`
-* PCM buffers are rendered **only** from MidiEvents (sin-sum or external synth).
-* FFT analysis of registers is performed **on PCM**; decoded magnitudes convert back to MidiEvents for downstream ops.
-* Two deliverables per run:
+- PCM buffers are rendered **only** from MidiEvents (sin-sum or external synth).
+- FFT analysis of registers is performed **on PCM**; decoded magnitudes convert back to MidiEvents for downstream ops.
+- Two deliverables per run:
 
   1. **Tape-state PCM** (raw carriers)
   2. **Execution PCM** (tape + motor + head sounds)
@@ -129,40 +152,40 @@ All modes must share the same primitive op definitions; only orchestration diffe
 
 ## 10  Header & Metadata (no JSON)
 
-* Fixed-length binary struct only.
-* Fields (order fixed):
+- Fixed-length binary struct only.
+- Fields (order fixed):
   magic ID | calib_fast | calib_read | num_inputs | inputs… | num_outputs | outputs… | instr_start_addr | reserved.
-* Encoded across **all tracks & lanes in parallel** for first few frames.
-* Sanity check = Hamming-distance test on magic ID; failure aborts run.
+- Encoded across **all tracks & lanes in parallel** for first few frames.
+- Sanity check = Hamming-distance test on magic ID; failure aborts run.
 
 ---
 
 ## 11  Testing & Failure Criteria
 
-* Every primitive op executed on test patterns must reproduce correct digital result **after round-trip PCM→FFT→bits**.
-* Any zero-motion read/write, missing audible frame, or digital shortcut counts as **FAIL**.
-* End-to-end test: multiply 5 × 3 via NAND-based adder; verify audio contains correct lane frames and output region decodes to “15”.
-* All existing unit tests in repo must still pass; extend with new analog-logic tests.
+- Every primitive op executed on test patterns must reproduce correct digital result **after round-trip PCM→FFT→bits**.
+- Any zero-motion read/write, missing audible frame, or digital shortcut counts as **FAIL**.
+- End-to-end test: multiply 5 × 3 via NAND-based adder; verify audio contains correct lane frames and output region decodes to “15”.
+- All existing unit tests in repo must still pass; extend with new analog-logic tests.
 
 ---
 
 ## 12  Stub Policy
 
-* If true analog modelling is temporarily infeasible, agent may provide **explicit placeholder waveform** that follows the amplitude/threshold rule and leaves TODO comment describing missing physics.
-* Silent stubs or direct-bit digital ops are **not allowed**.
+- If true analog modelling is temporarily infeasible, agent may provide **explicit placeholder waveform** that follows the amplitude/threshold rule and leaves TODO comment describing missing physics.
+- Silent stubs or direct-bit digital ops are **not allowed**.
 
 ---
 
 ## 13  Repository Layout
 
-* **backend.py** — entry point that runs the test suite and a small NAND demo tape.
-* **src/common** — shared utilities such as adaptive type aliases.
-* **src/compiler** — provenance tracing, SSA tools and a compiler that emits tape-ready instruction streams.
-* **src/hardware** — analogue simulation pieces including `analog_spec`, the high‑fidelity `cassette_tape` backend, lane tuning helpers and a legacy `cassette_adapter` façade.
-* **src/turing_machine** — tape mapping, transport mechanics, the `TapeMachine` execution loop and the high-level `survival_computer` driver.
-* **src/transmogrifier** — experimental graph and optimisation research (ILP scheduler, graph express, SSA registry).
-* **src/visualizations** — reel and cassette playback demos.
-* **tests** — pytest suite covering analogue fidelity, compiler features and machine behaviour.
+- **backend.py** — entry point that runs the test suite and a small NAND demo tape.
+- **src/common** — shared utilities such as adaptive type aliases.
+- **src/compiler** — provenance tracing, SSA tools and a compiler that emits tape-ready instruction streams.
+- **src/hardware** — analogue simulation pieces including `analog_spec`, the high‑fidelity `cassette_tape` backend, lane tuning helpers and a legacy `cassette_adapter` façade.
+- **src/turing_machine** — tape mapping, transport mechanics, the `TapeMachine` execution loop and the high-level `survival_computer` driver.
+- **src/transmogrifier** — experimental graph and optimisation research (ILP scheduler, graph express, SSA registry).
+- **src/visualizations** — reel and cassette playback demos.
+- **tests** — pytest suite covering analogue fidelity, compiler features and machine behaviour.
 
 Always run `pytest` before committing; new code must emit audible PCM and honour §§6–7.
 
