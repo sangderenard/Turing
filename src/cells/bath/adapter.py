@@ -79,7 +79,8 @@ class SPHAdapter(BathAdapter):
         self.sim.step(dt)
 
     def visualization_state(self) -> Dict[str, np.ndarray]:
-        return {"vertices": self.sim.export_vertices()}
+        pos, vec = self.sim.export_positions_vectors()
+        return {"positions": pos, "vectors": vec}
 
 
 @dataclass
