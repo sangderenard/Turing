@@ -559,64 +559,6 @@ class VoxelMACFluid:
 
     def _cg_helmholtz_face(self, F: np.ndarray, a: float, axis: int, tol=1e-6, maxiter=200) -> np.ndarray:
         """Solve (I - a ∇²) x = F on a face grid with solid faces as Dirichlet (x=0)."""
-        x = F.copy()
-        r = F - self._helmholtz_face_apply(x, a, axis)
-        p = r.copy()
-        rsold = float(np.sum(r*r))
-        if rsold < tol*tol: return x
-        for it in range(maxiter):
-            Ap = self._helmholtz_face_apply(p, a, axis)
-            denom = max(1e-30, float(np.sum(p*Ap)))
-            alpha = rsold / denom
-            x += alpha * p
-            r -= alpha * Ap
-            rsnew = float(np.sum(r*r))
-            if rsnew < tol*tol:
-                break
-            p = r + (rsnew/rsold) * p
-            rsold = rsnew
-        # enforce boundary (Dirichlet) after solve
-        if axis == 0:
-            x[self.solid_u] = 0.0
-        elif axis == 1:
-            x[self.solid_v] = 0.0
-        else:
-            x[self.solid_w] = 0.0
-        return x
-
-    # Operators ------------------------------------------------------------
-    def _laplace_cc(self, X: np.ndarray, solid_cc: np.ndarray) -> np.ndarray:
-        """7-point Laplacian on CC with Neumann at walls, Dirichlet in solids (X=0)."""
-        Y = np.zeros_like(X)
-        # Dirichlet in solids: treat them as zeros and ignore neighbors that are solid
-        solid = solid_cc
-        # interior
-        Y[1:-1,1:-1,1:-1] = (
-            -6.0 * X[1:-1,1:-1,1:-1]
-            + X[2:  ,1:-1,1:-1] + X[ :-2,1:-1,1:-1]
-            + X[1:-1,2:  ,1:-1] + X[1:-1, :-2,1:-1]
-            + X[1:-1,1:-1,2:  ] + X[1:-1,1:-1, :-2]
-        )
-        # walls (Neumann ~ copy interior neighbor)
-        Y[0, :, :] += X[1, :, :] - X[0, :, :]
-        Y[-1,:,:] += X[-2,:,:] - X[-1,:,:]
-        Y[:, 0,:] += X[:, 1,:] - X[:, 0,:]
-        Y[:, -1,:]+= X[:, -2,:] - X[:, -1,:]
-        Y[:, :, 0]+= X[:, :, 1] - X[:, :, 0]
-        Y[:, :, -1]+=X[:, :, -2] - X[:, :, -1]
-
-        # Zero out contributions in solid cells (Dirichlet X=0, so laplacian uses neighbor minus center w.r.t fluid only)
-        Y[solid] = 0.0
-        return (self.inv_dx**2) * Y
-
-    def _helmholtz_face_apply(self, X: np.ndarray, a: float, axis: int) -> np.ndarray:
-        """Apply (I - a ∇²) on a face grid with Dirichlet on solid faces."""
-        L = self._laplace_face(X, axis)
-        return X - a * L
-
-    def _laplace_face(self, F: np.ndarray, axis: int) -> np.ndarray:
-        """7-point Laplacian on a face grid with Dirichlet at solid faces and Neumann at domain walls."""
-        Y = np.zeros_like(F)
         if axis == 0:
             solid = self.solid_u
         elif axis == 1:
@@ -624,28 +566,101 @@ class VoxelMACFluid:
         else:
             solid = self.solid_w
 
-        # interior points
-        slices = (slice(1,-1), slice(1,-1), slice(1,-1))
-        Y[slices] = (
-            -6.0 * F[slices]
-            + F[2:  ,1:-1,1:-1] + F[ :-2,1:-1,1:-1]
-            + F[1:-1,2:  ,1:-1] + F[1:-1, :-2,1:-1]
-            + F[1:-1,1:-1,2:  ] + F[1:-1,1:-1, :-2]
-        )
-        # walls (Neumann)
-        # x faces
-        Y[0, :, :]   += F[1, :, :] - F[0, :, :]
-        Y[-1, :, :]  += F[-2, :, :] - F[-1, :, :]
-        # y faces
-        Y[:, 0, :]   += F[:, 1, :] - F[:, 0, :]
-        Y[:, -1, :]  += F[:, -2, :] - F[:, -1, :]
-        # z faces
-        Y[:, :, 0]   += F[:, :, 1] - F[:, :, 0]
-        Y[:, :, -1]  += F[:, :, -2] - F[:, :, -1]
+        x = F.copy()
+        x[solid] = 0.0
+        r = F - self._helmholtz_face_apply(x, a, axis, solid)
+        p = r.copy()
+        rsold = float(np.sum(r * r))
+        if rsold < tol * tol:
+            return x
+        for it in range(maxiter):
+            Ap = self._helmholtz_face_apply(p, a, axis, solid)
+            denom = max(1e-30, float(np.sum(p * Ap)))
+            alpha = rsold / denom
+            x += alpha * p
+            x[solid] = 0.0
+            r -= alpha * Ap
+            rsnew = float(np.sum(r * r))
+            if rsnew < tol * tol:
+                break
+            p = r + (rsnew / rsold) * p
+            p[solid] = 0.0
+            rsold = rsnew
+        x[solid] = 0.0
+        return x
 
-        # Dirichlet at solid faces
+    # Operators ------------------------------------------------------------
+    def _laplace_cc(self, X: np.ndarray, solid_cc: np.ndarray) -> np.ndarray:
+        """7-point Laplacian on CC with Neumann at walls, skipping solid neighbors."""
+        solid = solid_cc
+        fluid = ~solid
+        Y = np.zeros_like(X)
+        cnt = np.zeros_like(X, dtype=np.int32)
+
+        # +x and -x neighbors
+        mask = fluid[:-1, :, :] & fluid[1:, :, :]
+        Y[:-1, :, :][mask] += X[1:, :, :][mask]
+        cnt[:-1, :, :][mask] += 1
+        Y[1:, :, :][mask] += X[:-1, :, :][mask]
+        cnt[1:, :, :][mask] += 1
+
+        # +y and -y neighbors
+        mask = fluid[:, :-1, :] & fluid[:, 1:, :]
+        Y[:, :-1, :][mask] += X[:, 1:, :][mask]
+        cnt[:, :-1, :][mask] += 1
+        Y[:, 1:, :][mask] += X[:, :-1, :][mask]
+        cnt[:, 1:, :][mask] += 1
+
+        # +z and -z neighbors
+        mask = fluid[:, :, :-1] & fluid[:, :, 1:]
+        Y[:, :, :-1][mask] += X[:, :, 1:][mask]
+        cnt[:, :, :-1][mask] += 1
+        Y[:, :, 1:][mask] += X[:, :, :-1][mask]
+        cnt[:, :, 1:][mask] += 1
+
+        Y[fluid] -= cnt[fluid] * X[fluid]
         Y[solid] = 0.0
-        return (self.inv_dx**2) * Y
+        return (self.inv_dx ** 2) * Y
+
+    def _helmholtz_face_apply(self, X: np.ndarray, a: float, axis: int, solid: np.ndarray) -> np.ndarray:
+        """Apply (I - a ∇²) on a face grid with Dirichlet on solid faces."""
+        Xc = X.copy()
+        Xc[solid] = 0.0
+        L = self._laplace_face(Xc, axis, solid)
+        Y = Xc - a * L
+        Y[solid] = 0.0
+        return Y
+
+    def _laplace_face(self, F: np.ndarray, axis: int, solid: np.ndarray) -> np.ndarray:
+        """7-point Laplacian on a face grid with Dirichlet at solid faces and Neumann at domain walls."""
+        fluid = ~solid
+        Y = np.zeros_like(F)
+        cnt = np.zeros_like(F, dtype=np.int32)
+
+        # +x / -x neighbors
+        mask = fluid[:-1, :, :] & fluid[1:, :, :]
+        Y[:-1, :, :][mask] += F[1:, :, :][mask]
+        cnt[:-1, :, :][mask] += 1
+        Y[1:, :, :][mask] += F[:-1, :, :][mask]
+        cnt[1:, :, :][mask] += 1
+
+        # +y / -y neighbors
+        mask = fluid[:, :-1, :] & fluid[:, 1:, :]
+        Y[:, :-1, :][mask] += F[:, 1:, :][mask]
+        cnt[:, :-1, :][mask] += 1
+        Y[:, 1:, :][mask] += F[:, :-1, :][mask]
+        cnt[:, 1:, :][mask] += 1
+
+        # +z / -z neighbors
+        mask = fluid[:, :, :-1] & fluid[:, :, 1:]
+        Y[:, :, :-1][mask] += F[:, :, 1:][mask]
+        cnt[:, :, :-1][mask] += 1
+        Y[:, :, 1:][mask] += F[:, :, :-1][mask]
+        cnt[:, :, 1:][mask] += 1
+
+        Y[fluid] -= cnt[fluid] * F[fluid]
+        Y[solid] = 0.0
+        return (self.inv_dx ** 2) * Y
 
     # ---------------------------------------------------------------------
     # Utilities
