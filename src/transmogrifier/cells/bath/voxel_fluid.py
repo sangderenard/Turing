@@ -210,36 +210,42 @@ class VoxelMACFluid:
     # Forces
     # ---------------------------------------------------------------------
     def _add_body_forces(self, dt: float) -> None:
-        # buoyancy: ρ_eff = ρ0 (1 - β_T (T-T0) - β_S (S-S0)); body force = ρ_eff * g
+        # constant gravity plus buoyancy: g + ( -β_T ΔT - β_S ΔS ) * g
         p = self.p
-        dT = self.T - p.T0
-        dS = self.S - p.S0
-        rho_eff = p.rho0 * (1.0 - p.beta_T * dT - p.beta_S * dS)
-        fx, fy, fz = self.g[0], self.g[1], self.g[2]
+        fx, fy, fz = self.g
 
-        # deposit to faces by averaging neighboring cells
-        # u faces at (i, j+1/2, k+1/2) average cells (i-1, j, k) and (i, j, k)
+        # constant gravity on non-solid faces
         if fx != 0.0:
-            ru = 0.5 * (
-                self._pad_x(rho_eff, left=True, expand=True)
-                + self._pad_x(rho_eff, left=False, expand=True)
-            )
-            ru[self.solid_u] = 0.0
-            self.u += dt * fx * ru / p.rho0
+            self.u[~self.solid_u] += dt * fx
         if fy != 0.0:
-            rv = 0.5 * (
-                self._pad_y(rho_eff, left=True, expand=True)
-                + self._pad_y(rho_eff, left=False, expand=True)
-            )
-            rv[self.solid_v] = 0.0
-            self.v += dt * fy * rv / p.rho0
+            self.v[~self.solid_v] += dt * fy
         if fz != 0.0:
-            rw = 0.5 * (
-                self._pad_z(rho_eff, left=True, expand=True)
-                + self._pad_z(rho_eff, left=False, expand=True)
-            )
-            rw[self.solid_w] = 0.0
-            self.w += dt * fz * rw / p.rho0
+            self.w[~self.solid_w] += dt * fz
+
+        # buoyancy term from temperature and salinity differences
+        if fx != 0.0 or fy != 0.0 or fz != 0.0:
+            dT = self.T - p.T0
+            dS = self.S - p.S0
+            buoy = -(p.beta_T * dT + p.beta_S * dS)
+
+            if fx != 0.0:
+                bu = 0.5 * (
+                    self._pad_x(buoy, left=True, expand=True)
+                    + self._pad_x(buoy, left=False, expand=True)
+                )
+                self.u[~self.solid_u] += dt * fx * bu[~self.solid_u]
+            if fy != 0.0:
+                bv = 0.5 * (
+                    self._pad_y(buoy, left=True, expand=True)
+                    + self._pad_y(buoy, left=False, expand=True)
+                )
+                self.v[~self.solid_v] += dt * fy * bv[~self.solid_v]
+            if fz != 0.0:
+                bw = 0.5 * (
+                    self._pad_z(buoy, left=True, expand=True)
+                    + self._pad_z(buoy, left=False, expand=True)
+                )
+                self.w[~self.solid_w] += dt * fz * bw[~self.solid_w]
 
     # ---------------------------------------------------------------------
     # Viscosity (implicit Helmholtz) : (I - ν dt ∇²) u^{n+1} = u*
