@@ -30,15 +30,6 @@ class Bath:
         return {sp: self.n.get(sp, 0.0) / V for sp in species}
 
 
-def update_pressure(bath: Bath, sum_dV: float) -> None:
-    """Update bath pressure based on total volume change.
-
-    If bath has finite compressibility ``kappa`` then ``ΔV = kappa · V · ΔP``
-    so ``ΔP = ΔV / (kappa · V)``.
-    """
-
-    if bath.compressibility and bath.compressibility > 0.0:
-        bath.pressure += -(sum_dV / (bath.compressibility * max(bath.V, 1e-18)))
 
 
 def kedem_katchalsky_step(
@@ -86,7 +77,6 @@ def kedem_katchalsky_step(
         cell.n[sp] = max(cell.n.get(sp, 0.0) + dS, 0.0)
         bath.n[sp] = max(bath.n.get(sp, 0.0) - dS, 0.0)
 
-    update_pressure(bath, dV_cell)
     return dV_cell
 
 
@@ -110,16 +100,12 @@ def apply_fluxes(
         Sequence of dictionaries mapping species to mole changes per cell.
     """
 
-    sum_dV = 0.0
     for cell, dV, dS in zip(cells, dV_cells, dS_cells):
         cell.V = max(cell.V + dV, 0.0)
         bath.V = max(bath.V - dV, 0.0)
         for sp, dS_val in dS.items():
             cell.n[sp] = max(cell.n.get(sp, 0.0) + dS_val, 0.0)
             bath.n[sp] = max(bath.n.get(sp, 0.0) - dS_val, 0.0)
-        sum_dV += dV
-
-    update_pressure(bath, sum_dV)
 
 
-__all__ = ["Bath", "update_pressure", "kedem_katchalsky_step", "apply_fluxes"]
+__all__ = ["Bath", "kedem_katchalsky_step", "apply_fluxes"]
