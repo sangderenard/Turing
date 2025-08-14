@@ -846,7 +846,7 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     pts_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
-    pts0, _ = gather_func()
+    pts0, vecs0 = gather_func()
     center, radius = _compute_center_radius_pts(pts0)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -858,7 +858,7 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     t_sim = 0.0
     pts_offsets[0] = 0
     for f in range(frames):
-        pts, _ = gather_func()
+        pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
 
@@ -899,7 +899,7 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
     pts_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
-    pts0, _ = gather_func()
+    pts0, vecs0 = gather_func()
     center, radius = _compute_center_radius_pts(pts0)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -911,7 +911,7 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
     t_sim = 0.0
     pts_offsets[0] = 0
     for f in range(frames):
-        pts, _ = gather_func()
+        pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
 
@@ -943,21 +943,21 @@ def run_fluid_demo(args):
     if args.fluid == "discrete":
         from src.cells.bath.discrete_fluid import DiscreteFluid
         fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
-
-        def gather():
-            return fluid.export_positions_vectors()
-
         step = fluid.step
     elif args.fluid == "voxel":
         from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
         fluid = VoxelMACFluid(VoxelFluidParams(nx=8, ny=8, nz=8))
-
-        def gather():
-            return fluid.export_vector_field()
-
         step = fluid.step
     else:
         raise SystemExit("Unknown fluid engine")
+
+    def gather():
+        if hasattr(fluid, "export_positions_vectors"):
+            return fluid.export_positions_vectors()
+        if hasattr(fluid, "export_vector_field"):
+            return fluid.export_vector_field()
+        pts = fluid.export_vertices() if hasattr(fluid, "export_vertices") else np.zeros((0, 3), dtype=np.float32)
+        return pts, None
 
     if getattr(args, "export_npz", "") and args.export_kind == "opengl-points":
         export_fluid_points_stream(args, gather, step)
