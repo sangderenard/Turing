@@ -80,10 +80,10 @@ try:
         glCreateProgram, glAttachShader, glLinkProgram, glGetProgramiv, glGetProgramInfoLog, glDeleteShader,
         # buffers / vao
         glGenVertexArrays, glGenBuffers, glBindVertexArray, glBindBuffer, glBufferData, glBufferSubData,
-        glEnableVertexAttribArray, glVertexAttribPointer,
+        glEnableVertexAttribArray, glVertexAttribPointer, glVertexAttribDivisor,
         # uniforms / draw
         glGetUniformLocation, glUniform4fv, glUniform1f, glUniformMatrix4fv,
-        glDrawElements, glDrawArrays, glUseProgram,
+        glDrawElements, glDrawArrays, glDrawArraysInstanced, glUseProgram,
         # state
         glEnable, glBlendFunc, glViewport, glClearColor, glClear, glDepthMask, glCullFace,
         # enums
@@ -202,7 +202,38 @@ void main(){
     FragColor = uColor; // premult not needed; straight alpha ok with src-alpha blending
 }
 """
+
+# Instanced arrow shader ------------------------------------------------------
 POINT_VS = """
+#version 330 core
+layout(location=0) in vec3 aBase;   // arrow mesh vertex (unit scale, +X axis)
+layout(location=1) in vec3 aOffset; // per-instance position
+layout(location=2) in vec3 aVec;    // per-instance velocity vector
+uniform mat4 uMVP;
+void main(){
+    float len = length(aVec);
+    vec3 dir = (len > 1e-6) ? normalize(aVec) : vec3(1.0, 0.0, 0.0);
+    float ang = atan(dir.y, dir.x);
+    float c = cos(ang), s = sin(ang);
+    mat2 rot = mat2(c, -s, s, c);
+    vec3 base = aBase;
+    base.x *= len;            // scale by vector length (length along +X)
+    vec2 xy = rot * base.xy;  // rotate into direction
+    vec3 world = vec3(xy, base.z) + aOffset;
+    gl_Position = uMVP * vec4(world, 1.0);
+}
+"""
+POINT_FS = """
+#version 330 core
+out vec4 FragColor;
+uniform vec4 uColor; // rgba
+void main(){
+    FragColor = uColor;
+}
+"""
+
+# Point sprite shader ---------------------------------------------------------
+SPRITE_VS = """
 #version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
@@ -212,7 +243,7 @@ void main(){
     gl_PointSize = uPointScale;
 }
 """
-POINT_FS = """
+SPRITE_FS = """
 #version 330 core
 out vec4 FragColor;
 uniform vec4 uColor; // rgba
@@ -374,6 +405,71 @@ class PointsGL:
         glDrawArrays(GL_POINTS, 0, self.n)
         glBindVertexArray(0)
 
+class ArrowsGL:
+    """Instanced arrow renderer using per-instance velocity vectors."""
+
+    def __init__(self, pts, vecs):
+        self.n = len(pts)
+        self.vao = glGenVertexArrays(1)
+        glBindVertexArray(self.vao)
+
+        # Base arrow mesh oriented along +X consisting of two triangles
+        arrow = np.array([
+            [0.0, -0.02, 0.0],
+            [0.0,  0.02, 0.0],
+            [0.6,  0.0, 0.0],
+            [0.6, -0.05, 0.0],
+            [0.6,  0.05, 0.0],
+            [1.0,  0.0, 0.0],
+        ], dtype=np.float32)
+
+        self.base_count = len(arrow)
+        self.vbo_base = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_base)
+        glBufferData(GL_ARRAY_BUFFER, arrow.nbytes, arrow, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+
+        # Instance positions
+        self.vbo_pos = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_pos)
+        glBufferData(GL_ARRAY_BUFFER, pts.nbytes, pts, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+        glVertexAttribDivisor(1, 1)
+
+        # Instance velocity vectors
+        self.vbo_vec = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_vec)
+        glBufferData(GL_ARRAY_BUFFER, vecs.nbytes, vecs, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+        glVertexAttribDivisor(2, 1)
+
+        glBindVertexArray(0)
+
+        self.color = np.array([1, 1, 1, 1], dtype=np.float32)
+
+    def upload(self, pts, vecs):
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_pos)
+        if len(pts) != self.n:
+            glBufferData(GL_ARRAY_BUFFER, pts.nbytes, pts, GL_DYNAMIC_DRAW)
+            self.n = len(pts)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, pts.nbytes, pts)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_vec)
+        if len(vecs) != self.n:
+            glBufferData(GL_ARRAY_BUFFER, vecs.nbytes, vecs, GL_DYNAMIC_DRAW)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, vecs.nbytes, vecs)
+
+    def draw(self, prog, u_mvp, u_color, _u_unused=None):
+        glUniform4fv(u_color, 1, self.color)
+        glBindVertexArray(self.vao)
+        glDrawArraysInstanced(GL_TRIANGLES, 0, self.base_count, self.n)
+        glBindVertexArray(0)
+
 def compute_cells_center_of_mass(h):
     """Approximate a global center-of-mass from all cell meshes.
     We weight each cell's centroid by its vertex count to better reflect size.
@@ -443,7 +539,7 @@ def main():
     mesh_u_mvp = glGetUniformLocation(mesh_prog, "uMVP")
     mesh_u_color = glGetUniformLocation(mesh_prog, "uColor")
 
-    pt_prog = link_program(POINT_VS, POINT_FS)
+    pt_prog = link_program(SPRITE_VS, SPRITE_FS)
     pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
@@ -739,12 +835,15 @@ def play_points_stream(pts_offsets: np.ndarray,
     )
     from OpenGL.GL import glGetUniformLocation
 
-    # Reuse existing shader and point VAO logic
+    # Build shaders: point sprites for plain points, arrows for vectors
     mesh_prog = link_program(MESH_VS, MESH_FS)
-    pt_prog = link_program(POINT_VS, POINT_FS)
+    pt_prog = link_program(SPRITE_VS, SPRITE_FS)
     pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
+    arrow_prog = link_program(POINT_VS, POINT_FS)
+    arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
+    arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
 
     # Set up a single reusable point cloud object
     pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
@@ -753,10 +852,15 @@ def play_points_stream(pts_offsets: np.ndarray,
         if vec_concat is not None
         else None
     )
-    gl_pts = PointsGL(
-        pts.astype(np.float32, copy=False),
-        vecs.astype(np.float32, copy=False) if vecs is not None else None,
-    )
+    if vecs is not None:
+        gl_pts = ArrowsGL(
+            pts.astype(np.float32, copy=False),
+            vecs.astype(np.float32, copy=False),
+        )
+        use_arrows = True
+    else:
+        gl_pts = PointsGL(pts.astype(np.float32, copy=False))
+        use_arrows = False
     gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
     clock = pygame.time.Clock()
@@ -786,18 +890,25 @@ def play_points_stream(pts_offsets: np.ndarray,
         # Upload per-frame points (and optional vectors)
         start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
         cur = pts_concat[start:end]
-        cur_vecs = vec_concat[start:end] if vec_concat is not None else None
-        if gl_pts.n != len(cur):
-            gl_pts = PointsGL(
-                cur.astype(np.float32, copy=False),
-                cur_vecs.astype(np.float32, copy=False) if cur_vecs is not None else None,
-            )
-            gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        if use_arrows:
+            cur_vecs = vec_concat[start:end]
+            if gl_pts.n != len(cur):
+                gl_pts = ArrowsGL(
+                    cur.astype(np.float32, copy=False),
+                    cur_vecs.astype(np.float32, copy=False),
+                )
+                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                gl_pts.upload(
+                    cur.astype(np.float32, copy=False),
+                    cur_vecs.astype(np.float32, copy=False),
+                )
         else:
-            gl_pts.upload(
-                cur.astype(np.float32, copy=False),
-                cur_vecs.astype(np.float32, copy=False) if cur_vecs is not None else None,
-            )
+            if gl_pts.n != len(cur):
+                gl_pts = PointsGL(cur.astype(np.float32, copy=False))
+                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                gl_pts.upload(cur.astype(np.float32, copy=False))
 
         MVP = mvps[fidx].astype(np.float32, copy=False)
 
@@ -806,9 +917,14 @@ def play_points_stream(pts_offsets: np.ndarray,
         glClearColor(0.06, 0.07, 0.10, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        glUseProgram(pt_prog)
-        glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-        gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+        if use_arrows:
+            glUseProgram(arrow_prog)
+            glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
+        else:
+            glUseProgram(pt_prog)
+            glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
 
         pygame.display.flip()
         clock.tick(fps)
