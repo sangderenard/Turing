@@ -207,6 +207,14 @@ class DiscreteFluid:
         # Cached constants
         self._g = np.array(params.gravity, dtype=np.float64)
 
+        # Detached droplet particles
+        self.droplet_p = np.zeros((0, 3), dtype=np.float64)
+        self.droplet_v = np.zeros((0, 3), dtype=np.float64)
+        # Threshold speed for automatic emission; np.inf disables auto mode
+        self.droplet_threshold = np.inf
+        # Linear drag coefficient for ballistic droplets
+        self.droplet_drag = 0.0
+
     # ------------------------- Public API ------------------------------------
 
     def step(self, dt: float, substeps: int = 1) -> None:
@@ -259,6 +267,40 @@ class DiscreteFluid:
     def export_positions_vectors(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return copies of particle positions and velocity vectors."""
         return self.p.copy(), self.v.copy()
+
+    def emit_droplets(
+        self,
+        threshold: Optional[float] = None,
+        indices: Optional[Iterable[int]] = None,
+    ) -> None:
+        """Spawn ballistic droplets from fluid particles.
+
+        Parameters
+        ----------
+        threshold:
+            Speed above which particles are emitted.  If ``None`` the
+            instance's :attr:`droplet_threshold` is used.  ``np.inf`` disables
+            automatic emission.
+        indices:
+            Explicit particle indices to emit regardless of velocity.  When
+            provided, ``threshold`` is ignored.
+        """
+
+        if indices is None:
+            if threshold is None:
+                threshold = self.droplet_threshold
+            if not np.isfinite(threshold):
+                return
+            speeds = np.linalg.norm(self.v, axis=1)
+            indices = np.nonzero(speeds > threshold)[0]
+        else:
+            indices = np.asarray(list(indices), dtype=int)
+
+        if indices.size == 0:
+            return
+
+        self.droplet_p = np.vstack([self.droplet_p, self.p[indices]])
+        self.droplet_v = np.vstack([self.droplet_v, self.v[indices]])
 
     def apply_sources(self, centers: np.ndarray, dM: np.ndarray, dS_mass: np.ndarray,
                       radius: float) -> Dict[str, np.ndarray]:
@@ -322,6 +364,9 @@ class DiscreteFluid:
         self.S = np.clip(self.solute_mass / np.maximum(self.m, 1e-12), 0.0, 1.0)
 
     def _substep(self, dt: float) -> None:
+        # Emit droplets based on velocity threshold if requested
+        self.emit_droplets()
+
         # Relax any pending source targets before computing new densities
         self._relax_sources()
 
@@ -352,6 +397,16 @@ class DiscreteFluid:
         # Diffusion steps (explicit; can be substepped if needed)
         if self.params.thermal_diffusivity > 0.0 or self.params.solute_diffusivity > 0.0:
             self._diffuse_scalars(dt)
+
+        # Advance ballistic droplets
+        if self.droplet_p.size:
+            self._integrate_droplets(dt)
+
+    def _integrate_droplets(self, dt: float) -> None:
+        """Advance detached droplets under gravity and drag."""
+        g = self._g[None, :]
+        self.droplet_v += dt * (g - self.droplet_drag * self.droplet_v)
+        self.droplet_p += dt * self.droplet_v
 
     # --------------------------- Density & Pressure ---------------------------
 
