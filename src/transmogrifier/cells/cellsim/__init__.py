@@ -7,7 +7,6 @@ __all__ = [
     "mechanics",
     "organelles",
     "engine",
-    "bath",
     "membranes",
     "chemistry",
     "viz",
