@@ -88,7 +88,7 @@ class Softbody0DProvider(MechanicsProvider):
             sbc.external_pressure = P_ext
 
     # Array-first sync path to avoid Python conversions completely
-    def sync_arrays(self, *, V, elastic_k, imp, bath_pressure: float) -> None:  # type: ignore[override]
+    def sync_arrays(self, *, V, elastic_k, imp, bath_pressure: float, bath_temperature: float) -> None:  # type: ignore[override]
         if self._h is None:
             return
         V = np.maximum(1e-18, np.asarray(V, dtype=float))
@@ -120,6 +120,10 @@ class Softbody0DProvider(MechanicsProvider):
             sbc.membrane_tension = k
             sbc.osmotic_pressure = osm
             sbc.external_pressure = float(bath_pressure)
+
+        # Cache bath conditions for step phase if needed
+        self._bath_pressure = float(bath_pressure)
+        self._bath_temperature = float(bath_temperature)
 
     def step(self, dt: float) -> MechanicsSnapshot:
         if self._h is None or self._cells is None or self._bath is None:
