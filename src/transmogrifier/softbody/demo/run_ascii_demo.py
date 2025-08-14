@@ -139,39 +139,54 @@ def world_to_grid(
                 ix, iy = clamp_ixy(x, y)
                 put(ix, iy, ci, '.')
 
-        # Draw triangle edges (subsample faces for speed)
+        # Draw triangle edges or segments (subsample faces for speed)
         if render_mode in ("edges", "fill"):
             for fi in range(0, len(F), stride):
-                a, b, d = F[fi]
-                # Triangle is (a, b, d) in our face layout
-                ax, ay = float(X[a, 0]), float(X[a, 1])
-                bx, by = float(X[b, 0]), float(X[b, 1])
-                dx_, dy_ = float(X[d, 0]), float(X[d, 1])
-                iax, iay = clamp_ixy(ax, ay)
-                ibx, iby = clamp_ixy(bx, by)
-                idx, idy = clamp_ixy(dx_, dy_)
-                draw_line(iax, iay, ibx, iby, ci, edge_ch)
-                draw_line(ibx, iby, idx, idy, ci, edge_ch)
-                draw_line(idx, idy, iax, iay, ci, edge_ch)
+                row = F[fi]
+                # Numpy row can be np.ndarray; get length robustly
+                rlen = int(row.shape[0]) if hasattr(row, 'shape') else len(row)
+                if rlen >= 3:
+                    a, b, d = int(row[0]), int(row[1]), int(row[2])
+                    # Triangle is (a, b, d) in our face layout
+                    ax, ay = float(X[a, 0]), float(X[a, 1])
+                    bx, by = float(X[b, 0]), float(X[b, 1])
+                    dx_, dy_ = float(X[d, 0]), float(X[d, 1])
+                    iax, iay = clamp_ixy(ax, ay)
+                    ibx, iby = clamp_ixy(bx, by)
+                    idx, idy = clamp_ixy(dx_, dy_)
+                    draw_line(iax, iay, ibx, iby, ci, edge_ch)
+                    draw_line(ibx, iby, idx, idy, ci, edge_ch)
+                    draw_line(idx, idy, iax, iay, ci, edge_ch)
 
-                if render_mode == "fill":
-                    # Barycentric rasterization in bounding box
-                    minx = max(0, min(iax, ibx, idx))
-                    maxx = min(nx - 1, max(iax, ibx, idx))
-                    miny = max(0, min(iay, iby, idy))
-                    maxy = min(ny - 1, max(iay, iby, idy))
+                    if render_mode == "fill":
+                        # Barycentric rasterization in bounding box
+                        minx = max(0, min(iax, ibx, idx))
+                        maxx = min(nx - 1, max(iax, ibx, idx))
+                        miny = max(0, min(iay, iby, idy))
+                        maxy = min(ny - 1, max(iay, iby, idy))
 
-                    # Precompute area for barycentric weights
-                    denom = (iby - idy) * (iax - idx) + (idx - ibx) * (iay - idy)
-                    if abs(denom) < 1e-8:
-                        continue  # degenerate
-                    for yy in range(miny, maxy + 1):
-                        for xx in range(minx, maxx + 1):
-                            w1 = ((iby - idy) * (xx - idx) + (idx - ibx) * (yy - idy)) / denom
-                            w2 = ((idy - iay) * (xx - idx) + (iax - idx) * (yy - idy)) / denom
-                            w3 = 1.0 - w1 - w2
-                            if w1 >= 0 and w2 >= 0 and w3 >= 0:
-                                put(xx, yy, ci, fill_ch)
+                        # Precompute area for barycentric weights
+                        denom = (iby - idy) * (iax - idx) + (idx - ibx) * (iay - idy)
+                        if abs(denom) < 1e-8:
+                            continue  # degenerate
+                        for yy in range(miny, maxy + 1):
+                            for xx in range(minx, maxx + 1):
+                                w1 = ((iby - idy) * (xx - idx) + (idx - ibx) * (yy - idy)) / denom
+                                w2 = ((idy - iay) * (xx - idx) + (iax - idx) * (yy - idy)) / denom
+                                w3 = 1.0 - w1 - w2
+                                if w1 >= 0 and w2 >= 0 and w3 >= 0:
+                                    put(xx, yy, ci, fill_ch)
+                elif rlen == 2:
+                    # Segment face (common in 1D sims): just draw the edge
+                    a, b = int(row[0]), int(row[1])
+                    ax, ay = float(X[a, 0]), float(X[a, 1])
+                    bx, by = float(X[b, 0]), float(X[b, 1])
+                    iax, iay = clamp_ixy(ax, ay)
+                    ibx, iby = clamp_ixy(bx, by)
+                    draw_line(iax, iay, ibx, iby, ci, edge_ch)
+                else:
+                    # Unsupported face size; skip
+                    continue
 
         # Draw organelles as small discs
         for o in getattr(c, 'organelles', []) or []:

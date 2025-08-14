@@ -13,6 +13,7 @@ from .mesh import (
     polyline_length,
     polyline_length_gradients,
 )
+from src.transmogrifier.softbody.geometry.primitives import planar_ngon, line_segment
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
@@ -347,26 +348,13 @@ def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, ta
     dim = getattr(params, "dimension", 3)
     if dim == 2:
         n = int(8 * (2 ** max(0, int(subdiv))))
-        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-        cx, cy, cz = center
-        ring = np.stack(
-            [cx + radius * np.cos(angles), cy + radius * np.sin(angles), np.full(n, cz)],
-            axis=1,
-        )
-        X = np.vstack([[cx, cy, cz], ring])
-        F = np.column_stack(
-            [np.zeros(n, dtype=np.int32), np.arange(1, n + 1), np.roll(np.arange(1, n + 1), -1)]
-        )
-        edges, bends = build_adjacency(F)
+        X, F, edges = planar_ngon(n_segments=n, radius=radius, center=center, plane="xy", dtype=np.float64)
+        # 2D membranes don't use dihedral bending; keep empty bends
+        bends = np.zeros((0, 4), dtype=np.int32)
         V0 = mesh_area2d(X, F) if target_volume is None else float(target_volume)
     elif dim == 1:
         n = int(8 * (2 ** max(0, int(subdiv))))
-        cx, cy, cz = center
-        xs = np.linspace(cx - radius, cx + radius, n + 1)
-        X = np.stack([xs, np.full(n + 1, cy), np.full(n + 1, cz)], axis=1)
-        edges = np.column_stack(
-            [np.arange(n, dtype=np.int32), np.arange(1, n + 1, dtype=np.int32)]
-        )
+        X, edges = line_segment(n_segments=n, radius=radius, center=center, axis="x", dtype=np.float64)
         F = edges.copy()
         bends = np.zeros((0, 4), dtype=np.int32)
         V0 = polyline_length(X, F, dim=1) if target_volume is None else float(target_volume)

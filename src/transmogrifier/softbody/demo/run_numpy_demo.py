@@ -132,7 +132,7 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         add_help=add_help,
     )
     parser.add_argument("--cell-vols", type=float, nargs="+", default=[10.0, 10.0, 10.0])
-    parser.add_argument("--cell-imps", type=float, nargs="+", default=[10.0, 10.0, 10.0])
+    parser.add_argument("--cell-imps", type=float, nargs="+", default=[100.0, 100.0, 100.0])
     parser.add_argument("--cell-elastic-k", type=float, nargs="+", default=[0.1, 0.1, 0.1])
     parser.add_argument("--bath-volume-factor", type=float, default=5.0)
     parser.add_argument("--bath-na", type=float, default=10.0)
@@ -160,9 +160,9 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=60.0, help="Target FPS for streaming display.")
     parser.add_argument("--ascii-nx", type=int, default=120, help="ASCII export grid width")
     parser.add_argument("--ascii-ny", type=int, default=36, help="ASCII export grid height")
-    parser.add_argument("--render-mode", choices=["edges", "fill"], default="edges",
+    parser.add_argument("--render-mode", choices=["edges", "fill"], default="fill",
                         help="ASCII export render mode (edges/fill)")
-    parser.add_argument("--face-stride", type=int, default=8,
+    parser.add_argument("--face-stride", type=int, default=1,
                         help="ASCII export: draw every Nth face (performance)")
     parser.add_argument("--no-points", action="store_true",
                         help="ASCII export: disable drawing vertex points")

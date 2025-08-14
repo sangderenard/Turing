@@ -3,10 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class EngineParams:
-    dt: float = 1e-4
-    substeps: int = 6
-    iterations: int = 10
-    damping: float = 0.696
+    dt: float = 1e-2
+    substeps: int = 20
+    iterations: int = 100
+    damping: float = 0.69
     dimension: int = 3
 
     # XPBD compliances (1/k)
@@ -29,7 +29,7 @@ class EngineParams:
     contact_ram_limit: int | None = 1024 * 1024 * 1024 * 10  # bytes; ``None`` = no cap
 
     # Thin bath (Z is 1 voxel thick in the demo)
-    bath_min = (0.0, 0.0, 0.0)
-    bath_max = (1.0, 1.0, 0.02)
+    bath_min = (-1.0, -1.0, -1.0)
+    bath_max = (1.0, 1.0, 1.00)
 
     gravity: tuple = (0.0, 0.0, 0.0)  # not used in demo

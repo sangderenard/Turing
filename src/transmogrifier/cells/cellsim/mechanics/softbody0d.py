@@ -22,7 +22,7 @@ from src.transmogrifier.softbody.engine.fields import FieldStack
 
 @dataclass
 class SoftbodyProviderCfg:
-    substeps: int = 1
+    substeps: int = 20
     dt_provider: float = 1.0 / 60.0
     pressure_scale: float = 1.0
     area_scale: float = 1.0
@@ -281,9 +281,9 @@ class Softbody0DProvider(MechanicsProvider):
         # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
 
         # gentle Brownian jiggle (no COM drift)
-        #self._h.fields.add(fluid_noise(sigma=.05, com_neutral=True, dim=3))
+        self._h.fields.add(fluid_noise(sigma=.5e-4, com_neutral=True, dim=3))
 
         # gravity on a subset (example: only cell0 & cell2)
-        # self._h.fields.add(
-        #     gravity(g=(0, -0.4, 0), selector=lambda c: c.id in {"cell0", "cell2"}, dim=3)
-        # )
+        self._h.fields.add(
+             gravity(g=(0, -0.4, 0), selector=lambda c: c.id in {"cell0", "cell1","cell2"}, dim=3)
+        )

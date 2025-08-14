@@ -579,7 +579,9 @@ def main():
                 P = perspective(fovy, aspect, near, far)
                 V = look_at(eye, center, up)
                 # scene/world rotation using wall-clock
-                rot_speed = 0.25 if not args.flat2d else 0.0
+                # Turn off rotation for lower-dimensional sims (1D/2D) to match NumPy demo behavior
+                sim_dim = int(getattr(args, "sim_dim", 3))
+                rot_speed = 0.25 if (not args.flat2d and sim_dim == 3) else 0.0
                 t_wall = time.perf_counter() - t0
                 theta = rot_speed * t_wall
                 T_neg = translate(-center)

@@ -1,9 +1,14 @@
 # fields.py
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, TYPE_CHECKING
 import numpy as np
 
-VecFn = Callable[[np.ndarray, float, "Cell", "World"], np.ndarray]
+if TYPE_CHECKING:
+    # Only imported for type checking to avoid runtime cycles
+    from .hierarchy import Cell, Hierarchy
+
+# Vector field function: (X, t, cell, world) -> per-vertex vectors
+VecFn = Callable[[np.ndarray, float, "Cell", "Hierarchy"], np.ndarray]
 
 @dataclass
 class VectorField:
