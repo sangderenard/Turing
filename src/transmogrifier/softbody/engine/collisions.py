@@ -41,10 +41,6 @@ def _vertex_triangle_penetration(v: np.ndarray, a: np.ndarray, b: np.ndarray, c:
 def _resolve_pair(v: np.ndarray, tri_verts: List[np.ndarray], normal: np.ndarray, depth: float):
     v += -depth * normal
 
-import numpy as np
-from scipy import sparse
-
-import numpy as np
 
 def build_self_contacts_spatial_hash(
     X: np.ndarray,
@@ -55,6 +51,7 @@ def build_self_contacts_spatial_hash(
     # memory & batching
     max_vox_entries: int = 8_000_000,    # ~face-voxel expansions per face-chunk
     vbatch: int = 250_000,               # vertices per vertex-chunk
+    ram_limit_bytes: int | None = None,  # cap temporary arrays; shrink chunks if needed
     # sparsification
     vertex_sample: float = 1.0,          # process this fraction of vertices globally (0..1]
     keep_prob: float = 1.0,              # thin candidate (vi,fi) inside each batch (0..1]
@@ -72,10 +69,13 @@ def build_self_contacts_spatial_hash(
     - `vertex_sample < 1` skips a fraction of vertices deterministically.
     - `keep_prob < 1` randomly thins candidates (per-pair Bernoulli).
     - `adjacency="self"` removes pairs where the vertex is one of the face's 3 vertices.
+    - Pairs are deduped incrementally via 64-bit hashing to stay NumPy-only.
 
     Notes:
-      * For very large outputs, the final unique() can still be heavy. If that’s
-        a problem, switch to a consumer that accepts batch-emitted pairs.
+      * Temporary array sizes are estimated from ``max_vox_entries`` and
+        ``vbatch``.  If ``ram_limit_bytes`` is given, both chunk sizes are
+        aggressively halved until the estimate fits the budget.  This prevents
+        rare out-of-memory spikes on large meshes.
     """
     n = X.shape[0]
     m = faces.shape[0]
@@ -84,6 +84,24 @@ def build_self_contacts_spatial_hash(
 
     inv_vox = 1.0 / max(voxel_size, 1e-12)
     face_cell = cell_ids[faces[:, 0]]
+
+    # --- Estimate chunk memory & shrink to fit budget -------------------------
+    def _estimate(face_vox: int, vchunk: int) -> tuple[int, int]:
+        """Return (face_bytes, vert_bytes) for the memory model."""
+        # face expansion arrays: face_for_vox, kt, vx, vy, vz, order_t
+        face_bytes = face_vox * (8 * 5 + 4)
+        # vertex arrays: idx_v, V, vvox, kv, vv_idx and a few temporaries
+        vert_bytes = vchunk * (3 * 8 + 3 * 8 + 27 * (8 + 4))
+        return face_bytes, vert_bytes
+
+    if ram_limit_bytes is not None:
+        fb, vb = _estimate(max_vox_entries, vbatch)
+        while fb + vb > ram_limit_bytes and (max_vox_entries > 1 or vbatch > 1):
+            if fb >= vb and max_vox_entries > 1:
+                max_vox_entries = max(1, max_vox_entries // 2)
+            elif vbatch > 1:
+                vbatch = max(1, vbatch // 2)
+            fb, vb = _estimate(max_vox_entries, vbatch)
 
     # --- Precompute face voxel AABBs + per-face expansion counts (vectorized) ---
     P = X[faces]  # (m, 3, 3)
@@ -95,16 +113,9 @@ def build_self_contacts_spatial_hash(
         return np.empty((0, 2), dtype=np.int32)
 
     # --- Build face-chunk boundaries by cumulative voxel expansions ------------
-    # Greedy pack faces until ~max_vox_entries expansion, then start a new chunk.
-    cum = 0
-    f_starts = [0]
-    for i in range(m):
-        c = int(counts[i])
-        if cum and cum + c > max_vox_entries:
-            f_starts.append(i)
-            cum = 0
-        cum += c
-    f_starts.append(m)
+    cum_counts = np.cumsum(counts)
+    thresholds = np.arange(max_vox_entries, cum_counts[-1], max_vox_entries)
+    f_starts = np.concatenate(([0], np.searchsorted(cum_counts, thresholds, side="left"), [m]))
 
     # --- Vertex downsampling mask (deterministic) ------------------------------
     if vertex_sample < 1.0:
@@ -116,8 +127,8 @@ def build_self_contacts_spatial_hash(
 
     rng = np.random.default_rng(rng_seed)
 
-    # collect per-batch results then unique once at the end
-    out_chunks = []
+    codes_seen = np.empty(0, dtype=np.int64)
+    mask32 = np.int64((1 << 32) - 1)
 
     # --- Iterate face-chunks ---------------------------------------------------
     for fs, fe in zip(f_starts[:-1], f_starts[1:]):
@@ -222,14 +233,28 @@ def build_self_contacts_spatial_hash(
                     vi_all = vi_all[keep]; fi_all = fi_all[keep]
 
             if vi_all.size:
-                out_chunks.append(np.stack([vi_all, fi_all], axis=1).astype(np.int32))
+                # discard vertices exactly coplanar with the triangle
+                tri = faces[fi_all]
+                a = X[tri[:, 0]]
+                b = X[tri[:, 1]]
+                c = X[tri[:, 2]]
+                n = np.cross(b - a, c - a)
+                dist = np.einsum("ij,ij->i", X[vi_all] - a, n)
+                mask = dist != 0.0
+                if not mask.any():
+                    continue
+                vi_all = vi_all[mask]; fi_all = fi_all[mask]
 
-    if not out_chunks:
+            if vi_all.size:
+                codes = (vi_all.astype(np.int64) << 32) | fi_all.astype(np.int64)
+                codes_seen = np.unique(np.concatenate([codes_seen, codes]))
+
+    if codes_seen.size == 0:
         return np.empty((0, 2), dtype=np.int32)
 
-    # Concatenate & deduplicate once. If this is still too big, switch to a streaming consumer.
-    out = np.concatenate(out_chunks, axis=0)
-    out = np.unique(out, axis=0)
+    out = np.empty((codes_seen.size, 2), dtype=np.int32)
+    out[:, 0] = (codes_seen >> 32).astype(np.int32)
+    out[:, 1] = (codes_seen & mask32).astype(np.int32)
     return out
 
 

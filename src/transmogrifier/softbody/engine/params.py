@@ -20,6 +20,12 @@ class EngineParams:
     # reduce memory churn.
     enable_self_contacts: bool = True
     contact_voxel_size: float = 0.05
+    # Chunking knobs for ``build_self_contacts_spatial_hash``.  ``max_vox_entries``
+    # and ``vbatch`` are shrunk automatically when the estimated temporary array
+    # footprint exceeds ``contact_ram_limit``.
+    contact_max_vox_entries: int = 8_000_000
+    contact_vbatch: int = 250_000
+    contact_ram_limit: int | None = None  # bytes; ``None`` = no cap
 
     # Thin bath (Z is 1 voxel thick in the demo)
     bath_min = (0.0, 0.0, 0.0)

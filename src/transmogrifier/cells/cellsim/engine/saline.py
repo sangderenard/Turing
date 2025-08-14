@@ -172,9 +172,14 @@ class SalineEngine:
         idx_Na = self.species_index.get("Na")
         idx_K = self.species_index.get("K")
         if idx_Na is not None or idx_K is not None:
+            # Refresh constant pump rates from cells each step
+            self.J_pump_const = np.asarray(
+                [getattr(c, "J_pump", 0.0) for c in self.cells], dtype=float
+            )
             # Constant-rate for cells with J_pump > 0
             mask_const = self.J_pump_const > 0.0
-            J_pump[mask_const] = na_k_atpase_constant(self.J_pump_const[mask_const])
+            if np.any(mask_const):
+                J_pump[mask_const] = na_k_atpase_constant(self.J_pump_const[mask_const])
             # Saturating for enabled pumps
             mask_sat = (~mask_const) & self.pump_enabled
             if np.any(mask_sat):
@@ -234,6 +239,14 @@ class SalineEngine:
         # Update bath pressure if compressible
         if self.bath_compressibility > 0.0:
             self.bath_pressure += -(sum_dV / (self.bath_compressibility * max(self.bath_V, 1e-18)))
+
+        # Scatter array state back to object graph for external observers
+        for i, c in enumerate(self.cells):
+            c.V = float(self.V[i])
+            for j, sp in enumerate(species_list):
+                c.n[sp] = float(self.n[i, j])
+        for i, sp in enumerate(species_list):
+            self.bath.n[sp] = float(self.bath_n[i])
 
         if self.enable_checks:
             # These checks still reference object graph for messages; can be disabled if desired
