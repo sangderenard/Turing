@@ -489,6 +489,7 @@ def export_opengl_points_stream(args, api, provider):
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
+    vec_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
     # Camera state similar to GL demo
@@ -685,6 +686,7 @@ def stream_opengl_points(args, api, provider):
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
+    vec_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
     api.step(1e-3)
@@ -915,6 +917,7 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
+    vec_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
     pts0, vecs0 = gather_func()
@@ -931,6 +934,7 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
     for f in range(frames):
         pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
+        vec_concat_list.append(vecs.astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
 
         new_center, radius = _compute_center_radius_pts(pts)
@@ -953,8 +957,26 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
         step_func(dt)
         t_sim += dt
 
-    pts_concat = np.concatenate(pts_concat_list, axis=0) if pts_concat_list else np.zeros((0, 3), dtype=np.float32)
-    play_points_stream(pts_offsets, pts_concat, mvps, viewport_w=w, viewport_h=h, loop_mode=args.loop, fps=float(args.fps))
+    pts_concat = (
+        np.concatenate(pts_concat_list, axis=0)
+        if pts_concat_list
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    vec_concat = (
+        np.concatenate(vec_concat_list, axis=0)
+        if vec_concat_list
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    play_points_stream(
+        pts_offsets,
+        pts_concat,
+        mvps,
+        vec_concat=vec_concat,
+        viewport_w=w,
+        viewport_h=h,
+        loop_mode=args.loop,
+        fps=float(args.fps),
+    )
 
 
 def run_fluid_demo(args):

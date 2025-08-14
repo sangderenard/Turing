@@ -698,6 +698,7 @@ def _ensure_gl_context(width: int = 1100, height: int = 800):
 def play_points_stream(pts_offsets: np.ndarray,
                        pts_concat: np.ndarray,
                        mvps: np.ndarray,
+                       vec_concat: np.ndarray | None = None,
                        *,
                        viewport_w: int = 1100,
                        viewport_h: int = 800,
@@ -708,6 +709,7 @@ def play_points_stream(pts_offsets: np.ndarray,
     pts_offsets: (F+1,) int64
     pts_concat:  (N,3) float32
     mvps:        (F,4,4) float32
+    vec_concat:  optional (N,3) float32 per-vertex vectors
     loop_mode:   'none' | 'loop' | 'bounce'
     """
     pygame = _ensure_gl_context(viewport_w, viewport_h)
