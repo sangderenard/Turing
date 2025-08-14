@@ -294,6 +294,10 @@ class VoxelMACFluid:
 
         # Solve Poisson: ∇² p = (ρ/dt) div with Neumann at walls, Dirichlet inside solids
         b = (rho / max(dt, 1e-12)) * div
+        fluid_cells = ~self.solid
+        if np.any(fluid_cells):
+            b_mean = float(b[fluid_cells].mean())
+            b -= b_mean
         pr = self._cg_poisson_cc_rhs(b, self.solid, tol=self.p.pressure_tol, maxiter=self.p.pressure_maxiter)
 
         self.pr = pr
@@ -498,8 +502,39 @@ class VoxelMACFluid:
     # ---------------------------------------------------------------------
     # Linear solvers
     # ---------------------------------------------------------------------
-    def _cg_poisson_cc_rhs(self, b: np.ndarray, solid_cc: np.ndarray, tol=1e-6, maxiter=800) -> np.ndarray:
-        """Solve ∇²x = b with Neumann on walls and Dirichlet inside solids (x=0 in solids)."""
+    def _cg_poisson_cc_rhs(
+        self,
+        b: np.ndarray,
+        solid_cc: np.ndarray,
+        tol: float = 1e-6,
+        maxiter: int = 800,
+        zero_rhs_mean: bool = False,
+        ref_cell: Optional[Tuple[int, int, int]] = None,
+    ) -> np.ndarray:
+        """Solve ∇²x = b with Neumann on walls and Dirichlet inside solids (x=0 in solids).
+
+        Parameters
+        ----------
+        b : np.ndarray
+            Right-hand side.
+        solid_cc : np.ndarray
+            Boolean mask of solid cells.
+        tol : float
+            Convergence tolerance on the residual norm.
+        maxiter : int
+            Maximum CG iterations.
+        zero_rhs_mean : bool, optional
+            If True, subtract the mean of ``b`` over fluid cells before solving to
+            ensure compatibility with the nullspace.
+        ref_cell : tuple of int, optional
+            If given, subtract the resulting pressure at this fluid cell from the
+            entire solution, fixing the additive constant.
+        """
+        b = b.copy()
+        if zero_rhs_mean:
+            fluid = ~solid_cc
+            if np.any(fluid):
+                b -= float(b[fluid].mean())
         nx, ny, nz = self.nx, self.ny, self.nz
         x = np.zeros_like(b)
         r = b - self._laplace_cc(x, solid_cc)
@@ -518,6 +553,8 @@ class VoxelMACFluid:
             rsold = rsnew
         # zero inside solids for consistency
         x[solid_cc] = 0.0
+        if ref_cell is not None:
+            x -= x[ref_cell]
         return x
 
     def _cg_helmholtz_face(self, F: np.ndarray, a: float, axis: int, tol=1e-6, maxiter=200) -> np.ndarray:
