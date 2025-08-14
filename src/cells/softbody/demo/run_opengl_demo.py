@@ -37,6 +37,53 @@ def _normalize_vec(x):
     m = float(np.max(x)) if x.size else 0.0
     return (x / m) if m > 1e-12 else np.zeros_like(x, dtype=np.float64)
 
+
+def compute_curl(vec_field: np.ndarray,
+                 spacing: float | tuple[float, float, float] = 1.0) -> np.ndarray:
+    """Compute curl of a vector field on a regular grid using finite differences.
+
+    Parameters
+    ----------
+    vec_field:
+        Array of shape ``(..., d)`` where ``d`` is ``2`` or ``3`` representing the
+        components of the vector field arranged on a regular grid. The spatial
+        dimensions precede the last axis.
+    spacing:
+        Grid spacing along each axis. Either a scalar applied to all axes or a
+        sequence of length ``d``.
+
+    Returns
+    -------
+    np.ndarray
+        Curl with the same spatial shape. For ``d=2`` the result is a scalar
+        ``(...,)`` representing the out-of-plane component. For ``d=3`` the
+        result has shape ``(..., 3)``.
+    """
+
+    vec_field = np.asarray(vec_field, dtype=np.float64)
+    dim = vec_field.shape[-1]
+    spacing = np.broadcast_to(np.array(spacing, dtype=np.float64), (dim,))
+
+    if dim == 2:
+        Fx = vec_field[..., 0]
+        Fy = vec_field[..., 1]
+        dFydx, dFydy = np.gradient(Fy, *spacing, edge_order=2)
+        dFxdx, dFxdy = np.gradient(Fx, *spacing, edge_order=2)
+        return dFydx - dFxdy
+    elif dim == 3:
+        Fx = vec_field[..., 0]
+        Fy = vec_field[..., 1]
+        Fz = vec_field[..., 2]
+        dFxdx, dFxdy, dFxdz = np.gradient(Fx, *spacing, edge_order=2)
+        dFydx, dFydy, dFydz = np.gradient(Fy, *spacing, edge_order=2)
+        dFzdx, dFzdy, dFzdz = np.gradient(Fz, *spacing, edge_order=2)
+        curl_x = dFzdy - dFydz
+        curl_y = dFxdz - dFzdx
+        curl_z = dFydx - dFxdy
+        return np.stack((curl_x, curl_y, curl_z), axis=-1)
+    else:
+        raise ValueError("vec_field must have 2 or 3 components in its last axis")
+
 def _measure_pressure_mass(h, api):
     """Return (pressures, masses, greens255) per cell index."""
     pressures, masses, greens = [], [], []
@@ -209,6 +256,8 @@ POINT_VS = """
 layout(location=0) in vec3 aBase;   // arrow mesh vertex (unit scale, +X axis)
 layout(location=1) in vec3 aOffset; // per-instance position
 layout(location=2) in vec3 aVec;    // per-instance velocity vector
+layout(location=3) in float aScalar; // per-instance scalar (magnitude, curl, ...)
+out float vScalar;
 uniform mat4 uMVP;
 void main(){
     float len = length(aVec);
@@ -220,15 +269,25 @@ void main(){
     base.x *= len;            // scale by vector length (length along +X)
     vec2 xy = rot * base.xy;  // rotate into direction
     vec3 world = vec3(xy, base.z) + aOffset;
+    vScalar = aScalar;
     gl_Position = uMVP * vec4(world, 1.0);
 }
 """
 POINT_FS = """
 #version 330 core
+in float vScalar;
 out vec4 FragColor;
-uniform vec4 uColor; // rgba
+uniform vec4 uColor; // rgba (alpha used)
+
+vec3 hsv2rgb(vec3 c){
+    vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0.0,4.0,2.0),6.0)-3.0)-1.0,0.0,1.0);
+    return c.z * mix(vec3(1.0), rgb, c.y);
+}
+
 void main(){
-    FragColor = uColor;
+    float t = clamp(vScalar, 0.0, 1.0);
+    vec3 col = hsv2rgb(vec3(0.7*(1.0 - t), 1.0, 1.0));
+    FragColor = vec4(col, uColor.a);
 }
 """
 
@@ -408,7 +467,7 @@ class PointsGL:
 class ArrowsGL:
     """Instanced arrow renderer using per-instance velocity vectors."""
 
-    def __init__(self, pts, vecs):
+    def __init__(self, pts, vecs, scalars=None):
         self.n = len(pts)
         self.vao = glGenVertexArrays(1)
         glBindVertexArray(self.vao)
@@ -446,11 +505,22 @@ class ArrowsGL:
         glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
         glVertexAttribDivisor(2, 1)
 
+        # Optional scalar for color mapping (defaults to vector magnitude)
+        if scalars is None:
+            scalars = np.linalg.norm(vecs, axis=1)
+        scalars = _normalize_vec(np.asarray(scalars, dtype=np.float32))
+        self.vbo_scalar = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_scalar)
+        glBufferData(GL_ARRAY_BUFFER, scalars.nbytes, scalars, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0))
+        glVertexAttribDivisor(3, 1)
+
         glBindVertexArray(0)
 
         self.color = np.array([1, 1, 1, 1], dtype=np.float32)
 
-    def upload(self, pts, vecs):
+    def upload(self, pts, vecs, scalars=None):
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo_pos)
         if len(pts) != self.n:
             glBufferData(GL_ARRAY_BUFFER, pts.nbytes, pts, GL_DYNAMIC_DRAW)
@@ -463,6 +533,15 @@ class ArrowsGL:
             glBufferData(GL_ARRAY_BUFFER, vecs.nbytes, vecs, GL_DYNAMIC_DRAW)
         else:
             glBufferSubData(GL_ARRAY_BUFFER, 0, vecs.nbytes, vecs)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo_scalar)
+        if scalars is None:
+            scalars = np.linalg.norm(vecs, axis=1)
+        scalars = _normalize_vec(np.asarray(scalars, dtype=np.float32))
+        if len(scalars) != self.n:
+            glBufferData(GL_ARRAY_BUFFER, scalars.nbytes, scalars, GL_DYNAMIC_DRAW)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, scalars.nbytes, scalars)
 
     def draw(self, prog, u_mvp, u_color, _u_unused=None):
         glUniform4fv(u_color, 1, self.color)
@@ -815,6 +894,7 @@ def play_points_stream(pts_offsets: np.ndarray,
                        pts_concat: np.ndarray,
                        mvps: np.ndarray,
                        vec_concat: np.ndarray | None = None,
+                       scalar_concat: np.ndarray | None = None,
                        *,
                        viewport_w: int = 1100,
                        viewport_h: int = 800,
@@ -823,10 +903,11 @@ def play_points_stream(pts_offsets: np.ndarray,
     """Render a precomputed OpenGL points stream in-process.
 
     pts_offsets: (F+1,) int64
-    pts_concat:  (N,3) float32
-    mvps:        (F,4,4) float32
-    vec_concat:  optional (N,3) float32 per-vertex vectors
-    loop_mode:   'none' | 'loop' | 'bounce'
+    pts_concat:   (N,3) float32
+    mvps:         (F,4,4) float32
+    vec_concat:   optional (N,3) float32 per-vertex vectors
+    scalar_concat: optional (N,) float32 per-vertex scalar (magnitude, curl, ...)
+    loop_mode:    'none' | 'loop' | 'bounce'
     """
     pygame = _ensure_gl_context(viewport_w, viewport_h)
     from OpenGL.GL import (
@@ -852,10 +933,18 @@ def play_points_stream(pts_offsets: np.ndarray,
         if vec_concat is not None
         else None
     )
+    scalars = (
+        scalar_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
+        if scalar_concat is not None
+        else None
+    )
     if vecs is not None:
+        if scalars is None:
+            scalars = np.linalg.norm(vecs, axis=1)
         gl_pts = ArrowsGL(
             pts.astype(np.float32, copy=False),
             vecs.astype(np.float32, copy=False),
+            scalars.astype(np.float32, copy=False),
         )
         use_arrows = True
     else:
@@ -892,16 +981,23 @@ def play_points_stream(pts_offsets: np.ndarray,
         cur = pts_concat[start:end]
         if use_arrows:
             cur_vecs = vec_concat[start:end]
+            cur_scalars = (
+                scalar_concat[start:end]
+                if scalar_concat is not None
+                else np.linalg.norm(cur_vecs, axis=1)
+            )
             if gl_pts.n != len(cur):
                 gl_pts = ArrowsGL(
                     cur.astype(np.float32, copy=False),
                     cur_vecs.astype(np.float32, copy=False),
+                    cur_scalars.astype(np.float32, copy=False),
                 )
                 gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
             else:
                 gl_pts.upload(
                     cur.astype(np.float32, copy=False),
                     cur_vecs.astype(np.float32, copy=False),
+                    cur_scalars.astype(np.float32, copy=False),
                 )
         else:
             if gl_pts.n != len(cur):
