@@ -325,20 +325,33 @@ def gather_vertices(h):
         return None
 
 class PointsGL:
-    def __init__(self, pts, cols):
+    def __init__(self, pts, vecs=None, cols=None):
         self.n = len(pts)
         self.vao = glGenVertexArrays(1)
-        self.vbo = glGenBuffers(1)
         glBindVertexArray(self.vao)
+
+        # Position buffer
+        self.vbo = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         glBufferData(GL_ARRAY_BUFFER, pts.nbytes, pts, GL_DYNAMIC_DRAW)
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+
+        # Optional vector buffer
+        self.vbo_vec = None
+        if vecs is not None:
+            self.vbo_vec = glGenBuffers(1)
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo_vec)
+            glBufferData(GL_ARRAY_BUFFER, vecs.nbytes, vecs, GL_DYNAMIC_DRAW)
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+
         glBindVertexArray(0)
+
         self.color = np.array([1,1,1,0.5], dtype=np.float32)  # fallback if no per-pt color
         self.cols = cols  # not used per-point to keep shader minimal
 
-    def upload(self, pts):
+    def upload(self, pts, vecs=None):
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         # If size changed, reallocate buffer
         if len(pts) != self.n:
@@ -346,6 +359,13 @@ class PointsGL:
             self.n = len(pts)
         else:
             glBufferSubData(GL_ARRAY_BUFFER, 0, pts.nbytes, pts)
+
+        if self.vbo_vec is not None and vecs is not None:
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo_vec)
+            if len(vecs) != self.n:
+                glBufferData(GL_ARRAY_BUFFER, vecs.nbytes, vecs, GL_DYNAMIC_DRAW)
+            else:
+                glBufferSubData(GL_ARRAY_BUFFER, 0, vecs.nbytes, vecs)
 
     def draw(self, prog, u_mvp, u_color, u_psize):
         glUniform4fv(u_color, 1, self.color)
@@ -461,17 +481,17 @@ def main():
                 cs.faces = F
                 gl_cells.append(CellGL(cs))
         else:
-            gl_vtx_pts = PointsGL(np.zeros((1,3), dtype=np.float32), None)
+            gl_vtx_pts = PointsGL(np.zeros((1,3), dtype=np.float32))
             gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     else:
         if args.render == "mesh":
             gl_cells = _rebuild_gl_cells(h)
             pts, cols = gather_organelles(h)
-            gl_pts = PointsGL(pts, cols) if pts is not None else None
+            gl_pts = PointsGL(pts, cols=cols) if pts is not None else None
         else:
             vtx = gather_vertices(h)
             if vtx is not None:
-                gl_vtx_pts = PointsGL(vtx, None)
+                gl_vtx_pts = PointsGL(vtx)
                 gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
     # camera (initialized to look near the initial cell cluster)
@@ -522,7 +542,7 @@ def main():
                         gl_pts = None
                     else:
                         if gl_pts.n != len(pts):
-                            gl_pts = PointsGL(pts, None)
+                            gl_pts = PointsGL(pts)
                         else:
                             gl_pts.upload(pts)
             else:
@@ -532,10 +552,10 @@ def main():
                     gl_vtx_pts = None
                 else:
                     if gl_vtx_pts is None:
-                        gl_vtx_pts = PointsGL(vtx, None)
+                        gl_vtx_pts = PointsGL(vtx)
                         gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
                     elif gl_vtx_pts.n != len(vtx):
-                        gl_vtx_pts = PointsGL(vtx, None)
+                        gl_vtx_pts = PointsGL(vtx)
                         gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
                     else:
                         gl_vtx_pts.upload(vtx)
@@ -657,7 +677,7 @@ def main():
                 start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
                 pts = pts_concat[start:end]
                 if gl_vtx_pts is None or gl_vtx_pts.n != len(pts):
-                    gl_vtx_pts = PointsGL(pts, None)
+                    gl_vtx_pts = PointsGL(pts)
                     gl_vtx_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
                 else:
                     gl_vtx_pts.upload(pts)
@@ -728,7 +748,15 @@ def play_points_stream(pts_offsets: np.ndarray,
 
     # Set up a single reusable point cloud object
     pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
-    gl_pts = PointsGL(pts.astype(np.float32, copy=False), None)
+    vecs = (
+        vec_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
+        if vec_concat is not None
+        else None
+    )
+    gl_pts = PointsGL(
+        pts.astype(np.float32, copy=False),
+        vecs.astype(np.float32, copy=False) if vecs is not None else None,
+    )
     gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
     clock = pygame.time.Clock()
@@ -755,14 +783,21 @@ def play_points_stream(pts_offsets: np.ndarray,
         elif fidx < 0 and loop_mode == "bounce":
             direction = 1; frame = 0; fidx = 0
 
-        # Upload per-frame points
+        # Upload per-frame points (and optional vectors)
         start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
         cur = pts_concat[start:end]
+        cur_vecs = vec_concat[start:end] if vec_concat is not None else None
         if gl_pts.n != len(cur):
-            gl_pts = PointsGL(cur.astype(np.float32, copy=False), None)
+            gl_pts = PointsGL(
+                cur.astype(np.float32, copy=False),
+                cur_vecs.astype(np.float32, copy=False) if cur_vecs is not None else None,
+            )
             gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
         else:
-            gl_pts.upload(cur.astype(np.float32, copy=False))
+            gl_pts.upload(
+                cur.astype(np.float32, copy=False),
+                cur_vecs.astype(np.float32, copy=False) if cur_vecs is not None else None,
+            )
 
         MVP = mvps[fidx].astype(np.float32, copy=False)
 
