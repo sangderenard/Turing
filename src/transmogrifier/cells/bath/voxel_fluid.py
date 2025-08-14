@@ -204,7 +204,9 @@ class VoxelMACFluid:
         T0 = self.T.copy(); S0 = self.S.copy()
         self.T = self._advect_scalar_cc(T0, dt)
         self.S = self._advect_scalar_cc(S0, dt)
+        self.S = np.clip(self.S, 0.0, 1.0)
         self._diffuse_scalars(dt)
+        self.S = np.clip(self.S, 0.0, 1.0)
 
     # ---------------------------------------------------------------------
     # Forces
