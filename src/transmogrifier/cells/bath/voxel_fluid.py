@@ -220,13 +220,25 @@ class VoxelMACFluid:
         # deposit to faces by averaging neighboring cells
         # u faces at (i, j+1/2, k+1/2) average cells (i-1, j, k) and (i, j, k)
         if fx != 0.0:
-            ru = 0.5 * (self._pad_x(rho_eff, left=True) + self._pad_x(rho_eff, left=False))
+            ru = 0.5 * (
+                self._pad_x(rho_eff, left=True, expand=True)
+                + self._pad_x(rho_eff, left=False, expand=True)
+            )
+            ru[self.solid_u] = 0.0
             self.u += dt * fx * ru / p.rho0
         if fy != 0.0:
-            rv = 0.5 * (self._pad_y(rho_eff, left=True) + self._pad_y(rho_eff, left=False))
+            rv = 0.5 * (
+                self._pad_y(rho_eff, left=True, expand=True)
+                + self._pad_y(rho_eff, left=False, expand=True)
+            )
+            rv[self.solid_v] = 0.0
             self.v += dt * fy * rv / p.rho0
         if fz != 0.0:
-            rw = 0.5 * (self._pad_z(rho_eff, left=True) + self._pad_z(rho_eff, left=False))
+            rw = 0.5 * (
+                self._pad_z(rho_eff, left=True, expand=True)
+                + self._pad_z(rho_eff, left=False, expand=True)
+            )
+            rw[self.solid_w] = 0.0
             self.w += dt * fz * rw / p.rho0
 
     # ---------------------------------------------------------------------
@@ -593,24 +605,36 @@ class VoxelMACFluid:
     # ---------------------------------------------------------------------
     # Utilities
     # ---------------------------------------------------------------------
-    def _pad_x(self, A: np.ndarray, left: bool) -> np.ndarray:
-        """Pad +/- x for averaging to u faces."""
-        if left:
-            return np.pad(A, ((1,0),(0,0),(0,0)), mode='edge')[:-1,:,:]
-        else:
-            return np.pad(A, ((0,1),(0,0),(0,0)), mode='edge')[1:,:,:]
+    def _pad_x(self, A: np.ndarray, left: bool, expand: bool = False) -> np.ndarray:
+        """Pad +/- x for averaging to u faces.
 
-    def _pad_y(self, A: np.ndarray, left: bool) -> np.ndarray:
+        When ``expand`` is True the returned array has ``nx+1`` entries in the
+        x-direction so it can directly correspond to the u-face grid.  When
+        False the padded array is cropped back to the original size and can be
+        used for centered differences.
+        """
         if left:
-            return np.pad(A, ((0,0),(1,0),(0,0)), mode='edge')[:,:-1,:]
+            P = np.pad(A, ((1, 0), (0, 0), (0, 0)), mode="edge")
+            return P if expand else P[:-1, :, :]
         else:
-            return np.pad(A, ((0,0),(0,1),(0,0)), mode='edge')[:,1:,:]
+            P = np.pad(A, ((0, 1), (0, 0), (0, 0)), mode="edge")
+            return P if expand else P[1:, :, :]
 
-    def _pad_z(self, A: np.ndarray, left: bool) -> np.ndarray:
+    def _pad_y(self, A: np.ndarray, left: bool, expand: bool = False) -> np.ndarray:
         if left:
-            return np.pad(A, ((0,0),(0,0),(1,0)), mode='edge')[:,:,:-1]
+            P = np.pad(A, ((0, 0), (1, 0), (0, 0)), mode="edge")
+            return P if expand else P[:, :-1, :]
         else:
-            return np.pad(A, ((0,0),(0,0),(0,1)), mode='edge')[:,:,1:]
+            P = np.pad(A, ((0, 0), (0, 1), (0, 0)), mode="edge")
+            return P if expand else P[:, 1:, :]
+
+    def _pad_z(self, A: np.ndarray, left: bool, expand: bool = False) -> np.ndarray:
+        if left:
+            P = np.pad(A, ((0, 0), (0, 0), (1, 0)), mode="edge")
+            return P if expand else P[:, :, :-1]
+        else:
+            P = np.pad(A, ((0, 0), (0, 0), (0, 1)), mode="edge")
+            return P if expand else P[:, :, 1:]
 
     def _accumulate_face_forces(self, F: np.ndarray, centers: np.ndarray, comp: np.ndarray, radius: float, axis: int) -> None:
         """Distribute force density onto face grid with a cone kernel."""
