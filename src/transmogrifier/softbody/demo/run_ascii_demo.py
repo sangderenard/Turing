@@ -198,6 +198,8 @@ def main():
                         help="Draw every Nth face to control cost (default: 8)")
     parser.add_argument("--no-points", action="store_true",
                         help="Disable drawing vertex points to lighten output")
+    parser.add_argument("--no-self-contacts", action="store_true",
+                        help="Disable intra-mesh self-contact broad-phase to reduce RAM/CPU")
     parser.add_argument("--stream-npz", type=str, default="",
                         help="If provided, read a prerendered ASCII NPZ stream and play it.")
     args = parser.parse_args()
@@ -242,6 +244,16 @@ def main():
         substeps=args.substeps,
         dt_provider=args.dt_provider,
     )
+    # Optional: prime mechanics and disable self-contacts before main loop
+    if getattr(args, "no_self_contacts", False):
+        try:
+            # ensure hierarchy exists
+            api.step(1e-6)
+            h = getattr(provider, "_h", None)
+            if h is not None and hasattr(h, "params"):
+                setattr(h.params, "enable_self_contacts", False)
+        except Exception:
+            pass
     # Assign clear identity greens for cells (rendering only)
     try:
         levels = [64, 144, 208]
@@ -310,3 +322,56 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ---- In-process ASCII streaming API ---------------------------------------
+def play_ascii_stream(chars: np.ndarray,
+                      rgb: np.ndarray,
+                      *,
+                      color_mode: str = "auto",
+                      loop_mode: str = "none",
+                      fps: float = 30.0):
+    """Render an ASCII stream from NumPy arrays without file I/O.
+
+    chars: (F, ny, nx) uint8 of ASCII codes.
+    rgb:   (F, ny, nx, 3) uint8 of per-cell colors.
+    loop_mode: 'none' | 'loop' | 'bounce'
+    """
+    import time
+    F = int(chars.shape[0])
+    frame = 0
+    direction = 1
+    prev_lines = 0
+    dt_target = 1.0 / max(1e-6, float(fps))
+    while True:
+        fidx = int(frame)
+        if fidx >= F:
+            if loop_mode == "loop":
+                fidx = 0; frame = 0
+            elif loop_mode == "bounce":
+                direction = -1; frame = F-1; fidx = frame
+            else:
+                break
+        elif fidx < 0 and loop_mode == "bounce":
+            direction = 1; frame = 0; fidx = 0
+
+        if _is_tty() and prev_lines:
+            sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
+        sys.stdout.write(f"Frame {fidx}\n")
+        ny, nx = chars.shape[1], chars.shape[2]
+        for iy in range(ny):
+            parts = []
+            ch_row = chars[fidx, iy]
+            rgb_row = rgb[fidx, iy]
+            # vectorized join still needs per-cell colorization, but avoid Python tuple packing
+            for ix in range(nx):
+                ch = chr(int(ch_row[ix]))
+                r = int(rgb_row[ix, 0]); g = int(rgb_row[ix, 1]); b = int(rgb_row[ix, 2])
+                parts.append(colorize(ch, (r, g, b), mode=color_mode))
+            sys.stdout.write(''.join(parts) + "\n")
+        sys.stdout.flush()
+        prev_lines = 1 + ny
+
+        t0 = time.perf_counter()
+        time.sleep(max(0.0, dt_target - (time.perf_counter() - t0)))
+        frame += direction
+

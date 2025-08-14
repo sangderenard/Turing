@@ -41,88 +41,197 @@ def _vertex_triangle_penetration(v: np.ndarray, a: np.ndarray, b: np.ndarray, c:
 def _resolve_pair(v: np.ndarray, tri_verts: List[np.ndarray], normal: np.ndarray, depth: float):
     v += -depth * normal
 
+import numpy as np
+from scipy import sparse
+
+import numpy as np
 
 def build_self_contacts_spatial_hash(
-    X: np.ndarray, faces: np.ndarray, cell_ids: np.ndarray, voxel_size: float
+    X: np.ndarray,
+    faces: np.ndarray,
+    cell_ids: np.ndarray,
+    voxel_size: float,
+    *,
+    # memory & batching
+    max_vox_entries: int = 8_000_000,    # ~face-voxel expansions per face-chunk
+    vbatch: int = 250_000,               # vertices per vertex-chunk
+    # sparsification
+    vertex_sample: float = 1.0,          # process this fraction of vertices globally (0..1]
+    keep_prob: float = 1.0,              # thin candidate (vi,fi) inside each batch (0..1]
+    rng_seed: int | None = 0,
+    # adjacency
+    adjacency: str = "self",             # "none" | "self"
 ) -> np.ndarray:
-    """Return potential vertex–triangle pairs using a 3‑D hash grid.
-
-    Parameters
-    ----------
-    X : (n, 3) array
-        Vertex positions.
-    faces : (m, 3) array
-        Triangle vertex indices.
-    cell_ids : (n,) array
-        Cell identifier per vertex.  Faces are assumed to belong to the cell of
-        their first vertex.  Contacts are only generated within a cell.
-    voxel_size : float
-        Edge length of spatial hash voxels.
-
-    Returns
-    -------
-    np.ndarray
-        Array of ``(vertex_index, face_index)`` pairs that may collide.  The
-        function performs only a broad‑phase search and does *not* check actual
-        penetration depths.
     """
+    Streaming broad-phase vertex–triangle candidate generator with sub-batching
+    and sparsification. Returns unique (vi, fi) pairs.
 
-    if X.size == 0 or faces.size == 0:
+    - Sub-batches faces by *expanded voxel count* so we never allocate the full
+      face->voxel expansion at once.
+    - Sub-batches vertices so the 27-neighborhood key set is bounded.
+    - `vertex_sample < 1` skips a fraction of vertices deterministically.
+    - `keep_prob < 1` randomly thins candidates (per-pair Bernoulli).
+    - `adjacency="self"` removes pairs where the vertex is one of the face's 3 vertices.
+
+    Notes:
+      * For very large outputs, the final unique() can still be heavy. If that’s
+        a problem, switch to a consumer that accepts batch-emitted pairs.
+    """
+    n = X.shape[0]
+    m = faces.shape[0]
+    if n == 0 or m == 0:
         return np.empty((0, 2), dtype=np.int32)
 
     inv_vox = 1.0 / max(voxel_size, 1e-12)
-
-    # --- Build per-face adjacency to exclude neighbour triangles -------------
-    n_faces = len(faces)
-    adjacency = [set(f) for f in faces]  # start with the face's own vertices
-    edge2faces = {}
-    for fi, (i, j, k) in enumerate(faces):
-        for e in ((i, j), (j, k), (k, i)):
-            key = tuple(sorted(e))
-            edge2faces.setdefault(key, []).append(fi)
-
-    for tris in edge2faces.values():
-        if len(tris) < 2:
-            continue
-        verts = set()
-        for fi in tris:
-            verts.update(faces[fi])
-        for fi in tris:
-            adjacency[fi].update(verts)
-
-    # --- Hash triangles into voxel grid -------------------------------------
-    tri_hash = {}
-    for fi in range(n_faces):
-        pts = X[faces[fi]]
-        mn = np.floor(pts.min(axis=0) * inv_vox).astype(int)
-        mx = np.floor(pts.max(axis=0) * inv_vox).astype(int)
-        for ix in range(mn[0], mx[0] + 1):
-            for iy in range(mn[1], mx[1] + 1):
-                for iz in range(mn[2], mx[2] + 1):
-                    tri_hash.setdefault((ix, iy, iz), []).append(fi)
-
     face_cell = cell_ids[faces[:, 0]]
-    pairs = set()
-    for vi, v in enumerate(X):
-        cell = cell_ids[vi]
-        voxel = np.floor(v * inv_vox).astype(int)
-        for ix in range(voxel[0] - 1, voxel[0] + 2):
-            for iy in range(voxel[1] - 1, voxel[1] + 2):
-                for iz in range(voxel[2] - 1, voxel[2] + 2):
-                    tris = tri_hash.get((ix, iy, iz))
-                    if not tris:
-                        continue
-                    for fi in tris:
-                        if face_cell[fi] != cell:
-                            continue
-                        if vi in adjacency[fi]:
-                            continue
-                        pairs.add((vi, fi))
 
-    if not pairs:
+    # --- Precompute face voxel AABBs + per-face expansion counts (vectorized) ---
+    P = X[faces]  # (m, 3, 3)
+    mn = np.floor(P.min(axis=1) * inv_vox).astype(np.int64)   # (m,3)
+    mx = np.floor(P.max(axis=1) * inv_vox).astype(np.int64)   # (m,3)
+    spans = (mx - mn + 1)                                     # (m,3)
+    counts = spans[:, 0] * spans[:, 1] * spans[:, 2]          # voxels per face
+    if counts.sum() == 0:
         return np.empty((0, 2), dtype=np.int32)
-    out = np.array(sorted(pairs), dtype=np.int32)
+
+    # --- Build face-chunk boundaries by cumulative voxel expansions ------------
+    # Greedy pack faces until ~max_vox_entries expansion, then start a new chunk.
+    cum = 0
+    f_starts = [0]
+    for i in range(m):
+        c = int(counts[i])
+        if cum and cum + c > max_vox_entries:
+            f_starts.append(i)
+            cum = 0
+        cum += c
+    f_starts.append(m)
+
+    # --- Vertex downsampling mask (deterministic) ------------------------------
+    if vertex_sample < 1.0:
+        # hash-like deterministic mask: keep roughly vertex_sample fraction
+        step = max(1, int(round(1.0 / vertex_sample)))
+        v_keep_mask = (np.arange(n, dtype=np.int64) % step) == 0
+    else:
+        v_keep_mask = np.ones(n, dtype=bool)
+
+    rng = np.random.default_rng(rng_seed)
+
+    # collect per-batch results then unique once at the end
+    out_chunks = []
+
+    # --- Iterate face-chunks ---------------------------------------------------
+    for fs, fe in zip(f_starts[:-1], f_starts[1:]):
+        F_idx = np.arange(fs, fe, dtype=np.int64)
+        if F_idx.size == 0:
+            continue
+
+        spans_f = spans[F_idx]
+        mn_f = mn[F_idx]
+
+        # Expand face voxels for this chunk (vectorized, same trick as before)
+        sx, sy, sz = spans_f.T
+        counts_f = sx * sy * sz
+        total = int(counts_f.sum())
+        off = np.empty(len(F_idx) + 1, dtype=np.int64); off[0] = 0
+        np.cumsum(counts_f, out=off[1:])
+
+        face_for_vox = np.repeat(F_idx, counts_f)
+        t_all = np.arange(total, dtype=np.int64) - off[face_for_vox - F_idx[0]]
+
+        sy_ = sy[face_for_vox - F_idx[0]]
+        sz_ = sz[face_for_vox - F_idx[0]]
+        yz = sy_ * sz_
+        dx = t_all // yz
+        rem = t_all - dx * yz
+        dy = rem // sz_
+        dz = rem - dy * sz_
+
+        vx = mn_f[face_for_vox - F_idx[0], 0] + dx
+        vy = mn_f[face_for_vox - F_idx[0], 1] + dy
+        vz = mn_f[face_for_vox - F_idx[0], 2] + dz
+
+        # hash voxel indices (int64, works with negatives)
+        kt = (vx * 73856093) ^ (vy * 19349663) ^ (vz * 83492791)
+        order_t = np.argsort(kt, kind="mergesort")
+        kt_sorted = kt[order_t]
+        face_sorted = face_for_vox[order_t].astype(np.int32, copy=False)
+
+        # --- Iterate vertex-chunks --------------------------------------------
+        for v0 in range(0, n, vbatch):
+            v1 = min(v0 + vbatch, n)
+            # apply global vertex downsampling in this chunk
+            sel = v_keep_mask[v0:v1]
+            if not sel.any():
+                continue
+            idx_v = np.arange(v0, v1, dtype=np.int32)[sel]
+            V = X[idx_v]
+
+            # 27-neighborhood voxel keys for these vertices
+            vvox = np.floor(V * inv_vox).astype(np.int64)  # (k,3)
+            offs = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1],
+                                        indexing="ij")).reshape(3, -1).T  # (27,3)
+            nei = vvox[:, None, :] + offs[None, :, :]      # (k,27,3)
+            kv = (nei[..., 0].ravel() * 73856093) ^ \
+                 (nei[..., 1].ravel() * 19349663) ^ \
+                 (nei[..., 2].ravel() * 83492791)          # (27k,)
+            vv_idx = np.repeat(idx_v.astype(np.int32, copy=False), 27)
+
+            # intersect with face voxels for this face-chunk
+            L = np.searchsorted(kt_sorted, kv, side="left")
+            R = np.searchsorted(kt_sorted, kv, side="right")
+            lens = R - L
+            valid = lens > 0
+            if not valid.any():
+                continue
+
+            L = L[valid]
+            lens = lens[valid]
+            verts_sel = vv_idx[valid]
+
+            csum = np.cumsum(lens, dtype=np.int64)
+            starts = csum - lens
+            base = np.repeat(L, lens)
+            within = np.arange(csum[-1], dtype=np.int64) - np.repeat(starts, lens)
+            tri_pos = base + within
+
+            fi_all = face_sorted[tri_pos]                # candidate faces
+            vi_all = np.repeat(verts_sel, lens)          # matching vertices
+
+            # same-cell filter
+            same = (cell_ids[vi_all] == face_cell[fi_all])
+            if not same.any():
+                continue
+            vi_all = vi_all[same]; fi_all = fi_all[same]
+
+            # optional thinning of pairs
+            if keep_prob < 1.0 and vi_all.size:
+                keep = rng.random(vi_all.size) < keep_prob
+                if not keep.any():
+                    continue
+                vi_all = vi_all[keep]; fi_all = fi_all[keep]
+
+            # adjacency filter ("self"): drop if vi in faces[fi]
+            if adjacency == "self" and vi_all.size:
+                # gather 3 verts of each candidate face and compare
+                tri_verts = faces[fi_all]                      # (q,3)
+                bad = (tri_verts[:, 0] == vi_all) | \
+                      (tri_verts[:, 1] == vi_all) | \
+                      (tri_verts[:, 2] == vi_all)
+                if bad.any():
+                    keep = ~bad
+                    vi_all = vi_all[keep]; fi_all = fi_all[keep]
+
+            if vi_all.size:
+                out_chunks.append(np.stack([vi_all, fi_all], axis=1).astype(np.int32))
+
+    if not out_chunks:
+        return np.empty((0, 2), dtype=np.int32)
+
+    # Concatenate & deduplicate once. If this is still too big, switch to a streaming consumer.
+    out = np.concatenate(out_chunks, axis=0)
+    out = np.unique(out, axis=0)
     return out
+
 
 
 def resolve_membrane_collisions(

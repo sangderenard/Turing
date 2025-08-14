@@ -22,7 +22,7 @@ from src.transmogrifier.softbody.engine.fields import FieldStack
 
 @dataclass
 class SoftbodyProviderCfg:
-    substeps: int = 5
+    substeps: int = 1
     dt_provider: float = 1.0 / 60.0
     pressure_scale: float = 1.0
     area_scale: float = 1.0
@@ -56,16 +56,14 @@ class Softbody0DProvider(MechanicsProvider):
 
         # Map cell state onto provider controls using vectorized operations
         assert self._h is not None
-        V = np.maximum(1e-18, np.array([float(c.V) for c in cells], dtype=float))
-        elastic_k = np.array([float(c.elastic_k) for c in cells], dtype=float)
-        imp = np.array([float(c.n.get("Imp", 0.0)) for c in cells], dtype=float)
+        V = np.maximum(1e-18, np.asarray([getattr(c, "V", 0.0) for c in cells], dtype=float))
+        elastic_k = np.asarray([getattr(c, "elastic_k", 0.0) for c in cells], dtype=float)
+        imp = np.asarray([getattr(c, "n", {}).get("Imp", 0.0) for c in cells], dtype=float)
         P_ext = float(getattr(bath, "pressure", 0.0))
 
         V_min, V_max = float(np.min(V)), float(np.max(V))
         if V_max <= V_min:
-            mapped_vols = np.full_like(
-                V, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3)
-            )
+            mapped_vols = np.full_like(V, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3))
         else:
             alpha = (V - V_min) / max(1e-18, (V_max - V_min))
             r = self.cfg.r_min * (1 - alpha) + self.cfg.r_max * alpha
@@ -73,10 +71,34 @@ class Softbody0DProvider(MechanicsProvider):
         osmotic = imp / np.maximum(V, 1e-18)
 
         for sbc, V_t, k, osm in zip(self._h.cells, mapped_vols, elastic_k, osmotic):
-            sbc.constraints["volume"].target = float(V_t)
-            sbc.membrane_tension = float(k)
-            sbc.osmotic_pressure = float(osm)
+            sbc.constraints["volume"].target = V_t
+            sbc.membrane_tension = k
+            sbc.osmotic_pressure = osm
             sbc.external_pressure = P_ext
+
+    # Array-first sync path to avoid Python conversions completely
+    def sync_arrays(self, *, V, elastic_k, imp, bath_pressure: float) -> None:  # type: ignore[override]
+        if self._h is None:
+            return
+        V = np.maximum(1e-18, np.asarray(V, dtype=float))
+        elastic_k = np.asarray(elastic_k, dtype=float)
+        imp = np.asarray(imp, dtype=float)
+        n = V.shape[0]
+        # Map volumes to provider target volumes
+        V_min = float(np.min(V))
+        V_max = float(np.max(V))
+        if V_max <= V_min:
+            mapped_vols = np.full(n, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3), dtype=float)
+        else:
+            alpha = (V - V_min) / max(1e-18, (V_max - V_min))
+            r = self.cfg.r_min * (1 - alpha) + self.cfg.r_max * alpha
+            mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
+        osmotic = imp / np.maximum(V, 1e-18)
+        for sbc, V_t, k, osm in zip(self._h.cells, mapped_vols, elastic_k, osmotic):
+            sbc.constraints["volume"].target = V_t
+            sbc.membrane_tension = k
+            sbc.osmotic_pressure = osm
+            sbc.external_pressure = float(bath_pressure)
 
     def step(self, dt: float) -> MechanicsSnapshot:
         if self._h is None or self._cells is None or self._bath is None:
@@ -136,10 +158,11 @@ class Softbody0DProvider(MechanicsProvider):
         vols      = V
 
         # Write back aggregates to 0D cells
-        for c0d, g, P_i, vol in zip(self._cells, gamma, P_internal, V):
-            c0d.membrane_tension = float(g)
-            c0d.internal_pressure = float(P_i)
-            c0d.measured_volume = float(vol)
+        for c0d, g, P_i, vol in zip(self._cells or [], gamma, P_internal, V):
+            # Keep as raw numpy-friendly types; avoid forcing to Python floats
+            c0d.membrane_tension = g
+            c0d.internal_pressure = P_i
+            c0d.measured_volume = vol
 
         return {"pressures": pressures, "areas": areas, "volumes": vols}
 
@@ -175,7 +198,7 @@ class Softbody0DProvider(MechanicsProvider):
                 r = V_to_r(V_list[idx])
                 X, F, V, invm, edges, bends, constraints = build_cell(
                     id_str=f"cell{idx}", center=(cx, cy, 0.01), radius=r,
-                    params=self._params, subdiv=5, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
+                    params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
                 )
                 # Build minimal shim that Hierarchy expects
                 from src.transmogrifier.softbody.engine.hierarchy import Cell as SBC
@@ -190,8 +213,8 @@ class Softbody0DProvider(MechanicsProvider):
                 idx += 1
 
         self._h = Hierarchy(
-            box_min=np.array([0.0, 0.0, -0.25]),
-            box_max=np.array([1.0, 1.0, 0.25]),
+            box_min=np.array([-2.0, -2.0, -2.0]),
+            box_max=np.array([2.0, 2.0, 2.0]),
             cells=sb_cells,
             solver=solver,
             params=self._params,
@@ -213,7 +236,7 @@ class Softbody0DProvider(MechanicsProvider):
         # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
 
         # gentle Brownian jiggle (no COM drift)
-        self._h.fields.add(fluid_noise(sigma=.05, com_neutral=True, dim=3))
+        #self._h.fields.add(fluid_noise(sigma=.05, com_neutral=True, dim=3))
 
         # gravity on a subset (example: only cell0 & cell2)
         # self._h.fields.add(

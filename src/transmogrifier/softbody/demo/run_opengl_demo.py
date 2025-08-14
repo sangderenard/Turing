@@ -651,3 +651,203 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ---- In-process streaming API ----------------------------------------------
+# These helpers allow another module (like the NumPy demo) to feed frames
+# directly as NumPy arrays without writing/reading NPZ files or using sockets.
+
+def _ensure_gl_context(width: int = 1100, height: int = 800):
+    try:
+        import pygame
+        from pygame.locals import DOUBLEBUF, OPENGL
+    except Exception:
+        raise
+    pygame.init()
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+    pygame.display.set_mode((int(width), int(height)), DOUBLEBUF | OPENGL)
+    pygame.display.set_caption("XPBD Softbody — OpenGL Stream")
+    return pygame
+
+def play_points_stream(pts_offsets: np.ndarray,
+                       pts_concat: np.ndarray,
+                       mvps: np.ndarray,
+                       *,
+                       viewport_w: int = 1100,
+                       viewport_h: int = 800,
+                       loop_mode: str = "none",
+                       fps: float = 60.0):
+    """Render a precomputed OpenGL points stream in-process.
+
+    pts_offsets: (F+1,) int64
+    pts_concat:  (N,3) float32
+    mvps:        (F,4,4) float32
+    loop_mode:   'none' | 'loop' | 'bounce'
+    """
+    pygame = _ensure_gl_context(viewport_w, viewport_h)
+    from OpenGL.GL import (
+        glUseProgram, glUniformMatrix4fv, glUniform4fv, glUniform1f, glViewport,
+        glClearColor, glClear, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_FALSE
+    )
+    from OpenGL.GL import glGetUniformLocation
+
+    # Reuse existing shader and point VAO logic
+    mesh_prog = link_program(MESH_VS, MESH_FS)
+    pt_prog = link_program(POINT_VS, POINT_FS)
+    pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
+    pt_u_color = glGetUniformLocation(pt_prog, "uColor")
+    pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
+
+    # Set up a single reusable point cloud object
+    pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
+    gl_pts = PointsGL(pts.astype(np.float32, copy=False), None)
+    gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+    clock = pygame.time.Clock()
+    running = True
+    frame = 0
+    F = int(mvps.shape[0])
+    direction = 1
+    while running:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                running = False
+
+        # Frame indices with loop/bounce
+        fidx = int(frame)
+        if fidx >= F:
+            if loop_mode == "loop":
+                fidx = 0; frame = 0
+            elif loop_mode == "bounce":
+                direction = -1; frame = F-1; fidx = frame
+            else:
+                running = False; break
+        elif fidx < 0 and loop_mode == "bounce":
+            direction = 1; frame = 0; fidx = 0
+
+        # Upload per-frame points
+        start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
+        cur = pts_concat[start:end]
+        if gl_pts.n != len(cur):
+            gl_pts = PointsGL(cur.astype(np.float32, copy=False), None)
+            gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        else:
+            gl_pts.upload(cur.astype(np.float32, copy=False))
+
+        MVP = mvps[fidx].astype(np.float32, copy=False)
+
+        viewport = pygame.display.get_surface().get_size()
+        glViewport(0, 0, viewport[0], viewport[1])
+        glClearColor(0.06, 0.07, 0.10, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        glUseProgram(pt_prog)
+        glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+        gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+
+        pygame.display.flip()
+        clock.tick(fps)
+        frame += direction
+
+    pygame.quit()
+
+def play_mesh_stream(*,
+                     n_cells: int,
+                     vtx_counts: np.ndarray,
+                     vtx_offsets: np.ndarray,
+                     faces_concat: np.ndarray,
+                     face_counts: np.ndarray,
+                     vtx_concat: np.ndarray,
+                     colors: np.ndarray,
+                     draw_order: np.ndarray,
+                     mvps: np.ndarray,
+                     viewport_w: int = 1100,
+                     viewport_h: int = 800,
+                     loop_mode: str = "none",
+                     fps: float = 60.0):
+    """Render a precomputed OpenGL mesh stream in-process.
+
+    Arguments mirror the NPZ keys used in streaming mode, but are NumPy arrays.
+    loop_mode: 'none' | 'loop' | 'bounce'.
+    """
+    pygame = _ensure_gl_context(viewport_w, viewport_h)
+    from OpenGL.GL import (
+        glUseProgram, glUniformMatrix4fv, glUniform4fv, glViewport,
+        glClearColor, glClear, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_FALSE,
+        glDepthMask
+    )
+    from OpenGL.GL import glGetUniformLocation
+
+    mesh_prog = link_program(MESH_VS, MESH_FS)
+    mesh_u_mvp = glGetUniformLocation(mesh_prog, "uMVP")
+    mesh_u_color = glGetUniformLocation(mesh_prog, "uColor")
+
+    # Build GL wrappers (CellGL) per cell topology once
+    class _CellShim:
+        pass
+    gl_cells = []
+    off = 0
+    # Build faces per cell
+    f_off = 0
+    faces_per_cell = []
+    for i in range(int(n_cells)):
+        nf = int(face_counts[i])
+        F = faces_concat[f_off*3:(f_off+nf)*3].reshape(nf, 3)
+        f_off += nf
+        cs = _CellShim()
+        cs.X = np.zeros((int(vtx_counts[i]), 3), dtype=np.float32)
+        cs.faces = F.astype(np.uint32, copy=False)
+        gl_cells.append(CellGL(cs))
+
+    clock = pygame.time.Clock()
+    running = True
+    frame = 0
+    F = int(mvps.shape[0])
+    direction = 1
+    while running:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                running = False
+
+        fidx = int(frame)
+        if fidx >= F:
+            if loop_mode == "loop":
+                fidx = 0; frame = 0
+            elif loop_mode == "bounce":
+                direction = -1; frame = F-1; fidx = frame
+            else:
+                running = False; break
+        elif fidx < 0 and loop_mode == "bounce":
+            direction = 1; frame = 0; fidx = 0
+
+        MVP = mvps[fidx].astype(np.float32, copy=False)
+
+        viewport = pygame.display.get_surface().get_size()
+        glViewport(0, 0, viewport[0], viewport[1])
+        glClearColor(0.06, 0.07, 0.10, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        glUseProgram(mesh_prog)
+        glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+
+        # Draw in precomputed order
+        order = draw_order[fidx].astype(np.int32, copy=False)
+        for draw_i in order:
+            i = int(draw_i)
+            off = int(vtx_offsets[i]); n = int(vtx_counts[i])
+            gl_cells[i].cell.X = vtx_concat[fidx, off:off+n, :].astype(np.float32, copy=False)
+            gl_cells[i].color = colors[fidx, i, :].astype(np.float32, copy=False)
+            gl_cells[i].upload()
+            gl_cells[i].draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+
+        pygame.display.flip()
+        clock.tick(fps)
+        frame += direction
+
+    pygame.quit()
+

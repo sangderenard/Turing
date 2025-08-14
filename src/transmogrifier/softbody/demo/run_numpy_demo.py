@@ -92,7 +92,7 @@ def make_cellsim_backend(*,
 
 
 def step_cellsim(api: SalinePressureAPI, dt: float) -> float:
-    """Advance cellsim one step; returns suggested next dt."""
+    """Advance cellsim one step; returns suggested next dt. Keeps arrays resident on engine."""
     return api.step(dt)
 
 
@@ -144,11 +144,16 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--dt", type=float, default=1e-10,
         help="base integrator step; increase to amplify drift",
     )
-    # Export options
+    # Export/stream options
     parser.add_argument("--export-npz", type=str, default="",
                         help="If set, write a prerendered NPZ stream to this path.")
     parser.add_argument("--export-kind", choices=["ascii", "opengl-points", "opengl-mesh"], default="",
                         help="What kind of stream to export when --export-npz is set.")
+    parser.add_argument("--stream", choices=["", "ascii", "opengl-points", "opengl-mesh"], default="",
+                        help="If set, stream frames live to the chosen visualizer in-process (no files).")
+    parser.add_argument("--loop", choices=["none", "loop", "bounce"], default="none",
+                        help="Playback mode for streaming/NPZ viewers.")
+    parser.add_argument("--fps", type=float, default=60.0, help="Target FPS for streaming display.")
     parser.add_argument("--ascii-nx", type=int, default=120, help="ASCII export grid width")
     parser.add_argument("--ascii-ny", type=int, default=36, help="ASCII export grid height")
     parser.add_argument("--render-mode", choices=["edges", "fill"], default="edges",
@@ -224,9 +229,140 @@ def _normalize(x: np.ndarray) -> np.ndarray:
     m = float(np.max(x)) if x.size else 0.0
     return (x / m) if m > 1e-12 else np.zeros_like(x, dtype=np.float64)
 
+def _ascii_colors_per_cell(api, h) -> np.ndarray:
+    """Compute per-cell RGB color as float32 in [0,1], using pressure (B), mass (R), identity green (G)."""
+    pressures, masses, greens255 = _measure_pressure_mass(api, h)
+    pN = _normalize(pressures)
+    mN = _normalize(masses)
+    BASE_R, BASE_B = 0.15, 0.25
+    PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
+    n = len(getattr(h, 'cells', []) or [])
+    cols = np.zeros((n, 3), dtype=np.float32)
+    if n == 0:
+        return cols
+    Gs = (greens255.astype(np.float32) / 255.0)
+    R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
+    B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
+    cols[:, 0] = R
+    cols[:, 1] = Gs
+    cols[:, 2] = B
+    return cols
+
+def _rasterize_ascii_numpy(h, api, nx: int, ny: int, *, render_mode: str, face_stride: int, draw_points: bool):
+    """Rasterize meshes to ASCII buffers using only NumPy arrays (no Pythonic grid structures).
+
+    Returns (chars uint8 [ny,nx], rgb uint8 [ny,nx,3]).
+    """
+    nx = int(nx); ny = int(ny)
+    chars = np.full((ny, nx), ord(' '), dtype=np.uint8)
+    rgb = np.zeros((ny, nx, 3), dtype=np.uint8)
+
+    cells = getattr(h, 'cells', []) or []
+    if not cells:
+        return chars, rgb
+
+    # Per-cell color (float 0..1)
+    cols = _ascii_colors_per_cell(api, h)
+    # Default identity greens if missing
+    if cols.shape[0] != len(cells):
+        cols = np.tile(np.array([[0.3, 0.5, 0.4]], dtype=np.float32), (len(cells), 1))
+
+    stride = max(1, int(face_stride))
+
+    def draw_line_ixy(ix0: int, iy0: int, ix1: int, iy1: int, color_u8: np.ndarray, ch_code: int):
+        # Bresenham directly into numpy arrays
+        x0 = int(ix0); y0 = int(iy0); x1 = int(ix1); y1 = int(iy1)
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            if 0 <= x < nx and 0 <= y < ny:
+                chars[y, x] = ch_code
+                rgb[y, x, :] = color_u8
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
+    for ci, c in enumerate(cells):
+        X = np.asarray(getattr(c, 'X', None))
+        F = np.asarray(getattr(c, 'faces', None))
+        if X is None or F is None or X.ndim != 2 or X.shape[1] < 2 or F.size == 0:
+            continue
+        # Project XY to grid indices (vectorized)
+        ix = np.clip((X[:, 0] * nx).astype(np.int32), 0, nx - 1)
+        iy = np.clip((X[:, 1] * ny).astype(np.int32), 0, ny - 1)
+
+        # Convert color to u8 once per cell
+        col = cols[ci]
+        col_u8 = np.array([int(col[0] * 255.0), int(col[1] * 255.0), int(col[2] * 255.0)], dtype=np.uint8)
+
+        if draw_points:
+            # Subsample points based on density (vectorized indexing)
+            k = max(1, int(len(X) / (nx * 0.75)))
+            sel = np.arange(0, len(X), k, dtype=np.int32)
+            px = ix[sel]; py = iy[sel]
+            ch = ord('.')
+            mask = (px >= 0) & (px < nx) & (py >= 0) & (py < ny)
+            chars[py[mask], px[mask]] = ch
+            rgb[py[mask], px[mask], :] = col_u8
+
+        if render_mode in ("edges", "fill"):
+            # Vectorized edge sampling: form unique edge list and sample along each
+            F = F.reshape(-1, 3)
+            F = F[::stride]
+            e01 = F[:, [0, 1]]; e12 = F[:, [1, 2]]; e20 = F[:, [2, 0]]
+            E = np.concatenate([e01, e12, e20], axis=0)
+            # Remove degenerate edges
+            valid = (E[:, 0] != E[:, 1])
+            E = E[valid]
+            if E.size:
+                # Sample S points per edge
+                S = 12  # samples per edge; adjust for thickness/continuity
+                t = np.linspace(0.0, 1.0, S, dtype=np.float32)[None, :]
+                x0 = X[E[:, 0], 0][:, None]; y0 = X[E[:, 0], 1][:, None]
+                x1 = X[E[:, 1], 0][:, None]; y1 = X[E[:, 1], 1][:, None]
+                xs = x0 + (x1 - x0) * t
+                ys = y0 + (y1 - y0) * t
+                ixs = np.clip((xs * nx).astype(np.int32), 0, nx - 1)
+                iys = np.clip((ys * ny).astype(np.int32), 0, ny - 1)
+                # Flatten and write
+                flat_ix = ixs.reshape(-1)
+                flat_iy = iys.reshape(-1)
+                chars[flat_iy, flat_ix] = ord('#')
+                rgb[flat_iy, flat_ix, :] = col_u8
+
+        # Organelles as discs
+        organs = getattr(c, 'organelles', []) or []
+        if organs:
+            # We will loop; still only manipulating numpy buffers
+            for o in organs:
+                cx = int(np.clip(int(o.pos[0] * nx), 0, nx - 1))
+                cy = int(np.clip(int(o.pos[1] * ny), 0, ny - 1))
+                pr = max(1, int(o.radius * max(nx, ny)))
+                rr = pr * pr
+                y0 = max(0, cy - pr); y1 = min(ny - 1, cy + pr)
+                x0 = max(0, cx - pr); x1 = min(nx - 1, cx + pr)
+                for yy in range(y0, y1 + 1):
+                    dy = yy - cy
+                    # horizontal span per y
+                    dx_max = int((rr - dy * dy) ** 0.5) if rr >= dy * dy else 0
+                    xs = max(x0, cx - dx_max); xe = min(x1, cx + dx_max)
+                    if xe >= xs:
+                        chars[yy, xs:xe + 1] = ord('o')
+                        rgb[yy, xs:xe + 1, :] = col_u8
+
+    return chars, rgb
+
 def export_ascii_stream(args, api, provider):
-    # Import here to avoid circular import at module load time
-    from .run_ascii_demo import world_to_grid
     dt = float(getattr(args, "dt", 1e-3))
     frames = int(args.frames)
     nx, ny = int(args.ascii_nx), int(args.ascii_ny)
@@ -238,28 +374,14 @@ def export_ascii_stream(args, api, provider):
         h = getattr(provider, "_h", None)
         if h is None:
             continue
-        grid = world_to_grid(
-            h,
-            api=api,
-            nx=nx,
-            ny=ny,
+        ch, col = _rasterize_ascii_numpy(
+            h, api, nx, ny,
             render_mode=args.render_mode,
             face_stride=args.face_stride,
             draw_points=not args.no_points,
         )
-        # Convert grid to arrays
-        for iy, row in enumerate(grid):
-            for ix, cell in enumerate(row):
-                if isinstance(cell, str):
-                    ch = cell
-                    col = (255, 255, 255)
-                else:
-                    ch, col = cell
-                chars[f, iy, ix] = ord(ch[0]) if ch else 32
-                r, g, b = col
-                rgb[f, iy, ix, 0] = int(r)
-                rgb[f, iy, ix, 1] = int(g)
-                rgb[f, iy, ix, 2] = int(b)
+        chars[f] = ch
+        rgb[f] = col
 
     meta = dict(stream_type='ascii_v1', nx=nx, ny=ny, frames=frames)
     np.savez_compressed(args.export_npz, **meta, chars=chars, rgb=rgb)
@@ -364,56 +486,55 @@ def export_opengl_mesh_stream(args, api, provider):
         dt = step_cellsim(api, dt)
         t_sim += dt
         hobj = getattr(provider, "_h", hobj)
+    # fill vertex positions into concat buffer (vectorized via concatenate)
+    vtx_concat[f, :, :] = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
 
-        # fill vertex positions into concat buffer
-        off = 0
-        for i, c in enumerate(hobj.cells):
-            X = np.asarray(c.X, dtype=np.float32)
-            n = len(X)
-            vtx_concat[f, off:off+n, :] = X
-            off += n
+    # colors from pressures/masses
+    pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
+    pN = _normalize(pressures)
+    mN = _normalize(masses)
+    BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
+    PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
+    G = (greens255.astype(np.float32) / 255.0)
+    R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
+    B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
+    colors[f, :, 0] = R
+    colors[f, :, 1] = G
+    colors[f, :, 2] = B
+    colors[f, :, 3] = BASE_A
 
-        # colors from pressures/masses
-        pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
-        pN = _normalize(pressures)
-        mN = _normalize(masses)
-        BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
-        PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
-        for i in range(n_cells):
-            G = float(greens255[i]) / 255.0
-            R = min(1.0, BASE_R + MASS_GAIN * float(mN[i]))
-            B = min(1.0, BASE_B + PRESSURE_GAIN * float(pN[i]))
-            colors[f, i, :] = np.array([R, G, B, BASE_A], dtype=np.float32)
+    # camera
+    new_center, radius = _compute_center_radius(hobj)
+    desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+    alpha = 0.15
+    center_s = (1.0 - alpha) * center_s + alpha * new_center
+    dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+    center = center_s; cam_dist = float(dist_s)
+    eye = center - cam_dir * cam_dist
+    P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+    V = _look_at(eye, center, up)
+    theta = rot_speed * t_sim
+    T_neg = _translate(-center)
+    R_y = _rotate_y(theta)
+    T_pos = _translate(center)
+    M = (T_pos @ R_y @ T_neg).astype(np.float32)
+    MVP = (P @ V @ M).astype(np.float32)
+    mvps[f] = MVP
 
-        # camera
-        new_center, radius = _compute_center_radius(hobj)
-        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
-        alpha = 0.15
-        center_s = (1.0 - alpha) * center_s + alpha * new_center
-        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
-        center = center_s; cam_dist = float(dist_s)
-        eye = center - cam_dir * cam_dist
-        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
-        V = _look_at(eye, center, up)
-        theta = rot_speed * t_sim
-        T_neg = _translate(-center)
-        R_y = _rotate_y(theta)
-        T_pos = _translate(center)
-        M = (T_pos @ R_y @ T_neg).astype(np.float32)
-        MVP = (P @ V @ M).astype(np.float32)
-        mvps[f] = MVP
-
-        # depth sort order using centroid depth after model rotation
-        view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
-        depths = []
-        for i, c in enumerate(hobj.cells):
-            ctr = np.mean(c.X, axis=0).astype(np.float32)
-            ctr_h = np.array([ctr[0], ctr[1], ctr[2], 1.0], dtype=np.float32)
-            ctr_rot = (M @ ctr_h)[:3]
-            d = float(np.dot(ctr_rot - eye, view_dir))
-            depths.append((d, i))
-        depths.sort(key=lambda x: x[0])
-        draw_order[f, :] = np.array([i for _, i in depths], dtype=np.int32)
+    # depth sort order using centroid depth after model rotation (vectorized)
+    view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+    # Compute centroids per cell from concatenated vertices
+    Xcat = vtx_concat[f]
+    # segment sums using reduceat
+    off = vtx_offsets.astype(np.int32)
+    sums = np.add.reduceat(Xcat, off[:-1], axis=0)
+    counts = (off[1:] - off[:-1]).astype(np.float32)[:, None]
+    centroids = sums / np.maximum(counts, 1e-12)
+    # rotate centroids
+    centroids_h = np.concatenate([centroids, np.ones((n_cells, 1), dtype=np.float32)], axis=1)
+    ctr_rot = (M @ centroids_h.T).T[:, :3]
+    depths = np.dot(ctr_rot - eye[None, :], view_dir)
+    draw_order[f, :] = np.argsort(depths).astype(np.int32)
 
     meta = dict(stream_type='opengl_mesh_v1', frames=frames, viewport_w=w, viewport_h=h)
     np.savez_compressed(
@@ -428,6 +549,186 @@ def export_opengl_mesh_stream(args, api, provider):
         colors=colors,
         draw_order=draw_order,
         mvps=mvps,
+    )
+
+def stream_ascii(args, api, provider):
+    # Build frames into NumPy arrays (no Pythonic grid) and stream directly
+    from .run_ascii_demo import play_ascii_stream
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    nx, ny = int(args.ascii_nx), int(args.ascii_ny)
+    chars = np.zeros((frames, ny, nx), dtype=np.uint8)
+    rgb = np.zeros((frames, ny, nx, 3), dtype=np.uint8)
+
+    for f in range(frames):
+        dt = step_cellsim(api, dt)
+        h = getattr(provider, "_h", None)
+        if h is None:
+            continue
+        ch, col = _rasterize_ascii_numpy(
+            h, api, nx, ny,
+            render_mode=args.render_mode,
+            face_stride=args.face_stride,
+            draw_points=not args.no_points,
+        )
+        chars[f] = ch
+        rgb[f] = col
+
+    play_ascii_stream(chars, rgb, color_mode="auto", loop_mode=args.loop, fps=float(args.fps))
+
+def stream_opengl_points(args, api, provider):
+    from .run_opengl_demo import play_points_stream
+    # Build stream arrays (same as export, but feed player directly)
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+
+    pts_offsets = np.zeros(frames + 1, dtype=np.int64)
+    pts_concat_list = []
+    mvps = np.zeros((frames, 4, 4), dtype=np.float32)
+
+    api.step(1e-3)
+    hobj = getattr(provider, "_h", None)
+    if hobj is None:
+        raise RuntimeError("Softbody provider failed to initialize _h")
+
+    center, radius = _compute_center_radius(hobj)
+    eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    cam_dir = center - eye
+    cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+    cam_dist = float(np.linalg.norm(center - eye))
+    center_s = center.copy(); dist_s = cam_dist
+    aspect = w / max(1, h)
+
+    t_sim = 0.0
+    for f in range(frames):
+        dt = step_cellsim(api, dt)
+        t_sim += dt
+        hobj = getattr(provider, "_h", hobj)
+        vtx = _gather_vertices(hobj)
+        if vtx is None:
+            vtx = np.zeros((0, 3), dtype=np.float32)
+        pts_concat_list.append(vtx.astype(np.float32, copy=False))
+        pts_offsets[f + 1] = pts_offsets[f] + int(len(vtx))
+
+        new_center, radius = _compute_center_radius(hobj)
+        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+        alpha = 0.15
+        center_s = (1.0 - alpha) * center_s + alpha * new_center
+        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+        center = center_s; cam_dist = float(dist_s)
+        eye = center - cam_dir * cam_dist
+
+        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+        V = _look_at(eye, center, up)
+        theta = rot_speed * t_sim
+        T_neg = _translate(-center)
+        R_y = _rotate_y(theta)
+        T_pos = _translate(center)
+        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+        mvps[f] = (P @ V @ M).astype(np.float32)
+
+    pts_concat = np.concatenate(pts_concat_list, axis=0) if pts_concat_list else np.zeros((0, 3), dtype=np.float32)
+    play_points_stream(pts_offsets, pts_concat, mvps, viewport_w=w, viewport_h=h, loop_mode=args.loop, fps=float(args.fps))
+
+def stream_opengl_mesh(args, api, provider):
+    from .run_opengl_demo import play_mesh_stream
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+
+    api.step(1e-3)
+    hobj = getattr(provider, "_h", None)
+    if hobj is None:
+        raise RuntimeError("Softbody provider failed to initialize _h")
+
+    n_cells = len(getattr(hobj, 'cells', []) or [])
+    vtx_counts = _cells_vertex_counts(hobj)
+    faces_concat, face_counts = _cells_faces_counts(hobj)
+    vtx_offsets = np.zeros(n_cells + 1, dtype=np.int64)
+    for i in range(n_cells):
+        vtx_offsets[i + 1] = vtx_offsets[i] + int(vtx_counts[i])
+
+    mvps = np.zeros((frames, 4, 4), dtype=np.float32)
+    colors = np.zeros((frames, n_cells, 4), dtype=np.float32)
+    draw_order = np.zeros((frames, n_cells), dtype=np.int32)
+    vtx_concat = np.zeros((frames, int(vtx_offsets[-1]), 3), dtype=np.float32)
+
+    center, radius = _compute_center_radius(hobj)
+    eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    cam_dir = center - eye; cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+    cam_dist = float(np.linalg.norm(center - eye))
+    center_s = center.copy(); dist_s = cam_dist
+    aspect = w / max(1, h)
+
+    t_sim = 0.0
+    for f in range(frames):
+        dt = step_cellsim(api, dt)
+        t_sim += dt
+        hobj = getattr(provider, "_h", hobj)
+    vtx_concat[f, :, :] = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
+
+    pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
+    pN = _normalize(pressures)
+    mN = _normalize(masses)
+    BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
+    PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
+    G = (greens255.astype(np.float32) / 255.0)
+    R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
+    B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
+    colors[f, :, 0] = R
+    colors[f, :, 1] = G
+    colors[f, :, 2] = B
+    colors[f, :, 3] = BASE_A
+
+    new_center, radius = _compute_center_radius(hobj)
+    desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+    alpha = 0.15
+    center_s = (1.0 - alpha) * center_s + alpha * new_center
+    dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+    center = center_s; cam_dist = float(dist_s)
+    eye = center - cam_dir * cam_dist
+    P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+    V = _look_at(eye, center, up)
+    theta = rot_speed * t_sim
+    T_neg = _translate(-center)
+    R_y = _rotate_y(theta)
+    T_pos = _translate(center)
+    M = (T_pos @ R_y @ T_neg).astype(np.float32)
+    MVP = (P @ V @ M).astype(np.float32)
+    mvps[f] = MVP
+
+    view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+    Xcat = vtx_concat[f]
+    off = vtx_offsets.astype(np.int32)
+    sums = np.add.reduceat(Xcat, off[:-1], axis=0)
+    counts = (off[1:] - off[:-1]).astype(np.float32)[:, None]
+    centroids = sums / np.maximum(counts, 1e-12)
+    centroids_h = np.concatenate([centroids, np.ones((n_cells, 1), dtype=np.float32)], axis=1)
+    ctr_rot = (M @ centroids_h.T).T[:, :3]
+    depths = np.dot(ctr_rot - eye[None, :], view_dir)
+    draw_order[f, :] = np.argsort(depths).astype(np.int32)
+
+    play_mesh_stream(
+        n_cells=n_cells,
+        vtx_counts=vtx_counts,
+        vtx_offsets=vtx_offsets,
+        faces_concat=faces_concat,
+        face_counts=face_counts,
+        vtx_concat=vtx_concat,
+        colors=colors,
+        draw_order=draw_order,
+        mvps=mvps,
+        viewport_w=w,
+        viewport_h=h,
+        loop_mode=args.loop,
+        fps=float(args.fps),
     )
 
 def main():
@@ -456,11 +757,27 @@ def main():
         print(f"Wrote stream to {args.export_npz}")
         return
 
+    # Live in-process streaming: build arrays and hand to visualizer APIs
+    if getattr(args, "stream", ""):
+        kind = args.stream
+        if kind == "ascii":
+            stream_ascii(args, api, provider)
+        elif kind == "opengl-points":
+            stream_opengl_points(args, api, provider)
+        elif kind == "opengl-mesh":
+            stream_opengl_mesh(args, api, provider)
+        else:
+            raise SystemExit("Unknown --stream kind")
+        return
+
     dt = args.dt
-    prev_vols = np.array([float(c.V) for c in api.cells], dtype=float)
+    # Use array state from engine if available
+    engine = getattr(api, "engine", None)
+    prev_vols = getattr(engine, "V", np.array([getattr(c, "V", 0.0) for c in api.cells], dtype=float)).astype(float, copy=False)
     for frame in range(int(args.frames)):
         dt = step_cellsim(api, dt)
-        vols = np.array([float(c.V) for c in api.cells], dtype=float)
+        engine = getattr(api, "engine", engine)
+        vols = getattr(engine, "V", np.array([getattr(c, "V", 0.0) for c in api.cells], dtype=float)).astype(float, copy=False)
         # dV (change in volume), kept as its own stat (not velocity)
         dV = vols - prev_vols
         # Compute COM velocities from softbody provider
@@ -473,11 +790,12 @@ def main():
                 v_out = [tuple(float(x) for x in v) for v in vcoms]
             except Exception:
                 v_out = None
-        osm = np.array([getattr(c, "osmotic_pressure", 0.0) for c in api.cells], dtype=float)
+        osm = getattr(engine, "osmotic_pressure", np.zeros_like(vols))
+        # Lightweight textual output without converting arrays to Python lists unnecessarily
         if v_out is None:
-            print(f"frame {frame}: vols {vols.tolist()} dV {dV.tolist()} osm {osm.tolist()}")
+            print(f"frame {frame}: vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)} osm {np.array2string(osm, precision=4)}")
         else:
-            print(f"frame {frame}: vols {vols.tolist()} dV {dV.tolist()} com_vel {v_out} osm {osm.tolist()}")
+            print(f"frame {frame}: vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)} com_vel {v_out} osm {np.array2string(osm, precision=4)}")
         prev_vols = vols
 
 

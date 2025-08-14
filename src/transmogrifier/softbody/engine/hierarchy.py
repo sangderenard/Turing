@@ -159,14 +159,16 @@ class Hierarchy:
             if self.cells
             else np.empty((0, 3), dtype=np.int32)
         )
-        voxel_size = getattr(self.params, "contact_voxel_size", 0.05)
-        pairs = build_self_contacts_spatial_hash(X, all_faces, cell_ids, voxel_size)
-        if len(pairs):
-            cons["contacts"] = {
-                "pairs": pairs,
-                "compliance": np.full(len(pairs), self.params.contact_compliance, dtype=np.float64),
-                "lamb": np.zeros(len(pairs), dtype=np.float64),
-            }
+        pairs = np.empty((0, 2), dtype=np.int32)
+        if getattr(self.params, "enable_self_contacts", True):
+            voxel_size = getattr(self.params, "contact_voxel_size", 0.05)
+            pairs = build_self_contacts_spatial_hash(X, all_faces, cell_ids, voxel_size)
+            if len(pairs):
+                cons["contacts"] = {
+                    "pairs": pairs,
+                    "compliance": np.full(len(pairs), self.params.contact_compliance, dtype=np.float64),
+                    "lamb": np.zeros(len(pairs), dtype=np.float64),
+                }
 
         # XPBDSolver.project expects explicit bounding box limits.  The
         # previous call passed ``self`` which was interpreted as ``box_min``
