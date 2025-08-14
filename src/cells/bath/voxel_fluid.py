@@ -569,19 +569,23 @@ class VoxelMACFluid:
                 b -= float(b[fluid].mean())
         nx, ny, nz = self.nx, self.ny, self.nz
         x = np.zeros_like(b)
-        r = b - self._laplace_cc(x, solid_cc)
+        r = np.nan_to_num(b - self._laplace_cc(x, solid_cc))
         p = r.copy()
-        rsold = float(np.sum(r*r))
-        if rsold < tol*tol: return x
+        rsold = float(np.sum(r * r))
+        if not np.isfinite(rsold) or rsold < tol * tol:
+            return x
         for it in range(maxiter):
             Ap = self._laplace_cc(p, solid_cc)
-            alpha = rsold / max(1e-30, float(np.sum(p*Ap)))
-            x += alpha * p
-            r -= alpha * Ap
-            rsnew = float(np.sum(r*r))
-            if rsnew < tol*tol:
+            denom = float(np.sum(p * Ap))
+            if not np.isfinite(denom) or abs(denom) < 1e-30:
                 break
-            p = r + (rsnew/rsold) * p
+            alpha = rsold / denom
+            x = np.nan_to_num(x + alpha * p)
+            r = np.nan_to_num(r - alpha * Ap)
+            rsnew = float(np.sum(r * r))
+            if not np.isfinite(rsnew) or rsnew < tol * tol:
+                break
+            p = np.nan_to_num(r + (rsnew / rsold) * p)
             rsold = rsnew
         # zero inside solids for consistency
         x[solid_cc] = 0.0
@@ -600,22 +604,24 @@ class VoxelMACFluid:
 
         x = F.copy()
         x[solid] = 0.0
-        r = F - self._helmholtz_face_apply(x, a, axis, solid)
+        r = np.nan_to_num(F - self._helmholtz_face_apply(x, a, axis, solid))
         p = r.copy()
         rsold = float(np.sum(r * r))
-        if rsold < tol * tol:
+        if not np.isfinite(rsold) or rsold < tol * tol:
             return x
         for it in range(maxiter):
             Ap = self._helmholtz_face_apply(p, a, axis, solid)
-            denom = max(1e-30, float(np.sum(p * Ap)))
-            alpha = rsold / denom
-            x += alpha * p
-            x[solid] = 0.0
-            r -= alpha * Ap
-            rsnew = float(np.sum(r * r))
-            if rsnew < tol * tol:
+            denom = float(np.sum(p * Ap))
+            if not np.isfinite(denom) or abs(denom) < 1e-30:
                 break
-            p = r + (rsnew / rsold) * p
+            alpha = rsold / denom
+            x = np.nan_to_num(x + alpha * p)
+            x[solid] = 0.0
+            r = np.nan_to_num(r - alpha * Ap)
+            rsnew = float(np.sum(r * r))
+            if not np.isfinite(rsnew) or rsnew < tol * tol:
+                break
+            p = np.nan_to_num(r + (rsnew / rsold) * p)
             p[solid] = 0.0
             rsold = rsnew
         x[solid] = 0.0
@@ -626,6 +632,7 @@ class VoxelMACFluid:
         """7-point Laplacian on CC with Neumann at walls, skipping solid neighbors."""
         solid = solid_cc
         fluid = ~solid
+        X = np.nan_to_num(X)
         Y = np.zeros_like(X)
         cnt = np.zeros_like(X, dtype=np.int32)
 
@@ -656,7 +663,7 @@ class VoxelMACFluid:
 
     def _helmholtz_face_apply(self, X: np.ndarray, a: float, axis: int, solid: np.ndarray) -> np.ndarray:
         """Apply (I - a ∇²) on a face grid with Dirichlet on solid faces."""
-        Xc = X.copy()
+        Xc = np.nan_to_num(X.copy())
         Xc[solid] = 0.0
         L = self._laplace_face(Xc, axis, solid)
         Y = Xc - a * L
@@ -666,6 +673,7 @@ class VoxelMACFluid:
     def _laplace_face(self, F: np.ndarray, axis: int, solid: np.ndarray) -> np.ndarray:
         """7-point Laplacian on a face grid with Dirichlet at solid faces and Neumann at domain walls."""
         fluid = ~solid
+        F = np.nan_to_num(F)
         Y = np.zeros_like(F)
         cnt = np.zeros_like(F, dtype=np.int32)
 
