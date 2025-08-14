@@ -191,13 +191,28 @@ class Softbody0DProvider(MechanicsProvider):
     def _build_world(self, cells: List[Cell]) -> None:
         n = len(cells)
         self._params = EngineParams(dimension=self.cfg.dim)
+        if self.cfg.dim == 1:
+            self._params.bath_min = (0.0, 0.5, 0.0)
+            self._params.bath_max = (1.0, 0.5, 0.0)
+        elif self.cfg.dim == 2:
+            self._params.bath_min = (0.0, 0.0, 0.0)
+            self._params.bath_max = (1.0, 1.0, 0.0)
+        else:
+            self._params.bath_min = (0.0, 0.0, 0.0)
+            self._params.bath_max = (1.0, 1.0, 0.02)
         solver = XPBDSolver(self._params)
 
-        # Simple layout: grid in [0.2,0.8]^2, z=0.01
-        grid_cols = max(1, int(math.ceil(math.sqrt(n))))
-        grid_rows = max(1, int(math.ceil(n / grid_cols)))
-        xs = np.linspace(0.2, 0.8, grid_cols)
-        ys = np.linspace(0.2, 0.8, grid_rows)
+        # Simple layout: grid in [0.2,0.8], collapse unused dims
+        if self.cfg.dim == 1:
+            grid_cols = n
+            grid_rows = 1
+            xs = np.linspace(0.2, 0.8, grid_cols)
+            ys = np.full(1, 0.5)
+        else:
+            grid_cols = max(1, int(math.ceil(math.sqrt(n))))
+            grid_rows = max(1, int(math.ceil(n / grid_cols)))
+            xs = np.linspace(0.2, 0.8, grid_cols)
+            ys = np.linspace(0.2, 0.8, grid_rows)
 
         # Radii mapped from current V set
         V_list = [max(1e-18, float(c.V)) for c in cells]
@@ -219,12 +234,15 @@ class Softbody0DProvider(MechanicsProvider):
                 r = V_to_r(V_list[idx])
                 if self.cfg.dim == 2:
                     target = math.pi * r ** 2
+                    center = (cx, cy, 0.0)
                 elif self.cfg.dim == 1:
                     target = 2.0 * r
+                    center = (cx, 0.5, 0.0)
                 else:
                     target = (4.0 / 3.0) * math.pi * r ** 3
+                    center = (cx, cy, 0.01)
                 X, F, V, invm, edges, bends, constraints = build_cell(
-                    id_str=f"cell{idx}", center=(cx, cy, 0.01), radius=r,
+                    id_str=f"cell{idx}", center=center, radius=r,
                     params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=target
                 )
                 # Build minimal shim that Hierarchy expects
@@ -240,8 +258,8 @@ class Softbody0DProvider(MechanicsProvider):
                 idx += 1
 
         self._h = Hierarchy(
-            box_min=np.array([-2.0, -2.0, -2.0]),
-            box_max=np.array([2.0, 2.0, 2.0]),
+            box_min=np.array(self._params.bath_min, dtype=float),
+            box_max=np.array(self._params.bath_max, dtype=float),
             cells=sb_cells,
             solver=solver,
             params=self._params,

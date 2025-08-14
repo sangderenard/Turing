@@ -340,8 +340,9 @@ def _rasterize_ascii_numpy(h, api, nx: int, ny: int, *, render_mode: str, face_s
     for ci, c in enumerate(cells):
         X = np.asarray(getattr(c, 'X', None))
         F = np.asarray(getattr(c, 'faces', None))
-        if X is None or F is None or X.ndim != 2 or X.shape[1] < 2 or F.size == 0:
+        if X is None or X.ndim != 2 or X.shape[1] < 2:
             continue
+        has_faces = F.ndim == 2 and F.size > 0
         # Project XY to grid indices (vectorized)
         ix = np.clip((X[:, 0] * nx).astype(np.int32), 0, nx - 1)
         iy = np.clip((X[:, 1] * ny).astype(np.int32), 0, ny - 1)
@@ -360,12 +361,14 @@ def _rasterize_ascii_numpy(h, api, nx: int, ny: int, *, render_mode: str, face_s
             chars[py[mask], px[mask]] = ch
             rgb[py[mask], px[mask], :] = col_u8
 
-        if render_mode in ("edges", "fill"):
-            # Vectorized edge sampling: form unique edge list and sample along each
-            F = F.reshape(-1, 3)
-            F = F[::stride]
-            e01 = F[:, [0, 1]]; e12 = F[:, [1, 2]]; e20 = F[:, [2, 0]]
-            E = np.concatenate([e01, e12, e20], axis=0)
+        if render_mode in ("edges", "fill") and has_faces:
+            # Support triangular faces (shape (?,3)) and polylines (shape (?,2))
+            if F.shape[1] == 2:
+                E = F.astype(np.int32)[::stride]
+            else:
+                F = F.reshape(-1, 3)[::stride]
+                e01 = F[:, [0, 1]]; e12 = F[:, [1, 2]]; e20 = F[:, [2, 0]]
+                E = np.concatenate([e01, e12, e20], axis=0)
             # Remove degenerate edges
             valid = (E[:, 0] != E[:, 1])
             E = E[valid]
@@ -439,6 +442,7 @@ def export_opengl_points_stream(args, api, provider):
     w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
     fovy = float(args.gl_fovy)
     rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
@@ -483,7 +487,7 @@ def export_opengl_points_stream(args, api, provider):
 
         P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
         V = _look_at(eye, center, up)
-        theta = rot_speed * t_sim  # tie rotation to simulated time
+        theta = rot_speed * t_sim if dim == 3 else 0.0  # no rotation in 1D/2D
         T_neg = _translate(-center)
         R_y = _rotate_y(theta)
         T_pos = _translate(center)
@@ -500,6 +504,7 @@ def export_opengl_mesh_stream(args, api, provider):
     w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
     fovy = float(args.gl_fovy)
     rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
 
     # Prime hierarchy
     api.step(1e-3)
@@ -560,7 +565,7 @@ def export_opengl_mesh_stream(args, api, provider):
     eye = center - cam_dir * cam_dist
     P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
     V = _look_at(eye, center, up)
-    theta = rot_speed * t_sim
+    theta = rot_speed * t_sim if dim == 3 else 0.0
     T_neg = _translate(-center)
     R_y = _rotate_y(theta)
     T_pos = _translate(center)
@@ -633,6 +638,7 @@ def stream_opengl_points(args, api, provider):
     w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
     fovy = float(args.gl_fovy)
     rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
@@ -675,7 +681,7 @@ def stream_opengl_points(args, api, provider):
 
         P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
         V = _look_at(eye, center, up)
-        theta = rot_speed * t_sim
+        theta = rot_speed * t_sim if dim == 3 else 0.0
         T_neg = _translate(-center)
         R_y = _rotate_y(theta)
         T_pos = _translate(center)
@@ -692,6 +698,7 @@ def stream_opengl_mesh(args, api, provider):
     w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
     fovy = float(args.gl_fovy)
     rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
 
     api.step(1e-3)
     hobj = getattr(provider, "_h", None)
@@ -749,7 +756,7 @@ def stream_opengl_mesh(args, api, provider):
         eye = center - cam_dir * cam_dist
         P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
         V = _look_at(eye, center, up)
-        theta = rot_speed * t_sim
+        theta = rot_speed * t_sim if dim == 3 else 0.0
         T_neg = _translate(-center)
         R_y = _rotate_y(theta)
         T_pos = _translate(center)
