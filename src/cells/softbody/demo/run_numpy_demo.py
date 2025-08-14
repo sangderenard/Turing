@@ -195,6 +195,8 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--gl-viewport-h", type=int, default=800, help="OpenGL stream: viewport height")
     parser.add_argument("--show-vectors", action="store_true",
                         help="OpenGL stream: render velocity vectors as arrows")
+    parser.add_argument("--show-droplets", action="store_true",
+                        help="OpenGL stream: render secondary droplet point cloud if available")
     parser.add_argument("--color-metric", choices=["none", "magnitude"], default="magnitude",
                         help="Metric for arrow coloration (none/magnitude)")
     parser.add_argument("--arrow-scale", type=float, default=1.0,
@@ -857,7 +859,10 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     vec_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
-    pts0, vecs0 = gather_func()
+    try:
+        pts0, vecs0, _drops0 = gather_func()
+    except ValueError:
+        pts0, vecs0 = gather_func()
     center, radius = _compute_center_radius_pts(pts0)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -869,7 +874,10 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     t_sim = 0.0
     pts_offsets[0] = 0
     for f in range(frames):
-        pts, vecs = gather_func()
+        try:
+            pts, vecs, _drops = gather_func()
+        except ValueError:
+            pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
         vec_concat_list.append(vecs.astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
@@ -922,6 +930,7 @@ def stream_fluid_points(
     dim: int = 3,
     *,
     show_vectors: bool = False,
+    show_droplets: bool = False,
     color_metric: str = "magnitude",
     arrow_scale: float = 1.0,
     flow_anim_speed: float = 1.0,
@@ -937,9 +946,15 @@ def stream_fluid_points(
     pts_concat_list = []
     vec_concat_list = [] if show_vectors else None
     scalar_concat_list = [] if show_vectors and color_metric != "none" else None
+    drop_offsets = np.zeros(frames + 1, dtype=np.int64) if show_droplets else None
+    drop_concat_list = [] if show_droplets else None
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
-    pts0, _vecs0 = gather_func()
+    try:
+        pts0, _vecs0, _drops0 = gather_func()
+    except ValueError:
+        pts0, _vecs0 = gather_func()
+        _drops0 = None
     center, radius = _compute_center_radius_pts(pts0)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -950,8 +965,14 @@ def stream_fluid_points(
 
     t_sim = 0.0
     pts_offsets[0] = 0
+    if show_droplets and drop_offsets is not None:
+        drop_offsets[0] = 0
     for f in range(frames):
-        pts, vecs = gather_func()
+        try:
+            pts, vecs, drops = gather_func()
+        except ValueError:
+            pts, vecs = gather_func()
+            drops = None
         pts_concat_list.append(pts.astype(np.float32, copy=False))
         if show_vectors and vecs is not None and vec_concat_list is not None:
             vec = vecs.astype(np.float32, copy=False)
@@ -959,6 +980,10 @@ def stream_fluid_points(
             if scalar_concat_list is not None and color_metric == "magnitude":
                 scalar_concat_list.append(np.linalg.norm(vec, axis=1).astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
+        if show_droplets and drop_offsets is not None and drop_concat_list is not None:
+            d = drops.astype(np.float32, copy=False) if drops is not None else np.zeros((0, 3), dtype=np.float32)
+            drop_concat_list.append(d)
+            drop_offsets[f + 1] = drop_offsets[f] + int(len(d))
 
         new_center, radius = _compute_center_radius_pts(pts)
         desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
@@ -995,12 +1020,20 @@ def stream_fluid_points(
         if scalar_concat_list
         else None
     )
+    drop_concat = (
+        np.concatenate(drop_concat_list, axis=0)
+        if drop_concat_list
+        else None
+    )
     play_points_stream(
         pts_offsets,
         pts_concat,
         mvps,
         vec_concat=vec_concat,
         scalar_concat=scalar_concat,
+        droplet_offsets=drop_offsets,
+        droplet_concat=drop_concat,
+        show_droplets=show_droplets,
         show_vectors=show_vectors,
         color_metric=color_metric,
         arrow_scale=arrow_scale,
@@ -1025,12 +1058,17 @@ def run_fluid_demo(args):
         raise SystemExit("Unknown fluid engine")
 
     def gather():
+        if hasattr(fluid, "export_positions_vectors_droplets"):
+            return fluid.export_positions_vectors_droplets()
         if hasattr(fluid, "export_positions_vectors"):
-            return fluid.export_positions_vectors()
-        if hasattr(fluid, "export_vector_field"):
-            return fluid.export_vector_field()
-        pts = fluid.export_vertices() if hasattr(fluid, "export_vertices") else np.zeros((0, 3), dtype=np.float32)
-        return pts, None
+            pts, vecs = fluid.export_positions_vectors()
+        elif hasattr(fluid, "export_vector_field"):
+            pts, vecs = fluid.export_vector_field()
+        else:
+            pts = fluid.export_vertices() if hasattr(fluid, "export_vertices") else np.zeros((0, 3), dtype=np.float32)
+            vecs = None
+        drops = fluid.export_droplets() if hasattr(fluid, "export_droplets") else None
+        return pts, vecs, drops
 
     if getattr(args, "export_npz", "") and args.export_kind == "opengl-points":
         export_fluid_points_stream(args, gather, step)
@@ -1043,6 +1081,7 @@ def run_fluid_demo(args):
                 fluid.export_positions_vectors,
                 fluid.step,
                 show_vectors=args.show_vectors,
+                show_droplets=args.show_droplets,
                 color_metric=args.color_metric,
                 arrow_scale=args.arrow_scale,
                 flow_anim_speed=args.flow_anim_speed,
@@ -1053,6 +1092,7 @@ def run_fluid_demo(args):
                 gather,
                 step,
                 show_vectors=args.show_vectors,
+                show_droplets=args.show_droplets,
                 color_metric=args.color_metric,
                 arrow_scale=args.arrow_scale,
                 flow_anim_speed=args.flow_anim_speed,

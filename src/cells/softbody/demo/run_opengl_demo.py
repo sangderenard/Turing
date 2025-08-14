@@ -321,6 +321,21 @@ void main(){
 }
 """
 
+# Sprite fragment shader with a simple specular highlight used for droplets.
+DROPLET_FS = """
+#version 330 core
+out vec4 FragColor;
+uniform vec4 uColor; // rgba
+void main(){
+    vec2 uv = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(uv, uv);
+    if (r2 > 1.0) discard;
+    float edge = smoothstep(1.0, 0.7, r2);
+    float spec = pow(max(0.0, 1.0 - r2), 4.0);
+    FragColor = vec4(uColor.rgb * (0.5 + 0.5 * spec), uColor.a * (1.0 - edge));
+}
+"""
+
 class CellGL:
     def __init__(self, cell):
         self.cell = cell
@@ -905,8 +920,11 @@ def play_points_stream(
     mvps: np.ndarray,
     vec_concat: np.ndarray | None = None,
     scalar_concat: np.ndarray | None = None,
+    droplet_offsets: np.ndarray | None = None,
+    droplet_concat: np.ndarray | None = None,
     *,
     show_vectors: bool = False,
+    show_droplets: bool = False,
     color_metric: str = "magnitude",
     arrow_scale: float = 1.0,
     flow_anim_speed: float = 1.0,
@@ -922,7 +940,10 @@ def play_points_stream(
     mvps:         (F,4,4) float32
     vec_concat:   optional (N,3) float32 per-vertex vectors
     scalar_concat: optional (N,) float32 per-vertex scalar (magnitude, curl, ...)
+    droplet_offsets: optional (F+1,) int64 for secondary droplet cloud
+    droplet_concat: optional (Nd,3) float32 secondary droplet positions
     show_vectors: render arrows when vector data present
+    show_droplets: render secondary droplet cloud when provided
     color_metric: descriptor for scalar_concat; currently informational
     arrow_scale:  scale factor for arrow lengths
     flow_anim_speed: multiplier for pulsing animation speed
@@ -942,6 +963,10 @@ def play_points_stream(
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
     pt_u_time = glGetUniformLocation(pt_prog, "uTime")
+    drop_prog = link_program(SPRITE_VS, DROPLET_FS)
+    drop_u_mvp = glGetUniformLocation(drop_prog, "uMVP")
+    drop_u_color = glGetUniformLocation(drop_prog, "uColor")
+    drop_u_psize = glGetUniformLocation(drop_prog, "uPointScale")
     arrow_prog = link_program(POINT_VS, POINT_FS)
     arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
     arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
@@ -973,6 +998,16 @@ def play_points_stream(
         gl_pts = PointsGL(pts.astype(np.float32, copy=False))
         use_arrows = False
     gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+    # Optional droplet cloud
+    if show_droplets and droplet_offsets is not None and droplet_concat is not None:
+        dstart = int(droplet_offsets[0])
+        dend = int(droplet_offsets[1]) if len(droplet_offsets) > 1 else dstart
+        dpts = droplet_concat[dstart:dend]
+        gl_drops = PointsGL(dpts.astype(np.float32, copy=False))
+        gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
+    else:
+        gl_drops = None
 
     clock = pygame.time.Clock()
     running = True
@@ -1029,6 +1064,16 @@ def play_points_stream(
             else:
                 gl_pts.upload(cur.astype(np.float32, copy=False))
 
+        if gl_drops is not None and droplet_offsets is not None and droplet_concat is not None:
+            dstart = int(droplet_offsets[fidx])
+            dend = int(droplet_offsets[fidx+1])
+            dcur = droplet_concat[dstart:dend]
+            if gl_drops.n != len(dcur):
+                gl_drops = PointsGL(dcur.astype(np.float32, copy=False))
+                gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
+            else:
+                gl_drops.upload(dcur.astype(np.float32, copy=False))
+
         MVP = mvps[fidx].astype(np.float32, copy=False)
 
         viewport = pygame.display.get_surface().get_size()
@@ -1047,6 +1092,11 @@ def play_points_stream(
             glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
             glUniform1f(pt_u_time, time_s)
             gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+
+        if gl_drops is not None:
+            glUseProgram(drop_prog)
+            glUniformMatrix4fv(drop_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            gl_drops.draw(drop_prog, drop_u_mvp, drop_u_color, drop_u_psize)
 
         pygame.display.flip()
         clock.tick(fps)
