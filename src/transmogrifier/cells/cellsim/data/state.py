@@ -1,11 +1,13 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
+
 from ..core.geometry import sphere_area_from_volume
 from ..constants import (
     DEFAULT_ELASTIC_K,
     DEFAULT_LP0,
     SALINITY_PER_DATA_UNIT,
 )
+from ...bath import Bath
 
 @dataclass
 class Compartment:
@@ -86,8 +88,3 @@ class Cell(Compartment):
             A0, _ = sphere_area_from_volume(self.V)
             self.A0 = A0
 
-@dataclass
-class Bath(Compartment):
-    pressure: float = 10
-    temperature: float = 298.15
-    compressibility: float = 0.0
