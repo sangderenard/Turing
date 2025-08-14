@@ -300,13 +300,25 @@ class DiscreteFluid:
 
     # --------------------------- Density & Pressure ---------------------------
 
-    def _compute_density(self) -> None:
-        """ρ_i = m * sum_j W_ij"""
+    def _compute_density(self, include_self: bool = True) -> None:
+        """ρ_i = m * ∑_j W_ij.
+
+        Parameters
+        ----------
+        include_self:
+            If True, add the self-contribution ``W(0)`` for each particle.
+        """
         N = self.N
         rho = np.zeros(N, dtype=np.float64)
+
+        if include_self:
+            rho += self._m * float(self.kernel.W(np.array([0.0]))[0])
+
         for (i, j, rvec, r, W) in self._pairs_particles():
-            # self term included naturally because cell list includes i=j when r=0
-            rho[i] += self._m * W
+            contrib = self._m * W
+            np.add.at(rho, i, contrib)
+            np.add.at(rho, j, contrib)
+
         self.rho = np.maximum(rho, 1e-6)
 
     def _compute_pressure(self) -> None:
