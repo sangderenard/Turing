@@ -193,6 +193,14 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--gl-rot-speed", type=float, default=0.25, help="OpenGL stream: Y-rotation speed rad/sec (used as frame*dt)")
     parser.add_argument("--gl-viewport-w", type=int, default=1100, help="OpenGL stream: viewport width")
     parser.add_argument("--gl-viewport-h", type=int, default=800, help="OpenGL stream: viewport height")
+    parser.add_argument("--show-vectors", action="store_true",
+                        help="OpenGL stream: render velocity vectors as arrows")
+    parser.add_argument("--color-metric", choices=["none", "magnitude"], default="magnitude",
+                        help="Metric for arrow coloration (none/magnitude)")
+    parser.add_argument("--arrow-scale", type=float, default=1.0,
+                        help="Scale factor applied to arrow lengths")
+    parser.add_argument("--flow-anim-speed", type=float, default=1.0,
+                        help="Multiplier for flow animation speed in viewers")
     parser.add_argument("--verbose", action="store_true", help="Log per-cell parameters each frame")
     parser.add_argument("--debug", action="store_true", help="Log full per-vertex and per-face data")
     parser.add_argument("--sim-dim", type=int, choices=[1, 2, 3], default=3,
@@ -907,7 +915,17 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     )
 
 
-def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
+def stream_fluid_points(
+    args,
+    gather_func,
+    step_func,
+    dim: int = 3,
+    *,
+    show_vectors: bool = False,
+    color_metric: str = "magnitude",
+    arrow_scale: float = 1.0,
+    flow_anim_speed: float = 1.0,
+):
     from .run_opengl_demo import play_points_stream
     dt = float(getattr(args, "dt", 1e-3))
     frames = int(args.frames)
@@ -917,10 +935,11 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
-    vec_concat_list = []
+    vec_concat_list = [] if show_vectors else None
+    scalar_concat_list = [] if show_vectors and color_metric != "none" else None
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
-    pts0, vecs0 = gather_func()
+    pts0, _vecs0 = gather_func()
     center, radius = _compute_center_radius_pts(pts0)
     eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -934,7 +953,11 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
     for f in range(frames):
         pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
-        vec_concat_list.append(vecs.astype(np.float32, copy=False))
+        if show_vectors and vecs is not None and vec_concat_list is not None:
+            vec = vecs.astype(np.float32, copy=False)
+            vec_concat_list.append(vec)
+            if scalar_concat_list is not None and color_metric == "magnitude":
+                scalar_concat_list.append(np.linalg.norm(vec, axis=1).astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
 
         new_center, radius = _compute_center_radius_pts(pts)
@@ -965,13 +988,23 @@ def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
     vec_concat = (
         np.concatenate(vec_concat_list, axis=0)
         if vec_concat_list
-        else np.zeros((0, 3), dtype=np.float32)
+        else None
+    )
+    scalar_concat = (
+        np.concatenate(scalar_concat_list, axis=0)
+        if scalar_concat_list
+        else None
     )
     play_points_stream(
         pts_offsets,
         pts_concat,
         mvps,
         vec_concat=vec_concat,
+        scalar_concat=scalar_concat,
+        show_vectors=show_vectors,
+        color_metric=color_metric,
+        arrow_scale=arrow_scale,
+        flow_anim_speed=flow_anim_speed,
         viewport_w=w,
         viewport_h=h,
         loop_mode=args.loop,
@@ -1004,7 +1037,15 @@ def run_fluid_demo(args):
         return
 
     if getattr(args, "stream", "") == "opengl-points":
-        stream_fluid_points(args, gather, step)
+        stream_fluid_points(
+            args,
+            gather,
+            step,
+            show_vectors=args.show_vectors,
+            color_metric=args.color_metric,
+            arrow_scale=args.arrow_scale,
+            flow_anim_speed=args.flow_anim_speed,
+        )
         return
 
     dt = float(getattr(args, "dt", 1e-3))
