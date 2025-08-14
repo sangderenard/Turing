@@ -3,10 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class EngineParams:
-    dt: float = 0.01
+    dt: float = 1e-4
     substeps: int = 6
     iterations: int = 10
-    damping: float = 0.996
+    damping: float = 0.696
 
     # XPBD compliances (1/k)
     stretch_compliance: float = 1e-6
@@ -25,7 +25,7 @@ class EngineParams:
     # footprint exceeds ``contact_ram_limit``.
     contact_max_vox_entries: int = 8_000_000
     contact_vbatch: int = 250_000
-    contact_ram_limit: int | None = None  # bytes; ``None`` = no cap
+    contact_ram_limit: int | None = 1024 * 1024 * 1024 * 10  # bytes; ``None`` = no cap
 
     # Thin bath (Z is 1 voxel thick in the demo)
     bath_min = (0.0, 0.0, 0.0)
