@@ -1,10 +1,18 @@
 import numpy as np
 import math
+from .mesh import mesh_area2d, polyline_length
 
 
 def cell_area(cell):
-    """Compute total surface area of a softbody cell."""
+    """Compute total surface measure of a softbody cell."""
+    dim = getattr(cell, "dim", 3)
     X = np.asarray(cell.X, dtype=np.float64)
+    if dim == 2:
+        F = np.asarray(cell.faces, dtype=np.int32)
+        return float(mesh_area2d(X, F))
+    if dim == 1:
+        edges = np.asarray(cell.faces, dtype=np.int32)
+        return float(polyline_length(X, edges, dim=1))
     F = np.asarray(cell.faces, dtype=np.int32)
     AB = X[F[:, 1]] - X[F[:, 0]]
     AC = X[F[:, 2]] - X[F[:, 0]]
@@ -17,6 +25,8 @@ def _prep_refs(cell):
         cell._A0 = cell_area(cell)
     if not hasattr(cell, "_V0"):
         cell._V0 = abs(cell.enclosed_volume())
+    if getattr(cell, "dim", 3) != 3 or hasattr(cell, "_edge_dual_area"):
+        return
     if not hasattr(cell, "_edge_dual_area"):
         F = np.asarray(cell.faces, dtype=np.int32)
         X = np.asarray(cell.X, dtype=np.float64)
@@ -43,6 +53,8 @@ def _prep_refs(cell):
 
 
 def _set_stretch_from_Ka(cell, Ka):
+    if getattr(cell, "dim", 3) != 3:
+        return
     _prep_refs(cell)
     eps = 1e-12
     sc = cell.constraints.get("stretch")
@@ -57,13 +69,22 @@ def _set_stretch_from_Ka(cell, Ka):
 
 
 def laplace_from_Ka(cell, Ka, gamma0=0.0):
+    dim = getattr(cell, "dim", 3)
     A = cell_area(cell)
     A0 = max(1e-12, getattr(cell, "_A0", A))
     V = abs(cell.enclosed_volume())
-    R = ((3.0 * max(V, 1e-12)) / (4.0 * math.pi)) ** (1.0 / 3.0)
+    if dim == 3:
+        R = ((3.0 * max(V, 1e-12)) / (4.0 * math.pi)) ** (1.0 / 3.0)
+        dP_factor = 2.0 / max(1e-6, R)
+    elif dim == 2:
+        R = (max(A, 1e-12) / math.pi) ** 0.5
+        dP_factor = 1.0 / max(1e-6, R)
+    else:
+        R = max(V, 1e-12) * 0.5
+        dP_factor = 2.0 / max(1e-6, V)
     eps_A = (A - A0) / A0
     gamma = gamma0 + Ka * eps_A
-    dP_L = 2.0 * gamma / max(1e-6, R)
+    dP_L = gamma * dP_factor
     return float(gamma), float(dP_L)
 
 

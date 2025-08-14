@@ -7,6 +7,7 @@ class EngineParams:
     substeps: int = 6
     iterations: int = 10
     damping: float = 0.696
+    dimension: int = 3
 
     # XPBD compliances (1/k)
     stretch_compliance: float = 1e-6

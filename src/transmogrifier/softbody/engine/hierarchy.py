@@ -3,7 +3,16 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List
 
-from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
+from .mesh import (
+    make_icosphere,
+    mesh_volume,
+    volume_gradients,
+    build_adjacency,
+    mesh_area2d,
+    area_gradients2d,
+    polyline_length,
+    polyline_length_gradients,
+)
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
@@ -33,11 +42,24 @@ class Cell:
     membrane_tension: float = 0.0
     osmotic_pressure: float = 0.0
     external_pressure: float = 0.0
+    dim: int = 3
 
     def enclosed_volume(self) -> float:
+        if self.dim == 2:
+            return mesh_area2d(self.X, self.faces)
+        if self.dim == 1:
+            return polyline_length(self.X, self.faces, dim=1)
         return mesh_volume(self.X, self.faces)
 
     def surface_area(self) -> float:
+        if self.dim == 2:
+            e = self.edges
+            if len(e) == 0:
+                return 0.0
+            d = self.X[e[:, 1], :2] - self.X[e[:, 0], :2]
+            return float(np.linalg.norm(d, axis=1).sum())
+        if self.dim == 1:
+            return polyline_length(self.X, self.faces, dim=1)
         idx = self.faces
         a = self.X[idx[:, 0]]
         b = self.X[idx[:, 1]]
@@ -48,7 +70,11 @@ class Cell:
     def contact_pressure_estimate(self) -> float:
         V = abs(self.enclosed_volume())
         A = max(1e-12, self.surface_area())
-        return float(self.membrane_tension) * (A / (V**(2/3))) if V>1e-12 else 0.0
+        if self.dim == 2:
+            return float(self.membrane_tension) * (A / max(V, 1e-12))
+        if self.dim == 1:
+            return float(self.membrane_tension) / max(V, 1e-12)
+        return float(self.membrane_tension) * (A / (V**(2 / 3))) if V > 1e-12 else 0.0
 
 @dataclass
 class Hierarchy:
@@ -108,10 +134,10 @@ class Hierarchy:
         if not self.cells:
             return
 
-        sizes   = [len(c.X) for c in self.cells]
+        sizes = [len(c.X) for c in self.cells]
         offsets = np.cumsum([0] + sizes)
-        X       = np.vstack([c.X   for c in self.cells])
-        invm    = np.concatenate([c.invm for c in self.cells])
+        X = np.vstack([c.X for c in self.cells])
+        invm = np.concatenate([c.invm for c in self.cells])
 
         # ---- Batch stretch/bending only if membrane physics is OFF
         st_idx, st_rest, st_comp, st_lamb = [], [], [], []
@@ -150,15 +176,34 @@ class Hierarchy:
                 "lamb":        np.concatenate(bn_lamb),
             }
 
-        # Global indexing for faces and cells
+        dim = getattr(self.params, "dimension", 3)
         cell_ids = np.concatenate(
             [np.full(len(c.X), i, dtype=np.int32) for i, c in enumerate(self.cells)]
         )
-        all_faces = (
-            np.vstack([c.faces + off for c, off in zip(self.cells, offsets[:-1])])
-            if self.cells
-            else np.empty((0, 3), dtype=np.int32)
-        )
+        if dim == 1:
+            all_faces = (
+                np.vstack([c.faces + off for c, off in zip(self.cells, offsets[:-1])])
+                if self.cells
+                else np.empty((0, 2), dtype=np.int32)
+            )
+            vol_func = lambda X, f: polyline_length(X, f, dim=1)
+            vol_grads = lambda X, f: polyline_length_gradients(X, f, dim=1)
+        elif dim == 2:
+            all_faces = (
+                np.vstack([c.faces + off for c, off in zip(self.cells, offsets[:-1])])
+                if self.cells
+                else np.empty((0, 3), dtype=np.int32)
+            )
+            vol_func = mesh_area2d
+            vol_grads = area_gradients2d
+        else:
+            all_faces = (
+                np.vstack([c.faces + off for c, off in zip(self.cells, offsets[:-1])])
+                if self.cells
+                else np.empty((0, 3), dtype=np.int32)
+            )
+            vol_func = mesh_volume
+            vol_grads = volume_gradients
 
         # XPBDSolver.project expects explicit bounding box limits.  The
         # previous call passed ``self`` which was interpreted as ``box_min``
@@ -173,8 +218,8 @@ class Hierarchy:
             X,
             invm,
             all_faces,
-            mesh_volume,
-            volume_gradients,
+            vol_func,
+            vol_grads,
             dt,
             self.params.iterations,
             self.box_min,
@@ -206,7 +251,8 @@ class Hierarchy:
         for c in self.cells:
             vc = c.constraints.get("volume")
             if vc is not None:
-                vc.project(c.X, c.invm, c.faces, mesh_volume, volume_gradients, dt)
+                topo = c.faces
+                vc.project(c.X, c.invm, topo, vol_func, vol_grads, dt)
 
     def update_organelle_modes(self, dt):
         counts = [len(c.organelles) for c in self.cells]
@@ -298,11 +344,39 @@ class Hierarchy:
             c.V[:] = (c.X - c.X_prev) * inv_dt
 
 def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, target_volume=None):
-    X, F = make_icosphere(subdiv=subdiv, radius=radius, center=center)
+    dim = getattr(params, "dimension", 3)
+    if dim == 2:
+        n = int(8 * (2 ** max(0, int(subdiv))))
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        cx, cy, cz = center
+        ring = np.stack(
+            [cx + radius * np.cos(angles), cy + radius * np.sin(angles), np.full(n, cz)],
+            axis=1,
+        )
+        X = np.vstack([[cx, cy, cz], ring])
+        F = np.column_stack(
+            [np.zeros(n, dtype=np.int32), np.arange(1, n + 1), np.roll(np.arange(1, n + 1), -1)]
+        )
+        edges, bends = build_adjacency(F)
+        V0 = mesh_area2d(X, F) if target_volume is None else float(target_volume)
+    elif dim == 1:
+        n = int(8 * (2 ** max(0, int(subdiv))))
+        cx, cy, cz = center
+        xs = np.linspace(cx - radius, cx + radius, n + 1)
+        X = np.stack([xs, np.full(n + 1, cy), np.full(n + 1, cz)], axis=1)
+        edges = np.column_stack(
+            [np.arange(n, dtype=np.int32), np.arange(1, n + 1, dtype=np.int32)]
+        )
+        F = edges.copy()
+        bends = np.zeros((0, 4), dtype=np.int32)
+        V0 = polyline_length(X, F, dim=1) if target_volume is None else float(target_volume)
+    else:
+        X, F = make_icosphere(subdiv=subdiv, radius=radius, center=center)
+        edges, bends = build_adjacency(F)
+        V0 = abs(mesh_volume(X, F)) if target_volume is None else float(target_volume)
+
     V = np.zeros_like(X)
     invm = np.full(X.shape[0], 1.0 / mass_per_vertex, dtype=np.float64)
-    edges, bends = build_adjacency(F)
-
     edges = np.asarray(edges, dtype=np.int32)
     e_rest = np.linalg.norm(X[edges[:, 1]] - X[edges[:, 0]], axis=1)
     stretch = {
@@ -313,7 +387,7 @@ def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, ta
     }
 
     bends = np.asarray(bends, dtype=np.int32)
-    if bends.size:
+    if dim == 3 and bends.size:
         a, b, c, d = X[bends[:, 0]], X[bends[:, 1]], X[bends[:, 2]], X[bends[:, 3]]
         n1 = np.cross(c - a, b - a)
         n2 = np.cross(b - d, a - d)
@@ -321,7 +395,7 @@ def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, ta
         n2 /= np.linalg.norm(n2, axis=1, keepdims=True) + 1e-12
         rest = np.arccos(np.clip(np.sum(n1 * n2, axis=1), -1.0, 1.0))
     else:
-        rest = np.zeros(0, dtype=np.float64)
+        rest = np.zeros(len(bends), dtype=np.float64)
     bending = {
         "indices": bends,
         "rest": rest,
@@ -329,9 +403,7 @@ def build_cell(id_str, center, radius, params, subdiv=1, mass_per_vertex=1.0, ta
         "lamb": np.zeros(len(bends), dtype=np.float64),
     }
 
-    V0 = abs(mesh_volume(X, F)) if target_volume is None else float(target_volume)
     volc = VolumeConstraint(target=V0, compliance=params.volume_compliance)
-
     constraints = {"stretch": stretch, "bending": bending, "volume": volc}
     return X, F, V, invm, edges, bends, constraints
 

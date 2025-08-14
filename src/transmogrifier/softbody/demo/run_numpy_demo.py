@@ -63,6 +63,7 @@ def make_cellsim_backend(*,
     bath_volume_factor: float,
     substeps: int,
     dt_provider: float,
+    dim: int = 3,
 ):
     """Build a cellsim system attached to the softbody 0D provider.
 
@@ -89,7 +90,7 @@ def make_cellsim_backend(*,
 
     api = SalinePressureAPI(cells, bath)
     provider = api.attach_softbody_mechanics(
-        SoftbodyProviderCfg(substeps=substeps, dt_provider=dt_provider)
+        SoftbodyProviderCfg(substeps=substeps, dt_provider=dt_provider, dim=dim)
     )
     return api, provider
 
@@ -171,6 +172,8 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--gl-viewport-h", type=int, default=800, help="OpenGL stream: viewport height")
     parser.add_argument("--verbose", action="store_true", help="Log per-cell parameters each frame")
     parser.add_argument("--debug", action="store_true", help="Log full per-vertex and per-face data")
+    parser.add_argument("--sim-dim", type=int, choices=[1, 2, 3], default=3,
+                        help="Softbody simulation dimension")
     return parser
 
 

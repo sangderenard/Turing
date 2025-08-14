@@ -23,6 +23,7 @@ def make_cellsim_backend_from_args(args):
         bath_volume_factor=args.bath_volume_factor,
         substeps=args.substeps,
         dt_provider=args.dt_provider,
+        dim=args.sim_dim,
     )
 
     # color identity (rendering only)
@@ -108,6 +109,18 @@ def perspective(fovy_deg, aspect, znear, zfar):
     m[2,2] = (zfar + znear) / (znear - zfar)
     m[2,3] = (2 * zfar * znear) / (znear - zfar)
     m[3,2] = -1.0
+    return m
+
+
+def ortho(left, right, bottom, top, znear, zfar):
+    m = np.identity(4, dtype=np.float32)
+    m[0,0] = 2.0 / (right - left)
+    m[1,1] = 2.0 / (top - bottom)
+    m[2,2] = -2.0 / (zfar - znear)
+    m[3,3] = 1.0
+    m[0,3] = -(right + left) / (right - left)
+    m[1,3] = -(top + bottom) / (top - bottom)
+    m[2,3] = -(zfar + znear) / (zfar - znear)
     return m
 
 def look_at(eye, center, up):
@@ -373,6 +386,8 @@ def main():
                         help="Rendering mode: 'points' shows white vertex point cloud (default); 'mesh' shows shaded meshes.")
     parser.add_argument("--stream-npz", type=str, default="",
                         help="If provided, play a pre-rendered NPZ stream (points or mesh)")
+    parser.add_argument("--flat2d", action="store_true",
+                        help="Render in a fixed top-down 2D orthographic view")
     args = parser.parse_args()
 
     # If streaming mode, we still init pygame/GL, but won't step the sim.
@@ -464,12 +479,11 @@ def main():
     center = compute_cells_center_of_mass(h) if not streaming else np.array([0.0, 0.0, 0.0], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     fovy = 45.0
-    # lock initial view direction; we’ll track COM and adapt distance
     cam_dir = (center - eye)
     cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
     cam_dist = float(np.linalg.norm(center - eye))
-    center_s = center.copy()  # smoothed center
-    dist_s = cam_dist         # smoothed distance
+    center_s = center.copy()
+    dist_s = cam_dist
 
     clock = pygame.time.Clock()
     running = True
@@ -537,33 +551,42 @@ def main():
                 return
             MVP = stream['mvps'][fidx].astype(np.float32)
         else:
-            # Auto-frame camera: fit to current geometry (and smooth it)
-            new_center = compute_cells_center_of_mass(h)
-            allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
-            bmin, bmax = allX.min(0), allX.max(0)
-            radius = 0.5 * np.linalg.norm(bmax - bmin)
-            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
-            alpha = 0.15  # smoothing factor
-            center_s = (1.0 - alpha) * center_s + alpha * new_center
-            dist_s   = (1.0 - alpha) * dist_s   + alpha * desired_dist
-            center   = center_s
-            cam_dist = float(dist_s)
-            eye      = center - cam_dir * cam_dist
+            if args.flat2d:
+                allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
+                bmin, bmax = allX.min(0), allX.max(0)
+                margin = 0.1 * np.linalg.norm(bmax - bmin)
+                left, right = bmin[0] - margin, bmax[0] + margin
+                bottom, top = bmin[1] - margin, bmax[1] + margin
+                P = ortho(left, right, bottom, top, -1.0, 1.0)
+                MVP = P.astype(np.float32)
+            else:
+                # Auto-frame camera: fit to current geometry (and smooth it)
+                new_center = compute_cells_center_of_mass(h)
+                allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
+                bmin, bmax = allX.min(0), allX.max(0)
+                radius = 0.5 * np.linalg.norm(bmax - bmin)
+                desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+                alpha = 0.15  # smoothing factor
+                center_s = (1.0 - alpha) * center_s + alpha * new_center
+                dist_s   = (1.0 - alpha) * dist_s   + alpha * desired_dist
+                center   = center_s
+                cam_dist = float(dist_s)
+                eye      = center - cam_dir * cam_dist
 
-            # view/proj
-            near = 0.05
-            far  = max(10.0, cam_dist + 3.0*radius)
-            P = perspective(fovy, aspect, near, far)
-            V = look_at(eye, center, up)
-            # scene/world rotation using wall-clock
-            rot_speed = 0.25
-            t_wall = time.perf_counter() - t0
-            theta = rot_speed * t_wall
-            T_neg = translate(-center)
-            R_y  = rotate_y(theta)
-            T_pos = translate(center)
-            M = (T_pos @ R_y @ T_neg).astype(np.float32)
-            MVP = (P @ V @ M).astype(np.float32)
+                # view/proj
+                near = 0.05
+                far  = max(10.0, cam_dist + 3.0*radius)
+                P = perspective(fovy, aspect, near, far)
+                V = look_at(eye, center, up)
+                # scene/world rotation using wall-clock
+                rot_speed = 0.25 if not args.flat2d else 0.0
+                t_wall = time.perf_counter() - t0
+                theta = rot_speed * t_wall
+                T_neg = translate(-center)
+                R_y  = rotate_y(theta)
+                T_pos = translate(center)
+                M = (T_pos @ R_y @ T_neg).astype(np.float32)
+                MVP = (P @ V @ M).astype(np.float32)
 
         # clear
         glViewport(0, 0, viewport[0], viewport[1])

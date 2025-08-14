@@ -109,6 +109,60 @@ def volume_gradients(verts, faces):
     grads /= 6.0
     return grads
 
+
+# ----- Lower-dimensional measures -----------------------------------------
+
+def mesh_area2d(verts, faces):
+    """Area of a triangulated mesh projected to the XY plane."""
+    a = verts[faces[:, 0], :2]
+    b = verts[faces[:, 1], :2]
+    c = verts[faces[:, 2], :2]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return cross.sum() * 0.5
+
+
+def area_gradients2d(verts, faces):
+    """Gradient of ``mesh_area2d`` with respect to vertex positions."""
+    grads = np.zeros_like(verts)
+    a = verts[faces[:, 0], :2]
+    b = verts[faces[:, 1], :2]
+    c = verts[faces[:, 2], :2]
+    pad = np.zeros((len(faces), 1))
+    grad_a = np.stack([b[:, 1] - c[:, 1], c[:, 0] - b[:, 0]], axis=1) * 0.5
+    grad_b = np.stack([c[:, 1] - a[:, 1], a[:, 0] - c[:, 0]], axis=1) * 0.5
+    grad_c = np.stack([a[:, 1] - b[:, 1], b[:, 0] - a[:, 0]], axis=1) * 0.5
+    np.add.at(grads, faces[:, 0], np.hstack([grad_a, pad]))
+    np.add.at(grads, faces[:, 1], np.hstack([grad_b, pad]))
+    np.add.at(grads, faces[:, 2], np.hstack([grad_c, pad]))
+    return grads
+
+
+def polyline_length(verts, edges, dim=3):
+    """Total length of a polyline defined by ``edges``."""
+    a = verts[edges[:, 0], :dim]
+    b = verts[edges[:, 1], :dim]
+    return float(np.linalg.norm(b - a, axis=1).sum())
+
+
+def polyline_length_gradients(verts, edges, dim=3):
+    """Gradient of ``polyline_length`` wrt vertex positions."""
+    a = verts[edges[:, 0], :dim]
+    b = verts[edges[:, 1], :dim]
+    d = b - a
+    L = np.linalg.norm(d, axis=1, keepdims=True)
+    n = np.zeros_like(d)
+    mask = L[:, 0] > 1e-12
+    n[mask] = d[mask] / L[mask]
+    grads = np.zeros_like(verts)
+    pad = verts.shape[1] - dim
+    if pad > 0:
+        n_full = np.hstack([n, np.zeros((len(edges), pad))])
+    else:
+        n_full = n
+    np.add.at(grads, edges[:, 0], -n_full)
+    np.add.at(grads, edges[:, 1], n_full)
+    return grads
+
 def build_adjacency(faces):
     edge2tris = {}
     for t_idx,(i,j,k) in enumerate(faces):

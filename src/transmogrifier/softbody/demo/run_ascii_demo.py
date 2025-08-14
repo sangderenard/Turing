@@ -60,13 +60,13 @@ def world_to_grid(
     render_mode: str = "edges",
     face_stride: int = 8,
     draw_points: bool = True,
+    edge_ch: str = "#",
+    fill_ch: str = "+",
 ):
-    """
-    Rasterize the actual softbody mesh onto an ASCII grid using an XY orthographic projection.
+    """Rasterize the softbody mesh onto an ASCII grid.
 
-    render_mode: 'edges' | 'fill' (fill currently treated as edges for performance)
-    face_stride: draw every Nth face to limit cost (icosphere subdiv=5 is very dense)
-    draw_points: also stamp vertex points to thicken silhouettes
+    ``edge_ch`` and ``fill_ch`` allow callers to specify separate characters for
+    triangle edges versus interiors when ``render_mode`` is ``fill``.
     """
     grid = [[('.', (110, 110, 130)) for _ in range(nx)] for _ in range(ny)]
     cells = h.cells
@@ -101,7 +101,7 @@ def world_to_grid(
         R = int(255 * (masses[ci] / mmax)) if mmax > 0 else 0
         grid[iy][ix] = (ch, (R, int(G), B))
 
-    def draw_line(ix0: int, iy0: int, ix1: int, iy1: int, ci: int, ch: str = '#'):
+    def draw_line(ix0: int, iy0: int, ix1: int, iy1: int, ci: int, ch: str = edge_ch):
         # Bresenham's line algorithm on grid indices
         dx = abs(ix1 - ix0)
         dy = -abs(iy1 - iy0)
@@ -150,9 +150,28 @@ def world_to_grid(
                 iax, iay = clamp_ixy(ax, ay)
                 ibx, iby = clamp_ixy(bx, by)
                 idx, idy = clamp_ixy(dx_, dy_)
-                draw_line(iax, iay, ibx, iby, ci, '#')
-                draw_line(ibx, iby, idx, idy, ci, '#')
-                draw_line(idx, idy, iax, iay, ci, '#')
+                draw_line(iax, iay, ibx, iby, ci, edge_ch)
+                draw_line(ibx, iby, idx, idy, ci, edge_ch)
+                draw_line(idx, idy, iax, iay, ci, edge_ch)
+
+                if render_mode == "fill":
+                    # Barycentric rasterization in bounding box
+                    minx = max(0, min(iax, ibx, idx))
+                    maxx = min(nx - 1, max(iax, ibx, idx))
+                    miny = max(0, min(iay, iby, idy))
+                    maxy = min(ny - 1, max(iay, iby, idy))
+
+                    # Precompute area for barycentric weights
+                    denom = (iby - idy) * (iax - idx) + (idx - ibx) * (iay - idy)
+                    if abs(denom) < 1e-8:
+                        continue  # degenerate
+                    for yy in range(miny, maxy + 1):
+                        for xx in range(minx, maxx + 1):
+                            w1 = ((iby - idy) * (xx - idx) + (idx - ibx) * (yy - idy)) / denom
+                            w2 = ((idy - iay) * (xx - idx) + (iax - idx) * (yy - idy)) / denom
+                            w3 = 1.0 - w1 - w2
+                            if w1 >= 0 and w2 >= 0 and w3 >= 0:
+                                put(xx, yy, ci, fill_ch)
 
         # Draw organelles as small discs
         for o in getattr(c, 'organelles', []) or []:
@@ -178,11 +197,52 @@ def print_grid(grid, color_mode="auto", clear_each_line=False):
     """Print the grid and return the number of lines printed (no clearing)."""
     count = 0
     for row in grid:
-        line = ''.join([colorize(ch, (r, g, b), mode=color_mode) for ch,(r,g,b) in row])
-    # Ensure we start at column 1 of the current line without clearing
-    print("\x1b[G" + line)
-    count += 1
+        line = ''.join([colorize(ch, (r, g, b), mode=color_mode) for ch, (r, g, b) in row])
+        # Ensure we start at column 1 of the current line without clearing
+        print("\x1b[G" + line)
+        count += 1
     return count
+
+
+def world_to_line(h: Hierarchy, api=None, nx: int = 120, line_ch: str = "="):
+    """Rasterize the softbody mesh onto a single ASCII line.
+
+    Each cell covers the horizontal span of its projected vertices.  The
+    returned grid has shape ``[(ny=1, nx)]`` to remain compatible with
+    ``print_grid``.
+    """
+    grid = [[('.', (110, 110, 130)) for _ in range(nx)]]
+    cells = h.cells
+
+    pressures = [c.contact_pressure_estimate() for c in cells]
+    pmax = max(1e-8, max(pressures) if pressures else 0.0)
+    masses = []
+    if api is not None and getattr(api, "cells", None):
+        for i in range(len(cells)):
+            nd = getattr(api.cells[i], "n", None)
+            masses.append(sum(nd.values()) if isinstance(nd, dict) else 0.0)
+    else:
+        masses = [getattr(c, "osmotic_pressure", 0.0) for c in cells]
+    mmax = max(1e-8, max(masses) if masses else 0.0)
+
+    for ci, c in enumerate(cells):
+        X = np.asarray(c.X)
+        if X.ndim != 2 or X.shape[1] < 2:
+            continue
+        xs = X[:, 0]
+        x0 = max(0, min(nx - 1, int(xs.min() * nx)))
+        x1 = max(0, min(nx - 1, int(xs.max() * nx)))
+        default_g = 64 + (ci % 3) * 80
+        G = getattr(
+            c,
+            "_identity_green",
+            getattr(getattr(api, "cells", [None] * len(cells))[ci], "_identity_green", default_g),
+        )
+        B = int(255 * (pressures[ci] / pmax)) if pmax > 0 else 0
+        R = int(255 * (masses[ci] / mmax)) if mmax > 0 else 0
+        for ix in range(min(x0, x1), max(x0, x1) + 1):
+            grid[0][ix] = (line_ch, (R, int(G), B))
+    return grid
 
 def main():
     # Build CLI that inherits all numpy demo params, plus ASCII-only flags
@@ -202,6 +262,14 @@ def main():
                         help="Disable intra-mesh self-contact broad-phase to reduce RAM/CPU")
     parser.add_argument("--stream-npz", type=str, default="",
                         help="If provided, read a prerendered ASCII NPZ stream and play it.")
+    parser.add_argument("--dim", choices=["2d", "1d"], default="2d",
+                        help="Render as full 2D grid or a single 1D row")
+    parser.add_argument("--edge-char", type=str, default="#",
+                        help="Character for mesh edges")
+    parser.add_argument("--fill-char", type=str, default="+",
+                        help="Character for triangle interiors when render-mode=fill")
+    parser.add_argument("--line-char", type=str, default="=",
+                        help="Character for 1D cell spans")
     args = parser.parse_args()
     color_mode = args.color
 
@@ -243,6 +311,7 @@ def main():
         bath_volume_factor=args.bath_volume_factor,
         substeps=args.substeps,
         dt_provider=args.dt_provider,
+        dim=args.sim_dim,
     )
     # Optional: prime mechanics and disable self-contacts before main loop
     if getattr(args, "no_self_contacts", False):
@@ -270,15 +339,20 @@ def main():
         if h is None:
             continue
 
-        grid = world_to_grid(
-            h,
-            api=api,
-            nx=120,
-            ny=36,
-            render_mode=args.render_mode,
-            face_stride=args.face_stride,
-            draw_points=not args.no_points,
-        )
+        if args.dim == "1d":
+            grid = world_to_line(h, api=api, nx=120, line_ch=args.line_char)
+        else:
+            grid = world_to_grid(
+                h,
+                api=api,
+                nx=120,
+                ny=36,
+                render_mode=args.render_mode,
+                face_stride=args.face_stride,
+                draw_points=not args.no_points,
+                edge_ch=args.edge_char,
+                fill_ch=args.fill_char,
+            )
 
         if _is_tty():
             if prev_lines:
