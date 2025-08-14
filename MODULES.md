@@ -47,7 +47,7 @@ A hyperlinked index of modules and capabilities in this repository.
 - [src/turing_machine/turing_ssa.py](src/turing_machine/turing_ssa.py)
 - [src/turing_machine/turing_provenance.py](src/turing_machine/turing_provenance.py)
 
-## src/transmogrifier (core)
+## src/transmogrifier
 
 - [src/transmogrifier/__init__.py](src/transmogrifier/__init__.py)
 - [src/transmogrifier/dec.py](src/transmogrifier/dec.py)
@@ -86,55 +86,68 @@ A hyperlinked index of modules and capabilities in this repository.
   - [src/transmogrifier/graph/memory_graph/helpers/bit_tensor_memory_dag_helper.py](src/transmogrifier/graph/memory_graph/helpers/bit_tensor_memory_dag_helper.py)
   - [src/transmogrifier/graph/memory_graph/helpers/bit_tensor_memory_units.py](src/transmogrifier/graph/memory_graph/helpers/bit_tensor_memory_units.py)
 
-### src/transmogrifier/bitbitbuffer
+## src/bitbitbuffer
 
-- [src/transmogrifier/bitbitbuffer/__init__.py](src/transmogrifier/bitbitbuffer/__init__.py)
-- [src/transmogrifier/bitbitbuffer/bitbitbuffer.py](src/transmogrifier/bitbitbuffer/bitbitbuffer.py)
+- [src/bitbitbuffer/__init__.py](src/bitbitbuffer/__init__.py)
+- [src/bitbitbuffer/bitbitbuffer.py](src/bitbitbuffer/bitbitbuffer.py)
 - helpers
-  - [src/transmogrifier/bitbitbuffer/helpers/__init__.py](src/transmogrifier/bitbitbuffer/helpers/__init__.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/utils.py](src/transmogrifier/bitbitbuffer/helpers/utils.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/testbench.py](src/transmogrifier/bitbitbuffer/helpers/testbench.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/rawspan.py](src/transmogrifier/bitbitbuffer/helpers/rawspan.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/pidbuffer.py](src/transmogrifier/bitbitbuffer/helpers/pidbuffer.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/data_access.py](src/transmogrifier/bitbitbuffer/helpers/data_access.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/cell_proposal.py](src/transmogrifier/bitbitbuffer/helpers/cell_proposal.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/bitbitslice.py](src/transmogrifier/bitbitbuffer/helpers/bitbitslice.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/bitbititem.py](src/transmogrifier/bitbitbuffer/helpers/bitbititem.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/bitbitindex.py](src/transmogrifier/bitbitbuffer/helpers/bitbitindex.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/bitbitindexer.py](src/transmogrifier/bitbitbuffer/helpers/bitbitindexer.py)
-  - [src/transmogrifier/bitbitbuffer/helpers/bitstream_search.py](src/transmogrifier/bitbitbuffer/helpers/bitstream_search.py)
+  - [src/bitbitbuffer/helpers/__init__.py](src/bitbitbuffer/helpers/__init__.py)
+  - [src/bitbitbuffer/helpers/utils.py](src/bitbitbuffer/helpers/utils.py)
+  - [src/bitbitbuffer/helpers/testbench.py](src/bitbitbuffer/helpers/testbench.py)
+  - [src/bitbitbuffer/helpers/rawspan.py](src/bitbitbuffer/helpers/rawspan.py)
+  - [src/bitbitbuffer/helpers/pidbuffer.py](src/bitbitbuffer/helpers/pidbuffer.py)
+  - [src/bitbitbuffer/helpers/data_access.py](src/bitbitbuffer/helpers/data_access.py)
+  - [src/bitbitbuffer/helpers/cell_proposal.py](src/bitbitbuffer/helpers/cell_proposal.py)
+  - [src/bitbitbuffer/helpers/bitbitslice.py](src/bitbitbuffer/helpers/bitbitslice.py)
+  - [src/bitbitbuffer/helpers/bitbititem.py](src/bitbitbuffer/helpers/bitbititem.py)
+  - [src/bitbitbuffer/helpers/bitbitindex.py](src/bitbitbuffer/helpers/bitbitindex.py)
+  - [src/bitbitbuffer/helpers/bitbitindexer.py](src/bitbitbuffer/helpers/bitbitindexer.py)
+  - [src/bitbitbuffer/helpers/bitstream_search.py](src/bitbitbuffer/helpers/bitstream_search.py)
 
-### src/transmogrifier/cells
+## src/cells
 
-- [src/transmogrifier/cells/__init__.py](src/transmogrifier/cells/__init__.py)
-- [src/transmogrifier/cells/cell_consts.py](src/transmogrifier/cells/cell_consts.py)
-- [src/transmogrifier/cells/cell_walls.py](src/transmogrifier/cells/cell_walls.py)
-- [src/transmogrifier/cells/simulator.py](src/transmogrifier/cells/simulator.py)
+- [src/cells/__init__.py](src/cells/__init__.py)
+- [src/cells/cell_consts.py](src/cells/cell_consts.py)
+- [src/cells/cell_walls.py](src/cells/cell_walls.py)
+- [src/cells/simulator.py](src/cells/simulator.py)
+- bath
+  - [src/cells/bath/__init__.py](src/cells/bath/__init__.py)
+  - [src/cells/bath/adapter.py](src/cells/bath/adapter.py)
+  - [src/cells/bath/discrete_fluid.py](src/cells/bath/discrete_fluid.py)
+  - [src/cells/bath/fluid.py](src/cells/bath/fluid.py)
+  - [src/cells/bath/voxel_fluid.py](src/cells/bath/voxel_fluid.py)
 - cellsim
-  - [src/transmogrifier/cells/cellsim/__init__.py](src/transmogrifier/cells/cellsim/__init__.py)
-  - [src/transmogrifier/cells/cellsim/constants.py](src/transmogrifier/cells/cellsim/constants.py)
-  - api: [src/transmogrifier/cells/cellsim/api/saline.py](src/transmogrifier/cells/cellsim/api/saline.py)
-  - bath: [src/transmogrifier/cells/cellsim/bath/reservoir.py](src/transmogrifier/cells/cellsim/bath/reservoir.py)
-  - chemistry: [src/transmogrifier/cells/cellsim/chemistry/crn.py](src/transmogrifier/cells/cellsim/chemistry/crn.py), [electrochem.py](src/transmogrifier/cells/cellsim/chemistry/electrochem.py)
-  - core: [units.py](src/transmogrifier/cells/cellsim/core/units.py), [numerics.py](src/transmogrifier/cells/cellsim/core/numerics.py), [geometry.py](src/transmogrifier/cells/cellsim/core/geometry.py), [checks.py](src/transmogrifier/cells/cellsim/core/checks.py)
-  - data: [state.py](src/transmogrifier/cells/cellsim/data/state.py), [species.py](src/transmogrifier/cells/cellsim/data/species.py), [proposals.py](src/transmogrifier/cells/cellsim/data/proposals.py)
-  - engine: [saline.py](src/transmogrifier/cells/cellsim/engine/saline.py)
-  - membranes: [membrane.py](src/transmogrifier/cells/cellsim/membranes/membrane.py), [gates.py](src/transmogrifier/cells/cellsim/membranes/gates.py)
-  - mechanics: [provider.py](src/transmogrifier/cells/cellsim/mechanics/provider.py), [softbody0d.py](src/transmogrifier/cells/cellsim/mechanics/softbody0d.py), [tension.py](src/transmogrifier/cells/cellsim/mechanics/tension.py)
-  - transport: [pumps.py](src/transmogrifier/cells/cellsim/transport/pumps.py), [kedem_katchalsky.py](src/transmogrifier/cells/cellsim/transport/kedem_katchalsky.py), [ghk.py](src/transmogrifier/cells/cellsim/transport/ghk.py)
-  - placement: [bitbuffer.py](src/transmogrifier/cells/cellsim/placement/bitbuffer.py), [sync.py](src/transmogrifier/cells/cellsim/placement/sync.py)
-  - organelles: [inner_loop.py](src/transmogrifier/cells/cellsim/organelles/inner_loop.py)
-  - viz: [ascii.py](src/transmogrifier/cells/cellsim/viz/ascii.py)
-  - examples: [demo_sim.py](src/transmogrifier/cells/cellsim/examples/demo_sim.py)
-
-### src/transmogrifier/softbody
-
-- [src/transmogrifier/softbody/__init__.py](src/transmogrifier/softbody/__init__.py)
-- engine: [__init__.py](src/transmogrifier/softbody/engine/__init__.py), [xpbd_core.py](src/transmogrifier/softbody/engine/xpbd_core.py), [params.py](src/transmogrifier/softbody/engine/params.py), [mesh.py](src/transmogrifier/softbody/engine/mesh.py), [hierarchy.py](src/transmogrifier/softbody/engine/hierarchy.py), [fields.py](src/transmogrifier/softbody/engine/fields.py), [coupling.py](src/transmogrifier/softbody/engine/coupling.py), [constraints.py](src/transmogrifier/softbody/engine/constraints.py), [collisions.py](src/transmogrifier/softbody/engine/collisions.py)
-- geometry: [primitives.py](src/transmogrifier/softbody/geometry/primitives.py), [geodesic.py](src/transmogrifier/softbody/geometry/geodesic.py)
-- bridge: [__init__.py](src/transmogrifier/softbody/bridge/__init__.py), [state_io.py](src/transmogrifier/softbody/bridge/state_io.py)
-- resources: [field_library.py](src/transmogrifier/softbody/resources/field_library.py)
-- demo: [__init__.py](src/transmogrifier/softbody/demo/__init__.py), [run_ascii_demo.py](src/transmogrifier/softbody/demo/run_ascii_demo.py), [run_numpy_demo.py](src/transmogrifier/softbody/demo/run_numpy_demo.py), [run_opengl_demo.py](src/transmogrifier/softbody/demo/run_opengl_demo.py)
+  - [src/cells/cellsim/__init__.py](src/cells/cellsim/__init__.py)
+  - [src/cells/cellsim/constants.py](src/cells/cellsim/constants.py)
+  - api: [src/cells/cellsim/api/saline.py](src/cells/cellsim/api/saline.py)
+  - bath: [src/cells/cellsim/bath/reservoir.py](src/cells/cellsim/bath/reservoir.py)
+  - chemistry: [src/cells/cellsim/chemistry/crn.py](src/cells/cellsim/chemistry/crn.py), [electrochem.py](src/cells/cellsim/chemistry/electrochem.py)
+  - core: [units.py](src/cells/cellsim/core/units.py), [numerics.py](src/cells/cellsim/core/numerics.py), [geometry.py](src/cells/cellsim/core/geometry.py), [checks.py](src/cells/cellsim/core/checks.py)
+  - data: [state.py](src/cells/cellsim/data/state.py), [species.py](src/cells/cellsim/data/species.py), [proposals.py](src/cells/cellsim/data/proposals.py)
+  - engine: [saline.py](src/cells/cellsim/engine/saline.py)
+  - membranes: [membrane.py](src/cells/cellsim/membranes/membrane.py), [gates.py](src/cells/cellsim/membranes/gates.py)
+  - mechanics: [provider.py](src/cells/cellsim/mechanics/provider.py), [softbody0d.py](src/cells/cellsim/mechanics/softbody0d.py), [tension.py](src/cells/cellsim/mechanics/tension.py)
+  - transport: [pumps.py](src/cells/cellsim/transport/pumps.py), [kedem_katchalsky.py](src/cells/cellsim/transport/kedem_katchalsky.py), [ghk.py](src/cells/cellsim/transport/ghk.py)
+  - placement: [bitbuffer.py](src/cells/cellsim/placement/bitbuffer.py), [sync.py](src/cells/cellsim/placement/sync.py)
+  - organelles: [inner_loop.py](src/cells/cellsim/organelles/inner_loop.py)
+  - viz: [ascii.py](src/cells/cellsim/viz/ascii.py)
+  - examples: [demo_sim.py](src/cells/cellsim/examples/demo_sim.py)
+- simulator_methods
+  - [src/cells/simulator_methods/cell_mask.py](src/cells/simulator_methods/cell_mask.py)
+  - [src/cells/simulator_methods/data_io.py](src/cells/simulator_methods/data_io.py)
+  - [src/cells/simulator_methods/injection.py](src/cells/simulator_methods/injection.py)
+  - [src/cells/simulator_methods/lcm.py](src/cells/simulator_methods/lcm.py)
+  - [src/cells/simulator_methods/logutil.py](src/cells/simulator_methods/logutil.py)
+  - [src/cells/simulator_methods/minimize.py](src/cells/simulator_methods/minimize.py)
+  - [src/cells/simulator_methods/quanta_map_and_dump_cells.py](src/cells/simulator_methods/quanta_map_and_dump_cells.py)
+  - [src/cells/simulator_methods/visualization.py](src/cells/simulator_methods/visualization.py)
+- softbody
+  - [src/cells/softbody/__init__.py](src/cells/softbody/__init__.py)
+  - engine: [src/cells/softbody/engine/__init__.py](src/cells/softbody/engine/__init__.py), [xpbd_core.py](src/cells/softbody/engine/xpbd_core.py), [params.py](src/cells/softbody/engine/params.py), [mesh.py](src/cells/softbody/engine/mesh.py), [hierarchy.py](src/cells/softbody/engine/hierarchy.py), [fields.py](src/cells/softbody/engine/fields.py), [coupling.py](src/cells/softbody/engine/coupling.py), [constraints.py](src/cells/softbody/engine/constraints.py), [collisions.py](src/cells/softbody/engine/collisions.py)
+  - geometry: [primitives.py](src/cells/softbody/geometry/primitives.py), [geodesic.py](src/cells/softbody/geometry/geodesic.py)
+  - bridge: [__init__.py](src/cells/softbody/bridge/__init__.py), [state_io.py](src/cells/softbody/bridge/state_io.py)
+  - resources: [field_library.py](src/cells/softbody/resources/field_library.py)
+  - demo: [__init__.py](src/cells/softbody/demo/__init__.py), [run_ascii_demo.py](src/cells/softbody/demo/run_ascii_demo.py), [run_numpy_demo.py](src/cells/softbody/demo/run_numpy_demo.py), [run_opengl_demo.py](src/cells/softbody/demo/run_opengl_demo.py)
 
 ## src/visualizations
 

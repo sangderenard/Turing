@@ -1,4 +1,4 @@
-# src/transmogrifier/softbody/geometry/geodesic.py
+# src/cells/softbody/geometry/geodesic.py
 from __future__ import annotations
 import math
 from typing import List, Tuple, Dict, Iterable, Optional, Literal
