@@ -112,6 +112,9 @@ class FluidParams:
     # Boundary
     bounce_damping: float = 0.0           # velocity damping on boundary collision [0..1]
 
+    # Source term relaxation (0..1, 1 = immediate)
+    source_relaxation: float = 1.0
+
 
 # ----------------------------- Discrete Fluid -------------------------------
 
@@ -159,6 +162,12 @@ class DiscreteFluid:
                   if salinity is not None else
                   np.zeros(self.N, dtype=np.float64))
 
+        # Mass and solute tracking
+        self.m = np.full(self.N, params.particle_mass, dtype=np.float64)
+        self.solute_mass = self.m * self.S
+        self.m_target = self.m.copy()
+        self.solute_mass_target = self.solute_mass.copy()
+
         self.params = params
         self.kernel = SPHKernel(params.smoothing_length)
 
@@ -174,7 +183,6 @@ class DiscreteFluid:
         self._neighbor_offsets = self._build_neighbor_offsets()
 
         # Cached constants
-        self._m = params.particle_mass
         self._g = np.array(params.gravity, dtype=np.float64)
 
     # ------------------------- Public API ------------------------------------
@@ -205,10 +213,10 @@ class DiscreteFluid:
 
         for (pi, pj, rvec, r, W) in pairs_iter:
             # accumulate SPH sums at points pi from neighbor particles pj
-            m_over_rho = (self._m / self.rho[pj])
+            m_over_rho = (self.m[pj] / self.rho[pj])
             w = W * m_over_rho
 
-            rho[pi]  += self._m * W
+            rho[pi]  += self.m[pj] * W
             denom[pi] += w
             P[pi]    += self.P[pj] * w
             T[pi]    += self.T[pj] * w
@@ -225,9 +233,10 @@ class DiscreteFluid:
     def apply_sources(self, centers: np.ndarray, dM: np.ndarray, dS_mass: np.ndarray,
                       radius: float) -> Dict[str, np.ndarray]:
         """
-        Apply source/sink terms to mass (dM [kg]) and solute mass (dS_mass [kg]) around
-        given centers within a spherical radius using kernel weights.
-        Returns realized amounts per center (may be smaller if needed to keep positivity).
+        Distribute mass and solute sources around ``centers`` within ``radius`` using
+        kernel weights.  Mass and solute are tracked separately via target particle
+        masses and solute masses.  Realized amounts are returned per center after
+        clamping to keep per-particle quantities non-negative.
         """
         assert centers.ndim == 2 and centers.shape[1] == 3
         assert dM.shape == (centers.shape[0],)
@@ -237,32 +246,32 @@ class DiscreteFluid:
         out_M = np.zeros_like(dM)
         out_Sm = np.zeros_like(dS_mass)
 
-        # For each center, distribute to nearby particles (batched)
-        # Use h_src = max(radius, h) for smoother deposition
         h_src = max(radius, self.kernel.h)
         k_src = SPHKernel(h_src)
 
         for ci in range(centers.shape[0]):
             c = centers[ci:ci+1, :]
-            # gather nearby particles
             pi, pj, rvec, r, W = next(self._pairs_points(c, custom_kernel=k_src, yield_once=True))
             if pj.size == 0:
                 continue
             w = W / (W.sum() + 1e-12)
 
-            # Compute capacity constraints: keep rho, S non-negative
-            # Mass update: change particle mass proxy by modifying density (WCSPH uses constant m,
-            # but adding/removing mass can be modeled by adjusting rho "target" to reflect injection).
-            # We emulate it by modifying density immediately; pressure will react in next step.
             dM_j = dM[ci] * w
-            # Solute mass: add to particle salinity mass = rho * volume * S ≈ m * S, here assume per-particle mass m const.
             dSm_j = dS_mass[ci] * w
 
-            # Apply: adjust density proportionally and salinity mass -> S (clamped to [0,1])
-            self.rho[pj] = np.maximum(1e-6, self.rho[pj] + dM_j / (self._particle_volume_estimate(pj) + 1e-12))
-            # Update S by mass fraction: (m*S + dSm) / m, with m≈constant (proxy)
-            S_new = np.clip((self._m * self.S[pj] + dSm_j) / max(self._m, 1e-12), 0.0, 1.0)
-            self.S[pj] = S_new
+            m_new = self.m_target[pj] + dM_j
+            neg_mask = m_new < 1e-12
+            if np.any(neg_mask):
+                dM_j[neg_mask] = 1e-12 - self.m_target[pj][neg_mask]
+                m_new = self.m_target[pj] + dM_j
+            self.m_target[pj] = m_new
+
+            sm_new = self.solute_mass_target[pj] + dSm_j
+            neg_sm = sm_new < 0.0
+            if np.any(neg_sm):
+                dSm_j[neg_sm] = -self.solute_mass_target[pj][neg_sm]
+                sm_new = self.solute_mass_target[pj] + dSm_j
+            self.solute_mass_target[pj] = sm_new
 
             out_M[ci] = dM_j.sum()
             out_Sm[ci] = dSm_j.sum()
@@ -271,7 +280,21 @@ class DiscreteFluid:
 
     # --------------------------- Core substep ---------------------------------
 
+    def _relax_sources(self) -> None:
+        """Relax particle mass and solute mass toward targets."""
+        r = np.clip(self.params.source_relaxation, 0.0, 1.0)
+        if r <= 0.0:
+            return
+        dm = self.m_target - self.m
+        self.m += r * dm
+        dsm = self.solute_mass_target - self.solute_mass
+        self.solute_mass += r * dsm
+        self.S = np.clip(self.solute_mass / np.maximum(self.m, 1e-12), 0.0, 1.0)
+
     def _substep(self, dt: float) -> None:
+        # Relax any pending source targets before computing new densities
+        self._relax_sources()
+
         # Neighbor grid
         self._build_grid()
 
@@ -314,12 +337,13 @@ class DiscreteFluid:
         rho = np.zeros(N, dtype=np.float64)
 
         if include_self:
-            rho += self._m * float(self.kernel.W(np.array([0.0]))[0])
+            rho += self.m * float(self.kernel.W(np.array([0.0]))[0])
 
         for (i, j, rvec, r, W) in self._pairs_particles():
-            contrib = self._m * W
-            np.add.at(rho, i, contrib)
-            np.add.at(rho, j, contrib)
+            contrib_i = self.m[j] * W
+            contrib_j = self.m[i] * W
+            np.add.at(rho, i, contrib_i)
+            np.add.at(rho, j, contrib_j)
 
         self.rho = np.maximum(rho, 1e-6)
 
@@ -356,7 +380,7 @@ class DiscreteFluid:
             Pi = P[i]; Pj = P[j]
             rhoi = self.rho[i]; rhoj = self.rho[j]
             # pair coefficient (positive for repulsion)
-            c = self._m * self._m * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
+            c = self.m[i] * self.m[j] * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
             fij = c[:, None] * gW
             # action-reaction (scatter-add)
             np.add.at(f, i,  fij)
@@ -375,9 +399,9 @@ class DiscreteFluid:
         for (i, j, rvec, r, W) in self._pairs_particles():
             lapW = self.kernel.laplaceW_visc(r)
             rhoi = self.rho[i]; rhoj = self.rho[j]
-            coeff = mu * self._m * self._m * (lapW / np.maximum(rhoi * rhoj, 1e-12))[:, None]
+            coeff = mu * self.m[i] * self.m[j] * (lapW / np.maximum(rhoi * rhoj, 1e-12))
             dv = (self.v[j] - self.v[i])
-            fij = coeff * dv
+            fij = coeff[:, None] * dv
             np.add.at(f, i,  fij)
             np.add.at(f, j, -fij)
         return f
@@ -414,8 +438,8 @@ class DiscreteFluid:
         # therefore points outward from the fluid.
         n_vec = np.zeros_like(self.p)
         for (i, j, rvec, r, W) in self._pairs_particles():
-            m_over_rho_j = self._m / np.maximum(self.rho[j], 1e-12)
-            m_over_rho_i = self._m / np.maximum(self.rho[i], 1e-12)
+            m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
+            m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
             gW = self.kernel.gradW(rvec, r)
             n_vec[i] += m_over_rho_j[:, None] * gW
             n_vec[j] -= m_over_rho_i[:, None] * gW
@@ -428,8 +452,8 @@ class DiscreteFluid:
         kappa = np.zeros(self.N)
         for (i, j, rvec, r, W) in self._pairs_particles():
             gW = self.kernel.gradW(rvec, r)
-            m_over_rho_j = self._m / np.maximum(self.rho[j], 1e-12)
-            m_over_rho_i = self._m / np.maximum(self.rho[i], 1e-12)
+            m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
+            m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
             kappa[i] += m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
             kappa[j] += m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
 
@@ -449,10 +473,10 @@ class DiscreteFluid:
         dv_accum = np.zeros_like(self.v)
         for (i, j, rvec, r, W) in self._pairs_particles():
             rho_avg = 0.5 * (self.rho[i] + self.rho[j])
-            w = (self._m / np.maximum(rho_avg, 1e-12)) * W
-            contrib = (self.v[j] - self.v[i]) * w[:, None]
-            np.add.at(dv_accum, i, contrib)
-            np.add.at(dv_accum, j, -contrib)
+            w_ij = (self.m[j] / np.maximum(rho_avg, 1e-12)) * W
+            w_ji = (self.m[i] / np.maximum(rho_avg, 1e-12)) * W
+            np.add.at(dv_accum, i, (self.v[j] - self.v[i]) * w_ij[:, None])
+            np.add.at(dv_accum, j, (self.v[i] - self.v[j]) * w_ji[:, None])
         return self.v + eps * dv_accum
 
     # ------------------------------- Diffusion --------------------------------
@@ -470,13 +494,14 @@ class DiscreteFluid:
         dT = np.zeros(self.N); dS = np.zeros(self.N)
         for (i, j, rvec, r, W) in self._pairs_particles():
             lapW = self.kernel.laplaceW_visc(r)  # same operator works as Laplacian weight
-            m_over_rho = self._m / np.maximum(self.rho[j], 1e-12)
+            m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
+            m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
             if kappa > 0:
-                np.add.at(dT, i, kappa * m_over_rho * (self.T[j] - self.T[i]) * lapW)
-                np.add.at(dT, j, kappa * (self._m / np.maximum(self.rho[i],1e-12)) * (self.T[i] - self.T[j]) * lapW)
+                np.add.at(dT, i, kappa * m_over_rho_j * (self.T[j] - self.T[i]) * lapW)
+                np.add.at(dT, j, kappa * m_over_rho_i * (self.T[i] - self.T[j]) * lapW)
             if D_s > 0:
-                np.add.at(dS, i, D_s * m_over_rho * (self.S[j] - self.S[i]) * lapW)
-                np.add.at(dS, j, D_s * (self._m / np.maximum(self.rho[i],1e-12)) * (self.S[i] - self.S[j]) * lapW)
+                np.add.at(dS, i, D_s * m_over_rho_j * (self.S[j] - self.S[i]) * lapW)
+                np.add.at(dS, j, D_s * m_over_rho_i * (self.S[i] - self.S[j]) * lapW)
 
         self.T += dt * dT
         self.S = np.clip(self.S + dt * dS, 0.0, 1.0)
@@ -764,7 +789,7 @@ class DiscreteFluid:
 
     def _particle_volume_estimate(self, idx: np.ndarray) -> np.ndarray:
         """Estimate per-particle volume as m / ρ (vectorized)."""
-        return self._m / np.maximum(self.rho[idx], 1e-12)
+        return self.m[idx] / np.maximum(self.rho[idx], 1e-12)
 
     def _stable_dt(self) -> float:
         """
@@ -786,7 +811,7 @@ class DiscreteFluid:
     # ------------------------------ Diagnostics -------------------------------
 
     def kinetic_energy(self) -> float:
-        return 0.5 * self._m * float(np.sum(np.einsum('ij,ij->i', self.v, self.v)))
+        return 0.5 * float(np.sum(self.m * np.einsum('ij,ij->i', self.v, self.v)))
 
     def potential_energy(self) -> float:
         # gravitational potential relative to z=0 along gravity direction
@@ -796,7 +821,7 @@ class DiscreteFluid:
         # project position onto gravity direction (unit)
         gnorm = np.linalg.norm(g)
         gh = (self.p @ (g / gnorm))
-        return float(np.sum(self._m * gnorm * gh))
+        return float(np.sum(self.m * gnorm * gh))
 
     # ------------------------------ Debug/demo --------------------------------
 

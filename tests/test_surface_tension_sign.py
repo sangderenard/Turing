@@ -19,8 +19,8 @@ def test_surface_tension_normals_and_restoring_force():
     # Compute normals explicitly to check orientation
     n_vec = np.zeros_like(positions)
     for (i, j, rvec, r, W) in fluid._pairs_particles():
-        m_over_rho_j = fluid._m / np.maximum(fluid.rho[j], 1e-12)
-        m_over_rho_i = fluid._m / np.maximum(fluid.rho[i], 1e-12)
+        m_over_rho_j = fluid.m[j] / np.maximum(fluid.rho[j], 1e-12)
+        m_over_rho_i = fluid.m[i] / np.maximum(fluid.rho[i], 1e-12)
         gW = fluid.kernel.gradW(rvec, r)
         n_vec[i] += m_over_rho_j[:, None] * gW
         n_vec[j] -= m_over_rho_i[:, None] * gW
