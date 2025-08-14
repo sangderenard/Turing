@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import pytest
 
+
 # Ensure src is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
@@ -15,6 +16,7 @@ def test_salinity_clamp():
     fluid.S = np.linspace(-0.1, 1.1, fluid.S.size).reshape(fluid.S.shape)
     with pytest.warns(RuntimeWarning):
         fluid.step(1e-3)
+
     assert fluid.S.min() >= 0.0
     assert fluid.S.max() <= 1.0
 

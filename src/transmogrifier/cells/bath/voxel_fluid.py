@@ -209,6 +209,7 @@ class VoxelMACFluid:
         self._diffuse_scalars(dt)
         self._clip_salinity("after diffusion")
 
+
     # ---------------------------------------------------------------------
     # Forces
     # ---------------------------------------------------------------------
