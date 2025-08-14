@@ -1,6 +1,6 @@
-from src.transmogrifier.cells.cellsim.placement.bitbuffer import BitBufferAdapter
-from src.transmogrifier.bitbitbuffer import BitBitBuffer, CellProposal
-from src.transmogrifier.cells.cell_consts import Cell as LegacyCell
+from src.cells.cellsim.placement.bitbuffer import BitBufferAdapter
+from src.bitbitbuffer import BitBitBuffer, CellProposal
+from src.cells.cell_consts import Cell as LegacyCell
 
 
 def make_cell(label, left, right, stride):

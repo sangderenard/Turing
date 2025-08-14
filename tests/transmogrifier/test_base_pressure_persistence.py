@@ -1,8 +1,8 @@
 import pytest
 
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
+from src.cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.cells.cellsim.api.saline import SalinePressureAPI
 
 
 def test_base_pressure_preserved_from_legacy():

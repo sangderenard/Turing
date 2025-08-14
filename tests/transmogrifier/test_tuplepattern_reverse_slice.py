@@ -1,4 +1,4 @@
-from transmogrifier.bitbitbuffer.bitbitbuffer import BitBitBuffer
+from src.bitbitbuffer.bitbitbuffer import BitBitBuffer
 
 
 def test_tuplepattern_handles_full_reverse_slice():

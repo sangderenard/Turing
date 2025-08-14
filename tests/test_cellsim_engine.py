@@ -1,7 +1,7 @@
 import pytest
 
-from src.transmogrifier.cells.cellsim.engine.saline import SalineEngine
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
+from src.cells.cellsim.engine.saline import SalineEngine
+from src.cells.cellsim.data.state import Cell, Bath
 
 
 def test_engine_step_adapts_dt_and_conserves_nonneg():

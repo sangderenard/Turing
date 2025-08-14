@@ -4,9 +4,9 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import pygame
 import pytest
 
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.simulator_methods.visualization import _LCVisual
+from src.cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.cells.simulator_methods.visualization import _LCVisual
 
 
 def test_scale_updates_with_cell_resize():

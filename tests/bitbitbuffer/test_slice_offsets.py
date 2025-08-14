@@ -1,4 +1,4 @@
-from src.transmogrifier.bitbitbuffer.bitbitbuffer import BitBitBuffer
+from src.bitbitbuffer.bitbitbuffer import BitBitBuffer
 
 
 def test_nested_slice_offsets():

@@ -9,9 +9,9 @@ import sys
 import threading
 from uuid import uuid4
 
-from ....cells.simulator import Simulator
-from ....cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
-from ....cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
+from src.cells.cell_consts import Cell
 # Avoid importing via the parent ``memory_graph`` package to prevent
 # circular initialisation when ``memory_graph`` itself imports helpers.
 # ``BitTensorMemory`` lives alongside this module, so we can import it
@@ -28,7 +28,9 @@ class BitTensorMemoryDAGHelper:
         self.chunk_size = chunk_size
         self.bit_width = bit_width
         self.hard_memory_size = sys.getsizeof(bit_tensor_memory.data)
-        self.hard_memory = BitTensorMemory(self.hard_memory_size)
+        # Use the provided BitTensorMemory instance to avoid redundant
+        # allocation and circular init concerns.
+        self.hard_memory = bit_tensor_memory
         self.lock_manager = None  # placeholder for lock manager
         self.envelope_domain = (0, self.hard_memory_size // self.chunk_size)
         self.envelope_size = self.hard_memory_size // self.chunk_size

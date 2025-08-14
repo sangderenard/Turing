@@ -26,7 +26,7 @@ def main():
     assert buf2[0:3].hex() == 'e0'
 
 
-    from ...cells.cell_consts import Cell
+    from src.cells.cell_consts import Cell
 
     # 1) Create two test cells with stride=4, covering bits [1,4) and [4,7):
     cell1 = Cell(stride=4, left=1, right=4, len=3, label='c1')

@@ -1,8 +1,8 @@
 import pytest
 from sympy import Integer
 
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.cells.cell_consts import Cell
 
 
 def test_saline_api_equilibrium_fracs_sum_to_one():

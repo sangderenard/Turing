@@ -5,7 +5,7 @@ import numpy as np
 # Ensure src is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
-from src.transmogrifier.cells.bath.discrete_fluid import DiscreteFluid, FluidParams
+from src.cells.bath.discrete_fluid import DiscreteFluid, FluidParams
 
 
 def test_surface_tension_normals_and_restoring_force():

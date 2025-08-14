@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.transmogrifier.softbody.engine import build_self_contacts_spatial_hash
+from src.cells.softbody.engine import build_self_contacts_spatial_hash
 
 
 def test_build_self_contacts_spatial_hash_simple():

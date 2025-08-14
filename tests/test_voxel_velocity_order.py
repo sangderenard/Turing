@@ -6,7 +6,7 @@ import numpy as np
 # Ensure src is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
-from src.transmogrifier.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
+from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
 
 
 def test_velocity_advection_order_invariance():

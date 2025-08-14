@@ -1,5 +1,5 @@
 # Use a relative import to access Cell definition from cells package.
-from ...cells.cell_consts import Cell
+from src.cells.cell_consts import Cell
 
 class CellProposal(Cell):
     def __init__(self, cell):

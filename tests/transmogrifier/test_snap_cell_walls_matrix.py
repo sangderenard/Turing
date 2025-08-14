@@ -1,9 +1,9 @@
 import random
 import pytest
 
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.bitbitbuffer import CellProposal
+from src.cells.simulator import Simulator
+from src.cells.cell_consts import Cell
+from src.bitbitbuffer import CellProposal
 
 
 def build_cells(config: str, variant: str, seed: int | None = None):

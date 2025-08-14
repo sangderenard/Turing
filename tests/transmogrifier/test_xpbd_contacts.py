@@ -1,7 +1,7 @@
 import numpy as np
 
-from src.transmogrifier.softbody.engine.params import EngineParams
-from src.transmogrifier.softbody.engine.xpbd_core import XPBDSolver
+from src.cells.softbody.engine.params import EngineParams
+from src.cells.softbody.engine.xpbd_core import XPBDSolver
 
 
 def test_project_contacts_returns_lambda_and_resolves_penetration():

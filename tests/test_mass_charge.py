@@ -1,7 +1,7 @@
 import math
-from src.transmogrifier.cells.cellsim.engine.saline import SalineEngine
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
-from src.transmogrifier.cells.cellsim.core.geometry import sphere_area_from_volume
+from src.cells.cellsim.engine.saline import SalineEngine
+from src.cells.cellsim.data.state import Cell, Bath
+from src.cells.cellsim.core.geometry import sphere_area_from_volume
 
 
 def test_mass_conserved_without_pump():

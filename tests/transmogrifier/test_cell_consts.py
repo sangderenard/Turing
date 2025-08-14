@@ -1,10 +1,10 @@
-from transmogrifier.cells.cell_consts import Cell, DEFAULT_FLAG_PROFILES
-from transmogrifier.cells.cellsim.constants import (
+from src.cells.cell_consts import Cell, DEFAULT_FLAG_PROFILES
+from src.cells.cellsim.constants import (
     DEFAULT_ELASTIC_K,
     DEFAULT_LP0,
     SALINITY_PER_DATA_UNIT,
 )
-from transmogrifier.cells.cellsim.data.state import Organelle
+from src.cells.cellsim.data.state import Organelle
 
 
 def test_cell_flag_profiles():

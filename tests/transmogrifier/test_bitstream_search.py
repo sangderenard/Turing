@@ -1,4 +1,4 @@
-from src.transmogrifier.bitbitbuffer.helpers.bitstream_search import BitStreamSearch
+from src.bitbitbuffer.helpers.bitstream_search import BitStreamSearch
 
 
 class DummyBitslice:

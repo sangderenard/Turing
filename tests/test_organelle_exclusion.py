@@ -1,6 +1,6 @@
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath, Organelle
-from src.transmogrifier.cells.cellsim.engine.saline import SalineEngine
-from src.transmogrifier.cells.cellsim.organelles.inner_loop import cytosol_free_volume
+from src.cells.cellsim.data.state import Cell, Bath, Organelle
+from src.cells.cellsim.engine.saline import SalineEngine
+from src.cells.cellsim.organelles.inner_loop import cytosol_free_volume
 
 
 def test_organelle_exclusion():

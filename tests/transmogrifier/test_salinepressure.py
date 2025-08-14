@@ -1,8 +1,8 @@
 import pytest
-from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.cells.cellsim.data.state import Cell as SimCell, Bath
+from src.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
+from src.cells.simulator import Simulator
+from src.cells.cell_consts import Cell
+from src.cells.cellsim.data.state import Cell as SimCell, Bath
 
 
 def test_equilibrium_fracs_sum_to_one():

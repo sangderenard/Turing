@@ -9,15 +9,15 @@ from ..data.state import Cell, Bath
 from .provider import MechanicsProvider, MechanicsSnapshot
 
 # Softbody engine imports (kept optional to avoid import cost if unused)
-from src.transmogrifier.softbody.engine.params import EngineParams
-from src.transmogrifier.softbody.engine.hierarchy import Hierarchy, build_cell
-from src.transmogrifier.softbody.engine.xpbd_core import XPBDSolver
-from src.transmogrifier.softbody.engine.coupling import (
+from src.cells.softbody.engine.params import EngineParams
+from src.cells.softbody.engine.hierarchy import Hierarchy, build_cell
+from src.cells.softbody.engine.xpbd_core import XPBDSolver
+from src.cells.softbody.engine.coupling import (
     harmonized_update,
     laplace_from_Ka,
     cell_area,
 )
-from src.transmogrifier.softbody.engine.fields import FieldStack
+from src.cells.softbody.engine.fields import FieldStack
 
 
 @dataclass
@@ -250,7 +250,7 @@ class Softbody0DProvider(MechanicsProvider):
                     params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=target
                 )
                 # Build minimal shim that Hierarchy expects
-                from src.transmogrifier.softbody.engine.hierarchy import Cell as SBC
+                from src.cells.softbody.engine.hierarchy import Cell as SBC
                 sb_cell = SBC(
                     id=f"cell{idx}", X=X, V=V, invm=invm, faces=F, edges=edges,
                     bends=bends, constraints=constraints, organelles=[], dim=self.cfg.dim,
@@ -270,24 +270,24 @@ class Softbody0DProvider(MechanicsProvider):
         )
         # Attach a field stack for optional environmental forces/noise
         self._h.fields = FieldStack()
-
-        from src.transmogrifier.softbody.resources.field_library import (
-            uniform_flow,
-            shear_flow,
-            fluid_noise,
-            gravity,
-        )
-
-        # whole-system drift to +X
-        #self._h.fields.add(uniform_flow(u=(10.03, 0.0, 0.0), dim=3))
-
-        # visible shear (u_x = rate * y)
-        # self._h.fields.add(shear_flow(rate=0.5, axis_xy=(0,1), dim=3))
-
-        # gentle Brownian jiggle (no COM drift)
-        self._h.fields.add(fluid_noise(sigma=.5e-4, com_neutral=True, dim=3))
-
-        # gravity on a subset (example: only cell0 & cell2)
-        self._h.fields.add(
-             gravity(g=(0, -0.4, 0), selector=lambda c: c.id in {"cell0", "cell1","cell2"}, dim=3)
-        )
+        # Optional: attach default fields (noise, gravity demo). Safe if library is available.
+        try:
+            from src.cells.softbody.resources.field_library import (
+                uniform_flow,
+                shear_flow,
+                fluid_noise,
+                gravity,
+            )
+            # gentle Brownian jiggle (no COM drift)
+            self._h.fields.add(fluid_noise(sigma=.5e-4, com_neutral=True, dim=self.cfg.dim))
+            # example gravity on a subset
+            self._h.fields.add(
+                gravity(
+                    g=(0, -0.4, 0) if self.cfg.dim == 3 else (0, -0.4, 0),
+                    selector=lambda c: c.id in {"cell0", "cell1", "cell2"},
+                    dim=self.cfg.dim,
+                )
+            )
+        except Exception:
+            # Field library optional; proceed without if unavailable
+            pass

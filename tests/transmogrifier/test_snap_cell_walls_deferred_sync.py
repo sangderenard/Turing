@@ -1,6 +1,6 @@
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.bitbitbuffer import CellProposal
+from src.cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.bitbitbuffer import CellProposal
 
 
 def test_snap_cell_walls_defers_cell_sync_until_after_expand():

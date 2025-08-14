@@ -5,9 +5,9 @@ import numpy as np
 # Ensure src is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
-from src.transmogrifier.cells.bath import SPHAdapter, MACAdapter
-from src.transmogrifier.cells.bath.discrete_fluid import DiscreteFluid, FluidParams
-from src.transmogrifier.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
+from src.cells.bath import SPHAdapter, MACAdapter
+from src.cells.bath.discrete_fluid import DiscreteFluid, FluidParams
+from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
 
 
 def test_sph_adapter_deposit_and_sample():

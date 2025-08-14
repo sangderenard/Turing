@@ -1,9 +1,9 @@
 import numpy as np
 from types import SimpleNamespace
 
-from src.transmogrifier.softbody.demo.run_numpy_demo import _rasterize_ascii_numpy
-from src.transmogrifier.cells.cellsim.mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
+from src.cells.softbody.demo.run_numpy_demo import _rasterize_ascii_numpy
+from src.cells.cellsim.mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
+from src.cells.cellsim.data.state import Cell, Bath
 
 
 def test_rasterize_ascii_1d_no_error():

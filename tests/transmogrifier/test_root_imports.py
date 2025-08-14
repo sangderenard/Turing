@@ -5,11 +5,5 @@ import transmogrifier
 
 
 def test_root_exports():
-    expected = {
-        "Simulator",
-        "BitTensorMemoryGraph",
-        "NodeEntry",
-        "EdgeEntry",
-        "GraphSearch",
-    }
+    expected = {"BitTensorMemoryGraph", "NodeEntry", "EdgeEntry", "GraphSearch"}
     assert expected.issubset(set(transmogrifier.__all__))

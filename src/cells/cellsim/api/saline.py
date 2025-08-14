@@ -286,7 +286,7 @@ def run_saline_sim(sim, *, as_float: bool = False):
     sim.fractions = api.equilibrium_fracs(0.0)
 
     # Legacy flow returned proposals after a snap to boundaries
-    from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
+    from src.bitbitbuffer.helpers.cell_proposal import CellProposal
     proposals = [CellProposal(c) for c in tqdm(sim.cells, desc="cells", leave=False)]
     proposals = sim.snap_cell_walls(sim.cells, proposals)
     return proposals
@@ -312,7 +312,7 @@ def equilibrium_fracs(sim, t: float):
 def balance_system(sim, cells, bitbuffer, *args, **kwargs):
     # Lightweight legacy-compatible: ensure geometric fields and set concentrations/pressure.
     from math import pi
-    from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
+    from src.bitbitbuffer.helpers.cell_proposal import CellProposal
 
     def sphere_area_from_volume_legacy(V: float):
         R = (3.0 * V / (4.0 * pi)) ** (1.0 / 3.0)
@@ -355,7 +355,7 @@ def run_balanced_saline_sim(sim, mode: str = "open", *, dt: float = 1, max_steps
     - Copies pressure/volume and concentrations back to legacy cells
     - Computes fractions for the legacy integer-bar view and returns snap proposals
     """
-    from src.transmogrifier.bitbitbuffer.helpers.cell_proposal import CellProposal
+    from src.bitbitbuffer.helpers.cell_proposal import CellProposal
 
     api = SalinePressureAPI.from_legacy(sim)
     sim.cs_api = api

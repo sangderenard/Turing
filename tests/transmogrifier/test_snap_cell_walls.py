@@ -1,8 +1,8 @@
 import pytest
 import random
-from src.transmogrifier.cells.simulator import Simulator  # Adjust this import to your project structure
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.bitbitbuffer import CellProposal
+from src.cells.simulator import Simulator  # Adjust this import to your project structure
+from src.cells.cell_consts import Cell
+from src.bitbitbuffer import CellProposal
 
 def _build_cells(config: str, variant: str, seed: int | None = None):
     """

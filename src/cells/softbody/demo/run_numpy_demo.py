@@ -4,9 +4,9 @@ from typing import Sequence, Tuple, Dict, Any, Optional
 import numpy as np
 import logging
 
-from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
-from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
-from src.transmogrifier.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
+from src.cells.cellsim.data.state import Cell, Bath
+from src.cells.cellsim.api.saline import SalinePressureAPI
+from src.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
 
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math

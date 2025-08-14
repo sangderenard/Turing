@@ -1,8 +1,8 @@
 import pytest
 
-from src.transmogrifier.cells.cell_consts import Cell
-from src.transmogrifier.cells.simulator import Simulator
-from src.transmogrifier.cells.simulator_methods import visualization as viz
+from src.cells.cell_consts import Cell
+from src.cells.simulator import Simulator
+from src.cells.simulator_methods import visualization as viz
 
 
 def test_visualization_runs_without_pygame(monkeypatch):

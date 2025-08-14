@@ -1,8 +1,8 @@
 import numpy as np
 
-from src.transmogrifier.softbody.engine.mesh import make_icosphere, build_adjacency
-from src.transmogrifier.softbody.engine.hierarchy import Cell
-from src.transmogrifier.softbody.engine.collisions import resolve_membrane_collisions
+from src.cells.softbody.engine.mesh import make_icosphere, build_adjacency
+from src.cells.softbody.engine.hierarchy import Cell
+from src.cells.softbody.engine.collisions import resolve_membrane_collisions
 
 
 def _build_cell(offset=(0.0, 0.0, 0.0)):

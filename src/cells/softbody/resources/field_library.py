@@ -1,6 +1,6 @@
 # field_library.py
 import numpy as np
-from src.transmogrifier.softbody.engine.fields import VectorField
+from src.cells.softbody.engine.fields import VectorField
 
 def gravity(g=(0.0, -9.81, 0.0), selector=None, dim=3):
     g = np.asarray(g, dtype=float)

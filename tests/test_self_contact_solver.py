@@ -1,9 +1,9 @@
 import numpy as np
 import time
 
-from src.transmogrifier.softbody.engine.mesh import make_icosphere, build_adjacency
-from src.transmogrifier.softbody.engine.hierarchy import Cell
-from src.transmogrifier.softbody.engine.collisions import (
+from src.cells.softbody.engine.mesh import make_icosphere, build_adjacency
+from src.cells.softbody.engine.hierarchy import Cell
+from src.cells.softbody.engine.collisions import (
     resolve_membrane_collisions,
     build_self_contacts_spatial_hash,
 )

@@ -11,8 +11,11 @@ from .cellsim.api.saline import (
     run_balanced_saline_sim as cs_run_balanced,
     )
 
-from ..bitbitbuffer import BitBitBuffer, CellProposal
-from ..bitbitbuffer.helpers.bitstream_search import BitStreamSearch
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    # Only for type hints; avoid import-time circular deps
+    from ..bitbitbuffer import BitBitBuffer as _BBB_Type, CellProposal as _CP_Type
+    from ..bitbitbuffer.helpers.bitstream_search import BitStreamSearch as _BSS_Type
 from .cell_walls import snap_cell_walls, build_metadata, expand
 import math
 import random
@@ -39,9 +42,15 @@ class Simulator:
         self.N = len(cells)
         self.system_lcm   = self.lcm(cells)
         required_end = max(c.right for c in cells)
+        # Lazy import here to avoid circular import during package init
+        from ..bitbitbuffer import BitBitBuffer
+        from ..bitbitbuffer.helpers.bitstream_search import BitStreamSearch
         mask_size    = BitBitBuffer._intceil(required_end, self.system_lcm)
-        self.bitbuffer = BitBitBuffer(mask_size=mask_size, caster=bytes,
-                                    bitsforbits=MASK_BITS_TO_DATA_BITS)
+        self.bitbuffer = BitBitBuffer(
+            mask_size=mask_size,
+            caster=bytes,
+            bitsforbits=MASK_BITS_TO_DATA_BITS,
+        )
         self.bitbuffer.register_pid_buffer(cells=self.cells)
         self.locked_data_regions = []
         self.search = BitStreamSearch()

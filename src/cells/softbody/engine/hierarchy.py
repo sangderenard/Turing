@@ -13,12 +13,12 @@ from .mesh import (
     polyline_length,
     polyline_length_gradients,
 )
-from src.transmogrifier.softbody.geometry.primitives import planar_ngon, line_segment
+from src.cells.softbody.geometry.primitives import planar_ngon, line_segment
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
 from .collisions import project_self_contacts_streamed
-from src.transmogrifier.cells.cellsim.membranes.membrane import (
+from src.cells.cellsim.membranes.membrane import (
     Membrane, MembraneConfig, MembraneHooks,
 )
 
