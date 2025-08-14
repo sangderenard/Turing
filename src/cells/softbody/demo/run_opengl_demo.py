@@ -259,6 +259,7 @@ layout(location=2) in vec3 aVec;    // per-instance velocity vector
 layout(location=3) in float aScalar; // per-instance scalar (magnitude, curl, ...)
 out float vScalar;
 uniform mat4 uMVP;
+uniform float uArrowScale;
 void main(){
     float len = length(aVec);
     vec3 dir = (len > 1e-6) ? normalize(aVec) : vec3(1.0, 0.0, 0.0);
@@ -266,7 +267,7 @@ void main(){
     float c = cos(ang), s = sin(ang);
     mat2 rot = mat2(c, -s, s, c);
     vec3 base = aBase;
-    base.x *= len;            // scale by vector length (length along +X)
+    base.x *= len * uArrowScale;            // scale by vector length (length along +X)
     vec2 xy = rot * base.xy;  // rotate into direction
     vec3 world = vec3(xy, base.z) + aOffset;
     vScalar = aScalar;
@@ -898,16 +899,22 @@ def _ensure_gl_context(width: int = 1100, height: int = 800):
     pygame.display.set_caption("XPBD Softbody — OpenGL Stream")
     return pygame
 
-def play_points_stream(pts_offsets: np.ndarray,
-                       pts_concat: np.ndarray,
-                       mvps: np.ndarray,
-                       vec_concat: np.ndarray | None = None,
-                       scalar_concat: np.ndarray | None = None,
-                       *,
-                       viewport_w: int = 1100,
-                       viewport_h: int = 800,
-                       loop_mode: str = "none",
-                       fps: float = 60.0):
+def play_points_stream(
+    pts_offsets: np.ndarray,
+    pts_concat: np.ndarray,
+    mvps: np.ndarray,
+    vec_concat: np.ndarray | None = None,
+    scalar_concat: np.ndarray | None = None,
+    *,
+    show_vectors: bool = False,
+    color_metric: str = "magnitude",
+    arrow_scale: float = 1.0,
+    flow_anim_speed: float = 1.0,
+    viewport_w: int = 1100,
+    viewport_h: int = 800,
+    loop_mode: str = "none",
+    fps: float = 60.0,
+):
     """Render a precomputed OpenGL points stream in-process.
 
     pts_offsets: (F+1,) int64
@@ -915,6 +922,10 @@ def play_points_stream(pts_offsets: np.ndarray,
     mvps:         (F,4,4) float32
     vec_concat:   optional (N,3) float32 per-vertex vectors
     scalar_concat: optional (N,) float32 per-vertex scalar (magnitude, curl, ...)
+    show_vectors: render arrows when vector data present
+    color_metric: descriptor for scalar_concat; currently informational
+    arrow_scale:  scale factor for arrow lengths
+    flow_anim_speed: multiplier for pulsing animation speed
     loop_mode:    'none' | 'loop' | 'bounce'
     """
     pygame = _ensure_gl_context(viewport_w, viewport_h)
@@ -935,6 +946,7 @@ def play_points_stream(pts_offsets: np.ndarray,
     arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
     arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
     arrow_u_time = glGetUniformLocation(arrow_prog, "uTime")
+    arrow_u_scale = glGetUniformLocation(arrow_prog, "uArrowScale")
 
     # Set up a single reusable point cloud object
     pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
@@ -948,13 +960,13 @@ def play_points_stream(pts_offsets: np.ndarray,
         if scalar_concat is not None
         else None
     )
-    if vecs is not None:
-        if scalars is None:
+    if show_vectors and vecs is not None:
+        if scalars is None and color_metric == "magnitude":
             scalars = np.linalg.norm(vecs, axis=1)
         gl_pts = ArrowsGL(
             pts.astype(np.float32, copy=False),
             vecs.astype(np.float32, copy=False),
-            scalars.astype(np.float32, copy=False),
+            scalars.astype(np.float32, copy=False) if scalars is not None else None,
         )
         use_arrows = True
     else:
@@ -968,7 +980,7 @@ def play_points_stream(pts_offsets: np.ndarray,
     F = int(mvps.shape[0])
     direction = 1
     while running:
-        time_s = pygame.time.get_ticks() * 0.001
+        time_s = pygame.time.get_ticks() * 0.001 * flow_anim_speed
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
@@ -1028,6 +1040,7 @@ def play_points_stream(pts_offsets: np.ndarray,
             glUseProgram(arrow_prog)
             glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
             glUniform1f(arrow_u_time, time_s)
+            glUniform1f(arrow_u_scale, arrow_scale)
             gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
         else:
             glUseProgram(pt_prog)
