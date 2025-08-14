@@ -189,5 +189,26 @@ class Bath:
 
         return dV, dS
 
+    # ------------------------------------------------------------------
+    # Diagnostics / finalisation
+    # ------------------------------------------------------------------
+    def finalize_step(self) -> Dict[str, float]:
+        """Finalize thermodynamic state for external observers.
+
+        Returns
+        -------
+        Dict[str, float]
+            Mapping with ``pressure``, ``temperature`` and ``viscosity``.  The
+            method performs no additional physics; it merely exposes the latest
+            values so downstream viewers can verify that the bath remains within
+            physical bounds.
+        """
+
+        return {
+            "pressure": float(self.pressure),
+            "temperature": float(self.temperature),
+            "viscosity": float(self.viscosity),
+        }
+
 
 __all__ = ["Bath"]
