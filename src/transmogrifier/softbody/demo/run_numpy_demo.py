@@ -96,8 +96,27 @@ def make_cellsim_backend(*,
 
 
 def step_cellsim(api: SalinePressureAPI, dt: float) -> float:
-    """Advance cellsim one step; returns suggested next dt. Keeps arrays resident on engine."""
-    return api.step(dt)
+    """Advance cellsim one step and finalize bath thermodynamics.
+
+    The Saline engine is stepped first; the attached :class:`~transmogrifier.cells.bath.fluid.Bath`
+    layer then exposes its latest pressure/temperature/viscosity for downstream
+    diagnostics.  The returned value is the engine's suggested next ``dt`` and
+    the bath diagnostics are stored on ``api.last_bath_state``.
+    """
+
+    dt = api.step(dt)
+    # Bath diagnostics for viewers (robust to missing attributes)
+    bath = getattr(api, "bath", None)
+    if bath is not None and hasattr(bath, "finalize_step"):
+        try:
+            api.last_bath_state = bath.finalize_step()
+            logger.debug("Bath state: %s", api.last_bath_state)
+        except Exception:
+            api.last_bath_state = None
+            logger.exception("Bath finalization failed")
+    else:
+        api.last_bath_state = None
+    return dt
 
 
 def _com_and_com_vel(cell):
@@ -219,10 +238,20 @@ def _array_stats(arr: np.ndarray) -> Tuple[Any, Any, Any]:
     )
 
 
-def _log_hierarchy_state(h, frame: int, *, debug: bool = False) -> None:
+def _log_hierarchy_state(h, frame: int, api: SalinePressureAPI | None = None, *, debug: bool = False) -> None:
     if h is None:
         logger.info("frame %d: <no hierarchy>", frame)
         return
+    if api is not None:
+        bstate = getattr(api, "last_bath_state", None)
+        if isinstance(bstate, dict):
+            logger.info(
+                "frame %d bath pressure=%s temperature=%s viscosity=%s",
+                frame,
+                bstate.get("pressure"),
+                bstate.get("temperature"),
+                bstate.get("viscosity"),
+            )
     for ci, c in enumerate(getattr(h, 'cells', []) or []):
         logger.info("frame %d cell %d", frame, ci)
         for attr, val in c.__dict__.items():
@@ -421,7 +450,7 @@ def export_ascii_stream(args, api, provider):
         dt = step_cellsim(api, dt)
         h = getattr(provider, "_h", None)
         if args.verbose or args.debug:
-            _log_hierarchy_state(h, f, debug=args.debug)
+            _log_hierarchy_state(h, f, api=api, debug=args.debug)
         if h is None:
             continue
         ch, col = _rasterize_ascii_numpy(
@@ -616,7 +645,7 @@ def stream_ascii(args, api, provider):
         dt = step_cellsim(api, dt)
         h = getattr(provider, "_h", None)
         if args.verbose or args.debug:
-            _log_hierarchy_state(h, f, debug=args.debug)
+            _log_hierarchy_state(h, f, api=api, debug=args.debug)
         if h is None:
             continue
         ch, col = _rasterize_ascii_numpy(
@@ -664,7 +693,7 @@ def stream_opengl_points(args, api, provider):
         t_sim += dt
         hobj = getattr(provider, "_h", hobj)
         if args.verbose or args.debug:
-            _log_hierarchy_state(hobj, f, debug=args.debug)
+            _log_hierarchy_state(hobj, f, api=api, debug=args.debug)
         vtx = _gather_vertices(hobj)
         if vtx is None:
             vtx = np.zeros((0, 3), dtype=np.float32)
@@ -731,7 +760,7 @@ def stream_opengl_mesh(args, api, provider):
         t_sim += dt
         hobj = getattr(provider, "_h", hobj)
         if args.verbose or args.debug:
-            _log_hierarchy_state(hobj, f, debug=args.debug)
+            _log_hierarchy_state(hobj, f, api=api, debug=args.debug)
         vtx_concat[f, :, :] = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
 
         pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
@@ -855,7 +884,7 @@ def main():
         osm = getattr(engine, "osmotic_pressure", np.zeros_like(vols))
         # Lightweight textual output without converting arrays to Python lists unnecessarily
         if args.verbose or args.debug:
-            _log_hierarchy_state(h, frame, debug=args.debug)
+            _log_hierarchy_state(h, frame, api=api, debug=args.debug)
         msg = (
             f"vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)}"
         )
