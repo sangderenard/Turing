@@ -370,6 +370,15 @@ class VoxelMACFluid:
         w = self._sample_face(self.w, Xw, axis=2)
         return np.stack([u, v, w], axis=-1)
 
+    def _sample_velocity_from(
+        self, u: np.ndarray, v: np.ndarray, w: np.ndarray, Xw: np.ndarray
+    ) -> np.ndarray:
+        """Sample the provided MAC velocity (u, v, w) at world points Xw (N,3)."""
+        us = self._sample_face(u, Xw, axis=0)
+        vs = self._sample_face(v, Xw, axis=1)
+        ws = self._sample_face(w, Xw, axis=2)
+        return np.stack([us, vs, ws], axis=-1)
+
     def _sample_scalar_cc(self, F: np.ndarray, Xw: np.ndarray) -> np.ndarray:
         """Trilinear interpolation of a cell-centered scalar field at world points."""
         dx = self.dx
@@ -455,10 +464,9 @@ class VoxelMACFluid:
             I, J, K = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
             X = np.stack([I+0.5, J+0.5, K], axis=-1).reshape(-1,3) * dx
 
-        V = self._sample_velocity(X)
+        V = self._sample_velocity_from(u0, v0, w0, X)
         Xb = X - dt * V
 
-        # sample the same component from Fcomp at Xb
         vals = self._sample_face(Fcomp, Xb, axis)
         return vals.reshape(Fcomp.shape)
 
