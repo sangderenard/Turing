@@ -30,7 +30,7 @@ class MechanicsProvider(Protocol):
         ...
 
     # Optional array-first fast-path to avoid Python object conversions
-    def sync_arrays(self, *, V, elastic_k, imp, bath_pressure: float) -> None:  # type: ignore[override]
+    def sync_arrays(self, *, V, elastic_k, imp, bath_pressure: float, bath_temperature: float) -> None:  # type: ignore[override]
         """Sync provider directly from numpy arrays (optional)."""
         ...
 

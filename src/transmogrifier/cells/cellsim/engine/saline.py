@@ -2,7 +2,7 @@ from typing import Iterable, List, Optional
 import math
 import numpy as np
 from ..core.geometry import sphere_area_from_volume
-from ..core.numerics import clamp_nonneg, adapt_dt
+from ..core.numerics import adapt_dt
 from ..core.units import R as RGAS
 from ..mechanics.tension import laplace_pressure
 from ..transport.kedem_katchalsky import arrhenius
@@ -120,6 +120,7 @@ class SalineEngine:
                         elastic_k=self.elastic_k,
                         imp=imp,
                         bath_pressure=self.bath_pressure,
+                        bath_temperature=self.bath_temperature,
                     )
                 except Exception:
                     pass
@@ -211,6 +212,13 @@ class SalineEngine:
                     Cext_dict = {sp: Cext_vec[j] for j, sp in enumerate(species_list)}
                     checks.assert_passive_no_energy(self.cells[i], self.bath, dS_cell, Cint_dict, Cext_dict, self.species, T)
 
+        # Let bath enforce thermodynamic constraints and update its state
+        dV, dS = self.bath.apply_physics(dV, dS, {"species": species_list})
+        self.bath_pressure = float(self.bath.pressure)
+        self.bath_temperature = float(self.bath.temperature)
+        self.bath_V = float(self.bath.V)
+        self.bath_n = np.asarray([self.bath.n.get(sp, 0.0) for sp in species_list], dtype=float)
+
         # Apply updates with masks (array-only)
         V_min = np.full(n_cells, 1e-18, dtype=float)
         V_next = self.V + dV
@@ -224,21 +232,12 @@ class SalineEngine:
         dS[neg_mask] = -self.n[neg_mask]
         self.n = np.maximum(n_new, 0.0)
 
-        self.bath_n = np.maximum(self.bath_n - dS.sum(axis=0), 0.0)
-        if self.bath_compressibility > 0.0:
-            self.bath_V = clamp_nonneg(self.bath_V - dV.sum())
-
         max_rel = float(np.max(np.abs(dV) / np.maximum(self.V, 1e-18)))
-        sum_dV = float(np.sum(dV))
 
         # Update cached observables
         self.P_i = P_i
         self.osmotic_pressure = osm
         self.A = A
-
-        # Update bath pressure if compressible
-        if self.bath_compressibility > 0.0:
-            self.bath_pressure += -(sum_dV / (self.bath_compressibility * max(self.bath_V, 1e-18)))
 
         # Scatter array state back to object graph for external observers
         for i, c in enumerate(self.cells):
@@ -247,6 +246,9 @@ class SalineEngine:
                 c.n[sp] = float(self.n[i, j])
         for i, sp in enumerate(species_list):
             self.bath.n[sp] = float(self.bath_n[i])
+        self.bath.pressure = float(self.bath_pressure)
+        self.bath.temperature = float(self.bath_temperature)
+        self.bath.V = float(self.bath_V)
 
         if self.enable_checks:
             # These checks still reference object graph for messages; can be disabled if desired
