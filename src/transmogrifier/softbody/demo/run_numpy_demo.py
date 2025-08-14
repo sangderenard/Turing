@@ -2,6 +2,7 @@ import argparse
 from typing import Sequence, Tuple, Dict, Any, Optional
 
 import numpy as np
+import logging
 
 from src.transmogrifier.cells.cellsim.data.state import Cell, Bath
 from src.transmogrifier.cells.cellsim.api.saline import SalinePressureAPI
@@ -9,6 +10,8 @@ from src.transmogrifier.cells.cellsim.mechanics.softbody0d import SoftbodyProvid
 
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math
+
+logger = logging.getLogger(__name__)
 
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
@@ -166,6 +169,8 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--gl-rot-speed", type=float, default=0.25, help="OpenGL stream: Y-rotation speed rad/sec (used as frame*dt)")
     parser.add_argument("--gl-viewport-w", type=int, default=1100, help="OpenGL stream: viewport width")
     parser.add_argument("--gl-viewport-h", type=int, default=800, help="OpenGL stream: viewport height")
+    parser.add_argument("--verbose", action="store_true", help="Log per-cell parameters each frame")
+    parser.add_argument("--debug", action="store_true", help="Log full per-vertex and per-face data")
     return parser
 
 
@@ -198,6 +203,43 @@ def _cells_faces_counts(h) -> Tuple[np.ndarray, np.ndarray]:
 
 def _cells_vertex_counts(h) -> np.ndarray:
     return np.array([len(np.asarray(c.X)) for c in getattr(h, 'cells', [])], dtype=np.int32)
+
+
+def _array_stats(arr: np.ndarray) -> Tuple[Any, Any, Any]:
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        return arr.min().tolist(), arr.max().tolist(), arr.mean().tolist()
+    return (
+        arr.min(axis=0).tolist(),
+        arr.max(axis=0).tolist(),
+        arr.mean(axis=0).tolist(),
+    )
+
+
+def _log_hierarchy_state(h, frame: int, *, debug: bool = False) -> None:
+    if h is None:
+        logger.info("frame %d: <no hierarchy>", frame)
+        return
+    for ci, c in enumerate(getattr(h, 'cells', []) or []):
+        logger.info("frame %d cell %d", frame, ci)
+        for attr, val in c.__dict__.items():
+            if isinstance(val, np.ndarray):
+                if val.size == 0:
+                    logger.info("  %s: shape=%s", attr, val.shape)
+                else:
+                    mn, mx, mean = _array_stats(val)
+                    logger.info(
+                        "  %s: shape=%s min=%s max=%s mean=%s",
+                        attr,
+                        val.shape,
+                        mn,
+                        mx,
+                        mean,
+                    )
+                    if debug:
+                        logger.debug("  %s values=%s", attr, val.tolist())
+            else:
+                logger.info("  %s=%s", attr, val)
 
 def _compute_center_radius(h) -> Tuple[np.ndarray, float]:
     allX = np.concatenate([c.X for c in h.cells], axis=0).astype(np.float32)
@@ -372,6 +414,8 @@ def export_ascii_stream(args, api, provider):
     for f in range(frames):
         dt = step_cellsim(api, dt)
         h = getattr(provider, "_h", None)
+        if args.verbose or args.debug:
+            _log_hierarchy_state(h, f, debug=args.debug)
         if h is None:
             continue
         ch, col = _rasterize_ascii_numpy(
@@ -563,6 +607,8 @@ def stream_ascii(args, api, provider):
     for f in range(frames):
         dt = step_cellsim(api, dt)
         h = getattr(provider, "_h", None)
+        if args.verbose or args.debug:
+            _log_hierarchy_state(h, f, debug=args.debug)
         if h is None:
             continue
         ch, col = _rasterize_ascii_numpy(
@@ -608,6 +654,8 @@ def stream_opengl_points(args, api, provider):
         dt = step_cellsim(api, dt)
         t_sim += dt
         hobj = getattr(provider, "_h", hobj)
+        if args.verbose or args.debug:
+            _log_hierarchy_state(hobj, f, debug=args.debug)
         vtx = _gather_vertices(hobj)
         if vtx is None:
             vtx = np.zeros((0, 3), dtype=np.float32)
@@ -672,48 +720,50 @@ def stream_opengl_mesh(args, api, provider):
         dt = step_cellsim(api, dt)
         t_sim += dt
         hobj = getattr(provider, "_h", hobj)
-    vtx_concat[f, :, :] = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
+        if args.verbose or args.debug:
+            _log_hierarchy_state(hobj, f, debug=args.debug)
+        vtx_concat[f, :, :] = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
 
-    pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
-    pN = _normalize(pressures)
-    mN = _normalize(masses)
-    BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
-    PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
-    G = (greens255.astype(np.float32) / 255.0)
-    R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
-    B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
-    colors[f, :, 0] = R
-    colors[f, :, 1] = G
-    colors[f, :, 2] = B
-    colors[f, :, 3] = BASE_A
+        pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
+        pN = _normalize(pressures)
+        mN = _normalize(masses)
+        BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
+        PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
+        G = (greens255.astype(np.float32) / 255.0)
+        R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
+        B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
+        colors[f, :, 0] = R
+        colors[f, :, 1] = G
+        colors[f, :, 2] = B
+        colors[f, :, 3] = BASE_A
 
-    new_center, radius = _compute_center_radius(hobj)
-    desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
-    alpha = 0.15
-    center_s = (1.0 - alpha) * center_s + alpha * new_center
-    dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
-    center = center_s; cam_dist = float(dist_s)
-    eye = center - cam_dir * cam_dist
-    P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
-    V = _look_at(eye, center, up)
-    theta = rot_speed * t_sim
-    T_neg = _translate(-center)
-    R_y = _rotate_y(theta)
-    T_pos = _translate(center)
-    M = (T_pos @ R_y @ T_neg).astype(np.float32)
-    MVP = (P @ V @ M).astype(np.float32)
-    mvps[f] = MVP
+        new_center, radius = _compute_center_radius(hobj)
+        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+        alpha = 0.15
+        center_s = (1.0 - alpha) * center_s + alpha * new_center
+        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+        center = center_s; cam_dist = float(dist_s)
+        eye = center - cam_dir * cam_dist
+        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+        V = _look_at(eye, center, up)
+        theta = rot_speed * t_sim
+        T_neg = _translate(-center)
+        R_y = _rotate_y(theta)
+        T_pos = _translate(center)
+        M = (T_pos @ R_y @ T_neg).astype(np.float32)
+        MVP = (P @ V @ M).astype(np.float32)
+        mvps[f] = MVP
 
-    view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
-    Xcat = vtx_concat[f]
-    off = vtx_offsets.astype(np.int32)
-    sums = np.add.reduceat(Xcat, off[:-1], axis=0)
-    counts = (off[1:] - off[:-1]).astype(np.float32)[:, None]
-    centroids = sums / np.maximum(counts, 1e-12)
-    centroids_h = np.concatenate([centroids, np.ones((n_cells, 1), dtype=np.float32)], axis=1)
-    ctr_rot = (M @ centroids_h.T).T[:, :3]
-    depths = np.dot(ctr_rot - eye[None, :], view_dir)
-    draw_order[f, :] = np.argsort(depths).astype(np.int32)
+        view_dir = (center - eye); view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+        Xcat = vtx_concat[f]
+        off = vtx_offsets.astype(np.int32)
+        sums = np.add.reduceat(Xcat, off[:-1], axis=0)
+        counts = (off[1:] - off[:-1]).astype(np.float32)[:, None]
+        centroids = sums / np.maximum(counts, 1e-12)
+        centroids_h = np.concatenate([centroids, np.ones((n_cells, 1), dtype=np.float32)], axis=1)
+        ctr_rot = (M @ centroids_h.T).T[:, :3]
+        depths = np.dot(ctr_rot - eye[None, :], view_dir)
+        draw_order[f, :] = np.argsort(depths).astype(np.int32)
 
     play_mesh_stream(
         n_cells=n_cells,
@@ -733,6 +783,8 @@ def stream_opengl_mesh(args, api, provider):
 
 def main():
     args = parse_args()
+    level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=level)
     api, provider = make_cellsim_backend(
         cell_vols=args.cell_vols,
         cell_imps=args.cell_imps,
@@ -754,8 +806,8 @@ def main():
             export_opengl_mesh_stream(args, api, provider)
         else:
             raise SystemExit("Unknown export kind")
-        print(f"Wrote stream to {args.export_npz}")
-        return
+            logger.info("Wrote stream to %s", args.export_npz)
+            return
 
     # Live in-process streaming: build arrays and hand to visualizer APIs
     if getattr(args, "stream", ""):
@@ -792,10 +844,15 @@ def main():
                 v_out = None
         osm = getattr(engine, "osmotic_pressure", np.zeros_like(vols))
         # Lightweight textual output without converting arrays to Python lists unnecessarily
-        if v_out is None:
-            print(f"frame {frame}: vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)} osm {np.array2string(osm, precision=4)}")
-        else:
-            print(f"frame {frame}: vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)} com_vel {v_out} osm {np.array2string(osm, precision=4)}")
+        if args.verbose or args.debug:
+            _log_hierarchy_state(h, frame, debug=args.debug)
+        msg = (
+            f"vols {np.array2string(vols, precision=4)} dV {np.array2string(dV, precision=4)}"
+        )
+        if v_out is not None:
+            msg += f" com_vel {v_out}"
+        msg += f" osm {np.array2string(osm, precision=4)}"
+        logger.info("frame %d: %s", frame, msg)
         prev_vols = vols
 
 

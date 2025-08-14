@@ -42,3 +42,20 @@ def test_project_contacts_returns_lambda_and_resolves_penetration():
 
     assert np.allclose(X[0], [0.0, 0.0, 0.0])
     assert np.allclose(lamb, [0.1])
+
+
+def test_build_contacts_nd():
+    params = EngineParams()
+    solver = XPBDSolver(params)
+
+    X2 = np.array([[0.0, 0.0], [1.5, 0.0], [0.0, -1.5]], dtype=np.float64)
+    idx2, normals2, depth2 = solver.build_contacts(X2, np.array([-1.0, -1.0]), np.array([1.0, 1.0]))
+    assert idx2.shape[0] == 2
+    assert normals2.shape == (2, 2)
+    assert np.all(depth2 < 0)
+
+    X1 = np.array([[0.0], [2.0], [-2.0]], dtype=np.float64)
+    idx1, normals1, depth1 = solver.build_contacts(X1, np.array([-1.0]), np.array([1.0]))
+    assert idx1.shape[0] == 2
+    assert normals1.shape == (2, 1)
+    assert np.all(depth1 < 0)
