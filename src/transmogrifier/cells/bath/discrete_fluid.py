@@ -333,6 +333,9 @@ class DiscreteFluid:
         """
         Symmetric pressure force:
         f_i += - m^2 (P_i/ρ_i^2 + P_j/ρ_j^2) ∇W_ij
+        ``gradW`` already returns the gradient with respect to particle ``i``
+        (pointing from particle ``j`` to ``i``), so the pair coefficient is
+        positive to yield a repulsive force.
         """
         f = np.zeros_like(self.p)
         for (i, j, rvec, r, W) in self._pairs_particles():
@@ -340,8 +343,8 @@ class DiscreteFluid:
             gW = self.kernel.gradW(rvec, r)
             Pi = self.P[i]; Pj = self.P[j]
             rhoi = self.rho[i]; rhoj = self.rho[j]
-            # pair coefficient
-            c = - self._m * self._m * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
+            # pair coefficient (positive for repulsion)
+            c = self._m * self._m * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
             fij = c[:, None] * gW
             # action-reaction (scatter-add)
             np.add.at(f, i,  fij)
