@@ -201,22 +201,24 @@ class DiscreteFluid:
 
         rho = np.zeros(points.shape[0]); P = np.zeros_like(rho)
         v = np.zeros_like(points); T = np.zeros(points.shape[0]); S = np.zeros_like(T)
+        denom = np.zeros(points.shape[0])
 
         for (pi, pj, rvec, r, W) in pairs_iter:
             # accumulate SPH sums at points pi from neighbor particles pj
             m_over_rho = (self._m / self.rho[pj])
             w = W * m_over_rho
 
-            rho[pi] += self._m * W
-            P[pi]   += self.P[pj] * w
-            T[pi]   += self.T[pj] * w
-            S[pi]   += self.S[pj] * w
-            v[pi]   += self.v[pj] * w[:, None]
+            rho[pi]  += self._m * W
+            denom[pi] += w
+            P[pi]    += self.P[pj] * w
+            T[pi]    += self.T[pj] * w
+            S[pi]    += self.S[pj] * w
+            v[pi]    += self.v[pj] * w[:, None]
 
         # Normalize interpolated fields where needed (pressure, T, S, v)
         # For rho we used standard SPH density estimate; leave as-is.
         eps = 1e-12
-        denom = np.maximum(rho / self._m, eps)
+        denom = np.maximum(denom, eps)
         P /= denom; T /= denom; S /= denom; v /= denom[:, None]
         return {"rho": rho, "P": P, "v": v, "T": T, "S": S}
 
