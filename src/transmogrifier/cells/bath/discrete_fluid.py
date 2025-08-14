@@ -331,19 +331,29 @@ class DiscreteFluid:
 
     # ------------------------------- Forces ----------------------------------
 
-    def _pressure_forces(self) -> np.ndarray:
-        """
-        Symmetric pressure force:
-        f_i += - m^2 (P_i/ρ_i^2 + P_j/ρ_j^2) ∇W_ij
-        ``rvec`` from :meth:`_pairs_particles` is ``p_j - p_i`` and
-        ``gradW`` is evaluated as ``∇ᵢW`` (pointing from particle ``j`` to
-        ``i``), so the pair coefficient is positive to yield a repulsive force.
+    def _pressure_forces(self, bulk_modulus: Optional[float] = None) -> np.ndarray:
+        """Compute pairwise pressure forces.
+
+        Parameters
+        ----------
+        bulk_modulus:
+            Optional override for the equation of state ``K``.  When given,
+            pressures are recomputed on the fly using this value; otherwise the
+            precomputed :attr:`P` array is used.
         """
         f = np.zeros_like(self.p)
+
+        if bulk_modulus is None:
+            P = self.P
+        else:
+            p = self.params
+            ratio = self.rho / p.rest_density
+            P = bulk_modulus * (np.power(np.clip(ratio, 1e-6, None), p.gamma) - 1.0)
+
         for (i, j, rvec, r, W) in self._pairs_particles():
             # gradW is vector with shape (...,3)
             gW = self.kernel.gradW(rvec, r)
-            Pi = self.P[i]; Pj = self.P[j]
+            Pi = P[i]; Pj = P[j]
             rhoi = self.rho[i]; rhoj = self.rho[j]
             # pair coefficient (positive for repulsion)
             c = self._m * self._m * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
