@@ -197,6 +197,11 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
   - bridge/: `__init__.py`, `state_io.py`
   - resources/: `field_library.py`
   - demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`, `run_opengl_demo.py`
+    - Stream the discrete fluid demo with OpenGL points:
+
+      ```bash
+      python src/cells/softbody/demo/run_numpy_demo.py --fluid discrete --stream opengl-points
+      ```
 
 ### src/transmogrifier
 

@@ -1037,15 +1037,26 @@ def run_fluid_demo(args):
         return
 
     if getattr(args, "stream", "") == "opengl-points":
-        stream_fluid_points(
-            args,
-            gather,
-            step,
-            show_vectors=args.show_vectors,
-            color_metric=args.color_metric,
-            arrow_scale=args.arrow_scale,
-            flow_anim_speed=args.flow_anim_speed,
-        )
+        if args.fluid == "discrete":
+            stream_fluid_points(
+                args,
+                fluid.export_positions_vectors,
+                fluid.step,
+                show_vectors=args.show_vectors,
+                color_metric=args.color_metric,
+                arrow_scale=args.arrow_scale,
+                flow_anim_speed=args.flow_anim_speed,
+            )
+        else:
+            stream_fluid_points(
+                args,
+                gather,
+                step,
+                show_vectors=args.show_vectors,
+                color_metric=args.color_metric,
+                arrow_scale=args.arrow_scale,
+                flow_anim_speed=args.flow_anim_speed,
+            )
         return
 
     dt = float(getattr(args, "dt", 1e-3))
