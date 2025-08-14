@@ -335,9 +335,9 @@ class DiscreteFluid:
         """
         Symmetric pressure force:
         f_i += - m^2 (P_i/ρ_i^2 + P_j/ρ_j^2) ∇W_ij
-        ``gradW`` already returns the gradient with respect to particle ``i``
-        (pointing from particle ``j`` to ``i``), so the pair coefficient is
-        positive to yield a repulsive force.
+        ``rvec`` from :meth:`_pairs_particles` is ``p_j - p_i`` and
+        ``gradW`` is evaluated as ``∇ᵢW`` (pointing from particle ``j`` to
+        ``i``), so the pair coefficient is positive to yield a repulsive force.
         """
         f = np.zeros_like(self.p)
         for (i, j, rvec, r, W) in self._pairs_particles():
@@ -390,24 +390,25 @@ class DiscreteFluid:
         c = sum_j m/ρ_j W_ij
         n = ∇c (via symmetric gradient), κ = -∇·(n/|n|)
         f_s = σ κ n̂
-        This is approximate; set sigma=0 to disable.
+        Pairs are oriented with ``r = p_j - p_i`` and gradients evaluated as
+        ``∇ᵢW`` so that normals point outward and the curvature force restores
+        the interface.  This is approximate; set ``sigma=0`` to disable.
         """
         sigma = self.params.surface_tension
         if sigma <= 0.0:
             return np.zeros_like(self.p)
 
-        # Compute color field gradient per particle
+        # Compute color field gradient per particle.  ``rvec`` from
+        # :meth:`_pairs_particles` is ``p_j - p_i`` while ``gradW`` returns
+        # ``∇ᵢW`` pointing from ``j`` toward ``i``.  The accumulated ``n_vec``
+        # therefore points outward from the fluid.
         n_vec = np.zeros_like(self.p)
-        c_field = np.zeros(self.N)
         for (i, j, rvec, r, W) in self._pairs_particles():
             m_over_rho_j = self._m / np.maximum(self.rho[j], 1e-12)
             m_over_rho_i = self._m / np.maximum(self.rho[i], 1e-12)
-            # symmetric gradient approx
             gW = self.kernel.gradW(rvec, r)
             n_vec[i] += m_over_rho_j[:, None] * gW
             n_vec[j] -= m_over_rho_i[:, None] * gW
-            c_field[i] += m_over_rho_j * W
-            c_field[j] += m_over_rho_i * W
 
         # curvature κ = -∇·(n̂)
         n_norm = np.linalg.norm(n_vec, axis=1) + self.params.color_field_eps
@@ -419,8 +420,8 @@ class DiscreteFluid:
             gW = self.kernel.gradW(rvec, r)
             m_over_rho_j = self._m / np.maximum(self.rho[j], 1e-12)
             m_over_rho_i = self._m / np.maximum(self.rho[i], 1e-12)
-            kappa[i] -= m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
-            kappa[j] -= m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
+            kappa[i] += m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
+            kappa[j] += m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
 
         f_st = sigma * (kappa[:, None] * n_hat)
         return f_st
@@ -532,9 +533,17 @@ class DiscreteFluid:
                          ) -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Yield particle-particle neighbor interactions in chunks.
-        Each yield returns tuple of arrays (i, j, rvec, r, W).
-        We only generate each unordered pair once (j > i when same cell, and
-        only consider neighbor cells with a '>= key' rule).
+        Each yield returns tuple of arrays ``(i, j, rvec, r, W)``.
+
+        Notes
+        -----
+        ``rvec`` is defined as ``p_j - p_i`` (vector from particle ``i`` to
+        particle ``j``).  All gradient kernels must therefore be evaluated as
+        ``∇ᵢW`` with this ``rvec`` so that the resulting vector points from
+        ``j`` back toward ``i``.  The ordering ensures action–reaction symmetry.
+
+        We only generate each unordered pair once (``j > i`` when in the same
+        cell, and only consider neighbor cells with a ``>= key`` rule).
         """
         cell = self._grid_cell
         keys = self._grid_keys
@@ -662,8 +671,11 @@ class DiscreteFluid:
                       ) -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Yield interactions between arbitrary query points and particles.
-        Returns tuples (pi, pj, rvec, r, W) analogous to _pairs_particles,
-        where pi indexes into the query points array.
+        Returns tuples ``(pi, pj, rvec, r, W)`` analogous to
+        :meth:`_pairs_particles`, where ``pi`` indexes into the query points
+        array.  As with ``_pairs_particles``, ``rvec`` is ``p_j - p_i`` (pointing
+        from the query point to the particle) and gradients must be evaluated as
+        ``∇ᵢW``.
         If yield_once=True, yields exactly one combined batch (or empty) for the provided points.
         """
         kernel = custom_kernel if custom_kernel is not None else self.kernel
