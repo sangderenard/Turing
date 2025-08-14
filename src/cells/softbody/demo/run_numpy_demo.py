@@ -844,6 +844,7 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
 
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
+    vec_concat_list = []
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
 
     pts0, vecs0 = gather_func()
@@ -860,6 +861,7 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
     for f in range(frames):
         pts, vecs = gather_func()
         pts_concat_list.append(pts.astype(np.float32, copy=False))
+        vec_concat_list.append(vecs.astype(np.float32, copy=False))
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
 
         new_center, radius = _compute_center_radius_pts(pts)
@@ -882,9 +884,25 @@ def export_fluid_points_stream(args, gather_func, step_func, dim: int = 3):
         step_func(dt)
         t_sim += dt
 
-    pts_concat = np.concatenate(pts_concat_list, axis=0) if pts_concat_list else np.zeros((0, 3), dtype=np.float32)
+    pts_concat = (
+        np.concatenate(pts_concat_list, axis=0)
+        if pts_concat_list
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    vec_concat = (
+        np.concatenate(vec_concat_list, axis=0)
+        if vec_concat_list
+        else np.zeros((0, 3), dtype=np.float32)
+    )
     meta = dict(stream_type='opengl_points_v1', frames=frames, viewport_w=w, viewport_h=h)
-    np.savez_compressed(args.export_npz, **meta, pts_offsets=pts_offsets, pts_concat=pts_concat, mvps=mvps)
+    np.savez_compressed(
+        args.export_npz,
+        **meta,
+        pts_offsets=pts_offsets,
+        pts_concat=pts_concat,
+        vec_concat=vec_concat,
+        mvps=mvps,
+    )
 
 
 def stream_fluid_points(args, gather_func, step_func, dim: int = 3):
