@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
 
 import numpy as np
+import warnings
 
 
 @dataclass
@@ -204,9 +205,10 @@ class VoxelMACFluid:
         T0 = self.T.copy(); S0 = self.S.copy()
         self.T = self._advect_scalar_cc(T0, dt)
         self.S = self._advect_scalar_cc(S0, dt)
-        self.S = np.clip(self.S, 0.0, 1.0)
+        self._clip_salinity("after advection")
         self._diffuse_scalars(dt)
-        self.S = np.clip(self.S, 0.0, 1.0)
+        self._clip_salinity("after diffusion")
+
 
     # ---------------------------------------------------------------------
     # Forces
@@ -340,6 +342,12 @@ class VoxelMACFluid:
             self.T = self._diffuse_cc_explicit(self.T, kT, dt)
         if kS > 0.0:
             self.S = self._diffuse_cc_explicit(self.S, kS, dt)
+
+    def _clip_salinity(self, stage: str) -> None:
+        clipped = np.clip(self.S, 0.0, 1.0)
+        if not np.array_equal(clipped, self.S):
+            warnings.warn(f"Salinity outside [0,1] {stage}; clipping", RuntimeWarning)
+        self.S = clipped
 
     # ---------------------------------------------------------------------
     # Boundaries & masks
