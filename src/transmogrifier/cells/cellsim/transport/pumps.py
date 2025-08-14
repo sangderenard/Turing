@@ -1,10 +1,12 @@
 from __future__ import annotations
 from typing import Dict
 
+import numpy as np
 
-def na_k_atpase_constant(J_pump_cell: float) -> float:
+
+def na_k_atpase_constant(J_pump_cell: float | np.ndarray) -> float | np.ndarray:
     """Return pump mol/s (cell-wide). Positive means: 3 Na out, 2 K in."""
-    return max(J_pump_cell, 0.0)
+    return np.maximum(J_pump_cell, 0.0)
 
 
 def na_k_atpase_saturating(
