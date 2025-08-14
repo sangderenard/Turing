@@ -278,6 +278,7 @@ POINT_FS = """
 in float vScalar;
 out vec4 FragColor;
 uniform vec4 uColor; // rgba (alpha used)
+uniform float uTime;
 
 vec3 hsv2rgb(vec3 c){
     vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0.0,4.0,2.0),6.0)-3.0)-1.0,0.0,1.0);
@@ -287,7 +288,8 @@ vec3 hsv2rgb(vec3 c){
 void main(){
     float t = clamp(vScalar, 0.0, 1.0);
     vec3 col = hsv2rgb(vec3(0.7*(1.0 - t), 1.0, 1.0));
-    FragColor = vec4(col, uColor.a);
+    float pulse = 0.5 + 0.5 * sin(uTime + t * 6.2831);
+    FragColor = vec4(col * pulse, uColor.a);
 }
 """
 
@@ -306,13 +308,15 @@ SPRITE_FS = """
 #version 330 core
 out vec4 FragColor;
 uniform vec4 uColor; // rgba
+uniform float uTime;
 void main(){
     // circular sprite mask
     vec2 uv = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(uv, uv);
     if (r2 > 1.0) discard;
     float edge = smoothstep(1.0, 0.7, r2);
-    FragColor = vec4(uColor.rgb, uColor.a * (1.0 - edge));
+    float pulse = 0.5 + 0.5 * sin(uTime);
+    FragColor = vec4(uColor.rgb * pulse, uColor.a * (1.0 - edge));
 }
 """
 
@@ -622,6 +626,7 @@ def main():
     pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
+    pt_u_time = glGetUniformLocation(pt_prog, "uTime")
 
     # build GL objects depending on render mode or stream type
     gl_cells = []
@@ -738,6 +743,7 @@ def main():
         # view/proj and model (either from stream or computed)
         viewport = pygame.display.get_surface().get_size()
         aspect = viewport[0] / max(1, viewport[1])
+        time_s = pygame.time.get_ticks() * 0.001
         if streaming:
             # Pull MVP from stream for current frame index
             fidx = frame
@@ -840,11 +846,13 @@ def main():
                 if gl_pts is not None and gl_pts.n > 0:
                     glUseProgram(pt_prog)
                     glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                    glUniform1f(pt_u_time, time_s)
                     gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
         else:
             # points mode
             glUseProgram(pt_prog)
             glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUniform1f(pt_u_time, time_s)
             if streaming:
                 fidx = frame
                 pts_offsets = stream['pts_offsets']
@@ -922,9 +930,11 @@ def play_points_stream(pts_offsets: np.ndarray,
     pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
     pt_u_color = glGetUniformLocation(pt_prog, "uColor")
     pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
+    pt_u_time = glGetUniformLocation(pt_prog, "uTime")
     arrow_prog = link_program(POINT_VS, POINT_FS)
     arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
     arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
+    arrow_u_time = glGetUniformLocation(arrow_prog, "uTime")
 
     # Set up a single reusable point cloud object
     pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
@@ -958,6 +968,7 @@ def play_points_stream(pts_offsets: np.ndarray,
     F = int(mvps.shape[0])
     direction = 1
     while running:
+        time_s = pygame.time.get_ticks() * 0.001
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
@@ -1016,10 +1027,12 @@ def play_points_stream(pts_offsets: np.ndarray,
         if use_arrows:
             glUseProgram(arrow_prog)
             glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUniform1f(arrow_u_time, time_s)
             gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
         else:
             glUseProgram(pt_prog)
             glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUniform1f(pt_u_time, time_s)
             gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
 
         pygame.display.flip()
