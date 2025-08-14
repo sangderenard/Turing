@@ -210,6 +210,9 @@ class DiscreteFluid:
         # Detached droplet particles
         self.droplet_p = np.zeros((0, 3), dtype=np.float64)
         self.droplet_v = np.zeros((0, 3), dtype=np.float64)
+        # Each ballistic droplet uses a fixed mass taken from ``droplet_particle``
+        # for momentum conservation when merging back into the fluid.
+        self.droplet_mass = float(droplet_particle.mass)
         # Threshold speed for automatic emission; np.inf disables auto mode
         self.droplet_threshold = np.inf
         # Linear drag coefficient for ballistic droplets
@@ -401,12 +404,54 @@ class DiscreteFluid:
         # Advance ballistic droplets
         if self.droplet_p.size:
             self._integrate_droplets(dt)
+            # After moving droplets, check for re-entry into the main fluid
+            self._merge_droplets()
 
     def _integrate_droplets(self, dt: float) -> None:
         """Advance detached droplets under gravity and drag."""
         g = self._g[None, :]
         self.droplet_v += dt * (g - self.droplet_drag * self.droplet_v)
         self.droplet_p += dt * self.droplet_v
+
+    def _merge_droplets(self) -> None:
+        """Merge ballistic droplets back into nearby fluid particles."""
+        # Build an up-to-date grid of fluid particles for collision checks
+        self._build_grid()
+        M = self.droplet_p.shape[0]
+        if M == 0:
+            return
+        # Find neighbors of all droplets at once
+        pi, pj, rvec, r, W = next(self._pairs_points(self.droplet_p, yield_once=True))
+        if pj.size == 0:
+            return
+        merged = np.zeros(M, dtype=bool)
+        for di in np.unique(pi):
+            mask = (pi == di)
+            nb = pj[mask]
+            if nb.size == 0:
+                continue
+            weights = W[mask] * self.sigma[nb]
+            wsum = weights.sum()
+            if wsum <= 0.0:
+                weights = W[mask]
+                wsum = weights.sum()
+            if wsum <= 0.0:
+                continue
+            weights /= wsum
+            dm = self.droplet_mass * weights
+            m_old = self.m[nb]
+            # momentum-conserving velocity update
+            self.v[nb] = (self.v[nb] * m_old[:, None] + dm[:, None] * self.droplet_v[di]) / (m_old[:, None] + dm[:, None])
+            self.m[nb] = m_old + dm
+            self.m_target[nb] += dm
+            # droplet carries no solute; concentration adjusts with mass
+            self.solute_mass_target[nb] += 0.0
+            self.solute_mass[nb] += 0.0
+            self.S[nb] = np.clip(self.solute_mass[nb] / np.maximum(self.m[nb], 1e-12), 0.0, 1.0)
+            merged[di] = True
+        keep = ~merged
+        self.droplet_p = self.droplet_p[keep]
+        self.droplet_v = self.droplet_v[keep]
 
     # --------------------------- Density & Pressure ---------------------------
 
