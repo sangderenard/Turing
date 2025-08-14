@@ -118,6 +118,12 @@ class FluidParams:
 
 # ----------------------------- Discrete Fluid -------------------------------
 
+@dataclass
+class DropletParticle:
+    """Lightweight particle with higher surface tension and smaller mass."""
+    mass: float = 0.005
+    surface_tension: float = 0.072
+
 class DiscreteFluid:
     """
     Weakly-Compressible SPH (WCSPH) with:
@@ -146,6 +152,8 @@ class DiscreteFluid:
         params: FluidParams,
         bounds_min: Tuple[float, float, float] = (-np.inf, -np.inf, -np.inf),
         bounds_max: Tuple[float, float, float] = ( np.inf,  np.inf,  np.inf),
+        droplet_indices: Optional[Iterable[int]] = None,
+        droplet_particle: Optional[DropletParticle] = None,
     ) -> None:
         assert positions.ndim == 2 and positions.shape[1] == 3
         self.N = positions.shape[0]
@@ -167,6 +175,20 @@ class DiscreteFluid:
         self.solute_mass = self.m * self.S
         self.m_target = self.m.copy()
         self.solute_mass_target = self.solute_mass.copy()
+
+        # Surface tension per particle and droplet tagging
+        self.sigma = np.full(self.N, params.surface_tension, dtype=np.float64)
+        self.is_droplet = np.zeros(self.N, dtype=bool)
+        if droplet_particle is None:
+            droplet_particle = DropletParticle()
+        if droplet_indices is not None:
+            droplet_indices = np.asarray(list(droplet_indices), dtype=int)
+            self.is_droplet[droplet_indices] = True
+            self.m[droplet_indices] = droplet_particle.mass
+            self.solute_mass[droplet_indices] = self.m[droplet_indices] * self.S[droplet_indices]
+            self.m_target[droplet_indices] = self.m[droplet_indices]
+            self.solute_mass_target[droplet_indices] = self.solute_mass[droplet_indices]
+            self.sigma[droplet_indices] = droplet_particle.surface_tension
 
         self.params = params
         self.kernel = SPHKernel(params.smoothing_length)
@@ -312,7 +334,7 @@ class DiscreteFluid:
 
         # Forces
         f = self._pressure_forces() + self._viscosity_forces() + self._body_forces()
-        if self.params.surface_tension > 0.0:
+        if np.any(self.sigma > 0.0):
             f += self._surface_tension_forces()
 
         # Integrate velocities and positions (semi-implicit / symplectic Euler)
@@ -436,8 +458,8 @@ class DiscreteFluid:
         ``∇ᵢW`` so that normals point outward and the curvature force restores
         the interface.  This is approximate; set ``sigma=0`` to disable.
         """
-        sigma = self.params.surface_tension
-        if sigma <= 0.0:
+        sigma = self.sigma
+        if not np.any(sigma > 0.0):
             return np.zeros_like(self.p)
 
         # Compute color field gradient per particle.  ``rvec`` from
@@ -465,7 +487,7 @@ class DiscreteFluid:
             kappa[i] += m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
             kappa[j] += m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
 
-        f_st = sigma * (kappa[:, None] * n_hat)
+        f_st = sigma[:, None] * (kappa[:, None] * n_hat)
         return f_st
 
     def _xsph_velocity(self) -> np.ndarray:
