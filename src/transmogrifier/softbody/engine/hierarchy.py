@@ -7,7 +7,7 @@ from .mesh import make_icosphere, mesh_volume, volume_gradients, build_adjacency
 from .constraints import VolumeConstraint
 from .xpbd_core import XPBDSolver
 from .fields import FieldStack
-from .collisions import build_self_contacts_spatial_hash
+from .collisions import project_self_contacts_streamed
 from src.transmogrifier.cells.cellsim.membranes.membrane import (
     Membrane, MembraneConfig, MembraneHooks,
 )
@@ -150,7 +150,7 @@ class Hierarchy:
                 "lamb":        np.concatenate(bn_lamb),
             }
 
-        # Broad-phase self-contact detection.
+        # Global indexing for faces and cells
         cell_ids = np.concatenate(
             [np.full(len(c.X), i, dtype=np.int32) for i, c in enumerate(self.cells)]
         )
@@ -159,16 +159,6 @@ class Hierarchy:
             if self.cells
             else np.empty((0, 3), dtype=np.int32)
         )
-        pairs = np.empty((0, 2), dtype=np.int32)
-        if getattr(self.params, "enable_self_contacts", True):
-            voxel_size = getattr(self.params, "contact_voxel_size", 0.05)
-            pairs = build_self_contacts_spatial_hash(X, all_faces, cell_ids, voxel_size)
-            if len(pairs):
-                cons["contacts"] = {
-                    "pairs": pairs,
-                    "compliance": np.full(len(pairs), self.params.contact_compliance, dtype=np.float64),
-                    "lamb": np.zeros(len(pairs), dtype=np.float64),
-                }
 
         # XPBDSolver.project expects explicit bounding box limits.  The
         # previous call passed ``self`` which was interpreted as ``box_min``
@@ -190,6 +180,23 @@ class Hierarchy:
             self.box_min,
             self.box_max,
         )
+
+        if getattr(self.params, "enable_self_contacts", True):
+            project_self_contacts_streamed(
+                X,
+                all_faces,
+                invm,
+                cell_ids,
+                self.params.contact_voxel_size,
+                dt,
+                min_separation=getattr(self.params, "min_separation", 0.0),
+                compliance=self.params.contact_compliance,
+                iters=2,
+                max_vox_entries=self.params.contact_max_vox_entries,
+                vbatch=self.params.contact_vbatch,
+                ram_limit_bytes=self.params.contact_ram_limit,
+                adjacency="self",
+            )
 
         # Scatter back
         for c, a, b in zip(self.cells, offsets[:-1], offsets[1:]):
