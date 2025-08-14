@@ -42,3 +42,6 @@ def test_mac_adapter_deposit_salinity():
     adapter.step(1e-4)
     sample = adapter.sample(centers)
     assert "S" in sample and sample["S"].shape == (1,)
+    # guard against NaN/inf propagation in solver
+    assert np.all(np.isfinite(sample["S"]))
+    assert np.all(np.isfinite(sim.pr))
