@@ -182,6 +182,8 @@ All modes must share the same primitive op definitions; only orchestration diffe
 - **src/common** — shared utilities such as adaptive type aliases.
 - **src/compiler** — provenance tracing, SSA tools and a compiler that emits tape-ready instruction streams.
 - **src/hardware** — analogue simulation pieces including `analog_spec`, the high‑fidelity `cassette_tape` backend, lane tuning helpers and a legacy `cassette_adapter` façade.
+- **src/bitbitbuffer** — bit-level buffer utilities and helpers.
+- **src/cells** — cellular simulator with transport physics and soft-body models.
 - **src/turing_machine** — tape mapping, transport mechanics, the `TapeMachine` execution loop and the high-level `survival_computer` driver.
 - **src/transmogrifier** — experimental graph and optimisation research (ILP scheduler, graph express, SSA registry).
 - **src/visualizations** — reel and cassette playback demos.

@@ -165,7 +165,40 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
 - `tape_visualizer.py` — visualizations helpers
 - `turing.py`, `turing_ssa.py`, `turing_provenance.py` — core logic and provenance
 
-### src/transmogrifier (core)
+### src/bitbitbuffer
+
+- `__init__.py`, `bitbitbuffer.py`
+- helpers/: `__init__.py`, `utils.py`, `testbench.py`, `rawspan.py`, `pidbuffer.py`, `data_access.py`, `cell_proposal.py`, `bitbitslice.py`, `bitbititem.py`, `bitbitindex.py`, `bitbitindexer.py`, `bitstream_search.py`
+
+### src/cells
+
+- `__init__.py`, `cell_consts.py`, `cell_walls.py`, `simulator.py`
+- `bath/`
+- `cellsim/`
+  - `__init__.py`, `constants.py`
+  - api/: `saline.py`
+  - bath/: `reservoir.py`
+  - chemistry/: `crn.py`, `electrochem.py`
+  - core/: `units.py`, `numerics.py`, `geometry.py`, `checks.py`
+  - data/: `state.py`, `species.py`, `proposals.py`
+  - engine/: `saline.py`
+  - membranes/: `membrane.py`, `gates.py`
+  - mechanics/: `provider.py`, `softbody0d.py`, `tension.py`
+  - transport/: `pumps.py`, `kedem_katchalsky.py`, `ghk.py`
+  - placement/: `bitbuffer.py`, `sync.py`
+  - organelles/: `inner_loop.py`
+  - viz/: `ascii.py`
+  - examples/: `demo_sim.py`
+- `simulator_methods/`: `cell_mask.py`, `data_io.py`, `injection.py`, `lcm.py`, `logutil.py`, `minimize.py`, `quanta_map_and_dump_cells.py`, `visualization.py`
+- `softbody/`
+  - `__init__.py`
+  - engine/: `__init__.py`, `xpbd_core.py`, `params.py`, `mesh.py`, `hierarchy.py`, `fields.py`, `coupling.py`, `constraints.py`, `collisions.py`
+  - geometry/: `primitives.py`, `geodesic.py`
+  - bridge/: `__init__.py`, `state_io.py`
+  - resources/: `field_library.py`
+  - demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`, `run_opengl_demo.py`
+
+### src/transmogrifier
 
 - `__init__.py`
 - `dec.py` — decoding utilities
@@ -184,39 +217,6 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
 - `memory_graph/`
   - `__init__.py`, `memory_graph.py`
   - `helpers/`: `bt_graph_header.py`, `deque3_d.py`, `edge_entry.py`, `graph_search.py`, `mask_consolidation.py`, `meta_graph_edge.py`, `networkx_emulation.py`, `node_entry.py`, `node_region.py`, `set_micrograin_entry.py`, `struct_view.py`, `bit_tensor_memory.py`, `bit_tensor_memory_dag_helper.py`, `bit_tensor_memory_units.py`
-
-#### src/transmogrifier/bitbitbuffer
-
-- `__init__.py`, `bitbitbuffer.py`
-- helpers/: `__init__.py`, `utils.py`, `testbench.py`, `rawspan.py`, `pidbuffer.py`, `data_access.py`, `cell_proposal.py`, `bitbitslice.py`, `bitbititem.py`, `bitbitindex.py`, `bitbitindexer.py`, `bitstream_search.py`
-
-#### src/transmogrifier/cells
-
-- `__init__.py`, `cell_consts.py`, `cell_walls.py`, `simulator.py`
-- `cellsim/`
-  - `__init__.py`, `constants.py`
-  - api/: `saline.py`
-  - bath/: `reservoir.py`
-  - chemistry/: `crn.py`, `electrochem.py`
-  - core/: `units.py`, `numerics.py`, `geometry.py`, `checks.py`
-  - data/: `state.py`, `species.py`, `proposals.py`
-  - engine/: `saline.py`
-  - membranes/: `membrane.py`, `gates.py`
-  - mechanics/: `provider.py`, `softbody0d.py`, `tension.py`
-  - transport/: `pumps.py`, `kedem_katchalsky.py`, `ghk.py`
-  - placement/: `bitbuffer.py`, `sync.py`
-  - organelles/: `inner_loop.py`
-  - viz/: `ascii.py`
-  - examples/: `demo_sim.py`
-
-#### src/transmogrifier/softbody
-
-- `__init__.py`
-- engine/: `__init__.py`, `xpbd_core.py`, `params.py`, `mesh.py`, `hierarchy.py`, `fields.py`, `coupling.py`, `constraints.py`, `collisions.py`
-- geometry/: `primitives.py`, `geodesic.py`
-- bridge/: `__init__.py`, `state_io.py`
-- resources/: `field_library.py`
-- demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`, `run_opengl_demo.py`
 
 ### src/visualizations
 
