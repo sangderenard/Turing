@@ -29,6 +29,7 @@ class SoftbodyProviderCfg:
     # Radius range for placement in provider units (box [0,1]^2)
     r_min: float = 0.04
     r_max: float = 0.10
+    dim: int = 3
 
 
 class Softbody0DProvider(MechanicsProvider):
@@ -63,11 +64,21 @@ class Softbody0DProvider(MechanicsProvider):
 
         V_min, V_max = float(np.min(V)), float(np.max(V))
         if V_max <= V_min:
-            mapped_vols = np.full_like(V, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3))
+            if self.cfg.dim == 2:
+                mapped_vols = np.full_like(V, math.pi * (self.cfg.r_min ** 2))
+            elif self.cfg.dim == 1:
+                mapped_vols = np.full_like(V, 2.0 * self.cfg.r_min)
+            else:
+                mapped_vols = np.full_like(V, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3))
         else:
             alpha = (V - V_min) / max(1e-18, (V_max - V_min))
             r = self.cfg.r_min * (1 - alpha) + self.cfg.r_max * alpha
-            mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
+            if self.cfg.dim == 2:
+                mapped_vols = math.pi * (r ** 2)
+            elif self.cfg.dim == 1:
+                mapped_vols = 2.0 * r
+            else:
+                mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
         osmotic = imp / np.maximum(V, 1e-18)
 
         for sbc, V_t, k, osm in zip(self._h.cells, mapped_vols, elastic_k, osmotic):
@@ -88,11 +99,21 @@ class Softbody0DProvider(MechanicsProvider):
         V_min = float(np.min(V))
         V_max = float(np.max(V))
         if V_max <= V_min:
-            mapped_vols = np.full(n, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3), dtype=float)
+            if self.cfg.dim == 2:
+                mapped_vols = np.full(n, math.pi * (self.cfg.r_min ** 2), dtype=float)
+            elif self.cfg.dim == 1:
+                mapped_vols = np.full(n, 2.0 * self.cfg.r_min, dtype=float)
+            else:
+                mapped_vols = np.full(n, (4.0 / 3.0) * math.pi * (self.cfg.r_min ** 3), dtype=float)
         else:
             alpha = (V - V_min) / max(1e-18, (V_max - V_min))
             r = self.cfg.r_min * (1 - alpha) + self.cfg.r_max * alpha
-            mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
+            if self.cfg.dim == 2:
+                mapped_vols = math.pi * (r ** 2)
+            elif self.cfg.dim == 1:
+                mapped_vols = 2.0 * r
+            else:
+                mapped_vols = (4.0 / 3.0) * math.pi * (r ** 3)
         osmotic = imp / np.maximum(V, 1e-18)
         for sbc, V_t, k, osm in zip(self._h.cells, mapped_vols, elastic_k, osmotic):
             sbc.constraints["volume"].target = V_t
@@ -169,7 +190,7 @@ class Softbody0DProvider(MechanicsProvider):
     # Internals -------------------------------------------------------------
     def _build_world(self, cells: List[Cell]) -> None:
         n = len(cells)
-        self._params = EngineParams()
+        self._params = EngineParams(dimension=self.cfg.dim)
         solver = XPBDSolver(self._params)
 
         # Simple layout: grid in [0.2,0.8]^2, z=0.01
@@ -196,15 +217,21 @@ class Softbody0DProvider(MechanicsProvider):
                     break
                 cx, cy = float(xs[i]), float(ys[j])
                 r = V_to_r(V_list[idx])
+                if self.cfg.dim == 2:
+                    target = math.pi * r ** 2
+                elif self.cfg.dim == 1:
+                    target = 2.0 * r
+                else:
+                    target = (4.0 / 3.0) * math.pi * r ** 3
                 X, F, V, invm, edges, bends, constraints = build_cell(
                     id_str=f"cell{idx}", center=(cx, cy, 0.01), radius=r,
-                    params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=(4.0/3.0)*math.pi*r**3
+                    params=self._params, subdiv=1, mass_per_vertex=1.0, target_volume=target
                 )
                 # Build minimal shim that Hierarchy expects
                 from src.transmogrifier.softbody.engine.hierarchy import Cell as SBC
                 sb_cell = SBC(
                     id=f"cell{idx}", X=X, V=V, invm=invm, faces=F, edges=edges,
-                    bends=bends, constraints=constraints, organelles=[],
+                    bends=bends, constraints=constraints, organelles=[], dim=self.cfg.dim,
                 )
                 sb_cell.membrane_tension = float(cells[idx].elastic_k)
                 sb_cell.osmotic_pressure = 0.0
