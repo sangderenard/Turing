@@ -230,6 +230,10 @@ class DiscreteFluid:
         P /= denom; T /= denom; S /= denom; v /= denom[:, None]
         return {"rho": rho, "P": P, "v": v, "T": T, "S": S}
 
+    def export_vertices(self) -> np.ndarray:
+        """Return a copy of particle positions for visualization."""
+        return self.p.copy()
+
     def apply_sources(self, centers: np.ndarray, dM: np.ndarray, dS_mass: np.ndarray,
                       radius: float) -> Dict[str, np.ndarray]:
         """

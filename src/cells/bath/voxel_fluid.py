@@ -180,6 +180,22 @@ class VoxelMACFluid:
         S = self._sample_scalar_cc(self.S, points_world)
         return {"v": v, "P": p, "T": T, "S": S}
 
+    def export_vector_field(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return cell-center positions and velocity vectors for visualization."""
+        nx, ny, nz = self.nx, self.ny, self.nz
+        # cell center positions
+        xs = (np.arange(nx) + 0.5) * self.dx
+        ys = (np.arange(ny) + 0.5) * self.dx
+        zs = (np.arange(nz) + 0.5) * self.dx
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        pos = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        # velocity at cell centers: average neighboring faces
+        u_c = 0.5 * (self.u[:-1, :, :] + self.u[1:, :, :])
+        v_c = 0.5 * (self.v[:, :-1, :] + self.v[:, 1:, :])
+        w_c = 0.5 * (self.w[:, :, :-1] + self.w[:, :, 1:])
+        vec = np.stack([u_c, v_c, w_c], axis=-1).reshape(-1, 3)
+        return pos, vec
+
     # ---------------------------------------------------------------------
     # Core substep
     # ---------------------------------------------------------------------
