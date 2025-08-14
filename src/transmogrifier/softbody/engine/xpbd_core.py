@@ -17,32 +17,16 @@ class XPBDSolver:
         single vectorised pass and return the indices, normals and penetration
         depths for contacts that actually violate the box.
         """
-        normals = np.array(
-            [
-                [1.0, 0.0, 0.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, -1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, -1.0],
-            ],
-            dtype=np.float64,
-        )
-        d = np.array(
-            [
-                -box_min[0],
-                box_max[0],
-                -box_min[1],
-                box_max[1],
-                -box_min[2],
-                box_max[2],
-            ],
-            dtype=np.float64,
-        )
-        C = X @ normals.T + d  # (n_verts, 6)
+        box_min = np.asarray(box_min, dtype=np.float64)
+        box_max = np.asarray(box_max, dtype=np.float64)
+        D = X.shape[1]
+        I = np.eye(D, dtype=np.float64)
+        normals = np.vstack((I, -I))
+        d = np.concatenate((-box_min, box_max))
+        C = X @ normals.T + d  # (n_verts, 2D)
         mask = C < 0.0
         if not np.any(mask):
-            return np.array([], dtype=int), np.empty((0, 3)), np.array([])
+            return np.array([], dtype=int), np.empty((0, D)), np.array([])
         vidx, plane_idx = np.nonzero(mask)
         return vidx, normals[plane_idx], C[vidx, plane_idx]
 
