@@ -1,12 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, TYPE_CHECKING
-
-from ..cellsim.transport.kedem_katchalsky import arrhenius, fluxes
-from ..cellsim.core.geometry import sphere_area_from_volume
-from ..cellsim.core.units import R as RGAS
-
-if TYPE_CHECKING:  # pragma: no cover - for type checking only
-    from ..cellsim.data.state import Cell
+from typing import Dict, List
 
 
 @dataclass
@@ -111,103 +104,8 @@ class Bath:
         return allowed, dS
 
 
-def update_pressure(bath: Bath, sum_dV: float) -> None:
-    """Update bath pressure based on total volume change.
-
-    If bath has finite compressibility ``kappa`` then ``ΔV = kappa · V · ΔP``
-    so ``ΔP = ΔV / (kappa · V)``.
-    """
-
-    if bath.compressibility and bath.compressibility > 0.0:
-        bath.pressure += -(sum_dV / (bath.compressibility * max(bath.V, 1e-18)))
-        if bath.min_pressure is not None:
-            bath.pressure = max(bath.pressure, bath.min_pressure)
-        if bath.max_pressure is not None:
-            bath.pressure = min(bath.pressure, bath.max_pressure)
 
 
-def kedem_katchalsky_step(
-    cell: "Cell",
-    bath: Bath,
-    species: Iterable[str],
-    *,
-    area: float | None = None,
-    T: float | None = None,
-    Rgas: float = RGAS,
-) -> float:
-    """Exchange volume and solute between a cell and the bath.
 
-    This is a thin wrapper around the vectorised Kedem–Katchalsky ``fluxes``
-    routine used by the main cellsim engine.  It computes permeabilities via
-    Arrhenius activation energies, applies equal-and-opposite updates to the
-    cell and bath, and returns the cell volume change ``dV``.
-    """
+__all__ = ["Bath", "update_pressure"]
 
-    species = list(species)
-    T = T if T is not None else bath.temperature
-    A = area if area is not None else sphere_area_from_volume(cell.V)[0]
-
-    Lp = arrhenius(cell.Lp0, cell.Ea_Lp, T)
-    Ps = {sp: arrhenius(cell.Ps0.get(sp, 0.0), cell.Ea_Ps.get(sp), T) for sp in species}
-    sigma = {sp: cell.sigma.get(sp, 1.0) for sp in species}
-    Jv_term = getattr(cell, "base_pressure", 0.0) - bath.pressure
-
-    dV_cell, dS_cell = fluxes(
-        comp_left=cell,
-        comp_right=bath,
-        species=species,
-        Lp=Lp,
-        Ps=Ps,
-        sigma=sigma,
-        A=A,
-        T=T,
-        Rgas=Rgas,
-        Jv_pressure_term=Jv_term,
-    )
-
-    dV_cell, dS_cell = bath.cap_fluxes(dV_cell, dS_cell)
-
-    cell.V = max(cell.V + dV_cell, 0.0)
-    bath.V = max(bath.V - dV_cell, 0.0)
-    for sp, dS in dS_cell.items():
-        cell.n[sp] = max(cell.n.get(sp, 0.0) + dS, 0.0)
-        bath.n[sp] = max(bath.n.get(sp, 0.0) - dS, 0.0)
-
-    update_pressure(bath, dV_cell)
-    return dV_cell
-
-
-def apply_fluxes(
-    cells: Iterable["Cell"],
-    bath: Bath,
-    dV_cells: Iterable[float],
-    dS_cells: Iterable[Dict[str, float]],
-) -> None:
-    """Apply precomputed volume and solute fluxes.
-
-    Parameters
-    ----------
-    cells:
-        Iterable of cells whose state will be updated.
-    bath:
-        Bath to receive equal-and-opposite updates.
-    dV_cells:
-        Sequence of volume changes for each cell (positive means cell gains volume).
-    dS_cells:
-        Sequence of dictionaries mapping species to mole changes per cell.
-    """
-
-    sum_dV = 0.0
-    for cell, dV, dS in zip(cells, dV_cells, dS_cells):
-        dV, dS = bath.cap_fluxes(dV, dS)
-        cell.V = max(cell.V + dV, 0.0)
-        bath.V = max(bath.V - dV, 0.0)
-        for sp, dS_val in dS.items():
-            cell.n[sp] = max(cell.n.get(sp, 0.0) + dS_val, 0.0)
-            bath.n[sp] = max(bath.n.get(sp, 0.0) - dS_val, 0.0)
-        sum_dV += dV
-
-    update_pressure(bath, sum_dV)
-
-
-__all__ = ["Bath", "update_pressure", "kedem_katchalsky_step", "apply_fluxes"]
