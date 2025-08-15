@@ -99,6 +99,26 @@ class HybridParams:
     phi_shatter: float = 0.25
     p_shatter_max: float = 0.0
 
+    # Flux emission gate
+    phi_full: float = 0.95
+    p_low: float = -50.0
+    emit_fraction: float = 0.35
+    max_particles_per_face_step: int = 8
+
+    # Pressure/full pause (surface tension gate)
+    p_high: float = 100.0
+    sigma: float = 0.072
+    k_tau: float = 0.02
+    tau_min: float = 5e-3
+    tau_max: float = 80e-3
+    pause_damping: float = 0.85
+
+    # Minimum-velocity condensation
+    v_min: float = 0.05
+    v_hyst: float = 0.015
+    tau_slow: float = 0.0
+    slow_damping: float = 0.9
+
     # PIC/FLIP blending
     flip_alpha: float = 0.95   # 1 = pure FLIP, 0 = pure PIC
 
@@ -130,6 +150,8 @@ class HybridFluid:
     v: np.ndarray = field(init=False)
     m: np.ndarray = field(init=False)
     rho: np.ndarray = field(init=False)
+    phase: np.ndarray = field(init=False)
+    pause_t: np.ndarray = field(init=False)
 
     # caches
     _last_grid_u: List[np.ndarray] | None = field(default=None, init=False)
@@ -155,6 +177,8 @@ class HybridFluid:
         self.v = np.zeros_like(self.x)
         self.m = np.full(self.n_particles, self.params.particle_mass, dtype=np.float64)
         self.rho = np.full(self.n_particles, self.params.rho0, dtype=np.float64)
+        self.phase = np.zeros(self.n_particles, dtype=np.int8)
+        self.pause_t = np.zeros(self.n_particles, dtype=np.float64)
 
         self._last_grid_u = [comp.copy() for comp in (self.grid.u, self.grid.v, self.grid.w)]
 
@@ -228,16 +252,20 @@ class HybridFluid:
         # 4) PIC/FLIP update for particles from grid
         self._advect_particles_from_grid(dt, last_u, (self.grid.u, self.grid.v, self.grid.w))
 
-        # 5) Condense in high-fraction regions
-        self._condense(phi_tilde)
+        # 5) Flux-triggered emission (voxel -> particles)
+        self._flux_to_particles(dt)
 
-        # 6) Shatter in low-fraction / low-pressure regions
+        # 6) Update paused/min-velocity particles and condense if needed
+        self._update_pausing_particles(dt)
+
+        # 7) Condense and shatter based on liquid fraction
+        self._condense(phi_tilde)
         self._shatter()
 
-        # 7) Clamp particles to domain (lifted dims)
+        # 8) Clamp particles to domain (lifted dims)
         self._constrain_particles_to_domain()
 
-        # 8) Cache grid velocity for next FLIP
+        # 9) Cache grid velocity for next FLIP
         self._last_grid_u = [self.grid.u.copy(), self.grid.v.copy(), self.grid.w.copy()]
 
     # ------------------------------------------------------------------
@@ -325,6 +353,205 @@ class HybridFluid:
         self.v = self.v + alpha * dV + (1.0 - alpha) * (V_pic - self.v)
         self.x = self.x + dt * self.v
 
+    # ------------------------------------------------------------------
+    # Emission / absorption helpers
+    # ------------------------------------------------------------------
+    def _condense_particles(self, mask: np.ndarray, cell_idx: np.ndarray) -> int:
+        """Condense selected particles into grid cells.
+
+        Parameters
+        ----------
+        mask: boolean array selecting particles to condense
+        cell_idx: integer cell coordinates for all particles (shape (N,3))
+
+        Returns
+        -------
+        int
+            Number of particles condensed.
+        """
+        if not np.any(mask):
+            return 0
+        dx = self.params.dx
+        rho0 = self.params.rho0
+        cells = cell_idx[mask]
+        masses = self.m[mask]
+        for (ci, cj, ck), dm in zip(cells, masses):
+            self.phi[ci, cj, ck] = min(1.0, self.phi[ci, cj, ck] + dm / (rho0 * (dx ** 3)))
+        keep = ~mask
+        self.x = self.x[keep]
+        self.v = self.v[keep]
+        self.m = self.m[keep]
+        self.rho = self.rho[keep]
+        self.phase = self.phase[keep]
+        self.pause_t = self.pause_t[keep]
+        return int(np.sum(mask))
+
+    def _flux_to_particles(self, dt: float) -> None:
+        """Emit particles from grid faces based on flux and pressure gates."""
+        dx = self.params.dx
+        rho0 = self.params.rho0
+        alpha = self.params.emit_fraction
+        m_p = self.params.particle_mass
+        phi_full = self.params.phi_full
+        p_low = self.params.p_low
+        max_n = self.params.max_particles_per_face_step
+
+        dim = self.dim
+        area = dx ** max(1, dim - 1)
+
+        if self.grid is None:
+            return
+
+        new_x = []
+        new_v = []
+        n_spawn = 0
+
+        # iterate over axes
+        for axis, faces in enumerate([self.grid.u, self.grid.v, self.grid.w]):
+            if (axis == 1 and dim < 2) or (axis == 2 and dim < 3):
+                continue
+            shape = faces.shape
+            # interior faces
+            it = np.ndindex(shape)
+            for idx in it:
+                u_f = faces[idx]
+                if u_f <= 0:
+                    continue
+                # determine source and target cell indices
+                if axis == 0:
+                    i, j, k = idx
+                    if i >= self.grid.nx:
+                        continue
+                    src = (i - 1, j, k)
+                    tgt = (i, j, k)
+                elif axis == 1:
+                    i, j, k = idx
+                    if j >= self.grid.ny:
+                        continue
+                    src = (i, j - 1, k)
+                    tgt = (i, j, k)
+                else:
+                    i, j, k = idx
+                    if k >= self.grid.nz:
+                        continue
+                    src = (i, j, k - 1)
+                    tgt = (i, j, k)
+
+                if min(src) < 0:
+                    continue
+
+                if self.grid.pr[tgt] > p_low:
+                    continue
+                if self.phi[tgt] >= phi_full:
+                    continue
+
+                m_emit = alpha * rho0 * u_f * area * dt
+                n = int(np.ceil(m_emit / m_p))
+                if n <= 0:
+                    continue
+                n = min(n, max_n)
+                m_emit = n * m_p
+
+                # spawn particles at target cell center with small jitter
+                center = np.array([(tgt[0] + 0.5), (tgt[1] + 0.5), (tgt[2] + 0.5)]) * dx
+                jitter = (np.random.rand(n, 3) - 0.5) * 0.25 * dx
+                X = center[None, :] + jitter
+                V = np.zeros((n, 3))
+                V[:, axis] = u_f
+                new_x.append(X[:, :dim])
+                new_v.append(V[:, :dim])
+                n_spawn += n
+
+                # subtract mass from source cell
+                self.phi[src] = max(0.0, self.phi[src] - m_emit / (rho0 * (dx ** 3)))
+
+        if n_spawn > 0:
+            new_x_arr = np.vstack(new_x)
+            new_v_arr = np.vstack(new_v)
+            self.x = np.vstack([self.x, new_x_arr]) if self.x.size else new_x_arr
+            self.v = np.vstack([self.v, new_v_arr]) if self.v.size else new_v_arr
+            self.m = np.hstack([self.m, m_p * np.ones(n_spawn)]) if self.m.size else (m_p * np.ones(n_spawn))
+            self.rho = np.hstack([self.rho, rho0 * np.ones(n_spawn)]) if self.rho.size else (rho0 * np.ones(n_spawn))
+            self.phase = np.hstack([self.phase, np.zeros(n_spawn, dtype=np.int8)]) if self.phase.size else np.zeros(n_spawn, dtype=np.int8)
+            self.pause_t = np.hstack([self.pause_t, np.zeros(n_spawn, dtype=np.float64)]) if self.pause_t.size else np.zeros(n_spawn, dtype=np.float64)
+
+    def _update_pausing_particles(self, dt: float) -> None:
+        """Apply pressure/full pauses and minimum-velocity condensation."""
+        if self.x.size == 0:
+            return
+
+        dx = self.params.dx
+        dim = self.dim
+        nx, ny, nz = self.grid.nx, self.grid.ny, self.grid.nz
+        X3 = self._lift_positions_to3d(self.x)
+        cell = np.floor(X3 / dx - 0.5).astype(int)
+        cell[:, 0] = np.clip(cell[:, 0], 0, nx - 1)
+        if dim >= 2:
+            cell[:, 1] = np.clip(cell[:, 1], 0, ny - 1)
+        else:
+            cell[:, 1] = 0
+        if dim >= 3:
+            cell[:, 2] = np.clip(cell[:, 2], 0, nz - 1)
+        else:
+            cell[:, 2] = 0
+
+        # Rule A: pressure/full dwell
+        pr = self.grid.pr[tuple(cell.T)]
+        phi = self.phi[tuple(cell.T)]
+        enterA = ((pr >= self.params.p_high) | (phi >= self.params.phi_full)) & (self.phase == 0)
+        if np.any(enterA):
+            tau = self.params.k_tau * self.params.sigma / np.maximum(1e-12, pr[enterA] - 0.0)
+            tau = np.clip(tau, self.params.tau_min, self.params.tau_max)
+            self.pause_t[enterA] = tau
+            self.phase[enterA] = 1
+
+        # Rule B: min-velocity dwell
+        speed = np.linalg.norm(self.v, axis=1)
+        if self.params.tau_slow == 0.0:
+            condense_now = speed < self.params.v_min
+            self._condense_particles(condense_now, cell)
+            # update local arrays after removal
+            if self.x.size == 0:
+                return
+            X3 = self._lift_positions_to3d(self.x)
+            cell = np.floor(X3 / dx - 0.5).astype(int)
+            cell[:, 0] = np.clip(cell[:, 0], 0, nx - 1)
+            if dim >= 2:
+                cell[:, 1] = np.clip(cell[:, 1], 0, ny - 1)
+            if dim >= 3:
+                cell[:, 2] = np.clip(cell[:, 2], 0, nz - 1)
+            speed = np.linalg.norm(self.v, axis=1)
+        else:
+            enterB = (speed < self.params.v_min) & (self.phase == 0)
+            self.phase[enterB] = 2
+            self.pause_t[enterB] = self.params.tau_slow
+            slow = self.phase == 2
+            if np.any(slow):
+                self.v[slow] *= self.params.slow_damping
+                self.pause_t[slow] -= dt
+                unpause = slow & (np.linalg.norm(self.v[slow], axis=1) > self.params.v_hyst)
+                self.phase[unpause] = 0
+                self.pause_t[unpause] = 0.0
+                cond = slow & (self.pause_t <= 0)
+                self._condense_particles(cond, cell)
+                if self.x.size == 0:
+                    return
+                X3 = self._lift_positions_to3d(self.x)
+                cell = np.floor(X3 / dx - 0.5).astype(int)
+                cell[:, 0] = np.clip(cell[:, 0], 0, nx - 1)
+                if dim >= 2:
+                    cell[:, 1] = np.clip(cell[:, 1], 0, ny - 1)
+                if dim >= 3:
+                    cell[:, 2] = np.clip(cell[:, 2], 0, nz - 1)
+
+        # Paused by Rule A
+        paused = self.phase == 1
+        if np.any(paused):
+            self.v[paused] *= self.params.pause_damping
+            self.pause_t[paused] -= dt
+            cond = paused & (self.pause_t <= 0)
+            self._condense_particles(cond, cell)
+
     def _condense(self, phi_tilde: np.ndarray) -> None:
         # Hysteresis: condense where phi_tilde is high
         mask = phi_tilde >= self.params.phi_condense
@@ -342,6 +569,8 @@ class HybridFluid:
         self.v = self.v[keep]
         self.m = self.m[keep]
         self.rho = self.rho[keep]
+        self.phase = self.phase[keep]
+        self.pause_t = self.pause_t[keep]
 
     def _shatter(self) -> None:
         # Shatter select low-fraction cells into droplets (limit count per step)
@@ -378,10 +607,13 @@ class HybridFluid:
             # clear cell fraction (mass moved to particles)
             self.phi[i,j,k] = 0.0
         if new_x:
+            total_new = sum(len(m) for m in new_m)
             self.x = np.vstack([self.x, np.vstack(new_x)])
             self.v = np.vstack([self.v, np.vstack(new_v)])
             self.m = np.hstack([self.m, np.hstack(new_m)])
-            self.rho = np.hstack([self.rho, np.full(sum(len(m) for m in new_m), self.params.rho0)])
+            self.rho = np.hstack([self.rho, np.full(total_new, self.params.rho0)])
+            self.phase = np.hstack([self.phase, np.zeros(n_spawn, dtype=np.int8)]) if self.phase.size else np.zeros(n_spawn, dtype=np.int8)
+            self.pause_t = np.hstack([self.pause_t, np.zeros(n_spawn, dtype=np.float64)]) if self.pause_t.size else np.zeros(n_spawn, dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Sampling & export
@@ -451,6 +683,11 @@ class HybridFluid:
         vmax = float(np.max(np.linalg.norm(self.v, axis=1))) if self.v.size else 0.0
         adv = np.inf if vmax == 0 else self.params.cfl * self.params.dx / vmax
         return max(1e-6, min(dt_grid, adv))
+
+    def total_mass(self) -> float:
+        """Total mass of fluid in grid plus particles."""
+        cell_vol = self.params.dx ** 3
+        return self.params.rho0 * cell_vol * float(self.phi.sum()) + float(self.m.sum())
 
 
 # Convenience factory
