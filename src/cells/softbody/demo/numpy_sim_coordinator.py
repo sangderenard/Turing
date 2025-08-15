@@ -719,8 +719,21 @@ def gather_layers(provider, fluid=None, *, rainbow: bool = False, for_opengl: bo
             }
     if fluid is not None:
         pts = getattr(fluid, "p", None)
-        if pts is not None:
+        if isinstance(pts, np.ndarray):
             layers["fluid"] = {"points": np.asarray(pts, dtype=np.float32)}
+        else:
+            try:
+                nx = int(getattr(fluid, "nx", 0))
+                ny = int(getattr(fluid, "ny", 0))
+                nz = int(getattr(fluid, "nz", 0))
+                dx = float(getattr(fluid, "dx", 1.0))
+                xs = (np.arange(nx) + 0.5) * dx
+                ys = (np.arange(ny) + 0.5) * dx
+                zs = (np.arange(nz) + 0.5) * dx
+                grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+                layers["fluid"] = {"points": grid.astype(np.float32)}
+            except Exception:
+                pass
     return layers
 
 
@@ -764,11 +777,17 @@ def main():
         return
     draw_hook = None
     if args.debug_render:
-        from src.opengl_render.renderer import DebugRenderer
-        from src.opengl_render.api import make_draw_hook
+        try:
+            from src.opengl_render.renderer import DebugRenderer
+            from src.opengl_render.api import make_draw_hook
 
-        renderer = DebugRenderer()
-        draw_hook = make_draw_hook(renderer, (0, 0))
+            renderer = DebugRenderer()
+            draw_hook = make_draw_hook(renderer, (0, 0))
+        except Exception:  # pragma: no cover - debug aid
+            def _fallback(layer_map):
+                print(layer_map)
+
+            draw_hook = _fallback
 
     dt = float(getattr(args, "dt", 1e-3))
     hooks = SimHooks()
