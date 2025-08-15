@@ -184,10 +184,30 @@ def draw_layers(renderer: GLRenderer,
     lines = layers.get("lines")
     if isinstance(lines, LineLayer):
         renderer.set_lines(lines)
-    # Prefer fluid points if available, fall back to generic points
+    # Prefer fluid points if available, fall back to generic points.
+    # Optionally merge in a ghost trail (``ghost`` layer).
     pts = layers.get("fluid") or layers.get("points")
-    if isinstance(pts, PointLayer):
+    ghost = layers.get("ghost")
+    if isinstance(pts, PointLayer) and isinstance(ghost, PointLayer):
+        pos = np.concatenate([pts.positions, ghost.positions], axis=0)
+        col = None
+        if pts.colors is not None or ghost.colors is not None:
+            col_acc: list[np.ndarray] = []
+            if pts.colors is not None:
+                col_acc.append(pts.colors)
+            else:
+                col_acc.append(np.tile(np.array([[1, 1, 1, 1]], np.float32), (pts.positions.shape[0], 1)))
+            if ghost.colors is not None:
+                col_acc.append(ghost.colors)
+            else:
+                col_acc.append(np.tile(np.array([[1, 1, 1, 1]], np.float32), (ghost.positions.shape[0], 1)))
+            col = np.concatenate(col_acc, axis=0)
+        merged = PointLayer(positions=pos, colors=col, size_px_default=pts.size_px_default, alpha=pts.alpha)
+        renderer.set_points(merged)
+    elif isinstance(pts, PointLayer):
         renderer.set_points(pts)
+    elif isinstance(ghost, PointLayer):
+        renderer.set_points(ghost)
     renderer.draw(viewport)
 
 
@@ -195,17 +215,46 @@ def draw_layers(renderer: GLRenderer,
 def make_draw_hook(renderer: GLRenderer,
                    viewport: tuple[int, int],
                    *,
-                   history: int = 0,
+                   history: int = 32,
                    loop: bool = False,
-                   bounce: bool = False):
-    """Return a **threaded** draw hook (default).
+                   bounce: bool = False,
+                   ghost_trail: bool = True):
+    """Return a draw hook.
 
-    This wraps :func:`make_threaded_draw_hook` and returns only the submit hook,
-    ensuring all drawing happens on a dedicated GL thread by default.
-    The underlying thread controller is attached to ``renderer._render_thread``
-    for lifecycle management if needed.
+    When ``renderer`` exposes ``print_layers`` (debug mode) a synchronous hook is
+    returned so that output is immediate.  Otherwise a thread-backed hook is
+    created via :func:`make_threaded_draw_hook`.
     """
-    hook, thread = make_threaded_draw_hook(renderer, viewport, history=history, loop=loop, bounce=bounce)
+
+    if hasattr(renderer, "print_layers"):
+        from collections import deque
+        maxlen = history if history > 0 else None
+        hist: deque[Mapping[str, object]] = deque(maxlen=maxlen)
+
+        def hook(layers: Mapping[str, MeshLayer | LineLayer | PointLayer]) -> None:
+            hist.append(layers)
+            frame = layers
+            if ghost_trail:
+                pts_hist = []
+                for past in list(hist)[:-1]:
+                    pts = past.get("fluid") or past.get("points")
+                    if isinstance(pts, PointLayer):
+                        pts_hist.append(pts.positions)
+                if pts_hist:
+                    frame = dict(layers)
+                    frame["ghost"] = rainbow_history_points(pts_hist)
+            draw_layers(renderer, frame, viewport)
+
+        return hook
+
+    hook, thread = make_threaded_draw_hook(
+        renderer,
+        viewport,
+        history=history,
+        loop=loop,
+        bounce=bounce,
+        ghost_trail=ghost_trail,
+    )
     try:
         thread.start()
     except RuntimeError:
@@ -227,9 +276,10 @@ def make_threaded_draw_hook(
     renderer: GLRenderer,
     viewport: tuple[int, int],
     *,
-    history: int = 0,
+    history: int = 32,
     loop: bool = False,
     bounce: bool = False,
+    ghost_trail: bool = True,
 ):
     """Return a thread-backed draw hook and its controller.
 
@@ -247,5 +297,6 @@ def make_threaded_draw_hook(
         history=history,
         loop=loop,
         bounce=bounce,
+        ghost_trail=ghost_trail,
     )
     return thread.get_submit_hook(), thread

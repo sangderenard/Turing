@@ -227,7 +227,35 @@ class DebugRenderer:
 class GLRenderer:
     """A minimal scene graph: Mesh → Lines → Points (draw order)."""
 
-    def __init__(self, mvp: Optional[np.ndarray] = None):
+    def __init__(self, mvp: Optional[np.ndarray] = None, *, size: Tuple[int, int] = (640, 480)):
+        """Create a renderer and its backing window.
+
+        Parameters
+        ----------
+        mvp:
+            Optional model-view-projection matrix.  When ``None`` an identity
+            matrix is used.
+        size:
+            ``(width, height)`` of the window in pixels.  A new ``pygame``
+            window is created on construction which also establishes the OpenGL
+            context used for subsequent draw calls.
+        """
+
+        # Create an OpenGL context for this renderer (pygame based).
+        import pygame
+        from pygame.locals import DOUBLEBUF, OPENGL
+
+        pygame.init()
+        flags = DOUBLEBUF | OPENGL
+        try:  # pragma: no cover - best effort for headless environments
+            pygame.display.set_mode(size, flags)
+        except Exception:  # noqa: BLE001
+            # Fall back to dummy driver so tests can run headless.
+            import os
+            os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+            pygame.display.set_mode(size, flags)
+        self._window_size = size
+
         # programs
         self.prog_mesh = _link_program(MESH_VS,  MESH_FS)
         self.prog_line = _link_program(LINE_VS,  LINE_FS)

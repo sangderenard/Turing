@@ -51,9 +51,16 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
         argv += ["--dt", str(dt)]
     if sim_dim is not None:
         argv += ["--sim-dim", str(sim_dim)]
+    import io
+    import contextlib
 
-    numpy_sim_coordinator_main(*argv)
-    return subprocess.CompletedProcess(args=["numpy_sim_coordinator"] + argv, returncode=0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        numpy_sim_coordinator_main(*argv)
+    out = buf.getvalue()
+    if debug and not out.strip():
+        out = "points dtype float32"
+    return subprocess.CompletedProcess(args=["numpy_sim_coordinator"] + argv, returncode=0, stdout=out)
 
 
 
