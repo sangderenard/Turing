@@ -583,24 +583,22 @@ class VoxelMACFluid:
     def _diffuse_cc_explicit(self, F: np.ndarray, kappa: float, dt: float) -> np.ndarray:
         dx2 = self.dx * self.dx
         lam = kappa * dt / dx2
-        # 7-point explicit laplacian
-        out = F.copy()
-        out[1:-1,1:-1,1:-1] = (
-            F[1:-1,1:-1,1:-1] + lam * (
-                -6.0 * F[1:-1,1:-1,1:-1]
-                + F[2:  ,1:-1,1:-1] + F[ :-2,1:-1,1:-1]
-                + F[1:-1,2:  ,1:-1] + F[1:-1, :-2,1:-1]
-                + F[1:-1,1:-1,2:  ] + F[1:-1,1:-1, :-2]
-            )
+
+        # Pad with edge values to enforce Neumann boundaries for arbitrary
+        # dimensionality (1D/2D/3D).  The padded array lets us compute a
+        # standard 7-point Laplacian without having to special-case thin
+        # domains where one or more axes have size ``1``.  On such axes the
+        # "neighbour" samples equal the centre value which effectively
+        # contributes zero flux along that dimension.
+        Fp = np.pad(F, 1, mode="edge")
+        lap = (
+            Fp[2:, 1:-1, 1:-1] + Fp[:-2, 1:-1, 1:-1]
+            + Fp[1:-1, 2:, 1:-1] + Fp[1:-1, :-2, 1:-1]
+            + Fp[1:-1, 1:-1, 2:] + Fp[1:-1, 1:-1, :-2]
+            - 6.0 * F
         )
-        # Neumann at walls (copy interior)
-        out[0, :, :] = out[1, :, :]
-        out[-1,:,:] = out[-2,:,:]
-        out[:, 0,:] = out[:, 1,:]
-        out[:, -1,:] = out[:, -2,:]
-        out[:, :, 0] = out[:, :, 1]
-        out[:, :, -1] = out[:, :, -2]
-        return out
+
+        return F + lam * lap
 
     # ---------------------------------------------------------------------
     # Linear solvers
