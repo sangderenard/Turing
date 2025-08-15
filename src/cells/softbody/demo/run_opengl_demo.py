@@ -1,6 +1,7 @@
 import os, sys, time, math, random
 import argparse
 import ctypes
+from typing import Dict
 import numpy as np
 
 # ----- Cellsim backend (uses your code) -------------------------------------
@@ -936,13 +937,13 @@ def play_points_stream(
     pts_concat: np.ndarray,
     mvps: np.ndarray,
     vec_concat: np.ndarray | None = None,
-    scalar_concat: np.ndarray | None = None,
+    scalar_fields: Dict[str, np.ndarray] | None = None,
     droplet_offsets: np.ndarray | None = None,
     droplet_concat: np.ndarray | None = None,
     *,
     show_vectors: bool = False,
     show_droplets: bool = False,
-    color_metric: str = "magnitude",
+    initial_metric: str | None = "speed",
     arrow_scale: float = 1.0,
     flow_anim_speed: float = 1.0,
     viewport_w: int = 1100,
@@ -956,12 +957,12 @@ def play_points_stream(
     pts_concat:   (N,3) float32
     mvps:         (F,4,4) float32
     vec_concat:   optional (N,3) float32 per-vertex vectors
-    scalar_concat: optional (N,) float32 per-vertex scalar (magnitude, curl, ...)
+    scalar_fields: optional mapping name -> (N,) float32 per-vertex scalar fields
     droplet_offsets: optional (F+1,) int64 for secondary droplet cloud
     droplet_concat: optional (Nd,3) float32 secondary droplet positions
     show_vectors: render arrows when vector data present
     show_droplets: render secondary droplet cloud when provided
-    color_metric: descriptor for scalar_concat; currently informational
+    initial_metric: name of scalar field to display initially
     arrow_scale:  scale factor for arrow lengths
     flow_anim_speed: multiplier for pulsing animation speed
     loop_mode:    'none' | 'loop' | 'bounce'
@@ -997,18 +998,28 @@ def play_points_stream(
         if vec_concat is not None
         else None
     )
+
+    metric_names = list(scalar_fields.keys()) if scalar_fields else []
+    if initial_metric == "none":
+        current_metric = None
+    else:
+        current_metric = initial_metric if initial_metric in metric_names else (metric_names[0] if metric_names else None)
+    if metric_names:
+        menu = "Scalar fields:" + ", ".join(f" {i+1}:{n}" for i, n in enumerate(metric_names)) + " (0:none)"
+        print(menu)
+    scalar_concat = scalar_fields[current_metric] if current_metric and scalar_fields else None
     scalars = (
         scalar_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
         if scalar_concat is not None
         else None
     )
     if show_vectors and vecs is not None:
-        if scalars is None and color_metric == "magnitude":
+        if scalars is None:
             scalars = np.linalg.norm(vecs, axis=1)
         gl_pts = ArrowsGL(
             pts.astype(np.float32, copy=False),
             vecs.astype(np.float32, copy=False),
-            scalars.astype(np.float32, copy=False) if scalars is not None else None,
+            scalars.astype(np.float32, copy=False),
         )
         use_arrows = True
     else:
@@ -1038,6 +1049,14 @@ def play_points_stream(
                 running = False
             elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
+            elif e.type == pygame.KEYDOWN and metric_names:
+                if pygame.K_0 <= e.key <= pygame.K_9:
+                    idx = e.key - pygame.K_0
+                    if idx == 0:
+                        current_metric = None
+                    elif 1 <= idx <= len(metric_names):
+                        current_metric = metric_names[idx-1]
+                    scalar_concat = scalar_fields[current_metric] if current_metric else None
 
         # Frame indices with loop/bounce
         fidx = int(frame)

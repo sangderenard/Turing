@@ -11,6 +11,12 @@ from src.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math
 
+# Optional visualization helpers from the OpenGL demo (compute curl)
+try:  # Run-time optional; demo still works without OpenGL packages
+    from .run_opengl_demo import compute_curl
+except Exception:  # pragma: no cover - fallback when OpenGL deps missing
+    compute_curl = None
+
 logger = logging.getLogger(__name__)
 
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
@@ -208,8 +214,12 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="OpenGL stream: render velocity vectors as arrows")
     parser.add_argument("--show-droplets", action="store_true",
                         help="OpenGL stream: render secondary droplet point cloud if available")
-    parser.add_argument("--color-metric", choices=["none", "magnitude"], default="magnitude",
-                        help="Metric for arrow coloration (none/magnitude)")
+    parser.add_argument(
+        "--color-metric",
+        choices=["none", "speed", "curl"],
+        default="speed",
+        help="Initial scalar field used for arrow coloration (speed/curl/none)",
+    )
     parser.add_argument("--arrow-scale", type=float, default=1.0,
                         help="Scale factor applied to arrow lengths")
     parser.add_argument("--flow-anim-speed", type=float, default=1.0,
@@ -963,9 +973,11 @@ def stream_fluid_points(
     *,
     show_vectors: bool = False,
     show_droplets: bool = False,
-    color_metric: str = "magnitude",
+    color_metric: str = "speed",
     arrow_scale: float = 1.0,
     flow_anim_speed: float = 1.0,
+    grid_shape: Tuple[int, int, int] | None = None,
+    grid_spacing: float | Tuple[float, float, float] | None = None,
 ):
     from .run_opengl_demo import play_points_stream
     dt = float(getattr(args, "dt", 1e-3))
@@ -977,7 +989,12 @@ def stream_fluid_points(
     pts_offsets = np.zeros(frames + 1, dtype=np.int64)
     pts_concat_list = []
     vec_concat_list = [] if show_vectors else None
-    scalar_concat_list = [] if show_vectors and color_metric != "none" else None
+    # Precompute scalar fields for optional interactive selection
+    scalar_field_lists: Dict[str, list[np.ndarray]] = {}
+    if show_vectors:
+        scalar_field_lists["speed"] = []
+        if compute_curl is not None and grid_shape is not None and dim > 1:
+            scalar_field_lists["curl"] = []
     drop_offsets = np.zeros(frames + 1, dtype=np.int64) if show_droplets else None
     drop_concat_list = [] if show_droplets else None
     mvps = np.zeros((frames, 4, 4), dtype=np.float32)
@@ -1009,8 +1026,25 @@ def stream_fluid_points(
         if show_vectors and vecs is not None and vec_concat_list is not None:
             vec = vecs.astype(np.float32, copy=False)
             vec_concat_list.append(vec)
-            if scalar_concat_list is not None and color_metric == "magnitude":
-                scalar_concat_list.append(np.linalg.norm(vec, axis=1).astype(np.float32, copy=False))
+            if "speed" in scalar_field_lists:
+                scalar_field_lists["speed"].append(
+                    np.linalg.norm(vec, axis=1).astype(np.float32, copy=False)
+                )
+            if "curl" in scalar_field_lists and grid_shape is not None:
+                try:
+                    reshaped = vec.reshape(tuple(grid_shape) + (dim,))
+                    spacing = grid_spacing if grid_spacing is not None else 1.0
+                    curl_field = compute_curl(reshaped, spacing=spacing) if compute_curl else None
+                    if curl_field is not None:
+                        curl_mag = (
+                            np.abs(curl_field).reshape(-1)
+                            if curl_field.ndim == len(grid_shape)
+                            else np.linalg.norm(curl_field, axis=-1).reshape(-1)
+                        )
+                        scalar_field_lists["curl"].append(curl_mag.astype(np.float32, copy=False))
+                except Exception:
+                    # Fallback silently if curl computation fails
+                    pass
         pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
         if show_droplets and drop_offsets is not None and drop_concat_list is not None:
             d = drops.astype(np.float32, copy=False) if drops is not None else np.zeros((0, 3), dtype=np.float32)
@@ -1047,11 +1081,10 @@ def stream_fluid_points(
         if vec_concat_list
         else None
     )
-    scalar_concat = (
-        np.concatenate(scalar_concat_list, axis=0)
-        if scalar_concat_list
-        else None
-    )
+    scalar_fields = {
+        name: (np.concatenate(vals, axis=0) if vals else None)
+        for name, vals in scalar_field_lists.items()
+    }
     drop_concat = (
         np.concatenate(drop_concat_list, axis=0)
         if drop_concat_list
@@ -1062,12 +1095,12 @@ def stream_fluid_points(
         pts_concat,
         mvps,
         vec_concat=vec_concat,
-        scalar_concat=scalar_concat,
+        scalar_fields=scalar_fields if scalar_fields else None,
         droplet_offsets=drop_offsets,
         droplet_concat=drop_concat,
         show_droplets=show_droplets,
         show_vectors=show_vectors,
-        color_metric=color_metric,
+        initial_metric=color_metric,
         arrow_scale=arrow_scale,
         flow_anim_speed=flow_anim_speed,
         viewport_w=w,
@@ -1114,6 +1147,14 @@ def run_fluid_demo(args):
         return
 
     if getattr(args, "stream", "") == "opengl-points":
+        grid_shape = (
+            getattr(fluid, "nx", None),
+            getattr(fluid, "ny", None),
+            getattr(fluid, "nz", None),
+        )
+        if None in grid_shape:
+            grid_shape = None
+        spacing = getattr(fluid, "dx", None)
         if args.fluid == "discrete":
             stream_fluid_points(
                 args,
@@ -1124,6 +1165,8 @@ def run_fluid_demo(args):
                 color_metric=args.color_metric,
                 arrow_scale=args.arrow_scale,
                 flow_anim_speed=args.flow_anim_speed,
+                grid_shape=grid_shape,
+                grid_spacing=spacing,
             )
         else:
             stream_fluid_points(
@@ -1135,6 +1178,8 @@ def run_fluid_demo(args):
                 color_metric=args.color_metric,
                 arrow_scale=args.arrow_scale,
                 flow_anim_speed=args.flow_anim_speed,
+                grid_shape=grid_shape,
+                grid_spacing=spacing,
             )
         return
 
