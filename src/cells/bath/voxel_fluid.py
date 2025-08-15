@@ -38,6 +38,8 @@ from typing import Tuple, Dict, Optional
 
 import numpy as np
 import warnings
+import copy
+from src.cells.bath.dt_controller import Metrics, Targets, STController, step_with_dt_control
 
 # Default CFL number exposed for external callers.  A value of 0.5 is
 # reasonably conservative for the semi-Lagrangian scheme employed here.
@@ -179,6 +181,36 @@ class VoxelMACFluid:
             dt_s = min(self._stable_dt(), dt_target, self.p.max_dt, remaining)
             self._substep(dt_s)
             remaining -= dt_s
+
+    def copy_shallow(self):
+        """Return a shallow copy for rollback."""
+        return copy.deepcopy(self)
+
+    def restore(self, saved) -> None:
+        """Restore state from ``copy_shallow``."""
+        self.__dict__.update(copy.deepcopy(saved.__dict__))
+
+    def compute_metrics(self, prev_mass: float) -> Metrics:
+        max_vel = float(max(np.max(np.abs(self.u)), np.max(np.abs(self.v)), np.max(np.abs(self.w))))
+        return Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
+
+    def step_with_controller(
+        self,
+        dt: float,
+        ctrl: STController,
+        targets: Targets,
+    ) -> tuple[Metrics, float]:
+        """Adaptive step using :class:`STController`."""
+
+        dx = self.dx
+
+        def advance(state: "VoxelMACFluid", dt_step: float):
+            state._substep(dt_step)
+            metrics = state.compute_metrics(0.0)
+            return True, metrics
+
+        metrics, dt_next = step_with_dt_control(self, dt, dx, targets, ctrl, advance)
+        return metrics, dt_next
 
     def sample_at(self, points_world: np.ndarray) -> Dict[str, np.ndarray]:
         """Sample velocity, pressure, T, S at world points; returns dict of arrays."""

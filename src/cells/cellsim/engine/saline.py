@@ -89,7 +89,27 @@ class SalineEngine:
                 print(f"Warning: Mechanics provider {self.mechanics_provider} failed to sync on initialization. ")
                 raise
 
-    def step(self, dt: float) -> float:
+    def copy_shallow(self):
+        return {
+            "V": self.V.copy(),
+            "n": self.n.copy(),
+            "bath_n": self.bath_n.copy(),
+            "bath_pressure": self.bath_pressure,
+            "bath_temperature": self.bath_temperature,
+            "bath_V": self.bath_V,
+            "_prev_eps": self._prev_eps.copy(),
+        }
+
+    def restore(self, saved) -> None:
+        self.V[:] = saved["V"]
+        self.n[:] = saved["n"]
+        self.bath_n[:] = saved["bath_n"]
+        self.bath_pressure = saved["bath_pressure"]
+        self.bath_temperature = saved["bath_temperature"]
+        self.bath_V = saved["bath_V"]
+        self._prev_eps[:] = saved["_prev_eps"]
+
+    def step(self, dt: float, *, use_adapt: bool = True) -> float:
         T = self.bath_temperature
         species_list = list(self.species)
         n_cells = self.V.shape[0]
@@ -255,4 +275,6 @@ class SalineEngine:
             checks.assert_nonneg(self.cells, self.bath, self.species)
             checks.assert_mass_conserved(self.cells, self.bath, self.species, totals_before)
 
-        return adapt_dt(dt, max_rel)
+        if use_adapt:
+            return adapt_dt(dt, max_rel)
+        return dt

@@ -18,6 +18,7 @@ from src.cells.softbody.engine.coupling import (
     cell_area,
 )
 from src.cells.softbody.engine.fields import FieldStack
+from src.cells.bath.dt_controller import STController, Targets
 
 
 @dataclass
@@ -46,6 +47,9 @@ class Softbody0DProvider(MechanicsProvider):
         self._ids: List[str] = []
         self._cells: Optional[List[Cell]] = None
         self._bath: Optional[Bath] = None
+        self.dt_ctrl = STController()
+        self.dt_targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+        self.dx = 1.0
 
     # MechanicsProvider -----------------------------------------------------
     def sync(self, cells: List[Cell], bath: Bath) -> None:
@@ -133,6 +137,7 @@ class Softbody0DProvider(MechanicsProvider):
         nsub = max(1, int(self.cfg.substeps))
         base_dt = float(dt) if (dt is not None and dt > 0.0) else float(self.cfg.dt_provider)
         sub_dt = base_dt / nsub
+        dt_curr = sub_dt
 
         h = self._h
 
@@ -156,15 +161,21 @@ class Softbody0DProvider(MechanicsProvider):
         for _ in range(nsub):
             _harmonized_update_batch()
 
-            # Single canonical softbody step (predict → fields → project → rebuild V)
-            # Pass fields stack if you've attached one on the hierarchy (optional).
-            h.step(sub_dt, t=t_now, fields=getattr(h, "fields", None))
+            # Single canonical softbody step with adaptive dt
+            _, dt_curr = h.step_dt_control(
+                dt_curr,
+                self.dt_ctrl,
+                self.dt_targets,
+                dx=self.dx,
+                t=t_now,
+                fields=getattr(h, "fields", None),
+            )
 
             # Organelle mode updates (your existing hook)
-            h.update_organelle_modes(sub_dt)
+            h.update_organelle_modes(dt_curr)
 
             # Advance provider time
-            t_now += sub_dt
+            t_now += dt_curr
 
         # Persist time back to provider
         self._t = t_now
