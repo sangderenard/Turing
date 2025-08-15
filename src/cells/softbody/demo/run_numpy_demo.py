@@ -168,12 +168,18 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         help="base integrator step; increase to amplify drift",
     )
     parser.add_argument(
-        "--fluid", choices=["", "discrete", "voxel"], default="",
-        help="Run stand-alone fluid demo (discrete or voxel) instead of cellsim",
+        "--fluid",
+        choices=["", "discrete", "voxel", "hybrid"],
+        default="",
+        help="Run stand-alone fluid demo (discrete, voxel, or hybrid) instead of cellsim",
     )
     # Optional coupling: run cellsim with an external fluid engine
-    parser.add_argument("--couple-fluid", choices=["", "discrete", "voxel"], default="",
-                        help="Couple Bath/cellsim to a spatial fluid engine during cellsim run.")
+    parser.add_argument(
+        "--couple-fluid",
+        choices=["", "discrete", "voxel"],
+        default="",
+        help="Couple Bath/cellsim to a spatial fluid engine during cellsim run.",
+    )
     parser.add_argument("--couple-radius", type=float, default=0.05,
                         help="Source influence radius for discrete fluid coupling (world units)")
     # Export/stream options
@@ -1073,12 +1079,19 @@ def stream_fluid_points(
 
 def run_fluid_demo(args):
     if args.fluid == "discrete":
-        from src.cells.bath.discrete_fluid import DiscreteFluid
-        fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
+        from src.cells.bath.make_sph import make_sph
+
+        fluid = make_sph(dim=3, resolution=(8, 12, 8))
         step = fluid.step
     elif args.fluid == "voxel":
-        from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
-        fluid = VoxelMACFluid(VoxelFluidParams(nx=8, ny=8, nz=8))
+        from src.cells.bath.make_mac import make_mac
+
+        fluid = make_mac(dim=3, resolution=(8, 8, 8))
+        step = fluid.step
+    elif args.fluid == "hybrid":
+        from src.cells.bath.make_hybrid import make_hybrid
+
+        fluid = make_hybrid(dim=3, resolution=(8, 8, 8), n_particles=512)
         step = fluid.step
     else:
         raise SystemExit("Unknown fluid engine")
@@ -1182,13 +1195,20 @@ def main():
     if couple_kind:
         try:
             if couple_kind == "discrete":
-                from src.cells.bath.discrete_fluid import DiscreteFluid
-                fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
+                from src.cells.bath.make_sph import make_sph
+
+                fluid = make_sph(dim=3, resolution=(8, 12, 8))
             elif couple_kind == "voxel":
-                from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
-                fluid = VoxelMACFluid(VoxelFluidParams(nx=8, ny=8, nz=8))
+                from src.cells.bath.make_mac import make_mac
+
+                fluid = make_mac(dim=3, resolution=(8, 8, 8))
             from src.cells.bath.coupling import BathFluidCoupler
-            coupler = BathFluidCoupler(bath=getattr(api, "bath", None), engine=fluid, kind=couple_kind, radius=float(args.couple_radius))
+            coupler = BathFluidCoupler(
+                bath=getattr(api, "bath", None),
+                engine=fluid,
+                kind=couple_kind,
+                radius=float(args.couple_radius),
+            )
         except Exception:
             logger.exception("Failed to initialize fluid coupling; proceeding without it")
             coupler = None
