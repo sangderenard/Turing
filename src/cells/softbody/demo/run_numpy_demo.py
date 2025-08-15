@@ -270,6 +270,8 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="ASCII export: draw every Nth face (performance)")
     parser.add_argument("--no-points", action="store_true",
                         help="ASCII export: disable drawing vertex points")
+    parser.add_argument("--debug-render", action="store_true",
+                        help="Print gathered layers each frame instead of invoking OpenGL")
     parser.add_argument("--verbose", action="store_true", help="Log per-cell parameters each frame")
     parser.add_argument("--debug", action="store_true", help="Log full per-vertex and per-face data")
     return parser
@@ -657,19 +659,51 @@ def run_fluid_demo(args):
         engine.step(dt)
 
 
-def gather_layers(provider, fluid=None, *, rainbow: bool = False):
-    """Assemble visualization layers from the current simulators."""
-    from src.opengl_render.api import cellsim_layers, fluid_layers  # local import to keep deps light
+def gather_layers(provider, fluid=None, *, rainbow: bool = False, for_opengl: bool = True):
+    """Assemble visualization layers from the current simulators.
 
-    layers = {}
+    When ``for_opengl`` is ``True`` (default) the data is packed into
+    :mod:`opengl_render` layer dataclasses.  When ``False`` a simpler mapping of
+    plain ``numpy`` arrays is returned for debug printing or non-OpenGL
+    consumers.
+    """
+
+    layers: Dict[str, Any] = {}
     h = getattr(provider, "_h", None)
-    if h is not None:
+    if h is None:
+        return layers
+
+    if for_opengl:
+        from src.opengl_render.api import cellsim_layers, fluid_layers  # local import
+
         layers.update(cellsim_layers(h, rainbow=rainbow))
+        if fluid is not None:
+            try:
+                layers.update(fluid_layers(fluid, rainbow=rainbow))
+            except Exception:
+                pass
+        return layers
+
+    # Generic arrays path
+    positions = []
+    faces = []
+    offset = 0
+    for cell in getattr(h, "cells", []) or []:
+        X = np.asarray(getattr(cell, "X", np.zeros((0, 3))), dtype=np.float32)
+        F = np.asarray(getattr(cell, "F", np.zeros((0, 3), dtype=np.uint32)), dtype=np.uint32)
+        if X.size and F.size:
+            positions.append(X)
+            faces.append(F + offset)
+            offset += X.shape[0]
+    if positions and faces:
+        layers["membrane"] = {
+            "positions": np.concatenate(positions),
+            "faces": np.concatenate(faces),
+        }
     if fluid is not None:
-        try:
-            layers.update(fluid_layers(fluid, rainbow=rainbow))
-        except Exception:
-            pass
+        pts = getattr(fluid, "p", None)
+        if pts is not None:
+            layers["fluid"] = {"points": np.asarray(pts, dtype=np.float32)}
     return layers
 
 
@@ -711,6 +745,14 @@ def main():
         else:
             stream_ascii(args, api, provider)
         return
+    draw_hook = None
+    if args.debug_render:
+        from src.opengl_render.renderer import DebugRenderer
+        from src.opengl_render.api import make_draw_hook
+
+        renderer = DebugRenderer()
+        draw_hook = make_draw_hook(renderer, (0, 0))
+
     dt = float(getattr(args, "dt", 1e-3))
     hooks = SimHooks()
     for _ in range(int(args.frames)):
@@ -718,6 +760,9 @@ def main():
             centers, vols = _centers_and_vols(provider, api)
             coupler.exchange(dt=dt, centers=centers, vols=vols, hooks=hooks)
         dt = step_cellsim(api, dt, hooks=hooks)
+        if draw_hook is not None:
+            layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=False)
+            draw_hook(layers)
 
 if __name__ == "__main__":
     main()

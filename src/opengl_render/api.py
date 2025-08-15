@@ -1,8 +1,8 @@
 """Adapters for building renderer layers from numpy-based simulation data.
 
-This module offers small helper utilities that convert arrays produced by the
-``run_numpy_demo`` cellsim into :class:`MeshLayer`, :class:`LineLayer` and
-:class:`PointLayer` instances used by :class:`~opengl_render.renderer.GLRenderer`.
+These helpers convert raw ``numpy`` arrays from an external simulation into
+:class:`MeshLayer`, :class:`LineLayer` and :class:`PointLayer` instances used by
+:class:`~opengl_render.renderer.GLRenderer`.
 
 The helpers keep imports light so they can be used from headless tests. When
 ``rainbow`` is enabled a simple HSV→RGB mapping is applied to generate a color
@@ -11,11 +11,11 @@ older demos under ``inspiration/``.
 """
 from __future__ import annotations
 
-from typing import Mapping, Iterable
+from typing import Mapping, Iterable, Callable
 import colorsys
 import numpy as np
 
-from .renderer import MeshLayer, LineLayer, PointLayer
+from .renderer import MeshLayer, LineLayer, PointLayer, GLRenderer
 
 
 # ---------------------------------------------------------------------------
@@ -157,3 +157,40 @@ def fluid_layers(engine, *, rainbow: bool = False) -> Mapping[str, MeshLayer | P
     if pts is not None:
         layers["fluid"] = pack_points(np.asarray(pts, dtype=np.float32), rainbow=rainbow, default_size=2.0)
     return layers
+
+
+# ---------------------------------------------------------------------------
+# Rendering hooks
+# ---------------------------------------------------------------------------
+
+def draw_layers(renderer: GLRenderer,
+                layers: Mapping[str, MeshLayer | LineLayer | PointLayer],
+                viewport: tuple[int, int]) -> None:
+    """Upload ``layers`` to ``renderer`` and draw a frame.
+
+    When ``renderer`` exposes a ``print_layers`` attribute (see
+    :class:`~opengl_render.renderer.DebugRenderer`), the layer mapping is passed
+    directly to that method, bypassing all OpenGL work.
+    """
+    if hasattr(renderer, "print_layers"):
+        renderer.print_layers(layers)  # type: ignore[call-arg]
+        return
+    mesh = layers.get("membrane")
+    if isinstance(mesh, MeshLayer):
+        renderer.set_mesh(mesh)
+    lines = layers.get("lines")
+    if isinstance(lines, LineLayer):
+        renderer.set_lines(lines)
+    # Prefer fluid points if available, fall back to generic points
+    pts = layers.get("fluid") or layers.get("points")
+    if isinstance(pts, PointLayer):
+        renderer.set_points(pts)
+    renderer.draw(viewport)
+
+
+def make_draw_hook(renderer: GLRenderer,
+                   viewport: tuple[int, int]) -> Callable[[Mapping[str, MeshLayer | LineLayer | PointLayer]], None]:
+    """Return a hook that draws provided layer mappings."""
+    def hook(layers: Mapping[str, MeshLayer | LineLayer | PointLayer]) -> None:
+        draw_layers(renderer, layers, viewport)
+    return hook

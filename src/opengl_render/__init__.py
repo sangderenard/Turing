@@ -1,6 +1,6 @@
 """Minimal OpenGL renderer package with mesh, line and point layers."""
 
-from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer
+from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer, DebugRenderer
 from .api import (
     rainbow_colors,
     rainbow_history_points,
@@ -13,6 +13,7 @@ from .api import (
 
 __all__ = [
     "GLRenderer",
+    "DebugRenderer",
     "MeshLayer",
     "LineLayer",
     "PointLayer",
