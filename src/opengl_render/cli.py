@@ -5,7 +5,7 @@
 import math
 import numpy as np
 import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, QUIT
+from pygame.locals import QUIT
 from OpenGL.GL import *
 from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer
 
@@ -32,11 +32,7 @@ def look_at(eye, center, up):
     return m
 
 def run():
-    pygame.init()
     W, H = 1024, 640
-    pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
-    pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 8)
-    pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
 
     # Build MVP
     P = perspective(60, W/float(H), 0.1, 500.0)
@@ -44,7 +40,7 @@ def run():
     M = np.identity(4, np.float32)
     MVP = (P @ V @ M).astype(np.float32)
 
-    r = GLRenderer(MVP)
+    r = GLRenderer(MVP, size=(W, H))
 
     # Mesh: simple tetra
     verts = np.array([[1,1,1], [-1,-1,1], [-1,1,-1], [1,-1,-1]], np.float32) * 1.2

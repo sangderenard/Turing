@@ -34,9 +34,10 @@ class GLRenderThread:
         renderer: object,
         *,
         viewport: Tuple[int, int],
-        history: int = 0,
+        history: int = 32,
         loop: bool = False,
         bounce: bool = False,
+        ghost_trail: bool = True,
     ) -> None:
         self.renderer = renderer
         self.viewport = viewport
@@ -45,6 +46,7 @@ class GLRenderThread:
         self.queue: "queue.Queue[Mapping[str, object] | None]" = queue.Queue()
         self.loop = loop
         self.bounce = bounce
+        self.ghost_trail = ghost_trail
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -70,7 +72,11 @@ class GLRenderThread:
 
     # Internal worker ------------------------------------------------
     def _run(self) -> None:  # pragma: no cover - thread loop
-        from .api import draw_layers  # local import to avoid circular deps
+        from .api import draw_layers, rainbow_history_points  # local import
+        try:  # pragma: no cover - tolerate missing OpenGL libs
+            from .renderer import PointLayer
+        except Exception:  # noqa: BLE001
+            PointLayer = None  # type: ignore
 
         while not self._stop.is_set():
             try:
@@ -93,5 +99,16 @@ class GLRenderThread:
 
             # Normal frame: draw and store in history
             self.history.append(item)
-            draw_layers(self.renderer, item, self.viewport)
+            frame = item
+            if self.ghost_trail and PointLayer is not None:
+                pts_hist = []
+                for past in list(self.history)[:-1]:
+                    pts = past.get("fluid") or past.get("points")
+                    if isinstance(pts, PointLayer):
+                        pts_hist.append(pts.positions)
+                if pts_hist:
+                    ghost = rainbow_history_points(pts_hist)
+                    frame = dict(item)
+                    frame["ghost"] = ghost
+            draw_layers(self.renderer, frame, self.viewport)
             self.queue.task_done()
