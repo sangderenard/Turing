@@ -238,8 +238,6 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="Multiplier for flow animation speed in viewers")
     parser.add_argument("--verbose", action="store_true", help="Log per-cell parameters each frame")
     parser.add_argument("--debug", action="store_true", help="Log full per-vertex and per-face data")
-    parser.add_argument("--sim-dim", type=int, choices=[1, 2, 3], default=3,
-                        help="Softbody simulation dimension")
     return parser
 
 
@@ -1232,18 +1230,21 @@ def run_fluid_demo(args):
     dim = int(getattr(args, "sim_dim", 3))
     if args.fluid == "discrete":
         from src.cells.bath.make_sph import make_sph
-
-        fluid = make_sph(dim=dim, resolution=(8, 12, 8))
+        base_res = (8, 12, 8)
+        resolution = tuple(base_res[:dim])
+        fluid = make_sph(dim=dim, resolution=resolution)
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "voxel":
         from src.cells.bath.make_mac import make_mac
-
-        fluid = make_mac(dim=dim, resolution=(8, 8, 8))
+        base_res = (8, 8, 8)
+        resolution = tuple(base_res[:dim])
+        fluid = make_mac(dim=dim, resolution=resolution)
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "hybrid":
         from src.cells.bath.make_hybrid import make_hybrid
-
-        fluid = make_hybrid(dim=dim, resolution=(8, 8, 8), n_particles=512)
+        base_res = (8, 8, 8)
+        resolution = tuple(base_res[:dim])
+        fluid = make_hybrid(dim=dim, resolution=resolution, n_particles=512)
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     else:
         raise SystemExit("Unknown fluid engine")
@@ -1374,15 +1375,21 @@ def main():
             if couple_kind == "discrete":
                 from src.cells.bath.make_sph import make_sph
 
-                fluid = make_sph(dim=dim, resolution=(8, 12, 8))
+                base_res = (8, 12, 8)
+                resolution = tuple(base_res[:dim])
+                fluid = make_sph(dim=dim, resolution=resolution)
             elif couple_kind == "voxel":
                 from src.cells.bath.make_mac import make_mac
 
-                fluid = make_mac(dim=dim, resolution=(8, 8, 8))
+                base_res = (8, 8, 8)
+                resolution = tuple(base_res[:dim])
+                fluid = make_mac(dim=dim, resolution=resolution)
             elif couple_kind == "hybrid":
                 from src.cells.bath.make_hybrid import make_hybrid
 
-                fluid = make_hybrid(dim=dim, resolution=(8, 8, 8), n_particles=512)
+                base_res = (8, 8, 8)
+                resolution = tuple(base_res[:dim])
+                fluid = make_hybrid(dim=dim, resolution=resolution, n_particles=512)
             from src.cells.bath.coupling import BathFluidCoupler
             coupler = BathFluidCoupler(
                 bath=getattr(api, "bath", None),
