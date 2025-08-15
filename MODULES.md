@@ -147,7 +147,7 @@ A hyperlinked index of modules and capabilities in this repository.
   - geometry: [primitives.py](src/cells/softbody/geometry/primitives.py), [geodesic.py](src/cells/softbody/geometry/geodesic.py)
   - bridge: [__init__.py](src/cells/softbody/bridge/__init__.py), [state_io.py](src/cells/softbody/bridge/state_io.py)
   - resources: [field_library.py](src/cells/softbody/resources/field_library.py)
-  - demo: [__init__.py](src/cells/softbody/demo/__init__.py), [run_ascii_demo.py](src/cells/softbody/demo/run_ascii_demo.py), [run_numpy_demo.py](src/cells/softbody/demo/run_numpy_demo.py)
+  - demo: [__init__.py](src/cells/softbody/demo/__init__.py), [run_ascii_demo.py](src/cells/softbody/demo/run_ascii_demo.py), [numpy_sim_coordinator.py](src/cells/softbody/demo/numpy_sim_coordinator.py)
 
 ## src/visualizations
 

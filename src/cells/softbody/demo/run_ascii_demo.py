@@ -6,7 +6,7 @@ import numpy as np
 from ..engine.hierarchy import Hierarchy
 
 # Reuse the numpy-based backend so all demos share identical math
-from .run_numpy_demo import (
+from .numpy_sim_coordinator import (
     make_cellsim_backend,
     step_cellsim,
     build_numpy_parser,

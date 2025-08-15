@@ -5,7 +5,7 @@ from typing import Dict
 import numpy as np
 
 # ----- Cellsim backend (uses your code) -------------------------------------
-from .run_numpy_demo import (
+from src.cells.softbody.demo.numpy_sim_coordinator import (
     make_cellsim_backend as base_make_cellsim_backend,
     step_cellsim,
     build_numpy_parser,

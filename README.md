@@ -196,7 +196,7 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
   - geometry/: `primitives.py`, `geodesic.py`
   - bridge/: `__init__.py`, `state_io.py`
   - resources/: `field_library.py`
-  - demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`
+  - demo/: `__init__.py`, `run_ascii_demo.py`, `numpy_sim_coordinator.py`
     - Geometry visualization is handled by the shared `src/opengl_render` package.
 
 ### src/transmogrifier

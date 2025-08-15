@@ -2,5 +2,5 @@
 
 __all__ = [
     "run_ascii_demo",
-    "run_numpy_demo",
+    "numpy_sim_coordinator",
 ]
