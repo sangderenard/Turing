@@ -48,6 +48,15 @@ def make_hybrid(
     def export_positions_vectors_droplets():
         parts = engine.export_particles()
         grid_pts, grid_vecs = engine.export_vector_field()
+
+        # ``export_vector_field`` always returns 3D points/vectors even when the
+        # simulation is 1D or 2D.  Slice them so they match the particle
+        # dimensionality before concatenation.
+        dim = parts["x"].shape[1]
+        if grid_pts.shape[1] != dim:
+            grid_pts = grid_pts[:, :dim]
+            grid_vecs = grid_vecs[:, :dim]
+
         pts = np.concatenate([parts["x"], grid_pts], axis=0)
         vecs = np.concatenate([parts["v"], grid_vecs], axis=0)
         return pts, vecs, None
