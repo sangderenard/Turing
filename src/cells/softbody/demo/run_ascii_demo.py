@@ -437,35 +437,76 @@ def numpy_kwargs_from_args(args: dict | object) -> dict:
     return {k: getattr(args, k) for k in numpy_tag_names() if hasattr(args, k)}
 
 # ---- In-process ASCII streaming API ---------------------------------------
-def play_ascii_stream(chars: np.ndarray,
-                      rgb: np.ndarray,
-                      *,
-                      color_mode: str = "auto",
-                      loop_mode: str = "none",
-                      fps: float = 30.0):
-    """Render an ASCII stream from NumPy arrays without file I/O.
-
-    chars: (F, ny, nx) uint8 of ASCII codes.
-    rgb:   (F, ny, nx, 3) uint8 of per-cell colors.
-    loop_mode: 'none' | 'loop' | 'bounce'
-    """
+def play_ascii_stream(
+    chars: np.ndarray | None = None,
+    rgb: np.ndarray | None = None,
+    *,
+    gather_func=None,
+    step_func=None,
+    frames: int = 0,
+    dt: float = 0.0,
+    color_mode: str = "auto",
+    loop_mode: str = "none",
+    fps: float = 30.0,
+) -> None:
+    """Render an ASCII stream either from arrays or from a live simulator."""
     import time
+
+    live = gather_func is not None and step_func is not None
+    dt_target = 1.0 / max(1e-6, float(fps))
+
+    if live:
+        if frames < 0:
+            frames = 0
+        frame = 0
+        prev_lines = 0
+        while frames == 0 or frame < frames:
+            ch, col = gather_func()
+            if _is_tty() and prev_lines:
+                sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
+            sys.stdout.write(f"Frame {frame}\n")
+            ny, nx = ch.shape[0], ch.shape[1]
+            for iy in range(ny):
+                parts = []
+                ch_row = ch[iy]
+                rgb_row = col[iy]
+                for ix in range(nx):
+                    c = chr(int(ch_row[ix]))
+                    r = int(rgb_row[ix, 0]); g = int(rgb_row[ix, 1]); b = int(rgb_row[ix, 2])
+                    parts.append(colorize(c, (r, g, b), mode=color_mode))
+                sys.stdout.write(''.join(parts) + "\n")
+            sys.stdout.flush()
+            prev_lines = 1 + ny
+
+            t0 = time.perf_counter()
+            dt = step_func(dt)
+            time.sleep(max(0.0, dt_target - (time.perf_counter() - t0)))
+            frame += 1
+        return
+
+    if chars is None or rgb is None:
+        raise ValueError("precomputed playback requires chars and rgb arrays")
+
     F = int(chars.shape[0])
     frame = 0
     direction = 1
     prev_lines = 0
-    dt_target = 1.0 / max(1e-6, float(fps))
     while True:
         fidx = int(frame)
         if fidx >= F:
             if loop_mode == "loop":
-                fidx = 0; frame = 0
+                fidx = 0
+                frame = 0
             elif loop_mode == "bounce":
-                direction = -1; frame = F-1; fidx = frame
+                direction = -1
+                frame = F - 1
+                fidx = frame
             else:
                 break
         elif fidx < 0 and loop_mode == "bounce":
-            direction = 1; frame = 0; fidx = 0
+            direction = 1
+            frame = 0
+            fidx = 0
 
         if _is_tty() and prev_lines:
             sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
@@ -475,10 +516,11 @@ def play_ascii_stream(chars: np.ndarray,
             parts = []
             ch_row = chars[fidx, iy]
             rgb_row = rgb[fidx, iy]
-            # vectorized join still needs per-cell colorization, but avoid Python tuple packing
             for ix in range(nx):
                 ch = chr(int(ch_row[ix]))
-                r = int(rgb_row[ix, 0]); g = int(rgb_row[ix, 1]); b = int(rgb_row[ix, 2])
+                r = int(rgb_row[ix, 0])
+                g = int(rgb_row[ix, 1])
+                b = int(rgb_row[ix, 2])
                 parts.append(colorize(ch, (r, g, b), mode=color_mode))
             sys.stdout.write(''.join(parts) + "\n")
         sys.stdout.flush()

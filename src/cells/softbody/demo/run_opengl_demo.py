@@ -12,6 +12,11 @@ from .run_numpy_demo import (
     get_numpy_tag_names,
     extract_numpy_kwargs,
     run_fluid_demo,
+    _perspective,
+    _look_at,
+    _translate,
+    _rotate_y,
+    _compute_center_radius_pts,
 )
 
 
@@ -993,6 +998,354 @@ def play_points_stream_from_dir(
     pygame.quit()
 
 
+def play_points_stream(
+    pts_offsets: np.ndarray | None = None,
+    pts_concat: np.ndarray | None = None,
+    mvps: np.ndarray | None = None,
+    vec_concat: np.ndarray | None = None,
+    scalar_fields: Dict[str, np.ndarray] | None = None,
+    droplet_offsets: np.ndarray | None = None,
+    droplet_concat: np.ndarray | None = None,
+    *,
+    gather_func=None,
+    step_func=None,
+    frames: int = 0,
+    dt: float = 0.0,
+    fovy: float = 60.0,
+    rot_speed: float = 0.0,
+    show_vectors: bool = False,
+    show_droplets: bool = False,
+    initial_metric: str | None = "speed",
+    arrow_scale: float = 1.0,
+    flow_anim_speed: float = 1.0,
+    viewport_w: int = 1100,
+    viewport_h: int = 800,
+    loop_mode: str = "none",
+    fps: float = 60.0,
+) -> None:
+    """Render OpenGL points either from arrays or directly from a live simulator.
+
+    When ``gather_func`` and ``step_func`` are provided, this function streams
+    frames on-the-fly by calling ``gather_func`` to obtain the current point
+    positions and ``step_func`` to advance the simulation.  In this mode the
+    ``frames``, ``dt``, ``fovy`` and ``rot_speed`` parameters control playback.
+    Otherwise, precomputed arrays ``pts_offsets``, ``pts_concat`` and ``mvps``
+    are used along with optional per-vertex vectors and scalar fields.
+    """
+
+    pygame = _ensure_gl_context(viewport_w, viewport_h)
+    from OpenGL.GL import (
+        glUseProgram,
+        glUniformMatrix4fv,
+        glUniform4fv,
+        glUniform1f,
+        glViewport,
+        glClearColor,
+        glClear,
+        GL_COLOR_BUFFER_BIT,
+        GL_DEPTH_BUFFER_BIT,
+        GL_FALSE,
+    )
+    from OpenGL.GL import glGetUniformLocation
+
+    pt_prog = link_program(SPRITE_VS, SPRITE_FS)
+    pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
+    pt_u_color = glGetUniformLocation(pt_prog, "uColor")
+    pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
+    pt_u_time = glGetUniformLocation(pt_prog, "uTime")
+
+    drop_prog = link_program(SPRITE_VS, DROPLET_FS)
+    drop_u_mvp = glGetUniformLocation(drop_prog, "uMVP")
+    drop_u_color = glGetUniformLocation(drop_prog, "uColor")
+    drop_u_psize = glGetUniformLocation(drop_prog, "uPointScale")
+
+    arrow_prog = link_program(POINT_VS, POINT_FS)
+    arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
+    arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
+    arrow_u_time = glGetUniformLocation(arrow_prog, "uTime")
+    arrow_u_scale = glGetUniformLocation(arrow_prog, "uArrowScale")
+
+    live = gather_func is not None and step_func is not None
+
+    clock = pygame.time.Clock()
+
+    if live:
+        # --- initialize first frame and camera ---
+        try:
+            pts, vecs, drops = gather_func()
+        except ValueError:
+            pts, vecs = gather_func()
+            drops = None
+
+        center, radius = _compute_center_radius_pts(pts)
+        eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        cam_dir = center - eye
+        cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+        cam_dist = float(np.linalg.norm(center - eye))
+        center_s = center.copy()
+        dist_s = cam_dist
+        aspect = viewport_w / max(1, viewport_h)
+
+        gl_pts = None
+        gl_drops = None
+        use_arrows = False
+        t_sim = 0.0
+        frame = 0
+        running = True
+        while running and (frames <= 0 or frame < frames):
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    running = False
+                elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+
+            new_center, radius = _compute_center_radius_pts(pts)
+            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+            alpha = 0.15
+            center_s = (1.0 - alpha) * center_s + alpha * new_center
+            dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+            center = center_s
+            cam_dist = float(dist_s)
+            eye = center - cam_dir * cam_dist
+
+            P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+            V = _look_at(eye, center, up)
+            theta = rot_speed * t_sim
+            T_neg = _translate(-center)
+            R_y = _rotate_y(theta)
+            T_pos = _translate(center)
+            M = (T_pos @ R_y @ T_neg).astype(np.float32)
+            MVP = (P @ V @ M).astype(np.float32)
+
+            if show_vectors and vecs is not None:
+                scalars = np.linalg.norm(vecs, axis=1).astype(np.float32, copy=False)
+                if gl_pts is None or gl_pts.n != len(pts):
+                    gl_pts = ArrowsGL(
+                        pts.astype(np.float32, copy=False),
+                        vecs.astype(np.float32, copy=False),
+                        scalars,
+                    )
+                    gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                else:
+                    gl_pts.upload(
+                        pts.astype(np.float32, copy=False),
+                        vecs.astype(np.float32, copy=False),
+                        scalars,
+                    )
+                use_arrows = True
+            else:
+                if gl_pts is None or gl_pts.n != len(pts):
+                    gl_pts = PointsGL(pts.astype(np.float32, copy=False))
+                    gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+                else:
+                    gl_pts.upload(pts.astype(np.float32, copy=False))
+                use_arrows = False
+
+            if show_droplets and drops is not None:
+                if gl_drops is None or gl_drops.n != len(drops):
+                    gl_drops = PointsGL(drops.astype(np.float32, copy=False))
+                    gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
+                else:
+                    gl_drops.upload(drops.astype(np.float32, copy=False))
+            elif gl_drops is not None:
+                gl_drops = None
+
+            viewport = pygame.display.get_surface().get_size()
+            glViewport(0, 0, viewport[0], viewport[1])
+            glClearColor(0.06, 0.07, 0.10, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+            if use_arrows:
+                glUseProgram(arrow_prog)
+                glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                glUniform1f(arrow_u_time, t_sim * flow_anim_speed)
+                glUniform1f(arrow_u_scale, arrow_scale)
+                gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
+            else:
+                glUseProgram(pt_prog)
+                glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                glUniform1f(pt_u_time, t_sim * flow_anim_speed)
+                gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+
+            if gl_drops is not None:
+                glUseProgram(drop_prog)
+                glUniformMatrix4fv(drop_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+                gl_drops.draw(drop_prog, drop_u_mvp, drop_u_color, drop_u_psize)
+
+            pygame.display.flip()
+            clock.tick(fps)
+
+            dt = step_func(dt)
+            t_sim += dt
+            frame += 1
+            try:
+                pts, vecs, drops = gather_func()
+            except ValueError:
+                pts, vecs = gather_func()
+                drops = None
+
+        pygame.quit()
+        return
+
+    # --- Precomputed playback path ---
+    if pts_offsets is None or pts_concat is None or mvps is None:
+        raise ValueError("precomputed playback requires pts_offsets, pts_concat and mvps")
+
+    pts = pts_concat[: max(1, int(pts_offsets[1] - pts_offsets[0]))]
+    vecs = (
+        vec_concat[: max(1, int(pts_offsets[1] - pts_offsets[0]))]
+        if vec_concat is not None
+        else None
+    )
+
+    metric_names = list(scalar_fields.keys()) if scalar_fields else []
+    if initial_metric == "none":
+        current_metric = None
+    else:
+        current_metric = (
+            initial_metric
+            if initial_metric in metric_names
+            else (metric_names[0] if metric_names else None)
+        )
+    if metric_names:
+        menu = "Scalar fields:" + ", ".join(f" {i+1}:{n}" for i, n in enumerate(metric_names)) + " (0:none)"
+        print(menu)
+    scalar_concat = scalar_fields[current_metric] if current_metric and scalar_fields else None
+    scalars = (
+        scalar_concat[: max(1, int(pts_offsets[1] - pts_offsets[0]))]
+        if scalar_concat is not None
+        else None
+    )
+    if show_vectors and vecs is not None:
+        if scalars is None:
+            scalars = np.linalg.norm(vecs, axis=1)
+        gl_pts = ArrowsGL(
+            pts.astype(np.float32, copy=False),
+            vecs.astype(np.float32, copy=False),
+            scalars.astype(np.float32, copy=False),
+        )
+        use_arrows = True
+    else:
+        gl_pts = PointsGL(pts.astype(np.float32, copy=False))
+        use_arrows = False
+    gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+    if show_droplets and droplet_offsets is not None and droplet_concat is not None:
+        dstart = int(droplet_offsets[0])
+        dend = int(droplet_offsets[1]) if len(droplet_offsets) > 1 else dstart
+        dpts = droplet_concat[dstart:dend]
+        gl_drops = PointsGL(dpts.astype(np.float32, copy=False))
+        gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
+    else:
+        gl_drops = None
+
+    running = True
+    frame = 0
+    F = int(mvps.shape[0])
+    direction = 1
+    while running:
+        time_s = pygame.time.get_ticks() * 0.001 * flow_anim_speed
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                running = False
+            elif e.type == pygame.KEYDOWN and metric_names:
+                if pygame.K_0 <= e.key <= pygame.K_9:
+                    idx = e.key - pygame.K_0
+                    if idx == 0:
+                        current_metric = None
+                    elif 1 <= idx <= len(metric_names):
+                        current_metric = metric_names[idx - 1]
+                    scalar_concat = scalar_fields[current_metric] if current_metric else None
+
+        fidx = int(frame)
+        if fidx >= F:
+            if loop_mode == "loop":
+                fidx = 0
+                frame = 0
+            elif loop_mode == "bounce":
+                direction = -1
+                frame = F - 1
+                fidx = frame
+            else:
+                break
+        elif fidx < 0 and loop_mode == "bounce":
+            direction = 1
+            frame = 0
+            fidx = 0
+
+        start = int(pts_offsets[fidx])
+        end = int(pts_offsets[fidx + 1])
+        cur = pts_concat[start:end]
+        if use_arrows:
+            cur_vecs = vec_concat[start:end]
+            cur_scalars = (
+                scalar_concat[start:end]
+                if scalar_concat is not None
+                else np.linalg.norm(cur_vecs, axis=1)
+            )
+            if gl_pts.n != len(cur):
+                gl_pts = ArrowsGL(
+                    cur.astype(np.float32, copy=False),
+                    cur_vecs.astype(np.float32, copy=False),
+                    cur_scalars.astype(np.float32, copy=False),
+                )
+                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                gl_pts.upload(
+                    cur.astype(np.float32, copy=False),
+                    cur_vecs.astype(np.float32, copy=False),
+                    cur_scalars.astype(np.float32, copy=False),
+                )
+        else:
+            if gl_pts.n != len(cur):
+                gl_pts = PointsGL(cur.astype(np.float32, copy=False))
+                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                gl_pts.upload(cur.astype(np.float32, copy=False))
+
+        if gl_drops is not None and droplet_offsets is not None and droplet_concat is not None:
+            dstart = int(droplet_offsets[fidx])
+            dend = int(droplet_offsets[fidx + 1])
+            dcur = droplet_concat[dstart:dend]
+            if gl_drops.n != len(dcur):
+                gl_drops = PointsGL(dcur.astype(np.float32, copy=False))
+                gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
+            else:
+                gl_drops.upload(dcur.astype(np.float32, copy=False))
+
+        MVP = mvps[fidx].astype(np.float32, copy=False)
+
+        viewport = pygame.display.get_surface().get_size()
+        glViewport(0, 0, viewport[0], viewport[1])
+        glClearColor(0.06, 0.07, 0.10, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        if use_arrows:
+            glUseProgram(arrow_prog)
+            glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUniform1f(arrow_u_time, time_s)
+            glUniform1f(arrow_u_scale, arrow_scale)
+            gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
+        else:
+            glUseProgram(pt_prog)
+            glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            glUniform1f(pt_u_time, time_s)
+            gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
+
+        if gl_drops is not None:
+            glUseProgram(drop_prog)
+            glUniformMatrix4fv(drop_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+            gl_drops.draw(drop_prog, drop_u_mvp, drop_u_color, drop_u_psize)
+
+        pygame.display.flip()
+        clock.tick(fps)
+        frame += direction
+
+    pygame.quit()
+
 def play_mesh_stream_from_dir(
     dir_path: str,
     *,
@@ -1148,213 +1501,6 @@ def numpy_kwargs_from_args(args: dict | object) -> dict:
     d = {k: getattr(args, k) for k in numpy_tag_names() if hasattr(args, k)}
     return d
 
-def play_points_stream(
-    pts_offsets: np.ndarray,
-    pts_concat: np.ndarray,
-    mvps: np.ndarray,
-    vec_concat: np.ndarray | None = None,
-    scalar_fields: Dict[str, np.ndarray] | None = None,
-    droplet_offsets: np.ndarray | None = None,
-    droplet_concat: np.ndarray | None = None,
-    *,
-    show_vectors: bool = False,
-    show_droplets: bool = False,
-    initial_metric: str | None = "speed",
-    arrow_scale: float = 1.0,
-    flow_anim_speed: float = 1.0,
-    viewport_w: int = 1100,
-    viewport_h: int = 800,
-    loop_mode: str = "none",
-    fps: float = 60.0,
-):
-    """Render a precomputed OpenGL points stream in-process.
-
-    pts_offsets: (F+1,) int64
-    pts_concat:   (N,3) float32
-    mvps:         (F,4,4) float32
-    vec_concat:   optional (N,3) float32 per-vertex vectors
-    scalar_fields: optional mapping name -> (N,) float32 per-vertex scalar fields
-    droplet_offsets: optional (F+1,) int64 for secondary droplet cloud
-    droplet_concat: optional (Nd,3) float32 secondary droplet positions
-    show_vectors: render arrows when vector data present
-    show_droplets: render secondary droplet cloud when provided
-    initial_metric: name of scalar field to display initially
-    arrow_scale:  scale factor for arrow lengths
-    flow_anim_speed: multiplier for pulsing animation speed
-    loop_mode:    'none' | 'loop' | 'bounce'
-    """
-    pygame = _ensure_gl_context(viewport_w, viewport_h)
-    from OpenGL.GL import (
-        glUseProgram, glUniformMatrix4fv, glUniform4fv, glUniform1f, glViewport,
-        glClearColor, glClear, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_FALSE
-    )
-    from OpenGL.GL import glGetUniformLocation
-
-    # Build shaders: point sprites for plain points, arrows for vectors
-    mesh_prog = link_program(MESH_VS, MESH_FS)
-    pt_prog = link_program(SPRITE_VS, SPRITE_FS)
-    pt_u_mvp = glGetUniformLocation(pt_prog, "uMVP")
-    pt_u_color = glGetUniformLocation(pt_prog, "uColor")
-    pt_u_psize = glGetUniformLocation(pt_prog, "uPointScale")
-    pt_u_time = glGetUniformLocation(pt_prog, "uTime")
-    drop_prog = link_program(SPRITE_VS, DROPLET_FS)
-    drop_u_mvp = glGetUniformLocation(drop_prog, "uMVP")
-    drop_u_color = glGetUniformLocation(drop_prog, "uColor")
-    drop_u_psize = glGetUniformLocation(drop_prog, "uPointScale")
-    arrow_prog = link_program(POINT_VS, POINT_FS)
-    arrow_u_mvp = glGetUniformLocation(arrow_prog, "uMVP")
-    arrow_u_color = glGetUniformLocation(arrow_prog, "uColor")
-    arrow_u_time = glGetUniformLocation(arrow_prog, "uTime")
-    arrow_u_scale = glGetUniformLocation(arrow_prog, "uArrowScale")
-
-    # Set up a single reusable point cloud object
-    pts = pts_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
-    vecs = (
-        vec_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
-        if vec_concat is not None
-        else None
-    )
-
-    metric_names = list(scalar_fields.keys()) if scalar_fields else []
-    if initial_metric == "none":
-        current_metric = None
-    else:
-        current_metric = initial_metric if initial_metric in metric_names else (metric_names[0] if metric_names else None)
-    if metric_names:
-        menu = "Scalar fields:" + ", ".join(f" {i+1}:{n}" for i, n in enumerate(metric_names)) + " (0:none)"
-        print(menu)
-    scalar_concat = scalar_fields[current_metric] if current_metric and scalar_fields else None
-    scalars = (
-        scalar_concat[: max(1, int(pts_offsets[1]-pts_offsets[0]))]
-        if scalar_concat is not None
-        else None
-    )
-    if show_vectors and vecs is not None:
-        if scalars is None:
-            scalars = np.linalg.norm(vecs, axis=1)
-        gl_pts = ArrowsGL(
-            pts.astype(np.float32, copy=False),
-            vecs.astype(np.float32, copy=False),
-            scalars.astype(np.float32, copy=False),
-        )
-        use_arrows = True
-    else:
-        gl_pts = PointsGL(pts.astype(np.float32, copy=False))
-        use_arrows = False
-    gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-
-    # Optional droplet cloud
-    if show_droplets and droplet_offsets is not None and droplet_concat is not None:
-        dstart = int(droplet_offsets[0])
-        dend = int(droplet_offsets[1]) if len(droplet_offsets) > 1 else dstart
-        dpts = droplet_concat[dstart:dend]
-        gl_drops = PointsGL(dpts.astype(np.float32, copy=False))
-        gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
-    else:
-        gl_drops = None
-
-    clock = pygame.time.Clock()
-    running = True
-    frame = 0
-    F = int(mvps.shape[0])
-    direction = 1
-    while running:
-        time_s = pygame.time.get_ticks() * 0.001 * flow_anim_speed
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                running = False
-            elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
-                running = False
-            elif e.type == pygame.KEYDOWN and metric_names:
-                if pygame.K_0 <= e.key <= pygame.K_9:
-                    idx = e.key - pygame.K_0
-                    if idx == 0:
-                        current_metric = None
-                    elif 1 <= idx <= len(metric_names):
-                        current_metric = metric_names[idx-1]
-                    scalar_concat = scalar_fields[current_metric] if current_metric else None
-
-        # Frame indices with loop/bounce
-        fidx = int(frame)
-        if fidx >= F:
-            if loop_mode == "loop":
-                fidx = 0; frame = 0
-            elif loop_mode == "bounce":
-                direction = -1; frame = F-1; fidx = frame
-            else:
-                running = False; break
-        elif fidx < 0 and loop_mode == "bounce":
-            direction = 1; frame = 0; fidx = 0
-
-        # Upload per-frame points (and optional vectors)
-        start = int(pts_offsets[fidx]); end = int(pts_offsets[fidx+1])
-        cur = pts_concat[start:end]
-        if use_arrows:
-            cur_vecs = vec_concat[start:end]
-            cur_scalars = (
-                scalar_concat[start:end]
-                if scalar_concat is not None
-                else np.linalg.norm(cur_vecs, axis=1)
-            )
-            if gl_pts.n != len(cur):
-                gl_pts = ArrowsGL(
-                    cur.astype(np.float32, copy=False),
-                    cur_vecs.astype(np.float32, copy=False),
-                    cur_scalars.astype(np.float32, copy=False),
-                )
-                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-            else:
-                gl_pts.upload(
-                    cur.astype(np.float32, copy=False),
-                    cur_vecs.astype(np.float32, copy=False),
-                    cur_scalars.astype(np.float32, copy=False),
-                )
-        else:
-            if gl_pts.n != len(cur):
-                gl_pts = PointsGL(cur.astype(np.float32, copy=False))
-                gl_pts.color = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-            else:
-                gl_pts.upload(cur.astype(np.float32, copy=False))
-
-        if gl_drops is not None and droplet_offsets is not None and droplet_concat is not None:
-            dstart = int(droplet_offsets[fidx])
-            dend = int(droplet_offsets[fidx+1])
-            dcur = droplet_concat[dstart:dend]
-            if gl_drops.n != len(dcur):
-                gl_drops = PointsGL(dcur.astype(np.float32, copy=False))
-                gl_drops.color = np.array([0.8, 0.9, 1.0, 0.9], dtype=np.float32)
-            else:
-                gl_drops.upload(dcur.astype(np.float32, copy=False))
-
-        MVP = mvps[fidx].astype(np.float32, copy=False)
-
-        viewport = pygame.display.get_surface().get_size()
-        glViewport(0, 0, viewport[0], viewport[1])
-        glClearColor(0.06, 0.07, 0.10, 1.0)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
-        if use_arrows:
-            glUseProgram(arrow_prog)
-            glUniformMatrix4fv(arrow_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-            glUniform1f(arrow_u_time, time_s)
-            glUniform1f(arrow_u_scale, arrow_scale)
-            gl_pts.draw(arrow_prog, arrow_u_mvp, arrow_u_color, None)
-        else:
-            glUseProgram(pt_prog)
-            glUniformMatrix4fv(pt_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-            glUniform1f(pt_u_time, time_s)
-            gl_pts.draw(pt_prog, pt_u_mvp, pt_u_color, pt_u_psize)
-
-        if gl_drops is not None:
-            glUseProgram(drop_prog)
-            glUniformMatrix4fv(drop_u_mvp, 1, GL_FALSE, MVP.T.flatten())
-            gl_drops.draw(drop_prog, drop_u_mvp, drop_u_color, drop_u_psize)
-
-        pygame.display.flip()
-        clock.tick(fps)
-        frame += direction
-
-    pygame.quit()
 
 def play_mesh_stream(*,
                      n_cells: int,
