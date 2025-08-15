@@ -203,7 +203,7 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="If set, write a prerendered NPZ stream to this path.")
     parser.add_argument("--export-kind", choices=["ascii", "opengl-points", "opengl-mesh"], default="",
                         help="What kind of stream to export when --export-npz is set.")
-    parser.add_argument("--stream", choices=["", "ascii", "opengl-points", "opengl-mesh"], default="",
+    parser.add_argument("--stream", choices=["", "ascii", "opengl-points", "opengl-mesh", "opengl-renderer"], default="",
                         help="If set, stream frames live to the chosen visualizer in-process (no files).")
     parser.add_argument("--stream-dir", type=str, default="",
                         help="If set, write uncompressed frames to this directory and stream via disk.")
@@ -219,13 +219,17 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--no-points", action="store_true",
                         help="ASCII export: disable drawing vertex points")
     parser.add_argument("--gl-fovy", type=float, default=45.0, help="OpenGL stream: vertical FOV degrees")
-    parser.add_argument("--gl-rot-speed", type=float, default=0.25, help="OpenGL stream: Y-rotation speed rad/sec (used as frame*dt)")
+    parser.add_argument("--gl-rot-speed", type=float, default=0.0, help="OpenGL stream: Y-rotation speed rad/sec (set >0 to enable rotation)")
     parser.add_argument("--gl-viewport-w", type=int, default=1100, help="OpenGL stream: viewport width")
     parser.add_argument("--gl-viewport-h", type=int, default=800, help="OpenGL stream: viewport height")
     parser.add_argument("--show-vectors", action="store_true",
                         help="OpenGL stream: render velocity vectors as arrows")
     parser.add_argument("--show-droplets", action="store_true",
                         help="OpenGL stream: render secondary droplet point cloud if available")
+    # Rainbow history trails (GLRenderer paths)
+    parser.add_argument("--rainbow-history", action="store_true", help="Enable rainbow ghost trails from recent frames")
+    parser.add_argument("--history-frames", type=int, default=30, help="Number of frames to keep in rainbow history")
+    parser.add_argument("--history-stride", type=int, default=2, help="Downsample stride for history points to limit load")
     parser.add_argument(
         "--color-metric",
         choices=["none", "speed", "curl"],
@@ -1262,6 +1266,121 @@ def run_fluid_demo(args):
         drops = fluid.export_droplets() if hasattr(fluid, "export_droplets") else None
         return pts, vecs, drops
 
+    # If requested, stream using the minimal GLRenderer path
+    if getattr(args, "stream", "") == "opengl-renderer":
+        try:
+            import pygame
+            from pygame.locals import DOUBLEBUF, OPENGL
+        except Exception:
+            raise SystemExit("This mode requires pygame. Try: pip install pygame PyOpenGL")
+
+        from src.opengl_render.renderer import GLRenderer, PointLayer
+
+        # Initialize window + GL
+        pygame.init()
+        w, h = int(getattr(args, "gl_viewport_w", 1100)), int(getattr(args, "gl_viewport_h", 800))
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+        pygame.display.set_mode((w, h), DOUBLEBUF | OPENGL)
+        pygame.display.set_caption("Fluid — GLRenderer")
+
+        # Seed first frame
+        try:
+            pts, vecs, drops = gather()
+        except ValueError:
+            pts, vecs = gather()
+            drops = None
+        if pts is None:
+            pts = np.zeros((0, 3), dtype=np.float32)
+
+        # Camera init
+        center, radius = _compute_center_radius_pts(pts)
+        eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        cam_dir = center - eye; cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+        cam_dist = float(np.linalg.norm(center - eye))
+        center_s = center.copy(); dist_s = cam_dist
+        aspect = w / max(1, h)
+
+        fovy = float(getattr(args, "gl_fovy", 60.0))
+        rot_speed = float(getattr(args, "gl_rot_speed", 0.0))
+
+        P = _perspective(fovy, aspect, 0.05, 100.0)
+        V = _look_at(eye, center, up)
+        M = np.identity(4, dtype=np.float32)
+        MVP = (P @ V @ M).astype(np.float32)
+        renderer = GLRenderer(MVP)
+
+        # Initial points layer (merge droplets if provided)
+        if drops is not None and isinstance(drops, np.ndarray) and drops.size:
+            pos = np.concatenate([pts.astype(np.float32, copy=False), drops.astype(np.float32, copy=False)], axis=0)
+            cols = np.concatenate([
+                np.tile(np.array([1.0, 1.0, 1.0, 1.0], np.float32), (len(pts), 1)),
+                np.tile(np.array([0.8, 0.9, 1.0, 0.9], np.float32), (len(drops), 1))
+            ], axis=0)
+            renderer.set_points(PointLayer(positions=pos, colors=cols, size_px_default=4.0))
+        else:
+            renderer.set_points(PointLayer(positions=pts.astype(np.float32, copy=False), size_px_default=4.0))
+
+        clock = pygame.time.Clock()
+        running = True
+        frame = 0
+        dt_local = float(getattr(args, "dt", 1e-3))
+        while running and (int(getattr(args, "frames", 0)) <= 0 or frame < int(getattr(args, "frames", 0))):
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    running = False
+                elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+
+            # Update points from fluid
+            try:
+                pts, vecs, drops = gather()
+            except ValueError:
+                pts, vecs = gather(); drops = None
+            if pts is None:
+                pts = np.zeros((0, 3), dtype=np.float32)
+            if drops is not None and isinstance(drops, np.ndarray) and drops.size:
+                pos = np.concatenate([pts.astype(np.float32, copy=False), drops.astype(np.float32, copy=False)], axis=0)
+                cols = np.concatenate([
+                    np.tile(np.array([1.0, 1.0, 1.0, 1.0], np.float32), (len(pts), 1)),
+                    np.tile(np.array([0.8, 0.9, 1.0, 0.9], np.float32), (len(drops), 1))
+                ], axis=0)
+                renderer.update_points(positions=pos, colors=cols)
+            else:
+                renderer.update_points(positions=pts.astype(np.float32, copy=False))
+
+            # Camera auto-frame
+            new_center, radius = _compute_center_radius_pts(pts)
+            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+            alpha = 0.15
+            center_s = (1.0 - alpha) * center_s + alpha * new_center
+            dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+            center = center_s; cam_dist = float(dist_s)
+            eye = center - cam_dir * cam_dist
+            near = 0.05; far = max(10.0, cam_dist + 3.0 * radius)
+            P = _perspective(fovy, aspect, near, far)
+            V = _look_at(eye, center, up)
+            theta = rot_speed * (frame * dt_local)
+            T_neg = _translate(-center); R_y = _rotate_y(theta); T_pos = _translate(center)
+            M = (T_pos @ R_y @ T_neg).astype(np.float32)
+            renderer.set_mvp((P @ V @ M).astype(np.float32))
+
+            # Draw
+            viewport = pygame.display.get_surface().get_size()
+            renderer.draw(viewport)
+            pygame.display.flip()
+            clock.tick(float(getattr(args, "fps", 60.0)))
+
+            # Advance sim
+            dt_local = step(dt_local)
+            frame += 1
+
+        renderer.dispose()
+        pygame.quit()
+        return
+
     if getattr(args, "export_npz", "") and args.export_kind == "opengl-points":
         export_fluid_points_stream(args, gather, step, dim=dim)
         return
@@ -1360,6 +1479,124 @@ def main():
                 stream_opengl_mesh_to_dir(args, api, provider)
             else:
                 stream_opengl_mesh(args, api, provider)
+        elif kind == "opengl-renderer":
+            # New path: use minimal GLRenderer (src.opengl_render.renderer)
+            # to render the live cellsim meshes directly.
+            try:
+                import pygame
+                from pygame.locals import DOUBLEBUF, OPENGL
+            except Exception:
+                raise SystemExit("This mode requires pygame. Try: pip install pygame PyOpenGL")
+
+            from src.opengl_render.renderer import GLRenderer
+            from src.opengl_render.api import cellsim_layers
+
+            # Prime mechanics so hierarchy exists before rendering
+            api.step(1e-3)
+            hobj = getattr(provider, "_h", None)
+            if hobj is None:
+                raise SystemExit("Softbody mechanics provider did not initialize its hierarchy (_h)")
+
+            # Init window + GL context
+            pygame.init()
+            w, h = int(getattr(args, "gl_viewport_w", 1100)), int(getattr(args, "gl_viewport_h", 800))
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+            pygame.display.set_mode((w, h), DOUBLEBUF | OPENGL)
+            pygame.display.set_caption("Cells — GLRenderer")
+
+            # Camera state similar to OpenGL demo
+            center, radius = _compute_center_radius(hobj)
+            eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            cam_dir = center - eye
+            cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+            cam_dist = float(np.linalg.norm(center - eye))
+            center_s = center.copy()
+            dist_s = cam_dist
+            aspect = w / max(1, h)
+
+            fovy = float(getattr(args, "gl_fovy", 45.0))
+            rot_speed = float(getattr(args, "gl_rot_speed", 0.25))
+            sim_dim = int(getattr(args, "sim_dim", 3))
+
+            # Build initial mesh layer
+            layers = cellsim_layers(hobj, rainbow=False)
+            mesh = layers.get("membrane", None)
+            if mesh is None:
+                # fallback empty layer
+                from src.opengl_render.renderer import MeshLayer
+                mesh = MeshLayer(positions=np.zeros((0, 3), np.float32), indices=np.zeros((0,), np.uint32))
+
+            # Initial MVP
+            P = _perspective(fovy, aspect, 0.05, 100.0)
+            V = _look_at(eye, center, up)
+            M = np.identity(4, dtype=np.float32)
+            MVP = (P @ V @ M).astype(np.float32)
+            renderer = GLRenderer(MVP)
+            renderer.set_mesh(mesh)
+
+            clock = pygame.time.Clock()
+            running = True
+            frame = 0
+            dt_local = float(getattr(args, "dt", 1e-3))
+            while running and (int(getattr(args, "frames", 0)) <= 0 or frame < int(getattr(args, "frames", 0))):
+                for e in pygame.event.get():
+                    if e.type == pygame.QUIT:
+                        running = False
+                    elif e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+
+                # Step sim
+                dt_local = step_cellsim(api, dt_local)
+                hobj = getattr(provider, "_h", hobj)
+
+                # Update layer; rebuild if topology changed
+                L = cellsim_layers(hobj, rainbow=False).get("membrane", None)
+                if L is not None:
+                    same_topology = (
+                        L.indices.size == mesh.indices.size and
+                        L.positions.shape == mesh.positions.shape and
+                        np.allclose(L.indices, mesh.indices)
+                    )
+                    if same_topology:
+                        renderer.update_mesh_positions(L.positions)
+                        mesh = MeshLayer(positions=L.positions, indices=L.indices, colors=L.colors, rgba=L.rgba, alpha=L.alpha) if 'MeshLayer' in globals() else L  # keep reference shapes current
+                    else:
+                        renderer.set_mesh(L)
+                        mesh = L
+
+                # Camera auto-frame and gentle rotation (disabled for 1D/2D)
+                new_center, radius = _compute_center_radius(hobj)
+                desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+                alpha = 0.15
+                center_s = (1.0 - alpha) * center_s + alpha * new_center
+                dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+                center = center_s
+                cam_dist = float(dist_s)
+                eye = center - cam_dir * cam_dist
+                near = 0.05
+                far = max(10.0, cam_dist + 3.0 * radius)
+                P = _perspective(fovy, aspect, near, far)
+                V = _look_at(eye, center, up)
+                theta = (rot_speed if sim_dim == 3 else 0.0) * (frame * dt_local)
+                T_neg = _translate(-center)
+                R_y = _rotate_y(theta)
+                T_pos = _translate(center)
+                M = (T_pos @ R_y @ T_neg).astype(np.float32)
+                MVP = (P @ V @ M).astype(np.float32)
+                renderer.set_mvp(MVP)
+
+                # Draw
+                viewport = pygame.display.get_surface().get_size()
+                renderer.draw(viewport)
+                pygame.display.flip()
+                clock.tick(float(getattr(args, "fps", 60.0)))
+                frame += 1
+
+            renderer.dispose()
+            pygame.quit()
         else:
             raise SystemExit("Unknown --stream kind")
         return

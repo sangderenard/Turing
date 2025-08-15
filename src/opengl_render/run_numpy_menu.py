@@ -1,14 +1,13 @@
-"""Interactive launcher for the numpy-based softbody demo.
+"""Interactive launcher for numpy softbody demo and OpenGL renderer wiring.
 
 The menu delegates to :mod:`src.cells.softbody.demo.run_numpy_demo` with
-predefined argument sets for common scenarios (voxel fluid, discrete fluid,
-mesh‑coupled cellsim and a point cloud export).  It is a thin wrapper around
-``subprocess.run`` so the existing CLI of the numpy demo remains the source of
-truth.
+predefined argument sets and now includes an option to stream live geometry
+to the minimal GLRenderer (``--stream opengl-renderer``).
 """
 from __future__ import annotations
 
 import subprocess
+import sys
 
 
 OPTIONS = {
@@ -29,7 +28,10 @@ def main() -> None:
         print("Unknown option")
         return
     name, args = OPTIONS[choice]
-    cmd = ["python", "-m", "src.cells.softbody.demo.run_numpy_demo", *args]
+    # Force all runs to use the GLRenderer streaming path unless exporting only
+    if "--export-kind" not in args:
+        args = [*args, "--stream", "opengl-renderer"]
+    cmd = [sys.executable, "-m", "src.cells.softbody.demo.run_numpy_demo", *args]
     subprocess.run(cmd, check=False)
 
 
