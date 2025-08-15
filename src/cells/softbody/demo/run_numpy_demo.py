@@ -705,31 +705,46 @@ def export_opengl_mesh_stream(args, api, provider):
     )
 
 def stream_ascii(args, api, provider):
-    # Build frames into NumPy arrays (no Pythonic grid) and stream directly
+    # Stream frames live to the ASCII viewer
     from .run_ascii_demo import play_ascii_stream
     dt = float(getattr(args, "dt", 1e-3))
     frames = int(args.frames)
     nx, ny = int(args.ascii_nx), int(args.ascii_ny)
-    chars = np.zeros((frames, ny, nx), dtype=np.uint8)
-    rgb = np.zeros((frames, ny, nx, 3), dtype=np.uint8)
+    counter = {"f": 0}
 
-    for f in range(frames):
-        dt = step_cellsim(api, dt)
+    def gather():
         h = getattr(provider, "_h", None)
+        f = counter["f"]
         if args.verbose or args.debug:
             _log_hierarchy_state(h, f, api=api, debug=args.debug)
         if h is None:
-            continue
-        ch, col = _rasterize_ascii_numpy(
-            h, api, nx, ny,
-            render_mode=args.render_mode,
-            face_stride=args.face_stride,
-            draw_points=not args.no_points,
-        )
-        chars[f] = ch
-        rgb[f] = col
+            ch = np.zeros((ny, nx), dtype=np.uint8)
+            col = np.zeros((ny, nx, 3), dtype=np.uint8)
+        else:
+            ch, col = _rasterize_ascii_numpy(
+                h,
+                api,
+                nx,
+                ny,
+                render_mode=args.render_mode,
+                face_stride=args.face_stride,
+                draw_points=not args.no_points,
+            )
+        counter["f"] += 1
+        return ch, col
 
-    play_ascii_stream(chars, rgb, color_mode="auto", loop_mode=args.loop, fps=float(args.fps))
+    def step(dt_local):
+        return step_cellsim(api, dt_local)
+
+    play_ascii_stream(
+        gather_func=gather,
+        step_func=step,
+        frames=frames,
+        dt=dt,
+        color_mode="auto",
+        loop_mode=args.loop,
+        fps=float(args.fps),
+    )
 
 def stream_ascii_to_dir(args, api, provider):
     from .run_ascii_demo import play_ascii_stream_from_dir
@@ -1187,127 +1202,20 @@ def stream_fluid_points(
     fovy = float(args.gl_fovy)
     rot_speed = float(args.gl_rot_speed)
 
-    pts_offsets = np.zeros(frames + 1, dtype=np.int64)
-    pts_concat_list = []
-    vec_concat_list = [] if show_vectors else None
-    # Precompute scalar fields for optional interactive selection
-    scalar_field_lists: Dict[str, list[np.ndarray]] = {}
-    if show_vectors:
-        scalar_field_lists["speed"] = []
-        if compute_curl is not None and grid_shape is not None and dim > 1:
-            scalar_field_lists["curl"] = []
-    drop_offsets = np.zeros(frames + 1, dtype=np.int64) if show_droplets else None
-    drop_concat_list = [] if show_droplets else None
-    mvps = np.zeros((frames, 4, 4), dtype=np.float32)
-
-    try:
-        pts0, _vecs0, _drops0 = gather_func()
-    except ValueError:
-        pts0, _vecs0 = gather_func()
-        _drops0 = None
-    center, radius = _compute_center_radius_pts(pts0)
-    eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
-    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    cam_dir = center - eye; cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
-    cam_dist = float(np.linalg.norm(center - eye))
-    center_s = center.copy(); dist_s = cam_dist
-    aspect = w / max(1, h)
-
-    t_sim = 0.0
-    pts_offsets[0] = 0
-    if show_droplets and drop_offsets is not None:
-        drop_offsets[0] = 0
-    for f in range(frames):
-        try:
-            pts, vecs, drops = gather_func()
-        except ValueError:
-            pts, vecs = gather_func()
-            drops = None
-        pts_concat_list.append(pts.astype(np.float32, copy=False))
-        if show_vectors and vecs is not None and vec_concat_list is not None:
-            vec = vecs.astype(np.float32, copy=False)
-            vec_concat_list.append(vec)
-            if "speed" in scalar_field_lists:
-                scalar_field_lists["speed"].append(
-                    np.linalg.norm(vec, axis=1).astype(np.float32, copy=False)
-                )
-            if "curl" in scalar_field_lists and grid_shape is not None:
-                try:
-                    reshaped = vec.reshape(tuple(grid_shape) + (dim,))
-                    spacing = grid_spacing if grid_spacing is not None else 1.0
-                    curl_field = compute_curl(reshaped, spacing=spacing) if compute_curl else None
-                    if curl_field is not None:
-                        curl_mag = (
-                            np.abs(curl_field).reshape(-1)
-                            if curl_field.ndim == len(grid_shape)
-                            else np.linalg.norm(curl_field, axis=-1).reshape(-1)
-                        )
-                        scalar_field_lists["curl"].append(curl_mag.astype(np.float32, copy=False))
-                except Exception:
-                    # Fallback silently if curl computation fails
-                    pass
-        pts_offsets[f + 1] = pts_offsets[f] + int(len(pts))
-        if show_droplets and drop_offsets is not None and drop_concat_list is not None:
-            d = drops.astype(np.float32, copy=False) if drops is not None else np.zeros((0, 3), dtype=np.float32)
-            drop_concat_list.append(d)
-            drop_offsets[f + 1] = drop_offsets[f] + int(len(d))
-
-        new_center, radius = _compute_center_radius_pts(pts)
-        desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
-        alpha = 0.15
-        center_s = (1.0 - alpha) * center_s + alpha * new_center
-        dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
-        center = center_s; cam_dist = float(dist_s)
-        eye = center - cam_dir * cam_dist
-
-        P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
-        V = _look_at(eye, center, up)
-        theta = rot_speed * t_sim if dim == 3 else 0.0
-        T_neg = _translate(-center)
-        R_y = _rotate_y(theta)
-        T_pos = _translate(center)
-        M = (T_pos @ R_y @ T_neg).astype(np.float32)
-        mvps[f] = (P @ V @ M).astype(np.float32)
-
-        step_func(dt)
-        t_sim += dt
-
-    pts_concat = (
-        np.concatenate(pts_concat_list, axis=0)
-        if pts_concat_list
-        else np.zeros((0, 3), dtype=np.float32)
-    )
-    vec_concat = (
-        np.concatenate(vec_concat_list, axis=0)
-        if vec_concat_list
-        else None
-    )
-    scalar_fields = {
-        name: (np.concatenate(vals, axis=0) if vals else None)
-        for name, vals in scalar_field_lists.items()
-    }
-    drop_concat = (
-        np.concatenate(drop_concat_list, axis=0)
-        if drop_concat_list
-        else None
-    )
     play_points_stream(
-        pts_offsets,
-        pts_concat,
-        mvps,
-        vec_concat=vec_concat,
-        scalar_fields=scalar_fields if scalar_fields else None,
-        droplet_offsets=drop_offsets,
-        droplet_concat=drop_concat,
-        show_droplets=show_droplets,
-        show_vectors=show_vectors,
-        initial_metric=color_metric,
-        arrow_scale=arrow_scale,
-        flow_anim_speed=flow_anim_speed,
+        gather_func=gather_func,
+        step_func=step_func,
+        frames=frames,
+        dt=dt,
+        fovy=fovy,
+        rot_speed=rot_speed,
         viewport_w=w,
         viewport_h=h,
-        loop_mode=args.loop,
         fps=float(args.fps),
+        show_vectors=show_vectors,
+        show_droplets=show_droplets,
+        arrow_scale=arrow_scale,
+        flow_anim_speed=flow_anim_speed,
     )
 
 
