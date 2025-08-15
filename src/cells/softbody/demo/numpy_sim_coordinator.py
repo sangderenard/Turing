@@ -662,7 +662,7 @@ def run_fluid_demo(args):
             from src.opengl_render.api import make_draw_hook
 
             renderer = DebugRenderer()
-            draw_hook = make_draw_hook(renderer, (0, 0))
+            draw_hook = make_draw_hook(renderer)
         except Exception:  # pragma: no cover - debug aid
             def _fallback(layer_map):
                 print(layer_map)
@@ -782,7 +782,7 @@ def main(*args_in):
             from src.opengl_render.api import make_draw_hook
 
             renderer = DebugRenderer()
-            draw_hook = make_draw_hook(renderer, (0, 0))
+            draw_hook = make_draw_hook(renderer)
         except Exception:  # pragma: no cover - debug aid
             def _fallback(layer_map):
                 print(layer_map)

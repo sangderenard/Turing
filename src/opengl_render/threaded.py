@@ -6,7 +6,7 @@ from collections import deque
 import queue
 import threading
 import time
-from typing import Callable, Mapping, Tuple
+from typing import Callable, Mapping
 
 
 class GLRenderThread:
@@ -17,7 +17,8 @@ class GLRenderThread:
     renderer:
         Object with :func:`print_layers` or OpenGL ``draw`` methods.
     viewport:
-        Tuple ``(width, height)`` describing the viewport in pixels.
+        Tuple ``(width, height)`` describing the viewport in pixels.  When
+        omitted the renderer's window size is used.
     history:
         Maximum number of past frames to retain. ``0`` keeps an unbounded
         history.
@@ -33,13 +34,15 @@ class GLRenderThread:
         self,
         renderer: object,
         *,
-        viewport: Tuple[int, int],
+        viewport: tuple[int, int] | None = None,
         history: int = 32,
         loop: bool = False,
         bounce: bool = False,
         ghost_trail: bool = True,
     ) -> None:
         self.renderer = renderer
+        if viewport is None:
+            viewport = getattr(renderer, "_window_size", (640, 480))
         self.viewport = viewport
         maxlen = history if history > 0 else None
         self.history: deque[Mapping[str, object]] = deque(maxlen=maxlen)
