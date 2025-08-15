@@ -109,7 +109,7 @@ class SalineEngine:
         self.bath_V = saved["bath_V"]
         self._prev_eps[:] = saved["_prev_eps"]
 
-    def step(self, dt: float, *, use_adapt: bool = True) -> float:
+    def step(self, dt: float, *, use_adapt: bool = True, hooks=None) -> float:
         T = self.bath_temperature
         species_list = list(self.species)
         n_cells = self.V.shape[0]
@@ -151,7 +151,7 @@ class SalineEngine:
                 except Exception:
                     pass
             try:
-                mech = self.mechanics_provider.step(dt)
+                mech = self.mechanics_provider.step(dt, hooks=hooks)
             except Exception:
                 mech = None
 

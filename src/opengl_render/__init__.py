@@ -8,6 +8,7 @@ from .api import (
     pack_lines,
     pack_points,
     cellsim_layers,
+    fluid_layers,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "pack_lines",
     "pack_points",
     "cellsim_layers",
+    "fluid_layers",
 ]

@@ -129,7 +129,10 @@ class Softbody0DProvider(MechanicsProvider):
         self._bath_pressure = float(bath_pressure)
         self._bath_temperature = float(bath_temperature)
 
-    def step(self, dt: float) -> MechanicsSnapshot:
+    def step(self, dt: float, *, hooks=None) -> MechanicsSnapshot:
+        from src.common.sim_hooks import SimHooks
+
+        hooks = hooks or SimHooks()
         if self._h is None or self._cells is None or self._bath is None:
             return {}
 
@@ -161,6 +164,8 @@ class Softbody0DProvider(MechanicsProvider):
         for _ in range(nsub):
             _harmonized_update_batch()
 
+            hooks.run_pre(self, dt_curr)
+
             # Single canonical softbody step with adaptive dt
             _, dt_curr = h.step_dt_control(
                 dt_curr,
@@ -173,6 +178,8 @@ class Softbody0DProvider(MechanicsProvider):
 
             # Organelle mode updates (your existing hook)
             h.update_organelle_modes(dt_curr)
+
+            hooks.run_post(self, dt_curr)
 
             # Advance provider time
             t_now += dt_curr

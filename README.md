@@ -196,12 +196,8 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
   - geometry/: `primitives.py`, `geodesic.py`
   - bridge/: `__init__.py`, `state_io.py`
   - resources/: `field_library.py`
-  - demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`, `run_opengl_demo.py`
-    - Stream the discrete fluid demo with OpenGL points:
-
-      ```bash
-      python src/cells/softbody/demo/run_numpy_demo.py --fluid discrete --stream opengl-points
-      ```
+  - demo/: `__init__.py`, `run_ascii_demo.py`, `run_numpy_demo.py`
+    - Geometry visualization is handled by the shared `src/opengl_render` package.
 
 ### src/transmogrifier
 

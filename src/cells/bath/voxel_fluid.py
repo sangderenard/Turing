@@ -173,13 +173,18 @@ class VoxelMACFluid:
         self._accumulate_face_forces(self.v, centers_world, f[:,1], radius, axis=1)
         self._accumulate_face_forces(self.w, centers_world, f[:,2], radius, axis=2)
 
-    def step(self, dt: float, substeps: int = 1) -> None:
-        """Advance by dt seconds with stability-capped substeps."""
+    def step(self, dt: float, substeps: int = 1, *, hooks=None) -> None:
+        """Advance by ``dt`` seconds with stability-capped substeps."""
+        from src.common.sim_hooks import SimHooks
+
+        hooks = hooks or SimHooks()
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
             dt_s = min(self._stable_dt(), dt_target, self.p.max_dt, remaining)
+            hooks.run_pre(self, dt_s)
             self._substep(dt_s)
+            hooks.run_post(self, dt_s)
             remaining -= dt_s
 
     def copy_shallow(self):
