@@ -1,7 +1,9 @@
 # opengl_render/cli.py
-# Tiny demo: spins a triangle mesh, a wire cube, and dotted points above.
-# This is *only* to prove the renderer end-to-end. No physics; safe to delete.
+# Tiny demo: renders a triangle mesh, a wire cube, and dotted points.
+# Rotation is opt-in via ``--spin``. This is *only* to prove the renderer
+# end-to-end. No physics; safe to delete.
 
+import argparse
 import math
 import numpy as np
 import pygame
@@ -32,6 +34,11 @@ def look_at(eye, center, up):
     return m
 
 def run():
+    parser = argparse.ArgumentParser(description="OpenGL renderer demo")
+    parser.add_argument("--spin", action="store_true", help="Rotate the scene")
+    # Accept and ignore unknown args so this demo coexists with broader flag conventions.
+    args, _ = parser.parse_known_args()
+
     pygame.init()
     W, H = 1024, 640
     pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
@@ -87,17 +94,18 @@ def run():
             if e.type == QUIT:
                 running = False
 
-        # spin the model matrix a little for visual proof
-        angle += 0.8 * (clock.get_time()/1000.0)
-        ca, sa = math.cos(angle), math.sin(angle)
-        R = np.array([[ ca,0, sa,0],
-                      [  0,1,  0,0],
-                      [-sa,0, ca,0],
-                      [  0,0,  0,1]], np.float32)
-        MVP = (P @ V @ R).astype(np.float32)
-        r.set_mvp(MVP)
+        if args.spin:
+            # Optional rotation for visual proof
+            angle += 0.8 * (clock.get_time() / 1000.0)
+            ca, sa = math.cos(angle), math.sin(angle)
+            R = np.array([[ca, 0, sa, 0],
+                          [0, 1, 0, 0],
+                          [-sa, 0, ca, 0],
+                          [0, 0, 0, 1]], np.float32)
+            MVP = (P @ V @ R).astype(np.float32)
+            r.set_mvp(MVP)
 
-        r.draw((W,H))
+        r.draw((W, H))
         pygame.display.flip()
         clock.tick(60)
 
