@@ -177,6 +177,13 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         help="base integrator step; increase to amplify drift",
     )
     parser.add_argument(
+        "--sim-dim",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help="Spatial dimension for fluid and softbody sims",
+    )
+    parser.add_argument(
         "--fluid",
         choices=["", "discrete", "voxel", "hybrid"],
         default="",
@@ -185,7 +192,7 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     # Optional coupling: run cellsim with an external fluid engine
     parser.add_argument(
         "--couple-fluid",
-        choices=["", "discrete", "voxel"],
+        choices=["", "discrete", "voxel", "hybrid"],
         default="",
         help="Couple Bath/cellsim to a spatial fluid engine during cellsim run.",
     )
@@ -1222,20 +1229,21 @@ def stream_fluid_points(
 def run_fluid_demo(args):
     ctrl = STController()
     targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+    dim = int(getattr(args, "sim_dim", 3))
     if args.fluid == "discrete":
         from src.cells.bath.make_sph import make_sph
 
-        fluid = make_sph(dim=3, resolution=(8, 12, 8))
+        fluid = make_sph(dim=dim, resolution=(8, 12, 8))
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "voxel":
         from src.cells.bath.make_mac import make_mac
 
-        fluid = make_mac(dim=3, resolution=(8, 8, 8))
+        fluid = make_mac(dim=dim, resolution=(8, 8, 8))
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "hybrid":
         from src.cells.bath.make_hybrid import make_hybrid
 
-        fluid = make_hybrid(dim=3, resolution=(8, 8, 8), n_particles=512)
+        fluid = make_hybrid(dim=dim, resolution=(8, 8, 8), n_particles=512)
         step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     else:
         raise SystemExit("Unknown fluid engine")
@@ -1254,7 +1262,7 @@ def run_fluid_demo(args):
         return pts, vecs, drops
 
     if getattr(args, "export_npz", "") and args.export_kind == "opengl-points":
-        export_fluid_points_stream(args, gather, step)
+        export_fluid_points_stream(args, gather, step, dim=dim)
         return
 
     if getattr(args, "stream", "") == "opengl-points":
@@ -1271,6 +1279,7 @@ def run_fluid_demo(args):
                 args,
                 fluid.export_positions_vectors,
                 step,
+                dim=dim,
                 show_vectors=args.show_vectors,
                 show_droplets=args.show_droplets,
                 color_metric=args.color_metric,
@@ -1284,6 +1293,7 @@ def run_fluid_demo(args):
                 args,
                 gather,
                 step,
+                dim=dim,
                 show_vectors=args.show_vectors,
                 show_droplets=args.show_droplets,
                 color_metric=args.color_metric,
@@ -1316,6 +1326,7 @@ def main():
         bath_volume_factor=args.bath_volume_factor,
         substeps=args.substeps,
         dt_provider=args.dt_provider,
+        dim=args.sim_dim,
     )
     # If export requested, produce stream file and exit
     if getattr(args, "export_npz", "") and getattr(args, "export_kind", ""):
@@ -1359,14 +1370,19 @@ def main():
     fluid = None
     if couple_kind:
         try:
+            dim = int(getattr(args, "sim_dim", 3))
             if couple_kind == "discrete":
                 from src.cells.bath.make_sph import make_sph
 
-                fluid = make_sph(dim=3, resolution=(8, 12, 8))
+                fluid = make_sph(dim=dim, resolution=(8, 12, 8))
             elif couple_kind == "voxel":
                 from src.cells.bath.make_mac import make_mac
 
-                fluid = make_mac(dim=3, resolution=(8, 8, 8))
+                fluid = make_mac(dim=dim, resolution=(8, 8, 8))
+            elif couple_kind == "hybrid":
+                from src.cells.bath.make_hybrid import make_hybrid
+
+                fluid = make_hybrid(dim=dim, resolution=(8, 8, 8), n_particles=512)
             from src.cells.bath.coupling import BathFluidCoupler
             coupler = BathFluidCoupler(
                 bath=getattr(api, "bath", None),
