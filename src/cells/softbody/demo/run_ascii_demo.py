@@ -482,3 +482,68 @@ def play_ascii_stream(chars: np.ndarray,
         time.sleep(max(0.0, dt_target - (time.perf_counter() - t0)))
         frame += direction
 
+
+def play_ascii_stream_from_dir(dir_path: str,
+                               *,
+                               color_mode: str = "auto",
+                               loop_mode: str = "none",
+                               fps: float = 30.0) -> None:
+    """Render an ASCII stream by loading frames from ``dir_path``.
+
+    Frames are expected as ``chars_XXXXXX.npy`` and ``rgb_XXXXXX.npy`` where
+    ``XXXXXX`` is a zero-padded frame index.  A file named ``done`` in the
+    directory signals that no further frames will be written.
+    """
+    import os
+    import time
+
+    frame = 0
+    direction = 1
+    prev_lines = 0
+    dt_target = 1.0 / max(1e-6, float(fps))
+
+    while True:
+        ch_path = os.path.join(dir_path, f"chars_{frame:06d}.npy")
+        rgb_path = os.path.join(dir_path, f"rgb_{frame:06d}.npy")
+
+        while not (os.path.exists(ch_path) and os.path.exists(rgb_path)):
+            if os.path.exists(os.path.join(dir_path, "done")):
+                break
+            time.sleep(0.05)
+
+        if not (os.path.exists(ch_path) and os.path.exists(rgb_path)):
+            if loop_mode == "loop":
+                frame = 0
+                direction = 1
+                continue
+            if loop_mode == "bounce":
+                direction = -direction
+                frame += direction
+                if frame < 0:
+                    frame = 0
+                    direction = 1
+                continue
+            break
+
+        ch = np.load(ch_path)
+        rgb = np.load(rgb_path)
+        if _is_tty() and prev_lines:
+            sys.stdout.write(f"\x1b[{prev_lines}F\x1b[G")
+        sys.stdout.write(f"Frame {frame}\n")
+        ny, nx = ch.shape[0], ch.shape[1]
+        for iy in range(ny):
+            parts = []
+            ch_row = ch[iy]
+            rgb_row = rgb[iy]
+            for ix in range(nx):
+                c = chr(int(ch_row[ix]))
+                r = int(rgb_row[ix, 0]); g = int(rgb_row[ix, 1]); b = int(rgb_row[ix, 2])
+                parts.append(colorize(c, (r, g, b), mode=color_mode))
+            sys.stdout.write(''.join(parts) + "\n")
+        sys.stdout.flush()
+        prev_lines = 1 + ny
+
+        t0 = time.perf_counter()
+        time.sleep(max(0.0, dt_target - (time.perf_counter() - t0)))
+        frame += direction
+

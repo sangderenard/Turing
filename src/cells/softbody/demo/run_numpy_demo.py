@@ -3,6 +3,8 @@ from typing import Sequence, Tuple, Dict, Any, Optional
 
 import numpy as np
 import logging
+import os
+import threading
 
 from src.cells.cellsim.data.state import Cell, Bath
 from src.cells.cellsim.api.saline import SalinePressureAPI
@@ -196,6 +198,8 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="What kind of stream to export when --export-npz is set.")
     parser.add_argument("--stream", choices=["", "ascii", "opengl-points", "opengl-mesh"], default="",
                         help="If set, stream frames live to the chosen visualizer in-process (no files).")
+    parser.add_argument("--stream-dir", type=str, default="",
+                        help="If set, write uncompressed frames to this directory and stream via disk.")
     parser.add_argument("--loop", choices=["none", "loop", "bounce"], default="none",
                         help="Playback mode for streaming/NPZ viewers.")
     parser.add_argument("--fps", type=float, default=60.0, help="Target FPS for streaming display.")
@@ -727,6 +731,202 @@ def stream_ascii(args, api, provider):
 
     play_ascii_stream(chars, rgb, color_mode="auto", loop_mode=args.loop, fps=float(args.fps))
 
+def stream_ascii_to_dir(args, api, provider):
+    from .run_ascii_demo import play_ascii_stream_from_dir
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    nx, ny = int(args.ascii_nx), int(args.ascii_ny)
+    os.makedirs(args.stream_dir, exist_ok=True)
+    done_path = os.path.join(args.stream_dir, "done")
+
+    def writer():
+        nonlocal dt
+        for f in range(frames):
+            dt = step_cellsim(api, dt)
+            h = getattr(provider, "_h", None)
+            if args.verbose or args.debug:
+                _log_hierarchy_state(h, f, api=api, debug=args.debug)
+            if h is None:
+                continue
+            ch, col = _rasterize_ascii_numpy(
+                h, api, nx, ny,
+                render_mode=args.render_mode,
+                face_stride=args.face_stride,
+                draw_points=not args.no_points,
+            )
+            np.save(os.path.join(args.stream_dir, f"chars_{f:06d}.npy"), ch)
+            np.save(os.path.join(args.stream_dir, f"rgb_{f:06d}.npy"), col)
+        open(done_path, "wb").close()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    play_ascii_stream_from_dir(args.stream_dir, loop_mode=args.loop, fps=float(args.fps))
+    t.join()
+
+
+def stream_opengl_points_to_dir(args, api, provider):
+    from .run_opengl_demo import play_points_stream_from_dir
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
+
+    os.makedirs(args.stream_dir, exist_ok=True)
+    done_path = os.path.join(args.stream_dir, "done")
+
+    def writer():
+        nonlocal dt
+        api.step(1e-3)
+        hobj = getattr(provider, "_h", None)
+        if hobj is None:
+            raise RuntimeError("Softbody provider failed to initialize _h")
+        center, radius = _compute_center_radius(hobj)
+        eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        cam_dir = center - eye
+        cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+        cam_dist = float(np.linalg.norm(center - eye))
+        center_s = center.copy(); dist_s = cam_dist
+        aspect = w / max(1, h)
+        t_sim = 0.0
+        for f in range(frames):
+            dt = step_cellsim(api, dt)
+            t_sim += dt
+            hobj = getattr(provider, "_h", hobj)
+            if args.verbose or args.debug:
+                _log_hierarchy_state(hobj, f, api=api, debug=args.debug)
+            vtx = _gather_vertices(hobj)
+            if vtx is None:
+                vtx = np.zeros((0, 3), dtype=np.float32)
+            np.save(os.path.join(args.stream_dir, f"pts_{f:06d}.npy"), vtx.astype(np.float32, copy=False))
+
+            new_center, radius = _compute_center_radius(hobj)
+            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+            alpha = 0.15
+            center_s = (1.0 - alpha) * center_s + alpha * new_center
+            dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+            center = center_s; cam_dist = float(dist_s)
+            eye = center - cam_dir * cam_dist
+
+            P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+            V = _look_at(eye, center, up)
+            theta = rot_speed * t_sim if dim == 3 else 0.0
+            T_neg = _translate(-center)
+            R_y = _rotate_y(theta)
+            T_pos = _translate(center)
+            M = (T_pos @ R_y @ T_neg).astype(np.float32)
+            MVP = (P @ V @ M).astype(np.float32)
+            np.save(os.path.join(args.stream_dir, f"mvp_{f:06d}.npy"), MVP)
+        open(done_path, "wb").close()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    play_points_stream_from_dir(args.stream_dir, viewport_w=w, viewport_h=h, loop_mode=args.loop, fps=float(args.fps))
+    t.join()
+
+
+def stream_opengl_mesh_to_dir(args, api, provider):
+    from .run_opengl_demo import play_mesh_stream_from_dir
+    dt = float(getattr(args, "dt", 1e-3))
+    frames = int(args.frames)
+    w, h = int(args.gl_viewport_w), int(args.gl_viewport_h)
+    fovy = float(args.gl_fovy)
+    rot_speed = float(args.gl_rot_speed)
+    dim = getattr(getattr(provider, 'cfg', None), 'dim', 3)
+
+    os.makedirs(args.stream_dir, exist_ok=True)
+    done_path = os.path.join(args.stream_dir, "done")
+
+    api.step(1e-3)
+    hobj = getattr(provider, "_h", None)
+    if hobj is None:
+        raise RuntimeError("Softbody provider failed to initialize _h")
+
+    n_cells = len(getattr(hobj, 'cells', []) or [])
+    vtx_counts = _cells_vertex_counts(hobj)
+    faces_concat, face_counts = _cells_faces_counts(hobj)
+    vtx_offsets = np.zeros(n_cells + 1, dtype=np.int64)
+    for i in range(n_cells):
+        vtx_offsets[i + 1] = vtx_offsets[i] + int(vtx_counts[i])
+
+    np.save(os.path.join(args.stream_dir, "vtx_counts.npy"), vtx_counts)
+    np.save(os.path.join(args.stream_dir, "faces_concat.npy"), faces_concat)
+    np.save(os.path.join(args.stream_dir, "face_counts.npy"), face_counts)
+    np.save(os.path.join(args.stream_dir, "vtx_offsets.npy"), vtx_offsets)
+
+    def writer():
+        nonlocal dt, hobj
+        center, radius = _compute_center_radius(hobj)
+        eye = np.array([0.5, 0.5, 1.7], dtype=np.float32)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        cam_dir = center - eye
+        cam_dir = cam_dir / (np.linalg.norm(cam_dir) + 1e-12)
+        cam_dist = float(np.linalg.norm(center - eye))
+        center_s = center.copy(); dist_s = cam_dist
+        aspect = w / max(1, h)
+        t_sim = 0.0
+        for f in range(frames):
+            dt = step_cellsim(api, dt)
+            t_sim += dt
+            hobj = getattr(provider, "_h", hobj)
+            if args.verbose or args.debug:
+                _log_hierarchy_state(hobj, f, api=api, debug=args.debug)
+
+            vtx_concat = np.concatenate([np.asarray(c.X, dtype=np.float32) for c in hobj.cells], axis=0)
+            np.save(os.path.join(args.stream_dir, f"vtx_{f:06d}.npy"), vtx_concat)
+
+            pressures, masses, greens255 = _measure_pressure_mass(api, hobj)
+            pN = _normalize(pressures)
+            mN = _normalize(masses)
+            BASE_R, BASE_B, BASE_A = 0.15, 0.25, 0.35
+            PRESSURE_GAIN, MASS_GAIN = 0.75, 0.75
+            G = (greens255.astype(np.float32) / 255.0)
+            R = np.minimum(1.0, BASE_R + MASS_GAIN * mN.astype(np.float32))
+            B = np.minimum(1.0, BASE_B + PRESSURE_GAIN * pN.astype(np.float32))
+            cols = np.zeros((n_cells, 4), dtype=np.float32)
+            cols[:, 0] = R
+            cols[:, 1] = G
+            cols[:, 2] = B
+            cols[:, 3] = BASE_A
+            np.save(os.path.join(args.stream_dir, f"colors_{f:06d}.npy"), cols)
+
+            new_center, radius = _compute_center_radius(hobj)
+            desired_dist = max(0.2, radius / math.tan(math.radians(fovy * 0.5)) * 2.0)
+            alpha = 0.15
+            center_s = (1.0 - alpha) * center_s + alpha * new_center
+            dist_s = (1.0 - alpha) * dist_s + alpha * desired_dist
+            center = center_s; cam_dist = float(dist_s)
+            eye = center - cam_dir * cam_dist
+            P = _perspective(fovy, aspect, 0.05, max(10.0, cam_dist + 3.0 * radius))
+            V = _look_at(eye, center, up)
+            theta = rot_speed * t_sim if dim == 3 else 0.0
+            T_neg = _translate(-center)
+            R_y = _rotate_y(theta)
+            T_pos = _translate(center)
+            M = (T_pos @ R_y @ T_neg).astype(np.float32)
+            MVP = (P @ V @ M).astype(np.float32)
+            np.save(os.path.join(args.stream_dir, f"mvp_{f:06d}.npy"), MVP)
+
+            view_dir = (center - eye)
+            view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-12)
+            off = vtx_offsets.astype(np.int32)
+            sums = np.add.reduceat(vtx_concat, off[:-1], axis=0)
+            counts = (off[1:] - off[:-1]).astype(np.float32)[:, None]
+            centroids = sums / np.maximum(counts, 1e-12)
+            centroids_h = np.concatenate([centroids, np.ones((n_cells, 1), dtype=np.float32)], axis=1)
+            ctr_rot = (M @ centroids_h.T).T[:, :3]
+            depths = np.dot(ctr_rot - eye[None, :], view_dir)
+            order = np.argsort(depths).astype(np.int32)
+            np.save(os.path.join(args.stream_dir, f"draw_{f:06d}.npy"), order)
+        open(done_path, "wb").close()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    play_mesh_stream_from_dir(args.stream_dir, viewport_w=w, viewport_h=h, loop_mode=args.loop, fps=float(args.fps))
+    t.join()
+
 def stream_opengl_points(args, api, provider):
     from .run_opengl_demo import play_points_stream
     # Build stream arrays (same as export, but feed player directly)
@@ -1226,11 +1426,20 @@ def main():
     if getattr(args, "stream", ""):
         kind = args.stream
         if kind == "ascii":
-            stream_ascii(args, api, provider)
+            if getattr(args, "stream_dir", ""):
+                stream_ascii_to_dir(args, api, provider)
+            else:
+                stream_ascii(args, api, provider)
         elif kind == "opengl-points":
-            stream_opengl_points(args, api, provider)
+            if getattr(args, "stream_dir", ""):
+                stream_opengl_points_to_dir(args, api, provider)
+            else:
+                stream_opengl_points(args, api, provider)
         elif kind == "opengl-mesh":
-            stream_opengl_mesh(args, api, provider)
+            if getattr(args, "stream_dir", ""):
+                stream_opengl_mesh_to_dir(args, api, provider)
+            else:
+                stream_opengl_mesh(args, api, provider)
         else:
             raise SystemExit("Unknown --stream kind")
         return

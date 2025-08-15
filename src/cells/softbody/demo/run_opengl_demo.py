@@ -896,6 +896,216 @@ def main():
 
     pygame.quit()
 
+
+def play_points_stream_from_dir(
+    dir_path: str,
+    *,
+    viewport_w: int = 1100,
+    viewport_h: int = 800,
+    loop_mode: str = "none",
+    fps: float = 60.0,
+) -> None:
+    """Render a disk-backed OpenGL point stream.
+
+    Frames are read as ``pts_XXXXXX.npy`` and ``mvp_XXXXXX.npy`` in ``dir_path``.
+    A file named ``done`` signals no further frames will arrive.
+    """
+    import os
+    import time
+
+    pygame = _ensure_gl_context(viewport_w, viewport_h)
+    from OpenGL.GL import (
+        glUseProgram,
+        glUniformMatrix4fv,
+        glUniform4fv,
+        glUniform1f,
+        glViewport,
+        glClearColor,
+        glClear,
+        GL_COLOR_BUFFER_BIT,
+        GL_DEPTH_BUFFER_BIT,
+        GL_FALSE,
+    )
+    from OpenGL.GL import glGetUniformLocation
+
+    prog = link_program(SPRITE_VS, SPRITE_FS)
+    u_mvp = glGetUniformLocation(prog, "uMVP")
+    u_color = glGetUniformLocation(prog, "uColor")
+    u_psize = glGetUniformLocation(prog, "uPointScale")
+    u_time = glGetUniformLocation(prog, "uTime")
+
+    gl_pts = PointsGL(np.zeros((0, 3), dtype=np.float32))
+    clock = pygame.time.Clock()
+    frame = 0
+    direction = 1
+    while True:
+        pts_path = os.path.join(dir_path, f"pts_{frame:06d}.npy")
+        mvp_path = os.path.join(dir_path, f"mvp_{frame:06d}.npy")
+        while not (os.path.exists(pts_path) and os.path.exists(mvp_path)):
+            if os.path.exists(os.path.join(dir_path, "done")):
+                break
+            pygame.event.pump()
+            time.sleep(0.05)
+        if not (os.path.exists(pts_path) and os.path.exists(mvp_path)):
+            if loop_mode == "loop":
+                frame = 0
+                direction = 1
+                continue
+            if loop_mode == "bounce":
+                direction = -direction
+                frame += direction
+                if frame < 0:
+                    frame = 0
+                    direction = 1
+                continue
+            break
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (
+                e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q)
+            ):
+                pygame.quit()
+                return
+
+        pts = np.load(pts_path).astype(np.float32, copy=False)
+        mvp = np.load(mvp_path).astype(np.float32, copy=False)
+
+        glUseProgram(prog)
+        glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp.T.flatten())
+        glUniform1f(u_time, pygame.time.get_ticks() * 0.001)
+        gl_pts.upload(pts)
+
+        viewport = pygame.display.get_surface().get_size()
+        glViewport(0, 0, viewport[0], viewport[1])
+        glClearColor(0.06, 0.07, 0.10, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        gl_pts.draw(prog, u_mvp, u_color, u_psize)
+        pygame.display.flip()
+        clock.tick(fps)
+        frame += direction
+
+    pygame.quit()
+
+
+def play_mesh_stream_from_dir(
+    dir_path: str,
+    *,
+    viewport_w: int = 1100,
+    viewport_h: int = 800,
+    loop_mode: str = "none",
+    fps: float = 60.0,
+) -> None:
+    """Render a disk-backed OpenGL mesh stream.
+
+    Directory must contain ``vtx_counts.npy``, ``faces_concat.npy``,
+    ``face_counts.npy`` and ``vtx_offsets.npy`` along with per-frame
+    ``vtx_XXXXXX.npy``, ``colors_XXXXXX.npy``, ``draw_XXXXXX.npy`` and
+    ``mvp_XXXXXX.npy`` files.  A ``done`` file signals completion.
+    """
+    import os
+    import time
+
+    pygame = _ensure_gl_context(viewport_w, viewport_h)
+    from OpenGL.GL import (
+        glUseProgram,
+        glUniformMatrix4fv,
+        glUniform4fv,
+        glViewport,
+        glClearColor,
+        glClear,
+        GL_COLOR_BUFFER_BIT,
+        GL_DEPTH_BUFFER_BIT,
+        GL_FALSE,
+        glDepthMask,
+    )
+    from OpenGL.GL import glGetUniformLocation
+
+    vtx_counts = np.load(os.path.join(dir_path, "vtx_counts.npy")).astype(np.int32)
+    faces_concat = np.load(os.path.join(dir_path, "faces_concat.npy")).astype(np.uint32)
+    face_counts = np.load(os.path.join(dir_path, "face_counts.npy")).astype(np.int32)
+    vtx_offsets = np.load(os.path.join(dir_path, "vtx_offsets.npy")).astype(np.int32)
+    n_cells = int(len(vtx_counts))
+
+    mesh_prog = link_program(MESH_VS, MESH_FS)
+    mesh_u_mvp = glGetUniformLocation(mesh_prog, "uMVP")
+    mesh_u_color = glGetUniformLocation(mesh_prog, "uColor")
+
+    class _CellShim:
+        pass
+
+    gl_cells: list[CellGL] = []
+    f_off = 0
+    for i in range(n_cells):
+        nf = int(face_counts[i])
+        F = faces_concat[f_off * 3 : (f_off + nf) * 3].reshape(nf, 3)
+        f_off += nf
+        cs = _CellShim()
+        cs.X = np.zeros((int(vtx_counts[i]), 3), dtype=np.float32)
+        cs.faces = F.astype(np.uint32, copy=False)
+        gl_cells.append(CellGL(cs))
+
+    clock = pygame.time.Clock()
+    frame = 0
+    direction = 1
+    while True:
+        vtx_path = os.path.join(dir_path, f"vtx_{frame:06d}.npy")
+        col_path = os.path.join(dir_path, f"colors_{frame:06d}.npy")
+        draw_path = os.path.join(dir_path, f"draw_{frame:06d}.npy")
+        mvp_path = os.path.join(dir_path, f"mvp_{frame:06d}.npy")
+        while not all(os.path.exists(p) for p in (vtx_path, col_path, draw_path, mvp_path)):
+            if os.path.exists(os.path.join(dir_path, "done")):
+                break
+            pygame.event.pump()
+            time.sleep(0.05)
+        if not all(os.path.exists(p) for p in (vtx_path, col_path, draw_path, mvp_path)):
+            if loop_mode == "loop":
+                frame = 0
+                direction = 1
+                continue
+            if loop_mode == "bounce":
+                direction = -direction
+                frame += direction
+                if frame < 0:
+                    frame = 0
+                    direction = 1
+                continue
+            break
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (
+                e.type == pygame.KEYDOWN and e.key in (pygame.K_ESCAPE, pygame.K_q)
+            ):
+                pygame.quit()
+                return
+
+        vtx_concat = np.load(vtx_path).astype(np.float32, copy=False)
+        cols = np.load(col_path).astype(np.float32, copy=False)
+        order = np.load(draw_path).astype(np.int32, copy=False)
+        MVP = np.load(mvp_path).astype(np.float32, copy=False)
+
+        viewport = pygame.display.get_surface().get_size()
+        glViewport(0, 0, viewport[0], viewport[1])
+        glClearColor(0.06, 0.07, 0.10, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        glUseProgram(mesh_prog)
+        glUniformMatrix4fv(mesh_u_mvp, 1, GL_FALSE, MVP.T.flatten())
+        glDepthMask(GL_TRUE)
+        for draw_i in order:
+            i = int(draw_i)
+            off = int(vtx_offsets[i])
+            n = int(vtx_counts[i])
+            gl_cells[i].cell.X = vtx_concat[off : off + n, :]
+            gl_cells[i].color = cols[i, :]
+            gl_cells[i].upload()
+            gl_cells[i].draw(mesh_prog, mesh_u_mvp, mesh_u_color)
+
+        pygame.display.flip()
+        clock.tick(fps)
+        frame += direction
+
+    pygame.quit()
+
 if __name__ == "__main__":
     main()
 
