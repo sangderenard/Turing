@@ -1,7 +1,9 @@
 """Lightweight coupling between Bath (0D) and stateful fluid solvers.
 
 This module provides a minimal adapter that exchanges mass/pressure signals
-between the 0D Bath model and spatial fluid engines:
+between the 0D Bath model and spatial fluid engines.  Inside-cell fluids
+default to a voxel (MAC grid) representation; discrete particle clouds are
+opt-in to keep the lighter grid path cheap:
 
 - DiscreteFluid (SPH): supports mass sources/sinks around cell COMs via
   ``apply_sources`` using dM = -rho * dV per cell.
@@ -35,9 +37,11 @@ class BathFluidCoupler:
     engine:
         A fluid engine instance.  Supported kinds:
           - "discrete": must implement ``apply_sources`` and ``step``.
-          - "voxel": must implement ``step`` and ``sample_at``.
+          - "voxel": must implement ``step`` and ``sample_at`` (default).
     kind:
-        Fluid kind selector: "discrete" or "voxel".
+        Fluid kind selector. Defaults to ``"voxel"`` so that inside-cell fluids
+        use a MAC grid unless a caller explicitly requests the ``"discrete"``
+        particle cloud mode.
     radius:
         Source influence radius in world units when applying mass sources
         (used by discrete/SPH coupling).  Ignored for voxel.
@@ -48,7 +52,7 @@ class BathFluidCoupler:
 
     bath: object
     engine: object
-    kind: FluidKind
+    kind: FluidKind = "voxel"
     radius: float = 0.05
     density_hint: Optional[float] = None
 
