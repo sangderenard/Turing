@@ -166,9 +166,11 @@ def fluid_layers(engine, *, rainbow: bool = False) -> Mapping[str, MeshLayer | P
 # Rendering hooks
 # ---------------------------------------------------------------------------
 
-def draw_layers(renderer: GLRenderer,
-                layers: Mapping[str, MeshLayer | LineLayer | PointLayer],
-                viewport: tuple[int, int]) -> None:
+def draw_layers(
+    renderer: GLRenderer,
+    layers: Mapping[str, MeshLayer | LineLayer | PointLayer],
+    viewport: tuple[int, int] | None = None,
+) -> None:
     """Upload ``layers`` to ``renderer`` and draw a frame.
 
     When ``renderer`` exposes a ``print_layers`` attribute (see
@@ -178,6 +180,8 @@ def draw_layers(renderer: GLRenderer,
     if hasattr(renderer, "print_layers"):
         renderer.print_layers(layers)  # type: ignore[call-arg]
         return
+    if viewport is None:
+        viewport = getattr(renderer, "_window_size", (640, 480))
     mesh = layers.get("membrane")
     if isinstance(mesh, MeshLayer):
         renderer.set_mesh(mesh)
@@ -212,13 +216,15 @@ def draw_layers(renderer: GLRenderer,
 
 
 
-def make_draw_hook(renderer: GLRenderer,
-                   viewport: tuple[int, int],
-                   *,
-                   history: int = 32,
-                   loop: bool = False,
-                   bounce: bool = False,
-                   ghost_trail: bool = True):
+def make_draw_hook(
+    renderer: GLRenderer,
+    viewport: tuple[int, int] | None = None,
+    *,
+    history: int = 32,
+    loop: bool = False,
+    bounce: bool = False,
+    ghost_trail: bool = True,
+):
     """Return a draw hook.
 
     When ``renderer`` exposes ``print_layers`` (debug mode) a synchronous hook is
@@ -255,15 +261,6 @@ def make_draw_hook(renderer: GLRenderer,
         bounce=bounce,
         ghost_trail=ghost_trail,
     )
-    try:
-        thread._run()
-    except RuntimeError:
-        # Already started, or running in a guarded thread
-        try:
-            getattr(thread, "start_if_needed")()
-        except Exception:
-            print("Failed to start render thread")
-            raise
     # Store it on the renderer for lifecycle control
     try:
         renderer._render_thread = thread
@@ -274,7 +271,7 @@ def make_draw_hook(renderer: GLRenderer,
 
 def make_threaded_draw_hook(
     renderer: GLRenderer,
-    viewport: tuple[int, int],
+    viewport: tuple[int, int] | None = None,
     *,
     history: int = 32,
     loop: bool = False,
@@ -300,3 +297,4 @@ def make_threaded_draw_hook(
         ghost_trail=ghost_trail,
     )
     return thread.get_submit_hook(), thread
+

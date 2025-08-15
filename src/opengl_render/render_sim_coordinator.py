@@ -57,7 +57,7 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
     import contextlib
     renderer = GLRenderer()
     argv += ["--renderer", renderer]
-    argv += ["--draw-hook", make_draw_hook(renderer, (0,0))]
+    argv += ["--draw-hook", make_draw_hook(renderer)]
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
