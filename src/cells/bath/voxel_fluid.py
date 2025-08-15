@@ -370,9 +370,16 @@ class VoxelMACFluid:
         fluid_v = ~(self.solid[:, :-1,:] | self.solid[:, 1:,:])
         fluid_w = ~(self.solid[:, :, :-1] | self.solid[:, :, 1:])
 
-        self.u[1:-1,:,:][fluid_u[1:-1,:,:]] -= (dt / rho) * gradx[1:-1,:,:][fluid_u[1:-1,:,:]]
-        self.v[:,1:-1,:][fluid_v[:,1:-1,:]]  -= (dt / rho) * grady[:,1:-1,:][fluid_v[:,1:-1,:]]
-        self.w[:,:,1:-1][fluid_w[:,:,1:-1]]  -= (dt / rho) * gradz[:,:,1:-1][fluid_w[:,:,1:-1]]
+        # The previous implementation attempted to slice the face arrays and
+        # then apply boolean indexing on the result.  Boolean indexing creates a
+        # copy which led to shape mismatches when the boolean mask was further
+        # sliced, ultimately raising ``IndexError`` in narrow grids (e.g. 1D
+        # domains).  Instead we subtract the pressure gradient in-place and use
+        # the boolean masks as multiplicative gates.  This keeps array shapes
+        # aligned and updates only the fluid faces.
+        self.u[1:-1, :, :] -= (dt / rho) * gradx * fluid_u
+        self.v[:, 1:-1, :] -= (dt / rho) * grady * fluid_v
+        self.w[:, :, 1:-1] -= (dt / rho) * gradz * fluid_w
 
         # Enforce boundary velocities again after projection
         self._apply_velocity_boundaries()
