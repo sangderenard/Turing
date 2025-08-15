@@ -1,5 +1,5 @@
 import ctypes
-from transmogrifier.graph.memory_graph import BitTensorMemoryGraph, NodeEntry
+from src.transmogrifier.graph.memory_graph import BitTensorMemoryGraph, NodeEntry
 import pytest
 
 

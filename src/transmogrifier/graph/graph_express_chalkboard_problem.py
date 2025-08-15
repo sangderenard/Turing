@@ -89,7 +89,7 @@ if __name__ == "__main__":
     print("\nSymbolic Variables:")
     sp.pprint(sp.lambdify((pos, vel, rest, base, mass, normals, hullv, edges, n_sub), chalkboard_problem))
     from .graph_express2 import ProcessGraph
-    from graph_deep_compiler import GraphDeepCompiler
+    from .graph_deep_compiler import GraphDeepCompiler
     from operator_defs import torch_funcs, torch_sigs
     pg = ProcessGraph()
     pg.build_from_expression(chalkboard_problem)

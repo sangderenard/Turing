@@ -8,6 +8,8 @@ from .run_numpy_demo import (
     make_cellsim_backend as base_make_cellsim_backend,
     step_cellsim,
     build_numpy_parser,
+    get_numpy_tag_names,
+    extract_numpy_kwargs,
 )
 
 
@@ -913,6 +915,21 @@ def _ensure_gl_context(width: int = 1100, height: int = 800):
     pygame.display.set_mode((int(width), int(height)), DOUBLEBUF | OPENGL)
     pygame.display.set_caption("XPBD Softbody — OpenGL Stream")
     return pygame
+
+
+# ---- NumPy tag bridge -------------------------------------------------------
+def numpy_tag_names() -> list[str]:
+    """Expose the shared NumPy CLI tag names for external callers."""
+    return get_numpy_tag_names()
+
+
+def numpy_kwargs_from_args(args: dict | object) -> dict:
+    """Extract only NumPy-relevant kwargs from a larger args dict/namespace."""
+    if isinstance(args, dict):
+        return extract_numpy_kwargs(args)
+    # generic object/namespace
+    d = {k: getattr(args, k) for k in numpy_tag_names() if hasattr(args, k)}
+    return d
 
 def play_points_stream(
     pts_offsets: np.ndarray,

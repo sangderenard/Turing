@@ -1,7 +1,7 @@
 import os
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
-from transmogrifier.graph.memory_graph import NodeEntry, EdgeEntry
+from src.transmogrifier.graph.memory_graph import NodeEntry, EdgeEntry
 import ctypes
 
 

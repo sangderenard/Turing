@@ -196,14 +196,14 @@ class Softbody0DProvider(MechanicsProvider):
         n = len(cells)
         self._params = EngineParams(dimension=self.cfg.dim)
         if self.cfg.dim == 1:
-            self._params.bath_min = (0.0, 0.5, 0.0)
-            self._params.bath_max = (1.0, 0.5, 0.0)
+            self._params.bath_min = (-1.0, 0.0, -1.0)
+            self._params.bath_max = (1.0, 0.0, -1.0)
         elif self.cfg.dim == 2:
-            self._params.bath_min = (0.0, 0.0, 0.0)
-            self._params.bath_max = (1.0, 1.0, 0.0)
+            self._params.bath_min = (-1.0, -1.0, -1.0)
+            self._params.bath_max = (1.0, 1.0, -1.0)
         else:
-            self._params.bath_min = (0.0, 0.0, 0.0)
-            self._params.bath_max = (1.0, 1.0, 0.02)
+            self._params.bath_min = (-1.0, -1.0, -1.0)
+            self._params.bath_max = (1.0, 1.0, 1.00)
         solver = XPBDSolver(self._params)
 
         # Simple layout: grid in [0.2,0.8], collapse unused dims

@@ -171,6 +171,11 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--fluid", choices=["", "discrete", "voxel"], default="",
         help="Run stand-alone fluid demo (discrete or voxel) instead of cellsim",
     )
+    # Optional coupling: run cellsim with an external fluid engine
+    parser.add_argument("--couple-fluid", choices=["", "discrete", "voxel"], default="",
+                        help="Couple Bath/cellsim to a spatial fluid engine during cellsim run.")
+    parser.add_argument("--couple-radius", type=float, default=0.05,
+                        help="Source influence radius for discrete fluid coupling (world units)")
     # Export/stream options
     parser.add_argument("--export-npz", type=str, default="",
                         help="If set, write a prerendered NPZ stream to this path.")
@@ -208,6 +213,27 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--sim-dim", type=int, choices=[1, 2, 3], default=3,
                         help="Softbody simulation dimension")
     return parser
+
+
+def get_numpy_tag_names() -> list[str]:
+    """Return the argparse dest names for the shared NumPy demo options.
+
+    Useful for other modules (e.g., OpenGL demo) to extract only the
+    NumPy-relevant kwargs from a larger argument namespace.
+    """
+    p = build_numpy_parser(add_help=False)
+    # Exclude argparse internals like 'help'
+    names = [a.dest for a in getattr(p, "_actions", []) if getattr(a, "dest", None)]
+    names = [n for n in names if n not in ("help",)]
+    return sorted(set(names))
+
+
+def extract_numpy_kwargs(args_or_dict: argparse.Namespace | dict) -> dict:
+    """Filter an args Namespace or dict down to NumPy demo kwargs only."""
+    tags = set(get_numpy_tag_names())
+    if isinstance(args_or_dict, dict):
+        return {k: v for k, v in args_or_dict.items() if k in tags}
+    return {k: getattr(args_or_dict, k) for k in tags if hasattr(args_or_dict, k)}
 
 
 def parse_args():
@@ -1149,27 +1175,60 @@ def main():
         return
 
     dt = args.dt
+    # Optional Bath–fluid coupling
+    couple_kind = getattr(args, "couple_fluid", "")
+    coupler = None
+    fluid = None
+    if couple_kind:
+        try:
+            if couple_kind == "discrete":
+                from src.cells.bath.discrete_fluid import DiscreteFluid
+                fluid = DiscreteFluid.demo_dam_break(n_x=8, n_y=12, n_z=8, h=0.05)
+            elif couple_kind == "voxel":
+                from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
+                fluid = VoxelMACFluid(VoxelFluidParams(nx=8, ny=8, nz=8))
+            from src.cells.bath.coupling import BathFluidCoupler
+            coupler = BathFluidCoupler(bath=getattr(api, "bath", None), engine=fluid, kind=couple_kind, radius=float(args.couple_radius))
+        except Exception:
+            logger.exception("Failed to initialize fluid coupling; proceeding without it")
+            coupler = None
+
     # Use array state from engine if available
     engine = getattr(api, "engine", None)
     prev_vols = getattr(engine, "V", np.array([getattr(c, "V", 0.0) for c in api.cells], dtype=float)).astype(float, copy=False)
+    if coupler is not None:
+        coupler.prime_volumes(prev_vols)
+
     for frame in range(int(args.frames)):
+        # Step cellsim first
         dt = step_cellsim(api, dt)
+
+        # Compute current volumes and cell COMs for coupling and logs
         engine = getattr(api, "engine", engine)
         vols = getattr(engine, "V", np.array([getattr(c, "V", 0.0) for c in api.cells], dtype=float)).astype(float, copy=False)
-        # dV (change in volume), kept as its own stat (not velocity)
         dV = vols - prev_vols
-        # Compute COM velocities from softbody provider
         h = getattr(provider, "_h", None)
+        centers = None
         v_out = None
         if h is not None and getattr(h, "cells", None):
             try:
-                coms_vcoms = [_com_and_com_vel(c) for c in h.cells]
-                _, vcoms = zip(*coms_vcoms) if coms_vcoms else ([], [])
-                v_out = [tuple(float(x) for x in v) for v in vcoms]
+                com_v = [_com_and_com_vel(c) for c in h.cells]
+                coms, vcoms = zip(*com_v) if com_v else ([], [])
+                centers = np.stack(coms, axis=0).astype(np.float32) if coms else None
+                v_out = [tuple(float(x) for x in v) for v in vcoms] if vcoms else None
             except Exception:
+                centers = None
                 v_out = None
+
+        # Exchange with fluid if enabled
+        if coupler is not None:
+            try:
+                coupler.exchange(dt=float(dt), centers=centers, vols=vols)
+            except Exception:
+                logger.exception("Fluid coupling step failed; disabling")
+                coupler = None
+
         osm = getattr(engine, "osmotic_pressure", np.zeros_like(vols))
-        # Lightweight textual output without converting arrays to Python lists unnecessarily
         if args.verbose or args.debug:
             _log_hierarchy_state(h, frame, api=api, debug=args.debug)
         msg = (
@@ -1178,6 +1237,8 @@ def main():
         if v_out is not None:
             msg += f" com_vel {v_out}"
         msg += f" osm {np.array2string(osm, precision=4)}"
+        if couple_kind:
+            msg += f" fluid={couple_kind}"
         logger.info("frame %d: %s", frame, msg)
         prev_vols = vols
 
