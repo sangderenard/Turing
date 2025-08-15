@@ -1,6 +1,6 @@
 import pytest
 
-from src.cells.softbody.demo.run_numpy_demo import make_cellsim_backend, step_cellsim
+from src.cells.softbody.demo.numpy_sim_coordinator import make_cellsim_backend, step_cellsim
 
 
 def test_step_cellsim_exposes_bath_state():

@@ -1,7 +1,7 @@
-"""Interactive launcher for numpy softbody demo.
+"""Interactive launcher for the NumPy simulation coordinator.
 
-The menu delegates to :mod:`src.cells.softbody.demo.run_numpy_demo` with
-predefined argument sets; visualization is handled separately by the
+The menu delegates to :mod:`src.cells.softbody.demo.numpy_sim_coordinator`
+with predefined argument sets; visualization is handled separately by the
 ``src.opengl_render`` package.
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ OPTIONS = {
 
 
 def main() -> None:
-    print("Select numpy demo to run:\n")
+    print("Select NumPy simulation to run:\n")
     for key, (name, _) in OPTIONS.items():
         print(f" {key}) {name}")
     choice = input("\nChoice: ").strip()
@@ -27,8 +27,8 @@ def main() -> None:
         print("Unknown option")
         return
     name, args = OPTIONS[choice]
-    # Run the numpy demo; rendering is expected to be handled externally
-    cmd = [sys.executable, "-m", "src.cells.softbody.demo.run_numpy_demo", *args]
+    # Run the NumPy simulation coordinator; rendering is expected to be handled externally
+    cmd = [sys.executable, "-m", "src.cells.softbody.demo.numpy_sim_coordinator", *args]
     subprocess.run(cmd, check=False)
 
 
