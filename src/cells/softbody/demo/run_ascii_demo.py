@@ -6,7 +6,13 @@ import numpy as np
 from ..engine.hierarchy import Hierarchy
 
 # Reuse the numpy-based backend so all demos share identical math
-from .run_numpy_demo import make_cellsim_backend, step_cellsim, build_numpy_parser
+from .run_numpy_demo import (
+    make_cellsim_backend,
+    step_cellsim,
+    build_numpy_parser,
+    get_numpy_tag_names,
+    extract_numpy_kwargs,
+)
 
 # ---- color helpers ---------------------------------------------------------
 try:
@@ -411,6 +417,18 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ---- NumPy tag bridge -------------------------------------------------------
+def numpy_tag_names() -> list[str]:
+    """Expose the shared NumPy CLI tag names for external callers."""
+    return get_numpy_tag_names()
+
+
+def numpy_kwargs_from_args(args: dict | object) -> dict:
+    """Extract only NumPy-relevant kwargs from a larger args dict/namespace."""
+    if isinstance(args, dict):
+        return extract_numpy_kwargs(args)
+    return {k: getattr(args, k) for k in numpy_tag_names() if hasattr(args, k)}
 
 # ---- In-process ASCII streaming API ---------------------------------------
 def play_ascii_stream(chars: np.ndarray,
