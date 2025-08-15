@@ -94,7 +94,7 @@ class GLRenderThread:
                         if self._stop.is_set():
                             break
                         draw_layers(self.renderer, frame, self.viewport)
-                        time.sleep(0.001)
+                        time.sleep(0.01)
                 continue
 
             # Normal frame: draw and store in history
@@ -112,3 +112,4 @@ class GLRenderThread:
                     frame["ghost"] = ghost
             draw_layers(self.renderer, frame, self.viewport)
             self.queue.task_done()
+        time.sleep(0.01)

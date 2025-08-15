@@ -256,7 +256,7 @@ def make_draw_hook(renderer: GLRenderer,
         ghost_trail=ghost_trail,
     )
     try:
-        thread.start()
+        thread._run()
     except RuntimeError:
         # Already started, or running in a guarded thread
         try:

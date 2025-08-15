@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Iterable, Mapping, Sequence
 
+from src.opengl_render.api import make_draw_hook
+from .renderer import GLRenderer
 
 OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),
@@ -53,6 +55,9 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
         argv += ["--sim-dim", str(sim_dim)]
     import io
     import contextlib
+    renderer = GLRenderer()
+    argv += ["--renderer", renderer]
+    argv += ["--draw-hook", make_draw_hook(renderer, (0,0))]
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
