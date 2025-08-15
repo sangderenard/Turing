@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple, Iterable
+from typing import Optional, Tuple, Iterable, Mapping
 import ctypes
 import numpy as np
 
@@ -161,6 +161,64 @@ class PointLayer:
     sizes_px:  Optional[np.ndarray] = None   # (Np,) float32
     size_px_default: float = 6.0
     alpha: float = 1.0
+
+# ---------------------------
+# Debug renderer
+# ---------------------------
+
+class DebugRenderer:
+    """Headless renderer that pretty-prints layer data.
+
+    This bypasses all OpenGL calls while exercising the same layer gathering
+    logic used by :class:`GLRenderer`.  Each call simply prints a small table of
+    the received arrays, making it suitable for test environments or machines
+    without a graphics context.
+    """
+
+    def __init__(self, *, file=None):
+        import sys
+        self.file = file or sys.stdout
+
+    # The OpenGL renderer expects a hook with ``print_layers`` when running in
+    # debug mode.  ``layers`` is a mapping from string name to either raw
+    # ``numpy`` arrays or the dataclasses defined above.
+    def print_layers(self, layers: Mapping[str, object]) -> None:
+        import numpy as _np
+
+        def _preview(arr: _np.ndarray, max_rows: int = 5) -> str:
+            arr = _np.asarray(arr)
+            with _np.printoptions(precision=3, suppress=True, threshold=10):
+                if arr.ndim >= 2:
+                    arr = arr[:max_rows]
+                else:
+                    arr = arr[:max_rows]
+                return _np.array2string(arr)
+
+        print("=== DebugRenderer Frame ===", file=self.file)
+        for name, layer in layers.items():
+            print(f"[{name}]", file=self.file)
+            if isinstance(layer, MeshLayer):
+                print(
+                    f"  positions: {_preview(layer.positions)}", file=self.file
+                )
+                print(f"  indices:   {_preview(layer.indices)}", file=self.file)
+            elif isinstance(layer, LineLayer):
+                print(
+                    f"  positions: {_preview(layer.positions)}", file=self.file
+                )
+            elif isinstance(layer, PointLayer):
+                print(
+                    f"  positions: {_preview(layer.positions)}", file=self.file
+                )
+            elif isinstance(layer, Mapping):
+                for key, arr in layer.items():
+                    print(f"  {key}: {_preview(arr)}", file=self.file)
+            else:
+                try:
+                    print(f"  {_preview(layer)}", file=self.file)
+                except Exception:
+                    print("  (unprintable layer)", file=self.file)
+        print("", file=self.file)
 
 # ---------------------------
 # Core renderer
