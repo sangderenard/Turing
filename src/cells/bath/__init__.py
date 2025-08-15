@@ -6,7 +6,14 @@ convenience.
 """
 
 from .fluid import Bath
-from .adapter import BathAdapter, SPHAdapter, MACAdapter
+from .adapter import BathAdapter, SPHAdapter, MACAdapter, HybridAdapter
 from .hybrid_fluid import HybridFluid
 
-__all__ = ["Bath", "BathAdapter", "SPHAdapter", "MACAdapter", "HybridFluid"]
+__all__ = [
+    "Bath",
+    "BathAdapter",
+    "SPHAdapter",
+    "MACAdapter",
+    "HybridAdapter",
+    "HybridFluid",
+]

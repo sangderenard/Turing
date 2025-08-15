@@ -10,12 +10,18 @@ branching on the backend type.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional, List
 
 import numpy as np
 
 from .discrete_fluid import DiscreteFluid
 from .voxel_fluid import VoxelMACFluid
+from .hybrid_fluid import HybridFluid
+
+try:  # Surface animation is optional; allow import failure
+    from .surface_animator import SurfaceAnimator
+except Exception:  # pragma: no cover
+    SurfaceAnimator = None  # type: ignore
 
 
 class BathAdapter:
@@ -78,9 +84,9 @@ class SPHAdapter(BathAdapter):
     def step(self, dt: float) -> None:
         self.sim.step(dt)
 
-    def visualization_state(self) -> Dict[str, np.ndarray]:
+    def visualization_state(self) -> Dict[str, np.ndarray | List]:
         pos, vec = self.sim.export_positions_vectors()
-        return {"positions": pos, "vectors": vec}
+        return {"positions": pos, "vectors": vec, "surface_batches": []}
 
 
 @dataclass
@@ -88,6 +94,8 @@ class MACAdapter(BathAdapter):
     """Adapter for :class:`VoxelMACFluid` (incompressible grid solver)."""
 
     sim: VoxelMACFluid
+    animator: Optional[SurfaceAnimator] = None
+    _time: float = 0.0
 
     def sample(self, points: np.ndarray) -> Dict[str, np.ndarray]:
         return self.sim.sample_at(points)
@@ -106,7 +114,62 @@ class MACAdapter(BathAdapter):
 
     def step(self, dt: float) -> None:
         self.sim.step(dt)
+        self._time += dt
+        if self.animator is not None:
+            try:
+                self.animator.update(self.sim, self._time)
+            except Exception:
+                pass
 
-    def visualization_state(self) -> Dict[str, np.ndarray]:
+    def visualization_state(self) -> Dict[str, np.ndarray | List]:
         pos, vec = self.sim.export_vector_field()
-        return {"positions": pos, "vectors": vec}
+        state: Dict[str, np.ndarray | List] = {"positions": pos, "vectors": vec, "surface_batches": []}
+        if self.animator is not None:
+            try:
+                state["surface_batches"] = self.animator.instance_batches()
+            except Exception:
+                state["surface_batches"] = []
+        return state
+
+
+@dataclass
+class HybridAdapter(BathAdapter):
+    """Adapter for :class:`HybridFluid` (particle–grid solver)."""
+
+    sim: HybridFluid
+    animator: Optional[SurfaceAnimator] = None
+    _time: float = 0.0
+
+    def sample(self, points: np.ndarray) -> Dict[str, np.ndarray]:
+        return self.sim.sample_at(points)
+
+    def deposit(
+        self,
+        centers: np.ndarray,
+        dV: np.ndarray,
+        dS: np.ndarray,
+        radius: float,
+    ) -> Dict[str, np.ndarray]:
+        dS = np.asarray(dS, dtype=float)
+        # Forward scalar sources to underlying grid; volume change ignored.
+        self.sim.grid.add_scalar_sources(centers, dT=np.zeros_like(dS), dS=dS, radius=radius)
+        return {"dV": np.zeros_like(dV), "dS": dS}
+
+    def step(self, dt: float) -> None:
+        self.sim.step(dt)
+        self._time += dt
+        if self.animator is not None:
+            try:
+                self.animator.update(self.sim.grid, self._time)
+            except Exception:
+                pass
+
+    def visualization_state(self) -> Dict[str, np.ndarray | List]:
+        pos, vec = self.sim.export_vector_field()
+        state: Dict[str, np.ndarray | List] = {"positions": pos, "vectors": vec, "surface_batches": []}
+        if self.animator is not None:
+            try:
+                state["surface_batches"] = self.animator.instance_batches()
+            except Exception:
+                state["surface_batches"] = []
+        return state
