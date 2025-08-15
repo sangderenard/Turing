@@ -409,5 +409,7 @@ class GLRenderer:
     # ---- disposal ----
     def dispose(self):
         for pid in (self.prog_mesh, self.prog_line, self.prog_point):
-            try: glDeleteProgram(pid)
-            except Exception: pass
+            try:
+                glDeleteProgram(pid)
+            except Exception:
+                pass
