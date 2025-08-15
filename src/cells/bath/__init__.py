@@ -6,7 +6,14 @@ convenience.
 """
 
 from .fluid import Bath
-from .adapter import BathAdapter, SPHAdapter, MACAdapter, HybridAdapter
+from .adapter import (
+    BathAdapter,
+    SPHAdapter,
+    MACAdapter,
+    HybridAdapter,
+    run_headless,
+    run_opengl,
+)
 from .hybrid_fluid import HybridFluid
 
 __all__ = [
@@ -16,4 +23,6 @@ __all__ = [
     "MACAdapter",
     "HybridAdapter",
     "HybridFluid",
+    "run_headless",
+    "run_opengl",
 ]
