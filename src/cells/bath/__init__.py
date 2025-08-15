@@ -7,5 +7,6 @@ convenience.
 
 from .fluid import Bath
 from .adapter import BathAdapter, SPHAdapter, MACAdapter
+from .hybrid_fluid import HybridFluid
 
-__all__ = ["Bath", "BathAdapter", "SPHAdapter", "MACAdapter"]
+__all__ = ["Bath", "BathAdapter", "SPHAdapter", "MACAdapter", "HybridFluid"]
