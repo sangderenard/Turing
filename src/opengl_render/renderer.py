@@ -1,4 +1,4 @@
-# general_gl_renderer/renderer.py
+# opengl_render/renderer.py
 # Minimal, context-agnostic OpenGL renderer for Mesh + Line + Point layers.
 # Requires an active OpenGL 3.3+ context (created by your host app or cli.py).
 
