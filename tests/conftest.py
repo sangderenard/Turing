@@ -1,6 +1,8 @@
 import os
-import pytest
+import time
+from pathlib import Path
 
+import pytest
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -33,11 +35,31 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+_RUN_LOG = "pytest_run_times.log"
+
+
+def pytest_sessionstart(session):
+    session._start_time = time.time()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    duration = time.time() - session._start_time
+    log_file = Path(session.config.rootpath) / _RUN_LOG
+    history = int(os.environ.get("PYTEST_RUN_TIME_HISTORY", "50"))
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {duration:.2f}\n"
+    with log_file.open("a") as fh:
+        fh.write(line)
+    with log_file.open("r+") as fh:
+        lines = fh.readlines()
+        if len(lines) > history:
+            fh.seek(0)
+            fh.writelines(lines[-history:])
+            fh.truncate()
+
+
 # ---------------------------------------------------------------------------
 # Helpers for cell pressure tests
 # ---------------------------------------------------------------------------
-
-import pytest
 
 
 @pytest.fixture(params=[7, 11, 13, 17])

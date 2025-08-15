@@ -239,3 +239,7 @@ For a clickable, hyperlinked index, see MODULES.md.
   - bitbitbuffer: slicing/indexing/search and PID buffer
   - Cellsim: API/engine, pressure/mass/charge, membranes/collisions, organelle exclusion
   - Transmogrifier graphs and memory graph dynamics
+
+This is a large project and a full `pytest` run can take a while. Each run records
+its total runtime in `pytest_run_times.log` (kept to the last 50 entries) so you can
+track how long recent test sessions have taken.
