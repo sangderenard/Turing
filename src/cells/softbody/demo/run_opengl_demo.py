@@ -11,6 +11,7 @@ from .run_numpy_demo import (
     build_numpy_parser,
     get_numpy_tag_names,
     extract_numpy_kwargs,
+    run_fluid_demo,
 )
 
 
@@ -607,6 +608,11 @@ def main():
     parser.add_argument("--flat2d", action="store_true",
                         help="Render in a fixed top-down 2D orthographic view")
     args = parser.parse_args()
+
+    # When a fluid demo is requested, delegate to shared numpy handler
+    if getattr(args, "fluid", ""):
+        run_fluid_demo(args)
+        return
 
     # If streaming mode, we still init pygame/GL, but won't step the sim.
     streaming = bool(getattr(args, "stream_npz", ""))

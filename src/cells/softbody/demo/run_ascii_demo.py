@@ -12,6 +12,7 @@ from .run_numpy_demo import (
     build_numpy_parser,
     get_numpy_tag_names,
     extract_numpy_kwargs,
+    run_fluid_demo,
 )
 
 # ---- color helpers ---------------------------------------------------------
@@ -293,6 +294,11 @@ def main():
                         help="Character for 1D cell spans")
     args = parser.parse_args()
     color_mode = args.color
+
+    # Delegate to fluid demo when --fluid tag is present
+    if getattr(args, "fluid", ""):
+        run_fluid_demo(args)
+        return
 
     # If streaming from NPZ, bypass simulation entirely
     if getattr(args, "stream_npz", ""):
