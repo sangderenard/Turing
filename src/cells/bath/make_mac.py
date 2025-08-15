@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Iterable, Tuple
 
-from .voxel_fluid import VoxelMACFluid, VoxelFluidParams
+from .voxel_fluid import CFL, VoxelMACFluid, VoxelFluidParams
 
 
 def make_mac(
@@ -12,6 +12,7 @@ def make_mac(
     resolution: Iterable[int] | int = 8,
     viscosity: float = 1.0e-6,
     buoyancy: Tuple[float, float, float] = (0.0, -9.81, 0.0),
+    cfl: float = CFL,
 ) -> SimpleNamespace:
     """Construct a VoxelMACFluid solver wrapped for demos."""
 
@@ -30,6 +31,7 @@ def make_mac(
         nz=nz,
         nu=viscosity,
         gravity=buoyancy,
+        cfl=cfl,
     )
     engine = VoxelMACFluid(params)
 

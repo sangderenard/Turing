@@ -59,12 +59,20 @@ except Exception as e:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Kernel constants & helpers (dimension-aware)
 # ---------------------------------------------------------------------------
-_POLY6_CONST = {1: 35.0 / 32.0, 2: 4.0 / np.pi, 3: 315.0 / (64.0 * np.pi)}
-_SPIKY_CONST = {1: 15.0 / 16.0, 2: 10.0 / np.pi, 3: 15.0 / np.pi}
+# Normalization constants for standard SPH kernels grouped by dimension.
+# The ``poly6`` kernel appears in density estimates while the ``spiky``
+# gradient is used for pressure forces.  Storing them in a single dictionary
+# keyed by ``dim`` keeps all dimension-specific factors together and makes it
+# trivial to extend to other kernels later.
+KERNEL_NORMALIZERS = {
+    1: {"poly6_norm": 35.0 / 32.0, "spiky_norm": 15.0 / 16.0},
+    2: {"poly6_norm": 4.0 / np.pi, "spiky_norm": 10.0 / np.pi},
+    3: {"poly6_norm": 315.0 / (64.0 * np.pi), "spiky_norm": 15.0 / np.pi},
+}
 
 
 def poly6_W(r: np.ndarray, h: float, dim: int) -> np.ndarray:
-    c = _POLY6_CONST[dim] / (h ** (dim + 2))  # matches (h^2 - r^2)^3 scaling
+    c = KERNEL_NORMALIZERS[dim]["poly6_norm"] / (h ** (dim + 2))
     q2 = np.clip(h * h - r * r, 0.0, None)
     return c * q2 * q2 * q2
 

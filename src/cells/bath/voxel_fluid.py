@@ -39,6 +39,10 @@ from typing import Tuple, Dict, Optional
 import numpy as np
 import warnings
 
+# Default CFL number exposed for external callers.  A value of 0.5 is
+# reasonably conservative for the semi-Lagrangian scheme employed here.
+CFL = 0.5
+
 
 @dataclass
 class VoxelFluidParams:
@@ -62,7 +66,7 @@ class VoxelFluidParams:
     solute_diffusivity: float = 1.0e-9    # m^2/s
 
     # Time stepping
-    cfl: float = 0.5
+    cfl: float = CFL
     max_dt: float = 1e-3
     pressure_tol: float = 1e-6
     pressure_maxiter: int = 800
@@ -94,6 +98,10 @@ class VoxelMACFluid:
         self.nx, self.ny, self.nz = nx, ny, nz
         self.dx = float(p.dx)
         self.inv_dx = 1.0 / self.dx
+        # Dimensionality inferred from grid extents (size-1 axes ignored)
+        self.dim = int((nx > 1) + (ny > 1) + (nz > 1))
+        # Expose CFL number for external consumers
+        self.cfl = p.cfl
 
         # Staggered velocities
         self.u = np.zeros((nx+1, ny, nz), dtype=np.float64)
@@ -203,6 +211,12 @@ class VoxelMACFluid:
         # 1) Add body forces (gravity + buoyancy) to face velocities
         self._add_body_forces(dt)
 
+        # Optional vorticity forces (e.g., confinement) are meaningful only in
+        # 2D/3D. Skip when ``dim == 1`` to avoid spuriously injecting momentum
+        # in a purely linear domain.
+        if self.dim > 1:
+            self._add_vorticity_forces(dt)
+
         # 2) Viscosity (implicit Helmholtz) if nu>0
         if self.p.nu > 0.0:
             self._viscosity_implicit(dt)
@@ -267,6 +281,16 @@ class VoxelMACFluid:
                 )
                 self.w[~self.solid_w] += dt * fz * bw[~self.solid_w]
 
+    def _add_vorticity_forces(self, dt: float) -> None:
+        """Placeholder for vorticity-based forces.
+
+        The solver currently does not implement vorticity confinement or
+        similar effects; the stub keeps the call site in :meth:`_substep`
+        explicit and documents that such forces are intentionally skipped when
+        ``dim == 1``.
+        """
+        return
+
     # ---------------------------------------------------------------------
     # Viscosity (implicit Helmholtz) : (I - ν dt ∇²) u^{n+1} = u*
     # ---------------------------------------------------------------------
@@ -324,7 +348,15 @@ class VoxelMACFluid:
         if np.any(fluid_cells):
             b_mean = float(b[fluid_cells].mean())
             b -= b_mean
-        pr = self._cg_poisson_cc_rhs(b, self.solid, tol=self.p.pressure_tol, maxiter=self.p.pressure_maxiter)
+        # Dispatch to a dimension-appropriate pressure solver: a direct
+        # tridiagonal solve for purely 1D domains, otherwise the generic CG
+        # Poisson solver used for 2D/3D grids.
+        if self.dim == 1:
+            pr = self._poisson_1d_tridiag(b, self.solid)
+        else:
+            pr = self._cg_poisson_cc_rhs(b, self.solid,
+                                         tol=self.p.pressure_tol,
+                                         maxiter=self.p.pressure_maxiter)
 
         self.pr = pr
 
@@ -534,6 +566,44 @@ class VoxelMACFluid:
     # ---------------------------------------------------------------------
     # Linear solvers
     # ---------------------------------------------------------------------
+    def _poisson_1d_tridiag(self, b: np.ndarray, solid_cc: np.ndarray) -> np.ndarray:
+        """Solve the 1D Poisson equation with Neumann boundaries.
+
+        This routine is used when the grid is effectively one-dimensional
+        (``ny == nz == 1``).  A simple tridiagonal matrix representing the
+        second derivative is assembled and solved directly.  Solid cells are
+        treated as Dirichlet regions with zero pressure.
+        """
+
+        nx = self.nx
+        rhs = b[:, 0, 0].copy()
+        solid = solid_cc[:, 0, 0]
+
+        main = -2.0 * np.ones(nx)
+        off = np.ones(nx - 1)
+        # Neumann boundary conditions: one-sided derivative at ends
+        main[0] = main[-1] = -1.0
+
+        A = np.diag(main)
+        if nx > 1:
+            A += np.diag(off, 1) + np.diag(off, -1)
+
+        # Dirichlet in solid cells
+        for i in range(nx):
+            if solid[i]:
+                A[i, :] = 0.0
+                A[i, i] = 1.0
+                rhs[i] = 0.0
+
+        # Scale by dx^2 since Laplacian discretisation divides by dx^2
+        A *= self.inv_dx ** 2
+
+        p = np.linalg.solve(A, rhs)
+        out = np.zeros_like(b)
+        out[:, 0, 0] = p
+        out[solid_cc] = 0.0
+        return out
+
     def _cg_poisson_cc_rhs(
         self,
         b: np.ndarray,
@@ -762,17 +832,33 @@ class VoxelMACFluid:
             F += w
 
     def _stable_dt(self) -> float:
-        # CFL based on max face velocity magnitude
-        if self.u.size == 0: return self.p.max_dt
+        # CFL based on per-axis face velocities
+        if self.u.size == 0:
+            return self.p.max_dt
+
+        adv_limits = []
         umax = float(np.max(np.abs(self.u)))
-        vmax = float(np.max(np.abs(self.v)))
-        wmax = float(np.max(np.abs(self.w)))
-        vmag = max(umax, vmax, wmax)
-        adv = np.inf if vmag == 0 else self.p.cfl * self.dx / vmag
-        # diffusion limit for scalars/velocity if explicit were used; we do implicit for vel.
+        if umax > 0:
+            adv_limits.append(self.p.cfl * self.dx / umax)
+        if self.dim >= 2:
+            vmax = float(np.max(np.abs(self.v)))
+            if vmax > 0:
+                adv_limits.append(self.p.cfl * self.dx / vmax)
+        if self.dim == 3:
+            wmax = float(np.max(np.abs(self.w)))
+            if wmax > 0:
+                adv_limits.append(self.p.cfl * self.dx / wmax)
+        adv = min(adv_limits) if adv_limits else np.inf
+
+        # Viscosity / diffusion stability limits (explicit). Velocity diffusion is
+        # implicit in this solver but we still cap dt against scalar diffusion for
+        # completeness.  The factor ``2*dim`` follows the standard ftcs limit.
+        nu = self.p.nu
+        visc = np.inf if nu <= 0 else (self.dx ** 2) / (2.0 * nu * self.dim)
         dmax = max(self.p.thermal_diffusivity, self.p.solute_diffusivity, 0.0)
-        diff = np.inf if dmax == 0 else (self.dx**2) / (2.0 * dmax + 1e-30)
-        return max(1e-6, min(adv, diff))
+        diff = np.inf if dmax == 0 else (self.dx ** 2) / (2.0 * dmax * self.dim)
+
+        return max(1e-6, min(adv, visc, diff))
 
     # ---------------------------------------------------------------------
     # Demo & smoke test
