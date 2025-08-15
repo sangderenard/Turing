@@ -1,4 +1,4 @@
-# general_gl_renderer/cli.py
+# opengl_render/cli.py
 # Tiny demo: spins a triangle mesh, a wire cube, and dotted points above.
 # This is *only* to prove the renderer end-to-end. No physics; safe to delete.
 
@@ -7,7 +7,7 @@ import numpy as np
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, QUIT
 from OpenGL.GL import *
-from general_gl_renderer.renderer import GLRenderer, MeshLayer, LineLayer, PointLayer
+from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer
 
 def perspective(fovy_deg, aspect, znear, zfar):
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
