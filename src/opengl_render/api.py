@@ -15,7 +15,10 @@ from typing import Mapping, Iterable, Callable
 import colorsys
 import numpy as np
 
-from .renderer import MeshLayer, LineLayer, PointLayer, GLRenderer
+try:  # pragma: no cover - tolerate missing OpenGL libs
+    from .renderer import MeshLayer, LineLayer, PointLayer, GLRenderer
+except Exception:  # noqa: BLE001
+    MeshLayer = LineLayer = PointLayer = GLRenderer = object  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +197,31 @@ def make_draw_hook(renderer: GLRenderer,
     def hook(layers: Mapping[str, MeshLayer | LineLayer | PointLayer]) -> None:
         draw_layers(renderer, layers, viewport)
     return hook
+
+
+def make_threaded_draw_hook(
+    renderer: GLRenderer,
+    viewport: tuple[int, int],
+    *,
+    history: int = 0,
+    loop: bool = False,
+    bounce: bool = False,
+):
+    """Return a thread-backed draw hook and its controller.
+
+    The returned tuple ``(hook, thread)`` provides a callable ``hook`` that
+    enqueues layer mappings to be drawn on a dedicated thread.  ``thread`` is the
+    :class:`~opengl_render.renderer.GLRenderThread` instance managing the queue
+    and history.
+    """
+
+    from .threaded import GLRenderThread
+
+    thread = GLRenderThread(
+        renderer,
+        viewport=viewport,
+        history=history,
+        loop=loop,
+        bounce=bounce,
+    )
+    return thread.get_submit_hook(), thread

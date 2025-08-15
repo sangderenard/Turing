@@ -9,6 +9,8 @@ raising ``ImportError``.
 
 from __future__ import annotations
 
+from .threaded import GLRenderThread
+
 try:  # pragma: no cover - best effort in headless CI
     from .renderer import GLRenderer, MeshLayer, LineLayer, PointLayer, DebugRenderer
 except Exception:  # noqa: BLE001 - tolerate missing OpenGL libs
@@ -23,13 +25,17 @@ try:  # pragma: no cover - best effort in headless CI
         pack_points,
         cellsim_layers,
         fluid_layers,
+        make_draw_hook,
+        make_threaded_draw_hook,
     )
 except Exception:  # noqa: BLE001 - tolerate missing OpenGL libs
     rainbow_colors = rainbow_history_points = pack_mesh = None  # type: ignore
     pack_lines = pack_points = cellsim_layers = fluid_layers = None  # type: ignore
+    make_draw_hook = make_threaded_draw_hook = None  # type: ignore
 
 __all__ = [
     "GLRenderer",
+    "GLRenderThread",
     "DebugRenderer",
     "MeshLayer",
     "LineLayer",
@@ -42,4 +48,6 @@ __all__ = [
     "pack_points",
     "cellsim_layers",
     "fluid_layers",
+    "make_draw_hook",
+    "make_threaded_draw_hook",
 ]
