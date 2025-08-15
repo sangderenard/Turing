@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple, Iterable
 
 import numpy as np
+import copy
+from src.cells.bath.dt_controller import Metrics, Targets, STController, step_with_dt_control
 
 
 # ------------------------------ Kernels -------------------------------------
@@ -229,6 +231,41 @@ class DiscreteFluid:
             dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
             self._substep(dt_s)
             remaining -= dt_s
+
+    def copy_shallow(self):
+        """Return a shallow copy for rollback in adaptive stepping."""
+        return copy.deepcopy(self)
+
+    def restore(self, saved) -> None:
+        """Restore state from :func:`copy_shallow`."""
+        self.__dict__.update(copy.deepcopy(saved.__dict__))
+
+    def step_with_controller(
+        self,
+        dt: float,
+        ctrl: STController,
+        targets: Targets,
+    ) -> tuple[Metrics, float]:
+        """Advance with :class:`STController` adaptive timestep."""
+
+        dx = self.kernel.h
+
+        def advance(state: "DiscreteFluid", dt_step: float):
+            prev_mass = float(np.sum(state.m))
+            state._substep(dt_step)
+            vmax = float(np.max(np.linalg.norm(state.v, axis=1))) if state.N > 0 else 0.0
+            mass_now = float(np.sum(state.m))
+            mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-12)
+            metrics = Metrics(
+                max_vel=vmax,
+                max_flux=vmax,
+                div_inf=0.0,
+                mass_err=mass_err,
+            )
+            return True, metrics
+
+        metrics, dt_next = step_with_dt_control(self, dt, dx, targets, ctrl, advance)
+        return metrics, dt_next
 
     def sample_at(self, points: np.ndarray) -> Dict[str, np.ndarray]:
         """

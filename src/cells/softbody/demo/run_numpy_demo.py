@@ -7,6 +7,7 @@ import logging
 from src.cells.cellsim.data.state import Cell, Bath
 from src.cells.cellsim.api.saline import SalinePressureAPI
 from src.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
+from src.cells.bath.dt_controller import STController, Targets
 
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math
@@ -1111,21 +1112,23 @@ def stream_fluid_points(
 
 
 def run_fluid_demo(args):
+    ctrl = STController()
+    targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
     if args.fluid == "discrete":
         from src.cells.bath.make_sph import make_sph
 
         fluid = make_sph(dim=3, resolution=(8, 12, 8))
-        step = fluid.step
+        step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "voxel":
         from src.cells.bath.make_mac import make_mac
 
         fluid = make_mac(dim=3, resolution=(8, 8, 8))
-        step = fluid.step
+        step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     elif args.fluid == "hybrid":
         from src.cells.bath.make_hybrid import make_hybrid
 
         fluid = make_hybrid(dim=3, resolution=(8, 8, 8), n_particles=512)
-        step = fluid.step
+        step = lambda dt: fluid.step_with_controller(dt, ctrl, targets)[1]
     else:
         raise SystemExit("Unknown fluid engine")
 
@@ -1159,7 +1162,7 @@ def run_fluid_demo(args):
             stream_fluid_points(
                 args,
                 fluid.export_positions_vectors,
-                fluid.step,
+                step,
                 show_vectors=args.show_vectors,
                 show_droplets=args.show_droplets,
                 color_metric=args.color_metric,

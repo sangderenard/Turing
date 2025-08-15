@@ -49,7 +49,7 @@ from typing import Dict, Iterable, Tuple, List, Optional
 import copy
 import numpy as np
 
-from .dt_controller import Metrics
+from .dt_controller import Metrics, Targets, STController, step_with_dt_control
 
 try:
     # Local sibling import; adjust path if packaging differs
@@ -299,6 +299,25 @@ class HybridFluid:
             dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
             self._substep(dt_s)
             remaining -= dt_s
+
+    def step_with_controller(
+        self,
+        dt: float,
+        ctrl: STController,
+        targets: Targets,
+    ) -> tuple[Metrics, float]:
+        """Advance with adaptive timestep control."""
+
+        dx = self.params.dx
+
+        def advance(state: "HybridFluid", dt_step: float):
+            prev_mass = state.total_mass()
+            state._substep(dt_step)
+            metrics = state.compute_metrics(prev_mass)
+            return True, metrics
+
+        metrics, dt_next = step_with_dt_control(self, dt, dx, targets, ctrl, advance)
+        return metrics, dt_next
 
     # ------------------------------------------------------------------
     # Substep

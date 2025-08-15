@@ -2,6 +2,8 @@
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List
+from src.cells.bath.dt_controller import Metrics, Targets, STController, step_with_dt_control
+import copy
 
 from .mesh import (
     make_icosphere,
@@ -88,6 +90,38 @@ class Hierarchy:
     # Membrane surface physics toggle (replaces XPBD stretch+bending)
     use_membrane_surface_physics: bool = True
     membranes: List[Membrane] = field(default_factory=list)
+
+    # --- dt controller helpers ---
+    def copy_shallow(self):
+        return [(c.X.copy(), c.V.copy()) for c in self.cells]
+
+    def restore(self, saved) -> None:
+        for c, (X, V) in zip(self.cells, saved):
+            c.X[:] = X
+            c.V[:] = V
+
+    def max_vertex_speed(self) -> float:
+        if not self.cells:
+            return 0.0
+        return float(max(np.max(np.linalg.norm(c.V, axis=1)) for c in self.cells))
+
+    def step_dt_control(
+        self,
+        dt: float,
+        ctrl: STController,
+        targets: Targets,
+        dx: float = 1.0,
+        t: float = 0.0,
+        fields=None,
+    ) -> tuple[Metrics, float]:
+        def advance(state: "Hierarchy", dt_step: float):
+            state.step(dt_step, t=t, fields=fields)
+            vmax = state.max_vertex_speed()
+            metrics = Metrics(max_vel=vmax, max_flux=vmax, div_inf=0.0, mass_err=0.0)
+            return True, metrics
+
+        metrics, dt_next = step_with_dt_control(self, dt, dx, targets, ctrl, advance)
+        return metrics, dt_next
 
     def integrate(self, dt):
         if not self.cells:

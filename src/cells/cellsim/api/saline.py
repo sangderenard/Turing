@@ -13,6 +13,7 @@ from ..mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
 from tqdm.auto import tqdm  # type: ignore
+from src.cells.bath.dt_controller import STController, Targets, Metrics, step_with_dt_control
 
 # Module logger (DEBUG by default so logs appear without extra setup)
 logger = logging.getLogger("cellsim.api.saline")
@@ -67,6 +68,11 @@ class SalinePressureAPI:
             if c.A0 <= 0.0:
                 A0, _ = sphere_area_from_volume(c.V); c.A0 = A0
         self.engine = SalineEngine(self.cells, self.bath, species=self.species)
+
+        # Adaptive timestep controller
+        self.dt_ctrl = STController()
+        self.dt_targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+        self.dx = 1.0
 
     def attach_softbody_mechanics(self, cfg: SoftbodyProviderCfg | None = None):
         """Attach the softbody-backed 0D mechanics provider to the engine."""
@@ -216,8 +222,28 @@ class SalinePressureAPI:
 
     # ---- physics step (cellsim backend) ----
     def step(self, dt: float) -> float:
-        """Returns suggested next dt (adaptive)."""
-        return self.engine.step(dt)
+        """Advance the engine with adaptive dt control."""
+
+        def advance(state, dt_step):
+            engine = self.engine
+            prev_mass = float(engine.n.sum() + engine.bath_n.sum())
+            V_before = engine.V.copy()
+            engine.step(dt_step, use_adapt=False)
+            max_flux = float(np.max(np.abs(engine.V - V_before)) / max(dt_step, 1e-12))
+            mass_now = float(engine.n.sum() + engine.bath_n.sum())
+            mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-18)
+            metrics = Metrics(
+                max_vel=max_flux,
+                max_flux=max_flux,
+                div_inf=0.0,
+                mass_err=mass_err,
+            )
+            return True, metrics
+
+        metrics, dt_next = step_with_dt_control(
+            self.engine, dt, self.dx, self.dt_targets, self.dt_ctrl, advance
+        )
+        return dt_next
 
     # ---- helpers to construct from your legacy sim object ----
     @classmethod
