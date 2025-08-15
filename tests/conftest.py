@@ -39,6 +39,18 @@ _RUN_LOG = "pytest_run_times.log"
 
 
 def pytest_sessionstart(session):
+    log_file = Path(session.config.rootpath) / _RUN_LOG
+    if log_file.exists():
+        lines = log_file.read_text().splitlines()
+    else:
+        lines = []
+
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter and lines:
+        reporter.write_line("Recent pytest run times:")
+        for entry in lines[-5:]:
+            reporter.write_line(f"  {entry}")
+
     session._start_time = time.time()
 
 
@@ -46,15 +58,22 @@ def pytest_sessionfinish(session, exitstatus):
     duration = time.time() - session._start_time
     log_file = Path(session.config.rootpath) / _RUN_LOG
     history = int(os.environ.get("PYTEST_RUN_TIME_HISTORY", "50"))
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {duration:.2f}\n"
-    with log_file.open("a") as fh:
-        fh.write(line)
-    with log_file.open("r+") as fh:
-        lines = fh.readlines()
-        if len(lines) > history:
-            fh.seek(0)
-            fh.writelines(lines[-history:])
-            fh.truncate()
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {duration:.2f}"
+
+    if log_file.exists():
+        lines = log_file.read_text().splitlines()
+    else:
+        lines = []
+
+    lines.append(line)
+    lines = lines[-history:]
+    log_file.write_text("\n".join(lines) + "\n")
+
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter and lines:
+        reporter.write_line("Recent pytest run times:")
+        for entry in lines[-5:]:
+            reporter.write_line(f"  {entry}")
 
 
 # ---------------------------------------------------------------------------
