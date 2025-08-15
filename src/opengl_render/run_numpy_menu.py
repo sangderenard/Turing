@@ -14,8 +14,9 @@ import subprocess
 OPTIONS = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),
     "2": ("Discrete fluid demo", ["--fluid", "discrete"]),
-    "3": ("Cells + fluid (mesh)", ["--couple-fluid", "voxel"]),
-    "4": ("Point cloud export", ["--export-kind", "opengl-points"]),
+    "3": ("Hybrid fluid demo", ["--fluid", "hybrid"]),
+    "4": ("Cells + fluid (mesh)", ["--couple-fluid", "voxel"]),
+    "5": ("Point cloud export", ["--export-kind", "opengl-points"]),
 }
 
 

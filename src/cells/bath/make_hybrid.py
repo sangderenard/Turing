@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Iterable, Tuple
 
+import numpy as np
+
 from .hybrid_fluid import HybridFluid, HybridParams
 
 
@@ -44,8 +46,11 @@ def make_hybrid(
         pass
 
     def export_positions_vectors_droplets():
-        data = engine.export_particles()
-        return data["x"], data["v"], None
+        parts = engine.export_particles()
+        grid_pts, grid_vecs = engine.export_vector_field()
+        pts = np.concatenate([parts["x"], grid_pts], axis=0)
+        vecs = np.concatenate([parts["v"], grid_vecs], axis=0)
+        return pts, vecs, None
 
     return SimpleNamespace(
         engine=engine,
