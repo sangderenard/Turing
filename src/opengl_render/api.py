@@ -144,3 +144,16 @@ def cellsim_layers(h, *, rainbow: bool = False) -> Mapping[str, MeshLayer | Poin
     if positions and faces:
         layers["membrane"] = pack_mesh(np.concatenate(positions), np.concatenate(faces), rainbow=rainbow)
     return layers
+
+
+def fluid_layers(engine, *, rainbow: bool = False) -> Mapping[str, MeshLayer | PointLayer]:
+    """Pack simple fluid visuals from a fluid engine.
+
+    Currently supports discrete particle fluids by exposing their particle
+    positions as a ``PointLayer``.
+    """
+    layers: dict[str, MeshLayer | PointLayer] = {}
+    pts = getattr(engine, "p", None)
+    if pts is not None:
+        layers["fluid"] = pack_points(np.asarray(pts, dtype=np.float32), rainbow=rainbow, default_size=2.0)
+    return layers

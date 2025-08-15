@@ -221,14 +221,20 @@ class SalinePressureAPI:
         return ceilings
 
     # ---- physics step (cellsim backend) ----
-    def step(self, dt: float) -> float:
+    def step(self, dt: float, hooks=None) -> float:
         """Advance the engine with adaptive dt control."""
+
+        from src.common.sim_hooks import SimHooks
+
+        hooks = hooks or SimHooks()
 
         def advance(state, dt_step):
             engine = self.engine
+            hooks.run_pre(engine, dt_step)
             prev_mass = float(engine.n.sum() + engine.bath_n.sum())
             V_before = engine.V.copy()
-            engine.step(dt_step, use_adapt=False)
+            engine.step(dt_step, use_adapt=False, hooks=hooks)
+            hooks.run_post(engine, dt_step)
             max_flux = float(np.max(np.abs(engine.V - V_before)) / max(dt_step, 1e-12))
             mass_now = float(engine.n.sum() + engine.bath_n.sum())
             mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-18)

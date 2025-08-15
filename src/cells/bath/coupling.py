@@ -62,7 +62,7 @@ class BathFluidCoupler:
     def prime_volumes(self, vols: np.ndarray) -> None:
         self._prev_vols = np.array(vols, dtype=float, copy=True)
 
-    def exchange(self, *, dt: float, centers: Optional[np.ndarray], vols: Optional[np.ndarray]) -> None:
+    def exchange(self, *, dt: float, centers: Optional[np.ndarray], vols: Optional[np.ndarray], hooks=None) -> None:
         """Apply sources based on cell dV and advance the fluid engine.
 
         This method is safe to call even if geometry or volume arrays are
@@ -94,7 +94,7 @@ class BathFluidCoupler:
         # Advance fluid engine
         try:
             if hasattr(self.engine, "step"):
-                self.engine.step(float(dt))
+                self.engine.step(float(dt), hooks=hooks)
         except Exception:
             pass
 
