@@ -37,7 +37,21 @@ class STController:
     clamp_events: int = 0
 
     def update_dt_max(self, max_vel: float, dx: float) -> None:
-        self.max_vel_ever = max(self.max_vel_ever, max_vel)
+        """Update the adaptive ``dt_max`` based on recent velocities.
+
+        The previous implementation tracked the *maximum* velocity seen so
+        far which meant that any early spike would permanently clamp the
+        timestep.  To let the controller accelerate once the flow calms
+        down, we keep a softly decaying envelope of the observed maximum.
+        This effectively aims for the minimum of recent maxima across the
+        data, allowing ``dt`` to grow when speeds drop.
+        """
+
+        # Exponential decay lets old peaks fade so that ``max_vel_ever``
+        # approaches the smallest recent maximum velocity.  This provides an
+        # upper bound that adapts upward, permitting acceleration when the
+        # system slows.
+        self.max_vel_ever = max(max_vel, 0.98 * self.max_vel_ever)
         self.dt_max = 0.25 * dx / max(self.max_vel_ever, 1e-30)
 
     def pi_update(self, dt_prev: float, dt_pen: float, osc: bool) -> float:
