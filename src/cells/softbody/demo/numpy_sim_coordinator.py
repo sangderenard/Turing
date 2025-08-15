@@ -652,11 +652,15 @@ def stream_ascii_to_dir(args, api, provider):
     t.join()
 
 
-def run_fluid_demo(args):
+def run_fluid_demo(args, *, draw_hook=None):
     engine = make_fluid_engine(args.fluid, args.sim_dim)
     dt = float(getattr(args, "dt", 1e-3))
-    draw_hook = None
-    if getattr(args, "debug_render", False):
+
+    # When no hook is provided explicitly, fall back to the original debug
+    # renderer behaviour when ``--debug-render`` is set.  This mirrors the
+    # previous CLI-driven approach while allowing callers to supply a custom
+    # renderer programmatically.
+    if draw_hook is None and getattr(args, "debug_render", False):
         try:
             from src.opengl_render.renderer import DebugRenderer
             from src.opengl_render.api import make_draw_hook
@@ -668,10 +672,14 @@ def run_fluid_demo(args):
                 print(layer_map)
 
             draw_hook = _fallback
+
     for _ in range(int(args.frames)):
         engine.step(dt)
         if draw_hook is not None:
-            layers = gather_layers(None, engine, for_opengl=False)
+            # When a draw hook is provided we feed it OpenGL-oriented layer
+            # dataclasses so that higher level renderers can consume them
+            # directly.
+            layers = gather_layers(None, engine, for_opengl=True)
             draw_hook(layers)
 
 
@@ -737,12 +745,12 @@ def gather_layers(provider, fluid=None, *, rainbow: bool = False, for_opengl: bo
     return layers
 
 
-def main(*args_in):
+def main(*args_in, draw_hook=None):
     args = parse_args(args_in or None)
     level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=level)
     if getattr(args, "fluid", ""):
-        run_fluid_demo(args)
+        run_fluid_demo(args, draw_hook=draw_hook)
         return
     api, provider = make_cellsim_backend(
         cell_vols=args.cell_vols,
@@ -775,8 +783,10 @@ def main(*args_in):
         else:
             stream_ascii(args, api, provider)
         return
-    draw_hook = None
-    if args.debug_render:
+    # ``draw_hook`` may be supplied by external callers (e.g., OpenGL demos).
+    # Only construct a default debug renderer if one has not been provided and
+    # ``--debug-render`` was requested.
+    if draw_hook is None and args.debug_render:
         try:
             from src.opengl_render.renderer import DebugRenderer
             from src.opengl_render.api import make_draw_hook
@@ -797,7 +807,7 @@ def main(*args_in):
             coupler.exchange(dt=dt, centers=centers, vols=vols, hooks=hooks)
         dt = step_cellsim(api, dt, hooks=hooks)
         if draw_hook is not None:
-            layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=False)
+            layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)
             draw_hook(layers)
 
 if __name__ == "__main__":
