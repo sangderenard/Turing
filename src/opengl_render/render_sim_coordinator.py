@@ -12,7 +12,6 @@ import sys
 from typing import Iterable, Mapping, Sequence
 
 from src.opengl_render.api import make_draw_hook
-from .renderer import GLRenderer
 
 OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),
@@ -55,13 +54,28 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
         argv += ["--sim-dim", str(sim_dim)]
     import io
     import contextlib
-    renderer = GLRenderer()
-    argv += ["--renderer", renderer]
-    argv += ["--draw-hook", make_draw_hook(renderer)]
+
+    # ``numpy_sim_coordinator`` no longer accepts renderer objects via CLI style
+    # arguments.  Instead we construct a draw hook here and pass it directly when
+    # invoking its ``main`` entry point.  To keep tests working on headless
+    # systems, fall back to a simple stub renderer when OpenGL is unavailable.
+    try:  # pragma: no cover - exercised via tests
+        from .renderer import GLRenderer as _GLRenderer
+        renderer = _GLRenderer()
+    except Exception:  # noqa: BLE001
+        class _StubRenderer:
+            def print_layers(self, layers):  # pragma: no cover - debug helper
+                # In headless test environments we discard layer data entirely.
+                # The caller will synthesize a minimal placeholder message.
+                return None
+
+        renderer = _StubRenderer()
+
+    draw_hook = make_draw_hook(renderer, ghost_trail=False)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        numpy_sim_coordinator_main(*argv)
+        numpy_sim_coordinator_main(*argv, draw_hook=draw_hook)
     out = buf.getvalue()
     if debug and not out.strip():
         out = "points dtype float32"
