@@ -298,8 +298,8 @@ def extract_numpy_kwargs(args_or_dict: argparse.Namespace | dict) -> dict:
     return {k: getattr(args_or_dict, k) for k in tags if hasattr(args_or_dict, k)}
 
 
-def parse_args():
-    return build_numpy_parser(add_help=True).parse_args()
+def parse_args(argv=None):
+    return build_numpy_parser(add_help=True).parse_args(list(argv) if argv is not None else None)
 
 
 def _gather_vertices(h) -> Optional[np.ndarray]:
@@ -737,8 +737,8 @@ def gather_layers(provider, fluid=None, *, rainbow: bool = False, for_opengl: bo
     return layers
 
 
-def main():
-    args = parse_args()
+def main(*args_in):
+    args = parse_args(args_in or None)
     level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=level)
     if getattr(args, "fluid", ""):

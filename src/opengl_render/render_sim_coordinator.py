@@ -20,31 +20,41 @@ OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
 }
 
 
-def run_option(choice: str, *, debug: bool = False) -> subprocess.CompletedProcess:
-    """Run a predefined NumPy simulation option.
 
-    Parameters
-    ----------
-    choice:
-        Key from :data:`OPTIONS` selecting which demo to run.
-    debug:
-        When ``True`` the underlying simulator is invoked with ``--debug``
-        flags and a single frame to emit layer positions and metadata.
+def run_option(choice: str, *, debug: bool = False, frames: int | None = None, dt: float | None = None,
+               sim_dim: int | None = None, debug_render: bool | None = None) -> subprocess.CompletedProcess:
+    """Run a predefined NumPy simulation option (in-process).
 
-    Returns
-    -------
-    :class:`subprocess.CompletedProcess`
-        The completed process object from :func:`subprocess.run`.
+    Passes flags in CLI style to the coordinator's ``main``.
     """
-
     if choice not in OPTIONS:
         raise ValueError("Unknown option")
-    _, args = OPTIONS[choice]
-    cmd = [sys.executable, "-m", "src.cells.softbody.demo.numpy_sim_coordinator", *args]
+    _, base_args = OPTIONS[choice]
+
+    # Import here to avoid package import path issues when used as a script.
+    try:
+        from src.cells.softbody.demo.numpy_sim_coordinator import main as numpy_sim_coordinator_main  # type: ignore
+    except Exception:  # pragma: no cover - fallback for local/relative
+        try:
+            from .numpy_sim_coordinator import main as numpy_sim_coordinator_main  # type: ignore
+        except Exception:
+            from numpy_sim_coordinator import main as numpy_sim_coordinator_main  # type: ignore
+
+    argv = list(base_args)
     if debug:
-        cmd += ["--debug-render", "--debug", "--frames", "1", "--dt", "1e-4"]
-        return subprocess.run(cmd, check=False, capture_output=True, text=True)
-    return subprocess.run(cmd, check=False)
+        argv.append("--debug")
+    if debug_render:
+        argv.append("--debug-render")
+    if frames is not None:
+        argv += ["--frames", str(frames)]
+    if dt is not None:
+        argv += ["--dt", str(dt)]
+    if sim_dim is not None:
+        argv += ["--sim-dim", str(sim_dim)]
+
+    numpy_sim_coordinator_main(*argv)
+    return subprocess.CompletedProcess(args=["numpy_sim_coordinator"] + argv, returncode=0)
+
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -52,11 +62,15 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--choice", choices=list(OPTIONS.keys()), help="Run a specific option without prompting")
     parser.add_argument("--all", action="store_true", help="Run all options sequentially")
     parser.add_argument("--debug", action="store_true", help="Enable debug rendering and logging")
+    parser.add_argument("--frames", type=int, default=10, help="Number of frames to render (default: 10)")
+    parser.add_argument("--dt", type=float, default=1e-3, help="Time step for the simulation (default: 1e-3)")
+    parser.add_argument("--debug-render", action="store_true", help="Enable debug rendering mode")
+    parser.add_argument("--sim-dim", type=int, default=2, help="Dimensionality of the simulation (default: 2)")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.all:
         for key in OPTIONS:
-            proc = run_option(key, debug=args.debug)
+            proc = run_option(key, debug=args.debug, frames=args.frames, dt=args.dt, sim_dim=args.sim_dim, debug_render=args.debug_render)
             if args.debug:
                 print(proc.stdout)
         return
@@ -70,7 +84,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     if choice not in OPTIONS:
         print("Unknown option")
         return
-    proc = run_option(choice, debug=args.debug)
+    proc = run_option(choice, debug=args.debug, frames=args.frames, dt=args.dt, sim_dim=args.sim_dim, debug_render=args.debug_render)
     if args.debug:
         print(proc.stdout)
 

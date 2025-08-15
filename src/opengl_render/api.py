@@ -191,13 +191,37 @@ def draw_layers(renderer: GLRenderer,
     renderer.draw(viewport)
 
 
-def make_draw_hook(renderer: GLRenderer,
-                   viewport: tuple[int, int]) -> Callable[[Mapping[str, MeshLayer | LineLayer | PointLayer]], None]:
-    """Return a hook that draws provided layer mappings."""
-    def hook(layers: Mapping[str, MeshLayer | LineLayer | PointLayer]) -> None:
-        draw_layers(renderer, layers, viewport)
-    return hook
 
+def make_draw_hook(renderer: GLRenderer,
+                   viewport: tuple[int, int],
+                   *,
+                   history: int = 0,
+                   loop: bool = False,
+                   bounce: bool = False):
+    """Return a **threaded** draw hook (default).
+
+    This wraps :func:`make_threaded_draw_hook` and returns only the submit hook,
+    ensuring all drawing happens on a dedicated GL thread by default.
+    The underlying thread controller is attached to ``renderer._render_thread``
+    for lifecycle management if needed.
+    """
+    hook, thread = make_threaded_draw_hook(renderer, viewport, history=history, loop=loop, bounce=bounce)
+    try:
+        thread.start()
+    except RuntimeError:
+        # Already started, or running in a guarded thread
+        try:
+            getattr(thread, "start_if_needed")()
+        except Exception:
+            print("Failed to start render thread")
+            raise
+    # Store it on the renderer for lifecycle control
+    try:
+        renderer._render_thread = thread
+    except Exception:
+        pass
+
+    return hook
 
 def make_threaded_draw_hook(
     renderer: GLRenderer,
