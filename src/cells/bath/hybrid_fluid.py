@@ -46,7 +46,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Tuple, List, Optional
 
+import copy
 import numpy as np
+
+from .dt_controller import Metrics
 
 try:
     # Local sibling import; adjust path if packaging differs
@@ -189,6 +192,61 @@ class HybridFluid:
         self.pause_t = np.zeros(self.n_particles, dtype=np.float64)
 
         self._last_grid_u = [comp.copy() for comp in (self.grid.u, self.grid.v, self.grid.w)]
+
+    # ------------------------------------------------------------------
+    # State copy helpers for rollback
+    # ------------------------------------------------------------------
+    def copy_shallow(self):
+        """Return a shallow copy of the simulator state."""
+        return copy.deepcopy(self)
+
+    def restore(self, saved) -> None:
+        """Restore simulator state from ``copy_shallow``."""
+        self.__dict__.update(copy.deepcopy(saved.__dict__))
+
+    # ------------------------------------------------------------------
+    # Metrics & export helpers
+    # ------------------------------------------------------------------
+    def compute_metrics(self, prev_mass: float) -> Metrics:
+        assert self.grid is not None
+        max_vel_grid = float(max(
+            np.max(np.abs(self.grid.u)),
+            np.max(np.abs(self.grid.v)),
+            np.max(np.abs(self.grid.w)),
+        ))
+        max_vel_particles = float(
+            np.max(np.linalg.norm(self.v, axis=1)) if self.v.size else 0.0
+        )
+        max_vel = max(max_vel_grid, max_vel_particles)
+        max_flux = max_vel  # placeholder for actual flux
+        inv_dx = 1.0 / self.params.dx
+        div = np.zeros_like(self.phi)
+        div += (self.grid.u[1:, :, :] - self.grid.u[:-1, :, :]) * inv_dx
+        div += (self.grid.v[:, 1:, :] - self.grid.v[:, :-1, :]) * inv_dx
+        div += (self.grid.w[:, :, 1:] - self.grid.w[:, :, :-1]) * inv_dx
+        div_inf = float(np.max(np.abs(div)))
+        mass_now = self.total_mass()
+        mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-12)
+        return Metrics(
+            max_vel=max_vel,
+            max_flux=max_flux,
+            div_inf=div_inf,
+            mass_err=mass_err,
+            osc_flag=False,
+            stiff_flag=False,
+        )
+
+    def export_vertex_tape(self) -> np.ndarray:
+        """Return an array [[x,u,p,rho,T], ...] for each cell."""
+        assert self.grid is not None
+        nx = self.grid.nx
+        dx = self.params.dx
+        x = (np.arange(nx) + 0.5) * dx
+        u_center = 0.5 * (self.grid.u[:-1, 0, 0] + self.grid.u[1:, 0, 0])
+        p = self.grid.p[:, 0, 0]
+        rho = self.params.rho0 * self.phi[:, 0, 0]
+        T = np.zeros_like(x)
+        return np.stack([x, u_center, p, rho, T], axis=1)
 
     # ------------------------------------------------------------------
     # Initialization helpers
