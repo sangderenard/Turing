@@ -620,8 +620,8 @@ class HybridFluid:
             self.v = np.vstack([self.v, np.vstack(new_v)])
             self.m = np.hstack([self.m, np.hstack(new_m)])
             self.rho = np.hstack([self.rho, np.full(total_new, self.params.rho0)])
-            self.phase = np.hstack([self.phase, np.zeros(n_spawn, dtype=np.int8)]) if self.phase.size else np.zeros(n_spawn, dtype=np.int8)
-            self.pause_t = np.hstack([self.pause_t, np.zeros(n_spawn, dtype=np.float64)]) if self.pause_t.size else np.zeros(n_spawn, dtype=np.float64)
+            self.phase = np.hstack([self.phase, np.zeros(n, dtype=np.int8)]) if self.phase.size else np.zeros(n, dtype=np.int8)
+            self.pause_t = np.hstack([self.pause_t, np.zeros(n, dtype=np.float64)]) if self.pause_t.size else np.zeros(n, dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Sampling & export
