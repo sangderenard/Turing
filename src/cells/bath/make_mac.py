@@ -42,6 +42,7 @@ def make_mac(
     return SimpleNamespace(
         engine=engine,
         step=engine.step,
+        step_with_controller=engine.step_with_controller,
         export_vector_field=engine.export_vector_field,
         export_positions_vectors=engine.export_vector_field,
         export_droplets=lambda: None,

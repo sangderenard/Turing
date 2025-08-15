@@ -50,6 +50,7 @@ def make_hybrid(
     return SimpleNamespace(
         engine=engine,
         step=engine.step,
+        step_with_controller=engine.step_with_controller,
         export_particles=engine.export_particles,
         export_vector_field=engine.export_vector_field,
         export_positions_vectors=lambda: (

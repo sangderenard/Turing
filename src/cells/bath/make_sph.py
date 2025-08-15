@@ -79,6 +79,7 @@ def make_sph(
     return SimpleNamespace(
         engine=engine,
         step=engine.step,
+        step_with_controller=engine.step_with_controller,
         export_positions_vectors=engine.export_positions_vectors,
         export_vertices=engine.export_vertices,
         export_droplets=lambda: engine.droplet_p.copy(),
