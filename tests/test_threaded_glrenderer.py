@@ -29,7 +29,7 @@ def test_threaded_glrenderer_collects_history():
 
 def test_threaded_glrenderer_loops():
     rec = Recorder()
-    hook, thread = make_threaded_draw_hook(rec, (1, 1), history=1, loop=True)
+    hook, thread = make_threaded_draw_hook(rec, (1, 1), history=1, loop_mode="loop")
     frame = {"points": np.zeros((1, 3), np.float32)}
     hook(frame)
     thread.queue.join()
@@ -37,3 +37,18 @@ def test_threaded_glrenderer_loops():
     time.sleep(0.05)
     thread.stop()
     assert len(rec.frames) >= 2
+
+
+def test_threaded_glrenderer_bounces():
+    rec = Recorder()
+    hook, thread = make_threaded_draw_hook(rec, (1, 1), history=2, loop_mode="bounce")
+    f1 = {"points": np.zeros((1, 3), np.float32)}
+    f2 = {"points": np.ones((1, 3), np.float32)}
+    hook(f1)
+    hook(f2)
+    thread.queue.join()
+    time.sleep(0.05)
+    thread.stop()
+    # initial frames then bounced back to f1
+    assert rec.frames[:2] == [f1, f2]
+    assert len(rec.frames) >= 3 and rec.frames[2] == f1

@@ -1,3 +1,11 @@
+"""Convenience entry point for running tests and a small NAND demo.
+
+This module executes the project's pytest suite and, if successful, runs a
+minimal tape simulation showcasing a single NAND operation.  The additional
+documentation here clarifies the script's purpose without affecting runtime
+behaviour.
+"""
+
 import subprocess
 import sys
 from pathlib import Path

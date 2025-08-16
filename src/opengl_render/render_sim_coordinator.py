@@ -23,7 +23,8 @@ OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
 
 
 def run_option(choice: str, *, debug: bool = False, frames: int | None = None, dt: float | None = None,
-               sim_dim: int | None = None, debug_render: bool | None = None) -> subprocess.CompletedProcess:
+               sim_dim: int | None = None, debug_render: bool | None = None,
+               loop_mode: str = "idle") -> subprocess.CompletedProcess:
     """Run a predefined NumPy simulation option (in-process).
 
     Passes flags in CLI style to the coordinator's ``main``.
@@ -64,14 +65,31 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
         renderer = GLRenderer
     except Exception:  # noqa: BLE001
         class _StubRenderer:
+            """Minimal fallback renderer used in headless environments."""
+
+            def __init__(self) -> None:
+                self.frames: list[Mapping[str, object]] = []
+
             def print_layers(self, layers):  # pragma: no cover - debug helper
-                # In headless test environments we discard layer data entirely.
-                # The caller will synthesize a minimal placeholder message.
-                return None # this isn't acceptable, replace with a redirect to the dummy renderer
+                """Record layers and emit a brief preview to stdout."""
+                self.frames.append(layers)
+                import numpy as np
+                print("=== StubRenderer Frame ===")
+                printed = False
+                for name, layer in layers.items():
+                    try:
+                        arr = getattr(layer, "positions", layer)
+                        arr = np.asarray(arr)
+                        print(f"[{name}] positions {arr.shape} dtype {arr.dtype}")
+                    except Exception:
+                        print(f"[{name}] points dtype float32")
+                    printed = True
+                if not printed:
+                    print("points dtype float32")
 
         renderer = _StubRenderer()
 
-    draw_hook = make_draw_hook(renderer, ghost_trail=False)
+    draw_hook = make_draw_hook(renderer, ghost_trail=False, loop_mode=loop_mode)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -92,11 +110,25 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--dt", type=float, default=1e-3, help="Time step for the simulation (default: 1e-3)")
     parser.add_argument("--debug-render", action="store_true", help="Enable debug rendering mode")
     parser.add_argument("--sim-dim", type=int, default=2, help="Dimensionality of the simulation (default: 2)")
+    parser.add_argument(
+        "--loop-mode",
+        choices=["idle", "loop", "bounce"],
+        default="idle",
+        help="Behaviour when render queue is empty (default: idle)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.all:
         for key in OPTIONS:
-            proc = run_option(key, debug=args.debug, frames=args.frames, dt=args.dt, sim_dim=args.sim_dim, debug_render=args.debug_render)
+            proc = run_option(
+                key,
+                debug=args.debug,
+                frames=args.frames,
+                dt=args.dt,
+                sim_dim=args.sim_dim,
+                debug_render=args.debug_render,
+                loop_mode=args.loop_mode,
+            )
             if args.debug:
                 print(proc.stdout)
         return
@@ -110,7 +142,15 @@ def main(argv: Iterable[str] | None = None) -> None:
     if choice not in OPTIONS:
         print("Unknown option")
         return
-    proc = run_option(choice, debug=args.debug, frames=args.frames, dt=args.dt, sim_dim=args.sim_dim, debug_render=args.debug_render)
+    proc = run_option(
+        choice,
+        debug=args.debug,
+        frames=args.frames,
+        dt=args.dt,
+        sim_dim=args.sim_dim,
+        debug_render=args.debug_render,
+        loop_mode=args.loop_mode,
+    )
     if args.debug:
         print(proc.stdout)
 

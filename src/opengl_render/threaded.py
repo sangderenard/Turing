@@ -24,12 +24,10 @@ class GLRenderThread:
     history:
         Maximum number of past frames to retain. ``0`` keeps an unbounded
         history.
-    loop:
-        When ``True`` the stored history is replayed whenever the input queue is
-        empty.
-    bounce:
-        When ``True`` and :paramref:`loop` is enabled, the history is played
-        forwards then backwards (ping-pong).
+    loop_mode:
+        Behaviour when the input queue is empty. ``"idle"`` re-draws the last
+        known frame. ``"loop"`` replays the stored history from start to end.
+        ``"bounce"`` replays history forwards then backwards (ping-pong).
     """
 
     def __init__(
@@ -38,8 +36,7 @@ class GLRenderThread:
         *,
         viewport: tuple[int, int] | None = None,
         history: int = 32,
-        loop: bool = False,
-        bounce: bool = False,
+        loop_mode: str = "idle",
         ghost_trail: bool = True,
     ) -> None:
         self._renderer_factory = renderer_factory
@@ -49,8 +46,12 @@ class GLRenderThread:
         maxlen = history if history > 0 else None
         self.history: deque[Mapping[str, object]] = deque(maxlen=maxlen)
         self.queue: "queue.Queue[Mapping[str, object] | None]" = queue.Queue()
-        self.loop = loop
-        self.bounce = bounce
+        norm = loop_mode.lower()
+        if norm == "none":
+            norm = "idle"
+        if norm not in {"idle", "loop", "bounce"}:
+            raise ValueError("loop_mode must be 'idle', 'loop' or 'bounce'")
+        self.loop_mode = norm
         self.ghost_trail = ghost_trail
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -83,6 +84,14 @@ class GLRenderThread:
         except Exception:  # noqa: BLE001
             PointLayer = None  # type: ignore
 
+        def _pump_events() -> None:
+            """Best-effort event pump to keep window responsive."""
+            try:  # pragma: no cover - headless environments
+                import pygame
+                pygame.event.pump()
+            except Exception:
+                pass
+
         while not self._stop.is_set():
             # Lazily construct the renderer in this thread before any drawing
             if self.renderer is None:
@@ -100,15 +109,27 @@ class GLRenderThread:
 
             if item is None:
                 # queue empty or sentinel; replay history if requested
-                if self.loop and self.history:
+                if self.loop_mode in {"loop", "bounce"} and self.history:
                     seq = list(self.history)
-                    if self.bounce and len(seq) > 1:
+                    if self.loop_mode == "bounce" and len(seq) > 1:
                         seq = seq + seq[-2:0:-1]
                     for frame in seq:
                         if self._stop.is_set():
                             break
+                        _pump_events()
                         draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
-                        time.sleep(0.01)
+                        time.sleep(1.0 / 60.0)
+                else:
+                    _pump_events()
+                    if self.renderer is not None and hasattr(self.renderer, "draw"):
+                        try:
+                            self.renderer.draw(self.viewport)  # type: ignore[call-arg]
+                        except Exception:
+                            pass
+                    elif self.history:
+                        frame = self.history[-1]
+                        draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
+                    time.sleep(1.0 / 60.0)
                 continue
 
             # Normal frame: draw and store in history
