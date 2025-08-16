@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, TYPE_CHECKING
 
+import logging
 import numpy as np
 
 from .discrete_fluid import DiscreteFluid
@@ -19,6 +20,8 @@ from .voxel_fluid import VoxelMACFluid
 from .hybrid_fluid import HybridFluid
 from .dt_controller import STController, Targets, run_superstep_plan
 from src.common.dt import SuperstepPlan, SuperstepResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # import only for types
     from .surface_animator import SurfaceAnimator
@@ -227,11 +230,23 @@ class MACAdapter(BathAdapter):
                 state.step(dt_step)
                 vel1 = getattr(state, "max_velocity", lambda: 0.0)()
                 max_vel = max(vel0, vel1)
-                metrics = type("M", (), {"max_vel": max_vel, "max_flux": max_vel, "div_inf": 0.0, "mass_err": 0.0, "osc_flag": False, "stiff_flag": False})()
+                metrics = type(
+                    "M",
+                    (),
+                    {
+                        "max_vel": max_vel,
+                        "max_flux": max_vel,
+                        "div_inf": 0.0,
+                        "mass_err": 0.0,
+                        "osc_flag": False,
+                        "stiff_flag": False,
+                    },
+                )()
                 return True, metrics
-            except Exception:
+            except Exception as exc:
                 state.restore(saved)
-                return False, type("M", (), {"max_vel": 0.0, "max_flux": 0.0, "div_inf": 0.0, "mass_err": 1.0, "osc_flag": False, "stiff_flag": True})()
+                logger.exception("MACAdapter step_super failed", exc_info=exc)
+                raise
         plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
         res = run_superstep_plan(self.sim, plan, getattr(self.sim, "dx", 1.0), self.dt_targets, self.dt_ctrl, advance)
         self._time += float(res.advanced)
@@ -324,11 +339,23 @@ class HybridAdapter(BathAdapter):
                 state.step(dt_step)
                 v1 = getattr(state, "max_velocity", lambda: 0.0)()
                 vmax = max(v0, v1)
-                metrics = type("M", (), {"max_vel": vmax, "max_flux": vmax, "div_inf": 0.0, "mass_err": 0.0, "osc_flag": False, "stiff_flag": False})()
+                metrics = type(
+                    "M",
+                    (),
+                    {
+                        "max_vel": vmax,
+                        "max_flux": vmax,
+                        "div_inf": 0.0,
+                        "mass_err": 0.0,
+                        "osc_flag": False,
+                        "stiff_flag": False,
+                    },
+                )()
                 return True, metrics
-            except Exception:
+            except Exception as exc:
                 state.restore(saved)
-                return False, type("M", (), {"max_vel": 0.0, "max_flux": 0.0, "div_inf": 0.0, "mass_err": 1.0, "osc_flag": False, "stiff_flag": True})()
+                logger.exception("HybridAdapter step_super failed", exc_info=exc)
+                raise
         plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
         res = run_superstep_plan(self.sim, plan, getattr(self.sim.params, "dx", 1.0), self.dt_targets, self.dt_ctrl, advance)
         self._time += float(res.advanced)
@@ -356,8 +383,9 @@ def run_headless(adapter: BathAdapter, steps: int, dt: float) -> List[Dict[str, 
         if callable(step_super):
             try:
                 _res = step_super(float(dt))
-            except Exception:
-                adapter.step(dt)
+            except Exception as exc:
+                logger.exception("run_headless: step_super failed", exc_info=exc)
+                raise
         else:
             adapter.step(dt)
         frames.append(adapter.visualization_state())
@@ -401,8 +429,9 @@ def run_opengl(
         if callable(step_super):
             try:
                 _res = step_super(float(dt))
-            except Exception:
-                adapter.step(dt)
+            except Exception as exc:
+                logger.exception("run_opengl: step_super failed", exc_info=exc)
+                raise
         else:
             adapter.step(dt)
         state = adapter.visualization_state()
