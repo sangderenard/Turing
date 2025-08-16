@@ -161,7 +161,7 @@ def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> n
 
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
-
+    """Return a row-major view matrix."""
     eye = np.asarray(eye, dtype=np.float32)
     center = np.asarray(center, dtype=np.float32)
     up = np.asarray(up, dtype=np.float32)
@@ -326,7 +326,6 @@ def draw_layers(
             mvp = _perspective(45.0, aspect, 0.1, radius * 10.0) @ _look_at(eye, center, up)
             try:
 
-                # Transpose because OpenGL expects column-major matrices
                 renderer.set_mvp(mvp.T)
 
             except Exception:
@@ -405,7 +404,11 @@ def make_draw_hook(
 def _normalize_factory(factory: RendererFactory | object) -> Callable[[], "_GLRenderer_T"]:
     """Normalize classes, callables or instances to a zero-arg constructor."""
     if callable(factory):
+        # The input is already a class or zero-argument factory; return as-is so
+        # callers can construct the renderer directly.
         return factory  # type: ignore[misc]
+    # Wrap pre-instantiated renderer objects so call sites always receive a
+    # callable constructor instead of a raw instance.
     return lambda: factory  # type: ignore[return-value]
 
 
