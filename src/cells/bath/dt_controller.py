@@ -22,8 +22,8 @@ class STController:
     Ki: float = 0.05
     A: float = 1.5
     shrink: float = 0.5
-    dt_min: float = 1e-6
-    dt_max: float = 1.0
+    dt_min: float | None = 1e-6
+    dt_max: float | None = 1.0
     acc: float = 0.0
     max_vel_ever: float = 1e-30
     clamp_events: int = 0
@@ -48,14 +48,25 @@ class STController:
         # guard to avoid division by zero.
         self.dt_max = 1.0 * dx / max(self.max_vel_ever, 1e-30)
 
-    def pi_update(self, dt_prev: float, dt_pen: float, osc: bool) -> float:
-        e = math.log(max(dt_pen, self.dt_min)) - math.log(max(dt_prev, self.dt_min))
+    def pi_update(self, dt_prev: float, dt_pen: float, osc: bool,
+                  *, dt_min: float | None = None, dt_max: float | None = None) -> float:
+        """PI-smoothed dt proposal with optional clamps."""
+        dt_min = self.dt_min if dt_min is None else dt_min
+        dt_max = self.dt_max if dt_max is None else dt_max
+        floor = dt_min if dt_min is not None else 1e-30
+        e = math.log(max(dt_pen, floor)) - math.log(max(dt_prev, floor))
         self.acc = float(np.clip(self.acc + self.Ki * e, -self.A, self.A))
-        log_dt = math.log(max(dt_prev, self.dt_min)) + self.Kp * e + self.acc
-        dt_new = float(np.clip(math.exp(log_dt), self.dt_min, self.dt_max))
+        log_dt = math.log(max(dt_prev, floor)) + self.Kp * e + self.acc
+        dt_new = math.exp(log_dt)
+        if dt_min is not None:
+            dt_new = max(dt_new, dt_min)
+        if dt_max is not None:
+            dt_new = min(dt_new, dt_max)
         if osc:
-            dt_new = max(dt_new * self.shrink, self.dt_min)
-        return dt_new
+            dt_new *= self.shrink
+            if dt_min is not None:
+                dt_new = max(dt_new, dt_min)
+        return float(dt_new)
 
 
 def step_with_dt_control_used(state,
@@ -118,7 +129,9 @@ def step_with_dt_control_used(state,
                 )
             print("\n".join(lines))
             raise RuntimeError("adaptive timestep controller failed")
-        dt_half = max(dt * 0.5, ctrl.dt_min)
+        dt_half = dt * 0.5
+        if ctrl.dt_min is not None:
+            dt_half = max(dt_half, ctrl.dt_min)
         return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures)
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
@@ -128,7 +141,11 @@ def step_with_dt_control_used(state,
         1.0,
     )
     dt_pen = dt_cfl / penalty
-    dt_next = ctrl.pi_update(dt_prev=dt, dt_pen=dt_pen, osc=(metrics.osc_flag or metrics.stiff_flag))
+    dt_next = ctrl.pi_update(
+        dt_prev=dt,
+        dt_pen=dt_pen,
+        osc=(metrics.osc_flag or metrics.stiff_flag),
+    )
     ctrl.update_dt_max(metrics.max_vel, dx)
     return metrics, dt_next, float(dt)
 
@@ -167,7 +184,9 @@ def run_superstep(state,
         Metrics.
     """
     total = 0.0
-    dt_cap = float(max(dt_init, ctrl.dt_min))
+    dt_cap = float(dt_init)
+    if ctrl.dt_min is not None:
+        dt_cap = max(dt_cap, ctrl.dt_min)
     # Track the controller's raw proposal separately from the in-round cap so
     # that growth suggestions survive to the next meta step.  The original
     # implementation overwrote this with the clamped ``dt_cap`` which meant the
@@ -193,9 +212,11 @@ def run_superstep(state,
 
         # Enforce non-increasing dt within the round unless explicitly allowed.
         if allow_increase_mid_round:
-            dt_cap = max(ctrl.dt_min, dt_next)
+            dt_cap = dt_next if ctrl.dt_min is None else max(ctrl.dt_min, dt_next)
         else:
-            dt_cap = max(ctrl.dt_min, min(dt_cap, dt_next))
+            dt_cap = min(dt_cap, dt_next)
+            if ctrl.dt_min is not None:
+                dt_cap = max(ctrl.dt_min, dt_cap)
         # Preserve the controller's proposal for the next round rather than the
         # capped value used internally this round.
         last_dt_next = dt_next
@@ -230,7 +251,10 @@ def run_superstep_plan(state,
         eps=plan.eps,
     )
     # Minimal guess for clamped: true if next dt is smaller than attempted cap
-    clamped = bool(dt_next < max(plan.dt_init, ctrl.dt_min))
+    ref = plan.dt_init
+    if ctrl.dt_min is not None:
+        ref = max(ref, ctrl.dt_min)
+    clamped = bool(dt_next < ref)
     steps = max(1, int(round(total / max(plan.dt_init, 1e-30)))) if total > 0 else 0
     return SuperstepResult(advanced=float(total), dt_next=float(dt_next), steps=steps, clamped=clamped, metrics=metrics)
 

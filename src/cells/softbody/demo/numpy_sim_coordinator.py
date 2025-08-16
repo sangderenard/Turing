@@ -266,6 +266,10 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--dt", type=float, default=1e-10,
         help="base integrator step; increase to amplify drift",
     )
+    parser.add_argument("--dt-min", type=float, default=None,
+                        help="Minimum timestep clamp for adaptive controller (None disables)")
+    parser.add_argument("--dt-max", type=float, default=None,
+                        help="Maximum timestep clamp for adaptive controller (None uses engine estimate)")
     parser.add_argument(
         "--sim-dim",
         type=int,
@@ -700,7 +704,22 @@ def run_fluid_demo(args, *, draw_hook=None):
     engine = make_fluid_engine(args.fluid, args.sim_dim)
     dt = float(getattr(args, "dt", 1e-3))
     stats = DtStats()
-    ctrl = STController()
+    params = getattr(engine, "params", None)
+    dt_min = getattr(args, "dt_min", None)
+    dt_max = getattr(args, "dt_max", None)
+    if dt_max is None and params is not None:
+        if getattr(params, "nocap", True):
+            dt_max = None
+        else:
+            dt_max = getattr(params, "max_dt", None)
+    if dt_max is None:
+        dt0 = getattr(engine, "_stable_dt", None)
+        if callable(dt0):
+            try:
+                dt_max = float(dt0())
+            except Exception:
+                dt_max = None
+    ctrl = STController(dt_min=dt_min, dt_max=dt_max)
     params = getattr(engine, "params", None)
     cfl = float(getattr(params, "cfl", getattr(params, "cfl_number", 0.5)) or 0.5)
     targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
