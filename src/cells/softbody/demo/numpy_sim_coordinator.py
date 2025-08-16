@@ -729,6 +729,10 @@ def run_fluid_demo(args, *, draw_hook=None):
             draw_hook = _fallback
 
     for _ in range(int(args.frames)):
+        # Track the dt being attempted for the current simulation step so the
+        # HUD can display both the controller proposal and the actual step used.
+        stats.update("sim step", dt)
+
         def advance(state, dt_step: float):
             prev_mass_fn = getattr(state, "total_mass", None)
             if callable(prev_mass_fn):
@@ -761,9 +765,22 @@ def run_fluid_demo(args, *, draw_hook=None):
             ctrl=ctrl,
             advance=advance,
         )
-        if advanced <= 0.0:
-            break
+        # ``dt_next`` is the controller's proposal for the next step while
+        # ``advanced`` is the actual simulated time this round.  Record the
+        # proposal first so ratios can be computed against the attempted step.
         stats.update("fluid", dt_next)
+
+        if advanced <= 0.0:
+            # Controller failed to advance (e.g., due to repeated step
+            # rejection). Adopt the proposed ``dt_next`` and try again rather
+            # than silently exiting the demo after a single frame.
+            dt = dt_next
+            if draw_hook is not None:
+                layers = gather_layers(None, engine, for_opengl=True)
+                layers["hud_text"] = stats.lines
+                draw_hook(layers)
+            continue
+
         stats.accumulate(advanced)
         dt = dt_next
         if draw_hook is not None:
@@ -898,6 +915,8 @@ def main(*args_in, draw_hook=None):
     hooks = SimHooks()
     stats = DtStats()
     for _ in range(int(args.frames)):
+        # Record the planned dt for this superstep so HUD ratios include it.
+        stats.update("sim step", dt)
         # Plan to advance exactly one frame of time using superstep
         # Keep external coupling in sync by using the planned frame dt
         if coupler is not None:
@@ -908,8 +927,17 @@ def main(*args_in, draw_hook=None):
         res = api.step_super(round_max=dt, dt_init=dt, hooks=hooks)
         advanced = float(getattr(res, "advanced", dt))
         dt_next = float(getattr(res, "dt_next", dt))
-        stats.accumulate(advanced)
         stats.update("cellsim", dt_next)
+        if advanced > 0.0:
+            stats.accumulate(advanced)
+        else:
+            # No progress; adopt controller suggestion and retry next loop.
+            dt = dt_next
+            if draw_hook is not None:
+                layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)
+                layers["hud_text"] = stats.lines
+                draw_hook(layers)
+            continue
         dt = dt_next
         if draw_hook is not None:
             layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)

@@ -58,7 +58,14 @@ class STController:
         return dt_new
 
 
-def step_with_dt_control_used(state, dt, dx, targets: Targets, ctrl: STController, advance, retries: int = 0):
+def step_with_dt_control_used(state,
+                             dt,
+                             dx,
+                             targets: Targets,
+                             ctrl: STController,
+                             advance,
+                             retries: int = 0,
+                             failures: list[tuple[float, Metrics]] | None = None):
     """Advance with adaptive control, returning (metrics, dt_next, dt_used).
 
     This engine-agnostic helper drives a single micro-step:
@@ -66,6 +73,8 @@ def step_with_dt_control_used(state, dt, dx, targets: Targets, ctrl: STControlle
       to a shallow copy and retries with ``dt/2`` (bounded retries).
     - On success, computes a new proposal ``dt_next`` from controller PI and CFL
       targets, and reports ``dt_used`` = dt actually advanced.
+    - If every retry fails, a report of all attempts is printed and a
+      ``RuntimeError`` is raised to abort the caller.
 
     Parameters
     ----------
@@ -84,22 +93,33 @@ def step_with_dt_control_used(state, dt, dx, targets: Targets, ctrl: STControlle
         :class:`Metrics`.
     retries : int
         Current retry count (internal recursion).
+    failures : list[tuple[float, Metrics]] | None
+        Accumulator for failed attempts (internal recursion).
 
     Returns
     -------
     (Metrics, float, float)
         Tuple of ``(metrics, dt_next, dt_used)``.
     """
+    if failures is None:
+        failures = []
+
     saved = state.copy_shallow()
     ok, metrics = advance(state, dt)
     if (not ok) or (metrics.mass_err > targets.mass_max) or (metrics.div_inf > targets.div_max * 10.0):
         state.restore(saved)
+        failures.append((float(dt), metrics))
         if retries >= 3:
             ctrl.clamp_events += 1
-            # No progress made; propose same dt for next try
-            return metrics, dt, 0.0
+            lines = [f"timestep controller failed after {len(failures)} attempts:"]
+            for i, (dt_f, m) in enumerate(failures, 1):
+                lines.append(
+                    f"  attempt {i}: dt={dt_f:.6g} mass_err={m.mass_err:.3e} div_inf={m.div_inf:.3e} max_vel={m.max_vel:.3e}"
+                )
+            print("\n".join(lines))
+            raise RuntimeError("adaptive timestep controller failed")
         dt_half = max(dt * 0.5, ctrl.dt_min)
-        return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1)
+        return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures)
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
     penalty = max(
