@@ -29,6 +29,10 @@ class DtStats:
         self.dts: dict[str, float] = {}
         self.sim_time: float = 0.0
         self.t0 = time.time()
+        # Wall-clock timestamp of the most recently drawn frame. Updated when
+        # :meth:`lines` is invoked by the renderer so the HUD reflects the
+        # actual presentation time rather than the point of frame generation.
+        self.real_t: float = 0.0
 
     def update(self, name: str, dt: float) -> None:
         self.dts[name] = float(dt)
@@ -45,9 +49,13 @@ class DtStats:
                 if ref_dt:
                     lines.append(f"{name}/{ref_name}: {dt / ref_dt:.3f}")
         lines.append(f"sim t: {self.sim_time:.3f}s")
-        real = time.time() - self.t0
-        if real > 1e-12:
-            lines.append(f"real t: {real:.3f}s x{self.sim_time / real:.2f}")
+        # Capture the real time *at draw* so slow renderers continue to advance
+        # the on-screen timer while frames are displayed.
+        self.real_t = time.time() - self.t0
+        if self.real_t > 1e-12:
+            lines.append(
+                f"real t: {self.real_t:.3f}s x{self.sim_time / self.real_t:.2f}"
+            )
         return lines
 
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
@@ -718,7 +726,10 @@ def run_fluid_demo(args, *, draw_hook=None):
             # dataclasses so that higher level renderers can consume them
             # directly.
             layers = gather_layers(None, engine, for_opengl=True)
-            layers["hud_text"] = stats.lines()
+            # ``hud_text`` is a callable so the draw hook can evaluate it at
+            # presentation time, keeping the on-screen timer in sync with real
+            # wall-clock progression.
+            layers["hud_text"] = stats.lines
             draw_hook(layers)
 
 
@@ -857,7 +868,7 @@ def main(*args_in, draw_hook=None):
         dt = dt_next
         if draw_hook is not None:
             layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)
-            layers["hud_text"] = stats.lines()
+            layers["hud_text"] = stats.lines
             draw_hook(layers)
 
 if __name__ == "__main__":

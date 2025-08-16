@@ -265,7 +265,10 @@ def draw_layers(
     hud = layers.get("hud_text")
     if hud is not None and hasattr(renderer, "set_overlay_text"):
         try:
-            renderer.set_overlay_text(hud)  # type: ignore[call-arg]
+            # Allow ``hud_text`` to be a callable so timestamps can be evaluated
+            # at draw time rather than when the frame was generated.
+            hud_lines = hud() if callable(hud) else hud
+            renderer.set_overlay_text(hud_lines)  # type: ignore[call-arg]
         except Exception:
             pass
 
