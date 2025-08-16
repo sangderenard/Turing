@@ -108,6 +108,8 @@ class GLRenderThread:
                 item = None
 
             if item is None:
+                if self._stop.is_set():
+                    break
                 # queue empty or sentinel; replay history if requested
                 if self.loop_mode in {"loop", "bounce"} and self.history:
                     seq = list(self.history)

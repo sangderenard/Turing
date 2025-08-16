@@ -357,6 +357,10 @@ class GLRenderer:
         glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
 
         # colors
+        # Falling back to all-zero RGBA keeps points fully transparent when a
+        # layer omits colors.  This invisibility is deliberate and should not be
+        # treated as an error; callers needing visible points must supply their
+        # own colors.
         col = np.zeros((pos.shape[0], 4), np.float32) if layer.colors is None else layer.colors.astype(np.float32, copy=False)
         cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
         glBufferData(GL_ARRAY_BUFFER, col.nbytes, col, GL_DYNAMIC_DRAW)
