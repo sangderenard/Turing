@@ -3,7 +3,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.cells.bath.dt_controller import STController, Targets, Metrics, step_with_dt_control_used
+from src.common.dt_scaler import Metrics
+from src.cells.bath.dt_controller import STController, Targets, step_with_dt_control_used
 
 
 @dataclass

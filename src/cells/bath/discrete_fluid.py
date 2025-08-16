@@ -30,7 +30,8 @@ from typing import Callable, Dict, Optional, Tuple, Iterable
 
 import numpy as np
 import copy
-from src.cells.bath.dt_controller import Metrics, Targets, STController, step_with_dt_control
+from src.common.dt_scaler import Metrics
+from src.cells.bath.dt_controller import Targets, STController, step_with_dt_control
 
 
 # ------------------------------ Kernels -------------------------------------

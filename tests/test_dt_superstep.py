@@ -4,11 +4,11 @@ from dataclasses import dataclass
 import pytest
 
 from src.cells.bath.dt_controller import (
-    Metrics,
     Targets,
     STController,
     run_superstep_plan,
 )
+from src.common.dt_scaler import Metrics
 from src.common.dt import SuperstepPlan
 
 

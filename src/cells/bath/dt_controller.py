@@ -6,15 +6,7 @@ from dataclasses import dataclass
 import math
 import numpy as np
 
-
-@dataclass
-class Metrics:
-    max_vel: float
-    max_flux: float
-    div_inf: float
-    mass_err: float
-    osc_flag: bool = False
-    stiff_flag: bool = False
+from src.common.dt_scaler import Metrics
 
 
 @dataclass
