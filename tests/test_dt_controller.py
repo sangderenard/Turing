@@ -51,3 +51,12 @@ def test_dt_controller_step():
     metrics, dt_next = step_with_dt_control(state, 1e-4, dx, targets, ctrl, advance)
     assert dt_next > 0
     assert isinstance(metrics.max_vel, float)
+
+
+def test_dt_controller_no_clamps():
+    ctrl = STController(dt_min=None, dt_max=None)
+    dt_small = ctrl.pi_update(dt_prev=1e-8, dt_pen=1e-9, osc=False)
+    assert dt_small < 1e-6
+    ctrl2 = STController(dt_min=1e-6, dt_max=None)
+    dt_large = ctrl2.pi_update(dt_prev=1.0, dt_pen=10.0, osc=False)
+    assert dt_large > 1.0

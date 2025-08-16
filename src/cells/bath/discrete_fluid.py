@@ -243,11 +243,10 @@ class DiscreteFluid:
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
-            # choose stable dt <= dt_target (optionally <= params.max_dt)
-            if getattr(self.params, "nocap", True):
-                dt_s = min(self._stable_dt(), dt_target, remaining)
-            else:
-                dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
+            # choose stable dt <= dt_target and optionally <= params.max_dt
+            dt_s = min(self._stable_dt(), dt_target, remaining)
+            if not getattr(self.params, "nocap", True):
+                dt_s = min(dt_s, self.params.max_dt)
             hooks.run_pre(self, dt_s)
             self._substep(dt_s)
             hooks.run_post(self, dt_s)
@@ -994,7 +993,10 @@ class DiscreteFluid:
         dmax = max(p.thermal_diffusivity, p.solute_diffusivity)
         if dmax > 0:
             diff = (self.kernel.h ** 2) / (2.0 * dmax)
-        return max(1e-6, p.cfl_number * min(adv, diff))
+        dt = max(1e-6, p.cfl_number * min(adv, diff))
+        if not getattr(p, "nocap", True):
+            dt = min(dt, p.max_dt)
+        return dt
 
     # ------------------------------ Diagnostics -------------------------------
 
