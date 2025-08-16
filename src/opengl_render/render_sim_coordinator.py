@@ -95,16 +95,11 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
     with contextlib.redirect_stdout(buf):
         numpy_sim_coordinator_main(*argv, draw_hook=draw_hook)
 
-    # If a real GL window was created (threaded hook), keep it open until the
-    # user closes it.  In headless/debug modes the hook is synchronous and has
-    # no render thread attribute, so we skip this.
-    try:  # pragma: no cover - exercised interactively
-        thread = getattr(draw_hook, "_render_thread", None)
-        # Only block when a real render thread exists (GL context case)
-        if thread is not None and getattr(thread, "is_alive", lambda: False)():
-            thread.join()
-    except Exception:
-        pass
+    # Rendering is handled asynchronously by the draw hook; avoid blocking on
+    # any background render thread here so that the simulator can terminate
+    # cleanly once frame generation completes.
+    # In headless or debug modes the hook is synchronous and has no
+    # ``_render_thread`` attribute, so there's nothing further to do.
 
     out = buf.getvalue()
     if debug and not out.strip():
