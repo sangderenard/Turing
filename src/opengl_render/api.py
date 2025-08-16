@@ -15,10 +15,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Type, Union, TYPE_CHECKING
 from collections import deque
-from queue import SimpleQueue
 import colorsys
 import math
 import numpy as np
+from .double_buffer import DoubleBuffer
 
 # ---------------------------------------------------------------------------
 # Optional OpenGL types (safe under headless tests)
@@ -413,22 +413,20 @@ def make_draw_hook(
     return hook
 
 
-def make_queue_draw_hook(
+def make_double_buffer_draw_hook(
     *,
     history: int = 32,
     ghost_trail: bool = True,
 ):
-    """Return ``(queue, hook)`` for main-thread rendering.
+    """Return ``(buffer, hook)`` for main-thread rendering.
 
-    The ``hook`` appends frames to an internal :class:`~queue.SimpleQueue` so a
-    foreground event loop can consume and render them synchronously.  When
-    ``ghost_trail`` is ``True`` the hook maintains a short history of recent
-    point layers and injects a rainbow tinted ``"ghost"`` layer similar to the
-    threaded renderer.
+    The ``hook`` swaps frames into a :class:`DoubleBuffer` so a foreground event
+    loop can consume them synchronously. When ``ghost_trail`` is ``True`` the
+    hook maintains a short history of recent point layers and injects a rainbow
+    tinted ``"ghost"`` layer similar to the threaded renderer.
     """
-    frame_queue: SimpleQueue[
-        Mapping[str, Union[MeshLayer, LineLayer, PointLayer]]
-    ] = SimpleQueue()
+
+    buffer = DoubleBuffer()
     maxlen = history if history > 0 else None
     hist: deque[
         Mapping[str, Union[MeshLayer, LineLayer, PointLayer]]
@@ -448,9 +446,9 @@ def make_queue_draw_hook(
             if pts_hist:
                 frame = dict(layers)
                 frame["ghost"] = rainbow_history_points(pts_hist)
-        frame_queue.put(frame)
+        buffer.write_frame(frame)
 
-    return frame_queue, hook
+    return buffer, hook
 
 
 def _normalize_factory(factory: RendererFactory | object) -> Callable[[], "_GLRenderer_T"]:

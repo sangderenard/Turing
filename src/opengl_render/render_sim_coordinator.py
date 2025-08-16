@@ -10,10 +10,14 @@ import argparse
 import subprocess
 import sys
 import threading
-from queue import SimpleQueue
 from typing import Iterable, Mapping, Sequence, Callable
 
-from src.opengl_render.api import make_draw_hook, make_queue_draw_hook, draw_layers
+from src.opengl_render.api import (
+    make_draw_hook,
+    make_double_buffer_draw_hook,
+    draw_layers,
+)
+from src.opengl_render.double_buffer import DoubleBuffer
 
 OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),
@@ -32,7 +36,7 @@ def _menu_text() -> str:
 
 
 def render_main_loop(
-    frame_queue: SimpleQueue[Mapping[str, object]],
+    buffer: DoubleBuffer,
     *,
     menu_text: str = "",
     loop_mode: str = "idle",
@@ -48,7 +52,6 @@ def render_main_loop(
     try:
         from .renderer import GLRenderer
         import pygame
-        from queue import Empty
     except Exception:  # pragma: no cover - headless fallback
         return
 
@@ -77,11 +80,12 @@ def render_main_loop(
                 elif key_handler is not None:
                     key_handler(event.key)
 
-        try:
-            last = frame_queue.get_nowait()
+        frame = buffer.read_frame()
+        if frame is not None:
+            last = frame
             history.append(last)
             hist_idx = len(history) - 1
-        except Empty:
+        else:
             if loop_mode == "loop" and history:
                 hist_idx = (hist_idx + 1) % len(history)
                 last = history[hist_idx]
@@ -179,7 +183,7 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
 
     # Real GL path: spawn the simulator on a worker thread and render on the main
     # thread without a background render thread.
-    frame_queue, draw_hook = make_queue_draw_hook(ghost_trail=False)
+    buffer, draw_hook = make_double_buffer_draw_hook(ghost_trail=False)
 
     worker = threading.Thread(
         target=lambda: numpy_sim_coordinator_main(*argv, draw_hook=draw_hook),
@@ -187,7 +191,7 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
     )
     worker.start()
 
-    render_main_loop(frame_queue, menu_text=_menu_text(), loop_mode=loop_mode)
+    render_main_loop(buffer, menu_text=_menu_text(), loop_mode=loop_mode)
     worker.join()
     return subprocess.CompletedProcess(
         args=["numpy_sim_coordinator"] + argv, returncode=0, stdout=""
