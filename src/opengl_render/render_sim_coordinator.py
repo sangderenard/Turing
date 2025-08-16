@@ -94,6 +94,18 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         numpy_sim_coordinator_main(*argv, draw_hook=draw_hook)
+
+    # If a real GL window was created (threaded hook), keep it open until the
+    # user closes it.  In headless/debug modes the hook is synchronous and has
+    # no render thread attribute, so we skip this.
+    try:  # pragma: no cover - exercised interactively
+        thread = getattr(draw_hook, "_render_thread", None)
+        # Only block when a real render thread exists (GL context case)
+        if thread is not None and getattr(thread, "is_alive", lambda: False)():
+            thread.join()
+    except Exception:
+        pass
+
     out = buf.getvalue()
     if debug and not out.strip():
         out = "points dtype float32"
@@ -107,7 +119,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--all", action="store_true", help="Run all options sequentially")
     parser.add_argument("--debug", action="store_true", help="Enable debug rendering and logging")
     parser.add_argument("--frames", type=int, default=10, help="Number of frames to render (default: 10)")
-    parser.add_argument("--dt", type=float, default=1e-3, help="Time step for the simulation (default: 1e-3)")
+    parser.add_argument("--dt", type=float, default=1e-6, help="Frame time window; adaptive controller seeds from stability (default: 1e-6)")
     parser.add_argument("--debug-render", action="store_true", help="Enable debug rendering mode")
     parser.add_argument("--sim-dim", type=int, default=2, help="Dimensionality of the simulation (default: 2)")
     parser.add_argument(

@@ -588,7 +588,9 @@ def export_ascii_stream(args, api, provider):
     rgb = np.zeros((frames, ny, nx, 3), dtype=np.uint8)
 
     for f in range(frames):
-        dt = step_cellsim(api, dt)
+        # Advance exactly one frame using superstep (non-increasing dt within substeps)
+        res = api.step_super(round_max=dt, dt_init=dt)
+        dt = float(getattr(res, "dt_next", dt))
         h = getattr(provider, "_h", None)
         if args.verbose or args.debug:
             _log_hierarchy_state(h, f, api=api, debug=args.debug)
@@ -636,7 +638,9 @@ def stream_ascii(args, api, provider):
         return ch, col
 
     def step(dt_local):
-        return step_cellsim(api, dt_local)
+        # Use superstep to land exactly on dt_local for this frame
+        res = api.step_super(round_max=float(dt_local), dt_init=float(dt_local))
+        return float(getattr(res, "dt_next", dt_local))
 
     play_ascii_stream(
         gather_func=gather,
@@ -659,7 +663,9 @@ def stream_ascii_to_dir(args, api, provider):
     def writer():
         nonlocal dt
         for f in range(frames):
-            dt = step_cellsim(api, dt)
+            # Advance exactly one frame using superstep
+            res = api.step_super(round_max=dt, dt_init=dt)
+            dt = float(getattr(res, "dt_next", dt))
             h = getattr(provider, "_h", None)
             if args.verbose or args.debug:
                 _log_hierarchy_state(h, f, api=api, debug=args.debug)
@@ -836,13 +842,19 @@ def main(*args_in, draw_hook=None):
     hooks = SimHooks()
     stats = DtStats()
     for _ in range(int(args.frames)):
+        # Plan to advance exactly one frame of time using superstep
+        # Keep external coupling in sync by using the planned frame dt
         if coupler is not None:
             centers, vols = _centers_and_vols(provider, api)
             stats.update("fluid", dt)
             coupler.exchange(dt=dt, centers=centers, vols=vols, hooks=hooks)
-        stats.accumulate(dt)
-        dt = step_cellsim(api, dt, hooks=hooks)
-        stats.update("cellsim", dt)
+
+        res = api.step_super(round_max=dt, dt_init=dt, hooks=hooks)
+        advanced = float(getattr(res, "advanced", dt))
+        dt_next = float(getattr(res, "dt_next", dt))
+        stats.accumulate(advanced)
+        stats.update("cellsim", dt_next)
+        dt = dt_next
         if draw_hook is not None:
             layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)
             layers["hud_text"] = stats.lines()

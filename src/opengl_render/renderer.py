@@ -471,12 +471,30 @@ class GLRenderer:
             if self._font is None:
                 pygame.font.init()
                 self._font = pygame.font.SysFont("Courier", 14)
+            # Ensure alpha blending is enabled for RGBA text surfaces
+            try:
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            except Exception:
+                pass
+
             y = self._window_size[1] - 20
             for line in self._overlay_lines:
-                surf = self._font.render(line, True, (255, 255, 255))
-                data = pygame.image.tostring(surf, "RGBA", True)
-                w, h = surf.get_size()
+                # Draw a subtle outline/drop shadow so text is visible on any background
+                text_surf = self._font.render(line, True, (255, 255, 255))
+                shadow_surf = self._font.render(line, True, (0, 0, 0))
+
+                w, h = text_surf.get_size()
                 glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+                # Offsets for a simple 4-direction outline
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    sdata = pygame.image.tostring(shadow_surf, "RGBA", True)
+                    glWindowPos2f(5 + dx, y + dy)
+                    glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, sdata)
+
+                # Main text on top
+                data = pygame.image.tostring(text_surf, "RGBA", True)
                 glWindowPos2f(5, y)
                 glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
                 y -= h

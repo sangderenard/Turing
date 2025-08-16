@@ -13,7 +13,8 @@ from ..mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
 from tqdm.auto import tqdm  # type: ignore
-from src.cells.bath.dt_controller import STController, Targets, Metrics, step_with_dt_control
+from src.cells.bath.dt_controller import STController, Targets, Metrics, step_with_dt_control, run_superstep_plan
+from src.common.dt import SuperstepPlan, SuperstepResult
 
 # Module logger (DEBUG by default so logs appear without extra setup)
 logger = logging.getLogger("cellsim.api.saline")
@@ -250,6 +251,44 @@ class SalinePressureAPI:
             self.engine, dt, self.dx, self.dt_targets, self.dt_ctrl, advance
         )
         return dt_next
+
+    def step_super(self, round_max: float, dt_init: float, hooks=None, *, allow_increase_mid_round: bool = False) -> SuperstepResult:
+        """Advance exactly ``round_max`` time using superstep plan/result.
+
+        This preserves non-increasing dt within the sequence and returns a
+        :class:`~src.common.dt.SuperstepResult` describing the outcome.
+        """
+        from src.common.sim_hooks import SimHooks
+
+        hooks = hooks or SimHooks()
+
+        def advance(state, dt_step):
+            engine = self.engine
+            hooks.run_pre(engine, dt_step)
+            prev_mass = float(engine.n.sum() + engine.bath_n.sum())
+            V_before = engine.V.copy()
+            engine.step(dt_step, use_adapt=False, hooks=hooks)
+            hooks.run_post(engine, dt_step)
+            max_flux = float(np.max(np.abs(engine.V - V_before)) / max(dt_step, 1e-12))
+            mass_now = float(engine.n.sum() + engine.bath_n.sum())
+            mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-18)
+            metrics = Metrics(
+                max_vel=max_flux,
+                max_flux=max_flux,
+                div_inf=0.0,
+                mass_err=mass_err,
+            )
+            return True, metrics
+
+        plan = SuperstepPlan(round_max=float(round_max), dt_init=float(dt_init), allow_increase_mid_round=bool(allow_increase_mid_round))
+        return run_superstep_plan(
+            self.engine,
+            plan,
+            self.dx,
+            self.dt_targets,
+            self.dt_ctrl,
+            advance,
+        )
 
     # ---- helpers to construct from your legacy sim object ----
     @classmethod

@@ -100,6 +100,7 @@ class HybridParams:
     gravity: Tuple[float, float, float] = (0.0, -9.81, 0.0)
     cfl: float = 0.5
     max_dt: float = 1e-3
+    nocap: bool = True
 
     # Particle side
     particle_mass: float = 0.02
@@ -152,7 +153,7 @@ class HybridFluid:
 
     # --- internal state (filled in __post_init__) ---
     dim: int = field(init=False)
-    grid: VoxelMACFluid | None = field(init=False)
+    grid: object = field(init=False)
     phi: np.ndarray = field(init=False)       # liquid fraction per cell [0,1]
     solid: np.ndarray = field(init=False)     # cell-centered solid mask
 
@@ -178,7 +179,7 @@ class HybridFluid:
             raise ImportError("voxel_fluid.VoxelMACFluid not available; ensure sibling module is on PYTHONPATH")
         vp = VoxelFluidParams(nx=nx, ny=ny, nz=nz, dx=self.params.dx, rho0=self.params.rho0,
                               nu=self.params.nu, gravity=self.params.gravity,
-                              cfl=self.params.cfl, max_dt=self.params.max_dt)
+                              cfl=self.params.cfl, max_dt=self.params.max_dt, nocap=self.params.nocap)
         self.grid = VoxelMACFluid(vp)
         self.phi = np.zeros((nx, ny, nz), dtype=np.float64)
         self.solid = np.zeros_like(self.phi, dtype=bool)
@@ -299,7 +300,10 @@ class HybridFluid:
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
-            dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
+            if getattr(self.params, "nocap", True):
+                dt_s = min(self._stable_dt(), dt_target, remaining)
+            else:
+                dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
             hooks.run_pre(self, dt_s)
             self._substep(dt_s)
             hooks.run_post(self, dt_s)

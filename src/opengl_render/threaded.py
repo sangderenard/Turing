@@ -76,6 +76,15 @@ class GLRenderThread:
         self.queue.put(None)
         self._thread.join()
 
+    # Lifecycle helpers ------------------------------------------------
+    def is_alive(self) -> bool:
+        """Return whether the internal render thread is alive."""
+        return self._thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> None:
+        """Block until the render thread exits (user closes the window)."""
+        self._thread.join(timeout)
+
     # Internal worker ------------------------------------------------
     def _run(self) -> None:  # pragma: no cover - thread loop
         from .api import draw_layers, rainbow_history_points  # local import

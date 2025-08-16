@@ -70,6 +70,7 @@ class VoxelFluidParams:
     # Time stepping
     cfl: float = CFL
     max_dt: float = 1e-3
+    nocap: bool = True
     pressure_tol: float = 1e-6
     pressure_maxiter: int = 800
     visc_tol: float = 1e-6
@@ -181,7 +182,10 @@ class VoxelMACFluid:
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
-            dt_s = min(self._stable_dt(), dt_target, self.p.max_dt, remaining)
+            if getattr(self.p, "nocap", True):
+                dt_s = min(self._stable_dt(), dt_target, remaining)
+            else:
+                dt_s = min(self._stable_dt(), dt_target, self.p.max_dt, remaining)
             hooks.run_pre(self, dt_s)
             self._substep(dt_s)
             hooks.run_post(self, dt_s)
@@ -876,7 +880,7 @@ class VoxelMACFluid:
     def _stable_dt(self) -> float:
         # CFL based on per-axis face velocities
         if self.u.size == 0:
-            return self.p.max_dt
+            return 1e-6 if getattr(self.p, "nocap", True) else self.p.max_dt
 
         adv_limits = []
         umax = float(np.max(np.abs(self.u)))

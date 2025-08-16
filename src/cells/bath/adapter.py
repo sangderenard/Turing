@@ -9,19 +9,19 @@ branching on the backend type.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional, List
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, TYPE_CHECKING
 
 import numpy as np
 
 from .discrete_fluid import DiscreteFluid
 from .voxel_fluid import VoxelMACFluid
 from .hybrid_fluid import HybridFluid
+from .dt_controller import STController, Targets, run_superstep_plan
+from src.common.dt import SuperstepPlan, SuperstepResult
 
-try:  # Surface animation is optional; allow import failure
+if TYPE_CHECKING:  # import only for types
     from .surface_animator import SurfaceAnimator
-except Exception:  # pragma: no cover
-    SurfaceAnimator = None  # type: ignore
 
 
 class BathAdapter:
@@ -59,6 +59,11 @@ class SPHAdapter(BathAdapter):
     """Adapter for :class:`DiscreteFluid` (weakly-compressible SPH)."""
 
     sim: DiscreteFluid
+    # Adaptive dt controller state
+    dt_ctrl: STController = field(default_factory=STController)
+    dt_targets: Targets | None = None
+    _dt_curr: float = 0.0
+    _time: float = 0.0
 
     def __post_init__(self) -> None:
         # rest_density is used to convert volume sources to mass sources
@@ -82,7 +87,25 @@ class SPHAdapter(BathAdapter):
         return self.sim.apply_sources(centers, dM=dM, dS_mass=dS_mass, radius=radius)
 
     def step(self, dt: float) -> None:
-        self.sim.step(dt)
+        # Initialize targets lazily to favor CFL-only scaling against kernel h
+        if self.dt_targets is None:
+            # Use the SPH cfl_number as the target CFL; relax other penalties
+            cfl = float(getattr(self.sim.params, "cfl_number", 0.25) or 0.25)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        # Determine current dt from controller; use provided dt as seed on first call
+        if self._dt_curr <= 0.0:
+            self._dt_curr = float(dt)
+        # Advance using adaptive dt controller (velocity-scaled)
+        try:
+            _, dt_next = self.sim.step_with_controller(self._dt_curr, self.dt_ctrl, self.dt_targets)
+        except Exception:
+            # Fallback to fixed stepping if controller path fails for any reason
+            self.sim.step(self._dt_curr)
+            dt_next = self._dt_curr
+        self._time += self._dt_curr
+        self._dt_curr = float(dt_next)
+        # Optionally allow subsequent callers to pass dt_next
+        return None
 
     def visualization_state(self) -> Dict[str, np.ndarray | List]:
         pos, vec = self.sim.export_positions_vectors()
@@ -94,13 +117,48 @@ class SPHAdapter(BathAdapter):
             "surface_batches": [],
         }
 
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
+        """Advance exactly one frame window with a non-increasing dt policy.
+
+        Returns a :class:`~src.common.dt.SuperstepResult` and updates internal
+        controller state and time accumulator.
+        """
+        # Ensure targets
+        if self.dt_targets is None:
+            cfl = float(getattr(self.sim.params, "cfl_number", 0.25) or 0.25)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        if self._dt_curr <= 0.0:
+            # Seed from engine stability estimate to avoid artificial 1e-3 caps
+            dt0 = getattr(self.sim, "_stable_dt", None)
+            self._dt_curr = float(dt0() if callable(dt0) else 1e-6)
+        def advance(state, dt_step):
+            # Advance once and compute metrics à la DiscreteFluid.step_with_controller
+            prev_mass = float(np.sum(state.m))
+            state._substep(dt_step)
+            vmax = float(np.max(np.linalg.norm(state.v, axis=1))) if state.N > 0 else 0.0
+            mass_now = float(np.sum(state.m))
+            mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-12)
+            metrics = type("M", (), {"max_vel": vmax, "max_flux": vmax, "div_inf": 0.0, "mass_err": mass_err, "osc_flag": False, "stiff_flag": False})()
+            return True, metrics
+        plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
+        # For SPH, use smoothing length as spatial scale for CFL
+        dx_val = float(getattr(self.sim, "kernel", type("K", (), {"h": 1.0})()).h)
+        res = run_superstep_plan(self.sim, plan, dx_val, self.dt_targets, self.dt_ctrl, advance)
+        self._time += float(res.advanced)
+        self._dt_curr = float(res.dt_next)
+        return res
+
 
 @dataclass
 class MACAdapter(BathAdapter):
     """Adapter for :class:`VoxelMACFluid` (incompressible grid solver)."""
 
     sim: VoxelMACFluid
-    animator: Optional[SurfaceAnimator] = None
+    animator: Optional["SurfaceAnimator"] = None
+    # Adaptive dt controller state
+    dt_ctrl: STController = field(default_factory=STController)
+    dt_targets: Targets | None = None
+    _dt_curr: float = 0.0
     _time: float = 0.0
 
     def sample(self, points: np.ndarray) -> Dict[str, np.ndarray]:
@@ -119,8 +177,19 @@ class MACAdapter(BathAdapter):
         return {"dV": np.zeros_like(dV), "dS": dS}
 
     def step(self, dt: float) -> None:
-        self.sim.step(dt)
-        self._time += dt
+        # Lazy init of targets: use grid CFL and relax constraints so CFL dominates
+        if self.dt_targets is None:
+            cfl = float(getattr(self.sim, "cfl", getattr(self.sim.p, "cfl", 0.5)) or 0.5)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        if self._dt_curr <= 0.0:
+            self._dt_curr = float(dt)
+        try:
+            _, dt_next = self.sim.step_with_controller(self._dt_curr, self.dt_ctrl, self.dt_targets)
+        except Exception:
+            self.sim.step(self._dt_curr)
+            dt_next = self._dt_curr
+        self._time += self._dt_curr
+        self._dt_curr = float(dt_next)
         if self.animator is not None:
             try:
                 self.animator.update(self.sim, self._time)
@@ -143,13 +212,48 @@ class MACAdapter(BathAdapter):
                 state["surface_batches"] = []
         return state
 
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
+        if self.dt_targets is None:
+            cfl = float(getattr(self.sim, "cfl", getattr(self.sim.p, "cfl", 0.5)) or 0.5)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        if self._dt_curr <= 0.0:
+            dt0 = getattr(self.sim, "_stable_dt", None)
+            self._dt_curr = float(dt0() if callable(dt0) else 1e-6)
+        def advance(state, dt_step):
+            # Run the solver step directly; gather simple velocity metric
+            saved = state.copy_shallow()
+            try:
+                vel0 = getattr(state, "max_velocity", lambda: 0.0)()
+                state.step(dt_step)
+                vel1 = getattr(state, "max_velocity", lambda: 0.0)()
+                max_vel = max(vel0, vel1)
+                metrics = type("M", (), {"max_vel": max_vel, "max_flux": max_vel, "div_inf": 0.0, "mass_err": 0.0, "osc_flag": False, "stiff_flag": False})()
+                return True, metrics
+            except Exception:
+                state.restore(saved)
+                return False, type("M", (), {"max_vel": 0.0, "max_flux": 0.0, "div_inf": 0.0, "mass_err": 1.0, "osc_flag": False, "stiff_flag": True})()
+        plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
+        res = run_superstep_plan(self.sim, plan, getattr(self.sim, "dx", 1.0), self.dt_targets, self.dt_ctrl, advance)
+        self._time += float(res.advanced)
+        self._dt_curr = float(res.dt_next)
+        if self.animator is not None:
+            try:
+                self.animator.update(self.sim, self._time)
+            except Exception:
+                pass
+        return res
+
 
 @dataclass
 class HybridAdapter(BathAdapter):
     """Adapter for :class:`HybridFluid` (particle–grid solver)."""
 
     sim: HybridFluid
-    animator: Optional[SurfaceAnimator] = None
+    animator: Optional["SurfaceAnimator"] = None
+    # Adaptive dt controller state
+    dt_ctrl: STController = field(default_factory=STController)
+    dt_targets: Targets | None = None
+    _dt_curr: float = 0.0
     _time: float = 0.0
 
     def sample(self, points: np.ndarray) -> Dict[str, np.ndarray]:
@@ -168,8 +272,19 @@ class HybridAdapter(BathAdapter):
         return {"dV": np.zeros_like(dV), "dS": dS}
 
     def step(self, dt: float) -> None:
-        self.sim.step(dt)
-        self._time += dt
+        if self.dt_targets is None:
+            # Use grid CFL from hybrid params; relax other penalties
+            cfl = float(getattr(self.sim.params, "cfl", 0.5) or 0.5)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        if self._dt_curr <= 0.0:
+            self._dt_curr = float(dt)
+        try:
+            _, dt_next = self.sim.step_with_controller(self._dt_curr, self.dt_ctrl, self.dt_targets)
+        except Exception:
+            self.sim.step(self._dt_curr)
+            dt_next = self._dt_curr
+        self._time += self._dt_curr
+        self._dt_curr = float(dt_next)
         if self.animator is not None:
             try:
                 self.animator.update(self.sim.grid, self._time)
@@ -195,6 +310,36 @@ class HybridAdapter(BathAdapter):
                 state["surface_batches"] = []
         return state
 
+    def step_super(self, round_max: float, allow_increase_mid_round: bool = False) -> SuperstepResult:
+        if self.dt_targets is None:
+            cfl = float(getattr(self.sim.params, "cfl", 0.5) or 0.5)
+            self.dt_targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+        if self._dt_curr <= 0.0:
+            dt0 = getattr(self.sim, "_stable_dt", None)
+            self._dt_curr = float(dt0() if callable(dt0) else 1e-6)
+        def advance(state, dt_step):
+            saved = state.copy_shallow()
+            try:
+                v0 = getattr(state, "max_velocity", lambda: 0.0)()
+                state.step(dt_step)
+                v1 = getattr(state, "max_velocity", lambda: 0.0)()
+                vmax = max(v0, v1)
+                metrics = type("M", (), {"max_vel": vmax, "max_flux": vmax, "div_inf": 0.0, "mass_err": 0.0, "osc_flag": False, "stiff_flag": False})()
+                return True, metrics
+            except Exception:
+                state.restore(saved)
+                return False, type("M", (), {"max_vel": 0.0, "max_flux": 0.0, "div_inf": 0.0, "mass_err": 1.0, "osc_flag": False, "stiff_flag": True})()
+        plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
+        res = run_superstep_plan(self.sim, plan, getattr(self.sim.params, "dx", 1.0), self.dt_targets, self.dt_ctrl, advance)
+        self._time += float(res.advanced)
+        self._dt_curr = float(res.dt_next)
+        if self.animator is not None:
+            try:
+                self.animator.update(self.sim.grid, self._time)
+            except Exception:
+                pass
+        return res
+
 
 def run_headless(adapter: BathAdapter, steps: int, dt: float) -> List[Dict[str, np.ndarray | List]]:
     """Advance ``adapter`` for ``steps`` without drawing.
@@ -206,7 +351,15 @@ def run_headless(adapter: BathAdapter, steps: int, dt: float) -> List[Dict[str, 
 
     frames: List[Dict[str, np.ndarray | List]] = []
     for _ in range(int(steps)):
-        adapter.step(dt)
+        # Prefer exact landing via superstep when available
+        step_super = getattr(adapter, "step_super", None)
+        if callable(step_super):
+            try:
+                _res = step_super(float(dt))
+            except Exception:
+                adapter.step(dt)
+        else:
+            adapter.step(dt)
         frames.append(adapter.visualization_state())
     return frames
 
@@ -243,7 +396,15 @@ def run_opengl(
     frames: List[Dict[str, Dict[str, np.ndarray]]] = []
 
     for _ in range(int(steps)):
-        adapter.step(dt)
+        # Prefer exact landing via superstep when available
+        step_super = getattr(adapter, "step_super", None)
+        if callable(step_super):
+            try:
+                _res = step_super(float(dt))
+            except Exception:
+                adapter.step(dt)
+        else:
+            adapter.step(dt)
         state = adapter.visualization_state()
 
         p_pos = np.asarray(state.get("positions", np.zeros((0, 3))), dtype=float)

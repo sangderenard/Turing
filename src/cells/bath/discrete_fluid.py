@@ -109,7 +109,8 @@ class FluidParams:
     # Time stepping / stabilization
     xsph_eps: float = 0.0                 # XSPH velocity blending (0..0.5 typical)
     cfl_number: float = 0.25
-    max_dt: float = 1e-3                  # safety cap
+    max_dt: float = 1e-3                  # safety cap (ignored when nocap=True)
+    nocap: bool = True                    # when True, do not enforce max_dt caps
 
     # Boundary
     bounce_damping: float = 0.0           # velocity damping on boundary collision [0..1]
@@ -241,8 +242,11 @@ class DiscreteFluid:
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
-            # choose stable dt <= dt_target and <= params.max_dt
-            dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
+            # choose stable dt <= dt_target (optionally <= params.max_dt)
+            if getattr(self.params, "nocap", True):
+                dt_s = min(self._stable_dt(), dt_target, remaining)
+            else:
+                dt_s = min(self._stable_dt(), dt_target, self.params.max_dt, remaining)
             hooks.run_pre(self, dt_s)
             self._substep(dt_s)
             hooks.run_post(self, dt_s)
