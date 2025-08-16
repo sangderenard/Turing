@@ -1,59 +1,53 @@
 import time
-import torch
 import threading
 from collections import defaultdict, deque
-import threading, time
 import numpy as np
-from collections import deque
-import threading
-import time
-import numpy as np
-import torch
 import random
 import os
-import networkx as nx
 import queue  # <-- Add this for LockManagerThread and elsewhere
-
-# Optional: OpenGL and CUDA interop for Tribuffer video buffer support
 import importlib
 import subprocess
 import sys
 
+try:  # Optional heavy deps
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
+try:
+    import networkx as nx
+except Exception:  # pragma: no cover
+    nx = None  # type: ignore
+
 def ensure_package(pkg_name, import_name=None):
-    """
-    Ensure that pkg_name is installed (via pip) and importable.
-    pkg_name: the name to pass to pip
-    import_name: the module name to import (if different)
-    """
+    """Best-effort import helper that skips installation if missing."""
     module_name = import_name or pkg_name
     try:
-        importlib.import_module(module_name)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
-        importlib.invalidate_caches()
-    return importlib.import_module(module_name)
+        return importlib.import_module(module_name)
+    except Exception:  # pragma: no cover
+        return None
 
 # ---- install & import PyOpenGL and PyCUDA if needed ----
-gl     = ensure_package("PyOpenGL",      "OpenGL.GL")
-_gl_all = ensure_package("PyOpenGL",      "OpenGL.GL")  # for `from OpenGL.GL import *`
-shaders = ensure_package("PyOpenGL",      "OpenGL.GL.shaders")
-
-# you’ll now have:
-#   gl      → the OpenGL.GL module
-#   _gl_all → same, so `from _gl_all import *` works
-#   shaders → OpenGL.GL.shaders
+try:
+    gl = ensure_package("PyOpenGL", "OpenGL.GL")
+    _gl_all = gl  # for `from OpenGL.GL import *`
+    shaders = ensure_package("PyOpenGL", "OpenGL.GL.shaders")
+    from OpenGL.GL import *  # type: ignore
+    from OpenGL.GL.shaders import compileShader, compileProgram  # type: ignore
+except Exception:  # pragma: no cover
+    gl = _gl_all = shaders = None  # type: ignore
+    def compileShader(*args, **kwargs):  # type: ignore
+        raise RuntimeError("OpenGL not available")
+    def compileProgram(*args, **kwargs):  # type: ignore
+        raise RuntimeError("OpenGL not available")
 
 # attempt PyCUDA-GL interop
-try:
+try:  # pragma: no cover
     cuda_gl = ensure_package("pycuda", "pycuda.gl")
-    cuda    = ensure_package("pycuda", "pycuda.driver")
-except Exception:
+    cuda = ensure_package("pycuda", "pycuda.driver")
+except Exception:  # pragma: no cover
     cuda_gl = None
-    cuda    = None
-
-# finally, bring in all the GL symbols you need
-from OpenGL.GL import *
-from OpenGL.GL.shaders import compileShader, compileProgram
+    cuda = None
 
 
 VERBOSE = False
@@ -1087,6 +1081,7 @@ class DoubleBuffer:
         self.reference = reference or physics_keys
         self.read_idx = [0] * num_agents
         self.write_idx = [1] * num_agents
+        self.frames = [None] * roll_length
         phase_distance = roll_length // num_agents
         for i in range(num_agents):
             self.read_idx[i] = self.read_idx[i-1]+1 if i > 0 else 0
@@ -1125,6 +1120,23 @@ class DoubleBuffer:
         idx = self.get_read_page(agent_idx) if mode == 'read' else self.get_write_page(agent_idx)
         if callback:
             return callback(idx, keys, agent_idx)
+
+    # Lightweight frame exchange helpers ---------------------------------
+    def write_frame(self, frame, agent_idx=0):
+        verbose_log(f"DoubleBuffer.write_frame(agent_idx={agent_idx})")
+        idx = self.get_write_page(agent_idx)
+        self.frames[idx] = frame
+        self.advance(agent_idx)
+
+    def read_frame(self, agent_idx=1):
+        verbose_log(f"DoubleBuffer.read_frame(agent_idx={agent_idx})")
+        idx = self.get_read_page(agent_idx)
+        frame = self.frames[idx]
+        if frame is not None:
+            self.frames[idx] = None
+            self.advance(agent_idx)
+            return frame
+        return None
 
 class NumpyActionHistory:
     def __init__(self, num_agents, num_pages, num_keys, window_size=256):
@@ -1193,7 +1205,10 @@ import time
 import threading
 import random
 import numpy as np
-import torch
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 # ----------- Gold Standard Stress Test ------------
 
