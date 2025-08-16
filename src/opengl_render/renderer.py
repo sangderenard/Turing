@@ -123,13 +123,13 @@ void main(){
 
 POINT_FS = """
 #version 330 core
-in vec4 vColor;
+//in vec4 vColor;
 out vec4 FragColor;
 void main(){
-    vec2 uv = gl_PointCoord * 2.0 - 1.0;
-    float r2 = dot(uv, uv);
-    if (r2 > 1.0) discard;
-    float edge = smoothstep(0.7, 1.0, r2);
+    //vec2 uv = gl_PointCoord * 2.0 - 1.0;
+    //float r2 = dot(uv, uv);
+    //if (r2 > 1.0) discard;
+    //float edge = smoothstep(0.7, 1.0, r2);
     FragColor = vec4(1.0,1.0,1.0,1.0);//vec4(vColor.rgb, vColor.a);// * (1.0 - edge));
 }
 """

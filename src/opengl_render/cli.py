@@ -92,7 +92,7 @@ def run():
     sint = np.sqrt(1 - cost * cost)
     base_pts = np.stack([sint * np.cos(phi), sint * np.sin(phi), cost], axis=1).astype(np.float32) * 2.2
     pt_colors = np.ones((npts, 4), np.float32)
-    #pt_colors[:, :3] = np.array([1.0, 0.2, 0.2], np.float32)
+    pt_colors[:, :3] = np.array([1.0, 0.2, 0.2], np.float32)
     pt_sizes = np.full((npts,), 8.0, np.float32)
 
     # ------------------------------------------------------------------------
