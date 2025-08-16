@@ -142,8 +142,12 @@ def pack_points(
 # Minimal camera helpers
 # ---------------------------------------------------------------------------
 
+# NOTE: Matrices are **row-major** (NumPy convention).  When sending them to
+# OpenGL uniforms, transpose first so the data is interpreted correctly as
+# column-major.
+
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
-    """Return a column-major perspective projection matrix."""
+    """Return a row-major perspective projection matrix."""
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
     m = np.zeros((4, 4), dtype=np.float32)
     m[0, 0] = f / aspect
@@ -155,7 +159,7 @@ def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> n
 
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
-    """Return a column-major view matrix."""
+    """Return a row-major view matrix."""
     eye = np.asarray(eye, dtype=np.float32)
     center = np.asarray(center, dtype=np.float32)
     up = np.asarray(up, dtype=np.float32)
@@ -311,7 +315,8 @@ def draw_layers(
             aspect = float(viewport[0]) / float(viewport[1])
             mvp = _perspective(45.0, aspect, 0.1, radius * 10.0) @ _look_at(eye, center, up)
             try:
-                renderer.set_mvp(mvp)
+                # Transpose because OpenGL expects column-major matrices
+                renderer.set_mvp(mvp.T)
             except Exception:
                 pass
 
@@ -388,7 +393,11 @@ def make_draw_hook(
 def _normalize_factory(factory: RendererFactory | object) -> Callable[[], "_GLRenderer_T"]:
     """Normalize classes, callables or instances to a zero-arg constructor."""
     if callable(factory):
+        # The input is already a class or zero-argument factory; return as-is so
+        # callers can construct the renderer directly.
         return factory  # type: ignore[misc]
+    # Wrap pre-instantiated renderer objects so call sites always receive a
+    # callable constructor instead of a raw instance.
     return lambda: factory  # type: ignore[return-value]
 
 
