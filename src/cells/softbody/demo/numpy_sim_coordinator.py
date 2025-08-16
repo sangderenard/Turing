@@ -107,13 +107,18 @@ def make_fluid_engine(kind: str, dim: int):
     kind = (kind or "").lower()
     if kind == "discrete":
         from src.cells.bath.discrete_fluid import DiscreteFluid, FluidParams
+        from src.opengl_render.api import rainbow_colors
 
         params = FluidParams()
         # Place a tiny cross of particles for determinism
         from ..geometry.geodesic import icosahedron
         pts = icosahedron(radius=1.2)[0]
-        
-        return DiscreteFluid(pts, None, None, None, params)
+
+        fluid = DiscreteFluid(pts, None, None, None, params)
+        # Visualization helpers for OpenGL rendering
+        fluid._render_colors = rainbow_colors(pts.shape[0])
+        fluid._render_sizes = np.full((pts.shape[0],), 4.0, np.float32)
+        return fluid
     if kind == "voxel":
         from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
 

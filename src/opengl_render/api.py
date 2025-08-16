@@ -142,12 +142,14 @@ def pack_points(
 # Minimal camera helpers
 # ---------------------------------------------------------------------------
 
+
 # NOTE: Matrices are **row-major** (NumPy convention).  When sending them to
 # OpenGL uniforms, transpose first so the data is interpreted correctly as
 # column-major.
 
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     """Return a row-major perspective projection matrix."""
+
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
     m = np.zeros((4, 4), dtype=np.float32)
     m[0, 0] = f / aspect
@@ -159,7 +161,7 @@ def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> n
 
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
-    """Return a row-major view matrix."""
+
     eye = np.asarray(eye, dtype=np.float32)
     center = np.asarray(center, dtype=np.float32)
     up = np.asarray(up, dtype=np.float32)
@@ -225,7 +227,15 @@ def fluid_layers(engine: Any, *, rainbow: bool = False) -> Mapping[str, Union[Me
     layers: dict[str, Union[MeshLayer, PointLayer]] = {}
     pts = getattr(engine, "p", None)
     if pts is not None:
-        layers["fluid"] = pack_points(np.asarray(pts, dtype=np.float32), rainbow=rainbow, default_size=2.0)
+        col = getattr(engine, "_render_colors", None)
+        sizes = getattr(engine, "_render_sizes", None)
+        layers["fluid"] = pack_points(
+            np.asarray(pts, dtype=np.float32),
+            colors=col,
+            rainbow=rainbow,
+            sizes=sizes,
+            default_size=2.0,
+        )
     return layers
 
 
@@ -271,8 +281,8 @@ def draw_layers(
         def _as_colors(pl: PointLayer, n: int) -> np.ndarray:
             if getattr(pl, "colors", None) is not None:
                 return pl.colors
-            # default opaque white if layer has no colors
-            return np.tile(np.array([[1, 1, 1, 1]], dtype=np.float32), (n, 1))
+            # Missing colors default to zeros (fully transparent)
+            return np.zeros((n, 4), np.float32)
 
         col = np.concatenate([
             _as_colors(pts, pts.positions.shape[0]),
@@ -315,8 +325,10 @@ def draw_layers(
             aspect = float(viewport[0]) / float(viewport[1])
             mvp = _perspective(45.0, aspect, 0.1, radius * 10.0) @ _look_at(eye, center, up)
             try:
+
                 # Transpose because OpenGL expects column-major matrices
                 renderer.set_mvp(mvp.T)
+
             except Exception:
                 pass
 
