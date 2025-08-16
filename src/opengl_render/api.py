@@ -262,6 +262,13 @@ def draw_layers(
     if viewport is None:
         viewport = getattr(renderer, "_window_size", (640, 480))
 
+    hud = layers.get("hud_text")
+    if hud is not None and hasattr(renderer, "set_overlay_text"):
+        try:
+            renderer.set_overlay_text(hud)  # type: ignore[call-arg]
+        except Exception:
+            pass
+
     mesh = layers.get("membrane")
     if isinstance(mesh, MeshLayer):
         renderer.set_mesh(mesh)

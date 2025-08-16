@@ -5,6 +5,7 @@ import numpy as np
 import logging
 import os
 import threading
+import time
 
 from src.cells.cellsim.data.state import Cell, Bath
 from src.cells.cellsim.api.saline import SalinePressureAPI
@@ -19,6 +20,35 @@ import math
 # Generic layer packing for external renderers
 
 logger = logging.getLogger(__name__)
+
+
+class DtStats:
+    """Track per-simulator ``dt`` values and wall-clock time."""
+
+    def __init__(self) -> None:
+        self.dts: dict[str, float] = {}
+        self.sim_time: float = 0.0
+        self.t0 = time.time()
+
+    def update(self, name: str, dt: float) -> None:
+        self.dts[name] = float(dt)
+
+    def accumulate(self, dt: float) -> None:
+        self.sim_time += float(dt)
+
+    def lines(self) -> list[str]:
+        lines = [f"{k} dt: {v:.3e}" for k, v in self.dts.items()]
+        if len(self.dts) > 1:
+            items = list(self.dts.items())
+            ref_name, ref_dt = items[0]
+            for name, dt in items[1:]:
+                if ref_dt:
+                    lines.append(f"{name}/{ref_name}: {dt / ref_dt:.3f}")
+        lines.append(f"sim t: {self.sim_time:.3f}s")
+        real = time.time() - self.t0
+        if real > 1e-12:
+            lines.append(f"real t: {real:.3f}s x{self.sim_time / real:.2f}")
+        return lines
 
 def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
@@ -654,6 +684,7 @@ def stream_ascii_to_dir(args, api, provider):
 def run_fluid_demo(args, *, draw_hook=None):
     engine = make_fluid_engine(args.fluid, args.sim_dim)
     dt = float(getattr(args, "dt", 1e-3))
+    stats = DtStats()
 
     # When no hook is provided explicitly, fall back to the original debug
     # renderer behaviour when ``--debug-render`` is set.  This mirrors the
@@ -674,11 +705,14 @@ def run_fluid_demo(args, *, draw_hook=None):
 
     for _ in range(int(args.frames)):
         engine.step(dt)
+        stats.update("fluid", dt)
+        stats.accumulate(dt)
         if draw_hook is not None:
             # When a draw hook is provided we feed it OpenGL-oriented layer
             # dataclasses so that higher level renderers can consume them
             # directly.
             layers = gather_layers(None, engine, for_opengl=True)
+            layers["hud_text"] = stats.lines()
             draw_hook(layers)
 
 
@@ -800,13 +834,18 @@ def main(*args_in, draw_hook=None):
 
     dt = float(getattr(args, "dt", 1e-3))
     hooks = SimHooks()
+    stats = DtStats()
     for _ in range(int(args.frames)):
         if coupler is not None:
             centers, vols = _centers_and_vols(provider, api)
+            stats.update("fluid", dt)
             coupler.exchange(dt=dt, centers=centers, vols=vols, hooks=hooks)
+        stats.accumulate(dt)
         dt = step_cellsim(api, dt, hooks=hooks)
+        stats.update("cellsim", dt)
         if draw_hook is not None:
             layers = gather_layers(provider, fluid_engine, rainbow=False, for_opengl=True)
+            layers["hud_text"] = stats.lines()
             draw_hook(layers)
 
 if __name__ == "__main__":
