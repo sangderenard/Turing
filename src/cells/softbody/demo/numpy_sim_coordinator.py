@@ -726,11 +726,6 @@ def run_fluid_demo(args, *, draw_hook=None):
     params = getattr(engine, "params", None)
     dt_min = getattr(args, "dt_min", None)
     dt_max = getattr(args, "dt_max", None)
-    if dt_max is None and params is not None:
-        if getattr(params, "nocap", True):
-            dt_max = None
-        else:
-            dt_max = getattr(params, "max_dt", None)
     if dt_max is None:
         dt0 = getattr(engine, "_stable_dt", None)
         if callable(dt0):
