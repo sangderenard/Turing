@@ -404,7 +404,7 @@ class GLRenderer:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # 1) Meshes (base)
-        if False and self._mesh:
+        if self._mesh:
             glUseProgram(self.prog_mesh)
             uMVP  = glGetUniformLocation(self.prog_mesh, "uMVP")
             uCol  = glGetUniformLocation(self.prog_mesh, "uMeshColor")
@@ -417,7 +417,7 @@ class GLRenderer:
             glBindVertexArray(0)
 
         # 2) Lines (edges)
-        if False and self._line:
+        if self._line:
             glUseProgram(self.prog_line)
             uMVP  = glGetUniformLocation(self.prog_line, "uMVP")
             uAlph = glGetUniformLocation(self.prog_line, "uAlpha")
