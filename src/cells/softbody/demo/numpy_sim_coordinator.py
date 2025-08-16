@@ -24,9 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class DtStats:
-    """Track per-simulator ``dt`` values and wall-clock time."""
+    """Track per-simulator ``dt`` values and wall-clock time.
 
-    def __init__(self) -> None:
+    ``warn_thresh`` (if >0) marks entries whose controller output drops below
+    this threshold, aiding HUD debugging when ``dt`` collapses.
+    """
+
+    def __init__(self, warn_thresh: float = 0.0) -> None:
         self.dts: dict[str, float] = {}
         self.sim_time: float = 0.0
         self.t0 = time.time()
@@ -34,15 +38,25 @@ class DtStats:
         # :meth:`lines` is invoked by the renderer so the HUD reflects the
         # actual presentation time rather than the point of frame generation.
         self.real_t: float = 0.0
+        self.warn_thresh = float(warn_thresh)
+        self._clamped: set[str] = set()
 
     def update(self, name: str, dt: float) -> None:
-        self.dts[name] = float(dt)
+        dt = float(dt)
+        self.dts[name] = dt
+        if self.warn_thresh > 0 and name != "sim step" and dt < self.warn_thresh:
+            self._clamped.add(name)
+        else:
+            self._clamped.discard(name)
 
     def accumulate(self, dt: float) -> None:
         self.sim_time += float(dt)
 
     def lines(self) -> list[str]:
-        lines = [f"{k} dt: {v:.3e}" for k, v in self.dts.items()]
+        lines = []
+        for k, v in self.dts.items():
+            mark = " !" if k in self._clamped else ""
+            lines.append(f"{k} dt: {v:.3e}{mark}")
         if len(self.dts) > 1:
             items = list(self.dts.items())
             ref_name, ref_dt = items[0]
@@ -270,6 +284,10 @@ def build_numpy_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help="Minimum timestep clamp for adaptive controller (None disables)")
     parser.add_argument("--dt-max", type=float, default=None,
                         help="Maximum timestep clamp for adaptive controller (None uses engine estimate)")
+    parser.add_argument(
+        "--dt-warn", type=float, default=0.0,
+        help="HUD marker threshold when controller dt falls below this value",
+    )
     parser.add_argument(
         "--sim-dim",
         type=int,
@@ -703,7 +721,8 @@ def stream_ascii_to_dir(args, api, provider):
 def run_fluid_demo(args, *, draw_hook=None):
     engine = make_fluid_engine(args.fluid, args.sim_dim)
     dt = float(getattr(args, "dt", 1e-3))
-    stats = DtStats()
+
+    stats = DtStats(warn_thresh=getattr(args, "dt_warn", 0.0))
     params = getattr(engine, "params", None)
     dt_min = getattr(args, "dt_min", None)
     dt_max = getattr(args, "dt_max", None)
@@ -720,6 +739,7 @@ def run_fluid_demo(args, *, draw_hook=None):
             except Exception:
                 dt_max = None
     ctrl = STController(dt_min=dt_min, dt_max=dt_max)
+
     params = getattr(engine, "params", None)
     cfl = float(getattr(params, "cfl", getattr(params, "cfl_number", 0.5)) or 0.5)
     targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
@@ -747,6 +767,7 @@ def run_fluid_demo(args, *, draw_hook=None):
 
             draw_hook = _fallback
 
+    prev_clamps = 0
     for _ in range(int(args.frames)):
         # Track the dt being attempted for the current simulation step so the
         # HUD can display both the controller proposal and the actual step used.
@@ -759,10 +780,18 @@ def run_fluid_demo(args, *, draw_hook=None):
             else:
                 m = getattr(state, "m", None)
                 prev_mass = float(np.sum(m)) if isinstance(m, np.ndarray) else 0.0
-            step_fn = getattr(state, "_substep", getattr(state, "step", None))
+            # Prefer the engine's public ``step`` method so it can internally
+            # subdivide as needed. Fall back to ``_substep`` for legacy
+            # simulators that have not yet been updated.
+            step_fn = getattr(state, "step", None)
+            if not callable(step_fn):
+                step_fn = getattr(state, "_substep", None)
             if not callable(step_fn):
                 return False, Metrics(0.0, 0.0, 0.0, 1.0, False, True)
             step_fn(dt_step)
+
+            # Preserve metric collection after the higher-level step so the
+            # controller, couplers, and HUD remain in sync.
             compute_metrics_fn = getattr(state, "compute_metrics", None)
             if callable(compute_metrics_fn):
                 metrics = compute_metrics_fn(prev_mass)
@@ -784,13 +813,19 @@ def run_fluid_demo(args, *, draw_hook=None):
             ctrl=ctrl,
             advance=advance,
         )
-        logger.debug(
-            "run_superstep advanced=%s dt_next=%s max_vel=%s mass_err=%s",
+        logger.info(
+            "fluid step dt=%s advanced=%s dt_next=%s max_vel=%s mass_err=%s",
+            dt,
             advanced,
             dt_next,
             getattr(metrics, "max_vel", None),
             getattr(metrics, "mass_err", None),
         )
+        if ctrl.clamp_events > prev_clamps:
+            logger.warning(
+                "controller clamp events: %s", ctrl.clamp_events - prev_clamps
+            )
+            prev_clamps = ctrl.clamp_events
         # ``dt_next`` is the controller's proposal for the next step while
         # ``advanced`` is the actual simulated time this round.  Record the
         # proposal first so ratios can be computed against the attempted step.
@@ -944,7 +979,7 @@ def main(*args_in, draw_hook=None):
 
     dt = float(getattr(args, "dt", 1e-3))
     hooks = SimHooks()
-    stats = DtStats()
+    stats = DtStats(warn_thresh=getattr(args, "dt_warn", 0.0))
     for _ in range(int(args.frames)):
         # Record the planned dt for this superstep so HUD ratios include it.
         stats.update("sim step", dt)
