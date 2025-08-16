@@ -14,6 +14,8 @@ Design notes
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Type, Union, TYPE_CHECKING
+from collections import deque
+from queue import SimpleQueue
 import colorsys
 import math
 import numpy as np
@@ -409,6 +411,46 @@ def make_draw_hook(
         pass
 
     return hook
+
+
+def make_queue_draw_hook(
+    *,
+    history: int = 32,
+    ghost_trail: bool = True,
+):
+    """Return ``(queue, hook)`` for main-thread rendering.
+
+    The ``hook`` appends frames to an internal :class:`~queue.SimpleQueue` so a
+    foreground event loop can consume and render them synchronously.  When
+    ``ghost_trail`` is ``True`` the hook maintains a short history of recent
+    point layers and injects a rainbow tinted ``"ghost"`` layer similar to the
+    threaded renderer.
+    """
+    frame_queue: SimpleQueue[
+        Mapping[str, Union[MeshLayer, LineLayer, PointLayer]]
+    ] = SimpleQueue()
+    maxlen = history if history > 0 else None
+    hist: deque[
+        Mapping[str, Union[MeshLayer, LineLayer, PointLayer]]
+    ] = deque(maxlen=maxlen)
+
+    def hook(
+        layers: Mapping[str, Union[MeshLayer, LineLayer, PointLayer]]
+    ) -> None:
+        hist.append(layers)
+        frame = layers
+        if ghost_trail:
+            pts_hist = []
+            for past in list(hist)[:-1]:
+                pts = past.get("fluid") or past.get("points")
+                if isinstance(pts, PointLayer):
+                    pts_hist.append(pts.positions)
+            if pts_hist:
+                frame = dict(layers)
+                frame["ghost"] = rainbow_history_points(pts_hist)
+        frame_queue.put(frame)
+
+    return frame_queue, hook
 
 
 def _normalize_factory(factory: RendererFactory | object) -> Callable[[], "_GLRenderer_T"]:
