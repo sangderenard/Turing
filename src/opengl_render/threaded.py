@@ -14,11 +14,13 @@ class GLRenderThread:
 
     Parameters
     ----------
-    renderer:
-        Object with :func:`print_layers` or OpenGL ``draw`` methods.
+    renderer_factory:
+        Callable that returns an object with :func:`print_layers` or OpenGL
+        ``draw`` methods. The renderer is constructed inside the render
+        thread to ensure proper OpenGL context affinity.
     viewport:
         Tuple ``(width, height)`` describing the viewport in pixels.  When
-        omitted the renderer's window size is used.
+        omitted, the renderer's internal default is used by the draw API.
     history:
         Maximum number of past frames to retain. ``0`` keeps an unbounded
         history.
@@ -32,7 +34,7 @@ class GLRenderThread:
 
     def __init__(
         self,
-        renderer: object,
+        renderer_factory: Callable[[], object],
         *,
         viewport: tuple[int, int] | None = None,
         history: int = 32,
@@ -40,9 +42,9 @@ class GLRenderThread:
         bounce: bool = False,
         ghost_trail: bool = True,
     ) -> None:
-        self.renderer = renderer
-        if viewport is None:
-            viewport = getattr(renderer, "_window_size", (640, 480))
+        self._renderer_factory = renderer_factory
+        self.renderer: object | None = None
+        # May be None; draw_layers will fall back to renderer default
         self.viewport = viewport
         maxlen = history if history > 0 else None
         self.history: deque[Mapping[str, object]] = deque(maxlen=maxlen)
@@ -82,6 +84,15 @@ class GLRenderThread:
             PointLayer = None  # type: ignore
 
         while not self._stop.is_set():
+            # Lazily construct the renderer in this thread before any drawing
+            if self.renderer is None:
+                try:
+                    self.renderer = self._renderer_factory()
+                except Exception:
+                    # If creation fails, sleep briefly and retry loop; allows
+                    # environments without GL libs to progress/exit cleanly.
+                    time.sleep(0.05)
+                    continue
             try:
                 item = self.queue.get(timeout=0.01)
             except queue.Empty:
@@ -96,7 +107,7 @@ class GLRenderThread:
                     for frame in seq:
                         if self._stop.is_set():
                             break
-                        draw_layers(self.renderer, frame, self.viewport)
+                        draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
                         time.sleep(0.01)
                 continue
 
@@ -113,6 +124,6 @@ class GLRenderThread:
                     ghost = rainbow_history_points(pts_hist)
                     frame = dict(item)
                     frame["ghost"] = ghost
-            draw_layers(self.renderer, frame, self.viewport)
+            draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
             self.queue.task_done()
         time.sleep(0.01)

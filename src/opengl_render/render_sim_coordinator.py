@@ -60,14 +60,14 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
     # invoking its ``main`` entry point.  To keep tests working on headless
     # systems, fall back to a simple stub renderer when OpenGL is unavailable.
     try:  # pragma: no cover - exercised via tests
-        from .renderer import GLRenderer as _GLRenderer
-        renderer = _GLRenderer()
+        from .renderer import GLRenderer
+        renderer = GLRenderer
     except Exception:  # noqa: BLE001
         class _StubRenderer:
             def print_layers(self, layers):  # pragma: no cover - debug helper
                 # In headless test environments we discard layer data entirely.
                 # The caller will synthesize a minimal placeholder message.
-                return None
+                return None # this isn't acceptable, replace with a redirect to the dummy renderer
 
         renderer = _StubRenderer()
 

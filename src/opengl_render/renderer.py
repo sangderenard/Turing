@@ -129,8 +129,8 @@ void main(){
     vec2 uv = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(uv, uv);
     if (r2 > 1.0) discard;
-    float edge = smoothstep(1.0, 0.7, r2);
-    FragColor = vec4(vColor.rgb, vColor.a * (1.0 - edge));
+    float edge = smoothstep(0.7, 1.0, r2);
+    FragColor = vec4(1.0,1.0,1.0,1.0);//vec4(vColor.rgb, vColor.a);// * (1.0 - edge));
 }
 """
 
@@ -161,6 +161,7 @@ class PointLayer:
     sizes_px:  Optional[np.ndarray] = None   # (Np,) float32
     size_px_default: float = 6.0
     alpha: float = 1.0
+    
 
 # ---------------------------
 # Debug renderer
@@ -374,7 +375,7 @@ class GLRenderer:
     def update_points(self, positions: Optional[np.ndarray] = None,
                       colors: Optional[np.ndarray] = None,
                       sizes_px: Optional[np.ndarray] = None):
-        if not self._point: return
+        #if not self._point: return
         if positions is not None:
             glBindBuffer(GL_ARRAY_BUFFER, self._point["vbo"])
             data = positions.astype(np.float32, copy=False)
@@ -399,7 +400,7 @@ class GLRenderer:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         # 1) Meshes (base)
-        if self._mesh:
+        if False and self._mesh:
             glUseProgram(self.prog_mesh)
             uMVP  = glGetUniformLocation(self.prog_mesh, "uMVP")
             uCol  = glGetUniformLocation(self.prog_mesh, "uMeshColor")
@@ -412,7 +413,7 @@ class GLRenderer:
             glBindVertexArray(0)
 
         # 2) Lines (edges)
-        if self._line:
+        if False and self._line:
             glUseProgram(self.prog_line)
             uMVP  = glGetUniformLocation(self.prog_line, "uMVP")
             uAlph = glGetUniformLocation(self.prog_line, "uAlpha")
@@ -425,6 +426,9 @@ class GLRenderer:
 
         # 3) Points (peaks)
         if self._point:
+            glDisable(GL_DEPTH_TEST)
+            glDisable(GL_BLEND)
+
             glUseProgram(self.prog_point)
             uMVP  = glGetUniformLocation(self.prog_point, "uMVP")
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
@@ -433,7 +437,8 @@ class GLRenderer:
             glBindVertexArray(0)
 
         glUseProgram(0)
-
+        import pygame
+        pygame.display.flip()
     # ---- disposal ----
     def dispose(self):
         for pid in (self.prog_mesh, self.prog_line, self.prog_point):

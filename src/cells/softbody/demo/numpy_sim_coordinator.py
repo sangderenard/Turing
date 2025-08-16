@@ -110,15 +110,9 @@ def make_fluid_engine(kind: str, dim: int):
 
         params = FluidParams()
         # Place a tiny cross of particles for determinism
-        pts = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [0.05, 0.0, 0.0],
-                [0.0, 0.05, 0.0],
-                [0.0, 0.0, 0.05],
-            ],
-            dtype=np.float64,
-        )
+        from ..geometry.geodesic import icosahedron
+        pts = icosahedron(radius=1.2)[0]
+        
         return DiscreteFluid(pts, None, None, None, params)
     if kind == "voxel":
         from src.cells.bath.voxel_fluid import VoxelMACFluid, VoxelFluidParams
