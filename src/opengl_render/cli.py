@@ -114,7 +114,8 @@ def run():
                       [  0, 1,   0, 0],
                       [-sa, 0,  ca, 0],
                       [  0, 0,   0, 1]], np.float32)
-        r.set_mvp((P @ V @ R).astype(np.float32))
+        # Matrices are row-major; transpose before uploading to OpenGL
+        r.set_mvp((P @ V @ R).astype(np.float32).T)
 
         # Slightly wobble the point cloud so "fluid" visibly updates
         t += 0.015
