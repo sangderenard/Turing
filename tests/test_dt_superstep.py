@@ -160,3 +160,22 @@ def test_update_dt_max_decay_envelope():
         f"dt_max did not recover after velocity drop:\n"
         f"after_spike={dt_after_spike:.3e} after_calm={dt_after_calm:.3e}"
     )
+
+
+def test_superstep_returns_unclamped_proposal():
+    """Controller proposals must survive the round cap for next frame."""
+    dx = 1.0
+    targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+    ctrl = STController(dt_min=1e-6)
+
+    state = FakeState()
+
+    def vel_fn(_t):
+        return 0.0
+
+    plan = SuperstepPlan(round_max=1e-6, dt_init=1e-6)
+    res = run_superstep_plan(state, plan, dx, targets, ctrl, make_advance(vel_fn))
+
+    assert res.dt_next > plan.dt_init, (
+        f"expected dt_next > dt_init when velocity is zero; got {res.dt_next}"
+    )
