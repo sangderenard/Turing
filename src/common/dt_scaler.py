@@ -12,7 +12,9 @@ class Metrics:
     """Simulation diagnostics collected during a micro-step.
 
     These fields are intentionally generic so they can be shared across
-    simulators. Individual engines may ignore a subset of them.
+    simulators. Individual engines may ignore a subset of them. ``sim_frame``
+    tracks the outer simulation frame index associated with the metrics, which
+    can be useful when aggregating statistics across frames.
     """
 
     max_vel: float
@@ -21,6 +23,7 @@ class Metrics:
     mass_err: float
     osc_flag: bool = False
     stiff_flag: bool = False
+    sim_frame: int = 0
 
 
 class ScalerControl:
