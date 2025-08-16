@@ -756,7 +756,7 @@ def run_fluid_demo(args, *, draw_hook=None):
                 metrics = Metrics(max_vel=vmax, max_flux=vmax, div_inf=0.0, mass_err=mass_err)
             return True, metrics
 
-        advanced, dt_next, _ = run_superstep(
+        advanced, dt_next, metrics = run_superstep(
             engine,
             round_max=dt,
             dt_init=dt,
@@ -764,6 +764,13 @@ def run_fluid_demo(args, *, draw_hook=None):
             targets=targets,
             ctrl=ctrl,
             advance=advance,
+        )
+        logger.debug(
+            "run_superstep advanced=%s dt_next=%s max_vel=%s mass_err=%s",
+            advanced,
+            dt_next,
+            getattr(metrics, "max_vel", None),
+            getattr(metrics, "mass_err", None),
         )
         # ``dt_next`` is the controller's proposal for the next step while
         # ``advanced`` is the actual simulated time this round.  Record the
@@ -774,6 +781,11 @@ def run_fluid_demo(args, *, draw_hook=None):
             # Controller failed to advance (e.g., due to repeated step
             # rejection). Adopt the proposed ``dt_next`` and try again rather
             # than silently exiting the demo after a single frame.
+            logger.warning(
+                "run_superstep returned no progress; dt=%s dt_next=%s",
+                dt,
+                dt_next,
+            )
             dt = dt_next
             if draw_hook is not None:
                 layers = gather_layers(None, engine, for_opengl=True)
