@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Type, Union, TYPE_CHECKING
 import colorsys
+import math
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,44 @@ def pack_points(
 
 
 # ---------------------------------------------------------------------------
+# Minimal camera helpers
+# ---------------------------------------------------------------------------
+
+def _perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
+    """Return a column-major perspective projection matrix."""
+    f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
+    m = np.zeros((4, 4), dtype=np.float32)
+    m[0, 0] = f / aspect
+    m[1, 1] = f
+    m[2, 2] = (zfar + znear) / (znear - zfar)
+    m[2, 3] = (2 * zfar * znear) / (znear - zfar)
+    m[3, 2] = -1.0
+    return m
+
+
+def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Return a column-major view matrix."""
+    eye = np.asarray(eye, dtype=np.float32)
+    center = np.asarray(center, dtype=np.float32)
+    up = np.asarray(up, dtype=np.float32)
+    f = center - eye
+    f = f / (np.linalg.norm(f) + 1e-12)
+    s = np.cross(f, up)
+    s = s / (np.linalg.norm(s) + 1e-12)
+    u = np.cross(s, f)
+    m = np.identity(4, dtype=np.float32)
+    m[0, 0:3] = s
+    m[1, 0:3] = u
+    m[2, 0:3] = -f
+    m[:3, 3] = -np.array([
+        np.dot(s, eye),
+        np.dot(u, eye),
+        np.dot(-f, eye),
+    ], dtype=np.float32)
+    return m
+
+
+# ---------------------------------------------------------------------------
 # Cellsim adapters
 # ---------------------------------------------------------------------------
 
@@ -245,8 +284,36 @@ def draw_layers(
         renderer.set_points(merged)
     elif isinstance(pts, PointLayer):
         renderer.set_points(pts)
+        active_pts = pts
     elif isinstance(ghost, PointLayer):
         renderer.set_points(ghost)
+        active_pts = ghost
+    else:
+        active_pts = None
+
+    # Auto-fit view to the supplied geometry if the renderer supports it.
+    if hasattr(renderer, "set_mvp"):
+        pos_list: list[np.ndarray] = []
+        if isinstance(mesh, MeshLayer):
+            pos_list.append(mesh.positions)
+        if isinstance(lines, LineLayer):
+            pos_list.append(lines.positions)
+        if isinstance(active_pts, PointLayer):
+            pos_list.append(active_pts.positions)
+        if pos_list:
+            pts_all = np.concatenate(pos_list, axis=0)
+            center = pts_all.mean(axis=0)
+            radius = float(np.linalg.norm(pts_all - center, axis=1).max())
+            if radius <= 0:
+                radius = 1.0
+            eye = center + np.array([0.0, 0.0, radius * 3.0], dtype=np.float32)
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            aspect = float(viewport[0]) / float(viewport[1])
+            mvp = _perspective(45.0, aspect, 0.1, radius * 10.0) @ _look_at(eye, center, up)
+            try:
+                renderer.set_mvp(mvp)
+            except Exception:
+                pass
 
     renderer.draw(viewport)
 
@@ -318,20 +385,20 @@ def make_draw_hook(
     return hook
 
 
-def _normalize_factory(factory: RendererFactory) -> Callable[[], "_GLRenderer_T"]:
-    """Normalize class or callable to a zero-arg constructor."""
-    if not callable(factory):
-        raise TypeError("renderer_factory must be GLRenderer class or zero-arg callable returning GLRenderer")
-    return factory
+def _normalize_factory(factory: RendererFactory | object) -> Callable[[], "_GLRenderer_T"]:
+    """Normalize classes, callables or instances to a zero-arg constructor."""
+    if callable(factory):
+        return factory  # type: ignore[misc]
+    return lambda: factory  # type: ignore[return-value]
 
 
 def make_threaded_draw_hook(
     renderer_factory: RendererFactory,
-    *,
     viewport: Optional[Tuple[int, int]] = None,
+    *,
     history: int = 32,
     loop_mode: str = "idle",
-    ghost_trail: bool = True,
+    ghost_trail: bool = False,
 ):
     """Return a thread-backed draw hook and its controller.
 
