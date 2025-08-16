@@ -18,12 +18,14 @@ from OpenGL.GL import (
     glGetUniformLocation, glUniformMatrix4fv, glUniform1f, glUniform4fv,
     glDrawArrays, glDrawElements, glPolygonMode, glLineWidth,
     glEnable, glDisable, glBlendFunc, glDepthMask, glCullFace, glViewport, glClearColor, glClear,
+    glWindowPos2f, glDrawPixels, glPixelStorei,
     GL_COMPILE_STATUS, GL_LINK_STATUS,
     GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
     GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
     GL_FLOAT, GL_FALSE, GL_TRIANGLES, GL_LINES, GL_POINTS,
     GL_DEPTH_TEST, GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_PROGRAM_POINT_SIZE,
-    GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_CULL_FACE, GL_BACK
+    GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_CULL_FACE, GL_BACK,
+    GL_UNPACK_ALIGNMENT, GL_RGBA, GL_UNSIGNED_BYTE
 )
 
 # ---------------------------
@@ -214,6 +216,9 @@ class DebugRenderer:
             elif isinstance(layer, Mapping):
                 for key, arr in layer.items():
                     print(f"  {key}: {_preview(arr)}", file=self.file)
+            elif isinstance(layer, (list, tuple)):
+                for line in layer:
+                    print(f"  {line}", file=self.file)
             else:
                 try:
                     print(f"  {_preview(layer)}", file=self.file)
@@ -276,6 +281,9 @@ class GLRenderer:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_PROGRAM_POINT_SIZE)
         glCullFace(GL_BACK)
+
+        self._overlay_lines: list[str] = []
+        self._font = None
 
     # ---- Mesh API ----
     def set_mesh(self, layer: MeshLayer):
@@ -442,6 +450,7 @@ class GLRenderer:
 
         glUseProgram(0)
         import pygame
+        self._draw_overlay()
         pygame.display.flip()
     # ---- disposal ----
     def dispose(self):
@@ -450,3 +459,26 @@ class GLRenderer:
                 glDeleteProgram(pid)
             except Exception:
                 pass
+
+    def set_overlay_text(self, lines: Iterable[str]) -> None:
+        self._overlay_lines = [str(l) for l in lines]
+
+    def _draw_overlay(self) -> None:
+        if not self._overlay_lines:
+            return
+        try:
+            import pygame
+            if self._font is None:
+                pygame.font.init()
+                self._font = pygame.font.SysFont("Courier", 14)
+            y = self._window_size[1] - 20
+            for line in self._overlay_lines:
+                surf = self._font.render(line, True, (255, 255, 255))
+                data = pygame.image.tostring(surf, "RGBA", True)
+                w, h = surf.get_size()
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+                glWindowPos2f(5, y)
+                glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
+                y -= h
+        except Exception:
+            pass
