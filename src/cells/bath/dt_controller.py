@@ -22,8 +22,8 @@ class STController:
     Ki: float = 0.05
     A: float = 1.5
     shrink: float = 0.5
-    dt_min: float | None = 1e-6
-    dt_max: float | None = 1.0
+    dt_min: float | None = None
+    dt_max: float | None = None
     acc: float = 0.0
     max_vel_ever: float = 1e-30
     clamp_events: int = 0
@@ -187,6 +187,8 @@ def run_superstep(state,
     dt_cap = float(dt_init)
     if ctrl.dt_min is not None:
         dt_cap = max(dt_cap, ctrl.dt_min)
+    if ctrl.dt_max is not None:
+        dt_cap = min(dt_cap, ctrl.dt_max)
     # Track the controller's raw proposal separately from the in-round cap so
     # that growth suggestions survive to the next meta step.  The original
     # implementation overwrote this with the clamped ``dt_cap`` which meant the
@@ -212,11 +214,13 @@ def run_superstep(state,
 
         # Enforce non-increasing dt within the round unless explicitly allowed.
         if allow_increase_mid_round:
-            dt_cap = dt_next if ctrl.dt_min is None else max(ctrl.dt_min, dt_next)
+            dt_cap = dt_next
         else:
             dt_cap = min(dt_cap, dt_next)
-            if ctrl.dt_min is not None:
-                dt_cap = max(ctrl.dt_min, dt_cap)
+        if ctrl.dt_min is not None:
+            dt_cap = max(ctrl.dt_min, dt_cap)
+        if ctrl.dt_max is not None:
+            dt_cap = min(ctrl.dt_max, dt_cap)
         # Preserve the controller's proposal for the next round rather than the
         # capped value used internally this round.
         last_dt_next = dt_next

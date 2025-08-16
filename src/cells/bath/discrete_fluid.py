@@ -110,8 +110,6 @@ class FluidParams:
     # Time stepping / stabilization
     xsph_eps: float = 0.0                 # XSPH velocity blending (0..0.5 typical)
     cfl_number: float = 0.25
-    max_dt: float = 1e-3                  # safety cap (ignored when nocap=True)
-    nocap: bool = True                    # when True, do not enforce max_dt caps
 
     # Boundary
     bounce_damping: float = 0.0           # velocity damping on boundary collision [0..1]
@@ -243,10 +241,8 @@ class DiscreteFluid:
         dt_target = dt / max(1, int(substeps))
         remaining = dt
         while remaining > 1e-12:
-            # choose stable dt <= dt_target and optionally <= params.max_dt
+            # choose stable dt <= dt_target
             dt_s = min(self._stable_dt(), dt_target, remaining)
-            if not getattr(self.params, "nocap", True):
-                dt_s = min(dt_s, self.params.max_dt)
             hooks.run_pre(self, dt_s)
             self._substep(dt_s)
             hooks.run_post(self, dt_s)
@@ -671,7 +667,7 @@ class DiscreteFluid:
     def _diffuse_scalars(self, dt: float) -> None:
         """
         Explicit diffusion of temperature T and salinity S via SPH Laplacian.
-        Stable if dt <= h^2 / (2 * d), capped by max_dt anyway.
+        Stable if dt <= h^2 / (2 * d).
         """
         kappa = self.params.thermal_diffusivity
         D_s = self.params.solute_diffusivity
@@ -993,9 +989,7 @@ class DiscreteFluid:
         dmax = max(p.thermal_diffusivity, p.solute_diffusivity)
         if dmax > 0:
             diff = (self.kernel.h ** 2) / (2.0 * dmax)
-        dt = max(1e-6, p.cfl_number * min(adv, diff))
-        if not getattr(p, "nocap", True):
-            dt = min(dt, p.max_dt)
+        dt = p.cfl_number * min(adv, diff)
         return dt
 
     # ------------------------------ Diagnostics -------------------------------

@@ -201,3 +201,37 @@ def test_controller_reports_and_raises_on_persistent_failure(capsys):
 
     out = capsys.readouterr().out
     assert "timestep controller failed" in out
+
+
+def test_nested_supersteps_compose():
+    """Inner controllers may subdivide outer dt requests."""
+    dx_outer = 1.0
+    dx_inner = 0.1
+    targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+    outer_ctrl = STController(dt_min=1e-6)
+    inner_ctrl = STController(dt_min=1e-6)
+
+    outer_state = FakeState()
+    inner_state = FakeState()
+    inner_attempted: list[float] = []
+
+    def inner_advance(state: FakeState, dt: float):
+        inner_attempted.append(float(dt))
+        state.t += float(dt)
+        # High velocity enforces small CFL dt
+        m = Metrics(max_vel=10.0, max_flux=10.0, div_inf=0.0, mass_err=0.0)
+        return True, m
+
+    def outer_advance(state: FakeState, dt: float):
+        plan_inner = SuperstepPlan(round_max=float(dt), dt_init=0.01)
+        res_inner = run_superstep_plan(inner_state, plan_inner, dx_inner, targets, inner_ctrl, inner_advance)
+        state.t += res_inner.advanced
+        m = Metrics(max_vel=1.0, max_flux=1.0, div_inf=0.0, mass_err=0.0)
+        return True, m
+
+    plan_outer = SuperstepPlan(round_max=0.2, dt_init=0.2)
+    res_outer = run_superstep_plan(outer_state, plan_outer, dx_outer, targets, outer_ctrl, outer_advance)
+
+    assert math.isclose(res_outer.advanced, plan_outer.round_max, rel_tol=0, abs_tol=plan_outer.eps)
+    assert len(inner_attempted) > 1, "inner controller should have subdivided the dt"
+    assert math.isclose(inner_state.t, plan_outer.round_max, rel_tol=0, abs_tol=plan_outer.eps)
