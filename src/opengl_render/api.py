@@ -260,8 +260,7 @@ def make_draw_hook(
     *,
     viewport: Optional[Tuple[int, int]] = None,
     history: int = 32,
-    loop: bool = False,
-    bounce: bool = False,
+    loop_mode: str = "idle",
     ghost_trail: bool = True,
 ):
     """Return a draw hook.
@@ -272,6 +271,9 @@ def make_draw_hook(
       or zero-arg callable). A thread-backed hook is created via
       :func:`make_threaded_draw_hook`, which will construct the window+GL context
       **inside** the worker thread.
+    - ``loop_mode`` controls behaviour when the frame queue is empty: ``"idle"``
+      (default) re-draws the last frame, ``"loop"`` replays history, and
+      ``"bounce"`` ping-pongs through history.
     """
     # Debug synchronous path (e.g. DebugRenderer instance)
     if hasattr(renderer_or_factory, "print_layers"):
@@ -303,8 +305,7 @@ def make_draw_hook(
         factory,
         viewport=viewport,
         history=history,
-        loop=loop,
-        bounce=bounce,
+        loop_mode=loop_mode,
         ghost_trail=ghost_trail,
     )
 
@@ -329,8 +330,7 @@ def make_threaded_draw_hook(
     *,
     viewport: Optional[Tuple[int, int]] = None,
     history: int = 32,
-    loop: bool = False,
-    bounce: bool = False,
+    loop_mode: str = "idle",
     ghost_trail: bool = True,
 ):
     """Return a thread-backed draw hook and its controller.
@@ -338,8 +338,10 @@ def make_threaded_draw_hook(
     The returned tuple ``(hook, thread)`` provides a callable ``hook`` that
     enqueues layer mappings to be drawn on a dedicated thread.  ``thread`` is the
     :class:`~opengl_render.threaded.GLRenderThread` instance managing the queue
-    and history. The thread **must** construct the GL context inside itself by
-    calling the provided ``renderer_factory``.
+    and history. ``loop_mode`` determines behaviour when no new frames arrive:
+    ``"idle"`` redraws the last frame, while ``"loop"`` and ``"bounce"`` replay
+    the stored history. The thread **must** construct the GL context inside
+    itself by calling the provided ``renderer_factory``.
     """
     from .threaded import GLRenderThread  # local import to keep headless tests light
 
@@ -347,8 +349,7 @@ def make_threaded_draw_hook(
         renderer_factory=_normalize_factory(renderer_factory),
         viewport=viewport,
         history=history,
-        loop=loop,
-        bounce=bounce,
+        loop_mode=loop_mode,
         ghost_trail=ghost_trail,
     )
     return thread.get_submit_hook(), thread
