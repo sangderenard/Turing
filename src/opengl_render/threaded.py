@@ -85,10 +85,13 @@ class GLRenderThread:
             PointLayer = None  # type: ignore
 
         def _pump_events() -> None:
-            """Best-effort event pump to keep window responsive."""
+            """Process pygame events and handle window closure."""
             try:  # pragma: no cover - headless environments
                 import pygame
-                pygame.event.pump()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self._stop.set()
+                        pygame.quit()
             except Exception:
                 pass
 
@@ -116,13 +119,15 @@ class GLRenderThread:
                     if self.loop_mode == "bounce" and len(seq) > 1:
                         seq = seq + seq[-2:0:-1]
                     for frame in seq:
+                        _pump_events()
                         if self._stop.is_set():
                             break
-                        _pump_events()
                         draw_layers(self.renderer, frame, self.viewport)  # type: ignore[arg-type]
                         time.sleep(1.0 / 60.0)
                 else:
                     _pump_events()
+                    if self._stop.is_set():
+                        break
                     if self.renderer is not None and hasattr(self.renderer, "draw"):
                         try:
                             self.renderer.draw(self.viewport)  # type: ignore[call-arg]
