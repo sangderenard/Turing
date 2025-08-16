@@ -64,7 +64,7 @@ def test_dt_scaler_step_response(capsys):
         # Metrics for current loop index (bound via closure on v_series length)
         i = len(v_series)
         v = _schedule_piecewise(i)
-        m = Metrics(max_vel=v, max_flux=v, div_inf=0.0, mass_err=0.0)
+        m = Metrics(max_vel=v, max_flux=v, div_inf=0.0, mass_err=0.0, sim_frame=i)
         return True, m
 
     for i in range(N):
