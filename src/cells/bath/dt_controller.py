@@ -148,6 +148,13 @@ def run_superstep(state,
     """
     total = 0.0
     dt_cap = float(max(dt_init, ctrl.dt_min))
+    # Track the controller's raw proposal separately from the in-round cap so
+    # that growth suggestions survive to the next meta step.  The original
+    # implementation overwrote this with the clamped ``dt_cap`` which meant the
+    # outer controller never saw increases when the round started with a tiny
+    # seed (e.g. the 1e-6 fallback), effectively locking the simulation to that
+    # value.  ``last_dt_next`` now records the unclamped proposal from the final
+    # micro-step and is returned to the caller.
     last_dt_next = dt_cap
     last_metrics = None
 
@@ -169,7 +176,9 @@ def run_superstep(state,
             dt_cap = max(ctrl.dt_min, dt_next)
         else:
             dt_cap = max(ctrl.dt_min, min(dt_cap, dt_next))
-        last_dt_next = dt_cap
+        # Preserve the controller's proposal for the next round rather than the
+        # capped value used internally this round.
+        last_dt_next = dt_next
 
     return total, last_dt_next, last_metrics
 
