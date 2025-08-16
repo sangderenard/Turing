@@ -9,9 +9,11 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from typing import Iterable, Mapping, Sequence
+import threading
+from queue import SimpleQueue
+from typing import Iterable, Mapping, Sequence, Callable
 
-from src.opengl_render.api import make_draw_hook
+from src.opengl_render.api import make_draw_hook, make_queue_draw_hook, draw_layers
 
 OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),
@@ -20,6 +22,81 @@ OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "4": ("Cells + fluid (mesh)", ["--couple-fluid", "voxel"]),
 }
 
+
+
+def _menu_text() -> str:
+    lines = ["Select NumPy simulation to run:"]
+    for key, (name, _) in OPTIONS.items():
+        lines.append(f" {key}) {name}")
+    return "\n".join(lines)
+
+
+def render_main_loop(
+    frame_queue: SimpleQueue[Mapping[str, object]],
+    *,
+    menu_text: str = "",
+    loop_mode: str = "idle",
+    key_handler: Callable[[int], None] | None = None,
+) -> None:
+    """Render ``frame_queue`` on the main thread using :class:`GLRenderer`.
+
+    ``menu_text`` is printed to stdout and pushed to the renderer overlay so the
+    user sees a white-on-black menu inside the window.  The loop exits when the
+    window is closed or the user presses Esc/Q.  Other ``pygame`` keypresses are
+    forwarded to ``key_handler`` if supplied.
+    """
+    try:
+        from .renderer import GLRenderer
+        import pygame
+        from queue import Empty
+    except Exception:  # pragma: no cover - headless fallback
+        return
+
+    renderer = GLRenderer()
+    if menu_text:
+        print(menu_text)
+        try:
+            renderer.set_overlay_text(menu_text)
+        except Exception:
+            pass
+
+    pygame.init()
+    running = True
+    history: list[Mapping[str, object]] = []
+    hist_idx = 0
+    direction = 1
+    last = None
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                elif key_handler is not None:
+                    key_handler(event.key)
+
+        try:
+            last = frame_queue.get_nowait()
+            history.append(last)
+            hist_idx = len(history) - 1
+        except Empty:
+            if loop_mode == "loop" and history:
+                hist_idx = (hist_idx + 1) % len(history)
+                last = history[hist_idx]
+            elif loop_mode == "bounce" and history:
+                if hist_idx + direction >= len(history) or hist_idx + direction < 0:
+                    direction *= -1
+                hist_idx += direction
+                last = history[hist_idx]
+
+        if last is not None:
+            draw_layers(renderer, last)
+
+        pygame.time.wait(10)
+
+    pygame.quit()
 
 
 def run_option(choice: str, *, debug: bool = False, frames: int | None = None, dt: float | None = None,
@@ -53,17 +130,18 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
         argv += ["--dt", str(dt)]
     if sim_dim is not None:
         argv += ["--sim-dim", str(sim_dim)]
+
     import io
     import contextlib
 
-    # ``numpy_sim_coordinator`` no longer accepts renderer objects via CLI style
-    # arguments.  Instead we construct a draw hook here and pass it directly when
-    # invoking its ``main`` entry point.  To keep tests working on headless
-    # systems, fall back to a simple stub renderer when OpenGL is unavailable.
+    # Attempt to import the real GL renderer; fall back to a stub in headless
+    # or ``--debug-render`` scenarios so tests remain lightweight.
     try:  # pragma: no cover - exercised via tests
         from .renderer import GLRenderer
-        renderer = GLRenderer
     except Exception:  # noqa: BLE001
+        GLRenderer = None  # type: ignore[assignment]
+
+    if debug_render or GLRenderer is None:
         class _StubRenderer:
             """Minimal fallback renderer used in headless environments."""
 
@@ -88,23 +166,32 @@ def run_option(choice: str, *, debug: bool = False, frames: int | None = None, d
                     print("points dtype float32")
 
         renderer = _StubRenderer()
+        draw_hook = make_draw_hook(renderer, ghost_trail=False, loop_mode=loop_mode)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            numpy_sim_coordinator_main(*argv, draw_hook=draw_hook)
+        out = buf.getvalue()
+        if debug and not out.strip():
+            out = "points dtype float32"
+        return subprocess.CompletedProcess(
+            args=["numpy_sim_coordinator"] + argv, returncode=0, stdout=out
+        )
 
-    draw_hook = make_draw_hook(renderer, ghost_trail=False, loop_mode=loop_mode)
+    # Real GL path: spawn the simulator on a worker thread and render on the main
+    # thread without a background render thread.
+    frame_queue, draw_hook = make_queue_draw_hook(ghost_trail=False)
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        numpy_sim_coordinator_main(*argv, draw_hook=draw_hook)
+    worker = threading.Thread(
+        target=lambda: numpy_sim_coordinator_main(*argv, draw_hook=draw_hook),
+        daemon=True,
+    )
+    worker.start()
 
-    # Rendering is handled asynchronously by the draw hook; avoid blocking on
-    # any background render thread here so that the simulator can terminate
-    # cleanly once frame generation completes.
-    # In headless or debug modes the hook is synchronous and has no
-    # ``_render_thread`` attribute, so there's nothing further to do.
-
-    out = buf.getvalue()
-    if debug and not out.strip():
-        out = "points dtype float32"
-    return subprocess.CompletedProcess(args=["numpy_sim_coordinator"] + argv, returncode=0, stdout=out)
+    render_main_loop(frame_queue, menu_text=_menu_text(), loop_mode=loop_mode)
+    worker.join()
+    return subprocess.CompletedProcess(
+        args=["numpy_sim_coordinator"] + argv, returncode=0, stdout=""
+    )
 
 
 
