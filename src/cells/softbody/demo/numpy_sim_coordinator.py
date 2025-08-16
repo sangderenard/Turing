@@ -740,10 +740,18 @@ def run_fluid_demo(args, *, draw_hook=None):
             else:
                 m = getattr(state, "m", None)
                 prev_mass = float(np.sum(m)) if isinstance(m, np.ndarray) else 0.0
-            step_fn = getattr(state, "_substep", getattr(state, "step", None))
+            # Prefer the engine's public ``step`` method so it can internally
+            # subdivide as needed. Fall back to ``_substep`` for legacy
+            # simulators that have not yet been updated.
+            step_fn = getattr(state, "step", None)
+            if not callable(step_fn):
+                step_fn = getattr(state, "_substep", None)
             if not callable(step_fn):
                 return False, Metrics(0.0, 0.0, 0.0, 1.0, False, True)
             step_fn(dt_step)
+
+            # Preserve metric collection after the higher-level step so the
+            # controller, couplers, and HUD remain in sync.
             compute_metrics_fn = getattr(state, "compute_metrics", None)
             if callable(compute_metrics_fn):
                 metrics = compute_metrics_fn(prev_mass)
