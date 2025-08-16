@@ -11,8 +11,9 @@ from src.cells.cellsim.data.state import Cell, Bath
 from src.cells.cellsim.api.saline import SalinePressureAPI
 from src.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
 from src.cells.bath.coupling import BathFluidCoupler
-from src.cells.bath.dt_controller import STController, Targets
+from src.cells.bath.dt_controller import STController, Targets, run_superstep
 from src.common.sim_hooks import SimHooks
+from src.common.dt_scaler import Metrics
 
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math
@@ -691,6 +692,16 @@ def run_fluid_demo(args, *, draw_hook=None):
     engine = make_fluid_engine(args.fluid, args.sim_dim)
     dt = float(getattr(args, "dt", 1e-3))
     stats = DtStats()
+    ctrl = STController()
+    params = getattr(engine, "params", None)
+    cfl = float(getattr(params, "cfl", getattr(params, "cfl_number", 0.5)) or 0.5)
+    targets = Targets(cfl=cfl, div_max=1e30, mass_max=1e30)
+    dx_attr = getattr(engine, "dx", None)
+    if dx_attr is None and params is not None:
+        dx_attr = getattr(params, "dx", None)
+    if dx_attr is None:
+        dx_attr = getattr(getattr(engine, "kernel", object()), "h", 1.0)
+    dx = float(dx_attr)
 
     # When no hook is provided explicitly, fall back to the original debug
     # renderer behaviour when ``--debug-render`` is set.  This mirrors the
@@ -710,9 +721,43 @@ def run_fluid_demo(args, *, draw_hook=None):
             draw_hook = _fallback
 
     for _ in range(int(args.frames)):
-        engine.step(dt)
-        stats.update("fluid", dt)
-        stats.accumulate(dt)
+        def advance(state, dt_step: float):
+            prev_mass_fn = getattr(state, "total_mass", None)
+            if callable(prev_mass_fn):
+                prev_mass = float(prev_mass_fn())
+            else:
+                m = getattr(state, "m", None)
+                prev_mass = float(np.sum(m)) if isinstance(m, np.ndarray) else 0.0
+            step_fn = getattr(state, "_substep", getattr(state, "step", None))
+            if not callable(step_fn):
+                return False, Metrics(0.0, 0.0, 0.0, 1.0, False, True)
+            step_fn(dt_step)
+            compute_metrics_fn = getattr(state, "compute_metrics", None)
+            if callable(compute_metrics_fn):
+                metrics = compute_metrics_fn(prev_mass)
+            else:
+                v = getattr(state, "v", None)
+                vmax = float(np.max(np.linalg.norm(v, axis=1))) if isinstance(v, np.ndarray) and v.size else 0.0
+                m_now = getattr(state, "m", None)
+                mass_now = float(np.sum(m_now)) if isinstance(m_now, np.ndarray) else 0.0
+                mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-12) if prev_mass else 0.0
+                metrics = Metrics(max_vel=vmax, max_flux=vmax, div_inf=0.0, mass_err=mass_err)
+            return True, metrics
+
+        advanced, dt_next, _ = run_superstep(
+            engine,
+            round_max=dt,
+            dt_init=dt,
+            dx=dx,
+            targets=targets,
+            ctrl=ctrl,
+            advance=advance,
+        )
+        if advanced <= 0.0:
+            break
+        stats.update("fluid", dt_next)
+        stats.accumulate(advanced)
+        dt = dt_next
         if draw_hook is not None:
             # When a draw hook is provided we feed it OpenGL-oriented layer
             # dataclasses so that higher level renderers can consume them
