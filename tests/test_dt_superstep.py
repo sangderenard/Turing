@@ -179,3 +179,25 @@ def test_superstep_returns_unclamped_proposal():
     assert res.dt_next > plan.dt_init, (
         f"expected dt_next > dt_init when velocity is zero; got {res.dt_next}"
     )
+
+
+def test_controller_reports_and_raises_on_persistent_failure(capsys):
+    """Controller should emit a failure report and raise after exhausting retries."""
+    dx = 1.0
+    targets = Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6)
+    ctrl = STController(dt_min=1e-6)
+
+    state = FakeState()
+
+    def vel_fn(_t):
+        return 1.0
+
+    # fail_over_dt=0 ensures all attempts fail regardless of dt
+    advance = make_advance(vel_fn, fail_over_dt=0.0)
+    plan = SuperstepPlan(round_max=0.1, dt_init=0.1)
+
+    with pytest.raises(RuntimeError):
+        run_superstep_plan(state, plan, dx, targets, ctrl, advance)
+
+    out = capsys.readouterr().out
+    assert "timestep controller failed" in out
