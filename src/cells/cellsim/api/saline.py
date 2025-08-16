@@ -13,7 +13,8 @@ from ..mechanics.softbody0d import Softbody0DProvider, SoftbodyProviderCfg
 from ..data.state import Cell, Bath, Organelle
 from ..core.geometry import sphere_area_from_volume
 from tqdm.auto import tqdm  # type: ignore
-from src.cells.bath.dt_controller import STController, Targets, Metrics, step_with_dt_control, run_superstep_plan
+from src.common.dt_scaler import Metrics
+from src.cells.bath.dt_controller import STController, Targets, step_with_dt_control, run_superstep_plan
 from src.common.dt import SuperstepPlan, SuperstepResult
 
 # Module logger (DEBUG by default so logs appear without extra setup)

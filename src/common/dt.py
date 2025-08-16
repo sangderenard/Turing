@@ -31,7 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from src.cells.bath.dt_controller import Metrics
+from src.common.dt_scaler import Metrics
 
 
 @dataclass
@@ -76,7 +76,7 @@ class SuperstepResult:
     clamped:
         True if any halving/clamp events occurred due to instability.
     metrics:
-        The last-step :class:`~src.cells.bath.dt_controller.Metrics` for UI or
+        The last-step :class:`~src.common.dt_scaler.Metrics` for UI or
         logging. Optional and engine-dependent.
     """
     advanced: float

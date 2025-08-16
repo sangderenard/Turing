@@ -49,7 +49,8 @@ from typing import Dict, Iterable, Tuple, List, Optional
 import copy
 import numpy as np
 
-from .dt_controller import Metrics, Targets, STController, step_with_dt_control
+from src.common.dt_scaler import Metrics
+from .dt_controller import Targets, STController, step_with_dt_control
 
 try:
     # Local sibling import; adjust path if packaging differs
