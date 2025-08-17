@@ -96,7 +96,7 @@ class EngineNode:
                 raise ValueError("Explicit state_table argument is required")
             sync_engine_from_table(self.registration.engine, self.registration.name, state_table)
             eng = self.registration.engine
-            ok, metrics, state_new = eng.step_with_state(state_obj, float(dt), realtime=realtime)  # type: ignore[misc]
+            ok, metrics, state_new = eng.step_with_state(state_obj, float(dt), realtime=realtime, state_table=state_table)  # type: ignore[misc]
             if realtime:
                 penalty = 0.0
                 targets = getattr(self.registration, "targets", None)

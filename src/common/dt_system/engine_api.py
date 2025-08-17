@@ -38,15 +38,26 @@ class DtCompatibleEngine:
     lightweight path.
     """
 
-    def step(self, dt: float) -> tuple[bool, Metrics]:  # pragma: no cover - interface
+    def step(self, dt: float, state, state_table) -> tuple[bool, Metrics]:  # pragma: no cover - interface
         raise NotImplementedError
 
     # New required capability for compliant engines
     def step_with_state(
-        self, state: object, dt: float, *, realtime: bool = False
+        self, state: object, dt: float, *, realtime: bool = False, state_table = None
     ) -> tuple[bool, Metrics, object]:  # pragma: no cover - default bridge
-        ok, m = self.step(float(dt))
+        if state_table is None:
+            state_table = getattr(self, '_state_table', None)
+        if state_table is None:
+            raise ValueError("state_table is required for step_with_state")
+        ok, m, state = self.step(float(dt), state, state_table=state_table)
+        state = self.get_state() if state is None else state
         return ok, m, state
+
+    def get_state(self, state=None) -> object:  # pragma: no cover - default bridge
+        """
+        Return the current state of the engine as a dict or object. If a state is supplied, update it in place with the current internal state fields relevant to this engine and return it.
+        """
+        raise NotImplementedError("get_state(state=None) must be implemented to return the current state object")
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover - optional
         return None

@@ -14,6 +14,12 @@ from ..debug import dbg, is_enabled, pretty_metrics
 
 @dataclass
 class HybridFluidEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        out = state if isinstance(state, dict) else {}
+        for k in ("x", "v", "grid"):
+            if hasattr(self.sim, k):
+                out[k] = getattr(self.sim, k)
+        return out
     sim: object
     name: str = "bath.hybrid"
 
@@ -28,16 +34,21 @@ class HybridFluidEngine(DtCompatibleEngine):
         if hasattr(self.sim, "restore") and snap is not None:
             self.sim.restore(snap)
 
-    def step(self, dt: float):
+    def step(self, dt: float, state=None, state_table=None):
         if is_enabled():
             dbg("eng.bath").debug(f"hybrid step: dt={float(dt):.6g} name={self.name}")
         try:
+            # Optionally update sim state from state dict
+            if isinstance(state, dict):
+                for k in ("x", "v", "grid"):
+                    if k in state and hasattr(self.sim, k):
+                        setattr(self.sim, k, state[k])
             self.sim.step(float(dt))
         except Exception as e:
             if is_enabled():
                 dbg("eng.bath").debug(f"ERROR during hybrid sim.step: {type(e).__name__}: {e}")
             metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
-            return False, metrics
+            return False, metrics, self.get_state()
         try:
             metrics = self._compute_metrics()
         except Exception:
@@ -45,7 +56,7 @@ class HybridFluidEngine(DtCompatibleEngine):
         self._last_metrics = metrics
         if is_enabled():
             dbg("eng.bath").debug(f"hybrid done: {pretty_metrics(metrics)}")
-        return True, metrics
+        return True, metrics, self.get_state()
 
     def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
         try:

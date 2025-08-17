@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-
+from ..engine_api import DtCompatibleEngine
 from typing import Tuple, Optional, List, Dict
 import numpy as np
 
@@ -29,7 +29,13 @@ class WorldObjectLink:
 
 
 
-class RigidBodyEngine:
+class RigidBodyEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        out = state if isinstance(state, dict) else {}
+        out['nodes'] = self.nodes.copy()
+        out['velocities'] = self.velocities.copy()
+        out['masses'] = self.masses.copy()
+        return out
     def __init__(self, links: List[WorldObjectLink]):
         self.links = links
         self.object_anchors = [link.object_anchor for link in links]
@@ -38,13 +44,16 @@ class RigidBodyEngine:
         self.masses = np.array([oa[3] for oa in self.object_anchors], dtype=float)
         self.velocities = np.zeros_like(self.nodes)
         self.forces = np.zeros_like(self.nodes)
-
-    def _lookup_vertex_group(self, vertex_set_identifier, state_table, set_index=None):
+    def _lookup_vertex_group(
+        self, *, state_table, vertex_set_identifier, set_index
+    ):
         """Look up a vertex group (e.g., all vertices for an object) from the state table."""
         # Convention: state_table.get(scope, name, field_name)
         # For classic mechanics, use ('object', vertex_set_identifier, 'pos')
         if state_table is None:
             raise ValueError("RigidBodyEngine requires explicit state_table for COM/group lookups.")
+        assert hasattr(state_table, "get"), f"state_table must support .get; got {type(state_table)}"
+
         pos = state_table.get('object', vertex_set_identifier, 'pos')
         mass = state_table.get('object', vertex_set_identifier, 'mass')
         if pos is None or mass is None:
@@ -68,7 +77,7 @@ class RigidBodyEngine:
                 # Use the world_anchor_index to find the object identifier
                 # For now, assume set_index is the object id/name
                 object_id = set_index
-                pos, mass_arr = self._lookup_vertex_group(object_id, state_table)
+                pos, mass_arr = self._lookup_vertex_group(state_table=state_table, vertex_set_identifier=object_id, set_index=None)
                 total_mass = np.sum(mass_arr)
                 if total_mass < 1e-12:
                     com = np.mean(pos, axis=0)
@@ -78,7 +87,7 @@ class RigidBodyEngine:
                 node_mass = total_mass
             else:
                 # Otherwise, look up the specific vertex (or group)
-                pos, mass_arr = self._lookup_vertex_group(vertex_set_identifier, state_table, set_index)
+                pos, mass_arr = self._lookup_vertex_group(state_table=state_table, vertex_set_identifier=vertex_set_identifier, set_index=set_index)
                 node_pos = pos
                 node_mass = mass_arr
             delta = node_pos - anchor_pos
@@ -117,15 +126,20 @@ class RigidBodyEngine:
                 self.forces[i] += force
                 # TODO: add angular constraint (no rotation) if needed
 
-    def step(self, dt: float, state_table=None):
+    def step(self, dt: float, state=None, state_table=None):
+        # Optionally update internal state from state dict
+        if isinstance(state, dict):
+            if 'nodes' in state:
+                self.nodes = np.asarray(state['nodes'], dtype=float)
+            if 'velocities' in state:
+                self.velocities = np.asarray(state['velocities'], dtype=float)
+            if 'masses' in state:
+                self.masses = np.asarray(state['masses'], dtype=float)
         self.apply_forces(state_table=state_table)
-        # Integrate motion for free vertices (if needed)
-        for i, mass in enumerate(self.masses):
-            if mass > 0:
-                acc = self.forces[i] / mass
-                self.velocities[i] += acc * dt
-                self.nodes[i] += self.velocities[i] * dt
-            # Anchored nodes (infinite mass) do not move
+        # Return ok, metrics, new state object
+        metrics = None  # Optionally compute or set a Metrics object if available
+        return True, metrics, self.get_state()
+
 
 # Example usage/defaults
 if __name__ == "__main__":

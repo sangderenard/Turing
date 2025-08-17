@@ -306,7 +306,7 @@ def _run_demo(
     reset_requested = False
 
     def reset_scene():
-        nonlocal craft_a, craft_b, fluid_engine, regs, gb, top_round, runner, nodes_for_hud, last_a, last_b
+        nonlocal craft_a, craft_b, fluid_engine, regs, gb, top_round, runner, nodes_for_hud, last_a, last_b, state_table
         # Rebuild crafts and engines
         craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic)
         craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic)
@@ -322,7 +322,9 @@ def _run_demo(
         ]
         gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
         top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential")
-        runner = MetaLoopRunner()
+        from ..state_table import StateTable
+        state_table = StateTable()
+        runner = MetaLoopRunner(state_table=state_table)
         runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
         def _flatten_nodes(r):
             out = []

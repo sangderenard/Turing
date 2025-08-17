@@ -18,6 +18,11 @@ from .debug import dbg, is_enabled, pretty_metrics
 
 @dataclass
 class RoundNodeEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        # Not all runners/roundnodes have a canonical state, but we can try to extract from runner if possible
+        if hasattr(self.runner, 'get_state'):
+            return self.runner.get_state(state)
+        return state
     inner: RoundNode
     runner: Optional[MetaLoopRunner] = None
 
@@ -25,7 +30,10 @@ class RoundNodeEngine(DtCompatibleEngine):
         if self.runner is None:
             self.runner = MetaLoopRunner()
 
-    def step(self, dt: float):
+    def step(self, dt: float, state=None, state_table=None):
+        # Optionally update runner state from state dict
+        if hasattr(self.runner, 'restore') and state is not None:
+            self.runner.restore(state)
         # Temporarily override the inner plan to match the requested slice
         saved = self.inner.plan
         from .dt import SuperstepPlan
@@ -39,7 +47,8 @@ class RoundNodeEngine(DtCompatibleEngine):
         m = res.metrics or Metrics(0.0, 0.0, 0.0, 0.0)
         if is_enabled():
             dbg("roundnode").debug(f"step done: metrics=({pretty_metrics(m)})")
-        return True, m
+        # Return new state if possible
+        return True, m, self.runner.get_state() if hasattr(self.runner, 'get_state') else None
 
     def step_realtime(self, dt: float) -> tuple[bool, Metrics]:  # pragma: no cover - exercised via demo
         if self.runner is None:

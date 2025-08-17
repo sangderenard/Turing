@@ -38,6 +38,11 @@ class _StepRequest:
 
 
 class ThreadedSystemEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        # Delegate to the underlying engine if possible
+        if hasattr(self._engine, 'get_state'):
+            return self._engine.get_state(state)
+        return state
     """Wrap a DtCompatibleEngine to run steps on a worker thread.
 
     Parameters
@@ -78,11 +83,17 @@ class ThreadedSystemEngine(DtCompatibleEngine):
         self._thread.start()
         self._realtime = bool(realtime)
     # DtCompatibleEngine interface -------------------------------
-    def step(self, dt: float) -> tuple[bool, Metrics]:
+    def step(self, dt: float, state=None, state_table=None):
         """Synchronously request a worker step and wait for Metrics.
 
         The worker performs the compute and may enqueue a frame.
         """
+        # Optionally, update the underlying engine's state if possible
+        if hasattr(self._engine, 'restore') and state is not None:
+            self._engine.restore(state)
+        # Optionally, set state_table if the engine supports it
+        if hasattr(self._engine, '_state_table'):
+            self._engine._state_table = state_table
         rep: "queue.Queue[tuple[bool, Metrics]]" = queue.Queue(maxsize=1)
         self._requests.put(_StepRequest(float(dt), rep))
         if is_enabled():
@@ -91,13 +102,12 @@ class ThreadedSystemEngine(DtCompatibleEngine):
             ok, metrics = rep.get(timeout=10.0)
         except queue.Empty:
             # Treat timeout as a failed step with punitive metrics
-            return False, Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
+            return False, Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9), None
         if is_enabled():
             dbg("threaded").debug(f"reply: ok={ok} metrics=({pretty_metrics(metrics)})")
-        return ok, metrics
+        # Return new state if possible
+        return ok, metrics, self._engine.get_state() if hasattr(self._engine, 'get_state') else None
 
-    def step_with_state(self, state, dt, *, realtime = False):
-        return super().step_with_state(state, dt, realtime=realtime)
 
     # Lifecycle ---------------------------------------------------
     def stop(self) -> None:

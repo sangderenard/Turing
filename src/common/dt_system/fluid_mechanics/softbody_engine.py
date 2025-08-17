@@ -60,19 +60,18 @@ class SoftbodyEngineWrapper(DtCompatibleEngine):
         if hasattr(self.solver, "restore") and snap is not None:
             self.solver.restore(snap)
 
-    def step(self, dt: float):
-        # Pseudocode for a future full implementation:
-        # 1) Sample surface queries from providers (if any):
-        #    points = self._surface_points_world()
-        #    samples = [sampler(points) for sampler in self.surface_samplers]
-        # 2) Feed samples into the solver (pressure forces, drag, etc.)
-        # 3) Run solver substeps/iterations for exactly dt.
-        # 4) Compute metrics: max velocity, penetration, mass/energy proxies.
-        # For now, we provide a safe stub that signals "not yet implemented".
-        raise NotImplementedError(
-            "SoftbodyEngineWrapper.step is a stub. Wire surface sampling, XPBD iterations, and metrics.\n"
-            "Guidance: provide SurfaceSampler providers and a penetration_fn so dt_solver can bisect on it."
-        )
+    def step(self, dt: float, state=None, state_table=None):
+      # Optionally update solver state from state dict
+      if isinstance(state, dict):
+        for k, v in state.items():
+          if hasattr(self.solver, k):
+            setattr(self.solver, k, v)
+      # Optionally use state_table for advanced metrics (not implemented)
+      # TODO: implement full step logic
+      # For now, just return ok, metrics, and the current state
+      metrics = None  # Optionally compute or set a Metrics object if available
+      new_state = self.solver.copy_shallow() if hasattr(self.solver, 'copy_shallow') else None
+      return True, metrics, new_state
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover
         return None

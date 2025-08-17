@@ -27,6 +27,15 @@ except Exception:  # pragma: no cover - optional import
 
 @dataclass
 class BathDiscreteFluidEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        """
+        Return the current state as a dict of relevant fields. If a state dict is supplied, update it in place.
+        """
+        out = state if isinstance(state, dict) else {}
+        for k in ("x", "v", "m", "rho", "T", "S"):
+            if hasattr(self.sim, k):
+                out[k] = getattr(self.sim, k)
+        return out
     """Adapter over :class:`DiscreteFluid` exposing DtCompatibleEngine.
 
     Parameters
@@ -206,7 +215,13 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         except Exception:
             pass
 
-    def step(self, dt: float):
+    def step(self, dt: float, state=None, state_table=None):
+        # If state is provided, update sim fields from it
+        if isinstance(state, dict):
+            for k in ("x", "v", "m", "rho", "T", "S"):
+                if k in state and hasattr(self.sim, k):
+                    setattr(self.sim, k, state[k])
+        # Optionally use state_table for advanced cross-system metrics (not implemented here)
         if is_enabled():
             try:
                 N = int(getattr(self.sim, "N", 0))
@@ -226,7 +241,7 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         except Exception:
             pass
 
-    # Advance exactly dt (sim may internally substep to remain stable)
+        # Advance exactly dt (sim may internally substep to remain stable)
         try:
             self.sim.step(float(dt))
         except Exception as e:
@@ -234,7 +249,7 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
                 dbg("eng.bath").debug(f"ERROR during sim.step: {type(e).__name__}: {e}")
             # Return a failure tuple to trigger controller retries/halving
             metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
-            return False, metrics
+            return False, metrics, self.get_state()
 
         # Compute metrics conservatively
         try:
@@ -271,7 +286,8 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         self._last_metrics = metrics
         if is_enabled():
             dbg("eng.bath").debug(f"done: {pretty_metrics(metrics)} vmin={vmin:.3e}")
-        return True, metrics
+        # Return new state object
+        return True, metrics, self.get_state()
 
     # New stateful stepping: accept and return external state
     def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
