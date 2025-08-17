@@ -61,6 +61,27 @@ class VoxelFluidEngine(DtCompatibleEngine):
             dbg("eng.bath").debug(f"voxel done: {pretty_metrics(metrics)}")
         return True, metrics
 
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - light bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("u", "v", "w", "rho", "p"):
+                    if k in state and hasattr(self.sim, k):
+                        setattr(self.sim, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        new_state = state
+        try:
+            if isinstance(state, dict):
+                out = {}
+                for k in ("u", "v", "w", "rho", "p"):
+                    if hasattr(self.sim, k):
+                        out[k] = getattr(self.sim, k)
+                new_state = out
+        except Exception:
+            new_state = state
+        return ok, m, new_state
+
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover
         dt0 = getattr(self.sim, "_stable_dt", None)
         try:

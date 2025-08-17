@@ -47,6 +47,27 @@ class HybridFluidEngine(DtCompatibleEngine):
             dbg("eng.bath").debug(f"hybrid done: {pretty_metrics(metrics)}")
         return True, metrics
 
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - light bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("x", "v", "grid"):
+                    if k in state and hasattr(self.sim, k):
+                        setattr(self.sim, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        new_state = state
+        try:
+            if isinstance(state, dict):
+                out = {}
+                for k in ("x", "v", "grid"):
+                    if hasattr(self.sim, k):
+                        out[k] = getattr(self.sim, k)
+                new_state = out
+        except Exception:
+            new_state = state
+        return ok, m, new_state
+
     def _compute_metrics(self) -> Metrics:
         try:
             grid = self.sim.grid

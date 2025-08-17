@@ -123,6 +123,23 @@ class GravityEngine(DtCompatibleEngine):
             self.s.acc[i] = v_add(self.s.acc[i], (0.0, -self.s.g))
         return True, Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
 
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
+
 
 class ThrustersEngine(DtCompatibleEngine):
     def __init__(self, state: DemoState, thrust: Vec = (0.0, 0.0)):
@@ -147,6 +164,23 @@ class ThrustersEngine(DtCompatibleEngine):
                 continue
             self.s.acc[i] = v_add(self.s.acc[i], a)
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
 
 
 class SpringEngine(DtCompatibleEngine):
@@ -175,6 +209,23 @@ class SpringEngine(DtCompatibleEngine):
             self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass", "springs", "rest_len", "k_spring"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
 
 
 class PneumaticDamperEngine(DtCompatibleEngine):
@@ -205,6 +256,23 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass", "springs", "pneu_damp"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
 
 
 class GroundCollisionEngine(DtCompatibleEngine):
@@ -237,6 +305,23 @@ class GroundCollisionEngine(DtCompatibleEngine):
                 a = (Fx / max(self.s.mass[i], 1e-9), Fy / max(self.s.mass[i], 1e-9))
                 self.s.acc[i] = v_add(self.s.acc[i], a)
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
 
 
 class IntegratorEngine(DtCompatibleEngine):
@@ -289,6 +374,23 @@ class IntegratorEngine(DtCompatibleEngine):
             except Exception:
                 pass
         return True, Metrics(max_vel=max_v, max_flux=0.0, div_inf=0.0, mass_err=0.0)
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        try:
+            if isinstance(state, dict):
+                for k in ("pos", "vel", "acc", "mass"):
+                    if k in state and hasattr(self.s, k):
+                        setattr(self.s, k, state[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out = {
+            "pos": list(self.s.pos),
+            "vel": list(self.s.vel),
+            "acc": list(self.s.acc),
+            "mass": list(self.s.mass),
+        }
+        return ok, m, out
 
 
 class MetaCollisionEngine(DtCompatibleEngine):
@@ -622,3 +724,28 @@ class MetaCollisionEngine(DtCompatibleEngine):
                 max_vel = max(max_vel, math.hypot(vx, vy))
         m = Metrics(max_vel=max_vel, max_flux=0.0, div_inf=max_pen, mass_err=0.0)
         return True, m
+
+    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+        # State can be a list of DemoState-like dicts
+        try:
+            if isinstance(state, list) and len(state) == len(self.states):
+                for i, sdict in enumerate(state):
+                    if isinstance(sdict, dict):
+                        for k in ("pos", "vel", "acc", "mass"):
+                            if k in sdict and hasattr(self.states[i], k):
+                                setattr(self.states[i], k, sdict[k])
+        except Exception:
+            pass
+        ok, m = self.step(float(dt))
+        out_list = []
+        try:
+            for s in self.states:
+                out_list.append({
+                    "pos": list(s.pos),
+                    "vel": list(s.vel),
+                    "acc": list(s.acc),
+                    "mass": list(s.mass),
+                })
+        except Exception:
+            pass
+        return ok, m, out_list if out_list else state

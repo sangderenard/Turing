@@ -58,7 +58,7 @@ class RoundNodeEngine(DtCompatibleEngine):
         for ch in list(self.inner.children):
             if hasattr(ch, "advance"):
                 # Advance leaf once
-                ok, m = ch.advance(ch.state.state, float(dt))  # type: ignore[attr-defined]
+                ok, m, _state_new = ch.advance(ch.state.state, float(dt))  # type: ignore[attr-defined]
                 if not ok:
                     return False, Metrics(0.0, 0.0, 1e9, 1e9)
                 last_m = m
@@ -67,7 +67,7 @@ class RoundNodeEngine(DtCompatibleEngine):
                 try:
                     for gch in list(getattr(ch, "children", [])):
                         if hasattr(gch, "advance"):
-                            ok, m = gch.advance(gch.state.state, float(dt))  # type: ignore[attr-defined]
+                            ok, m, _state_new = gch.advance(gch.state.state, float(dt))  # type: ignore[attr-defined]
                             if not ok:
                                 return False, Metrics(0.0, 0.0, 1e9, 1e9)
                             last_m = m

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 """
-Pygame demo: dt-graph orchestration with two craft system nodes + bath fluid.
+Pygame demo: dt-graph orchestration with two craft system nodes.
 
 Crafts are built from classic mechanics engines (thrusters, springs,
 pneumatics, ground, integrator) inside nested rounds controlled by the dt
 graph. Each craft round is wrapped as a DtCompatibleEngine so the parent
-graph schedules it like a system node. The bath discrete fluid sim runs as a
-regular engine in the same graph. The top-level dt remains centralized.
+graph schedules it like a system node. This demo intentionally avoids any
+dependency on the bath fluid modules.
 """
 
 from dataclasses import dataclass
@@ -51,6 +51,7 @@ from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
 from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
+from ..state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_engine_to_table
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
@@ -204,10 +205,8 @@ def _run_demo(
     craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80))
     craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255))
 
-    # Bath discrete fluid (small dam break)
-    # Slightly larger fluid block for visibility
-    fluid = DiscreteFluid.demo_dam_break(n_x=20, n_y=24, n_z=1, h=0.12)
-    fluid_engine = BathDiscreteFluidEngine(fluid)
+    # Bath discrete fluid: construct via engine convenience (n) and derive bounds from world planes
+    fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
 
     # Top-level graph: gravity -> meta-collision(A,B) -> craft A (system) -> craft B (system) -> fluid
     targets = Targets(cfl=0.9, div_max=1e3, mass_max=1e6)
@@ -223,11 +222,12 @@ def _run_demo(
         EngineRegistration(name="collision", engine=meta_collision, targets=targets, dx=dx, localize=False, solver_config=solver_cfg),
         EngineRegistration(name="craftA", engine=craft_a.system, targets=targets, dx=dx, localize=False),
         EngineRegistration(name="craftB", engine=craft_b.system, targets=targets, dx=dx, localize=False),
-        EngineRegistration(name="fluid", engine=fluid_engine, targets=targets, dx=float(fluid.kernel.h), localize=True),
+        EngineRegistration(name="fluid", engine=fluid_engine, targets=targets, dx=dx, localize=True),
     ]
     gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
     top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential")
     runner = MetaLoopRunner()
+    runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
 
     # Flatten node tree for HUD stats
     def _flatten_nodes(r):
@@ -249,6 +249,8 @@ def _run_demo(
     # Per-engine controllers (independent PI state) and current dt trackers
     per_ctrl: dict[str, STController] = {}
     dt_curr: dict[str, float] = {}
+    # Per-engine mutable state passed to realtime step (engines with step_with_state can use this)
+    per_state: dict[str, dict] = {}
     for reg in regs:
         if reg.ctrl is not None:
             per_ctrl[reg.name] = reg.ctrl
@@ -263,15 +265,62 @@ def _run_demo(
             )
         # Start realtime dt at budget rather than controller dt to avoid tiny values
         dt_curr[reg.name] = 1.0 / max(fps, 1)
+        # Initialize an empty state dict; engines that don't use it will ignore it
+        per_state[reg.name] = {}
 
     last_a = {"pos": np.array(craft_a.state.pos[1], dtype=float), "anchor": np.array(craft_a.state.pos[0], dtype=float), "color": (240, 80, 80)}
     last_b = {"pos": np.array(craft_b.state.pos[1], dtype=float), "anchor": np.array(craft_b.state.pos[0], dtype=float), "color": (80, 180, 255)}
 
+
     running = True
+    paused = True  # Start paused
+    reset_requested = False
+
+    def reset_scene():
+        nonlocal craft_a, craft_b, fluid_engine, regs, gb, top_round, runner, nodes_for_hud, last_a, last_b
+        # Rebuild crafts and engines
+        craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80))
+        craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255))
+        fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
+        meta_collision = MetaCollisionEngine([craft_a.state, craft_b.state], restitution=0.25, friction_mu=0.6, body_radius=0.12)
+        solver_cfg = BisectSolverConfig(target=0.0, eps=1e-5, field="div_inf", monotonic="increase", dt_min=1e-6)
+        regs = [
+            EngineRegistration(name="gravity", engine=GravityEngine(craft_a.state), targets=targets, dx=dx, localize=False),
+            EngineRegistration(name="collision", engine=meta_collision, targets=targets, dx=dx, localize=False, solver_config=solver_cfg),
+            EngineRegistration(name="craftA", engine=craft_a.system, targets=targets, dx=dx, localize=False),
+            EngineRegistration(name="craftB", engine=craft_b.system, targets=targets, dx=dx, localize=False),
+            EngineRegistration(name="fluid", engine=fluid_engine, targets=targets, dx=dx, localize=True),
+        ]
+        gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
+        top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential")
+        runner = MetaLoopRunner()
+        runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
+        def _flatten_nodes(r):
+            out = []
+            for ch in r.children:
+                out.append(ch)
+                if hasattr(ch, "children"):
+                    for gch in ch.children:
+                        out.append(gch)
+            return out
+        nodes_for_hud = _flatten_nodes(top_round)
+        last_a = {"pos": np.array(craft_a.state.pos[1], dtype=float), "anchor": np.array(craft_a.state.pos[0], dtype=float), "color": (240, 80, 80)}
+        last_b = {"pos": np.array(craft_b.state.pos[1], dtype=float), "anchor": np.array(craft_b.state.pos[0], dtype=float), "color": (80, 180, 255)}
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    paused = not paused
+                elif event.key == pygame.K_RETURN:
+                    reset_requested = True
+
+        if reset_requested:
+            reset_scene()
+            reset_requested = False
+            paused = True
 
         keys = pygame.key.get_pressed()
         # WASD for craft A
@@ -284,52 +333,20 @@ def _run_demo(
         craft_b.thrusters.thrust = (bx * 10.0, by * 10.0)
 
         dt = clock.tick(fps) / 1000.0
-        if classic:
-            # Classic mode: run superstep via graph
-            from ..dt import SuperstepPlan
-            saved = top_round.plan
-            top_round.plan = SuperstepPlan(round_max=float(dt), dt_init=max(float(dt), 1e-6))
-            try:
-                _res = runner.run_round(top_round)
-            finally:
-                top_round.plan = saved
-        else:
-            # Realtime mode: single-step each engine with time allocations
-            alloc = compile_allocations(rt_cfg, rt_state, engine_ids)
-            _base, _min_total = compute_minimum_budget(rt_cfg, rt_state, engine_ids)
-            _weights = compute_normalized_weights(rt_cfg, rt_state, engine_ids)
-
-            # Build simple advance adapters inline (avoids touching the graph runner)
-            for reg in regs:
-                name = reg.name
-                # Prefer realtime single-step when provided to avoid nested control
-                def adv(_s, _dt, _eng=reg.engine):
-                    sp = getattr(_eng, "step_realtime", None)
-                    if callable(sp):
-                        return sp(float(_dt))
-                    return _eng.step(float(_dt))
-                m, dt_next, _used = step_realtime_once(
-                    state=None,
-                    dt_current=dt_curr[name],
-                    dx=reg.dx,
-                    targets=reg.targets,
-                    ctrl=per_ctrl[name],
-                    advance=adv,
-                    alloc_ms=float(alloc.get(name, rt_cfg.ms_floor)),
-                    allow_exceptions=False,
-                )
-                # Update EMA penalty and proc time for next-frame allocations
-                pen = compute_penalty(m, reg.targets)
-                rt_state.update_penalty(name, pen, rt_cfg.ema_alpha)
-                # If metrics recorded proc_ms, include it in EMA for potential future use
+        if not paused:
+            if classic:
+                from ..dt import SuperstepPlan
+                saved = top_round.plan
+                top_round.plan = SuperstepPlan(round_max=float(dt), dt_init=max(float(dt), 1e-6))
                 try:
-                    _proc_ms = float(getattr(m, "proc_ms", 0.0))
-                    rt_state.update_proc_ms(name, _proc_ms, rt_cfg.ema_alpha)
-                except Exception:
-                    pass
-                dt_curr[name] = float(dt_next)
+                    _res = runner.run_round()
+                finally:
+                    top_round.plan = saved
+            else:
+                print("running round")
+                _res = runner.run_round()
 
-        # Drain craft frames
+        # Drain craft frames (always, so rendering is up to date)
         try:
             while True:
                 frame = craft_a.system.output_queue.get_nowait()
@@ -343,12 +360,12 @@ def _run_demo(
         except Exception:
             pass
 
-        # Render ------------------------------------------------------
+        # Rendering and HUD should always run, regardless of pause
         screen.fill((8, 9, 12))  # slightly cooler dark bg for contrast
 
         # Fluid particles
         try:
-            p = fluid.export_vertices()
+            p = fluid_engine.sim.export_vertices()  # type: ignore[union-attr]
             for i in range(min(p.shape[0], 2000)):
                 # Accept 2D or 3D particle positions
                 if p.shape[1] >= 3:
@@ -421,7 +438,7 @@ def _run_demo(
         # HUD: dt + per-node metrics
         font = pygame.font.SysFont("consolas", 15)
         hud_lines = []
-        hud_lines.append("Controls: WASD / Arrows; Debug: TURING_DT_DEBUG=1")
+        hud_lines.append("Controls: SPACE=play/pause, ENTER=reset, WASD / Arrows; Debug: TURING_DT_DEBUG=1")
         if classic:
             hud_lines.append(
                 ("[classic] " if classic else "[realtime] ")
@@ -467,7 +484,7 @@ def _run_demo(
                 ema_ms = float(rt_state.proc_ms_ma.get(name, 0.0))
                 ema_pen = float(rt_state.penalty_ma.get(name, 1.0))
                 hud_lines.append(
-                    f"{name[:20]:20}  alloc={ms:5.2f}ms  ema_cost={ema_ms:5.2f}ms  pen={ema_pen:6.3f}  dt={dt_curr[name]:7.4f}"
+                    f"{name[:20]:20}  alloc={ms:5.2f}ms  ema_cost={ema_ms:5.2f}ms  pen={ema_pen:6.3f}  dt=N/A"
                 )
         # Draw HUD panel
         pad, lh = 8, 18

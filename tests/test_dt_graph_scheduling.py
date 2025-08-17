@@ -21,7 +21,7 @@ class Ctr:
 def make_adv(tag: str, ctr: Ctr, vel: float):
     def advance(_state, dt: float):
         ctr.calls.append((tag, float(dt)))
-        return True, Metrics(max_vel=vel, max_flux=vel, div_inf=0.0, mass_err=0.0)
+    return True, Metrics(max_vel=vel, max_flux=vel, div_inf=0.0, mass_err=0.0), _state
     return advance
 
 
@@ -52,8 +52,8 @@ def test_interleave_schedule_slices_dt():
 @pytest.mark.fast
 def test_parallel_schedule_combines_metrics():
     s = StateNode(state=object())
-    a1 = AdvanceNode(advance=lambda st, dt: (True, Metrics(1.0, 1.0, 1e-6, 1e-9)), state=s)
-    a2 = AdvanceNode(advance=lambda st, dt: (True, Metrics(2.0, 2.0, 2e-6, 2e-9)), state=s)
+    a1 = AdvanceNode(advance=lambda st, dt: (True, Metrics(1.0, 1.0, 1e-6, 1e-9), st), state=s)
+    a2 = AdvanceNode(advance=lambda st, dt: (True, Metrics(2.0, 2.0, 2e-6, 2e-9), st), state=s)
 
     plan = SuperstepPlan(round_max=0.1, dt_init=0.1)
     ctrl = ControllerNode(ctrl=STController(dt_min=1e-6), targets=Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6), dx=1.0)

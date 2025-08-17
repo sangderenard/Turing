@@ -19,7 +19,7 @@ class S:
 
 def adv(max_vel: float):
     def f(_state: S, dt: float):
-        return True, Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
+    return True, Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0), _state
     return f
 
 

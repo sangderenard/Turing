@@ -22,7 +22,7 @@ def make_advance(max_vel: float):
     def advance(state: DummyState, dt: float):
         state.t += float(dt)
         m = Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
-        return True, m
+    return True, m, state
     return advance
 
 

@@ -33,7 +33,8 @@ class DtStats:
     def __init__(self, warn_thresh: float = 0.0) -> None:
         self.dts: dict[str, float] = {}
         self.sim_time: float = 0.0
-        self.t0 = time.time()
+    # High-resolution start time for stable sub-millisecond deltas
+        self.t0 = time.perf_counter()
         # Wall-clock timestamp of the most recently drawn frame. Updated when
         # :meth:`lines` is invoked by the renderer so the HUD reflects the
         # actual presentation time rather than the point of frame generation.
@@ -65,8 +66,9 @@ class DtStats:
                     lines.append(f"{name}/{ref_name}: {dt / ref_dt:.3f}")
         lines.append(f"sim t: {self.sim_time:.3f}s")
         # Capture the real time *at draw* so slow renderers continue to advance
-        # the on-screen timer while frames are displayed.
-        self.real_t = time.time() - self.t0
+        # the on-screen timer while frames are displayed. Use perf_counter for
+        # stable high-resolution timing on all platforms.
+        self.real_t = time.perf_counter() - self.t0
         if self.real_t > 1e-12:
             lines.append(
                 f"real t: {self.real_t:.3f}s x{self.sim_time / self.real_t:.2f}"

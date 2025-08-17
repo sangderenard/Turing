@@ -38,7 +38,9 @@ from .state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_eng
 # 
 
 
-AdvanceFn = Callable[[Any, float], Tuple[bool, Metrics]]
+# Accept both legacy two-tuple and new three-tuple signatures at runtime.
+# Annotation uses the broader three-tuple, but call sites handle both.
+AdvanceFn = Callable[[Any, float], Tuple[bool, Metrics, Any]]
 
 
 @dataclass
@@ -53,8 +55,9 @@ class StateNode:
 class AdvanceNode:
     """Leaf that advances a StateNode and returns Metrics.
 
-    The callable must mirror the engine-specific ``advance(state, dt)`` used by
-    existing dt code: returns (ok, Metrics).
+    The callable must mirror the engine-specific ``advance(state, dt)`` and
+    return a strict three-tuple: ``(ok: bool, metrics: Metrics, state: Any)``.
+    The returned state will be written back to the attached StateNode.
     """
 
     advance: AdvanceFn
@@ -84,20 +87,55 @@ class EngineNode:
     label: str = "engine"
 
     def to_advance_node(self, state: StateNode) -> "AdvanceNode":
-        def advance(state_obj: Any, dt: float):
+        def advance(state_obj: Any, dt: float, *, realtime: bool = False):
             if is_enabled():
-                dbg("engine").debug(f"step: name={self.registration.name} dt={float(dt):.6g}")
-            # Sync engine state from the global table before stepping
+                dbg("engine").debug(f"step: name={self.registration.name} dt={float(dt):.6g} realtime={realtime}")
             sync_engine_from_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
-            ok, metrics = self.registration.engine.step(dt)
-            # Publish updated engine state back to the table
+            eng = self.registration.engine
+            # In realtime mode: single step, accumulate penalty if metric violated
+            if realtime:
+                if hasattr(eng, "step_with_state"):
+                    try:
+                        ok, metrics, state_new = eng.step_with_state(state_obj, float(dt))  # type: ignore[misc]
+                    except Exception:
+                        ok, metrics = eng.step(float(dt))
+                        state_new = state_obj
+                else:
+                    ok, metrics = eng.step(float(dt))
+                    state_new = state_obj
+                # Penalty: accumulate error if controller metric violated (e.g., max_vel, div_inf, etc.)
+                # This is a placeholder: you may want to customize which metric and how penalty is computed
+                penalty = 0.0
+                targets = getattr(self.registration, "targets", None)
+                if targets is not None:
+                    if hasattr(metrics, "max_vel") and hasattr(targets, "cfl"):
+                        if metrics.max_vel > targets.cfl:
+                            penalty += float(metrics.max_vel - targets.cfl)
+                    if hasattr(metrics, "div_inf") and hasattr(targets, "div_max"):
+                        if metrics.div_inf > targets.div_max:
+                            penalty += float(metrics.div_inf - targets.div_max)
+                    if hasattr(metrics, "mass_err") and hasattr(targets, "mass_max"):
+                        if abs(metrics.mass_err) > targets.mass_max:
+                            penalty += float(abs(metrics.mass_err) - targets.mass_max)
+                # You can log or accumulate penalty as needed (e.g., attach to metrics, or log elsewhere)
+                metrics.penalty = penalty
+            else:
+                # Non-realtime: allow controller-driven superstep/substep logic
+                if hasattr(eng, "step_with_state"):
+                    try:
+                        ok, metrics, state_new = eng.step_with_state(state_obj, float(dt))  # type: ignore[misc]
+                    except Exception:
+                        ok, metrics = eng.step(float(dt))
+                        state_new = state_obj
+                else:
+                    ok, metrics = eng.step(float(dt))
+                    state_new = state_obj
             publish_engine_to_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
             if is_enabled():
                 dbg("engine").debug(
                     f"done: name={self.registration.name} ok={ok} metrics=({pretty_metrics(metrics)})"
                 )
-            # Engine owns its internal state; state_obj is passed for consistency
-            return bool(ok), metrics
+            return bool(ok), metrics, state_new
 
         return AdvanceNode(advance=advance, state=state, label=f"advance:{self.registration.name}")
 
@@ -145,86 +183,72 @@ class MetaLoopRunner:
 
     def __init__(self) -> None:
         self._stats: Dict[int, NodeStats] = {}
+        self._process_graph = None
+        self._adapter = None
+        self._root_round = None
+        self._ilp_scheduler = None
+        self._schedule = None
+        self._adv_map = None
+        self._schedule_method = "asap"
+        self._schedule_order = "dependency"
+        self._last_timings: list[float] = []  # timings for last frame, in schedule order
 
-    # ------------------------------ public API
-    def run_round(self, round_node: RoundNode) -> SuperstepResult:
-        """Execute one frame described by the given RoundNode tree."""
+    def set_process_graph(self, round_node: RoundNode, *, schedule_method: str = "asap", schedule_order: str = "dependency") -> None:
+        """Build and store a process graph, adapter, and schedule from the given RoundNode. Only called once unless graph changes."""
+        from .dt_process_adapter import DtToProcessAdapter
+        from ...transmogrifier.ilpscheduler import ILPScheduler
+        self._adapter = DtToProcessAdapter()
+        self._process_graph = self._adapter.build(round_node)
+        self._root_round = round_node
+        self._ilp_scheduler = ILPScheduler(self._process_graph)
+        self._schedule_method = schedule_method
+        self._schedule_order = schedule_order
+        # Build id->AdvanceNode mapping by traversing the RoundNode tree
+        adv_map = {}
+        def collect_adv(node):
+            if isinstance(node, AdvanceNode):
+                adv_map[id(node)] = node
+            elif isinstance(node, RoundNode):
+                for c in node.children:
+                    collect_adv(c)
+        collect_adv(self._root_round)
+        self._adv_map = adv_map
+        # Compute and cache the schedule ONCE
+        levels = self._ilp_scheduler.compute_levels(schedule_method, schedule_order)
+        self._schedule = [self._adv_map[nid] for nid, _ in sorted(levels.items(), key=lambda x: (x[1], x[0])) if nid in self._adv_map]
 
-        # Build an adapter that routes the outer dt request into the children.
-        def advance_adapter(_unused_state: Any, dt: float) -> Tuple[bool, Metrics]:
-            if is_enabled():
-                dbg("graph").debug(
-                    f"advance_adapter: dt={float(dt):.6g} children={len(round_node.children)} sched={round_node.schedule}"
-                )
-            metrics = self._advance_children(round_node, dt)
-            # Optionally post-process metrics via distribution to influence dt penalty.
-            if round_node.distribution is not None:
-                # Synthesize a penalty via user hook by mapping it to div_inf so the
-                # controller will reduce dt accordingly. Penalty p>=1 translates to
-                # div_inf = p * targets.div_max (i.e., penalty 1 means neutral).
-                try:
-                    pen = float(round_node.distribution(metrics, round_node.controller.targets, round_node.controller.dx))
-                    pen = max(pen, 1.0)
-                    tgt = round_node.controller.targets
-                    metrics = Metrics(
-                        max_vel=metrics.max_vel,
-                        max_flux=metrics.max_flux,
-                        div_inf=max(metrics.div_inf, float(tgt.div_max) * pen),
-                        mass_err=metrics.mass_err,
-                    )
-                except Exception:
-                    pass
-            if is_enabled():
-                dbg("graph").debug(f"advance_adapter: done metrics=({pretty_metrics(metrics)})")
-            return True, metrics
-
-        ctrl = round_node.controller.ctrl
-        targets = round_node.controller.targets
-        dx = round_node.controller.dx
-
-        # Provide a minimal state stub expected by step_with_dt_control_used.
-        class _NullState:
-            def copy_shallow(self):
-                return self
-
-            def restore(self, _other):
-                return None
-
-        # Run the superstep using the established algorithm.
-        if is_enabled():
-            dbg("graph").debug(
-                f"run_round: round_max={round_node.plan.round_max:.6g} dt_init={round_node.plan.dt_init:.6g}"
-            )
-        total, dt_next, metrics = run_superstep(
-            state=_NullState(),
-            round_max=round_node.plan.round_max,
-            dt_init=round_node.plan.dt_init,
-            dx=dx,
-            targets=targets,
-            ctrl=ctrl,
-            advance=advance_adapter,
-            allow_increase_mid_round=round_node.allow_increase_mid_round,
+    def run_round(self, dt: Optional[float] = None, *, realtime: bool = False) -> SuperstepResult:
+        """Execute one frame by walking the process graph in the cached schedule order (ILPScheduler). Passes realtime flag to advance functions."""
+        if self._schedule is None or self._root_round is None:
+            raise RuntimeError("No process graph set. Call set_process_graph() first.")
+        # Use dt from root round unless overridden
+        step_dt = dt if dt is not None else self._root_round.plan.dt_init
+        import time
+        last_metrics = None
+        self._last_timings = []
+        for adv in self._schedule:
+            if realtime:
+                t0 = time.perf_counter()
+                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=True)
+                t1 = time.perf_counter()
+                elapsed = t1 - t0
+                self._last_timings.append(elapsed)
+            else:
+                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=False)
+                self._last_timings.append(0.0)
+            adv.state.state = new_state
+            last_metrics = metrics
+    def get_last_schedule_timings(self) -> list[float]:
+        """Return the list of per-node timings (in seconds) for the last frame, in schedule order."""
+        return list(self._last_timings)
+        from .dt import SuperstepResult
+        return SuperstepResult(
+            advanced=step_dt,
+            dt_next=step_dt,
+            steps=len(self._schedule),
+            clamped=False,
+            metrics=last_metrics if last_metrics is not None else None,
         )
-
-        # Persist stats on the round node
-        st = self._stats.setdefault(id(round_node), NodeStats())
-        st.advanced_total += float(total)
-        st.last_metrics = metrics
-
-        # Construct a SuperstepResult compatible with existing API
-        steps = max(1, int(round(total / max(round_node.plan.dt_init, 1e-30)))) if total > 0 else 0
-        res = SuperstepResult(
-            advanced=float(total),
-            dt_next=float(dt_next),
-            steps=steps,
-            clamped=False,  # high-level round doesn't know inner clamps; see stats for detail
-            metrics=metrics,
-        )
-        if is_enabled():
-            dbg("graph").debug(
-                f"run_round: advanced={res.advanced:.6g} steps={res.steps} dt_next={res.dt_next:.6g} metrics=({pretty_metrics(metrics)})"
-            )
-        return res
 
     def get_latest_metrics(self, node: Union[RoundNode, AdvanceNode, ControllerNode]) -> Optional[Metrics]:
         """Return the latest Metrics observed at the given node, if any."""
@@ -255,11 +279,19 @@ class MetaLoopRunner:
                 st.attempted.append(float(slice_dt))
                 if is_enabled():
                     dbg("graph").debug(f"  leaf advance: label={child.label} dt={float(slice_dt):.6g}")
-                ok, m = child.advance(child.state.state, slice_dt)
+                res = child.advance(child.state.state, slice_dt)
+                # Strict contract: must return (ok, Metrics, state)
+                if not (isinstance(res, tuple) and len(res) == 3):
+                    raise ValueError(
+                        f"AdvanceNode advance() must return a three-tuple (ok, Metrics, state); got {type(res)} with len={len(res) if isinstance(res, tuple) else 'n/a'}"
+                    )
+                ok, m, new_state = res  # type: ignore[misc]
                 if not ok:
                     return Metrics(max_vel=m.max_vel, max_flux=m.max_flux, div_inf=1e9, mass_err=1e9)
                 st.last_metrics = m
                 st.advanced_total += float(slice_dt)
+                # Update the StateNode with the returned state
+                child.state.state = new_state
                 if is_enabled():
                     dbg("graph").debug(f"  leaf metrics: label={child.label} {pretty_metrics(m)}")
                 return m
@@ -356,13 +388,25 @@ class GraphBuilder:
             if reg.solver_config is not None:
                 # Wrap engine with a RoundNode whose adapter uses the bisect solver
                 def make_adv_with_bisect(reg_local: EngineRegistration) -> AdvanceNode:
-                    def advance(_state_obj: Any, dt: float):
+                    def advance(_state_obj: Any, dt: float, *, realtime: bool = False):
                         if is_enabled():
                             dbg("graph").debug(
-                                f"bisect solve: name={reg_local.name} dt={float(dt):.6g}"
+                                f"bisect solve: name={reg_local.name} dt={float(dt):.6g} realtime={realtime}"
                             )
-                        m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
-                        return True, m
+                        if realtime:
+                            # In realtime, just do one bisect solve and accumulate penalty
+                            m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
+                            penalty = 0.0
+                            targets = getattr(reg_local, "targets", None)
+                            if targets is not None:
+                                if hasattr(m, "div_inf") and hasattr(targets, "div_max"):
+                                    if m.div_inf > targets.div_max:
+                                        penalty += float(m.div_inf - targets.div_max)
+                            m.penalty = penalty
+                            return True, m, _state_obj
+                        else:
+                            m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
+                            return True, m, _state_obj
 
                     return AdvanceNode(advance=advance, state=state_stub, label=f"bisect:{reg_local.name}")
 

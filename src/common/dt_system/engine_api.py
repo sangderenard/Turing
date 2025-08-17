@@ -27,10 +27,22 @@ If omitted, the default penalty is computed from CFL and error ratios.
 
 
 class DtCompatibleEngine:
-    """Base compatibility shim engines should extend."""
+    """Base compatibility shim engines should extend.
+
+    Engines MUST be able to accept an external state and return the same
+    shape/state object after stepping. To enable a staged rollout, the
+    legacy ``step(dt)`` remains, and a new ``step_with_state(state, dt)``
+    default implementation delegates to ``step`` and returns the input state
+    unchanged. Compliant engines should override ``step_with_state``.
+    """
 
     def step(self, dt: float) -> tuple[bool, Metrics]:  # pragma: no cover - interface
         raise NotImplementedError
+
+    # New required capability for compliant engines
+    def step_with_state(self, state: object, dt: float) -> tuple[bool, Metrics, object]:  # pragma: no cover - default bridge
+        ok, m = self.step(float(dt))
+        return ok, m, state
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover - optional
         return None
