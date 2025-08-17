@@ -14,13 +14,21 @@ from ..debug import dbg, is_enabled, pretty_metrics
 
 @dataclass
 class VoxelFluidEngine(DtCompatibleEngine):
+    sim: object
+    dedup: bool = False
+    def register_vertices(self, state_table, positions, masses):
+        uuids = []
+        for pos, mass in zip(positions, masses):
+            uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+            uuids.append(uuid_str)
+        return uuids
     def get_state(self, state=None):
         out = state if isinstance(state, dict) else {}
         for k in ("u", "v", "w", "rho", "p"):
             if hasattr(self.sim, k):
                 out[k] = getattr(self.sim, k)
         return out
-    sim: object
+    
     name: str = "bath.voxel"
 
     _last_metrics: Optional[Metrics] = None

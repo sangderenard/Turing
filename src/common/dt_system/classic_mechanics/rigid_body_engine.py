@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from ..engine_api import DtCompatibleEngine
-from typing import Tuple, Optional, List, Dict
+from typing import Hashable, Tuple, Optional, List, Dict
 import numpy as np
 
 class MagicCenterOfMass:
@@ -36,32 +36,94 @@ class RigidBodyEngine(DtCompatibleEngine):
         out['velocities'] = self.velocities.copy()
         out['masses'] = self.masses.copy()
         return out
-    def __init__(self, links: List[WorldObjectLink]):
+
+    def __init__(self, links: List[WorldObjectLink], state_table, rigid_body_groups: List[dict]):
+        """
+        links: list of WorldObjectLink
+        state_table: shared StateTable instance
+        rigid_body_groups: list of dicts, each with keys:
+            - 'label': unique group label
+            - 'vertices': set or list of vertex indices or ids
+            - 'edges': (optional) dict of {color: set(edge_ids)}
+            - 'faces': (optional) set/list of face ids
+            - ... (any extra features)
+        """
         self.links = links
         self.object_anchors = [link.object_anchor for link in links]
-        # Placeholder arrays; real positions/velocities will be looked up via state_table
         self.nodes = np.array([link.world_anchor.position for link in links], dtype=float)
         self.masses = np.array([oa[3] for oa in self.object_anchors], dtype=float)
         self.velocities = np.zeros_like(self.nodes)
         self.forces = np.zeros_like(self.nodes)
+        # Explicit group registration with identity assignment
+        import uuid
+        self.rigid_body_groups = []
+        for group in rigid_body_groups:
+            label = group['label']
+            vertices = set(group['vertices'])
+            edges = group.get('edges', None)
+            faces = group.get('faces', None)
+            # Assign UUID identity to group if not present
+            group_uuid = group.get('uuid', str(uuid.uuid4()))
+            # Register group identity with COM marker for position
+            if hasattr(state_table, 'register_identity'):
+                state_table.register_identity(pos='COM', mass=0.0, uuid_str=group_uuid)
+            # Assign UUIDs to edges and faces if not already present, and register their identity
+            edge_identities = {}
+            if edges:
+                for color, edge_set in edges.items():
+                    for edge in edge_set:
+                        if isinstance(edge, tuple) and len(edge) == 2:
+                            edge_uuid = f"edge_{label}_{edge[0]}_{edge[1]}"
+                            # COM marker: edge position is the COM of its two vertices
+                            edge_pos_marker = ('COM', edge)
+                        else:
+                            edge_uuid = f"edge_{label}_{str(edge)}"
+                            edge_pos_marker = 'COM'  # fallback
+                        edge_identities[edge] = edge_uuid
+                        if hasattr(state_table, 'register_identity'):
+                            state_table.register_identity(pos=edge_pos_marker, mass=0.0, uuid_str=edge_uuid)
+            face_identities = {}
+            if faces:
+                for face in faces:
+                    face_uuid = f"face_{label}_{str(face)}"
+                    # COM marker: face position is the COM of its vertices (assume face is a tuple/list of vertex indices)
+                    if isinstance(face, (tuple, list)):
+                        face_pos_marker = ('COM', tuple(face))
+                    else:
+                        face_pos_marker = 'COM'
+                    face_identities[face] = face_uuid
+                    if hasattr(state_table, 'register_identity'):
+                        state_table.register_identity(pos=face_pos_marker, mass=0.0, uuid_str=face_uuid)
+            # Register in state_table
+            if hasattr(state_table, 'register_group'):
+                state_table.register_group(
+                    group_label=label,
+                    vertices=vertices,
+                    edges=edges,
+                    faces=faces
+                )
+            self.rigid_body_groups.append(label)
     def _lookup_vertex_group(
         self, *, state_table, vertex_set_identifier, set_index
     ):
-        """Look up a vertex group (e.g., all vertices for an object) from the state table."""
-        # Convention: state_table.get(scope, name, field_name)
-        # For classic mechanics, use ('object', vertex_set_identifier, 'pos')
+        """Look up a vertex group (e.g., all vertices for an object) from the state table using group accessors only."""
         if state_table is None:
             raise ValueError("RigidBodyEngine requires explicit state_table for COM/group lookups.")
-        assert hasattr(state_table, "get"), f"state_table must support .get; got {type(state_table)}"
-
-        pos = state_table.get('object', vertex_set_identifier, 'pos')
-        mass = state_table.get('object', vertex_set_identifier, 'mass')
-        if pos is None or mass is None:
-            raise ValueError(f"No position/mass found for object '{vertex_set_identifier}' in state_table.")
-        pos = np.asarray(pos)
-        mass = np.asarray(mass)
+        vertex_indices = list(state_table.get_group_vertices(vertex_set_identifier))
+        if not vertex_indices:
+            raise ValueError(f"No vertices found for group '{vertex_set_identifier}' in state_table.")
+        # Expect group registration to provide positions and masses, or raise if not available
+        group_positions = getattr(state_table, 'group_positions', None)
+        group_masses = getattr(state_table, 'group_masses', None)
+        if group_positions and vertex_set_identifier in group_positions:
+            pos = np.asarray([group_positions[vertex_set_identifier][i] for i in vertex_indices])
+        else:
+            raise ValueError(f"No position array found for group '{vertex_set_identifier}' in state_table.")
+        if group_masses and vertex_set_identifier in group_masses:
+            mass = np.asarray([group_masses[vertex_set_identifier].get(i, 1.0) for i in vertex_indices])
+        else:
+            mass = np.ones(len(vertex_indices))
         if set_index is not None:
-            # Optionally select a subset (e.g., a specific group)
             pos = pos[set_index]
             mass = mass[set_index]
         return pos, mass

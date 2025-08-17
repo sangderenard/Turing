@@ -206,7 +206,9 @@ def _run_demo(
     # Default: realtime mode ON; use --classic to fall back to superstep graph.
     rt_cfg = RealtimeConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
     rt_state = RealtimeState()
-
+    # --- StateTable for dt_tape HUD wiring and metaloop constructor---
+    from ..state_table import StateTable
+    state_table = StateTable()
     # Build crafts, passing the root's realtime config/state
     craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
     craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
@@ -225,12 +227,37 @@ def _run_demo(
 
     # To use the rigid body engine as a constraint/finalizer, add it as the last engine in your engine registration list:
     from .rigid_body_engine import RigidBodyEngine, WorldAnchor, WorldObjectLink, COM
-    world_anchors = [WorldAnchor(position=(0.0, 0.0))]
-    object_anchors = [(0, "craft_a", COM, 0.0),
-                      (0, "craft_b", COM, 0.0)]#(world_anchor_index, vertex_set_identifier, set_index, mass)
 
+    world_anchors = [WorldAnchor(position=(0.0, 0.0))]
+    object_anchors = [ (0, "craft_a", COM, 0.0), (0, "craft_b", COM, 0.0) ]
     links = [WorldObjectLink(world_anchor=world_anchors[object_anchors[i][0]], object_anchor=object_anchors[i], link_type='steel_beam', properties={'length': 1.0, 'k': 10000.0}) for i in range(len(object_anchors))]
-    rigid_engine = RigidBodyEngine(links)
+
+    # --- Explicitly define rigid body groups for each craft ---
+    rigid_body_groups = []
+    # Craft A
+    craft_a_vertices = set(range(len(craft_a.state.pos)))
+    craft_a_edges = { 'spring': set(craft_a.state.springs) }
+    craft_a_masses = {i: craft_a.state.mass[i] for i in craft_a_vertices}
+    rigid_body_groups.append({
+        'label': 'craft_a',
+        'vertices': craft_a_vertices,
+        'edges': craft_a_edges,
+        'masses': craft_a_masses,
+        # Faces can be added if defined
+    })
+    # Craft B
+    craft_b_vertices = set(range(len(craft_b.state.pos)))
+    craft_b_edges = { 'spring': set(craft_b.state.springs) }
+    craft_b_masses = {i: craft_b.state.mass[i] for i in craft_b_vertices}
+    rigid_body_groups.append({
+        'label': 'craft_b',
+        'vertices': craft_b_vertices,
+        'edges': craft_b_edges,
+        'masses': craft_b_masses,
+    })
+
+    # Pass explicit group structure to RigidBodyEngine
+    rigid_engine = RigidBodyEngine(links, state_table, rigid_body_groups)
 
     regs: List[EngineRegistration] = [
         EngineRegistration(name="gravity", engine=GravityEngine(craft_a.state), targets=targets, dx=dx, localize=False),
@@ -254,9 +281,7 @@ def _run_demo(
     gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
     top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential", realtime_config=rt_cfg, realtime_state=rt_state)
 
-    # --- StateTable for dt_tape HUD wiring and metaloop constructor---
-    from ..state_table import StateTable
-    state_table = StateTable()
+
     runner = MetaLoopRunner(realtime_config=rt_cfg, realtime_state=rt_state, realtime=not classic, state_table=state_table)
     runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
 

@@ -27,6 +27,14 @@ except Exception:  # pragma: no cover - optional import
 
 @dataclass
 class BathDiscreteFluidEngine(DtCompatibleEngine):
+    # If using identity registration, dedup should default to False for fluids
+    dedup: bool = False
+    def register_vertices(self, state_table, positions, masses):
+        uuids = []
+        for pos, mass in zip(positions, masses):
+            uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+            uuids.append(uuid_str)
+        return uuids
     def get_state(self, state=None):
         """
         Return the current state as a dict of relevant fields. If a state dict is supplied, update it in place.

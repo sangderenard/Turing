@@ -41,6 +41,13 @@ SurfaceSampler = Callable[[np.ndarray], Dict[str, np.ndarray]]
 
 @dataclass
 class SoftbodyEngineWrapper(DtCompatibleEngine):
+  dedup: bool = False
+  def register_vertices(self, state_table, positions, masses):
+    uuids = []
+    for pos, mass in zip(positions, masses):
+      uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+      uuids.append(uuid_str)
+    return uuids
     solver: object
     name: str = "softbody.xpbd"
     # Optional providers that deliver surface data (pressure/velocity/etc.)

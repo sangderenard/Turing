@@ -104,16 +104,27 @@ class Contact:
 
 
 class GravityEngine(DtCompatibleEngine):
-    def get_state(self, state=None):
-        out = state if isinstance(state, dict) else {}
-        for k in ("pos", "vel", "acc", "mass"):
-            if hasattr(self.s, k):
-                out[k] = list(getattr(self.s, k))
-        return out
-    def __init__(self, state: DemoState):
+
+    def get_state(self, state_table=None):
+        # Return a dict of UUIDs to identity objects (pos, mass, acc, etc.)
+        if state_table is None:
+            return {}
+        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+
+    def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
+        self.state_table = state_table
+        self.group_label = group_label or "gravity_group"
+        self.uuids = uuids or []
+        if self.state_table is not None:
+            self.uuids = []
+            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
+                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
+                self.uuids.append(uuid_str)
+            self.state_table.register_group(self.group_label, set(self.uuids))
 
     # Snapshot proxies (optional)
+
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
 
@@ -121,26 +132,49 @@ class GravityEngine(DtCompatibleEngine):
         return self.s.restore(snap)
 
     def step(self, dt: float, state, state_table):
+        # Use the state_table identity registry for all updates
         if is_enabled():
             dbg("eng.gravity").debug(f"dt={float(dt):.6g}")
-        for i, m in enumerate(self.s.mass):
-            if m <= 0:  
+        if state_table is None:
+            state_table = self.state_table
+        if state_table is None:
+            raise ValueError("GravityEngine requires a StateTable for identity-based state management.")
+        for uuid in self.uuids:
+            identity = state_table.get_identity(uuid)
+            if identity is None:
                 continue
-            self.s.acc[i] = v_add(self.s.acc[i], (0.0, -self.s.g))
+            mass = identity.get('mass', 0.0)
+            if mass <= 0:
+                continue
+            acc = identity.get('acc', (0.0, 0.0))
+            acc = v_add(acc, (0.0, -self.s.g))
+            state_table.update_identity(uuid, pos=identity.get('pos'), mass=mass)
+            # Also update acceleration in the identity object
+            identity['acc'] = acc
         metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
-        return True, metrics, self.get_state()
+        return True, metrics, self.get_state(state_table)
 
 
 class ThrustersEngine(DtCompatibleEngine):
-    def get_state(self, state=None):
-        out = state if isinstance(state, dict) else {}
-        for k in ("pos", "vel", "acc", "mass"):
-            if hasattr(self.s, k):
-                out[k] = list(getattr(self.s, k))
-        return out
-    def __init__(self, state: DemoState, thrust: Vec = (0.0, 0.0)):
+
+    def get_state(self, state_table=None):
+        if state_table is None:
+            return {}
+        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+
+    def __init__(self, state: DemoState, thrust: Vec = (0.0, 0.0), state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
         self.thrust = thrust
+        self.state_table = state_table
+        self.group_label = group_label or "thrusters_group"
+        self.uuids = uuids or []
+        if self.state_table is not None:
+            self.uuids = []
+            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
+                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
+                self.uuids.append(uuid_str)
+            self.state_table.register_group(self.group_label, set(self.uuids))
+
 
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
@@ -151,27 +185,66 @@ class ThrustersEngine(DtCompatibleEngine):
     def step(self, dt: float, state, state_table):
         if is_enabled():
             dbg("eng.thrusters").debug(f"dt={float(dt):.6g} thrust={self.thrust}")
-        total_mass = sum(max(m, 1e-9) for m in self.s.mass)
+        if state_table is None:
+            state_table = self.state_table
+        if state_table is None:
+            raise ValueError("ThrustersEngine requires a StateTable for identity-based state management.")
+        # Compute total mass from identities
+        total_mass = 0.0
+        for uuid in self.uuids:
+            identity = state_table.get_identity(uuid)
+            if identity is not None:
+                total_mass += max(identity.get('mass', 0.0), 1e-9)
         eff = max(0.0, min(1.0, getattr(self.s, "thruster_eff", 1.0)))
-        a = (eff * self.thrust[0] / total_mass, eff * self.thrust[1] / total_mass)
-        # Apply only to dynamic (mass>0) nodes; anchors are inert
-        for i, m in enumerate(self.s.mass):
-            if m <= 0.0:
+        if total_mass == 0.0:
+            a = (0.0, 0.0)
+        else:
+            a = (eff * self.thrust[0] / total_mass, eff * self.thrust[1] / total_mass)
+        for uuid in self.uuids:
+            identity = state_table.get_identity(uuid)
+            if identity is None:
                 continue
-            self.s.acc[i] = v_add(self.s.acc[i], a)
+            mass = identity.get('mass', 0.0)
+            if mass <= 0.0:
+                continue
+            acc = identity.get('acc', (0.0, 0.0))
+            acc = v_add(acc, a)
+            state_table.update_identity(uuid, pos=identity.get('pos'), mass=mass)
+            identity['acc'] = acc
         metrics = Metrics(0.0, 0.0, 0.0, 0.0)
-        return True, metrics, self.get_state()
+        return True, metrics, self.get_state(state_table)
 
 
 class SpringEngine(DtCompatibleEngine):
-    def get_state(self, state=None):
-        out = state if isinstance(state, dict) else {}
-        for k in ("pos", "vel", "acc", "mass", "springs", "rest_len", "k_spring"):
-            if hasattr(self.s, k):
-                out[k] = getattr(self.s, k)
-        return out
-    def __init__(self, state: DemoState):
+
+    def get_state(self, state_table=None):
+        if state_table is None:
+            return {}
+        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+
+    def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
+        self.state_table = state_table
+        self.group_label = group_label or "spring_group"
+        self.uuids = uuids or []
+        self.edge_ids = []
+        self.edge_uuids = []
+        if self.state_table is not None:
+            self.uuids = []
+            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
+                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
+                self.uuids.append(uuid_str)
+            self.edge_ids = []
+            self.edge_uuids = []
+            for (i, j) in self.s.springs:
+                edge = (self.uuids[i], self.uuids[j])
+                self.edge_ids.append(edge)
+                # Register edge as an identity object with mass proportional to resting length
+                L0 = self.s.rest_len[(i, j)]
+                edge_uuid = self.state_table.register_identity(edge, mass=L0, dedup=True)
+                self.edge_uuids.append(edge_uuid)
+            self.state_table.register_group(self.group_label, set(self.uuids), edges={"spring": set(self.edge_uuids)})
+
 
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
@@ -182,9 +255,19 @@ class SpringEngine(DtCompatibleEngine):
     def step(self, dt: float, state, state_table):
         if is_enabled():
             dbg("eng.spring").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
+        if state_table is None:
+            state_table = self.state_table
+        if state_table is None:
+            raise ValueError("SpringEngine requires a StateTable for identity-based state management.")
         eff = max(0.0, min(1.0, getattr(self.s, "spring_eff", 1.0)))
-        for (i, j) in self.s.springs:
-            p_i, p_j = self.s.pos[i], self.s.pos[j]
+        for idx, (i, j) in enumerate(self.s.springs):
+            uuid_i = self.uuids[i]
+            uuid_j = self.uuids[j]
+            identity_i = state_table.get_identity(uuid_i)
+            identity_j = state_table.get_identity(uuid_j)
+            if identity_i is None or identity_j is None:
+                continue
+            p_i, p_j = identity_i.get('pos'), identity_j.get('pos')
             k = self.s.k_spring[(i, j)]
             L0 = self.s.rest_len[(i, j)]
             d = v_sub(p_j, p_i)
@@ -192,22 +275,57 @@ class SpringEngine(DtCompatibleEngine):
             dir_ = v_norm(d)
             F = eff * k * (L - L0)
             f = v_scale(dir_, F)
-            self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
-            self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
+            mass_i = identity_i.get('mass', 1e-9)
+            mass_j = identity_j.get('mass', 1e-9)
+            acc_i = identity_i.get('acc', (0.0, 0.0))
+            acc_j = identity_j.get('acc', (0.0, 0.0))
+            acc_i = v_add(acc_i, v_scale(f, +1.0 / max(mass_i, 1e-9)))
+            acc_j = v_add(acc_j, v_scale(f, -1.0 / max(mass_j, 1e-9)))
+            state_table.update_identity(uuid_i, pos=p_i, mass=mass_i)
+            state_table.update_identity(uuid_j, pos=p_j, mass=mass_j)
+            identity_i['acc'] = acc_i
+            identity_j['acc'] = acc_j
+            # Edge identity update: store force magnitude as a property
+            edge_uuid = self.edge_uuids[idx]
+            edge_identity = state_table.get_identity(edge_uuid)
+            if edge_identity is not None:
+                edge_identity['force'] = F
+                state_table.update_identity(edge_uuid, pos=(p_i, p_j), mass=L0)
         metrics = Metrics(0.0, 0.0, 0.0, 0.0)
-        return True, metrics, self.get_state()
+        return True, metrics, self.get_state(state_table)
 
 
 
 class PneumaticDamperEngine(DtCompatibleEngine):
-    def get_state(self, state=None):
-        out = state if isinstance(state, dict) else {}
-        for k in ("pos", "vel", "acc", "mass", "springs", "pneu_damp"):
-            if hasattr(self.s, k):
-                out[k] = getattr(self.s, k)
-        return out
-    def __init__(self, state: DemoState):
+
+    def get_state(self, state_table=None):
+        if state_table is None:
+            return {}
+        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+
+    def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
+        self.state_table = state_table
+        self.group_label = group_label or "pneumatic_group"
+        self.uuids = uuids or []
+        self.edge_ids = []
+        self.edge_uuids = []
+        if self.state_table is not None:
+            self.uuids = []
+            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
+                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
+                self.uuids.append(uuid_str)
+            self.edge_ids = []
+            self.edge_uuids = []
+            for (i, j) in self.s.springs:
+                edge = (self.uuids[i], self.uuids[j])
+                self.edge_ids.append(edge)
+                # Register edge as an identity object with mass proportional to resting length
+                L0 = self.s.rest_len[(i, j)] if hasattr(self.s, 'rest_len') and (i, j) in self.s.rest_len else 1.0
+                edge_uuid = self.state_table.register_identity(edge, mass=L0, dedup=True)
+                self.edge_uuids.append(edge_uuid)
+            self.state_table.register_group(self.group_label, set(self.uuids), edges={"spring": set(self.edge_uuids)})
+
 
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
@@ -217,38 +335,70 @@ class PneumaticDamperEngine(DtCompatibleEngine):
 
     def step(self, dt: float, state=None, state_table=None):
         if state is not None:
-            # Replace internal state with provided state
             self.s.restore(state)
         if is_enabled():
             dbg("eng.pneumatic").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
+        if state_table is None:
+            state_table = self.state_table
+        if state_table is None:
+            raise ValueError("PneumaticDamperEngine requires a StateTable for identity-based state management.")
         eff = max(0.0, min(1.0, getattr(self.s, "pneumatic_eff", 1.0)))
-        for (i, j) in self.s.springs:
-            p_i, p_j = self.s.pos[i], self.s.pos[j]
-            v_i, v_j = self.s.vel[i], self.s.vel[j]
+        for idx, (i, j) in enumerate(self.s.springs):
+            uuid_i = self.uuids[i]
+            uuid_j = self.uuids[j]
+            identity_i = state_table.get_identity(uuid_i)
+            identity_j = state_table.get_identity(uuid_j)
+            if identity_i is None or identity_j is None:
+                continue
+            p_i, p_j = identity_i.get('pos'), identity_j.get('pos')
+            v_i, v_j = identity_i.get('vel', (0.0, 0.0)), identity_j.get('vel', (0.0, 0.0))
             d = v_sub(p_j, p_i)
             dir_ = v_norm(d)
             rel_v = v_sub(v_j, v_i)
             along = rel_v[0] * dir_[0] + rel_v[1] * dir_[1]
             damp_a, damp_b = self.s.pneu_damp[(i, j)]
             coeff = damp_a if along > 0 else damp_b
-            # Apply damping opposite to relative motion so the pair slows down
             f = v_scale(dir_, eff * coeff * along)
-            self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
-            self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
+            mass_i = identity_i.get('mass', 1e-9)
+            mass_j = identity_j.get('mass', 1e-9)
+            acc_i = identity_i.get('acc', (0.0, 0.0))
+            acc_j = identity_j.get('acc', (0.0, 0.0))
+            acc_i = v_add(acc_i, v_scale(f, +1.0 / max(mass_i, 1e-9)))
+            acc_j = v_add(acc_j, v_scale(f, -1.0 / max(mass_j, 1e-9)))
+            state_table.update_identity(uuid_i, pos=p_i, mass=mass_i)
+            state_table.update_identity(uuid_j, pos=p_j, mass=mass_j)
+            identity_i['acc'] = acc_i
+            identity_j['acc'] = acc_j
+            # Edge identity update: store force magnitude as a property
+            edge_uuid = self.edge_uuids[idx]
+            edge_identity = state_table.get_identity(edge_uuid)
+            if edge_identity is not None:
+                edge_identity['force'] = eff * coeff * along
+                state_table.update_identity(edge_uuid, pos=(p_i, p_j), mass=state_table.get_identity(edge_uuid).get('mass', 1.0))
         metrics = Metrics(0.0, 0.0, 0.0, 0.0)
-        return True, metrics, self.get_state()
+        return True, metrics, self.get_state(state_table)
 
 
 
 class GroundCollisionEngine(DtCompatibleEngine):
-    def get_state(self, state=None):
-        out = state if isinstance(state, dict) else {}
-        for k in ("pos", "vel", "acc", "mass"):
-            if hasattr(self.s, k):
-                out[k] = list(getattr(self.s, k))
-        return out
-    def __init__(self, state: DemoState):
+
+    def get_state(self, state_table=None):
+        if state_table is None:
+            return {}
+        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+
+    def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
+        self.state_table = state_table
+        self.group_label = group_label or "ground_group"
+        self.uuids = uuids or []
+        if self.state_table is not None:
+            self.uuids = []
+            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
+                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
+                self.uuids.append(uuid_str)
+            self.state_table.register_group(self.group_label, set(self.uuids))
+
 
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
@@ -261,24 +411,34 @@ class GroundCollisionEngine(DtCompatibleEngine):
             self.s.restore(state)
         if is_enabled():
             dbg("eng.ground").debug(f"dt={float(dt):.6g}")
+        if state_table is None:
+            state_table = self.state_table
+        if state_table is None:
+            raise ValueError("GroundCollisionEngine requires a StateTable for identity-based state management.")
         k = self.s.ground_k
         b = self.s.ground_b
         mu = self.s.mu
-        for i, p in enumerate(self.s.pos):
-            if self.s.mass[i] <= 0.0:
-                # anchors do not interact with ground
+        for idx, uuid in enumerate(self.uuids):
+            identity = state_table.get_identity(uuid)
+            if identity is None:
                 continue
-            if p[1] < 0.0:
-                # penalty force upward proportional to penetration and velocity
-                pen = -p[1]
-                vy = self.s.vel[i][1]
+            mass = identity.get('mass', 0.0)
+            if mass <= 0.0:
+                continue
+            pos = identity.get('pos', (0.0, 0.0))
+            vel = identity.get('vel', (0.0, 0.0))
+            if pos[1] < 0.0:
+                pen = -pos[1]
+                vy = vel[1]
                 Fy = k * pen - b * vy
-                # friction along x against motion when in contact
-                Fx = -mu * k * pen * math.copysign(1.0, self.s.vel[i][0]) if abs(self.s.vel[i][0]) > 1e-6 else 0.0
-                a = (Fx / max(self.s.mass[i], 1e-9), Fy / max(self.s.mass[i], 1e-9))
-                self.s.acc[i] = v_add(self.s.acc[i], a)
+                Fx = -mu * k * pen * math.copysign(1.0, vel[0]) if abs(vel[0]) > 1e-6 else 0.0
+                a = (Fx / max(mass, 1e-9), Fy / max(mass, 1e-9))
+                acc = identity.get('acc', (0.0, 0.0))
+                acc = v_add(acc, a)
+                state_table.update_identity(uuid, pos=pos, mass=mass)
+                identity['acc'] = acc
         metrics = Metrics(0.0, 0.0, 0.0, 0.0)
-        return True, metrics, self.get_state()
+        return True, metrics, self.get_state(state_table)
 
 
 
