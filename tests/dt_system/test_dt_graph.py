@@ -14,6 +14,7 @@ from src.common.dt_system.dt_graph import (
 )
 from src.cells.bath.dt_controller import STController, Targets
 from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.state_table import StateTable
 
 
 class DummyState:
@@ -22,10 +23,19 @@ class DummyState:
 
 
 def make_advance(max_vel: float):
-    def advance(state: DummyState, dt: float, *, realtime: bool = False):
+    uid = None
+
+    def advance(state: DummyState, dt: float, *, realtime: bool = False, state_table=None):
+        nonlocal uid
         state.t += float(dt)
+        if state_table is not None:
+            if uid is None:
+                uid = state_table.register_identity(pos=state.t, mass=1.0)
+            else:
+                state_table.update_identity(uid, pos=state.t)
         m = Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
         return True, m, state
+
     return advance
 
 
@@ -41,12 +51,14 @@ def test_round_with_single_advance_node():
     plan = SuperstepPlan(round_max=0.2, dt_init=0.05)
     round_root = RoundNode(plan=plan, controller=ctrl, children=[a_node])
 
-    runner = MetaLoopRunner()
-    res = runner.run_round(round_root)
+    table = StateTable()
+    runner = MetaLoopRunner(state_table=table)
+    res = runner.run_round(round_root, dt=plan.round_max, state_table=table)
 
     assert math.isclose(res.advanced, plan.round_max, rel_tol=0, abs_tol=plan.eps)
     assert isinstance(res.dt_next, float)
     assert state.t > 0.0
+    assert len(table.identity_registry) == 1
 
 
 @pytest.mark.dt
@@ -71,9 +83,12 @@ def test_nested_rounds_delegate_dt():
     # Outer round delegates its dt to inner round first, then performs a simple outer advance
     outer_round = RoundNode(plan=plan_outer, controller=outer_ctrl, children=[inner_round, a_outer])
 
-    runner = MetaLoopRunner()
-    res = runner.run_round(outer_round)
+    table = StateTable()
+    runner = MetaLoopRunner(state_table=table)
+    res = runner.run_round(outer_round, dt=plan_outer.round_max, state_table=table)
 
     assert math.isclose(res.advanced, plan_outer.round_max, rel_tol=0, abs_tol=plan_outer.eps)
     # Inner advanced fully
     assert math.isclose(inner.t, plan_outer.round_max, rel_tol=0, abs_tol=plan_outer.eps)
+    # Two advance nodes should have registered identities
+    assert len(table.identity_registry) == 2

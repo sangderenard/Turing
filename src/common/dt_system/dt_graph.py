@@ -247,6 +247,7 @@ class MetaLoopRunner:
                 elapsed = t1 - t0
                 self._last_timings.append(elapsed)
             else:
+                step_dt = dt if dt is not None else 1.0
                 ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=False, state_table=table)
                 self._last_timings.append(0.0)
             adv.state.state = new_state
