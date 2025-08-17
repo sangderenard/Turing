@@ -12,6 +12,7 @@ from src.common.dt_system.dt_graph import (
 from src.common.dt_system.dt_process_adapter import schedule_dt_round
 from src.cells.bath.dt_controller import STController, Targets
 from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.state_table import StateTable
 
 
 class S:
@@ -20,8 +21,11 @@ class S:
 
 
 def adv(max_vel: float):
-    def f(_state: S, dt: float):
+    def f(_state: S, dt: float, *, state_table=None, realtime: bool = False):
+        if state_table is not None:
+            state_table.set("adv", str(id(_state)), "t", getattr(_state, "t", 0.0))
         return True, Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0), _state
+
     return f
 
 
@@ -34,7 +38,8 @@ def test_adapter_builds_levels_and_interference_sequential():
 
     ctrl = ControllerNode(ctrl=STController(dt_min=1e-6), targets=Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6), dx=1.0)
     plan = SuperstepPlan(round_max=0.1, dt_init=0.1)
-    root = RoundNode(plan=plan, controller=ctrl, children=[a1, a2], schedule="sequential")
+    table = StateTable()
+    root = RoundNode(plan=plan, controller=ctrl, children=[a1, a2], schedule="sequential", state_table=table)
 
     levels, ig, lifespans, G = schedule_dt_round(root, method="asap", order="dependency")
 
@@ -55,7 +60,8 @@ def test_adapter_parallel_no_dependency_edge():
 
     ctrl = ControllerNode(ctrl=STController(dt_min=1e-6), targets=Targets(cfl=0.5, div_max=1e-3, mass_max=1e-6), dx=1.0)
     plan = SuperstepPlan(round_max=0.1, dt_init=0.1)
-    root = RoundNode(plan=plan, controller=ctrl, children=[a1, a2], schedule="parallel")
+    table = StateTable()
+    root = RoundNode(plan=plan, controller=ctrl, children=[a1, a2], schedule="parallel", state_table=table)
 
     levels, ig, lifespans, G = schedule_dt_round(root, method="asap", order="dependency")
 

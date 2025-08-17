@@ -13,6 +13,7 @@ from typing import List, Tuple
 from ..dt_controller import STController, Targets
 from ..dt_graph import GraphBuilder, MetaLoopRunner
 from ..engine_api import EngineRegistration
+from ..state_table import StateTable
 from .engines import (
     DemoState,
     GravityEngine,
@@ -38,15 +39,17 @@ def make_state() -> DemoState:
     return DemoState(pos, vel, acc, mass, springs, rest_len, k_spring, pneu)
 
 
-def build_demo_round(dt: float = 0.016):
+def build_demo_round(dt: float = 0.016, *, state_table: StateTable | None = None):
+    if state_table is None:
+        state_table = StateTable()
     s = make_state()
 
     engines = [
-        ("gravity", GravityEngine(s)),
-        ("thrusters", ThrustersEngine(s, thrust=(0.0, 0.0))),
-        ("springs", SpringEngine(s)),
-        ("pneumatics", PneumaticDamperEngine(s)),
-        ("ground", GroundCollisionEngine(s)),
+        ("gravity", GravityEngine(s, state_table=state_table)),
+        ("thrusters", ThrustersEngine(s, thrust=(0.0, 0.0), state_table=state_table)),
+        ("springs", SpringEngine(s, state_table=state_table)),
+        ("pneumatics", PneumaticDamperEngine(s, state_table=state_table)),
+        ("ground", GroundCollisionEngine(s, state_table=state_table)),
         ("integrate", IntegratorEngine(s)),
     ]
 
@@ -62,13 +65,13 @@ def build_demo_round(dt: float = 0.016):
     gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
     # sequential here to demonstrate explicit dependency chain; switch to
     # interleave/parallel to change the adapter’s edges
-    round_node = gb.round(dt=dt, engines=regs, schedule="sequential")
+    round_node = gb.round(dt=dt, engines=regs, schedule="sequential", state_table=state_table)
 
-    return s, regs, round_node
+    return s, regs, round_node, state_table
 
 
-def run_demo(dt: float = 0.016, steps: int = 1) -> None:
-    state, regs, round_node = build_demo_round(dt=dt)
+def run_demo(dt: float = 0.016, steps: int = 1, *, state_table: StateTable | None = None) -> None:
+    state, regs, round_node, table = build_demo_round(dt=dt, state_table=state_table)
 
     # 1) Materialize process graph and compute schedule metadata
     levels, ig, lifespans, proc_nx = schedule_dt_round(round_node, method="asap", order="dependency")
@@ -90,9 +93,9 @@ def run_demo(dt: float = 0.016, steps: int = 1) -> None:
         print(f"  {proc_nx.nodes[u].get('label')} ↔ {proc_nx.nodes[v].get('label')}")
 
     # 2) Execute one or more frames via MetaLoopRunner
-    runner = MetaLoopRunner()
+    runner = MetaLoopRunner(state_table=table)
     for k in range(steps):
-        res = runner.run_round(round_node)
+        res = runner.run_round(round_node, dt=dt, state_table=table)
         print(f"\n=== Frame {k} advanced {res.advanced:.6f}s, dt_next={res.dt_next:.6f} ===")
         for reg in regs:
             print(f"  ran engine: {reg.name}")
