@@ -23,7 +23,6 @@ Important design notes for a correct implementation
 - Snapshot/restore: Provide shallow copy helpers so the bisection solver can
   try multiple dt candidates without committing state.
 
-Until wired, this class raises NotImplementedError in step().
 """
 from __future__ import annotations
 
@@ -41,47 +40,92 @@ SurfaceSampler = Callable[[np.ndarray], Dict[str, np.ndarray]]
 
 @dataclass
 class SoftbodyEngineWrapper(DtCompatibleEngine):
-  dedup: bool = False
-  def register_vertices(self, state_table, positions, masses):
-    uuids = []
-    for pos, mass in zip(positions, masses):
-      uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
-      uuids.append(uuid_str)
-    return uuids
+    """Generic DtCompatibleEngine adapter for XPBD-style softbody solvers."""
+
     solver: object
     name: str = "softbody.xpbd"
-    # Optional providers that deliver surface data (pressure/velocity/etc.)
     surface_samplers: tuple[SurfaceSampler, ...] = ()
-    # Optional hook to return a scalar penetration value for dt solving
     penetration_fn: Optional[Callable[[object], float]] = None
-    # Optional solids registry to consult for collisions/contacts
     solids: Optional["SolidRegistry"] = None
+    dedup: bool = False
     _last_metrics: Optional[Metrics] = None
+
+    def register_vertices(self, state_table, positions, masses):
+        uuids = []
+        for pos, mass in zip(positions, masses):
+            uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+            uuids.append(uuid_str)
+        return uuids
 
     def snapshot(self):  # pragma: no cover
         if hasattr(self.solver, "copy_shallow"):
-            return self.solver.copy_shallow()
+            try:
+                return self.solver.copy_shallow()
+            except Exception:
+                return None
         return None
 
     def restore(self, snap) -> None:  # pragma: no cover
         if hasattr(self.solver, "restore") and snap is not None:
-            self.solver.restore(snap)
+            try:
+                self.solver.restore(snap)
+            except Exception:
+                pass
+
+    def _snapshot_state(self):
+        if hasattr(self.solver, "copy_shallow"):
+            try:
+                return self.solver.copy_shallow()
+            except Exception:
+                return None
+        return None
+
+    def _compute_metrics(self) -> Metrics:
+        try:
+            if hasattr(self.solver, "max_vertex_speed"):
+                vmax = float(self.solver.max_vertex_speed())
+            elif hasattr(self.solver, "V"):
+                vmax = float(np.max(np.linalg.norm(self.solver.V, axis=1)))
+            else:
+                vmax = 0.0
+        except Exception:
+            vmax = 0.0
+        pen = 0.0
+        if self.penetration_fn is not None:
+            try:
+                pen = float(self.penetration_fn(self.solver))
+            except Exception:
+                pen = 0.0
+        dt_hint = None
+        try:
+            dt_fn = getattr(self.solver, "_stable_dt", None)
+            if callable(dt_fn):
+                dt_hint = float(dt_fn())
+        except Exception:
+            dt_hint = None
+        return Metrics(max_vel=vmax, max_flux=vmax, div_inf=pen, mass_err=0.0, dt_limit=dt_hint)
 
     def step(self, dt: float, state=None, state_table=None):
-      # Optionally update solver state from state dict
-      if isinstance(state, dict):
-        for k, v in state.items():
-          if hasattr(self.solver, k):
-            setattr(self.solver, k, v)
-      # Optionally use state_table for advanced metrics (not implemented)
-      # TODO: implement full step logic
-      # For now, just return ok, metrics, and the current state
-      metrics = None  # Optionally compute or set a Metrics object if available
-      new_state = self.solver.copy_shallow() if hasattr(self.solver, 'copy_shallow') else None
-      return True, metrics, new_state
+        if isinstance(state, dict):
+            for k, v in state.items():
+                if hasattr(self.solver, k):
+                    setattr(self.solver, k, v)
+        try:
+            self.solver.step(float(dt))
+        except Exception:
+            metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
+            return False, metrics, self._snapshot_state()
+        metrics = self._compute_metrics()
+        self._last_metrics = metrics
+        new_state = self._snapshot_state()
+        return True, metrics, new_state
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover
-        return None
+        dt0 = getattr(self.solver, "_stable_dt", None)
+        try:
+            return float(dt0()) if callable(dt0) else None
+        except Exception:
+            return None
 
     def get_metrics(self) -> Optional[Metrics]:  # pragma: no cover
         return self._last_metrics
