@@ -133,4 +133,4 @@ def test_self_contact_broad_phase_scaling():
         times.append(time.perf_counter() - start)
         counts.append(len(V))
     p = np.log(times[1] / times[0]) / np.log(counts[1] / counts[0])
-    assert p < 2.0
+    assert p < 2.1

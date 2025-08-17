@@ -1,6 +1,9 @@
 import math
 import pytest
 
+import math
+import pytest
+
 from src.common.dt_system.dt import SuperstepPlan
 from src.common.dt_system.dt_graph import (
     StateNode,
@@ -19,10 +22,10 @@ class DummyState:
 
 
 def make_advance(max_vel: float):
-    def advance(state: DummyState, dt: float):
+    def advance(state: DummyState, dt: float, *, realtime: bool = False):
         state.t += float(dt)
         m = Metrics(max_vel=max_vel, max_flux=max_vel, div_inf=0.0, mass_err=0.0)
-        return True, m
+        return True, m, state
     return advance
 
 

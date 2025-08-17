@@ -274,7 +274,7 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         return True, metrics
 
     # New stateful stepping: accept and return external state
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - light bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
         # Accept mappings with common bath fields and apply before stepping
         try:
             if isinstance(state, dict):
