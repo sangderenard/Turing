@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from ..engine_api import DtCompatibleEngine
+from ..dt_scaler import Metrics
 from typing import Hashable, Tuple, Optional, List, Dict
 import numpy as np
 
@@ -54,6 +55,7 @@ class RigidBodyEngine(DtCompatibleEngine):
         self.masses = np.array([oa[3] for oa in self.object_anchors], dtype=float)
         self.velocities = np.zeros_like(self.nodes)
         self.forces = np.zeros_like(self.nodes)
+        self._constraint_accum = 0.0
         # Explicit group registration with identity assignment
         import uuid
         self.rigid_body_groups = []
@@ -122,6 +124,7 @@ class RigidBodyEngine(DtCompatibleEngine):
         self.masses = np.array([oa[3] for oa in self.object_anchors], dtype=float)
         self.velocities = np.zeros_like(self.nodes)
         self.forces = np.zeros_like(self.nodes)
+        self._constraint_accum = 0.0
         # Explicit group registration with identity assignment
         import uuid
         self.rigid_body_groups = []
@@ -266,8 +269,11 @@ class RigidBodyEngine(DtCompatibleEngine):
             if 'masses' in state:
                 self.masses = np.asarray(state['masses'], dtype=float)
         self.apply_forces(state_table=state_table)
-        # Return ok, metrics, new state object
-        metrics = None  # Optionally compute or set a Metrics object if available
+        max_vel = float(np.max(np.linalg.norm(self.velocities, axis=1))) if len(self.velocities) else 0.0
+        err = float(np.max(np.linalg.norm(self.forces, axis=1))) if len(self.forces) else 0.0
+        self._constraint_accum += err * dt
+        dt_limit = 0.5 / (max_vel + 1e-9) if max_vel > 0 else None
+        metrics = Metrics(max_vel=max_vel, max_flux=0.0, div_inf=self._constraint_accum, mass_err=0.0, dt_limit=dt_limit)
         return True, metrics, self.get_state()
 
 
