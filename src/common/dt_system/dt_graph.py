@@ -30,8 +30,10 @@ from .dt_controller import STController, Targets, Metrics, run_superstep
 from .engine_api import EngineRegistration
 from .debug import dbg, is_enabled, pretty_metrics
 from .dt_solver import solve_window_bisect
-from .state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_engine_to_table
+from .state_table import sync_engine_from_table, publish_engine_to_table
 
+import time
+from .realtime import RealtimeConfig, RealtimeState, compile_allocations
 
 # 
 # Node types
@@ -87,15 +89,15 @@ class EngineNode:
     label: str = "engine"
 
     def to_advance_node(self, state: StateNode) -> "AdvanceNode":
-        def advance(state_obj: Any, dt: float, *, realtime: bool = False):
+        def advance(state_obj: Any, dt: float, *, realtime: bool = False, state_table=None):
             if is_enabled():
                 dbg("engine").debug(f"step: name={self.registration.name} dt={float(dt):.6g} realtime={realtime}")
-            sync_engine_from_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
+            if state_table is None:
+                raise ValueError("Explicit state_table argument is required")
+            sync_engine_from_table(self.registration.engine, self.registration.name, state_table)
             eng = self.registration.engine
             ok, metrics, state_new = eng.step_with_state(state_obj, float(dt), realtime=realtime)  # type: ignore[misc]
             if realtime:
-                # Penalty: accumulate error if controller metric violated (e.g., max_vel, div_inf, etc.)
-                # This is a placeholder: you may want to customize which metric and how penalty is computed
                 penalty = 0.0
                 targets = getattr(self.registration, "targets", None)
                 if targets is not None:
@@ -108,9 +110,8 @@ class EngineNode:
                     if hasattr(metrics, "mass_err") and hasattr(targets, "mass_max"):
                         if abs(metrics.mass_err) > targets.mass_max:
                             penalty += float(abs(metrics.mass_err) - targets.mass_max)
-                # You can log or accumulate penalty as needed (e.g., attach to metrics, or log elsewhere)
                 metrics.penalty = penalty
-            publish_engine_to_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
+            publish_engine_to_table(self.registration.engine, self.registration.name, state_table)
             if is_enabled():
                 dbg("engine").debug(
                     f"done: name={self.registration.name} ok={ok} metrics=({pretty_metrics(metrics)})"
@@ -137,6 +138,8 @@ class RoundNode:
     # Optional nonlinear distribution hook: (metrics, targets, dx) -> dt_penalty scalar
     distribution: Optional[Callable[[Metrics, Targets, float], float]] = None
     label: str = "round"
+    # Reference to the state_table, only set at the root
+    state_table: Any = None
 
 
 # 
@@ -150,7 +153,7 @@ class NodeStats:
     attempted: List[float] = field(default_factory=list)
     advanced_total: float = 0.0
 
-
+from .realtime import RealtimeConfig, RealtimeState
 class MetaLoopRunner:
     """Standardized meta-loop runner that executes a RoundNode tree.
 
@@ -161,7 +164,7 @@ class MetaLoopRunner:
     - Supports arbitrary nesting depth.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, realtime_config: RealtimeConfig = None, realtime_state: RealtimeState = None, realtime: bool = False, state_table=None) -> None:
         self._stats: Dict[int, NodeStats] = {}
         self._process_graph = None
         self._adapter = None
@@ -171,12 +174,19 @@ class MetaLoopRunner:
         self._adv_map = None
         self._schedule_method = "asap"
         self._schedule_order = "dependency"
+        self._realtime_config = realtime_config
+        self._realtime_state = realtime_state
+        self._realtime_allocations = None
         self._last_timings: list[float] = []  # timings for last frame, in schedule order
+        self._realtime = realtime
+        self._constructed_state_table = state_table
 
     def set_process_graph(self, round_node: RoundNode, *, schedule_method: str = "asap", schedule_order: str = "dependency") -> None:
         """Build and store a process graph, adapter, and schedule from the given RoundNode. Only called once unless graph changes."""
         from .dt_process_adapter import DtToProcessAdapter
         from ...transmogrifier.ilpscheduler import ILPScheduler
+        if round_node.state_table is None:
+            round_node.state_table = self._constructed_state_table
         self._adapter = DtToProcessAdapter()
         self._process_graph = self._adapter.build(round_node)
         self._root_round = round_node
@@ -197,35 +207,61 @@ class MetaLoopRunner:
         levels = self._ilp_scheduler.compute_levels(schedule_method, schedule_order)
         self._schedule = [self._adv_map[nid] for nid, _ in sorted(levels.items(), key=lambda x: (x[1], x[0])) if nid in self._adv_map]
 
+    def _renew_allocations(self) -> None:
+        if self._realtime_config is not None and self._realtime_state is not None:
+            id_list = [id(adv) for adv in self._schedule]
+            self._realtime_allocations = compile_allocations(self._realtime_config, self._realtime_state, id_list)
+
+    # set_realtime_config is now removed; realtime config/state must be provided at construction
+
+
     def run_round(
         self,
         round_node: Optional[RoundNode] = None,
         dt: Optional[float] = None,
         *,
-        realtime: bool = False,
+        realtime: Optional[bool] = None,
+        state_table=None,
     ) -> SuperstepResult:
-        """Execute one frame. Optionally accept a RoundNode on first call."""
+        """Execute one frame. Optionally accept a RoundNode on first call. Logs dt tape to state_table if provided."""
         if round_node is not None:
             self.set_process_graph(round_node)
         if self._schedule is None or self._root_round is None:
             raise RuntimeError("No process graph set. Call set_process_graph() first.")
-        # Use the round's requested window unless overridden
-        step_dt = dt if dt is not None else self._root_round.plan.round_max
-        import time
-        last_metrics = None
-        self._last_timings = []
-        for adv in self._schedule:
+        # Use the state_table from the root node if not explicitly provided
+        table = state_table if state_table is not None else getattr(self._root_round, 'state_table', None)
+        # Use the instance default if not explicitly provided
+        if realtime is None:
+            realtime = self._realtime
+        if realtime:
+            self._renew_allocations()
+        else:
+            self._realtime_allocations = [None] * len(self._schedule)  # reset for non-realtime
+        for adv, alloc in zip(self._schedule, self._realtime_allocations):
             if realtime:
+                step_dt_ms = alloc if alloc is not None else dt*1000.0 if dt is not None else 1.0
+                step_dt = step_dt_ms / 1000.0  # convert ms to seconds
                 t0 = time.perf_counter()
-                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=True)
+                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=True, state_table=table)
                 t1 = time.perf_counter()
                 elapsed = t1 - t0
                 self._last_timings.append(elapsed)
             else:
-                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=False)
+                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=False, state_table=table)
                 self._last_timings.append(0.0)
             adv.state.state = new_state
             last_metrics = metrics
+            # --- DT TAPE LOGGING ---
+            if table is not None:
+                node_id = adv.label
+                # Log latest metrics
+                table.set('dt_tape', node_id, 'metrics', metrics)
+                # Log actual dt used for this node
+                table.set('dt_tape', node_id, 'dt', step_dt)
+                # Log attempted dts (if available)
+                st = self._stats.get(adv.label)
+                if st is not None:
+                    table.set('dt_tape', node_id, 'attempted', list(st.attempted))
         from .dt import SuperstepResult
         return SuperstepResult(
             advanced=step_dt,
@@ -241,12 +277,11 @@ class MetaLoopRunner:
 
     def get_latest_metrics(self, node: Union[RoundNode, AdvanceNode, ControllerNode]) -> Optional[Metrics]:
         """Return the latest Metrics observed at the given node, if any."""
-
-        st = self._stats.get(id(node))
+        st = self._stats.get(node.label)
         return st.last_metrics if st else None
 
     def get_attempted_dts(self, node: Union[RoundNode, AdvanceNode, ControllerNode]) -> List[float]:
-        st = self._stats.get(id(node))
+        st = self._stats.get(node.label)
         return list(st.attempted) if st else []
 
     # ------------------------------ helpers
@@ -264,7 +299,7 @@ class MetaLoopRunner:
 
         def run_one(child, slice_dt: float) -> Metrics:
             if isinstance(child, AdvanceNode):
-                st = self._stats.setdefault(id(child), NodeStats())
+                st = self._stats.setdefault(child.label, NodeStats())
                 st.attempted.append(float(slice_dt))
                 if is_enabled():
                     dbg("graph").debug(f"  leaf advance: label={child.label} dt={float(slice_dt):.6g}")
@@ -336,7 +371,7 @@ class MetaLoopRunner:
             # empty sequence: return inert metrics
             last_metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
         # Also track on the parent round for introspection
-        self._stats.setdefault(id(parent_round), NodeStats()).last_metrics = last_metrics
+        self._stats.setdefault(parent_round.label, NodeStats()).last_metrics = last_metrics
         if is_enabled():
             dbg("graph").debug(
                 f"_advance_children: sched={sched} children={len(children)} -> {pretty_metrics(last_metrics)}"
@@ -367,50 +402,67 @@ class GraphBuilder:
         *,
         allow_increase_mid_round: bool = False,
         schedule: str = "sequential",
+        realtime_config: RealtimeConfig = None,
+        realtime_state: RealtimeState = None,
+        parent_label: str = None,
+        state_table: Any = None,
     ) -> RoundNode:
         plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt))
         controller = ControllerNode(ctrl=self.ctrl, targets=self.targets, dx=self.dx)
         state_stub = StateNode(state=None)
         children: List[Union[AdvanceNode, RoundNode]] = []
-        for reg in engines:
+        # Compose a unique label prefix for this round
+        label_prefix = parent_label + "/" if parent_label else ""
+        for idx, reg in enumerate(engines):
             adv = EngineNode(reg).to_advance_node(state_stub)
-            if reg.solver_config is not None:
-                # Wrap engine with a RoundNode whose adapter uses the bisect solver
-                def make_adv_with_bisect(reg_local: EngineRegistration) -> AdvanceNode:
+            unique_label = f"{label_prefix}{reg.name}_{idx}"
+            localize = getattr(reg, "localize", True)
+            if realtime_config is not None:
+                localize = False
+            if len(engines) == 1 and parent_label is not None:
+                localize = False
+            if reg.solver_config is not None and realtime_config is None:
+                def make_adv_with_bisect(reg_local: EngineRegistration, label: str) -> AdvanceNode:
                     def advance(_state_obj: Any, dt: float, *, realtime: bool = False):
                         if is_enabled():
                             dbg("graph").debug(
                                 f"bisect solve: name={reg_local.name} dt={float(dt):.6g} realtime={realtime}"
                             )
-                        if realtime:
-                            # In realtime, just do one bisect solve and accumulate penalty
-                            m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
-                            penalty = 0.0
-                            targets = getattr(reg_local, "targets", None)
-                            if targets is not None:
-                                if hasattr(m, "div_inf") and hasattr(targets, "div_max"):
-                                    if m.div_inf > targets.div_max:
-                                        penalty += float(m.div_inf - targets.div_max)
-                            m.penalty = penalty
-                            return True, m, _state_obj
-                        else:
-                            m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
-                            return True, m, _state_obj
+                        m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
+                        penalty = 0.0
+                        targets = getattr(reg_local, "targets", None)
+                        if targets is not None:
+                            if hasattr(m, "div_inf") and hasattr(targets, "div_max"):
+                                if m.div_inf > targets.div_max:
+                                    penalty += float(m.div_inf - targets.div_max)
+                        m.penalty = penalty
+                        if realtime and realtime_state is not None:
+                            realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
+                        return True, m, _state_obj
+                    return AdvanceNode(advance=advance, state=state_stub, label=f"bisect:{label}")
 
-                    return AdvanceNode(advance=advance, state=state_stub, label=f"bisect:{reg_local.name}")
-
-                # Build a single-child round that directly consumes the parent slice via bisect
                 e_round = RoundNode(
                     plan=SuperstepPlan(round_max=float(dt), dt_init=float(dt)),
                     controller=ControllerNode(ctrl=self.ctrl, targets=self.targets, dx=self.dx),
-                    children=[make_adv_with_bisect(reg)],
+                    children=[make_adv_with_bisect(reg, unique_label)],
                     allow_increase_mid_round=False,
                     schedule="sequential",
-                    label=f"bisect-round:{reg.name}",
+                    label=f"bisect-round:{unique_label}",
+                    state_table=state_table,
                 )
                 children.append(e_round)
-            elif getattr(reg, "localize", True):
-                # Wrap in a nested round so the engine can run finer than the parent request
+            elif reg.solver_config is not None and realtime_config is not None:
+                
+                def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
+                    # Forward state_table if the underlying advance supports it
+                    
+                    ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
+
+                    if realtime and realtime_state is not None:
+                        realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
+                    return ok, m, state_new
+                children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
+            elif localize:
                 e_ctrl = reg.ctrl if reg.ctrl is not None else STController(
                     Kp=self.ctrl.Kp,
                     Ki=self.ctrl.Ki,
@@ -420,26 +472,42 @@ class GraphBuilder:
                     dt_max=self.ctrl.dt_max,
                 )
                 e_controller = ControllerNode(ctrl=e_ctrl, targets=reg.targets, dx=reg.dx)
-                e_round = RoundNode(
-                    plan=SuperstepPlan(round_max=float(dt), dt_init=float(dt)),
-                    controller=e_controller,
-                    children=[adv],
+                nested_round = GraphBuilder(ctrl=e_ctrl, targets=reg.targets, dx=reg.dx).round(
+                    dt=dt,
+                    engines=[reg],
                     allow_increase_mid_round=False,
                     schedule="sequential",
-                    label=f"round:{reg.name}",
-                )
-                # Apply per-engine distribution hook if provided
-                if reg.distribution is not None:
-                    e_round.distribution = reg.distribution
-                children.append(e_round)
+                    realtime_config=realtime_config,
+                    realtime_state=realtime_state,
+                    parent_label=unique_label,
+                    state_table=state_table,
+                ) if not (realtime_config is not None and len(engines) == 1) else None
+                if nested_round is not None:
+                    if reg.distribution is not None:
+                        nested_round.distribution = reg.distribution
+                    children.append(nested_round)
+                else:
+                    def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
+                        ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
+                        if realtime and realtime_state is not None:
+                            realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
+                        return ok, m, state_new
+                    children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
             else:
-                children.append(adv)
+                def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
+                    ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
+                    if realtime and realtime_state is not None:
+                        realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
+                    return ok, m, state_new
+                children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
         return RoundNode(
             plan=plan,
             controller=controller,
             children=children,
             allow_increase_mid_round=allow_increase_mid_round,
             schedule=schedule,
+            label=label_prefix.rstrip("/") or "root",
+            state_table=state_table,
         )
 
 

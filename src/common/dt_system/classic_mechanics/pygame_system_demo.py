@@ -51,7 +51,7 @@ from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
 from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
-from ..state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_engine_to_table
+from ..state_table import sync_engine_from_table, publish_engine_to_table
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
@@ -68,7 +68,7 @@ class Craft:
     system: ThreadedSystemEngine
 
 
-def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40)) -> Craft:
+def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40), *, classic: bool, realtime_config=None, realtime_state=None) -> Craft:
     # 4-node square craft: fully connected with diagonals, equal masses
     ax, ay = float(anchor[0]), float(anchor[1])
     size = 0.8
@@ -119,10 +119,11 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40)) ->
     ctrl = STController(dt_min=1e-6)
     dx = 0.1
     regs: List[EngineRegistration] = [
-        EngineRegistration(name=n, engine=e, targets=targets, dx=dx, localize=True) for (n, e) in engines
+        EngineRegistration(name=n, engine=e, targets=targets, dx=dx, localize=classic) for (n, e) in engines
     ]
     gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
-    craft_round = gb.round(dt=0.016, engines=regs, schedule="sequential")
+    # Use the craft name as the parent_label to ensure all node labels are unique per craft
+    craft_round = gb.round(dt=0.016, engines=regs, schedule="sequential", realtime_config=realtime_config, realtime_state=realtime_state, parent_label=name)
     rne = RoundNodeEngine(craft_round)
 
     # Threaded system wrapper captures a snapshot for UI
@@ -133,7 +134,7 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40)) ->
         com = nodes.mean(axis=0) if len(nodes) > 0 else np.array([0.0, 0.0])
         return {"craft": {"nodes": nodes, "edges": edges, "com": com, "color": color}}
 
-    sys = ThreadedSystemEngine(rne, capture=capture, realtime=True)
+    sys = ThreadedSystemEngine(rne, capture=capture, realtime=not classic)
     return Craft(name=name, state=s, thrusters=thr, round_engine=rne, system=sys)
 
 
@@ -201,9 +202,14 @@ def _run_demo(
         scale = 60.0
         return (int(px * scale + width * 0.15), int(height - (py * scale + height * 0.15)))
 
-    # Build crafts
-    craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80))
-    craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255))
+    # Realtime state --------------------------------------------------------
+    # Default: realtime mode ON; use --classic to fall back to superstep graph.
+    rt_cfg = RealtimeConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
+    rt_state = RealtimeState()
+
+    # Build crafts, passing the root's realtime config/state
+    craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
+    craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
 
     # Bath discrete fluid: construct via engine convenience (n) and derive bounds from world planes
     fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
@@ -217,17 +223,43 @@ def _run_demo(
     # Configure bisect solver to drive penetration (encoded in Metrics.div_inf) toward 0 within epsilon
     solver_cfg = BisectSolverConfig(target=0.0, eps=1e-5, field="div_inf", monotonic="increase", dt_min=1e-6)
 
+    # To use the rigid body engine as a constraint/finalizer, add it as the last engine in your engine registration list:
+    from .rigid_body_engine import RigidBodyEngine, WorldAnchor, WorldObjectLink, COM
+    world_anchors = [WorldAnchor(position=(0.0, 0.0))]
+    object_anchors = [(0, "craft_a", COM, 0.0),
+                      (0, "craft_b", COM, 0.0)]#(world_anchor_index, vertex_set_identifier, set_index, mass)
+
+    links = [WorldObjectLink(world_anchor=world_anchors[object_anchors[i][0]], object_anchor=object_anchors[i], link_type='steel_beam', properties={'length': 1.0, 'k': 10000.0}) for i in range(len(object_anchors))]
+    rigid_engine = RigidBodyEngine(links)
+
     regs: List[EngineRegistration] = [
         EngineRegistration(name="gravity", engine=GravityEngine(craft_a.state), targets=targets, dx=dx, localize=False),
         EngineRegistration(name="collision", engine=meta_collision, targets=targets, dx=dx, localize=False, solver_config=solver_cfg),
         EngineRegistration(name="craftA", engine=craft_a.system, targets=targets, dx=dx, localize=False),
         EngineRegistration(name="craftB", engine=craft_b.system, targets=targets, dx=dx, localize=False),
+        EngineRegistration(
+            name="rigid_body_constraint",
+            engine=rigid_engine,
+            targets=targets,
+            dx=dx,
+            localize=False
+        ),
         EngineRegistration(name="fluid", engine=fluid_engine, targets=targets, dx=dx, localize=True),
     ]
+
+    # Realtime state --------------------------------------------------------
+    # Default: realtime mode ON; use --classic to fall back to superstep graph.
+    rt_cfg = RealtimeConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
+    rt_state = RealtimeState()
     gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
-    top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential")
-    runner = MetaLoopRunner()
+    top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential", realtime_config=rt_cfg, realtime_state=rt_state)
+
+    # --- StateTable for dt_tape HUD wiring and metaloop constructor---
+    from ..state_table import StateTable
+    state_table = StateTable()
+    runner = MetaLoopRunner(realtime_config=rt_cfg, realtime_state=rt_state, realtime=not classic, state_table=state_table)
     runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
+
 
     # Flatten node tree for HUD stats
     def _flatten_nodes(r):
@@ -241,10 +273,7 @@ def _run_demo(
 
     nodes_for_hud = _flatten_nodes(top_round)
 
-    # Realtime state --------------------------------------------------------
-    # Default: realtime mode ON; use --classic to fall back to superstep graph.
-    rt_cfg = RealtimeConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
-    rt_state = RealtimeState()
+
     engine_ids = [reg.name for reg in regs]
     # Per-engine controllers (independent PI state) and current dt trackers
     per_ctrl: dict[str, STController] = {}
@@ -279,8 +308,8 @@ def _run_demo(
     def reset_scene():
         nonlocal craft_a, craft_b, fluid_engine, regs, gb, top_round, runner, nodes_for_hud, last_a, last_b
         # Rebuild crafts and engines
-        craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80))
-        craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255))
+        craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic)
+        craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic)
         fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
         meta_collision = MetaCollisionEngine([craft_a.state, craft_b.state], restitution=0.25, friction_mu=0.6, body_radius=0.12)
         solver_cfg = BisectSolverConfig(target=0.0, eps=1e-5, field="div_inf", monotonic="increase", dt_min=1e-6)
@@ -343,7 +372,7 @@ def _run_demo(
                 finally:
                     top_round.plan = saved
             else:
-                print("running round")
+                
                 _res = runner.run_round()
 
         # Drain craft frames (always, so rendering is up to date)
@@ -459,32 +488,44 @@ def _run_demo(
                 )
             except Exception:
                 pass
+        # --- HUD wiring: always use StateTable's dt_tape for per-node data ---
+        def get_dt_tape(label, field):
+            return state_table.get('dt_tape', label, field)
+
         if classic:
-            # Top-round metrics
-            top_m = runner.get_latest_metrics(top_round)
-            if top_m is not None:
-                hud_lines.append(
-                    f"top: max_vel={top_m.max_vel:6.3f}  div_inf={top_m.div_inf:7.4f}  mass_err={top_m.mass_err:7.2e}"
-                )
+            # Top-round metrics from dt_tape
+            top_label = getattr(top_round, 'label', None)
+            if top_label:
+                m = get_dt_tape(top_label, 'metrics')
+                if m is not None:
+                    hud_lines.append(
+                        f"top: max_vel={getattr(m, 'max_vel', 0.0):6.3f}  div_inf={getattr(m, 'div_inf', 0.0):7.4f}  mass_err={getattr(m, 'mass_err', 0.0):7.2e}"
+                    )
             # Child nodes
             for ch in nodes_for_hud:
                 label = getattr(ch, "label", "node")
-                m = runner.get_latest_metrics(ch)  # type: ignore[arg-type]
+                m = get_dt_tape(label, 'metrics')
                 if m is None:
                     continue
                 hud_lines.append(
-                    f"{label[:20]:20}  v={m.max_vel:6.3f}  pen={m.div_inf:7.4f}  mass={m.mass_err:6.2e}"
+                    f"{label[:20]:20}  v={getattr(m, 'max_vel', 0.0):6.3f}  pen={getattr(m, 'div_inf', 0.0):7.4f}  mass={getattr(m, 'mass_err', 0.0):6.2e}"
                 )
         else:
-            # Realtime HUD: per-engine live stats
+            # Realtime HUD: per-engine live stats from dt_tape
             alloc = compile_allocations(rt_cfg, rt_state, engine_ids)
             for reg in regs:
                 name = reg.name
+                label = f"advance:{name}"
                 ms = float(alloc.get(name, rt_cfg.ms_floor))
                 ema_ms = float(rt_state.proc_ms_ma.get(name, 0.0))
                 ema_pen = float(rt_state.penalty_ma.get(name, 1.0))
+                dt_val = get_dt_tape(label, 'dt')
+                if dt_val is not None:
+                    dt_str = f"{float(dt_val)*1000.0:6.3f}ms"
+                else:
+                    dt_str = "N/A"
                 hud_lines.append(
-                    f"{name[:20]:20}  alloc={ms:5.2f}ms  ema_cost={ema_ms:5.2f}ms  pen={ema_pen:6.3f}  dt=N/A"
+                    f"{name[:20]:20}  alloc={ms:5.2f}ms  ema_cost={ema_ms:5.2f}ms  pen={ema_pen:6.3f}  dt={dt_str}"
                 )
         # Draw HUD panel
         pad, lh = 8, 18
@@ -505,6 +546,9 @@ def _run_demo(
     pygame.quit()
 
 
+
+
+# This ensures the rigid body constraint is enforced after all other steps.
 if __name__ == "__main__":  # pragma: no cover
     parser = argparse.ArgumentParser(description="dt-graph demo: crafts + bath fluid")
     parser.add_argument("--debug", action="store_true", help="enable deep dt debug logging")

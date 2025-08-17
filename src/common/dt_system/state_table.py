@@ -36,7 +36,6 @@ class StateTable:
 
 
 # Global default table; can be replaced/injected by runners when needed
-GLOBAL_STATE_TABLE = StateTable()
 
 
 # --------------------- engine sync/publish helpers -------------------------
@@ -105,12 +104,11 @@ def _publish_fluid_state(engine: Any, name: str, table: StateTable) -> bool:
     return touched
 
 
-def sync_engine_from_table(engine: Any, reg_name: str, table: StateTable | None = None) -> None:
-    """Load engine state from the table if present.
+def sync_engine_from_table(engine: Any, reg_name: str, table: StateTable) -> None:
+    """Load engine state from the table if present. (table is now required)
 
     Order: engine-provided hook -> known adapters -> no-op.
     """
-    table = table or GLOBAL_STATE_TABLE
     # Engine-supplied hook takes precedence
     hook = getattr(engine, "sync_from_state", None)
     if callable(hook):
@@ -126,12 +124,11 @@ def sync_engine_from_table(engine: Any, reg_name: str, table: StateTable | None 
         return
 
 
-def publish_engine_to_table(engine: Any, reg_name: str, table: StateTable | None = None) -> None:
-    """Publish engine state into table.
+def publish_engine_to_table(engine: Any, reg_name: str, table: StateTable) -> None:
+    """Publish engine state into table. (table is now required)
 
     Order: engine-provided hook -> known adapters -> no-op.
     """
-    table = table or GLOBAL_STATE_TABLE
     hook = getattr(engine, "publish_to_state", None)
     if callable(hook):
         try:
@@ -147,7 +144,6 @@ def publish_engine_to_table(engine: Any, reg_name: str, table: StateTable | None
 
 __all__ = [
     "StateTable",
-    "GLOBAL_STATE_TABLE",
     "sync_engine_from_table",
     "publish_engine_to_table",
 ]

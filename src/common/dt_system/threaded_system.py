@@ -96,6 +96,9 @@ class ThreadedSystemEngine(DtCompatibleEngine):
             dbg("threaded").debug(f"reply: ok={ok} metrics=({pretty_metrics(metrics)})")
         return ok, metrics
 
+    def step_with_state(self, state, dt, *, realtime = False):
+        return super().step_with_state(state, dt, realtime=realtime)
+
     # Lifecycle ---------------------------------------------------
     def stop(self) -> None:
         """Signal the worker to exit and wait for completion."""
