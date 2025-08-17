@@ -30,6 +30,7 @@ from .dt_controller import STController, Targets, Metrics, run_superstep
 from .engine_api import EngineRegistration
 from .debug import dbg, is_enabled, pretty_metrics
 from .dt_solver import solve_window_bisect
+from .state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_engine_to_table
 
 
 # 
@@ -86,7 +87,11 @@ class EngineNode:
         def advance(state_obj: Any, dt: float):
             if is_enabled():
                 dbg("engine").debug(f"step: name={self.registration.name} dt={float(dt):.6g}")
+            # Sync engine state from the global table before stepping
+            sync_engine_from_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
             ok, metrics = self.registration.engine.step(dt)
+            # Publish updated engine state back to the table
+            publish_engine_to_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
             if is_enabled():
                 dbg("engine").debug(
                     f"done: name={self.registration.name} ok={ok} metrics=({pretty_metrics(metrics)})"

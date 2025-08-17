@@ -41,5 +41,43 @@ class RoundNodeEngine(DtCompatibleEngine):
             dbg("roundnode").debug(f"step done: metrics=({pretty_metrics(m)})")
         return True, m
 
+    # Lightweight realtime path: advance children once without inner supersteps.
+    # Used by realtime mode to avoid nested time control.
+    def step_realtime(self, dt: float) -> tuple[bool, Metrics]:  # pragma: no cover - exercised via demo
+        try:
+            from .dt_scaler import Metrics as _M
+            from .dt_graph import SuperstepPlan as _Plan  # type: ignore
+        except Exception:
+            pass
+
+        # Construct a one-off adapter similar to MetaLoopRunner._advance_children
+        # but without recursive superstep execution.
+        last_m: Optional[Metrics] = None
+        if is_enabled():
+            dbg("roundnode").debug(f"step_realtime: dt={float(dt):.6g} inner={self.inner.label}")
+        for ch in list(self.inner.children):
+            if hasattr(ch, "advance"):
+                # Advance leaf once
+                ok, m = ch.advance(ch.state.state, float(dt))  # type: ignore[attr-defined]
+                if not ok:
+                    return False, Metrics(0.0, 0.0, 1e9, 1e9)
+                last_m = m
+            else:
+                # Nested round: run its advance children directly
+                try:
+                    for gch in list(getattr(ch, "children", [])):
+                        if hasattr(gch, "advance"):
+                            ok, m = gch.advance(gch.state.state, float(dt))  # type: ignore[attr-defined]
+                            if not ok:
+                                return False, Metrics(0.0, 0.0, 1e9, 1e9)
+                            last_m = m
+                except Exception:
+                    pass
+        if last_m is None:
+            last_m = Metrics(0.0, 0.0, 0.0, 0.0)
+        if is_enabled():
+            dbg("roundnode").debug(f"step_realtime done: metrics=({pretty_metrics(last_m)})")
+        return True, last_m
+
 
 __all__ = ["RoundNodeEngine"]

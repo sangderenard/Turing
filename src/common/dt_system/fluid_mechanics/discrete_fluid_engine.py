@@ -7,13 +7,16 @@ other fluid mechanics adapters. The class name and API are unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
 from ..dt_scaler import Metrics
 from ..engine_api import DtCompatibleEngine
 from ..debug import dbg, is_enabled, pretty_metrics
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..solids.api import SolidRegistry
+from ..solids.api import GLOBAL_SOLIDS, GLOBAL_WORLD
 
 
 @dataclass
@@ -30,8 +33,14 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
 
     sim: object
     name: str = "bath.discrete"
+    solids: Optional["SolidRegistry"] = None
 
     _last_metrics: Optional[Metrics] = None
+
+    def __post_init__(self) -> None:
+        # Default to global registry if none provided
+        if self.solids is None:
+            self.solids = GLOBAL_SOLIDS
 
     # Optional snapshot/restore for bisect solver: delegate to underlying sim if present
     def snapshot(self):  # pragma: no cover
@@ -76,7 +85,14 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         except Exception:
             m0 = 0.0
 
-        # Advance exactly dt (sim may internally substep to remain stable)
+        # Optional: pass solids registry to sim if supported
+        try:
+            if self.solids is not None and hasattr(self.sim, "set_solids"):
+                self.sim.set_solids(self.solids)
+        except Exception:
+            pass
+
+    # Advance exactly dt (sim may internally substep to remain stable)
         try:
             self.sim.step(float(dt))
         except Exception as e:
@@ -85,6 +101,53 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
             # Return a failure tuple to trigger controller retries/halving
             metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
             return False, metrics
+
+    # Optional: apply world confinement for fluids after step (wrap/respawn)
+        try:
+            world = GLOBAL_WORLD
+            # Per-plane override if any plane specifies a fluid_mode
+            planes = getattr(world, "planes", []) or []
+            plane_mode = None
+            for pl in planes:
+                pm = getattr(pl, "fluid_mode", None)
+                if pm:
+                    plane_mode = pm
+                    break
+            mode = plane_mode or getattr(world, "fluid_mode", None)
+            bounds = getattr(world, "bounds", None)
+            if mode and bounds is not None and hasattr(self.sim, "x"):
+                import numpy as _np
+                x = _np.asarray(self.sim.x)
+                if x.ndim == 2 and x.shape[1] >= 2:
+                    (mnx, mny, mnz), (mxx, mxy, mxz) = bounds
+                    if mode == "wrap":
+                        # modulo wrap within [min, max)
+                        w = float(mxx - mnx)
+                        h = float(mxy - mny)
+                        if w > 0 and h > 0:
+                            x[:, 0] = ((x[:, 0] - mnx) % w) + mnx
+                            x[:, 1] = ((x[:, 1] - mny) % h) + mny
+                    elif mode == "respawn":
+                        # respawn out-of-bounds at random positions with avg speed direction
+                        rng = _np.random.default_rng()
+                        # Estimate average kinetic energy via velocity if available
+                        if hasattr(self.sim, "v"):
+                            v = _np.asarray(self.sim.v)
+                            vnorm = _np.linalg.norm(v[:, :2], axis=1) if v.ndim == 2 else _np.zeros(x.shape[0])
+                            v_avg = float(_np.mean(vnorm)) if vnorm.size else 0.0
+                        else:
+                            v_avg = 0.0
+                        oob = (x[:, 0] < mnx) | (x[:, 0] > mxx) | (x[:, 1] < mny) | (x[:, 1] > mxy)
+                        n_oob = int(_np.count_nonzero(oob))
+                        if n_oob:
+                            x[oob, 0] = rng.uniform(mnx, mxx, size=n_oob)
+                            x[oob, 1] = rng.uniform(mny, mxy, size=n_oob)
+                            if hasattr(self.sim, "v") and v_avg > 0:
+                                theta = rng.uniform(0.0, 2.0 * _np.pi, size=n_oob)
+                                self.sim.v[oob, 0] = v_avg * _np.cos(theta)
+                                self.sim.v[oob, 1] = v_avg * _np.sin(theta)
+        except Exception:
+            pass
 
         # Compute metrics conservatively
         try:

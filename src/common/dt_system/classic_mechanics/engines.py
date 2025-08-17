@@ -17,12 +17,15 @@ Each engine reads/writes from a shared state dict to keep the demo simple.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TYPE_CHECKING, Callable, Optional
 import math
 
 from ..dt_scaler import Metrics
 from ..engine_api import DtCompatibleEngine
 from ..debug import dbg, is_enabled
+if TYPE_CHECKING:  # typing only to avoid hard dependency
+    from ..solids.api import SolidRegistry, WorldConfinement, WorldPlane, SurfaceMaterial
+from ..solids.api import GLOBAL_SOLIDS, GLOBAL_WORLD, MATERIAL_ELASTIC, MATERIAL_SOIL
 
 Vec = Tuple[float, float]
 
@@ -65,6 +68,11 @@ class DemoState:
     ground_b: float = 10.0
     mu: float = 0.3
     g: float = 9.81
+    # Entropic/efficiency factors (0..1 for efficiencies); drag in 1/s
+    spring_eff: float = 1.0
+    thruster_eff: float = 1.0
+    pneumatic_eff: float = 1.0
+    linear_drag: float = 0.0
 
     # Optional snapshot/restore for bisect solver compatibility
     def snapshot(self):  # pragma: no cover - lightweight
@@ -81,6 +89,18 @@ class DemoState:
             self.acc = list(snap["acc"])  # type: ignore[index]
         except Exception:
             pass
+
+
+@dataclass
+class Contact:
+    """Lightweight contact report for softbody harmonization stubs."""
+    p: Vec
+    n: Vec
+    pen: float
+    material_kind: str
+    state_idx: int
+    vertex_idx: int
+    source: str  # 'plane' | 'solid'
 
 
 class GravityEngine(DtCompatibleEngine):
@@ -119,8 +139,12 @@ class ThrustersEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.thrusters").debug(f"dt={float(dt):.6g} thrust={self.thrust}")
         total_mass = sum(max(m, 1e-9) for m in self.s.mass)
-        a = (self.thrust[0] / total_mass, self.thrust[1] / total_mass)
-        for i in range(len(self.s.pos)):
+        eff = max(0.0, min(1.0, getattr(self.s, "thruster_eff", 1.0)))
+        a = (eff * self.thrust[0] / total_mass, eff * self.thrust[1] / total_mass)
+        # Apply only to dynamic (mass>0) nodes; anchors are inert
+        for i, m in enumerate(self.s.mass):
+            if m <= 0.0:
+                continue
             self.s.acc[i] = v_add(self.s.acc[i], a)
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
 
@@ -138,6 +162,7 @@ class SpringEngine(DtCompatibleEngine):
     def step(self, dt: float):
         if is_enabled():
             dbg("eng.spring").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
+        eff = max(0.0, min(1.0, getattr(self.s, "spring_eff", 1.0)))
         for (i, j) in self.s.springs:
             p_i, p_j = self.s.pos[i], self.s.pos[j]
             k = self.s.k_spring[(i, j)]
@@ -145,7 +170,7 @@ class SpringEngine(DtCompatibleEngine):
             d = v_sub(p_j, p_i)
             L = v_len(d)
             dir_ = v_norm(d)
-            F = k * (L - L0)
+            F = eff * k * (L - L0)
             f = v_scale(dir_, F)
             self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
@@ -165,6 +190,7 @@ class PneumaticDamperEngine(DtCompatibleEngine):
     def step(self, dt: float):
         if is_enabled():
             dbg("eng.pneumatic").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
+        eff = max(0.0, min(1.0, getattr(self.s, "pneumatic_eff", 1.0)))
         for (i, j) in self.s.springs:
             p_i, p_j = self.s.pos[i], self.s.pos[j]
             v_i, v_j = self.s.vel[i], self.s.vel[j]
@@ -174,7 +200,7 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             along = rel_v[0] * dir_[0] + rel_v[1] * dir_[1]
             damp_a, damp_b = self.s.pneu_damp[(i, j)]
             coeff = damp_a if along > 0 else damp_b
-            f = v_scale(dir_, -coeff * along)
+            f = v_scale(dir_, -eff * coeff * along)
             self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
@@ -197,6 +223,9 @@ class GroundCollisionEngine(DtCompatibleEngine):
         b = self.s.ground_b
         mu = self.s.mu
         for i, p in enumerate(self.s.pos):
+            if self.s.mass[i] <= 0.0:
+                # anchors do not interact with ground
+                continue
             if p[1] < 0.0:
                 # penalty force upward proportional to penetration and velocity
                 pen = -p[1]
@@ -222,12 +251,25 @@ class IntegratorEngine(DtCompatibleEngine):
     def step(self, dt: float):
         if is_enabled():
             dbg("eng.integrate").debug(f"dt={float(dt):.6g} n={len(self.s.pos)}")
+        drag = max(0.0, float(getattr(self.s, "linear_drag", 0.0)))
+        # precompute exponential decay for unconditional stability
+        damp = math.exp(-drag * max(0.0, float(dt))) if drag > 0.0 else 1.0
         for i in range(len(self.s.pos)):
+            m = self.s.mass[i]
+            if m <= 0.0:
+                # Keep anchors fixed and clean any numeric junk
+                self.s.acc[i] = (0.0, 0.0)
+                self.s.vel[i] = (0.0, 0.0)
+                # Do not modify position
+                continue
             ax, ay = self.s.acc[i]
             vx, vy = self.s.vel[i]
             # semi-implicit Euler for stability
             vx += ax * dt
             vy += ay * dt
+            # apply linear drag
+            vx *= damp
+            vy *= damp
             x, y = self.s.pos[i]
             x += vx * dt
             y += vy * dt
@@ -236,7 +278,16 @@ class IntegratorEngine(DtCompatibleEngine):
             self.s.pos[i] = (x, y)
             # clear acceleration for next accumulation cycle
             self.s.acc[i] = (0.0, 0.0)
-        return True, Metrics(max_vel=max(v_len(v) for v in self.s.vel), max_flux=0.0, div_inf=0.0, mass_err=0.0)
+        # Robust max velocity ignoring non-finite values
+        max_v = 0.0
+        for (vx, vy) in self.s.vel:
+            try:
+                if not (math.isfinite(vx) and math.isfinite(vy)):
+                    continue
+                max_v = max(max_v, v_len((vx, vy)))
+            except Exception:
+                pass
+        return True, Metrics(max_vel=max_v, max_flux=0.0, div_inf=0.0, mass_err=0.0)
 
 
 class MetaCollisionEngine(DtCompatibleEngine):
@@ -255,14 +306,26 @@ class MetaCollisionEngine(DtCompatibleEngine):
         self,
         states: List[DemoState],
         *,
-        restitution: float = 0.2,
-        friction_mu: float = 0.5,
-        body_radius: float = 0.12,
+    restitution: float = 0.2,
+    friction_mu: float = 0.5,
+    body_radius: float = 0.12,
+    solids: "SolidRegistry" | None = None,
+    world: "WorldConfinement" | None = None,
+    plastic_beta: float = 0.0,
+    enable_plastic_relax: bool = False,
+    softbody_contact_cb: Optional[Callable[[Contact], None]] = None,
     ) -> None:
         self.states = states
         self.e = float(max(0.0, min(1.0, restitution)))
         self.mu = float(max(0.0, friction_mu))
         self.r = float(max(1e-6, body_radius))
+        self.solids = solids or GLOBAL_SOLIDS
+        self.world = world or GLOBAL_WORLD
+        # Optional plastic deformation factor and gate flag
+        self.plastic_beta = float(max(0.0, min(1.0, plastic_beta)))
+        self.enable_plastic_relax = bool(enable_plastic_relax)
+        # Optional contact callback for softbody coupling (stub-friendly)
+        self.softbody_contact_cb = softbody_contact_cb
 
     # Snapshot both states for solver lookahead compatibility
     def snapshot(self):  # pragma: no cover - lightweight
@@ -285,11 +348,20 @@ class MetaCollisionEngine(DtCompatibleEngine):
     def _integrate(self, dt: float) -> None:
         # Semi-implicit Euler (same as IntegratorEngine)
         for s in self.states:
+            drag = max(0.0, float(getattr(s, "linear_drag", 0.0)))
+            damp = math.exp(-drag * max(0.0, float(dt))) if drag > 0.0 else 1.0
             for i in range(len(s.pos)):
+                if s.mass[i] <= 0.0:
+                    # anchors remain fixed; also sanitize
+                    s.acc[i] = (0.0, 0.0)
+                    s.vel[i] = (0.0, 0.0)
+                    continue
                 ax, ay = s.acc[i]
                 vx, vy = s.vel[i]
                 vx += ax * dt
                 vy += ay * dt
+                vx *= damp
+                vy *= damp
                 x, y = s.pos[i]
                 x += vx * dt
                 y += vy * dt
@@ -297,26 +369,69 @@ class MetaCollisionEngine(DtCompatibleEngine):
                 s.pos[i] = (x, y)
                 s.acc[i] = (0.0, 0.0)  # clear for next cycle
 
-    def _resolve_ground(self) -> float:
-        """Project nodes above ground and adjust velocities; return max penetration."""
+    def _resolve_world_planes(self) -> float:
+        """Resolve contacts against world planes with material behavior.
+
+        Plane half-space: n·x + d >= 0 is inside. Project bodies if outside.
+        """
         max_pen = 0.0
-        for s in self.states:
-            k = s.ground_k
-            mu = s.mu
-            for i, (x, y) in enumerate(s.pos):
-                if y < 0.0:
-                    pen = -y
-                    max_pen = max(max_pen, pen)
-                    # position projection
-                    s.pos[i] = (x, 0.0)
-                    # velocity response: reflect normal with restitution
-                    vx, vy = s.vel[i]
-                    vy = -self.e * vy
-                    # friction: damp tangent when in contact; approximate Coulomb
-                    # using a simple multiplier bounded by mu.
-                    fx_scale = max(0.0, 1.0 - mu)
-                    vx *= fx_scale
-                    s.vel[i] = (vx, vy)
+        planes = getattr(self.world, "planes", [])
+        if not planes:
+            return 0.0
+        for si, s in enumerate(self.states):
+            for i, m in enumerate(s.mass):
+                if m <= 0:
+                    continue
+                x, y = s.pos[i]
+                p3 = (float(x), float(y), 0.0)
+                for pl in planes:
+                    n = getattr(pl, "normal", (0.0, 1.0, 0.0))
+                    d = float(getattr(pl, "offset", 0.0))
+                    nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+                    # 2D point assumed z=0
+                    dist = nx * p3[0] + ny * p3[1] + nz * 0.0 + d
+                    if dist < 0.0:
+                        pen = -dist
+                        max_pen = max(max_pen, pen)
+                        # Project to plane
+                        x_corr = p3[0] + nx * pen
+                        y_corr = p3[1] + ny * pen
+                        s.pos[i] = (x_corr, y_corr)
+                        # Velocity response based on material
+                        vx, vy = s.vel[i]
+                        v_n = vx * nx + vy * ny
+                        v_t_x, v_t_y = vx - v_n * nx, vy - v_n * ny
+                        mat = getattr(pl, "material", MATERIAL_ELASTIC)
+                        kind = getattr(mat, "kind", "elastic")
+                        rest = float(getattr(mat, "restitution", self.e))
+                        mu = float(getattr(mat, "friction", self.mu))
+                        # Report contact to softbody callback if relevant
+                        if kind == "softbody_stub" and self.softbody_contact_cb:
+                            try:
+                                self.softbody_contact_cb(Contact(
+                                    p=(x_corr, y_corr), n=(nx, ny), pen=float(pen),
+                                    material_kind=kind, state_idx=si, vertex_idx=i, source="plane"
+                                ))
+                            except Exception:
+                                pass
+                        if kind == "soil":
+                            # strong damping, no bounce
+                            v_n_post = 0.0
+                            damp = max(0.0, min(1.0, float(getattr(mat, "embed_damping", 0.7))))
+                            v_t_x *= (1.0 - min(1.0, mu)) * (1.0 - damp)
+                            v_t_y *= (1.0 - min(1.0, mu)) * (1.0 - damp)
+                        elif kind == "softbody_stub":
+                            # placeholder: treat like elastic for now
+                            v_n_post = -rest * v_n
+                            v_t_x *= max(0.0, 1.0 - mu)
+                            v_t_y *= max(0.0, 1.0 - mu)
+                        else:  # elastic
+                            v_n_post = -rest * v_n
+                            v_t_x *= max(0.0, 1.0 - mu)
+                            v_t_y *= max(0.0, 1.0 - mu)
+                        vx = v_t_x + v_n_post * nx
+                        vy = v_t_y + v_n_post * ny
+                        s.vel[i] = (vx, vy)
         return max_pen
 
     def _resolve_pairs(self) -> float:
@@ -385,6 +500,103 @@ class MetaCollisionEngine(DtCompatibleEngine):
                     sB.vel[iB] = (vBx, vBy)
         return max_pen
 
+    def _resolve_solids(self) -> float:
+        """Project bodies out of static solid AABBs (projected to XY); return max penetration."""
+        if not getattr(self, "solids", None):
+            return 0.0
+        # Build AABBs lazily each call (registry may change)
+        aabbs: List[Tuple[float, float, float, float, object]] = []
+        try:
+            for _name, mesh in self.solids.all():  # type: ignore[union-attr]
+                v = mesh.as_vertex_array()
+                xs = v[:, 0]
+                ys = v[:, 1]
+                mnx, mny = float(xs.min()), float(ys.min())
+                mxx, mxy = float(xs.max()), float(ys.max())
+                mat = getattr(mesh, "material", MATERIAL_ELASTIC)
+                aabbs.append((mnx, mny, mxx, mxy, mat))
+        except Exception:
+            return 0.0
+        max_pen = 0.0
+        for si, s in enumerate(self.states):
+            for i, m in enumerate(s.mass):
+                if m <= 0.0:
+                    continue
+                x, y = s.pos[i]
+                for (mnx, mny, mxx, mxy, mat) in aabbs:
+                    if (mnx <= x <= mxx) and (mny <= y <= mxy):
+                        # Inside: push out along smallest penetration to box face
+                        pen_left = x - mnx
+                        pen_right = mxx - x
+                        pen_bottom = y - mny
+                        pen_top = mxy - y
+                        # Choose minimal push
+                        pens = [
+                            (pen_left, (-1.0, 0.0)),
+                            (pen_right, (1.0, 0.0)),
+                            (pen_bottom, (0.0, -1.0)),
+                            (pen_top, (0.0, 1.0)),
+                        ]
+                        pen, n = min(pens, key=lambda t: t[0])
+                        max_pen = max(max_pen, float(pen))
+                        nx, ny = n
+                        s.pos[i] = (x + nx * pen, y + ny * pen)
+                        # velocity reflection along normal with restitution; simple tangent damp
+                        vx, vy = s.vel[i]
+                        v_n = vx * nx + vy * ny
+                        kind = getattr(mat, "kind", "elastic")
+                        rest = float(getattr(mat, "restitution", self.e))
+                        mu = float(getattr(mat, "friction", self.mu))
+                        if kind == "soil":
+                            # no bounce, strong tangent damping
+                            v_n_post = 0.0
+                            damp = max(0.0, min(1.0, float(getattr(mat, "embed_damping", 0.7))))
+                            v_t_x = vx - v_n * nx
+                            v_t_y = vy - v_n * ny
+                            v_t_x *= (1.0 - min(1.0, mu)) * (1.0 - damp)
+                            v_t_y *= (1.0 - min(1.0, mu)) * (1.0 - damp)
+                            vx = v_t_x + v_n_post * nx
+                            vy = v_t_y + v_n_post * ny
+                        elif kind == "softbody_stub":
+                            # placeholder: treat like elastic for now
+                            vx -= (1.0 + rest) * v_n * nx
+                            vy -= (1.0 + rest) * v_n * ny
+                            vx *= max(0.0, 1.0 - mu)
+                            vy *= max(0.0, 1.0 - mu)
+                            # Report to softbody callback
+                            if self.softbody_contact_cb:
+                                try:
+                                    self.softbody_contact_cb(Contact(
+                                        p=(x + nx * pen, y + ny * pen), n=(nx, ny), pen=float(pen),
+                                        material_kind=kind, state_idx=si, vertex_idx=i, source="solid"
+                                    ))
+                                except Exception:
+                                    pass
+                        else:
+                            vx -= (1.0 + rest) * v_n * nx
+                            vy -= (1.0 + rest) * v_n * ny
+                            vx *= max(0.0, 1.0 - mu)
+                            vy *= max(0.0, 1.0 - mu)
+                        s.vel[i] = (vx, vy)
+        return max_pen
+
+    def _plastic_relax_rest_lengths(self) -> None:
+        """Gently relax spring rest lengths toward current lengths (softbody-like plasticity).
+
+        Controlled by self.plastic_beta; when 0, disabled. This models
+        quasi-plastic deformation for spring networks without a full softbody.
+        """
+        b = self.plastic_beta
+        if b <= 0.0:
+            return
+        for s in self.states:
+            for (i, j) in s.springs:
+                pi = s.pos[i]; pj = s.pos[j]
+                L = v_len(v_sub(pj, pi))
+                key = (i, j)
+                L0 = s.rest_len.get(key, L)
+                s.rest_len[key] = (1.0 - b) * L0 + b * L
+
     def step(self, dt: float):
         if is_enabled():
             dbg("eng.collision").debug(f"dt={float(dt):.6g} n_states={len(self.states)}")
@@ -392,14 +604,20 @@ class MetaCollisionEngine(DtCompatibleEngine):
         self._apply_springs_dampers(dt)
         # 2) integrate to predict motion
         self._integrate(dt)
-        # 3) resolve collisions (ground + pairwise bodies); report max penetration
-        pen_g = self._resolve_ground()
+        # 3) resolve collisions (world planes + pairwise bodies + solids); report max penetration
+        pen_g = self._resolve_world_planes()
         pen_p = self._resolve_pairs()
-        max_pen = max(pen_g, pen_p)
+        pen_s = self._resolve_solids()
+        max_pen = max(pen_g, pen_p, pen_s)
+        # 4) optional plastic relaxation of spring rest lengths (flagged off by default)
+        if self.enable_plastic_relax and self.plastic_beta > 0.0:
+            self._plastic_relax_rest_lengths()
         # metrics: div_inf encodes penetration for solver objective compatibility
         max_vel = 0.0
         for s in self.states:
             for vx, vy in s.vel:
+                if not (math.isfinite(vx) and math.isfinite(vy)):
+                    continue
                 max_vel = max(max_vel, math.hypot(vx, vy))
         m = Metrics(max_vel=max_vel, max_flux=0.0, div_inf=max_pen, mass_err=0.0)
         return True, m

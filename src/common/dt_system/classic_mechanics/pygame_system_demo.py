@@ -23,12 +23,19 @@ try:
 except Exception:  # pragma: no cover - headless environments
     pygame = None  # type: ignore
 
-from ..dt_controller import STController, Targets, step_preview_once
+from ..dt_controller import STController, Targets, step_realtime_once
 from ..dt_graph import GraphBuilder, MetaLoopRunner
 from ..engine_api import EngineRegistration
 from ..roundnode_engine import RoundNodeEngine
 from ..threaded_system import ThreadedSystemEngine
-from ..rt_preview import RTPreviewConfig, RTPreviewState, compile_allocations, compute_penalty
+from ..realtime import (
+    RealtimeConfig,
+    RealtimeState,
+    compile_allocations,
+    compute_penalty,
+    compute_minimum_budget,
+    compute_normalized_weights,
+)
 from .engines import (
     DemoState,
     GravityEngine,
@@ -60,16 +67,40 @@ class Craft:
 
 
 def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40)) -> Craft:
-    # Minimal 2-vertex "craft": anchor (fixed) + body mass on spring
-    pos: List[Tuple[float, float]] = [anchor, (anchor[0] + 0.8, anchor[1] + 0.6)]
+    # 4-node square craft: fully connected with diagonals, equal masses
+    ax, ay = float(anchor[0]), float(anchor[1])
+    size = 0.8
+    # Nodes in CCW order
+    pos: List[Tuple[float, float]] = [
+        (ax, ay),
+        (ax + size, ay),
+        (ax + size, ay + size),
+        (ax, ay + size),
+    ]
     vel = [(0.0, 0.0) for _ in pos]
     acc = [(0.0, 0.0) for _ in pos]
-    mass = [0.0, 1.0]  # anchor mass 0 -> inert
-    springs = [(0, 1)]
-    rest_len = {(0, 1): 0.6}
-    k_spring = {(0, 1): 40.0}
-    pneu = {(0, 1): (2.0, 4.0)}
-    s = DemoState(pos, vel, acc, mass, springs, rest_len, k_spring, pneu, ground_k=1200.0)
+    mass = [1.0 for _ in pos]
+    # Edges: perimeter + diagonals
+    springs = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 2), (1, 3)]
+    rest_len = {}
+    k_spring = {}
+    pneu = {}
+    base_k = 60.0
+    for (i, j) in springs:
+        dx = pos[j][0] - pos[i][0]
+        dy = pos[j][1] - pos[i][1]
+        L0 = float((dx * dx + dy * dy) ** 0.5)
+        rest_len[(i, j)] = L0
+        # Slightly softer diagonals
+        k = base_k * (0.8 if abs(i - j) == 2 else 1.0)
+        k_spring[(i, j)] = k
+        # Directional damping (along, against)
+        pneu[(i, j)] = (3.0, 5.0)
+    s = DemoState(
+        pos, vel, acc, mass, springs, rest_len, k_spring, pneu,
+        ground_k=1200.0,
+        spring_eff=0.98, thruster_eff=0.92, pneumatic_eff=0.95, linear_drag=0.15,
+    )
 
     # Engines composing the craft
     thr = ThrustersEngine(s, thrust=(0.0, 0.0))
@@ -94,11 +125,13 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40)) ->
 
     # Threaded system wrapper captures a snapshot for UI
     def capture():
-        body = s.pos[1]
-        anc = s.pos[0]
-        return {"craft": {"pos": np.array(body, dtype=float), "anchor": np.array(anc, dtype=float), "color": color}}
+        nodes = np.array(s.pos, dtype=float)
+        edges = np.array(s.springs, dtype=int)
+        # Center of mass for quick indicator
+        com = nodes.mean(axis=0) if len(nodes) > 0 else np.array([0.0, 0.0])
+        return {"craft": {"nodes": nodes, "edges": edges, "com": com, "color": color}}
 
-    sys = ThreadedSystemEngine(rne, capture=capture)
+    sys = ThreadedSystemEngine(rne, capture=capture, realtime=True)
     return Craft(name=name, state=s, thrusters=thr, round_engine=rne, system=sys)
 
 
@@ -153,7 +186,8 @@ def _run_demo(
     craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255))
 
     # Bath discrete fluid (small dam break)
-    fluid = DiscreteFluid.demo_dam_break(n_x=10, n_y=12, n_z=1, h=0.08)
+    # Slightly larger fluid block for visibility
+    fluid = DiscreteFluid.demo_dam_break(n_x=20, n_y=24, n_z=1, h=0.12)
     fluid_engine = BathDiscreteFluidEngine(fluid)
 
     # Top-level graph: gravity -> meta-collision(A,B) -> craft A (system) -> craft B (system) -> fluid
@@ -188,10 +222,10 @@ def _run_demo(
 
     nodes_for_hud = _flatten_nodes(top_round)
 
-    # Realtime preview state ----------------------------------------------
-    # Default: preview mode ON; use --classic to fall back to superstep graph.
-    rt_cfg = RTPreviewConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
-    rt_state = RTPreviewState()
+    # Realtime state --------------------------------------------------------
+    # Default: realtime mode ON; use --classic to fall back to superstep graph.
+    rt_cfg = RealtimeConfig(budget_ms=1000.0 / max(fps, 1), slack=0.92, beta=1.0, w_floor=0.25, ms_floor=0.25)
+    rt_state = RealtimeState()
     engine_ids = [reg.name for reg in regs]
     # Per-engine controllers (independent PI state) and current dt trackers
     per_ctrl: dict[str, STController] = {}
@@ -208,6 +242,7 @@ def _run_demo(
                 dt_min=ctrl.dt_min,
                 dt_max=ctrl.dt_max,
             )
+        # Start realtime dt at budget rather than controller dt to avoid tiny values
         dt_curr[reg.name] = 1.0 / max(fps, 1)
 
     last_a = {"pos": np.array(craft_a.state.pos[1], dtype=float), "anchor": np.array(craft_a.state.pos[0], dtype=float), "color": (240, 80, 80)}
@@ -240,14 +275,21 @@ def _run_demo(
             finally:
                 top_round.plan = saved
         else:
-            # Preview mode: single-step each engine with time allocations
+            # Realtime mode: single-step each engine with time allocations
             alloc = compile_allocations(rt_cfg, rt_state, engine_ids)
+            _base, _min_total = compute_minimum_budget(rt_cfg, rt_state, engine_ids)
+            _weights = compute_normalized_weights(rt_cfg, rt_state, engine_ids)
 
             # Build simple advance adapters inline (avoids touching the graph runner)
             for reg in regs:
                 name = reg.name
-                adv = lambda _s, _dt, _eng=reg.engine: _eng.step(_dt)
-                m, dt_next, _used = step_preview_once(
+                # Prefer realtime single-step when provided to avoid nested control
+                def adv(_s, _dt, _eng=reg.engine):
+                    sp = getattr(_eng, "step_realtime", None)
+                    if callable(sp):
+                        return sp(float(_dt))
+                    return _eng.step(float(_dt))
+                m, dt_next, _used = step_realtime_once(
                     state=None,
                     dt_current=dt_curr[name],
                     dx=reg.dx,
@@ -299,24 +341,10 @@ def _run_demo(
             pass
 
         def draw_craft(snapshot):
-            def as_xy(p):
-                try:
-                    # Handle numpy arrays, lists, tuples
-                    x = float(p[0])
-                    y = float(p[1])
-                    return (x, y)
-                except Exception:
-                    # Fallbacks: dict with x/y or insufficient data
-                    try:
-                        return (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
-                    except Exception:
-                        return (0.0, 0.0)
-
-            pos = as_xy(snapshot.get("pos", (0.0, 0.0)))
-            anc = as_xy(snapshot.get("anchor", (0.0, 0.0)))
             color = snapshot.get("color", (200, 200, 200))
-            sp_anc = world_to_screen(anc)
-            sp_pos = world_to_screen(pos)
+            nodes = snapshot.get("nodes")
+            edges = snapshot.get("edges")
+            com = snapshot.get("com")
 
             def _is_valid_screen_pt(pt):
                 if not isinstance(pt, (tuple, list)) or len(pt) != 2:
@@ -327,42 +355,41 @@ def _run_demo(
                 except Exception:
                     return False
 
-            if not _is_valid_screen_pt(sp_anc):
-                print(
-                    f"[draw_craft] invalid start_pos: anc={repr(anc)} -> screen={repr(sp_anc)} types: anc={type(anc)} screen={type(sp_anc)}"
-                )
-                assert _is_valid_screen_pt(sp_anc), f"invalid start_pos (2D) {sp_anc}"
-            if not _is_valid_screen_pt(sp_pos):
-                print(
-                    f"[draw_craft] invalid end_pos: pos={repr(pos)} -> screen={repr(sp_pos)} types: pos={type(pos)} screen={type(sp_pos)}"
-                )
-                assert _is_valid_screen_pt(sp_pos), f"invalid end_pos (2D) {sp_pos}"
-
-            # Force plain Python ints to appease pygame argument validation
-            try:
-                sp_anc_i = (int(sp_anc[0]), int(sp_anc[1]))
-                sp_pos_i = (int(sp_pos[0]), int(sp_pos[1]))
-            except Exception as e:
-                print(f"[draw_craft] cast-to-int failed: anc={repr(sp_anc)} pos={repr(sp_pos)} err={e}")
+            if nodes is not None and edges is not None:
+                # Draw edges and nodes
+                try:
+                    for (i, j) in edges:
+                        pi = world_to_screen(nodes[int(i)])
+                        pj = world_to_screen(nodes[int(j)])
+                        pygame.draw.line(screen, (140, 140, 180), (int(pi[0]), int(pi[1])), (int(pj[0]), int(pj[1])), 2)
+                    for p in nodes:
+                        sp = world_to_screen(p)
+                        pygame.draw.circle(screen, color, (int(sp[0]), int(sp[1])), 7)
+                    if com is not None:
+                        spc = world_to_screen(com)
+                        pygame.draw.circle(screen, (250, 240, 240), (int(spc[0]), int(spc[1])), 4)
+                except Exception:
+                    pass
                 return
 
-            try:
-                pygame.draw.line(screen, (140, 140, 180), sp_anc_i, sp_pos_i, 2)
-            except TypeError as e:
-                print(
-                    "[draw_craft] pygame.draw.line TypeError:", e,
-                    " anc=", repr(sp_anc_i), " pos=", repr(sp_pos_i),
-                    " raw_anc=", repr(anc), " raw_pos=", repr(pos)
-                )
-                # Skip drawing this craft this frame
-                return
-            try:
-                pygame.draw.circle(screen, color, sp_pos_i, 10)
-            except TypeError as e:
-                print(
-                    "[draw_craft] pygame.draw.circle TypeError:", e,
-                    " center=", repr(sp_pos_i), " color=", repr(color)
-                )
+            # Back-compat: draw a tethered point if only pos/anchor provided
+            def as_xy(p):
+                try:
+                    x = float(p[0]); y = float(p[1])
+                    return (x, y)
+                except Exception:
+                    try:
+                        return (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
+                    except Exception:
+                        return (0.0, 0.0)
+
+            pos = as_xy(snapshot.get("pos", (0.0, 0.0)))
+            anc = as_xy(snapshot.get("anchor", (0.0, 0.0)))
+            sp_anc = world_to_screen(anc)
+            sp_pos = world_to_screen(pos)
+            if _is_valid_screen_pt(sp_anc) and _is_valid_screen_pt(sp_pos):
+                pygame.draw.line(screen, (140, 140, 180), (int(sp_anc[0]), int(sp_anc[1])), (int(sp_pos[0]), int(sp_pos[1])), 2)
+                pygame.draw.circle(screen, color, (int(sp_pos[0]), int(sp_pos[1])), 10)
 
         draw_craft(last_a)
         draw_craft(last_b)
@@ -376,11 +403,26 @@ def _run_demo(
         font = pygame.font.SysFont("consolas", 15)
         hud_lines = []
         hud_lines.append("Controls: WASD / Arrows; Debug: TURING_DT_DEBUG=1")
-        hud_lines.append(
-            ("[classic] " if classic else "[preview] ")
-            + ("proj " if projection_enabled else "2D ")
-            + f"Frame dt={dt*1000.0:6.1f} ms  fps_target={fps}  budget={rt_cfg.budget_ms:4.1f}ms"
-        )
+        if classic:
+            hud_lines.append(
+                ("[classic] " if classic else "[realtime] ")
+                + ("proj " if projection_enabled else "2D ")
+                + f"Frame dt={dt*1000.0:6.1f} ms  fps_target={fps}  budget={rt_cfg.budget_ms:4.1f}ms"
+            )
+        else:
+            hud_lines.append(
+                ("[classic] " if classic else "[realtime] ")
+                + ("proj " if projection_enabled else "2D ")
+                + f"Frame dt={dt*1000.0:6.1f} ms  fps_target={fps}  budget={rt_cfg.budget_ms:4.1f}ms"
+            )
+            # Show minimum budget vs target and slack weights summary
+            try:
+                _, min_total_ms = compute_minimum_budget(rt_cfg, rt_state, engine_ids)
+                hud_lines.append(
+                    f"min_budget={min_total_ms:5.2f}ms  target_pool={rt_cfg.slack*rt_cfg.budget_ms:5.2f}ms"
+                )
+            except Exception:
+                pass
         if classic:
             # Top-round metrics
             top_m = runner.get_latest_metrics(top_round)
@@ -398,7 +440,7 @@ def _run_demo(
                     f"{label[:20]:20}  v={m.max_vel:6.3f}  pen={m.div_inf:7.4f}  mass={m.mass_err:6.2e}"
                 )
         else:
-            # Preview HUD: per-engine live stats
+            # Realtime HUD: per-engine live stats
             alloc = compile_allocations(rt_cfg, rt_state, engine_ids)
             for reg in regs:
                 name = reg.name

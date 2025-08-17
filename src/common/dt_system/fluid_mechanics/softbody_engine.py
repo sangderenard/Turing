@@ -28,11 +28,13 @@ Until wired, this class raises NotImplementedError in step().
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, TYPE_CHECKING
 import numpy as np
 
 from ..dt_scaler import Metrics
 from ..engine_api import DtCompatibleEngine
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..solids.api import SolidRegistry
 
 SurfaceSampler = Callable[[np.ndarray], Dict[str, np.ndarray]]
 
@@ -45,7 +47,8 @@ class SoftbodyEngineWrapper(DtCompatibleEngine):
     surface_samplers: tuple[SurfaceSampler, ...] = ()
     # Optional hook to return a scalar penetration value for dt solving
     penetration_fn: Optional[Callable[[object], float]] = None
-
+    # Optional solids registry to consult for collisions/contacts
+    solids: Optional["SolidRegistry"] = None
     _last_metrics: Optional[Metrics] = None
 
     def snapshot(self):  # pragma: no cover

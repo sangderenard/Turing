@@ -210,9 +210,9 @@ def run_superstep_plan(state,
     return SuperstepResult(advanced=float(total), dt_next=float(dt_next), steps=steps, clamped=clamped, metrics=metrics)
 
 
-# ------------------------- Realtime preview (single-step) --------------------
+# ------------------------- Realtime mode (single-step) -----------------------
 
-def step_preview_once(
+def step_realtime_once(
     state,
     dt_current: float,
     dx: float,
@@ -225,14 +225,15 @@ def step_preview_once(
 ):
     """Run exactly one advance and set next dt from a time allocation.
 
-    This "preview" mode prioritizes liveness: it executes a single step, measures
+    This realtime mode prioritizes liveness: it executes a single step, measures
     wall-clock time, records it into Metrics.proc_ms, and proposes the next dt as
-    alloc_ms/1000, subject to an engine-provided dt_limit when present. No
+    alloc_ms/1000. In realtime mode we ignore engine-provided dt_limit to preserve
+    real-time pacing. No
     retries, no superstep/substep are performed here unless ``allow_exceptions``
     is True, in which case a future extension may try minimal corrective splits
     within the allocation if it demonstrably reduces penalty.
     """
-    # Single attempt only; no rollback or halving in preview mode.
+    # Single attempt only; no rollback or halving in realtime mode.
     t0 = time.perf_counter()
     ok, metrics = advance(state, float(dt_current))
     t1 = time.perf_counter()
@@ -248,22 +249,20 @@ def step_preview_once(
         dt_baseline = ctrl.dt_min if ctrl.dt_min is not None else 1e-6
         if is_enabled():
             dbg("ctrl").warning(
-                f"rt-preview advance failed: dt={dt_current:.6g} -> next={dt_baseline:.6g} ({pretty_metrics(metrics)})"
+                f"rt advance failed: dt={dt_current:.6g} -> next={dt_baseline:.6g} ({pretty_metrics(metrics)})"
             )
         return metrics, float(dt_baseline), float(dt_current)
 
     # Base proposal from allocation (thumbnailing simulated time to budget)
+    # Ignore engine hard limit (dt_limit) in realtime to maintain pacing.
     dt_next = max(alloc_ms, 0.0) * 1e-3
-    # Never exceed engine hard limit if provided
-    if metrics.dt_limit is not None:
-        dt_next = min(dt_next, float(metrics.dt_limit))
 
     # Controller book-keeping still learns dt_max from velocities
     ctrl.update_dt_max(metrics.max_vel, dx)
 
     if is_enabled():
         dbg("ctrl").debug(
-            "rt-preview: "
+            "rt: "
             f"used_dt={float(dt_current):.6g} alloc={alloc_ms:.3f}ms cost={elapsed_ms:.3f}ms "
             + (f"dt_limit={metrics.dt_limit:.6g} " if metrics.dt_limit is not None else "")
             + f"-> dt_next={dt_next:.6g} | {pretty_metrics(metrics)}"

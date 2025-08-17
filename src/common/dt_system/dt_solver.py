@@ -28,6 +28,7 @@ from typing import Callable, Optional, Any
 
 from .dt_scaler import Metrics
 from .debug import dbg, is_enabled, pretty_metrics
+from .state_table import GLOBAL_STATE_TABLE, sync_engine_from_table, publish_engine_to_table
 
 
 ObjectiveFn = Callable[[Metrics], float]
@@ -85,6 +86,11 @@ def _eval_on_snapshot(engine: Any, dt: float, cfg: BisectSolverConfig) -> tuple[
         if snap is None and cfg.require_snapshot:
             raise ValueError("No snapshot/restore available for bisect solver (engine or inner state)")
 
+    # Sync from shared table before evaluation
+    try:
+        sync_engine_from_table(engine, getattr(engine, "name", getattr(engine, "__class__", type(engine)).__name__), GLOBAL_STATE_TABLE)
+    except Exception:
+        pass
     ok, m = engine.step(dt)
     # Roll back if we can; ignore errors
     try:
@@ -174,7 +180,16 @@ def solve_window_bisect(engine: Any, total_dt: float, cfg: BisectSolverConfig) -
                     pick_dt, pick_m = 0.5 * (lo + hi), m_mid
 
         # Commit chosen dt
+        # Sync from state table before commit, publish after commit
+        try:
+            sync_engine_from_table(engine, getattr(engine, "name", getattr(engine, "__class__", type(engine)).__name__), GLOBAL_STATE_TABLE)
+        except Exception:
+            pass
         ok, m_commit = engine.step(pick_dt)
+        try:
+            publish_engine_to_table(engine, getattr(engine, "name", getattr(engine, "__class__", type(engine)).__name__), GLOBAL_STATE_TABLE)
+        except Exception:
+            pass
         last_metrics = m_commit if ok else pick_m
         advanced += float(pick_dt)
         if is_enabled():

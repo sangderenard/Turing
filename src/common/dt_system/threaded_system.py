@@ -66,6 +66,7 @@ class ThreadedSystemEngine(DtCompatibleEngine):
         capture: Optional[CaptureFn] = None,
         draw_hook: Optional[Callable[[Mapping[str, Any]], None]] = None,
         max_queue: int = 4,
+        realtime: bool = False,
     ) -> None:
         self._engine = engine
         self._capture = capture or (lambda: {})
@@ -75,7 +76,7 @@ class ThreadedSystemEngine(DtCompatibleEngine):
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-
+        self._realtime = bool(realtime)
     # DtCompatibleEngine interface -------------------------------
     def step(self, dt: float) -> tuple[bool, Metrics]:
         """Synchronously request a worker step and wait for Metrics.
@@ -144,7 +145,15 @@ class ThreadedSystemEngine(DtCompatibleEngine):
             try:
                 if is_enabled():
                     dbg("threaded").debug(f"worker: step dt={req.dt:.6g}")
-                ok, metrics = self._engine.step(req.dt)
+                # If in realtime mode and the engine exposes a realtime path,
+                # prefer it to avoid nested superstep control.
+                if self._realtime and hasattr(self._engine, "step_realtime"):
+                    try:
+                        ok, metrics = getattr(self._engine, "step_realtime")(req.dt)  # type: ignore[misc]
+                    except Exception:
+                        ok, metrics = self._engine.step(req.dt)
+                else:
+                    ok, metrics = self._engine.step(req.dt)
                 # Emit frame best-effort regardless of ok
                 frame = self._capture()
                 if isinstance(frame, dict):
