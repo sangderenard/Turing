@@ -11,9 +11,9 @@ from src.cells.cellsim.data.state import Cell, Bath
 from src.cells.cellsim.api.saline import SalinePressureAPI
 from src.cells.cellsim.mechanics.softbody0d import SoftbodyProviderCfg
 from src.cells.bath.coupling import BathFluidCoupler
-from src.cells.bath.dt_controller import STController, Targets, run_superstep
+from src.common.dt_system.dt_controller import STController, Targets, run_superstep
 from src.common.sim_hooks import SimHooks
-from src.common.dt_scaler import Metrics
+from src.common.dt_system.dt_scaler import Metrics
 
 # Lightweight math helpers (duplicated to avoid importing OpenGL demo)
 import math

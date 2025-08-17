@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from src.cells.softbody.demo import numpy_sim_coordinator as coord
-from src.common.dt_scaler import Metrics
+from src.common.dt_system.dt_scaler import Metrics
 
 
 class DummyEngine:

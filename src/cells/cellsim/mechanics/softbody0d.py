@@ -18,7 +18,7 @@ from src.cells.softbody.engine.coupling import (
     cell_area,
 )
 from src.cells.softbody.engine.fields import FieldStack
-from src.cells.bath.dt_controller import STController, Targets
+from src.common.dt_system.dt_controller import STController, Targets
 
 
 @dataclass

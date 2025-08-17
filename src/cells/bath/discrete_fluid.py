@@ -30,8 +30,9 @@ from typing import Callable, Dict, Optional, Tuple, Iterable
 
 import numpy as np
 import copy
-from src.common.dt_scaler import Metrics
-from src.cells.bath.dt_controller import Targets, STController, step_with_dt_control
+from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.dt_controller import Targets, STController, step_with_dt_control
+from src.common.dt_system.debug import dbg, is_enabled
 
 
 # ------------------------------ Kernels -------------------------------------
@@ -223,30 +224,40 @@ class DiscreteFluid:
     # ------------------------- Public API ------------------------------------
 
     def step(self, dt: float, substeps: int = 1, *, hooks=None) -> None:
-        """Advance the fluid by ``dt`` seconds.
+        """Advance the fluid by exactly ``dt`` seconds without self-capping.
 
-        Parameters
-        ----------
-        dt:
-            Total time to advance.
-        substeps:
-            Number of substeps to split ``dt`` into (CFL capped).
-        hooks:
-            Optional :class:`~src.common.sim_hooks.SimHooks` for pre/post
-            callbacks on each internal substep.
+        Internal stability is now governed by the dt controller via metrics,
+        so this method performs a single substep of size ``dt``. Any desired
+        pre/post hooks are still honored around the substep.
         """
         from src.common.sim_hooks import SimHooks
 
         hooks = hooks or SimHooks()
-        dt_target = dt / max(1, int(substeps))
-        remaining = dt
-        while remaining > 1e-12:
-            # choose stable dt <= dt_target
-            dt_s = min(self._stable_dt(), dt_target, remaining)
-            hooks.run_pre(self, dt_s)
-            self._substep(dt_s)
-            hooks.run_post(self, dt_s)
-            remaining -= dt_s
+        if is_enabled():
+            try:
+                vmax0 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
+            except Exception:
+                vmax0 = 0.0
+            dbg("eng.discrete").debug(
+                f"step: dt={float(dt):.6g} N={self.N} h={self.kernel.h:.3g} vmax0={vmax0:.3e}"
+            )
+        hooks.run_pre(self, float(dt))
+        self._substep(float(dt))
+        hooks.run_post(self, float(dt))
+        if is_enabled():
+            try:
+                vmax1 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
+                rho_min = float(np.min(self.rho)) if self.N > 0 else 0.0
+                rho_max = float(np.max(self.rho)) if self.N > 0 else 0.0
+                p_min = float(np.min(self.P)) if self.N > 0 else 0.0
+                p_max = float(np.max(self.P)) if self.N > 0 else 0.0
+                n_drop = int(self.droplet_p.shape[0])
+            except Exception:
+                vmax1 = rho_min = rho_max = p_min = p_max = 0.0
+                n_drop = 0
+            dbg("eng.discrete").debug(
+                f"done: vmax={vmax1:.3e} rho=[{rho_min:.3e},{rho_max:.3e}] P=[{p_min:.3e},{p_max:.3e}] droplets={n_drop}"
+            )
 
     def copy_shallow(self):
         """Return a shallow copy for rollback in adaptive stepping."""
@@ -420,6 +431,8 @@ class DiscreteFluid:
         self.S = np.clip(self.solute_mass / np.maximum(self.m, 1e-12), 0.0, 1.0)
 
     def _substep(self, dt: float) -> None:
+        if is_enabled():
+            dbg("eng.discrete").debug(f"    _substep dt={float(dt):.6g}")
         # Emit droplets based on velocity threshold if requested
         self.emit_droplets()
 
@@ -432,6 +445,17 @@ class DiscreteFluid:
         # Density & pressure (EOS)
         self._compute_density()
         self._compute_pressure()
+        if is_enabled():
+            try:
+                rho_min = float(np.min(self.rho)) if self.N > 0 else 0.0
+                rho_max = float(np.max(self.rho)) if self.N > 0 else 0.0
+                p_min = float(np.min(self.P)) if self.N > 0 else 0.0
+                p_max = float(np.max(self.P)) if self.N > 0 else 0.0
+            except Exception:
+                rho_min = rho_max = p_min = p_max = 0.0
+            dbg("eng.discrete").debug(
+                f"      density/pressure: rho=[{rho_min:.3e},{rho_max:.3e}] P=[{p_min:.3e},{p_max:.3e}]"
+            )
 
         # Forces
         f = self._pressure_forces() + self._viscosity_forces() + self._body_forces()
@@ -445,6 +469,7 @@ class DiscreteFluid:
         if self.params.xsph_eps > 0.0:
             self.v = (1.0 - self.params.xsph_eps) * self.v + self.params.xsph_eps * self._xsph_velocity()
 
+        # Position update
         self.p += dt * self.v
 
         # Boundaries (box)
@@ -459,6 +484,15 @@ class DiscreteFluid:
             self._integrate_droplets(dt)
             # After moving droplets, check for re-entry into the main fluid
             self._merge_droplets()
+
+        # Anomaly checks
+        if is_enabled():
+            try:
+                bad = (not np.all(np.isfinite(self.p))) or (not np.all(np.isfinite(self.v)))
+            except Exception:
+                bad = False
+            if bad:
+                dbg("eng.discrete").debug("      anomaly: non-finite positions or velocities detected")
 
     def _integrate_droplets(self, dt: float) -> None:
         """Advance detached droplets under gravity and drag."""

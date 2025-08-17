@@ -243,3 +243,10 @@ For a clickable, hyperlinked index, see MODULES.md.
 This is a large project and a full `pytest` run can take a while. Each run records
 its total runtime in `pytest_run_times.log` (kept to the last 50 entries) so you can
 track how long recent test sessions have taken.
+
+### Focused subsets
+
+- dt system fast: run adaptive-dt controller and graph smoke tests quickly
+  using markers: `pytest -q -m "dt and fast"`
+- dt graph only: `pytest -q -m dt_graph`
+- explicit files: `pytest -q tests/test_dt_controller.py tests/test_dt_graph.py`

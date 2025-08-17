@@ -39,8 +39,8 @@ from typing import Tuple, Dict, Optional
 import numpy as np
 import warnings
 import copy
-from src.common.dt_scaler import Metrics
-from src.cells.bath.dt_controller import Targets, STController, step_with_dt_control
+from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.dt_controller import Targets, STController, step_with_dt_control
 
 # Default CFL number exposed for external callers.  A value of 0.5 is
 # reasonably conservative for the semi-Lagrangian scheme employed here.

@@ -34,4 +34,4 @@ class DtStepper(Protocol):
         """Advance according to ``plan`` and report the result."""
 
 
-__all__ = ["DtStepper"]
+__all__ = ["DtStepper", "SuperstepPlan", "SuperstepResult"]

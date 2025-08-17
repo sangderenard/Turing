@@ -24,6 +24,14 @@ class Metrics:
     osc_flag: bool = False
     stiff_flag: bool = False
     sim_frame: int = 0
+    # Wall-clock time of the last step for this engine (milliseconds).
+    # Populated in preview mode or when instrumentation is enabled.
+    proc_ms: float = 0.0
+    # Optional sidechain: absolute dt limit hint proposed by the engine.
+    # When provided, the dt controller will clamp the next proposal to this
+    # value (min()), centralizing stability control instead of engines
+    # self-capping internally.
+    dt_limit: float | None = None
 
 
 class ScalerControl:
@@ -89,3 +97,10 @@ def scale_metric(
     if control is not None:
         scaled = control.apply(scaled)
     return float(scaled)
+
+
+__all__ = [
+    "Metrics",
+    "ScalerControl",
+    "scale_metric",
+]

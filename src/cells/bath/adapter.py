@@ -19,7 +19,7 @@ from .discrete_fluid import DiscreteFluid
 from .voxel_fluid import VoxelMACFluid
 from .hybrid_fluid import HybridFluid
 from .dt_controller import STController, Targets, run_superstep_plan
-from src.common.dt import SuperstepPlan, SuperstepResult
+from src.common.dt_system.dt import SuperstepPlan, SuperstepResult
 
 logger = logging.getLogger(__name__)
 
