@@ -92,17 +92,8 @@ class EngineNode:
                 dbg("engine").debug(f"step: name={self.registration.name} dt={float(dt):.6g} realtime={realtime}")
             sync_engine_from_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
             eng = self.registration.engine
-            # In realtime mode: single step, accumulate penalty if metric violated
+            ok, metrics, state_new = eng.step_with_state(state_obj, float(dt), realtime=realtime)  # type: ignore[misc]
             if realtime:
-                if hasattr(eng, "step_with_state"):
-                    try:
-                        ok, metrics, state_new = eng.step_with_state(state_obj, float(dt))  # type: ignore[misc]
-                    except Exception:
-                        ok, metrics = eng.step(float(dt))
-                        state_new = state_obj
-                else:
-                    ok, metrics = eng.step(float(dt))
-                    state_new = state_obj
                 # Penalty: accumulate error if controller metric violated (e.g., max_vel, div_inf, etc.)
                 # This is a placeholder: you may want to customize which metric and how penalty is computed
                 penalty = 0.0
@@ -119,17 +110,6 @@ class EngineNode:
                             penalty += float(abs(metrics.mass_err) - targets.mass_max)
                 # You can log or accumulate penalty as needed (e.g., attach to metrics, or log elsewhere)
                 metrics.penalty = penalty
-            else:
-                # Non-realtime: allow controller-driven superstep/substep logic
-                if hasattr(eng, "step_with_state"):
-                    try:
-                        ok, metrics, state_new = eng.step_with_state(state_obj, float(dt))  # type: ignore[misc]
-                    except Exception:
-                        ok, metrics = eng.step(float(dt))
-                        state_new = state_obj
-                else:
-                    ok, metrics = eng.step(float(dt))
-                    state_new = state_obj
             publish_engine_to_table(self.registration.engine, self.registration.name, GLOBAL_STATE_TABLE)
             if is_enabled():
                 dbg("engine").debug(
@@ -217,12 +197,20 @@ class MetaLoopRunner:
         levels = self._ilp_scheduler.compute_levels(schedule_method, schedule_order)
         self._schedule = [self._adv_map[nid] for nid, _ in sorted(levels.items(), key=lambda x: (x[1], x[0])) if nid in self._adv_map]
 
-    def run_round(self, dt: Optional[float] = None, *, realtime: bool = False) -> SuperstepResult:
-        """Execute one frame by walking the process graph in the cached schedule order (ILPScheduler). Passes realtime flag to advance functions."""
+    def run_round(
+        self,
+        round_node: Optional[RoundNode] = None,
+        dt: Optional[float] = None,
+        *,
+        realtime: bool = False,
+    ) -> SuperstepResult:
+        """Execute one frame. Optionally accept a RoundNode on first call."""
+        if round_node is not None:
+            self.set_process_graph(round_node)
         if self._schedule is None or self._root_round is None:
             raise RuntimeError("No process graph set. Call set_process_graph() first.")
-        # Use dt from root round unless overridden
-        step_dt = dt if dt is not None else self._root_round.plan.dt_init
+        # Use the round's requested window unless overridden
+        step_dt = dt if dt is not None else self._root_round.plan.round_max
         import time
         last_metrics = None
         self._last_timings = []
@@ -238,9 +226,6 @@ class MetaLoopRunner:
                 self._last_timings.append(0.0)
             adv.state.state = new_state
             last_metrics = metrics
-    def get_last_schedule_timings(self) -> list[float]:
-        """Return the list of per-node timings (in seconds) for the last frame, in schedule order."""
-        return list(self._last_timings)
         from .dt import SuperstepResult
         return SuperstepResult(
             advanced=step_dt,
@@ -249,6 +234,10 @@ class MetaLoopRunner:
             clamped=False,
             metrics=last_metrics if last_metrics is not None else None,
         )
+
+    def get_last_schedule_timings(self) -> list[float]:
+        """Return the list of per-node timings (in seconds) for the last frame, in schedule order."""
+        return list(self._last_timings)
 
     def get_latest_metrics(self, node: Union[RoundNode, AdvanceNode, ControllerNode]) -> Optional[Metrics]:
         """Return the latest Metrics observed at the given node, if any."""

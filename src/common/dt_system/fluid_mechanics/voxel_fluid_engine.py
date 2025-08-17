@@ -61,7 +61,7 @@ class VoxelFluidEngine(DtCompatibleEngine):
             dbg("eng.bath").debug(f"voxel done: {pretty_metrics(metrics)}")
         return True, metrics
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - light bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
         try:
             if isinstance(state, dict):
                 for k in ("u", "v", "w", "rho", "p"):

@@ -123,7 +123,7 @@ class GravityEngine(DtCompatibleEngine):
             self.s.acc[i] = v_add(self.s.acc[i], (0.0, -self.s.g))
         return True, Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass"):
@@ -165,7 +165,7 @@ class ThrustersEngine(DtCompatibleEngine):
             self.s.acc[i] = v_add(self.s.acc[i], a)
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass"):
@@ -210,7 +210,7 @@ class SpringEngine(DtCompatibleEngine):
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass", "springs", "rest_len", "k_spring"):
@@ -257,7 +257,7 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass", "springs", "pneu_damp"):
@@ -306,7 +306,7 @@ class GroundCollisionEngine(DtCompatibleEngine):
                 self.s.acc[i] = v_add(self.s.acc[i], a)
         return True, Metrics(0.0, 0.0, 0.0, 0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass"):
@@ -375,7 +375,7 @@ class IntegratorEngine(DtCompatibleEngine):
                 pass
         return True, Metrics(max_vel=max_v, max_flux=0.0, div_inf=0.0, mass_err=0.0)
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         try:
             if isinstance(state, dict):
                 for k in ("pos", "vel", "acc", "mass"):
@@ -725,7 +725,7 @@ class MetaCollisionEngine(DtCompatibleEngine):
         m = Metrics(max_vel=max_vel, max_flux=0.0, div_inf=max_pen, mass_err=0.0)
         return True, m
 
-    def step_with_state(self, state: object, dt: float):  # pragma: no cover - bridge
+    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - bridge
         # State can be a list of DemoState-like dicts
         try:
             if isinstance(state, list) and len(state) == len(self.states):
