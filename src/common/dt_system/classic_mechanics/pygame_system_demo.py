@@ -50,6 +50,7 @@ from ..fluid_mechanics import BathDiscreteFluidEngine
 from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
+from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
@@ -151,6 +152,24 @@ def _run_demo(
     screen = pygame.display.set_mode((width, height))
     pygame.display.set_caption("dt-graph: crafts + bath fluid")
     clock = pygame.time.Clock()
+
+    # Set up a simple world cage so fluids wrap within bounds and crafts hit walls
+    world = GLOBAL_WORLD
+    cage_min = np.array([-2.0, -1.5, -2.0], dtype=float)
+    cage_max = np.array([9.0, 4.0, 2.0], dtype=float)
+    world.bounds = (
+        (float(cage_min[0]), float(cage_min[1]), float(cage_min[2])),
+        (float(cage_max[0]), float(cage_max[1]), float(cage_max[2])),
+    )
+    world.fluid_mode = "wrap"
+    world.planes = [
+        WorldPlane(normal=np.array([0.0, 1.0, 0.0], dtype=float), offset=0.0, material=MATERIAL_ELASTIC),
+        WorldPlane(normal=np.array([0.0, -1.0, 0.0], dtype=float), offset=float(cage_max[1]), material=MATERIAL_ELASTIC),
+        WorldPlane(normal=np.array([1.0, 0.0, 0.0], dtype=float), offset=float(-cage_min[0]), material=MATERIAL_ELASTIC),
+        WorldPlane(normal=np.array([-1.0, 0.0, 0.0], dtype=float), offset=float(cage_max[0]), material=MATERIAL_ELASTIC),
+        WorldPlane(normal=np.array([0.0, 0.0, 1.0], dtype=float), offset=float(-cage_min[2]), material=MATERIAL_ELASTIC),
+        WorldPlane(normal=np.array([0.0, 0.0, -1.0], dtype=float), offset=float(cage_max[2]), material=MATERIAL_ELASTIC),
+    ]
 
     # Optional simple perspective projection from 3D->2D, default enabled.
     projection_enabled = os.environ.get("TURING_2D", "0") in ("0", "false", "False", "no", "No", "")

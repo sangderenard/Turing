@@ -164,6 +164,13 @@ class VoxelMACFluid:
             self.T[I, J, K] += (dT[i] * w).reshape(I.shape)
             self.S[I, J, K] = np.clip(self.S[I, J, K] + (dS[i] * w).reshape(I.shape), 0.0, 1.0)
 
+    def minvelocity(self, max_vel: float) -> None:
+        """Clamp all velocity components to ``[-max_vel, max_vel]``."""
+        vmax = float(max_vel)
+        self.u = np.clip(self.u, -vmax, vmax)
+        self.v = np.clip(self.v, -vmax, vmax)
+        self.w = np.clip(self.w, -vmax, vmax)
+
     def add_momentum_sources(self, centers_world: np.ndarray, force_world: np.ndarray, radius: float) -> None:
         """Distribute body force density (N/m^3) to velocities via face weights; crude but useful for jets."""
         assert centers_world.shape == force_world.shape

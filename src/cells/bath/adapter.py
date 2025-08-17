@@ -141,7 +141,19 @@ class SPHAdapter(BathAdapter):
             vmax = float(np.max(np.linalg.norm(state.v, axis=1))) if state.N > 0 else 0.0
             mass_now = float(np.sum(state.m))
             mass_err = abs(mass_now - prev_mass) / max(prev_mass, 1e-12)
-            metrics = type("M", (), {"max_vel": vmax, "max_flux": vmax, "div_inf": 0.0, "mass_err": mass_err, "osc_flag": False, "stiff_flag": False})()
+            metrics = type(
+                "M",
+                (),
+                {
+                    "max_vel": vmax,
+                    "max_flux": vmax,
+                    "div_inf": 0.0,
+                    "mass_err": mass_err,
+                    "osc_flag": False,
+                    "stiff_flag": False,
+                    "dt_limit": None,
+                },
+            )()
             return True, metrics
         plan = SuperstepPlan(round_max=float(round_max), dt_init=float(self._dt_curr or 1e-6), allow_increase_mid_round=bool(allow_increase_mid_round))
         # For SPH, use smoothing length as spatial scale for CFL
@@ -240,6 +252,7 @@ class MACAdapter(BathAdapter):
                         "mass_err": 0.0,
                         "osc_flag": False,
                         "stiff_flag": False,
+                        "dt_limit": None,
                     },
                 )()
                 return True, metrics
@@ -349,6 +362,7 @@ class HybridAdapter(BathAdapter):
                         "mass_err": 0.0,
                         "osc_flag": False,
                         "stiff_flag": False,
+                        "dt_limit": None,
                     },
                 )()
                 return True, metrics
