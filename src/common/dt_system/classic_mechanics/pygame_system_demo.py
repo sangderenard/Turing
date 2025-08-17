@@ -213,6 +213,17 @@ def _run_demo(
     craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
     craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
 
+    # --- Register craft vertices as identities in the state table ---
+    import uuid
+    craft_a_vertex_uuids = [
+        state_table.register_identity(pos=pos, mass=mass)
+        for pos, mass in zip(craft_a.state.pos, craft_a.state.mass)
+    ]
+    craft_b_vertex_uuids = [
+        state_table.register_identity(pos=pos, mass=mass)
+        for pos, mass in zip(craft_b.state.pos, craft_b.state.mass)
+    ]
+
     # Bath discrete fluid: construct via engine convenience (n) and derive bounds from world planes
     fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
 
@@ -229,31 +240,25 @@ def _run_demo(
     from .rigid_body_engine import RigidBodyEngine, WorldAnchor, WorldObjectLink, COM
 
     world_anchors = [WorldAnchor(position=(0.0, 0.0))]
-    object_anchors = [ (0, "craft_a", COM, 0.0), (0, "craft_b", COM, 0.0) ]
+    object_anchors = [ (0, "A", COM, 0.0), (0, "B", COM, 0.0) ]
     links = [WorldObjectLink(world_anchor=world_anchors[object_anchors[i][0]], object_anchor=object_anchors[i], link_type='steel_beam', properties={'length': 1.0, 'k': 10000.0}) for i in range(len(object_anchors))]
 
     # --- Explicitly define rigid body groups for each craft ---
     rigid_body_groups = []
     # Craft A
-    craft_a_vertices = set(range(len(craft_a.state.pos)))
     craft_a_edges = { 'spring': set(craft_a.state.springs) }
-    craft_a_masses = {i: craft_a.state.mass[i] for i in craft_a_vertices}
     rigid_body_groups.append({
-        'label': 'craft_a',
-        'vertices': craft_a_vertices,
+        'label': 'A',
+        'vertices': set(craft_a_vertex_uuids),
         'edges': craft_a_edges,
-        'masses': craft_a_masses,
         # Faces can be added if defined
     })
     # Craft B
-    craft_b_vertices = set(range(len(craft_b.state.pos)))
     craft_b_edges = { 'spring': set(craft_b.state.springs) }
-    craft_b_masses = {i: craft_b.state.mass[i] for i in craft_b_vertices}
     rigid_body_groups.append({
-        'label': 'craft_b',
-        'vertices': craft_b_vertices,
+        'label': 'B',
+        'vertices': set(craft_b_vertex_uuids),
         'edges': craft_b_edges,
-        'masses': craft_b_masses,
     })
 
     # Pass explicit group structure to RigidBodyEngine

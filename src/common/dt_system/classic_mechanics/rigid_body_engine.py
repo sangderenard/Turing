@@ -66,6 +66,74 @@ class RigidBodyEngine(DtCompatibleEngine):
             group_uuid = group.get('uuid', str(uuid.uuid4()))
             # Register group identity with COM marker for position
             if hasattr(state_table, 'register_identity'):
+                from dataclasses import dataclass, field
+from ..engine_api import DtCompatibleEngine
+from typing import Hashable, Tuple, Optional, List, Dict
+import numpy as np
+
+class MagicCenterOfMass:
+    pass
+COM: MagicCenterOfMass = MagicCenterOfMass()  # Placeholder for center of mass identifier
+
+
+@dataclass
+class WorldAnchor:
+    position: Tuple[float, float]
+    massless: bool = True  # Always treated as infinite mass in force calculations
+
+@dataclass
+class FreeVertexAnchor:
+    position: Tuple[float, float]
+    massless: bool = True  # Can be influenced by attached rigid body
+    attached_body: Optional[int] = None  # Index or ID of the rigid body, if any
+
+
+@dataclass
+class WorldObjectLink:
+    world_anchor: WorldAnchor
+    object_anchor: tuple  # (world_anchor_index, vertex_set_identifier, set_index, mass)
+    link_type: str  # 'rope', 'steel_beam', 'spring', 'gas_dampner', 'lever_arm'
+    properties: Optional[dict] = field(default_factory=dict)
+
+
+
+class RigidBodyEngine(DtCompatibleEngine):
+    def get_state(self, state=None):
+        out = state if isinstance(state, dict) else {}
+        out['nodes'] = self.nodes.copy()
+        out['velocities'] = self.velocities.copy()
+        out['masses'] = self.masses.copy()
+        return out
+
+    def __init__(self, links: List[WorldObjectLink], state_table, rigid_body_groups: List[dict]):
+        """
+        links: list of WorldObjectLink
+        state_table: shared StateTable instance
+        rigid_body_groups: list of dicts, each with keys:
+            - 'label': unique group label
+            - 'vertices': set or list of vertex indices or ids
+            - 'edges': (optional) dict of {color: set(edge_ids)}
+            - 'faces': (optional) set/list of face ids
+            - ... (any extra features)
+        """
+        self.links = links
+        self.object_anchors = [link.object_anchor for link in links]
+        self.nodes = np.array([link.world_anchor.position for link in links], dtype=float)
+        self.masses = np.array([oa[3] for oa in self.object_anchors], dtype=float)
+        self.velocities = np.zeros_like(self.nodes)
+        self.forces = np.zeros_like(self.nodes)
+        # Explicit group registration with identity assignment
+        import uuid
+        self.rigid_body_groups = []
+        for group in rigid_body_groups:
+            label = group['label']
+            vertices = set(group['vertices'])
+            edges = group.get('edges', None)
+            faces = group.get('faces', None)
+            # Assign UUID identity to group if not present
+            group_uuid = group.get('uuid', str(uuid.uuid4()))
+            # Register group identity with COM marker for position
+            if hasattr(state_table, 'register_identity'):
                 state_table.register_identity(pos='COM', mass=0.0, uuid_str=group_uuid)
             # Assign UUIDs to edges and faces if not already present, and register their identity
             edge_identities = {}
@@ -106,27 +174,26 @@ class RigidBodyEngine(DtCompatibleEngine):
     def _lookup_vertex_group(
         self, *, state_table, vertex_set_identifier, set_index
     ):
-        """Look up a vertex group (e.g., all vertices for an object) from the state table using group accessors only."""
+        
+        """Look up a vertex group (e.g., all vertices for an object) from the state table using group accessors only.
+        Uses state_table.get_group_vertices and state_table.get_identity for positions and masses."""
         if state_table is None:
             raise ValueError("RigidBodyEngine requires explicit state_table for COM/group lookups.")
-        vertex_indices = list(state_table.get_group_vertices(vertex_set_identifier))
-        if not vertex_indices:
+        vertex_uuids = list(state_table.get_group_vertices(vertex_set_identifier))
+        if not vertex_uuids:
             raise ValueError(f"No vertices found for group '{vertex_set_identifier}' in state_table.")
-        # Expect group registration to provide positions and masses, or raise if not available
-        group_positions = getattr(state_table, 'group_positions', None)
-        group_masses = getattr(state_table, 'group_masses', None)
-        if group_positions and vertex_set_identifier in group_positions:
-            pos = np.asarray([group_positions[vertex_set_identifier][i] for i in vertex_indices])
-        else:
-            raise ValueError(f"No position array found for group '{vertex_set_identifier}' in state_table.")
-        if group_masses and vertex_set_identifier in group_masses:
-            mass = np.asarray([group_masses[vertex_set_identifier].get(i, 1.0) for i in vertex_indices])
-        else:
-            mass = np.ones(len(vertex_indices))
-        if set_index is not None:
+        # Get positions and masses from identity_registry
+        pos = np.asarray([state_table.get_identity(uuid)['pos'] for uuid in vertex_uuids])
+        mass = np.asarray([state_table.get_identity(uuid)['mass'] for uuid in vertex_uuids])
+        if set_index is not None and type(set_index) is not MagicCenterOfMass:
             pos = pos[set_index]
             mass = mass[set_index]
-        return pos, mass
+        elif type(set_index) is MagicCenterOfMass:
+            # Compute center of mass
+            com = np.sum(pos * mass[:, None], axis=0) / np.sum(mass) if np.sum(mass) > 0 else np.zeros(3)
+            
+            mass = np.array([np.sum(mass)])
+        return com, mass
 
     def apply_forces(self, state_table=None):
         self.forces[:] = 0.0
@@ -139,6 +206,7 @@ class RigidBodyEngine(DtCompatibleEngine):
                 # Use the world_anchor_index to find the object identifier
                 # For now, assume set_index is the object id/name
                 object_id = set_index
+                
                 pos, mass_arr = self._lookup_vertex_group(state_table=state_table, vertex_set_identifier=object_id, set_index=None)
                 total_mass = np.sum(mass_arr)
                 if total_mass < 1e-12:
@@ -216,3 +284,4 @@ if __name__ == "__main__":
     for _ in range(10):
         engine.step(0.01)
         print(engine.nodes)
+
