@@ -1,5 +1,5 @@
 pytest_cache
 __pycache__
 .vscode
-.zip
+*.zip
 pytest_run_times.log
