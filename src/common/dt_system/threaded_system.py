@@ -34,7 +34,9 @@ CaptureFn = Callable[[], Mapping[str, Any]]
 @dataclass
 class _StepRequest:
     dt: float
-    reply: "queue.Queue[tuple[bool, Metrics]]"
+    state: Any
+    state_table: Any
+    reply: "queue.Queue[tuple[bool, Metrics, Any]]"
 
 
 class ThreadedSystemEngine(DtCompatibleEngine):
@@ -88,25 +90,21 @@ class ThreadedSystemEngine(DtCompatibleEngine):
 
         The worker performs the compute and may enqueue a frame.
         """
-        # Optionally, update the underlying engine's state if possible
-        if hasattr(self._engine, 'restore') and state is not None:
-            self._engine.restore(state)
-        # Optionally, set state_table if the engine supports it
+        # Optionally, set state_table attribute for capture hooks
         if hasattr(self._engine, '_state_table'):
             self._engine._state_table = state_table
-        rep: "queue.Queue[tuple[bool, Metrics]]" = queue.Queue(maxsize=1)
-        self._requests.put(_StepRequest(float(dt), rep))
+        rep: "queue.Queue[tuple[bool, Metrics, Any]]" = queue.Queue(maxsize=1)
+        self._requests.put(_StepRequest(float(dt), state, state_table, rep))
         if is_enabled():
             dbg("threaded").debug(f"request: dt={float(dt):.6g}")
         try:
-            ok, metrics = rep.get(timeout=10.0)
+            ok, metrics, state_new = rep.get(timeout=10.0)
         except queue.Empty:
             # Treat timeout as a failed step with punitive metrics
             return False, Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9), None
         if is_enabled():
             dbg("threaded").debug(f"reply: ok={ok} metrics=({pretty_metrics(metrics)})")
-        # Return new state if possible
-        return ok, metrics, self._engine.get_state() if hasattr(self._engine, 'get_state') else None
+        return ok, metrics, state_new
 
 
     # Lifecycle ---------------------------------------------------
@@ -154,29 +152,37 @@ class ThreadedSystemEngine(DtCompatibleEngine):
                 continue
             if req is None:
                 break
-            ok, metrics = False, Metrics(0.0, 0.0, 0.0, 0.0)
+            ok, metrics, state_out = False, Metrics(0.0, 0.0, 0.0, 0.0), None
             try:
                 if is_enabled():
                     dbg("threaded").debug(f"worker: step dt={req.dt:.6g}")
+                # Ensure worker-visible attribute
+                if hasattr(self._engine, '_state_table'):
+                    self._engine._state_table = req.state_table
                 # If in realtime mode and the engine exposes a realtime path,
                 # prefer it to avoid nested superstep control.
                 if self._realtime and hasattr(self._engine, "step_realtime"):
                     try:
-                        ok, metrics = getattr(self._engine, "step_realtime")(req.dt)  # type: ignore[misc]
+                        res = getattr(self._engine, "step_realtime")(req.dt, state=req.state, state_table=req.state_table)  # type: ignore[misc]
                     except Exception:
-                        ok, metrics = self._engine.step(req.dt)
+                        res = self._engine.step(req.dt, req.state, req.state_table)
                 else:
-                    ok, metrics = self._engine.step(req.dt)
+                    res = self._engine.step(req.dt, req.state, req.state_table)
+                if isinstance(res, tuple) and len(res) == 3:
+                    ok, metrics, state_out = res
+                else:
+                    ok, metrics = res  # type: ignore[misc]
+                    state_out = self._engine.get_state() if hasattr(self._engine, 'get_state') else None
                 # Emit frame best-effort regardless of ok
                 frame = self._capture()
                 if isinstance(frame, dict):
                     self._emit_frame(frame)
             except Exception:
                 # On error, emit nothing and flag failure
-                ok, metrics = False, Metrics(0.0, 0.0, 1e9, 1e9)
+                ok, metrics, state_out = False, Metrics(0.0, 0.0, 1e9, 1e9), None
             finally:
                 try:
-                    req.reply.put_nowait((ok, metrics))
+                    req.reply.put_nowait((ok, metrics, state_out))
                 except Exception:
                     pass
 
