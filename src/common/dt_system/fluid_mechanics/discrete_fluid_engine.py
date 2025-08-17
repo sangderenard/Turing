@@ -297,29 +297,6 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         # Return new state object
         return True, metrics, self.get_state()
 
-    # New stateful stepping: accept and return external state
-    def step_with_state(self, state: object, dt: float, *, realtime: bool = False):  # pragma: no cover - light bridge
-        # Accept mappings with common bath fields and apply before stepping
-        try:
-            if isinstance(state, dict):
-                for k in ("x", "v", "m", "rho", "T", "S"):
-                    if k in state and hasattr(self.sim, k):
-                        setattr(self.sim, k, state[k])
-        except Exception:
-            pass
-        ok, m = self.step(float(dt))
-        # Return same-shape state object updated
-        new_state = state
-        try:
-            if isinstance(state, dict):
-                out = {}
-                for k in ("x", "v", "m", "rho", "T", "S"):
-                    if hasattr(self.sim, k):
-                        out[k] = getattr(self.sim, k)
-                new_state = out
-        except Exception:
-            new_state = state
-        return ok, m, new_state
 
     def preferred_dt(self) -> Optional[float]:  # pragma: no cover - optional
         # Offer the simulator's stability hint if available
