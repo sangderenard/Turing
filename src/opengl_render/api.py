@@ -27,7 +27,30 @@ from .double_buffer import DoubleBuffer
 try:  # pragma: no cover - tolerate missing OpenGL libs
     from .renderer import MeshLayer, LineLayer, PointLayer, GLRenderer
 except Exception:  # noqa: BLE001
-    MeshLayer = LineLayer = PointLayer = GLRenderer = object  # type: ignore[misc,assignment]
+    from dataclasses import dataclass
+    import numpy as _np
+
+    @dataclass
+    class MeshLayer:  # minimal fallback with attribute storage
+        positions: _np.ndarray
+        indices: _np.ndarray | None = None
+        colors: _np.ndarray | None = None
+
+    @dataclass
+    class LineLayer:
+        positions: _np.ndarray
+        colors: _np.ndarray | None = None
+        width: float = 2.0
+
+    @dataclass
+    class PointLayer:
+        positions: _np.ndarray
+        colors: _np.ndarray | None = None
+        sizes_px: _np.ndarray | None = None
+        size_px_default: float = 6.0
+
+    class GLRenderer:  # type: ignore[empty-body]
+        pass
 
 if TYPE_CHECKING:  # for type hints only
     from .renderer import GLRenderer as _GLRenderer_T

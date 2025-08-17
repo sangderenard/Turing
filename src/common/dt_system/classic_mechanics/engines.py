@@ -200,7 +200,8 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             along = rel_v[0] * dir_[0] + rel_v[1] * dir_[1]
             damp_a, damp_b = self.s.pneu_damp[(i, j)]
             coeff = damp_a if along > 0 else damp_b
-            f = v_scale(dir_, -eff * coeff * along)
+            # Apply damping opposite to relative motion so the pair slows down
+            f = v_scale(dir_, eff * coeff * along)
             self.s.acc[i] = v_add(self.s.acc[i], v_scale(f, +1.0 / max(self.s.mass[i], 1e-9)))
             self.s.acc[j] = v_add(self.s.acc[j], v_scale(f, -1.0 / max(self.s.mass[j], 1e-9)))
         return True, Metrics(0.0, 0.0, 0.0, 0.0)

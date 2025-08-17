@@ -57,7 +57,7 @@ class SolidMesh:
     vertices: np.ndarray  # shape (N, 3), dtype=float32/64
     faces: Optional[np.ndarray] = None  # shape (M, 3), dtype=int32/64
     name: str = "solid"
-    material: SurfaceMaterial = MATERIAL_ELASTIC
+    material: SurfaceMaterial = field(default_factory=lambda: MATERIAL_ELASTIC)
 
     def as_vertex_array(self) -> np.ndarray:
         v = np.asarray(self.vertices)
@@ -130,7 +130,7 @@ class WorldPlane:
 
     normal: np.ndarray  # shape (3,)
     offset: float  # d in plane equation
-    material: SurfaceMaterial = MATERIAL_ELASTIC
+    material: SurfaceMaterial = field(default_factory=lambda: MATERIAL_ELASTIC)
     # Optional plane-level fluid boundary override: "wrap" or "respawn"
     fluid_mode: Optional[Literal["wrap", "respawn"]] = None
 
