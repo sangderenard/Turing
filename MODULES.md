@@ -18,7 +18,7 @@ A hyperlinked index of modules and capabilities in this repository.
 
 ## src/render_chooser
 
-- [src/render_chooser/__init__.py](src/render_chooser/__init__.py) — routes state tables to backends and polls input on a worker thread
+- [src/render_chooser/__init__.py](src/render_chooser/__init__.py) — double-buffered router selecting backends and polling input on a worker thread
 
 ## src/common
 

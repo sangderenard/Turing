@@ -3,16 +3,19 @@
 ``RenderChooser`` inspects the runtime environment and chooses between an
 OpenGL, pygame or ASCII renderer.  Inputs are simple mappings describing
 primitive shapes (points, edges, triangles) in screen space.  The chooser
-translates these into the selected backend's preferred format.
+translates these into the selected backend's preferred format and exchanges
+frames with a :class:`~render_chooser.double_buffer.DoubleBuffer` to keep data
+and rendering concerns on separate threads.
 """
 
 from __future__ import annotations
 
-import queue
 import select
 import sys
 import threading
+import time
 from typing import Any, Dict, Iterable, Tuple, List, Set
+from .double_buffer import DoubleBuffer
 
 __all__ = ["RenderChooser"]
 
@@ -63,7 +66,7 @@ class RenderChooser:
                 self.mode = "ascii"
 
         # Input and rendering thread state
-        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._buffer = DoubleBuffer()
         self._events: List[str] = []
         self._keys: Set[str] = set()
         self._lock = threading.Lock()
@@ -76,7 +79,7 @@ class RenderChooser:
     def render(self, state: Dict[str, Any]) -> None:
         """Queue ``state`` for rendering on the worker thread."""
 
-        self._queue.put(state)
+        self._buffer.write_frame(state)
 
     # ------------------------------------------------------------------
     def poll_input(self) -> Tuple[Set[str], List[str]]:
@@ -117,9 +120,9 @@ class RenderChooser:
 
         while self._running:
             self._poll_input()
-            try:
-                state = self._queue.get(timeout=0.05)
-            except queue.Empty:
+            state = self._buffer.read_frame(agent_idx=1)
+            if state is None:
+                time.sleep(0.05)
                 continue
             if self.mode == "opengl":  # pragma: no cover - requires GL context
                 self._render_opengl(state)

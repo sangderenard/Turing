@@ -75,7 +75,7 @@ def build_edges(nodes, dataG):
 
 import threading
 import time
-from double_buffer import DoubleBuffer
+from render_chooser.double_buffer import DoubleBuffer
 
 def rk4_step(net, positions, velocities, dt): #this isn't our algorithm but it's included for debugging convenience
     # classical RK4 on (pos, vel)
