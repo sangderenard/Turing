@@ -10,6 +10,7 @@ and rendering concerns on separate threads.
 
 from __future__ import annotations
 
+import os
 import select
 import sys
 import threading
@@ -21,32 +22,33 @@ __all__ = ["RenderChooser"]
 
 
 class RenderChooser:
-    """Select the most capable renderer available at runtime."""
+    """Select a renderer backend, defaulting to ASCII."""
 
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(self, width: int, height: int, mode: str | None = None) -> None:
         self.width = width
         self.height = height
         self.mode = "ascii"
         self.renderer: Any
         self.screen = None
 
-        # Try OpenGL first (uses pygame for window/context)
-        try:  # pragma: no cover - best effort in headless CI
-            from opengl_render import GLRenderer
-            import pygame
-            from pygame.locals import DOUBLEBUF, OPENGL
+        preferred = (mode or os.environ.get("TURING_RENDERER", "ascii")).lower()
 
-            pygame.init()
-            pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-            if GLRenderer is not None:
-                # TODO: GLRenderer currently creates its own window; we simply
-                # establish a context here so that future versions can reuse it.
-                self.renderer = GLRenderer(size=(width, height))  # type: ignore[call-arg]
-                self.mode = "opengl"
-            else:
-                raise RuntimeError
-        except Exception:
-            # Fall back to pygame
+        if preferred == "auto":
+            try:  # pragma: no cover - best effort in headless CI
+                from opengl_render import GLRenderer
+                import pygame
+                from pygame.locals import DOUBLEBUF, OPENGL
+
+                pygame.init()
+                pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
+                if GLRenderer is not None:
+                    # TODO: GLRenderer currently creates its own window; we simply
+                    # establish a context here so that future versions can reuse it.
+                    self.renderer = GLRenderer(size=(width, height))  # type: ignore[call-arg]
+                    self.mode = "opengl"
+                    return
+            except Exception:
+                pass
             try:  # pragma: no cover - headless environments
                 from pygame_render import PygameRenderer, is_available
                 import pygame
@@ -56,14 +58,44 @@ class RenderChooser:
                     self.screen = pygame.display.set_mode((width, height))
                     self.renderer = PygameRenderer(width, height, self.screen)
                     self.mode = "pygame"
-                else:
-                    raise RuntimeError
+                    return
             except Exception:
-                # Final fallback: ASCII
-                from ascii_render import AsciiRenderer
+                pass
+            preferred = "ascii"
 
-                self.renderer = AsciiRenderer(width, height)
-                self.mode = "ascii"
+        if preferred == "opengl":
+            try:  # pragma: no cover - best effort in headless CI
+                from opengl_render import GLRenderer
+                import pygame
+                from pygame.locals import DOUBLEBUF, OPENGL
+
+                pygame.init()
+                pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
+                if GLRenderer is not None:
+                    self.renderer = GLRenderer(size=(width, height))  # type: ignore[call-arg]
+                    self.mode = "opengl"
+                    return
+            except Exception:
+                preferred = "pygame"
+
+        if preferred == "pygame":
+            try:  # pragma: no cover - headless environments
+                from pygame_render import PygameRenderer, is_available
+                import pygame
+
+                if is_available():
+                    pygame.init()
+                    self.screen = pygame.display.set_mode((width, height))
+                    self.renderer = PygameRenderer(width, height, self.screen)
+                    self.mode = "pygame"
+                    return
+            except Exception:
+                preferred = "ascii"
+
+        from ascii_render import AsciiRenderer
+
+        self.renderer = AsciiRenderer(width, height)
+        self.mode = "ascii"
 
         # Input and rendering thread state
         self._buffer = DoubleBuffer()
