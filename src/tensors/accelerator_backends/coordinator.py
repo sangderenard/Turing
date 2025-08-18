@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Backend-agnostic buffer coordinator for accelerator operations."""
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ except Exception:
     import sys
     print("Accelerator coordinator imports failed")
     sys.exit(1)
-# --- END HEADER ---
 
 
 @dataclass

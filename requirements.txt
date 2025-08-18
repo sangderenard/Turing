@@ -7,8 +7,5 @@ matplotlib>=3
 tqdm>=4
 PyOpenGL>=3.1.7
 scipy>=1.7
-torch
-jax
-torch-geometric
-cffi
-ziglang
+Pillow>=10
+fonttools>=4

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Faculty levels for runtime resources."""
 from __future__ import annotations
 
@@ -9,7 +8,6 @@ except Exception:
     import sys
     print("faculty.py: Failed to import required modules.")
     sys.exit(1)
-# --- END HEADER ---
 
 
 class Faculty(IntEnum):
@@ -23,13 +21,13 @@ class Faculty(IntEnum):
 
 
 
-FORCE_ENV = "SPEAKTOME_FACULTY"
+FORCE_ENV = "TENSOR_FACULTY"
 
 
 def detect_faculty() -> Faculty:
     """Return the highest available Faculty tier based on installed packages.
 
-    The environment variable ``SPEAKTOME_FACULTY`` may be set to force a
+    The environment variable ``TENSOR_FACULTY`` may be set to force a
     specific tier regardless of installed libraries.
     """
     forced = os.environ.get(FORCE_ENV)

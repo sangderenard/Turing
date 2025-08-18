@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prototype pipeline for dynamically compiling C tensor operations."""
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ except Exception:
     import sys
     print("C pipeline failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 
 # ########## STUB: CTensor Compilation Pipeline ##########

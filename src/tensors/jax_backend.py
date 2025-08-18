@@ -45,7 +45,6 @@ except Exception:
     import sys
     print("JAX backend failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 class JAXTensorOperations(AbstractTensor):
     """Tensor operations powered by `jax.numpy`."""

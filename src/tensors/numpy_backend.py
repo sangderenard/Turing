@@ -44,7 +44,6 @@ except Exception:
     import sys
     print("NumPy backend failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 class NumPyTensorOperations(AbstractTensor):
     def __init__(self, track_time: bool = False):

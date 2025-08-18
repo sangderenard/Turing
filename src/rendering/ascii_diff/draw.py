@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
 """Terminal drawing helpers for ASCII frame diffs."""
 from __future__ import annotations
 
 import sys
 import numpy as np
 from colorama import Style, Fore, Back
-from ascii_diff.ascii_kernel_classifier import AsciiKernelClassifier
-# --- END HEADER ---
+from .ascii_kernel_classifier import AsciiKernelClassifier
 
 
 # Default ASCII ramp used if no specific ramp is provided to drawing functions.

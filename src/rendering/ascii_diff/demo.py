@@ -1,18 +1,18 @@
-#!/usr/bin/env python3
 """Minimal demo for ASCII diff rendering."""
 from __future__ import annotations
 
 import time
 from PIL import Image
 import numpy as np
+import sys
 
-from ascii_diff.frame_buffer import PixelFrameBuffer
-from ascii_diff.draw import (
+from .frame_buffer import PixelFrameBuffer
+from .draw import (
     draw_diff,
     get_changed_subunits,
     default_subunit_batch_to_chars,
 )
-from ascii_diff.console import full_clear_and_reset_cursor, reset_cursor_to_top
+from .console import full_clear_and_reset_cursor, reset_cursor_to_top
 
 
 def load_pixels(path: str) -> np.ndarray:

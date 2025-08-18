@@ -35,7 +35,6 @@ import json
 
 from .abstraction import AbstractTensor, _get_shape, _flatten
 
-# --- END HEADER ---
 
 
 class PurePythonTensorOperations(AbstractTensor):

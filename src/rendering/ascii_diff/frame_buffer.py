@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
 """Triple-buffered ASCII frame diff manager."""
 from __future__ import annotations
 
 import numpy as np
 import threading
-# --- END HEADER ---
 
 
 class PixelFrameBuffer:

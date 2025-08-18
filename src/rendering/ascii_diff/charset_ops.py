@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 """Charset and charmap utilities for FontMapper."""
 from __future__ import annotations
 
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-# --- END HEADER ---
 
 # --- Optional: Torch (soft fail) ---
 try:

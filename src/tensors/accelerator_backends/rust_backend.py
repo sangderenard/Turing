@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Rust backend stub for accelerated tensor operations."""
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ except Exception:
     import sys
     print("Rust backend failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 # ########## STUB: Rust Async Backend ##########
 # PURPOSE: Provide a high-performance backend implemented in Rust.

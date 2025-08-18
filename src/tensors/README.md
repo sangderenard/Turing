@@ -1,8 +1,7 @@
 # Tensors Package
 
 This package provides an abstract tensor interface and backend implementations.
-It was moved out of the main `speaktome` project to serve as a standalone
-codebase. Optional extras let you install JAX, C, and NumPy backends.
+Optional extras let you install JAX, C, and NumPy backends.
 
 For a guided overview of the architecture, see `EXPLAINER.md`.
 ## Design Philosophy

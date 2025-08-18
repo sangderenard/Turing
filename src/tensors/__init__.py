@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tensor backends and abstraction layer."""
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ except Exception:
     import sys
     print("Failed to import optional tensor backends")
     sys.exit(1)
-# --- END HEADER ---
 
 PyTorchTensorOperations = None
 try:  # optional torch backend

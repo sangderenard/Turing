@@ -38,7 +38,6 @@ from cffi import FFI
 # accordingly so the C backend stays in sync with the other backends.
 from ..abstraction import AbstractTensor, _get_shape, _flatten
 
-# --- END HEADER ---
 
 ffi = FFI()
 ffi.cdef("""
@@ -110,7 +109,7 @@ if not SOURCE_PATH.exists():
     raise FileNotFoundError(f"Missing C source: {SOURCE_PATH}")
 C_SOURCE = SOURCE_PATH.read_text()
 
-_prebuilt = os.environ.get("SPEAKTOME_CTENSOR_LIB")
+_prebuilt = os.environ.get("TENSOR_CTENSOR_LIB")
 if _prebuilt and os.path.exists(_prebuilt):
     C = ffi.dlopen(_prebuilt)
 else:
@@ -128,7 +127,7 @@ else:
 # OUTPUTS: Path to the compiled library.
 # KEY ASSUMPTIONS/DEPENDENCIES: Requires the ``ziglang`` package which
 #         bundles the Zig binary. Compilation occurs only if no prebuilt
-#         library is supplied via ``SPEAKTOME_CTENSOR_LIB``.
+#         library is supplied via ``TENSOR_CTENSOR_LIB``.
 # TODO:
 #   - Implement the Zig command invocation.
 #   - Add caching logic to avoid recompilation.

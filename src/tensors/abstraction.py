@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Abstraction layer for tensor operations."""
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ try:
     from collections import deque
 
     from .faculty import Faculty, DEFAULT_FACULTY
-    #import speaktome.config as config
     DEFAULT_DEVICE = "cpu"
     import torch
     import numpy as np
@@ -24,7 +22,6 @@ except Exception:
     import sys
 
     sys.exit(1)
-# --- END HEADER ---
 
 CONVERSION_REGISTRY: Dict[
     Tuple[type, type], Callable[["AbstractTensor", Any, "AbstractTensor"], Any]
