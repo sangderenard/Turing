@@ -244,6 +244,12 @@ class SpringEngine(DtCompatibleEngine):
         self.edge_uuids = []
         for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
             uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+            identity = state_table.get_identity(uuid_str)
+            if identity is not None:
+                vel = self.s.vel[i] if i < len(self.s.vel) else (0.0, 0.0)
+                acc = self.s.acc[i] if i < len(self.s.acc) else (0.0, 0.0)
+                identity['vel'] = vel
+                identity['acc'] = acc
             self.uuids.append(uuid_str)
         for (i, j) in self.s.springs:
             edge = (self.uuids[i], self.uuids[j])
@@ -632,6 +638,15 @@ class MetaCollisionEngine(DtCompatibleEngine):
                     # 2D point assumed z=0
                     dist = nx * p3[0] + ny * p3[1] + nz * 0.0 + d
                     if dist < 0.0:
+                   
+                        if pl.is_fluid_permeable(p3):
+                            mode = getattr(pl, "fluid_mode", None) or getattr(self.world, "fluid_mode", None)
+                            if mode in ("wrap", "respawn"):
+                                p3 = pl.warp_position(p3)
+                                s.pos[i] = (float(p3[0]), float(p3[1]))
+                            else:
+                                s.pos[i] = (float(p3[0]), float(p3[1]))
+                            continue                        
                         pen = -dist
                         max_pen = max(max_pen, pen)
                         # Project to plane
