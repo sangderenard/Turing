@@ -257,7 +257,7 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
                 dbg("eng.bath").debug(f"ERROR during sim.step: {type(e).__name__}: {e}")
             # Return a failure tuple to trigger controller retries/halving
             metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
-            return False, metrics, self.get_state()
+            return False, metrics
 
         # Compute metrics conservatively
         try:
@@ -294,7 +294,6 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         self._last_metrics = metrics
         if is_enabled():
             dbg("eng.bath").debug(f"done: {pretty_metrics(metrics)} vmin={vmin:.3e}")
-        # Return new state object
         return True, metrics, self.get_state()
 
 
