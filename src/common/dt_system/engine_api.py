@@ -12,7 +12,7 @@ nonlinearize dt proposals relative to metric ranges.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Iterable, Mapping, Any
+from typing import Callable, Optional, Iterable, Mapping, Any, Sequence
 
 
 from .state_table import StateTable
@@ -69,6 +69,34 @@ def create_identity_assembly(
         state_table.register_group(group_label, set(uuids))
     return IdentityAssembly(state_table=state_table, uuids=uuids, group_label=group_label)
 
+
+@dataclass
+class ComputeShaderSpec:
+    """Descriptor for a GPU compute shader stage.
+
+    Engines may provide a list of these specifications so the dt system can
+    compile GLSL compute shaders and bind stateful buffers without performing
+    any intermediate data conversions.
+
+    Attributes
+    ----------
+    name:
+        Identifier for the shader stage.
+    source:
+        GLSL compute shader source code as a string.
+    buffers:
+        Mapping of buffer names to pre-created Python or GL objects that will be
+        bound for input/output.  Objects are passed through unchanged, enabling
+        zero-copy interop between Pythonic arrays and GPU buffers.
+    next:
+        Optional sequence of shader names that should run after this stage,
+        allowing callers to build chained compute pipelines.
+    """
+
+    name: str
+    source: str
+    buffers: Mapping[str, Any]
+    next: Optional[Sequence[str]] = None
 
 class DtCompatibleEngine:
     """Base compatibility shim engines should extend.
@@ -179,6 +207,19 @@ class DtCompatibleEngine:
     def get_metrics(self) -> Optional[Metrics]:  # pragma: no cover - optional
         return None
 
+    def get_compute_shaders(self) -> list[ComputeShaderSpec]:  # pragma: no cover - optional
+        """Return compute shader specs this engine wants to run.
+
+        The default implementation returns an empty list. Engines targeting
+        GPU execution may override this to supply shader source strings and
+        pre-bound buffers. Callers are responsible for compilation and
+        dispatch.  Buffers provided in :class:`ComputeShaderSpec` must already
+        be suitable for direct use by the GPU backend with no format
+        conversion.
+        """
+
+        return []
+
 
 @dataclass
 class EngineRegistration:
@@ -204,4 +245,5 @@ __all__ = [
     "DistributionFn",
     "IdentityAssembly",
     "create_identity_assembly",
+    "ComputeShaderSpec",
 ]
