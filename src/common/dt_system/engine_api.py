@@ -12,7 +12,9 @@ nonlinearize dt proposals relative to metric ranges.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Iterable, Mapping, Any
+
+from .state_table import StateTable
 
 from .dt_scaler import Metrics
 from .dt_controller import Targets, STController
@@ -24,6 +26,46 @@ DistributionFn = Callable[[Metrics, Targets, float], float]
 
 If omitted, the default penalty is computed from CFL and error ratios.
 """
+
+
+@dataclass
+class IdentityAssembly:
+    """Collection of UUIDs tied to a ``StateTable``.
+
+    Engines may attach an existing assembly to share a common set of
+    identities without re-registering them.
+    """
+
+    state_table: StateTable
+    uuids: list[str]
+    group_label: Optional[str] = None
+
+
+def create_identity_assembly(
+    state_table: StateTable,
+    schema: Callable[[Any], Mapping[str, Any]],
+    items: Iterable[Any],
+    *,
+    group_label: Optional[str] = None,
+    dedup: bool = True,
+) -> IdentityAssembly:
+    """Register ``items`` with ``state_table`` and return an assembly."""
+    if state_table is None:
+        raise ValueError("state_table is required for registration")
+    uuids: list[str] = []
+    for item in items:
+        data = dict(schema(item))
+        pos = data.get("pos")
+        mass = data.get("mass", 0.0)
+        uuid_str = state_table.register_identity(pos, mass, dedup=dedup)
+        identity = state_table.get_identity(uuid_str)
+        for k, v in data.items():
+            if k not in ("pos", "mass") and identity is not None:
+                identity[k] = v
+        uuids.append(uuid_str)
+    if group_label is not None:
+        state_table.register_group(group_label, set(uuids))
+    return IdentityAssembly(state_table=state_table, uuids=uuids, group_label=group_label)
 
 
 class DtCompatibleEngine:
@@ -45,11 +87,55 @@ class DtCompatibleEngine:
     def step(self, dt: float, state, state_table) -> tuple[bool, Metrics]:  # pragma: no cover - interface
         raise NotImplementedError
 
+    # --- Registration -------------------------------------------------
+    def register(
+        self,
+        state_table,
+        schema: Callable[[Any], Mapping[str, Any]],
+        items: Iterable[Any],
+        *,
+        group_label: Optional[str] = None,
+        dedup: bool = True,
+    ) -> "IdentityAssembly":
+        """Register a set of identities with ``state_table``.
+
+        ``schema`` maps each item in ``items`` to a dict describing the
+        identity fields (at minimum ``pos`` and optional ``mass``). Any
+        additional fields are merged into the identity object after
+        creation. Registered UUIDs are tracked internally so stepping
+        without prior registration raises an error.
+        """
+        assembly = create_identity_assembly(
+            state_table,
+            schema,
+            items,
+            group_label=group_label,
+            dedup=dedup,
+        )
+        self.attach_assembly(assembly)
+        return assembly
+
+    def attach_assembly(self, assembly: "IdentityAssembly") -> list[str]:
+        """Attach a prebuilt identity assembly to this engine."""
+        if assembly is None:
+            raise ValueError("assembly is required")
+        self._state_table = assembly.state_table
+        existing = getattr(self, "_registration", set())
+        existing.update(assembly.uuids)
+        self._registration = existing
+        return list(assembly.uuids)
+
+    def _require_registration(self) -> None:
+        if getattr(self, "_registration", None) is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__} has no registered identities; call register() first"
+            )
+
     # New required capability for compliant engines
     def step_with_state(
         self, state: object, dt: float, *, realtime: bool = False, state_table = None
     ) -> tuple[bool, Metrics, object]:  # pragma: no cover - default bridge
-        
+
         self.world_time += dt
 
         if isinstance(self.causal_ceiling_dt, float) and self.causal_ceiling_dt < dt or isinstance(self.causal_ceiling_dt, Callable) and self.causal_ceiling_dt() < dt:
@@ -67,6 +153,10 @@ class DtCompatibleEngine:
             state_table = getattr(self, '_state_table', None)
         if state_table is None:
             raise ValueError("state_table is required for step_with_state")
+        if getattr(self, "_registration", None) is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__} has no registered identities; call register() first"
+            )
         ok, m, state = self.step(float(dt), state, state_table=state_table)
         state = self.get_state() if state is None else state
         return ok, m, state
@@ -106,4 +196,6 @@ __all__ = [
     "DtCompatibleEngine",
     "EngineRegistration",
     "DistributionFn",
+    "IdentityAssembly",
+    "create_identity_assembly",
 ]

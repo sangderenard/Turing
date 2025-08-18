@@ -35,7 +35,7 @@ def test_discrete_fluid_dt_sidechain_clamps_next_dt():
 
     # Advance callback integrates via the engine to capture its Metrics (with dt_limit)
     def advance(state, dt):
-        ok, m = eng.step(float(dt))
+        ok, m, _ = eng.step(float(dt))
         return ok, m
 
     # Use the fluid as the 'state' since it provides copy_shallow/restore

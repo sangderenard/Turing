@@ -126,8 +126,8 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
                 bounds_min=(float(sim_min[0]), float(sim_min[1]), float(sim_min[2])),
                 bounds_max=(float(sim_max[0]), float(sim_max[1]), float(sim_max[2])),
             )
-        else:
-            exit()
+        elif self.sim is None:
+            raise RuntimeError("BathDiscreteFluidEngine requires a DiscreteFluid simulation")
         self.causal_ceiling_dt = getattr(self.sim, "_stable_dt", None)
 
     # -------- Bridge factories ------------------------------------------------
