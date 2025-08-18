@@ -113,15 +113,14 @@ class GravityEngine(DtCompatibleEngine):
 
     def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
-        self.state_table = state_table
         self.group_label = group_label or "gravity_group"
         self.uuids = uuids or []
-        if self.state_table is not None:
-            self.uuids = []
-            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
-                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
-                self.uuids.append(uuid_str)
-            self.state_table.register_group(self.group_label, set(self.uuids))
+        if state_table is not None:
+            items = range(len(self.s.pos)) if uuids is None else range(len(uuids))
+            schema = lambda i: {"pos": self.s.pos[i], "mass": self.s.mass[i]}
+            self.uuids = self.register(
+                state_table, schema, items, group_label=self.group_label, dedup=dedup
+            )
 
     # Snapshot proxies (optional)
 
@@ -136,9 +135,10 @@ class GravityEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.gravity").debug(f"dt={float(dt):.6g}")
         if state_table is None:
-            state_table = self.state_table
+            state_table = getattr(self, "_state_table", None)
         if state_table is None:
             raise ValueError("GravityEngine requires a StateTable for identity-based state management.")
+        self._require_registration()
         for uuid in self.uuids:
             identity = state_table.get_identity(uuid)
             if identity is None:
@@ -165,15 +165,14 @@ class ThrustersEngine(DtCompatibleEngine):
     def __init__(self, state: DemoState, thrust: Vec = (0.0, 0.0), state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
         self.thrust = thrust
-        self.state_table = state_table
         self.group_label = group_label or "thrusters_group"
         self.uuids = uuids or []
-        if self.state_table is not None:
-            self.uuids = []
-            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
-                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
-                self.uuids.append(uuid_str)
-            self.state_table.register_group(self.group_label, set(self.uuids))
+        if state_table is not None:
+            items = range(len(self.s.pos)) if uuids is None else range(len(uuids))
+            schema = lambda i: {"pos": self.s.pos[i], "mass": self.s.mass[i]}
+            self.uuids = self.register(
+                state_table, schema, items, group_label=self.group_label, dedup=dedup
+            )
 
 
     def snapshot(self):  # pragma: no cover
@@ -186,9 +185,10 @@ class ThrustersEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.thrusters").debug(f"dt={float(dt):.6g} thrust={self.thrust}")
         if state_table is None:
-            state_table = self.state_table
+            state_table = getattr(self, "_state_table", None)
         if state_table is None:
             raise ValueError("ThrustersEngine requires a StateTable for identity-based state management.")
+        self._require_registration()
         # Compute total mass from identities
         total_mass = 0.0
         for uuid in self.uuids:
@@ -224,40 +224,37 @@ class SpringEngine(DtCompatibleEngine):
 
     def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
-        self.state_table = state_table
         self.group_label = group_label or "spring_group"
         self.uuids = uuids or []
         self.edge_ids: list[tuple[str, str]] = []
         self.edge_uuids: list[str] = []
         self.dedup = dedup
-        if self.state_table is not None:
-            self._register_with_state_table(self.state_table)
+        if state_table is not None:
+            self._register_with_state_table(state_table)
 
     def _register_with_state_table(self, state_table) -> None:
         if state_table is None:
             raise ValueError("SpringEngine requires a StateTable for identity registration.")
-        if self.uuids and self.state_table is state_table:
+        if self.uuids and getattr(self, "_state_table", None) is state_table:
             return
-        self.state_table = state_table
-        self.uuids = []
-        self.edge_ids = []
-        self.edge_uuids = []
-        for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
-            uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
-            identity = state_table.get_identity(uuid_str)
-            if identity is not None:
-                vel = self.s.vel[i] if i < len(self.s.vel) else (0.0, 0.0)
-                acc = self.s.acc[i] if i < len(self.s.acc) else (0.0, 0.0)
-                identity['vel'] = vel
-                identity['acc'] = acc
-            self.uuids.append(uuid_str)
+        self._registration = set()
+        items = range(len(self.s.pos))
+        def v_schema(i):
+            return {
+                "pos": self.s.pos[i],
+                "mass": self.s.mass[i],
+                "vel": self.s.vel[i] if i < len(self.s.vel) else (0.0, 0.0),
+                "acc": self.s.acc[i] if i < len(self.s.acc) else (0.0, 0.0),
+            }
+        self.uuids = self.register(state_table, v_schema, items, group_label=None, dedup=self.dedup)
+        edge_items = []
         for (i, j) in self.s.springs:
             edge = (self.uuids[i], self.uuids[j])
             self.edge_ids.append(edge)
-            # Register edge as an identity object with mass proportional to resting length
             L0 = self.s.rest_len[(i, j)]
-            edge_uuid = state_table.register_identity(edge, mass=L0, dedup=True)
-            self.edge_uuids.append(edge_uuid)
+            edge_items.append((edge, L0))
+        e_schema = lambda item: {"pos": item[0], "mass": item[1]}
+        self.edge_uuids = self.register(state_table, e_schema, edge_items, group_label=None, dedup=True)
         state_table.register_group(self.group_label, set(self.uuids), edges={"spring": set(self.edge_uuids)})
 
 
@@ -271,8 +268,11 @@ class SpringEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.spring").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
         if state_table is None:
+            state_table = getattr(self, "_state_table", None)
+        if state_table is None:
             raise ValueError("SpringEngine requires a StateTable for identity-based state management.")
         self._register_with_state_table(state_table)
+        self._require_registration()
         eff = max(0.0, min(1.0, getattr(self.s, "spring_eff", 1.0)))
         for idx, (i, j) in enumerate(self.s.springs):
             uuid_i = self.uuids[i]
@@ -319,34 +319,36 @@ class PneumaticDamperEngine(DtCompatibleEngine):
 
     def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
-        self.state_table = state_table
         self.group_label = group_label or "pneumatic_group"
         self.uuids = uuids or []
         self.edge_ids: list[tuple[str, str]] = []
         self.edge_uuids: list[str] = []
         self.dedup = dedup
-        if self.state_table is not None:
-            self._register_with_state_table(self.state_table)
+        if state_table is not None:
+            self._register_with_state_table(state_table)
 
     def _register_with_state_table(self, state_table) -> None:
         if state_table is None:
             raise ValueError("PneumaticDamperEngine requires a StateTable for identity registration.")
-        if self.uuids and self.state_table is state_table:
+        if self.uuids and getattr(self, "_state_table", None) is state_table:
             return
-        self.state_table = state_table
-        self.uuids = []
-        self.edge_ids = []
-        self.edge_uuids = []
-        for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
-            uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
-            self.uuids.append(uuid_str)
+        self._registration = set()
+        items = range(len(self.s.pos))
+        v_schema = lambda i: {
+            "pos": self.s.pos[i],
+            "mass": self.s.mass[i],
+            "vel": self.s.vel[i] if i < len(self.s.vel) else (0.0, 0.0),
+            "acc": self.s.acc[i] if i < len(self.s.acc) else (0.0, 0.0),
+        }
+        self.uuids = self.register(state_table, v_schema, items, group_label=None, dedup=self.dedup)
+        edge_items = []
         for (i, j) in self.s.springs:
             edge = (self.uuids[i], self.uuids[j])
             self.edge_ids.append(edge)
-            # Register edge as an identity object with mass proportional to resting length
             L0 = self.s.rest_len[(i, j)] if hasattr(self.s, 'rest_len') and (i, j) in self.s.rest_len else 1.0
-            edge_uuid = state_table.register_identity(edge, mass=L0, dedup=True)
-            self.edge_uuids.append(edge_uuid)
+            edge_items.append((edge, L0))
+        e_schema = lambda item: {"pos": item[0], "mass": item[1]}
+        self.edge_uuids = self.register(state_table, e_schema, edge_items, group_label=None, dedup=True)
         state_table.register_group(self.group_label, set(self.uuids), edges={"spring": set(self.edge_uuids)})
 
 
@@ -362,8 +364,11 @@ class PneumaticDamperEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.pneumatic").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
         if state_table is None:
+            state_table = getattr(self, "_state_table", None)
+        if state_table is None:
             raise ValueError("PneumaticDamperEngine requires a StateTable for identity-based state management.")
         self._register_with_state_table(state_table)
+        self._require_registration()
         eff = max(0.0, min(1.0, getattr(self.s, "pneumatic_eff", 1.0)))
         for idx, (i, j) in enumerate(self.s.springs):
             uuid_i = self.uuids[i]
@@ -411,15 +416,14 @@ class GroundCollisionEngine(DtCompatibleEngine):
 
     def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
-        self.state_table = state_table
         self.group_label = group_label or "ground_group"
         self.uuids = uuids or []
-        if self.state_table is not None:
-            self.uuids = []
-            for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
-                uuid_str = self.state_table.register_identity(pos, mass, dedup=dedup)
-                self.uuids.append(uuid_str)
-            self.state_table.register_group(self.group_label, set(self.uuids))
+        if state_table is not None:
+            items = range(len(self.s.pos)) if uuids is None else range(len(uuids))
+            schema = lambda i: {"pos": self.s.pos[i], "mass": self.s.mass[i]}
+            self.uuids = self.register(
+                state_table, schema, items, group_label=self.group_label, dedup=dedup
+            )
 
 
     def snapshot(self):  # pragma: no cover
@@ -434,9 +438,10 @@ class GroundCollisionEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.ground").debug(f"dt={float(dt):.6g}")
         if state_table is None:
-            state_table = self.state_table
+            state_table = getattr(self, "_state_table", None)
         if state_table is None:
             raise ValueError("GroundCollisionEngine requires a StateTable for identity-based state management.")
+        self._require_registration()
         k = self.s.ground_k
         b = self.s.ground_b
         mu = self.s.mu
@@ -474,6 +479,8 @@ class IntegratorEngine(DtCompatibleEngine):
         return out
     def __init__(self, state: DemoState):
         self.s = state
+        # Integrator has no external registration but mark as intentional
+        self._registration = set()
 
     def snapshot(self):  # pragma: no cover
         return self.s.snapshot()
