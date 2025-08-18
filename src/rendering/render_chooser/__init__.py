@@ -92,7 +92,7 @@ class RenderChooser:
             except Exception:
                 preferred = "ascii"
 
-        from ascii_render import AsciiRenderer
+        from src.ascii_render import AsciiRenderer
 
         self.renderer = AsciiRenderer(width, height)
         self.mode = "ascii"
