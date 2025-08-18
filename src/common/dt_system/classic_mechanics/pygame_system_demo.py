@@ -43,9 +43,9 @@ from .engines import (
     SpringEngine,
     PneumaticDamperEngine,
     GroundCollisionEngine,
-    IntegratorEngine,
     MetaCollisionEngine,
 )
+from ..integrator.integrator import Integrator
 from ..fluid_mechanics import BathDiscreteFluidEngine
 from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
@@ -126,7 +126,7 @@ def build_craft(
         (f"{name}.springs", SpringEngine(s, assembly=assembly)),
         (f"{name}.pneumatics", PneumaticDamperEngine(s, assembly=assembly)),
         (f"{name}.ground", GroundCollisionEngine(s, assembly=assembly)),
-        (f"{name}.integrate", IntegratorEngine(s, assembly=assembly)),
+        (f"{name}.integrate", Integrator(lambda t, x: 0.0)),  # Placeholder dynamics, replace as needed
     ]
 
     # Per-craft controller/targets; allow the craft to refine within the parent slice
