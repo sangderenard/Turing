@@ -12,6 +12,14 @@ A hyperlinked index of modules and capabilities in this repository.
 
 - [src/ascii_render/__init__.py](src/ascii_render/__init__.py)
 
+## src/pygame_render
+
+- [src/pygame_render/__init__.py](src/pygame_render/__init__.py) — minimal pygame shape renderer accepting external windows
+
+## src/render_chooser
+
+- [src/render_chooser/__init__.py](src/render_chooser/__init__.py) — routes state tables to backends and polls input on a worker thread
+
 ## src/common
 
 - [src/common/types.py](src/common/types.py)
