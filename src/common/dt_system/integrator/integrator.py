@@ -16,7 +16,19 @@ class IntegrationAlgorithm:
 
 class EulerIntegrator(IntegrationAlgorithm):
     def step(self, f, t, x, dt):
-        return x + f(t, x) * dt
+        """Advance ``x`` by one Euler step.
+
+        The demo integrator occasionally operates on non-numeric states
+        (e.g. dictionaries representing structured values).  In that case
+        addition with ``x`` is undefined; we fall back to returning the
+        derivative directly.
+        """
+
+        y = f(t, x)
+        try:
+            return x + y * dt
+        except TypeError:
+            return y
 
 class VelocityVerletIntegrator(IntegrationAlgorithm):
     def step(self, f, t, x, dt, v=0.0):

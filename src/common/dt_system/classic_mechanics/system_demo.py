@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-"""
-Pygame demo: dt-graph orchestration with two craft system nodes.
+"""System demo orchestrating two craft nodes with optional rendering.
 
 Crafts are built from classic mechanics engines (thrusters, springs,
 pneumatics, ground, integrator) inside nested rounds controlled by the dt
 graph. Each craft round is wrapped as a DtCompatibleEngine so the parent
-graph schedules it like a system node. This demo intentionally avoids any
-dependency on the bath fluid modules.
+graph schedules it like a system node. Rendering is delegated to a
+``RenderChooser`` which selects between OpenGL, pygame or ASCII backends.
 """
 
 from dataclasses import dataclass
@@ -17,11 +16,7 @@ import numpy as np
 import math
 import os
 import argparse
-
-try:
-    import pygame
-except Exception:  # pragma: no cover - headless environments
-    pygame = None  # type: ignore
+import time
 
 from ..dt_controller import STController, Targets, step_realtime_once
 from ..dt_graph import GraphBuilder, MetaLoopRunner
@@ -51,6 +46,7 @@ from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
 from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
+from render_chooser import RenderChooser
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
@@ -153,7 +149,7 @@ def build_craft(
     return Craft(name=name, state=s, thrusters=thr, round_engine=rne, system=sys, assembly=assembly)
 
 
-# ---------------- Parent graph + pygame loop ---------------------
+# ---------------- Parent graph + rendering loop ------------------
 
 def _run_demo(
     *, width: int = 1000, height: int = 700, fps: int = 2, debug: bool = False, classic: bool = True
@@ -162,13 +158,8 @@ def _run_demo(
         # Also set env so any subprocesses/threads see it
         os.environ["TURING_DT_DEBUG"] = "1"
         enable_debug(True)
-    if pygame is None:
-        raise RuntimeError("pygame not available")
 
-    pygame.init()
-    screen = pygame.display.set_mode((width, height))
-    pygame.display.set_caption("dt-graph: crafts + bath fluid")
-    clock = pygame.time.Clock()
+    chooser = RenderChooser(width, height)
 
     # Set up a simple world cage so fluids wrap within bounds and crafts hit walls
     world = GLOBAL_WORLD
@@ -436,32 +427,32 @@ def _run_demo(
         last_a = {"pos": np.array(craft_a.state.pos[1], dtype=float), "anchor": np.array(craft_a.state.pos[0], dtype=float), "color": (240, 80, 80)}
         last_b = {"pos": np.array(craft_b.state.pos[1], dtype=float), "anchor": np.array(craft_b.state.pos[0], dtype=float), "color": (80, 180, 255)}
 
+    prev = time.time()
     while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    paused = not paused
-                elif event.key == pygame.K_RETURN:
-                    reset_requested = True
+        keys, events = chooser.poll_input()
+        if "quit" in events:
+            running = False
+        if "space" in events:
+            paused = not paused
+        if "return" in events:
+            reset_requested = True
+
+        ax = float("d" in keys) - float("a" in keys)
+        ay = float("w" in keys) - float("s" in keys)
+        bx = float("right" in keys) - float("left" in keys)
+        by = float("up" in keys) - float("down" in keys)
 
         if reset_requested:
             reset_scene()
             reset_requested = False
             paused = True
 
-        keys = pygame.key.get_pressed()
-        # WASD for craft A
-        ax = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
-        ay = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
         craft_a.thrusters.thrust = (ax * 10.0, ay * 10.0)
-        # Arrows for craft B
-        bx = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
-        by = float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN])
         craft_b.thrusters.thrust = (bx * 10.0, by * 10.0)
 
-        dt = clock.tick(fps) / 1000.0
+        now = time.time()
+        dt = now - prev
+        prev = now
         if not paused:
             if classic:
                 from ..dt import SuperstepPlan
@@ -489,161 +480,51 @@ def _run_demo(
         except Exception:
             pass
 
-        # Rendering and HUD should always run, regardless of pause
-        screen.fill((8, 9, 12))  # slightly cooler dark bg for contrast
+        # Build primitive shape state for the current frame
+        frame_state = {"points": [], "edges": []}
 
-        # Fluid particles
+        # Fluid particles as points
         try:
             p = fluid_engine.sim.export_vertices()  # type: ignore[union-attr]
             for i in range(min(p.shape[0], 2000)):
-                # Accept 2D or 3D particle positions
                 if p.shape[1] >= 3:
-                    pos = (float(p[i, 0]), float(p[i, 1]), float(p[i, 2]))
+                    pos = (float(p[i, 0]), float(p[i, 1]))
                 else:
                     pos = (float(p[i, 0]), float(p[i, 1]))
-                pygame.draw.circle(screen, (90, 160, 255), world_to_screen(pos), 2)
+                frame_state["points"].append(world_to_screen(pos))
         except Exception:
             pass
 
-        def draw_craft(snapshot):
-            color = snapshot.get("color", (200, 200, 200))
+        def craft_shapes(snapshot):
             nodes = snapshot.get("nodes")
             edges = snapshot.get("edges")
-            com = snapshot.get("com")
-
-            def _is_valid_screen_pt(pt):
-                if not isinstance(pt, (tuple, list)) or len(pt) != 2:
-                    return False
-                try:
-                    x, y = float(pt[0]), float(pt[1])
-                    return math.isfinite(x) and math.isfinite(y)
-                except Exception:
-                    return False
-
-            if nodes is not None and edges is not None:
-                # Draw edges and nodes
-                try:
-                    for (i, j) in edges:
-                        pi = world_to_screen(nodes[int(i)])
-                        pj = world_to_screen(nodes[int(j)])
-                        pygame.draw.line(screen, (140, 140, 180), (int(pi[0]), int(pi[1])), (int(pj[0]), int(pj[1])), 2)
-                    for p in nodes:
-                        sp = world_to_screen(p)
-                        pygame.draw.circle(screen, color, (int(sp[0]), int(sp[1])), 7)
-                    if com is not None:
-                        spc = world_to_screen(com)
-                        pygame.draw.circle(screen, (250, 240, 240), (int(spc[0]), int(spc[1])), 4)
-                except Exception:
-                    pass
+            if nodes is None:
                 return
+            for p in nodes:
+                frame_state["points"].append(world_to_screen(p))
+            if edges is not None:
+                for (i, j) in edges:
+                    pi = world_to_screen(nodes[int(i)])
+                    pj = world_to_screen(nodes[int(j)])
+                    frame_state["edges"].append((pi, pj))
 
-            # Back-compat: draw a tethered point if only pos/anchor provided
-            def as_xy(p):
-                try:
-                    x = float(p[0]); y = float(p[1])
-                    return (x, y)
-                except Exception:
-                    try:
-                        return (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
-                    except Exception:
-                        return (0.0, 0.0)
+        craft_shapes(last_a)
+        craft_shapes(last_b)
 
-            pos = as_xy(snapshot.get("pos", (0.0, 0.0)))
-            anc = as_xy(snapshot.get("anchor", (0.0, 0.0)))
-            sp_anc = world_to_screen(anc)
-            sp_pos = world_to_screen(pos)
-            if _is_valid_screen_pt(sp_anc) and _is_valid_screen_pt(sp_pos):
-                pygame.draw.line(screen, (140, 140, 180), (int(sp_anc[0]), int(sp_anc[1])), (int(sp_pos[0]), int(sp_pos[1])), 2)
-                pygame.draw.circle(screen, color, (int(sp_pos[0]), int(sp_pos[1])), 10)
+        # Ground line
+        gy_px = world_to_screen((0, 0.0))[1]
+        frame_state["edges"].append(((0, gy_px), (width, gy_px)))
 
-        draw_craft(last_a)
-        draw_craft(last_b)
+        chooser.render(frame_state)
 
-        # Ground (thicker, higher contrast)
-        gy = 0.0
-        gy_px = world_to_screen((0, gy))[1]
-        pygame.draw.line(screen, (120, 120, 130), (0, gy_px), (width, gy_px), 3)
+        # (HUD and direct window drawing removed; rendering handled by chooser)
 
-        # HUD: dt + per-node metrics
-        font = pygame.font.SysFont("consolas", 15)
-        hud_lines = []
-        hud_lines.append("Controls: SPACE=play/pause, ENTER=reset, WASD / Arrows; Debug: TURING_DT_DEBUG=1")
-        if classic:
-            hud_lines.append(
-                ("[classic] " if classic else "[realtime] ")
-                + ("proj " if projection_enabled else "2D ")
-                + f"Frame dt={dt*1000.0:6.1f} ms  fps_target={fps}  budget={rt_cfg.budget_ms:4.1f}ms"
-            )
-        else:
-            hud_lines.append(
-                ("[classic] " if classic else "[realtime] ")
-                + ("proj " if projection_enabled else "2D ")
-                + f"Frame dt={dt*1000.0:6.1f} ms  fps_target={fps}  budget={rt_cfg.budget_ms:4.1f}ms"
-            )
-            # Show minimum budget vs target and slack weights summary
-            try:
-                _, min_total_ms = compute_minimum_budget(rt_cfg, rt_state, engine_ids)
-                hud_lines.append(
-                    f"min_budget={min_total_ms:5.2f}ms  target_pool={rt_cfg.slack*rt_cfg.budget_ms:5.2f}ms"
-                )
-            except Exception:
-                pass
-        # --- HUD wiring: always use StateTable's dt_tape for per-node data ---
-        def get_dt_tape(label, field):
-            return state_table.get('dt_tape', label, field)
-
-        if classic:
-            # Top-round metrics from dt_tape
-            top_label = getattr(top_round, 'label', None)
-            if top_label:
-                m = get_dt_tape(top_label, 'metrics')
-                if m is not None:
-                    hud_lines.append(
-                        f"top: max_vel={getattr(m, 'max_vel', 0.0):6.3f}  div_inf={getattr(m, 'div_inf', 0.0):7.4f}  mass_err={getattr(m, 'mass_err', 0.0):7.2e}"
-                    )
-            # Child nodes
-            for ch in nodes_for_hud:
-                label = getattr(ch, "label", "node")
-                m = get_dt_tape(label, 'metrics')
-                if m is None:
-                    continue
-                hud_lines.append(
-                    f"{label[:20]:20}  v={getattr(m, 'max_vel', 0.0):6.3f}  pen={getattr(m, 'div_inf', 0.0):7.4f}  mass={getattr(m, 'mass_err', 0.0):6.2e}"
-                )
-        else:
-            # Realtime HUD: per-engine live stats from dt_tape
-            alloc = compile_allocations(rt_cfg, rt_state, engine_ids)
-            for reg in regs:
-                name = reg.name
-                label = f"advance:{name}"
-                ms = float(alloc.get(name, rt_cfg.ms_floor))
-                ema_ms = float(rt_state.proc_ms_ma.get(name, 0.0))
-                ema_pen = float(rt_state.penalty_ma.get(name, 1.0))
-                dt_val = get_dt_tape(label, 'dt')
-                if dt_val is not None:
-                    dt_str = f"{float(dt_val)*1000.0:6.3f}ms"
-                else:
-                    dt_str = "N/A"
-                hud_lines.append(
-                    f"{name[:20]:20}  alloc={ms:5.2f}ms  ema_cost={ema_ms:5.2f}ms  pen={ema_pen:6.3f}  dt={dt_str}"
-                )
-        # Draw HUD panel
-        pad, lh = 8, 18
-        box_w = 460
-        box_h = lh * (len(hud_lines) + 1)
-        srf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
-        srf.fill((0, 0, 0, 120))
-        screen.blit(srf, (10, 10))
-        y = 10 + pad
-        for line in hud_lines:
-            txt = font.render(line, True, (235, 238, 245))
-            screen.blit(txt, (10 + pad, y))
-            y += lh
-
-        pygame.display.flip()
+        elapsed = time.time() - now
+        if elapsed < 1.0 / fps:
+            time.sleep(1.0 / fps - elapsed)
 
     craft_a.system.stop(); craft_b.system.stop()
-    pygame.quit()
+    chooser.close()
 
 
 
