@@ -18,7 +18,7 @@ from collections import deque
 import colorsys
 import math
 import numpy as np
-from .double_buffer import DoubleBuffer
+from render_chooser.double_buffer import DoubleBuffer
 
 # ---------------------------------------------------------------------------
 # Optional OpenGL types (safe under headless tests)
