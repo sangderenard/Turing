@@ -13,15 +13,6 @@ Design goals
     * per-step callbacks (e.g., osmotic filters).
 - Deterministic, reproducible results for the same inputs (no RNG use here).
 - Units: MKS (meter, kilogram, second). Keep parameters consistent.
-
-References (informal):
-- Monaghan, "Smoothed Particle Hydrodynamics", Annual Review of Astronomy and Astrophysics, 1992.
-- Becker & Teschner, "Weakly compressible SPH for free surface flows", 2007.
-- Morris, Fox, Zhu (viscosity/discretization details), 1997/2000.
-
-Copyright
----------
-MIT License. Use freely with attribution.
 """
 
 from __future__ import annotations
@@ -56,6 +47,7 @@ class SPHKernel:
         # viscosity laplacian: ∇^2 W = C * (h - r)
         self.c_visc = 45.0 / (np.pi * self.h ** 6)
 
+    # Original safe versions (kept for compatibility)
     def W(self, r: np.ndarray) -> np.ndarray:
         """Scalar kernel value for distances r (shape: (...,))."""
         q2 = np.clip(self.h2 - r*r, 0.0, None)
@@ -70,7 +62,7 @@ class SPHKernel:
         mask = (r > 0) & (r < self.h)
         coeff = np.zeros_like(r)
         dr = (self.h - r[mask])
-        coeff[mask] = -self.c_spiky * dr * dr / r[mask]  # -(C*(h - r)^2) * r_hat
+        coeff[mask] = -self.c_spiky * dr * dr / np.maximum(r[mask], 1e-20)  # -(C*(h - r)^2) * r_hat
         return r_vec * coeff[:, None]
 
     def laplaceW_visc(self, r: np.ndarray) -> np.ndarray:
@@ -79,6 +71,18 @@ class SPHKernel:
         mask = (r >= 0) & (r < self.h)
         out[mask] = self.c_visc * (self.h - r[mask])
         return out
+
+    # Hot-path masked variants (callers guarantee r< h etc.)
+    def W_from_r2_masked(self, r2: np.ndarray) -> np.ndarray:
+        q2 = self.h2 - r2
+        return self.c_poly6 * q2 * q2 * q2
+
+    def gradW_masked(self, r_vec: np.ndarray, r: np.ndarray) -> np.ndarray:
+        coeff = -self.c_spiky * ((self.h - r) ** 2) / np.maximum(r, 1e-20)
+        return r_vec * coeff[:, None]
+
+    def laplaceW_visc_masked(self, r: np.ndarray) -> np.ndarray:
+        return self.c_visc * (self.h - r)
 
 
 # --------------------------- Physical Parameters ----------------------------
@@ -200,11 +204,12 @@ class DiscreteFluid:
         self.bounds_max = np.array(bounds_max, dtype=np.float64)
 
         # Grid for neighbor search (hash -> particle indices)
-        self._grid_cell = None          # (N,3) int32 indices
+        self._grid_cell = None          # (N,3) int64 indices
         self._grid_keys = None          # (N,) int64 hash
         self._cell_index = None         # sorted indices into particles
         self._cell_starts = None        # start offsets per unique key
         self._cell_keys = None          # unique keys
+        self._cell_span_map = None      # dict: key -> (start,end)
         self._neighbor_offsets = self._build_neighbor_offsets()
 
         # Cached constants
@@ -232,11 +237,9 @@ class DiscreteFluid:
         """
         from src.common.sim_hooks import SimHooks
 
-
         hooks = hooks or SimHooks()
         if is_enabled():
             try:
-                
                 vmax0 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
             except Exception:
                 vmax0 = 0.0
@@ -247,7 +250,6 @@ class DiscreteFluid:
         self._substep(float(dt))
         hooks.run_post(self, float(dt))
         if is_enabled():
-
             try:
                 vmax1 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
                 rho_min = float(np.min(self.rho)) if self.N > 0 else 0.0
@@ -312,7 +314,6 @@ class DiscreteFluid:
         denom = np.zeros(points.shape[0])
 
         for (pi, pj, rvec, r, W) in pairs_iter:
-            # accumulate SPH sums at points pi from neighbor particles pj
             m_over_rho = (self.m[pj] / self.rho[pj])
             w = W * m_over_rho
 
@@ -323,8 +324,6 @@ class DiscreteFluid:
             S[pi]    += self.S[pj] * w
             v[pi]    += self.v[pj] * w[:, None]
 
-        # Normalize interpolated fields where needed (pressure, T, S, v)
-        # For rho we used standard SPH density estimate; leave as-is.
         eps = 1e-12
         denom = np.maximum(denom, eps)
         P /= denom; T /= denom; S /= denom; v /= denom[:, None]
@@ -343,19 +342,7 @@ class DiscreteFluid:
         threshold: Optional[float] = None,
         indices: Optional[Iterable[int]] = None,
     ) -> None:
-        """Spawn ballistic droplets from fluid particles.
-
-        Parameters
-        ----------
-        threshold:
-            Speed above which particles are emitted.  If ``None`` the
-            instance's :attr:`droplet_threshold` is used.  ``np.inf`` disables
-            automatic emission.
-        indices:
-            Explicit particle indices to emit regardless of velocity.  When
-            provided, ``threshold`` is ignored.
-        """
-
+        """Spawn ballistic droplets from fluid particles."""
         if indices is None:
             if threshold is None:
                 threshold = self.droplet_threshold
@@ -422,17 +409,6 @@ class DiscreteFluid:
 
     # --------------------------- Core substep ---------------------------------
 
-    def _relax_sources(self) -> None:
-        """Relax particle mass and solute mass toward targets."""
-        r = np.clip(self.params.source_relaxation, 0.0, 1.0)
-        if r <= 0.0:
-            return
-        dm = self.m_target - self.m
-        self.m += r * dm
-        dsm = self.solute_mass_target - self.solute_mass
-        self.solute_mass += r * dsm
-        self.S = np.clip(self.solute_mass / np.maximum(self.m, 1e-12), 0.0, 1.0)
-
     def _substep(self, dt: float) -> None:
         if is_enabled():
             dbg("eng.discrete").debug(f"    _substep dt={float(dt):.6g}")
@@ -497,6 +473,17 @@ class DiscreteFluid:
             if bad:
                 dbg("eng.discrete").debug("      anomaly: non-finite positions or velocities detected")
 
+    def _relax_sources(self) -> None:
+        """Relax particle mass and solute mass toward targets."""
+        r = np.clip(self.params.source_relaxation, 0.0, 1.0)
+        if r <= 0.0:
+            return
+        dm = self.m_target - self.m
+        self.m += r * dm
+        dsm = self.solute_mass_target - self.solute_mass
+        self.solute_mass += r * dsm
+        self.S = np.clip(self.solute_mass / np.maximum(self.m, 1e-12), 0.0, 1.0)
+
     def _integrate_droplets(self, dt: float) -> None:
         """Advance detached droplets under gravity and drag."""
         g = self._g[None, :]
@@ -505,12 +492,10 @@ class DiscreteFluid:
 
     def _merge_droplets(self) -> None:
         """Merge ballistic droplets back into nearby fluid particles."""
-        # Build an up-to-date grid of fluid particles for collision checks
         self._build_grid()
         M = self.droplet_p.shape[0]
         if M == 0:
             return
-        # Find neighbors of all droplets at once
         pi, pj, rvec, r, W = next(self._pairs_points(self.droplet_p, yield_once=True))
         if pj.size == 0:
             return
@@ -530,11 +515,9 @@ class DiscreteFluid:
             weights /= wsum
             dm = self.droplet_mass * weights
             m_old = self.m[nb]
-            # momentum-conserving velocity update
             self.v[nb] = (self.v[nb] * m_old[:, None] + dm[:, None] * self.droplet_v[di]) / (m_old[:, None] + dm[:, None])
             self.m[nb] = m_old + dm
             self.m_target[nb] += dm
-            # droplet carries no solute; concentration adjusts with mass
             self.solute_mass_target[nb] += 0.0
             self.solute_mass[nb] += 0.0
             self.S[nb] = np.clip(self.solute_mass[nb] / np.maximum(self.m[nb], 1e-12), 0.0, 1.0)
@@ -546,24 +529,24 @@ class DiscreteFluid:
     # --------------------------- Density & Pressure ---------------------------
 
     def _compute_density(self, include_self: bool = True) -> None:
-        """ρ_i = m * ∑_j W_ij.
-
-        Parameters
-        ----------
-        include_self:
-            If True, add the self-contribution ``W(0)`` for each particle.
-        """
+        """ρ_i = m * ∑_j W_ij (with r²-culling and bincount scatter)."""
         N = self.N
         rho = np.zeros(N, dtype=np.float64)
 
         if include_self:
             rho += self.m * float(self.kernel.W(np.array([0.0]))[0])
 
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            contrib_i = self.m[j] * W
-            contrib_j = self.m[i] * W
-            np.add.at(rho, i, contrib_i)
-            np.add.at(rho, j, contrib_j)
+        h2 = self.kernel.h2
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask):
+                continue
+            i = i[mask]; j = j[mask]; r2 = r2[mask]
+
+            W = self.kernel.W_from_r2_masked(r2)
+            # symmetric contributions via bincount
+            rho += np.bincount(i, weights=self.m[j] * W, minlength=N)
+            rho += np.bincount(j, weights=self.m[i] * W, minlength=N)
 
         self.rho = np.maximum(rho, 1e-6)
 
@@ -575,36 +558,41 @@ class DiscreteFluid:
 
     # ------------------------------- Forces ----------------------------------
 
-    def _pressure_forces(self, bulk_modulus: Optional[float] = None) -> np.ndarray:
-        """Compute pairwise pressure forces.
+    @staticmethod
+    def _scatter_add_vec_pm_(f: np.ndarray, i: np.ndarray, j: np.ndarray, vec_ij: np.ndarray) -> None:
+        """In-place: add +vec_ij to rows i and -vec_ij to rows j using bincount per axis."""
+        N = f.shape[0]
+        for k in range(3):
+            if vec_ij.shape[0] == 0:
+                continue
+            f[:, k] += np.bincount(i, weights=vec_ij[:, k], minlength=N)
+            f[:, k] -= np.bincount(j, weights=vec_ij[:, k], minlength=N)
 
-        Parameters
-        ----------
-        bulk_modulus:
-            Optional override for the equation of state ``K``.  When given,
-            pressures are recomputed on the fly using this value; otherwise the
-            precomputed :attr:`P` array is used.
-        """
-        f = np.zeros_like(self.p)
+    def _pressure_forces(self, bulk_modulus: Optional[float] = None) -> np.ndarray:
+        """Compute pairwise pressure forces with r²-culling and bincount scatter."""
+        N = self.N
+        f = np.zeros((N, 3), dtype=np.float64)
+        p = self.params
 
         if bulk_modulus is None:
-            P = self.P
+            P_over_rho2 = self.P / np.maximum(self.rho, 1e-12) ** 2
         else:
-            p = self.params
             ratio = self.rho / p.rest_density
-            P = bulk_modulus * (np.power(np.clip(ratio, 1e-6, None), p.gamma) - 1.0)
+            P_tmp = bulk_modulus * (np.power(np.clip(ratio, 1e-6, None), p.gamma) - 1.0)
+            P_over_rho2 = P_tmp / np.maximum(self.rho, 1e-12) ** 2
 
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            # gradW is vector with shape (...,3)
-            gW = self.kernel.gradW(rvec, r)
-            Pi = P[i]; Pj = P[j]
-            rhoi = self.rho[i]; rhoj = self.rho[j]
-            # pair coefficient (positive for repulsion)
-            c = self.m[i] * self.m[j] * (Pi / (rhoi * rhoi) + Pj / (rhoj * rhoj))
+        h2 = self.kernel.h2
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask):
+                continue
+            i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = np.sqrt(r2[mask])
+
+            gW = self.kernel.gradW_masked(rvec, r)
+            c = self.m[i] * self.m[j] * (P_over_rho2[i] + P_over_rho2[j])
             fij = c[:, None] * gW
-            # action-reaction (scatter-add)
-            np.add.at(f, i,  fij)
-            np.add.at(f, j, -fij)
+            self._scatter_add_vec_pm_(f, i, j, fij)
+
         return f
 
     def _viscosity_forces(self) -> np.ndarray:
@@ -613,17 +601,26 @@ class DiscreteFluid:
         f_i += μ m^2 (v_j - v_i)/ (ρ_i ρ_j) ∇^2 W_ij
         Here μ is dynamic viscosity = ρ0 * ν (use rest density).
         """
+        N = self.N
         nu = self.params.viscosity_nu
         mu = self.params.rest_density * nu
-        f = np.zeros_like(self.p)
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            lapW = self.kernel.laplaceW_visc(r)
-            rhoi = self.rho[i]; rhoj = self.rho[j]
-            coeff = mu * self.m[i] * self.m[j] * (lapW / np.maximum(rhoi * rhoj, 1e-12))
+        f = np.zeros((N, 3), dtype=np.float64)
+
+        inv_rho = 1.0 / np.maximum(self.rho, 1e-12)
+        h2 = self.kernel.h2
+
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask):
+                continue
+            i = i[mask]; j = j[mask]; r = np.sqrt(r2[mask])
+
+            lapW = self.kernel.laplaceW_visc_masked(r)
+            coeff = mu * self.m[i] * self.m[j] * (lapW * (inv_rho[i] * inv_rho[j]))
             dv = (self.v[j] - self.v[i])
             fij = coeff[:, None] * dv
-            np.add.at(f, i,  fij)
-            np.add.at(f, j, -fij)
+            self._scatter_add_vec_pm_(f, i, j, fij)
+
         return f
 
     def _body_forces(self) -> np.ndarray:
@@ -641,41 +638,46 @@ class DiscreteFluid:
     def _surface_tension_forces(self) -> np.ndarray:
         """
         Continuum surface force using color field gradient and curvature.
-        c = sum_j m/ρ_j W_ij
-        n = ∇c (via symmetric gradient), κ = -∇·(n/|n|)
-        f_s = σ κ n̂
-        Pairs are oriented with ``r = p_j - p_i`` and gradients evaluated as
-        ``∇ᵢW`` so that normals point outward and the curvature force restores
-        the interface.  This is approximate; set ``sigma=0`` to disable.
         """
         sigma = self.sigma
         if not np.any(sigma > 0.0):
             return np.zeros_like(self.p)
 
-        # Compute color field gradient per particle.  ``rvec`` from
-        # :meth:`_pairs_particles` is ``p_j - p_i`` while ``gradW`` returns
-        # ``∇ᵢW`` pointing from ``j`` toward ``i``.  The accumulated ``n_vec``
-        # therefore points outward from the fluid.
         n_vec = np.zeros_like(self.p)
-        for (i, j, rvec, r, W) in self._pairs_particles():
+        h2 = self.kernel.h2
+
+        # color gradient
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask): continue
+            i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = np.sqrt(r2[mask])
+
+            gW = self.kernel.gradW_masked(rvec, r)
             m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
             m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
-            gW = self.kernel.gradW(rvec, r)
-            n_vec[i] += m_over_rho_j[:, None] * gW
-            n_vec[j] -= m_over_rho_i[:, None] * gW
 
-        # curvature κ = -∇·(n̂)
+            # n_i += sum_j m_j/ρ_j ∇_i W_ij ; n_j -= m_i/ρ_i ∇_j W_ji = -(...)∇_i W_ij
+            self._scatter_add_vec_pm_(n_vec, i, j, m_over_rho_j[:, None] * gW)
+            self._scatter_add_vec_pm_(n_vec, j, i, m_over_rho_i[:, None] * gW)
+
         n_norm = np.linalg.norm(n_vec, axis=1) + self.params.color_field_eps
         n_hat = n_vec / n_norm[:, None]
 
-        # approximate divergence via SPH identity: ∇·A_i ≈ sum_j m/ρ_j (A_j - A_i) · ∇W_ij
+        # curvature κ = -∇·(n̂)
         kappa = np.zeros(self.N)
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            gW = self.kernel.gradW(rvec, r)
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask): continue
+            i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = np.sqrt(r2[mask])
+            gW = self.kernel.gradW_masked(rvec, r)
             m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
             m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
-            kappa[i] += m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
-            kappa[j] += m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
+
+            # ∇·A_i ≈ sum_j m/ρ_j (A_j - A_i) · ∇W_ij
+            kappa_i = m_over_rho_j * np.einsum('ij,ij->i', (n_hat[j] - n_hat[i]), gW)
+            kappa_j = m_over_rho_i * np.einsum('ij,ij->i', (n_hat[i] - n_hat[j]), -gW)
+            kappa += np.bincount(i, weights=kappa_i, minlength=self.N)
+            kappa += np.bincount(j, weights=kappa_j, minlength=self.N)
 
         f_st = sigma[:, None] * (kappa[:, None] * n_hat)
         return f_st
@@ -683,20 +685,26 @@ class DiscreteFluid:
     def _xsph_velocity(self) -> np.ndarray:
         """
         XSPH velocity smoothing:
-        v_i' = v_i + eps * sum_j (m/ρ_avg) (v_j - v_i) W_ij
+        v_i' = v_i + eps * sum_j (m/ρ_avg) (v_j - v_i) W_ij  (here W factor omitted per your original;
+        if you want kernel-weighted XSPH, reintroduce W_ij.)
         """
         eps = self.params.xsph_eps
-        v_new = self.v.copy()
         if eps <= 0.0:
-            return v_new
+            return self.v
 
+        N = self.N
         dv_accum = np.zeros_like(self.v)
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            rho_avg = 0.5 * (self.rho[i] + self.rho[j])
-            w_ij = (self.m[j] / np.maximum(rho_avg, 1e-12)) * W
-            w_ji = (self.m[i] / np.maximum(rho_avg, 1e-12)) * W
-            np.add.at(dv_accum, i, (self.v[j] - self.v[i]) * w_ij[:, None])
-            np.add.at(dv_accum, j, (self.v[i] - self.v[j]) * w_ji[:, None])
+        rho = self.rho
+
+        for (i, j, _rvec, _r2) in self._pairs_particles():
+            inv_rho_avg = 2.0 / np.maximum(rho[i] + rho[j], 1e-12)
+            w_ij = self.m[j] * inv_rho_avg
+            w_ji = self.m[i] * inv_rho_avg
+
+            dv = self.v[j] - self.v[i]
+            self._scatter_add_vec_pm_(dv_accum, i, j, dv * w_ij[:, None])
+            self._scatter_add_vec_pm_(dv_accum, j, i, dv * w_ji[:, None])
+
         return self.v + eps * dv_accum
 
     # ------------------------------- Diffusion --------------------------------
@@ -711,17 +719,31 @@ class DiscreteFluid:
         if kappa <= 0.0 and D_s <= 0.0:
             return
 
-        dT = np.zeros(self.N); dS = np.zeros(self.N)
-        for (i, j, rvec, r, W) in self._pairs_particles():
-            lapW = self.kernel.laplaceW_visc(r)  # same operator works as Laplacian weight
-            m_over_rho_j = self.m[j] / np.maximum(self.rho[j], 1e-12)
-            m_over_rho_i = self.m[i] / np.maximum(self.rho[i], 1e-12)
+        N = self.N
+        dT = np.zeros(N); dS = np.zeros(N)
+        inv_rho = 1.0 / np.maximum(self.rho, 1e-12)
+        h2 = self.kernel.h2
+
+        for (i, j, rvec, r2) in self._pairs_particles():
+            mask = r2 < h2
+            if not np.any(mask): continue
+            i = i[mask]; j = j[mask]; r = np.sqrt(r2[mask])
+
+            lapW = self.kernel.laplaceW_visc_masked(r)
+            m_over_rho_j = self.m[j] * inv_rho[j]
+            m_over_rho_i = self.m[i] * inv_rho[i]
+
             if kappa > 0:
-                np.add.at(dT, i, kappa * m_over_rho_j * (self.T[j] - self.T[i]) * lapW)
-                np.add.at(dT, j, kappa * m_over_rho_i * (self.T[i] - self.T[j]) * lapW)
+                inc_i = kappa * m_over_rho_j * (self.T[j] - self.T[i]) * lapW
+                inc_j = kappa * m_over_rho_i * (self.T[i] - self.T[j]) * lapW
+                dT += np.bincount(i, weights=inc_i, minlength=N)
+                dT += np.bincount(j, weights=inc_j, minlength=N)
+
             if D_s > 0:
-                np.add.at(dS, i, D_s * m_over_rho_j * (self.S[j] - self.S[i]) * lapW)
-                np.add.at(dS, j, D_s * m_over_rho_i * (self.S[i] - self.S[j]) * lapW)
+                inc_i = D_s * m_over_rho_j * (self.S[j] - self.S[i]) * lapW
+                inc_j = D_s * m_over_rho_i * (self.S[i] - self.S[j]) * lapW
+                dS += np.bincount(i, weights=inc_i, minlength=N)
+                dS += np.bincount(j, weights=inc_j, minlength=N)
 
         self.T += dt * dT
         self.S = np.clip(self.S + dt * dS, 0.0, 1.0)
@@ -759,9 +781,7 @@ class DiscreteFluid:
         key_sorted = key[order]
         cell_sorted = cell[order]
 
-        # unique keys and ranges
         uniq_keys, starts = np.unique(key_sorted, return_index=True)
-        # append end sentinel
         starts = np.concatenate([starts, np.array([len(order)], dtype=np.int64)])
 
         self._grid_cell = cell_sorted
@@ -769,6 +789,9 @@ class DiscreteFluid:
         self._cell_index = order
         self._cell_starts = starts
         self._cell_keys = uniq_keys
+        # Build span map for fast lookups in _pairs_points
+        self._cell_span_map = {int(k): (int(self._cell_starts[i]), int(self._cell_starts[i+1]))
+                               for i, k in enumerate(self._cell_keys)}
 
     @staticmethod
     def _hash3(ix: np.ndarray, iy: np.ndarray, iz: np.ndarray) -> np.ndarray:
@@ -783,43 +806,34 @@ class DiscreteFluid:
         return d.astype(np.int64)
 
     # -------------------------- Pair iterators --------------------------------
+    # NOTE: hot-path now yields (i, j, rvec, r2) with r²-culling inside.
+    # Callers decide whether to sqrt(r2) or compute kernels from r2.
 
     def _pairs_particles(self, max_pairs_chunk: int = 5_000_000
-                         ) -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+                         ) -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Yield particle-particle neighbor interactions in chunks.
-        Each yield returns tuple of arrays ``(i, j, rvec, r, W)``.
+        Each yield returns arrays ``(i, j, rvec, r2)`` already culled by r² < h².
 
-        Notes
-        -----
-        ``rvec`` is defined as ``p_j - p_i`` (vector from particle ``i`` to
-        particle ``j``).  All gradient kernels must therefore be evaluated as
-        ``∇ᵢW`` with this ``rvec`` so that the resulting vector points from
-        ``j`` back toward ``i``.  The ordering ensures action–reaction symmetry.
-
-        We only generate each unordered pair once (``j > i`` when in the same
-        cell, and only consider neighbor cells with a ``>= key`` rule).
+        rvec is defined as ``p_j - p_i`` (vector from particle i to j).
+        We only generate each unordered pair once.
         """
         cell = self._grid_cell
         keys = self._grid_keys
         starts = self._cell_starts
         uniq_keys = self._cell_keys
         order = self._cell_index
-        h = self.kernel.h
+        h2 = self.kernel.h2
 
-        # map from key -> span [start, end)
-        # iterate each cell's neighbors with a consistent ordering
         for ui, key in enumerate(uniq_keys):
             a0 = starts[ui]; a1 = starts[ui+1]
-            idxA = order[a0:a1]             # particle indices in cell A
-            cellA = cell[a0]                # its integer coords
+            idxA = order[a0:a1]
+            cellA = cell[a0]
 
-            # loop over neighbor offsets
             for off in self._neighbor_offsets:
                 nb_cell = cellA + off
                 nb_key = self._hash3(nb_cell[0], nb_cell[1], nb_cell[2])
-                # impose ordering to avoid duplicates: only process neighbor cells
-                # with nb_key > key, except the same cell (nb_key==key) where we enforce j>i.
+
                 rel = nb_key - key
                 if rel < 0:
                     continue
@@ -833,29 +847,22 @@ class DiscreteFluid:
                 idxB = order[b0:b1]
 
                 if nb_key == key:
-                    # same cell: form all pairs i<j
                     if idxA.size < 2:
                         continue
-                    # Use broadcasting to form upper triangle pairs in chunks
-                    # Split if too many pairs
-                    # Approx pairs = n(n-1)/2
                     n = idxA.size
-                    if n*(n-1)//2 <= max_pairs_chunk:
+                    approx_pairs = n*(n-1)//2
+                    if approx_pairs <= max_pairs_chunk:
                         I, J = np.triu_indices(n, k=1)
                         i = idxA[I]; j = idxA[J]
                         rvec = self.p[j] - self.p[i]
-                        r = np.linalg.norm(rvec, axis=1)
-                        mask = r < h
+                        r2 = np.einsum('ij,ij->i', rvec, rvec)
+                        mask = r2 < h2
                         if not np.any(mask):
                             continue
-                        i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = r[mask]
-                        W = self.kernel.W(r)
-                        yield i, j, rvec, r, W
+                        yield i[mask], j[mask], rvec[mask], r2[mask]
                     else:
-                        # chunk by rows
                         row_start = 0
                         while row_start < n-1:
-                            # choose a window size w so that ~w*(n - row) <= max_pairs_chunk
                             w = max(1, min(n - row_start - 1, max_pairs_chunk // max(1, n - row_start - 1)))
                             I = []; J = []
                             for rr in range(row_start, min(n-1, row_start + w)):
@@ -865,15 +872,12 @@ class DiscreteFluid:
                             I = np.concatenate(I); J = np.concatenate(J)
                             i = idxA[I]; j = idxA[J]
                             rvec = self.p[j] - self.p[i]
-                            r = np.linalg.norm(rvec, axis=1)
-                            mask = r < h
+                            r2 = np.einsum('ij,ij->i', rvec, rvec)
+                            mask = r2 < h2
                             if np.any(mask):
-                                i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = r[mask]
-                                W = self.kernel.W(r)
-                                yield i, j, rvec, r, W
+                                yield i[mask], j[mask], rvec[mask], r2[mask]
                             row_start += w
                 else:
-                    # distinct cells: all pairs A x B
                     na = idxA.size; nb = idxB.size
                     if na == 0 or nb == 0:
                         continue
@@ -882,16 +886,12 @@ class DiscreteFluid:
                         i = np.repeat(idxA, nb)
                         j = np.tile(idxB, na)
                         rvec = self.p[j] - self.p[i]
-                        r = np.linalg.norm(rvec, axis=1)
-                        mask = r < h
+                        r2 = np.einsum('ij,ij->i', rvec, rvec)
+                        mask = r2 < h2
                         if not np.any(mask):
                             continue
-                        i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = r[mask]
-                        W = self.kernel.W(r)
-                        yield i, j, rvec, r, W
+                        yield i[mask], j[mask], rvec[mask], r2[mask]
                     else:
-                        # sub-batch by slicing A or B
-                        # choose chunk along larger dimension
                         if na >= nb:
                             stride = max(1, max_pairs_chunk // max(1, nb))
                             for a0b in range(0, na, stride):
@@ -900,12 +900,10 @@ class DiscreteFluid:
                                 i = np.repeat(aa, nb)
                                 j = np.tile(idxB, aa.size)
                                 rvec = self.p[j] - self.p[i]
-                                r = np.linalg.norm(rvec, axis=1)
-                                mask = r < h
+                                r2 = np.einsum('ij,ij->i', rvec, rvec)
+                                mask = r2 < h2
                                 if np.any(mask):
-                                    i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = r[mask]
-                                    W = self.kernel.W(r)
-                                    yield i, j, rvec, r, W
+                                    yield i[mask], j[mask], rvec[mask], r2[mask]
                         else:
                             stride = max(1, max_pairs_chunk // max(1, na))
                             for b0b in range(0, nb, stride):
@@ -914,24 +912,17 @@ class DiscreteFluid:
                                 i = np.repeat(idxA, bb.size)
                                 j = np.tile(bb, idxA.size)
                                 rvec = self.p[j] - self.p[i]
-                                r = np.linalg.norm(rvec, axis=1)
-                                mask = r < h
+                                r2 = np.einsum('ij,ij->i', rvec, rvec)
+                                mask = r2 < h2
                                 if np.any(mask):
-                                    i = i[mask]; j = j[mask]; rvec = rvec[mask]; r = r[mask]
-                                    W = self.kernel.W(r)
-                                    yield i, j, rvec, r, W
+                                    yield i[mask], j[mask], rvec[mask], r2[mask]
 
     def _pairs_points(self, points: np.ndarray, custom_kernel: Optional[SPHKernel] = None,
                       yield_once: bool = False
                       ) -> Iterable[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Yield interactions between arbitrary query points and particles.
-        Returns tuples ``(pi, pj, rvec, r, W)`` analogous to
-        :meth:`_pairs_particles`, where ``pi`` indexes into the query points
-        array.  As with ``_pairs_particles``, ``rvec`` is ``p_j - p_i`` (pointing
-        from the query point to the particle) and gradients must be evaluated as
-        ``∇ᵢW``.
-        If yield_once=True, yields exactly one combined batch (or empty) for the provided points.
+        Returns tuples ``(pi, pj, rvec, r, W)`` analogous to the particle version.
         """
         kernel = custom_kernel if custom_kernel is not None else self.kernel
         h = kernel.h
@@ -941,22 +932,19 @@ class DiscreteFluid:
         cell_q = np.floor(points * inv_h).astype(np.int64)   # (M,3)
         key_q = self._hash3(cell_q[:,0], cell_q[:,1], cell_q[:,2])
 
-        # For each point, collect neighbors across 27 cells and form one batch
-        # Implementation: loop over points in Python (acceptable M is small for sampling/sources)
-        # but form a single vectorized batch if yield_once.
+        span_map = self._cell_span_map  # pre-built dict from _build_grid()
+
         M = points.shape[0]
         if yield_once:
-            # aggregate all
             pi_list = []; pj_list = []; rvec_list = []; r_list = []; W_list = []
             for qi in range(M):
-                # Build candidate particle index list
                 for off in self._neighbor_offsets:
                     nb_cell = cell_q[qi] + off
-                    nb_key = self._hash3(nb_cell[0], nb_cell[1], nb_cell[2])
-                    pos = np.searchsorted(self._cell_keys, nb_key)
-                    if pos >= self._cell_keys.size or self._cell_keys[pos] != nb_key:
+                    nb_key = int(self._hash3(nb_cell[0], nb_cell[1], nb_cell[2]))
+                    span = span_map.get(nb_key)
+                    if span is None:
                         continue
-                    b0 = self._cell_starts[pos]; b1 = self._cell_starts[pos+1]
+                    b0, b1 = span
                     idxB = self._cell_index[b0:b1]
                     if idxB.size == 0: continue
                     pj = idxB
@@ -976,16 +964,15 @@ class DiscreteFluid:
                 rvec = np.concatenate(rvec_list); r = np.concatenate(r_list); W = np.concatenate(W_list)
                 yield pi, pj, rvec, r, W
         else:
-            # point-by-point streaming (rarely used; sampling typically small anyway)
             for qi in range(M):
                 pi_list = []; pj_list = []; rvec_list = []; r_list = []; W_list = []
                 for off in self._neighbor_offsets:
                     nb_cell = cell_q[qi] + off
-                    nb_key = self._hash3(nb_cell[0], nb_cell[1], nb_cell[2])
-                    pos = np.searchsorted(self._cell_keys, nb_key)
-                    if pos >= self._cell_keys.size or self._cell_keys[pos] != nb_key:
+                    nb_key = int(self._hash3(nb_cell[0], nb_cell[1], nb_cell[2]))
+                    span = span_map.get(nb_key)
+                    if span is None:
                         continue
-                    b0 = self._cell_starts[pos]; b1 = self._cell_starts[pos+1]
+                    b0, b1 = span
                     idxB = self._cell_index[b0:b1]
                     if idxB.size == 0: continue
                     pj = idxB
@@ -1035,11 +1022,9 @@ class DiscreteFluid:
         return 0.5 * float(np.sum(self.m * np.einsum('ij,ij->i', self.v, self.v)))
 
     def potential_energy(self) -> float:
-        # gravitational potential relative to z=0 along gravity direction
         g = self._g
         if np.allclose(g, 0.0):
             return 0.0
-        # project position onto gravity direction (unit)
         gnorm = np.linalg.norm(g)
         gh = (self.p @ (g / gnorm))
         return float(np.sum(self.m * gnorm * gh))
@@ -1058,7 +1043,7 @@ class DiscreteFluid:
         zs = np.arange(n_z) * dx
         X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
         pos = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-        pos[:, 1] += 0.2   # lift above ground
+        pos[:, 1] += 0.2
 
         params = FluidParams(smoothing_length=h, particle_mass=0.02, bounce_damping=0.2)
         fluid = DiscreteFluid(pos, None, None, None, params,

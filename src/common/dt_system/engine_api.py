@@ -55,7 +55,7 @@ class DtCompatibleEngine:
         if isinstance(self.causal_ceiling_dt, float) and self.causal_ceiling_dt < dt or isinstance(self.causal_ceiling_dt, Callable) and self.causal_ceiling_dt() < dt:
             ceiling = self.causal_ceiling_dt if isinstance(self.causal_ceiling_dt, float) else self.causal_ceiling_dt()
             if realtime:
-                ceiling *= 1e2
+                ceiling *= 1e1
             
             slip = dt - ceiling
             dt = ceiling
