@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - headless environments
 
 from ..dt_controller import STController, Targets, step_realtime_once
 from ..dt_graph import GraphBuilder, MetaLoopRunner
-from ..engine_api import EngineRegistration
+from ..engine_api import EngineRegistration, IdentityAssembly, create_identity_assembly
 from ..roundnode_engine import RoundNodeEngine
 from ..threaded_system import ThreadedSystemEngine
 from ..realtime import (
@@ -51,7 +51,6 @@ from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
 from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
-from ..state_table import sync_engine_from_table, publish_engine_to_table
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
@@ -66,9 +65,19 @@ class Craft:
     thrusters: ThrustersEngine
     round_engine: RoundNodeEngine
     system: ThreadedSystemEngine
+    assembly: IdentityAssembly
 
 
-def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40), *, classic: bool, realtime_config=None, realtime_state=None) -> Craft:
+def build_craft(
+    name: str,
+    anchor: Tuple[float, float],
+    color=(255, 200, 40),
+    *,
+    classic: bool,
+    realtime_config=None,
+    realtime_state=None,
+    state_table=None,
+) -> Craft:
     # 4-node square craft: fully connected with diagonals, equal masses
     ax, ay = float(anchor[0]), float(anchor[1])
     size = 0.8
@@ -104,14 +113,20 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40), *,
         spring_eff=0.98, thruster_eff=0.92, pneumatic_eff=0.95, linear_drag=0.15,
     )
 
+    if state_table is None:
+        raise ValueError("state_table is required for identity registration")
+    items = range(len(s.pos))
+    schema = lambda i: {"pos": s.pos[i], "mass": s.mass[i]}
+    assembly = create_identity_assembly(state_table, schema, items, group_label=name)
+
     # Engines composing the craft
-    thr = ThrustersEngine(s, thrust=(0.0, 0.0))
+    thr = ThrustersEngine(s, thrust=(0.0, 0.0), assembly=assembly)
     engines = [
         (f"{name}.thrusters", thr),
-        (f"{name}.springs", SpringEngine(s)),
-        (f"{name}.pneumatics", PneumaticDamperEngine(s)),
-        (f"{name}.ground", GroundCollisionEngine(s)),
-        (f"{name}.integrate", IntegratorEngine(s)),
+        (f"{name}.springs", SpringEngine(s, assembly=assembly)),
+        (f"{name}.pneumatics", PneumaticDamperEngine(s, assembly=assembly)),
+        (f"{name}.ground", GroundCollisionEngine(s, assembly=assembly)),
+        (f"{name}.integrate", IntegratorEngine(s, assembly=assembly)),
     ]
 
     # Per-craft controller/targets; allow the craft to refine within the parent slice
@@ -135,7 +150,7 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40), *,
         return {"craft": {"nodes": nodes, "edges": edges, "com": com, "color": color}}
 
     sys = ThreadedSystemEngine(rne, capture=capture, realtime=not classic)
-    return Craft(name=name, state=s, thrusters=thr, round_engine=rne, system=sys)
+    return Craft(name=name, state=s, thrusters=thr, round_engine=rne, system=sys, assembly=assembly)
 
 
 # ---------------- Parent graph + pygame loop ---------------------
@@ -209,20 +224,28 @@ def _run_demo(
     # --- StateTable for dt_tape HUD wiring and metaloop constructor---
     from ..state_table import StateTable
     state_table = StateTable()
-    # Build crafts, passing the root's realtime config/state
-    craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
-    craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic, realtime_config=rt_cfg, realtime_state=rt_state)
+    # Build crafts, passing the root's realtime config/state and state table
+    craft_a = build_craft(
+        "A",
+        anchor=(2.5, 3.0),
+        color=(240, 80, 80),
+        classic=classic,
+        realtime_config=rt_cfg,
+        realtime_state=rt_state,
+        state_table=state_table,
+    )
+    craft_b = build_craft(
+        "B",
+        anchor=(6.5, 3.2),
+        color=(80, 180, 255),
+        classic=classic,
+        realtime_config=rt_cfg,
+        realtime_state=rt_state,
+        state_table=state_table,
+    )
 
-    # --- Register craft vertices as identities in the state table ---
-    import uuid
-    craft_a_vertex_uuids = [
-        state_table.register_identity(pos=pos, mass=mass)
-        for pos, mass in zip(craft_a.state.pos, craft_a.state.mass)
-    ]
-    craft_b_vertex_uuids = [
-        state_table.register_identity(pos=pos, mass=mass)
-        for pos, mass in zip(craft_b.state.pos, craft_b.state.mass)
-    ]
+    craft_a_vertex_uuids = list(craft_a.assembly.uuids)
+    craft_b_vertex_uuids = list(craft_b.assembly.uuids)
 
     # Bath discrete fluid: construct via engine convenience (n) and derive bounds from world planes
     fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
@@ -232,7 +255,13 @@ def _run_demo(
     ctrl = STController(dt_min=1e-6)
     dx = 0.1
     # Build meta collision engine that internally consults the spring/damper networks
-    meta_collision = MetaCollisionEngine([craft_a.state, craft_b.state], restitution=0.25, friction_mu=0.6, body_radius=0.12)
+    meta_collision = MetaCollisionEngine(
+        [craft_a.state, craft_b.state],
+        restitution=0.25,
+        friction_mu=0.6,
+        body_radius=0.12,
+        assemblies=[craft_a.assembly, craft_b.assembly],
+    )
     # Configure bisect solver to drive penetration (encoded in Metrics.div_inf) toward 0 within epsilon
     solver_cfg = BisectSolverConfig(target=0.0, eps=1e-5, field="div_inf", monotonic="increase", dt_min=1e-6)
 
@@ -337,23 +366,62 @@ def _run_demo(
 
     def reset_scene():
         nonlocal craft_a, craft_b, fluid_engine, regs, gb, top_round, runner, nodes_for_hud, last_a, last_b, state_table
-        # Rebuild crafts and engines
-        craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic)
-        craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic)
+        from ..state_table import StateTable
+        state_table = StateTable()
+        craft_a = build_craft("A", anchor=(2.5, 3.0), color=(240, 80, 80), classic=classic, state_table=state_table)
+        craft_b = build_craft("B", anchor=(6.5, 3.2), color=(80, 180, 255), classic=classic, state_table=state_table)
         fluid_engine = BathDiscreteFluidEngine(n=100, world=world)
-        meta_collision = MetaCollisionEngine([craft_a.state, craft_b.state], restitution=0.25, friction_mu=0.6, body_radius=0.12)
+        meta_collision = MetaCollisionEngine(
+            [craft_a.state, craft_b.state],
+            restitution=0.25,
+            friction_mu=0.6,
+            body_radius=0.12,
+            assemblies=[craft_a.assembly, craft_b.assembly],
+        )
         solver_cfg = BisectSolverConfig(target=0.0, eps=1e-5, field="div_inf", monotonic="increase", dt_min=1e-6)
+        world_anchors = [WorldAnchor(position=(0.0, 0.0))]
+        object_anchors = [(0, "A", COM, 0.0), (0, "B", COM, 0.0)]
+        links = [
+            WorldObjectLink(
+                world_anchor=world_anchors[object_anchors[i][0]],
+                object_anchor=object_anchors[i],
+                link_type="steel_beam",
+                properties={"length": 1.0, "k": 10000.0},
+            )
+            for i in range(len(object_anchors))
+        ]
+        rigid_engine = RigidBodyEngine(
+            links,
+            state_table,
+            [
+                {
+                    "label": "A",
+                    "vertices": set(craft_a.assembly.uuids),
+                    "edges": {"spring": set(craft_a.state.springs)},
+                },
+                {
+                    "label": "B",
+                    "vertices": set(craft_b.assembly.uuids),
+                    "edges": {"spring": set(craft_b.state.springs)},
+                },
+            ],
+        )
         regs = [
             EngineRegistration(name="gravity", engine=GravityEngine(craft_a.state), targets=targets, dx=dx, localize=False),
             EngineRegistration(name="collision", engine=meta_collision, targets=targets, dx=dx, localize=False, solver_config=solver_cfg),
             EngineRegistration(name="craftA", engine=craft_a.system, targets=targets, dx=dx, localize=False),
             EngineRegistration(name="craftB", engine=craft_b.system, targets=targets, dx=dx, localize=False),
+            EngineRegistration(
+                name="rigid_body_constraint",
+                engine=rigid_engine,
+                targets=targets,
+                dx=dx,
+                localize=False,
+            ),
             EngineRegistration(name="fluid", engine=fluid_engine, targets=targets, dx=dx, localize=True),
         ]
         gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=dx)
         top_round = gb.round(dt=1.0 / fps, engines=regs, schedule="sequential")
-        from ..state_table import StateTable
-        state_table = StateTable()
         runner = MetaLoopRunner(state_table=state_table)
         runner.set_process_graph(top_round, schedule_method="asap", schedule_order="dependency")
         def _flatten_nodes(r):
