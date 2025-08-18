@@ -14,7 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional, Iterable, Mapping, Any
 
+
 from .state_table import StateTable
+
 
 from .dt_scaler import Metrics
 from .dt_controller import Targets, STController
@@ -96,7 +98,9 @@ class DtCompatibleEngine:
         *,
         group_label: Optional[str] = None,
         dedup: bool = True,
+
     ) -> "IdentityAssembly":
+
         """Register a set of identities with ``state_table``.
 
         ``schema`` maps each item in ``items`` to a dict describing the
@@ -105,6 +109,7 @@ class DtCompatibleEngine:
         creation. Registered UUIDs are tracked internally so stepping
         without prior registration raises an error.
         """
+
         assembly = create_identity_assembly(
             state_table,
             schema,
@@ -125,6 +130,7 @@ class DtCompatibleEngine:
         self._registration = existing
         return list(assembly.uuids)
 
+
     def _require_registration(self) -> None:
         if getattr(self, "_registration", None) is None:
             raise RuntimeError(
@@ -141,7 +147,7 @@ class DtCompatibleEngine:
         if isinstance(self.causal_ceiling_dt, float) and self.causal_ceiling_dt < dt or isinstance(self.causal_ceiling_dt, Callable) and self.causal_ceiling_dt() < dt:
             ceiling = self.causal_ceiling_dt if isinstance(self.causal_ceiling_dt, float) else self.causal_ceiling_dt()
             if realtime:
-                ceiling *= 1e2
+                ceiling *= 1e1
             
             slip = dt - ceiling
             dt = ceiling
