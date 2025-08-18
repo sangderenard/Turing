@@ -8,6 +8,10 @@ A hyperlinked index of modules and capabilities in this repository.
 - [generated_ssa_helpers.py](generated_ssa_helpers.py) — generated SSA helpers
 - [count_loc.py](count_loc.py) — LOC utility
 
+## src/ascii_render
+
+- [src/ascii_render/__init__.py](src/ascii_render/__init__.py)
+
 ## src/common
 
 - [src/common/types.py](src/common/types.py)
