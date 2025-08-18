@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
 """ASCII classifier using tensor backends for parallel evaluation."""
 from __future__ import annotations
 
 from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from src.tensors import (
+from ...tensors import (
     AbstractTensor,
     Faculty,
+    NumPyTensorOperations,
+    PyTorchTensorOperations,
 )
-# --- END HEADER ---
 
 try:
     from skimage.metrics import structural_similarity as ssim

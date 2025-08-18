@@ -29,15 +29,12 @@ operate on tensors without binding to a specific backend.
    arithmetic operators route through `_apply_operator` so behavior stays
    consistent across backends.
 4. Optional convenience helpers in `faculty.py` allow you to inspect available
-   faculties or force a specific backend using the `SPEAKTOME_FACULTY`
+   faculties or force a specific backend using the `TENSOR_FACULTY`
    environment variable.
 
 ## Relationship to Other Projects
 
-The `speaktome` core components rely on this abstraction layer so they can run
-with or without heavy numerical dependencies. The experimental
-`tensorprinting` package also builds upon these classes to explore novel tensor
-visualization techniques.
+This abstraction layer allows other projects to run with or without heavy numerical dependencies. The experimental `tensorprinting` package also builds upon these classes to explore novel tensor visualization techniques.
 
 ## Project Ethos
 

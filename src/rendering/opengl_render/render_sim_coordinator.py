@@ -17,7 +17,7 @@ from src.opengl_render.api import (
     make_double_buffer_draw_hook,
     draw_layers,
 )
-from render_chooser.double_buffer import DoubleBuffer
+from ..render_chooser.double_buffer import DoubleBuffer
 
 OPTIONS: Mapping[str, tuple[str, Sequence[str]]] = {
     "1": ("Voxel fluid demo", ["--fluid", "voxel"]),

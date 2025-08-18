@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prototype classes for OpenGL shader orchestration."""
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ except Exception:
     import sys
     print("OpenGL pipeline failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 
 # ########## STUB: OpenGL Shader Pipeline ##########

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """OpenGL backend skeleton using buffer objects and compute shaders."""
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ except Exception:
     import sys
     print("OpenGL backend failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 
 class GLBuffer:

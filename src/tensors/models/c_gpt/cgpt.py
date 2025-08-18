@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 from cffi import FFI
 
-# --- END HEADER ---
 
 ffi = FFI()
 ffi.cdef(

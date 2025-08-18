@@ -41,7 +41,6 @@ except Exception:
     import sys
     print("PyTorch backend failed to import")
     sys.exit(1)
-# --- END HEADER ---
 
 class PyTorchTensorOperations(AbstractTensor):
     def __init__(self, default_device: Union[str, "torch.device"] = "cpu", track_time: bool = False):
