@@ -38,7 +38,7 @@ class DtCompatibleEngine:
     lightweight path.
     """
 
-    def step(self, dt: float, state, state_table) -> tuple[bool, Metrics]:  # pragma: no cover - interface
+    def step(self, dt: float, state, state_table) -> tuple[bool, Metrics, object]:  # pragma: no cover - interface
         raise NotImplementedError
 
     # New required capability for compliant engines
@@ -49,9 +49,9 @@ class DtCompatibleEngine:
             state_table = getattr(self, '_state_table', None)
         if state_table is None:
             raise ValueError("state_table is required for step_with_state")
-        ok, m, state = self.step(float(dt), state, state_table=state_table)
-        state = self.get_state() if state is None else state
-        return ok, m, state
+        ok, m, state_out = self.step(float(dt), state, state_table=state_table)
+        state_out = self.get_state(state_table) if state_out is None else state_out
+        return ok, m, state_out
 
     def get_state(self, state=None) -> object:  # pragma: no cover - default bridge
         """

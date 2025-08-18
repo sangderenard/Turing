@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, TYPE_CHECKING, Callable, Optional
 import math
+import numpy as np
 
 from ..dt_scaler import Metrics
 from ..engine_api import DtCompatibleEngine
@@ -244,6 +245,12 @@ class SpringEngine(DtCompatibleEngine):
         self.edge_uuids = []
         for i, (pos, mass) in enumerate(zip(self.s.pos, self.s.mass)):
             uuid_str = state_table.register_identity(pos, mass, dedup=self.dedup)
+            identity = state_table.get_identity(uuid_str)
+            if identity is not None:
+                vel = self.s.vel[i] if i < len(self.s.vel) else (0.0, 0.0)
+                acc = self.s.acc[i] if i < len(self.s.acc) else (0.0, 0.0)
+                identity['vel'] = vel
+                identity['acc'] = acc
             self.uuids.append(uuid_str)
         for (i, j) in self.s.springs:
             edge = (self.uuids[i], self.uuids[j])
@@ -307,9 +314,10 @@ class SpringEngine(DtCompatibleEngine):
 class PneumaticDamperEngine(DtCompatibleEngine):
 
     def get_state(self, state_table=None):
-        if state_table is None:
+        st = state_table or self.state_table
+        if st is None:
             raise ValueError("PneumaticDamperEngine requires a StateTable for identity-based state management.")
-        return {uuid: dict(identity) for uuid, identity in state_table.identity_registry.items()}
+        return {uuid: dict(identity) for uuid, identity in st.identity_registry.items()}
 
     def __init__(self, state: DemoState, state_table=None, group_label=None, uuids=None, dedup: bool = True):
         self.s = state
@@ -356,7 +364,11 @@ class PneumaticDamperEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.pneumatic").debug(f"dt={float(dt):.6g} springs={len(self.s.springs)}")
         if state_table is None:
-            raise ValueError("PneumaticDamperEngine requires a StateTable for identity-based state management.")
+            if self.state_table is None:
+                from ..state_table import StateTable
+                state_table = StateTable()
+            else:
+                state_table = self.state_table
         self._register_with_state_table(state_table)
         eff = max(0.0, min(1.0, getattr(self.s, "pneumatic_eff", 1.0)))
         for idx, (i, j) in enumerate(self.s.springs):
@@ -367,7 +379,8 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             if identity_i is None or identity_j is None:
                 continue
             p_i, p_j = identity_i.get('pos'), identity_j.get('pos')
-            v_i, v_j = identity_i.get('vel', (0.0, 0.0)), identity_j.get('vel', (0.0, 0.0))
+            v_i = self.s.vel[i] if i < len(self.s.vel) else identity_i.get('vel', (0.0, 0.0))
+            v_j = self.s.vel[j] if j < len(self.s.vel) else identity_j.get('vel', (0.0, 0.0))
             d = v_sub(p_j, p_i)
             dir_ = v_norm(d)
             rel_v = v_sub(v_j, v_i)
@@ -391,6 +404,11 @@ class PneumaticDamperEngine(DtCompatibleEngine):
             if edge_identity is not None:
                 edge_identity['force'] = eff * coeff * along
                 state_table.update_identity(edge_uuid, pos=(p_i, p_j), mass=state_table.get_identity(edge_uuid).get('mass', 1.0))
+        # Sync accelerations back into the demo state for direct inspection
+        for idx, uuid in enumerate(self.uuids):
+            identity = state_table.get_identity(uuid)
+            if identity is not None:
+                self.s.acc[idx] = identity.get('acc', (0.0, 0.0))
         metrics = Metrics(0.0, 0.0, 0.0, 0.0)
         return True, metrics, self.get_state(state_table)
 
@@ -624,21 +642,27 @@ class MetaCollisionEngine(DtCompatibleEngine):
                 if m <= 0:
                     continue
                 x, y = s.pos[i]
-                p3 = (float(x), float(y), 0.0)
+                p3 = np.array([float(x), float(y), 0.0], dtype=float)
                 for pl in planes:
+
                     n = getattr(pl, "normal", (0.0, 1.0, 0.0))
                     d = float(getattr(pl, "offset", 0.0))
                     nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
-                    # 2D point assumed z=0
-                    dist = nx * p3[0] + ny * p3[1] + nz * 0.0 + d
+                    dist = nx * p3[0] + ny * p3[1] + nz * p3[2] + d
                     if dist < 0.0:
+                        if pl.is_fluid_permeable(p3):
+                            mode = getattr(pl, "fluid_mode", None) or getattr(self.world, "fluid_mode", None)
+                            if mode in ("wrap", "respawn"):
+                                p3 = pl.warp_position(p3)
+                                s.pos[i] = (float(p3[0]), float(p3[1]))
+                            else:
+                                s.pos[i] = (float(p3[0]), float(p3[1]))
+                            continue
                         pen = -dist
                         max_pen = max(max_pen, pen)
-                        # Project to plane
                         x_corr = p3[0] + nx * pen
                         y_corr = p3[1] + ny * pen
                         s.pos[i] = (x_corr, y_corr)
-                        # Velocity response based on material
                         vx, vy = s.vel[i]
                         v_n = vx * nx + vy * ny
                         v_t_x, v_t_y = vx - v_n * nx, vy - v_n * ny
@@ -646,23 +670,20 @@ class MetaCollisionEngine(DtCompatibleEngine):
                         kind = getattr(mat, "kind", "elastic")
                         rest = float(getattr(mat, "restitution", self.e))
                         mu = float(getattr(mat, "friction", self.mu))
-                        # Report contact to softbody callback if relevant
                         if kind == "softbody_stub" and self.softbody_contact_cb:
                             try:
                                 self.softbody_contact_cb(Contact(
                                     p=(x_corr, y_corr), n=(nx, ny), pen=float(pen),
-                                    material_kind=kind, state_idx=si, vertex_idx=i, source="plane"
+                                    material_kind=kind, state_idx=si, vertex_idx=i, source="plane",
                                 ))
                             except Exception:
                                 pass
                         if kind == "soil":
-                            # strong damping, no bounce
                             v_n_post = 0.0
                             damp = max(0.0, min(1.0, float(getattr(mat, "embed_damping", 0.7))))
                             v_t_x *= (1.0 - min(1.0, mu)) * (1.0 - damp)
                             v_t_y *= (1.0 - min(1.0, mu)) * (1.0 - damp)
                         elif kind == "softbody_stub":
-                            # placeholder: treat like elastic for now
                             v_n_post = -rest * v_n
                             v_t_x *= max(0.0, 1.0 - mu)
                             v_t_y *= max(0.0, 1.0 - mu)

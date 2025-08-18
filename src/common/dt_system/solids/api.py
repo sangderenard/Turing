@@ -43,6 +43,8 @@ class SurfaceMaterial:
 MATERIAL_ELASTIC = SurfaceMaterial("elastic", restitution=0.25, friction=0.6)
 MATERIAL_SOIL = SurfaceMaterial("soil", restitution=0.0, friction=0.9, embed_damping=0.8)
 MATERIAL_SOFTBODY_STUB = SurfaceMaterial("softbody_stub", restitution=0.2, friction=0.6)
+# Low-friction, weakly elastic surface useful for cages or slippery walls
+MATERIAL_SLIPPERY = SurfaceMaterial("elastic", restitution=0.05, friction=0.0)
 
 
 @dataclass
@@ -133,6 +135,10 @@ class WorldPlane:
     material: SurfaceMaterial = field(default_factory=lambda: MATERIAL_ELASTIC)
     # Optional plane-level fluid boundary override: "wrap" or "respawn"
     fluid_mode: Optional[Literal["wrap", "respawn"]] = None
+    # Optional permeability pattern across in-plane axes as (div_u, div_v).
+    # When provided, the plane alternates open and solid regions; a zero entry
+    # yields stripes, while two positive entries produce a checkerboard.
+    permeability: Optional[Tuple[int, int]] = None
 
     def __post_init__(self) -> None:
         n = np.asarray(self.normal, dtype=float).reshape(-1)
@@ -140,6 +146,55 @@ class WorldPlane:
             raise ValueError("WorldPlane.normal must have 3 components")
         l = float(np.linalg.norm(n)) or 1.0
         self.normal = (n / l).astype(float)
+
+    def is_fluid_permeable(self, point: np.ndarray) -> bool:
+        """Return True if a fluid particle at ``point`` may pass through.
+
+        The check assumes axis-aligned planes. When ``permeability`` is
+        ``None`` the plane blocks fluid completely. If ``permeability`` is
+        provided, the plane is divided into equal regions. With one positive
+        division value the regions form stripes; with two they form a
+        checkerboard. Regions with even parity are considered openings.
+        """
+        if self.permeability is None:
+            return False
+
+        div_u, div_v = self.permeability
+        axis = int(np.argmax(np.abs(self.normal)))
+        axes = [0, 1, 2]
+        axes.pop(axis)
+        u = float(point[axes[0]])
+        v = float(point[axes[1]])
+
+        iu = int(np.floor(u * div_u)) if div_u and div_u > 0 else 0
+        iv = int(np.floor(v * div_v)) if div_v and div_v > 0 else 0
+
+        if div_u and div_u > 0 and div_v and div_v > 0:
+            return (iu + iv) % 2 == 0
+        elif div_u and div_u > 0:
+            return iu % 2 == 0
+        elif div_v and div_v > 0:
+            return iv % 2 == 0
+        return False
+
+    def warp_position(self, point: np.ndarray) -> np.ndarray:
+        """Warp ``point`` across the plane when in wrap mode.
+
+        A simple helper for engines: if ``fluid_mode`` is ``"wrap"`` and the
+        point lies outside the plane, translate it to the opposite side while
+        preserving tangential coordinates. This behaves like a portal through a
+        permeable gap.
+        """
+        if self.fluid_mode != "wrap":
+            return np.asarray(point, dtype=float)
+
+        p = np.asarray(point, dtype=float)
+        side = float(np.dot(self.normal, p) + self.offset)
+        if side >= 0.0:
+            return p
+        # Move across the plane by twice the penetration distance
+        p = p + self.normal * (-2.0 * side)
+        return p
 
 
 @dataclass
@@ -165,6 +220,7 @@ __all__ = [
     "MATERIAL_ELASTIC",
     "MATERIAL_SOIL",
     "MATERIAL_SOFTBODY_STUB",
+    "MATERIAL_SLIPPERY",
     "SolidMesh",
     "SolidRegistry",
     "make_box",
