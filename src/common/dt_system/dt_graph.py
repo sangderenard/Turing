@@ -31,6 +31,7 @@ from .engine_api import EngineRegistration
 from .debug import dbg, is_enabled, pretty_metrics
 from .dt_solver import solve_window_bisect
 from .state_table import sync_engine_from_table, publish_engine_to_table
+from .integrator.integrator import Integrator
 
 import time
 from .realtime import RealtimeConfig, RealtimeState, compile_allocations
@@ -502,6 +503,19 @@ class GraphBuilder:
                         realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                     return ok, m, state_new
                 children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
+        # Ensure an integrator finalizes the round by default
+        if not any(isinstance(reg.engine, Integrator) for reg in engines):
+            integ = Integrator()
+            if state_table is not None:
+                try:
+                    integ.register(state_table, lambda _: {"pos": (0.0, 0.0), "mass": 0.0}, [0])
+                except Exception:
+                    pass
+            int_reg = EngineRegistration(name="integrator", engine=integ, targets=self.targets, dx=self.dx, localize=False)
+            adv_int = EngineNode(int_reg).to_advance_node(state_stub)
+            int_label = f"{label_prefix}integrator_{len(children)}"
+            children.append(AdvanceNode(advance=adv_int.advance, state=state_stub, label=f"advance:{int_label}"))
+
         return RoundNode(
             plan=plan,
             controller=controller,

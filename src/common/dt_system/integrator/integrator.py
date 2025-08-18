@@ -8,6 +8,7 @@ methods and a poetic API for summing over infinitesimals.
 
 from typing import Callable, Any, Optional
 from ..engine_api import DtCompatibleEngine
+from ..state_table_archive import StateTableArchive
 
 class IntegrationAlgorithm:
     def step(self, f: Callable, t: float, x: float, dt: float) -> float:
@@ -43,13 +44,13 @@ class RK4Integrator(IntegrationAlgorithm):
 
 class Integrator(DtCompatibleEngine):
 
-    def __init__(self, dynamics: Callable[[float, Any], float] = None, algorithm: str = "euler"):
+    def __init__(self, dynamics: Callable[[float, Any], float] = None, algorithm: str = "euler", archive: Optional[StateTableArchive] = None):
         """
         dynamics: a function f(t, x) returning the derivative at time t and state x, or None for deferred registration.
         algorithm: one of 'euler', 'verlet', 'rk2', 'rk4'
         """
         super().__init__()
-        self.dynamics = dynamics
+        self.dynamics = dynamics if dynamics is not None else (lambda t, x: 0.0)
         self.dt_graph = None
         self.algorithm = algorithm.lower()
         self._algorithms = {
@@ -59,6 +60,7 @@ class Integrator(DtCompatibleEngine):
             "rk4": RK4Integrator(),
         }
         self._state = None
+        self.archive = archive or StateTableArchive()
 
     def register_dt_graph(self, dt_graph: object):
         """
@@ -109,6 +111,15 @@ class Integrator(DtCompatibleEngine):
         self._state = x
         self.world_time = t + dt
         metrics = None  # Could be extended to return integration error, etc.
+        if state_table is not None:
+            # Attach archive to state_table for external access
+            if getattr(state_table, "archive", None) is None:
+                state_table.archive = self.archive
+            t_vec = (self.world_time,)
+            try:
+                self.archive.insert(t_vec, state_table)
+            except Exception:
+                pass
         return True, metrics, self._state
 
     def get_state(self, state=None) -> object:

@@ -41,7 +41,7 @@ class RoundNodeEngine(DtCompatibleEngine):
         try:
             if is_enabled():
                 dbg("roundnode").debug(f"step: dt={float(dt):.6g} inner={self.inner.label}")
-            res = self.runner.run_round(self.inner)
+            res = self.runner.run_round(self.inner, state_table=state_table)
         finally:
             self.inner.plan = saved
         m = res.metrics or Metrics(0.0, 0.0, 0.0, 0.0)
@@ -50,9 +50,13 @@ class RoundNodeEngine(DtCompatibleEngine):
         # Return new state if possible
         return True, m, self.runner.get_state() if hasattr(self.runner, 'get_state') else None
 
-    def step_realtime(self, dt: float) -> tuple[bool, Metrics]:  # pragma: no cover - exercised via demo
+    def step_realtime(self, dt: float, state=None, state_table=None) -> tuple[bool, Metrics]:  # pragma: no cover - exercised via demo
         if self.runner is None:
             self.runner = MetaLoopRunner()
+
+        # Optionally update runner state from state dict
+        if hasattr(self.runner, 'restore') and state is not None:
+            self.runner.restore(state)
 
         # Ensure the runner has a realtime config. If not, create one using
         # the provided dt as the budget.
@@ -70,7 +74,7 @@ class RoundNodeEngine(DtCompatibleEngine):
             if is_enabled():
                 dbg("roundnode").debug(f"step_realtime: dt={float(dt):.6g} inner={self.inner.label}")
             # We don't pass dt to run_round, because the budget is now in the config.
-            res = self.runner.run_round(self.inner, realtime=True)
+            res = self.runner.run_round(self.inner, realtime=True, state_table=state_table)
             m = res.metrics or Metrics(0.0, 0.0, 0.0, 0.0)
             if is_enabled():
                 dbg("roundnode").debug(f"step_realtime done: metrics=({pretty_metrics(m)})")

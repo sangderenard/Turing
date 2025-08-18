@@ -62,7 +62,7 @@ class CausalEvolutionMap:
 
     # Placeholder for future: percentile ordering, risk analysis, region grouping, etc.
 import bisect
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
 class CausalRegionView:
     def state_table_mask(self, query_spatial: tuple, query_t: float) -> dict:
