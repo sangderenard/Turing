@@ -38,6 +38,10 @@ class DtCompatibleEngine:
     lightweight path.
     """
 
+    world_time: float = 0.0
+    observer_time: float = 0.0
+    causal_ceiling_dt: float = float('inf')
+
     def step(self, dt: float, state, state_table) -> tuple[bool, Metrics]:  # pragma: no cover - interface
         raise NotImplementedError
 
@@ -45,6 +49,20 @@ class DtCompatibleEngine:
     def step_with_state(
         self, state: object, dt: float, *, realtime: bool = False, state_table = None
     ) -> tuple[bool, Metrics, object]:  # pragma: no cover - default bridge
+        
+        self.world_time += dt
+
+        if isinstance(self.causal_ceiling_dt, float) and self.causal_ceiling_dt < dt or isinstance(self.causal_ceiling_dt, Callable) and self.causal_ceiling_dt() < dt:
+            ceiling = self.causal_ceiling_dt if isinstance(self.causal_ceiling_dt, float) else self.causal_ceiling_dt()
+            if realtime:
+                ceiling *= 1e2
+            
+            slip = dt - ceiling
+            dt = ceiling
+
+        #shift observer
+        self.observer_time += dt
+
         if state_table is None:
             state_table = getattr(self, '_state_table', None)
         if state_table is None:

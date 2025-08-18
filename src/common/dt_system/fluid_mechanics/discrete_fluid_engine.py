@@ -126,6 +126,9 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
                 bounds_min=(float(sim_min[0]), float(sim_min[1]), float(sim_min[2])),
                 bounds_max=(float(sim_max[0]), float(sim_max[1]), float(sim_max[2])),
             )
+        else:
+            exit()
+        self.causal_ceiling_dt = getattr(self.sim, "_stable_dt", None)
 
     # -------- Bridge factories ------------------------------------------------
     @classmethod
@@ -210,6 +213,23 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         except Exception:
             return None
 
+    def _validate_input(self, input_array):
+        """ run a battery of tests for numeric stability"""
+        if not isinstance(input_array, np.ndarray):
+            raise TypeError("Input must be a numpy array")
+        if input_array.ndim != 2:
+            raise ValueError("Input array must be 2D")
+        if input_array.shape[1] != 3:
+            raise ValueError("Input array must have shape (N, 3)")
+        
+        #finite check
+        if not np.isfinite(input_array).all():
+            raise ValueError("Input array contains non-finite values")
+        
+        #nan check
+        if np.isnan(input_array).any():
+            raise ValueError("Input array contains NaN values")
+
     def restore(self, snap) -> None:  # pragma: no cover
         sim = self.sim
         try:
@@ -258,7 +278,7 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
             # Return a failure tuple to trigger controller retries/halving
             metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=1e9, mass_err=1e9)
             return False, metrics, self.get_state()
-
+        self._validate_input(self.sim.v)
         # Compute metrics conservatively
         try:
             if getattr(self.sim, "N", 0) > 0:
@@ -295,6 +315,9 @@ class BathDiscreteFluidEngine(DtCompatibleEngine):
         if is_enabled():
             dbg("eng.bath").debug(f"done: {pretty_metrics(metrics)} vmin={vmin:.3e}")
         # Return new state object
+
+        self.causal_ceiling_dt = getattr(self.sim, "_stable_dt", None)
+
         return True, metrics, self.get_state()
 
 

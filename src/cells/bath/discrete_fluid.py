@@ -232,6 +232,7 @@ class DiscreteFluid:
         """
         from src.common.sim_hooks import SimHooks
 
+
         hooks = hooks or SimHooks()
         if is_enabled():
             try:
