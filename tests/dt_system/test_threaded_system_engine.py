@@ -17,7 +17,6 @@ class _PointsEngine(DtCompatibleEngine):
 
     def step(self, dt: float, state=None, state_table=None):
         self.t += float(dt)
-        # Circle in XY for first 4 pts; static others
         n = self.pos.shape[0]
         k = np.arange(n // 2, dtype=np.float32)
         ang = self.t + k * 0.25
@@ -25,8 +24,10 @@ class _PointsEngine(DtCompatibleEngine):
         self.pos[: n // 2, 1] = np.sin(ang)
         vmax = float(np.max(np.abs(self.pos[: n // 2, :2]))) if n > 0 else 0.0
         if state_table is not None:
-            if self._uuid is None:
-                self._uuid = state_table.register_identity(pos=self.pos[0].tolist(), mass=1.0)
+            if not getattr(self, "_registration", None):
+                schema = lambda _: {"pos": self.pos[0].tolist(), "mass": 1.0}
+                self.register(state_table, schema, [0])
+                self._uuid = next(iter(self._registration))
             else:
                 state_table.update_identity(self._uuid, pos=self.pos[0].tolist())
         return True, Metrics(max_vel=vmax, max_flux=vmax, div_inf=0.0, mass_err=0.0)
