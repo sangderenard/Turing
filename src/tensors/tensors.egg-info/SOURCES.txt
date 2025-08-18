@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+tensors.egg-info/PKG-INFO
+tensors.egg-info/SOURCES.txt
+tensors.egg-info/dependency_links.txt
+tensors.egg-info/requires.txt
+tensors.egg-info/top_level.txt

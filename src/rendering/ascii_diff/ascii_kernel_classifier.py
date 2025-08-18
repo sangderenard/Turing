@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from tensors import (
+from src.tensors import (
     AbstractTensor,
     Faculty,
 )
@@ -17,7 +17,7 @@ try:
 except ImportError:
     SSIM_AVAILABLE = False
 
-from fontmapper.FM16.modules.charset_ops import obtain_charset
+from .charset_ops import obtain_charset
 
 
 def _backend_numpy(ops: AbstractTensor) -> bool:

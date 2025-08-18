@@ -1,0 +1,70 @@
+[tool.poetry]
+name = "tensors"
+version = "0.1.0"
+description = "Tensor backends and abstraction layer"
+authors = ["Tensors Authors"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+
+[tool.poetry.group.jax]
+optional = true
+
+[tool.poetry.group.jax.dependencies]
+"jax[cpu]" = ">=0.4"
+
+[tool.poetry.group.ctensor]
+optional = true
+
+[tool.poetry.group.ctensor.dependencies]
+cffi = ">=1.15"
+setuptools = ">=61"
+ziglang = ">=0.14"
+
+[tool.poetry.group.torch]
+optional = true
+
+[tool.poetry.group.torch.dependencies]
+torch = "*"
+
+[tool.poetry.group.numpy]
+optional = true
+
+[tool.poetry.group.numpy.dependencies]
+numpy = ">=1.26,<2.3"
+
+[tool.poetry.group.opengl]
+optional = true
+
+[tool.poetry.group.opengl.dependencies]
+PyOpenGL = ">=3.1"
+glfw = "*"
+numpy = ">=1.26,<2.3"
+
+[tool.poetry.group.rust]
+optional = true
+
+[tool.poetry.group.rust.dependencies]
+maturin = ">=1.5"
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+tools = {path = "../AGENTS/tools", develop = true}
+
+[tool.poetry.extras]
+jax = []
+ctensor = []
+torch = []
+numpy = []
+opengl = []
+rust = []
+dev = []
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
