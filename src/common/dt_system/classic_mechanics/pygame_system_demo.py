@@ -141,7 +141,7 @@ def build_craft(name: str, anchor: Tuple[float, float], color=(255, 200, 40), *,
 # ---------------- Parent graph + pygame loop ---------------------
 
 def _run_demo(
-    *, width: int = 1000, height: int = 700, fps: int = 60, debug: bool = False, classic: bool = False
+    *, width: int = 1000, height: int = 700, fps: int = 2, debug: bool = False, classic: bool = True
 ) -> None:
     if debug:
         # Also set env so any subprocesses/threads see it

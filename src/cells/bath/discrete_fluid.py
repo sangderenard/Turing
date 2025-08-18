@@ -235,6 +235,7 @@ class DiscreteFluid:
         hooks = hooks or SimHooks()
         if is_enabled():
             try:
+                
                 vmax0 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
             except Exception:
                 vmax0 = 0.0
@@ -245,6 +246,7 @@ class DiscreteFluid:
         self._substep(float(dt))
         hooks.run_post(self, float(dt))
         if is_enabled():
+
             try:
                 vmax1 = float(np.max(np.linalg.norm(self.v, axis=1))) if self.N > 0 else 0.0
                 rho_min = float(np.min(self.rho)) if self.N > 0 else 0.0
