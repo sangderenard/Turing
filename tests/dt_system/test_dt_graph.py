@@ -15,6 +15,16 @@ from src.common.dt_system.dt_graph import (
 from src.cells.bath.dt_controller import STController, Targets
 from src.common.dt_system.dt_scaler import Metrics
 from src.common.dt_system.state_table import StateTable
+from src.common.dt_system.engine_api import DtCompatibleEngine, EngineRegistration
+from src.common.dt_system.dt_graph import GraphBuilder
+
+
+class TrivialEngine(DtCompatibleEngine):
+    def step(self, dt: float, state=None, state_table=None):
+        return True, Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0), state
+
+    def get_state(self, state=None):  # pragma: no cover - simple passthrough
+        return state
 
 
 class DummyState:
@@ -92,3 +102,22 @@ def test_nested_rounds_delegate_dt():
     assert math.isclose(inner.t, plan_outer.round_max, rel_tol=0, abs_tol=plan_outer.eps)
     # Two advance nodes should have registered identities
     assert len(table.identity_registry) == 2
+
+
+@pytest.mark.dt
+@pytest.mark.dt_graph
+def test_graphbuilder_appends_integrator_and_archives_state():
+    table = StateTable()
+    eng = TrivialEngine()
+    eng.register(table, lambda _: {"pos": (0.0, 0.0), "mass": 0.0}, [0])
+    targets = Targets(cfl=1.0, div_max=1.0, mass_max=1.0)
+    ctrl = STController(dt_min=1e-6)
+    reg = EngineRegistration(name="dummy", engine=eng, targets=targets, dx=0.1, localize=False)
+    gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=0.1)
+    round_node = gb.round(dt=0.1, engines=[reg], state_table=table)
+    labels = [getattr(ch, "label", "") for ch in round_node.children]
+    assert any("integrator" in lab for lab in labels)
+    runner = MetaLoopRunner(state_table=table)
+    runner.run_round(round_node, state_table=table)
+    assert getattr(table, "archive", None) is not None
+    assert len(table.archive.t_vectors) == 1
