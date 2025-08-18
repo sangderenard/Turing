@@ -46,7 +46,7 @@ from src.cells.bath.discrete_fluid import DiscreteFluid
 from ..debug import enable as enable_debug
 from ..dt_solver import BisectSolverConfig
 from ..solids.api import GLOBAL_WORLD, WorldPlane, MATERIAL_ELASTIC
-from render_chooser import RenderChooser
+from src.render_chooser import RenderChooser
 # Tip: to run a bisect-based dt solver for a specific engine, pass
 # EngineRegistration(..., solver_config=BisectSolverConfig(target=..., field="div_inf"))
 # when building the graph. See src/common/dt_system/dt_solver.py for details.
