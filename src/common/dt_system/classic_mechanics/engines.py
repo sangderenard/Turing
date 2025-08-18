@@ -651,16 +651,18 @@ class MetaCollisionEngine(DtCompatibleEngine):
         self,
         states: List[DemoState],
         *,
-    restitution: float = 0.2,
-    friction_mu: float = 0.5,
-    body_radius: float = 0.12,
-    solids: "SolidRegistry" | None = None,
-    world: "WorldConfinement" | None = None,
-    plastic_beta: float = 0.0,
-    enable_plastic_relax: bool = False,
-    softbody_contact_cb: Optional[Callable[[Contact], None]] = None,
+        assemblies: Optional[List[IdentityAssembly]] = None,
+        restitution: float = 0.2,
+        friction_mu: float = 0.5,
+        body_radius: float = 0.12,
+        solids: "SolidRegistry" | None = None,
+        world: "WorldConfinement" | None = None,
+        plastic_beta: float = 0.0,
+        enable_plastic_relax: bool = False,
+        softbody_contact_cb: Optional[Callable[[Contact], None]] = None,
     ) -> None:
         self.states = states
+        self.assemblies = assemblies or [None] * len(states)
         self.e = float(max(0.0, min(1.0, restitution)))
         self.mu = float(max(0.0, friction_mu))
         self.r = float(max(1e-6, body_radius))
@@ -687,10 +689,12 @@ class MetaCollisionEngine(DtCompatibleEngine):
     def _apply_springs_dampers(self, dt: float, state_table) -> None:
         if state_table is None:
             raise ValueError("MetaCollisionEngine requires a StateTable for spring/damper evaluation.")
-        for s in self.states:
-            # accumulate spring and damper accelerations
-            _ = SpringEngine(s).step(dt, s, state_table)
-            _ = PneumaticDamperEngine(s).step(dt, s, state_table)
+        for idx, s in enumerate(self.states):
+            asm = None
+            if self.assemblies and idx < len(self.assemblies):
+                asm = self.assemblies[idx]
+            _ = SpringEngine(s, assembly=asm).step(dt, s, state_table)
+            _ = PneumaticDamperEngine(s, assembly=asm).step(dt, s, state_table)
 
     def _integrate(self, dt: float) -> None:
         # Semi-implicit Euler (same as IntegratorEngine)
