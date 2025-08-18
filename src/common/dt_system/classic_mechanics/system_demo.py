@@ -152,14 +152,20 @@ def build_craft(
 # ---------------- Parent graph + rendering loop ------------------
 
 def _run_demo(
-    *, width: int = 1000, height: int = 700, fps: int = 2, debug: bool = False, classic: bool = True
+    *,
+    width: int = 1000,
+    height: int = 700,
+    fps: int = 2,
+    debug: bool = False,
+    classic: bool = True,
+    renderer: str | None = None,
 ) -> None:
     if debug:
         # Also set env so any subprocesses/threads see it
         os.environ["TURING_DT_DEBUG"] = "1"
         enable_debug(True)
 
-    chooser = RenderChooser(width, height)
+    chooser = RenderChooser(width, height, mode=renderer)
 
     # Set up a simple world cage so fluids wrap within bounds and crafts hit walls
     world = GLOBAL_WORLD
@@ -536,7 +542,20 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("--width", type=int, default=1000)
     parser.add_argument("--height", type=int, default=700)
     parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument(
+        "--renderer",
+        choices=["ascii", "pygame", "opengl", "auto"],
+        default="ascii",
+        help="renderer backend (default: ascii)",
+    )
     args = parser.parse_args()
     # Default to preview mode; set TURING_CLASSIC=1 to force classic if desired
     classic_env = os.environ.get("TURING_CLASSIC", "0") not in ("0", "false", "False", "no", "No", "")
-    _run_demo(width=args.width, height=args.height, fps=args.fps, debug=args.debug, classic=classic_env)
+    _run_demo(
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        debug=args.debug,
+        classic=classic_env,
+        renderer=args.renderer,
+    )
