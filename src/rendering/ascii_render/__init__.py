@@ -12,6 +12,14 @@ from typing import Tuple
 
 import numpy as np
 
+# Import relevant ascii_diff components
+from src.rendering.ascii_diff import (
+    draw_diff,
+    PixelFrameBuffer,
+    default_subunit_batch_to_chars,
+    DEFAULT_DRAW_ASCII_RAMP,
+)
+
 __all__ = ["AsciiRenderer"]
 
 
@@ -137,3 +145,27 @@ class AsciiRenderer:
         idx = (norm * (len(self.ramp) - 1)).astype(int)
         rows = ["".join(self.ramp[row]) for row in idx]
         return "\n".join(rows)
+
+    # -- ascii_diff integration ------------------------------------------------
+    def to_ascii_diff(self, prev_buffer=None, ramp=None) -> str:
+        """
+        Convert the current canvas (double buffer) into an abstract tensor and use ascii_diff to display.
+        Optionally takes a previous buffer for diffing.
+        """
+        # Convert canvas to 2D if needed (collapse depth)
+        if self.canvas.shape[2] == 1:
+            tensor = self.canvas[..., 0]
+        else:
+            tensor = self.canvas.mean(axis=2)
+
+        # Create PixelFrameBuffer from tensor
+        fb = PixelFrameBuffer(tensor)
+
+        # If previous buffer is provided, do diff; else just render current
+        if prev_buffer is not None:
+            diff = draw_diff(prev_buffer, fb, ramp or DEFAULT_DRAW_ASCII_RAMP)
+        else:
+            # No diff, just render current buffer as ascii
+            diff = default_subunit_batch_to_chars(fb.buffer, ramp or DEFAULT_DRAW_ASCII_RAMP)
+            diff = "\n".join(["".join(row) for row in diff])
+        return diff
