@@ -44,6 +44,21 @@ A hyperlinked index of modules and capabilities in this repository.
 - [src/hardware/lane_tuner.py](src/hardware/lane_tuner.py)
 - [src/hardware/nand_wave.py](src/hardware/nand_wave.py)
 
+## src/tensors
+
+- [src/tensors/__init__.py](src/tensors/__init__.py)
+- [src/tensors/abstraction.py](src/tensors/abstraction.py)
+- [src/tensors/pure_backend.py](src/tensors/pure_backend.py)
+- [src/tensors/numpy_backend.py](src/tensors/numpy_backend.py)
+- [src/tensors/torch_backend.py](src/tensors/torch_backend.py)
+- [src/tensors/jax_backend.py](src/tensors/jax_backend.py)
+- accelerator_backends
+  - [src/tensors/accelerator_backends/c_backend.py](src/tensors/accelerator_backends/c_backend.py)
+  - [src/tensors/accelerator_backends/rust_backend/__init__.py](src/tensors/accelerator_backends/rust_backend/__init__.py)
+  - [src/tensors/accelerator_backends/glsl_kernels/__init__.py](src/tensors/accelerator_backends/glsl_kernels/__init__.py)
+- models
+  - [src/tensors/models/__init__.py](src/tensors/models/__init__.py)
+
 ## src/turing_machine
 
 - [src/turing_machine/__init__.py](src/turing_machine/__init__.py)
