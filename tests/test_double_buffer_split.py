@@ -26,8 +26,8 @@ def test_lock_graph_init():
 def test_tribuffer_basic():
     try:
         tb = Tribuffer(keys=['a'], shapes=[(2,)], type='float', depth='32')
-    except NotImplementedError:
-        pytest.skip("pin_memory not supported")
+    except (NotImplementedError, AttributeError):
+        pytest.skip("torch or pin_memory not supported")
     assert 'a' in tb.data
     tb.sync_manager.shutdown()
 
@@ -38,12 +38,21 @@ def test_double_buffer_basic():
     assert db.read_frame(agent_idx=1) is None
 
 
+def test_double_buffer_custom_frames():
+    frames = np.zeros(4)
+    db = DoubleBuffer(num_agents=1, frames=frames)
+    db.write_frame(1.0, agent_idx=0)
+    assert db.read_frame(agent_idx=0) == pytest.approx(1.0)
+    # Second read should yield nothing even though frames container retains value
+    assert db.read_frame(agent_idx=0) is None
+
+
 def test_thread_safe_buffer_init():
     spec = AgentSpec(0, 'numpy', 'cpu')
     try:
         buf = ThreadSafeBuffer(shape=(2, 2), dtype='float', agent_specs=[spec], manager=None)
-    except NotImplementedError:
-        pytest.skip("pin_memory not supported")
+    except (NotImplementedError, AttributeError):
+        pytest.skip("torch or pin_memory not supported")
     assert buf.shape[0] == 2
     buf.manager.shutdown()
 

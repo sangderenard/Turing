@@ -1,5 +1,9 @@
 from ..double_buffer.base import *
-from ..double_buffer.workers import AsyncCPUSyncWorker, AsyncGPUSyncWorker
+try:  # Optional sync workers require torch
+    from ..double_buffer.workers import AsyncCPUSyncWorker, AsyncGPUSyncWorker
+except Exception:  # pragma: no cover - missing optional deps
+    AsyncCPUSyncWorker = None  # type: ignore
+    AsyncGPUSyncWorker = None  # type: ignore
 from ..double_buffer.lock import LockManagerThread, LockGraph
 
 
