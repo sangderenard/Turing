@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import numpy as np
 from colorama import Style, Fore, Back
+from pathlib import Path
 from .ascii_kernel_classifier import AsciiKernelClassifier
 
 
@@ -62,6 +63,9 @@ _classifier_cache = {
     "classifier": None,
 }
 
+# Module-relative default font path
+DEFAULT_FONT_PATH = Path(__file__).with_name("consola.ttf")
+
 def default_subunit_batch_to_chars(
     subunit_batch: np.ndarray,
     ramp: str = DEFAULT_DRAW_ASCII_RAMP,
@@ -79,7 +83,7 @@ def default_subunit_batch_to_chars(
         # AsciiKernelClassifier expects char_size as (width, height)
         classifier = AsciiKernelClassifier(ramp, char_size=(char_width, char_height))
         # font_size is for rendering reference characters, which are then scaled to char_size
-        classifier.set_font(font_path="C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\consola.ttf", font_size=16, char_size=(char_width, char_height))
+        classifier.set_font(font_path=str(DEFAULT_FONT_PATH), font_size=16, char_size=(char_width, char_height))
         _classifier_cache["ramp_char_size"] = cache_key
         _classifier_cache["classifier"] = classifier
     else:

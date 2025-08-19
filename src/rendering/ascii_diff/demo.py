@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from PIL import Image
 import numpy as np
 import sys
@@ -13,6 +14,9 @@ from .draw import (
     default_subunit_batch_to_chars,
 )
 from .console import full_clear_and_reset_cursor, reset_cursor_to_top
+
+# Module-relative default image path
+DEFAULT_IMAGE_PATH = Path(__file__).with_name("analogback.png")
 
 
 def load_pixels(path: str) -> np.ndarray:
@@ -44,7 +48,6 @@ def main(image_path: str) -> None:
 
 
 if __name__ == "__main__":
-    import sys
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\analogback.png"
-    main(img_path)
+    img_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_IMAGE_PATH
+    main(str(img_path))
 

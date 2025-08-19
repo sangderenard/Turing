@@ -37,8 +37,31 @@ def register_conversion(*args, **kwargs):
 CONVERSION_REGISTRY = dict()
 DEBUG = False
 class ShapeAccessor:
+    """Utility wrapper exposing tensor ``shape`` like NumPy/PyTorch."""
+
     def __init__(self, tensor):
         self.tensor = tensor
+
+    def _shape_tuple(self) -> tuple[int, ...]:
+        """Fetch the concrete shape tuple from the underlying tensor."""
+        # ``shape_`` is the backend hook returning a tuple[int, ...]
+        return self.tensor.shape_()
+
+    # Iterable / sequence protocol -------------------------------------------------
+    def __call__(self) -> tuple[int, ...]:
+        return self._shape_tuple()
+
+    def __iter__(self):
+        return iter(self._shape_tuple())
+
+    def __len__(self) -> int:
+        return len(self._shape_tuple())
+
+    def __getitem__(self, idx):
+        return self._shape_tuple()[idx]
+
+    def __repr__(self) -> str:
+        return repr(self._shape_tuple())
 
 
 # --- Backend Registry Pattern ---

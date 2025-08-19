@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from ...tensors import AbstractTensor, Faculty
@@ -26,18 +27,21 @@ def _backend_torch(ops: AbstractTensor) -> bool:
     """Return True if ``ops`` uses a PyTorch backend."""
     return isinstance(ops, PyTorchTensorOperations)
 
+DEFAULT_FONT_PATH = Path(__file__).with_name("consola.ttf")
+
+
 class AsciiKernelClassifier:
     def __init__(
         self,
         ramp: str,
-        font_path: str = "C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\consola.ttf",
+        font_path: str | Path = DEFAULT_FONT_PATH,
         font_size: int = 16,
         char_size: tuple[int, int] = (16, 16),
         loss_mode: str = "sad",
     ) -> None:
         self.ramp = ramp
         self.vocab_size = len(ramp)
-        self.font_path = font_path
+        self.font_path = str(font_path)
         self.font_size = font_size
         self.char_size = char_size
         self.loss_mode = loss_mode  # "sad" or "ssim"
