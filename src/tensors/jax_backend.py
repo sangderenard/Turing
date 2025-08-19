@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Any, Tuple, List, Optional
 
-from .abstraction import AbstractTensor
+
 
 try:
     import jax
@@ -45,6 +45,8 @@ except Exception:
     import sys
     print("JAX backend failed to import")
     sys.exit(1)
+
+from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
     """Tensor operations powered by `jax.numpy`."""
@@ -85,8 +87,9 @@ class JAXTensorOperations(AbstractTensor):
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         """Apply arithmetic ops using JAX arrays."""
-        a = self._to_jnp(left)
-        b = self._to_jnp(right)
+        from .abstraction import AbstractTensor
+        a = self._to_jnp(left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left)
+        b = self._to_jnp(right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
@@ -255,15 +258,25 @@ class JAXTensorOperations(AbstractTensor):
     def sqrt_(self, tensor: Any) -> Any:
         return jnp.sqrt(self._to_jnp(tensor))
 
-    def tensor_from_list_(self, data: List[Any], dtype: Any, device: Any) -> Any:
+    def tensor_from_list_(self, data: list, dtype: Any, device: Any) -> Any:
+        if not isinstance(data, (list, tuple)):
+            try:
+                data = data.tolist()
+                auto_converted = True
+            except Exception:
+                auto_converted = False
+        else:
+            auto_converted = False
+        if auto_converted:
+            print("[TensorBackend:jax] Auto-converted input to list for tensor_from_list_()")
         arr = jnp.array(data, dtype=dtype)
         return jax.device_put(arr, device or self.default_device)
 
     def boolean_mask_select_(self, tensor: Any, mask: Any) -> Any:
         return self._to_jnp(tensor)[mask]
 
-    def tolist_(self, tensor: Any) -> List[Any]:
-        return list(self._to_jnp(tensor).tolist())
+    def tolist_(self) -> list:
+        return list(self._to_jnp(self.data).tolist())
 
     def less_(self, tensor: Any, value: Any) -> Any:
         return jnp.less(self._to_jnp(tensor), value)
@@ -401,3 +414,12 @@ class JAXTensorOperations(AbstractTensor):
 
     def get_ndims(self) -> int:
         return self.data.ndim
+
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        inst = cls(track_time=False)
+        inst.data = inst.tensor_from_list_(data, dtype, device)
+        return inst
+
+from .abstraction import register_backend
+register_backend("jax", JAXTensorOperations)

@@ -27,11 +27,9 @@
 # AbstractTensor. Backend implementations provide only the raw
 # tensor operations.
 
+
 try:
     from typing import Any, Tuple, List, Optional, Union
-
-    from .abstraction import AbstractTensor
-
     import torch
     import torch.nn.functional as F
 except ModuleNotFoundError:
@@ -42,15 +40,20 @@ except Exception:
     print("PyTorch backend failed to import")
     sys.exit(1)
 
+from .abstraction import AbstractTensor
+
 class PyTorchTensorOperations(AbstractTensor):
-    def __init__(self, default_device: Union[str, "torch.device"] = "cpu", track_time: bool = False):
+    def __init__(self, default_device = "cpu", track_time: bool = False):
         super().__init__(track_time=track_time)
-        if torch is None:
+        try:
+            import torch
+        except ImportError:
             raise RuntimeError("PyTorch is required for this backend")
         self.default_device = torch.device(default_device)
 
-    def _apply_operator__(self, op: str, left: Any, right: Any):
+    def _apply_operator__(self, op, left, right):
         """Delegate arithmetic ops to PyTorch tensors. Always unwrap to raw tensors."""
+        # torch is imported in __init__ and assigned to self._torch
         a = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
         b = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
         
@@ -131,6 +134,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return self.data.bool()
 
     def not_equal_(self, other):
+        from .abstraction import AbstractTensor
         return self.data != (other.data if isinstance(other, AbstractTensor) else other)
 
     def arange_(self, start, end=None, step=1, device=None, dtype=None):
@@ -148,6 +152,8 @@ class PyTorchTensorOperations(AbstractTensor):
         return F.pad(self.data, pad, value=value)
 
     def cat_(self, tensors, dim=0):
+        from .abstraction import AbstractTensor
+        # torch is imported in __init__ and assigned to self._torch
         tensors = [t.data if isinstance(t, AbstractTensor) else t for t in tensors]
         return torch.cat(tensors, dim=dim)
 
@@ -155,6 +161,8 @@ class PyTorchTensorOperations(AbstractTensor):
         return torch.topk(self.data, k=k, dim=dim)
 
     def stack_(self, tensors, dim=0):
+        from .abstraction import AbstractTensor
+        # torch is imported in __init__ and assigned to self._torch
         tensors = [t.data if isinstance(t, AbstractTensor) else t for t in tensors]
         return torch.stack(tensors, dim=dim)
 
@@ -191,6 +199,17 @@ class PyTorchTensorOperations(AbstractTensor):
         return torch.sqrt(self.data)
 
     def tensor_from_list_(self, data, dtype, device):
+        if not isinstance(data, (list, tuple)):
+            # If not a list/tuple, try to convert to list (e.g., numpy array)
+            try:
+                data = data.tolist()
+                auto_converted = True
+            except Exception:
+                auto_converted = False
+        else:
+            auto_converted = False
+        if auto_converted:
+            print("[TensorBackend:torch] Auto-converted input to list for tensor_from_list_()")
         return torch.tensor(data, dtype=dtype, device=device or self.default_device)
 
     def boolean_mask_select_(self, mask):
@@ -265,7 +284,7 @@ class PyTorchTensorOperations(AbstractTensor):
     def from_numpy(source_ops, tensor, target_ops):
         if tensor is None:
             raise ValueError("from_numpy called with tensor=None")
-        import torch
+        # torch is imported in __init__ and assigned to self._torch
         arr = tensor.data if hasattr(tensor, "data") else tensor
         result = type(target_ops)(default_device=target_ops.default_device)
         result.data = torch.from_numpy(arr).to(target_ops.default_device)
@@ -283,7 +302,7 @@ class PyTorchTensorOperations(AbstractTensor):
 
     @staticmethod
     def from_pure(source_ops, tensor, target_ops):
-        import torch
+        # torch is imported in __init__ and assigned to self._torch
         data = tensor.data if hasattr(tensor, "data") else tensor
         result = type(target_ops)(default_device=target_ops.default_device)
         result.data = torch.tensor(data, device=target_ops.default_device)
@@ -291,7 +310,7 @@ class PyTorchTensorOperations(AbstractTensor):
 
     @staticmethod
     def from_jax(source_ops, tensor, target_ops):
-        import torch
+        # torch is imported in __init__ and assigned to self._torch
         import numpy as np
         arr = tensor.data if hasattr(tensor, "data") else tensor
         np_array = np.array(arr)
@@ -315,10 +334,19 @@ class PyTorchTensorOperations(AbstractTensor):
         else:
             return self.data.float()
 
-    def repeat_(self, repeats: Any = None, dim: int = 0) -> "AbstractTensor":
+    def repeat_(self, repeats = None, dim: int = 0):
         t = self.data
         repeated = t.repeat(*repeats) if isinstance(repeats, (list, tuple)) else t.repeat(repeats)
         result = type(self)(default_device=self.default_device)
         result.data = repeated
         return result
+
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        inst = cls(track_time=False)
+        inst.data = inst.tensor_from_list_(data, dtype, device)
+        return inst
+
+from .abstraction import register_backend
+register_backend("torch", PyTorchTensorOperations)
 

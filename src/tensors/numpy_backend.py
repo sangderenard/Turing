@@ -29,7 +29,10 @@
 
 from typing import Any, Tuple, List, Optional
 
-from .abstraction import AbstractTensor
+
+from .abstraction import AbstractTensor, register_backend
+
+
 
 try:
     import numpy as np
@@ -51,8 +54,9 @@ class NumPyTensorOperations(AbstractTensor):
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         """Apply arithmetic operators on NumPy arrays."""
-        a = np.array(left) if not isinstance(left, np.ndarray) else left
-        b = np.array(right) if not isinstance(right, np.ndarray) else right
+        from .abstraction import AbstractTensor
+        a = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
+        b = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
@@ -264,6 +268,16 @@ class NumPyTensorOperations(AbstractTensor):
         return np.sqrt(self._AbstractTensor__unwrap(tensor))
 
     def tensor_from_list_(self, data, dtype, device):
+        if not isinstance(data, (list, tuple)):
+            try:
+                data = data.tolist()
+                auto_converted = True
+            except Exception:
+                auto_converted = False
+        else:
+            auto_converted = False
+        if auto_converted:
+            print("[TensorBackend:numpy] Auto-converted input to list for tensor_from_list_()")
         return np.array(data, dtype=self._torch_dtype_to_numpy(dtype))
 
     def boolean_mask_select_(self, tensor, mask):
@@ -271,8 +285,8 @@ class NumPyTensorOperations(AbstractTensor):
         m = self._AbstractTensor__unwrap(mask)
         return tensor[m]
 
-    def tolist_(self, tensor):
-        return self._AbstractTensor__unwrap(tensor).tolist()
+    def tolist_(self):
+        return self._AbstractTensor__unwrap(self.data).tolist()
 
     def less_(self, tensor, value):
         return self._AbstractTensor__unwrap(tensor) < value
@@ -391,3 +405,11 @@ class NumPyTensorOperations(AbstractTensor):
 
     def get_ndims(self) -> int:
         return self.data.ndim
+
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        inst = cls(track_time=False)
+        inst.data = inst.tensor_from_list_(data, dtype, device)
+        return inst
+
+register_backend("numpy", NumPyTensorOperations)

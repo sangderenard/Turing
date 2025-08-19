@@ -33,9 +33,11 @@ from typing import Any, Tuple, Optional, List
 import math
 import json
 
-from .abstraction import AbstractTensor, _get_shape, _flatten
+from .abstraction import _get_shape, _flatten, register_backend
 
 
+
+from .abstraction import AbstractTensor
 
 class PurePythonTensorOperations(AbstractTensor):
     """Educational tensor ops using nested Python lists."""
@@ -60,8 +62,9 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         """Dispatch basic arithmetic for nested lists."""
-        left = self._AbstractTensor__unwrap(left)
-        right = self._AbstractTensor__unwrap(right)
+        from .abstraction import AbstractTensor
+        left = self._AbstractTensor__unwrap(left) if isinstance(left, AbstractTensor) else left
+        right = self._AbstractTensor__unwrap(right) if isinstance(right, AbstractTensor) else right
         if op in {"matmul", "rmatmul", "imatmul"}:
             a, b = (left, right) if op != "rmatmul" else (right, left)
             return self._matmul(a, b)
@@ -407,7 +410,17 @@ class PurePythonTensorOperations(AbstractTensor):
             return [self.sqrt_(item) for item in tensor]
         return math.sqrt(tensor)
 
-    def tensor_from_list_(self, data: List[Any], dtype: Any, device: Any) -> Any:
+    def tensor_from_list_(self, data: list, dtype: Any, device: Any) -> Any:
+        if not isinstance(data, (list, tuple)):
+            try:
+                data = data.tolist()
+                auto_converted = True
+            except Exception:
+                auto_converted = False
+        else:
+            auto_converted = False
+        if auto_converted:
+            print("[TensorBackend:pure] Auto-converted input to list for tensor_from_list_()")
         return data
 
     def boolean_mask_select_(self, tensor: Any, mask: Any) -> Any:
@@ -421,9 +434,8 @@ class PurePythonTensorOperations(AbstractTensor):
             raise NotImplementedError("boolean_mask_select only supports flat lists with boolean mask")
         return [tensor[i] for i in range(len(tensor)) if mask[i]]
 
-    def tolist_(self, tensor: Any) -> List[Any]:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        return self.clone_(tensor)
+    def tolist_(self) -> list:
+        return self.clone_(self.data)
 
     def less_(self, tensor: Any, value: Any) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)
@@ -582,3 +594,11 @@ class PurePythonTensorOperations(AbstractTensor):
         if isinstance(tensor, list):
             return [self.to_dtype_(t, dtype) for t in tensor]
         return convert(tensor)
+
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        inst = cls(track_time=False)
+        inst.data = inst.tensor_from_list_(data, dtype, device)
+        return inst
+
+register_backend("pure_python", PurePythonTensorOperations)

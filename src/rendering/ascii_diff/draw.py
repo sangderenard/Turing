@@ -79,7 +79,7 @@ def default_subunit_batch_to_chars(
         # AsciiKernelClassifier expects char_size as (width, height)
         classifier = AsciiKernelClassifier(ramp, char_size=(char_width, char_height))
         # font_size is for rendering reference characters, which are then scaled to char_size
-        classifier.set_font(font_path="fontmapper/FM16/consola.ttf", font_size=16, char_size=(char_width, char_height))
+        classifier.set_font(font_path="C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\consola.ttf", font_size=16, char_size=(char_width, char_height))
         _classifier_cache["ramp_char_size"] = cache_key
         _classifier_cache["classifier"] = classifier
     else:

@@ -4,12 +4,9 @@ from __future__ import annotations
 from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from ...tensors import (
-    AbstractTensor,
-    Faculty,
-    NumPyTensorOperations,
-    PyTorchTensorOperations,
-)
+from ...tensors import AbstractTensor, Faculty
+from ...tensors.numpy_backend import NumPyTensorOperations
+from ...tensors.torch_backend import PyTorchTensorOperations
 
 try:
     from skimage.metrics import structural_similarity as ssim
@@ -33,7 +30,7 @@ class AsciiKernelClassifier:
     def __init__(
         self,
         ramp: str,
-        font_path: str = "fontmapper/FM16/consola.ttf",
+        font_path: str = "C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\consola.ttf",
         font_size: int = 16,
         char_size: tuple[int, int] = (16, 16),
         loss_mode: str = "sad",

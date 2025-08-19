@@ -45,6 +45,6 @@ def main(image_path: str) -> None:
 
 if __name__ == "__main__":
     import sys
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "timesync/analogback.png"
+    img_path = sys.argv[1] if len(sys.argv) > 1 else "C:\\dev\\Powershell\\turing\\src\\rendering\\ascii_diff\\analogback.png"
     main(img_path)
 

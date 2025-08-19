@@ -1,130 +1,86 @@
 """Abstraction layer for tensor operations."""
 from __future__ import annotations
 
+
+from abc import ABC, abstractmethod
+from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque
+import math
+import time
+from collections import deque
+
+# TYPE: Faculty, DEFAULT_FACULTY should be imported from .faculty
 try:
-    from abc import ABC, abstractmethod
-    from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque
-    import math
-    import time
-    from collections import deque
-
     from .faculty import Faculty, DEFAULT_FACULTY
-    DEFAULT_DEVICE = "cpu"
+except ImportError:
+    Faculty = None  # TYPE: ignore
+    DEFAULT_FACULTY = None  # TYPE: ignore
+
+DEFAULT_DEVICE = "cpu"
+
+# Optional dependencies
+try:
     import torch
+except ImportError:
+    torch = None  # TYPE: ignore
+try:
     import numpy as np
+except ImportError:
+    np = None  # TYPE: ignore
+try:
     from .accelerator_backends.c_backend import CTensor
-except ModuleNotFoundError:
-    torch = None  # type: ignore
-    np = None  # type: ignore
-    CTensor = None  # type: ignore
-except Exception:
-    print("Failed to import required modules for tensor operations.")
-    import sys
+except ImportError:
+    CTensor = None  # TYPE: ignore
 
-    sys.exit(1)
-
-CONVERSION_REGISTRY: Dict[
-    Tuple[type, type], Callable[["AbstractTensor", Any, "AbstractTensor"], Any]
-] = {}
-
-OPS_CACHE: Dict[type, "AbstractTensor"] = {}
-
-DEBUG = False  # True
-
-
+# TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, ShapeAccessor, _get_ops_for_class
+def register_conversion(*args, **kwargs):
+    pass
+CONVERSION_REGISTRY = dict()
+DEBUG = False
 class ShapeAccessor:
-    """Proxy object allowing both ``tensor.shape`` and ``tensor.shape()``."""
-
-    def __init__(self, owner: "AbstractTensor") -> None:
-        self.owner = owner
-
-    def __call__(self) -> Tuple[int, ...]:
-        """Return the shape of ``owner`` as a tuple."""
-        return self.owner.shape_()
-
-    def __iter__(self):  # type: ignore[override]
-        return iter(self())
-
-    def __len__(self) -> int:  # type: ignore[override]
-        return len(self())
-
-    def __getitem__(self, idx: int) -> int:  # type: ignore[override]
-        return self()[idx]
-
-    def __repr__(self) -> str:  # type: ignore[override]
-        return repr(self())
+    def __init__(self, tensor):
+        self.tensor = tensor
 
 
-def register_conversion(
-    src_cls: type,
-    tgt_cls: type,
-    func: Callable[["AbstractTensor", Any, "AbstractTensor"], Any],
-) -> None:
-    """Register a direct tensor conversion function."""
-    CONVERSION_REGISTRY[(src_cls, tgt_cls)] = func
+# --- Backend Registry Pattern ---
+# This registry allows dynamic discovery and decoupling of tensor backends.
+# Each backend module registers itself here at import time, avoiding all circular imports.
+BACKEND_REGISTRY: dict[str, type] = {}
+
+def register_backend(name: str, backend_cls: type) -> None:
+    """
+    Register a tensor backend class under a given name.
+    Backends should call this after their class definition.
+    """
+    BACKEND_REGISTRY[name] = backend_cls
+
+# Delayed import to avoid circular dependency
 
 
-def _get_ops_for_class(cls: type) -> "AbstractTensor":
-    if cls in OPS_CACHE:
-        return OPS_CACHE[cls]
-    if cls.__name__.startswith("PyTorch"):
-        ops = AbstractTensor.get_tensor(faculty=Faculty.TORCH)
-    elif cls.__name__.startswith("NumPy"):
-        ops = AbstractTensor.get_tensor(faculty=Faculty.NUMPY)
-    elif cls.__name__.startswith("PurePython"):
-        ops = AbstractTensor.get_tensor(faculty=Faculty.PURE_PYTHON)
-    elif cls.__name__.startswith("JAX"):
-        ops = AbstractTensor.get_tensor(faculty=Faculty.NUMPY)  # approximate
-    else:
-        ops = AbstractTensor.get_tensor()
-    OPS_CACHE[cls] = ops
-    return ops
 
-
-def _find_conversion_path(src_cls: type, tgt_cls: type) -> List[Tuple[type, type]]:
-    if src_cls == tgt_cls:
-        return []
-    q: Deque[Tuple[type, List[Tuple[type, type]]]] = deque([(src_cls, [])])
-    seen = {src_cls}
-    while q:
-        cur, path = q.popleft()
-        if cur == tgt_cls:
-            return path
-        for (a, b), _ in CONVERSION_REGISTRY.items():
-            if a == cur and b not in seen:
-                q.append((b, path + [(a, b)]))
-                seen.add(b)
-    return []
-
-
-class AbstractTensor(ABC):
-    def __init__(self, track_time: bool = False) -> None:
-        """Optional benchmark support for tensor operations."""
-        self.track_time = track_time
-        self.last_op_time: float | None = None
-        self.data = None  # Holds the tensor's data
-
-    def _AbstractTensor__wrap(self, tensor):
-        """Default wrap: should be overridden by backend. Wraps a backend-native tensor."""
-        obj = type(self)()
-        obj.data = tensor
+def _register_all_conversions():
+    NumPyTensorOperations = BACKEND_REGISTRY.get("numpy")
+    PyTorchTensorOperations = BACKEND_REGISTRY.get("torch")
+    JAXTensorOperations = BACKEND_REGISTRY.get("jax")
+    PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
+class AbstractTensor:
+    # Add other backend methods as needed for harmony
+    def tolist_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement tolist_() for conversion to list.")
+    def _AbstractTensor__unwrap(self, obj=None):
+        """Return the underlying tensor data for this AbstractTensor or for another AbstractTensor instance."""
+        if obj is None:
+            return self.data
+        if isinstance(obj, AbstractTensor):
+            return obj.data
         return obj
+    def __init__(self, track_time: bool = False):
+        self.track_time = track_time
 
-    # --------------------------------------------------------------
-    # Internal helpers
-    def __unwrap(self) -> Any:
-        """Internal helper to access the raw tensor value."""
-        return self.data
-
-    def benchmark(self, call: "Callable[[], Any]") -> Any:
-        """Run ``call`` and store elapsed time if benchmarking is enabled."""
-        if self.track_time:
-            start = time.process_time()
-            result = call()
-            self.last_op_time = time.process_time() - start
-            return result
-        return call()
-
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        inst = cls(track_time=False)
+        inst.data = inst.tensor_from_list_(data, dtype, device)
+        return inst
     # --- Tensor creation and manipulation methods ---
     @classmethod
     def full(
@@ -134,9 +90,9 @@ class AbstractTensor(ABC):
         dtype: Any = None,
         device: Any = None,
     ) -> "AbstractTensor":
-        ops = _get_ops_for_class(cls)
-        result = cls(track_time=getattr(ops, "track_time", False))
-        result.data = ops.full_(size, fill_value, dtype, device)
+        # Instance-based: use the backend of this tensor
+        result = cls(track_time=False)  # Assuming default track_time
+        result.data = result.full_(size, fill_value, dtype, device)
         return result
 
     def full(self, size: Tuple[int, ...], fill_value: Any, dtype: Any = None, device: Any = None):
@@ -146,9 +102,9 @@ class AbstractTensor(ABC):
     def zeros(
         cls, size: Tuple[int, ...], dtype: Any = None, device: Any = None
     ) -> "AbstractTensor":
-        ops = _get_ops_for_class(cls)
-        result = cls(track_time=getattr(ops, "track_time", False))
-        result.data = ops.zeros_(size, dtype, device)
+        # Instance-based: use the backend of this tensor
+        result = cls(track_time=False)  # Assuming default track_time
+        result.data = result.zeros_(size, dtype, device)
         return result
 
     def zeros(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
@@ -222,9 +178,9 @@ class AbstractTensor(ABC):
         device: Any = None,
         dtype: Any = None,
     ) -> "AbstractTensor":
-        ops = _get_ops_for_class(cls)
-        result = cls(track_time=getattr(ops, "track_time", False))
-        result.data = ops.arange_(start, end, step, device, dtype)
+        # Instance-based: use the backend of this tensor
+        result = cls(track_time=False)  # Assuming default track_time
+        result.data = result.arange_(start, end, step, device, dtype)
         return result
 
     def arange(
@@ -300,44 +256,9 @@ class AbstractTensor(ABC):
         result.data = self.increment_at_indices_(mask)
         return result
 
-    def clamp(
-        self, min_val: Optional[float] = None, max_val: Optional[float] = None
-    ) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.clamp_(min_val, max_val)
-        return result
+    # Only keep the upper, guarded to_backend (already present above)
 
-    def numel(self) -> int:
-        return self.numel_()
-
-    def mean(self, dim: Optional[int] = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.mean_(dim)
-        return result
-
-    def pow(self, exponent: float = 1.0) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.pow_(exponent)
-        return result
-
-    def sqrt(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.sqrt_()
-        return result
-
-    @classmethod
-    def tensor_from_list(
-        cls, data: List[Any], dtype: Any = None, device: Any = None
-    ) -> "AbstractTensor":
-        ops = _get_ops_for_class(cls)
-        result = cls(track_time=getattr(ops, "track_time", False))
-        result.data = ops.tensor_from_list_(data, dtype, device)
-        return result
-
-    def tensor_from_list(
-        self, data: List[Any], dtype: Any = None, device: Any = None
-    ) -> "AbstractTensor":
-        return type(self).tensor_from_list(data, dtype, device)
+    
 
     def boolean_mask_select(self, mask: Any = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
@@ -423,20 +344,9 @@ class AbstractTensor(ABC):
         return self.get_ndims(self.data)
 
     # Lightweight helper to coerce arbitrary input to this backend's tensor type
-    def to_backend(
-        self,
-        target_ops: "AbstractTensor",
-    ) -> "AbstractTensor":
-        """Return ``self`` converted to ``target_ops`` backend."""
 
-        if not isinstance(target_ops, AbstractTensor):
-            raise TypeError("target_ops must be an AbstractTensor instance")
 
-        if type(self) is type(target_ops):
-            result = type(target_ops)(track_time=self.track_time)
-            result.data = self.clone_()
-            return result
-
+    def to_backend(self, target_ops):
         conv_func = CONVERSION_REGISTRY.get((type(self), type(target_ops)))
         if conv_func is None:
             converted = default_to_backend(self, self, target_ops)
@@ -444,6 +354,13 @@ class AbstractTensor(ABC):
             converted = conv_func(self, self, target_ops)
 
         if isinstance(converted, AbstractTensor):
+            if type(converted) is type(target_ops):
+                return converted
+            # No progress? Inject raw data into the target and bail.
+            if type(converted) is type(self):
+                out = type(target_ops)(track_time=self.track_time)
+                out.data = converted.data
+                return out
             return converted.to_backend(target_ops)
 
         new_tensor = type(target_ops)(track_time=self.track_time)
@@ -452,12 +369,15 @@ class AbstractTensor(ABC):
 
     def ensure_tensor(self, tensor: Any) -> "AbstractTensor":
         """Return ``tensor`` wrapped as an ``AbstractTensor`` instance."""
+        if not isinstance(self, AbstractTensor):
+            raise TypeError(f"ensure_tensor called on non-AbstractTensor instance: {type(self)}")
         if tensor is None:
             raise ValueError("ensure_tensor called with tensor=None")
+        backend_cls = self.__class__
         if isinstance(tensor, AbstractTensor):
             return tensor.to_backend(self)
         if isinstance(tensor, self.tensor_type):
-            result = type(self)(track_time=self.track_time)
+            result = backend_cls(track_time=self.track_time)
             result.data = tensor
             return result
         if torch is not None and isinstance(tensor, torch.Tensor):
@@ -470,7 +390,7 @@ class AbstractTensor(ABC):
             numpy_tensor = numpy_ops.__class__()
             numpy_tensor.data = tensor
             return numpy_tensor.to_backend(self)
-        if isinstance(tensor, list):
+        if isinstance(tensor, (list, tuple)):
             return self.tensor_from_list(tensor, dtype=None, device=None)
         if hasattr(tensor, "tolist"):
             return self.tensor_from_list(tensor.tolist(), dtype=None, device=None)
@@ -772,27 +692,65 @@ class AbstractTensor(ABC):
         If faculty is provided, use the corresponding backend.
         """
         faculty = faculty or DEFAULT_FACULTY
+        if isinstance(data, list):
+            return PurePythonListTensor(track_time=track_time, data=data)
         if faculty in (Faculty.TORCH, Faculty.PYGEO):
-            from .torch_backend import PyTorchTensorOperations
-
-            tensor = PyTorchTensorOperations(
-                default_device=DEFAULT_DEVICE, track_time=track_time
-            )
+            backend_cls = BACKEND_REGISTRY.get("torch")
+            tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
         elif faculty is Faculty.NUMPY and np is not None:
-            from .numpy_backend import NumPyTensorOperations
-
-            tensor = NumPyTensorOperations(track_time=track_time)
+            backend_cls = BACKEND_REGISTRY.get("numpy")
+            tensor = backend_cls(track_time=track_time)
         elif faculty is Faculty.CTENSOR:
-            from .c_backend import CTensorOperations
-
+            from .accelerator_backends.c_backend import CTensorOperations
             tensor = CTensorOperations(track_time=track_time)
         else:
-            from .pure_backend import PurePythonTensorOperations
-
-            tensor = PurePythonTensorOperations(track_time=track_time)
+            backend_cls = BACKEND_REGISTRY.get("pure_python")
+            tensor = backend_cls(track_time=track_time)
         if data is not None:
             return tensor.ensure_tensor(data)
         return tensor
+
+    # ...existing AbstractTensor code...
+
+# Sentinel wrapper for pure Python lists as tensors
+class PurePythonListTensor(AbstractTensor):
+    long_dtype_ = None
+    bool_dtype_ = None
+    float_dtype_ = None
+    tensor_type_ = list
+
+    def __init__(self, track_time: bool = False, data=None):
+        super().__init__(track_time=track_time)
+        self.data = data
+
+    @property
+    def tensor_type(self):
+        return list
+
+    def tolist_(self):
+        return self.data
+
+    def clone_(self, tensor=None):
+        t = self.data if tensor is None else tensor
+        if isinstance(t, list):
+            return [self.clone_(item) for item in t]
+        return t
+
+    def get_shape(self) -> tuple:
+        return _get_shape(self.data)
+
+    def get_ndims(self) -> int:
+        return len(self.get_shape())
+
+    def get_dtype(self, data=None):
+        return "list"
+
+    def get_device(self, data=None):
+        return None
+
+    @classmethod
+    def tensor_from_list(cls, data, dtype=None, device=None):
+        return cls(data=list(data))
 
 
 class AbstractF:
@@ -811,7 +769,8 @@ class AbstractF:
         channel_dim=1,
         backend: str = None,
         align_corners=False,
-        **kwargs,
+    postprocess: str = None,  # 'round', 'floor', 'ceil', or None
+    **kwargs,
     ):
         """
         Interpolate a tensor to a new size using the best available backend.
@@ -826,6 +785,14 @@ class AbstractF:
         """
         # Convert to AbstractTensor if needed
         tensor = AbstractTensor.get_tensor(tensor)
+        orig_dtype = None
+        import torch
+        if hasattr(tensor, 'data'):
+            arr_data = tensor.data
+        else:
+            arr_data = tensor
+        if hasattr(arr_data, 'dtype'):
+            orig_dtype = arr_data.dtype
         # Backend selection
         chosen = None
         if backend == "torch":
@@ -856,7 +823,10 @@ class AbstractF:
                     data = data.unsqueeze(0)
                 else:
                     data = data.unsqueeze(1)
-            # Now data is (N, C, H, W)
+            # Convert to float if needed (required by F.interpolate for most modes)
+            was_int = not torch.is_floating_point(data)
+            if was_int:
+                data = data.float()
             out = F.interpolate(
                 data,
                 size=size,
@@ -868,6 +838,19 @@ class AbstractF:
                     else None
                 ),
             )
+            # Postprocess if requested
+            if postprocess is not None:
+                if postprocess == 'round':
+                    out = torch.round(out)
+                elif postprocess == 'floor':
+                    out = torch.floor(out)
+                elif postprocess == 'ceil':
+                    out = torch.ceil(out)
+                else:
+                    raise ValueError(f"Unknown postprocess: {postprocess}")
+            # Cast back to original dtype if it was int
+            if was_int and orig_dtype is not None:
+                out = out.to(orig_dtype)
             # Remove added batch/channel dims if needed
             if nd == 2:
                 out = out[0, 0]
@@ -920,23 +903,25 @@ def _flatten(data):
     return [item for sublist in data for item in _flatten(sublist)]
 
 
-def default_to_backend(
-    source_ops: "AbstractTensor", tensor: Any, target_ops: "AbstractTensor"
-) -> Any:
-    """Fallback conversion using :meth:`tolist` and :meth:`tensor_from_list`."""
+def default_to_backend(source_ops, tensor, target_ops):
     if type(source_ops) is type(target_ops):
-        return source_ops.clone(tensor)
-    data = source_ops.tolist(tensor)
+        return source_ops.clone()
+
+    data = tensor.tolist()
     dtype = None
     device = None
-    try:
-        dtype = source_ops.get_dtype(tensor)
-    except Exception:
-        pass
-    try:
-        device = source_ops.get_device(tensor)
-    except Exception:
-        pass
+    try: dtype = source_ops.get_dtype(tensor)
+    except: pass
+    try: device = source_ops.get_device(tensor)
+    except: pass
+    # Works if backend exposes either a classmethod, staticmethod, or instance method:
+    import inspect
+    cls = type(target_ops)
+    raw = inspect.getattr_static(cls, "tensor_from_list", None)
+    if isinstance(raw, classmethod):
+        return raw.__func__(cls, data, dtype, device)
+    if isinstance(raw, staticmethod):
+        return raw.__func__(data, dtype, device)
     return target_ops.tensor_from_list(data, dtype=dtype, device=device)
 
 
@@ -949,88 +934,6 @@ def get_tensor_operations(
     )
 
 
-# --- Conversion registration ---
-try:
-    from .torch_backend import PyTorchTensorOperations
-except Exception:  # pragma: no cover - optional backend
-    PyTorchTensorOperations = None  # type: ignore
-try:
-    from .numpy_backend import NumPyTensorOperations
-except Exception:  # pragma: no cover - optional backend
-    NumPyTensorOperations = None  # type: ignore
-from .pure_backend import PurePythonTensorOperations
 
-if np is not None and NumPyTensorOperations is not None:
-    register_conversion(
-        NumPyTensorOperations,
-        PurePythonTensorOperations,
-        PurePythonTensorOperations.from_numpy,
-    )
-    register_conversion(
-        PurePythonTensorOperations,
-        NumPyTensorOperations,
-        NumPyTensorOperations.from_pure,
-    )
+# --- Delayed backend registration to avoid circular imports ---
 
-if (
-    torch is not None
-    and PyTorchTensorOperations is not None
-    and NumPyTensorOperations is not None
-):
-    register_conversion(
-        PyTorchTensorOperations, NumPyTensorOperations, NumPyTensorOperations.from_torch
-    )
-    register_conversion(
-        NumPyTensorOperations,
-        PyTorchTensorOperations,
-        PyTorchTensorOperations.from_numpy,
-    )
-    register_conversion(
-        PyTorchTensorOperations,
-        PurePythonTensorOperations,
-        PurePythonTensorOperations.from_torch,
-    )
-    register_conversion(
-        PurePythonTensorOperations,
-        PyTorchTensorOperations,
-        PyTorchTensorOperations.from_pure,
-    )
-
-try:
-    from .jax_backend import JAXTensorOperations
-except Exception:  # pragma: no cover - optional backend
-    JAXTensorOperations = None  # type: ignore
-
-if (
-    np is not None
-    and NumPyTensorOperations is not None
-    and JAXTensorOperations is not None
-):
-    register_conversion(
-        JAXTensorOperations, NumPyTensorOperations, NumPyTensorOperations.from_jax
-    )
-    register_conversion(
-        NumPyTensorOperations, JAXTensorOperations, JAXTensorOperations.from_numpy
-    )
-
-if (
-    torch is not None
-    and PyTorchTensorOperations is not None
-    and JAXTensorOperations is not None
-):
-    register_conversion(
-        PyTorchTensorOperations, JAXTensorOperations, JAXTensorOperations.from_torch
-    )
-    register_conversion(
-        JAXTensorOperations, PyTorchTensorOperations, PyTorchTensorOperations.from_jax
-    )
-
-if JAXTensorOperations is not None:
-    register_conversion(
-        JAXTensorOperations,
-        PurePythonTensorOperations,
-        PurePythonTensorOperations.from_jax,
-    )
-    register_conversion(
-        PurePythonTensorOperations, JAXTensorOperations, JAXTensorOperations.from_pure
-    )
