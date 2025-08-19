@@ -36,6 +36,10 @@ class BitBitItem:
         raw = self.buffer.indexer.access(spec)
         return (raw[0] >> 7) & 1
 
+    def __index__(self):
+        """Return int value so BitBitItem can act as a slice index."""
+        return self.__int__()
+
     def __getitem__(self, key):
             # Allow default plane indexing with int or slice
             second_key = None

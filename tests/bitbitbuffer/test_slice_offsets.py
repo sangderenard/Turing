@@ -22,3 +22,11 @@ def test_cell_slice_does_not_overlap():
     cell1 = buf[128:256]
     assert cell1.hex() == '00' * 16
     assert cell1[0:128].hex() == '00' * 16
+
+
+def test_bitbititem_as_index():
+    buf = BitBitBuffer(mask_size=8)
+    buf[0:8] = [0, 1, 0, 1, 0, 1, 0, 1]
+    index = buf[1]
+    values = ['zero', 'one']
+    assert values[index] == 'one'
