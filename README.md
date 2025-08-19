@@ -153,7 +153,7 @@ Below is a current inventory of the repository’s Python modules, grouped by pa
 - `lane_tuner.py` — frequency lane tuning and helpers
 - `nand_wave.py` — NAND tone synthesis/decoding
 
-### src/tensors
+### src/common/tensors
 
 - `abstraction.py` — shared `AbstractTensor` interface and backend registry
 - `pure_backend.py` — reference backend built on nested Python lists

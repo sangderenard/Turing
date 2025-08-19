@@ -1,19 +1,19 @@
 import pytest
 
-from src.tensors.pure_backend import PurePythonTensorOperations
+from src.common.tensors.pure_backend import PurePythonTensorOperations
 
 try:
-    from src.tensors.torch_backend import PyTorchTensorOperations
+    from src.common.tensors.torch_backend import PyTorchTensorOperations
 except Exception:  # pragma: no cover - optional dependency
     PyTorchTensorOperations = None
 
 try:
-    from src.tensors.numpy_backend import NumPyTensorOperations
+    from src.common.tensors.numpy_backend import NumPyTensorOperations
 except Exception:  # pragma: no cover - optional dependency
     NumPyTensorOperations = None
 
 try:
-    from src.tensors.jax_backend import JAXTensorOperations
+    from src.common.tensors.jax_backend import JAXTensorOperations
 except Exception:  # pragma: no cover - optional dependency
     JAXTensorOperations = None
 

@@ -1,20 +1,20 @@
 import pytest
 import numpy as np
 
-from src.tensors.abstraction import AbstractTensor
-from src.tensors.pure_backend import PurePythonTensorOperations
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.pure_backend import PurePythonTensorOperations
 
 # Try to import optional backends
 try:
-    from src.tensors.torch_backend import PyTorchTensorOperations
+    from src.common.tensors.torch_backend import PyTorchTensorOperations
 except Exception:
     PyTorchTensorOperations = None
 try:
-    from src.tensors.numpy_backend import NumPyTensorOperations
+    from src.common.tensors.numpy_backend import NumPyTensorOperations
 except Exception:
     NumPyTensorOperations = None
 try:
-    from src.tensors.jax_backend import JAXTensorOperations
+    from src.common.tensors.jax_backend import JAXTensorOperations
 except Exception:
     JAXTensorOperations = None
 

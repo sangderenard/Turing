@@ -1,4 +1,4 @@
-from src.tensors.abstraction import AbstractTensor, Faculty
+from src.common.tensors.abstraction import AbstractTensor, Faculty
 
 # 1) Pure list → target backends
 L = [[0,1,1],[1,0,1]]

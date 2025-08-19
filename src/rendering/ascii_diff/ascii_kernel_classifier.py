@@ -5,9 +5,9 @@ from typing import Any
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from ...tensors import AbstractTensor, Faculty
-from ...tensors.numpy_backend import NumPyTensorOperations
-from ...tensors.torch_backend import PyTorchTensorOperations
+from ...common.tensors import AbstractTensor, Faculty
+from ...common.tensors.numpy_backend import NumPyTensorOperations
+from ...common.tensors.torch_backend import PyTorchTensorOperations
 
 try:
     from skimage.metrics import structural_similarity as ssim
