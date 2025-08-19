@@ -86,6 +86,17 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    def mean(self, dim=None):
+        """Return the mean of the tensor along the specified dimension(s)."""
+        return self.mean_(dim=dim)
+
+    def sum(self, dim=None):
+        """Return the sum of the tensor along the specified dimension(s)."""
+        return self.sum_(dim=dim)
+
+    def min(self, dim=None):
+        """Return the minimum of the tensor along the specified dimension(s)."""
+        return self.min_(dim=dim)
     # Add other backend methods as needed for harmony
     def tolist_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement tolist_() for conversion to list.")
