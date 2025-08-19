@@ -6,7 +6,11 @@ from .base import (
     cuda_gl, cuda, VERBOSE, VERBOSE_LOGFILE,
     physics_keys, video_keys,
 )
-from .workers import AsyncGPUSyncWorker, AsyncCPUSyncWorker
+try:  # Optional GPU workers depend on torch
+    from .workers import AsyncGPUSyncWorker, AsyncCPUSyncWorker
+except Exception:  # pragma: no cover - missing optional deps
+    AsyncGPUSyncWorker = None  # type: ignore
+    AsyncCPUSyncWorker = None  # type: ignore
 from ..quad_buffer.tribuffer import Tribuffer, GeneralBufferSync
 from .lock import (
     LockCommand, RegionToken, LockManagerThread,

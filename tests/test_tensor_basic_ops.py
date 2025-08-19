@@ -1,3 +1,4 @@
+import importlib.util
 import pytest
 
 from src.common.tensors.pure_backend import PurePythonTensorOperations
@@ -18,11 +19,13 @@ except Exception:  # pragma: no cover - optional dependency
     JAXTensorOperations = None
 
 BACKENDS = [("PurePython", PurePythonTensorOperations)]
-if PyTorchTensorOperations is not None:
+torch_spec = importlib.util.find_spec("torch")
+if PyTorchTensorOperations is not None and torch_spec is not None:
     BACKENDS.append(("PyTorch", PyTorchTensorOperations))
 if NumPyTensorOperations is not None:
     BACKENDS.append(("NumPy", NumPyTensorOperations))
-if JAXTensorOperations is not None:
+jax_spec = importlib.util.find_spec("jax")
+if JAXTensorOperations is not None and jax_spec is not None:
     BACKENDS.append(("JAX", JAXTensorOperations))
 
 
