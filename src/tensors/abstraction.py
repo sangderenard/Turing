@@ -730,9 +730,15 @@ class AbstractTensor:
             return PurePythonListTensor(track_time=track_time, data=data)
         if faculty in (Faculty.TORCH, Faculty.PYGEO):
             backend_cls = BACKEND_REGISTRY.get("torch")
+            if backend_cls is None:
+                from . import torch_backend  # noqa: F401
+                backend_cls = BACKEND_REGISTRY.get("torch")
             tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
         elif faculty is Faculty.NUMPY and np is not None:
             backend_cls = BACKEND_REGISTRY.get("numpy")
+            if backend_cls is None:
+                from . import numpy_backend  # noqa: F401
+                backend_cls = BACKEND_REGISTRY.get("numpy")
             tensor = backend_cls(track_time=track_time)
         elif faculty is Faculty.CTENSOR:
             from .accelerator_backends.c_backend import CTensorOperations
@@ -820,12 +826,15 @@ class AbstractF:
         # Convert to AbstractTensor if needed
         tensor = AbstractTensor.get_tensor(tensor)
         orig_dtype = None
-        import torch
+        try:
+            import torch  # type: ignore
+        except Exception:  # torch may be unavailable
+            torch = None  # type: ignore
         if hasattr(tensor, 'data'):
             arr_data = tensor.data
         else:
             arr_data = tensor
-        if hasattr(arr_data, 'dtype'):
+        if torch is not None and hasattr(arr_data, 'dtype'):
             orig_dtype = arr_data.dtype
         # Backend selection
         chosen = None
@@ -944,8 +953,12 @@ def default_to_backend(source_ops, tensor, target_ops):
     data = tensor.tolist()
     dtype = None
     device = None
-    try: dtype = source_ops.get_dtype(tensor)
-    except: pass
+    try:
+        dtype = source_ops.get_dtype(tensor)
+    except Exception:
+        dtype = None
+    if isinstance(dtype, str):
+        dtype = None
     try: device = source_ops.get_device(tensor)
     except: pass
     # Works if backend exposes either a classmethod, staticmethod, or instance method:

@@ -127,8 +127,8 @@ class NumPyTensorOperations(AbstractTensor):
     def zeros_(self, size, dtype, device):
         return np.zeros(size, dtype=self._torch_dtype_to_numpy(dtype))
 
-    def clone_(self, tensor):
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def clone_(self, tensor=None):
+        tensor = self._AbstractTensor__unwrap(tensor if tensor is not None else self.data)
         return np.array(tensor, copy=True)
 
     def to_device_(self, tensor, device):
@@ -329,8 +329,9 @@ class NumPyTensorOperations(AbstractTensor):
             arr = arr.astype(self._torch_dtype_to_numpy(dtype))
         return arr
 
-    def to_dtype_(self, tensor, dtype: str = "float"):
+    def to_dtype_(self, dtype: str = "float"):
         import numpy as np
+        tensor = self.data
         if dtype in ("float", "float32", "f32"):
             return tensor.astype(np.float32)
         elif dtype in ("float64", "double", "f64"):

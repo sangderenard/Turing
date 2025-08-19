@@ -93,10 +93,10 @@ class AsciiKernelClassifier:
 
     def classify_batch(self, subunit_batch: np.ndarray) -> dict:
         batch = AbstractTensor.get_tensor(subunit_batch).to_dtype("float")
-        batch_shape = batch.shape()
+        batch_shape = tuple(batch.shape)
         N = batch_shape[0]
         if len(batch_shape) == 4 and batch_shape[3] == 3:
-            luminance_tensor = batch.mean(dim=3) / 255.0
+            luminance_tensor = AbstractTensor.get_tensor(batch.mean(dim=3)) / 255.0
         elif len(batch_shape) == 3:
             luminance_tensor = batch / 255.0
         else:
@@ -105,7 +105,8 @@ class AsciiKernelClassifier:
         
         # Compare tensor's (H,W) with classifier's (target_H, target_W)
         expected_hw_shape = (self.char_size[1], self.char_size[0])
-        if luminance_tensor.shape()[1:] != expected_hw_shape:
+        luminance_tensor = AbstractTensor.get_tensor(luminance_tensor)
+        if luminance_tensor.shape[1:] != expected_hw_shape:
             resized = [AbstractTensor.F.interpolate(luminance_tensor[i], size=expected_hw_shape) for i in range(N)]
             luminance_tensor = AbstractTensor.get_tensor().stack(resized, dim=0)
         refs = AbstractTensor.get_tensor().stack(self.charBitmasks, dim=0)
@@ -113,9 +114,9 @@ class AsciiKernelClassifier:
         expanded_refs = refs[None, :, :, :].repeat_interleave(repeats=N, dim=0)
         diff = expanded_inputs - expanded_refs
         abs_diff = (diff ** 2) ** 0.5
-        losses = abs_diff.mean(dim=(2, 3))
+        losses = AbstractTensor.get_tensor(abs_diff.mean(dim=(2, 3)))
         idxs = losses.argmin(dim=1)
-        row_indices = AbstractTensor.get_tensor().arange(N, dtype=losses.long_dtype)
+        row_indices = AbstractTensor.get_tensor(np.arange(N, dtype=np.int64))
         selected_losses = losses[row_indices, idxs]
         chars = [self.charset[int(i)] for i in idxs.tolist()]
         return {
