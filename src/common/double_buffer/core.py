@@ -10,19 +10,41 @@ class DoubleBuffer:
     """
     Thin agent-index/cursor tracker for hyperlocal concurrent buffer access.
     All data operations are callback-driven; this class holds *no* locks.
+
+    Parameters
+    ----------
+    roll_length:
+        Number of pages in the rolling window. Ignored if ``frames`` is
+        provided; in that case the length of ``frames`` determines the roll
+        length.
+    num_agents:
+        Number of independent agents accessing the buffer.
+    reference:
+        Optional reference key list.
+    frames:
+        Optional externally managed indexable container. It must support
+        ``__len__``, ``__getitem__`` and ``__setitem__``. If omitted, an
+        internal list is created. This enables callers to supply anything that
+        can be sliced (NumPy arrays, ``bytearray``\s, etc.).
     """
-    def __init__(self, roll_length=2, num_agents=2, reference=None):
-        verbose_log(f"DoubleBuffer.__init__(roll_length={roll_length}, num_agents={num_agents})")
-        self.roll_length = roll_length
+
+    def __init__(self, roll_length=2, num_agents=2, reference=None, frames=None):
+        verbose_log(
+            f"DoubleBuffer.__init__(roll_length={roll_length}, num_agents={num_agents})"
+        )
+        self.frames = frames if frames is not None else [None] * roll_length
+        self.roll_length = len(self.frames)
         self.num_agents = num_agents
         self.reference = reference or physics_keys
         self.read_idx = [0] * num_agents
         self.write_idx = [1] * num_agents
-        self.frames = [None] * roll_length
-        phase_distance = roll_length // num_agents
+        self._frame_written = [False] * self.roll_length
+        phase_distance = self.roll_length // num_agents if num_agents > 1 else 1
         for i in range(num_agents):
-            self.read_idx[i] = self.read_idx[i-1]+1 if i > 0 else 0
-            self.write_idx[i] = (self.read_idx[i] + phase_distance) % roll_length
+            self.read_idx[i] = self.read_idx[i - 1] + 1 if i > 0 else 0
+            self.write_idx[i] = (
+                (self.read_idx[i] + phase_distance) % self.roll_length
+            )
 
     def get_read_page(self, agent_idx=0):
         verbose_log(f"DoubleBuffer.get_read_page(agent_idx={agent_idx})")
@@ -63,14 +85,15 @@ class DoubleBuffer:
         verbose_log(f"DoubleBuffer.write_frame(agent_idx={agent_idx})")
         idx = self.get_write_page(agent_idx)
         self.frames[idx] = frame
+        self._frame_written[idx] = True
         self.advance(agent_idx)
 
     def read_frame(self, agent_idx=1):
         verbose_log(f"DoubleBuffer.read_frame(agent_idx={agent_idx})")
         idx = self.get_read_page(agent_idx)
-        frame = self.frames[idx]
-        if frame is not None:
-            self.frames[idx] = None
+        if self._frame_written[idx]:
+            frame = self.frames[idx]
+            self._frame_written[idx] = False
             self.advance(agent_idx)
             return frame
         return None

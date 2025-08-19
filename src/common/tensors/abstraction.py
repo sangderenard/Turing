@@ -141,9 +141,6 @@ class AbstractTensor:
         result.data = result.zeros_(size, dtype, device)
         return result
 
-    def zeros(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
-        return type(self).zeros(size, dtype, device)
-
     def clone(self) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
         result.data = self.clone_()
