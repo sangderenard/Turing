@@ -7,7 +7,7 @@ from .base import (
     physics_keys, video_keys,
 )
 from .workers import AsyncGPUSyncWorker, AsyncCPUSyncWorker
-from .tribuffer import Tribuffer, GeneralBufferSync
+from ..quad_buffer.tribuffer import Tribuffer, GeneralBufferSync
 from .lock import (
     LockCommand, RegionToken, LockManagerThread,
     LockNode, LockGraph, extra_verbose_node_print,

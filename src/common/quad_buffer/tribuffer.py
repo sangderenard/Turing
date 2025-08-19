@@ -1,6 +1,6 @@
-from .base import *
-from .workers import AsyncCPUSyncWorker, AsyncGPUSyncWorker
-from .lock import LockManagerThread, LockGraph
+from ..double_buffer.base import *
+from ..double_buffer.workers import AsyncCPUSyncWorker, AsyncGPUSyncWorker
+from ..double_buffer.lock import LockManagerThread, LockGraph
 
 
 class Tribuffer:

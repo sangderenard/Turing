@@ -3,7 +3,7 @@ import threading
 import time
 import random
 from .base import verbose_log, physics_keys
-from .tribuffer import Tribuffer
+from ..quad_buffer.tribuffer import Tribuffer
 from .lock import LockManagerThread, LockGraph, LockCommand
 
 class DoubleBuffer:
