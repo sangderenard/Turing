@@ -1,10 +1,8 @@
 import pytest
 import numpy as np
 
-from src.tensors import (
-    AbstractTensor,
-    PurePythonTensorOperations,
-)
+from src.tensors.abstraction import AbstractTensor
+from src.tensors.pure_backend import PurePythonTensorOperations
 
 # Try to import optional backends
 try:
@@ -104,3 +102,4 @@ def test_math_rodeo(backend_name, BackendCls):
         print(f"[FAILURES] {backend_name}: {failures}")
     else:
         print(f"[SUCCESS] {backend_name}: All math ops passed!")
+    assert not failures
