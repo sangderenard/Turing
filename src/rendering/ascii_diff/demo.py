@@ -28,7 +28,7 @@ def main(image_path: str) -> None:
     frame_a = load_pixels(image_path)
     frame_b = np.flip(frame_a, axis=1)  # simple transformation
 
-    char_h, char_w = 8, 4
+    char_h, char_w = 32, 16
 
     old_frame = np.zeros_like(frame_a)
     full_clear_and_reset_cursor()

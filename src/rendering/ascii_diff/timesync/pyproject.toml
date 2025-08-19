@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "timesync"
+version = "0.1.0"
+description = "System time synchronization utilities"
+authors = ["Time Sync Authors"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+ntplib = "*"
+colorama = "*"
+pillow = "*"
+
+[tool.poetry.group.gui]
+optional = true
+
+[tool.poetry.group.gui.dependencies]
+pygame = ">=2"
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+tools = {path = "../AGENTS/tools", develop = true}
+
+[tool.poetry.extras]
+gui = []
+dev = []
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,48 @@
+{
+  "normal": {
+    "quit": { "keys": ["q", "Q"], "description": "Quit application" },
+    "toggle_legend": { "keys": ["h", "?"], "description": "Toggle help/legend" },
+    "cycle_ascii_style_forward": { "keys": ["a"], "description": "ASCII Style (Fwd)" },
+    "cycle_ascii_style_backward": { "keys": ["A"], "description": "ASCII Style (Back)" },
+    "cycle_palette_forward": { "keys": ["p"], "description": "Color Palette (Fwd)" },
+    "cycle_palette_backward": { "keys": ["P"], "description": "Color Palette (Back)" },
+    "cycle_effects_forward": { "keys": ["e"], "description": "Effects (Fwd)" },
+    "cycle_effects_backward": { "keys": ["E"], "description": "Effects (Back)" },
+    "cycle_post_processing_forward": { "keys": ["r"], "description": "Post-Proc (Fwd)" },
+    "cycle_post_processing_backward": { "keys": ["R"], "description": "Post-Proc (Back)" },
+    "toggle_clock_inversion": { "keys": ["i"], "description": "Invert Clock Colors" },
+    "toggle_backdrop_inversion": { "keys": ["b"], "description": "Invert Backdrop Colors" },
+    "cycle_backdrop_forward": { "keys": ["n"], "description": "Cycle Backdrop (Fwd)" },
+    "cycle_backdrop_backward": { "keys": ["N"], "description": "Cycle Backdrop (Back)" },
+    "enter_config_mode": { "keys": ["c"], "description": "Enter Config Mode" },
+    "cycle_config_focus": { "keys": ["TAB"], "description": "Cycle Config Focus" }
+  },
+  "config": {
+    "analog": {
+      "config_quit": { "keys": ["q"], "description": "Exit configuration mode" },
+      "config_save": { "keys": ["s"], "description": "Save configuration" },
+      "config_left": { "keys": ["LEFT", "a"], "description": "Move left / width -" },
+      "config_right": { "keys": ["RIGHT", "d"], "description": "Move right / width +" },
+      "config_up": { "keys": ["UP", "w"], "description": "Move up / height -" },
+      "config_down": { "keys": ["DOWN", "s"], "description": "Move down / height +" },
+      "config_width_increase": { "keys": ["L"], "description": "Increase analog width" },
+      "config_width_decrease": { "keys": ["J"], "description": "Decrease analog width" },
+      "config_height_increase": { "keys": ["K"], "description": "Increase analog height" },
+      "config_height_decrease": { "keys": ["I"], "description": "Decrease analog height" },
+      "config_ascii_diameter_increase": { "keys": ["+"], "description": "Increase ASCII diameter" },
+      "config_ascii_diameter_decrease": { "keys": ["-"], "description": "Decrease ASCII diameter" },
+      "config_canvas_increase": { "keys": ["C"], "description": "Increase canvas size" },
+      "config_canvas_decrease": { "keys": ["c"], "description": "Decrease canvas size" }
+    },
+    "digital": {
+      "config_quit": { "keys": ["q"], "description": "Exit configuration mode" },
+      "config_save": { "keys": ["s"], "description": "Save configuration" },
+      "config_left": { "keys": ["LEFT", "a"], "description": "Decrease width" },
+      "config_right": { "keys": ["RIGHT", "d"], "description": "Increase width" },
+      "config_up": { "keys": ["UP", "w"], "description": "Decrease height" },
+      "config_down": { "keys": ["DOWN", "s"], "description": "Increase height" },
+      "config_font_increase": { "keys": ["+"], "description": "Increase font size" },
+      "config_font_decrease": { "keys": ["-"], "description": "Decrease font size" }
+    }
+  }
+}
