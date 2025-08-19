@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.rendering.render_chooser.double_buffer import DoubleBuffer
+from src.common.double_buffer import DoubleBuffer
 
 from src.rendering.ascii_render import AsciiRenderer
 from src.rendering.ascii_diff import PixelFrameBuffer, draw_diff, DEFAULT_DRAW_ASCII_RAMP

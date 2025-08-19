@@ -4,7 +4,7 @@
 OpenGL, pygame or ASCII renderer.  Inputs are simple mappings describing
 primitive shapes (points, edges, triangles) in screen space.  The chooser
 translates these into the selected backend's preferred format and exchanges
-frames with a :class:`~render_chooser.double_buffer.DoubleBuffer` to keep data
+frames with a :class:`~src.common.double_buffer.DoubleBuffer` to keep data
 and rendering concerns on separate threads.
 """
 
@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from typing import Any, Dict, Iterable, Tuple, List, Set
-from .double_buffer import DoubleBuffer
+from src.common.double_buffer import DoubleBuffer
 
 __all__ = ["RenderChooser"]
 
