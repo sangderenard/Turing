@@ -9,6 +9,10 @@ from .draw import (
     get_changed_subunits,
 )
 from .console import full_clear_and_reset_cursor, reset_cursor_to_top
+from .clock_renderer import ClockRenderer
+from .theme_manager import ThemeManager
+from .time_units import TimeUnit
+from .render_backend import RenderingBackend
 
 __all__ = [
     "AsciiKernelClassifier",
@@ -20,5 +24,9 @@ __all__ = [
     "get_changed_subunits",
     "full_clear_and_reset_cursor",
     "reset_cursor_to_top",
+    "ClockRenderer",
+    "ThemeManager",
+    "TimeUnit",
+    "RenderingBackend",
 ]
 
