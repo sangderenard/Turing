@@ -60,13 +60,14 @@ class AsciiKernelClassifier:
         self._prepare_reference_bitmasks()
 
     def _prepare_reference_bitmasks(self) -> None:
+        # Always use the ramp as the preset_charset so all ramp characters are attempted
         fonts, charset, charBitmasks, _max_w, _max_h = obtain_charset(
-            font_files=[self.font_path], font_size=self.font_size, complexity_level=0
+            font_files=[self.font_path], font_size=self.font_size, complexity_level=0, preset_charset=self.ramp
         )
-        filtered = [(c, bm) for c, bm in zip(charset, charBitmasks) if c in self.ramp and bm is not None]
+        filtered = [(c, bm) for c, bm in zip(charset, charBitmasks) if bm is not None]
         self.charset = [c for c, _ in filtered] # type: ignore
         # self.char_size is (W, H), interpolate expects (H, W) for size
-        self.charBitmasks = [AbstractTensor.F.interpolate(AbstractTensor.get_tensor(bm), size=(self.char_size[1], self.char_size[0])) for _, bm in filtered] # type: ignore
+        self.charBitmasks = [AbstractTensor.F.interpolate(AbstractTensor.get_tensor(bm).to_dtype("float") / 255.0, size=(self.char_size[1], self.char_size[0])) for _, bm in filtered] # type: ignore
 
     def _resize_tensor_to_char(self, tensor: AbstractTensor) -> AbstractTensor:
         # self.char_size is (W, H), interpolate expects (H, W) for size
@@ -115,6 +116,7 @@ class AsciiKernelClassifier:
         diff = expanded_inputs - expanded_refs
         abs_diff = (diff ** 2) ** 0.5
         losses = AbstractTensor.get_tensor(abs_diff.mean(dim=(2, 3)))
+        #print(losses)
         idxs = losses.argmin(dim=1)
         row_indices = AbstractTensor.get_tensor(np.arange(N, dtype=np.int64))
         selected_losses = losses[row_indices, idxs]
@@ -125,3 +127,25 @@ class AsciiKernelClassifier:
             "losses": selected_losses,
             "logits": None,
         }
+if __name__ == "__main__":
+    import argparse
+    from .charset_ops import obtain_charset
+    fontfile = Path(__file__).with_name("consola.ttf")
+    parser = argparse.ArgumentParser(description="Test AsciiKernelClassifier on its own font bitmaps at 1:1 scale.")
+    parser.add_argument("--font", type=str, default=str(fontfile), help="Path to a TTF/OTF font file")
+    parser.add_argument("--size", type=int, default=16, help="Font size (default: 16)")
+    parser.add_argument("--ramp", type=str, default=" .:░▒▓█", help="ASCII ramp to use (default: block ramp)")
+    args = parser.parse_args()
+
+    # Generate bitmaps for the ramp characters at the requested size
+    fonts, charset, bitmasks, max_w, max_h = obtain_charset([args.font], args.size, 0, preset_charset=args.ramp)
+    print(f"Font: {args.font}\nSize: {args.size}\nRamp: {args.ramp}\n")
+    print("Testing classifier on its own reference bitmaps (should be perfect match):\n")
+
+    # Stack bitmasks into a batch (N, H, W)
+    batch = np.stack(bitmasks, axis=0)
+    classifier = AsciiKernelClassifier(args.ramp, font_path=args.font, font_size=args.size, char_size=(max_w, max_h))
+    result = classifier.classify_batch(batch)
+    for i, (expected, predicted, loss) in enumerate(zip(charset, result["chars"], result["losses"])):
+        status = "OK" if expected == predicted else "FAIL"
+        print(f"[{status}] idx={i} expected='{expected}' classified='{predicted}' loss={loss:.4f}")

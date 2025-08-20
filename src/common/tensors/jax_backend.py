@@ -49,6 +49,86 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    def where_(self, x, y):
+        import jax.numpy as jnp
+        x = x.data if hasattr(x, 'data') else x
+        y = y.data if hasattr(y, 'data') else y
+        return jnp.where(self.data, x, y)
+
+    def maximum_(self, other):
+        import jax.numpy as jnp
+        other = other.data if hasattr(other, 'data') else other
+        return jnp.maximum(self.data, other)
+
+    def minimum_(self, other):
+        import jax.numpy as jnp
+        other = other.data if hasattr(other, 'data') else other
+        return jnp.minimum(self.data, other)
+
+    def clamp_(self, min_val=None, max_val=None):
+        import jax.numpy as jnp
+        return jnp.clip(self.data, a_min=min_val, a_max=max_val)
+
+    def clamp_min_(self, min_val):
+        import jax.numpy as jnp
+        return jnp.maximum(self.data, min_val)
+
+    def clamp_max_(self, max_val):
+        import jax.numpy as jnp
+        return jnp.minimum(self.data, max_val)
+
+    def greater_(self, value):
+        value = value.data if hasattr(value, 'data') else value
+        return self.data > value
+
+    def greater_equal_(self, value):
+        value = value.data if hasattr(value, 'data') else value
+        return self.data >= value
+
+    def less_equal_(self, value):
+        value = value.data if hasattr(value, 'data') else value
+        return self.data <= value
+
+    def equal_(self, value):
+        value = value.data if hasattr(value, 'data') else value
+        return self.data == value
+
+    def logical_not_(self):
+        import jax.numpy as jnp
+        return jnp.logical_not(self.data)
+
+    def sqrt_(self):
+        import jax.numpy as jnp
+        return jnp.sqrt(self.data)
+
+    def exp_(self):
+        import jax.numpy as jnp
+        return jnp.exp(self.data)
+
+    def log_(self):
+        import jax.numpy as jnp
+        return jnp.log(self.data)
+
+    def softmax_(self, dim):
+        import jax.numpy as jnp
+        x = self.data
+        x_max = jnp.max(x, axis=dim, keepdims=True)
+        e_x = jnp.exp(x - x_max)
+        return e_x / jnp.sum(e_x, axis=dim, keepdims=True)
+
+    def log_softmax_(self, dim):
+        import jax.numpy as jnp
+        x = self.data
+        x_max = jnp.max(x, axis=dim, keepdims=True)
+        e_x = jnp.exp(x - x_max)
+        softmax = e_x / jnp.sum(e_x, axis=dim, keepdims=True)
+        return jnp.log(softmax)
+
+    def transpose_(self, dim0, dim1):
+        import jax.numpy as jnp
+        axes = list(range(self.data.ndim))
+        axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+        return jnp.transpose(self.data, axes)
     """Tensor operations powered by `jax.numpy`."""
 
     def __init__(self, default_device: Optional[Any] = None, track_time: bool = False) -> None:

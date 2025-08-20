@@ -49,6 +49,97 @@ except Exception:
     sys.exit(1)
 
 class NumPyTensorOperations(AbstractTensor):
+    def max_(self, tensor, dim=None, keepdim=False):
+        return np.max(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+
+    def argmax_(self, tensor, dim=None, keepdim=False):
+        arr = self._AbstractTensor__unwrap(tensor)
+        if dim is None:
+            return int(np.argmax(arr))
+        idx = np.argmax(arr, axis=dim)
+        if keepdim:
+            return np.expand_dims(idx, axis=dim)
+        return idx
+    def where_(self, x, y):
+        import numpy as np
+        x = x.data if isinstance(x, AbstractTensor) else x
+        y = y.data if isinstance(y, AbstractTensor) else y
+        return np.where(self.data, x, y)
+
+    def maximum_(self, other):
+        import numpy as np
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return np.maximum(self.data, other)
+
+    def minimum_(self, other):
+        import numpy as np
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return np.minimum(self.data, other)
+
+    def clamp_(self, min_val=None, max_val=None):
+        import numpy as np
+        return np.clip(self.data, a_min=min_val, a_max=max_val)
+
+    def clamp_min_(self, min_val):
+        import numpy as np
+        return np.maximum(self.data, min_val)
+
+    def clamp_max_(self, max_val):
+        import numpy as np
+        return np.minimum(self.data, max_val)
+
+    def greater_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data > value
+
+    def greater_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data >= value
+
+    def less_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data <= value
+
+    def equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data == value
+
+    def logical_not_(self):
+        import numpy as np
+        return np.logical_not(self.data)
+
+    def sqrt_(self):
+        import numpy as np
+        return np.sqrt(self.data)
+
+    def exp_(self):
+        import numpy as np
+        return np.exp(self.data)
+
+    def log_(self):
+        import numpy as np
+        return np.log(self.data)
+
+    def softmax_(self, dim):
+        import numpy as np
+        x = self.data
+        x_max = np.max(x, axis=dim, keepdims=True)
+        e_x = np.exp(x - x_max)
+        return e_x / np.sum(e_x, axis=dim, keepdims=True)
+
+    def log_softmax_(self, dim):
+        import numpy as np
+        x = self.data
+        x_max = np.max(x, axis=dim, keepdims=True)
+        e_x = np.exp(x - x_max)
+        softmax = e_x / np.sum(e_x, axis=dim, keepdims=True)
+        return np.log(softmax)
+
+    def transpose_(self, dim0, dim1):
+        import numpy as np
+        axes = list(range(self.data.ndim))
+        axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+        return np.transpose(self.data, axes)
     def __init__(self, track_time: bool = False):
         super().__init__(track_time=track_time)
 
@@ -258,8 +349,12 @@ class NumPyTensorOperations(AbstractTensor):
     def numel_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).size
 
-    def mean_(self, tensor, dim=None):
-        return np.mean(self._AbstractTensor__unwrap(tensor), axis=dim)
+    def mean_(self, tensor, dim=None, keepdim=False):
+        return np.mean(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+    def sum_(self, tensor, dim=None, keepdim=False):
+        return np.sum(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+    def min_(self, tensor, dim=None, keepdim=False):
+        return np.min(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
 
     def pow_(self, tensor, exponent: float):
         return np.power(self._AbstractTensor__unwrap(tensor), exponent)
@@ -296,8 +391,8 @@ class NumPyTensorOperations(AbstractTensor):
         idx = self._AbstractTensor__unwrap(indices)
         return np.take(tensor, idx, axis=dim)
 
-    def argmin_(self, tensor, dim=None):
-        return np.argmin(self._AbstractTensor__unwrap(tensor), axis=dim)
+    def argmin_(self, tensor, dim=None, keepdim=False):
+        return np.argmin(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
 
     def interpolate_(self, tensor, size):
         arr = np.array(self._AbstractTensor__unwrap(tensor))

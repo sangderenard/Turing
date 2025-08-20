@@ -86,18 +86,205 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
-    def mean(self, dim=None):
+    def max(self, dim=None, keepdim: bool = False):
+        """Return the maximum of the tensor along the specified dimension(s)."""
+        return self.max_(dim=dim, keepdim=keepdim)
+
+    def argmax(self, dim: Optional[int] = None, keepdim: bool = False):
+        """Return the indices of the maximum values along an axis."""
+        return self.argmax_(dim, keepdim)
+    def max_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement max_() with keepdim.")
+
+    def argmax_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement argmax_() with keepdim.")
+    def to(self, dtype):
+        """Redirect to to_dtype for compatibility with backend-style dtype conversion."""
+        return self.to_dtype(dtype)
+
+    def astype(self, dtype):
+        """Redirect to to_dtype for compatibility with backend-style dtype conversion."""
+        return self.to_dtype(dtype)
+    # --- Selection / piecewise ---
+    def where(self, x: Any, y: Any) -> "AbstractTensor":
+        """Elementwise select: self as bool mask, x if True else y."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.where_(x, y)
+        return result
+
+    def where_(self, x, y):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement where_()")
+
+    # --- Extrema ---
+    def maximum(self, other: Any) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.maximum_(other)
+        return result
+
+    def maximum_(self, other):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement maximum_()")
+
+    def minimum(self, other: Any) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.minimum_(other)
+        return result
+
+    def minimum_(self, other):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement minimum_()")
+
+    # --- Clamping ---
+    def clamp(self, min: Any = None, max: Any = None) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_(min, max)
+        return result
+
+    def clamp_(self, min, max):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_()")
+
+    def clamp_min(self, min: Any) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_min_(min)
+        return result
+
+    def clamp_min_(self, min):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_min_()")
+
+    def clamp_max(self, max: Any) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_max_(max)
+        return result
+
+    def clamp_max_(self, max):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_max_()")
+
+    # --- Comparisons ---
+    def greater(self, value: Any) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.greater_(value)
+        return result
+
+    def greater_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement greater_()")
+
+    def greater_equal(self, value) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.greater_equal_(value)
+        return result
+
+    def greater_equal_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement greater_equal_()")
+
+    def less_equal(self, value) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.less_equal_(value)
+        return result
+
+    def less_equal_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement less_equal_()")
+
+    def equal(self, value) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.equal_(value)
+        return result
+
+    def equal_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement equal_()")
+
+    def not_equal(self, value) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.not_equal_(value)
+        return result
+
+    def not_equal_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement not_equal_()")
+
+    # --- Logical ---
+    def logical_not(self) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.logical_not_()
+        return result
+
+    def logical_not_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement logical_not_()")
+
+    # --- Unary math ---
+    def sqrt(self) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.sqrt_()
+        return result
+
+    def sqrt_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement sqrt_()")
+
+    def exp(self) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.exp_()
+        return result
+
+    def exp_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement exp_()")
+
+    def log(self) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.log_()
+        return result
+
+    def log_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement log_()")
+
+    # --- Softmax utilities ---
+    def softmax(self, dim: int = -1) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.softmax_(dim)
+        return result
+
+    def softmax_(self, dim):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement softmax_()")
+
+    def log_softmax(self, dim: int = -1) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.log_softmax_(dim)
+        return result
+
+    def log_softmax_(self, dim):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
+
+    # --- Basic layout ---
+    def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.transpose_(dim0, dim1)
+        return result
+
+    def transpose_(self, dim0, dim1):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement transpose_()")
+    def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
-        return self.mean_(dim=dim)
+        return self.mean_(dim=dim, keepdim=keepdim)
 
-    def sum(self, dim=None):
+    def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
-        return self.sum_(dim=dim)
+        return self.sum_(dim=dim, keepdim=keepdim)
 
-    def min(self, dim=None):
+    def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        return self.min_(dim=dim)
-    # Add other backend methods as needed for harmony
+        return self.min_(dim=dim, keepdim=keepdim)
+
+    def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
+        """Return the indices of the minimum values along an axis."""
+        return self.argmin_(dim, keepdim)
+    # --- Backend hooks for reductions (must be implemented by backends) ---
+    def mean_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement mean_() with keepdim.")
+
+    def sum_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement sum_() with keepdim.")
+
+    def min_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement min_() with keepdim.")
+
+    def argmin_(self, dim=None, keepdim: bool = False):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement argmin_() with keepdim.")
+
     def tolist_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement tolist_() for conversion to list.")
     def _AbstractTensor__unwrap(self, obj=None):
@@ -429,18 +616,71 @@ class AbstractTensor:
 
     # --- Operator routing ---
     def _apply_operator(self, op: str, left: Any, right: Any):
-        """Apply ``op`` to ``left`` and ``right`` returning a new tensor."""
+        """
+        Arithmetic with bool tensors:
+        - if mixing with floats/complex -> cast bool to float
+        - if mixing with ints          -> cast bool to int (0/1)
+        - for true division            -> cast bool to float
+        Promotion happens BEFORE unwrap; backends never see bool arithmetic.
+        """
+        arithmetic_ops = {
+            "add","sub","mul","truediv","floordiv","mod","pow",
+            "iadd","isub","imul","itruediv","ifloordiv","imod","ipow",
+            "radd","rsub","rmul","rtruediv","rfloordiv","rmod","rpow",
+        }
+        div_ops = {"truediv","rtruediv","itruediv"}
+
+        def kind(x):
+            if isinstance(x, AbstractTensor):
+                try:
+                    dt = x.get_dtype()
+                    if dt == x.bool_dtype: return "bool"
+                    s = str(dt).lower()
+                    if "complex" in s: return "complex"
+                    if "float" in s or "half" in s or "bfloat" in s: return "float"
+                    if "int" in s or "long" in s: return "int"
+                except Exception:
+                    return "unknown"
+                return "unknown"
+            if isinstance(x, bool):  return "bool"
+            if isinstance(x, float): return "float"
+            if isinstance(x, int):   return "int"
+            return "unknown"
+
+        def cast_bool_like(x, target_kind):
+            if target_kind in ("float","complex"):
+                return x.to_dtype("float")
+            else:
+                return x.long()
+
+        if op in arithmetic_ops:
+            lk, rk = kind(left), kind(right)
+            if op in div_ops:
+                if isinstance(left, AbstractTensor) and lk == "bool":
+                    left = left.to_dtype("float")
+                if isinstance(right, AbstractTensor) and rk == "bool":
+                    right = right.to_dtype("float")
+            else:
+                target = "float" if ("float" in (lk, rk) or "complex" in (lk, rk)) else "int"
+                if isinstance(left, AbstractTensor) and lk == "bool":
+                    left = cast_bool_like(left, target)
+                if isinstance(right, AbstractTensor) and rk == "bool":
+                    right = cast_bool_like(right, target)
+
+            # Handle raw Python bools symmetrically (e.g., 1 - True)
+            if isinstance(left, bool):
+                left = 1.0 if (op in div_ops or "float" in (rk,)) else 1
+            if isinstance(right, bool):
+                right = 1.0 if (op in div_ops or "float" in (lk,)) else 1
+
+        # unwrap AFTER promotion
         l = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
-        r = (
-            right._AbstractTensor__unwrap()
-            if isinstance(right, AbstractTensor)
-            else right
-        )
+        r = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
 
         result = type(self)(track_time=self.track_time)
-
         result.data = self._apply_operator__(op, l, r)
         return result
+
 
     def __add__(self, other):
         return self._apply_operator("add", self, other)
@@ -653,6 +893,9 @@ class AbstractTensor:
 
         table = "\n".join(lines)
         return f"\n\n{header}\n{table}\n\n"
+
+    def __format__(self, format_spec: str) -> str:
+        return f"AbstractTensor (shape={self.get_shape()}, dtype={self.get_dtype()}, device={self.get_device()})"
 
     def __repr__(self):
         # Unified repr: AbstractTensor (BackendClass (backend data repr))

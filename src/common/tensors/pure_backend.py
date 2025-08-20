@@ -40,6 +40,65 @@ from .abstraction import _get_shape, _flatten, register_backend
 from .abstraction import AbstractTensor
 
 class PurePythonTensorOperations(AbstractTensor):
+    def max_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _max(lst):
+            flat = _flatten(lst)
+            return max(flat) if flat else 0.0
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    m = max(lst)
+                    return [m] if keepdim else m
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    m = max(col)
+                    result.append(m)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            m = _max(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    m = [m]
+            return m
+        return reduce_dim(data, dim)
+
+    def argmax_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _argmax(lst):
+            flat = _flatten(lst)
+            return flat.index(max(flat)) if flat else 0
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    idx = lst.index(max(lst))
+                    return [idx] if keepdim else idx
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    idx = col.index(max(col))
+                    result.append(idx)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            idx = _argmax(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    idx = [idx]
+            return idx
+        return reduce_dim(data, dim)
     """Educational tensor ops using nested Python lists."""
 
     def __init__(self, track_time: bool = False):
@@ -385,18 +444,94 @@ class PurePythonTensorOperations(AbstractTensor):
     def numel_(self, tensor: Any) -> int:
         return len(_flatten(self._AbstractTensor__unwrap(tensor)))
 
-    def mean_(self, tensor: Any, dim: Optional[int] = None) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        if not isinstance(tensor, list):
-            return tensor
-        if dim is None or dim == 0:
-            flat = _flatten(tensor)
+    def mean_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _mean(lst):
+            flat = _flatten(lst)
             return sum(flat) / len(flat) if flat else 0.0
-        if dim == 1:
-            if not isinstance(tensor[0], list):
-                raise ValueError("Tensor must be 2D for mean along dim 1")
-            return [sum(row) / len(row) if row else 0.0 for row in tensor]
-        raise NotImplementedError("mean only implemented for dim 0, 1, or None")
+        def reduce_dim(lst, d):
+            if d == 0:
+                # mean over axis 0
+                if not isinstance(lst[0], list):
+                    m = sum(lst) / len(lst) if lst else 0.0
+                    return [m] if keepdim else m
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    m = sum(col) / len(col) if col else 0.0
+                    result.append(m)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            m = _mean(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    m = [m]
+            return m
+        return reduce_dim(data, dim)
+    def sum_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _sum(lst):
+            flat = _flatten(lst)
+            return sum(flat)
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    s = sum(lst)
+                    return [s] if keepdim else s
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    s = sum(col)
+                    result.append(s)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            s = _sum(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    s = [s]
+            return s
+        return reduce_dim(data, dim)
+    def min_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _min(lst):
+            flat = _flatten(lst)
+            return min(flat) if flat else 0.0
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    m = min(lst)
+                    return [m] if keepdim else m
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    m = min(col)
+                    result.append(m)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            m = _min(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    m = [m]
+            return m
+        return reduce_dim(data, dim)
 
     def pow_(self, tensor: Any, exponent: float) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)
@@ -452,19 +587,35 @@ class PurePythonTensorOperations(AbstractTensor):
             return [[row[i] for i in idx] for row in tensor]
         raise NotImplementedError("index_select only implemented for dim 0 or 1")
 
-    def argmin_(self, tensor: Any, dim: Optional[int] = None) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        shape = _get_shape(tensor)
-        if dim is None:
-            flat = _flatten(tensor)
+    def argmin_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self._AbstractTensor__unwrap(tensor)
+        def _argmin(lst):
+            flat = _flatten(lst)
             return flat.index(min(flat)) if flat else 0
-        if dim < 0:
-            dim += len(shape)
-        if len(shape) == 1:
-            return tensor.index(min(tensor))
-        if dim == 0:
-            return [self.argmin_([row[i] for row in tensor]) for i in range(shape[1])]
-        return [self.argmin_(sub, dim - 1) for sub in tensor]
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    idx = lst.index(min(lst))
+                    return [idx] if keepdim else idx
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    idx = col.index(min(col))
+                    result.append(idx)
+                if keepdim:
+                    return [result]
+                return result
+            else:
+                return [reduce_dim(row, d-1) for row in lst]
+        if dim is None:
+            idx = _argmin(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    idx = [idx]
+            return idx
+        return reduce_dim(data, dim)
 
     def interpolate_(self, tensor: Any, size: Tuple[int, ...]) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)

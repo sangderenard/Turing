@@ -111,7 +111,9 @@ def draw_diff(
     subunit_to_char_kernel: callable[[np.ndarray, str, int, int], list[str]] = default_subunit_batch_to_chars, # Update signature
     active_ascii_ramp: str = DEFAULT_DRAW_ASCII_RAMP,  # The ASCII ramp to use for character conversion
     base_row: int = 1, 
-    base_col: int = 1
+    base_col: int = 1,
+    enable_fg_color: bool = True,
+    enable_bg_color: bool = True,
 ) -> None:
     """Render changed subunits using a kernel to map subunit data to characters.
     
@@ -135,15 +137,18 @@ def draw_diff(
         char_y = y_pixel // char_cell_pixel_height
         char_x = x_pixel // char_cell_pixel_width
 
-        # Determine average color of the subunit for foreground/background
-        if subunit_data.ndim == 3 and subunit_data.shape[2] == 3:  # RGB
+        ansi_color_bg = ""
+        ansi_color_fg = ""
+        if subunit_data.ndim == 3 and subunit_data.shape[2] == 3:
             avg_color = np.mean(subunit_data, axis=(0, 1)).astype(int)
             r, g, b = avg_color[0], avg_color[1], avg_color[2]
-            ansi_color_bg = f"\x1b[48;2;{r};{g};{b}m"
-            ansi_color_fg = "\x1b[38;2;255;255;255m"
+            if enable_bg_color:
+                ansi_color_bg = f"\x1b[48;2;{r};{g};{b}m"
+            if enable_fg_color:
+                ansi_color_fg = "\x1b[38;2;255;255;255m"
         else:
-            ansi_color_bg = ""
-            ansi_color_fg = ""
+            if enable_fg_color:
+                ansi_color_fg = "\x1b[38;2;255;255;255m"
 
         terminal_row = base_row + char_y
         terminal_col = base_col + char_x

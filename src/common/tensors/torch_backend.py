@@ -43,6 +43,89 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    def max_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            out = x.max()
+            return out if not keepdim else out.view(*([1] * x.dim()))
+        vals, _ = x.max(dim=dim, keepdim=keepdim)
+        return vals
+
+    def argmax_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            return x.argmax()
+        return x.argmax(dim=dim, keepdim=keepdim)
+    def where_(self, x, y):
+        import torch
+        x = x.data if isinstance(x, AbstractTensor) else x
+        y = y.data if isinstance(y, AbstractTensor) else y
+        return torch.where(self.data, x, y)
+
+    def maximum_(self, other):
+        import torch
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return torch.maximum(self.data, other)
+
+    def minimum_(self, other):
+        import torch
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return torch.minimum(self.data, other)
+
+    def clamp_(self, min_val=None, max_val=None):
+        import torch
+        return torch.clamp(self.data, min=min_val, max=max_val)
+
+    def clamp_min_(self, min_val):
+        import torch
+        return torch.clamp_min(self.data, min_val)
+
+    def clamp_max_(self, max_val):
+        import torch
+        return torch.clamp_max(self.data, max_val)
+
+    def greater_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data > value
+
+    def greater_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data >= value
+
+    def less_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data <= value
+
+    def equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data == value
+
+    def logical_not_(self):
+        import torch
+        return torch.logical_not(self.data)
+
+    def sqrt_(self):
+        import torch
+        return torch.sqrt(self.data)
+
+    def exp_(self):
+        import torch
+        return torch.exp(self.data)
+
+    def log_(self):
+        import torch
+        return torch.log(self.data)
+
+    def softmax_(self, dim):
+        import torch
+        return torch.softmax(self.data, dim=dim)
+
+    def log_softmax_(self, dim):
+        import torch
+        return torch.log_softmax(self.data, dim=dim)
+
+    def transpose_(self, dim0, dim1):
+        return self.data.transpose(dim0, dim1)
     def __init__(self, default_device = "cpu", track_time: bool = False):
         super().__init__(track_time=track_time)
         try:
@@ -189,8 +272,25 @@ class PyTorchTensorOperations(AbstractTensor):
     def numel_(self):
         return self.data.numel()
 
-    def mean_(self, dim=None):
-        return torch.mean(self.data, dim=dim)
+    def mean_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            out = x.mean()
+            return out if not keepdim else out.view(*([1] * x.dim()))
+        return x.mean(dim=dim, keepdim=keepdim)
+    def sum_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            out = x.sum()
+            return out if not keepdim else out.view(*([1] * x.dim()))
+        return x.sum(dim=dim, keepdim=keepdim)
+    def min_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            out = x.min()
+            return out if not keepdim else out.view(*([1] * x.dim()))
+        vals, _ = x.min(dim=dim, keepdim=keepdim)
+        return vals
 
     def pow_(self, exponent: float):
         return torch.pow(self.data, exponent)
@@ -224,8 +324,11 @@ class PyTorchTensorOperations(AbstractTensor):
     def index_select_(self, dim, indices):
         return torch.index_select(self.data, dim, indices)
 
-    def argmin_(self, dim=None):
-        return torch.argmin(self.data) if dim is None else torch.argmin(self.data, dim=dim)
+    def argmin_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            return x.argmin()  # flattened index; keepdim not meaningful here
+        return x.argmin(dim=dim, keepdim=keepdim)
 
     def get_shape(self):
         return tuple(self.data.shape)

@@ -1,5 +1,6 @@
 """Charset and charmap utilities for FontMapper."""
 from __future__ import annotations
+from pathlib import Path
 
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
@@ -164,6 +165,7 @@ def obtain_charset(
     return fonts, charset, bitmasks, max_w, max_h
 
 
+
 __all__ = [
     "list_printable_characters",
     "generate_checkerboard_pattern",
@@ -171,3 +173,19 @@ __all__ = [
     "bytemaps_as_ascii",
     "obtain_charset",
 ]
+
+
+if __name__ == "__main__":
+    import argparse
+    fontfile = Path(__file__).with_name("consola.ttf")
+    parser = argparse.ArgumentParser(description="Show all generated bitmaps as ASCII art for a font.")
+    parser.add_argument("font", type=str, default=fontfile, help="Path to a TTF/OTF font file")
+    parser.add_argument("--size", type=int, default=16, help="Font size (default: 16)")
+    parser.add_argument("--level", type=int, default=1, help="Complexity level for variants (default: 1)")
+    parser.add_argument("--console-width", type=int, default=120, help="Console width for ASCII preview")
+    args = parser.parse_args()
+
+    fonts, charset, bitmasks, max_w, max_h = obtain_charset([args.font], args.size, args.level)
+    print(f"Font: {args.font}\nSize: {args.size}\nComplexity Level: {args.level}\nCharset: {charset}\n")
+    ascii_preview = bytemaps_as_ascii(bitmasks, max_w, max_h, console_width=args.console_width)
+    print(ascii_preview)
