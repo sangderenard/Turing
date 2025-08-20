@@ -114,7 +114,7 @@ class Model:
         for i in reversed(range(len(self.layers))):
             act = self.activations[i]
             if act is not None:
-                g = act.backward(self._post[i], g)
+                g = act.backward(self._pre[i], g)
             g = self.layers[i].backward(g)
         return g
 
