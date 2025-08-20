@@ -788,6 +788,7 @@ class AbstractTensor:
             "add","sub","mul","truediv","floordiv","mod","pow",
             "iadd","isub","imul","itruediv","ifloordiv","imod","ipow",
             "radd","rsub","rmul","rtruediv","rfloordiv","rmod","rpow",
+            "neg","abs","invert",
         }
         div_ops = {"truediv","rtruediv","itruediv"}
 

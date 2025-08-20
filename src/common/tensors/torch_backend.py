@@ -116,6 +116,33 @@ class PyTorchTensorOperations(AbstractTensor):
         import torch
         return torch.log(self.data)
 
+    def neg_(self):
+        return -self.data
+
+    def abs_(self):
+        import torch
+        return torch.abs(self.data)
+
+    def invert_(self):
+        import torch
+        return torch.bitwise_not(self.data)
+
+    def round_(self, n=None):
+        import torch
+        return torch.round(self.data, decimals=n) if n is not None else torch.round(self.data)
+
+    def trunc_(self):
+        import torch
+        return torch.trunc(self.data)
+
+    def floor_(self):
+        import torch
+        return torch.floor(self.data)
+
+    def ceil_(self):
+        import torch
+        return torch.ceil(self.data)
+
     def softmax_(self, dim):
         import torch
         return torch.softmax(self.data, dim=dim)
@@ -139,7 +166,13 @@ class PyTorchTensorOperations(AbstractTensor):
         # torch is imported in __init__ and assigned to self._torch
         a = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
         b = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
-        
+
+        if op == "neg":
+            return -a
+        if op == "abs":
+            return torch.abs(a)
+        if op == "invert":
+            return torch.bitwise_not(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":

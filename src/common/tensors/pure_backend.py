@@ -124,6 +124,10 @@ class PurePythonTensorOperations(AbstractTensor):
         from .abstraction import AbstractTensor
         left = self._AbstractTensor__unwrap(left) if isinstance(left, AbstractTensor) else left
         right = self._AbstractTensor__unwrap(right) if isinstance(right, AbstractTensor) else right
+        if right is None:
+            if isinstance(left, list):
+                return self._elementwise_unary(op, left)
+            return self._apply_scalar_unary(op, left)
         if op in {"matmul", "rmatmul", "imatmul"}:
             a, b = (left, right) if op != "rmatmul" else (right, left)
             return self._matmul(a, b)
@@ -136,6 +140,20 @@ class PurePythonTensorOperations(AbstractTensor):
         if isinstance(left, list):
             return self._elementwise_op_scalar(op, left, right)
         return self._apply_scalar_op(op, left, right)
+
+    def _elementwise_unary(self, op: str, a):
+        if not isinstance(a, list):
+            return self._apply_scalar_unary(op, a)
+        return [self._elementwise_unary(op, ai) for ai in a]
+
+    def _apply_scalar_unary(self, op: str, x):
+        if op == "neg":
+            return -x
+        if op == "abs":
+            return abs(x)
+        if op == "invert":
+            return ~x
+        raise NotImplementedError(f"Operator {op} not implemented for pure Python backend.")
 
     def _elementwise_op(self, op: str, a, b):
         # Recursively apply op to nested lists
@@ -748,6 +766,35 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def get_ndims(self) -> int:
         return len(_get_shape(self.data))
+
+    def _map_unary(self, func, data):
+        if isinstance(data, list):
+            return [self._map_unary(func, x) for x in data]
+        return func(data)
+
+    def neg_(self):
+        return self._map_unary(lambda x: -x, self.data)
+
+    def abs_(self):
+        return self._map_unary(abs, self.data)
+
+    def invert_(self):
+        return self._map_unary(lambda x: ~x, self.data)
+
+    def round_(self, n=None):
+        return self._map_unary(lambda x: round(x, n) if n is not None else round(x), self.data)
+
+    def trunc_(self):
+        import math
+        return self._map_unary(math.trunc, self.data)
+
+    def floor_(self):
+        import math
+        return self._map_unary(math.floor, self.data)
+
+    def ceil_(self):
+        import math
+        return self._map_unary(math.ceil, self.data)
 
     def to_dtype_(self, tensor, dtype: str = "float"):
         # For pure Python, just convert all elements recursively
