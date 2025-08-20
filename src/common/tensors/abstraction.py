@@ -804,10 +804,15 @@ class AbstractTensor:
         # Coerce list-like operands into tensors so that operator logic remains
         # backend-agnostic. This ensures raw Python lists interoperate with
         # tensors without requiring callers to explicitly convert them.
+        # In AbstractTensor._apply_operator(...)
         if isinstance(left, AbstractTensor) and isinstance(right, (list, tuple)):
-            right = left.ensure_tensor(right)
+            right = left.ensure_tensor(right)      # instead of get_tensor(... Faculty.NUMPY)
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
-            left = right.ensure_tensor(left)
+            left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
+
+        # Optional belt-and-suspenders: align mixed backends
+        if isinstance(left, AbstractTensor) and isinstance(right, AbstractTensor) and (type(left) is not type(right)):
+            right = right.to_backend(left)
 
         arithmetic_ops = {
             "add","sub","mul","truediv","floordiv","mod","pow",
@@ -873,6 +878,8 @@ class AbstractTensor:
         return self._apply_operator("add", self, other)
 
     def __sub__(self, other):
+        if isinstance(self, (list, tuple)):
+            exit()
         return self._apply_operator("sub", self, other)
 
     def __mul__(self, other):
