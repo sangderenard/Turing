@@ -14,7 +14,18 @@ class MSELoss(Loss):
         return (diff * diff).mean()
     def backward(self, pred: AbstractTensor, target: AbstractTensor) -> AbstractTensor:
         diff = pred - target
-        N = len(pred) if hasattr(pred, '__len__') else 1
+        if hasattr(pred, "numel"):
+            N = pred.numel()
+        elif hasattr(pred, "numel_"):
+            N = pred.numel_()
+        elif hasattr(pred, "shape"):
+            N = 1
+            for d in pred.shape:
+                N *= d
+        else:
+            def _count(x):
+                return sum(_count(v) for v in x) if isinstance(x, list) else 1
+            N = _count(as_list(pred)) if hasattr(pred, "__len__") else 1
         return (2.0 / float(N)) * diff
 
 class CrossEntropyLoss(Loss):
