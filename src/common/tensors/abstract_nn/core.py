@@ -14,7 +14,7 @@ class Linear:
         self.like = like
         scale = math.sqrt(2.0 / float(in_dim + out_dim)) if init == "xavier" else 0.02
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
-        self.b = from_list_like([[0.0 for _ in range(out_dim)]], like=like) if bias else None
+        self.b = from_list_like([[0.0] * out_dim], like=like) if bias else None
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
