@@ -156,6 +156,12 @@ class JAXTensorOperations(AbstractTensor):
         axes = list(range(self.data.ndim))
         axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
         return jnp.transpose(self.data, axes)
+    def reshape_(self, shape):
+        import jax.numpy as jnp
+        return jnp.reshape(self.data, shape)
+    def squeeze_(self, dim: int | None = None):
+        import jax.numpy as jnp
+        return jnp.squeeze(self.data, axis=dim) if dim is not None else jnp.squeeze(self.data)
     """Tensor operations powered by `jax.numpy`."""
 
     def __init__(self, default_device: Optional[Any] = None, track_time: bool = False) -> None:
@@ -290,7 +296,7 @@ class JAXTensorOperations(AbstractTensor):
     def select_by_indices_(self, tensor: Any, indices_dim0: Any, indices_dim1: Any) -> Any:
         return self._to_jnp(tensor)[indices_dim0, indices_dim1]
 
-    def log_softmax_(self, tensor: Any, dim: int) -> Any:
+    def log_softmax_tensor_(self, tensor: Any, dim: int) -> Any:
         from jax.nn import log_softmax
         return log_softmax(self._to_jnp(tensor), axis=dim)
 
