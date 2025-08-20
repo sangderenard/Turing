@@ -109,6 +109,33 @@ class JAXTensorOperations(AbstractTensor):
         import jax.numpy as jnp
         return jnp.log(self.data)
 
+    def neg_(self):
+        return -self.data
+
+    def abs_(self):
+        import jax.numpy as jnp
+        return jnp.abs(self.data)
+
+    def invert_(self):
+        import jax.numpy as jnp
+        return jnp.invert(self.data)
+
+    def round_(self, n=None):
+        import jax.numpy as jnp
+        return jnp.round(self.data, n or 0)
+
+    def trunc_(self):
+        import jax.numpy as jnp
+        return jnp.trunc(self.data)
+
+    def floor_(self):
+        import jax.numpy as jnp
+        return jnp.floor(self.data)
+
+    def ceil_(self):
+        import jax.numpy as jnp
+        return jnp.ceil(self.data)
+
     def softmax_(self, dim):
         import jax.numpy as jnp
         x = self.data
@@ -170,6 +197,12 @@ class JAXTensorOperations(AbstractTensor):
         from .abstraction import AbstractTensor
         a = self._to_jnp(left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left)
         b = self._to_jnp(right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right)
+        if op == "neg":
+            return -a
+        if op == "abs":
+            return jnp.abs(a)
+        if op == "invert":
+            return jnp.invert(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":

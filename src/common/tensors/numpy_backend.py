@@ -120,6 +120,33 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.log(self.data)
 
+    def neg_(self):
+        return -self.data
+
+    def abs_(self):
+        import numpy as np
+        return np.abs(self.data)
+
+    def invert_(self):
+        import numpy as np
+        return np.invert(self.data)
+
+    def round_(self, n=None):
+        import numpy as np
+        return np.round(self.data, n)
+
+    def trunc_(self):
+        import numpy as np
+        return np.trunc(self.data)
+
+    def floor_(self):
+        import numpy as np
+        return np.floor(self.data)
+
+    def ceil_(self):
+        import numpy as np
+        return np.ceil(self.data)
+
     def softmax_(self, dim):
         import numpy as np
         x = self.data
@@ -148,6 +175,12 @@ class NumPyTensorOperations(AbstractTensor):
         from .abstraction import AbstractTensor
         a = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
         b = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
+        if op == "neg":
+            return -a
+        if op == "abs":
+            return np.abs(a)
+        if op == "invert":
+            return np.invert(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
