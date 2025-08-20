@@ -186,17 +186,20 @@ class JAXTensorOperations(AbstractTensor):
             return tensor
         return jnp.array(tensor)
 
-    def to_device_(self, tensor: Any, device: Any) -> Any:
+    def to_device_(self, device: Any) -> Any:
         """Move tensor to specified device with validation."""
         target_device = device or self.default_device
         if target_device is not None:
             device_str = str(target_device).lower()
-            if ('gpu' in device_str and not self.has_gpu) or \
-               ('tpu' in device_str and not self.has_tpu):
-                print(f"Warning: Requested device {device_str} not available. Using CPU.")
+            if ('gpu' in device_str and not self.has_gpu) or (
+                'tpu' in device_str and not self.has_tpu
+            ):
+                print(
+                    f"Warning: Requested device {device_str} not available. Using CPU."
+                )
                 target_device = jax.devices('cpu')[0]
-        
-        return jax.device_put(self._to_jnp(tensor), target_device)
+
+        return jax.device_put(self.data, target_device)
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         """Apply arithmetic ops using JAX arrays."""
@@ -286,8 +289,9 @@ class JAXTensorOperations(AbstractTensor):
     def bool_(self, tensor: Any) -> Any:
         return self.to_dtype_(tensor, "bool")
 
-    def not_equal_(self, tensor1: Any, tensor2: Any) -> Any:
-        return jnp.not_equal(self._to_jnp(tensor1), self._to_jnp(tensor2))
+    def not_equal_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return jnp.not_equal(self.data, value)
 
     def arange_(self, start: int, end: Optional[int] = None, step: int = 1, device: Any = None, dtype: Any = None) -> Any:
         arr = jnp.arange(start, end, step, dtype=dtype) if end is not None else jnp.arange(start, dtype=dtype)
@@ -397,8 +401,9 @@ class JAXTensorOperations(AbstractTensor):
     def tolist_(self) -> list:
         return list(self._to_jnp(self.data).tolist())
 
-    def less_(self, tensor: Any, value: Any) -> Any:
-        return jnp.less(self._to_jnp(tensor), value)
+    def less_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return jnp.less(self.data, value)
 
     def index_select_(self, tensor: Any, dim: int, indices: Any) -> Any:
         return jnp.take(self._to_jnp(tensor), indices, axis=dim)

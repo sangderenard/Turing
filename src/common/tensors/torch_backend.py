@@ -251,9 +251,9 @@ class PyTorchTensorOperations(AbstractTensor):
     def bool_(self):
         return self.data.bool()
 
-    def not_equal_(self, other):
-        from .abstraction import AbstractTensor
-        return self.data != (other.data if isinstance(other, AbstractTensor) else other)
+    def not_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data != value
 
     def arange_(self, start, end=None, step=1, device=None, dtype=None):
         if end is None:
@@ -357,6 +357,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return self.data.tolist()
 
     def less_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
         return self.data < value
 
     def index_select_(self, dim, indices):

@@ -100,6 +100,10 @@ class NumPyTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return self.data <= value
 
+    def less_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data < value
+
     def equal_(self, value):
         value = value.data if isinstance(value, AbstractTensor) else value
         return self.data == value
@@ -261,14 +265,14 @@ class NumPyTensorOperations(AbstractTensor):
         tensor = self._AbstractTensor__unwrap(tensor if tensor is not None else self.data)
         return np.array(tensor, copy=True)
 
-    def to_device_(self, tensor, device):
-        return self._AbstractTensor__unwrap(tensor)
+    def to_device_(self, device):
+        return self.data
 
-    def get_device_(self, tensor):
-        return 'cpu'
+    def get_device_(self):
+        return "cpu"
 
-    def get_dtype_(self, tensor):
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def get_dtype_(self):
+        tensor = self.data
         if isinstance(tensor, np.ndarray):
             return self._numpy_dtype_to_torch(tensor.dtype)
         return tensor.dtype
@@ -297,8 +301,9 @@ class NumPyTensorOperations(AbstractTensor):
     def bool_(self, tensor):
         return self.to_dtype_(tensor, "bool")
 
-    def not_equal_(self, tensor1, tensor2):
-        return self._AbstractTensor__unwrap(tensor1) != self._AbstractTensor__unwrap(tensor2)
+    def not_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self.data != value
 
     def arange_(self, start, end=None, step=1, device=None, dtype=None):
         np_dtype = self._torch_dtype_to_numpy(dtype) if dtype is not None else None
@@ -386,7 +391,11 @@ class NumPyTensorOperations(AbstractTensor):
         return np.clip(self.data, a_min=min_val, a_max=max_val)
 
     def shape_(self):
-        return tuple(self.data.shape)
+        v = self.data
+        try:
+            return tuple(v.shape)
+        except Exception:
+            return ()
 
     def numel_(self):
         return self.data.size

@@ -276,6 +276,14 @@ class AbstractTensor:
     def greater_equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement greater_equal_()")
 
+    def less(self, value) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.less_(value)
+        return result
+
+    def less_(self, value):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement less_()")
+
     def less_equal(self, value) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
         result.data = self.less_equal_(value)
@@ -462,6 +470,12 @@ class AbstractTensor:
 
     def get_dtype(self) -> Any:
         return self.get_dtype_()
+
+    def numel(self) -> int:
+        return self.numel_()
+
+    def numel_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement numel_()")
 
     def item(self) -> Union[int, float, bool]:
         return self.item_()
@@ -878,8 +892,6 @@ class AbstractTensor:
         return self._apply_operator("add", self, other)
 
     def __sub__(self, other):
-        if isinstance(self, (list, tuple)):
-            exit()
         return self._apply_operator("sub", self, other)
 
     def __mul__(self, other):
@@ -899,6 +911,24 @@ class AbstractTensor:
 
     def __matmul__(self, other):
         return self._apply_operator("matmul", self, other)
+
+    def __eq__(self, other):
+        return self.equal(other)
+
+    def __ne__(self, other):
+        return self.not_equal(other)
+
+    def __lt__(self, other):
+        return self.less(other)
+
+    def __le__(self, other):
+        return self.less_equal(other)
+
+    def __gt__(self, other):
+        return self.greater(other)
+
+    def __ge__(self, other):
+        return self.greater_equal(other)
 
     # Reverse operators
     def __radd__(self, other):
@@ -1130,6 +1160,15 @@ class AbstractTensor:
         if data is None:
             raise ValueError("__len__ called on empty tensor")
         return len(data)
+
+    def __bool__(self):
+        try:
+            n = int(self.numel())
+        except Exception:
+            return bool(self.item())
+        if n != 1:
+            raise ValueError("The truth value of a tensor with more than one element is ambiguous.")
+        return bool(self.item())
 
     def data_or(self, obj: Any = None) -> Any:
         """Return self.data if no argument is passed, otherwise return the argument unchanged."""
