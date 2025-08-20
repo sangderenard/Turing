@@ -9,6 +9,8 @@ def get_operator_dataset(op_name, like):
     X = from_list_like(
         [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], like=like
     )
+    # Zero-center the inputs for tanh stability
+    X = X * 2.0 - 1.0
     if op_name == 'xor':
         Y = from_list_like([[0.0], [1.0], [1.0], [0.0]], like=like)
     elif op_name == 'and':
@@ -37,7 +39,8 @@ def run_operator_demo(op_name, loss_type, like, debug_hooks=None, until_stop=Fal
         ],
         activations=[Tanh(), Sigmoid() if loss_type == 'mse' else None],
     )
-    opt = Adam(model.parameters(), lr=1e-2 if loss_type == 'mse' else 3e-3)
+    # Use the same learning rate for both losses; BCE needs a higher LR
+    opt = Adam(model.parameters(), lr=1e-2)
     if loss_type == 'mse':
         loss_fn = MSELoss()
     else:
