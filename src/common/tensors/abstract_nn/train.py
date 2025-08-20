@@ -28,7 +28,11 @@ class GradControl:
 
 def _l2(g) -> float:
     # scalar float L2 for any AbstractTensor
-    return float(((g * g).sum()).sqrt().item())
+    s = (g * g).sum()
+    # Some backends return a tensor with sqrt(), others a numeric value
+    if hasattr(s, "sqrt"):
+        return float(s.sqrt().item())
+    return float(s) ** 0.5
 
 
 def _global_l2(grads: List) -> float:

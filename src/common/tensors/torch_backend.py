@@ -180,31 +180,31 @@ class PyTorchTensorOperations(AbstractTensor):
         if op in ("sub", "isub"):
             return a - b
         if op == "rsub":
-            return b - a
+            return a - b
         if op in ("mul", "imul"):
             return a * b
         if op == "rmul":
-            return b * a
+            return a * b
         if op in ("truediv", "itruediv"):
             return a / b
         if op == "rtruediv":
-            return b / a
+            return a / b
         if op in ("floordiv", "ifloordiv"):
             return torch.floor_divide(a, b)
         if op == "rfloordiv":
-            return torch.floor_divide(b, a)
+            return torch.floor_divide(a, b)
         if op in ("mod", "imod"):
             return a % b
         if op == "rmod":
-            return b % a
+            return a % b
         if op in ("pow", "ipow"):
             return a ** b
         if op == "rpow":
-            return b ** a
+            return a ** b
         if op in ("matmul", "imatmul"):
             return a @ b
         if op == "rmatmul":
-            return b @ a
+            return a @ b
         raise NotImplementedError(f"Operator {op} not implemented for PyTorch backend.")
 
     def full_(self, size, fill_value, dtype, device):

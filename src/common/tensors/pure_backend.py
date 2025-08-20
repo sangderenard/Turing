@@ -170,19 +170,19 @@ class PurePythonTensorOperations(AbstractTensor):
         if op in ("add", "radd", "iadd"):
             return x + y
         if op in ("sub", "rsub", "isub"):
-            return x - y if op != "rsub" else y - x
+            return x - y
         if op in ("mul", "rmul", "imul"):
             return x * y
         if op in ("truediv", "rtruediv", "itruediv"):
-            return x / y if op != "rtruediv" else y / x
+            return x / y
         if op in ("floordiv", "rfloordiv", "ifloordiv"):
-            return x // y if op != "rfloordiv" else y // x
+            return x // y
         if op in ("mod", "rmod", "imod"):
-            return x % y if op != "rmod" else y % x
+            return x % y
         if op in ("pow", "rpow", "ipow"):
-            return x**y if op != "rpow" else y**x
+            return x**y
         if op in ("matmul", "rmatmul", "imatmul"):
-            return self._matmul(x, y) if op != "rmatmul" else self._matmul(y, x)
+            return self._matmul(x, y)
         raise NotImplementedError(
             f"Operator {op} not implemented for pure Python backend."
         )

@@ -62,8 +62,9 @@ class BCEWithLogitsLoss(Loss):
         self.run_hooks('before_forward', pred=logits, target=target)
         z = logits
         y = target
-        absz = (z * z).sqrt()
-        out = (z.clamp_min(0.0) - z * y + ((absz * -1.0).exp() + 1.0).log()).mean()
+        # softplus(z) - y*z with an explicit abs() to avoid sqrt(z*z)
+        softplus = z.clamp_min(0.0) + ((-abs(z)).exp() + 1.0).log()
+        out = (softplus - z * y).mean()
         self.run_hooks('after_forward', pred=logits, target=target, output=out)
         return out
 

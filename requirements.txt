@@ -10,3 +10,4 @@ scipy>=1.7
 Pillow>=10
 fonttools>=4
 scikit-image>=0.21
+pandas>=2

@@ -206,35 +206,35 @@ class JAXTensorOperations(AbstractTensor):
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
-            return b + a
+            return a + b
         if op in ("sub", "isub"):
             return a - b
         if op == "rsub":
-            return b - a
+            return a - b
         if op in ("mul", "imul"):
             return a * b
         if op == "rmul":
-            return b * a
+            return a * b
         if op in ("truediv", "itruediv"):
             return a / b
         if op == "rtruediv":
-            return b / a
+            return a / b
         if op in ("floordiv", "ifloordiv"):
             return jnp.floor(a / b)
         if op == "rfloordiv":
-            return jnp.floor(b / a)
+            return jnp.floor(a / b)
         if op in ("mod", "imod"):
             return jnp.mod(a, b)
         if op == "rmod":
-            return jnp.mod(b, a)
+            return jnp.mod(a, b)
         if op in ("pow", "ipow"):
             return jnp.power(a, b)
         if op == "rpow":
-            return jnp.power(b, a)
+            return jnp.power(a, b)
         if op in ("matmul", "imatmul"):
             return a @ b
         if op == "rmatmul":
-            return b @ a
+            return a @ b
         raise NotImplementedError(f"Operator {op} not implemented for JAX backend.")
 
     # ------------------------------------------------------------------

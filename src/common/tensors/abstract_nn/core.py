@@ -18,14 +18,16 @@ class Linear:
         if init == "he" or init == "auto_relu":
             scale = math.sqrt(2.0 / float(in_dim))
         elif init == "xavier":
-            scale = math.sqrt(2.0 / float(in_dim + out_dim))
+            # Use a tanh-friendly Xavier gain by default
+            scale = math.sqrt(1.0 / float(in_dim + out_dim))
         else:
             scale = 0.02
         logger.debug(
             f"Linear layer init: in_dim={in_dim}, out_dim={out_dim}, bias={bias}, init={init}, scale={scale}"
         )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
-        self.b = from_list_like([[0.0] * out_dim], like=like) if bias else None
+        # Seed a small positive bias to avoid symmetric stall at init
+        self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
