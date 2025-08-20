@@ -26,9 +26,10 @@ class Linear:
         self.gW = zeros_like(self.W)
         if self.b is not None:
             self.gb = zeros_like(self.b)
+        self._x = None
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
-        # core.py (inside Linear.forward)
+        self._x = x
         out = x @ self.W
         if self.b is not None:
             b = self.b.broadcast_rows(out.shape[0], label="Linear.forward(bias)")
@@ -37,6 +38,8 @@ class Linear:
 
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        if self._x is None:
+            raise RuntimeError("Linear.backward called before forward; self._x is None")
         xT = self._x.transpose(0, 1)
         self.gW = xT @ grad_out
         if self.b is not None:
@@ -44,6 +47,7 @@ class Linear:
             self.gb = grad_out.ensure_tensor(gb_raw)
         WT = self.W.transpose(0, 1)
         grad_in = grad_out @ WT
+        self._x = None
         return grad_in
 
 class Model:
