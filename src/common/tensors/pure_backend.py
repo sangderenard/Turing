@@ -39,6 +39,9 @@ from .abstraction import _get_shape, _flatten, register_backend
 
 from .abstraction import AbstractTensor
 
+def _to_tuple2(x):
+    return (x, x) if isinstance(x, int) else x
+
 class PurePythonTensorOperations(AbstractTensor):
     def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
@@ -441,6 +444,98 @@ class PurePythonTensorOperations(AbstractTensor):
         for _ in range(pad_bottom):
             padded_rows.append([value] * (cols + pad_left + pad_right))
         return padded_rows
+
+    def pad2d_(self, pad, value=0.0):
+        pad_left, pad_right, pad_top, pad_bottom = pad
+        result = []
+        for n in self.data:
+            n_out = []
+            for c in n:
+                rows = len(c)
+                cols = len(c[0]) if rows > 0 else 0
+                width = cols + pad_left + pad_right
+                padded = []
+                for _ in range(pad_top):
+                    padded.append([value] * width)
+                for row in c:
+                    padded.append([value] * pad_left + row + [value] * pad_right)
+                for _ in range(pad_bottom):
+                    padded.append([value] * width)
+                n_out.append(padded)
+            result.append(n_out)
+        return result
+
+    def unfold2d_(self, kernel_size, stride=1, padding=0, dilation=1):
+        kH, kW = _to_tuple2(kernel_size)
+        sH, sW = _to_tuple2(stride)
+        pH, pW = _to_tuple2(padding)
+        dH, dW = _to_tuple2(dilation)
+        x = self.pad2d_((pW, pW, pH, pH), 0.0)
+        N = len(x)
+        C = len(x[0]) if N > 0 else 0
+        H = len(x[0][0]) if C > 0 else 0
+        W = len(x[0][0][0]) if H > 0 else 0
+        eKH, eKW = (kH - 1) * dH + 1, (kW - 1) * dW + 1
+        Hout = (H - eKH) // sH + 1
+        Wout = (W - eKW) // sW + 1
+        patches = []
+        for n in range(N):
+            cols = []
+            for h in range(Hout):
+                for w in range(Wout):
+                    patch = []
+                    for c in range(C):
+                        for i in range(kH):
+                            for j in range(kW):
+                                hi = h * sH + i * dH
+                                wj = w * sW + j * dW
+                                patch.append(x[n][c][hi][wj])
+                    cols.append(patch)
+            # transpose to (C*kH*kW, L)
+            cols = [list(col) for col in zip(*cols)]
+            patches.append(cols)
+        return patches
+
+    def fold2d_(
+        self,
+        output_size,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+    ):
+        N, C, H, W = output_size
+        kH, kW = _to_tuple2(kernel_size)
+        sH, sW = _to_tuple2(stride)
+        pH, pW = _to_tuple2(padding)
+        dH, dW = _to_tuple2(dilation)
+        Hpad, Wpad = H + 2 * pH, W + 2 * pW
+        eKH, eKW = (kH - 1) * dH + 1, (kW - 1) * dW + 1
+        Hout = (Hpad - eKH) // sH + 1
+        Wout = (Wpad - eKW) // sW + 1
+        ypad = [[[ [0.0 for _ in range(Wpad)] for _ in range(Hpad)] for _ in range(C)] for _ in range(N)]
+        data = self.data
+        for n in range(N):
+            for h in range(Hout):
+                for w in range(Wout):
+                    l = h * Wout + w
+                    for c in range(C):
+                        for i in range(kH):
+                            for j in range(kW):
+                                idx = ((c * kH + i) * kW) + j
+                                hi = h * sH + i * dH
+                                wj = w * sW + j * dW
+                                ypad[n][c][hi][wj] += data[n][idx][l]
+        out = []
+        for n in range(N):
+            chans = []
+            for c in range(C):
+                rows = []
+                for h in range(pH, Hpad - pH):
+                    rows.append(ypad[n][c][h][pW:Wpad - pW])
+                chans.append(rows)
+            out.append(chans)
+        return out
 
     def cat_(self, tensors: List[Any], dim: int = 0) -> Any:
         if not tensors:

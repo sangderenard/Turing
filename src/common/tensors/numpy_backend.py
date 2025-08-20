@@ -36,6 +36,7 @@ from .abstraction import AbstractTensor, register_backend
 
 try:
     import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     np = None  # type: ignore
 
@@ -47,6 +48,10 @@ except Exception:
     import sys
     print("NumPy backend failed to import")
     sys.exit(1)
+
+def _to_tuple2(x):
+    """Normalize an int or 2-tuple to a 2-tuple."""
+    return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
     def max_(self, dim=None, keepdim=False):
@@ -354,6 +359,65 @@ class NumPyTensorOperations(AbstractTensor):
             right = pad[-2 * (i + 1) + 1]
             np_pad_width.append((left, right))
         return np.pad(tensor, pad_width=np_pad_width, constant_values=value)
+
+    def pad2d_(self, pad, value=0.0):
+        pl, pr, pt, pb = pad
+        return np.pad(
+            self.data,
+            ((0, 0), (0, 0), (pt, pb), (pl, pr)),
+            mode="constant",
+            constant_values=float(value),
+        )
+
+    def unfold2d_(self, kernel_size, stride=1, padding=0, dilation=1):
+        kH, kW = _to_tuple2(kernel_size)
+        sH, sW = _to_tuple2(stride)
+        pH, pW = _to_tuple2(padding)
+        dH, dW = _to_tuple2(dilation)
+        x = np.pad(
+            self.data,
+            ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+            mode="constant",
+        )
+        N, C, H, W = x.shape
+        eKH, eKW = (kH - 1) * dH + 1, (kW - 1) * dW + 1
+        win = sliding_window_view(x, window_shape=(eKH, eKW), axis=(2, 3))
+        win = win[:, :, ::sH, ::sW, ::dH, ::dW]
+        N, C, Hout, Wout, KH, KW = win.shape
+        patches = win.transpose(0, 1, 4, 5, 2, 3).reshape(N, C * KH * KW, Hout * Wout)
+        return patches
+
+    def fold2d_(
+        self,
+        output_size,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+    ):
+        N, C, H, W = output_size
+        kH, kW = _to_tuple2(kernel_size)
+        sH, sW = _to_tuple2(stride)
+        pH, pW = _to_tuple2(padding)
+        dH, dW = _to_tuple2(dilation)
+        Hpad, Wpad = H + 2 * pH, W + 2 * pW
+        eKH, eKW = (kH - 1) * dH + 1, (kW - 1) * dW + 1
+        Hout = (Hpad - eKH) // sH + 1
+        Wout = (Wpad - eKW) // sW + 1
+        cols6 = self.data.reshape(N, C, kH, kW, Hout, Wout)
+        ypad = np.zeros((N, C, Hpad, Wpad), dtype=self.data.dtype)
+        for i in range(kH):
+            hi = i * dH
+            hi_end = hi + sH * Hout
+            for j in range(kW):
+                wj = j * dW
+                wj_end = wj + sW * Wout
+                np.add.at(
+                    ypad,
+                    (slice(None), slice(None), slice(hi, hi_end, sH), slice(wj, wj_end, sW)),
+                    cols6[:, :, i, j, :, :],
+                )
+        return ypad[:, :, pH : Hpad - pH or None, pW : Wpad - pW or None]
 
     def cat_(self, tensors, dim=0):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
