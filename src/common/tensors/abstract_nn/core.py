@@ -28,7 +28,7 @@ class Linear:
             self.gb = zeros_like(self.b)
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
-        # core.py (inside Linear.forward)
+        self._x = x
         out = x @ self.W
         if self.b is not None:
             b = self.b.broadcast_rows(out.shape[0], label="Linear.forward(bias)")

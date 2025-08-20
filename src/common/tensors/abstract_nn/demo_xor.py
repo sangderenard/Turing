@@ -1,6 +1,8 @@
 from ..abstraction import AbstractTensor
-from . import Linear, Model, ReLU, MSELoss, Adam, train_loop
+from . import Linear, Model, ReLU, MSELoss, Adam, train_loop, set_seed
 from .utils import from_list_like
+
+set_seed(0)
 
 # Instantiate a 'like' tensor to choose backend (DEFAULT_FACULTY)
 ops = AbstractTensor.get_tensor(faculty=None)
