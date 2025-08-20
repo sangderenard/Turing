@@ -7,5 +7,5 @@ def get_tensors_logger():
         formatter = logging.Formatter('[%(asctime)s][%(levelname)s][%(name)s] %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     return logger
