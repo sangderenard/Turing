@@ -801,6 +801,14 @@ class AbstractTensor:
         - for true division            -> cast bool to float
         Promotion happens BEFORE unwrap; backends never see bool arithmetic.
         """
+        # Coerce list-like operands into tensors so that operator logic remains
+        # backend-agnostic. This ensures raw Python lists interoperate with
+        # tensors without requiring callers to explicitly convert them.
+        if isinstance(left, AbstractTensor) and isinstance(right, (list, tuple)):
+            right = left.ensure_tensor(right)
+        elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
+            left = right.ensure_tensor(left)
+
         arithmetic_ops = {
             "add","sub","mul","truediv","floordiv","mod","pow",
             "iadd","isub","imul","itruediv","ifloordiv","imod","ipow",
