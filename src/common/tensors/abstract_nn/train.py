@@ -86,7 +86,8 @@ def train_step(
     y: AbstractTensor,
     debug: bool = False,
     grad_control: Optional[GradControl] = None,
-) -> Tuple[float, float]:
+    grad_log: Optional[dict] = None,
+) -> Tuple[float, float, float]:
     hook_panel.run('step_start', model=model, x=x, y=y)
     pred = model.forward(x)
     hook_panel.run('forward', model=model, x=x, pred=pred)
@@ -103,6 +104,7 @@ def train_step(
             b0 = float(l.b[0, 0].item()) if l.b is not None else None
             hook_panel.run('debug', layer=l, i=i, W=l.W, gW=l.gW, b0=b0)
 
+
     # Collect params/grads in a stable order
     params: List[AbstractTensor] = []
     grads: List[AbstractTensor] = []
@@ -115,10 +117,17 @@ def train_step(
         b_n = _l2(layer.gb) if layer.b is not None else None
         per_layer_norms_before.append({"W": w_n, "b": b_n})
 
+    global_grad_norm_preclip = _global_l2(grads)
+    global_grad_norm_postclip = global_grad_norm_preclip
+    global_grad_norm_requested = global_grad_norm_preclip
+    global_grad_norm_preclip_actual = None
+    did_clip = False
+    grads_preclip = [g for g in grads]
+
     hook_panel.run(
         'grad_stats_before',
         per_layer=per_layer_norms_before,
-        global_norm=_global_l2(grads),
+        global_norm=global_grad_norm_preclip,
     )
 
     # --- Gradient norm control ---
@@ -127,6 +136,9 @@ def train_step(
             grads, norms_before, scales = _clip_per_param_norm(
                 grads, grad_control.per_param_max_norm
             )
+            if any(s < 1.0 for s in scales):
+                did_clip = True
+                global_grad_norm_preclip_actual = global_grad_norm_preclip
             hook_panel.run(
                 'grad_clipped_per_param',
                 norms_before=norms_before,
@@ -136,6 +148,9 @@ def train_step(
             grads, g_before, g_scale = _clip_global_norm(
                 grads, grad_control.max_global_norm
             )
+            if g_scale < 1.0:
+                did_clip = True
+                global_grad_norm_preclip_actual = global_grad_norm_preclip
             hook_panel.run(
                 'grad_clipped_global',
                 global_norm_before=g_before,
@@ -152,6 +167,8 @@ def train_step(
                     scale=s,
                     target=grad_control.target_global_norm,
                 )
+
+    global_grad_norm_postclip = _global_l2(grads)
 
     # Per-layer/global norms after control (for visibility)
     per_layer_norms_after = []
@@ -170,8 +187,16 @@ def train_step(
     hook_panel.run(
         'grad_stats_after',
         per_layer=per_layer_norms_after,
-        global_norm=_global_l2(grads),
+        global_norm=global_grad_norm_postclip,
     )
+
+    if grad_log is not None:
+        grad_log.setdefault('requested', []).append(global_grad_norm_requested)
+        grad_log.setdefault('capped', []).append(global_grad_norm_postclip)
+        if did_clip:
+            grad_log.setdefault('preclip', []).append(global_grad_norm_preclip_actual)
+        else:
+            grad_log.setdefault('preclip', []).append(None)
 
     new_params = optimizer.step(params, grads)
     i = 0
@@ -183,7 +208,7 @@ def train_step(
             i += 1
     model.zero_grad()
     hook_panel.run('step_end', model=model, x=x, y=y, loss=loss)
-    return _to_scalar(loss), _global_l2(grads)
+    return _to_scalar(loss), global_grad_norm_requested, global_grad_norm_postclip
 
 def train_loop(
     model: Model,
@@ -197,8 +222,9 @@ def train_loop(
     grad_control: Optional[GradControl] = None,
 ):
     losses = []
+    grad_log = {'requested': [], 'capped': [], 'preclip': []}
     for e in range(1, epochs + 1):
-        l, g = train_step(
+        l, g_req, g_cap = train_step(
             model,
             loss_fn,
             optimizer,
@@ -206,12 +232,13 @@ def train_loop(
             Y,
             debug=(e == 1),
             grad_control=grad_control,
+            grad_log=grad_log,
         )
         losses.append(l)
         hook_panel.run('epoch_end', epoch=e, loss=l)
         if provenance_tracker is not None:
             provenance_tracker.record(e, l, model)
         if (e % log_every) == 0:
-            hook_panel.run('log', epoch=e, loss=l, grad_global=g)
-            print(f"[{e}] loss={l:.6f}  || grad||={g:.6f}")
-    return losses
+            hook_panel.run('log', epoch=e, loss=l, grad_global=g_cap)
+            print(f"[{e}] loss={l:.6f}  || grad||={g_cap:.6f}")
+    return losses, grad_log

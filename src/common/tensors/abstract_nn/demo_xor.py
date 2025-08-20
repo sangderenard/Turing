@@ -59,18 +59,19 @@ def run_operator_demo(op_name, loss_type, like, debug_hooks=None, until_stop=Fal
             import sys, select
             select.select([sys.stdin], [], [], None)
         stop_flag['stop'] = True
+    grad_log = None
     if until_stop:
         t = threading.Thread(target=wait_for_key, daemon=True)
         t.start()
         epoch = 0
         while not stop_flag['stop']:
             epoch += 1
-            train_loop(model, loss_fn, opt, X, Y, epochs=1, log_every=1)
+            _, grad_log = train_loop(model, loss_fn, opt, X, Y, epochs=1, log_every=1)
             time.sleep(0.01)
         print("\nStopped by user after", epoch, "epochs.")
     else:
-        train_loop(model, loss_fn, opt, X, Y, epochs=10000, log_every=1)
-    return debug_data
+        _, grad_log = train_loop(model, loss_fn, opt, X, Y, epochs=10000, log_every=1)
+    return debug_data, grad_log
 
 def loss_debug_hook(debug_data):
     def hook(pred, target, output, **kwargs):
@@ -91,17 +92,44 @@ def main():
         for loss_type in loss_types:
             mode = input(f"Run {op.upper()} with {loss_type.upper()} in 'until I stop you' mode? (y/n): ")
             until_stop = (mode.strip().lower() == 'y')
-            debug_data = run_operator_demo(
+            debug_data, grad_log = run_operator_demo(
                 op, loss_type, ops,
                 debug_hooks={'after_forward': loss_debug_hook},
                 until_stop=until_stop
             )
             df = pd.DataFrame(debug_data)
-            plt.figure()
-            plt.plot(df['loss'])
-            plt.title(f'{op.upper()} - {loss_type.upper()} Loss per Step')
+            plt.figure(figsize=(10, 6))
+            plt.plot(df['loss'], label='Loss')
+            # Normalize gradients to loss range for overlay
+            if grad_log is not None:
+                import numpy as np
+                loss_arr = np.array(df['loss'])
+                grad_req = np.array(grad_log['requested'])
+                grad_cap = np.array(grad_log['capped'])
+                grad_preclip = np.array([
+                    v if v is not None else np.nan for v in grad_log['preclip']
+                ])
+                # Normalize to loss range
+                def norm_to_loss(arr):
+                    arr = np.array(arr)
+                    if np.all(np.isnan(arr)):
+                        return arr
+                    arr_min, arr_max = np.nanmin(arr), np.nanmax(arr)
+                    loss_min, loss_max = np.min(loss_arr), np.max(loss_arr)
+                    if arr_max - arr_min < 1e-8:
+                        return np.full_like(arr, loss_min)
+                    return (arr - arr_min) / (arr_max - arr_min) * (loss_max - loss_min) + loss_min
+                grad_req_norm = norm_to_loss(grad_req)
+                grad_cap_norm = norm_to_loss(grad_cap)
+                grad_preclip_norm = norm_to_loss(grad_preclip)
+                plt.plot(grad_req_norm, label='Requested Grad (normed)', linestyle='--', alpha=0.7)
+                plt.plot(grad_cap_norm, label='Capped Grad (normed)', linestyle='-.', alpha=0.7)
+                if not np.all(np.isnan(grad_preclip_norm)):
+                    plt.plot(grad_preclip_norm, label='Pre-clip Grad (normed)', linestyle=':', alpha=0.7)
+            plt.title(f'{op.upper()} - {loss_type.upper()} Loss & Gradients per Step')
             plt.xlabel('Step')
-            plt.ylabel('Loss')
+            plt.ylabel('Loss / Normalized Grad')
+            plt.legend()
             plt.show()
         user = input(f"Continue to next operator? (y/n/select [0-{len(operators)-1}]): ")
         if user.lower() == 'n':
