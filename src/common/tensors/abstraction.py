@@ -133,6 +133,61 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    # --- Unary operators ---
+
+
+    def __neg__(self):
+        return self._apply_operator("neg", self, None)
+
+    def __pos__(self):
+        # +tensor is a no-op, return self
+        return self
+
+
+    def __abs__(self):
+        return self._apply_operator("abs", self, None)
+
+
+    def __invert__(self):
+        return self._apply_operator("invert", self, None)
+
+
+    def __round__(self, n=None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement __round__()")
+
+
+    def __trunc__(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement __trunc__()")
+
+
+    def __floor__(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement __floor__()")
+
+
+    def __ceil__(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement __ceil__()")
+
+    # --- Backend hooks for unary ops (must be implemented by backends) ---
+    def neg_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement neg_()")
+
+    def abs_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement abs_()")
+
+    def invert_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement invert_()")
+
+    def round_(self, n=None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement round_()")
+
+    def trunc_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement trunc_()")
+
+    def floor_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement floor_()")
+
+    def ceil_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement ceil_()")
     def max(self, dim=None, keepdim: bool = False):
         """Return the maximum of the tensor along the specified dimension(s)."""
         return self.max_(dim=dim, keepdim=keepdim)
