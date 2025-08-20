@@ -40,8 +40,8 @@ from .abstraction import _get_shape, _flatten, register_backend
 from .abstraction import AbstractTensor
 
 class PurePythonTensorOperations(AbstractTensor):
-    def max_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
-        data = self._AbstractTensor__unwrap(tensor)
+    def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
         def _max(lst):
             flat = _flatten(lst)
             return max(flat) if flat else 0.0
@@ -70,8 +70,8 @@ class PurePythonTensorOperations(AbstractTensor):
             return m
         return reduce_dim(data, dim)
 
-    def argmax_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
-        data = self._AbstractTensor__unwrap(tensor)
+    def argmax_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
         def _argmax(lst):
             flat = _flatten(lst)
             return flat.index(max(flat)) if flat else 0
@@ -340,6 +340,14 @@ class PurePythonTensorOperations(AbstractTensor):
             indices.append(idxs)
         return values, indices
 
+    def transpose_(self, dim0: int, dim1: int):
+        data = self.data
+        if dim0 == 0 and dim1 == 1:
+            if not all(isinstance(row, list) for row in data):
+                raise NotImplementedError("transpose_ expects a 2D list")
+            return [list(row) for row in zip(*data)]
+        raise NotImplementedError("transpose_ only supports dim0=0 and dim1=1")
+
     def pad_(self, tensor: Any, pad: Tuple[int, ...], value: float = 0) -> Any:
         if len(pad) != 4:
             raise NotImplementedError("pad only implemented for 2D tensors")
@@ -378,8 +386,17 @@ class PurePythonTensorOperations(AbstractTensor):
             return result
         raise NotImplementedError("cat only implemented for dim 0 and 1")
 
-    def repeat_interleave_(self, tensor: Any, repeats: int, dim: Optional[int] = None) -> Any:
+    def expand_(self, shape):
+        out = self.data
+        n, d = shape
+        if isinstance(out[0], list):
+            if len(out) == 1:
+                return [out[0][:] for _ in range(n)]
+        raise NotImplementedError("expand_ not implemented for this shape")
+
+    def repeat_interleave_(self, repeats: int = 1, dim: Optional[int] = None) -> Any:
         if dim is None or dim == 0:
+            tensor = self.data
             if not isinstance(tensor, list):
                 return [tensor] * repeats
             result = []
@@ -392,11 +409,11 @@ class PurePythonTensorOperations(AbstractTensor):
         """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
         raise NotImplementedError("repeat not implemented for PurePython backend")
 
-    def view_flat_(self, tensor: Any) -> Any:
-        return _flatten(tensor)
+    def view_flat_(self) -> Any:
+        return _flatten(self.data)
 
-    def assign_at_indices_(self, tensor_to_modify: Any, indices_dim0: Any, indices_dim1: Any, values_to_assign: Any):
-        tensor_to_modify = self._AbstractTensor__unwrap(tensor_to_modify)
+    def assign_at_indices_(self, indices_dim0: Any, indices_dim1: Any, values_to_assign: Any):
+        tensor_to_modify = self.data
         values_to_assign = self._AbstractTensor__unwrap(values_to_assign)
         i0 = self._AbstractTensor__unwrap(indices_dim0)
         i1 = self._AbstractTensor__unwrap(indices_dim1)
@@ -413,8 +430,8 @@ class PurePythonTensorOperations(AbstractTensor):
             tensor_to_modify[row_idx][col_idx] = value
         return tensor_to_modify
 
-    def increment_at_indices_(self, tensor_to_modify: Any, mask: Any):
-        tensor_to_modify = self._AbstractTensor__unwrap(tensor_to_modify)
+    def increment_at_indices_(self, mask: Any):
+        tensor_to_modify = self.data
         mask = self._AbstractTensor__unwrap(mask)
         if (
             not isinstance(tensor_to_modify, list)
@@ -427,25 +444,25 @@ class PurePythonTensorOperations(AbstractTensor):
                 tensor_to_modify[i] += 1
         return tensor_to_modify
 
-    def clamp_(self, tensor: Any, min_val: Optional[float] = None, max_val: Optional[float] = None) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        if isinstance(tensor, list):
-            return [self.clamp_(item, min_val, max_val) for item in tensor]
-        value = tensor
-        if min_val is not None:
-            value = max(value, min_val)
-        if max_val is not None:
-            value = min(value, max_val)
-        return value
+    def clamp_(self, min_val: Optional[float] = None, max_val: Optional[float] = None) -> Any:
+        def _clamp(val):
+            if isinstance(val, list):
+                return [_clamp(v) for v in val]
+            if min_val is not None:
+                val = max(val, min_val)
+            if max_val is not None:
+                val = min(val, max_val)
+            return val
+        return _clamp(self.data)
 
-    def shape_(self, tensor: Any) -> Tuple[int, ...]:
-        return _get_shape(self._AbstractTensor__unwrap(tensor))
+    def shape_(self) -> Tuple[int, ...]:
+        return _get_shape(self.data)
 
-    def numel_(self, tensor: Any) -> int:
-        return len(_flatten(self._AbstractTensor__unwrap(tensor)))
+    def numel_(self) -> int:
+        return len(_flatten(self.data))
 
-    def mean_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
-        data = self._AbstractTensor__unwrap(tensor)
+    def mean_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
         def _mean(lst):
             flat = _flatten(lst)
             return sum(flat) / len(flat) if flat else 0.0
@@ -474,8 +491,9 @@ class PurePythonTensorOperations(AbstractTensor):
                     m = [m]
             return m
         return reduce_dim(data, dim)
-    def sum_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
-        data = self._AbstractTensor__unwrap(tensor)
+
+    def sum_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
         def _sum(lst):
             flat = _flatten(lst)
             return sum(flat)
@@ -503,8 +521,8 @@ class PurePythonTensorOperations(AbstractTensor):
                     s = [s]
             return s
         return reduce_dim(data, dim)
-    def min_(self, tensor: Any, dim: Optional[int] = None, keepdim: bool = False) -> Any:
-        data = self._AbstractTensor__unwrap(tensor)
+    def min_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
         def _min(lst):
             flat = _flatten(lst)
             return min(flat) if flat else 0.0

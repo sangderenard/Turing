@@ -249,6 +249,9 @@ class PyTorchTensorOperations(AbstractTensor):
         tensors = [t.data if isinstance(t, AbstractTensor) else t for t in tensors]
         return torch.stack(tensors, dim=dim)
 
+    def expand_(self, shape):
+        return self.data.expand(*shape)
+
     def repeat_interleave_(self, repeats=1, dim=None):
         if dim is None:
             dim = 0

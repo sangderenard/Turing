@@ -49,11 +49,11 @@ except Exception:
     sys.exit(1)
 
 class NumPyTensorOperations(AbstractTensor):
-    def max_(self, tensor, dim=None, keepdim=False):
-        return np.max(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+    def max_(self, dim=None, keepdim=False):
+        return np.max(self.data, axis=dim, keepdims=keepdim)
 
-    def argmax_(self, tensor, dim=None, keepdim=False):
-        arr = self._AbstractTensor__unwrap(tensor)
+    def argmax_(self, dim=None, keepdim=False):
+        arr = self.data
         if dim is None:
             return int(np.argmax(arr))
         idx = np.argmax(arr, axis=dim)
@@ -295,11 +295,11 @@ class NumPyTensorOperations(AbstractTensor):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         return np.stack(tensors, axis=dim)
 
-    def pad_(self, tensor, pad, value=0.0):
+    def pad_(self, pad, value=0.0):
         if len(pad) % 2 != 0:
             raise ValueError("Padding length must be even.")
         num_dims_to_pad = len(pad) // 2
-        tensor = self._AbstractTensor__unwrap(tensor)
+        tensor = self.data
         if num_dims_to_pad > tensor.ndim:
             raise ValueError("Padding tuple length implies padding more dimensions than tensor has.")
         np_pad_width = []
@@ -315,52 +315,57 @@ class NumPyTensorOperations(AbstractTensor):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         return np.concatenate(tensors, axis=dim)
 
-    def repeat_interleave_(self, tensor, repeats, dim=None):
-        tensor = self._AbstractTensor__unwrap(tensor)
-        return np.repeat(tensor, repeats, axis=dim)
+    def expand_(self, shape):
+        return np.broadcast_to(self.data, shape)
+    def repeat_interleave_(self, repeats=1, dim=None):
+        if dim is None:
+            dim = 0
+        return np.repeat(self.data, repeats, axis=dim)
 
     def repeat_(self, repeats=None, dim: int = 0):
         """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
         raise NotImplementedError("repeat not implemented for NumPy backend")
 
-    def view_flat_(self, tensor):
-        return self._AbstractTensor__unwrap(tensor).reshape(-1)
+    def view_flat_(self):
+        return self.data.reshape(-1)
 
-    def assign_at_indices_(self, tensor_to_modify, indices_dim0, indices_dim1, values_to_assign):
-        t = self._AbstractTensor__unwrap(tensor_to_modify)
+    def assign_at_indices_(self, indices_dim0, indices_dim1, values_to_assign):
+        t = self.data
         v = self._AbstractTensor__unwrap(values_to_assign)
         i0 = self._AbstractTensor__unwrap(indices_dim0)
         i1 = self._AbstractTensor__unwrap(indices_dim1)
         t[i0, i1] = v
         return t
 
-    def increment_at_indices_(self, tensor_to_modify, mask):
-        t = self._AbstractTensor__unwrap(tensor_to_modify)
+    def increment_at_indices_(self, mask):
+        t = self.data
         m = self._AbstractTensor__unwrap(mask)
         t[m] += 1
         return t
 
-    def clamp_(self, tensor, min_val=None, max_val=None):
-        return np.clip(self._AbstractTensor__unwrap(tensor), a_min=min_val, a_max=max_val)
+    def clamp_(self, min_val=None, max_val=None):
+        return np.clip(self.data, a_min=min_val, a_max=max_val)
 
-    def shape_(self, tensor):
-        return tuple(self._AbstractTensor__unwrap(tensor).shape)
+    def shape_(self):
+        return tuple(self.data.shape)
 
-    def numel_(self, tensor):
-        return self._AbstractTensor__unwrap(tensor).size
+    def numel_(self):
+        return self.data.size
 
-    def mean_(self, tensor, dim=None, keepdim=False):
-        return np.mean(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
-    def sum_(self, tensor, dim=None, keepdim=False):
-        return np.sum(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
-    def min_(self, tensor, dim=None, keepdim=False):
-        return np.min(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+    def mean_(self, dim=None, keepdim=False):
+        return np.mean(self.data, axis=dim, keepdims=keepdim)
 
-    def pow_(self, tensor, exponent: float):
-        return np.power(self._AbstractTensor__unwrap(tensor), exponent)
+    def sum_(self, dim=None, keepdim=False):
+        return np.sum(self.data, axis=dim, keepdims=keepdim)
 
-    def sqrt_(self, tensor):
-        return np.sqrt(self._AbstractTensor__unwrap(tensor))
+    def min_(self, dim=None, keepdim=False):
+        return np.min(self.data, axis=dim, keepdims=keepdim)
+
+    def pow_(self, exponent: float):
+        return np.power(self.data, exponent)
+
+    def sqrt_(self):
+        return np.sqrt(self.data)
 
     def tensor_from_list_(self, data, dtype, device):
         if not isinstance(data, (list, tuple)):
@@ -375,27 +380,27 @@ class NumPyTensorOperations(AbstractTensor):
             print("[TensorBackend:numpy] Auto-converted input to list for tensor_from_list_()")
         return np.array(data, dtype=self._torch_dtype_to_numpy(dtype))
 
-    def boolean_mask_select_(self, tensor, mask):
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def boolean_mask_select_(self, mask):
+        tensor = self.data
         m = self._AbstractTensor__unwrap(mask)
         return tensor[m]
 
     def tolist_(self):
         return self._AbstractTensor__unwrap(self.data).tolist()
 
-    def less_(self, tensor, value):
-        return self._AbstractTensor__unwrap(tensor) < value
+    def less_(self, value):
+        return self.data < value
 
-    def index_select_(self, tensor, dim, indices):
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def index_select_(self, dim, indices):
+        tensor = self.data
         idx = self._AbstractTensor__unwrap(indices)
         return np.take(tensor, idx, axis=dim)
 
-    def argmin_(self, tensor, dim=None, keepdim=False):
-        return np.argmin(self._AbstractTensor__unwrap(tensor), axis=dim, keepdims=keepdim)
+    def argmin_(self, dim=None, keepdim=False):
+        return np.argmin(self.data, axis=dim, keepdims=keepdim)
 
-    def interpolate_(self, tensor, size):
-        arr = np.array(self._AbstractTensor__unwrap(tensor))
+    def interpolate_(self, size):
+        arr = np.array(self.data)
         if len(size) != arr.ndim:
             raise ValueError("size must match tensor dimensions")
         def interp_axis(a, new_len, axis):
@@ -415,8 +420,8 @@ class NumPyTensorOperations(AbstractTensor):
             result = interp_axis(result, size[d], d)
         return result
 
-    def save_(self, tensor, filepath: str) -> None:
-        np.save(filepath, tensor)
+    def save_(self, filepath: str) -> None:
+        np.save(filepath, self.data)
 
     def load_(self, filepath: str, dtype, device):
         arr = np.load(f"{filepath}.npy") if not filepath.endswith('.npy') else np.load(filepath)
