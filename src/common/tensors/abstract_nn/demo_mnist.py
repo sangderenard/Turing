@@ -99,7 +99,7 @@ def main():
     set_seed(42)
     X_train, y_train, X_test, y_test = get_mnist()
     # Use a small subset for demo speed
-    N = 10000
+    N = len(X_train)
     X = X_train[:N]
     y = y_train[:N]
     # Convert to AbstractTensor (torch or numpy backend)
@@ -115,7 +115,7 @@ def main():
     loss_fn = CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=1e-3)
     print("Training...")
-    train_loop(model, loss_fn, optimizer, X_tensor, y_tensor, epochs=10, log_every=1)
+    train_loop(model, loss_fn, optimizer, X_tensor, y_tensor, epochs=1000, log_every=1)
     # Evaluate
     logits = model.forward(X_tensor)
     preds = logits.argmax(dim=1)
