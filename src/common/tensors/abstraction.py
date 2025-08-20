@@ -561,6 +561,77 @@ class AbstractTensor:
         result.data = self.pad_(pad, value)
         return result
 
+    # --- 2D spatial helpers -------------------------------------------------
+    def pad2d(self, pad: Tuple[int, int, int, int], value: float = 0.0) -> "AbstractTensor":
+        """Pad a 4D NCHW tensor with constant values.
+
+        Parameters
+        ----------
+        pad:
+            Tuple ``(pad_left, pad_right, pad_top, pad_bottom)``.
+        value:
+            Constant fill value for padded regions.
+        """
+        result = type(self)(track_time=self.track_time)
+        result.data = self.pad2d_(pad, value)
+        return result
+
+    def pad2d_(self, pad: Tuple[int, int, int, int], value: float = 0.0):
+        """Backend hook for :meth:`pad2d`."""
+        # Default implementation delegates to generic ``pad``.
+        return self.pad_(pad, value)
+
+    def unfold2d(
+        self,
+        kernel_size: Tuple[int, int],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        dilation: Union[int, Tuple[int, int]] = 1,
+    ) -> "AbstractTensor":
+        """Extract sliding local blocks as columns (im2col)."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.unfold2d_(kernel_size, stride, padding, dilation)
+        return result
+
+    def unfold2d_(
+        self,
+        kernel_size: Tuple[int, int],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        dilation: Union[int, Tuple[int, int]] = 1,
+    ):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement unfold2d_()"
+        )
+
+    @staticmethod
+    def fold2d(
+        cols: "AbstractTensor",
+        output_size: Tuple[int, int, int, int],
+        kernel_size: Tuple[int, int],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        dilation: Union[int, Tuple[int, int]] = 1,
+    ) -> "AbstractTensor":
+        """Inverse of :meth:`unfold2d`, accumulating patches back to images."""
+        result = type(cols)(track_time=cols.track_time)
+        result.data = cols.fold2d_(
+            output_size, kernel_size, stride, padding, dilation
+        )
+        return result
+
+    def fold2d_(
+        self,
+        output_size: Tuple[int, int, int, int],
+        kernel_size: Tuple[int, int],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        dilation: Union[int, Tuple[int, int]] = 1,
+    ):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement fold2d_()"
+        )
+
     def cat(self, tensors: List[Any], dim: int = 0) -> "AbstractTensor":
         tensors = [self.ensure_tensor(t) for t in tensors]
         result = type(self)(track_time=self.track_time)

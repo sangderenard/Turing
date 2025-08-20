@@ -269,6 +269,36 @@ class PyTorchTensorOperations(AbstractTensor):
     def pad_(self, pad, value=0.0):
         return F.pad(self.data, pad, value=value)
 
+    def pad2d_(self, pad, value=0.0):
+        return F.pad(self.data, pad, mode="constant", value=float(value))
+
+    def unfold2d_(self, kernel_size, stride=1, padding=0, dilation=1):
+        return F.unfold(
+            self.data,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+            stride=stride,
+        )
+
+    def fold2d_(
+        self,
+        output_size,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+    ):
+        # ``output_size`` is (N, C, H, W); F.fold expects (H, W)
+        return F.fold(
+            self.data,
+            output_size=output_size[2:],
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+            stride=stride,
+        )
+
     def cat_(self, tensors, dim=0):
         from .abstraction import AbstractTensor
         # torch is imported in __init__ and assigned to self._torch

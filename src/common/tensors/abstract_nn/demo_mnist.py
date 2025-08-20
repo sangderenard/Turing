@@ -9,8 +9,8 @@ import numpy as np
 from PIL import Image
 
 from ..abstraction import AbstractTensor
-from .core import Linear, Model
-from .activations import Identity
+from .core import Linear, Model, RectConv2d, MaxPool2d, Flatten
+from .activations import Identity, ReLU
 from .losses import CrossEntropyLoss
 from .optimizer import Adam
 from .train import train_loop
@@ -76,7 +76,7 @@ def load_images(filename):
         rows = int.from_bytes(f.read(4), 'big')
         cols = int.from_bytes(f.read(4), 'big')
         data = np.frombuffer(f.read(), dtype=np.uint8)
-        data = data.reshape(n, rows * cols).astype(np.float32) / 255.0
+        data = data.reshape(n, 1, rows, cols).astype(np.float32) / 255.0
         return data
 
 def load_labels(filename):
@@ -106,12 +106,17 @@ def main():
     like = AbstractTensor.get_tensor(X)
     X_tensor = like.ensure_tensor(X)
     y_tensor = like.ensure_tensor(y.reshape(-1, 1))
-    # Model: 784 -> 256 -> 128 -> 10
+    # CNN model
     model = Model([
-        Linear(784, 256, like=like),
-        Linear(256, 128, like=like),
-        Linear(128, 10, like=like)
-    ], [Identity(), Identity(), None])
+        RectConv2d(1, 8, 3, padding=1, like=like),
+        RectConv2d(8, 16, 3, padding=1, like=like),
+        MaxPool2d(2, stride=2, like=like),
+        RectConv2d(16, 32, 3, padding=1, like=like),
+        MaxPool2d(2, stride=2, like=like),
+        Flatten(like=like),
+        Linear(32 * 7 * 7, 64, like=like),
+        Linear(64, 10, like=like)
+    ], [ReLU(), ReLU(), None, ReLU(), None, None, ReLU(), None])
     loss_fn = CrossEntropyLoss()
     optimizer = Adam(model.parameters(), lr=1e-3)
     print("Training...")
