@@ -446,11 +446,44 @@ class AbstractTensor:
         result.data = self.stack_(tensors, dim)
         return result
 
+    # --- Broadcasting helpers (abstract, backend-agnostic) ---
+    def expand(self, shape: tuple) -> "AbstractTensor":
+        """Backend-agnostic expand/broadcast_to (view when possible)."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.expand_(shape)
+        return result
+
+    def broadcast_rows(self, n: int) -> "AbstractTensor":
+        """
+        Given a 1xD (or NxD where N==1), make it NxD using view-style expand when
+        possible, else fall back to repeat_interleave.
+        """
+        assert len(self.shape) == 2, f"broadcast_rows expects 2D, got {self.shape}"
+        if self.shape[0] == n:
+            return self
+        try:
+            return self.expand((n, self.shape[1]))
+        except NotImplementedError:
+            return self.repeat_interleave(repeats=n, dim=0)
+
     def repeat_interleave(
         self, repeats: int = 1, dim: Optional[int] = None
     ) -> "AbstractTensor":
         result = AbstractTensor.get_tensor(self.repeat_interleave_(repeats, dim))
         return result
+
+    # Backend hooks -----------------------------------------------------------
+    def expand_(self, shape):  # pragma: no cover - backend required
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement expand_()"
+        )
+
+    def repeat_interleave_(
+        self, repeats: int = 1, dim: Optional[int] = None
+    ):  # pragma: no cover - backend required
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement repeat_interleave_()"
+        )
 
     def view_flat(self) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)

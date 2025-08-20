@@ -31,9 +31,7 @@ class Linear:
         self._x = x
         out = x @ self.W
         if self.b is not None:
-            b = self.b
-            if b.shape[0] != out.shape[0]:
-                b = b.repeat((out.shape[0], 1))
+            b = self.b.broadcast_rows(out.shape[0])
             out = out + b
         return out
 
@@ -41,8 +39,8 @@ class Linear:
         xT = self._x.transpose(0, 1)
         self.gW = xT @ grad_out
         if self.b is not None:
-            N = len(grad_out) if hasattr(grad_out, '__len__') else 1
-            self.gb = grad_out.mean(dim=0) * float(N)
+            gb_raw = grad_out.sum(dim=0, keepdim=True)
+            self.gb = grad_out.ensure_tensor(gb_raw)
         WT = self.W.transpose(0, 1)
         grad_in = grad_out @ WT
         return grad_in
