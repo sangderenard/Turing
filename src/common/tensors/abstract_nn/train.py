@@ -29,6 +29,7 @@ def _to_scalar(x):
 
 
 def train_step(model: Model, loss_fn: Loss, optimizer: Adam, x: AbstractTensor, y: AbstractTensor) -> Tuple[float, float]:
+    model.zero_grad()
     pred = model.forward(x)
     loss = loss_fn.forward(pred, y)
     grad_pred = loss_fn.backward(pred, y)
