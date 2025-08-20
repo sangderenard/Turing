@@ -232,8 +232,8 @@ class PurePythonTensorOperations(AbstractTensor):
             return tensor
         return [self.clone_(item) for item in tensor]
 
-    def to_device_(self, tensor: Any, device: Any) -> Any:
-        return self._AbstractTensor__unwrap(tensor)
+    def to_device_(self, device: Any) -> Any:
+        return self.data
 
     def stack_(self, tensors: List[Any], dim: int = 0) -> Any:
         if not tensors:
@@ -289,10 +289,19 @@ class PurePythonTensorOperations(AbstractTensor):
     def bool_(self, tensor: Any) -> Any:
         return self.to_dtype_(tensor, "bool")
 
-    def not_equal_(self, tensor1: Any, tensor2: Any) -> Any:
-        if isinstance(tensor1, list) and isinstance(tensor2, list):
-            return [self.not_equal_(t1, t2) for t1, t2 in zip(tensor1, tensor2)]
-        return tensor1 != tensor2
+    def not_equal_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a != b
+
+        return rec(self.data, value)
 
     def arange_(self, start: int, end: Optional[int] = None, step: int = 1, device: Any = None, dtype: Any = None) -> Any:
         if end is None:
@@ -658,11 +667,19 @@ class PurePythonTensorOperations(AbstractTensor):
     def tolist_(self) -> list:
         return self.clone_(self.data)
 
-    def less_(self, tensor: Any, value: Any) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        if isinstance(tensor, list):
-            return [self.less_(item, value) for item in tensor]
-        return tensor < value
+    def less_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a < b
+
+        return rec(self.data, value)
 
     def index_select_(self, tensor: Any, dim: int, indices: Any) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)
