@@ -31,10 +31,13 @@ def run_operator_demo(op_name, loss_type, like, debug_hooks=None, until_stop=Fal
     set_seed(0)
     X, Y = get_operator_dataset(op_name, like)
     model = Model(
-        layers=[Linear(2, 8, like=like), Linear(8, 1, like=like)],
+        layers=[
+            Linear(2, 8, like=like, init="xavier"),
+            Linear(8, 1, like=like, init="xavier"),
+        ],
         activations=[Tanh(), Sigmoid() if loss_type == 'mse' else None],
     )
-    opt = Adam(model.parameters(), lr=1e-2 if loss_type == 'mse' else 1e-3)
+    opt = Adam(model.parameters(), lr=1e-2 if loss_type == 'mse' else 3e-3)
     if loss_type == 'mse':
         loss_fn = MSELoss()
     else:
