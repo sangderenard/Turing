@@ -1,6 +1,33 @@
 from __future__ import annotations
+
+import random
 from typing import Any, Callable, List, Tuple
+
+import numpy as np
+
+try:  # pragma: no cover - torch is optional
+    import torch
+except Exception:  # pragma: no cover - torch is optional
+    torch = None
+
 from ..abstraction import AbstractTensor
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy and (optionally) PyTorch RNGs.
+
+    Parameters
+    ----------
+    seed:
+        The seed value used for all available random number generators.
+    """
+
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 def as_list(t: AbstractTensor) -> list:
     return t.tolist()

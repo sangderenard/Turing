@@ -3,6 +3,9 @@ import time
 from pathlib import Path
 
 import pytest
+from src.common.tensors.abstract_nn import set_seed
+
+set_seed(0)
 
 def pytest_addoption(parser):
     parser.addoption(
