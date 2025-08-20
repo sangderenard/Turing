@@ -9,6 +9,8 @@ very small ASCII art approximation using a luminance ramp.
 from __future__ import annotations
 
 from typing import Tuple
+from io import StringIO
+from contextlib import redirect_stdout
 
 import numpy as np
 
@@ -41,6 +43,8 @@ class AsciiRenderer:
     def __init__(self, width: int, height: int, depth: int = 1, *, float_mode: bool = False) -> None:
         dtype = float if float_mode else np.uint8
         self.canvas = np.zeros((height, width, depth), dtype=dtype)
+        # Maintain a persistent frame buffer for diffing
+        self._fb = PixelFrameBuffer((height, width))
 
     # -- canvas helpers -------------------------------------------------
     def clear(self, value: float | int = 0) -> None:
@@ -147,10 +151,11 @@ class AsciiRenderer:
         return "\n".join(rows)
 
     # -- ascii_diff integration ------------------------------------------------
-    def to_ascii_diff(self, prev_buffer=None, ramp=None) -> str:
+    def to_ascii_diff(self, ramp: str | None = None) -> str:
         """
-        Convert the current canvas (double buffer) into an abstract tensor and use ascii_diff to display.
-        Optionally takes a previous buffer for diffing.
+        Return an ASCII diff of the current canvas using a persistent frame buffer.
+
+        Only regions that changed since the last call are emitted.
         """
         # Convert canvas to 2D if needed (collapse depth)
         if self.canvas.shape[2] == 1:
@@ -158,9 +163,29 @@ class AsciiRenderer:
         else:
             tensor = self.canvas.mean(axis=2)
 
-        fb = PixelFrameBuffer(tensor.shape)
+        # Update the persistent frame buffer with the new RGB data
         rgb = np.repeat(tensor[..., None], 3, axis=2).astype(np.uint8)
-        fb.update_render(rgb)
+        self._fb.update_render(rgb)
+        updates = self._fb.get_diff_and_promote()
+        if not updates:
+            return ""
 
-        diff = default_subunit_batch_to_chars(fb.buffer_render, ramp or DEFAULT_DRAW_ASCII_RAMP)
-        return "\n".join(["".join(row) for row in diff])
+        # Convert updates to the subunit format expected by draw_diff
+        changed_subunits = [
+            (y, x, np.array([[[r, g, b]]], dtype=np.uint8))
+            for y, x, (r, g, b) in updates
+        ]
+
+        ascii_ramp = ramp or DEFAULT_DRAW_ASCII_RAMP
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            draw_diff(
+                changed_subunits,
+                char_cell_pixel_height=1,
+                char_cell_pixel_width=1,
+                subunit_to_char_kernel=default_subunit_batch_to_chars,
+                active_ascii_ramp=ascii_ramp,
+                enable_fg_color=False,
+                enable_bg_color=False,
+            )
+        return buffer.getvalue()
