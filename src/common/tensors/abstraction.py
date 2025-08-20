@@ -36,6 +36,53 @@ def register_conversion(*args, **kwargs):
     pass
 CONVERSION_REGISTRY = dict()
 DEBUG = False
+
+
+
+# ---- diagnostics ------------------------------------------------------------
+import os
+from dataclasses import dataclass
+
+DIAG_LEVEL = os.environ.get("ABSTRACT_TENSOR_DIAG", "auto")  # 'concise' | 'auto' | 'verbose'
+
+@dataclass
+class _Diag:
+    op: str | None = None          # e.g., "broadcast_rows"
+    tensor: str | None = None      # e.g., "Linear.forward(bias)"
+    expected: str | None = None    # e.g., "(1, 16) or (32, 16)"
+    actual: str | None = None      # e.g., "(8, 16)"
+    batch_size: int | None = None
+    hint: str | None = None
+
+class TensorShapeError(ValueError):
+    def __init__(self, message: str, diag: _Diag | None = None):
+        self._message = message
+        self._diag = diag
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        d = self._diag
+        if d is None:
+            return self._message
+        head = self._message
+        # concise core: one line with labels + shapes
+        parts = []
+        if d.op:     parts.append(d.op)
+        if d.tensor: parts.append(d.tensor)
+        prefix = f"{' in '.join(parts)}: " if parts else ""
+        line1 = f"{prefix}expected {d.expected}"
+        if d.batch_size is not None:
+            line1 += f" for batch_size={d.batch_size}"
+        line1 += f", got {d.actual}."
+        # hint policy
+        want_hint = (DIAG_LEVEL == "verbose") or (DIAG_LEVEL == "auto" and d.hint)
+        if want_hint:
+            return head + "\n" + line1 + (f"\nHint: {d.hint}" if d.hint else "")
+        return head + "\n" + line1
+
+
+
+
 class ShapeAccessor:
     """Utility wrapper exposing tensor ``shape`` like NumPy/PyTorch."""
 
@@ -452,19 +499,45 @@ class AbstractTensor:
         result = type(self)(track_time=self.track_time)
         result.data = self.expand_(shape)
         return result
-
-    def broadcast_rows(self, n: int) -> "AbstractTensor":
+    # in AbstractTensor (abstraction.py)
+    def broadcast_rows(self, n: int, *, label: str | None = None) -> "AbstractTensor":
         """
-        Given a 1xD (or NxD where N==1), make it NxD using view-style expand when
-        possible, else fall back to repeat_interleave.
+        Make a (1, D) bias behave as (n, D) via view-style expand when possible.
+        If already (n, D) return self.
+        If neither 1 nor n rows, raise a labeled TensorShapeError.
         """
-        assert len(self.shape) == 2, f"broadcast_rows expects 2D, got {self.shape}"
-        if self.shape[0] == n:
+        rows, cols = self.shape[0], self.shape[1]
+        if rows == n:
             return self
-        try:
-            return self.expand((n, self.shape[1]))
-        except NotImplementedError:
-            return self.repeat_interleave(repeats=n, dim=0)
+        if rows == 1:
+            try:
+                return self.expand((n, cols))
+            except Exception:
+                # backend lacks true view-expand; fall back to repeat
+                return self.repeat_interleave(repeats=n, dim=0)
+
+        # Build an iff-applicable hint (only when it's the classic "multi-row bias" mistake)
+        hint = None
+        if rows > 1 and cols >= 1:
+            # This really looks like an accidental (N, D) bias; propose a safe collapse.
+            hint = (
+                "Bias must be a single row broadcast across the batch, or match the batch exactly. "
+                "If you accidentally created an (N, D) bias, collapse it, e.g.: "
+                "bias = bias.sum(dim=0, keepdim=True)  # -> (1, D)"
+            )
+
+        raise TensorShapeError(
+            "Broadcast error",
+            _Diag(
+                op="broadcast_rows",
+                tensor=label,
+                expected=f"(1, {cols}) or ({n}, {cols})",
+                actual=f"({rows}, {cols})",
+                batch_size=n,
+                hint=hint,  # only shown in 'auto' if we actually built one
+            ),
+        )
+
 
     def repeat_interleave(
         self, repeats: int = 1, dim: Optional[int] = None
