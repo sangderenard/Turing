@@ -31,7 +31,10 @@ class Linear:
         self._x = x
         out = x @ self.W
         if self.b is not None:
-            out = out + self.b
+            b = self.b
+            if b.shape[0] != out.shape[0]:
+                b = b.repeat((out.shape[0], 1))
+            out = out + b
         return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
