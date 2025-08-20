@@ -158,14 +158,9 @@ class AsciiRenderer:
         else:
             tensor = self.canvas.mean(axis=2)
 
-        # Create PixelFrameBuffer from tensor
-        fb = PixelFrameBuffer(tensor)
+        fb = PixelFrameBuffer(tensor.shape)
+        rgb = np.repeat(tensor[..., None], 3, axis=2).astype(np.uint8)
+        fb.update_render(rgb)
 
-        # If previous buffer is provided, do diff; else just render current
-        if prev_buffer is not None:
-            diff = draw_diff(prev_buffer, fb, ramp or DEFAULT_DRAW_ASCII_RAMP)
-        else:
-            # No diff, just render current buffer as ascii
-            diff = default_subunit_batch_to_chars(fb.buffer, ramp or DEFAULT_DRAW_ASCII_RAMP)
-            diff = "\n".join(["".join(row) for row in diff])
-        return diff
+        diff = default_subunit_batch_to_chars(fb.buffer_render, ramp or DEFAULT_DRAW_ASCII_RAMP)
+        return "\n".join(["".join(row) for row in diff])

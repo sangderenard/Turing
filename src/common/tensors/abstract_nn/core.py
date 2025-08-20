@@ -13,13 +13,22 @@ def _randn_matrix(rows: int, cols: int, like: AbstractTensor, scale: float = 0.0
     return from_list_like(data, like=like)
 
 class Linear:
-    def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "xavier"):
+    def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu"):
         self.like = like
-        scale = math.sqrt(2.0 / float(in_dim + out_dim)) if init == "xavier" else 0.02
-        logger.debug(f"Linear layer init: in_dim={in_dim}, out_dim={out_dim}, bias={bias}, init={init}, scale={scale}")
+        if init == "he" or init == "auto_relu":
+            scale = math.sqrt(2.0 / float(in_dim))
+        elif init == "xavier":
+            scale = math.sqrt(2.0 / float(in_dim + out_dim))
+        else:
+            scale = 0.02
+        logger.debug(
+            f"Linear layer init: in_dim={in_dim}, out_dim={out_dim}, bias={bias}, init={init}, scale={scale}"
+        )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
         self.b = from_list_like([[0.0] * out_dim], like=like) if bias else None
-        logger.debug(f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}")
+        logger.debug(
+            f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
+        )
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
@@ -59,12 +68,16 @@ class Linear:
         return grad_in
 
 class Model:
-    def __init__(self, layers: List[Linear], activation) -> None:
-        logger.debug(f"Model init with {len(layers)} layers and activation {activation}")
+    def __init__(self, layers: List[Linear], activations) -> None:
+        logger.debug(f"Model init with {len(layers)} layers and activations {activations}")
         self.layers = layers
-        self.activation = activation if activation is not None else Identity()
-        self._pre = []
-        self._post = []
+        if isinstance(activations, list):
+            assert len(activations) == len(layers), "activations list must match layers"
+            self.activations = activations
+        else:
+            self.activations = [activations] * len(layers)
+        self._pre = [None] * len(layers)
+        self._post = [None] * len(layers)
 
     def parameters(self) -> List[AbstractTensor]:
         ps: List[AbstractTensor] = []
@@ -72,28 +85,38 @@ class Model:
             ps.extend(layer.parameters())
         return ps
 
+    def grads(self) -> List[AbstractTensor]:
+        gs: List[AbstractTensor] = []
+        for l in self.layers:
+            gs.append(l.gW)
+            if l.b is not None:
+                gs.append(l.gb)
+        return gs
+
     def zero_grad(self) -> None:
         for layer in self.layers:
             layer.zero_grad()
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         logger.debug(f"Model.forward called with input shape: {getattr(x, 'shape', None)}")
-        self._pre, self._post = [], []
         for i, layer in enumerate(self.layers):
             logger.debug(f"Model.forward: passing through layer {i} ({layer})")
             z = layer.forward(x)
-            self._pre.append(z)
-            x = self.activation(z)
-            self._post.append(x)
+            self._pre[i] = z
+            act = self.activations[i]
+            x = act.forward(z) if act is not None else z
+            self._post[i] = x
             logger.debug(f"Model.forward: after activation, shape: {getattr(x, 'shape', None)}")
         return x
 
-    def backward(self, grad_out: AbstractTensor) -> None:
-        grads = grad_out
+    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        g = grad_out
         for i in reversed(range(len(self.layers))):
-            z = self._pre[i]
-            grads = self.activation.backward(z, grads)
-            grads = self.layers[i].backward(grads)
+            act = self.activations[i]
+            if act is not None:
+                g = act.backward(self._post[i], g)
+            g = self.layers[i].backward(g)
+        return g
 
 class Sequential(Model):
     pass
