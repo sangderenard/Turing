@@ -352,6 +352,14 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
 
     # --- Basic layout ---
+    def reshape(self, *shape: int) -> "AbstractTensor":
+        result = type(self)(track_time=self.track_time)
+        result.data = self.reshape_(shape)
+        return result
+
+    def reshape_(self, shape):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement reshape_()")
+
     def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
         result.data = self.transpose_(dim0, dim1)
@@ -359,6 +367,15 @@ class AbstractTensor:
 
     def transpose_(self, dim0, dim1):
         raise NotImplementedError(f"{self.__class__.__name__} must implement transpose_()")
+
+    def squeeze(self, dim: int | None = None) -> "AbstractTensor":
+        """Return a tensor with all (or one) dimensions of size 1 removed."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.squeeze_(dim)
+        return result
+
+    def squeeze_(self, dim: int | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
     def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
         return self.mean_(dim=dim, keepdim=keepdim)

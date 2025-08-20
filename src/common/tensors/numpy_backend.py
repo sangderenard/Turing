@@ -167,6 +167,12 @@ class NumPyTensorOperations(AbstractTensor):
         axes = list(range(self.data.ndim))
         axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
         return np.transpose(self.data, axes)
+    def reshape_(self, shape):
+        import numpy as np
+        return np.reshape(self.data, shape)
+    def squeeze_(self, dim: int | None = None):
+        import numpy as np
+        return np.squeeze(self.data, axis=dim) if dim is not None else np.squeeze(self.data)
     def __init__(self, track_time: bool = False):
         super().__init__(track_time=track_time)
 
@@ -306,7 +312,7 @@ class NumPyTensorOperations(AbstractTensor):
         i1 = self._AbstractTensor__unwrap(indices_dim1)
         return tensor[i0, i1]
 
-    def log_softmax_(self, tensor, dim):
+    def log_softmax_tensor_(self, tensor, dim):
         tensor = self._AbstractTensor__unwrap(tensor)
         e_x = np.exp(tensor - np.max(tensor, axis=dim, keepdims=True))
         softmax = e_x / np.sum(e_x, axis=dim, keepdims=True)

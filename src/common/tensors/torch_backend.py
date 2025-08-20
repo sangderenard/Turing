@@ -147,12 +147,14 @@ class PyTorchTensorOperations(AbstractTensor):
         import torch
         return torch.softmax(self.data, dim=dim)
 
-    def log_softmax_(self, dim):
-        import torch
-        return torch.log_softmax(self.data, dim=dim)
+    def reshape_(self, shape):
+        return self.data.reshape(*shape)
 
     def transpose_(self, dim0, dim1):
         return self.data.transpose(dim0, dim1)
+
+    def squeeze_(self, dim: int | None = None):
+        return self.data.squeeze() if dim is None else self.data.squeeze(dim)
     def __init__(self, default_device = "cpu", track_time: bool = False):
         super().__init__(track_time=track_time)
         try:

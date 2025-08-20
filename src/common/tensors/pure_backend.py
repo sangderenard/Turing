@@ -314,7 +314,7 @@ class PurePythonTensorOperations(AbstractTensor):
         else:
             return [row[i1] for row in selected_rows]
 
-    def log_softmax_(self, tensor: Any, dim: int) -> Any:
+    def log_softmax_tensor_(self, tensor: Any, dim: int) -> Any:
         if dim != -1 and dim != len(_get_shape(tensor)) - 1:
             raise NotImplementedError("log_softmax only implemented for last dimension")
         if not isinstance(tensor, list):
@@ -324,7 +324,7 @@ class PurePythonTensorOperations(AbstractTensor):
             exp_tensor = [math.exp(x - max_val) for x in tensor]
             sum_exp = sum(exp_tensor)
             return [math.log(x / sum_exp) for x in exp_tensor]
-        return [self.log_softmax_(sublist, dim=-1) for sublist in tensor]
+        return [self.log_softmax_tensor_(sublist, dim=-1) for sublist in tensor]
 
     def topk_(self, tensor: Any, k: int, dim: int) -> Tuple[Any, Any]:
         shape = _get_shape(tensor)
@@ -365,6 +365,56 @@ class PurePythonTensorOperations(AbstractTensor):
                 raise NotImplementedError("transpose_ expects a 2D list")
             return [list(row) for row in zip(*data)]
         raise NotImplementedError("transpose_ only supports dim0=0 and dim1=1")
+
+    def reshape_(self, shape):
+        flat = _flatten(self.data)
+
+        total = len(flat)
+        shape = list(shape)
+        if -1 in shape:
+            minus_one_count = shape.count(-1)
+            if minus_one_count > 1:
+                raise ValueError("Only one dimension can be -1")
+            known = 1
+            for s in shape:
+                if s != -1:
+                    known *= s
+            if total % known != 0:
+                raise ValueError("Cannot reshape array with incompatible size")
+            shape[shape.index(-1)] = total // known
+
+        it = iter(flat)
+
+        def build(s):
+            if not s:
+                return next(it)
+            n = s[0]
+            return [build(s[1:]) for _ in range(n)]
+
+        return build(shape)
+
+    def squeeze_(self, dim: int | None = None):
+        data = self.data
+
+        def squeeze_axis(lst, axis):
+            if axis == 0:
+                if isinstance(lst, list) and len(lst) == 1:
+                    return lst[0]
+                return lst
+            if not isinstance(lst, list):
+                return lst
+            return [squeeze_axis(x, axis - 1) for x in lst]
+
+        if dim is not None:
+            shape = _get_shape(data)
+            if dim < 0:
+                dim += len(shape)
+            return squeeze_axis(data, dim)
+
+        shape = _get_shape(data)
+        for axis in reversed([i for i, s in enumerate(shape) if s == 1]):
+            data = squeeze_axis(data, axis)
+        return data
 
     def pad_(self, tensor: Any, pad: Tuple[int, ...], value: float = 0) -> Any:
         if len(pad) != 4:

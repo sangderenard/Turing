@@ -18,5 +18,5 @@ def test_xor_learns(loss_type):
     opt = Adam(model.parameters(), lr=1e-2)
     loss_fn = MSELoss() if loss_type == "mse" else BCEWithLogitsLoss()
     # Large log_every suppresses internal printing during tests
-    losses = train_loop(model, loss_fn, opt, X, Y, epochs=2000, log_every=10000)
+    losses, _ = train_loop(model, loss_fn, opt, X, Y, epochs=2000, log_every=10000)
     assert losses[-1] < 0.1
