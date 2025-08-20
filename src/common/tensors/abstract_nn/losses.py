@@ -28,6 +28,34 @@ class MSELoss(Loss):
             N = _count(as_list(pred)) if hasattr(pred, "__len__") else 1
         return (2.0 / float(N)) * diff
 
+class BCEWithLogitsLoss(Loss):
+    def forward(self, logits: AbstractTensor, target: AbstractTensor) -> AbstractTensor:
+        z = logits
+        y = target
+        absz = (z * z).sqrt()
+        return (z.clamp_min(0.0) - z * y + ((absz * -1.0).exp() + 1.0).log()).mean()
+
+    def backward(self, logits: AbstractTensor, target: AbstractTensor) -> AbstractTensor:
+        z = logits
+        y = target
+        exp_neg = (z * -1.0).exp()
+        ones = from_list_like([[1.0]] * exp_neg.shape[0], like=exp_neg)
+        sig = ones / (ones + exp_neg)
+        grad = sig - y
+        if hasattr(grad, "numel"):
+            N = grad.numel()
+        elif hasattr(grad, "numel_"):
+            N = grad.numel_()
+        elif hasattr(grad, "shape"):
+            N = 1
+            for d in grad.shape:
+                N *= d
+        else:
+            def _count(x):
+                return sum(_count(v) for v in x) if isinstance(x, list) else 1
+            N = _count(as_list(grad)) if hasattr(grad, "__len__") else 1
+        return grad * (1.0 / float(N))
+
 class CrossEntropyLoss(Loss):
     def forward(self, pred: AbstractTensor, target: AbstractTensor) -> AbstractTensor:
         # log_probs: (batch, num_classes), target: (batch,) or (batch, 1)
