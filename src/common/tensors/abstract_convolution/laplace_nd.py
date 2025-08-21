@@ -2008,7 +2008,7 @@ def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.
     def update(frame):
         nonlocal temperature, temperature_grid, Z, surface
         # Compute temperature evolution: T_new = T + alpha * dt * Laplacian(T)
-        temperature += alpha * dt * laplacian_tensor @ temperature
+        temperature += -alpha * dt * laplacian_tensor @ temperature
         temperature_grid = temperature.reshape(N_u, N_u, N_u)
         Z = temperature_grid[:, :, N_u // 2]  # Update the middle slice
         
@@ -2071,6 +2071,7 @@ if __name__ == "__main__":
         boundary_conditions=boundary_conditions,
         grid_boundaries=(True, True, True, True, True, True),
         device='cpu',
+        dense=True,
         f=0.0
     )
 
@@ -2082,4 +2083,4 @@ if __name__ == "__main__":
     initial_temperature = np.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
 
     # Run the demo
-    heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.1, steps=200)
+    heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=1.1, steps=200)
