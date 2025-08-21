@@ -1987,69 +1987,119 @@ def test_build_laplace3d():
     print("Test passed: Numerical Laplacian matches analytical Laplacian within tolerance.")
 
 
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+# dt_system imports
+from src.common.dt_system.engine_api import DtCompatibleEngine
+from src.common.dt_system.dt_scaler import Metrics
+from src.common.dt_system.dt_controller import STController, Targets, step_with_dt_control
 
-def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.01, steps=500):
+
+class HeatEngine(DtCompatibleEngine):
+    def __init__(self, laplacian_tensor, initial_temperature, alpha=0.01):
+        self.laplacian_tensor = laplacian_tensor
+        self.alpha = alpha
+        self.temperature = initial_temperature.flatten().copy()
+        self.N_u = int(np.cbrt(len(self.temperature)))
+        self.prev_temperature = self.temperature.copy()
+        self.step_count = 0
+        # Compute dx from grid size (assume unit cube)
+        self.dx = 1.0 / self.N_u
+        self.dim = 3
+        # Explicit stability limit for dt
+        self.dt_limit = self.dx ** 2 / (2 * self.alpha * self.dim)
+
+    def step(self, dt, state=None, state_table=None):
+        self.prev_temperature = self.temperature.copy()
+        self.temperature += -self.alpha * dt * (self.laplacian_tensor @ self.temperature)
+        # Relative system energy change (L2 norm)
+        prev_energy = np.linalg.norm(self.prev_temperature)
+        curr_energy = np.linalg.norm(self.temperature)
+        rel_energy_change = abs(curr_energy - prev_energy) / (prev_energy + 1e-12)
+        # Clamp negative temperatures (optional: warn)
+        if np.any(self.temperature < 0):
+            import warnings
+            warnings.warn("Negative temperature detected; clamping to zero.")
+            self.temperature = np.maximum(self.temperature, 0)
+        metrics = Metrics(
+            max_vel=rel_energy_change,
+            max_flux=0.0,
+            div_inf=0.0,
+            mass_err=0.0,
+            dt_limit=self.dt_limit
+        )
+        self.step_count += 1
+        return True, metrics, self.temperature.copy()
+
+    def get_state(self):
+        return self.temperature.copy()
+
+    def restore(self, state):
+        self.temperature = state.copy()
+
+    def copy_shallow(self):
+        clone = HeatEngine(self.laplacian_tensor, self.temperature.copy(), self.alpha)
+        clone.prev_temperature = self.prev_temperature.copy()
+        clone.step_count = self.step_count
+        return clone
+
+def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.01, steps=500, adaptive_dt=True):
     """
-    Simulates heat evolution on a 3D grid using a precomputed Laplacian matrix.
-    
-    Args:
-        laplacian_tensor: A dense Laplacian matrix (torch.Tensor or numpy.ndarray).
-        initial_temperature: Initial temperature distribution (numpy.ndarray).
-        alpha: Thermal diffusivity coefficient (float).
-        dt: Time step for simulation (float).
-        steps: Number of simulation steps (int).
+    Simulates heat evolution on a 3D grid using a precomputed Laplacian matrix, with optional adaptive dt.
+    Returns the FuncAnimation object for display or further use.
     """
-    # Convert Laplacian tensor to NumPy if needed
-    if isinstance(laplacian_tensor, torch.Tensor):
+    if hasattr(laplacian_tensor, 'cpu'):
         laplacian_tensor = laplacian_tensor.cpu().numpy()
 
-    # Flatten the initial temperature distribution
     initial_temperature = initial_temperature.flatten()
+    N_u = int(np.cbrt(len(initial_temperature)))
 
-    # Time evolution of temperature
-    temperature = initial_temperature.copy()
-    
-    # Reshape dimensions for visualization
-    N_u = int(np.cbrt(len(temperature)))  # Assuming a cubic grid
-    temperature_grid = temperature.reshape(N_u, N_u, N_u)
+    engine = HeatEngine(laplacian_tensor, initial_temperature, alpha)
 
-    # Prepare the plot
     fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
-    ax.set_box_aspect([1, 1, 1])  # Equal aspect ratio
+    ax.set_box_aspect([1, 1, 1])
     x = np.linspace(0, 1, N_u)
     y = np.linspace(0, 1, N_u)
     X, Y = np.meshgrid(x, y)
-    Z = temperature_grid[:, :, N_u // 2]  # Middle slice for 3D visualization
-    surface = ax.plot_surface(X, Y, Z, cmap='viridis')
+    surface = None
+    plot_state = {"surface": None}
 
-    
+    targets = Targets(cfl=1.0, div_max=1e3, mass_max=1e6)
+    ctrl = STController(dt_min=1e-6, dt_max=0.1)
+    dx = 1.0 / N_u
+    time = 0.0
+    frame = 0
+    max_time = steps * dt
 
-    def update(frame):
-        nonlocal temperature, temperature_grid, Z, surface
-        # Compute temperature evolution: T_new = T + alpha * dt * Laplacian(T)
-        temperature += -alpha * dt * laplacian_tensor @ temperature
-        temperature_grid = temperature.reshape(N_u, N_u, N_u)
-        Z = temperature_grid[:, :, N_u // 2]  # Update the middle slice
-        
-        # Remove the previous surface if it exists
-        if surface is not None:
-            surface.remove()
-        
-        # Replot the surface
-        surface = ax.plot_surface(X, Y, Z, cmap='viridis')
-        ax.set_title(f"Time Step: {frame}")
-        ax.set_zlim(0, initial_temperature.max())  # Adjust limits dynamically
-        return surface,
+    def advance(state, dt):
+        ok, metrics, new_state = engine.step(dt)
+        return ok, metrics
 
+    def update(frame_idx):
+        nonlocal time, frame, dt
+        if time >= max_time or frame >= steps:
+            return plot_state["surface"],
+        if adaptive_dt:
+            metrics, dt_next = step_with_dt_control(engine, dt, dx, targets, ctrl, advance)
+            dt = dt_next
+        else:
+            engine.step(dt)
+        temp_grid = engine.temperature.reshape(N_u, N_u, N_u)
+        Z = temp_grid[:, :, N_u // 2]
+        if plot_state["surface"] is not None:
+            plot_state["surface"].remove()
+        plot_state["surface"] = ax.plot_surface(X, Y, Z, cmap='viridis')
+        ax.set_title(f"Time: {time:.4f}, Frame: {frame}")
+        ax.set_zlim(0, initial_temperature.max())
+        time += dt
+        frame += 1
+        return plot_state["surface"],
 
-    # Animate
     ani = FuncAnimation(fig, update, frames=steps, blit=False, interval=50)
-
-    # Show the animation
     plt.show()
+    return ani
 # Store the surface plot reference globally
 surface = None
 
@@ -2105,4 +2155,4 @@ if __name__ == "__main__":
     initial_temperature = np.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
 
     # Run the demo
-    heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=1.1, steps=200)
+    heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.01, steps=200)

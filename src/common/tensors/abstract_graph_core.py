@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 AbstractGraphCore: graph-first mixin for AbstractTensor.
 
@@ -29,103 +30,16 @@ Then implement backend hooks in your backends:
 from dataclasses import dataclass, field
 from typing import Dict
 
-# --- SegmentMap dataclass for clear segment structure ---
-@dataclass
-class SegmentMap:
-    """
-    Describes a subnetwork/segment for graph-NN assembly.
-    nodes: List of node ids in this segment
-    edges: List of (src, dst) tuples (optionally with edge keys)
-    node_props: Dict[node_id, dict] of node attributes
-    edge_props: Dict[edge_tuple, dict] of edge attributes
-    label: Optional segment label or id
-    
-    Create a segment map from a human-readable description for even the most complex networks.
-    Supports:
-      - Any number of segments/layers, each with a custom 'type' (e.g., 'conv', 'flatten', 'residual', 'attention', ...)
-      - Arbitrary attributes per segment (activation, params, etc.)
-      - Dynamic autonaming of nodes if not provided (e.g., conv_0, dense_1, ...)
-      - 'mode' per segment: 'fully_connected' (default), 'one_to_one', 'custom', etc.
-      - Edges auto-generated between adjacent segments unless overridden
-      - Explicit nodes/edges override auto-generation
-      - Arbitrary connections: skip, merge, split, multi-input/output, etc.
 
-    Example:
-      [
-        {'label': 'conv1', 'type': 'conv', 'num_nodes': 8, 'params': {'kernel': 3}},
-        {'label': 'flatten', 'type': 'flatten', 'num_nodes': 8},
-        {'label': 'dense1', 'type': 'dense', 'num_nodes': 4, 'activation': 'relu'},
-        {'label': 'dense2', 'type': 'dense', 'num_nodes': 2, 'activation': 'softmax', 'edges': [('dense1_0', 'dense2_0'), ('flatten_3', 'dense2_1')]},
-        {'label': 'output', 'type': 'output', 'nodes': ['out1', 'out2'], 'edges': [('dense2_0', 'out1'), ('dense2_1', 'out2')]},
-      ]
-
-    Returns: dict[label, SegmentMap]
-    """
-    nodes: list = field(default_factory=list)
-    edges: list = field(default_factory=list)
-    node_props: Dict = field(default_factory=dict)
-    edge_props: Dict = field(default_factory=dict)
-    label: str = None
+# --- SegmentMap dataclass and segment logic now belong to AbstractNNGraphCore ---
 
 
-    if isinstance(description, str):
-        raise NotImplementedError("String DSL parsing not yet implemented.")
-    if isinstance(description, dict):
-        segments = list(description.values())
-    else:
-        segments = list(description)
-    segmap = {}
-    prev_nodes = None
-    prev_label = None
-    for idx, seg in enumerate(segments):
-        label = seg.get('label')
-        if not label:
-            label = f'segment_{idx}'
-        seg_type = seg.get('type', label)
-        # Node naming
-        nodes = seg.get('nodes')
-        num_nodes = seg.get('num_nodes')
-        if nodes is None:
-            base = seg_type
-            if num_nodes is None:
-                raise ValueError(f"Segment '{label}' must specify 'nodes' or 'num_nodes'.")
-            nodes = [f"{base}_{i}" for i in range(num_nodes)]
-        # Edge generation
-        edges = seg.get('edges')
-        mode = seg.get('mode', 'fully_connected')
-        if edges is None and prev_nodes is not None:
-            if mode == 'fully_connected':
-                edges = [(src, dst) for src in prev_nodes for dst in nodes]
-            elif mode == 'one_to_one':
-                if len(prev_nodes) != len(nodes):
-                    raise ValueError(f"Cannot do one_to_one from {prev_label} to {label}: size mismatch.")
-                edges = list(zip(prev_nodes, nodes))
-            elif mode == 'custom':
-                edges = []  # User must provide
-            else:
-                raise ValueError(f"Unknown mode '{mode}' for segment '{label}'.")
-        elif edges is None:
-            edges = []
-        # Collect all extra attributes for future use
-        extra = {k: v for k, v in seg.items() if k not in {'label', 'type', 'nodes', 'num_nodes', 'edges', 'mode', 'node_props', 'edge_props'}}
-        segmap[label] = SegmentMap(
-            nodes=nodes,
-            edges=edges,
-            node_props=seg.get('node_props', {}),
-            edge_props=seg.get('edge_props', {}),
-            label=label
-        )
-        # Attach extra attributes to the SegmentMap for introspection
-        for k, v in extra.items():
-            setattr(segmap[label], k, v)
-        prev_nodes = nodes
-        prev_label = label
-    return segmap
 
 
-from __future__ import annotations
+
 from abc import ABC
 from typing import Any, Callable, Iterable, Optional, Tuple, List, Union, Literal
+from src.common.tensors.abstraction import AbstractTensor
 import networkx as nx
 
 SegmentReduce = Literal["sum", "mean", "max", "min"]
@@ -134,8 +48,255 @@ SemiringAdd = Literal["sum", "max", "min", "logsumexp"]
 SemiringMul = Literal["mul", "plus"]  # "mul": multiply, "plus": a+b (for tropical/max-plus)
 
 
-class AbstractGraphCore(ABC):
 
+# --- COO Matrix Engine ---
+class COOMatrix:
+    """
+    Minimal backend-agnostic COO matrix for graph core.
+    Stores edge_index (2, E), edge_weight (E,), and shape (N, N).
+    Uses AbstractTensor for all storage and access.
+    Changes to indices/values propagate to the network if attached.
+    """
+    def __init__(self, edge_index, edge_weight, shape, network=None):
+        # edge_index: AbstractTensor (2, E)
+        # edge_weight: AbstractTensor (E,)
+        # shape: tuple (N, N)
+        self.edge_index = AbstractTensor.get_tensor(edge_index)
+        self.edge_weight = AbstractTensor.get_tensor(edge_weight)
+        self.shape = shape
+        self.network = network  # Optional: link to AbstractGraphCore for propagation
+
+    @property
+    def indices(self):
+        return self.edge_index
+
+    @property
+    def values(self):
+        return self.edge_weight
+
+    def to_dense(self):
+        # TODO: Efficient AbstractTensor-based scatter for dense conversion
+        N = self.shape[0]
+        dense = AbstractTensor.zeros((N, N))
+        idx = self.edge_index
+        vals = self.edge_weight
+        # Pseudocode: dense[idx[0], idx[1]] = vals
+        # This should be a scatter operation
+        for i in range(idx.shape[1]):
+            dense[idx[0, i], idx[1, i]] = vals[i]
+        return dense
+
+    def update(self, edge_index=None, edge_weight=None):
+        if edge_index is not None:
+            self.edge_index = AbstractTensor.get_tensor(edge_index)
+        if edge_weight is not None:
+            self.edge_weight = AbstractTensor.get_tensor(edge_weight)
+        # Propagate changes to network if attached
+        if self.network is not None:
+            self.network.on_coo_update(self)
+
+    def __repr__(self):
+        return f"COOMatrix(shape={self.shape}, nnz={self.edge_weight.shape[0]})"
+
+
+
+# --- Lightweight backend-agnostic graph/tensor COO engine ---
+class AbstractGraphCore:
+    """
+    Minimal graph/tensor core for COO-based sparse data.
+    Can be attached to any AbstractTensor for sparse structure.
+    Provides COO matrix creation, update, and propagation.
+    """
+
+    def on_graph_update(self):
+        """
+        Synchronize the COO tensors (indices and values) with the current state of the network (graph).
+        Validates the graph structure and generates new contiguous tensors.
+        """
+        if not hasattr(self, 'network') or self.network is None:
+            raise RuntimeError("No network/graph to sync from.")
+        G = self.network
+        # Find all index nodes and value nodes
+        index_nodes = [n for n, d in G.nodes(data=True) if d.get('type') == 'index']
+        value_nodes = [n for n, d in G.nodes(data=True) if d.get('type') == 'value']
+        # Build edge list: (index_node, value_node)
+        edges = [(src, dst) for src, dst in G.edges() if src in index_nodes and dst in value_nodes]
+        # Validate: all edges must go from index to value
+        for src, dst in edges:
+            if src not in index_nodes or dst not in value_nodes:
+                raise ValueError(f"Invalid edge from {src} to {dst}: must go from index to value node.")
+        # Build contiguous tensors
+        if not edges:
+            # No edges, empty COO
+            import numpy as np
+            edge_index = np.zeros((2, 0), dtype=int)
+            edge_weight = np.zeros((0,), dtype=float)
+        else:
+            import numpy as np
+            idxs = np.array([list(src) for src, _ in edges], dtype=int).T  # shape (2, E)
+            vals = np.array([float(dst[1]) for _, dst in edges], dtype=float)  # shape (E,)
+            edge_index = idxs
+            edge_weight = vals
+        # Update the COO matrix
+        self.coo = self.to_coo(edge_index, edge_weight, self.coo.shape if self.coo else None)
+
+    def __init__(self, edge_index=None, edge_weight=None, shape=None):
+        self.coo = None
+        if edge_index is not None and edge_weight is not None:
+            self.coo = self.to_coo(edge_index, edge_weight, shape)
+
+    def to_coo(self, edge_index, edge_weight, shape=None):
+        edge_index = AbstractTensor.get_tensor(edge_index)
+        edge_weight = AbstractTensor.get_tensor(edge_weight)
+        if shape is None:
+            N = int(edge_index.max().item()) + 1
+            shape = (N, N)
+        self.coo = COOMatrix(edge_index, edge_weight, shape, network=self)
+        return self.coo
+
+    def on_coo_update(self, coo_matrix):
+        # Always sync the .coo reference to the latest COOMatrix
+        self.coo = coo_matrix
+        # Ensure self.network exists and is a graph (networkx or compatible)
+        if not hasattr(self, 'network') or self.network is None:
+            import networkx as nx
+            self.network = nx.DiGraph()
+        G = self.network
+        G.clear()
+        idx = coo_matrix.edge_index
+        vals = coo_matrix.edge_weight
+        # Deduplicate index nodes and value nodes
+        index_nodes = set()
+        value_nodes = set()
+        edges = []
+        for i in range(idx.shape[1]):
+            index_node = (int(idx[0, i]), int(idx[1, i]))
+            value_node = ("val", float(vals[i]))
+            index_nodes.add(index_node)
+            value_nodes.add(value_node)
+            edges.append((index_node, value_node))
+        for n in index_nodes:
+            G.add_node(n, type="index")
+        for n in value_nodes:
+            G.add_node(n, type="value")
+        for src, dst in edges:
+            G.add_edge(src, dst)
+
+
+# --- Neural Network Graph Core (segment/NN management) ---
+from dataclasses import dataclass, field
+from typing import Dict
+
+class AbstractNNGraphCore(ABC):
+    """
+    Graph-first mixin for AbstractTensor, for NN/segment management.
+    Handles segment maps, segment registration, and NN graph assembly.
+    """
+    @dataclass
+    class SegmentMap:
+        """
+        Describes a subnetwork/segment for graph-NN assembly.
+        nodes: List of node ids in this segment
+        edges: List of (src, dst) tuples (optionally with edge keys)
+        node_props: Dict[node_id, dict] of node attributes
+        edge_props: Dict[edge_tuple, dict] of edge attributes
+        label: Optional segment label or id
+        """
+        nodes: list = field(default_factory=list)
+        edges: list = field(default_factory=list)
+        node_props: Dict = field(default_factory=dict)
+        edge_props: Dict = field(default_factory=dict)
+        label: str = None
+
+    @staticmethod
+    def create_segment_map(description):
+        if isinstance(description, str):
+            raise NotImplementedError("String DSL parsing not yet implemented.")
+        if isinstance(description, dict):
+            segments = list(description.values())
+        else:
+            segments = list(description)
+        segmap = {}
+        prev_nodes = None
+        prev_label = None
+        for idx, seg in enumerate(segments):
+            label = seg.get('label')
+            if not label:
+                label = f'segment_{idx}'
+            seg_type = seg.get('type', label)
+            nodes = seg.get('nodes')
+            num_nodes = seg.get('num_nodes')
+            if nodes is None:
+                base = seg_type
+                if num_nodes is None:
+                    raise ValueError(f"Segment '{label}' must specify 'nodes' or 'num_nodes'.")
+                nodes = [f"{base}_{i}" for i in range(num_nodes)]
+            edges = seg.get('edges')
+            mode = seg.get('mode', 'fully_connected')
+            if edges is None and prev_nodes is not None:
+                if mode == 'fully_connected':
+                    edges = [(src, dst) for src in prev_nodes for dst in nodes]
+                elif mode == 'one_to_one':
+                    if len(prev_nodes) != len(nodes):
+                        raise ValueError(f"Cannot do one_to_one from {prev_label} to {label}: size mismatch.")
+                    edges = list(zip(prev_nodes, nodes))
+                elif mode == 'custom':
+                    edges = []
+                else:
+                    raise ValueError(f"Unknown mode '{mode}' for segment '{label}'.")
+            elif edges is None:
+                edges = []
+            extra = {k: v for k, v in seg.items() if k not in {'label', 'type', 'nodes', 'num_nodes', 'edges', 'mode', 'node_props', 'edge_props'}}
+            segmap[label] = AbstractNNGraphCore.SegmentMap(
+                nodes=nodes,
+                edges=edges,
+                node_props=seg.get('node_props', {}),
+                edge_props=seg.get('edge_props', {}),
+                label=label
+            )
+            for k, v in extra.items():
+                setattr(segmap[label], k, v)
+            prev_nodes = nodes
+            prev_label = label
+        return segmap
+
+    def __init__(self, backing = None, in_nodes: Optional[List[int]] = None, out_nodes: Optional[List[int]] = None, track_time: bool = False):
+        self.backing = backing if backing is not None else nx.DiGraph()
+        self.track_time = track_time
+        self.in_nodes = in_nodes if in_nodes is not None else []
+        self.out_nodes = out_nodes if out_nodes is not None else []
+        self.n_in = len(self.in_nodes)
+        self.n_out = len(self.out_nodes)
+        self.NN = None
+
+    def _register_NN(self, nn, segment_map: Optional[Dict] = None, flags: Optional[dict] = None):
+        self.NN = nn
+        flags = flags or {}
+        autowrap = flags.get('autowrap_inputs', True)
+        if segment_map is None and hasattr(nn, "segments"):
+            segment_map = nn.segments
+        if segment_map is None:
+            raise ValueError("No segment map provided and network has no .segments attribute.")
+        for seg_id, seg in segment_map.items():
+            if isinstance(seg, dict):
+                seg = AbstractNNGraphCore.SegmentMap(**seg)
+            for n in seg.nodes:
+                props = dict(segment=seg_id)
+                props.update(seg.node_props.get(n, {}))
+                self.backing.add_node(n, **props)
+            for e in seg.edges:
+                src, dst = e[:2]
+                props = dict(segment=seg_id)
+                props.update(seg.edge_props.get(e, {}))
+                self.backing.add_edge(src, dst, **props)
+        if autowrap:
+            if hasattr(nn, 'in_nodes') and hasattr(nn, 'out_nodes'):
+                self.in_nodes = nn.in_nodes
+                self.out_nodes = nn.out_nodes
+    """
+    Graph-first mixin for AbstractTensor, for NN/segment management.
+    Handles segment maps, segment registration, and NN graph assembly.
+    """
     def __init__(self, backing = None, in_nodes: Optional[List[int]] = None, out_nodes: Optional[List[int]] = None, track_time: bool = False):
         self.backing = backing if backing is not None else nx.DiGraph()
         self.track_time = track_time
@@ -218,8 +379,8 @@ class AbstractGraphCore(ABC):
         values: (..., E, ...), segment_ids: (E,)
         Returns tensor with segment axis size == num_segments (if given) or max(segment_ids)+1
         """
-        values = self.ensure_tensor(values)
-        segment_ids = self.ensure_tensor(segment_ids)
+        values = self.get_tensor(values)
+        segment_ids = self.get_tensor(segment_ids)
         return self._wrap(self.segment_sum_(values.data, segment_ids.data, num_segments, dim))
 
     def segment_mean(
@@ -232,8 +393,8 @@ class AbstractGraphCore(ABC):
         eps: float = 1e-12,
     ) -> "AbstractGraphCore":
         """Mean per segment; safe-divide with 'eps'."""
-        values = self.ensure_tensor(values)
-        segment_ids = self.ensure_tensor(segment_ids)
+        values = self.get_tensor(values)
+        segment_ids = self.get_tensor(segment_ids)
         return self._wrap(self.segment_mean_(values.data, segment_ids.data, num_segments, dim, eps))
 
     def segment_max(
@@ -249,8 +410,8 @@ class AbstractGraphCore(ABC):
         Max per segment. Returns (values, indices_within_segment).
         Indices may be backend-native if that matches your other APIs (like topk).
         """
-        values = self.ensure_tensor(values)
-        segment_ids = self.ensure_tensor(segment_ids)
+        values = self.get_tensor(values)
+        segment_ids = self.get_tensor(segment_ids)
         v, idx = self.segment_max_(values.data, segment_ids.data, num_segments, dim, initial)
         return self._wrap(v), idx
 
@@ -264,8 +425,8 @@ class AbstractGraphCore(ABC):
         initial: Optional[float] = None,
     ) -> Tuple["AbstractGraphCore", Any]:
         """Min per segment. Returns (values, indices_within_segment)."""
-        values = self.ensure_tensor(values)
-        segment_ids = self.ensure_tensor(segment_ids)
+        values = self.get_tensor(values)
+        segment_ids = self.get_tensor(segment_ids)
         v, idx = self.segment_min_(values.data, segment_ids.data, num_segments, dim, initial)
         return self._wrap(v), idx
 
@@ -273,7 +434,7 @@ class AbstractGraphCore(ABC):
         """
         Gather elements along 'dim' using integer 'index'. Mirrors torch.gather semantics on that axis.
         """
-        index = self.ensure_tensor(index)
+        index = self.get_tensor(index)
         return self._wrap(self.gather_(index.data, dim))
 
     def scatter_add(
@@ -287,7 +448,7 @@ class AbstractGraphCore(ABC):
         Scatter-ADD this tensor into a result along 'dim' at positions in 'index'.
         'self' provides the values to add.
         """
-        index = self.ensure_tensor(index)
+        index = self.get_tensor(index)
         return self._wrap(self.scatter_add_(index.data, dim, dim_size))
 
     def edge_softmax(
@@ -301,7 +462,7 @@ class AbstractGraphCore(ABC):
         Softmax this tensor per-segment defined by 'segment_ids' (common for attention over incoming edges).
         Typically called on edge scores of shape (E, 1) or (E,).
         """
-        segment_ids = self.ensure_tensor(segment_ids)
+        segment_ids = self.get_tensor(segment_ids)
         return self._wrap(self.edge_softmax_(segment_ids.data, temperature, max_stabilize))
 
     def segment_softmax(
@@ -325,8 +486,8 @@ class AbstractGraphCore(ABC):
         """
         Top-k per segment. Returns (topk_values, topk_indices_within_segment).
         """
-        values = self.ensure_tensor(values)
-        segment_ids = self.ensure_tensor(segment_ids)
+        values = self.get_tensor(values)
+        segment_ids = self.get_tensor(segment_ids)
         v, idx = self.topk_per_segment_(values.data, segment_ids.data, k, largest)
         return self._wrap(v), idx
 
@@ -342,8 +503,8 @@ class AbstractGraphCore(ABC):
         """
         Coalesce duplicate edges by (src,dst), reducing edge_weight with 'op'.
         """
-        edge_index = self.ensure_tensor(edge_index)
-        ew = None if edge_weight is None else self.ensure_tensor(edge_weight)
+        edge_index = self.get_tensor(edge_index)
+        ew = None if edge_weight is None else self.get_tensor(edge_weight)
         ei, ew2 = self.coalesce_edges_(edge_index.data, None if ew is None else ew.data, num_nodes, op)
         return self._wrap(ei), (None if ew2 is None else self._wrap(ew2))
 
@@ -358,7 +519,7 @@ class AbstractGraphCore(ABC):
         Convert COO edge_index -> CSR (indptr, indices) for fast matvec/matmul.
         Returns (indptr: (N+1,), indices: (E,))
         """
-        edge_index = self.ensure_tensor(edge_index)
+        edge_index = self.get_tensor(edge_index)
         indptr, indices = self.edge_index_to_csr_(edge_index.data, num_nodes, sorted)
         return self._wrap(indptr), self._wrap(indices)
 
@@ -373,10 +534,10 @@ class AbstractGraphCore(ABC):
         Sparse matvec y = A x with A in CSR (indptr, indices, values).
         If 'values' is None, treat unweighted (all ones).
         """
-        indptr = self.ensure_tensor(indptr)
-        indices = self.ensure_tensor(indices)
-        x = self.ensure_tensor(x)
-        vdata = None if values is None else self.ensure_tensor(values).data
+        indptr = self.get_tensor(indptr)
+        indices = self.get_tensor(indices)
+        x = self.get_tensor(x)
+        vdata = None if values is None else self.get_tensor(values).data
         return self._wrap(self.csr_matvec_(indptr.data, indices.data, vdata, x.data))
 
     def masked_matmul(
@@ -389,8 +550,8 @@ class AbstractGraphCore(ABC):
         """
         Dense matmul with optional mask. If 'neg_inf', use additive -inf before softmax attention.
         """
-        other = self.ensure_tensor(other)
-        m = None if mask is None else self.ensure_tensor(mask)
+        other = self.get_tensor(other)
+        m = None if mask is None else self.get_tensor(mask)
         return self._wrap(self.masked_matmul_(other.data, None if m is None else m.data, mask_mode))
 
     def semiring_matmul(
@@ -405,8 +566,8 @@ class AbstractGraphCore(ABC):
         Generalized matmul over a (add, mul) semiring.
         Presets: tropical (min, plus), max-plus (max, plus), log-sum-exp (logsumexp, plus).
         """
-        other = self.ensure_tensor(other)
-        m = None if mask is None else self.ensure_tensor(mask)
+        other = self.get_tensor(other)
+        m = None if mask is None else self.get_tensor(mask)
         return self._wrap(self.semiring_matmul_(other.data, add, mul, None if m is None else m.data))
 
     # ---------- tier 3: algebraic graph ops ----------
@@ -419,8 +580,8 @@ class AbstractGraphCore(ABC):
         num_nodes: Optional[int] = None,
     ) -> Tuple["AbstractGraphCore", Optional["AbstractGraphCore"]]:
         """Add self-loops (i,i) with weight fill_value for missing nodes."""
-        edge_index = self.ensure_tensor(edge_index)
-        ew = None if edge_weight is None else self.ensure_tensor(edge_weight)
+        edge_index = self.get_tensor(edge_index)
+        ew = None if edge_weight is None else self.get_tensor(edge_weight)
         ei, ew2 = self.add_self_loops_(edge_index.data, None if ew is None else ew.data, fill_value, num_nodes)
         return self._wrap(ei), (None if ew2 is None else self._wrap(ew2))
 
@@ -430,8 +591,8 @@ class AbstractGraphCore(ABC):
         edge_weight: Optional["AbstractGraphCore"] = None,
     ) -> Tuple["AbstractGraphCore", Optional["AbstractGraphCore"]]:
         """Remove edges (i,i)."""
-        edge_index = self.ensure_tensor(edge_index)
-        ew = None if edge_weight is None else self.ensure_tensor(edge_weight)
+        edge_index = self.get_tensor(edge_index)
+        ew = None if edge_weight is None else self.get_tensor(edge_weight)
         ei, ew2 = self.remove_self_loops_(edge_index.data, None if ew is None else ew.data)
         return self._wrap(ei), (None if ew2 is None else self._wrap(ew2))
 
@@ -448,8 +609,8 @@ class AbstractGraphCore(ABC):
         Return Laplacian in COO: (edge_index_L, edge_weight_L).
         norm: "sym" (I - D^{-1/2} A D^{-1/2}), "rw" (I - D^{-1} A), or None (D - A).
         """
-        edge_index = self.ensure_tensor(edge_index)
-        ew = None if edge_weight is None else self.ensure_tensor(edge_weight)
+        edge_index = self.get_tensor(edge_index)
+        ew = None if edge_weight is None else self.get_tensor(edge_weight)
         ei, ew2 = self.laplacian_(edge_index.data, None if ew is None else ew.data, num_nodes, norm, add_self_loops_if_absent)
         return self._wrap(ei), (None if ew2 is None else self._wrap(ew2))
 
@@ -465,9 +626,9 @@ class AbstractGraphCore(ABC):
         Apply Chebyshev polynomial filter sum_{k=0}^{K} theta_k T_k(tilde{L}) x.
         L can be (edge_index_L, edge_weight_L) in COO or a backend-specific Laplacian handle.
         """
-        x = self.ensure_tensor(x)
+        x = self.get_tensor(x)
         if isinstance(L, tuple):
-            L = (self.ensure_tensor(L[0]).data, None if L[1] is None else self.ensure_tensor(L[1]).data)
+            L = (self.get_tensor(L[0]).data, None if L[1] is None else self.get_tensor(L[1]).data)
         return self._wrap(self.chebyshev_filter_(x.data, L, K, lambda_max))
 
     def random_walk(
@@ -484,9 +645,9 @@ class AbstractGraphCore(ABC):
         Discrete-time random walk. If 'start' is None, return the transition matrix^steps or stationary distribution
         depending on backend capability. Otherwise simulate from start nodes.
         """
-        edge_index = self.ensure_tensor(edge_index)
-        ew = None if edge_weight is None else self.ensure_tensor(edge_weight)
-        st = None if start is None else self.ensure_tensor(start)
+        edge_index = self.get_tensor(edge_index)
+        ew = None if edge_weight is None else self.get_tensor(edge_weight)
+        st = None if start is None else self.get_tensor(start)
         return self._wrap(self.random_walk_(edge_index.data, None if ew is None else ew.data, None if st is None else st.data, steps, num_nodes, return_distribution))
 
     # ---------- tier 5: ragged batching & utilities ----------
@@ -494,14 +655,14 @@ class AbstractGraphCore(ABC):
         """
         Return prefix-sum offsets given lengths (e.g., node-per-graph counts).
         """
-        lengths = self.ensure_tensor(lengths)
+        lengths = self.get_tensor(lengths)
         return self._wrap(self.pack_segments_(lengths.data))
 
     def unpack_segments(self, offsets: "AbstractGraphCore") -> "AbstractGraphCore":
         """
         Invert pack_segments for lengths (diff of consecutive offsets).
         """
-        offsets = self.ensure_tensor(offsets)
+        offsets = self.get_tensor(offsets)
         return self._wrap(self.unpack_segments_(offsets.data))
 
     def block_diag(self, blocks: List["AbstractGraphCore"]) -> "AbstractGraphCore":
@@ -509,12 +670,12 @@ class AbstractGraphCore(ABC):
         Build a block-diagonal matrix from a list of dense/sparse adjacency blocks.
         For sparse COO inputs, return sparse COO.
         """
-        blocks = [self.ensure_tensor(b) for b in blocks]
+        blocks = [self.get_tensor(b) for b in blocks]
         return self._wrap(self.block_diag_([b.data for b in blocks]))
 
     def permute(self, perm: "AbstractGraphCore", *, dim: int = 0) -> "AbstractGraphCore":
         """Permute along 'dim' according to integer permutation 'perm'."""
-        perm = self.ensure_tensor(perm)
+        perm = self.get_tensor(perm)
         return self._wrap(self.permute_(perm.data, dim))
 
     def reindex_nodes(
@@ -523,8 +684,8 @@ class AbstractGraphCore(ABC):
         perm: "AbstractGraphCore",
     ) -> "AbstractGraphCore":
         """Apply permutation 'perm' to node ids in COO edge_index."""
-        edge_index = self.ensure_tensor(edge_index)
-        perm = self.ensure_tensor(perm)
+        edge_index = self.get_tensor(edge_index)
+        perm = self.get_tensor(perm)
         return self._wrap(self.reindex_nodes_(edge_index.data, perm.data))
 
     # ---------- backend hooks (to be implemented per backend) ----------
