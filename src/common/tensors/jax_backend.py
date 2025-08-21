@@ -346,6 +346,10 @@ class JAXTensorOperations(AbstractTensor):
     def repeat_interleave_(self, tensor: Any, repeats: int, dim: Optional[int] = None) -> Any:
         return jnp.repeat(self._to_jnp(tensor), repeats, axis=dim).tolist()
 
+    def cumsum_(self, dim: int = 0) -> Any:
+        import jax.numpy as jnp
+        return jnp.cumsum(self.data, axis=dim)
+
     def repeat_(self, repeats: Any = None, dim: int = 0) -> Any:
         """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
         raise NotImplementedError("repeat not implemented for JAX backend")

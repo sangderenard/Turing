@@ -430,6 +430,10 @@ class NumPyTensorOperations(AbstractTensor):
             dim = 0
         return np.repeat(self.data, repeats, axis=dim)
 
+    def cumsum_(self, dim=0):
+        import numpy as np
+        return np.cumsum(self.data, axis=dim)
+
     def repeat_(self, repeats=None, dim: int = 0):
         """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
         raise NotImplementedError("repeat not implemented for NumPy backend")

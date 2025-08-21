@@ -320,6 +320,10 @@ class PyTorchTensorOperations(AbstractTensor):
         if dim is None:
             dim = 0
         return self.data.repeat_interleave(repeats, dim=dim)
+
+    def cumsum_(self, dim=0):
+        import torch
+        return torch.cumsum(self.data, dim=dim)
         
 
     def view_flat_(self):
