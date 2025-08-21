@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from abc import ABC, abstractmethod
-from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque
+from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple
 import math
 import time
 from collections import deque
@@ -603,22 +603,51 @@ class AbstractTensor:
             f"{self.__class__.__name__} must implement fold2d_()"
         )
 
-    def cat(self, tensors: List[Any], dim: int = 0) -> "AbstractTensor":
-        tensors = [self.ensure_tensor(t) for t in tensors]
-        result = type(self)(track_time=self.track_time)
-        result.data = self.cat_(tensors, dim)
+    @staticmethod
+    def cat(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
+        """Concatenate ``tensors`` along dimension ``dim``.
+
+        Accepts raw backend tensors or ``AbstractTensor`` instances and
+        dispatches to the underlying backend implementation via ``cat_``.
+        """
+        if not tensors:
+            raise ValueError("cat requires at least one tensor")
+        first = AbstractTensor.get_tensor(tensors[0])
+        tensors = [first.ensure_tensor(t) for t in tensors]
+        result = first.__class__(track_time=first.track_time)
+        result.data = first.cat_(tensors, dim)
         return result
 
-    def topk(self, k: int = 1, dim: int = -1) -> Tuple["AbstractTensor", Any]:
-        values, idxs = self.topk_(k, dim)
-        result = type(self)(track_time=self.track_time)
-        result.data = values
-        return result, idxs
+    class _TopKResult(NamedTuple):
+        values: "AbstractTensor"
+        indices: Any
 
-    def stack(self, tensors: List[Any], dim: int = 0) -> "AbstractTensor":
-        tensors = [self.ensure_tensor(t) for t in tensors]
-        result = type(self)(track_time=self.track_time)
-        result.data = self.stack_(tensors, dim)
+    @staticmethod
+    def topk(tensor: Any, k: int = 1, dim: int = -1) -> "AbstractTensor._TopKResult":
+        """Return the top ``k`` elements and their indices along ``dim``.
+
+        Mirrors ``torch.topk`` by returning a named tuple with ``values`` and
+        ``indices`` fields.
+        """
+        tensor = AbstractTensor.get_tensor(tensor)
+        values, idxs = tensor.topk_(k, dim)
+        result = tensor.__class__(track_time=tensor.track_time)
+        result.data = values
+        return AbstractTensor._TopKResult(result, idxs)
+
+    @staticmethod
+    def stack(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
+        """Stack ``tensors`` along a new dimension ``dim``.
+
+        This is analogous to ``torch.stack`` and can be invoked as a class
+        method: ``AbstractTensor.stack([...])``.
+        """
+        if not tensors:
+            raise ValueError("stack requires at least one tensor")
+        first = AbstractTensor.get_tensor(tensors[0])
+        tensors = [first.ensure_tensor(t) for t in tensors]
+        result = first.__class__(track_time=first.track_time)
+        result.data = first.stack_(tensors, dim)
         return result
 
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
