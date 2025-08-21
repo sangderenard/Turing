@@ -154,116 +154,6 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
-    @staticmethod
-    def linspace(start, stop, steps, dtype=None, device=None):
-        if steps <= 0:
-            raise ValueError("steps must be positive")
-        # i = [0, 1, ..., steps-1] dispatched via backend-aware arange
-        i = AbstractTensor.arange(0, steps, 1, dtype=dtype, device=device)
-        if steps == 1:
-            return i * 0 + start  # length-1 tensor with value `start`
-        step_val = (stop - start) / (steps - 1)
-        return start + i * step_val
-
-
-    @staticmethod
-    def meshgrid(*vectors, indexing: str = "ij", copy: bool = False, as_class: bool = False):
-        """
-        Create N-D coordinate matrices from 1-D coordinate vectors.
-
-        Parameters
-        ----------
-        *vectors : AbstractTensor 1-D, or a single iterable of them
-            1-D tensors defining the grid coordinates along each axis.
-        indexing : {'ij','xy'}, default 'ij'
-            'ij'  -> matrix indexing for any N.
-            'xy'  -> Cartesian indexing for the first two axes (N>=2).
-        copy : bool, default False
-            If True, materialize writable copies (best-effort: uses .clone() or .copy() if available).
-            If False, return broadcasted views (memory-efficient).
-        as_class : bool, default False
-            If True, return a MeshGrid wrapper; else return a tuple.
-
-        Returns
-        -------
-        tuple[AbstractTensor, ...] or MeshGrid
-        """
-        # Support a single iterable form: meshgrid([x, y, z])
-        if len(vectors) == 1 and isinstance(vectors[0], (list, tuple)):
-            vectors = tuple(vectors[0])
-
-        if len(vectors) == 0:
-            raise ValueError("meshgrid requires at least one 1-D input tensor")
-
-        # Normalize inputs and validate 1-D
-        vecs = []
-        sizes = []
-        for i, v in enumerate(vectors):
-            if not isinstance(v, AbstractTensor):
-                v = AbstractTensor.get_tensor(v)
-            shp = getattr(v, "shape", None)
-            if shp is None or len(shp) != 1:
-                raise ValueError(f"meshgrid expects 1-D tensors; arg {i} has shape {shp}")
-            vecs.append(v)
-            sizes.append(shp[0])
-
-        dims = len(vecs)
-        if indexing not in ("ij", "xy"):
-            raise ValueError("indexing must be 'ij' or 'xy'")
-
-        # Guard: all inputs from the same backend/class
-        base_cls = type(vecs[0])
-        if any(type(v) is not base_cls for v in vecs[1:]):
-            raise TypeError("meshgrid inputs must be from the same backend/class")
-
-        # Optional: enforce dtype/device if present
-        want_dtype = getattr(vecs[0], "dtype", None)
-        want_device = getattr(vecs[0], "device", None)
-        for i, v in enumerate(vecs[1:], start=1):
-            v_dtype = getattr(v, "dtype", None)
-            v_device = getattr(v, "device", None)
-            if (want_dtype is not None and v_dtype is not None and v_dtype != want_dtype) or \
-            (want_device is not None and v_device is not None and v_device != want_device):
-                raise TypeError(
-                    f"meshgrid inputs must share dtype/device; arg0 has (dtype={want_dtype}, device={want_device}) "
-                    f"but arg{i} has (dtype={v_dtype}, device={v_device})."
-                )
-
-        grids = []
-        if indexing == "ij" or dims < 2:
-            # Standard N-D matrix indexing
-            full_shape = tuple(sizes)
-            for i, v in enumerate(vecs):
-                shape = [1] * dims
-                shape[i] = sizes[i]                  # put Ni at axis i
-                g = v.reshape(*shape).expand(full_shape)   # NOTE: pass a single tuple
-                if copy:
-                    if hasattr(g, "clone"):
-                        g = g.clone()
-                    elif hasattr(g, "copy"):
-                        g = g.copy()
-                grids.append(g)
-        else:
-            # 'xy' indexing: final shape is (N1, N0, N2, ..., Nk)
-            final_shape = (sizes[1], sizes[0], *sizes[2:])
-            for i, v in enumerate(vecs):
-                shape = [1] * dims
-                if i == 0:
-                    shape[1] = sizes[0]              # X varies along axis 1
-                elif i == 1:
-                    shape[0] = sizes[1]              # Y varies along axis 0
-                else:
-                    shape[i] = sizes[i]
-                g = v.reshape(*shape).expand(final_shape)  # NOTE: pass a single tuple
-                if copy:
-                    if hasattr(g, "clone"):
-                        g = g.clone()
-                    elif hasattr(g, "copy"):
-                        g = g.copy()
-                grids.append(g)
-
-        return MeshGrid(grids) if as_class else tuple(grids)
-
     # --- Sentinel dtypes for use before backend is set ---
     float_dtype_ = 'float32'  # Default sentinel, can be replaced by backend
     long_dtype_ = 'int64'     # Default sentinel, can be replaced by backend
@@ -323,49 +213,17 @@ class AbstractTensor:
 
     def ceil_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement ceil_()")
-    def max(self, dim=None, keepdim: bool = False):
-        """Return the maximum of the tensor along the specified dimension(s)."""
-        return self.max_(dim=dim, keepdim=keepdim)
-
-    def argmax(self, dim: Optional[int] = None, keepdim: bool = False):
-        """Return the indices of the maximum values along an axis."""
-        return self.argmax_(dim, keepdim)
     def max_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement max_() with keepdim.")
 
     def argmax_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement argmax_() with keepdim.")
-    def to(self, dtype):
-        """Redirect to to_dtype for compatibility with backend-style dtype conversion."""
-        return self.to_dtype(dtype)
-
-    def astype(self, dtype):
-        """Redirect to to_dtype for compatibility with backend-style dtype conversion."""
-        return self.to_dtype(dtype)
-    # --- Selection / piecewise ---
-    def where(self, x: Any, y: Any) -> "AbstractTensor":
-        """Elementwise select: self as bool mask, x if True else y."""
-        result = type(self)(track_time=self.track_time)
-        result.data = self.where_(x, y)
-        return result
 
     def clamp_max_(self, max):
         raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_max_()")
 
-    # --- Comparisons ---
-    def greater(self, value: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.greater_(value)
-        return result
-
     def greater_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement greater_()")
-
-    def greater_equal(self, value) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.greater_equal_(value)
-        return result
-
     def greater_equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement greater_equal_()")
 
@@ -1688,6 +1546,22 @@ class AbstractF:
 
 # Attach to AbstractTensor
 AbstractTensor.F = AbstractF
+
+# --- Abstraction method assignments ---------------------------------------
+from .abstraction_methods.creation import linspace, meshgrid
+from .abstraction_methods.reduction import max as reduction_max, argmax as reduction_argmax
+from .abstraction_methods.type_ops import to as type_to, astype as type_astype, where as type_where
+from .abstraction_methods.comparison import greater as comp_greater, greater_equal as comp_greater_equal
+
+AbstractTensor.linspace = staticmethod(linspace)
+AbstractTensor.meshgrid = staticmethod(meshgrid)
+AbstractTensor.max = reduction_max
+AbstractTensor.argmax = reduction_argmax
+AbstractTensor.to = type_to
+AbstractTensor.astype = type_astype
+AbstractTensor.where = type_where
+AbstractTensor.greater = comp_greater
+AbstractTensor.greater_equal = comp_greater_equal
 
 
 def _get_shape(data):
