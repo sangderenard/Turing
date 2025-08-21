@@ -1,7 +1,32 @@
 from __future__ import annotations
 
+"""Lightweight automatic differentiation helpers.
+
+The project purposely keeps the autograd core extremely small.  Only a tiny
+subset of primitive arithmetic operators are supported which is sufficient for
+educational examples and the pure/numpy backends.  Torch and JAX backends rely
+on their native autograd systems and therefore bypass this module entirely.
+
+The implementation below provides two main pieces:
+
+* ``GradTape`` – records a very small computation graph.
+* ``Autograd`` – exposes ``record`` and ``grad`` helpers and houses backward
+  rules for primitive operators (``add``, ``mul``, ``truediv``, ``pow``, ...).
+
+Backends without a native autograd can call ``Autograd.record`` after executing
+an operator to append a node to the tape.  ``Autograd.grad`` then walks the
+recorded graph in reverse to accumulate gradients for requested inputs.
+"""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
+
+import math
+
+try:  # NumPy is an optional dependency for the repository
+    import numpy as np
+except Exception:  # pragma: no cover - tested in environments without numpy
+    np = None  # type: ignore
 
 
 @dataclass
@@ -105,3 +130,167 @@ class GradTape:
         dfs(id(result))
         for item in reversed(order):
             yield item
+
+# ----------------------------------------------------------------------------
+# Primitive backward rules
+# ----------------------------------------------------------------------------
+
+def _to_numpy(x: Any) -> "np.ndarray":
+    """Best effort conversion of ``x`` to a NumPy array."""
+
+    if np is None:
+        raise RuntimeError("NumPy is required for autograd operations")
+    if isinstance(x, np.ndarray):
+        return x
+    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
+        return x.detach().cpu().numpy()
+    if hasattr(x, "__array__"):
+        return np.asarray(x)
+    return np.asarray(x)
+
+
+def _reduce_like(grad: "np.ndarray", like: Any) -> "np.ndarray":
+    """Reduce ``grad`` so that its shape matches ``like``."""
+
+    target = _to_numpy(like)
+    g = grad
+    while g.ndim > target.ndim:
+        g = g.sum(axis=0)
+    for axis, size in enumerate(target.shape):
+        if size == 1:
+            g = g.sum(axis=axis, keepdims=True)
+    return g.reshape(target.shape)
+
+
+def bw_add(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
+    g = _to_numpy(grad_out)
+    return _reduce_like(g, x), _reduce_like(g, y)
+
+
+def bw_sub(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
+    g = _to_numpy(grad_out)
+    return _reduce_like(g, x), _reduce_like(-g, y)
+
+
+def bw_mul(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
+    g = _to_numpy(grad_out)
+    gx = g * _to_numpy(y)
+    gy = g * _to_numpy(x)
+    return _reduce_like(gx, x), _reduce_like(gy, y)
+
+
+def bw_truediv(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
+    g = _to_numpy(grad_out)
+    a, b = _to_numpy(x), _to_numpy(y)
+    gx = g / b
+    gy = -g * a / (b * b)
+    return _reduce_like(gx, x), _reduce_like(gy, y)
+
+
+def bw_pow(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
+    g = _to_numpy(grad_out)
+    a, b = _to_numpy(x), _to_numpy(y)
+    gx = g * b * np.power(a, b - 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gy = g * np.power(a, b) * np.log(np.where(a == 0, 1.0, a))
+    return _reduce_like(gx, x), _reduce_like(gy, y)
+
+
+PRIMITIVE_BACKWARD: Dict[str, Callable[..., Tuple[Any, ...]]] = {
+    "add": bw_add,
+    "radd": bw_add,
+    "sub": bw_sub,
+    "rsub": lambda g, x, y: bw_sub(g, y, x),
+    "mul": bw_mul,
+    "rmul": bw_mul,
+    "truediv": bw_truediv,
+    "rtruediv": lambda g, x, y: bw_truediv(g, y, x),
+    "pow": bw_pow,
+    "rpow": lambda g, x, y: bw_pow(g, y, x),
+}
+
+
+# ----------------------------------------------------------------------------
+# Autograd engine
+# ----------------------------------------------------------------------------
+
+
+class Autograd:
+    """Very small reverse-mode autodiff engine."""
+
+    def __init__(self) -> None:
+        self.tape = GradTape()
+
+    def record(self, op: str, inputs: Iterable[Any], result: Any) -> Any:
+        bw = PRIMITIVE_BACKWARD.get(op)
+        if bw is None:
+            return result
+        inputs = list(inputs)
+        data_inputs = [x.data if hasattr(x, "data") else x for x in inputs]
+
+        def backward_fn(grad_out: Any) -> Iterable[Any]:
+            return bw(grad_out, *data_inputs)
+
+        self.tape.record(op, inputs, result, backward_fn)
+        return result
+
+    def grad(
+        self,
+        output: Any,
+        inputs: Iterable[Any],
+        grad_outputs: Any | None = None,
+        retain_graph: bool = False,
+        allow_unused: bool = False,
+    ) -> List[Any]:
+        if np is None:
+            raise RuntimeError("NumPy is required for autograd operations")
+
+        inputs = list(inputs)
+        out_grad = grad_outputs
+        if out_grad is None:
+            out_grad = np.ones_like(output.data if hasattr(output, "data") else output)
+
+        grad_map: Dict[int, Any] = {id(output): _to_numpy(out_grad)}
+
+        for tid, node in self.tape.traverse(output):
+            grad_out = grad_map.get(tid)
+            if grad_out is None:
+                continue
+            parent_grads = node.backward(grad_out)
+            for (pid, _), g in zip(node.parents, parent_grads):
+                if g is None:
+                    continue
+                g = _to_numpy(g)
+                if pid in grad_map:
+                    grad_map[pid] = grad_map[pid] + g
+                else:
+                    grad_map[pid] = g
+
+        results: List[Any] = []
+        for inp in inputs:
+            g = grad_map.get(id(inp))
+            if g is None:
+                if allow_unused:
+                    results.append(None)
+                else:
+                    raise ValueError("No gradient found for one of the inputs")
+            else:
+                if hasattr(inp, "data") and isinstance(inp.data, list):
+                    results.append(g.tolist())
+                else:
+                    results.append(g)
+
+        if not retain_graph:
+            self.tape = GradTape()
+        return results
+
+
+autograd = Autograd()
+
+try:  # pragma: no cover
+    from .abstraction import AbstractTensor
+
+    AbstractTensor.autograd = autograd  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    pass
+

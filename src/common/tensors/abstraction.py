@@ -913,6 +913,18 @@ class AbstractTensor:
 
         result = type(self)(track_time=self.track_time)
         result.data = self._apply_operator__(op, l, r)
+
+        # Record operation on the lightweight autograd tape for backends
+        # lacking native autograd (pure Python and NumPy).  Torch/JAX rely on
+        # their own automatic differentiation systems.
+        from . import autograd as _autograd
+
+        backend_name = type(self).__name__
+        if backend_name in ("PurePythonTensorOperations", "NumPyTensorOperations"):
+            _autograd.autograd.record(
+                op, [x for x in (left, right) if x is not None], result
+            )
+
         return result
 
 
