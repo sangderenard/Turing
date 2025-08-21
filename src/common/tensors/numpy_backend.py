@@ -196,6 +196,30 @@ class NumPyTensorOperations(AbstractTensor):
             return np.abs(a)
         if op == "invert":
             return np.invert(a)
+        if op == "sin":
+            return np.sin(a)
+        if op == "cos":
+            return np.cos(a)
+        if op == "tan":
+            return np.tan(a)
+        if op == "asin":
+            return np.arcsin(a)
+        if op == "acos":
+            return np.arccos(a)
+        if op == "atan":
+            return np.arctan(a)
+        if op == "sinh":
+            return np.sinh(a)
+        if op == "cosh":
+            return np.cosh(a)
+        if op == "tanh":
+            return np.tanh(a)
+        if op == "asinh":
+            return np.arcsinh(a)
+        if op == "acosh":
+            return np.arccosh(a)
+        if op == "atanh":
+            return np.arctanh(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":

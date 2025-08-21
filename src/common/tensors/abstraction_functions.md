@@ -102,6 +102,27 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.max()
 - AbstractTensor.log_softmax()
 
+## Trigonometric & Hyperbolic
+- AbstractTensor.sin()
+- AbstractTensor.cos()
+- AbstractTensor.tan()
+- AbstractTensor.asin()
+- AbstractTensor.acos()
+- AbstractTensor.atan()
+- AbstractTensor.sinh()
+- AbstractTensor.cosh()
+- AbstractTensor.tanh()
+- AbstractTensor.asinh()
+- AbstractTensor.acosh()
+- AbstractTensor.atanh()
+- AbstractTensor.sec()
+- AbstractTensor.csc()
+- AbstractTensor.cot()
+- AbstractTensor.sech()
+- AbstractTensor.csch()
+- AbstractTensor.coth()
+- AbstractTensor.sinc()
+
 ## Persistence
 - AbstractTensor.save()
 - AbstractTensor.load()

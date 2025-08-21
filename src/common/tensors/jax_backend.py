@@ -212,6 +212,30 @@ class JAXTensorOperations(AbstractTensor):
             return jnp.abs(a)
         if op == "invert":
             return jnp.invert(a)
+        if op == "sin":
+            return jnp.sin(a)
+        if op == "cos":
+            return jnp.cos(a)
+        if op == "tan":
+            return jnp.tan(a)
+        if op == "asin":
+            return jnp.arcsin(a)
+        if op == "acos":
+            return jnp.arccos(a)
+        if op == "atan":
+            return jnp.arctan(a)
+        if op == "sinh":
+            return jnp.sinh(a)
+        if op == "cosh":
+            return jnp.cosh(a)
+        if op == "tanh":
+            return jnp.tanh(a)
+        if op == "asinh":
+            return jnp.arcsinh(a)
+        if op == "acosh":
+            return jnp.arccosh(a)
+        if op == "atanh":
+            return jnp.arctanh(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
