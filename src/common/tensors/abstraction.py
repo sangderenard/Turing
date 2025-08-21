@@ -101,7 +101,6 @@ class ShapeAccessor:
     def __iter__(self):
         return iter(self._shape_tuple())
 
-    def __len__(self) -> int:
         return len(self._shape_tuple())
 
     def __getitem__(self, idx):
@@ -132,7 +131,6 @@ class MeshGrid:
     def __iter__(self):
         return iter(self.tensors)
 
-    def __len__(self):
         return len(self.tensors)
 
     def __getitem__(self, idx):
@@ -415,14 +413,13 @@ class AbstractTensor:
     def get_dtype(self) -> Any:
         return self.get_dtype_()
 
-    def numel(self) -> int:
-        return self.numel_()
-
     def numel_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement numel_()")
 
+
     def item(self) -> Union[int, float, bool]:
         return self.item_()
+
 
     
     @classmethod
@@ -784,29 +781,6 @@ class AbstractTensor:
     def tensor_type(self) -> type:
         return self.tensor_type_
 
-    # --- Shape and dimension accessors (overloads) ---
-    @property
-    def shape(self) -> ShapeAccessor:
-        """Return a callable/iterable shape accessor."""
-        return ShapeAccessor(self)
-
-    def shape_(self) -> Tuple[int, ...]:
-        """Return the shape of the tensor as a tuple (backend hook)."""
-        return self.get_shape()
-
-    @property
-    def ndim(self):
-        """Return the number of dimensions (property, numpy style)."""
-        return self.get_ndims(self.data)
-
-    def dim(self) -> int:
-        """Return the number of dimensions (method, torch style)."""
-        return self.get_ndims(self.data)
-
-    def ndims(self) -> int:
-        """Return the number of dimensions (method, project style)."""
-        return self.get_ndims(self.data)
-
     # Lightweight helper to coerce arbitrary input to this backend's tensor type
 
 
@@ -1077,111 +1051,6 @@ class AbstractTensor:
             return wrapped
         return result
 
-    def __str__(self):
-        # Unified print: show the underlying tensor's string representation
-        return self.datastring(self.data)
-
-    def datastring(self, data: Any) -> str:
-        """Return a pretty string representation of ``data`` for console output."""
-
-        if data is None:
-            return "AbstractTensor (None)"
-
-        try:
-            shape = self.get_shape()
-        except Exception:
-            shape = ()
-
-        try:
-            dtype = self.get_dtype(data)
-        except Exception:
-            dtype = getattr(data, "dtype", None)
-
-        try:
-            device = self.get_device(data)
-        except Exception:
-            device = getattr(data, "device", None)
-
-        header = f"shape={shape} dtype={dtype} device={device}"
-
-        # Attempt color support via colorama
-        try:
-            from colorama import Fore, Style
-        except Exception:  # pragma: no cover - optional dependency
-
-            class _NoColor:
-                RED = BLUE = CYAN = YELLOW = GREEN = MAGENTA = WHITE = RESET_ALL = ""
-
-            Fore = Style = _NoColor()  # type: ignore
-
-        if hasattr(data, "tolist"):
-            values = data.tolist()
-        else:
-            values = data
-
-        if not isinstance(values, list):
-            values = [values]
-
-        if shape and len(shape) == 1:
-            values = [values]
-
-        rows = len(values)
-        cols = len(values[0]) if rows and isinstance(values[0], list) else 1
-
-        flat_vals = [
-            float(x)
-            for row in values
-            for x in (row if isinstance(row, list) else [row])
-            if isinstance(x, (int, float))
-        ]
-        if flat_vals:
-            min_val, max_val = min(flat_vals), max(flat_vals)
-            spread = max_val - min_val or 1.0
-        else:
-            min_val, max_val, spread = 0.0, 0.0, 1.0
-
-        def colorize(v: Any) -> str:
-            if not isinstance(v, (int, float)):
-                return str(v)
-            norm = (float(v) - min_val) / spread
-            palette = [Fore.BLUE, Fore.CYAN, Fore.GREEN, Fore.YELLOW, Fore.RED]
-            idx = int(norm * (len(palette) - 1))
-            return f"{palette[idx]}{v:.4e}{Style.RESET_ALL}"
-
-        cell_w = 10
-        col_cap = 6
-        row_cap = 10
-        lines = []
-        border = "+" + "+".join(["-" * cell_w] * min(cols, col_cap)) + "+"
-        lines.append(border)
-        for r in range(min(rows, row_cap)):
-            row = values[r] if isinstance(values[r], list) else [values[r]]
-            cells = []
-            for c in range(min(cols, col_cap)):
-                if c < len(row):
-                    cell = colorize(row[c]).ljust(cell_w)
-                else:
-                    cell = "".ljust(cell_w)
-                cells.append(cell)
-            lines.append("|" + "|".join(cells) + "|")
-        if rows > row_cap or cols > col_cap:
-            ell = "...".center(cell_w)
-            lines.append("|" + "|".join([ell] * min(cols, col_cap)) + "|")
-        lines.append(border)
-
-        table = "\n".join(lines)
-        return f"\n\n{header}\n{table}\n\n"
-
-    def __format__(self, format_spec: str) -> str:
-        return f"AbstractTensor (shape={self.get_shape()}, dtype={self.get_dtype()}, device={self.get_device()})"
-
-    def __repr__(self):
-        # Unified repr: AbstractTensor (BackendClass (backend data repr))
-        backend_class = (
-            type(self.data).__name__ if self.data is not None else "NoneType"
-        )
-        backend_data_repr = repr(self.data)
-        return f"AbstractTensor ({backend_class} ({backend_data_repr}))"
 
     def __setitem__(self, idx, value):
         """Assign to the underlying tensor using Python indexing.
@@ -1203,17 +1072,6 @@ class AbstractTensor:
             value = value.data
         index = self._AbstractTensor__unwrap(idx)
         data[index] = value
-
-    def __len__(self):
-        """Return the length of the underlying tensor along the first dimension."""
-        if DEBUG:
-            print(f"__len__ called on {self.__class__.__name__}")
-        data = self.data
-        # Removed unconditional print: print(f"{type(data)}, {data.shape if hasattr(data, 'shape') else 'no shape'}")
-
-        if data is None:
-            raise ValueError("__len__ called on empty tensor")
-        return len(data)
 
     def __bool__(self):
         try:
@@ -1485,6 +1343,20 @@ from .abstraction_methods.trigonometry import (
     coth as trig_coth,
     sinc as trig_sinc,
 )
+from .abstraction_methods.properties import (
+    numel as prop_numel,
+    item as prop_item,
+    shape as prop_shape,
+    shape_ as prop_shape_,
+    ndim as prop_ndim,
+    dim as prop_dim,
+    ndims as prop_ndims,
+    datastring as prop_datastring,
+    __str__ as prop_str,
+    __format__ as prop_format,
+    __repr__ as prop_repr,
+    __len__ as prop_len,
+)
 
 AbstractTensor.linspace = staticmethod(linspace)
 AbstractTensor.meshgrid = staticmethod(meshgrid)
@@ -1530,6 +1402,18 @@ AbstractTensor.sech = trig_sech
 AbstractTensor.csch = trig_csch
 AbstractTensor.coth = trig_coth
 AbstractTensor.sinc = trig_sinc
+AbstractTensor.numel = prop_numel
+AbstractTensor.item = prop_item
+AbstractTensor.shape = property(prop_shape)
+AbstractTensor.shape_ = prop_shape_
+AbstractTensor.ndim = property(prop_ndim)
+AbstractTensor.dim = prop_dim
+AbstractTensor.ndims = prop_ndims
+AbstractTensor.datastring = prop_datastring
+AbstractTensor.__str__ = prop_str
+AbstractTensor.__format__ = prop_format
+AbstractTensor.__repr__ = prop_repr
+AbstractTensor.__len__ = prop_len
 
 
 def _get_shape(data):
