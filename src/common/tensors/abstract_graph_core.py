@@ -1,18 +1,31 @@
+"""
+AbstractGraphCore: graph-first mixin for AbstractTensor.
+
+This defines a stable, backend-agnostic API for graph & segment operations.
+Public methods call backend hooks with trailing underscores (e.g., segment_sum_),
+and wrap raw backend returns into the same wrapper type as `self`, exactly like
+AbstractTensor does.
+
+Conventions
+----------
+- edge_index: int tensor of shape (2, E) in COO (src=0, dst=1)
+- edge_weight: shape (E,) or (E, D) aligned with edges
+- node features x: shape (N, F)
+- segment_ids: int tensor of shape (E,) or (N,), grouping by identical ids
+- All indices are 0-based.
+- Methods that return multiple tensors will wrap each into the same class as `self`
+  unless noted (e.g., some index arrays may be returned raw if consistent with AbstractTensor.topk).
+
+To use: have AbstractTensor inherit from AbstractGraphCore:
+    class AbstractTensor(AbstractGraphCore):
+        ...
+
+Then implement backend hooks in your backends:
+- segment_sum_(self, values, segment_ids, num_segments: int | None, dim: int) -> BACKEND_DATA
+- ...
+"""
+
 # --- SegmentMap creator from human-readable description ---
-from dataclasses import dataclass, field
-from typing import Dict
-
-# --- SegmentMap dataclass for clear segment structure ---
-@dataclass
-            - Arbitrary attributes per segment (activation, params, etc.)
-
-from dataclasses import dataclass, field
-from typing import Dict
-
-# --- SegmentMap dataclass for clear segment structure ---
-@dataclass
-      - Arbitrary attributes per segment (activation, params, etc.)
-
 from dataclasses import dataclass, field
 from typing import Dict
 
@@ -26,15 +39,7 @@ class SegmentMap:
     node_props: Dict[node_id, dict] of node attributes
     edge_props: Dict[edge_tuple, dict] of edge attributes
     label: Optional segment label or id
-    """
-    nodes: list = field(default_factory=list)
-    edges: list = field(default_factory=list)
-    node_props: Dict = field(default_factory=dict)
-    edge_props: Dict = field(default_factory=dict)
-    label: str = None
-
-    label: Optional segment label or id
-    """
+    
     Create a segment map from a human-readable description for even the most complex networks.
     Supports:
       - Any number of segments/layers, each with a custom 'type' (e.g., 'conv', 'flatten', 'residual', 'attention', ...)
@@ -56,6 +61,13 @@ class SegmentMap:
 
     Returns: dict[label, SegmentMap]
     """
+    nodes: list = field(default_factory=list)
+    edges: list = field(default_factory=list)
+    node_props: Dict = field(default_factory=dict)
+    edge_props: Dict = field(default_factory=dict)
+    label: str = None
+
+
     if isinstance(description, str):
         raise NotImplementedError("String DSL parsing not yet implemented.")
     if isinstance(description, dict):
@@ -109,38 +121,7 @@ class SegmentMap:
         prev_nodes = nodes
         prev_label = label
     return segmap
-    """
-    nodes: list = field(default_factory=list)
-    edges: list = field(default_factory=list)
-    node_props: Dict = field(default_factory=dict)
-    edge_props: Dict = field(default_factory=dict)
-    label: str = None
-"""
-AbstractGraphCore: graph-first mixin for AbstractTensor.
 
-This defines a stable, backend-agnostic API for graph & segment operations.
-Public methods call backend hooks with trailing underscores (e.g., segment_sum_),
-and wrap raw backend returns into the same wrapper type as `self`, exactly like
-AbstractTensor does.
-
-Conventions
-----------
-- edge_index: int tensor of shape (2, E) in COO (src=0, dst=1)
-- edge_weight: shape (E,) or (E, D) aligned with edges
-- node features x: shape (N, F)
-- segment_ids: int tensor of shape (E,) or (N,), grouping by identical ids
-- All indices are 0-based.
-- Methods that return multiple tensors will wrap each into the same class as `self`
-  unless noted (e.g., some index arrays may be returned raw if consistent with AbstractTensor.topk).
-
-To use: have AbstractTensor inherit from AbstractGraphCore:
-    class AbstractTensor(AbstractGraphCore):
-        ...
-
-Then implement backend hooks in your backends:
-- segment_sum_(self, values, segment_ids, num_segments: int | None, dim: int) -> BACKEND_DATA
-- ...
-"""
 
 from __future__ import annotations
 from abc import ABC
