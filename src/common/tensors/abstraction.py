@@ -392,6 +392,12 @@ class AbstractTensor:
         """Return the sum of the tensor along the specified dimension(s)."""
         return self.sum_(dim=dim, keepdim=keepdim)
 
+    def cumsum(self, dim: int = 0) -> "AbstractTensor":
+        """Return the cumulative sum of the tensor along a dimension."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.cumsum_(dim)
+        return result
+
     def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
         return self.min_(dim=dim, keepdim=keepdim)
@@ -405,6 +411,9 @@ class AbstractTensor:
 
     def sum_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement sum_() with keepdim.")
+
+    def cumsum_(self, dim: int = 0):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement cumsum_()")
 
     def min_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement min_() with keepdim.")

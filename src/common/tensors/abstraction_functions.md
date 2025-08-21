@@ -98,6 +98,7 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.pow()
 - AbstractTensor.sqrt()
 - AbstractTensor.mean()
+- AbstractTensor.cumsum()
 - AbstractTensor.max()
 - AbstractTensor.log_softmax()
 

@@ -577,6 +577,20 @@ class PurePythonTensorOperations(AbstractTensor):
             return result
         raise NotImplementedError("repeat_interleave only implemented for dim 0 or None")
 
+    def cumsum_(self, dim: int = 0) -> Any:
+        try:
+            import numpy as np  # type: ignore
+            return np.cumsum(self.data, axis=dim).tolist()
+        except Exception:
+            if dim != 0:
+                raise NotImplementedError("pure backend cumsum_ only supports dim=0 without numpy")
+            out = []
+            total = 0.0
+            for v in self.data:
+                total += v
+                out.append(total)
+            return out
+
     def repeat_(self, repeats: Any = None, dim: int = 0) -> Any:
         """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
         raise NotImplementedError("repeat not implemented for PurePython backend")
