@@ -30,18 +30,18 @@ import torch
 import torch.nn as nn
 
 from localstatenetwork import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_LAPLACEBELTRAMI_STENCIL
-from indexcomposer import GeneralIndexComposer
+from src.common.index_composer.indexcomposer import GeneralIndexComposer
 
 class BuildLaplace3D:
     def __init__(self, grid_domain, wave_speed=343, precision=torch.float64, resolution=68,
-                 metric_tensor_func=None, density_func=None, tension_func=None, 
-                 singularity_conditions=None, singularity_dirichlet_func=None, singularity_neumann_func=None, 
-                 boundary_conditions=('neumann', 'neumann', 'neumann', 'neumann', 'neumann', 'neumann'), 
+                 metric_tensor_func=None, density_func=None, tension_func=None,
+                 singularity_conditions=None, singularity_dirichlet_func=None, singularity_neumann_func=None,
+                 boundary_conditions=('neumann', 'neumann', 'neumann', 'neumann', 'neumann', 'neumann'),
                  artificial_stability=0, switchboard_config = {
                     'padded_raw': [{'func': lambda raw: raw, 'args': ['padded_raw']}],
                     'weighted_padded': [{'func': lambda weighted: weighted, 'args': ['weighted_padded']}],
                     'modulated_padded': [{'func': lambda modulated: modulated, 'args': ['modulated_padded']}]
-                }):
+                }, device=None):
         """
         Initialize BuildLaplace for 3D with additional dimension handling.
         
@@ -60,7 +60,8 @@ class BuildLaplace3D:
                                  (default: ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')).
             artificial_stability: Small stability term added to metrics (default: 0).
         """
-        self.general_index_composer = GeneralIndexComposer()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.general_index_composer = GeneralIndexComposer(device=self.device)
         
         self.grid_domain = grid_domain
         self.wave_speed = wave_speed
@@ -79,7 +80,10 @@ class BuildLaplace3D:
         # Generate Laplace labels dynamically based on boundary conditions
         self.labels = self._generate_laplace_labels(boundary_conditions)
         self.index_map_patterns = self.general_index_composer.generate_patterns(self.labels)
-        self.index_map = self.general_index_composer.compose_indices((self.grid_domain.resolution_u, self.grid_domain.resolution_v, self.grid_domain.resolution_w), self.index_map_patterns)
+        self.index_map = self.general_index_composer.compose_indices(
+            (self.grid_domain.resolution_u, self.grid_domain.resolution_v, self.grid_domain.resolution_w),
+            self.index_map_patterns,
+        )
 
     def _generate_laplace_labels(self, boundary_conditions):
         """
@@ -125,6 +129,10 @@ class BuildLaplace3D:
         logger.debug(f"Boundary conditions: {boundary_conditions}")
         logger.debug(f"Singularity conditions: {singularity_conditions}")
         logger.debug(f"k: {k}, f: {f}")
+        device = device or self.device
+        if device != self.device:
+            self.device = device
+            self.general_index_composer.device = device
         logger.debug(f"Device: {device}, Grid boundaries: {grid_boundaries}")
 
         # Conditional reassignments, use method parameters if provided, otherwise use class attributes
