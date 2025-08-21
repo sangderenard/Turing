@@ -341,6 +341,44 @@ class AbstractTensor:
     def __init__(self, track_time: bool = False):
         self.track_time = track_time
 
+
+    def tensor_from_list_(self, data, dtype=None, device=None):
+        """
+        Create a tensor from a Python list using the first suitable backend in BACKEND_REGISTRY (including torch),
+        or try to import numpy/pure_python as fallback. Use the first available backend found.
+        """
+        # 1. Try any already-registered backend
+        for name, backend_cls in BACKEND_REGISTRY.items():
+            if backend_cls is not None:
+                inst = backend_cls(track_time=False)
+                return inst.tensor_from_list_(data, dtype, device)
+
+        # 2. Try to import and register numpy backend
+        backend_cls = BACKEND_REGISTRY.get("numpy")
+        if backend_cls is None:
+            try:
+                from . import numpy_backend  # noqa: F401
+                backend_cls = BACKEND_REGISTRY.get("numpy")
+            except Exception:
+                backend_cls = None
+        if backend_cls is not None:
+            inst = backend_cls(track_time=False)
+            return inst.tensor_from_list_(data, dtype, device)
+
+        # 3. Try to import and register pure_python backend
+        backend_cls = BACKEND_REGISTRY.get("pure_python")
+        if backend_cls is None:
+            try:
+                from . import pure_backend  # noqa: F401
+                backend_cls = BACKEND_REGISTRY.get("pure_python")
+            except Exception:
+                backend_cls = None
+        if backend_cls is not None:
+            inst = backend_cls(track_time=False)
+            return inst.tensor_from_list_(data, dtype, device)
+
+        # 4. If all else fails, raise an error
+        raise RuntimeError("No suitable tensor backend is available to create a tensor from list.")
     @classmethod
     def tensor_from_list(cls, data, dtype=None, device=None):
         inst = cls(track_time=False)
@@ -615,11 +653,13 @@ class AbstractTensor:
         result.data = values
         return result, idxs
 
-    def stack(self, tensors: List[Any], dim: int = 0) -> "AbstractTensor":
-        tensors = [self.ensure_tensor(t) for t in tensors]
-        result = type(self)(track_time=self.track_time)
-        result.data = self.stack_(tensors, dim)
+    @classmethod
+    def stack(cls, tensors: List[Any], dim: int = 0) -> "AbstractTensor":
+        tensors = [cls.get_tensor(tensors[i], cls=cls) for i in range(len(tensors))]
+        result = cls()
+        result.data = result.stack_(tensors, dim)
         return result
+
 
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
     def expand(self, shape: tuple) -> "AbstractTensor":
