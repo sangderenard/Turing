@@ -227,35 +227,14 @@ class AbstractTensor:
     def greater_equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement greater_equal_()")
 
-    def less(self, value) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.less_(value)
-        return result
-
     def less_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement less_()")
-
-    def less_equal(self, value) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.less_equal_(value)
-        return result
 
     def less_equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement less_equal_()")
 
-    def equal(self, value) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.equal_(value)
-        return result
-
     def equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement equal_()")
-
-    def not_equal(self, value) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.not_equal_(value)
-        return result
-
     def not_equal_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement not_equal_()")
 
@@ -445,40 +424,6 @@ class AbstractTensor:
     def item(self) -> Union[int, float, bool]:
         return self.item_()
 
-    def long_cast(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.long_cast_()
-        return result
-
-    def float(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.float_()
-        return result
-
-    def double(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.double_()
-        return result
-
-    def int(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.int_()
-        return result
-
-    def long(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.long_()
-        return result
-
-    def bool(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.bool_()
-        return result
-
-    def not_equal(self, other: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.not_equal_(other)
-        return result
     
     @classmethod
     def tensor(
@@ -791,10 +736,6 @@ class AbstractTensor:
     def tolist(self) -> List[Any]:
         return self.tolist_()
 
-    def less(self, value: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.less_(value)
-        return result
 
     def index_select(self, dim: int = 0, indices: Any = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
@@ -1504,8 +1445,25 @@ from .abstraction_methods.creation import (
     full_like as create_full_like,
 )
 from .abstraction_methods.reduction import max as reduction_max, argmax as reduction_argmax
-from .abstraction_methods.type_ops import to as type_to, astype as type_astype, where as type_where
-from .abstraction_methods.comparison import greater as comp_greater, greater_equal as comp_greater_equal
+from .abstraction_methods.type_ops import (
+    to as type_to,
+    astype as type_astype,
+    where as type_where,
+    long_cast as type_long_cast,
+    float as type_float,
+    double as type_double,
+    int as type_int,
+    long as type_long,
+    bool as type_bool,
+)
+from .abstraction_methods.comparison import (
+    greater as comp_greater,
+    greater_equal as comp_greater_equal,
+    less as comp_less,
+    less_equal as comp_less_equal,
+    equal as comp_equal,
+    not_equal as comp_not_equal,
+)
 from .abstraction_methods.trigonometry import (
     sin as trig_sin,
     cos as trig_cos,
@@ -1541,8 +1499,18 @@ AbstractTensor.argmax = reduction_argmax
 AbstractTensor.to = type_to
 AbstractTensor.astype = type_astype
 AbstractTensor.where = type_where
+AbstractTensor.long_cast = type_long_cast
+AbstractTensor.float = type_float
+AbstractTensor.double = type_double
+AbstractTensor.int = type_int
+AbstractTensor.long = type_long
+AbstractTensor.bool = type_bool
 AbstractTensor.greater = comp_greater
 AbstractTensor.greater_equal = comp_greater_equal
+AbstractTensor.less = comp_less
+AbstractTensor.less_equal = comp_less_equal
+AbstractTensor.equal = comp_equal
+AbstractTensor.not_equal = comp_not_equal
 AbstractTensor.sin = trig_sin
 AbstractTensor.cos = trig_cos
 AbstractTensor.tan = trig_tan
