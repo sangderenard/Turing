@@ -91,6 +91,8 @@ def train_step(
     debug: bool = False,
     grad_control: Optional[GradControl] = None,
     grad_log: Optional[dict] = None,
+    accumulate: bool = False,
+    zero_grad: bool = True,
 ) -> Tuple[float, float, float]:
     hook_panel.run('step_start', model=model, x=x, y=y)
     pred = model.forward(x)
@@ -202,16 +204,20 @@ def train_step(
         else:
             grad_log.setdefault('preclip', []).append(None)
 
-    new_params = optimizer.step(params, grads)
-    i = 0
-    for layer in model.layers:
-        layer.W = new_params[i]
-        i += 1
-        if layer.b is not None:
-            layer.b = new_params[i]
+    if not accumulate:
+        new_params = optimizer.step(params, grads)
+        i = 0
+        for layer in model.layers:
+            layer.W = new_params[i]
             i += 1
-    model.zero_grad()
-    hook_panel.run('step_end', model=model, x=x, y=y, loss=loss)
+            if layer.b is not None:
+                layer.b = new_params[i]
+                i += 1
+        if zero_grad:
+            model.zero_grad()
+        hook_panel.run('step_end', model=model, x=x, y=y, loss=loss)
+    else:
+        hook_panel.run('accumulation_step', model=model, x=x, y=y, loss=loss)
     return _to_scalar(loss), global_grad_norm_requested, global_grad_norm_postclip
 
 def train_loop(
@@ -224,20 +230,91 @@ def train_loop(
     log_every: int = 1,
     provenance_tracker=None,
     grad_control: Optional[GradControl] = None,
+    grad_accum_steps: int = 1,
+    subbatch_size: Optional[int] = None,
 ):
+    """
+    grad_accum_steps: accumulate gradients over this many steps before optimizer update
+    subbatch_size: if set, split X/Y into subbatches of this size
+    """
     losses = []
     grad_log = {'requested': [], 'capped': [], 'preclip': []}
+    N = len(X) if hasattr(X, '__len__') else None
     for e in range(1, epochs + 1):
-        l, g_req, g_cap = train_step(
-            model,
-            loss_fn,
-            optimizer,
-            X,
-            Y,
-            debug=(e == 1),
-            grad_control=grad_control,
-            grad_log=grad_log,
-        )
+        if subbatch_size is not None and N is not None:
+            num_subbatches = (N + subbatch_size - 1) // subbatch_size
+            subbatch_losses = []
+            for sb in range(num_subbatches):
+                start = sb * subbatch_size
+                end = min((sb + 1) * subbatch_size, N)
+                x_sb = X[start:end]
+                y_sb = Y[start:end]
+                hook_panel.run('subbatch_start', epoch=e, subbatch=sb, x=x_sb, y=y_sb)
+                l, g_req, g_cap = train_step(
+                    model,
+                    loss_fn,
+                    optimizer,
+                    x_sb,
+                    y_sb,
+                    debug=(e == 1 and sb == 0),
+                    grad_control=grad_control,
+                    grad_log=grad_log,
+                    accumulate=(grad_accum_steps > 1),
+                    zero_grad=(sb == 0),
+                )
+                subbatch_losses.append(l)
+                hook_panel.run('subbatch_end', epoch=e, subbatch=sb, loss=l)
+            # After all subbatches, do optimizer step if accumulating
+            if grad_accum_steps > 1:
+                params: List[AbstractTensor] = []
+                grads: List[AbstractTensor] = []
+                for layer in model.layers:
+                    params.extend([p for p in layer.parameters()])
+                    g_list = [layer.gW] + ([layer.gb] if layer.b is not None else [])
+                    grads.extend(g_list)
+                new_params = optimizer.step(params, grads)
+                i = 0
+                for layer in model.layers:
+                    layer.W = new_params[i]
+                    i += 1
+                    if layer.b is not None:
+                        layer.b = new_params[i]
+                        i += 1
+                model.zero_grad()
+                hook_panel.run('optimizer_step', epoch=e)
+            l = sum(subbatch_losses) / len(subbatch_losses)
+            g_cap = grad_log['capped'][-1] if grad_log['capped'] else None
+        else:
+            l, g_req, g_cap = train_step(
+                model,
+                loss_fn,
+                optimizer,
+                X,
+                Y,
+                debug=(e == 1),
+                grad_control=grad_control,
+                grad_log=grad_log,
+                accumulate=(grad_accum_steps > 1),
+                zero_grad=True,
+            )
+            # After grad_accum_steps, do optimizer step
+            if grad_accum_steps > 1:
+                params: List[AbstractTensor] = []
+                grads: List[AbstractTensor] = []
+                for layer in model.layers:
+                    params.extend([p for p in layer.parameters()])
+                    g_list = [layer.gW] + ([layer.gb] if layer.b is not None else [])
+                    grads.extend(g_list)
+                new_params = optimizer.step(params, grads)
+                i = 0
+                for layer in model.layers:
+                    layer.W = new_params[i]
+                    i += 1
+                    if layer.b is not None:
+                        layer.b = new_params[i]
+                        i += 1
+                model.zero_grad()
+                hook_panel.run('optimizer_step', epoch=e)
         losses.append(l)
         hook_panel.run('epoch_end', epoch=e, loss=l)
         if provenance_tracker is not None:

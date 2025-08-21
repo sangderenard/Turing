@@ -99,7 +99,7 @@ def main():
     set_seed(42)
     X_train, y_train, X_test, y_test = get_mnist()
     # Use a small subset for demo speed
-    N = len(X_train)
+    N = 10000
     X = X_train[:N]
     y = y_train[:N]
     # Convert to AbstractTensor (torch or numpy backend)

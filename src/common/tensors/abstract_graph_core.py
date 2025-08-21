@@ -1,3 +1,120 @@
+# --- SegmentMap creator from human-readable description ---
+from dataclasses import dataclass, field
+from typing import Dict
+
+# --- SegmentMap dataclass for clear segment structure ---
+@dataclass
+            - Arbitrary attributes per segment (activation, params, etc.)
+
+from dataclasses import dataclass, field
+from typing import Dict
+
+# --- SegmentMap dataclass for clear segment structure ---
+@dataclass
+      - Arbitrary attributes per segment (activation, params, etc.)
+
+from dataclasses import dataclass, field
+from typing import Dict
+
+# --- SegmentMap dataclass for clear segment structure ---
+@dataclass
+class SegmentMap:
+    """
+    Describes a subnetwork/segment for graph-NN assembly.
+    nodes: List of node ids in this segment
+    edges: List of (src, dst) tuples (optionally with edge keys)
+    node_props: Dict[node_id, dict] of node attributes
+    edge_props: Dict[edge_tuple, dict] of edge attributes
+    label: Optional segment label or id
+    """
+    nodes: list = field(default_factory=list)
+    edges: list = field(default_factory=list)
+    node_props: Dict = field(default_factory=dict)
+    edge_props: Dict = field(default_factory=dict)
+    label: str = None
+
+    label: Optional segment label or id
+    """
+    Create a segment map from a human-readable description for even the most complex networks.
+    Supports:
+      - Any number of segments/layers, each with a custom 'type' (e.g., 'conv', 'flatten', 'residual', 'attention', ...)
+      - Arbitrary attributes per segment (activation, params, etc.)
+      - Dynamic autonaming of nodes if not provided (e.g., conv_0, dense_1, ...)
+      - 'mode' per segment: 'fully_connected' (default), 'one_to_one', 'custom', etc.
+      - Edges auto-generated between adjacent segments unless overridden
+      - Explicit nodes/edges override auto-generation
+      - Arbitrary connections: skip, merge, split, multi-input/output, etc.
+
+    Example:
+      [
+        {'label': 'conv1', 'type': 'conv', 'num_nodes': 8, 'params': {'kernel': 3}},
+        {'label': 'flatten', 'type': 'flatten', 'num_nodes': 8},
+        {'label': 'dense1', 'type': 'dense', 'num_nodes': 4, 'activation': 'relu'},
+        {'label': 'dense2', 'type': 'dense', 'num_nodes': 2, 'activation': 'softmax', 'edges': [('dense1_0', 'dense2_0'), ('flatten_3', 'dense2_1')]},
+        {'label': 'output', 'type': 'output', 'nodes': ['out1', 'out2'], 'edges': [('dense2_0', 'out1'), ('dense2_1', 'out2')]},
+      ]
+
+    Returns: dict[label, SegmentMap]
+    """
+    if isinstance(description, str):
+        raise NotImplementedError("String DSL parsing not yet implemented.")
+    if isinstance(description, dict):
+        segments = list(description.values())
+    else:
+        segments = list(description)
+    segmap = {}
+    prev_nodes = None
+    prev_label = None
+    for idx, seg in enumerate(segments):
+        label = seg.get('label')
+        if not label:
+            label = f'segment_{idx}'
+        seg_type = seg.get('type', label)
+        # Node naming
+        nodes = seg.get('nodes')
+        num_nodes = seg.get('num_nodes')
+        if nodes is None:
+            base = seg_type
+            if num_nodes is None:
+                raise ValueError(f"Segment '{label}' must specify 'nodes' or 'num_nodes'.")
+            nodes = [f"{base}_{i}" for i in range(num_nodes)]
+        # Edge generation
+        edges = seg.get('edges')
+        mode = seg.get('mode', 'fully_connected')
+        if edges is None and prev_nodes is not None:
+            if mode == 'fully_connected':
+                edges = [(src, dst) for src in prev_nodes for dst in nodes]
+            elif mode == 'one_to_one':
+                if len(prev_nodes) != len(nodes):
+                    raise ValueError(f"Cannot do one_to_one from {prev_label} to {label}: size mismatch.")
+                edges = list(zip(prev_nodes, nodes))
+            elif mode == 'custom':
+                edges = []  # User must provide
+            else:
+                raise ValueError(f"Unknown mode '{mode}' for segment '{label}'.")
+        elif edges is None:
+            edges = []
+        # Collect all extra attributes for future use
+        extra = {k: v for k, v in seg.items() if k not in {'label', 'type', 'nodes', 'num_nodes', 'edges', 'mode', 'node_props', 'edge_props'}}
+        segmap[label] = SegmentMap(
+            nodes=nodes,
+            edges=edges,
+            node_props=seg.get('node_props', {}),
+            edge_props=seg.get('edge_props', {}),
+            label=label
+        )
+        # Attach extra attributes to the SegmentMap for introspection
+        for k, v in extra.items():
+            setattr(segmap[label], k, v)
+        prev_nodes = nodes
+        prev_label = label
+    return segmap
+    """
+    nodes: list = field(default_factory=list)
+    edges: list = field(default_factory=list)
+    node_props: Dict = field(default_factory=dict)
+    edge_props: Dict = field(default_factory=dict)
+    label: str = None
 """
 AbstractGraphCore: graph-first mixin for AbstractTensor.
 
@@ -28,6 +145,7 @@ Then implement backend hooks in your backends:
 from __future__ import annotations
 from abc import ABC
 from typing import Any, Callable, Iterable, Optional, Tuple, List, Union, Literal
+import networkx as nx
 
 SegmentReduce = Literal["sum", "mean", "max", "min"]
 NormKind = Literal["sym", "rw", None]
@@ -36,6 +154,67 @@ SemiringMul = Literal["mul", "plus"]  # "mul": multiply, "plus": a+b (for tropic
 
 
 class AbstractGraphCore(ABC):
+
+    def __init__(self, backing = None, in_nodes: Optional[List[int]] = None, out_nodes: Optional[List[int]] = None, track_time: bool = False):
+        self.backing = backing if backing is not None else nx.DiGraph()
+        self.track_time = track_time
+        self.in_nodes = in_nodes if in_nodes is not None else []
+        self.out_nodes = out_nodes if out_nodes is not None else []
+        self.n_in = len(self.in_nodes)
+        self.n_out = len(self.out_nodes)
+        self.NN = None
+
+    def _register_NN(self, nn, segment_map: Optional[Dict] = None, flags: Optional[dict] = None):
+        """
+        Register an abstract_nn network object with this graph core.
+        - nn: The network object (should provide .segments, .nodes, .edges, etc.)
+        - segment_map: Optional mapping from segment id to SegmentMap or dict
+        - flags: Dict of options, e.g. {'autowrap_inputs': True, ...}
+        """
+        self.NN = nn
+        flags = flags or {}
+        autowrap = flags.get('autowrap_inputs', True)
+        # If no segment_map, try to get from nn
+        if segment_map is None and hasattr(nn, "segments"):
+            segment_map = nn.segments  # {segment_id: SegmentMap or dict}
+        if segment_map is None:
+            raise ValueError("No segment map provided and network has no .segments attribute.")
+        for seg_id, seg in segment_map.items():
+            # Accept both SegmentMap and dict
+            if isinstance(seg, dict):
+                seg = SegmentMap(**seg)
+            # Add nodes with segment id and node_props
+            for n in seg.nodes:
+                props = dict(segment=seg_id)
+                props.update(seg.node_props.get(n, {}))
+                self.backing.add_node(n, **props)
+            # Add edges with segment id and edge_props
+            for e in seg.edges:
+                src, dst = e[:2]
+                props = dict(segment=seg_id)
+                props.update(seg.edge_props.get(e, {}))
+                self.backing.add_edge(src, dst, **props)
+        # Optionally autowrap input/output nodes
+        if autowrap:
+            # Try to set in_nodes/out_nodes from NN or segments
+            if hasattr(nn, 'in_nodes') and hasattr(nn, 'out_nodes'):
+                self.in_nodes = list(nn.in_nodes)
+                self.out_nodes = list(nn.out_nodes)
+            elif hasattr(nn, 'inputs') and hasattr(nn, 'outputs'):
+                self.in_nodes = list(nn.inputs)
+                self.out_nodes = list(nn.outputs)
+            else:
+                # Try to infer from segment labels or raise
+                in_segs = [seg for seg in segment_map.values() if getattr(seg, 'label', None) == 'input']
+                out_segs = [seg for seg in segment_map.values() if getattr(seg, 'label', None) == 'output']
+                if in_segs:
+                    self.in_nodes = [n for seg in in_segs for n in seg.nodes]
+                if out_segs:
+                    self.out_nodes = [n for seg in out_segs for n in seg.nodes]
+        else:
+            if not self.in_nodes or not self.out_nodes:
+                raise ValueError("Input/output nodes must be set or autowrap_inputs enabled.")
+
     # ---------- helper ----------
     def _wrap(self, backend_data: Any):
         """Wrap backend-native 'backend_data' as the same AbstractTensor type as self."""

@@ -230,8 +230,7 @@ class PyTorchTensorOperations(AbstractTensor):
     def item_(self):
         return self.data.item()
 
-    def max_(self):
-        return torch.max(self.data)
+
 
     def long_cast_(self):
         return self.data.long()

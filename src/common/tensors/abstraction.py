@@ -480,11 +480,6 @@ class AbstractTensor:
     def item(self) -> Union[int, float, bool]:
         return self.item_()
 
-    def max(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.max_()
-        return result
-
     def long_cast(self) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
         result.data = self.long_cast_()
