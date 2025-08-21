@@ -1330,6 +1330,8 @@ from .abstraction_methods.type_ops import (
     int as type_int,
     long as type_long,
     bool as type_bool,
+    cpu as type_cpu,
+    cuda as type_cuda,
 )
 from .abstraction_methods.comparison import (
     greater as comp_greater,
@@ -1368,6 +1370,8 @@ from .abstraction_methods.properties import (
     ndim as prop_ndim,
     dim as prop_dim,
     ndims as prop_ndims,
+    device as prop_device,
+    dtype as prop_dtype,
     datastring as prop_datastring,
     __str__ as prop_str,
     __format__ as prop_format,
@@ -1417,6 +1421,8 @@ AbstractTensor.double    = type_double
 AbstractTensor.int       = type_int
 AbstractTensor.long      = type_long
 AbstractTensor.bool      = type_bool
+AbstractTensor.cpu       = type_cpu
+AbstractTensor.cuda      = type_cuda
 
 AbstractTensor.greater        = comp_greater
 AbstractTensor.greater_equal  = comp_greater_equal
@@ -1452,6 +1458,8 @@ AbstractTensor.shape_  = prop_shape_
 AbstractTensor.ndim    = property(prop_ndim)
 AbstractTensor.dim     = prop_dim
 AbstractTensor.ndims   = prop_ndims
+AbstractTensor.device  = property(prop_device)
+AbstractTensor.dtype   = property(prop_dtype)
 AbstractTensor.datastring = prop_datastring
 AbstractTensor.__str__    = prop_str
 AbstractTensor.__format__ = prop_format
