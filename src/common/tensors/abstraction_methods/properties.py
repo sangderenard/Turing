@@ -35,6 +35,22 @@ def ndims(self) -> int:
     return self.get_ndims(self.data)
 
 
+def device(self):
+    """Return the device of the tensor if available, else ``None``."""
+    try:
+        return self.get_device()
+    except Exception:
+        return None
+
+
+def dtype(self):
+    """Return the dtype of the tensor if available, else ``None``."""
+    try:
+        return self.get_dtype()
+    except Exception:
+        return None
+
+
 def datastring(self, data: Any) -> str:
     """Return a pretty string representation of ``data`` for console output."""
     if data is None:
