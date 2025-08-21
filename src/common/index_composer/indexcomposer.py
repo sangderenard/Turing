@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 
 class GeneralIndexComposer:
     """
@@ -11,7 +12,9 @@ class GeneralIndexComposer:
         compose_indices(grid_shape, patterns): Produces row/col indices and masks for all patterns.
         validate(grid_shape): Verifies the correctness on a small known example grid.
     """
-    def __init__(self):
+    def __init__(self, device: Optional[str] = None):
+        # Resolve device once for the composer
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         # Map dimension characters to axis indices
         self.dimension_map = {'u': 0, 'v': 1, 'w': 2}
 
@@ -76,7 +79,7 @@ class GeneralIndexComposer:
             dict: Contains row indices, column indices, masks for each pattern, 
                 and boundary masks specific to each pattern.
         """
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = self.device
         ndim = len(grid_shape)
 
         # Grid indices and flat index grid
@@ -92,11 +95,15 @@ class GeneralIndexComposer:
             offset = pattern['offset']
             periodic = pattern['periodic']
 
+            # Fresh boundary mask per pattern
+            bm = (
+                torch.zeros(grid_shape, dtype=torch.bool, device=device)
+                if boundary_mask is None
+                else boundary_mask.clone()
+            )
+
             # Compute neighbor indices
             neighbor_indices = []
-            if boundary_mask is None:
-                boundary_mask = torch.zeros(grid_shape, dtype=torch.bool, device=device)
-
             for dim in range(ndim):
                 new_index = grid_indices[dim] + offset[dim]
 
@@ -105,18 +112,16 @@ class GeneralIndexComposer:
                 else:
                     # Identify boundary regions only on one side per offset direction
                     if offset[dim] > 0:
-                        boundary_upper = (grid_indices[dim] + offset[dim]) >= grid_shape[dim]
-                        boundary_mask |= boundary_upper
+                        bm |= (grid_indices[dim] + offset[dim]) >= grid_shape[dim]
                     elif offset[dim] < 0:
-                        boundary_lower = (grid_indices[dim] + offset[dim]) < 0
-                        boundary_mask |= boundary_lower
+                        bm |= (grid_indices[dim] + offset[dim]) < 0
 
                     new_index = torch.clamp(new_index, 0, grid_shape[dim] - 1)
 
                 neighbor_indices.append(new_index)
 
             # Compute valid mask (excluding boundary contributions for this pattern)
-            valid_mask = ~boundary_mask
+            valid_mask = ~bm
 
             # Compute row and column indices
             row_indices = flat_indices[valid_mask]
@@ -126,7 +131,7 @@ class GeneralIndexComposer:
             results['row_indices'][label] = row_indices
             results['col_indices'][label] = col_indices
             results['masks'][label] = valid_mask
-            results['boundary_masks'][label] = boundary_mask  # Pattern-specific boundary mask
+            results['boundary_masks'][label] = bm  # Pattern-specific boundary mask
 
         return results
 
@@ -147,6 +152,8 @@ class GeneralIndexComposer:
             print("Col indices:", results['col_indices'][label])
             print("Mask:", results['masks'][label])
             print("------")
-validation = GeneralIndexComposer()
 
-validation.validate((3,3,3))
+
+if __name__ == "__main__":
+    validation = GeneralIndexComposer()
+    validation.validate((3, 3, 3))
