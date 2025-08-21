@@ -11,6 +11,7 @@ from collections import deque
 
 # Wire in new abstraction_methods/properties
 from .abstraction_methods import properties as _properties
+from .abstraction_methods import reshape as _reshape_methods
 
 # TYPE: Faculty, DEFAULT_FACULTY should be imported from .faculty
 try:
@@ -132,6 +133,10 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    repeat = _reshape_methods.repeat
+    
+    repeat_interleave = _reshape_methods.repeat_interleave
+    
     # --- Sentinel dtypes for use before backend is set ---
     float_dtype_ = 'float32'  # Default sentinel, can be replaced by backend
     long_dtype_ = 'int64'     # Default sentinel, can be replaced by backend
@@ -268,30 +273,6 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_softmax_()")
 
     # --- Basic layout ---
-    def reshape(self, *shape: int) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.reshape_(shape)
-        return result
-
-    def reshape_(self, shape):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement reshape_()")
-
-    def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.transpose_(dim0, dim1)
-        return result
-
-    def transpose_(self, dim0, dim1):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement transpose_()")
-
-    def squeeze(self, dim: int | None = None) -> "AbstractTensor":
-        """Return a tensor with all (or one) dimensions of size 1 removed."""
-        result = type(self)(track_time=self.track_time)
-        result.data = self.squeeze_(dim)
-        return result
-
-    def squeeze_(self, dim: int | None = None):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
     def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
         return self.mean_(dim=dim, keepdim=keepdim)
@@ -444,6 +425,12 @@ class AbstractTensor:
     __str__ = _properties.__str__
     __repr__ = _properties.__repr__
     __len__ = _properties.__len__
+    # Wire in reshape and flatten from abstraction_methods.reshape
+    reshape = _reshape_methods.reshape
+    flatten = _reshape_methods.flatten
+    transpose = _reshape_methods.transpose
+    squeeze = _reshape_methods.squeeze
+
 
 
     
@@ -735,11 +722,6 @@ class AbstractTensor:
         )
 
 
-    def repeat_interleave(
-        self, repeats: int = 1, dim: Optional[int] = None
-    ) -> "AbstractTensor":
-        result = AbstractTensor.get_tensor(self.repeat_interleave_(repeats, dim))
-        return result
 
     # Backend hooks -----------------------------------------------------------
     def expand_(self, shape):  # pragma: no cover - backend required
@@ -1179,56 +1161,74 @@ class AbstractTensor:
         device=None,
         cls=None
     ) -> "AbstractTensor":
-        """
-        Create and return an AbstractTensor instance from any data, auto-selecting the best backend if faculty is None.
-        If faculty is provided, use the corresponding backend.
-        If cls is provided, it is used directly as the backend class.
-        """
+        # ---- resolve backend + get a typed empty wrapper (ops handle) ----
         if cls is not None:
             backend_cls = cls
-            # Try to pass default_device if the backend supports it
             try:
-                tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
+                ops = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
             except TypeError:
-                tensor = backend_cls(track_time=track_time)
+                ops = backend_cls(track_time=track_time)
         else:
             faculty = faculty or DEFAULT_FACULTY
-            if faculty in (Faculty.TORCH, Faculty.PYGEO):
+            if faculty in (Faculty.TORCH, getattr(Faculty, "PYGEO", object())):
                 backend_cls = BACKEND_REGISTRY.get("torch")
                 if backend_cls is None:
                     from . import torch_backend  # noqa: F401
                     backend_cls = BACKEND_REGISTRY.get("torch")
-                tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
+                ops = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
             elif faculty is Faculty.NUMPY and np is not None:
                 backend_cls = BACKEND_REGISTRY.get("numpy")
                 if backend_cls is None:
                     from . import numpy_backend  # noqa: F401
                     backend_cls = BACKEND_REGISTRY.get("numpy")
-                tensor = backend_cls(track_time=track_time)
-            elif faculty is Faculty.CTENSOR:
+                ops = backend_cls(track_time=track_time)
+            elif faculty is getattr(Faculty, "CTENSOR", object()):
                 from .accelerator_backends.c_backend import CTensorOperations
-                tensor = CTensorOperations(track_time=track_time)
+                ops = CTensorOperations(track_time=track_time)
             else:
                 backend_cls = BACKEND_REGISTRY.get("pure_python")
-                tensor = backend_cls(track_time=track_time)
+                if backend_cls is None:
+                    from . import pure_backend  # noqa: F401
+                    backend_cls = BACKEND_REGISTRY.get("pure_python")
+                ops = backend_cls(track_time=track_time)
 
-        if data is not None:
-            out = tensor.ensure_tensor(data)
-            # apply dtype/device if requested (best-effort)
-            if dtype is not None:
-                try:
-                    out = out.to_dtype(dtype)
-                except Exception:
-                    pass
-            if device is not None:
-                try:
-                    out = out.to_device(device)
-                except Exception:
-                    pass
+        # ---- no data: return a NEW wrapper (not `ops`), with no payload ----
+        if data is None:
+            out = type(ops)(track_time=track_time)
+            out.data = None
             return out
 
-        # no data: return a backend handle (dtype/device can be applied later when data exists)
-        return tensor
+        # ---- have data: wrap it, and ensure we return a wrapper of THIS backend ----
+        out = ops.ensure_tensor(data)
+
+        if isinstance(out, AbstractTensor) and (type(out) is not type(ops)):
+            out = out.to_backend(ops)
+
+        if not isinstance(out, AbstractTensor):
+            wrapped = type(ops)(track_time=track_time)
+            wrapped.data = out
+            out = wrapped
+
+        if dtype is not None:
+            try: out = out.to_dtype(dtype)
+            except: pass
+        if device is not None:
+            try: out = out.to_device(device)
+            except: pass
+
+        return out
+
+
+# --- Added backend hook methods/properties ---
+    def reshape_(self, shape):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement reshape_()")
+
+    def transpose_(self, dim0, dim1):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement transpose_()")
+
+    def squeeze_(self, dim: int | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
+
 
 class AbstractF:
     """

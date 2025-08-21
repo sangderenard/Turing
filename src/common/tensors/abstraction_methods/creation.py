@@ -129,7 +129,7 @@ def meshgrid(*vectors, indexing: str = "ij", copy: bool = False, as_class: bool 
         for i, v in enumerate(vecs):
             shape = [1] * dims
             shape[i] = sizes[i]
-            g = v.reshape(*shape).expand(full_shape)
+            g = v.reshape(shape).expand(full_shape)
             if copy:
                 if hasattr(g, "clone"):
                     g = g.clone()
@@ -146,7 +146,7 @@ def meshgrid(*vectors, indexing: str = "ij", copy: bool = False, as_class: bool 
                 shape[0] = sizes[1]
             else:
                 shape[i] = sizes[i]
-            g = v.reshape(*shape).expand(final_shape)
+            g = v.reshape(shape).expand(final_shape)
             if copy:
                 if hasattr(g, "clone"):
                     g = g.clone()

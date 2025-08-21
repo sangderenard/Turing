@@ -426,9 +426,14 @@ class PyTorchTensorOperations(AbstractTensor):
 
     def get_shape(self):
         return tuple(self.data.shape)
+    def get_ndims(self, data=None):
+        t = data if data is not None else self.data
+        try:
+            return int(t.dim())
+        except AttributeError:
+            # fallback for array-likes if you ever pass them through here
+            return len(getattr(t, "shape", ()))
 
-    def get_ndims(self):
-        return self.data.dim()
 
     def interpolate_(self, size):
         t = self.data
