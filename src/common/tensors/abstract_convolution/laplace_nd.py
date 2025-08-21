@@ -29,7 +29,7 @@ import math
 import torch
 import torch.nn as nn
 
-from localstatenetwork import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_LAPLACEBELTRAMI_STENCIL
+from .local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_LAPLACEBELTRAMI_STENCIL
 from src.common.index_composer.indexcomposer import GeneralIndexComposer
 
 class BuildLaplace3D:
