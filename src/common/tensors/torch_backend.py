@@ -278,9 +278,7 @@ class PyTorchTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return self.data != value
 
-    def arange_(self, start, end=None, step=1, device=None, dtype=None):
-        if end is None:
-            return torch.arange(start, device=device or self.default_device, dtype=dtype)
+    def arange_(self, start, end, step=1, *, dtype=None, device=None):
         return torch.arange(start, end, step, device=device or self.default_device, dtype=dtype)
 
     def select_by_indices_(self, indices_dim0, indices_dim1):

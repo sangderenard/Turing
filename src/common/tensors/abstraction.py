@@ -124,6 +124,27 @@ def register_backend(name: str, backend_cls: type) -> None:
     BACKEND_REGISTRY[name] = backend_cls
 
 # Delayed import to avoid circular dependency
+class MeshGrid:
+    """Tuple-like wrapper for meshgrid results."""
+    def __init__(self, tensors):
+        self.tensors = tuple(tensors)
+
+    def __iter__(self):
+        return iter(self.tensors)
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __getitem__(self, idx):
+        return self.tensors[idx]
+
+    def __repr__(self):
+        return f"MeshGrid(len={len(self.tensors)}, shape={self.shape})"
+
+    @property
+    def shape(self):
+        return self.tensors[0].shape if self.tensors else ()
+
 
 
 
@@ -133,6 +154,120 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    @staticmethod
+    def linspace(start, stop, steps, dtype=None, device=None):
+        if steps <= 0:
+            raise ValueError("steps must be positive")
+        # i = [0, 1, ..., steps-1] dispatched via backend-aware arange
+        i = AbstractTensor.arange(0, steps, 1, dtype=dtype, device=device)
+        if steps == 1:
+            return i * 0 + start  # length-1 tensor with value `start`
+        step_val = (stop - start) / (steps - 1)
+        return start + i * step_val
+
+
+    @staticmethod
+    def meshgrid(*vectors, indexing: str = "ij", copy: bool = False, as_class: bool = False):
+        """
+        Create N-D coordinate matrices from 1-D coordinate vectors.
+
+        Parameters
+        ----------
+        *vectors : AbstractTensor 1-D, or a single iterable of them
+            1-D tensors defining the grid coordinates along each axis.
+        indexing : {'ij','xy'}, default 'ij'
+            'ij'  -> matrix indexing for any N.
+            'xy'  -> Cartesian indexing for the first two axes (N>=2).
+        copy : bool, default False
+            If True, materialize writable copies (best-effort: uses .clone() or .copy() if available).
+            If False, return broadcasted views (memory-efficient).
+        as_class : bool, default False
+            If True, return a MeshGrid wrapper; else return a tuple.
+
+        Returns
+        -------
+        tuple[AbstractTensor, ...] or MeshGrid
+        """
+        # Support a single iterable form: meshgrid([x, y, z])
+        if len(vectors) == 1 and isinstance(vectors[0], (list, tuple)):
+            vectors = tuple(vectors[0])
+
+        if len(vectors) == 0:
+            raise ValueError("meshgrid requires at least one 1-D input tensor")
+
+        # Normalize inputs and validate 1-D
+        vecs = []
+        sizes = []
+        for i, v in enumerate(vectors):
+            if not isinstance(v, AbstractTensor):
+                v = AbstractTensor.get_tensor(v)
+            shp = getattr(v, "shape", None)
+            if shp is None or len(shp) != 1:
+                raise ValueError(f"meshgrid expects 1-D tensors; arg {i} has shape {shp}")
+            vecs.append(v)
+            sizes.append(shp[0])
+
+        dims = len(vecs)
+        if indexing not in ("ij", "xy"):
+            raise ValueError("indexing must be 'ij' or 'xy'")
+
+        # Guard: all inputs from the same backend/class
+        base_cls = type(vecs[0])
+        if any(type(v) is not base_cls for v in vecs[1:]):
+            raise TypeError("meshgrid inputs must be from the same backend/class")
+
+        # Optional: enforce dtype/device if present
+        want_dtype = getattr(vecs[0], "dtype", None)
+        want_device = getattr(vecs[0], "device", None)
+        for i, v in enumerate(vecs[1:], start=1):
+            v_dtype = getattr(v, "dtype", None)
+            v_device = getattr(v, "device", None)
+            if (want_dtype is not None and v_dtype is not None and v_dtype != want_dtype) or \
+            (want_device is not None and v_device is not None and v_device != want_device):
+                raise TypeError(
+                    f"meshgrid inputs must share dtype/device; arg0 has (dtype={want_dtype}, device={want_device}) "
+                    f"but arg{i} has (dtype={v_dtype}, device={v_device})."
+                )
+
+        grids = []
+        if indexing == "ij" or dims < 2:
+            # Standard N-D matrix indexing
+            full_shape = tuple(sizes)
+            for i, v in enumerate(vecs):
+                shape = [1] * dims
+                shape[i] = sizes[i]                  # put Ni at axis i
+                g = v.reshape(*shape).expand(full_shape)   # NOTE: pass a single tuple
+                if copy:
+                    if hasattr(g, "clone"):
+                        g = g.clone()
+                    elif hasattr(g, "copy"):
+                        g = g.copy()
+                grids.append(g)
+        else:
+            # 'xy' indexing: final shape is (N1, N0, N2, ..., Nk)
+            final_shape = (sizes[1], sizes[0], *sizes[2:])
+            for i, v in enumerate(vecs):
+                shape = [1] * dims
+                if i == 0:
+                    shape[1] = sizes[0]              # X varies along axis 1
+                elif i == 1:
+                    shape[0] = sizes[1]              # Y varies along axis 0
+                else:
+                    shape[i] = sizes[i]
+                g = v.reshape(*shape).expand(final_shape)  # NOTE: pass a single tuple
+                if copy:
+                    if hasattr(g, "clone"):
+                        g = g.clone()
+                    elif hasattr(g, "copy"):
+                        g = g.copy()
+                grids.append(g)
+
+        return MeshGrid(grids) if as_class else tuple(grids)
+
+    # --- Sentinel dtypes for use before backend is set ---
+    float_dtype_ = 'float32'  # Default sentinel, can be replaced by backend
+    long_dtype_ = 'int64'     # Default sentinel, can be replaced by backend
+    bool_dtype_ = 'bool'      # Default sentinel, can be replaced by backend
     # --- Unary operators ---
 
 
@@ -212,48 +347,6 @@ class AbstractTensor:
         """Elementwise select: self as bool mask, x if True else y."""
         result = type(self)(track_time=self.track_time)
         result.data = self.where_(x, y)
-        return result
-
-    def where_(self, x, y):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement where_()")
-
-    # --- Extrema ---
-    def maximum(self, other: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.maximum_(other)
-        return result
-
-    def maximum_(self, other):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement maximum_()")
-
-    def minimum(self, other: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.minimum_(other)
-        return result
-
-    def minimum_(self, other):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement minimum_()")
-
-    # --- Clamping ---
-    def clamp(self, min: Any = None, max: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.clamp_(min, max)
-        return result
-
-    def clamp_(self, min, max):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_()")
-
-    def clamp_min(self, min: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.clamp_min_(min)
-        return result
-
-    def clamp_min_(self, min):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_min_()")
-
-    def clamp_max(self, max: Any) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
-        result.data = self.clamp_max_(max)
         return result
 
     def clamp_max_(self, max):
@@ -498,6 +591,7 @@ class AbstractTensor:
         inst.data = inst.tensor_from_list_(data, dtype, device)
         return inst
     # --- Tensor creation and manipulation methods ---
+
     @classmethod
     def full(
         cls,
@@ -582,30 +676,112 @@ class AbstractTensor:
         result = type(self)(track_time=self.track_time)
         result.data = self.not_equal_(other)
         return result
-
+    
     @classmethod
-    def arange(
+    def tensor(
         cls,
-        start: int,
-        end: Optional[int] = None,
-        step: int = 1,
-        device: Any = None,
-        dtype: Any = None,
+        data=None,
+        *,
+        dtype=None,
+        device=None,
+        track_time: bool = False,
+        faculty: "Faculty" = None,
     ) -> "AbstractTensor":
-        # Instance-based: use the backend of this tensor
-        result = cls(track_time=False)  # Assuming default track_time
-        result.data = result.arange_(start, end, step, device, dtype)
-        return result
+        """
+        Create an AbstractTensor from `data`.
 
+        - If called on AbstractTensor: auto-select backend via get_tensor(...).
+        - If called on a backend subclass: use that backend directly.
+        - dtype/device are applied best-effort after wrapping.
+        """
+        if cls is AbstractTensor:
+            # Auto-select backend
+            return AbstractTensor.get_tensor(
+                data,
+                faculty=faculty,
+                track_time=track_time,
+                dtype=dtype,
+                device=device,
+            )
+
+        # Use the specific backend class
+        inst = cls(track_time=track_time)
+        if data is None:
+            return inst  # handle-as-backend-handle case, like get_tensor(None)
+
+        out = inst.ensure_tensor(data)
+        if dtype is not None:
+            try:
+                out = out.to_dtype(dtype)
+            except Exception:
+                pass
+        if device is not None:
+            try:
+                out = out.to_device(device)
+            except Exception:
+                pass
+        return out
+
+
+    @staticmethod
+    def range(start, end=None, step=1, *, dtype=None, device=None, cls=None):
+        return AbstractTensor.arange(start, end, step, dtype=dtype, device=device, cls=cls)
+
+    @staticmethod
     def arange(
-        self,
-        start: int,
-        end: Optional[int] = None,
-        step: int = 1,
-        device: Any = None,
-        dtype: Any = None,
+        start,
+        end=None,
+        step=1,
+        *,
+        dtype=None,
+        device=None,
+        cls=None,
     ) -> "AbstractTensor":
-        return type(self).arange(start, end, step, device, dtype)
+        """
+        Create an arange tensor using the best available backend if cls is None.
+
+        Forms:
+        arange(end)                -> [0, 1, ..., end-1]
+        arange(start, end)         -> [start, ..., end-step]
+        arange(start, end, step)   -> general form
+
+        Notes:
+        - step must be nonzero.
+        - dtype/device are forwarded to the backend.
+        """
+        # Normalize one-argument form
+        if end is None:
+            start, end = 0, start
+
+        if step == 0:
+            raise ValueError("arange step must be nonzero")
+
+        # Backend selection (attempt to register common backends)
+        if cls is None:
+            try:
+                from . import torch_backend  # noqa: F401
+            except Exception:
+                pass
+            try:
+                from . import numpy_backend  # noqa: F401
+            except Exception:
+                pass
+            try:
+                from . import pure_backend  # noqa: F401
+            except Exception:
+                pass
+
+            for backend_name in ("torch", "numpy", "pure_python"):
+                backend_cls = BACKEND_REGISTRY.get(backend_name)
+                if backend_cls is not None:
+                    cls = backend_cls
+                    break
+            if cls is None:
+                raise RuntimeError("No tensor backend available for arange.")
+
+        inst = cls(track_time=False)  # Assuming default track_time
+        inst.data = inst.arange_(start, end, step, dtype=dtype, device=device)
+        return inst
 
     def select_by_indices(
         self, indices_dim0: Any = None, indices_dim1: Any = None
@@ -1326,15 +1502,18 @@ class AbstractTensor:
 
     @staticmethod
     def get_tensor(
-        data=None, faculty: "Faculty" = None, *, track_time: bool = False
+        data=None,
+        faculty: "Faculty" = None,
+        *,
+        track_time: bool = False,
+        dtype=None,
+        device=None
     ) -> "AbstractTensor":
         """
         Create and return an AbstractTensor instance from any data, auto-selecting the best backend if faculty is None.
         If faculty is provided, use the corresponding backend.
         """
         faculty = faculty or DEFAULT_FACULTY
-        if isinstance(data, list):
-            return PurePythonListTensor(track_time=track_time, data=data)
         if faculty in (Faculty.TORCH, Faculty.PYGEO):
             backend_cls = BACKEND_REGISTRY.get("torch")
             if backend_cls is None:
@@ -1353,52 +1532,24 @@ class AbstractTensor:
         else:
             backend_cls = BACKEND_REGISTRY.get("pure_python")
             tensor = backend_cls(track_time=track_time)
+
         if data is not None:
-            return tensor.ensure_tensor(data)
+            out = tensor.ensure_tensor(data)
+            # apply dtype/device if requested (best-effort)
+            if dtype is not None:
+                try:
+                    out = out.to_dtype(dtype)
+                except Exception:
+                    pass
+            if device is not None:
+                try:
+                    out = out.to_device(device)
+                except Exception:
+                    pass
+            return out
+
+        # no data: return a backend handle (dtype/device can be applied later when data exists)
         return tensor
-
-    # ...existing AbstractTensor code...
-
-# Sentinel wrapper for pure Python lists as tensors
-class PurePythonListTensor(AbstractTensor):
-    long_dtype_ = None
-    bool_dtype_ = None
-    float_dtype_ = None
-    tensor_type_ = list
-
-    def __init__(self, track_time: bool = False, data=None):
-        super().__init__(track_time=track_time)
-        self.data = data
-
-    @property
-    def tensor_type(self):
-        return list
-
-    def tolist_(self):
-        return self.data
-
-    def clone_(self, tensor=None):
-        t = self.data if tensor is None else tensor
-        if isinstance(t, list):
-            return [self.clone_(item) for item in t]
-        return t
-
-    def get_shape(self) -> tuple:
-        return _get_shape(self.data)
-
-    def get_ndims(self) -> int:
-        return len(self.get_shape())
-
-    def get_dtype(self, data=None):
-        return "list"
-
-    def get_device(self, data=None):
-        return None
-
-    @classmethod
-    def tensor_from_list(cls, data, dtype=None, device=None):
-        return cls(data=list(data))
-
 
 class AbstractF:
     """

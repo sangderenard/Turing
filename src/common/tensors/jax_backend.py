@@ -317,8 +317,8 @@ class JAXTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return jnp.not_equal(self.data, value)
 
-    def arange_(self, start: int, end: Optional[int] = None, step: int = 1, device: Any = None, dtype: Any = None) -> Any:
-        arr = jnp.arange(start, end, step, dtype=dtype) if end is not None else jnp.arange(start, dtype=dtype)
+    def arange_(self, start: int, end: int, step: int = 1, *, dtype: Any = None, device: Any = None) -> Any:
+        arr = jnp.arange(start, end, step, dtype=dtype)
         return jax.device_put(arr, device or self.default_device)
 
     def select_by_indices_(self, tensor: Any, indices_dim0: Any, indices_dim1: Any) -> Any:

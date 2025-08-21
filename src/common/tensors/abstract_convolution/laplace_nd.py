@@ -1,9 +1,8 @@
 
-import torch
-import numpy as np
+from ..abstraction import AbstractTensor
 import math
 import logging
-from scipy.sparse import coo_matrix
+
 
 # Configure the logger at the module level
 logger = logging.getLogger(__name__)
@@ -22,18 +21,12 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 
-import torch
-import numpy as np
-from scipy.sparse import coo_matrix
-import math
-import torch
-import torch.nn as nn
 
 from .local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_LAPLACEBELTRAMI_STENCIL
 from src.common.index_composer.indexcomposer import GeneralIndexComposer
 
 class BuildLaplace3D:
-    def __init__(self, grid_domain, wave_speed=343, precision=torch.float64, resolution=68,
+    def __init__(self, grid_domain, wave_speed=343, precision=AbstractTensor.float_dtype_, resolution=68,
                  metric_tensor_func=None, density_func=None, tension_func=None,
                  singularity_conditions=None, singularity_dirichlet_func=None, singularity_neumann_func=None,
                  boundary_conditions=('neumann', 'neumann', 'neumann', 'neumann', 'neumann', 'neumann'),
@@ -48,7 +41,7 @@ class BuildLaplace3D:
         Args:
             grid_domain: Object that handles the grid transformations (u, v, w) -> (x, y, z).
             wave_speed: Speed of wave propagation, used to compute local wave numbers.
-            precision: Torch precision type for tensor creation (default: torch.float64).
+            precision: AbstractTensor precision type for tensor creation (default: AbstractTensor.float_dtype_).
             resolution: Maximum resolution for dense tensor calculations (default: 68).
             metric_tensor_func: Function to compute the metric tensor (default: None for Euclidean space).
             density_func: Function or tensor defining the density over the grid (default: None, assumes 1.0 everywhere).
@@ -60,7 +53,7 @@ class BuildLaplace3D:
                                  (default: ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')).
             artificial_stability: Small stability term added to metrics (default: 0).
         """
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if AbstractTensor.cuda.is_available() else "cpu")
         self.general_index_composer = GeneralIndexComposer(device=self.device)
         
         self.grid_domain = grid_domain
@@ -153,7 +146,7 @@ class BuildLaplace3D:
         # Allow callers to pass either 1D coordinate vectors or full 3D meshes.
         def _to_mesh3d(u, v, w):
             if u.dim() == v.dim() == w.dim() == 1:
-                U, V, W = torch.meshgrid(u, v, w, indexing='ij')
+                U, V, W = AbstractTensor.meshgrid(u, v, w, indexing='ij')
                 return U, V, W
             if u.dim() == v.dim() == w.dim() == 3:
                 return u, v, w
@@ -178,18 +171,18 @@ class BuildLaplace3D:
             logger.debug("Computed metric tensor components.")
 
             # Stack into a 3x3 matrix
-            g_ij = torch.stack([
-                torch.stack([g_uu, g_uv, g_uw], dim=-1),
-                torch.stack([g_uv, g_vv, g_vw], dim=-1),
-                torch.stack([g_uw, g_vw, g_ww], dim=-1)
+            g_ij = AbstractTensor.stack([
+                AbstractTensor.stack([g_uu, g_uv, g_uw], dim=-1),
+                AbstractTensor.stack([g_uv, g_vv, g_vw], dim=-1),
+                AbstractTensor.stack([g_uw, g_vw, g_ww], dim=-1)
             ], dim=-2)  # Shape: (N_u, N_v, N_w, 3, 3)
 
             logger.debug(f"g_ij shape: {g_ij.shape}")
 
-            det_g = torch.det(g_ij)  # Shape: (N_u, N_v, N_w)
+            det_g = AbstractTensor.det(g_ij)  # Shape: (N_u, N_v, N_w)
             logger.debug(f"det_g shape: {det_g.shape}")
 
-            g_inv = torch.inverse(g_ij)  # Shape: (N_u, N_v, N_w, 3, 3)
+            g_inv = AbstractTensor.inverse(g_ij)  # Shape: (N_u, N_v, N_w, 3, 3)
             logger.debug("Computed inverse metric tensor.")
 
             return g_ij, g_inv, det_g
@@ -241,11 +234,11 @@ class BuildLaplace3D:
         # Handle the u-direction (dim=0, radial or x-direction)
         if boundary_conditions[0] == 'periodic' or boundary_conditions[1] == 'periodic':
             logger.debug("Handling periodic boundary conditions for u-direction.")
-            sum_du = torch.sum(unique_u_values[1:] - unique_u_values[:-1])
-            final_du = (2 * np.pi) - sum_du
+            sum_du = AbstractTensor.sum(unique_u_values[1:] - unique_u_values[:-1])
+            final_du = (2 * AbstractTensor.pi) - sum_du
             final_u_value = unique_u_values[-1]
-            final_u_row = torch.full_like(unique_v_values.unsqueeze(1).repeat(1, N_w), final_u_value.item())
-            wrap_u_row = torch.full_like(unique_v_values.unsqueeze(1).repeat(1, N_w), unique_u_values[0].item())
+            final_u_row = AbstractTensor.full_like(unique_v_values.unsqueeze(1).repeat(1, N_w), final_u_value.item())
+            wrap_u_row = AbstractTensor.full_like(unique_v_values.unsqueeze(1).repeat(1, N_w), unique_u_values[0].item())
 
             logger.debug(f"sum_du: {sum_du}, final_du: {final_du}")
             logger.debug(f"final_u_row: {final_u_row}, wrap_u_row: {wrap_u_row}")
@@ -271,9 +264,9 @@ class BuildLaplace3D:
             if final_dZdu.dim() == 2:
                 final_dZdu = final_dZdu.unsqueeze(0)
 
-            dXdu = torch.cat([dXdu, final_dXdu], dim=0)
-            dYdu = torch.cat([dYdu, final_dYdu], dim=0)
-            dZdu = torch.cat([dZdu, final_dZdu], dim=0)
+            dXdu = AbstractTensor.cat([dXdu, final_dXdu], dim=0)
+            dYdu = AbstractTensor.cat([dYdu, final_dYdu], dim=0)
+            dZdu = AbstractTensor.cat([dZdu, final_dZdu], dim=0)
             logger.debug("Appended final differentials to u-direction derivatives.")
         else:
             logger.debug("Non-periodic boundary conditions for u-direction. No action taken.")
@@ -281,11 +274,11 @@ class BuildLaplace3D:
         # Handle the v-direction (dim=1, angular or y-direction)
         if boundary_conditions[2] == 'periodic' or boundary_conditions[3] == 'periodic':
             logger.debug("Handling periodic boundary conditions for v-direction.")
-            sum_dv = torch.sum(unique_v_values[1:] - unique_v_values[:-1])
-            final_dv = (2 * np.pi) - sum_dv
+            sum_dv = AbstractTensor.sum(unique_v_values[1:] - unique_v_values[:-1])
+            final_dv = (2 * AbstractTensor.pi) - sum_dv
             final_v_value = unique_v_values[-1]
-            final_v_row = torch.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, 1, N_w), final_v_value.item())
-            wrap_v_row = torch.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, 1, N_w), unique_v_values[0].item())
+            final_v_row = AbstractTensor.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, 1, N_w), final_v_value.item())
+            wrap_v_row = AbstractTensor.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, 1, N_w), unique_v_values[0].item())
 
             logger.debug(f"sum_dv: {sum_dv}, final_dv: {final_dv}")
             logger.debug(f"final_v_row: {final_v_row}, wrap_v_row: {wrap_v_row}")
@@ -319,9 +312,9 @@ class BuildLaplace3D:
             if final_dZdv.dim() == 2:
                 final_dZdv = final_dZdv.unsqueeze(1)
 
-            dXdv = torch.cat([dXdv, final_dXdv], dim=1)
-            dYdv = torch.cat([dYdv, final_dYdv], dim=1)
-            dZdv = torch.cat([dZdv, final_dZdv], dim=1)
+            dXdv = AbstractTensor.cat([dXdv, final_dXdv], dim=1)
+            dYdv = AbstractTensor.cat([dYdv, final_dYdv], dim=1)
+            dZdv = AbstractTensor.cat([dZdv, final_dZdv], dim=1)
             logger.debug("Appended final differentials to v-direction derivatives.")
         else:
             logger.debug("Non-periodic boundary conditions for v-direction. No action taken.")
@@ -329,11 +322,11 @@ class BuildLaplace3D:
         # Handle the w-direction (dim=2, z-direction)
         if boundary_conditions[4] == 'periodic' or boundary_conditions[5] == 'periodic':
             logger.debug("Handling periodic boundary conditions for w-direction.")
-            sum_dw = torch.sum(unique_w_values[1:] - unique_w_values[:-1])
-            final_dw = (2 * np.pi) - sum_dw
+            sum_dw = AbstractTensor.sum(unique_w_values[1:] - unique_w_values[:-1])
+            final_dw = (2 * AbstractTensor.pi) - sum_dw
             final_w_value = unique_w_values[-1]
-            final_w_row = torch.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, N_v, 1), final_w_value.item())
-            wrap_w_row = torch.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, N_v, 1), unique_w_values[0].item())
+            final_w_row = AbstractTensor.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, N_v, 1), final_w_value.item())
+            wrap_w_row = AbstractTensor.full_like(unique_u_values.unsqueeze(1).unsqueeze(2).repeat(1, N_v, 1), unique_w_values[0].item())
 
             logger.debug(f"sum_dw: {sum_dw}, final_dw: {final_dw}")
             logger.debug(f"final_w_row: {final_w_row}, wrap_w_row: {wrap_w_row}")
@@ -359,9 +352,9 @@ class BuildLaplace3D:
             if final_dZdw.dim() == 2:
                 final_dZdw = final_dZdw.unsqueeze(2)
 
-            dXdw = torch.cat([dXdw, final_dXdw], dim=2)
-            dYdw = torch.cat([dYdw, final_dYdw], dim=2)
-            dZdw = torch.cat([dZdw, final_dZdw], dim=2)
+            dXdw = AbstractTensor.cat([dXdw, final_dXdw], dim=2)
+            dYdw = AbstractTensor.cat([dYdw, final_dYdw], dim=2)
+            dZdw = AbstractTensor.cat([dZdw, final_dZdw], dim=2)
             logger.debug("Appended final differentials to w-direction derivatives.")
         else:
             logger.debug("Non-periodic boundary conditions for w-direction. No action taken.")
@@ -433,7 +426,7 @@ class BuildLaplace3D:
         metric_w = h2_w + eps
 
         # 6. Identify Singularities
-        singularity_mask = torch.zeros_like(det_g, dtype=torch.bool)
+        singularity_mask = AbstractTensor.zeros_like(det_g, dtype=AbstractTensor.bool)
 
         # 7. Extract Cross Terms
         inv_g_uv = g_inv[..., 0, 1]
@@ -441,7 +434,7 @@ class BuildLaplace3D:
         inv_g_vw = g_inv[..., 1, 2]
 
         # 8. Initialize Diagonal Entries
-        diagonal_entries = torch.zeros_like(det_g)
+        diagonal_entries = AbstractTensor.zeros_like(det_g)
 
         if singularity_conditions == 'dirichlet':
             diagonal_entries[singularity_mask] = 1.0
@@ -464,8 +457,8 @@ class BuildLaplace3D:
         values = []
 
         # Diagonal Entries Initialization
-        total_size = torch.prod(torch.tensor(det_g.shape)).item()
-        diagonal_entries = torch.zeros(total_size, device='cpu')
+        total_size = AbstractTensor.prod(AbstractTensor.tensor(det_g.shape)).item()
+        diagonal_entries = AbstractTensor.zeros(total_size, device='cpu')
 
         # 2. Iterate Through the Index Map Patterns
         for label, row_indices_map in self.index_map['row_indices'].items():
@@ -498,15 +491,15 @@ class BuildLaplace3D:
             print(f"laplacian_contrib flattened shape {laplacian_contrib.flatten().shape}" )
 
         # 3. Add Diagonal Contributions
-        flat_diag_indices = torch.arange(total_size, device='cpu')
+        flat_diag_indices = AbstractTensor.arange(total_size, device='cpu')
         row_indices.extend(flat_diag_indices.tolist())
         col_indices.extend(flat_diag_indices.tolist())
         values.extend(laplacian_diag.flatten().tolist())
 
         # 4. Assemble Sparse Tensor
-        laplacian = torch.sparse_coo_tensor(
-            indices=torch.tensor([row_indices, col_indices], device='cpu'),
-            values=torch.tensor(values, device='cpu'),
+        laplacian = AbstractTensor.sparse_coo_tensor(
+            indices=AbstractTensor.tensor([row_indices, col_indices], device='cpu'),
+            values=AbstractTensor.tensor(values, device='cpu'),
             size=(total_size, total_size)
         ).coalesce()
 
@@ -521,17 +514,17 @@ class BuildLaplace3D:
         if self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
             laplacian_dense = laplacian.toarray()
-            laplacian_tensor = torch.tensor(laplacian_dense, device=device, dtype=self.precision)
+            laplacian_tensor = AbstractTensor.tensor(laplacian_dense, device=device, dtype=self.precision)
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
 
             # Dense perturbation
             if perturbation_mode:
                 logger.debug("Applying dense perturbation to Laplacian tensor.")
                 if perturbation_seed is not None:
-                    torch.manual_seed(perturbation_seed)  # Set seed for deterministic behavior
+                    AbstractTensor.manual_seed(perturbation_seed)  # Set seed for deterministic behavior
                     logger.debug(f"Set perturbation seed to {perturbation_seed}.")
                 # Apply Gaussian noise to dense matrix
-                noise_dense = torch.randn(laplacian_tensor.shape, dtype=self.precision, device=device) * perturbation_scale
+                noise_dense = AbstractTensor.randn(laplacian_tensor.shape, dtype=self.precision, device=device) * perturbation_scale
                 laplacian_tensor += noise_dense  # Add noise to the dense Laplacian
                 logger.debug("Added Gaussian noise to dense Laplacian tensor.")
 
@@ -547,11 +540,11 @@ class BuildLaplace3D:
         if perturbation_mode:
             logger.debug("Applying sparse perturbation to Laplacian matrix.")
             if perturbation_seed is not None:
-                np.random.seed(perturbation_seed)  # Use numpy's random seed for reproducibility
+                AbstractTensor.random.seed(perturbation_seed)  # Use numpy's random seed for reproducibility
                 logger.debug(f"Set sparse perturbation seed to {perturbation_seed}.")
 
             # Generate noise for the non-zero elements in numpy format
-            noise_sparse = np.random.randn(laplacian.data.shape[0]) * perturbation_scale
+            noise_sparse = AbstractTensor.random.randn(laplacian.data.shape[0]) * perturbation_scale
             logger.debug(f"Generated noise for {laplacian.data.shape[0]} non-zero elements.")
 
             # Apply the noise by creating a new COO matrix with perturbed data
@@ -584,43 +577,43 @@ class BuildLaplace3D:
         valid = True
 
         # Handle both dense and sparse cases
-        if isinstance(laplace_tensor, torch.Tensor):
+        if isinstance(laplace_tensor, AbstractTensor.Tensor):
             # Dense matrix case
-            diagonal = torch.diag(laplace_tensor)
+            diagonal = AbstractTensor.diag(laplace_tensor)
 
             # Check diagonal entries in dense matrix
             if check_diagonal:
-                if torch.any(diagonal == 0):
+                if AbstractTensor.any(diagonal == 0):
                     valid = False
                     if verbose:
-                        zero_indices = torch.where(diagonal == 0)[0].tolist()
+                        zero_indices = AbstractTensor.where(diagonal == 0)[0].tolist()
                         print(f"Zero diagonal entries detected at indices: {zero_indices}")
                 
-                if torch.any(torch.isnan(diagonal)):
+                if AbstractTensor.any(AbstractTensor.isnan(diagonal)):
                     valid = False
                     if verbose:
-                        nan_indices = torch.where(torch.isnan(diagonal))[0].tolist()
+                        nan_indices = AbstractTensor.where(AbstractTensor.isnan(diagonal))[0].tolist()
                         print(f"NaN detected in diagonal at indices: {nan_indices}")
                 
-                if torch.any(torch.isinf(diagonal)):
+                if AbstractTensor.any(AbstractTensor.isinf(diagonal)):
                     valid = False
                     if verbose:
-                        inf_indices = torch.where(torch.isinf(diagonal))[0].tolist()
+                        inf_indices = AbstractTensor.where(AbstractTensor.isinf(diagonal))[0].tolist()
                         print(f"Inf detected in diagonal at indices: {inf_indices}")
 
             # Check off-diagonal entries in dense matrix
             if check_off_diagonal:
-                off_diagonal = laplace_tensor - torch.diag(torch.diag(laplace_tensor))
-                if torch.any(torch.isnan(off_diagonal)):
+                off_diagonal = laplace_tensor - AbstractTensor.diag(AbstractTensor.diag(laplace_tensor))
+                if AbstractTensor.any(AbstractTensor.isnan(off_diagonal)):
                     valid = False
                     if verbose:
-                        nan_locations = torch.where(torch.isnan(off_diagonal))
+                        nan_locations = AbstractTensor.where(AbstractTensor.isnan(off_diagonal))
                         print(f"NaN detected in off-diagonal at indices: {nan_locations}")
                 
-                if torch.any(torch.isinf(off_diagonal)):
+                if AbstractTensor.any(AbstractTensor.isinf(off_diagonal)):
                     valid = False
                     if verbose:
-                        inf_locations = torch.where(torch.isinf(off_diagonal))
+                        inf_locations = AbstractTensor.where(AbstractTensor.isinf(off_diagonal))
                         print(f"Inf detected in off-diagonal at indices: {inf_locations}")
 
         elif isinstance(laplace_tensor, coo_matrix):
@@ -632,17 +625,17 @@ class BuildLaplace3D:
                 if (diagonal == 0).any():
                     valid = False
                     if verbose:
-                        zero_indices = np.where(diagonal == 0)[0].tolist()
+                        zero_indices = AbstractTensor.where(diagonal == 0)[0].tolist()
                         print(f"Zero diagonal entries detected at indices: {zero_indices}")
-                if np.isnan(diagonal).any():
+                if AbstractTensor.isnan(diagonal).any():
                     valid = False
                     if verbose:
-                        nan_indices = np.where(np.isnan(diagonal))[0].tolist()
+                        nan_indices = AbstractTensor.where(AbstractTensor.isnan(diagonal))[0].tolist()
                         print(f"NaN detected in diagonal at indices: {nan_indices}")
-                if np.isinf(diagonal).any():
+                if AbstractTensor.isinf(diagonal).any():
                     valid = False
                     if verbose:
-                        inf_indices = np.where(np.isinf(diagonal))[0].tolist()
+                        inf_indices = AbstractTensor.where(AbstractTensor.isinf(diagonal))[0].tolist()
                         print(f"Inf detected in diagonal at indices: {inf_indices}")
 
             # Check off-diagonal entries in sparse matrix
@@ -651,17 +644,17 @@ class BuildLaplace3D:
                 data = laplace_tensor.data
                 for idx, (i, j, value) in enumerate(zip(row, col, data)):
                     if i != j:  # Only check off-diagonal elements
-                        if np.isnan(value):
+                        if AbstractTensor.isnan(value):
                             valid = False
                             if verbose:
                                 print(f"NaN detected in off-diagonal at indices: ({i}, {j})")
-                        if np.isinf(value):
+                        if AbstractTensor.isinf(value):
                             valid = False
                             if verbose:
                                 print(f"Inf detected in off-diagonal at indices: ({i}, {j})")
 
         else:
-            raise TypeError("Unsupported matrix format. Please provide a torch.Tensor or scipy.sparse matrix.")
+            raise TypeError("Unsupported matrix format. Please provide a AbstractTensor.Tensor or scipy.sparse matrix.")
 
         if verbose and valid:
             print("Laplace tensor passed all validation checks.")
@@ -669,15 +662,8 @@ class BuildLaplace3D:
         return valid
 # Assuming RectangularTransform and GridDomain are properly defined for 3D
 
-import torch
-import numpy as np
-from scipy.sparse import coo_matrix
-import math
 import matplotlib.pyplot as plt
 
-
-import torch
-import random
 
 class FaceMapGenerator:
     def __init__(self, vertices, edges, device="cpu"):
@@ -730,12 +716,12 @@ class FaceMapGenerator:
         for i in range(1, len(face)-1):
             edge1 = self.vertices[face[i]] - v0
             edge2 = self.vertices[face[i+1]] - v0
-            cross_product = torch.cross(edge1, edge2)
+            cross_product = AbstractTensor.cross(edge1, edge2)
             if normal is None:
                 normal = cross_product
             else:
                 # If not approximately parallel (same direction), not planar
-                if not torch.allclose(normal, cross_product, atol=1e-6):
+                if not AbstractTensor.allclose(normal, cross_product, atol=1e-6):
                     return False
         return True
 
@@ -763,7 +749,7 @@ class VolumeMapGenerator:
         print("Volume detection not implemented yet.")
         return {}
     
-import torch
+
 import hashlib
 
 class HodgeStarBuilder:
@@ -799,16 +785,16 @@ class HodgeStarBuilder:
         # Without faces, we cannot get a proper area-based measure easily.
         # Placeholder: assign uniform volumes
         num_vertices = vertices.shape[0]
-        vertex_volumes = torch.ones(num_vertices, device=self.device)
+        vertex_volumes = AbstractTensor.ones(num_vertices, device=self.device)
         
         # For edges: length could be a primal measure, and dual might be inverse
         print(f"vertices dimensions: {vertices.shape} edges dimensions: {edges.shape}")
-        edge_lengths = torch.sqrt(torch.sum((vertices[edges[:,0]] - vertices[edges[:,1]])**2, dim=1))
+        edge_lengths = AbstractTensor.sqrt(AbstractTensor.sum((vertices[edges[:,0]] - vertices[edges[:,1]])**2, dim=1))
         # Dual area approx: 1 / length (very rough approximation)
         dual_edge = 1/(edge_lengths+1e-8)
 
-        hodge_0 = torch.diag(vertex_volumes)
-        hodge_1 = torch.diag(dual_edge)
+        hodge_0 = AbstractTensor.diag(vertex_volumes)
+        hodge_1 = AbstractTensor.diag(dual_edge)
 
         # No faces => no hodge_2. Mark availability so downstream
         # consumers know higher-order operators are absent for this
@@ -834,26 +820,26 @@ class HodgeStarBuilder:
             return self.hodge_cache[hash_key]
 
         # Compute vertex volumes (0-forms)
-        vertex_volumes = torch.zeros(vertices.shape[0], device=self.device)
+        vertex_volumes = AbstractTensor.zeros(vertices.shape[0], device=self.device)
         face_tensors = []
         for f_idx, face in faces.items():
-            face_tensor = torch.tensor(face, device=self.device)
+            face_tensor = AbstractTensor.tensor(face, device=self.device)
             face_tensors.append(face_tensor)
             v0, v1, v2 = vertices[face_tensor[0]], vertices[face_tensor[1]], vertices[face_tensor[2]]
-            area = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0))
+            area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
             # Distribute area equally among vertices for volume approximation
             for vert in face:
                 vertex_volumes[vert] += area/3.0
 
         # Compute edge dual areas (1-forms)
         # Each edge belongs to some faces; sum area contributions
-        edge_dual_areas = torch.zeros(edges.shape[0], device=self.device)
+        edge_dual_areas = AbstractTensor.zeros(edges.shape[0], device=self.device)
         if face_tensors:
-            face_tensor = torch.stack(face_tensors)
+            face_tensor = AbstractTensor.stack(face_tensors)
         else:
             # No faces were detected; fall back to an empty tensor so downstream
             # operations become no-ops instead of crashing with a stack error.
-            face_tensor = torch.empty((0, 3), dtype=torch.long, device=self.device)
+            face_tensor = AbstractTensor.empty((0, 3), dtype=AbstractTensor.long, device=self.device)
         for i, edge in enumerate(edges):
             # Find faces containing this edge
             mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
@@ -861,23 +847,23 @@ class HodgeStarBuilder:
             dual_area = 0.0
             for f in shared_faces:
                 v0, v1, v2 = vertices[f[0]], vertices[f[1]], vertices[f[2]]
-                area = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0))
+                area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
                 dual_area += area/3.0
             edge_dual_areas[i] = dual_area if dual_area > 0 else 1.0  # fallback
 
         # Compute face areas (2-forms)
         face_areas = []
         for f in faces.values():
-            f_tensor = torch.tensor(f, device=self.device)
+            f_tensor = AbstractTensor.tensor(f, device=self.device)
             v0, v1, v2 = vertices[f_tensor[0]], vertices[f_tensor[1]], vertices[f_tensor[2]]
-            area = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0))
+            area = 0.5 * AbstractTensor.norm(AbstractTensor.cross(v1 - v0, v2 - v0))
             face_areas.append(area)
-        face_areas = torch.tensor(face_areas, device=self.device)
+        face_areas = AbstractTensor.tensor(face_areas, device=self.device)
         has_faces = face_areas.numel() > 0
 
-        hodge_0 = torch.diag(vertex_volumes)
-        hodge_1 = torch.diag(edge_dual_areas)
-        hodge_2 = torch.diag(face_areas) if has_faces else None
+        hodge_0 = AbstractTensor.diag(vertex_volumes)
+        hodge_1 = AbstractTensor.diag(edge_dual_areas)
+        hodge_2 = AbstractTensor.diag(face_areas) if has_faces else None
 
         availability = {"hodge_0": True, "hodge_1": True, "hodge_2": has_faces}
         hodge_stars = {
@@ -922,11 +908,11 @@ class TransformHub:
             Z_flat = Z.flatten()  # shape: (N*N*N,)
 
             # Now create a (num_vertices, 3) vertex array
-            vertex_reference = torch.stack([X_flat, Y_flat, Z_flat], dim=1)  # shape: (N*N*N, 3)
+            vertex_reference = AbstractTensor.stack([X_flat, Y_flat, Z_flat], dim=1)  # shape: (N*N*N, 3)
             
             network_profile = self.build_network_profile(edge_index, X, Y, Z)
             d_operators = self.build_d_operators(edge_index, network_profile)
-            vertices = torch.stack([X, Y, Z], dim=1)  # (N, 3) vertex positions
+            vertices = AbstractTensor.stack([X, Y, Z], dim=1)  # (N, 3) vertex positions
             
             hodge_builder = HodgeStarBuilder(self.device)
 
@@ -967,7 +953,7 @@ class TransformHub:
         Z_flat = Z.flatten()
 
         source, target = edge_index[:, 0], edge_index[:, 1]
-        edge_lengths = torch.sqrt((X_flat[source] - X_flat[target])**2 +
+        edge_lengths = AbstractTensor.sqrt((X_flat[source] - X_flat[target])**2 +
                                 (Y_flat[source] - Y_flat[target])**2 +
                                 (Z_flat[source] - Z_flat[target])**2)
         num_vertices = X_flat.numel()
@@ -983,7 +969,7 @@ class TransformHub:
         num_vertices = network_profile["num_vertices"]
         num_edges = network_profile["num_edges"]
 
-        d0 = torch.zeros((num_edges, num_vertices), device=self.device)
+        d0 = AbstractTensor.zeros((num_edges, num_vertices), device=self.device)
         for i, (src, tgt) in enumerate(edge_index):
             d0[i, src] = -1
             d0[i, tgt] = 1
@@ -999,12 +985,12 @@ class TransformHub:
         Compute the Frobenius norm of the metric tensor.
 
         Args:
-            g_ij (torch.Tensor): Metric tensor with shape (..., 2, 2) for 2D surfaces.
+            g_ij (AbstractTensor.Tensor): Metric tensor with shape (..., 2, 2) for 2D surfaces.
 
         Returns:
-            torch.Tensor: Frobenius norm of the metric tensor.
+            AbstractTensor.Tensor: Frobenius norm of the metric tensor.
         """
-        self.frobenius_norm = torch.sqrt(torch.sum(g_ij**2, dim=(-2, -1)))
+        self.frobenius_norm = AbstractTensor.sqrt(AbstractTensor.sum(g_ij**2, dim=(-2, -1)))
         return self.frobenius_norm
 
     def compute_partials_and_normals(self, U, V, W, validate_normals=True, diagnostic_mode=False):
@@ -1029,32 +1015,32 @@ class TransformHub:
             print("Z:", Z)
 
         # Calculate partial derivatives with respect to U
-        dXdu = torch.autograd.grad(X, U, grad_outputs=torch.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdu = torch.autograd.grad(Y, U, grad_outputs=torch.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdu = torch.autograd.grad(Z, U, grad_outputs=torch.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdu = AbstractTensor.autograd.grad(X, U, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
+        dYdu = AbstractTensor.autograd.grad(Y, U, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
+        dZdu = AbstractTensor.autograd.grad(Z, U, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
 
         # Calculate partial derivatives with respect to V
-        dXdv = torch.autograd.grad(X, V, grad_outputs=torch.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdv = torch.autograd.grad(Y, V, grad_outputs=torch.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdv = torch.autograd.grad(Z, V, grad_outputs=torch.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdv = AbstractTensor.autograd.grad(X, V, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
+        dYdv = AbstractTensor.autograd.grad(Y, V, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
+        dZdv = AbstractTensor.autograd.grad(Z, V, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
 
         # Calculate partial derivatives with respect to W
-        dXdw = torch.autograd.grad(X, W, grad_outputs=torch.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdw = torch.autograd.grad(Y, W, grad_outputs=torch.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdw = torch.autograd.grad(Z, W, grad_outputs=torch.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdw = AbstractTensor.autograd.grad(X, W, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
+        dYdw = AbstractTensor.autograd.grad(Y, W, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
+        dZdw = AbstractTensor.autograd.grad(Z, W, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
 
         target_shape = U.shape  # (N_u, N_v, N_w)
 
         # Handle None values from autograd
-        dXdu = dXdu if dXdu is not None else torch.zeros(target_shape).to(U.device)
-        dYdu = dYdu if dYdu is not None else torch.zeros(target_shape).to(U.device)
-        dZdu = dZdu if dZdu is not None else torch.zeros(target_shape).to(U.device)
-        dXdv = dXdv if dXdv is not None else torch.zeros(target_shape).to(V.device)
-        dYdv = dYdv if dYdv is not None else torch.zeros(target_shape).to(V.device)
-        dZdv = dZdv if dZdv is not None else torch.zeros(target_shape).to(V.device)
-        dXdw = dXdw if dXdw is not None else torch.zeros(target_shape).to(W.device)
-        dYdw = dYdw if dYdw is not None else torch.zeros(target_shape).to(W.device)
-        dZdw = dZdw if dZdw is not None else torch.zeros(target_shape).to(W.device)
+        dXdu = dXdu if dXdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
+        dYdu = dYdu if dYdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
+        dZdu = dZdu if dZdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
+        dXdv = dXdv if dXdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
+        dYdv = dYdv if dYdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
+        dZdv = dZdv if dZdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
+        dXdw = dXdw if dXdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
+        dYdw = dYdw if dYdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
+        dZdw = dZdw if dZdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
 
         if diagnostic_mode:
             print("Partial Derivatives:")
@@ -1069,18 +1055,18 @@ class TransformHub:
             print("dZdw:", dZdw)
 
         # Compute normals as cross-product of partial derivatives
-        normals = torch.stack([
-            torch.linalg.cross(torch.stack([dXdu, dYdu, dZdu], dim=-1), torch.stack([dXdv, dYdv, dZdv], dim=-1), dim=-1),
-            torch.linalg.cross(torch.stack([dXdv, dYdv, dZdv], dim=-1), torch.stack([dXdw, dYdw, dZdw], dim=-1), dim=-1),
-            torch.linalg.cross(torch.stack([dXdw, dYdw, dZdw], dim=-1), torch.stack([dXdu, dYdu, dZdu], dim=-1), dim=-1)
+        normals = AbstractTensor.stack([
+            AbstractTensor.linalg.cross(AbstractTensor.stack([dXdu, dYdu, dZdu], dim=-1), AbstractTensor.stack([dXdv, dYdv, dZdv], dim=-1), dim=-1),
+            AbstractTensor.linalg.cross(AbstractTensor.stack([dXdv, dYdv, dZdv], dim=-1), AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), dim=-1),
+            AbstractTensor.linalg.cross(AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), AbstractTensor.stack([dXdu, dYdu, dZdu], dim=-1), dim=-1)
         ], dim=-1)
 
         # Compute distances from the origin
-        distances = torch.sqrt(X**2 + Y**2 + Z**2)
+        distances = AbstractTensor.sqrt(X**2 + Y**2 + Z**2)
 
         # Select the top 10% farthest points
         top_10_percent_threshold = max(1, int(0.1 * distances.numel()))
-        top_10_percent_indices = torch.topk(distances.flatten(), top_10_percent_threshold).indices
+        top_10_percent_indices = AbstractTensor.topk(distances.flatten(), top_10_percent_threshold).indices
 
         # Randomly sample 10% of the top 10% farthest points
         sample_size = max(1, int(0.1 * top_10_percent_threshold))
@@ -1091,8 +1077,8 @@ class TransformHub:
         inward_votes = 0
         grid_shape = distances.shape  # (N_u, N_v, N_w)
         for idx in sample_indices:
-            i, j, k = np.unravel_index(idx, grid_shape)  # Convert flat index to 3D grid indices
-            farthest_point = torch.tensor([X[i, j, k], Y[i, j, k], Z[i, j, k]], device=U.device, dtype=U.dtype)
+            i, j, k = AbstractTensor.unravel_index(idx, grid_shape)  # Convert flat index to 3D grid indices
+            farthest_point = AbstractTensor.tensor([X[i, j, k], Y[i, j, k], Z[i, j, k]], device=U.device, dtype=U.dtype)
             outward_reference_point = 1.01 * farthest_point  # 1% further outward
 
             # Directional check based on the sampled normal and reference point
@@ -1100,9 +1086,9 @@ class TransformHub:
             direction_to_reference = outward_reference_point - farthest_point
             # Ensure sample_normal and direction_to_reference are broadcastable
             if sample_normal.dim() == 2 and direction_to_reference.dim() == 1:
-                dot_product = torch.einsum('ij,j->i', sample_normal, direction_to_reference)
+                dot_product = AbstractTensor.einsum('ij,j->i', sample_normal, direction_to_reference)
             else:
-                dot_product = torch.dot(sample_normal, direction_to_reference)
+                dot_product = AbstractTensor.dot(sample_normal, direction_to_reference)
 
             if (dot_product > 0).all():
                 outward_votes += 1
@@ -1114,21 +1100,21 @@ class TransformHub:
             normals = -normals
 
         # Continue with normalization and validation
-        norm_magnitudes = torch.norm(normals, dim=-1, keepdim=True)
+        norm_magnitudes = AbstractTensor.norm(normals, dim=-1, keepdim=True)
 
         # Normalize normals, avoid division by zero for zero-magnitude normals
-        normals = torch.where(norm_magnitudes > 1e-16, normals / norm_magnitudes, normals)
+        normals = AbstractTensor.where(norm_magnitudes > 1e-16, normals / norm_magnitudes, normals)
 
         # Identify zero-magnitude normals
         zero_norm_mask = norm_magnitudes.squeeze() < 1e-16  # Boolean mask for zero-magnitude normals
 
-        if torch.any(zero_norm_mask):
-            count_zero_normals = torch.sum(zero_norm_mask).item()  # Number of zero-magnitude normals
+        if AbstractTensor.any(zero_norm_mask):
+            count_zero_normals = AbstractTensor.sum(zero_norm_mask).item()  # Number of zero-magnitude normals
             print(f"{count_zero_normals} out of {normals.numel()} zero-magnitude normals detected.")
 
             if diagnostic_mode:
                 # Find the indices of the first zero-magnitude normal
-                zero_indices = torch.nonzero(zero_norm_mask, as_tuple=True)
+                zero_indices = AbstractTensor.nonzero(zero_norm_mask, as_tuple=True)
                 first_zero_idx = (zero_indices[0][0].item(), zero_indices[1][0].item(), zero_indices[2][0].item())
 
                 print(f"First zero-magnitude normal at index: {first_zero_idx}")
@@ -1160,7 +1146,7 @@ class TransformHub:
                 print("Repairing zero-magnitude normals.")
 
                 # Repair zero-magnitude normals by averaging surrounding normals
-                zero_indices = torch.nonzero(zero_norm_mask, as_tuple=True)
+                zero_indices = AbstractTensor.nonzero(zero_norm_mask, as_tuple=True)
                 for idx in zip(*zero_indices):
                     # Collect neighboring normals
                     neighbors = []
@@ -1178,8 +1164,8 @@ class TransformHub:
                                     if neighbor_magnitude > 1e-16:
                                         neighbors.append(neighbor_normal)
                     if neighbors:
-                        avg_normal = torch.mean(torch.stack(neighbors), dim=0)
-                        avg_normal_norm = torch.norm(avg_normal)
+                        avg_normal = AbstractTensor.mean(AbstractTensor.stack(neighbors), dim=0)
+                        avg_normal_norm = AbstractTensor.norm(avg_normal)
                         if avg_normal_norm > 1e-16:
                             normals[idx[0], idx[1], idx[2]] = avg_normal / avg_normal_norm  # Normalize average
                         else:
@@ -1189,13 +1175,13 @@ class TransformHub:
 
         if validate_normals:
             # Validation checks for the final normals
-            if torch.any(torch.isnan(normals)):
+            if AbstractTensor.any(AbstractTensor.isnan(normals)):
                 print("Validation failed: NaN values detected in normals.")
                 exit()
-            if not torch.all(torch.isfinite(normals)):
+            if not AbstractTensor.all(AbstractTensor.isfinite(normals)):
                 print("Validation failed: Non-finite values detected in normals.")
                 exit()
-            if not torch.allclose(torch.norm(normals, dim=-1), torch.ones_like(norm_magnitudes.squeeze()), atol=1e-5):
+            if not AbstractTensor.allclose(AbstractTensor.norm(normals, dim=-1), AbstractTensor.ones_like(norm_magnitudes.squeeze()), atol=1e-5):
                 print("Validation failed: Normals are not unit length within tolerance after normalization.")
                 exit()
 
@@ -1211,11 +1197,11 @@ class TransformHub:
         Helper to compute partials if they are not provided.
         
         Args:
-            U, V (torch.Tensor): Parameter grids.
-            dX_dU, dY_dU, dX_dV, dY_dV, dZ_dU, dZ_dV (torch.Tensor or None): Optional partials.
+            U, V (AbstractTensor.Tensor): Parameter grids.
+            dX_dU, dY_dU, dX_dV, dY_dV, dZ_dU, dZ_dV (AbstractTensor.Tensor or None): Optional partials.
         
         Returns:
-            Tuple[torch.Tensor]: Partial derivatives.
+            Tuple[AbstractTensor.Tensor]: Partial derivatives.
         """
         _, _, _, dX_dU, dY_dU, dZ_dU, dX_dV, dY_dV, dZ_dV, dXdw, dYdw, dZdw, _ = self.compute_partials_and_normals(U, V, W)
         return dX_dU, dY_dU, dZ_dU, dX_dV, dY_dV, dZ_dV, dXdw, dYdw, dZdw
@@ -1228,11 +1214,11 @@ class TransformHub:
         Enhanced metric tensor function for 3D geometry, calculated adaptively using partial derivatives.
         
         Args:
-            U, V, W (torch.Tensor): Grids for parameter space.
-            Partial derivatives dX_dU, dY_dU, ..., dZ_dW (torch.Tensor): Optional precomputed partial derivatives.
+            U, V, W (AbstractTensor.Tensor): Grids for parameter space.
+            Partial derivatives dX_dU, dY_dU, ..., dZ_dW (AbstractTensor.Tensor): Optional precomputed partial derivatives.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Metric tensor (g_ij), its inverse (g_inv), and determinant (det_g).
+            Tuple[AbstractTensor.Tensor, AbstractTensor.Tensor, AbstractTensor.Tensor]: Metric tensor (g_ij), its inverse (g_inv), and determinant (det_g).
         """
         # Compute partial derivatives if not provided
         dX_dU, dY_dU, dZ_dU, dX_dV, dY_dV, dZ_dV, dX_dW, dY_dW, dZ_dW = self.get_or_compute_partials(U, V, W)
@@ -1246,20 +1232,20 @@ class TransformHub:
         g_vw = dX_dV * dX_dW + dY_dV * dY_dW + dZ_dV * dZ_dW
 
         # Stack into a symmetric 3x3 metric tensor
-        g_ij = torch.stack([
-            torch.stack([g_uu, g_uv, g_uw], dim=-1),
-            torch.stack([g_uv, g_vv, g_vw], dim=-1),
-            torch.stack([g_uw, g_vw, g_ww], dim=-1)
+        g_ij = AbstractTensor.stack([
+            AbstractTensor.stack([g_uu, g_uv, g_uw], dim=-1),
+            AbstractTensor.stack([g_uv, g_vv, g_vw], dim=-1),
+            AbstractTensor.stack([g_uw, g_vw, g_ww], dim=-1)
         ], dim=-2)
 
         # Determinant of the 3x3 metric tensor
         det_g = (g_uu * (g_vv * g_ww - g_vw**2) - 
                 g_uv * (g_uv * g_ww - g_vw * g_uw) +
                 g_uw * (g_uv * g_vw - g_vv * g_uw))
-        det_g = torch.clamp(det_g, min=1e-6)  # Avoid singularities
+        det_g = AbstractTensor.clamp(det_g, min=1e-6)  # Avoid singularities
 
         # Inverse metric tensor g_inv using explicit formula for 3x3 matrices
-        g_inv = torch.zeros_like(g_ij)
+        g_inv = AbstractTensor.zeros_like(g_ij)
         g_inv[..., 0, 0] = (g_vv * g_ww - g_vw**2) / det_g
         g_inv[..., 0, 1] = (g_uw * g_vw - g_uv * g_ww) / det_g
         g_inv[..., 0, 2] = (g_uv * g_vw - g_uw * g_vv) / det_g
@@ -1283,19 +1269,19 @@ def validate_transform_hub():
 
     # Create a small grid and edges for testing
     N = 3
-    U_lin = torch.linspace(0, 1, N)
-    V_lin = torch.linspace(0, 1, N)
-    W_lin = torch.linspace(0, 1, N)
-    U, V, W = torch.meshgrid(U_lin, V_lin, W_lin)
+    U_lin = AbstractTensor.linspace(0, 1, N)
+    V_lin = AbstractTensor.linspace(0, 1, N)
+    W_lin = AbstractTensor.linspace(0, 1, N)
+    U, V, W = AbstractTensor.meshgrid(U_lin, V_lin, W_lin)
     # Flatten to list vertices
     num_vertices = U.numel()
-    vertices = torch.arange(num_vertices)
+    vertices = AbstractTensor.arange(num_vertices)
 
     # Simple edge index: connect each vertex to next in a line for demonstration
     edges = []
     for i in range(num_vertices-1):
         edges.append([i, i+1])
-    edge_index = torch.tensor(edges, dtype=torch.long)
+    edge_index = AbstractTensor.tensor(edges, dtype=AbstractTensor.long)
 
     hub = IdentityTransform(1.0, 1.0, (True, True, True, True))
     geometry = hub.calculate_geometry(U, V, W, edge_index=edge_index, detect_faces=True)
@@ -1307,8 +1293,8 @@ def validate_transform_hub():
     # lies in the kernel of d0.
     d0 = geometry["DEC"]["d_operators"]["d0"]
     row_sum = d0.sum(dim=1)
-    assert torch.allclose(
-        row_sum, torch.zeros_like(row_sum), atol=1e-8
+    assert AbstractTensor.allclose(
+        row_sum, AbstractTensor.zeros_like(row_sum), atol=1e-8
     ), "Edge incidences should sum to zero."
 
     print("Validation successful. Edge incidences sum to zero and faces detected (if any).")
@@ -1329,8 +1315,7 @@ def unpack_values(returned_values, n_desired):
     A tuple of length n_desired with values or None.
     """
     return (returned_values + (None,) * n_desired)[:n_desired]
-import torch
-import numpy as np
+
 
 class PeriodicLinspace:
     def __init__(self, min_density=0.5, max_density=1.5, num_oscillations=1):
@@ -1339,37 +1324,35 @@ class PeriodicLinspace:
         self.num_oscillations = num_oscillations
 
     def sin(self, normalized_i):
-        return self._oscillate(torch.sin, normalized_i)
+        return self._oscillate(AbstractTensor.sin, normalized_i)
 
     def cos(self, normalized_i):
-        return self._oscillate(torch.cos, normalized_i)
+        return self._oscillate(AbstractTensor.cos, normalized_i)
 
     def tan(self, normalized_i):
-        density = self._oscillate(torch.tan, normalized_i)
-        return torch.clamp(density, min=self.min_density, max=self.max_density)
+        density = self._oscillate(AbstractTensor.tan, normalized_i)
+        return AbstractTensor.clamp(density, min=self.min_density, max=self.max_density)
 
     def cot(self, normalized_i):
-        density = self._oscillate(lambda x: 1 / torch.tan(x + 1e-6), normalized_i)
-        return torch.clamp(density, min=self.min_density, max=self.max_density)
+        density = self._oscillate(lambda x: 1 / AbstractTensor.tan(x + 1e-6), normalized_i)
+        return AbstractTensor.clamp(density, min=self.min_density, max=self.max_density)
 
     def exp_sin(self, normalized_i):
-        density = self._oscillate(lambda x: torch.exp(torch.sin(x)), normalized_i)
-        return torch.clamp(density, min=self.min_density, max=self.max_density)
+        density = self._oscillate(lambda x: AbstractTensor.exp(AbstractTensor.sin(x)), normalized_i)
+        return AbstractTensor.clamp(density, min=self.min_density, max=self.max_density)
 
     def exp_cos(self, normalized_i):
-        density = self._oscillate(lambda x: torch.exp(torch.cos(x)), normalized_i)
-        return torch.clamp(density, min=self.min_density, max=self.max_density)
+        density = self._oscillate(lambda x: AbstractTensor.exp(AbstractTensor.cos(x)), normalized_i)
+        return AbstractTensor.clamp(density, min=self.min_density, max=self.max_density)
 
     def _oscillate(self, func, normalized_i):
-        phase_shifted_i = 2 * np.pi * self.num_oscillations * normalized_i - np.pi / 2
+        phase_shifted_i = 2 * AbstractTensor.pi * self.num_oscillations * normalized_i - AbstractTensor.pi / 2
         return self.min_density + (self.max_density - self.min_density) * 0.5 * (1 + func(phase_shifted_i))
 
     def get_density(self, normalized_i, oscillation_type):
         if not hasattr(self, oscillation_type):
             raise ValueError(f"Unknown oscillation_type: '{oscillation_type}'.")
         return getattr(self, oscillation_type)(normalized_i)
-import torch
-import numpy as np
 
 class GridDomain:
     def __init__(self, U, V, W, u_mode=None, u_p=1, v_mode=None, v_p=1, w_mode=None, w_p=1,
@@ -1427,11 +1410,11 @@ class GridDomain:
         self.normalized_W = self.normalize_grid(self.W, self.extent_w)
 
         # Step 4: Create a combined normalized grid for interpolation
-        self.normalized_grid = torch.stack([self.normalized_U, self.normalized_V, self.normalized_W], dim=-1).unsqueeze(0)
+        self.normalized_grid = AbstractTensor.stack([self.normalized_U, self.normalized_V, self.normalized_W], dim=-1).unsqueeze(0)
 
     @staticmethod
     def generate_grid_domain(coordinate_system, N_u, N_v, N_w, u_mode=None, v_mode=None, w_mode=None,
-                            device='cpu', precision=torch.float64, **kwargs):
+                            device='cpu', precision=AbstractTensor.float_dtype_, **kwargs):
         """
         Generates a GridDomain object based on the coordinate system and its parameters.
         """
@@ -1480,7 +1463,7 @@ class GridDomain:
             )
 
             # Create U, V, W meshgrids
-            U, V, W = torch.meshgrid(u_grid, v_grid, w_grid, indexing='ij')
+            U, V, W = AbstractTensor.meshgrid(u_grid, v_grid, w_grid, indexing='ij')
 
         # Create and return the GridDomain
         return GridDomain(U, V, W, transform=transform, coordinate_system=coordinate_system)
@@ -1527,7 +1510,7 @@ class GridDomain:
         )
 
         # Create the high-resolution meshgrid
-        U_high_res, V_high_res = torch.meshgrid(u_high_res, v_high_res, indexing='ij')
+        U_high_res, V_high_res = AbstractTensor.meshgrid(u_high_res, v_high_res, indexing='ij')
 
         # Normalize if required
         if normalize:
@@ -1627,7 +1610,7 @@ class GridDomain:
     
 def generate_grid(N, L, method='linear', p=2.0, min_density=0.5,
                   max_density=1.5, num_oscillations=1, keep_end=True, periodic=False,
-                  oscillation_type='sin', device='cpu', dtype=torch.float64):
+                  oscillation_type='sin', device='cpu', dtype=AbstractTensor.float_dtype_):
     """
     Generates a grid with various spacing methods and calculates infinitesimal values.
     
@@ -1638,7 +1621,7 @@ def generate_grid(N, L, method='linear', p=2.0, min_density=0.5,
         raise ValueError("N must be at least 2.")
 
     # Generate indices and normalize
-    i = torch.arange(0, N, device=device, dtype=dtype)
+    i = AbstractTensor.arange(0, N, device=device, dtype=dtype)
     normalized_i = i / (N - 1 if keep_end else N)
 
     if method == 'linear':
@@ -1651,7 +1634,7 @@ def generate_grid(N, L, method='linear', p=2.0, min_density=0.5,
         # Use PeriodicLinspace for density modulation
         periodic_gen = PeriodicLinspace(min_density, max_density, num_oscillations)
         density = periodic_gen.get_density(normalized_i, oscillation_type)
-        grid = torch.cumsum(density, dim=0)
+        grid = AbstractTensor.cumsum(density, dim=0)
         grid = grid / grid[-1] * L  # Normalize to fit within length L
     elif method == 'dense_extremes':
         grid = L * 0.5 * (normalized_i ** p + (1 - (1 - normalized_i) ** p))
@@ -1659,7 +1642,7 @@ def generate_grid(N, L, method='linear', p=2.0, min_density=0.5,
         raise ValueError(f"Unknown method: {method}. Use 'linear', 'non_uniform', 'inverted', 'periodic', or 'dense_extremes'.")
 
     # Compute infinitesimal values
-    infinitesimal = torch.zeros(N, device=device, dtype=dtype)
+    infinitesimal = AbstractTensor.zeros(N, device=device, dtype=dtype)
     infinitesimal[:-1] = grid[1:] - grid[:-1]
 
     if not keep_end:
@@ -1680,10 +1663,10 @@ def generate_full_meshgrid(N_u, L_u, N_v, L_v, N_w, L_w, periodic_u=True, period
     W, W_prime = generate_grid(N_w, L_w, method=wmethod, p=wpow, periodic=periodic_w, keep_end=not periodic_w, device=device, **kwargs)
     
     # Create full 3D meshgrid for U, V, W
-    U_mesh, V_mesh, W_mesh = torch.meshgrid(U, V, W, indexing='ij')
+    U_mesh, V_mesh, W_mesh = AbstractTensor.meshgrid(U, V, W, indexing='ij')
     
     # Create full 3D meshgrid for infinitesimal U', V', W'
-    U_prime_mesh, V_prime_mesh, W_prime_mesh = torch.meshgrid(U_prime, V_prime, W_prime, indexing='ij')
+    U_prime_mesh, V_prime_mesh, W_prime_mesh = AbstractTensor.meshgrid(U_prime, V_prime, W_prime, indexing='ij')
 
     return U_mesh, V_mesh, W_mesh, U_prime_mesh, V_prime_mesh, W_prime_mesh
 
@@ -1699,7 +1682,7 @@ class Transform(TransformHub):
         Transform coordinates using either spatial or metric transformation.
 
         Args:
-            U, V (torch.Tensor): Parameter grids.
+            U, V (AbstractTensor.Tensor): Parameter grids.
             use_metric (bool): Whether to use the metric transformation.
 
         Returns:
@@ -1714,7 +1697,7 @@ class Transform(TransformHub):
         Convert 2D parameter data to 3D coordinates and prepare for rendering.
 
         Args:
-            data_2d (torch.Tensor): Stacked 2D data in U, V parameter space.
+            data_2d (AbstractTensor.Tensor): Stacked 2D data in U, V parameter space.
             use_metric (bool): Whether to use the metric transformation.
 
         Returns:
@@ -1741,7 +1724,7 @@ class Transform(TransformHub):
         if data_2d.ndimension() == 2:
             data_3d = data_2d.flatten()
         else:
-            data_3d = torch.stack([data_2d[i].flatten() for i in range(data_2d.shape[0])])
+            data_3d = AbstractTensor.stack([data_2d[i].flatten() for i in range(data_2d.shape[0])])
 
         return vertices, indices, normals, data_3d
 
@@ -1749,9 +1732,9 @@ class Transform(TransformHub):
         if getattr(self, "autogrid", False):
             return self.obtain_autogrid()
         else:
-            u_values = torch.linspace(0, self.uextent, resolution_u)
-            v_values = torch.linspace(0, self.vextent, resolution_v)
-            U, V = torch.meshgrid(u_values, v_values, indexing='ij')
+            u_values = AbstractTensor.linspace(0, self.uextent, resolution_u)
+            v_values = AbstractTensor.linspace(0, self.vextent, resolution_v)
+            U, V = AbstractTensor.meshgrid(u_values, v_values, indexing='ij')
             return U, V
 
     
@@ -1802,14 +1785,14 @@ class Transform(TransformHub):
                     indices.append((resolution_u - 1) * resolution_v)   # Last row, first column
                     indices.append(0)                                   # First row, first column
                     
-        return torch.tensor(indices, dtype=torch.int32)
+        return AbstractTensor.tensor(indices, dtype=AbstractTensor.int32)
 
 
     def prepare_mesh_for_rendering(self, X, Y, Z):
         X_flat = X.flatten()
         Y_flat = Y.flatten()
         Z_flat = Z.flatten()
-        return torch.stack([X_flat, Y_flat, Z_flat], dim=-1)
+        return AbstractTensor.stack([X_flat, Y_flat, Z_flat], dim=-1)
 
     @classmethod
     def create_transform(cls, type_of_transform, **kwargs):
@@ -1895,7 +1878,7 @@ def test_build_laplace3d():
     build_laplace = BuildLaplace3D(
         grid_domain=grid_domain,
         wave_speed=343,  # Arbitrary value
-        precision=torch.float64,
+        precision=AbstractTensor.float_dtype_,
         resolution=20,  # Should match N_u, N_v, N_w
         metric_tensor_func=None,  # Use default Euclidean metric
         density_func=None,        # Uniform density
@@ -1920,11 +1903,11 @@ def test_build_laplace3d():
     X = grid_u.numpy()
     Y = grid_v.numpy()
     Z = grid_w.numpy()
-    f = np.sin(np.pi * X) * np.sin(np.pi * Y) * np.sin(np.pi * Z)
+    f = AbstractTensor.sin(AbstractTensor.pi * X) * AbstractTensor.sin(AbstractTensor.pi * Y) * AbstractTensor.sin(AbstractTensor.pi * Z)
     f_flat = f.flatten()
 
-    # Convert f_flat to a Torch tensor
-    f_tensor = torch.tensor(f_flat, dtype=torch.float64, device=device)
+    # Convert f_flat to a AbstractTensor tensor
+    f_tensor = AbstractTensor.tensor(f_flat, dtype=AbstractTensor.float_dtype_, device=device)
 
     # Apply the Laplacian matrix to f
     if laplacian_tensor is not None:
@@ -1932,23 +1915,23 @@ def test_build_laplace3d():
         laplace_f_numerical = -laplacian_tensor @ f_tensor
     else:
         # Sparse Laplacian
-        # Convert sparse matrix to Torch sparse tensor
-        indices = torch.tensor([laplacian_sparse.row, laplacian_sparse.col], dtype=torch.long)
-        values = torch.tensor(laplacian_sparse.data, dtype=torch.float64)
-        laplacian_sparse_torch = torch.sparse_coo_tensor(indices, values, size=(N_u * N_v * N_w, N_u * N_v * N_w)).to(device)
-        laplace_f_numerical = torch.sparse.mm(laplacian_sparse_torch, f_tensor.unsqueeze(1)).squeeze(1)
+        # Convert sparse matrix to AbstractTensor sparse tensor
+        indices = AbstractTensor.tensor([laplacian_sparse.row, laplacian_sparse.col], dtype=AbstractTensor.long)
+        values = AbstractTensor.tensor(laplacian_sparse.data, dtype=AbstractTensor.float_dtype_)
+        laplacian_sparse_AbstractTensor = AbstractTensor.sparse_coo_tensor(indices, values, size=(N_u * N_v * N_w, N_u * N_v * N_w)).to(device)
+        laplace_f_numerical = AbstractTensor.sparse.mm(laplacian_sparse_AbstractTensor, f_tensor.unsqueeze(1)).squeeze(1)
 
     # Compute the analytical Laplacian: -3 pi^2 f
     laplace_f_analytical = -3 * (math.pi ** 2) * f_flat
     # Note: Do NOT scale the analytical Laplacian
 
     # Convert laplace_f_numerical to numpy for comparison
-    laplace_f_numerical_np = laplace_f_numerical.cpu().numpy()
+    laplace_f_numerical_arr = laplace_f_numerical.cpu().numpy()
 
     # Compute the error
-    error = laplace_f_numerical_np/min(laplace_f_numerical_np) - laplace_f_analytical/min(laplace_f_analytical)
-    max_error = np.max(np.abs(error))
-    mean_error = np.mean(np.abs(error))
+    error = laplace_f_numerical_arr/min(laplace_f_numerical_arr) - laplace_f_analytical/min(laplace_f_analytical)
+    max_error = AbstractTensor.max(AbstractTensor.abs(error))
+    mean_error = AbstractTensor.mean(AbstractTensor.abs(error))
 
     print(f"Max Error: {max_error:.6e}")
     print(f"Mean Error: {mean_error:.6e}")
@@ -1956,7 +1939,7 @@ def test_build_laplace3d():
     # Visualization (optional)
     # Compare a central slice
     central_slice = N_w // 2
-    laplace_f_numerical_reshaped = laplace_f_numerical_np.reshape(N_u, N_v, N_w)
+    laplace_f_numerical_reshaped = laplace_f_numerical_arr.reshape(N_u, N_v, N_w)
     laplace_f_analytical_reshaped = laplace_f_analytical.reshape(N_u, N_v, N_w)
     error_reshaped = error.reshape(N_u, N_v, N_w)
 
@@ -1988,8 +1971,6 @@ def test_build_laplace3d():
 
 
 
-import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 # dt_system imports
 from src.common.dt_system.engine_api import DtCompatibleEngine
@@ -2002,7 +1983,7 @@ class HeatEngine(DtCompatibleEngine):
         self.laplacian_tensor = laplacian_tensor
         self.alpha = alpha
         self.temperature = initial_temperature.flatten().copy()
-        self.N_u = int(np.cbrt(len(self.temperature)))
+        self.N_u = int(AbstractTensor.cbrt(len(self.temperature)))
         self.prev_temperature = self.temperature.copy()
         self.step_count = 0
         # Compute dx from grid size (assume unit cube)
@@ -2015,14 +1996,14 @@ class HeatEngine(DtCompatibleEngine):
         self.prev_temperature = self.temperature.copy()
         self.temperature += -self.alpha * dt * (self.laplacian_tensor @ self.temperature)
         # Relative system energy change (L2 norm)
-        prev_energy = np.linalg.norm(self.prev_temperature)
-        curr_energy = np.linalg.norm(self.temperature)
+        prev_energy = AbstractTensor.linalg.norm(self.prev_temperature)
+        curr_energy = AbstractTensor.linalg.norm(self.temperature)
         rel_energy_change = abs(curr_energy - prev_energy) / (prev_energy + 1e-12)
         # Clamp negative temperatures (optional: warn)
-        if np.any(self.temperature < 0):
+        if AbstractTensor.any(self.temperature < 0):
             import warnings
             warnings.warn("Negative temperature detected; clamping to zero.")
-            self.temperature = np.maximum(self.temperature, 0)
+            self.temperature = AbstractTensor.maximum(self.temperature, 0)
         metrics = Metrics(
             max_vel=rel_energy_change,
             max_flux=0.0,
@@ -2054,15 +2035,15 @@ def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.
         laplacian_tensor = laplacian_tensor.cpu().numpy()
 
     initial_temperature = initial_temperature.flatten()
-    N_u = int(np.cbrt(len(initial_temperature)))
+    N_u = int(AbstractTensor.cbrt(len(initial_temperature)))
 
     engine = HeatEngine(laplacian_tensor, initial_temperature, alpha)
 
     fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
     ax.set_box_aspect([1, 1, 1])
-    x = np.linspace(0, 1, N_u)
-    y = np.linspace(0, 1, N_u)
-    X, Y = np.meshgrid(x, y)
+    x = AbstractTensor.linspace(0, 1, N_u)
+    y = AbstractTensor.linspace(0, 1, N_u)
+    X, Y = AbstractTensor.meshgrid(x, y)
     surface = None
     plot_state = {"surface": None}
 
@@ -2127,7 +2108,7 @@ if __name__ == "__main__":
     build_laplace = BuildLaplace3D(
         grid_domain=grid_domain,
         wave_speed=343,  # Arbitrary value
-        precision=torch.float64,
+        precision=AbstractTensor.float_dtype_,
         resolution=N_u,  # Should match N_u, N_v, N_w
         metric_tensor_func=None,  # Use default Euclidean metric
         density_func=None,        # Uniform density
@@ -2148,11 +2129,11 @@ if __name__ == "__main__":
     )
 
     # Initial temperature: Gaussian in the center
-    x = np.linspace(0, 1, N_u)
-    y = np.linspace(0, 1, N_v)
-    z = np.linspace(0, 1, N_w)
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    initial_temperature = np.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
+    x = AbstractTensor.linspace(0, 1, N_u)
+    y = AbstractTensor.linspace(0, 1, N_v)
+    z = AbstractTensor.linspace(0, 1, N_w)
+    X, Y, Z = AbstractTensor.meshgrid(x, y, z, indexing='ij')
+    initial_temperature = AbstractTensor.exp(-50 * ((X - 0.5)**2 + (Y - 0.5)**2 + (Z - 0.5)**2))
 
     # Run the demo
     heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.01, steps=200)

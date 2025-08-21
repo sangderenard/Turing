@@ -330,9 +330,7 @@ class PurePythonTensorOperations(AbstractTensor):
 
         return rec(self.data, value)
 
-    def arange_(self, start: int, end: Optional[int] = None, step: int = 1, device: Any = None, dtype: Any = None) -> Any:
-        if end is None:
-            return list(range(start))
+    def arange_(self, start: int, end: int, step: int = 1, *, dtype: Any = None, device: Any = None) -> Any:
         return list(range(start, end, step))
 
     def select_by_indices_(self, tensor: Any, indices_dim0: Any, indices_dim1: Any) -> Any:

@@ -301,8 +301,9 @@ class CTensorOperations(AbstractTensor):
         start: int,
         end: Optional[int] = None,
         step: int = 1,
-        device: Any = None,
+        *,
         dtype: Any = None,
+        device: Any = None,
     ) -> CTensor:
         if end is None:
             n = start

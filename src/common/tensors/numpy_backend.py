@@ -334,10 +334,8 @@ class NumPyTensorOperations(AbstractTensor):
         value = value.data if isinstance(value, AbstractTensor) else value
         return self.data != value
 
-    def arange_(self, start, end=None, step=1, device=None, dtype=None):
+    def arange_(self, start, end, step=1, *, dtype=None, device=None):
         np_dtype = self._torch_dtype_to_numpy(dtype) if dtype is not None else None
-        if end is None:
-            return np.arange(start, dtype=np_dtype)
         return np.arange(start, end, step, dtype=np_dtype)
 
     def select_by_indices_(self, tensor, indices_dim0, indices_dim1):
