@@ -1278,12 +1278,18 @@ def validate_transform_hub():
     hub = IdentityTransform(1.0, 1.0, (True, True, True, True))
     geometry = hub.calculate_geometry(U, V, W, edge_index=edge_index, detect_faces=True)
 
-    # Validate d0^T d0 = 0
+    # Validate that each edge has zero net incidence.
+    # In a proper incidence matrix every row should sum to zero
+    # because edges connect exactly two vertices with opposite
+    # orientation.  This property ensures that a constant 0-form
+    # lies in the kernel of d0.
     d0 = geometry["DEC"]["d_operators"]["d0"]
-    d0t_d0 = torch.mm(d0.T, d0)
-    assert torch.allclose(d0t_d0, torch.zeros_like(d0t_d0), atol=1e-8), "d0^T d0 != 0. Exactness violated."
+    row_sum = d0.sum(dim=1)
+    assert torch.allclose(
+        row_sum, torch.zeros_like(row_sum), atol=1e-8
+    ), "Edge incidences should sum to zero."
 
-    print("Validation successful. d0^T d0 = 0 and faces detected (if any).")
+    print("Validation successful. Edge incidences sum to zero and faces detected (if any).")
 
 if __name__ == "__main__":
     validate_transform_hub()
