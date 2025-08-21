@@ -108,3 +108,81 @@ def meshgrid(*vectors, indexing: str = "ij", copy: bool = False, as_class: bool 
             grids.append(g)
 
     return MeshGrid(grids) if as_class else tuple(grids)
+
+
+# ---------------------------------------------------------------------------
+# Basic tensor creation helpers
+
+
+def _resolve_cls(cls):
+    """Best-effort backend class resolution.
+
+    Mirrors the lazy backend selection used in :func:`AbstractTensor.arange`.
+    """
+    if cls is not None:
+        return cls
+    from ..abstraction import BACKEND_REGISTRY  # Local import to avoid circular dependency
+
+    for backend_name in ("torch", "numpy", "pure_python"):
+        backend_cls = BACKEND_REGISTRY.get(backend_name)
+        if backend_cls is not None:
+            return backend_cls
+    raise RuntimeError("No tensor backend available for tensor creation.")
+
+
+def zeros(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
+    """Create a tensor filled with zeros using the requested backend."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
+    cls = _resolve_cls(cls)
+    inst = cls(track_time=False)
+    inst.data = inst.zeros_(size, dtype, device)
+    return inst
+
+
+def ones(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
+    """Create a tensor filled with ones using the requested backend."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
+    cls = _resolve_cls(cls)
+    inst = cls(track_time=False)
+    inst.data = inst.ones_(size, dtype, device)
+    return inst
+
+
+def full(
+    size: Tuple[int, ...],
+    fill_value: Any,
+    dtype: Any = None,
+    device: Any = None,
+    *,
+    cls=None,
+):
+    """Create a tensor of ``size`` filled with ``fill_value`` using the backend."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
+    cls = _resolve_cls(cls)
+    inst = cls(track_time=False)
+    inst.data = inst.full_(size, fill_value, dtype, device)
+    return inst
+
+
+def zeros_like(tensor, dtype: Any = None, device: Any = None):
+    """Return a zeros tensor with the same shape as ``tensor``."""
+    result = type(tensor)(track_time=tensor.track_time)
+    result.data = tensor.zeros_like_(dtype, device)
+    return result
+
+
+def ones_like(tensor, dtype: Any = None, device: Any = None):
+    """Return a ones tensor with the same shape as ``tensor``."""
+    result = type(tensor)(track_time=tensor.track_time)
+    result.data = tensor.ones_like_(dtype, device)
+    return result
+
+
+def full_like(tensor, fill_value: Any, dtype: Any = None, device: Any = None):
+    """Return a tensor filled with ``fill_value`` and the same shape as ``tensor``."""
+    result = type(tensor)(track_time=tensor.track_time)
+    result.data = tensor.full_like_(fill_value, dtype, device)
+    return result

@@ -293,65 +293,6 @@ class AbstractTensor:
     def log_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_()")
 
-    # --- Trigonometric and hyperbolic functions ---
-    def sin(self) -> "AbstractTensor":
-        return self._apply_operator("sin", self, None)
-
-    def cos(self) -> "AbstractTensor":
-        return self._apply_operator("cos", self, None)
-
-    def tan(self) -> "AbstractTensor":
-        return self._apply_operator("tan", self, None)
-
-    def asin(self) -> "AbstractTensor":
-        return self._apply_operator("asin", self, None)
-
-    def acos(self) -> "AbstractTensor":
-        return self._apply_operator("acos", self, None)
-
-    def atan(self) -> "AbstractTensor":
-        return self._apply_operator("atan", self, None)
-
-    def sinh(self) -> "AbstractTensor":
-        return self._apply_operator("sinh", self, None)
-
-    def cosh(self) -> "AbstractTensor":
-        return self._apply_operator("cosh", self, None)
-
-    def tanh(self) -> "AbstractTensor":
-        return self._apply_operator("tanh", self, None)
-
-    def asinh(self) -> "AbstractTensor":
-        return self._apply_operator("asinh", self, None)
-
-    def acosh(self) -> "AbstractTensor":
-        return self._apply_operator("acosh", self, None)
-
-    def atanh(self) -> "AbstractTensor":
-        return self._apply_operator("atanh", self, None)
-
-    # Derived via identities
-    def sec(self) -> "AbstractTensor":
-        return self.cos() ** -1
-
-    def csc(self) -> "AbstractTensor":
-        return self.sin() ** -1
-
-    def cot(self) -> "AbstractTensor":
-        return self.cos() / self.sin()
-
-    def sech(self) -> "AbstractTensor":
-        return self.cosh() ** -1
-
-    def csch(self) -> "AbstractTensor":
-        return self.sinh() ** -1
-
-    def coth(self) -> "AbstractTensor":
-        return self.cosh() / self.sinh()
-
-    def sinc(self) -> "AbstractTensor":
-        return self.sin() / self
-
     # --- Softmax utilities ---
     def softmax(self, dim: int = -1) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
@@ -450,30 +391,34 @@ class AbstractTensor:
         return inst
     # --- Tensor creation and manipulation methods ---
 
-    @classmethod
-    def full(
-        cls,
+    def full_(
+        self,
         size: Tuple[int, ...],
         fill_value: Any,
         dtype: Any = None,
         device: Any = None,
-    ) -> "AbstractTensor":
-        # Instance-based: use the backend of this tensor
-        result = cls(track_time=False)  # Assuming default track_time
-        result.data = result.full_(size, fill_value, dtype, device)
-        return result
+    ):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement full_()")
 
-    def full(self, size: Tuple[int, ...], fill_value: Any, dtype: Any = None, device: Any = None):
-        return type(self).full(size, fill_value, dtype, device)
+    def zeros_(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement zeros_()")
 
-    @classmethod
-    def zeros(
-        cls, size: Tuple[int, ...], dtype: Any = None, device: Any = None
-    ) -> "AbstractTensor":
-        # Instance-based: use the backend of this tensor
-        result = cls(track_time=False)  # Assuming default track_time
-        result.data = result.zeros_(size, dtype, device)
-        return result
+    def ones_(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement ones_()")
+
+    def zeros_like_(self, dtype: Any = None, device: Any = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement zeros_like_()")
+
+    def ones_like_(self, dtype: Any = None, device: Any = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement ones_like_()")
+
+    def full_like_(
+        self,
+        fill_value: Any,
+        dtype: Any = None,
+        device: Any = None,
+    ):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement full_like_()")
 
     def clone(self) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
@@ -1548,13 +1493,49 @@ class AbstractF:
 AbstractTensor.F = AbstractF
 
 # --- Abstraction method assignments ---------------------------------------
-from .abstraction_methods.creation import linspace, meshgrid
+from .abstraction_methods.creation import (
+    linspace,
+    meshgrid,
+    zeros as create_zeros,
+    ones as create_ones,
+    full as create_full,
+    zeros_like as create_zeros_like,
+    ones_like as create_ones_like,
+    full_like as create_full_like,
+)
 from .abstraction_methods.reduction import max as reduction_max, argmax as reduction_argmax
 from .abstraction_methods.type_ops import to as type_to, astype as type_astype, where as type_where
 from .abstraction_methods.comparison import greater as comp_greater, greater_equal as comp_greater_equal
+from .abstraction_methods.trigonometry import (
+    sin as trig_sin,
+    cos as trig_cos,
+    tan as trig_tan,
+    asin as trig_asin,
+    acos as trig_acos,
+    atan as trig_atan,
+    sinh as trig_sinh,
+    cosh as trig_cosh,
+    tanh as trig_tanh,
+    asinh as trig_asinh,
+    acosh as trig_acosh,
+    atanh as trig_atanh,
+    sec as trig_sec,
+    csc as trig_csc,
+    cot as trig_cot,
+    sech as trig_sech,
+    csch as trig_csch,
+    coth as trig_coth,
+    sinc as trig_sinc,
+)
 
 AbstractTensor.linspace = staticmethod(linspace)
 AbstractTensor.meshgrid = staticmethod(meshgrid)
+AbstractTensor.zeros = staticmethod(create_zeros)
+AbstractTensor.ones = staticmethod(create_ones)
+AbstractTensor.full = staticmethod(create_full)
+AbstractTensor.zeros_like = create_zeros_like
+AbstractTensor.ones_like = create_ones_like
+AbstractTensor.full_like = create_full_like
 AbstractTensor.max = reduction_max
 AbstractTensor.argmax = reduction_argmax
 AbstractTensor.to = type_to
@@ -1562,6 +1543,25 @@ AbstractTensor.astype = type_astype
 AbstractTensor.where = type_where
 AbstractTensor.greater = comp_greater
 AbstractTensor.greater_equal = comp_greater_equal
+AbstractTensor.sin = trig_sin
+AbstractTensor.cos = trig_cos
+AbstractTensor.tan = trig_tan
+AbstractTensor.asin = trig_asin
+AbstractTensor.acos = trig_acos
+AbstractTensor.atan = trig_atan
+AbstractTensor.sinh = trig_sinh
+AbstractTensor.cosh = trig_cosh
+AbstractTensor.tanh = trig_tanh
+AbstractTensor.asinh = trig_asinh
+AbstractTensor.acosh = trig_acosh
+AbstractTensor.atanh = trig_atanh
+AbstractTensor.sec = trig_sec
+AbstractTensor.csc = trig_csc
+AbstractTensor.cot = trig_cot
+AbstractTensor.sech = trig_sech
+AbstractTensor.csch = trig_csch
+AbstractTensor.coth = trig_coth
+AbstractTensor.sinc = trig_sinc
 
 
 def _get_shape(data):
