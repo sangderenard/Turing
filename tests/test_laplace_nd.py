@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import pytest
 
-from abstract_convolution import laplace_nd as laplace
+from src.common.tensors.abstract_convolution import laplace_nd as laplace
 
 # ---- helpers ----
 
@@ -75,22 +75,14 @@ def test_dirichlet_cube_sin_analytic(shape):
     device = "cpu"
 
     # minimal RectangularTransform + GridDomain hooks if provided, otherwise craft a simple mesh
-    if hasattr(laplace, "GridDomain") and hasattr(laplace, "RectangularTransform"):
-        transform = laplace.RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device=device)
-        grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
-        grid_domain = laplace.GridDomain.generate_grid_domain(
-            coordinate_system='rectangular', N_u=N_u, N_v=N_v, N_w=N_w,
-            Lx=Lx, Ly=Ly, Lz=Lz, device=device
-        )
-    else:
-        # fallback: regular grids
-        grid_u = torch.linspace(0, Lx, N_u)
-        grid_v = torch.linspace(0, Ly, N_v)
-        grid_w = torch.linspace(0, Lz, N_w)
-        class _DummyGD:
-            @staticmethod
-            def generate_grid_domain(**kw): return types.SimpleNamespace()
-        grid_domain = _DummyGD.generate_grid_domain()
+    
+    transform = laplace.RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device=device)
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system='rectangular', N_u=N_u, N_v=N_v, N_w=N_w,
+        Lx=Lx, Ly=Ly, Lz=Lz, device=device
+    )
+
 
     boundary_conditions = ('dirichlet','dirichlet','dirichlet','dirichlet','dirichlet','dirichlet')
     BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=torch.float64, resolution=max(shape))
@@ -163,11 +155,25 @@ def test_symmetry_and_psd_small_2d():
             q = torch.dot(y, L @ y)
         assert q.item() >= -1e-8
 
-def test_sparse_vs_dense_consistency_tiny():
+@pytest.mark.parametrize("shape", [(20, 20, 20)])
+def test_sparse_vs_dense_consistency_tiny(shape):
     # Build a very small 3D Laplacian and compare dense vs sparse matmul if both are provided
     if not hasattr(laplace, "BuildLaplace3D"):
         pytest.skip("BuildLaplace3D not available")
-    BL = laplace.BuildLaplace3D(grid_domain=None, precision=torch.float64, resolution=6)
+
+
+    N_u, N_v, N_w = shape
+    Lx = Ly = Lz = 1.0
+    device = "cpu"
+
+    transform = laplace.RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device=device)
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system='rectangular', N_u=N_u, N_v=N_v, N_w=N_w,
+        Lx=Lx, Ly=Ly, Lz=Lz, device=device
+    )
+
+    BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=torch.float64, resolution=6)
     N = 6
     u = torch.linspace(0,1,N)
     v = torch.linspace(0,1,N)
@@ -187,11 +193,26 @@ def test_sparse_vs_dense_consistency_tiny():
     y_sparse = torch.sparse.mm(Ls, x[:,None]).squeeze(1)
     assert torch.allclose(y_dense, y_sparse, atol=1e-8, rtol=1e-6)
 
-def test_heat_diffusion_energy_decreases():
+
+@pytest.mark.parametrize("shape", [(20, 20, 20)])
+def test_heat_diffusion_energy_decreases(shape):
+
+
+    N_u, N_v, N_w = shape
+    Lx = Ly = Lz = 1.0
+    device = "cpu"
+
+    transform = laplace.RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device=device)
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system='rectangular', N_u=N_u, N_v=N_v, N_w=N_w,
+        Lx=Lx, Ly=Ly, Lz=Lz, device=device
+    )
+
     # diffusion should monotonically decrease Dirichlet energy u^T L u for small steps
     if not hasattr(laplace, "BuildLaplace3D"):
         pytest.skip("BuildLaplace3D not available")
-    BL = laplace.BuildLaplace3D(grid_domain=None, precision=torch.float64, resolution=8)
+    BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=torch.float64, resolution=8)
     N = 8
     u = torch.linspace(0,1,N)
     v = torch.linspace(0,1,N)
