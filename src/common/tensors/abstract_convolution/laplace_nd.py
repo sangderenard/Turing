@@ -150,6 +150,17 @@ class BuildLaplace3D:
 
         logger.debug("Parameters reassigned with either provided values or class attributes.")
 
+        # Allow callers to pass either 1D coordinate vectors or full 3D meshes.
+        def _to_mesh3d(u, v, w):
+            if u.dim() == v.dim() == w.dim() == 1:
+                U, V, W = torch.meshgrid(u, v, w, indexing='ij')
+                return U, V, W
+            if u.dim() == v.dim() == w.dim() == 3:
+                return u, v, w
+            raise ValueError("grid_u/v/w must all be 1D or all be 3D")
+
+        grid_u, grid_v, grid_w = _to_mesh3d(grid_u, grid_v, grid_w)
+
         def default_metric_tensor(u, v, w, dxdu, dydu, dzdu, dxdv, dydv, dzdv, dxdw, dydw, dzdw):
             """
             Default metric tensor for a flat Euclidean 3D space.
@@ -211,6 +222,17 @@ class BuildLaplace3D:
         logger.debug(f"Unique u values: {unique_u_values}")
         logger.debug(f"Unique v values: {unique_v_values}")
         logger.debug(f"Unique w values: {unique_w_values}")
+
+        # Derive uniform step sizes for each axis and their squares.
+        u_vals = unique_u_values
+        v_vals = unique_v_values
+        w_vals = unique_w_values
+        du = (u_vals[1:] - u_vals[:-1]).mean()
+        dv = (v_vals[1:] - v_vals[:-1]).mean()
+        dw = (w_vals[1:] - w_vals[:-1]).mean()
+        h2_u = du * du
+        h2_v = dv * dv
+        h2_w = dw * dw
 
         final_u_row = wrap_u_row = None
         final_v_row = wrap_v_row = None
@@ -404,13 +426,14 @@ class BuildLaplace3D:
 
 
 
-        # 5. Compute Metrics with Stability
-        metric_u = g_inv[..., 0, 0] + artificial_stability
-        metric_v = g_inv[..., 1, 1] + artificial_stability
-        metric_w = g_inv[..., 2, 2] + artificial_stability
+        # 5. Compute grid metrics using step sizes with optional stabilizer.
+        eps = artificial_stability
+        metric_u = h2_u + eps
+        metric_v = h2_v + eps
+        metric_w = h2_w + eps
 
         # 6. Identify Singularities
-        singularity_mask = (metric_u == 0) | (metric_v == 0) | (metric_w == 0)
+        singularity_mask = torch.zeros_like(det_g, dtype=torch.bool)
 
         # 7. Extract Cross Terms
         inv_g_uv = g_inv[..., 0, 1]
@@ -425,13 +448,12 @@ class BuildLaplace3D:
         elif singularity_conditions == 'neumann':
             diagonal_entries[singularity_mask] = 0.0
 
-        # 9. Compute Laplacian Diagonal Contributions
-        laplacian_diag = 2.0 * tension * (1.0 / metric_u + 1.0 / metric_v + 1.0 / metric_w) / density
+        scale = tension / density
+        laplacian_off_diag_u = -scale * g_inv[..., 0, 0] / metric_u
+        laplacian_off_diag_v = -scale * g_inv[..., 1, 1] / metric_v
+        laplacian_off_diag_w = -scale * g_inv[..., 2, 2] / metric_w
 
-        # 12. Compute Off-Diagonal Laplacian Contributions
-        laplacian_off_diag_u = -g_inv[..., 0, 0] / metric_u
-        laplacian_off_diag_v = -g_inv[..., 1, 1] / metric_v
-        laplacian_off_diag_w = -g_inv[..., 2, 2] / metric_w
+        laplacian_diag = -2.0 * (laplacian_off_diag_u + laplacian_off_diag_v + laplacian_off_diag_w)
 
 
         # 20. Assemble the Sparse Laplacian Matrix
