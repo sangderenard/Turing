@@ -10,7 +10,7 @@ The `AbstractTensor` class behaves as much like PyTorch as possible while still 
 operations that match NumPy, JAX, or pure Python expectations.  Methods are
 carefully overloaded so that users coming from any of those libraries find familiar
 interfaces.  When semantics differ between libraries we default to PyTorch's
-behavior.  The `ShapeAccessor` helper demonstrates this approach by mimicking
+behavior.  (Old: The `ShapeAccessor` helper demonstrated this approach by mimicking)
 `shape` access in a library‑agnostic way.
 
 Development priorities follow a strict order:

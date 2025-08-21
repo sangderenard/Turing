@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 
+
 from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque
 import math
 import time
 from collections import deque
+
+# Wire in new abstraction_methods/properties
+from .abstraction_methods import properties as _properties
 
 # TYPE: Faculty, DEFAULT_FACULTY should be imported from .faculty
 try:
@@ -31,11 +35,11 @@ try:
 except ImportError:
     CTensor = None  # TYPE: ignore
 
-# TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, ShapeAccessor, _get_ops_for_class
+# TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, _get_ops_for_class
+from . import DEBUG
 def register_conversion(*args, **kwargs):
     pass
 CONVERSION_REGISTRY = dict()
-DEBUG = False
 
 
 
@@ -83,31 +87,7 @@ class TensorShapeError(ValueError):
 
 
 
-class ShapeAccessor:
-    """Utility wrapper exposing tensor ``shape`` like NumPy/PyTorch."""
 
-    def __init__(self, tensor):
-        self.tensor = tensor
-
-    def _shape_tuple(self) -> tuple[int, ...]:
-        """Fetch the concrete shape tuple from the underlying tensor."""
-        # ``shape_`` is the backend hook returning a tuple[int, ...]
-        return self.tensor.shape_()
-
-    # Iterable / sequence protocol -------------------------------------------------
-    def __call__(self) -> tuple[int, ...]:
-        return self._shape_tuple()
-
-    def __iter__(self):
-        return iter(self._shape_tuple())
-
-        return len(self._shape_tuple())
-
-    def __getitem__(self, idx):
-        return self._shape_tuple()[idx]
-
-    def __repr__(self) -> str:
-        return repr(self._shape_tuple())
 
 
 # --- Backend Registry Pattern ---
@@ -413,12 +393,19 @@ class AbstractTensor:
     def get_dtype(self) -> Any:
         return self.get_dtype_()
 
-    def numel_(self):
-        raise NotImplementedError(f"{self.__class__.__name__} must implement numel_()")
 
-
-    def item(self) -> Union[int, float, bool]:
-        return self.item_()
+    # --- Properties and methods from abstraction_methods/properties.py ---
+    numel = _properties.numel
+    item = _properties.item
+    shape = _properties.shape
+    shape_ = _properties.shape_
+    ndim = _properties.ndim
+    dim = _properties.dim
+    ndims = _properties.ndims
+    datastring = _properties.datastring
+    __str__ = _properties.__str__
+    __repr__ = _properties.__repr__
+    __len__ = _properties.__len__
 
 
     
@@ -1121,31 +1108,41 @@ class AbstractTensor:
         *,
         track_time: bool = False,
         dtype=None,
-        device=None
+        device=None,
+        cls=None
     ) -> "AbstractTensor":
         """
         Create and return an AbstractTensor instance from any data, auto-selecting the best backend if faculty is None.
         If faculty is provided, use the corresponding backend.
+        If cls is provided, it is used directly as the backend class.
         """
-        faculty = faculty or DEFAULT_FACULTY
-        if faculty in (Faculty.TORCH, Faculty.PYGEO):
-            backend_cls = BACKEND_REGISTRY.get("torch")
-            if backend_cls is None:
-                from . import torch_backend  # noqa: F401
-                backend_cls = BACKEND_REGISTRY.get("torch")
-            tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
-        elif faculty is Faculty.NUMPY and np is not None:
-            backend_cls = BACKEND_REGISTRY.get("numpy")
-            if backend_cls is None:
-                from . import numpy_backend  # noqa: F401
-                backend_cls = BACKEND_REGISTRY.get("numpy")
-            tensor = backend_cls(track_time=track_time)
-        elif faculty is Faculty.CTENSOR:
-            from .accelerator_backends.c_backend import CTensorOperations
-            tensor = CTensorOperations(track_time=track_time)
+        if cls is not None:
+            backend_cls = cls
+            # Try to pass default_device if the backend supports it
+            try:
+                tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
+            except TypeError:
+                tensor = backend_cls(track_time=track_time)
         else:
-            backend_cls = BACKEND_REGISTRY.get("pure_python")
-            tensor = backend_cls(track_time=track_time)
+            faculty = faculty or DEFAULT_FACULTY
+            if faculty in (Faculty.TORCH, Faculty.PYGEO):
+                backend_cls = BACKEND_REGISTRY.get("torch")
+                if backend_cls is None:
+                    from . import torch_backend  # noqa: F401
+                    backend_cls = BACKEND_REGISTRY.get("torch")
+                tensor = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
+            elif faculty is Faculty.NUMPY and np is not None:
+                backend_cls = BACKEND_REGISTRY.get("numpy")
+                if backend_cls is None:
+                    from . import numpy_backend  # noqa: F401
+                    backend_cls = BACKEND_REGISTRY.get("numpy")
+                tensor = backend_cls(track_time=track_time)
+            elif faculty is Faculty.CTENSOR:
+                from .accelerator_backends.c_backend import CTensorOperations
+                tensor = CTensorOperations(track_time=track_time)
+            else:
+                backend_cls = BACKEND_REGISTRY.get("pure_python")
+                tensor = backend_cls(track_time=track_time)
 
         if data is not None:
             out = tensor.ensure_tensor(data)
@@ -1313,8 +1310,16 @@ from .abstraction_methods.creation import (
     zeros_like as create_zeros_like,
     ones_like as create_ones_like,
     full_like as create_full_like,
+    random_tensor,
+    randoms,
+    rand_like,
+    randint,
+    randint_like,
 )
-from .abstraction_methods.reduction import max as reduction_max, argmax as reduction_argmax
+from .abstraction_methods.reduction import (
+    max as reduction_max,
+    argmax as reduction_argmax,
+)
 from .abstraction_methods.type_ops import (
     to as type_to,
     astype as type_astype,
@@ -1370,63 +1375,88 @@ from .abstraction_methods.properties import (
     __len__ as prop_len,
 )
 
-AbstractTensor.linspace = staticmethod(linspace)
-AbstractTensor.meshgrid = staticmethod(meshgrid)
-AbstractTensor.zeros = staticmethod(create_zeros)
-AbstractTensor.ones = staticmethod(create_ones)
-AbstractTensor.full = staticmethod(create_full)
-AbstractTensor.zeros_like = create_zeros_like
-AbstractTensor.ones_like = create_ones_like
-AbstractTensor.full_like = create_full_like
-AbstractTensor.max = reduction_max
+# --- Autograd method assignments ------------------------------------------
+from . import autograd as _autograd_methods
+
+AbstractTensor.requires_grad_ = _autograd_methods.requires_grad_
+AbstractTensor.requires_grad  = _autograd_methods.requires_grad
+AbstractTensor.backward       = _autograd_methods.backward
+AbstractTensor.grad           = _autograd_methods.grad
+AbstractTensor.detach         = _autograd_methods.detach
+AbstractTensor.is_leaf        = _autograd_methods.is_leaf
+AbstractTensor.retain_grad    = _autograd_methods.retain_grad
+AbstractTensor.grad_fn        = _autograd_methods.grad_fn
+AbstractTensor.zero_grad      = _autograd_methods.zero_grad
+AbstractTensor.register_hook  = _autograd_methods.register_hook
+
+# --- Bindings to AbstractTensor -------------------------------------------
+
+AbstractTensor.linspace     = staticmethod(linspace)
+AbstractTensor.meshgrid     = staticmethod(meshgrid)
+AbstractTensor.zeros        = staticmethod(create_zeros)
+AbstractTensor.ones         = staticmethod(create_ones)
+AbstractTensor.full         = staticmethod(create_full)
+AbstractTensor.zeros_like   = create_zeros_like
+AbstractTensor.ones_like    = create_ones_like
+AbstractTensor.full_like    = create_full_like
+AbstractTensor.random       = staticmethod(random_tensor)
+AbstractTensor.randoms      = staticmethod(randoms)
+AbstractTensor.rand_like    = rand_like
+AbstractTensor.randint      = staticmethod(randint)
+AbstractTensor.randint_like = randint_like
+
+AbstractTensor.max    = reduction_max
 AbstractTensor.argmax = reduction_argmax
-AbstractTensor.to = type_to
-AbstractTensor.astype = type_astype
-AbstractTensor.where = type_where
+
+AbstractTensor.to        = type_to
+AbstractTensor.astype    = type_astype
+AbstractTensor.where     = type_where
 AbstractTensor.long_cast = type_long_cast
-AbstractTensor.float = type_float
-AbstractTensor.double = type_double
-AbstractTensor.int = type_int
-AbstractTensor.long = type_long
-AbstractTensor.bool = type_bool
-AbstractTensor.greater = comp_greater
-AbstractTensor.greater_equal = comp_greater_equal
-AbstractTensor.less = comp_less
-AbstractTensor.less_equal = comp_less_equal
-AbstractTensor.equal = comp_equal
-AbstractTensor.not_equal = comp_not_equal
-AbstractTensor.sin = trig_sin
-AbstractTensor.cos = trig_cos
-AbstractTensor.tan = trig_tan
-AbstractTensor.asin = trig_asin
-AbstractTensor.acos = trig_acos
-AbstractTensor.atan = trig_atan
-AbstractTensor.sinh = trig_sinh
-AbstractTensor.cosh = trig_cosh
-AbstractTensor.tanh = trig_tanh
+AbstractTensor.float     = type_float
+AbstractTensor.double    = type_double
+AbstractTensor.int       = type_int
+AbstractTensor.long      = type_long
+AbstractTensor.bool      = type_bool
+
+AbstractTensor.greater        = comp_greater
+AbstractTensor.greater_equal  = comp_greater_equal
+AbstractTensor.less           = comp_less
+AbstractTensor.less_equal     = comp_less_equal
+AbstractTensor.equal          = comp_equal
+AbstractTensor.not_equal      = comp_not_equal
+
+AbstractTensor.sin   = trig_sin
+AbstractTensor.cos   = trig_cos
+AbstractTensor.tan   = trig_tan
+AbstractTensor.asin  = trig_asin
+AbstractTensor.acos  = trig_acos
+AbstractTensor.atan  = trig_atan
+AbstractTensor.sinh  = trig_sinh
+AbstractTensor.cosh  = trig_cosh
+AbstractTensor.tanh  = trig_tanh
 AbstractTensor.asinh = trig_asinh
 AbstractTensor.acosh = trig_acosh
 AbstractTensor.atanh = trig_atanh
-AbstractTensor.sec = trig_sec
-AbstractTensor.csc = trig_csc
-AbstractTensor.cot = trig_cot
-AbstractTensor.sech = trig_sech
-AbstractTensor.csch = trig_csch
-AbstractTensor.coth = trig_coth
-AbstractTensor.sinc = trig_sinc
-AbstractTensor.numel = prop_numel
-AbstractTensor.item = prop_item
-AbstractTensor.shape = property(prop_shape)
-AbstractTensor.shape_ = prop_shape_
-AbstractTensor.ndim = property(prop_ndim)
-AbstractTensor.dim = prop_dim
-AbstractTensor.ndims = prop_ndims
-AbstractTensor.datastring = prop_datastring
-AbstractTensor.__str__ = prop_str
-AbstractTensor.__format__ = prop_format
-AbstractTensor.__repr__ = prop_repr
-AbstractTensor.__len__ = prop_len
+AbstractTensor.sec   = trig_sec
+AbstractTensor.csc   = trig_csc
+AbstractTensor.cot   = trig_cot
+AbstractTensor.sech  = trig_sech
+AbstractTensor.csch  = trig_csch
+AbstractTensor.coth  = trig_coth
+AbstractTensor.sinc  = trig_sinc
 
+AbstractTensor.numel   = prop_numel
+AbstractTensor.item    = prop_item
+AbstractTensor.shape   = property(prop_shape)
+AbstractTensor.shape_  = prop_shape_
+AbstractTensor.ndim    = property(prop_ndim)
+AbstractTensor.dim     = prop_dim
+AbstractTensor.ndims   = prop_ndims
+AbstractTensor.datastring = prop_datastring
+AbstractTensor.__str__    = prop_str
+AbstractTensor.__format__ = prop_format
+AbstractTensor.__repr__   = prop_repr
+AbstractTensor.__len__    = prop_len
 
 def _get_shape(data):
     if not isinstance(data, list):

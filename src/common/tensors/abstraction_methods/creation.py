@@ -1,6 +1,53 @@
 from __future__ import annotations
-
+from enum import auto
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict
+
+from .random import random_generator, RANDOM_KIND, PRNG_ALGO, CSPRNG_ALGO
+# Helper to take n items from an iterable and return as a list/array
+def take_n(iterable, n):
+    return [next(iterable) for _ in range(n)]
+
+# Random tensor creation (fluent with other helpers)
+def random_tensor(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """
+    Create a tensor of the given shape filled with random floats in [0,1).
+    kind: RANDOM_KIND enum (SYSTEM, CSPRNG, PRNG)
+    algo: PRNG_ALGO or CSPRNG_ALGO (optional)
+    seed: int or bytes (optional)
+    """
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+    cls = _resolve_cls(cls)
+    total = 1
+    for s in size:
+        total *= s
+    rng = random_generator(kind=kind, algo=algo, seed=seed, dtype="float", batch_size=total)
+    vals = next(rng)
+    inst = cls(vals, track_time=False)
+    return inst.reshape(*size)
+
+def rand_like(tensor, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """Return a random tensor with the same shape as `tensor`."""
+    return random_tensor(likeness(tensor), dtype, device, cls=type(tensor), kind=kind, algo=algo, seed=seed)
+
+
+def randint(size: Tuple[int, ...], low: int, high: int, dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """Create a tensor of the given shape filled with random integers in [low, high)."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+    cls = _resolve_cls(cls)
+    total = 1
+    for s in size:
+        total *= s
+    rng = random_generator(kind=kind, algo=algo, seed=seed, dtype="float", batch_size=total)
+    vals = next(rng)
+    # Map floats in [0,1) to [low, high)
+    int_vals = [int(low + (high - low) * v) for v in vals]
+    inst = cls(int_vals, track_time=False)
+    return inst.reshape(*size)
+
+
+def randint_like(tensor, low: int, high: int, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """Return a random integer tensor with the same shape as `tensor` and values in [low, high)."""
+    return randint(likeness(tensor), low, high, dtype, device, cls=type(tensor), kind=kind, algo=algo, seed=seed)
 
 
 def linspace(start, stop, steps, dtype=None, device=None):
@@ -129,25 +176,38 @@ def _resolve_cls(cls):
             return backend_cls
     raise RuntimeError("No tensor backend available for tensor creation.")
 
+def zero(cls):
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
+    cls = _resolve_cls(cls)
+    return AbstractTensor.get_tensor([0], cls=cls)
+
+def one(cls):
+    """Create a tensor filled with ones using the requested backend."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
+    cls = _resolve_cls(cls)
+    inst = zero(cls) + 1
+    
+    return inst
 
 def zeros(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
     """Create a tensor filled with zeros using the requested backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    cls = _resolve_cls(cls)
-    inst = cls(track_time=False)
-    inst.data = inst.zeros_(size, dtype, device)
-    return inst
+    return zero(cls).repeat(size)
+
+
+def randoms(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """Alias for random_tensor for API symmetry with zeros/ones/full."""
+    return random_tensor(size, dtype, device, cls=cls, kind=kind, algo=algo, seed=seed)
 
 
 def ones(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
     """Create a tensor filled with ones using the requested backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    cls = _resolve_cls(cls)
-    inst = cls(track_time=False)
-    inst.data = inst.ones_(size, dtype, device)
-    return inst
+    return one(cls).repeat(size)
 
 
 def full(
@@ -161,28 +221,23 @@ def full(
     """Create a tensor of ``size`` filled with ``fill_value`` using the backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    cls = _resolve_cls(cls)
-    inst = cls(track_time=False)
-    inst.data = inst.full_(size, fill_value, dtype, device)
-    return inst
+    inst = one(cls) * fill_value
+    return inst.repeat(size)
 
+def likeness(tensor):
+    return tensor.shape
 
 def zeros_like(tensor, dtype: Any = None, device: Any = None):
     """Return a zeros tensor with the same shape as ``tensor``."""
-    result = type(tensor)(track_time=tensor.track_time)
-    result.data = tensor.zeros_like_(dtype, device)
-    return result
+
+    return full(likeness(tensor), 0, dtype, device, cls=type(tensor))
 
 
 def ones_like(tensor, dtype: Any = None, device: Any = None):
     """Return a ones tensor with the same shape as ``tensor``."""
-    result = type(tensor)(track_time=tensor.track_time)
-    result.data = tensor.ones_like_(dtype, device)
-    return result
+    return full(likeness(tensor), 1, dtype, device, cls=type(tensor))
 
 
 def full_like(tensor, fill_value: Any, dtype: Any = None, device: Any = None):
     """Return a tensor filled with ``fill_value`` and the same shape as ``tensor``."""
-    result = type(tensor)(track_time=tensor.track_time)
-    result.data = tensor.full_like_(fill_value, dtype, device)
-    return result
+    return full(likeness(tensor), fill_value, dtype, device, cls=type(tensor))

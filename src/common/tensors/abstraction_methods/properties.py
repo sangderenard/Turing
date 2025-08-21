@@ -2,21 +2,18 @@ from __future__ import annotations
 
 from typing import Any, Tuple, Union
 
-from ..abstraction import ShapeAccessor, DEBUG
 
+from .. import DEBUG
 
 def numel(self) -> int:
     return self.numel_()
 
-
 def item(self) -> Union[int, float, bool]:
     return self.item_()
 
-
-def shape(self) -> ShapeAccessor:
-    """Return a callable/iterable shape accessor."""
-    return ShapeAccessor(self)
-
+def shape(self) -> Tuple[int, ...]:
+    """Return the shape of the tensor as a tuple (NumPy/PyTorch style)."""
+    return self.shape_()
 
 def shape_(self) -> Tuple[int, ...]:
     """Return the shape of the tensor as a tuple (backend hook)."""

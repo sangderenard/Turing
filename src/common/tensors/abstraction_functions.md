@@ -3,12 +3,6 @@
 This document groups available methods by theme for quick reference.
 
 ## Shape Accessors
-- ShapeAccessor.__init__()
-- ShapeAccessor.__call__()
-- ShapeAccessor.__iter__()
-- ShapeAccessor.__len__()
-- ShapeAccessor.__getitem__()
-- ShapeAccessor.__repr__()
 
 ## Creation & Initialization
 - AbstractTensor.full()

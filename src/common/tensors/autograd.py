@@ -1,5 +1,65 @@
 from __future__ import annotations
 
+def requires_grad_(self, requires_grad=True):
+    if hasattr(self.data, 'requires_grad_'):
+        self.data.requires_grad_(requires_grad)
+        return self
+    raise NotImplementedError("requires_grad_ not supported for this backend")
+
+@property
+def requires_grad(self):
+    if hasattr(self.data, 'requires_grad'):
+        return self.data.requires_grad
+    return False
+
+def backward(self, *args, **kwargs):
+    if hasattr(self.data, 'backward'):
+        return self.data.backward(*args, **kwargs)
+    raise NotImplementedError("backward not supported for this backend")
+
+@property
+def grad(self):
+    if hasattr(self.data, 'grad'):
+        return self.data.grad
+    return None
+
+def detach(self):
+    if hasattr(self.data, 'detach'):
+        result = type(self)(track_time=self.track_time)
+        result.data = self.data.detach()
+        return result
+    raise NotImplementedError("detach not supported for this backend")
+
+@property
+def is_leaf(self):
+    if hasattr(self.data, 'is_leaf'):
+        return self.data.is_leaf
+    return True
+
+def retain_grad(self):
+    if hasattr(self.data, 'retain_grad'):
+        self.data.retain_grad()
+        return self
+    raise NotImplementedError("retain_grad not supported for this backend")
+
+@property
+def grad_fn(self):
+    if hasattr(self.data, 'grad_fn'):
+        return self.data.grad_fn
+    return None
+
+def zero_grad(self):
+    if hasattr(self.data, 'grad') and self.data.grad is not None:
+        self.data.grad.zero_()
+        return self
+    raise NotImplementedError("zero_grad not supported for this backend")
+
+def register_hook(self, hook):
+    if hasattr(self.data, 'register_hook'):
+        return self.data.register_hook(hook)
+    raise NotImplementedError("register_hook not supported for this backend")
+
+
 """Lightweight automatic differentiation helpers.
 
 The project purposely keeps the autograd core extremely small.  Only a tiny
