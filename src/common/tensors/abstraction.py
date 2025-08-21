@@ -1466,6 +1466,44 @@ AbstractTensor.__format__ = prop_format
 AbstractTensor.__repr__   = prop_repr
 AbstractTensor.__len__    = prop_len
 
+from .linalg import (
+    dot as linalg_dot,
+    norm as linalg_norm,
+    cross as linalg_cross,
+    trace as linalg_trace,
+    det as linalg_det,
+    solve as linalg_solve,
+    inv as linalg_inv,
+    eye as linalg_eye,
+)
+
+class _LinalgNS:
+    pass
+
+if not hasattr(AbstractTensor, "linalg"):
+    AbstractTensor.linalg = _LinalgNS()
+
+# namespace (numpy-like)
+AbstractTensor.linalg.dot   = staticmethod(linalg_dot)
+AbstractTensor.linalg.norm  = staticmethod(linalg_norm)
+AbstractTensor.linalg.cross = staticmethod(linalg_cross)
+AbstractTensor.linalg.trace = staticmethod(linalg_trace)
+AbstractTensor.linalg.det   = staticmethod(linalg_det)
+AbstractTensor.linalg.solve = staticmethod(linalg_solve)
+AbstractTensor.linalg.inv   = staticmethod(linalg_inv)
+AbstractTensor.linalg.eye   = staticmethod(linalg_eye)
+
+# optional top-level shorthands used by your code already
+AbstractTensor.dot   = staticmethod(linalg_dot)
+AbstractTensor.norm  = staticmethod(linalg_norm)
+AbstractTensor.cross = staticmethod(linalg_cross)
+AbstractTensor.trace = staticmethod(linalg_trace)
+AbstractTensor.det   = staticmethod(linalg_det)
+AbstractTensor.solve = staticmethod(linalg_solve)
+AbstractTensor.inv   = staticmethod(linalg_inv)
+AbstractTensor.eye   = staticmethod(linalg_eye)
+
+
 def _get_shape(data):
     if not isinstance(data, list):
         return ()
