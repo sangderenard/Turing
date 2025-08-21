@@ -156,6 +156,30 @@ class PurePythonTensorOperations(AbstractTensor):
             return abs(x)
         if op == "invert":
             return ~x
+        if op == "sin":
+            return math.sin(x)
+        if op == "cos":
+            return math.cos(x)
+        if op == "tan":
+            return math.tan(x)
+        if op == "asin":
+            return math.asin(x)
+        if op == "acos":
+            return math.acos(x)
+        if op == "atan":
+            return math.atan(x)
+        if op == "sinh":
+            return math.sinh(x)
+        if op == "cosh":
+            return math.cosh(x)
+        if op == "tanh":
+            return math.tanh(x)
+        if op == "asinh":
+            return math.asinh(x)
+        if op == "acosh":
+            return math.acosh(x)
+        if op == "atanh":
+            return math.atanh(x)
         raise NotImplementedError(f"Operator {op} not implemented for pure Python backend.")
 
     def _elementwise_op(self, op: str, a, b):

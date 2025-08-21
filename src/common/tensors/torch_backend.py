@@ -175,6 +175,30 @@ class PyTorchTensorOperations(AbstractTensor):
             return torch.abs(a)
         if op == "invert":
             return torch.bitwise_not(a)
+        if op == "sin":
+            return torch.sin(a)
+        if op == "cos":
+            return torch.cos(a)
+        if op == "tan":
+            return torch.tan(a)
+        if op == "asin":
+            return torch.asin(a)
+        if op == "acos":
+            return torch.acos(a)
+        if op == "atan":
+            return torch.atan(a)
+        if op == "sinh":
+            return torch.sinh(a)
+        if op == "cosh":
+            return torch.cosh(a)
+        if op == "tanh":
+            return torch.tanh(a)
+        if op == "asinh":
+            return torch.asinh(a)
+        if op == "acosh":
+            return torch.acosh(a)
+        if op == "atanh":
+            return torch.atanh(a)
         if op in ("add", "iadd"):
             return a + b
         if op == "radd":
