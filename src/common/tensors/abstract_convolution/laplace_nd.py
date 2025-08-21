@@ -788,8 +788,16 @@ class HodgeStarBuilder:
         hodge_0 = torch.diag(vertex_volumes)
         hodge_1 = torch.diag(dual_edge)
 
-        # No faces => no hodge_2
-        hodge_stars = {"hodge_0": hodge_0, "hodge_1": hodge_1}
+        # No faces => no hodge_2. Mark availability so downstream
+        # consumers know higher-order operators are absent for this
+        # topology.
+        availability = {"hodge_0": True, "hodge_1": True, "hodge_2": False}
+        hodge_stars = {
+            "hodge_0": hodge_0,
+            "hodge_1": hodge_1,
+            "hodge_2": None,
+            "availability": availability,
+        }
 
         self.hodge_cache[hash_key] = hodge_stars
         return hodge_stars
@@ -818,7 +826,12 @@ class HodgeStarBuilder:
         # Compute edge dual areas (1-forms)
         # Each edge belongs to some faces; sum area contributions
         edge_dual_areas = torch.zeros(edges.shape[0], device=self.device)
-        face_tensor = torch.stack([torch.tensor(f, device=self.device) for f in faces.values()])
+        if face_tensors:
+            face_tensor = torch.stack(face_tensors)
+        else:
+            # No faces were detected; fall back to an empty tensor so downstream
+            # operations become no-ops instead of crashing with a stack error.
+            face_tensor = torch.empty((0, 3), dtype=torch.long, device=self.device)
         for i, edge in enumerate(edges):
             # Find faces containing this edge
             mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
@@ -838,12 +851,19 @@ class HodgeStarBuilder:
             area = 0.5 * torch.norm(torch.cross(v1 - v0, v2 - v0))
             face_areas.append(area)
         face_areas = torch.tensor(face_areas, device=self.device)
+        has_faces = face_areas.numel() > 0
 
         hodge_0 = torch.diag(vertex_volumes)
         hodge_1 = torch.diag(edge_dual_areas)
-        hodge_2 = torch.diag(face_areas)
+        hodge_2 = torch.diag(face_areas) if has_faces else None
 
-        hodge_stars = {"hodge_0": hodge_0, "hodge_1": hodge_1, "hodge_2": hodge_2}
+        availability = {"hodge_0": True, "hodge_1": True, "hodge_2": has_faces}
+        hodge_stars = {
+            "hodge_0": hodge_0,
+            "hodge_1": hodge_1,
+            "hodge_2": hodge_2,
+            "availability": availability,
+        }
         self.hodge_cache[hash_key] = hodge_stars
         return hodge_stars
 
