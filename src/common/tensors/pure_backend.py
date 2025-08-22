@@ -703,12 +703,26 @@ class PurePythonTensorOperations(AbstractTensor):
         raise NotImplementedError("cat only implemented for dim 0 and 1")
 
     def expand_(self, shape):
-        out = self.data
-        n, d = shape
-        if isinstance(out[0], list):
-            if len(out) == 1:
-                return [out[0][:] for _ in range(n)]
-        raise NotImplementedError("expand_ not implemented for this shape")
+        """Broadcast ``self.data`` to ``shape`` using pure Python lists."""
+        data = self.data
+        target = list(shape)
+        orig_shape = list(_get_shape(data))
+        if len(orig_shape) != len(target):
+            raise NotImplementedError("expand_ requires same number of dims as target shape")
+
+        def expand_rec(lst, dim):
+            if dim == len(target):
+                return self._clone_recursive(lst)
+            current = orig_shape[dim]
+            desired = target[dim]
+            if current == desired:
+                return [expand_rec(sub, dim + 1) for sub in lst]
+            if current == 1:
+                expanded_sub = expand_rec(lst[0], dim + 1)
+                return [self._clone_recursive(expanded_sub) for _ in range(desired)]
+            raise ValueError("cannot expand dimension {} from {} to {}".format(dim, current, desired))
+
+        return expand_rec(data, 0)
 
     def repeat_interleave_(self, repeats: int = 1, dim: Optional[int] = None) -> Any:
         if dim is None or dim == 0:
@@ -736,8 +750,50 @@ class PurePythonTensorOperations(AbstractTensor):
             return out
 
     def repeat_(self, repeats: Any = None, dim: int = 0) -> Any:
-        """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
-        raise NotImplementedError("repeat not implemented for PurePython backend")
+        """Repeat ``self.data`` along ``dim`` ``repeats`` times.
+
+        This mirrors the behaviour of :func:`numpy.tile` used in the
+        NumPy backend but operates purely on nested Python lists.  Only the
+        core cases exercised in the repository are supported: ``repeats`` may
+        be an ``int`` specifying how many copies to make along a single
+        ``dim``, or a tuple/list matching the number of dimensions in the
+        tensor.  No external numerical libraries are used.
+        """
+        if repeats is None:
+            raise ValueError("repeats must be specified for PurePython backend")
+
+        data = self.data
+
+        if isinstance(repeats, int):
+            # Repeat along a single axis ``dim``
+            shape = _get_shape(data)
+            if dim < 0:
+                dim += len(shape)
+            if dim >= len(shape):
+                raise IndexError("dim out of range for repeat_")
+
+            def rep_axis(lst, axis):
+                if axis == dim:
+                    return [self._clone_recursive(lst) for _ in range(repeats)]
+                if not isinstance(lst, list):
+                    raise TypeError("repeat_ expects list input along non-scalar dims")
+                return [rep_axis(sub, axis + 1) for sub in lst]
+
+            return rep_axis(data, 0)
+
+        if isinstance(repeats, (tuple, list)):
+            reps = list(repeats)
+            def tile(lst, axis):
+                if axis == len(reps):
+                    return self._clone_recursive(lst)
+                if not isinstance(lst, list):
+                    return [self._clone_recursive(lst) for _ in range(reps[axis])]
+                tiled_sub = [tile(sub, axis + 1) for sub in lst]
+                return tiled_sub * reps[axis]
+
+            return tile(data, 0)
+
+        raise TypeError("repeats must be int or tuple for PurePython backend")
 
     def view_flat_(self) -> Any:
         return _flatten(self.data)
