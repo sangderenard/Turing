@@ -77,7 +77,7 @@ def flatten(self):
         if not isinstance(data, list):
             return [data]
         return [item for sublist in data for item in _flatten(sublist)]
-    flat_data = _flatten(self.data)
+    flat_data = _flatten(self.tolist())
     out = type(self)(track_time=getattr(self, 'track_time', False))
     out.data = flat_data
     return out
