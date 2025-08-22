@@ -1,5 +1,7 @@
-import torch
 from typing import Optional
+import math
+
+from ..tensors.abstraction import AbstractTensor
 
 class GeneralIndexComposer:
     """
@@ -13,9 +15,7 @@ class GeneralIndexComposer:
         validate(grid_shape): Verifies the correctness on a small known example grid.
     """
     def __init__(self, device: Optional[str] = None):
-        # Resolve device once for the composer
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        # Map dimension characters to axis indices
+        self.device = device or "cpu"
         self.dimension_map = {'u': 0, 'v': 1, 'w': 2}
 
     def interpret_label(self, label):
@@ -82,57 +82,49 @@ class GeneralIndexComposer:
         device = self.device
         ndim = len(grid_shape)
 
-        # Grid indices and flat index grid
-        grid_indices = torch.meshgrid(
-            *[torch.arange(s, device=device) for s in grid_shape], indexing='ij'
+        grid_ranges = [
+            AbstractTensor.arange(s, dtype=AbstractTensor.long_dtype_, device=device)
+            for s in grid_shape
+        ]
+        grid_indices = AbstractTensor.meshgrid(*grid_ranges, indexing='ij')
+        total_size = math.prod(grid_shape)
+        flat_indices = (
+            AbstractTensor.arange(total_size, dtype=AbstractTensor.long_dtype_, device=device)
+            .reshape(grid_shape)
         )
-        flat_indices = torch.arange(torch.prod(torch.tensor(grid_shape))).reshape(grid_shape).to(device)
-
         results = {'row_indices': {}, 'col_indices': {}, 'masks': {}, 'boundary_masks': {}}
-
         for pattern in patterns:
             label = pattern['label']
             offset = pattern['offset']
             periodic = pattern['periodic']
-
-            # Fresh boundary mask per pattern
-            bm = (
-                torch.zeros(grid_shape, dtype=torch.bool, device=device)
+            bm_accum = (
+                AbstractTensor.zeros(grid_shape, dtype=AbstractTensor.long_dtype_, device=device)
                 if boundary_mask is None
-                else boundary_mask.clone()
+                else boundary_mask.astype(AbstractTensor.long_dtype_)
             )
-
-            # Compute neighbor indices
             neighbor_indices = []
             for dim in range(ndim):
                 new_index = grid_indices[dim] + offset[dim]
-
                 if periodic[dim]:
                     new_index = new_index % grid_shape[dim]
                 else:
-                    # Identify boundary regions only on one side per offset direction
+                    base = grid_indices[dim] + offset[dim]
                     if offset[dim] > 0:
-                        bm |= (grid_indices[dim] + offset[dim]) >= grid_shape[dim]
+                        cond = base >= grid_shape[dim]
+                        bm_accum = bm_accum + cond.astype(AbstractTensor.long_dtype_)
                     elif offset[dim] < 0:
-                        bm |= (grid_indices[dim] + offset[dim]) < 0
-
-                    new_index = torch.clamp(new_index, 0, grid_shape[dim] - 1)
-
+                        cond = base < 0
+                        bm_accum = bm_accum + cond.astype(AbstractTensor.long_dtype_)
+                    new_index = AbstractTensor.clamp(new_index, min=0, max=grid_shape[dim] - 1)
                 neighbor_indices.append(new_index)
-
-            # Compute valid mask (excluding boundary contributions for this pattern)
-            valid_mask = ~bm
-
-            # Compute row and column indices
+            bm = bm_accum.greater(0)
+            valid_mask = bm.logical_not()
             row_indices = flat_indices[valid_mask]
             col_indices = flat_indices[tuple(neighbor_indices)][valid_mask]
-
-            # Store results
             results['row_indices'][label] = row_indices
             results['col_indices'][label] = col_indices
             results['masks'][label] = valid_mask
-            results['boundary_masks'][label] = bm  # Pattern-specific boundary mask
-
+            results['boundary_masks'][label] = bm
         return results
 
     def validate(self, grid_shape):

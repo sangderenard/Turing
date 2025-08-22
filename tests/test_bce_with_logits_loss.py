@@ -3,9 +3,13 @@ import pytest
 
 from src.common.tensors.abstract_nn.losses import BCEWithLogitsLoss
 
-try:
-    from src.common.tensors.torch_backend import PyTorchTensorOperations
-except Exception:  # pragma: no cover - optional dependency
+torch_spec = importlib.util.find_spec("torch")
+if torch_spec is not None:
+    try:
+        from src.common.tensors.torch_backend import PyTorchTensorOperations
+    except Exception:  # pragma: no cover - optional dependency
+        PyTorchTensorOperations = None
+else:  # torch not available
     PyTorchTensorOperations = None
 
 try:
@@ -13,18 +17,22 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     NumPyTensorOperations = None
 
-try:
-    from src.common.tensors.jax_backend import JAXTensorOperations
-except Exception:  # pragma: no cover - optional dependency
+jax_spec = importlib.util.find_spec("jax")
+if jax_spec is not None:
+    try:
+        from src.common.tensors.jax_backend import JAXTensorOperations
+    except Exception:  # pragma: no cover - optional dependency
+        JAXTensorOperations = None
+else:  # jax not available
     JAXTensorOperations = None
 
 
 BACKENDS = []
-if PyTorchTensorOperations is not None and importlib.util.find_spec("torch") is not None:
+if PyTorchTensorOperations is not None:
     BACKENDS.append(("PyTorch", PyTorchTensorOperations))
 if NumPyTensorOperations is not None:
     BACKENDS.append(("NumPy", NumPyTensorOperations))
-if JAXTensorOperations is not None and importlib.util.find_spec("jax") is not None:
+if JAXTensorOperations is not None:
     BACKENDS.append(("JAX", JAXTensorOperations))
 
 

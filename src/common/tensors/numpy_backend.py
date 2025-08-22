@@ -117,6 +117,10 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.maximum(self.data, min_val)
 
+    def clamp_min(self, min_val):
+        import numpy as np
+        return np.maximum(self.data, min_val)
+
     def clamp_max_(self, max_val):
         import numpy as np
         return np.minimum(self.data, max_val)
@@ -492,8 +496,17 @@ class NumPyTensorOperations(AbstractTensor):
         return np.cumsum(self.data, axis=dim)
 
     def repeat_(self, repeats=None, dim: int = 0):
-        """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
-        raise NotImplementedError("repeat not implemented for NumPy backend")
+        """Repeat tensor along ``dim`` ``repeats`` times using NumPy."""
+        if repeats is None:
+            raise ValueError("repeats must be specified for NumPy backend")
+        if isinstance(repeats, int):
+            reps = [1] * self.data.ndim
+            reps[dim] = repeats
+            return np.tile(self.data, reps)
+        elif isinstance(repeats, (tuple, list)):
+            return np.tile(self.data, repeats)
+        else:
+            raise TypeError("repeats must be int or tuple for NumPy backend")
 
     def view_flat_(self):
         return self.data.reshape(-1)

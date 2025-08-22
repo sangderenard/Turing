@@ -4,9 +4,13 @@ import pytest
 from src.common.tensors.pure_backend import PurePythonTensorOperations
 from src.common.tensors.abstract_nn.core import Linear
 
-try:
-    from src.common.tensors.torch_backend import PyTorchTensorOperations
-except Exception:  # pragma: no cover - optional dependency
+torch_spec = importlib.util.find_spec("torch")
+if torch_spec is not None:
+    try:
+        from src.common.tensors.torch_backend import PyTorchTensorOperations
+    except Exception:  # pragma: no cover - optional dependency
+        PyTorchTensorOperations = None
+else:  # torch not available
     PyTorchTensorOperations = None
 
 try:
@@ -15,7 +19,7 @@ except Exception:  # pragma: no cover - optional dependency
     NumPyTensorOperations = None
 
 BACKENDS = [("PurePython", PurePythonTensorOperations)]
-if PyTorchTensorOperations is not None and importlib.util.find_spec("torch") is not None:
+if PyTorchTensorOperations is not None:
     BACKENDS.append(("PyTorch", PyTorchTensorOperations))
 if NumPyTensorOperations is not None:
     BACKENDS.append(("NumPy", NumPyTensorOperations))

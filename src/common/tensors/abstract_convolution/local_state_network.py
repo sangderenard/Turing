@@ -1,8 +1,18 @@
-import torch
-import torch.nn as nn
+import importlib.util
 import numpy as np
 from collections import defaultdict, deque
 import threading
+import types
+
+torch_spec = importlib.util.find_spec("torch")
+if torch_spec is not None:
+    import torch  # pragma: no cover - optional dependency
+    import torch.nn as nn  # pragma: no cover - optional dependency
+else:  # torch not available
+    torch = None  # type: ignore
+    class _DummyModule:  # pragma: no cover - minimal stub
+        pass
+    nn = types.SimpleNamespace(Module=_DummyModule)  # type: ignore
 # Face Neighbors (6)
 U_PLUS = 'u+'
 U_MINUS = 'u-'
@@ -283,13 +293,14 @@ def mock_metric_tensor_func(grid_u, grid_v, grid_w, *partials):
     return g_ij, g_inv, det_g
 
 grid_shape = (4, 4, 4)
-local_state = LocalStateNetwork(mock_metric_tensor_func, grid_shape, switchboard_config)
-
-grid_u = torch.ones(grid_shape)
-grid_v = torch.ones(grid_shape)
-grid_w = torch.ones(grid_shape)
-partials = (grid_u, grid_v, grid_w, grid_u, grid_v, grid_w)
-
-outputs = local_state(grid_u, grid_v, grid_w, partials)
-for key, value in outputs.items():
-    print(f"{key}: {value.shape}")
+if torch is not None:
+    local_state = LocalStateNetwork(mock_metric_tensor_func, grid_shape, switchboard_config)
+    grid_u = torch.ones(grid_shape)
+    grid_v = torch.ones(grid_shape)
+    grid_w = torch.ones(grid_shape)
+    partials = (grid_u, grid_v, grid_w, grid_u, grid_v, grid_w)
+    outputs = local_state(grid_u, grid_v, grid_w, partials)
+    for key, value in outputs.items():
+        print(f"{key}: {value.shape}")
+else:  # pragma: no cover - fallback when torch missing
+    local_state = None
