@@ -1,0 +1,6 @@
+diag_
+einsum_
+log_softmax_tensor_
+prod_
+shape_
+unsqueeze_

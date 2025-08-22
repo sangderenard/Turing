@@ -448,6 +448,28 @@ class PurePythonTensorOperations(AbstractTensor):
         else:
             return [row[i1] for row in selected_rows]
 
+    def softmax_(self, dim: int) -> Any:
+        if dim != -1 and dim != len(_get_shape(self.data)) - 1:
+            raise NotImplementedError("softmax only implemented for last dimension")
+
+        def _softmax(vec):
+            max_val = max(vec)
+            exp_vec = [math.exp(x - max_val) for x in vec]
+            s = sum(exp_vec)
+            return [x / s for x in exp_vec]
+
+        def rec(t):
+            if not isinstance(t, list) or not t:
+                return t
+            if not isinstance(t[0], list):
+                return _softmax(t)
+            return [rec(sub) for sub in t]
+
+        return rec(self.data)
+
+    def log_softmax_(self, dim: int) -> Any:
+        return self.log_softmax_tensor_(self.data, dim)
+
     def log_softmax_tensor_(self, tensor: Any, dim: int) -> Any:
         if dim != -1 and dim != len(_get_shape(tensor)) - 1:
             raise NotImplementedError("log_softmax only implemented for last dimension")
@@ -926,6 +948,176 @@ class PurePythonTensorOperations(AbstractTensor):
 
         return rec(self.data, value)
 
+    def greater_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a > b
+
+        return rec(self.data, value)
+
+    def greater_equal_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a >= b
+
+        return rec(self.data, value)
+
+    def less_equal_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a <= b
+
+        return rec(self.data, value)
+
+    def equal_(self, value: Any) -> Any:
+        value = value.data if isinstance(value, AbstractTensor) else value
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a == b
+
+        return rec(self.data, value)
+
+    def maximum_(self, other: Any) -> Any:
+        other = other.data if isinstance(other, AbstractTensor) else other
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a if a >= b else b
+
+        return rec(self.data, other)
+
+    def minimum_(self, other: Any) -> Any:
+        other = other.data if isinstance(other, AbstractTensor) else other
+
+        def rec(a, b):
+            if isinstance(a, list) and isinstance(b, list):
+                return [rec(x, y) for x, y in zip(a, b)]
+            if isinstance(a, list):
+                return [rec(x, b) for x in a]
+            if isinstance(b, list):
+                return [rec(a, y) for y in b]
+            return a if a <= b else b
+
+        return rec(self.data, other)
+
+    def where_(self, x: Any, y: Any) -> Any:
+        x = x.data if isinstance(x, AbstractTensor) else x
+        y = y.data if isinstance(y, AbstractTensor) else y
+
+        def rec(c, a, b):
+            if isinstance(c, list):
+                return [
+                    rec(ci, a[i] if isinstance(a, list) else a, b[i] if isinstance(b, list) else b)
+                    for i, ci in enumerate(c)
+                ]
+            return a if c else b
+
+        return rec(self.data, x, y)
+
+    def unsqueeze_(self, dim: int):
+        data = self.data
+        shape = _get_shape(data)
+        if dim < 0:
+            dim += len(shape) + 1
+
+        def rec(lst, axis):
+            if axis == dim:
+                return [lst]
+            if not isinstance(lst, list):
+                raise ValueError("unsqueeze_ expects list input")
+            return [rec(x, axis + 1) for x in lst]
+
+        return rec(data, 0)
+
+    def flatten_(self, start_dim: int = 0, end_dim: int = -1):
+        shape = list(_get_shape(self.data))
+        ndim = len(shape)
+        if end_dim < 0:
+            end_dim += ndim
+        if start_dim < 0:
+            start_dim += ndim
+        flat_dim = 1
+        for s in shape[start_dim : end_dim + 1]:
+            flat_dim *= s
+        new_shape = shape[:start_dim] + [flat_dim] + shape[end_dim + 1 :]
+        flat = _flatten(self.data)
+        it = iter(flat)
+
+        def build(s):
+            if not s:
+                return next(it)
+            return [build(s[1:]) for _ in range(s[0])]
+
+        return build(new_shape)
+
+    def prod_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
+        data = self.data
+
+        def _prod(lst):
+            flat = _flatten(lst)
+            p = 1
+            for v in flat:
+                p *= v
+            return p
+
+        def reduce_dim(lst, d):
+            if d == 0:
+                if not isinstance(lst[0], list):
+                    p = 1
+                    for v in lst:
+                        p *= v
+                    return [p] if keepdim else p
+                cols = len(lst[0])
+                result = []
+                for i in range(cols):
+                    col = [row[i] for row in lst]
+                    result.append(_prod(col))
+                if keepdim:
+                    return [result]
+                return result
+            return [reduce_dim(row, d - 1) for row in lst]
+
+        if dim is None:
+            p = _prod(data)
+            if keepdim:
+                shape = _get_shape(data)
+                for _ in range(len(shape)):
+                    p = [p]
+            return p
+        return reduce_dim(data, dim)
+
     def index_select_(self, tensor: Any, dim: int, indices: Any) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)
         idx = self._AbstractTensor__unwrap(indices)
@@ -1129,6 +1321,17 @@ class PurePythonTensorOperations(AbstractTensor):
     def ceil_(self):
         import math
         return self._map_unary(math.ceil, self.data)
+
+    def exp_(self):
+        import math
+        return self._map_unary(math.exp, self.data)
+
+    def log_(self):
+        import math
+        return self._map_unary(math.log, self.data)
+
+    def logical_not_(self):
+        return self._map_unary(lambda x: not x, self.data)
 
     def to_dtype_(self, tensor, dtype: str = "float"):
         # For pure Python, just convert all elements recursively
