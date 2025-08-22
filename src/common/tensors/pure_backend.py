@@ -965,6 +965,30 @@ class PurePythonTensorOperations(AbstractTensor):
             return idx
         return reduce_dim(data, dim)
 
+    def diag_(self, offset: int = 0):
+        data = self.data
+        # If input is 2D, extract diagonal with offset
+        if data and isinstance(data[0], list):
+            rows = len(data)
+            cols = len(data[0])
+            diag = []
+            for i in range(rows):
+                j = i + offset
+                if 0 <= j < cols:
+                    diag.append(data[i][j])
+            return diag
+        # Otherwise assume 1D vector and construct diagonal matrix
+        n = len(data)
+        size = n + abs(offset)
+        mat = [[0 for _ in range(size)] for _ in range(size)]
+        for idx, val in enumerate(data):
+            if offset >= 0:
+                i, j = idx, idx + offset
+            else:
+                i, j = idx - offset, idx
+            mat[i][j] = val
+        return mat
+
     def interpolate_(self, tensor: Any, size: Tuple[int, ...]) -> Any:
         tensor = self._AbstractTensor__unwrap(tensor)
         shape = _get_shape(tensor)

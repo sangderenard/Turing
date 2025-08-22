@@ -599,6 +599,10 @@ class NumPyTensorOperations(AbstractTensor):
     def argmin_(self, dim=None, keepdim=False):
         return np.argmin(self.data, axis=dim, keepdims=keepdim)
 
+    def diag_(self, offset: int = 0):
+        import numpy as np
+        return np.diag(self.data, k=offset)
+
     def interpolate_(self, size):
         arr = np.array(self.data)
         if len(size) != arr.ndim:
