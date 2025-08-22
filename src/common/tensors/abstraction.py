@@ -151,10 +151,6 @@ class AbstractTensor:
                 return backend_cls
         return None
 
-    repeat = _reshape_methods.repeat
-    
-    repeat_interleave = _reshape_methods.repeat_interleave
-    
     # --- Sentinel dtypes for use before backend is set ---
     float_dtype_ = 'float32'  # Default sentinel, can be replaced by backend
     long_dtype_ = 'int64'     # Default sentinel, can be replaced by backend
@@ -446,11 +442,6 @@ class AbstractTensor:
     __str__ = _properties.__str__
     __repr__ = _properties.__repr__
     __len__ = _properties.__len__
-    # Wire in reshape and flatten from abstraction_methods.reshape
-    reshape = _reshape_methods.reshape
-    flatten = _reshape_methods.flatten
-    transpose = _reshape_methods.transpose
-    squeeze = _reshape_methods.squeeze
 
     @staticmethod
     def check_or_build_registry():
@@ -931,6 +922,26 @@ class AbstractTensor:
         return self.tensor_from_list([tensor], dtype=None, device=None)
 
     # --- Operator routing ---
+    def _pre_autograd(self, op: str, inputs: Iterable[Any]):
+        """Return a callback that records ``op`` on the autograd tape.
+
+        Parameters
+        ----------
+        op:
+            Name of the operator about to be executed.
+        inputs:
+            Sequence of operands participating in the operation.
+        """
+        from . import autograd as _autograd
+
+        inputs = list(inputs)
+        if any(getattr(x, "requires_grad", False) for x in inputs if isinstance(x, AbstractTensor)):
+            def finalize(result: Any):
+                _autograd.autograd.record(op, inputs, result)
+                return result
+            return finalize
+        return lambda result: result
+
     def _apply_operator(self, op: str, left: Any, right: Any):
         """
         Arithmetic with bool tensors:
@@ -947,6 +958,8 @@ class AbstractTensor:
             right = left.ensure_tensor(right)      # instead of get_tensor(... Faculty.NUMPY)
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
+
+        finalize = self._pre_autograd(op, [x for x in (left, right) if x is not None])
 
         # Optional belt-and-suspenders: align mixed backends
         if isinstance(left, AbstractTensor) and isinstance(right, AbstractTensor) and (type(left) is not type(right)):
@@ -1009,19 +1022,7 @@ class AbstractTensor:
 
         result = type(self)(track_time=self.track_time)
         result.data = self._apply_operator__(op, l, r)
-
-        # Record operation on the lightweight autograd tape for backends
-        # lacking native autograd (pure Python and NumPy).  Torch/JAX rely on
-        # their own automatic differentiation systems.
-        from . import autograd as _autograd
-
-        backend_name = type(self).__name__
-        if backend_name in ("PurePythonTensorOperations", "NumPyTensorOperations"):
-            inputs = [x for x in (left, right) if x is not None]
-            if any(getattr(x, "requires_grad", False) for x in inputs):
-                _autograd.autograd.record(op, inputs, result)
-
-        return result
+        return finalize(result)
 
 
     def __add__(self, other):
@@ -1421,7 +1422,8 @@ from .abstraction_methods.comparison import (
     isnan as comp_isnan,
     isinf as comp_isinf,
     all as comp_all,
-    isfinite as comp_isfinite
+    isfinite as comp_isfinite,
+    allclose as comp_allclose,
 )
 from .abstraction_methods.trigonometry import (
     sin as trig_sin,
@@ -1489,72 +1491,91 @@ AbstractTensor.register_hook  = _autograd_methods.register_hook
 
 # --- Bindings to AbstractTensor -------------------------------------------
 
-AbstractTensor.linspace     = staticmethod(linspace)
-AbstractTensor.meshgrid     = staticmethod(meshgrid)
-AbstractTensor.zeros        = staticmethod(create_zeros)
-AbstractTensor.ones         = staticmethod(create_ones)
-AbstractTensor.full         = staticmethod(create_full)
-AbstractTensor.zeros_like   = create_zeros_like
-AbstractTensor.ones_like    = create_ones_like
-AbstractTensor.full_like    = create_full_like
+AbstractTensor.linspace = staticmethod(linspace)
+AbstractTensor.meshgrid = staticmethod(meshgrid)
+AbstractTensor.zeros = staticmethod(create_zeros)
+AbstractTensor.ones = staticmethod(create_ones)
+AbstractTensor.full = staticmethod(create_full)
 from .abstraction_methods.random import Random as _RandomClass
 AbstractTensor.random = _RandomClass()
-AbstractTensor.randoms      = staticmethod(randoms)
-AbstractTensor.rand_like    = rand_like
-AbstractTensor.randint      = staticmethod(randint)
-AbstractTensor.randint_like = randint_like
-
-AbstractTensor.max    = reduction_max
-AbstractTensor.argmax = reduction_argmax
-
+AbstractTensor.randoms = staticmethod(randoms)
+AbstractTensor.randint = staticmethod(randint)
 AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 
-AbstractTensor.to        = type_to
-AbstractTensor.astype    = type_astype
-AbstractTensor.long_cast = type_long_cast
-AbstractTensor.float     = type_float
-AbstractTensor.double    = type_double
-AbstractTensor.int       = type_int
-AbstractTensor.long      = type_long
-AbstractTensor.bool      = type_bool
-AbstractTensor.cpu       = type_cpu
-AbstractTensor.cuda      = type_cuda
 
-AbstractTensor.greater        = comp_greater
-AbstractTensor.greater_equal  = comp_greater_equal
-AbstractTensor.less           = comp_less
-AbstractTensor.less_equal     = comp_less_equal
-AbstractTensor.equal          = comp_equal
-AbstractTensor.not_equal      = comp_not_equal
-AbstractTensor.where     = comp_where
-AbstractTensor.all      = comp_all
-AbstractTensor.any        = comp_any
-AbstractTensor.nonzero  = comp_nonzero
-AbstractTensor.isfinite = comp_isfinite
-AbstractTensor.isnan = comp_isnan
-AbstractTensor.isinf = comp_isinf
-# allclose wiring
-from .abstraction_methods.comparison import allclose as comp_allclose
-AbstractTensor.allclose = comp_allclose
-AbstractTensor.sin   = trig_sin
-AbstractTensor.cos   = trig_cos
-AbstractTensor.tan   = trig_tan
-AbstractTensor.asin  = trig_asin
-AbstractTensor.acos  = trig_acos
-AbstractTensor.atan  = trig_atan
-AbstractTensor.sinh  = trig_sinh
-AbstractTensor.cosh  = trig_cosh
-AbstractTensor.tanh  = trig_tanh
-AbstractTensor.asinh = trig_asinh
-AbstractTensor.acosh = trig_acosh
-AbstractTensor.atanh = trig_atanh
-AbstractTensor.sec   = trig_sec
-AbstractTensor.csc   = trig_csc
-AbstractTensor.cot   = trig_cot
-AbstractTensor.sech  = trig_sech
-AbstractTensor.csch  = trig_csch
-AbstractTensor.coth  = trig_coth
-AbstractTensor.sinc  = trig_sinc
+def _wrap_with_autograd(name: str, func: Callable) -> Callable:
+    def wrapped(self, *args, **kwargs):
+        tensor_args = [a for a in args if isinstance(a, AbstractTensor)]
+        tensor_args += [v for v in kwargs.values() if isinstance(v, AbstractTensor)]
+        finalize = self._pre_autograd(name, [self] + tensor_args)
+        result = func(self, *args, **kwargs)
+        return finalize(result)
+    return wrapped
+
+
+def _bind_and_wrap(mapping: Dict[str, Callable]) -> None:
+    for _name, _func in mapping.items():
+        setattr(AbstractTensor, _name, _wrap_with_autograd(_name, _func))
+
+
+_bind_and_wrap({
+    "reshape": _reshape_methods.reshape,
+    "flatten": _reshape_methods.flatten,
+    "transpose": _reshape_methods.transpose,
+    "squeeze": _reshape_methods.squeeze,
+    "repeat": _reshape_methods.repeat,
+    "repeat_interleave": _reshape_methods.repeat_interleave,
+    "zeros_like": create_zeros_like,
+    "ones_like": create_ones_like,
+    "full_like": create_full_like,
+    "rand_like": rand_like,
+    "randint_like": randint_like,
+    "max": reduction_max,
+    "argmax": reduction_argmax,
+    "to": type_to,
+    "astype": type_astype,
+    "long_cast": type_long_cast,
+    "float": type_float,
+    "double": type_double,
+    "int": type_int,
+    "long": type_long,
+    "bool": type_bool,
+    "cpu": type_cpu,
+    "cuda": type_cuda,
+    "greater": comp_greater,
+    "greater_equal": comp_greater_equal,
+    "less": comp_less,
+    "less_equal": comp_less_equal,
+    "equal": comp_equal,
+    "not_equal": comp_not_equal,
+    "where": comp_where,
+    "all": comp_all,
+    "any": comp_any,
+    "nonzero": comp_nonzero,
+    "isfinite": comp_isfinite,
+    "isnan": comp_isnan,
+    "isinf": comp_isinf,
+    "allclose": comp_allclose,
+    "sin": trig_sin,
+    "cos": trig_cos,
+    "tan": trig_tan,
+    "asin": trig_asin,
+    "acos": trig_acos,
+    "atan": trig_atan,
+    "sinh": trig_sinh,
+    "cosh": trig_cosh,
+    "tanh": trig_tanh,
+    "asinh": trig_asinh,
+    "acosh": trig_acosh,
+    "atanh": trig_atanh,
+    "sec": trig_sec,
+    "csc": trig_csc,
+    "cot": trig_cot,
+    "sech": trig_sech,
+    "csch": trig_csch,
+    "coth": trig_coth,
+    "sinc": trig_sinc,
+})
 
 AbstractTensor.numel   = prop_numel
 AbstractTensor.item    = prop_item

@@ -1,88 +1,63 @@
 
 from __future__ import annotations
 
-# Global flag to control backend autograd deferral
-ALLOW_BACKEND_AUTOGRAD_DEFER = True
+# Internal, framework-independent gradient bookkeeping helpers.
 
-def set_backend_autograd_defer(allow: bool):
-    """Set whether backend autograd deferral is allowed at runtime."""
-    global ALLOW_BACKEND_AUTOGRAD_DEFER
-    ALLOW_BACKEND_AUTOGRAD_DEFER = allow
-
-
-def requires_grad_(self, requires_grad=True):
+def requires_grad_(self, requires_grad: bool = True):
+    """Enable or disable gradient tracking on this tensor."""
     self._requires_grad = requires_grad
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'requires_grad_'):
-        self.data.requires_grad_(requires_grad)
-        return self
     return self
 
 
 @property
-def requires_grad(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'requires_grad'):
-        return self.data.requires_grad
-    return getattr(self, '_requires_grad', False)
+def requires_grad(self) -> bool:
+    return getattr(self, "_requires_grad", False)
+
 
 @requires_grad.setter
-def requires_grad(self, value):
-    self.requires_grad_(value)
+def requires_grad(self, value: bool) -> None:  # pragma: no cover - simple setter
     self._requires_grad = value
 
 
-def backward(self, *args, **kwargs):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'backward'):
-        return self.data.backward(*args, **kwargs)
-    raise NotImplementedError("backward not supported for this backend")
+def backward(self, *args, **kwargs):  # pragma: no cover - not yet implemented
+    raise NotImplementedError(
+        "backward not supported; use AbstractTensor.autograd.grad instead"
+    )
 
 
 @property
 def grad(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'grad'):
-        return self.data.grad
-    return None
+    return getattr(self, "_grad", None)
 
 
 def detach(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'detach'):
-        result = type(self)(track_time=self.track_time)
-        result.data = self.data.detach()
-        return result
-    raise NotImplementedError("detach not supported for this backend")
+    result = type(self)(track_time=self.track_time)
+    result.data = self.data
+    result._requires_grad = False
+    return result
 
 
 @property
-def is_leaf(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'is_leaf'):
-        return self.data.is_leaf
-    return True
+def is_leaf(self) -> bool:
+    return not hasattr(self, "_grad_node")
 
 
-def retain_grad(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'retain_grad'):
-        self.data.retain_grad()
-        return self
-    raise NotImplementedError("retain_grad not supported for this backend")
+def retain_grad(self):  # pragma: no cover - placeholder for API compatibility
+    return self
 
 
 @property
 def grad_fn(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'grad_fn'):
-        return self.data.grad_fn
-    return None
+    return getattr(self, "_grad_node", None)
 
 
-def zero_grad(self):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'grad') and self.data.grad is not None:
-        self.data.grad.zero_()
-        return self
-    raise NotImplementedError("zero_grad not supported for this backend")
+def zero_grad(self):  # pragma: no cover - simple helper
+    self._grad = None
+    return self
 
 
-def register_hook(self, hook):
-    if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'register_hook'):
-        return self.data.register_hook(hook)
-    raise NotImplementedError("register_hook not supported for this backend")
+def register_hook(self, hook):  # pragma: no cover - hooks not supported
+    raise NotImplementedError("register_hook not supported for this tensor")
 
 
 """Lightweight automatic differentiation helpers.
@@ -347,9 +322,14 @@ class Autograd:
                     raise ValueError("No gradient found for one of the inputs")
             else:
                 if hasattr(inp, "data") and isinstance(inp.data, list):
-                    results.append(g.tolist())
-                else:
-                    results.append(g)
+                    g = g.tolist()
+                results.append(g)
+
+        for inp, g in zip(inputs, results):  # attach gradients to tensors
+            try:
+                inp._grad = g
+            except Exception:
+                pass
 
         if not retain_graph:
             self.tape = GradTape()
