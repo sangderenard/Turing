@@ -50,3 +50,15 @@ def test_autograd_records_only_for_grad_inputs():
     node = autograd.tape.node(z)
     assert node is not None
     assert {pid for pid, _ in node.parents} == {id(a), id(b)}
+
+
+def test_autograd_single_tensor_input():
+    autograd = AbstractTensor.autograd
+    autograd.tape._nodes.clear()
+
+    x = AbstractTensor.tensor([1.0, 2.0, 3.0])
+    x.requires_grad = True
+    y = x * 2.0
+
+    grad_x = autograd.grad(y, x)[0]
+    assert np.allclose(grad_x, np.array([2.0, 2.0, 2.0]))

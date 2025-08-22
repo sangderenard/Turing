@@ -1021,19 +1021,37 @@ class TransformHub:
             print("Z:", Z)
 
         # Calculate partial derivatives with respect to U
-        dXdu = AbstractTensor.autograd.grad(X, U, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdu = AbstractTensor.autograd.grad(Y, U, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdu = AbstractTensor.autograd.grad(Z, U, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdu = AbstractTensor.autograd.grad(
+            X, [U], grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True
+        )[0]
+        dYdu = AbstractTensor.autograd.grad(
+            Y, [U], grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True
+        )[0]
+        dZdu = AbstractTensor.autograd.grad(
+            Z, [U], grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True
+        )[0]
 
         # Calculate partial derivatives with respect to V
-        dXdv = AbstractTensor.autograd.grad(X, V, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdv = AbstractTensor.autograd.grad(Y, V, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdv = AbstractTensor.autograd.grad(Z, V, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdv = AbstractTensor.autograd.grad(
+            X, [V], grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True
+        )[0]
+        dYdv = AbstractTensor.autograd.grad(
+            Y, [V], grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True
+        )[0]
+        dZdv = AbstractTensor.autograd.grad(
+            Z, [V], grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True
+        )[0]
 
         # Calculate partial derivatives with respect to W
-        dXdw = AbstractTensor.autograd.grad(X, W, grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True)[0]
-        dYdw = AbstractTensor.autograd.grad(Y, W, grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True)[0]
-        dZdw = AbstractTensor.autograd.grad(Z, W, grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True)[0]
+        dXdw = AbstractTensor.autograd.grad(
+            X, [W], grad_outputs=AbstractTensor.ones_like(X), retain_graph=True, allow_unused=True
+        )[0]
+        dYdw = AbstractTensor.autograd.grad(
+            Y, [W], grad_outputs=AbstractTensor.ones_like(Y), retain_graph=True, allow_unused=True
+        )[0]
+        dZdw = AbstractTensor.autograd.grad(
+            Z, [W], grad_outputs=AbstractTensor.ones_like(Z), retain_graph=True, allow_unused=True
+        )[0]
 
         target_shape = U.shape  # (N_u, N_v, N_w)
 
