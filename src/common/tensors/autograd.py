@@ -106,6 +106,10 @@ recorded graph in reverse to accumulate gradients for requested inputs.
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
 
+# Integrate the lightweight backward registry so that backward rules are
+# resolved dynamically rather than being baked into the tape at record time.
+from .backward import BACKWARD_REGISTRY
+
 import math
 
 try:  # NumPy is an optional dependency for the repository
@@ -116,25 +120,11 @@ except Exception:  # pragma: no cover - tested in environments without numpy
 
 @dataclass
 class GradNode:
-    """Single operation in the automatic differentiation graph.
-
-    Attributes
-    ----------
-    op:
-        Name of the primitive operator that produced the tensor.
-    parents:
-        List of ``(tensor_id, arg_pos)`` pairs describing the incoming
-        edges for this node. ``tensor_id`` is the ``id()`` of the input
-        tensor, ``arg_pos`` is the positional index in the forward call.
-    backward:
-        Callable implementing the local backward rule. It receives the
-        gradient w.r.t. the node's output and must return an iterable of
-        gradients matching ``parents`` order.
-    """
+    """Single operation in the automatic differentiation graph."""
 
     op: str
     parents: List[Tuple[int, int]]
-    backward: Callable[[Any], Iterable[Any]]
+    ctx: Dict[str, Any]
 
 
 class GradTape:
@@ -157,30 +147,26 @@ class GradTape:
         op: str,
         inputs: Iterable[Any],
         result: Any,
-        backward_fn: Callable[[Any], Iterable[Any]],
     ) -> Any:
-        """Append a new node representing ``op`` to the tape.
+        """Append a new node representing ``op`` to the tape."""
 
-        Parameters
-        ----------
-        op:
-            Name of the operation.
-        inputs:
-            Iterable of input tensors from which the result was computed.
-        result:
-            The output tensor produced by ``op``.
-        backward_fn:
-            Function implementing the local backward rule for ``op``.
-
-        Returns
-        -------
-        Any
-            Passes ``result`` through unchanged to ease functional style.
-        """
-
+        inputs = list(inputs)
         parent_ids = [(id(t), pos) for pos, t in enumerate(inputs)]
-        node = GradNode(op=op, parents=parent_ids, backward=backward_fn)
+        ctx = {
+            "inputs": [x.data if hasattr(x, "data") else x for x in inputs],
+            "result": result.data if hasattr(result, "data") else result,
+            "input_shapes": [getattr(x, "shape", None) for x in inputs],
+            "result_shape": getattr(result, "shape", None),
+        }
+        node = GradNode(op=op, parents=parent_ids, ctx=ctx)
         self._nodes[id(result)] = node
+        # Attach graph references to the tensor itself so that each tensor knows
+        # about its generating node and tape.
+        try:
+            result._grad_node = node  # type: ignore[attr-defined]
+            result._grad_tape = self  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return result
 
     # ------------------------------------------------------------------
@@ -281,18 +267,20 @@ def bw_pow(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
     return _reduce_like(gx, x), _reduce_like(gy, y)
 
 
-PRIMITIVE_BACKWARD: Dict[str, Callable[..., Tuple[Any, ...]]] = {
-    "add": bw_add,
-    "radd": bw_add,
-    "sub": bw_sub,
-    "rsub": lambda g, x, y: bw_sub(g, y, x),
-    "mul": bw_mul,
-    "rmul": bw_mul,
-    "truediv": bw_truediv,
-    "rtruediv": lambda g, x, y: bw_truediv(g, y, x),
-    "pow": bw_pow,
-    "rpow": lambda g, x, y: bw_pow(g, y, x),
-}
+# Register primitive backward rules with the shared registry.  This keeps the
+# actual backward implementations in one place and allows other parts of the
+# system to consult the same registry when extending the set of supported
+# operators.
+BACKWARD_REGISTRY.register("add", bw_add)
+BACKWARD_REGISTRY.register("radd", bw_add)
+BACKWARD_REGISTRY.register("sub", bw_sub)
+BACKWARD_REGISTRY.register("rsub", lambda g, x, y: bw_sub(g, y, x))
+BACKWARD_REGISTRY.register("mul", bw_mul)
+BACKWARD_REGISTRY.register("rmul", bw_mul)
+BACKWARD_REGISTRY.register("truediv", bw_truediv)
+BACKWARD_REGISTRY.register("rtruediv", lambda g, x, y: bw_truediv(g, y, x))
+BACKWARD_REGISTRY.register("pow", bw_pow)
+BACKWARD_REGISTRY.register("rpow", lambda g, x, y: bw_pow(g, y, x))
 
 
 # ----------------------------------------------------------------------------
@@ -307,16 +295,11 @@ class Autograd:
         self.tape = GradTape()
 
     def record(self, op: str, inputs: Iterable[Any], result: Any) -> Any:
-        bw = PRIMITIVE_BACKWARD.get(op)
-        if bw is None:
+        """Record an operation on the tape if a backward rule exists."""
+
+        if op not in BACKWARD_REGISTRY._methods:
             return result
-        inputs = list(inputs)
-        data_inputs = [x.data if hasattr(x, "data") else x for x in inputs]
-
-        def backward_fn(grad_out: Any) -> Iterable[Any]:
-            return bw(grad_out, *data_inputs)
-
-        self.tape.record(op, inputs, result, backward_fn)
+        self.tape.record(op, inputs, result)
         return result
 
     def grad(
@@ -341,7 +324,10 @@ class Autograd:
             grad_out = grad_map.get(tid)
             if grad_out is None:
                 continue
-            parent_grads = node.backward(grad_out)
+            bw = BACKWARD_REGISTRY._methods.get(node.op)
+            if bw is None:
+                continue
+            parent_grads = bw(grad_out, *node.ctx["inputs"])
             for (pid, _), g in zip(node.parents, parent_grads):
                 if g is None:
                     continue
