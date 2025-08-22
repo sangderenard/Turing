@@ -250,7 +250,10 @@ class AbstractTensor:
 
     # --- Unary math ---
     def sqrt(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        if isinstance(self, AbstractTensor):
+            result = type(self)(track_time=self.track_time)
+        else:
+            result = AbstractTensor.get_tensor(self.data, track_time=False)
         result.data = self.sqrt_()
         return result
 
