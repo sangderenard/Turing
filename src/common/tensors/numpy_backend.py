@@ -82,8 +82,6 @@ class NumPyTensorOperations(AbstractTensor):
     def any_(self, dim=None):
         import numpy as np
         return np.any(self.data, axis=dim)
-    def max_(self, dim=None, keepdim=False):
-        return np.max(self.data, axis=dim, keepdims=keepdim)
 
     def argmax_(self, dim=None, keepdim=False):
         arr = self.data
@@ -348,8 +346,9 @@ class NumPyTensorOperations(AbstractTensor):
     def item_(self):
         return self.data.item()
 
-    def max_(self, tensor):
-        return np.max(self._AbstractTensor__unwrap(tensor))
+    def max_(self, tensor=None, dim=None, keepdim=False):
+        data = self._AbstractTensor__unwrap(tensor if tensor is not None else self.data)
+        return np.max(data, axis=dim, keepdims=keepdim)
 
     def long_cast_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).astype(np.int64)

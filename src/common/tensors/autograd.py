@@ -125,7 +125,11 @@ class GradTape:
     ) -> Any:
         """Append a new node representing ``op`` to the tape."""
 
-        inputs = list(inputs)
+        # Ensure a sequence of inputs; a single tensor should not be iterated elementwise.
+        if isinstance(inputs, (list, tuple, set)):
+            inputs = list(inputs)
+        else:
+            inputs = [inputs]
         parent_ids = [(id(t), pos) for pos, t in enumerate(inputs)]
         ctx = {
             "inputs": [x.data if hasattr(x, "data") else x for x in inputs],
@@ -288,7 +292,10 @@ class Autograd:
         if np is None:
             raise RuntimeError("NumPy is required for autograd operations")
 
-        inputs = list(inputs)
+        if isinstance(inputs, (list, tuple, set)):
+            inputs = list(inputs)
+        else:
+            inputs = [inputs]
         out_grad = grad_outputs
         if out_grad is None:
             out_grad = np.ones_like(output.data if hasattr(output, "data") else output)
