@@ -1070,7 +1070,7 @@ class TransformHub:
 
         # Randomly sample 10% of the top 10% farthest points
         sample_size = max(1, int(0.1 * top_10_percent_threshold))
-        sample_indices = random.sample(top_10_percent_indices.tolist(), sample_size)
+        sample_indices = AbstractTensor.random.sample(top_10_percent_indices.tolist(), sample_size)
 
         # Conduct majority check based on sampled normals
         outward_votes = 0

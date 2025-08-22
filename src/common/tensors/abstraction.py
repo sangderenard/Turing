@@ -1460,7 +1460,8 @@ AbstractTensor.full         = staticmethod(create_full)
 AbstractTensor.zeros_like   = create_zeros_like
 AbstractTensor.ones_like    = create_ones_like
 AbstractTensor.full_like    = create_full_like
-AbstractTensor.random       = staticmethod(random_tensor)
+from .abstraction_methods.random import Random as _RandomClass
+AbstractTensor.random = _RandomClass()
 AbstractTensor.randoms      = staticmethod(randoms)
 AbstractTensor.rand_like    = rand_like
 AbstractTensor.randint      = staticmethod(randint)

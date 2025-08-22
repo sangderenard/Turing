@@ -1,3 +1,4 @@
+
 # random.py
 from __future__ import annotations
 
@@ -823,3 +824,68 @@ def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float
         return prng_iter()
     else:
         raise ValueError("Unknown RANDOM_KIND for random_generator")
+
+
+# --- Python-random-like interface using project PRNG infra ---
+class Random:
+    """
+    Python random-like interface using the project's random_generator system.
+    By default uses fast PRNG (Xoroshiro128**), but can be seeded and configured.
+    """
+    def __init__(self, kind=None, algo=None, seed=None):
+        from .random import RANDOM_KIND, PRNG_ALGO
+        self.kind = kind or RANDOM_KIND.PRNG
+        self.algo = algo or PRNG_ALGO.XOROSHIRO128SS
+        self.seed = seed
+        self._reset_gen()
+
+    def _reset_gen(self):
+        self._gen = random_generator(kind=self.kind, algo=self.algo, seed=self.seed, dtype="float", batch_size=1)
+
+    def seed(self, seed=None):
+        self.seed = seed
+        self._reset_gen()
+
+    def random(self):
+        return next(self._gen)
+
+    def randint(self, a, b):
+        # Uniform integer in [a, b]
+        r = next(random_generator(kind=self.kind, algo=self.algo, seed=self.seed, dtype="float", batch_size=1))
+        return a + int(r * ((b - a) + 1))
+
+    def uniform(self, a, b):
+        r = next(self._gen)
+        return a + (b - a) * r
+
+    def choice(self, seq):
+        if not seq:
+            raise IndexError("Cannot choose from an empty sequence")
+        idx = int(next(self._gen) * len(seq))
+        return seq[idx]
+
+    def shuffle(self, x):
+        # Fisher-Yates shuffle
+        for i in reversed(range(1, len(x))):
+            j = int(next(self._gen) * (i + 1))
+            x[i], x[j] = x[j], x[i]
+
+    def sample(self, population, k):
+        if k > len(population):
+            raise ValueError("Sample larger than population")
+        pool = list(population)
+        self.shuffle(pool)
+        return pool[:k]
+
+    def gauss(self, mu, sigma):
+        # Box-Muller transform
+        import math
+        u1 = next(self._gen)
+        u2 = next(self._gen)
+        z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+        return mu + z0 * sigma
+
+    def normalvariate(self, mu, sigma):
+        return self.gauss(mu, sigma)
+
+    # Add more methods as needed for your use case
