@@ -1,10 +1,11 @@
 """
-Backward/VJP Registry
-=====================
+Backward Rule Registry
+======================
 
 This module is an **easy-to-read, static registry** of known backward rules
-(Vector-Jacobian Products, VJPs) for common tensor operations. It is intended
-to serve simultaneously as:
+for common tensor operations. Each rule stores a small snippet of Python code
+that can be turned into an executable function at runtime. The registry is
+intended to serve simultaneously as:
 
 1) **Hard data backing** for a `backward.py` implementation (machine-readable).
 2) **A computer-science + pure-math reference**, readable by humans.
@@ -16,9 +17,9 @@ Design principles
   - `arity`: "unary" | "binary" | "n-ary"
   - `signature`: canonical forward signature (names of inputs and parameters)
   - `latex`: math definition of the forward and its derivative(s)
-  - `vjp`: VJP pseudocode in a small, self-explanatory DSL
-           (variable names: `g` = upstream gradient, inputs by their names; may
-           reference helper symbols defined in `helpers_spec` below).
+  - `backward`: Python code for the backward pass (as string). The snippet
+           uses `g` for the upstream gradient and may reference helper symbols
+           defined in `helpers_spec` below.
   - `domain`: assumptions on inputs (e.g., positivity for `log`)
   - `notes`: shape/broadcasting remarks, corner cases, and subgradient choices.
   - `tags`: optional topical tags.
@@ -35,10 +36,11 @@ Design principles
   (e.g., 0 at 0 for `abs`, tie-breaking by 0.5 for `maximum/minimum`).
 
 
-VJP / DSL helpers
------------------
-The VJP pseudocode is designed to be trivially translatable to your tensor API.
-The following helper identifiers are assumed to exist (as math concepts):
+Backward code helpers
+---------------------
+The backward code snippets are designed to be trivially translatable to your
+tensor API. The following helper identifiers are assumed to exist (as math
+concepts):
 
 - `unbroadcast(G, shape)`
     Sum-reduce `G` over the axes that were broadcast relative to `shape` and
@@ -83,7 +85,7 @@ The following helper identifiers are assumed to exist (as math concepts):
 - `dot(a, b, dim)`
     Inner product along the specified `dim` (vectors).
 
-All ops used in the pseudocode should map to your `AbstractTensor` surface
+All ops used in the snippets should map to your `AbstractTensor` surface
 (using `+ - * / **`, `.sum`, `.reshape`, `.permute`, `.transpose`, etc.).
 
 
@@ -94,7 +96,7 @@ Each entry is a dictionary with keys:
       "arity": str,
       "signature": str,
       "latex": str or list[str],
-      "vjp": dict[str, str],     # map input_name -> VJP pseudocode
+      "backward": dict[str, str],     # map input_name -> backward code snippet
       "domain": str,
       "notes": str,
       "tags": list[str]
@@ -129,7 +131,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = -x",
         "latex": r"y = -x, \quad \frac{\partial y}{\partial x} = -1",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(-g, x.shape)"
         },
         "domain": "x: any real",
@@ -140,7 +142,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = exp(x)",
         "latex": r"y = e^x, \quad \frac{\partial y}{\partial x} = e^x = y",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * y, x.shape)"
         },
         "domain": "x: any real",
@@ -151,7 +153,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = log(x)",
         "latex": r"y = \log x, \quad \frac{\partial y}{\partial x} = 1/x",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g / (x + eps), x.shape)"
         },
         "domain": "x > 0 (strict); practical: x >= eps",
@@ -162,7 +164,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = sqrt(x)",
         "latex": r"y = \sqrt{x}, \quad \frac{\partial y}{\partial x} = \frac{1}{2\sqrt{x}}",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(0.5 * g / (y + eps), x.shape)"
         },
         "domain": "x >= 0; practical: x >= 0 with eps guard",
@@ -173,7 +175,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = |x|",
         "latex": r"y = |x|, \quad \frac{\partial y}{\partial x} = \mathrm{sign}(x) \text{ for } x \neq 0",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * where(x>0, 1, where(x<0, -1, 0)), x.shape)"
         },
         "domain": "x: any real",
@@ -184,7 +186,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = sin(x)",
         "latex": r"y = \sin x, \quad \frac{\partial y}{\partial x} = \cos x",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * cos(x), x.shape)"
         },
         "domain": "x: any real",
@@ -195,7 +197,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = cos(x)",
         "latex": r"y = \cos x, \quad \frac{\partial y}{\partial x} = -\sin x",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(-g * sin(x), x.shape)"
         },
         "domain": "x: any real",
@@ -206,7 +208,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = tan(x)",
         "latex": r"y = \tan x, \quad \frac{\partial y}{\partial x} = \sec^2 x = 1 + \tan^2 x",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * (1 + y*y), x.shape)"
         },
         "domain": "x != (pi/2 + k*pi)",
@@ -217,7 +219,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = tanh(x)",
         "latex": r"y = \tanh x, \quad \frac{\partial y}{\partial x} = 1 - \tanh^2 x = 1 - y^2",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * (1 - y*y), x.shape)"
         },
         "domain": "x: any real",
@@ -228,7 +230,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = sigmoid(x)",
         "latex": r"y = \sigma(x) = \frac{1}{1+e^{-x}}, \quad \frac{\partial y}{\partial x} = y(1-y)",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * y * (1 - y), x.shape)"
         },
         "domain": "x: any real",
@@ -239,7 +241,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = relu(x) = max(x, 0)",
         "latex": r"y = \max(x,0), \quad \frac{\partial y}{\partial x} = \mathbf{1}_{x>0}",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * indicator(x>0), x.shape)"
         },
         "domain": "x: any real",
@@ -250,7 +252,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = leaky_relu(x; alpha) = max(x, alpha*x)",
         "latex": r"y=\begin{cases}x & x>0\\ \alpha x & x\le0\end{cases},\quad \frac{\partial y}{\partial x}=\begin{cases}1 & x>0\\ \alpha & x\le0\end{cases}",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * where(x>0, 1, alpha), x.shape)"
         },
         "domain": "alpha in (0,1) typically",
@@ -261,7 +263,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = softplus(x) = log(1 + exp(x))",
         "latex": r"y = \log(1+e^{x}),\quad \frac{\partial y}{\partial x} = \sigma(x)",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * sigmoid(x), x.shape)"
         },
         "domain": "x: any real",
@@ -276,7 +278,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = x + y",
         "latex": r"z = x+y,\quad \frac{\partial z}{\partial x}=1,\ \frac{\partial z}{\partial y}=1",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g, x.shape)",
             "y": "gy = unbroadcast(g, y.shape)",
         },
@@ -288,7 +290,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = x - y",
         "latex": r"z = x-y,\quad \frac{\partial z}{\partial x}=1,\ \frac{\partial z}{\partial y}=-1",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g, x.shape)",
             "y": "gy = unbroadcast(-g, y.shape)",
         },
@@ -300,7 +302,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = x * y",
         "latex": r"z = xy,\quad \frac{\partial z}{\partial x}=y,\ \frac{\partial z}{\partial y}=x",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * y, x.shape)",
             "y": "gy = unbroadcast(g * x, y.shape)",
         },
@@ -312,7 +314,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = x / y",
         "latex": r"z = x/y,\quad \frac{\partial z}{\partial x}=1/y,\ \frac{\partial z}{\partial y}=-x/y^2",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g / (y + eps), x.shape)",
             "y": "gy = unbroadcast(-g * x / ((y + eps)*(y + eps)), y.shape)",
         },
@@ -327,7 +329,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             r"z = x^p, \quad \frac{\partial z}{\partial x} = p x^{p-1}",
             r"\frac{\partial z}{\partial p} = x^p \log x \quad (x>0)"
         ],
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * p * (x + eps)**(p - 1), x.shape)",
             "p": "gp = unbroadcast(g * (x + eps)**p * log(x + eps), p.shape)",
         },
@@ -339,9 +341,9 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = maximum(x, y)",
         "latex": r"z_i = \max(x_i, y_i)",
-        "vjp": {
-            "x": "gx = unbroadcast(g * where(x>y, 1, where(x<y, 0, 0.5))), x.shape)",
-            "y": "gy = unbroadcast(g * where(y>x, 1, where(y<x, 0, 0.5))), y.shape)",
+        "backward": {
+            "x": "gx = unbroadcast(g * where(x>y, 1, where(x<y, 0, 0.5)), x.shape)",
+            "y": "gy = unbroadcast(g * where(y>x, 1, where(y<x, 0, 0.5)), y.shape)",
         },
         "domain": "x,y: any real",
         "notes": "At ties (x==y) we choose to split gradient equally (0.5/0.5).",
@@ -351,9 +353,9 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "z = minimum(x, y)",
         "latex": r"z_i = \min(x_i, y_i)",
-        "vjp": {
-            "x": "gx = unbroadcast(g * where(x<y, 1, where(x>y, 0, 0.5))), x.shape)",
-            "y": "gy = unbroadcast(g * where(y<x, 1, where(y>x, 0, 0.5))), y.shape)",
+        "backward": {
+            "x": "gx = unbroadcast(g * where(x<y, 1, where(x>y, 0, 0.5)), x.shape)",
+            "y": "gy = unbroadcast(g * where(y<x, 1, where(y>x, 0, 0.5)), y.shape)",
         },
         "domain": "x,y: any real",
         "notes": "At ties (x==y) split the gradient 0.5/0.5.",
@@ -367,7 +369,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = sum(x, axis=None, keepdim=False)",
         "latex": r"y = \sum_{i \in \mathcal{I}} x_i",
-        "vjp": {
+        "backward": {
             "x": "gx = expand_to(g, x.shape)"
         },
         "domain": "x: any real",
@@ -378,7 +380,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = mean(x, axis=None, keepdim=False)",
         "latex": r"y = \frac{1}{N}\sum_{i \in \mathcal{I}} x_i",
-        "vjp": {
+        "backward": {
             "x": "N = number_of_elements_reduced; gx = expand_to(g, x.shape) / N"
         },
         "domain": "x: any real",
@@ -389,7 +391,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = var(x, axis=None, keepdim=False, unbiased=False)",
         "latex": r"y = \frac{1}{N}\sum_i (x_i - \bar{x})^2 \text{ (population)}",
-        "vjp": {
+        "backward": {
             "x": "mu = mean(x, axis, keepdim=True); gx = expand_to(g, x.shape) * 2*(x - mu)/N"
         },
         "domain": "x: any real",
@@ -400,7 +402,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = std(x, axis=None, keepdim=False, unbiased=False) = sqrt(var(x))",
         "latex": r"y = \sqrt{\mathrm{var}(x)}",
-        "vjp": {
+        "backward": {
             "x": "mu = mean(x, axis, keepdim=True); v = mean((x - mu)**2, axis, keepdim=True); gx = expand_to(g, x.shape) * (x - mu) / (sqrt(v) * N + eps)"
         },
         "domain": "x: any real",
@@ -415,7 +417,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = reshape(x, new_shape)",
         "latex": r"y = \mathrm{Reshape}(x)",
-        "vjp": {
+        "backward": {
             "x": "gx = reshape(g, x.shape)"
         },
         "domain": "Same number of elements.",
@@ -426,7 +428,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = T(x)  # last-two-dims transpose",
         "latex": r"y = x^\top,\quad \mathrm{(last\ two\ dims)}",
-        "vjp": {
+        "backward": {
             "x": "gx = T(g)"
         },
         "domain": "Tensor with rank >=2",
@@ -437,7 +439,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = permute(x, perm)",
         "latex": r"y_{i_{\pi(1)},\ldots,i_{\pi(n)}} = x_{i_1,\ldots,i_n}",
-        "vjp": {
+        "backward": {
             "x": "inv = inverse_permutation(perm); gx = permute(g, inv)"
         },
         "domain": "Any rank",
@@ -448,7 +450,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = broadcast_to(x, shape)",
         "latex": r"y = \mathrm{Broadcast}(x)",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g, x.shape)"
         },
         "domain": "Target shape is broadcast-compatible.",
@@ -459,7 +461,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = x[slices]",
         "latex": r"y = S(x) \text{ (slicing operator)}",
-        "vjp": {
+        "backward": {
             "x": "gx = zeros_like(x); gx[slices] = g"
         },
         "domain": "Any real; slices valid.",
@@ -470,8 +472,8 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "n-ary",
         "signature": "y = concat([x1, x2, ...], dim)",
         "latex": r"y = \mathrm{Concat}(x_1,x_2,\ldots; \mathrm{dim})",
-        "vjp": {
-            "x*": "g splits along dim with sizes [x1.size(dim), x2.size(dim), ...]"
+        "backward": {
+            "x*": "gs = split(g, [xi.shape[dim] for xi in xs], dim)"
         },
         "domain": "Shapes must align on all dims except `dim`.",
         "notes": "Backward is a split of `g` into per-input gradients.",
@@ -481,7 +483,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "n-ary",
         "signature": "y = stack([x1, x2, ...], dim)",
         "latex": r"y = \mathrm{Stack}(x_1,x_2,\ldots; \mathrm{dim})",
-        "vjp": {
+        "backward": {
             "x*": "gx_k = unstack(g, dim)[k]"
         },
         "domain": "All inputs same shape.",
@@ -496,7 +498,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "n-ary",
         "signature": "y = where(cond, a, b)",
         "latex": r"y_i = \begin{cases} a_i & \text{if } cond_i \\ b_i & \text{otherwise}\end{cases}",
-        "vjp": {
+        "backward": {
             "a": "ga = unbroadcast(g * indicator(cond), a.shape)",
             "b": "gb = unbroadcast(g * (1 - indicator(cond)), b.shape)"
         },
@@ -508,7 +510,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = clamp(x, min=None, max=None)",
         "latex": r"y = \min(\max(x, m), M)",
-        "vjp": {
+        "backward": {
             "x": "gx = unbroadcast(g * indicator((min is None or x>min) and (max is None or x<max)), x.shape)"
         },
         "domain": "x real; min<=max if provided.",
@@ -526,7 +528,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             r"Y = A B,\quad dA = G B^\top,\quad dB = A^\top G",
             r"(Broadcasted batch dims require summing over broadcast axes.)"
         ],
-        "vjp": {
+        "backward": {
             "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
             "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
         },
@@ -538,7 +540,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "binary",
         "signature": "y = dot(a, b, dim=-1)  # inner product vectors",
         "latex": r"y = \sum_i a_i b_i,\quad da = g b,\ db = g a",
-        "vjp": {
+        "backward": {
             "a": "ga = unbroadcast(g * b, a.shape)",
             "b": "gb = unbroadcast(g * a, b.shape)"
         },
@@ -550,7 +552,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = ||x||_2 = sqrt(sum(x^2, axis, keepdim=False))",
         "latex": r"y = \sqrt{\sum_i x_i^2},\quad \frac{\partial y}{\partial x} = \frac{x}{\|x\|_2}",
-        "vjp": {
+        "backward": {
             "x": "gx = expand_to(g, x.shape) * x / (norm2(x, axis, keepdim=True) + eps)"
         },
         "domain": "x real; handle zero norm via eps.",
@@ -561,7 +563,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "Y = inverse(X)",
         "latex": r"dX = -X^{-\top} \, G \, X^{-\top}",
-        "vjp": {
+        "backward": {
             "X": "gX = - matmul(T(inverse(X)), matmul(g, T(inverse(X))))"
         },
         "domain": "X square and nonsingular.",
@@ -572,7 +574,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = det(X)",
         "latex": r"dy = \det(X)\,\mathrm{tr}(X^{-1} dX)\quad \Rightarrow\quad \frac{\partial y}{\partial X} = y \, X^{-\top}",
-        "vjp": {
+        "backward": {
             "X": "gX = g * det(X) * T(inverse(X))"
         },
         "domain": "X square and nonsingular.",
@@ -583,7 +585,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = trace(X)",
         "latex": r"dy = \mathrm{tr}(dX) \Rightarrow \frac{\partial y}{\partial X} = I",
-        "vjp": {
+        "backward": {
             "X": "gX = g * I_like(X)"
         },
         "domain": "Square last-two-dims assumed; otherwise trace over min(n,m).",
@@ -598,7 +600,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = softmax(x, dim)",
         "latex": r"\frac{\partial y}{\partial x} = \mathrm{diag}(y) - y y^\top",
-        "vjp": {
+        "backward": {
             "x": "s = softmax(x, dim); dot = sum(g * s, dim, keepdim=True); gx = (g - dot) * s"
         },
         "domain": "x real; `dim` valid.",
@@ -609,7 +611,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "arity": "unary",
         "signature": "y = log_softmax(x, dim)",
         "latex": r"\frac{\partial y}{\partial x} = I - \mathbf{1} y^\top_{\exp} \quad\text{with } y_{\exp}=\mathrm{softmax}(x)",
-        "vjp": {
+        "backward": {
             "x": "s = softmax(x, dim); dot = sum(g, dim, keepdim=True); gx = g - dot * s"
         },
         "domain": "x real; `dim` valid.",
