@@ -15,6 +15,9 @@ def _randn_matrix(rows: int, cols: int, like: AbstractTensor, scale: float = 0.0
 def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
+def _to_tuple3(x):
+    return (x, x, x) if isinstance(x, int) else x
+
 class Linear:
     def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu"):
         self.like = like
@@ -195,6 +198,74 @@ class RectConv2d:
         self._cols = None
         self._x_shape = None
         return dx
+class RectConv3d:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int, int],
+        *,
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
+        dilation: int | tuple[int, int, int] = 1,
+        like: AbstractTensor,
+        bias: bool = True,
+    ):
+        self.like = like
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _to_tuple3(kernel_size)
+        self.stride = _to_tuple3(stride)
+        self.padding = _to_tuple3(padding)
+        self.dilation = _to_tuple3(dilation)
+        kD, kH, kW = self.kernel_size
+        scale = math.sqrt(2.0 / (in_channels * kD * kH * kW))
+        w_data = [
+            [
+                [
+                    [
+                        [random.gauss(0.0, 1.0) * scale for _ in range(kW)]
+                        for _ in range(kH)
+                    ]
+                    for _ in range(kD)
+                ]
+                for _ in range(in_channels)
+            ]
+            for _ in range(out_channels)
+        ]
+        self.W = from_list_like(w_data, like=like)
+        self.b = from_list_like([0.0] * out_channels, like=like) if bias else None
+        self.gW = zeros_like(self.W)
+        self.gb = zeros_like(self.b) if self.b is not None else None
+        self._x = None
+
+    def parameters(self) -> List[AbstractTensor]:
+        return [p for p in (self.W, self.b) if p is not None]
+
+    def zero_grad(self):
+        self.gW = zeros_like(self.W)
+        if self.b is not None:
+            self.gb = zeros_like(self.b)
+        self._x = None
+
+    def forward(self, x: AbstractTensor) -> AbstractTensor:
+        import numpy as np
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        self._x = x
+        arr = x.data
+        pD, pH, pW = self.padding
+        arr_p = np.pad(arr, ((0, 0), (0, 0), (pD, pD), (pH, pH), (pW, pW)))
+        kD, kH, kW = self.kernel_size
+        windows = sliding_window_view(arr_p, (kD, kH, kW), axis=(2, 3, 4))
+        out = np.tensordot(windows, self.W.data, axes=([1, 5, 6, 7], [1, 2, 3, 4]))
+        out = np.moveaxis(out, -1, 1)
+        if self.b is not None:
+            out = out + self.b.data.reshape(1, -1, 1, 1, 1)
+        return x.ensure_tensor(out)
+
+    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        raise NotImplementedError("RectConv3d.backward is not implemented")
 
 
 class MaxPool2d:

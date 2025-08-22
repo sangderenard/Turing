@@ -1,18 +1,14 @@
-import importlib.util
 import numpy as np
 from collections import defaultdict, deque
 import threading
-import types
 
-torch_spec = importlib.util.find_spec("torch")
-if torch_spec is not None:
-    import torch  # pragma: no cover - optional dependency
-    import torch.nn as nn  # pragma: no cover - optional dependency
-else:  # torch not available
-    torch = None  # type: ignore
-    class _DummyModule:  # pragma: no cover - minimal stub
-        pass
-    nn = types.SimpleNamespace(Module=_DummyModule)  # type: ignore
+from ..abstraction import AbstractTensor
+from ..abstract_nn import Linear, RectConv3d
+
+# ``LocalStateNetwork`` intentionally avoids heavyweight frameworks like
+# PyTorch.  Convolutional support will be wired in once an abstract 3D
+# convolution layer exists.  Until then we fall back to a simple Linear layer
+# that acts on the flattened per-voxel state.
 # Face Neighbors (6)
 U_PLUS = 'u+'
 U_MINUS = 'u-'
@@ -90,8 +86,8 @@ DEFAULT_CONFIGURATION = {
             'weighted_padded': [{'func': lambda weighted: weighted, 'args': ['weighted_padded']}],
             'modulated_padded': [{'func': lambda modulated: modulated, 'args': ['modulated_padded']}]
         }
-class LocalStateNetwork(nn.Module):
-    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None):
+class LocalStateNetwork:
+    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
 
@@ -102,12 +98,13 @@ class LocalStateNetwork(nn.Module):
             cache_ttl: Time-to-live (TTL) for cached values (default: 5 iterations).
             custom_hooks: Dictionary of hooks for custom tensor metrics.
         """
-        super().__init__()
         self.metric_tensor_func = metric_tensor_func
         self.grid_shape = grid_shape
         self.switchboard_config = switchboard_config
         self.cache_ttl = cache_ttl
         self.custom_hooks = custom_hooks or {}
+        self.recursion_depth = recursion_depth
+        self.max_depth = max_depth
 
         # Cache Manager
         self.state_cache = {}  # Key: hashed position, Value: (tensor, iteration_count)
@@ -115,17 +112,32 @@ class LocalStateNetwork(nn.Module):
         self.cache_lock = threading.Lock()
         num_parameters = 27
         # NN Integration Manager
-        self.weight_layer = nn.Parameter(torch.ones(3, 3, 3))
-        self.spatial_layer = nn.Conv3d(
-            in_channels=num_parameters,  
-            out_channels=num_parameters,  
-            kernel_size=3,  
-            padding=1,  
-            stride=1,
-            bias=False
-        )
+        self.weight_layer = AbstractTensor.get_tensor(np.ones((3, 3, 3), dtype=np.float32))
+        like = AbstractTensor.get_tensor(np.zeros((1, num_parameters), dtype=np.float32))
+        if recursion_depth < max_depth - 1:
+            self.spatial_layer = RectConv3d(
+                num_parameters,
+                num_parameters,
+                kernel_size=3,
+                padding=1,
+                like=like,
+                bias=False,
+            )
+            self.inner_state = LocalStateNetwork(
+                metric_tensor_func,
+                grid_shape,
+                switchboard_config,
+                cache_ttl=cache_ttl,
+                custom_hooks=custom_hooks,
+                recursion_depth=recursion_depth + 1,
+                max_depth=max_depth,
+            )
+        else:
+            self.spatial_layer = Linear(num_parameters, num_parameters, like=like, bias=False)
+            self.inner_state = None
 
         self.nn_generators = defaultdict(deque)
+
     def forward(self, padded_raw):
         """
         Forward pass to compute weighted_padded and modulated_padded.
@@ -141,19 +153,30 @@ class LocalStateNetwork(nn.Module):
             padded_raw = padded_raw.unsqueeze(0)
 
         B, D, H, W, _, _, _ = padded_raw.shape
-        
-        # Step 1: Compute weighted_padded
-        weight_layer = self.weight_layer.view(1,1,1,1,3,3,3) # Align dimensions for element-wise multiplication
-        weighted_padded = padded_raw * weight_layer  # Apply spatial weights
 
-        # Step 2: Reshape 3x3x3 state into 27 channels
-        padded_flat = padded_raw.reshape(B, D, H, W, -1).permute(0, 4, 1, 2, 3)  # (B, 27, D, H, W)
+        weight_layer = self.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        weighted_padded = padded_raw * weight_layer
 
-        # Step 3: Apply 3D convolution
-        modulated_flat = self.spatial_layer(padded_flat)  # Output shape: (B, 27, D, H, W)
+        padded_view = padded_raw.reshape((B, D, H, W, -1))
 
-        # Step 4: Reshape back to original (B, D, H, W, 3, 3) shape
-        modulated_padded = modulated_flat.permute(0, 2, 3, 4, 1).reshape(B, D, H, W, 3, 3, 3)
+        if isinstance(self.spatial_layer, RectConv3d):
+            padded_view = padded_view.transpose(1, 4)
+            padded_view = padded_view.transpose(2, 4)
+            padded_view = padded_view.transpose(3, 4)
+            modulated = self.spatial_layer.forward(padded_view)
+            modulated = modulated.transpose(3, 4)
+            modulated = modulated.transpose(2, 4)
+            modulated = modulated.transpose(1, 4)
+            modulated = modulated.reshape((B, D, H, W, -1))
+        else:
+            flat_view = padded_view.reshape((-1, padded_view.shape[-1]))
+            modulated = self.spatial_layer.forward(flat_view)
+            modulated = modulated.reshape((B, D, H, W, -1))
+
+        modulated_padded = modulated.reshape((B, D, H, W, 3, 3, 3))
+
+        if self.inner_state is not None:
+            _, modulated_padded = self.inner_state.forward(modulated_padded)
 
         return weighted_padded, modulated_padded
     # --------- CACHE MANAGER --------- #
@@ -232,30 +255,31 @@ class LocalStateNetwork(nn.Module):
 
 
         # Step 1: Initialize padded_raw
-        padded_raw = torch.zeros((*grid_shape, 3,  3, 3), device=g_ij.device)
+        padded_raw = AbstractTensor.zeros((*grid_shape, 3, 3, 3))
+
         # Handle tension and density
         if additional_params is None:
             additional_params = {}
 
-        tension = additional_params.get('tension', torch.ones(grid_shape, device=g_ij.device))
+        tension = additional_params.get('tension', AbstractTensor.ones(grid_shape))
         if callable(tension):
-            tension = tension(grid_u, grid_v, grid_w)  # Call the function if it's a hook
+            tension = tension(grid_u, grid_v, grid_w)
 
-        density = additional_params.get('density', torch.ones(grid_shape, device=g_ij.device))
+        density = additional_params.get('density', AbstractTensor.ones(grid_shape))
         if callable(density):
-            density = density(grid_u, grid_v, grid_w)  # Call the function if it's a hook
+            density = density(grid_u, grid_v, grid_w)
 
         # Place g_ij (metric tensor) and g_inv (inverse metric tensor)
-        padded_raw[..., 0, :, :] = g_ij[...,:,:]  # First 3x3 slot for metric tensor
-        padded_raw[..., 1, :, :] = g_inv[...,:,:]  # Second 3x3 slot for inverse metric tensor
+        padded_raw[..., 0, :, :] = g_ij[...,:,:]
+        padded_raw[..., 1, :, :] = g_inv[...,:,:]
 
         # Place det_g (determinant) and additional parameters in diagonal of third 3x3 slot
-        padded_raw[..., 2, 0, 0] = det_g  # Determinant of metric tensor
+        padded_raw[..., 2, 0, 0] = det_g
         padded_raw[..., 2, 1, 1] = tension
         padded_raw[..., 2, 2, 2] = density
         # Assign stencil constant dynamically (defaulting to STANDARD_STENCIL)
         default_stencil = INT_STANDARD_STENCIL if additional_params is None else additional_params.get("default_stencil", INT_STANDARD_STENCIL)
-        stencil_map = torch.full(grid_u.shape, float(default_stencil), dtype=grid_u.dtype, device=grid_u.device)
+        stencil_map = AbstractTensor.full(grid_u.shape, float(default_stencil))
         padded_raw[..., 2, 0, 1] = stencil_map
 
         
@@ -283,24 +307,3 @@ switchboard_config = {
     'weighted_padded': [{'func': lambda weighted: weighted, 'args': ['weighted_padded']}],
     'modulated_padded': [{'func': lambda modulated: modulated, 'args': ['modulated_padded']}]
 }
-
-# Test Example
-def mock_metric_tensor_func(grid_u, grid_v, grid_w, *partials):
-    shape = grid_u.shape + (3, 3)
-    g_ij = torch.eye(3).repeat(*grid_u.shape, 1, 1)
-    g_inv = torch.eye(3).repeat(*grid_u.shape, 1, 1)
-    det_g = torch.ones(grid_u.shape)
-    return g_ij, g_inv, det_g
-
-grid_shape = (4, 4, 4)
-if torch is not None:
-    local_state = LocalStateNetwork(mock_metric_tensor_func, grid_shape, switchboard_config)
-    grid_u = torch.ones(grid_shape)
-    grid_v = torch.ones(grid_shape)
-    grid_w = torch.ones(grid_shape)
-    partials = (grid_u, grid_v, grid_w, grid_u, grid_v, grid_w)
-    outputs = local_state(grid_u, grid_v, grid_w, partials)
-    for key, value in outputs.items():
-        print(f"{key}: {value.shape}")
-else:  # pragma: no cover - fallback when torch missing
-    local_state = None

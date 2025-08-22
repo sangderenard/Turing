@@ -21,6 +21,18 @@ class COOMatrix:
     def values(self):
         return self.edge_weight
 
+    @property
+    def row(self):
+        return self.edge_index[0]
+
+    @property
+    def col(self):
+        return self.edge_index[1]
+
+    @property
+    def data(self):
+        return self.edge_weight
+
     def to_dense(self):
         N = self.shape[0]
         dense = AbstractTensor.zeros((N, N))
@@ -29,6 +41,22 @@ class COOMatrix:
         for i in range(idx.shape[1]):
             dense[idx[0, i], idx[1, i]] = vals[i]
         return dense
+
+    def toarray(self):
+        dense = self.to_dense()
+        return getattr(dense, "data", dense)
+
+    def diagonal(self):
+        N = self.shape[0]
+        diag = AbstractTensor.zeros(N)
+        idx = self.edge_index
+        vals = self.edge_weight
+        for i in range(idx.shape[1]):
+            r = int(idx[0, i])
+            c = int(idx[1, i])
+            if r == c:
+                diag[r] = vals[i]
+        return diag
 
     def update(self, edge_index=None, edge_weight=None):
         if edge_index is not None:

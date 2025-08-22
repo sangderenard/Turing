@@ -1,4 +1,4 @@
-from .core import Linear, Sequential, Model, RectConv2d, MaxPool2d, Flatten
+from .core import Linear, Sequential, Model, RectConv2d, RectConv3d, MaxPool2d, Flatten
 from .activations import ReLU, Sigmoid, Tanh, Identity
 from .losses import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
 from .optimizer import Adam

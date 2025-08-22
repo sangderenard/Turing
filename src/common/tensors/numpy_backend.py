@@ -513,6 +513,14 @@ class NumPyTensorOperations(AbstractTensor):
     def view_flat_(self):
         return self.data.reshape(-1)
 
+    def coalesce(self):
+        return self
+
+    @staticmethod
+    def einsum_(equation, *operands):
+        import numpy as np
+        return np.einsum(equation, *operands)
+
     def assign_at_indices_(self, indices_dim0, indices_dim1, values_to_assign):
         t = self.data
         v = self._AbstractTensor__unwrap(values_to_assign)
@@ -545,6 +553,10 @@ class NumPyTensorOperations(AbstractTensor):
 
     def sum_(self, dim=None, keepdim=False):
         return np.sum(self.data, axis=dim, keepdims=keepdim)
+
+    def prod_(self, dim=None, keepdim=False):
+        import numpy as np
+        return np.prod(self.data, axis=dim, keepdims=keepdim)
 
     def min_(self, dim=None, keepdim=False):
         return np.min(self.data, axis=dim, keepdims=keepdim)

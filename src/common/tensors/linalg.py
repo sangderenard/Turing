@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Optional, Tuple, Union, List
 from .abstraction import AbstractTensor
+import numpy as np
 
 # ----------------------- small helpers -----------------------
 def _axis(dim: int, nd: int) -> int:
@@ -20,16 +21,16 @@ def _unsqueeze(x: AbstractTensor, dim: int) -> AbstractTensor:
     shp = list(x.get_shape())
     d = _axis(dim, len(shp)+1)
     shp.insert(d, 1)
-    return x.reshape(*shp)
+    return x.reshape(tuple(shp))
 
 def eye(n: int, *, dtype=None, device=None, batch_shape: Tuple[int, ...] = ()) -> AbstractTensor:
     """Vectorized I_n using arange/equality; supports broadcasting to batch_shape."""
-    i = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape(n, 1)
-    j = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape(1, n)
+    i = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((n, 1))
+    j = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((1, n))
     E = (i == j).to_dtype(dtype or AbstractTensor.float_dtype_)
     if batch_shape:
         # expand: (1,1,n,n) -> (*batch, n, n)
-        E = E.reshape(1, 1, n, n).expand(tuple(batch_shape) + (n, n))
+        E = E.reshape((1, 1, n, n)).expand(tuple(batch_shape) + (n, n))
     return E
 
 # ----------------------- vector ops --------------------------
@@ -44,17 +45,17 @@ def norm(x: AbstractTensor, ord: Union[int, str] = 2, dim: Optional[int] = None,
         if ord in (None, 2, 'fro'):
             return ( (x * x).sum() ).sqrt()
         if ord == 1:
-            return x.abs().sum()
+            return abs(x).sum()
         if ord == float('inf'):
-            return x.abs().max()
+            return abs(x).max()
         raise NotImplementedError(f"norm ord={ord} without dim not implemented")
     d = _axis(dim, x.dim())
     if ord in (None, 2, 'fro'):
         return ((x * x).sum(dim=d, keepdim=keepdim)).sqrt()
     if ord == 1:
-        return x.abs().sum(dim=d, keepdim=keepdim)
+        return abs(x).sum(dim=d, keepdim=keepdim)
     if ord == float('inf'):
-        return x.abs().max(dim=d, keepdim=keepdim)
+        return abs(x).max(dim=d, keepdim=keepdim)
     raise NotImplementedError(f"norm ord={ord} with dim implemented for 1,2,inf only")
 
 def cross(a: AbstractTensor, b: AbstractTensor, dim: int = -1) -> AbstractTensor:
@@ -134,7 +135,7 @@ def _lu_decompose_inplace(A: AbstractTensor):
     sign = one[..., 0, 0]  # scalar-like view per batch
     for k in range(n):
         # pivot: argmax |U[:,k,k:]| over rows k..n-1
-        col = U[..., k:, k].abs()
+        col = abs(U[..., k:, k])
         # find index of max along the row-axis (last-but-one of the sliced view)
         # We take the first occurrence; implement argmax via max + equality trick
         maxv = col.max(dim=-1, keepdim=True)
@@ -144,7 +145,7 @@ def _lu_decompose_inplace(A: AbstractTensor):
         idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=AbstractTensor.long_dtype_, device=U.get_device())
         idxv = _unsqueeze(idxv, -2).expand(col.get_shape())
         piv_idx_rel = (piv_rel * idxv).max(dim=-1)  # max picks the first highest index
-        piv = (piv_idx_rel + k).long()  # absolute pivot index
+        piv = (piv_idx_rel + k).astype(np.int64)  # absolute pivot index
         # swap rows k and piv in U
         # We need scalar pivot per batch; for simplicity, handle only no-batch or identical pivot → if not, loop batches
         if len(shp) == 2:
@@ -157,23 +158,24 @@ def _lu_decompose_inplace(A: AbstractTensor):
             # flatten batch dims
             B = 1
             for s in shp[:-2]: B *= s
-            Uv = U.reshape(B, n, n)
-            signv = sign.reshape(B)
-            pivv = piv.reshape(B)
+            Uv = U.reshape((B, n, n))
+            signv = sign.reshape((B,))
+            pivv = piv.reshape((B,))
             for b in range(B):
                 pk = int(pivv[b].item())
                 if pk != k:
                     _swap_rows(Uv[b:b+1], k, pk)
                     signv[b:b+1] = signv[b:b+1] * -1
-            U = Uv.reshape(*shp)
-            sign = signv.reshape(*shp[:-2])
+            U = Uv.reshape(tuple(shp))
+            sign = signv.reshape(tuple(shp[:-2]))
         # elimination
         pivot_val = U[..., k, k]
         # guard tiny pivot: no singular handling here, you can add epsilon
         for i in range(k+1, n):
             factor = U[..., i, k] / pivot_val
             U[..., i, k] = factor  # store L factor
-            U[..., i, k+1:] = U[..., i, k+1:] - factor * U[..., k, k+1:]
+            factor_exp = factor.unsqueeze(-1)
+            U[..., i, k+1:] = U[..., i, k+1:] - factor_exp * U[..., k, k+1:]
     return U, sign
 
 def _forward_substitute(LU: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
@@ -181,16 +183,23 @@ def _forward_substitute(LU: AbstractTensor, b: AbstractTensor) -> AbstractTensor
     shp = LU.get_shape(); n = shp[-1]
     y = b.clone()
     for i in range(n):
-        if i == 0: continue
-        y[..., i, :] = y[..., i, :] - LU[..., i, :i] @ y[..., :i, :]
+        if i == 0:
+            continue
+        lu_slice = LU[..., i, :i].unsqueeze(-1)
+        y_slice = y[..., :i, :]
+        prod = (lu_slice * y_slice).sum(dim=-2)
+        y[..., i, :] = y[..., i, :] - prod
     return y
 
 def _back_substitute(LU: AbstractTensor, y: AbstractTensor) -> AbstractTensor:
     """Solve Ux = y where U is upper from LU."""
     shp = LU.get_shape(); n = shp[-1]
     x = y.clone()
+    reshape_dims = tuple(list(LU.get_shape()[:-2]) + [1])
     for i in range(n-1, -1, -1):
-        x[..., i, :] = (x[..., i, :] - LU[..., i, i+1:] @ x[..., i+1:, :]) / LU[..., i, i].reshape(*LU.get_shape()[:-2], 1)
+        lu_slice = LU[..., i, i+1:].unsqueeze(-1)
+        prod = (lu_slice * x[..., i+1:, :]).sum(dim=-2)
+        x[..., i, :] = (x[..., i, :] - prod) / LU[..., i, i].reshape(reshape_dims)
     return x
 
 def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
@@ -208,7 +217,7 @@ def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
     # normalize b to (..., n, k)
     squeeze_vec = False
     if b.dim() == len(shpA)-1:  # (..., n)
-        b = b.reshape(*shpA[:-1], 1)
+        b = b.reshape(tuple(list(shpA[:-1]) + [1]))
         squeeze_vec = True
     elif b.dim() == len(shpA):  # (..., n, k)
         pass
@@ -222,7 +231,7 @@ def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
     B = b.clone()
     shp = U.get_shape()
     for k in range(n):
-        col = U[..., k:, k].abs()
+        col = abs(U[..., k:, k])
         maxv = col.max(dim=-1, keepdim=True)
         piv_rel = (col == maxv).to_dtype(AbstractTensor.long_dtype_)
         idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=AbstractTensor.long_dtype_, device=U.get_device())
@@ -235,26 +244,27 @@ def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
                 _swap_rows(B, k, pk)
         else:
             # loop batches
-            Bt = B.reshape(-1, n, B.get_shape()[-1])
-            Ut = U.reshape(-1, n, n)
+            Bt = B.reshape((-1, n, B.get_shape()[-1]))
+            Ut = U.reshape((-1, n, n))
             pivv = (piv_idx_rel + k).reshape(-1)
-            for bi in range(pivv.get_shape()[0]):
-                pk = int(pivv[bi].item())
+            for bi in range(pivv.shape[0]):
+                pk = int(pivv[bi])
                 if pk != k:
                     _swap_rows(Ut[bi:bi+1], k, pk)
                     _swap_rows(Bt[bi:bi+1], k, pk)
-            U = Ut.reshape(*shp)
-            B = Bt.reshape(*b.get_shape())
+            U = Ut.reshape(tuple(shp))
+            B = Bt.reshape(tuple(b.get_shape()))
         # elimination on U only to match pivots; not needed further
         pivot_val = U[..., k, k]
         for i in range(k+1, n):
             factor = U[..., i, k] / pivot_val
-            U[..., i, k+1:] = U[..., i, k+1:] - factor * U[..., k, k+1:]
+            factor_exp = factor.unsqueeze(-1)
+            U[..., i, k+1:] = U[..., i, k+1:] - factor_exp * U[..., k, k+1:]
     # Now solve using LU factors stored in LU
     # Note: LU lower has ones on diagonal; we already permuted B to match P
     y = _forward_substitute(LU, B)
     x = _back_substitute(LU, y)
-    return x.reshape(*A.get_shape()[:-1]) if squeeze_vec else x
+    return x.reshape(tuple(A.get_shape()[:-1])) if squeeze_vec else x
 
 def inv(A: AbstractTensor) -> AbstractTensor:
     """Matrix inverse via solve(A, I)."""
