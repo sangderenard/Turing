@@ -1161,7 +1161,7 @@ class TransformHub:
                                     0 <= nk < grid_shape[2]):
                                     neighbor_normal = normals[ni, nj, nk]
                                     neighbor_magnitude = norm_magnitudes[ni, nj, nk]
-                                    if neighbor_magnitude > 1e-16:
+                                    if neighbor_magnitude.item() > 1e-16:
                                         neighbors.append(neighbor_normal)
                     if neighbors:
                         avg_normal = AbstractTensor.mean(AbstractTensor.stack(neighbors), dim=0)
