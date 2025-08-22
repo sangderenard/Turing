@@ -209,6 +209,17 @@ class NumPyTensorOperations(AbstractTensor):
     def reshape_(self, shape):
         import numpy as np
         return np.reshape(self.data, shape)
+    def flatten_(self, start_dim=0, end_dim=-1):
+        import numpy as np
+        arr = self.data
+        ndim = arr.ndim
+        if start_dim < 0:
+            start_dim += ndim
+        if end_dim < 0:
+            end_dim += ndim
+        flat_dim = int(np.prod(arr.shape[start_dim:end_dim + 1]))
+        new_shape = arr.shape[:start_dim] + (flat_dim,) + arr.shape[end_dim + 1 :]
+        return arr.reshape(new_shape)
     def unsqueeze_(self, dim: int):
         import numpy as np
         return np.expand_dims(self.data, axis=dim)
