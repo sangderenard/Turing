@@ -122,6 +122,11 @@ class OpenGLTensorOperations(AbstractTensor):
     def stack_(self, tensors: list[Any], dim: int = 0):
         raise NotImplementedError
 
+    def unravel_index_(self, shape):
+        raise NotImplementedError(
+            "unravel_index not implemented for OpenGL backend"
+        )
+
     def repeat_interleave_(self, repeats: int = 1, dim: int | None = None):
         raise NotImplementedError
 

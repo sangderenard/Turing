@@ -648,6 +648,11 @@ class CTensorOperations(AbstractTensor):
         # ############################################################
         raise NotImplementedError("cat not implemented for C backend")
 
+    def unravel_index_(self, shape):
+        raise NotImplementedError(
+            "unravel_index not implemented for C backend"
+        )
+
     def get_device_(self, tensor: CTensor) -> str:
         return "cpu_cffi"
 

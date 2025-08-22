@@ -155,6 +155,13 @@ class PyTorchTensorOperations(AbstractTensor):
 
     def squeeze_(self, dim: int | None = None):
         return self.data.squeeze() if dim is None else self.data.squeeze(dim)
+
+    def unravel_index_(self, shape):
+        import torch
+        result = torch.unravel_index(self.data, shape)
+        if self.data.dim() == 0:
+            return tuple(int(x) for x in result)
+        return result
     def __init__(self, default_device = "cpu", track_time: bool = False):
         super().__init__(track_time=track_time)
         try:

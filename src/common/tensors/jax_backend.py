@@ -162,6 +162,13 @@ class JAXTensorOperations(AbstractTensor):
     def squeeze_(self, dim: int | None = None):
         import jax.numpy as jnp
         return jnp.squeeze(self.data, axis=dim) if dim is not None else jnp.squeeze(self.data)
+
+    def unravel_index_(self, shape):
+        import jax.numpy as jnp
+        result = jnp.unravel_index(self.data, shape)
+        if hasattr(self.data, "shape") and self.data.shape == ():
+            return tuple(int(x) for x in result)
+        return result
     """Tensor operations powered by `jax.numpy`."""
 
     def __init__(self, default_device: Optional[Any] = None, track_time: bool = False) -> None:

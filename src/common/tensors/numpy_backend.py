@@ -182,6 +182,13 @@ class NumPyTensorOperations(AbstractTensor):
     def squeeze_(self, dim: int | None = None):
         import numpy as np
         return np.squeeze(self.data, axis=dim) if dim is not None else np.squeeze(self.data)
+
+    def unravel_index_(self, shape):
+        import numpy as np
+        result = np.unravel_index(self.data, shape)
+        if np.isscalar(self.data) or (isinstance(self.data, np.ndarray) and self.data.ndim == 0):
+            return tuple(int(x) for x in result)
+        return result
     def __init__(self, track_time: bool = False):
         super().__init__(track_time=track_time)
 

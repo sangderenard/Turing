@@ -49,6 +49,7 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.increment_at_indices()
 - AbstractTensor.__getitem__()
 - AbstractTensor.__setitem__()
+- AbstractTensor.unravel_index()
 
 ## Reshaping & Manipulation
 - AbstractTensor.view_flat()

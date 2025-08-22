@@ -1218,6 +1218,11 @@ class AbstractTensor:
     def squeeze_(self, dim: int | None = None):
         raise NotImplementedError(f"{self.__class__.__name__} must implement squeeze_()")
 
+    def unravel_index_(self, shape):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement unravel_index_()"
+        )
+
 
 class AbstractF:
     """
@@ -1377,6 +1382,9 @@ from .abstraction_methods.reduction import (
     max as reduction_max,
     argmax as reduction_argmax,
 )
+from .abstraction_methods.indexing import (
+    unravel_index as indexing_unravel_index,
+)
 from .abstraction_methods.type_ops import (
     to as type_to,
     astype as type_astype,
@@ -1469,6 +1477,8 @@ AbstractTensor.randint_like = randint_like
 
 AbstractTensor.max    = reduction_max
 AbstractTensor.argmax = reduction_argmax
+
+AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 
 AbstractTensor.to        = type_to
 AbstractTensor.astype    = type_astype
