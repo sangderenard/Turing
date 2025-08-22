@@ -6,7 +6,7 @@ from src.common.tensors.abstraction import AbstractTensor
 
 @pytest.mark.parametrize("loss_type", ["bce", "mse"])
 def test_xor_learns(loss_type):
-    ops = AbstractTensor.get_tensor(faculty=None)
+    ops = AbstractTensor.get_tensor()
     set_seed(0)
     X = from_list_like([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], like=ops)
     X = X * 2.0 - 1.0

@@ -7,7 +7,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from ...common.tensors import AbstractTensor, Faculty
 from ...common.tensors.numpy_backend import NumPyTensorOperations
-from ...common.tensors.torch_backend import PyTorchTensorOperations
+try:  # optional torch backend
+    from ...common.tensors.torch_backend import PyTorchTensorOperations
+except Exception:  # pragma: no cover - torch is optional
+    PyTorchTensorOperations = None  # type: ignore[misc]
 
 try:
     from skimage.metrics import structural_similarity as ssim
@@ -25,7 +28,7 @@ def _backend_numpy(ops: AbstractTensor) -> bool:
 
 def _backend_torch(ops: AbstractTensor) -> bool:
     """Return True if ``ops`` uses a PyTorch backend."""
-    return isinstance(ops, PyTorchTensorOperations)
+    return PyTorchTensorOperations is not None and isinstance(ops, PyTorchTensorOperations)
 
 DEFAULT_FONT_PATH = Path(__file__).with_name("consola.ttf")
 
@@ -83,7 +86,7 @@ class AsciiKernelClassifier:
     def ssim_loss(self, candidate: AbstractTensor, reference: AbstractTensor) -> float:
         if not SSIM_AVAILABLE:
             raise RuntimeError("SSIM loss requires scikit-image")
-        np_backend = AbstractTensor.get_tensor(faculty=Faculty.NUMPY)
+        np_backend = AbstractTensor.get_tensor(cls=NumPyTensorOperations)
         arr1 = candidate.to_backend(np_backend)
         arr2 = reference.to_backend(np_backend)
         return 1.0 - ssim(

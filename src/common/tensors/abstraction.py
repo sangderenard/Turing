@@ -910,12 +910,17 @@ class AbstractTensor:
             result.data = tensor
             return result
         if torch is not None and isinstance(tensor, torch.Tensor):
-            torch_ops = AbstractTensor.get_tensor(faculty=Faculty.TORCH)
-            tmp = torch_ops.__class__()
-            tmp.data = tensor
-            return tmp.to_backend(self)
+            try:
+                from .torch_backend import PyTorchTensorOperations
+                torch_ops = AbstractTensor.get_tensor(cls=PyTorchTensorOperations)
+                tmp = torch_ops.__class__()
+                tmp.data = tensor
+                return tmp.to_backend(self)
+            except Exception:
+                pass
         if np is not None and isinstance(tensor, np.ndarray):
-            numpy_ops = AbstractTensor.get_tensor(faculty=Faculty.NUMPY)
+            from .numpy_backend import NumPyTensorOperations
+            numpy_ops = AbstractTensor.get_tensor(cls=NumPyTensorOperations)
             numpy_tensor = numpy_ops.__class__()
             numpy_tensor.data = tensor
             return numpy_tensor.to_backend(self)
@@ -1012,9 +1017,9 @@ class AbstractTensor:
 
         backend_name = type(self).__name__
         if backend_name in ("PurePythonTensorOperations", "NumPyTensorOperations"):
-            _autograd.autograd.record(
-                op, [x for x in (left, right) if x is not None], result
-            )
+            inputs = [x for x in (left, right) if x is not None]
+            if any(getattr(x, "requires_grad", False) for x in inputs):
+                _autograd.autograd.record(op, inputs, result)
 
         return result
 
@@ -1285,7 +1290,10 @@ class AbstractF:
             import torch
             import torch.nn.functional as F
 
-            arr = tensor.to_backend(AbstractTensor.get_tensor(faculty=Faculty.TORCH))
+            from .torch_backend import PyTorchTensorOperations
+            arr = tensor.to_backend(
+                AbstractTensor.get_tensor(cls=PyTorchTensorOperations)
+            )
             data = arr.data if hasattr(arr, "data") else arr
             # Ensure shape is (N, C, H, W) or (N, 1, H, W)
             nd = data.dim() if hasattr(data, "dim") else len(data.shape)
@@ -1333,7 +1341,10 @@ class AbstractF:
             return AbstractTensor.get_tensor(out)
         else:
             # Numpy fallback: use PIL for images, or scipy.ndimage.zoom if available
-            arr = tensor.to_backend(AbstractTensor.get_tensor(faculty=Faculty.NUMPY))
+            from .numpy_backend import NumPyTensorOperations
+            arr = tensor.to_backend(
+                AbstractTensor.get_tensor(cls=NumPyTensorOperations)
+            )
             data = arr.data if hasattr(arr, "data") else arr
             import numpy as np
 

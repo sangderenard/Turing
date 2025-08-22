@@ -10,10 +10,7 @@ def test_autograd_add_and_mul(a, b):
     t1.requires_grad = True
     t2.requires_grad = True
     z = t1 * t2 + t2
-    # Assume backward is automatic and accumulates gradients
-    z.backward()
-    t1_grad = t1.grad
-    t2_grad = t2.grad
+    t1_grad, t2_grad = AbstractTensor.autograd.grad(z, [t1, t2])
     t1_np = np.array(a)
     t2_np = np.array(b)
     expected_dz_dt1 = t2_np
@@ -27,12 +24,29 @@ def test_autograd_pow():
     t.requires_grad = True
     exp.requires_grad = True
     z = t ** exp
-    z.backward()
-    t_grad = t.grad
-    exp_grad = exp.grad
+    t_grad, exp_grad = AbstractTensor.autograd.grad(z, [t, exp])
     t_np = np.array([2.0, 3.0])
     exp_np = np.array([3.0, 2.0])
     expected_dz_dt = exp_np * t_np ** (exp_np - 1)
     expected_dz_dexp = t_np ** exp_np * np.log(t_np)
     assert np.allclose(t_grad, expected_dz_dt)
     assert np.allclose(exp_grad, expected_dz_dexp)
+
+
+def test_autograd_records_only_for_grad_inputs():
+    autograd = AbstractTensor.autograd
+    autograd.tape._nodes.clear()
+
+    a = AbstractTensor.tensor([1.0, 2.0])
+    b = AbstractTensor.tensor([3.0, 4.0])
+
+    _ = a + b
+    assert not autograd.tape._nodes
+
+    autograd.tape._nodes.clear()
+    a.requires_grad = True
+    z = a + b
+
+    node = autograd.tape.node(z)
+    assert node is not None
+    assert {pid for pid, _ in node.parents} == {id(a), id(b)}
