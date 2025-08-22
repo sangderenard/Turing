@@ -25,16 +25,14 @@ def test_coo_matrix_basic():
     assert np.all(coo.values.data == np.array([100, 200]))
     # on_coo_update should update g.coo
     assert g.coo is coo
-    # Test graph structure after COO update
+    # Test graph structure after COO update: graph reflects new values
     G = g.network
-    # Should have index nodes (0,1), (1,2) and value nodes ("val", 10), ("val", 20)
     assert (0, 1) in G.nodes
     assert (1, 2) in G.nodes
-    assert ("val", 10.0) in G.nodes
-    assert ("val", 20.0) in G.nodes
-    # Edges from index to value
-    assert G.has_edge((0, 1), ("val", 10.0))
-    assert G.has_edge((1, 2), ("val", 20.0))
+    assert ("val", 100.0) in G.nodes
+    assert ("val", 200.0) in G.nodes
+    assert G.has_edge((0, 1), ("val", 100.0))
+    assert G.has_edge((1, 2), ("val", 200.0))
 
 def test_on_coo_update_syncs():
     edge_index = AbstractTensor.get_tensor([[0, 1], [1, 2]])
