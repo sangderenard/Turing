@@ -39,6 +39,26 @@ def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
     raise NotImplementedError("Transpose fallback not implemented for this backend.")
 
 
+def unsqueeze(self, dim: int) -> "AbstractTensor":
+    """Return a tensor with an inserted dimension of size 1 at ``dim``."""
+    if hasattr(self, "unsqueeze_"):
+        return _wrap_result(self, self.unsqueeze_(dim))
+    try:
+        from ..abstraction import BACKEND_REGISTRY
+        backend_cls = BACKEND_REGISTRY.get("numpy")
+        if backend_cls is not None:
+            numpy_tensor = backend_cls(track_time=getattr(self, "track_time", False))
+            numpy_tensor = numpy_tensor.ensure_tensor(self.data)
+            import numpy as np
+            expanded = np.expand_dims(numpy_tensor.data, axis=dim)
+            expanded_tensor = backend_cls(track_time=getattr(self, "track_time", False))
+            expanded_tensor.data = expanded
+            return expanded_tensor.to_backend(self)
+    except Exception:
+        pass
+    raise NotImplementedError("Unsqueeze fallback not implemented for this backend.")
+
+
 def squeeze(self, dim: int | None = None) -> "AbstractTensor":
     """Return a tensor with all (or one) dimensions of size 1 removed."""
     if hasattr(self, "squeeze_"):

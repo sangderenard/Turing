@@ -209,6 +209,9 @@ class NumPyTensorOperations(AbstractTensor):
     def reshape_(self, shape):
         import numpy as np
         return np.reshape(self.data, shape)
+    def unsqueeze_(self, dim: int):
+        import numpy as np
+        return np.expand_dims(self.data, axis=dim)
     def squeeze_(self, dim: int | None = None):
         import numpy as np
         return np.squeeze(self.data, axis=dim) if dim is not None else np.squeeze(self.data)
