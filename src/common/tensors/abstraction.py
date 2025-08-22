@@ -46,7 +46,7 @@ CONVERSION_REGISTRY = dict()
 
 # ---- diagnostics ------------------------------------------------------------
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DIAG_LEVEL = os.environ.get("ABSTRACT_TENSOR_DIAG", "auto")  # 'concise' | 'auto' | 'verbose'
 
@@ -84,6 +84,65 @@ class TensorShapeError(ValueError):
         if want_hint:
             return head + "\n" + line1 + (f"\nHint: {d.hint}" if d.hint else "")
         return head + "\n" + line1
+
+
+@dataclass
+class TimeNode:
+    """Single timing record within a :class:`TimeTape`."""
+
+    start: float
+    end: float
+    parents: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def elapsed(self) -> float:
+        return self.end - self.start
+
+
+class TimeTape:
+    """Minimal tape that mirrors :class:`GradTape` but for timestamps."""
+
+    def __init__(self) -> None:
+        self._nodes: dict[int, TimeNode] = {}
+        self._last_id: int | None = None
+
+    def record(self, start: float, end: float) -> int:
+        """Append a new timing node to the tape."""
+
+        node_id = len(self._nodes)
+        parents = [(self._last_id, 0)] if self._last_id is not None else []
+        self._nodes[node_id] = TimeNode(start=start, end=end, parents=parents)
+        self._last_id = node_id
+        return node_id
+
+    def traverse(self):
+        """Yield ``(node_id, TimeNode)`` in chronological order."""
+
+        for nid in sorted(self._nodes):
+            yield nid, self._nodes[nid]
+
+
+@dataclass
+class BenchmarkResult:
+    """Timing statistics and graph returned by :meth:`AbstractTensor.benchmark`."""
+
+    times: List[float]
+    tape: TimeTape
+
+    @property
+    def mean(self) -> float:
+        """Return the mean runtime in seconds."""
+        return sum(self.times) / len(self.times) if self.times else 0.0
+
+    @property
+    def best(self) -> float:
+        """Return the shortest observed runtime."""
+        return min(self.times) if self.times else 0.0
+
+    @property
+    def worst(self) -> float:
+        """Return the longest observed runtime."""
+        return max(self.times) if self.times else 0.0
 
 
 
@@ -1285,6 +1344,36 @@ class AbstractTensor:
         if n != 1:
             raise ValueError("The truth value of a tensor with more than one element is ambiguous.")
         return bool(self.item())
+
+    @staticmethod
+    def benchmark(fn: Callable, *args, repeat: int = 10, warmup: int = 1, **kwargs) -> BenchmarkResult:
+        """Benchmark a callable and return timing statistics.
+
+        Args:
+            fn: The callable to execute. It is invoked as ``fn(*args, **kwargs)``.
+            *args: Positional arguments passed to ``fn``.
+            repeat: Number of timed iterations to run.
+            warmup: Number of initial iterations to run before timing begins.
+            **kwargs: Keyword arguments forwarded to ``fn``.
+
+        Returns:
+            :class:`BenchmarkResult` containing per-iteration runtimes in seconds
+            and a timestamp graph mirroring autograd's accounting.
+        """
+        import time
+
+        for _ in range(max(warmup, 0)):
+            fn(*args, **kwargs)
+
+        times: List[float] = []
+        tape = TimeTape()
+        for _ in range(max(repeat, 0)):
+            start = time.perf_counter()
+            fn(*args, **kwargs)
+            end = time.perf_counter()
+            times.append(end - start)
+            tape.record(start, end)
+        return BenchmarkResult(times, tape)
 
     def data_or(self, obj: Any = None) -> Any:
         """Return self.data if no argument is passed, otherwise return the argument unchanged."""
