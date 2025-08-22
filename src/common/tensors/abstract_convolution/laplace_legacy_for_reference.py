@@ -1082,7 +1082,9 @@ class TransformHub:
 
         if torch.any(zero_norm_mask):
             count_zero_normals = torch.sum(zero_norm_mask).item()  # Number of zero-magnitude normals
-            print(f"{count_zero_normals} out of {normals.numel()} zero-magnitude normals detected.")
+            grid_shape = normals.shape[:3]
+            total_points = grid_shape[0] * grid_shape[1] * grid_shape[2]
+            print(f"{count_zero_normals} out of {total_points} zero-magnitude normals detected.")
 
             if diagnostic_mode:
                 # Find the indices of the first zero-magnitude normal
