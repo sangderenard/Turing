@@ -216,8 +216,49 @@ class AbstractTensor:
     def argmax_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement argmax_() with keepdim.")
 
-    def clamp_max_(self, max):
+    # --- Clamping ---
+    def clamp(self, min: float | None = None, max: float | None = None) -> "AbstractTensor":
+        """Return ``self`` clamped between ``min`` and ``max``."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_(min_val=min, max_val=max)
+        return result
+
+    def clamp_(self, min_val: float | None = None, max_val: float | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_()")
+
+    def clamp_min(self, min_val: float) -> "AbstractTensor":
+        """Clamp values below ``min_val`` up to ``min_val``."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_min_(min_val)
+        return result
+
+    def clamp_min_(self, min_val: float):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_min_()")
+
+    def clamp_max(self, max_val: float) -> "AbstractTensor":
+        """Clamp values above ``max_val`` down to ``max_val``."""
+        result = type(self)(track_time=self.track_time)
+        result.data = self.clamp_max_(max_val)
+        return result
+
+    def clamp_max_(self, max_val: float):
         raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_max_()")
+
+    # --- API compatibility ---
+    def clip(
+        self,
+        min: float | None = None,
+        max: float | None = None,
+        *,
+        a_min: float | None = None,
+        a_max: float | None = None,
+    ) -> "AbstractTensor":
+        """Alias for :meth:`clamp` accepting NumPy-style parameters."""
+        if (min is not None or max is not None) and (a_min is not None or a_max is not None):
+            raise TypeError("Specify either min/max or a_min/a_max, not both")
+        if min is None and max is None:
+            min, max = a_min, a_max
+        return self.clamp(min=min, max=max)
 
     def greater_(self, value):
         raise NotImplementedError(f"{self.__class__.__name__} must implement greater_()")
