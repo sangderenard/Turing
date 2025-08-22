@@ -1,4 +1,5 @@
 import importlib.util
+import numpy as np
 import pytest
 
 from src.common.tensors.pure_backend import PurePythonTensorOperations
@@ -40,9 +41,9 @@ def test_linear_bias_broadcast_and_grad(backend_name, Backend):
     assert layer.gb.tolist() == [[3.0, 3.0]]
 
 
-def test_expand_is_view_on_torch():
-    if PyTorchTensorOperations is None or importlib.util.find_spec("torch") is None:
-        pytest.skip("torch not available")
-    t = PyTorchTensorOperations.tensor_from_list([[1.0, 2.0]])
+def test_expand_is_view_on_numpy():
+    if NumPyTensorOperations is None:
+        pytest.skip("numpy backend not available")
+    t = NumPyTensorOperations.tensor_from_list([[1.0, 2.0]])
     expanded = t.expand((3, 2))
-    assert expanded.data.storage().data_ptr() == t.data.storage().data_ptr()
+    assert np.shares_memory(expanded.data, t.data)
