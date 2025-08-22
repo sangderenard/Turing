@@ -345,6 +345,9 @@ class AbstractTensor:
         Create a tensor from a Python list using the first suitable backend in BACKEND_REGISTRY (including torch),
         or try to import numpy/pure_python as fallback. Use the first available backend found.
         """
+        if isinstance(data, AbstractTensor):
+            return data.data
+
         # 1. Try any already-registered backend
         for name, backend_cls in BACKEND_REGISTRY.items():
             if backend_cls is not None:
