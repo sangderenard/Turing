@@ -49,6 +49,15 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    def nonzero_(self, as_tuple: bool = False):
+        import jax.numpy as jnp
+        result = jnp.nonzero(self.data)
+        if as_tuple:
+            return result
+        return jnp.stack(result, axis=1)
+    def any_(self):
+        import jax.numpy as jnp
+        return jnp.any(self.data)
     def where_(self, x, y):
         import jax.numpy as jnp
         x = x.data if hasattr(x, 'data') else x

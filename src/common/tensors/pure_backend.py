@@ -43,6 +43,31 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
 class PurePythonTensorOperations(AbstractTensor):
+    def nonzero_(self, as_tuple: bool = False):
+        from .abstraction import _flatten, _get_shape
+        # Only works for 1D/2D for simplicity
+        data = self.data
+        shape = _get_shape(data)
+        indices = []
+        if len(shape) == 1:
+            for i, v in enumerate(data):
+                if v:
+                    indices.append((i,))
+        elif len(shape) == 2:
+            for i, row in enumerate(data):
+                for j, v in enumerate(row):
+                    if v:
+                        indices.append((i, j))
+        else:
+            raise NotImplementedError("nonzero_ only implemented for 1D/2D in pure backend")
+        if as_tuple:
+            if not indices:
+                return tuple([] for _ in range(len(shape)))
+            return tuple([tuple(idx[dim] for idx in indices) for dim in range(len(shape))])
+        return indices
+    def any_(self):
+        from .abstraction import _flatten
+        return any(_flatten(self.data))
     def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
         def _max(lst):

@@ -1060,7 +1060,7 @@ class TransformHub:
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdv, dYdv, dZdv], dim=-1), AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), dim=-1),
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), AbstractTensor.stack([dXdu, dYdu, dZdu], dim=-1), dim=-1)
         ], dim=-1)
-
+        print(type(normals))
         # Compute distances from the origin
         distances = AbstractTensor.sqrt(X**2 + Y**2 + Z**2)
 
@@ -1100,13 +1100,13 @@ class TransformHub:
             normals = -normals
 
         # Continue with normalization and validation
-        norm_magnitudes = AbstractTensor.norm(normals, dim=-1, keepdim=True)
-
+        norm_magnitudes = AbstractTensor.get_tensor(AbstractTensor.norm(normals, dim=-1, keepdim=True))
+        print(type(norm_magnitudes))
         # Normalize normals, avoid division by zero for zero-magnitude normals
         normals = AbstractTensor.where(norm_magnitudes > 1e-16, normals / norm_magnitudes, normals)
 
         # Identify zero-magnitude normals
-        zero_norm_mask = norm_magnitudes.squeeze() < 1e-16  # Boolean mask for zero-magnitude normals
+        zero_norm_mask = AbstractTensor.get_tensor(norm_magnitudes.squeeze()) < 1e-16  # Boolean mask for zero-magnitude normals
 
         if AbstractTensor.any(zero_norm_mask):
             count_zero_normals = AbstractTensor.sum(zero_norm_mask).item()  # Number of zero-magnitude normals

@@ -54,6 +54,16 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    def nonzero_(self, as_tuple: bool = False):
+        import numpy as np
+        result = np.nonzero(self.data)
+        if as_tuple:
+            return result
+        # Stack indices for non-tuple output (like torch)
+        return np.stack(result, axis=1)
+    def any_(self):
+        import numpy as np
+        return np.any(self.data)
     def max_(self, dim=None, keepdim=False):
         return np.max(self.data, axis=dim, keepdims=keepdim)
 

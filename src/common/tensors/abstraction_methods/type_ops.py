@@ -44,11 +44,7 @@ def astype(self, dtype):
     return self.to_dtype(dtype)
 
 
-def where(self, x: Any, y: Any) -> "AbstractTensor":
-    """Elementwise select: self as bool mask, x if True else y."""
-    result = type(self)(track_time=self.track_time)
-    result.data = self.where_(x, y)
-    return result
+
 
 
 def long_cast(self) -> "AbstractTensor":

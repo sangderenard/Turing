@@ -1388,7 +1388,6 @@ from .abstraction_methods.indexing import (
 from .abstraction_methods.type_ops import (
     to as type_to,
     astype as type_astype,
-    where as type_where,
     long_cast as type_long_cast,
     float as type_float,
     double as type_double,
@@ -1405,6 +1404,9 @@ from .abstraction_methods.comparison import (
     less_equal as comp_less_equal,
     equal as comp_equal,
     not_equal as comp_not_equal,
+    any as comp_any,
+    where as comp_where,
+    nonzero as comp_nonzero,
 )
 from .abstraction_methods.trigonometry import (
     sin as trig_sin,
@@ -1482,7 +1484,6 @@ AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 
 AbstractTensor.to        = type_to
 AbstractTensor.astype    = type_astype
-AbstractTensor.where     = type_where
 AbstractTensor.long_cast = type_long_cast
 AbstractTensor.float     = type_float
 AbstractTensor.double    = type_double
@@ -1498,7 +1499,9 @@ AbstractTensor.less           = comp_less
 AbstractTensor.less_equal     = comp_less_equal
 AbstractTensor.equal          = comp_equal
 AbstractTensor.not_equal      = comp_not_equal
-
+AbstractTensor.where     = comp_where
+AbstractTensor.any        = comp_any
+AbstractTensor.nonzero  = comp_nonzero
 AbstractTensor.sin   = trig_sin
 AbstractTensor.cos   = trig_cos
 AbstractTensor.tan   = trig_tan

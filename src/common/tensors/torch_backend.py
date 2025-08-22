@@ -43,6 +43,12 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    def nonzero_(self, as_tuple: bool = False):
+        import torch
+        return torch.nonzero(self.data, as_tuple=as_tuple)
+    def any_(self):
+        import torch
+        return torch.any(self.data)
     def max_(self, dim=None, keepdim=False):
         x = self.data
         if dim is None:
