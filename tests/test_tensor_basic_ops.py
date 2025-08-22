@@ -37,3 +37,10 @@ def test_basic_add_and_zeros(backend_name, Backend):
     assert result.tolist() == [[6, 8], [10, 12]]
     zeros = Backend.zeros((2, 2))
     assert zeros.tolist() == [[0, 0], [0, 0]]
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_flatten(backend_name, Backend):
+    a = Backend.tensor_from_list([[1, 2], [3, 4]])
+    flat = a.flatten()
+    assert flat.tolist() == [1, 2, 3, 4]

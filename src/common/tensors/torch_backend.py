@@ -351,6 +351,9 @@ class PyTorchTensorOperations(AbstractTensor):
     def view_flat_(self):
         return self.data.view(-1)
 
+    def flatten_(self):
+        return self.data.flatten()
+
     def assign_at_indices_(self, indices_dim0, indices_dim1, values_to_assign):
         self.data[indices_dim0, indices_dim1] = values_to_assign
         return self.data
