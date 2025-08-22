@@ -512,7 +512,17 @@ class AbstractTensor:
                 pass
         return out
 
-    def get_tensor(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":
+    @staticmethod
+    def get_tensor(data=None, *, dtype=None, device=None, cls=None, track_time=False) -> "AbstractTensor":
+        """
+        Get the tensor data from this AbstractTensor or create a new one if data is provided.
+        If data is None, return self.
+        """
+        if cls is None:
+            cls = AbstractTensor.check_or_build_registry()
+        return cls.tensor(data, dtype=dtype, device=device, track_time=track_time)
+
+    def tensor_like(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":
         """
         Get the tensor data from this AbstractTensor or create a new one if data is provided.
         If data is None, return self.
