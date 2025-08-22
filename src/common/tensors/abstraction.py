@@ -931,9 +931,16 @@ class AbstractTensor:
             numpy_tensor.data = tensor
             return numpy_tensor.to_backend(self)
         if isinstance(tensor, (list, tuple)):
-            return self.tensor_from_list(tensor, dtype=None, device=None)
+            # Mixed or nested sequences are routed through the nested packer
+            if any(isinstance(elem, (list, tuple, AbstractTensor)) for elem in tensor):
+                return self.__class__.from_nested(tensor)
+            try:
+                return self.tensor_from_list(tensor, dtype=None, device=None)
+            except Exception:
+                # numpy/pure backends may choke on ragged lists; fall back to nested pack
+                return self.__class__.from_nested(tensor)
         if hasattr(tensor, "tolist"):
-            return self.tensor_from_list(tensor.tolist(), dtype=None, device=None)
+            return self.ensure_tensor(tensor.tolist())
         return self.tensor_from_list([tensor], dtype=None, device=None)
 
     # --- Operator routing ---

@@ -9,11 +9,16 @@ def _is_seq(x: Any) -> bool:
     return isinstance(x, (list, tuple))
 
 
-def _same_shape(shapes: List[Tuple[int, ...]]) -> bool:
-    if not shapes:
-        return True
-    s0 = shapes[0]
-    return all(s == s0 for s in shapes[1:])
+def _max_shape(shapes: List[Tuple[int, ...]]) -> Tuple[int, ...]:
+    """Compute the broadcast shape covering all ``shapes``."""
+    max_rank = max((len(s) for s in shapes), default=0)
+    max_dims = [0] * max_rank
+    for shape in shapes:
+        for i in range(max_rank):
+            dim = shape[i] if i < len(shape) else 1
+            if dim > max_dims[i]:
+                max_dims[i] = dim
+    return tuple(max_dims)
 
 
 def _maybe_cast_dtype_device(x: "AbstractTensor", *, dtype, device) -> "AbstractTensor":
@@ -51,12 +56,6 @@ def _leaf_to_abstract(
     out = cls.tensor(leaf, dtype=dtype, device=device)
     # Ensure dtype/device if cls.tensor didn’t enforce perfectly
     out = _maybe_cast_dtype_device(out, dtype=dtype, device=device)
-    # Python scalars often materialize as shape (1,); squeeze to scalar
-    if not hasattr(leaf, "__len__") and getattr(out, "get_shape", lambda: ())() == (1,):
-        try:
-            out = out.squeeze()
-        except Exception:
-            pass
     return out
 
 
@@ -71,7 +70,7 @@ def _pack_recursive(
       - Pre-existing AbstractTensors are respected (no re-wrapping into lists).
       - Mixed content (numbers, numpy/torch tensors, AbstractTensors) is promoted to AbstractTensor leaves.
       - Autograd provenance is preserved via stack/cat edges (no .tolist()/.item()).
-      - Ragged structures raise an explicit error.
+      - Ragged structures are padded with zeros to a common shape.
     """
     if _is_seq(data):
         if all(not _is_seq(elem) and not isinstance(elem, cls) for elem in data):
@@ -85,19 +84,30 @@ def _pack_recursive(
         if not children:
             raise ValueError("Cannot pack an empty list/tuple into a tensor (ambiguous shape).")
 
-        # Ensure all children shapes match for stacking
+        # Ensure all children shapes match for stacking; pad if needed
         shapes = [tuple(ch.get_shape()) for ch in children]
-        if not _same_shape(shapes):
-            raise ValueError(f"Ragged nested structure: encountered differing child shapes {shapes}.")
+        target_shape = _max_shape(shapes)
+        padded_children: List["AbstractTensor"] = []
+        for ch in children:
+            shape = list(ch.get_shape())
+            # Expand rank with trailing dims of length 1
+            while len(shape) < len(target_shape):
+                if hasattr(ch, "unsqueeze"):
+                    ch = ch.unsqueeze(len(shape))
+                else:
+                    ch = cls.stack([ch], dim=len(shape))
+                shape.append(1)
+            pad = []
+            for i in range(len(target_shape) - 1, -1, -1):
+                size = shape[i]
+                pad.extend([0, target_shape[i] - size])
+            if any(pad[1::2]):
+                ch = ch.pad(tuple(pad), value=0)
+            padded_children.append(_maybe_cast_dtype_device(ch, dtype=dtype, device=device))
 
-        # Ensure all are on same backend/dtype/device; cast if needed
         # Use the type of the first child to call stack
-        head = children[0]
-        children = [_maybe_cast_dtype_device(ch, dtype=dtype, device=device) for ch in children]
-
-        # Prefer class-level stack to keep your abstraction consistent
-        # AbstractTensor.stack([...], dim=0) should exist in your API (you’ve used it elsewhere).
-        packed = cls.stack(children, dim=0)
+        head = padded_children[0]
+        packed = cls.stack(padded_children, dim=0)
 
         # Make contiguous if backend exposes it (avoid cost if not present)
         if hasattr(packed, "contiguous"):
@@ -118,6 +128,7 @@ def pack_nested_to_tensor(
     Public API: recursively packs `data` into a single AbstractTensor.
     - Sequences become stacked tensors with a new leading dimension at each level.
     - Leaves are coerced to AbstractTensors with (dtype, device) if provided.
+    - Ragged shapes are padded with zeros to the maximum size along each axis.
     - Preserves autograd provenance (no materialization to python lists).
 
     Example:
