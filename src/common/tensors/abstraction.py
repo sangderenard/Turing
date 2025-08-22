@@ -944,7 +944,8 @@ class AbstractTensor:
         return self.tensor_from_list([tensor], dtype=None, device=None)
 
     # --- Operator routing ---
-    def _pre_autograd(self, op: str, inputs: Iterable[Any]):
+    @staticmethod
+    def _pre_autograd(op: str, inputs: Iterable[Any]):
         """Return a callback that records ``op`` on the autograd tape.
 
         Parameters
@@ -981,7 +982,7 @@ class AbstractTensor:
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
 
-        finalize = self._pre_autograd(op, [x for x in (left, right) if x is not None])
+        finalize = AbstractTensor._pre_autograd(op, [x for x in (left, right) if x is not None])
 
         # Optional belt-and-suspenders: align mixed backends
         if isinstance(left, AbstractTensor) and isinstance(right, AbstractTensor) and (type(left) is not type(right)):
@@ -1529,7 +1530,7 @@ def _wrap_with_autograd(name: str, func: Callable) -> Callable:
     def wrapped(self, *args, **kwargs):
         tensor_args = [a for a in args if isinstance(a, AbstractTensor)]
         tensor_args += [v for v in kwargs.values() if isinstance(v, AbstractTensor)]
-        finalize = self._pre_autograd(name, [self] + tensor_args)
+        finalize = AbstractTensor._pre_autograd(name, [self] + tensor_args)
         result = func(self, *args, **kwargs)
         return finalize(result)
     return wrapped
