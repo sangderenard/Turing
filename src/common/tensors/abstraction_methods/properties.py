@@ -161,7 +161,18 @@ def __len__(self):
     data = self.data
     if data is None:
         raise ValueError("__len__ called on empty tensor")
-    return len(data)
+    try:
+        return len(data)
+    except TypeError:
+        # 0-d tensors (scalars) do not define a length in many backends.
+        # Treat them as a single element rather than raising an error.
+        try:
+            nd = self.get_ndims(data)
+        except Exception:
+            nd = None
+        if nd == 0:
+            return 1
+        raise
 
 
 
