@@ -25,9 +25,6 @@ def random_tensor(size: Tuple[int, ...], dtype: Any = None, device: Any = None, 
     inst = cls(vals, track_time=False)
     return inst.reshape(*size)
 
-def rand_like(tensor, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
-    """Return a random tensor with the same shape as `tensor`."""
-    return random_tensor(likeness(tensor), dtype, device, cls=type(tensor), kind=kind, algo=algo, seed=seed)
 
 
 def randint(size: Tuple[int, ...], low: int, high: int, dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
@@ -225,19 +222,34 @@ def full(
     return inst.repeat(size)
 
 def likeness(tensor):
-    return tensor.shape
+    return tensor.shape, likeclass(tensor)
+
+def likeclass(tensor, dtype: Any = None, device: Any = None):
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+    """Return a tensor with the same shape and dtype as ``tensor``."""
+    cls = AbstractTensor.backend_class_from_backend_data(tensor)
+    if cls is None:
+        cls = AbstractTensor.check_or_build_registry()
+    return cls
 
 def zeros_like(tensor, dtype: Any = None, device: Any = None):
     """Return a zeros tensor with the same shape as ``tensor``."""
-
-    return full(likeness(tensor), 0, dtype, device, cls=type(tensor))
+    size, cls = likeness(tensor)
+    return full(size, 0, dtype, device, cls=cls)
 
 
 def ones_like(tensor, dtype: Any = None, device: Any = None):
     """Return a ones tensor with the same shape as ``tensor``."""
-    return full(likeness(tensor), 1, dtype, device, cls=type(tensor))
+    size, cls = likeness(tensor)
+    return full(size, 1, dtype, device, cls=cls)
 
 
 def full_like(tensor, fill_value: Any, dtype: Any = None, device: Any = None):
     """Return a tensor filled with ``fill_value`` and the same shape as ``tensor``."""
-    return full(likeness(tensor), fill_value, dtype, device, cls=type(tensor))
+    size, cls = likeness(tensor)
+    return full(size, fill_value, dtype, device, cls=cls)
+
+def rand_like(tensor, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+    """Return a random tensor with the same shape as `tensor`."""
+    size, cls = likeness(tensor)
+    return random_tensor(size, dtype, device, cls=cls, kind=kind, algo=algo, seed=seed)

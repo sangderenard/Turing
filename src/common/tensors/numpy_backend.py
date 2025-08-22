@@ -598,9 +598,7 @@ class NumPyTensorOperations(AbstractTensor):
     def float_dtype_(self):
         return np.float32
 
-    @property
-    def tensor_type_(self) -> type:
-        return np.ndarray
+    tensor_type_ = np.ndarray
 
     @staticmethod
     def from_numpy(source_ops, tensor, target_ops):

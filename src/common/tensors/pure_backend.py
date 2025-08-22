@@ -905,9 +905,7 @@ class PurePythonTensorOperations(AbstractTensor):
     def float_dtype_(self) -> Any:
         return float
 
-    @property
-    def tensor_type_(self) -> type:
-        return list
+    tensor_type_ = list
 
     @staticmethod
     def test() -> None:

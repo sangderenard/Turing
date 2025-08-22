@@ -478,9 +478,8 @@ class PyTorchTensorOperations(AbstractTensor):
     def float_dtype_(self):
         return torch.float32
 
-    @property
-    def tensor_type_(self) -> type:
-        return torch.Tensor
+    
+    tensor_type_ = torch.Tensor
 
     @staticmethod
     def from_numpy(source_ops, tensor, target_ops):

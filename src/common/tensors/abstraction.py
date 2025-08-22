@@ -133,6 +133,24 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    @staticmethod
+    def backend_class_from_backend_data(data):
+        """
+        Given a backend-native data object (e.g., torch.Tensor, np.ndarray),
+        return the registered backend class that wraps this data type.
+        """
+        # Ensure registry is populated
+
+        for backend_cls in BACKEND_REGISTRY.values():
+            if type(data) == backend_cls:
+                return backend_cls
+            
+            tensor_type = backend_cls.tensor_type_
+            print(tensor_type)
+            if tensor_type is not None and isinstance(data, tensor_type):
+                return backend_cls
+        return None
+
     repeat = _reshape_methods.repeat
     
     repeat_interleave = _reshape_methods.repeat_interleave
@@ -431,9 +449,31 @@ class AbstractTensor:
     transpose = _reshape_methods.transpose
     squeeze = _reshape_methods.squeeze
 
+    @staticmethod
+    def check_or_build_registry():
+        if not BACKEND_REGISTRY:
+            try:
+                from . import torch_backend  # noqa: F401
+            except Exception:
+                pass
+            try:
+                from . import numpy_backend  # noqa: F401
+            except Exception:
+                pass
+            try:
+                from . import pure_backend  # noqa: F401
+            except Exception:
+                pass
 
+        for backend_name in ("torch", "numpy", "pure_python"):
+            backend_cls = BACKEND_REGISTRY.get(backend_name)
+            if backend_cls is not None:
+                cls = backend_cls
+                break
+        if cls is None:
+            raise RuntimeError("No tensor backend available for tensor creation.")
+        return cls
 
-    
     @classmethod
     def tensor(
         cls,
@@ -452,14 +492,7 @@ class AbstractTensor:
         - dtype/device are applied best-effort after wrapping.
         """
         if cls is AbstractTensor:
-            # Auto-select backend
-            return AbstractTensor.get_tensor(
-                data,
-                faculty=faculty,
-                track_time=track_time,
-                dtype=dtype,
-                device=device,
-            )
+            cls = cls.check_or_build_registry()
 
         # Use the specific backend class
         inst = cls(track_time=track_time)
@@ -479,6 +512,14 @@ class AbstractTensor:
                 pass
         return out
 
+    def get_tensor(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":
+        """
+        Get the tensor data from this AbstractTensor or create a new one if data is provided.
+        If data is None, return self.
+        """
+        if cls is not None:
+            return cls.tensor(data, dtype=dtype, device=device, track_time=self.track_time)
+        return self.tensor(data, dtype=dtype, device=device, track_time=self.track_time)
 
     @staticmethod
     def range(start, end=None, step=1, *, dtype=None, device=None, cls=None):
@@ -1151,72 +1192,7 @@ class AbstractTensor:
         """Repeat ``self`` along ``dim`` ``repeats`` times."""
         return self.repeat_(repeats, dim)
 
-    @staticmethod
-    def get_tensor(
-        data=None,
-        faculty: "Faculty" = None,
-        *,
-        track_time: bool = False,
-        dtype=None,
-        device=None,
-        cls=None
-    ) -> "AbstractTensor":
-        # ---- resolve backend + get a typed empty wrapper (ops handle) ----
-        if cls is not None:
-            backend_cls = cls
-            try:
-                ops = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
-            except TypeError:
-                ops = backend_cls(track_time=track_time)
-        else:
-            faculty = faculty or DEFAULT_FACULTY
-            if faculty in (Faculty.TORCH, getattr(Faculty, "PYGEO", object())):
-                backend_cls = BACKEND_REGISTRY.get("torch")
-                if backend_cls is None:
-                    from . import torch_backend  # noqa: F401
-                    backend_cls = BACKEND_REGISTRY.get("torch")
-                ops = backend_cls(default_device=DEFAULT_DEVICE, track_time=track_time)
-            elif faculty is Faculty.NUMPY and np is not None:
-                backend_cls = BACKEND_REGISTRY.get("numpy")
-                if backend_cls is None:
-                    from . import numpy_backend  # noqa: F401
-                    backend_cls = BACKEND_REGISTRY.get("numpy")
-                ops = backend_cls(track_time=track_time)
-            elif faculty is getattr(Faculty, "CTENSOR", object()):
-                from .accelerator_backends.c_backend import CTensorOperations
-                ops = CTensorOperations(track_time=track_time)
-            else:
-                backend_cls = BACKEND_REGISTRY.get("pure_python")
-                if backend_cls is None:
-                    from . import pure_backend  # noqa: F401
-                    backend_cls = BACKEND_REGISTRY.get("pure_python")
-                ops = backend_cls(track_time=track_time)
 
-        # ---- no data: return a NEW wrapper (not `ops`), with no payload ----
-        if data is None:
-            out = type(ops)(track_time=track_time)
-            out.data = None
-            return out
-
-        # ---- have data: wrap it, and ensure we return a wrapper of THIS backend ----
-        out = ops.ensure_tensor(data)
-
-        if isinstance(out, AbstractTensor) and (type(out) is not type(ops)):
-            out = out.to_backend(ops)
-
-        if not isinstance(out, AbstractTensor):
-            wrapped = type(ops)(track_time=track_time)
-            wrapped.data = out
-            out = wrapped
-
-        if dtype is not None:
-            try: out = out.to_dtype(dtype)
-            except: pass
-        if device is not None:
-            try: out = out.to_device(device)
-            except: pass
-
-        return out
 
 
 # --- Added backend hook methods/properties ---

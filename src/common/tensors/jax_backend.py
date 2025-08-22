@@ -489,9 +489,7 @@ class JAXTensorOperations(AbstractTensor):
     def float_dtype_(self) -> Any:
         return float
 
-    @property
-    def tensor_type_(self) -> type:
-        return jnp.ndarray
+    tensor_type_ = jnp.ndarray
 
     @staticmethod
     def test() -> None:
