@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from abc import ABC, abstractmethod
-from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple
+from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable
 import math
 import time
 from collections import deque
@@ -1463,6 +1463,7 @@ from .abstraction_methods.properties import (
 
 # --- Autograd method assignments ------------------------------------------
 from . import autograd as _autograd_methods
+from .backward import BACKWARD_REGISTRY
 
 AbstractTensor.requires_grad_ = _autograd_methods.requires_grad_
 AbstractTensor.requires_grad  = _autograd_methods.requires_grad
@@ -1473,6 +1474,17 @@ AbstractTensor.is_leaf        = _autograd_methods.is_leaf
 AbstractTensor.retain_grad    = _autograd_methods.retain_grad
 AbstractTensor.grad_fn        = _autograd_methods.grad_fn
 AbstractTensor.zero_grad      = _autograd_methods.zero_grad
+
+# Register backward algorithms and expose a helper for building pipelines
+_BACKWARD = BACKWARD_REGISTRY.register_from_module(_autograd_methods)
+
+
+def get_backward_tool(ops: Iterable[str]):
+    """Return a callable executing backward rules for ``ops`` in order."""
+    return _BACKWARD.build(ops)
+
+
+AbstractTensor.get_backward_tool = staticmethod(get_backward_tool)
 AbstractTensor.register_hook  = _autograd_methods.register_hook
 
 # --- Bindings to AbstractTensor -------------------------------------------

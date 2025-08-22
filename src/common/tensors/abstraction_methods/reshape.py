@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 def reshape(self, shape: int) -> "AbstractTensor":
     """Return a reshaped tensor as an AbstractTensor, using the backend registry pattern."""
     if hasattr(self, 'reshape_'):
@@ -88,5 +88,6 @@ def repeat(self, repeats: Any = None, dim: int = 0) -> "AbstractTensor":
 def repeat_interleave(
         self, repeats: int = 1, dim: Optional[int] = None
     ) -> "AbstractTensor":
+        from ..abstraction import AbstractTensor
         result = AbstractTensor.get_tensor(self.repeat_interleave_(repeats, dim))
         return result

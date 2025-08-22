@@ -142,8 +142,11 @@ class AbstractGraphCore:
 
     def __init__(self, edge_index=None, edge_weight=None, shape=None):
         self.coo = None
+        self.network = None
         if edge_index is not None and edge_weight is not None:
             self.coo = self.to_coo(edge_index, edge_weight, shape)
+            # Build initial network representation from the COO matrix
+            self.on_coo_update(self.coo)
 
     def to_coo(self, edge_index, edge_weight, shape=None):
         edge_index = AbstractTensor.get_tensor(edge_index)

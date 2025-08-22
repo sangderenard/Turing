@@ -994,10 +994,16 @@ class TransformHub:
         return self.frobenius_norm
 
     def compute_partials_and_normals(self, U, V, W, validate_normals=True, diagnostic_mode=False):
-        # Ensure U, V, W require gradients for autograd
-        U.requires_grad_(True)
-        V.requires_grad_(True)
-        W.requires_grad_(True)
+        U = AbstractTensor.get_tensor(U)
+        V = AbstractTensor.get_tensor(V)
+        W = AbstractTensor.get_tensor(W)
+        # Ensure U, V, W require gradients for autograd if supported
+        if hasattr(U, "requires_grad_"):
+            U.requires_grad_(True)
+        if hasattr(V, "requires_grad_"):
+            V.requires_grad_(True)
+        if hasattr(W, "requires_grad_"):
+            W.requires_grad_(True)
 
         # Forward pass: get transformed coordinates
         X, Y, Z = self.transform_spatial(U, V, W)
@@ -1032,15 +1038,15 @@ class TransformHub:
         target_shape = U.shape  # (N_u, N_v, N_w)
 
         # Handle None values from autograd
-        dXdu = dXdu if dXdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
-        dYdu = dYdu if dYdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
-        dZdu = dZdu if dZdu is not None else AbstractTensor.zeros(target_shape).to(U.device)
-        dXdv = dXdv if dXdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
-        dYdv = dYdv if dYdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
-        dZdv = dZdv if dZdv is not None else AbstractTensor.zeros(target_shape).to(V.device)
-        dXdw = dXdw if dXdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
-        dYdw = dYdw if dYdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
-        dZdw = dZdw if dZdw is not None else AbstractTensor.zeros(target_shape).to(W.device)
+        dXdu = AbstractTensor.get_tensor(dXdu) if dXdu is not None else AbstractTensor.zeros(target_shape, device=U.device)
+        dYdu = AbstractTensor.get_tensor(dYdu) if dYdu is not None else AbstractTensor.zeros(target_shape, device=U.device)
+        dZdu = AbstractTensor.get_tensor(dZdu) if dZdu is not None else AbstractTensor.zeros(target_shape, device=U.device)
+        dXdv = AbstractTensor.get_tensor(dXdv) if dXdv is not None else AbstractTensor.zeros(target_shape, device=V.device)
+        dYdv = AbstractTensor.get_tensor(dYdv) if dYdv is not None else AbstractTensor.zeros(target_shape, device=V.device)
+        dZdv = AbstractTensor.get_tensor(dZdv) if dZdv is not None else AbstractTensor.zeros(target_shape, device=V.device)
+        dXdw = AbstractTensor.get_tensor(dXdw) if dXdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
+        dYdw = AbstractTensor.get_tensor(dYdw) if dYdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
+        dZdw = AbstractTensor.get_tensor(dZdw) if dZdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
 
         if diagnostic_mode:
             print("Partial Derivatives:")
