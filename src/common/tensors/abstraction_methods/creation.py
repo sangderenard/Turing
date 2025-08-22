@@ -218,7 +218,8 @@ def full(
     """Create a tensor of ``size`` filled with ``fill_value`` using the backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    inst = one(cls) * fill_value
+    cls = _resolve_cls(cls)
+    inst = AbstractTensor.get_tensor([fill_value], dtype=dtype, device=device, cls=cls)
     return inst.repeat(size)
 
 def likeness(tensor):
@@ -234,19 +235,37 @@ def likeclass(tensor, dtype: Any = None, device: Any = None):
 
 def zeros_like(tensor, dtype: Any = None, device: Any = None):
     """Return a zeros tensor with the same shape as ``tensor``."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
     size, cls = likeness(tensor)
+    if dtype is None:
+        dtype = tensor.get_dtype() if isinstance(tensor, AbstractTensor) else getattr(tensor, "dtype", AbstractTensor.float_dtype_)
+    if device is None:
+        device = tensor.get_device() if isinstance(tensor, AbstractTensor) else getattr(tensor, "device", None)
     return full(size, 0, dtype, device, cls=cls)
 
 
 def ones_like(tensor, dtype: Any = None, device: Any = None):
     """Return a ones tensor with the same shape as ``tensor``."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
     size, cls = likeness(tensor)
+    if dtype is None:
+        dtype = tensor.get_dtype() if isinstance(tensor, AbstractTensor) else getattr(tensor, "dtype", AbstractTensor.float_dtype_)
+    if device is None:
+        device = tensor.get_device() if isinstance(tensor, AbstractTensor) else getattr(tensor, "device", None)
     return full(size, 1, dtype, device, cls=cls)
 
 
 def full_like(tensor, fill_value: Any, dtype: Any = None, device: Any = None):
     """Return a tensor filled with ``fill_value`` and the same shape as ``tensor``."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+
     size, cls = likeness(tensor)
+    if dtype is None:
+        dtype = tensor.get_dtype() if isinstance(tensor, AbstractTensor) else getattr(tensor, "dtype", AbstractTensor.float_dtype_)
+    if device is None:
+        device = tensor.get_device() if isinstance(tensor, AbstractTensor) else getattr(tensor, "device", None)
     return full(size, fill_value, dtype, device, cls=cls)
 
 def rand_like(tensor, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
