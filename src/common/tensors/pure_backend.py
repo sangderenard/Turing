@@ -763,6 +763,20 @@ class PurePythonTensorOperations(AbstractTensor):
             return val
         return _clamp(self.data)
 
+    def clamp_min_(self, min_val: float) -> Any:
+        def _clamp_min(val):
+            if isinstance(val, list):
+                return [_clamp_min(v) for v in val]
+            return val if val >= min_val else min_val
+        return _clamp_min(self.data)
+
+    def clamp_max_(self, max_val: float) -> Any:
+        def _clamp_max(val):
+            if isinstance(val, list):
+                return [_clamp_max(v) for v in val]
+            return val if val <= max_val else max_val
+        return _clamp_max(self.data)
+
     def shape_(self) -> Tuple[int, ...]:
         return _get_shape(self.data)
 
