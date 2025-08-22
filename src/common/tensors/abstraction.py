@@ -509,6 +509,18 @@ class AbstractTensor:
                 pass
         return out
 
+    @classmethod
+    def from_nested(cls, data, *, dtype=None, device=None):
+        """
+        Recursively pack arbitrarily nested sequences of leaves (scalars, numpy/torch tensors,
+        AbstractTensor instances) into a single AbstractTensor by stacking bottom-up.
+
+        This is the safe replacement for passing a nested list to .tensor(...).
+        """
+        from .nested_pack import pack_nested_to_tensor
+
+        return pack_nested_to_tensor(data, dtype=dtype, device=device, cls=cls)
+
     @staticmethod
     def get_tensor(data=None, *, dtype=None, device=None, cls=None, track_time=False) -> "AbstractTensor":
         """
