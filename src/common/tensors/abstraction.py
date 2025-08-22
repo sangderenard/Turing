@@ -468,6 +468,10 @@ class AbstractTensor:
         result.data = self.clone_()
         return result
 
+    # copy is an alias of clone for API compatibility
+    def copy(self) -> "AbstractTensor":
+        return self.clone()
+
     def to_device(self, device: Any = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time)
         result.data = self.to_device_(device)
@@ -780,6 +784,27 @@ class AbstractTensor:
         tensors = [first.ensure_tensor(t) for t in tensors]
         result = first.__class__(track_time=first.track_time)
         result.data = first.stack_(tensors, dim)
+        return result
+
+    @staticmethod
+    def diag(tensor: Any, offset: int = 0) -> "AbstractTensor":
+        """Extract or construct a diagonal.
+
+        Mirrors ``numpy.diag`` behaviour. If ``tensor`` is 1‑D, a square
+        matrix is returned with ``tensor`` on the ``offset`` diagonal. If
+        ``tensor`` is 2‑D, the specified diagonal is extracted.
+
+        Args:
+            tensor: Input array or ``AbstractTensor``.
+            offset: Which diagonal to consider. ``0`` selects the main
+                diagonal, positive values move up, negative move down.
+
+        Returns:
+            ``AbstractTensor`` holding the resulting diagonal data.
+        """
+        t = AbstractTensor.get_tensor(tensor)
+        result = t.__class__(track_time=t.track_time)
+        result.data = t.diag_(offset)
         return result
 
 
@@ -1702,6 +1727,16 @@ AbstractTensor.solve = staticmethod(linalg_solve)
 AbstractTensor.inv   = staticmethod(linalg_inv)
 AbstractTensor.eye   = staticmethod(linalg_eye)
 AbstractTensor.inverse = staticmethod(linalg_inv)
+
+def _cbrt(x):
+    import numpy as np
+    if isinstance(x, AbstractTensor):
+        result = type(x)(track_time=x.track_time)
+        result.data = np.cbrt(x.data)
+        return result
+    return np.cbrt(x)
+
+AbstractTensor.cbrt = staticmethod(_cbrt)
 
 def _einsum(equation: str, *tensors: "AbstractTensor") -> "AbstractTensor":
     cls = type(tensors[0])
