@@ -1407,6 +1407,10 @@ from .abstraction_methods.comparison import (
     any as comp_any,
     where as comp_where,
     nonzero as comp_nonzero,
+    isnan as comp_isnan,
+    isinf as comp_isinf,
+    all as comp_all,
+    isfinite as comp_isfinite
 )
 from .abstraction_methods.trigonometry import (
     sin as trig_sin,
@@ -1500,8 +1504,15 @@ AbstractTensor.less_equal     = comp_less_equal
 AbstractTensor.equal          = comp_equal
 AbstractTensor.not_equal      = comp_not_equal
 AbstractTensor.where     = comp_where
+AbstractTensor.all      = comp_all
 AbstractTensor.any        = comp_any
 AbstractTensor.nonzero  = comp_nonzero
+AbstractTensor.isfinite = comp_isfinite
+AbstractTensor.isnan = comp_isnan
+AbstractTensor.isinf = comp_isinf
+# allclose wiring
+from .abstraction_methods.comparison import allclose as comp_allclose
+AbstractTensor.allclose = comp_allclose
 AbstractTensor.sin   = trig_sin
 AbstractTensor.cos   = trig_cos
 AbstractTensor.tan   = trig_tan

@@ -49,15 +49,33 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
+        import jax.numpy as jnp
+        if not isinstance(other, type(self)):
+            other = type(self)(other)
+        return jnp.allclose(self.data, other.data, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    def isfinite_(self):
+        import jax.numpy as jnp
+        return jnp.isfinite(self.data)
+    def all_(self, dim=None):
+        import jax.numpy as jnp
+        return jnp.all(self.data, axis=dim)
+    def isnan_(self):
+        import jax.numpy as jnp
+        return jnp.isnan(self.data)
+
+    def isinf_(self):
+        import jax.numpy as jnp
+        return jnp.isinf(self.data)
     def nonzero_(self, as_tuple: bool = False):
         import jax.numpy as jnp
         result = jnp.nonzero(self.data)
         if as_tuple:
             return result
         return jnp.stack(result, axis=1)
-    def any_(self):
+    def any_(self, dim=None):
         import jax.numpy as jnp
-        return jnp.any(self.data)
+        return jnp.any(self.data, axis=dim)
     def where_(self, x, y):
         import jax.numpy as jnp
         x = x.data if hasattr(x, 'data') else x

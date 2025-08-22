@@ -43,6 +43,68 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
 class PurePythonTensorOperations(AbstractTensor):
+    def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
+        import math
+        from .abstraction import _flatten, _get_shape
+        if not isinstance(other, type(self)):
+            other = type(self)(other)
+        a = _flatten(self.data)
+        b = _flatten(other.data)
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if math.isnan(x) or math.isnan(y):
+                if not equal_nan or not (math.isnan(x) and math.isnan(y)):
+                    return False
+            elif not math.isclose(x, y, rel_tol=rtol, abs_tol=atol):
+                return False
+        return True
+    def isfinite_(self):
+        import math
+        from .abstraction import _flatten, _get_shape
+        data = self.data
+        shape = _get_shape(data)
+        if len(shape) == 1:
+            return [math.isfinite(x) for x in data]
+        elif len(shape) == 2:
+            return [[math.isfinite(x) for x in row] for row in data]
+        else:
+            raise NotImplementedError("isfinite_ only implemented for 1D/2D in pure backend")
+    def all_(self, dim=None):
+        from .abstraction import _flatten
+        if dim is None:
+            return all(_flatten(self.data))
+        # For 2D, all along axis 0 or 1
+        data = self.data
+        if dim == 0:
+            return [all(row[i] for row in data) for i in range(len(data[0]))]
+        elif dim == 1:
+            return [all(row) for row in data]
+        else:
+            raise NotImplementedError("all_ only implemented for 1D/2D and dim 0/1 in pure backend")
+    def isnan_(self):
+        import math
+        from .abstraction import _flatten, _get_shape
+        data = self.data
+        shape = _get_shape(data)
+        if len(shape) == 1:
+            return [math.isnan(x) for x in data]
+        elif len(shape) == 2:
+            return [[math.isnan(x) for x in row] for row in data]
+        else:
+            raise NotImplementedError("isnan_ only implemented for 1D/2D in pure backend")
+
+    def isinf_(self):
+        import math
+        from .abstraction import _flatten, _get_shape
+        data = self.data
+        shape = _get_shape(data)
+        if len(shape) == 1:
+            return [math.isinf(x) for x in data]
+        elif len(shape) == 2:
+            return [[math.isinf(x) for x in row] for row in data]
+        else:
+            raise NotImplementedError("isinf_ only implemented for 1D/2D in pure backend")
     def nonzero_(self, as_tuple: bool = False):
         from .abstraction import _flatten, _get_shape
         # Only works for 1D/2D for simplicity
@@ -65,9 +127,9 @@ class PurePythonTensorOperations(AbstractTensor):
                 return tuple([] for _ in range(len(shape)))
             return tuple([tuple(idx[dim] for idx in indices) for dim in range(len(shape))])
         return indices
-    def any_(self):
+    def any_(self, dim=None):
         from .abstraction import _flatten
-        return any(_flatten(self.data))
+        return any(_flatten(self.data)) if dim is None else any(_flatten(row[dim] for row in self.data))
     def max_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
         def _max(lst):

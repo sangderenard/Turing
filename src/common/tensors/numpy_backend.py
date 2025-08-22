@@ -54,6 +54,24 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
+        import numpy as np
+        if not isinstance(other, type(self)):
+            other = type(self)(other)
+        return np.allclose(self.data, other.data, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    def isfinite_(self):
+        import numpy as np
+        return np.isfinite(self.data)
+    def all_(self, dim=None):
+        import numpy as np
+        return np.all(self.data, axis=dim)
+    def isnan_(self):
+        import numpy as np
+        return np.isnan(self.data)
+
+    def isinf_(self):
+        import numpy as np
+        return np.isinf(self.data)
     def nonzero_(self, as_tuple: bool = False):
         import numpy as np
         result = np.nonzero(self.data)
@@ -61,9 +79,9 @@ class NumPyTensorOperations(AbstractTensor):
             return result
         # Stack indices for non-tuple output (like torch)
         return np.stack(result, axis=1)
-    def any_(self):
+    def any_(self, dim=None):
         import numpy as np
-        return np.any(self.data)
+        return np.any(self.data, axis=dim)
     def max_(self, dim=None, keepdim=False):
         return np.max(self.data, axis=dim, keepdims=keepdim)
 

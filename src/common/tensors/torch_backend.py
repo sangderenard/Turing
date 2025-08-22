@@ -43,12 +43,30 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
+        import torch
+        if not isinstance(other, type(self)):
+            other = type(self)(other)
+        return torch.allclose(self.data, other.data, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    def isfinite_(self):
+        import torch
+        return torch.isfinite(self.data)
+    def all_(self, dim=None):
+        import torch
+        return torch.all(self.data, dim=dim)
+    def isnan_(self):
+        import torch
+        return torch.isnan(self.data)
+
+    def isinf_(self):
+        import torch
+        return torch.isinf(self.data)
     def nonzero_(self, as_tuple: bool = False):
         import torch
         return torch.nonzero(self.data, as_tuple=as_tuple)
-    def any_(self):
+    def any_(self, dim=None):
         import torch
-        return torch.any(self.data)
+        return torch.any(self.data, dim=dim)
     def max_(self, dim=None, keepdim=False):
         x = self.data
         if dim is None:
