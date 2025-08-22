@@ -350,11 +350,14 @@ class PurePythonTensorOperations(AbstractTensor):
     def zeros_(self, size: Tuple[int, ...], dtype: Any, device: Any):
         return self.full_(size, 0, dtype, device)
 
-    def clone_(self, tensor: Any) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
-        if not isinstance(tensor, list):
-            return tensor
-        return [self.clone_(item) for item in tensor]
+    def clone_(self) -> Any:
+        tensor = self.data
+        return self._clone_recursive(tensor)
+
+    def _clone_recursive(self, tensor: Any) -> Any:
+        if isinstance(tensor, list):
+            return [self._clone_recursive(item) for item in tensor]
+        return tensor
 
     def to_device_(self, device: Any) -> Any:
         return self.data
@@ -364,7 +367,7 @@ class PurePythonTensorOperations(AbstractTensor):
             return []
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         if dim == 0:
-            return [self.clone_(t) for t in tensors]
+            return [self._clone_recursive(t) for t in tensors]
         ref_shape = _get_shape(tensors[0])
         for t in tensors:
             if _get_shape(t) != ref_shape:
@@ -893,7 +896,7 @@ class PurePythonTensorOperations(AbstractTensor):
         return [tensor[i] for i in range(len(tensor)) if mask[i]]
 
     def tolist_(self) -> list:
-        return self.clone_(self.data)
+        return self.clone_()
 
     def less_(self, value: Any) -> Any:
         value = value.data if isinstance(value, AbstractTensor) else value

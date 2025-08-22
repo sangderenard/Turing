@@ -345,8 +345,8 @@ class NumPyTensorOperations(AbstractTensor):
             return self._numpy_dtype_to_torch(tensor.dtype)
         return tensor.dtype
 
-    def item_(self, tensor):
-        return self._AbstractTensor__unwrap(tensor).item()
+    def item_(self):
+        return self.data.item()
 
     def max_(self, tensor):
         return np.max(self._AbstractTensor__unwrap(tensor))
@@ -389,8 +389,8 @@ class NumPyTensorOperations(AbstractTensor):
         softmax = e_x / np.sum(e_x, axis=dim, keepdims=True)
         return np.log(softmax)
 
-    def topk_(self, tensor, k, dim):
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def topk_(self, k, dim):
+        tensor = self.data
         if dim < 0:
             dim = tensor.ndim + dim
         sorted_indices = np.argsort(tensor, axis=dim)

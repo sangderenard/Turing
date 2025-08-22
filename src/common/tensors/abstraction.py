@@ -292,11 +292,15 @@ class AbstractTensor:
     # --- Basic layout ---
     def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
-        return self.mean_(dim=dim, keepdim=keepdim)
+        result = type(self)(track_time=self.track_time)
+        result.data = self.mean_(dim=dim, keepdim=keepdim)
+        return result
 
     def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
-        return self.sum_(dim=dim, keepdim=keepdim)
+        result = type(self)(track_time=self.track_time)
+        result.data = self.sum_(dim=dim, keepdim=keepdim)
+        return result
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
         """Return the cumulative sum of the tensor along a dimension."""
@@ -306,7 +310,9 @@ class AbstractTensor:
 
     def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        return self.min_(dim=dim, keepdim=keepdim)
+        result = type(self)(track_time=self.track_time)
+        result.data = self.min_(dim=dim, keepdim=keepdim)
+        return result
 
     def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
         """Return the indices of the minimum values along an axis."""

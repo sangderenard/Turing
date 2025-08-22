@@ -53,7 +53,7 @@ class BuildLaplace3D:
                                  (default: ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')).
             artificial_stability: Small stability term added to metrics (default: 0).
         """
-        self.device = device or ("cuda" if AbstractTensor.cuda.is_available() else "cpu")
+        self.device = device or "cpu"
         self.general_index_composer = GeneralIndexComposer(device=self.device)
         
         self.grid_domain = grid_domain
