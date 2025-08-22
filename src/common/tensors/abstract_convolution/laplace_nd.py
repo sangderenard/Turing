@@ -1100,22 +1100,26 @@ class TransformHub:
             normals = -normals
 
         # Continue with normalization and validation
-        norm_magnitudes = AbstractTensor.get_tensor(AbstractTensor.norm(normals, dim=-1, keepdim=True))
+        norm_magnitudes = AbstractTensor.get_tensor(AbstractTensor.norm(normals, dim=-2, keepdim=True))
         print(type(norm_magnitudes))
         # Normalize normals, avoid division by zero for zero-magnitude normals
         normals = AbstractTensor.where(norm_magnitudes > 1e-16, normals / norm_magnitudes, normals)
 
-        # Identify zero-magnitude normals
-        zero_norm_mask = AbstractTensor.get_tensor(norm_magnitudes.squeeze()) < 1e-16  # Boolean mask for zero-magnitude normals
+        # Identify zero-magnitude normals for any of the three faces
+        zero_norm_mask = AbstractTensor.any(norm_magnitudes.squeeze(-2) < 1e-16, dim=-1)
 
         if AbstractTensor.any(zero_norm_mask):
-            count_zero_normals = AbstractTensor.sum(zero_norm_mask).item()  # Number of zero-magnitude normals
+            count_zero_normals = AbstractTensor.sum(zero_norm_mask).item()  # Number of grid points with zero-magnitude normals
             print(f"{count_zero_normals} out of {normals.numel()} zero-magnitude normals detected.")
 
             if diagnostic_mode:
                 # Find the indices of the first zero-magnitude normal
                 zero_indices = AbstractTensor.nonzero(zero_norm_mask, as_tuple=True)
-                first_zero_idx = (zero_indices[0][0].item(), zero_indices[1][0].item(), zero_indices[2][0].item())
+                first_zero_idx = (
+                    zero_indices[0][0].item(),
+                    zero_indices[1][0].item(),
+                    zero_indices[2][0].item(),
+                )
 
                 print(f"First zero-magnitude normal at index: {first_zero_idx}")
 
@@ -1156,12 +1160,14 @@ class TransformHub:
                                 if di == 0 and dj == 0 and dk == 0:
                                     continue  # Skip the center point
                                 ni, nj, nk = idx[0] + di, idx[1] + dj, idx[2] + dk
-                                if (0 <= ni < grid_shape[0] and 
-                                    0 <= nj < grid_shape[1] and 
-                                    0 <= nk < grid_shape[2]):
+                                if (
+                                    0 <= ni < grid_shape[0]
+                                    and 0 <= nj < grid_shape[1]
+                                    and 0 <= nk < grid_shape[2]
+                                ):
                                     neighbor_normal = normals[ni, nj, nk]
                                     neighbor_magnitude = norm_magnitudes[ni, nj, nk]
-                                    if neighbor_magnitude.item() > 1e-16:
+                                    if AbstractTensor.any(neighbor_magnitude > 1e-16):
                                         neighbors.append(neighbor_normal)
                     if neighbors:
                         avg_normal = AbstractTensor.mean(AbstractTensor.stack(neighbors), dim=0)
@@ -1181,7 +1187,11 @@ class TransformHub:
             if not AbstractTensor.all(AbstractTensor.isfinite(normals)):
                 print("Validation failed: Non-finite values detected in normals.")
                 exit()
-            if not AbstractTensor.allclose(AbstractTensor.norm(normals, dim=-1), AbstractTensor.ones_like(norm_magnitudes.squeeze()), atol=1e-5):
+            if not AbstractTensor.allclose(
+                AbstractTensor.norm(normals, dim=-2),
+                AbstractTensor.ones_like(norm_magnitudes.squeeze(-2)),
+                atol=1e-5,
+            ):
                 print("Validation failed: Normals are not unit length within tolerance after normalization.")
                 exit()
 
