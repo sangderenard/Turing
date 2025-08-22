@@ -1592,6 +1592,7 @@ _bind_and_wrap({
     "reshape": _reshape_methods.reshape,
     "flatten": _reshape_methods.flatten,
     "transpose": _reshape_methods.transpose,
+    "unsqueeze": _reshape_methods.unsqueeze,
     "squeeze": _reshape_methods.squeeze,
     "repeat": _reshape_methods.repeat,
     "repeat_interleave": _reshape_methods.repeat_interleave,
