@@ -102,6 +102,16 @@ class PurePythonTensorOperations(AbstractTensor):
                     idx = [idx]
             return idx
         return reduce_dim(data, dim)
+
+    def unravel_index_(self, shape: Tuple[int, ...]):
+        idx = self.data
+        if isinstance(idx, list):
+            idx = idx[0]
+        coords = []
+        for dim in reversed(shape):
+            coords.append(idx % dim)
+            idx //= dim
+        return tuple(reversed(coords))
     """Educational tensor ops using nested Python lists."""
 
     def __init__(self, track_time: bool = False):

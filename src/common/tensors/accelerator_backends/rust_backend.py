@@ -54,3 +54,8 @@ class RustTensorOperations:
     def full_(self, size: tuple[int, ...], fill_value: Any, dtype: Any, device: Any):
         raise NotImplementedError
 
+    def unravel_index_(self, shape):
+        raise NotImplementedError(
+            "unravel_index not implemented for Rust backend"
+        )
+
