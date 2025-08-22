@@ -22,17 +22,17 @@ def shape_(self) -> Tuple[int, ...]:
 
 def ndim(self):
     """Return the number of dimensions (property, NumPy style)."""
-    return self.get_ndims(self.data)
+    return self.get_ndims()
 
 
 def dim(self) -> int:
     """Return the number of dimensions (method, torch style)."""
-    return self.get_ndims(self.data)
+    return self.get_ndims()
 
 
 def ndims(self) -> int:
     """Return the number of dimensions (method, project style)."""
-    return self.get_ndims(self.data)
+    return self.get_ndims()
 
 
 def device(self):
