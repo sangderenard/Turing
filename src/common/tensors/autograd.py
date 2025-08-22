@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # Global flag to control backend autograd deferral
-ALLOW_BACKEND_AUTOGRAD_DEFER = False
+ALLOW_BACKEND_AUTOGRAD_DEFER = True
 
 def set_backend_autograd_defer(allow: bool):
     """Set whether backend autograd deferral is allowed at runtime."""
