@@ -2,6 +2,7 @@
 from ..abstraction import AbstractTensor
 import math
 import logging
+from src.common.tensors.coo_matrix import COOMatrix
 
 
 # Configure the logger at the module level
@@ -497,14 +498,10 @@ class BuildLaplace3D:
         values.extend(laplacian_diag.flatten().tolist())
 
         # 4. Assemble Sparse Tensor
-        laplacian = AbstractTensor.sparse_coo_tensor(
-            indices=AbstractTensor.tensor([row_indices, col_indices], device='cpu'),
-            values=AbstractTensor.tensor(values, device='cpu'),
-            size=(total_size, total_size)
-        ).coalesce()
-
-        laplacian = coo_matrix((laplacian.values().cpu().numpy(), laplacian.indices().cpu().numpy()), shape=laplacian.shape)
-        # Now, use laplacian_matrix as needed in your application
+        indices_tensor = AbstractTensor.tensor([row_indices, col_indices], device='cpu')
+        values_tensor = AbstractTensor.tensor(values, device='cpu')
+        laplacian = COOMatrix(indices_tensor, values_tensor, (total_size, total_size))
+        # Now, use laplacian as needed in your application
 
         # Convert to dense tensor and move to specified device
         perturbation_mode = False  # Enable perturbation
@@ -513,8 +510,7 @@ class BuildLaplace3D:
 
         if self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
-            laplacian_dense = laplacian.toarray()
-            laplacian_tensor = AbstractTensor.tensor(laplacian_dense, device=device, dtype=self.precision)
+            laplacian_tensor = laplacian.to_dense()
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
 
             # Dense perturbation
@@ -547,9 +543,8 @@ class BuildLaplace3D:
             noise_sparse = AbstractTensor.random.randn(laplacian.data.shape[0]) * perturbation_scale
             logger.debug(f"Generated noise for {laplacian.data.shape[0]} non-zero elements.")
 
-            # Apply the noise by creating a new COO matrix with perturbed data
-            laplacian = coo_matrix((laplacian.data + noise_sparse, (laplacian.row, laplacian.col)), 
-                                   shape=laplacian.shape)
+            # Apply the noise by updating the COO matrix with perturbed data
+            laplacian.update(edge_weight=laplacian.data + noise_sparse)
             logger.debug("Applied noise to sparse Laplacian matrix.")
 
         # Validate perturbed sparse Laplace tensor
@@ -577,7 +572,7 @@ class BuildLaplace3D:
         valid = True
 
         # Handle both dense and sparse cases
-        if isinstance(laplace_tensor, AbstractTensor.Tensor):
+        if isinstance(laplace_tensor, AbstractTensor):
             # Dense matrix case
             diagonal = AbstractTensor.diag(laplace_tensor)
 
@@ -616,7 +611,7 @@ class BuildLaplace3D:
                         inf_locations = AbstractTensor.where(AbstractTensor.isinf(off_diagonal))
                         print(f"Inf detected in off-diagonal at indices: {inf_locations}")
 
-        elif isinstance(laplace_tensor, coo_matrix):
+        elif isinstance(laplace_tensor, COOMatrix):
             # Sparse matrix case (COO format)
 
             # Check diagonal entries in sparse matrix
@@ -654,7 +649,7 @@ class BuildLaplace3D:
                                 print(f"Inf detected in off-diagonal at indices: ({i}, {j})")
 
         else:
-            raise TypeError("Unsupported matrix format. Please provide a AbstractTensor.Tensor or scipy.sparse matrix.")
+            raise TypeError("Unsupported matrix format. Please provide an AbstractTensor or COOMatrix.")
 
         if verbose and valid:
             print("Laplace tensor passed all validation checks.")
@@ -1951,11 +1946,7 @@ def test_build_laplace3d():
         laplace_f_numerical = -laplacian_tensor @ f_tensor
     else:
         # Sparse Laplacian
-        # Convert sparse matrix to AbstractTensor sparse tensor
-        indices = AbstractTensor.tensor([laplacian_sparse.row, laplacian_sparse.col], dtype=AbstractTensor.long)
-        values = AbstractTensor.tensor(laplacian_sparse.data, dtype=AbstractTensor.float_dtype_)
-        laplacian_sparse_AbstractTensor = AbstractTensor.sparse_coo_tensor(indices, values, size=(N_u * N_v * N_w, N_u * N_v * N_w)).to(device)
-        laplace_f_numerical = AbstractTensor.sparse.mm(laplacian_sparse_AbstractTensor, f_tensor.unsqueeze(1)).squeeze(1)
+        laplace_f_numerical = -laplacian_sparse.to_dense() @ f_tensor
 
     # Compute the analytical Laplacian: -3 pi^2 f
     laplace_f_analytical = -3 * (math.pi ** 2) * f_flat

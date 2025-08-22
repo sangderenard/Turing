@@ -1463,6 +1463,7 @@ from .abstraction_methods.creation import (
 from .abstraction_methods.reduction import (
     max as reduction_max,
     argmax as reduction_argmax,
+    prod as reduction_prod,
 )
 from .abstraction_methods.indexing import (
     unravel_index as indexing_unravel_index,
@@ -1603,6 +1604,7 @@ _bind_and_wrap({
     "randint_like": randint_like,
     "max": reduction_max,
     "argmax": reduction_argmax,
+    "prod": reduction_prod,
     "to": type_to,
     "astype": type_astype,
     "long_cast": type_long_cast,
@@ -1699,6 +1701,22 @@ AbstractTensor.det   = staticmethod(linalg_det)
 AbstractTensor.solve = staticmethod(linalg_solve)
 AbstractTensor.inv   = staticmethod(linalg_inv)
 AbstractTensor.eye   = staticmethod(linalg_eye)
+AbstractTensor.inverse = staticmethod(linalg_inv)
+
+def _einsum(equation: str, *tensors: "AbstractTensor") -> "AbstractTensor":
+    cls = type(tensors[0])
+    data = [t.data if isinstance(t, AbstractTensor) else t for t in tensors]
+    result = cls(track_time=False)
+    result.data = cls.einsum_(equation, *data)
+    return result
+
+AbstractTensor.einsum = staticmethod(_einsum)
+
+def _sparse_coo_tensor(indices, values, size):
+    from .coo_matrix import COOMatrix
+    return COOMatrix(indices, values, size)
+
+AbstractTensor.sparse_coo_tensor = staticmethod(_sparse_coo_tensor)
 
 
 def _get_shape(data):
