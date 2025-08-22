@@ -1,0 +1,619 @@
+"""
+Backward/VJP Registry
+=====================
+
+This module is an **easy-to-read, static registry** of known backward rules
+(Vector-Jacobian Products, VJPs) for common tensor operations. It is intended
+to serve simultaneously as:
+
+1) **Hard data backing** for a `backward.py` implementation (machine-readable).
+2) **A computer-science + pure-math reference**, readable by humans.
+3) **A learning tool** with precise domain assumptions and broadcasting notes.
+
+Design principles
+-----------------
+- Each entry declares:
+  - `arity`: "unary" | "binary" | "n-ary"
+  - `signature`: canonical forward signature (names of inputs and parameters)
+  - `latex`: math definition of the forward and its derivative(s)
+  - `vjp`: VJP pseudocode in a small, self-explanatory DSL
+           (variable names: `g` = upstream gradient, inputs by their names; may
+           reference helper symbols defined in `helpers_spec` below).
+  - `domain`: assumptions on inputs (e.g., positivity for `log`)
+  - `notes`: shape/broadcasting remarks, corner cases, and subgradient choices.
+  - `tags`: optional topical tags.
+
+- **Broadcasting**: For elementwise rules, broadcasting is handled by
+  `unbroadcast(g_like, shape)` in the pseudocode, meaning: sum-reduce `g_like`
+  along axes that were broadcast in the forward so the result matches `shape`.
+
+- **Reduce ops**: For reductions (`sum`, `mean`, ...), use `expand_to(x.shape)`
+  to broadcast a reduced gradient back to the input's shape.
+
+- **Soft subgradients**: Where a function is nondifferentiable at isolated
+  points (e.g., `abs` at 0, `max` ties), we specify a standard subgradient
+  (e.g., 0 at 0 for `abs`, tie-breaking by 0.5 for `maximum/minimum`).
+
+
+VJP / DSL helpers
+-----------------
+The VJP pseudocode is designed to be trivially translatable to your tensor API.
+The following helper identifiers are assumed to exist (as math concepts):
+
+- `unbroadcast(G, shape)`
+    Sum-reduce `G` over the axes that were broadcast relative to `shape` and
+    reshape to `shape`. (Right-inverse of broadcasting.)
+
+- `sum(x, axis=None, keepdim=False)`
+    Summation along `axis` (or all axes if None).
+
+- `expand_to(G, shape)`
+    Broadcast `G` to `shape` by inserting/trailing singleton dims as needed.
+
+- `where(cond, a, b)`
+    Elementwise select.
+
+- `indicator(cond)`
+    1 where cond is true, else 0. (Use exact dtype semantics of your backend.)
+
+- `eps`
+    A small positive constant, used where divisions/logs need guarding.
+
+- `ones_like(x)` / `zeros_like(x)`
+    Standard helpers.
+
+- `T(x)`
+    Transpose (or last-two-dims transpose) – context dependent per rule.
+
+- `permute(x, perm)`
+    General axis permutation.
+
+- `reshape(x, shape)`
+    Shape change with shared storage.
+
+- `stack([...], dim)` / `concat([...], dim)` / `split(x, sizes, dim)` / `unstack(x, dim)`
+    Usual tensor layout ops.
+
+- `softmax(x, dim)` / `log_softmax(x, dim)` / `sigmoid(x)` / `tanh(x)`
+    Standard nonlinearities.
+
+- `matmul(A, B)`
+    Batched matrix multiply with broadcasting semantics.
+
+- `dot(a, b, dim)`
+    Inner product along the specified `dim` (vectors).
+
+All ops used in the pseudocode should map to your `AbstractTensor` surface
+(using `+ - * / **`, `.sum`, `.reshape`, `.permute`, `.transpose`, etc.).
+
+
+Registry structure
+------------------
+Each entry is a dictionary with keys:
+    {
+      "arity": str,
+      "signature": str,
+      "latex": str or list[str],
+      "vjp": dict[str, str],     # map input_name -> VJP pseudocode
+      "domain": str,
+      "notes": str,
+      "tags": list[str]
+    }
+
+The entire registry is exposed as `BACKWARD_RULES`.
+"""
+
+from __future__ import annotations
+from typing import Dict, Any, List
+
+
+helpers_spec: Dict[str, str] = {
+    "unbroadcast":
+        "unbroadcast(G, shape): reduce-sum G over axes that were broadcast to match shape; reshape to shape.",
+    "expand_to":
+        "expand_to(G, shape): broadcast G to target shape by (re)inserting singleton dims.",
+    "indicator":
+        "indicator(cond): 1 where cond, else 0 (cast to appropriate dtype).",
+    "eps":
+        "A small positive constant to guard divisions/logs/square-roots (e.g., 1e-12).",
+    "T":
+        "T(X): transpose last two dims of X (matrix transpose).",
+}
+
+
+BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
+    # ----------------------------------------------------------------------
+    # Elementwise unary
+    # ----------------------------------------------------------------------
+    "neg": {
+        "arity": "unary",
+        "signature": "y = -x",
+        "latex": r"y = -x, \quad \frac{\partial y}{\partial x} = -1",
+        "vjp": {
+            "x": "gx = unbroadcast(-g, x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "Pure sign flip.",
+        "tags": ["elementwise", "unary"],
+    },
+    "exp": {
+        "arity": "unary",
+        "signature": "y = exp(x)",
+        "latex": r"y = e^x, \quad \frac{\partial y}{\partial x} = e^x = y",
+        "vjp": {
+            "x": "gx = unbroadcast(g * y, x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "Use forward output `y` if available for efficiency.",
+        "tags": ["elementwise", "unary", "smooth"],
+    },
+    "log": {
+        "arity": "unary",
+        "signature": "y = log(x)",
+        "latex": r"y = \log x, \quad \frac{\partial y}{\partial x} = 1/x",
+        "vjp": {
+            "x": "gx = unbroadcast(g / (x + eps), x.shape)"
+        },
+        "domain": "x > 0 (strict); practical: x >= eps",
+        "notes": "Guard at 0 with eps to avoid NaNs.",
+        "tags": ["elementwise", "unary", "smooth", "domain"],
+    },
+    "sqrt": {
+        "arity": "unary",
+        "signature": "y = sqrt(x)",
+        "latex": r"y = \sqrt{x}, \quad \frac{\partial y}{\partial x} = \frac{1}{2\sqrt{x}}",
+        "vjp": {
+            "x": "gx = unbroadcast(0.5 * g / (y + eps), x.shape)"
+        },
+        "domain": "x >= 0; practical: x >= 0 with eps guard",
+        "notes": "Prefer using forward output `y` for stability.",
+        "tags": ["elementwise", "unary", "smooth", "domain"],
+    },
+    "abs": {
+        "arity": "unary",
+        "signature": "y = |x|",
+        "latex": r"y = |x|, \quad \frac{\partial y}{\partial x} = \mathrm{sign}(x) \text{ for } x \neq 0",
+        "vjp": {
+            "x": "gx = unbroadcast(g * where(x>0, 1, where(x<0, -1, 0)), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "Subgradient at x=0 set to 0. Other choices are valid but less common.",
+        "tags": ["elementwise", "unary", "nonsmooth"],
+    },
+    "sin": {
+        "arity": "unary",
+        "signature": "y = sin(x)",
+        "latex": r"y = \sin x, \quad \frac{\partial y}{\partial x} = \cos x",
+        "vjp": {
+            "x": "gx = unbroadcast(g * cos(x), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "",
+        "tags": ["elementwise", "unary", "smooth", "trig"],
+    },
+    "cos": {
+        "arity": "unary",
+        "signature": "y = cos(x)",
+        "latex": r"y = \cos x, \quad \frac{\partial y}{\partial x} = -\sin x",
+        "vjp": {
+            "x": "gx = unbroadcast(-g * sin(x), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "",
+        "tags": ["elementwise", "unary", "smooth", "trig"],
+    },
+    "tan": {
+        "arity": "unary",
+        "signature": "y = tan(x)",
+        "latex": r"y = \tan x, \quad \frac{\partial y}{\partial x} = \sec^2 x = 1 + \tan^2 x",
+        "vjp": {
+            "x": "gx = unbroadcast(g * (1 + y*y), x.shape)"
+        },
+        "domain": "x != (pi/2 + k*pi)",
+        "notes": "Use forward output `y` to compute 1 + tan^2(x).",
+        "tags": ["elementwise", "unary", "smooth", "trig"],
+    },
+    "tanh": {
+        "arity": "unary",
+        "signature": "y = tanh(x)",
+        "latex": r"y = \tanh x, \quad \frac{\partial y}{\partial x} = 1 - \tanh^2 x = 1 - y^2",
+        "vjp": {
+            "x": "gx = unbroadcast(g * (1 - y*y), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "",
+        "tags": ["elementwise", "unary", "smooth", "nn"],
+    },
+    "sigmoid": {
+        "arity": "unary",
+        "signature": "y = sigmoid(x)",
+        "latex": r"y = \sigma(x) = \frac{1}{1+e^{-x}}, \quad \frac{\partial y}{\partial x} = y(1-y)",
+        "vjp": {
+            "x": "gx = unbroadcast(g * y * (1 - y), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "Use numerically stable sigmoid implementation in forward.",
+        "tags": ["elementwise", "unary", "smooth", "nn"],
+    },
+    "relu": {
+        "arity": "unary",
+        "signature": "y = relu(x) = max(x, 0)",
+        "latex": r"y = \max(x,0), \quad \frac{\partial y}{\partial x} = \mathbf{1}_{x>0}",
+        "vjp": {
+            "x": "gx = unbroadcast(g * indicator(x>0), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "At x=0 use subgradient 0 by convention.",
+        "tags": ["elementwise", "unary", "nonsmooth", "nn"],
+    },
+    "leaky_relu": {
+        "arity": "unary",
+        "signature": "y = leaky_relu(x; alpha) = max(x, alpha*x)",
+        "latex": r"y=\begin{cases}x & x>0\\ \alpha x & x\le0\end{cases},\quad \frac{\partial y}{\partial x}=\begin{cases}1 & x>0\\ \alpha & x\le0\end{cases}",
+        "vjp": {
+            "x": "gx = unbroadcast(g * where(x>0, 1, alpha), x.shape)"
+        },
+        "domain": "alpha in (0,1) typically",
+        "notes": "Alpha passed as parameter to forward. Same value used in backward.",
+        "tags": ["elementwise", "unary", "nonsmooth", "nn"],
+    },
+    "softplus": {
+        "arity": "unary",
+        "signature": "y = softplus(x) = log(1 + exp(x))",
+        "latex": r"y = \log(1+e^{x}),\quad \frac{\partial y}{\partial x} = \sigma(x)",
+        "vjp": {
+            "x": "gx = unbroadcast(g * sigmoid(x), x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "Use numerically stable softplus in forward.",
+        "tags": ["elementwise", "unary", "smooth", "nn"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Elementwise binary
+    # ----------------------------------------------------------------------
+    "add": {
+        "arity": "binary",
+        "signature": "z = x + y",
+        "latex": r"z = x+y,\quad \frac{\partial z}{\partial x}=1,\ \frac{\partial z}{\partial y}=1",
+        "vjp": {
+            "x": "gx = unbroadcast(g, x.shape)",
+            "y": "gy = unbroadcast(g, y.shape)",
+        },
+        "domain": "x,y: any real; broadcasting allowed",
+        "notes": "Pure passthrough with broadcasting unrolled.",
+        "tags": ["elementwise", "binary"],
+    },
+    "sub": {
+        "arity": "binary",
+        "signature": "z = x - y",
+        "latex": r"z = x-y,\quad \frac{\partial z}{\partial x}=1,\ \frac{\partial z}{\partial y}=-1",
+        "vjp": {
+            "x": "gx = unbroadcast(g, x.shape)",
+            "y": "gy = unbroadcast(-g, y.shape)",
+        },
+        "domain": "x,y: any real; broadcasting allowed",
+        "notes": "",
+        "tags": ["elementwise", "binary"],
+    },
+    "mul": {
+        "arity": "binary",
+        "signature": "z = x * y",
+        "latex": r"z = xy,\quad \frac{\partial z}{\partial x}=y,\ \frac{\partial z}{\partial y}=x",
+        "vjp": {
+            "x": "gx = unbroadcast(g * y, x.shape)",
+            "y": "gy = unbroadcast(g * x, y.shape)",
+        },
+        "domain": "x,y: any real; broadcasting allowed",
+        "notes": "",
+        "tags": ["elementwise", "binary"],
+    },
+    "div": {
+        "arity": "binary",
+        "signature": "z = x / y",
+        "latex": r"z = x/y,\quad \frac{\partial z}{\partial x}=1/y,\ \frac{\partial z}{\partial y}=-x/y^2",
+        "vjp": {
+            "x": "gx = unbroadcast(g / (y + eps), x.shape)",
+            "y": "gy = unbroadcast(-g * x / ((y + eps)*(y + eps)), y.shape)",
+        },
+        "domain": "y != 0; practical: |y| >= eps",
+        "notes": "Guard division by zero with eps.",
+        "tags": ["elementwise", "binary"],
+    },
+    "pow": {
+        "arity": "binary",
+        "signature": "z = x ** p   # exponent p may be tensor or scalar",
+        "latex": [
+            r"z = x^p, \quad \frac{\partial z}{\partial x} = p x^{p-1}",
+            r"\frac{\partial z}{\partial p} = x^p \log x \quad (x>0)"
+        ],
+        "vjp": {
+            "x": "gx = unbroadcast(g * p * (x + eps)**(p - 1), x.shape)",
+            "p": "gp = unbroadcast(g * (x + eps)**p * log(x + eps), p.shape)",
+        },
+        "domain": "x>0 if p varies; if p is integer constant, extend by continuity.",
+        "notes": "When p is constant, only x-branch is needed.",
+        "tags": ["elementwise", "binary", "domain"],
+    },
+    "maximum": {
+        "arity": "binary",
+        "signature": "z = maximum(x, y)",
+        "latex": r"z_i = \max(x_i, y_i)",
+        "vjp": {
+            "x": "gx = unbroadcast(g * where(x>y, 1, where(x<y, 0, 0.5))), x.shape)",
+            "y": "gy = unbroadcast(g * where(y>x, 1, where(y<x, 0, 0.5))), y.shape)",
+        },
+        "domain": "x,y: any real",
+        "notes": "At ties (x==y) we choose to split gradient equally (0.5/0.5).",
+        "tags": ["elementwise", "binary", "nonsmooth"],
+    },
+    "minimum": {
+        "arity": "binary",
+        "signature": "z = minimum(x, y)",
+        "latex": r"z_i = \min(x_i, y_i)",
+        "vjp": {
+            "x": "gx = unbroadcast(g * where(x<y, 1, where(x>y, 0, 0.5))), x.shape)",
+            "y": "gy = unbroadcast(g * where(y<x, 1, where(y>x, 0, 0.5))), y.shape)",
+        },
+        "domain": "x,y: any real",
+        "notes": "At ties (x==y) split the gradient 0.5/0.5.",
+        "tags": ["elementwise", "binary", "nonsmooth"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Reductions
+    # ----------------------------------------------------------------------
+    "sum": {
+        "arity": "unary",
+        "signature": "y = sum(x, axis=None, keepdim=False)",
+        "latex": r"y = \sum_{i \in \mathcal{I}} x_i",
+        "vjp": {
+            "x": "gx = expand_to(g, x.shape)"
+        },
+        "domain": "x: any real",
+        "notes": "If axis is specified and keepdim=False, conceptually unsqueeze `g` on the reduced axes before expand.",
+        "tags": ["reduction", "linear"],
+    },
+    "mean": {
+        "arity": "unary",
+        "signature": "y = mean(x, axis=None, keepdim=False)",
+        "latex": r"y = \frac{1}{N}\sum_{i \in \mathcal{I}} x_i",
+        "vjp": {
+            "x": "N = number_of_elements_reduced; gx = expand_to(g, x.shape) / N"
+        },
+        "domain": "x: any real",
+        "notes": "Same broadcasting mechanics as `sum`, scaled by 1/N.",
+        "tags": ["reduction", "linear"],
+    },
+    "var": {
+        "arity": "unary",
+        "signature": "y = var(x, axis=None, keepdim=False, unbiased=False)",
+        "latex": r"y = \frac{1}{N}\sum_i (x_i - \bar{x})^2 \text{ (population)}",
+        "vjp": {
+            "x": "mu = mean(x, axis, keepdim=True); gx = expand_to(g, x.shape) * 2*(x - mu)/N"
+        },
+        "domain": "x: any real",
+        "notes": "For unbiased=True replace N by (N-1) in forward; backward uses population scaling in many libs; match your forward exactly.",
+        "tags": ["reduction", "statistics"],
+    },
+    "std": {
+        "arity": "unary",
+        "signature": "y = std(x, axis=None, keepdim=False, unbiased=False) = sqrt(var(x))",
+        "latex": r"y = \sqrt{\mathrm{var}(x)}",
+        "vjp": {
+            "x": "mu = mean(x, axis, keepdim=True); v = mean((x - mu)**2, axis, keepdim=True); gx = expand_to(g, x.shape) * (x - mu) / (sqrt(v) * N + eps)"
+        },
+        "domain": "x: any real",
+        "notes": "Derives via chain rule from var -> sqrt.",
+        "tags": ["reduction", "statistics"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Shape / layout ops
+    # ----------------------------------------------------------------------
+    "reshape": {
+        "arity": "unary",
+        "signature": "y = reshape(x, new_shape)",
+        "latex": r"y = \mathrm{Reshape}(x)",
+        "vjp": {
+            "x": "gx = reshape(g, x.shape)"
+        },
+        "domain": "Same number of elements.",
+        "notes": "Gradient reshapes back.",
+        "tags": ["shape"],
+    },
+    "transpose_last2": {
+        "arity": "unary",
+        "signature": "y = T(x)  # last-two-dims transpose",
+        "latex": r"y = x^\top,\quad \mathrm{(last\ two\ dims)}",
+        "vjp": {
+            "x": "gx = T(g)"
+        },
+        "domain": "Tensor with rank >=2",
+        "notes": "For general permutes use `permute` rule.",
+        "tags": ["shape", "linear"],
+    },
+    "permute": {
+        "arity": "unary",
+        "signature": "y = permute(x, perm)",
+        "latex": r"y_{i_{\pi(1)},\ldots,i_{\pi(n)}} = x_{i_1,\ldots,i_n}",
+        "vjp": {
+            "x": "inv = inverse_permutation(perm); gx = permute(g, inv)"
+        },
+        "domain": "Any rank",
+        "notes": "Pure reindexing; inverse permutation for backward.",
+        "tags": ["shape", "linear"],
+    },
+    "broadcast_to": {
+        "arity": "unary",
+        "signature": "y = broadcast_to(x, shape)",
+        "latex": r"y = \mathrm{Broadcast}(x)",
+        "vjp": {
+            "x": "gx = unbroadcast(g, x.shape)"
+        },
+        "domain": "Target shape is broadcast-compatible.",
+        "notes": "Right-inverse of broadcasting via summation.",
+        "tags": ["shape"],
+    },
+    "slice": {
+        "arity": "unary",
+        "signature": "y = x[slices]",
+        "latex": r"y = S(x) \text{ (slicing operator)}",
+        "vjp": {
+            "x": "gx = zeros_like(x); gx[slices] = g"
+        },
+        "domain": "Any real; slices valid.",
+        "notes": "Implements a simple scatter into the sliced region.",
+        "tags": ["shape", "indexing"],
+    },
+    "concat": {
+        "arity": "n-ary",
+        "signature": "y = concat([x1, x2, ...], dim)",
+        "latex": r"y = \mathrm{Concat}(x_1,x_2,\ldots; \mathrm{dim})",
+        "vjp": {
+            "x*": "g splits along dim with sizes [x1.size(dim), x2.size(dim), ...]"
+        },
+        "domain": "Shapes must align on all dims except `dim`.",
+        "notes": "Backward is a split of `g` into per-input gradients.",
+        "tags": ["shape", "layout"],
+    },
+    "stack": {
+        "arity": "n-ary",
+        "signature": "y = stack([x1, x2, ...], dim)",
+        "latex": r"y = \mathrm{Stack}(x_1,x_2,\ldots; \mathrm{dim})",
+        "vjp": {
+            "x*": "gx_k = unstack(g, dim)[k]"
+        },
+        "domain": "All inputs same shape.",
+        "notes": "Backward is unstack along the stacking dim.",
+        "tags": ["shape", "layout"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Selection / logic
+    # ----------------------------------------------------------------------
+    "where": {
+        "arity": "n-ary",
+        "signature": "y = where(cond, a, b)",
+        "latex": r"y_i = \begin{cases} a_i & \text{if } cond_i \\ b_i & \text{otherwise}\end{cases}",
+        "vjp": {
+            "a": "ga = unbroadcast(g * indicator(cond), a.shape)",
+            "b": "gb = unbroadcast(g * (1 - indicator(cond)), b.shape)"
+        },
+        "domain": "cond is boolean/tensor; a,b broadcast-compatible.",
+        "notes": "No gradient w.r.t. cond (discrete).",
+        "tags": ["selection"],
+    },
+    "clamp": {
+        "arity": "unary",
+        "signature": "y = clamp(x, min=None, max=None)",
+        "latex": r"y = \min(\max(x, m), M)",
+        "vjp": {
+            "x": "gx = unbroadcast(g * indicator((min is None or x>min) and (max is None or x<max)), x.shape)"
+        },
+        "domain": "x real; min<=max if provided.",
+        "notes": "Zero gradient outside the open interval; subgradient at endpoints set to 0.",
+        "tags": ["elementwise", "nonsmooth"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Linear algebra
+    # ----------------------------------------------------------------------
+    "matmul": {
+        "arity": "binary",
+        "signature": "Y = matmul(A, B)  # ... x m x k  @  ... x k x n",
+        "latex": [
+            r"Y = A B,\quad dA = G B^\top,\quad dB = A^\top G",
+            r"(Broadcasted batch dims require summing over broadcast axes.)"
+        ],
+        "vjp": {
+            "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
+            "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
+        },
+        "domain": "Inner dims match; batch dims broadcastable.",
+        "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
+        "tags": ["linear-algebra"],
+    },
+    "dot": {
+        "arity": "binary",
+        "signature": "y = dot(a, b, dim=-1)  # inner product vectors",
+        "latex": r"y = \sum_i a_i b_i,\quad da = g b,\ db = g a",
+        "vjp": {
+            "a": "ga = unbroadcast(g * b, a.shape)",
+            "b": "gb = unbroadcast(g * a, b.shape)"
+        },
+        "domain": "a,b same shape along `dim`.",
+        "notes": "Equivalent to reduce(sum(a*b, dim)).",
+        "tags": ["linear-algebra"],
+    },
+    "norm2": {
+        "arity": "unary",
+        "signature": "y = ||x||_2 = sqrt(sum(x^2, axis, keepdim=False))",
+        "latex": r"y = \sqrt{\sum_i x_i^2},\quad \frac{\partial y}{\partial x} = \frac{x}{\|x\|_2}",
+        "vjp": {
+            "x": "gx = expand_to(g, x.shape) * x / (norm2(x, axis, keepdim=True) + eps)"
+        },
+        "domain": "x real; handle zero norm via eps.",
+        "notes": "For axis=None treat as scalar norm; else vectorized by axis.",
+        "tags": ["linear-algebra", "smooth"],
+    },
+    "inverse": {
+        "arity": "unary",
+        "signature": "Y = inverse(X)",
+        "latex": r"dX = -X^{-\top} \, G \, X^{-\top}",
+        "vjp": {
+            "X": "gX = - matmul(T(inverse(X)), matmul(g, T(inverse(X))))"
+        },
+        "domain": "X square and nonsingular.",
+        "notes": "Uses the identity d(X^{-1}) = -X^{-1}(dX)X^{-1}.",
+        "tags": ["linear-algebra", "matrix-calculus", "advanced"],
+    },
+    "det": {
+        "arity": "unary",
+        "signature": "y = det(X)",
+        "latex": r"dy = \det(X)\,\mathrm{tr}(X^{-1} dX)\quad \Rightarrow\quad \frac{\partial y}{\partial X} = y \, X^{-\top}",
+        "vjp": {
+            "X": "gX = g * det(X) * T(inverse(X))"
+        },
+        "domain": "X square and nonsingular.",
+        "notes": "When X is singular, gradient is undefined; practical handling may return NaNs or zeros.",
+        "tags": ["linear-algebra", "matrix-calculus", "advanced"],
+    },
+    "trace": {
+        "arity": "unary",
+        "signature": "y = trace(X)",
+        "latex": r"dy = \mathrm{tr}(dX) \Rightarrow \frac{\partial y}{\partial X} = I",
+        "vjp": {
+            "X": "gX = g * I_like(X)"
+        },
+        "domain": "Square last-two-dims assumed; otherwise trace over min(n,m).",
+        "notes": "Implement I_like(X) as an identity on the last two dims, broadcast over batch dims.",
+        "tags": ["linear-algebra"],
+    },
+
+    # ----------------------------------------------------------------------
+    # Softmax family
+    # ----------------------------------------------------------------------
+    "softmax": {
+        "arity": "unary",
+        "signature": "y = softmax(x, dim)",
+        "latex": r"\frac{\partial y}{\partial x} = \mathrm{diag}(y) - y y^\top",
+        "vjp": {
+            "x": "s = softmax(x, dim); dot = sum(g * s, dim, keepdim=True); gx = (g - dot) * s"
+        },
+        "domain": "x real; `dim` valid.",
+        "notes": "Classic VJP form avoids an explicit Jacobian.",
+        "tags": ["nn", "softmax"],
+    },
+    "log_softmax": {
+        "arity": "unary",
+        "signature": "y = log_softmax(x, dim)",
+        "latex": r"\frac{\partial y}{\partial x} = I - \mathbf{1} y^\top_{\exp} \quad\text{with } y_{\exp}=\mathrm{softmax}(x)",
+        "vjp": {
+            "x": "s = softmax(x, dim); dot = sum(g, dim, keepdim=True); gx = g - dot * s"
+        },
+        "domain": "x real; `dim` valid.",
+        "notes": "Derived from softmax and the chain rule of log.",
+        "tags": ["nn", "softmax"],
+    },
+}
