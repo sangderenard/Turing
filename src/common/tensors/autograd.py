@@ -11,17 +11,23 @@ def set_backend_autograd_defer(allow: bool):
 
 
 def requires_grad_(self, requires_grad=True):
+    self._requires_grad = requires_grad
     if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'requires_grad_'):
         self.data.requires_grad_(requires_grad)
         return self
-    raise NotImplementedError("requires_grad_ not supported for this backend")
+    return self
 
 
 @property
 def requires_grad(self):
     if ALLOW_BACKEND_AUTOGRAD_DEFER and hasattr(self.data, 'requires_grad'):
         return self.data.requires_grad
-    return False
+    return getattr(self, '_requires_grad', False)
+
+@requires_grad.setter
+def requires_grad(self, value):
+    self.requires_grad_(value)
+    self._requires_grad = value
 
 
 def backward(self, *args, **kwargs):
@@ -370,6 +376,7 @@ try:  # pragma: no cover
     from .abstraction import AbstractTensor
 
     AbstractTensor.autograd = autograd  # type: ignore[attr-defined]
+    AbstractTensor._requires_grad = False  # default internal flag
 except Exception:  # pragma: no cover
     pass
 
