@@ -123,18 +123,23 @@ helpers_spec: Dict[str, str] = {
 }
 
 def unbroadcast(G, target_shape):
-    # Reduce extra leading dims
     g_shape = list(getattr(G, "shape", ()))
     t_shape = list(target_shape)
+
+    # If gradient is a scalar, broadcast directly to target shape
+    if not g_shape and t_shape:
+        return AbstractTensor.ones(tuple(t_shape), dtype=getattr(G, "dtype", None), device=getattr(G, "device", None)) * G
+
+    # Reduce extra leading dims
     if len(g_shape) > len(t_shape):
         reduce_axes = tuple(range(len(g_shape) - len(t_shape)))
-        G = AbstractTensor.sum(G, axis=reduce_axes)
+        G = AbstractTensor.sum(G, dim=reduce_axes)
 
     # Now same rank: sum where target has size 1 but grad has >1
     g_shape = list(getattr(G, "shape", ()))
     for ax, (gs, ts) in enumerate(zip(g_shape, t_shape)):
         if ts == 1 and gs != 1:
-            G = AbstractTensor.sum(G, axis=ax, keepdim=True)
+            G = AbstractTensor.sum(G, dim=ax, keepdim=True)
 
     return G.reshape(tuple(t_shape))
 
