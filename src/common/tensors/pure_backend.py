@@ -1193,6 +1193,9 @@ class PurePythonTensorOperations(AbstractTensor):
 
     def prod_(self, dim: Optional[int] = None, keepdim: bool = False) -> Any:
         data = self.data
+        shape = _get_shape(data)
+        if dim is not None and dim < 0:
+            dim += len(shape)
 
         def _prod(lst):
             flat = _flatten(lst)
@@ -1221,7 +1224,6 @@ class PurePythonTensorOperations(AbstractTensor):
         if dim is None:
             p = _prod(data)
             if keepdim:
-                shape = _get_shape(data)
                 for _ in range(len(shape)):
                     p = [p]
             return p
