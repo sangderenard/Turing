@@ -967,8 +967,10 @@ class TransformHub:
     def build_d_operators(self, edge_index, network_profile):
         num_vertices = network_profile["num_vertices"]
         num_edges = network_profile["num_edges"]
-
+        
+        print(edge_index)
         d0 = AbstractTensor.zeros((num_edges, num_vertices), device=self.device)
+        print(d0)
         for i, (src, tgt) in enumerate(edge_index):
             d0[i, src] = -1
             d0[i, tgt] = 1
