@@ -181,85 +181,9 @@ class GradTape:
         for item in reversed(order):
             yield item
 
-# ----------------------------------------------------------------------------
-# Primitive backward rules
-# ----------------------------------------------------------------------------
 
-def _to_numpy(x: Any) -> "np.ndarray":
-    """Best effort conversion of ``x`` to a NumPy array."""
-
-    if np is None:
-        raise RuntimeError("NumPy is required for autograd operations")
-    if isinstance(x, np.ndarray):
-        return x
-    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
-        return x.detach().cpu().numpy()
-    if hasattr(x, "__array__"):
-        return np.asarray(x)
-    return np.asarray(x)
-
-
-def _reduce_like(grad: "np.ndarray", like: Any) -> "np.ndarray":
-    """Reduce ``grad`` so that its shape matches ``like``."""
-
-    target = _to_numpy(like)
-    g = grad
-    while g.ndim > target.ndim:
-        g = g.sum(axis=0)
-    for axis, size in enumerate(target.shape):
-        if size == 1:
-            g = g.sum(axis=axis, keepdims=True)
-    return g.reshape(target.shape)
-
-
-def bw_add(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
-    g = _to_numpy(grad_out)
-    return _reduce_like(g, x), _reduce_like(g, y)
-
-
-def bw_sub(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
-    g = _to_numpy(grad_out)
-    return _reduce_like(g, x), _reduce_like(-g, y)
-
-
-def bw_mul(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
-    g = _to_numpy(grad_out)
-    gx = g * _to_numpy(y)
-    gy = g * _to_numpy(x)
-    return _reduce_like(gx, x), _reduce_like(gy, y)
-
-
-def bw_truediv(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
-    g = _to_numpy(grad_out)
-    a, b = _to_numpy(x), _to_numpy(y)
-    gx = g / b
-    gy = -g * a / (b * b)
-    return _reduce_like(gx, x), _reduce_like(gy, y)
-
-
-def bw_pow(grad_out: Any, x: Any, y: Any) -> Tuple[Any, Any]:
-    g = _to_numpy(grad_out)
-    a, b = _to_numpy(x), _to_numpy(y)
-    gx = g * b * np.power(a, b - 1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        gy = g * np.power(a, b) * np.log(np.where(a == 0, 1.0, a))
-    return _reduce_like(gx, x), _reduce_like(gy, y)
-
-
-# Register primitive backward rules with the shared registry.  This keeps the
-# actual backward implementations in one place and allows other parts of the
-# system to consult the same registry when extending the set of supported
-# operators.
-BACKWARD_REGISTRY.register("add", bw_add)
-BACKWARD_REGISTRY.register("radd", bw_add)
-BACKWARD_REGISTRY.register("sub", bw_sub)
-BACKWARD_REGISTRY.register("rsub", lambda g, x, y: bw_sub(g, y, x))
-BACKWARD_REGISTRY.register("mul", bw_mul)
-BACKWARD_REGISTRY.register("rmul", bw_mul)
-BACKWARD_REGISTRY.register("truediv", bw_truediv)
-BACKWARD_REGISTRY.register("rtruediv", lambda g, x, y: bw_truediv(g, y, x))
-BACKWARD_REGISTRY.register("pow", bw_pow)
-BACKWARD_REGISTRY.register("rpow", lambda g, x, y: bw_pow(g, y, x))
+## All primitive backward rules have been removed from this file.
+## The BACKWARD_REGISTRY should be populated externally (e.g., in a backend-specific module).
 
 
 # ----------------------------------------------------------------------------
@@ -289,18 +213,15 @@ class Autograd:
         retain_graph: bool = False,
         allow_unused: bool = False,
     ) -> List[Any]:
-        if np is None:
-            raise RuntimeError("NumPy is required for autograd operations")
-
         if isinstance(inputs, (list, tuple, set)):
             inputs = list(inputs)
         else:
             inputs = [inputs]
         out_grad = grad_outputs
         if out_grad is None:
-            out_grad = np.ones_like(output.data if hasattr(output, "data") else output)
+            out_grad = output.ones_like()
 
-        grad_map: Dict[int, Any] = {id(output): _to_numpy(out_grad)}
+        grad_map: Dict[int, Any] = {id(output): out_grad}
 
         for tid, node in self.tape.traverse(output):
             grad_out = grad_map.get(tid)
@@ -313,7 +234,6 @@ class Autograd:
             for (pid, _), g in zip(node.parents, parent_grads):
                 if g is None:
                     continue
-                g = _to_numpy(g)
                 if pid in grad_map:
                     grad_map[pid] = grad_map[pid] + g
                 else:

@@ -62,3 +62,35 @@ def test_autograd_single_tensor_input():
 
     grad_x = autograd.grad(y, x)[0]
     assert np.allclose(grad_x, np.array([2.0, 2.0, 2.0]))
+
+
+def test_autograd_complex_sequence():
+    autograd = AbstractTensor.autograd
+    autograd.tape._nodes.clear()
+
+    x = AbstractTensor.tensor([1.0, 2.0, 3.0])
+    y = AbstractTensor.tensor([4.0, 5.0, 6.0])
+    z = AbstractTensor.tensor([7.0, 8.0, 9.0])
+    x.requires_grad = True
+    y.requires_grad = True
+    z.requires_grad = True
+
+    w = AbstractTensor.sin(x * y + z)**2 - AbstractTensor.cos(x + y * z)
+    grad_w = autograd.grad(w, [x, y, z])
+
+    # PyTorch reference computation for parity validation
+    import torch
+    x_t = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    y_t = torch.tensor([4.0, 5.0, 6.0], requires_grad=True)
+    z_t = torch.tensor([7.0, 8.0, 9.0], requires_grad=True)
+    w_t = torch.sin(x_t * y_t + z_t) ** 2 - torch.cos(x_t + y_t * z_t)
+    w_t_sum = w_t.sum()  # To get gradients for all elements
+    w_t_sum.backward()
+    # Compare forward values
+    np.testing.assert_allclose(w, w_t.detach().numpy(), rtol=1e-5, atol=1e-7)
+    # Compare gradients
+    np.testing.assert_allclose(grad_w[0], x_t.grad.numpy(), rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(grad_w[1], y_t.grad.numpy(), rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(grad_w[2], z_t.grad.numpy(), rtol=1e-5, atol=1e-7)
+
+    

@@ -107,7 +107,7 @@ The entire registry is exposed as `BACKWARD_RULES`.
 
 from __future__ import annotations
 from typing import Dict, Any, List
-
+from .abstraction import AbstractTensor
 
 helpers_spec: Dict[str, str] = {
     "unbroadcast":
@@ -122,6 +122,20 @@ helpers_spec: Dict[str, str] = {
         "T(X): transpose last two dims of X (matrix transpose).",
 }
 
+def unbroadcast(G, shape):
+    return G.sum(axis=tuple(i for i in range(G.ndim) if i not in shape))
+
+def expand_to(G, shape):
+    return G.reshape(shape)
+
+def indicator(G, cond):
+    return G.where(cond, 1, 0)
+
+def eps():
+    return 1e-12
+
+def T(X):
+    return X.transpose(-2, -1)
 
 BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
@@ -619,3 +633,164 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "tags": ["nn", "softmax"],
     },
 }
+
+# --- Runtime loader: build BACKWARD_FUNCTIONS from BACKWARD_RULES ---
+import types
+import re
+from typing import Callable
+
+def _make_backward_func(code: str, argnames: list, helpers: dict) -> Callable:
+    # Build a function that takes all args in argnames and runs the code string
+    # The code string should end with 'return ...'
+    env = dict(helpers)
+    # Build function definition string
+    params = ', '.join(argnames)
+    func_code = f'def _backward({params}):\n'
+    for line in code.split(';'):
+        func_code += f'    {line.strip()}\n'
+    # Compile in env
+    exec(func_code, env)
+    return env['_backward']
+
+# Provide minimal helpers (replace with real implementations in your runtime)
+def unbroadcast(G, shape):
+    # Dummy: just return G
+    return G
+
+def expand_to(G, shape):
+    return G
+
+def indicator(cond):
+    return cond
+
+def where(cond, a, b):
+    return a if cond else b
+
+def zeros_like(x):
+    return 0
+
+def ones_like(x):
+    return 1
+
+def T(x):
+    return x
+
+def log(x):
+    import math
+    return math.log(x)
+
+def mean(x, axis=None, keepdim=False):
+    return x
+
+def sqrt(x):
+    import math
+    return math.sqrt(x)
+
+def softmax(x, dim=None):
+    return x
+
+def sum(x, axis=None, keepdim=False):
+    return x
+
+def matmul(a, b):
+    return a
+
+def inverse_permutation(perm):
+    return perm
+
+def det(x):
+    return x
+
+def I_like(x):
+    return x
+
+def inverse(x):
+    return x
+
+def permute(x, perm):
+    return x
+
+def reshape(x, shape):
+    return x
+
+def split(x, sizes, dim):
+    return [x]
+
+def unstack(x, dim):
+    return [x]
+
+def stack(xs, dim):
+    return xs
+
+def concat(xs, dim):
+    return xs
+
+def number_of_elements_reduced():
+    return 1
+
+def log_softmax(x, dim):
+    return x
+
+def norm2(x, axis=None, keepdim=False):
+    return x
+
+def mean(x, axis=None, keepdim=False):
+    return x
+
+def sigmoid(x):
+    return x
+
+def tanh(x):
+    return x
+
+def abs(x):
+    return x
+
+def maximum(x, y):
+    return x if x > y else y
+
+def minimum(x, y):
+    return x if x < y else y
+
+_helpers = locals().copy()
+_helpers['eps'] = 1e-12
+
+BACKWARD_FUNCTIONS = {}
+BACKWARD_GRAPHS = {}
+
+for opname, rule in BACKWARD_RULES.items():
+    code = rule['backward']
+    # Parse signature to get argnames (e.g. 'y = -x' -> ['g', 'x'])
+    sig = rule.get('signature', '')
+    # Find all variable names after '=' and before operators/commas
+    m = re.match(r"\\s*\\w+\\s*=\\s*(.*)", sig)
+    if m:
+        rhs = m.group(1)
+        # crude split on operators and commas
+        tokens = re.split(r'[^a-zA-Z0-9_]', rhs)
+        argnames = ['g'] + [t for t in tokens if t and not t.isdigit() and t != 'g']
+    else:
+        argnames = ['g']
+    # Remove duplicates, preserve order
+    seen = set()
+    argnames = [x for x in argnames if not (x in seen or seen.add(x))]
+    # Build the function
+    try:
+        BACKWARD_FUNCTIONS[opname] = _make_backward_func(code, argnames, _helpers)
+    except Exception as e:
+        BACKWARD_FUNCTIONS[opname] = None
+        print(f"Failed to build backward for {opname}: {e}")
+    # Build a simple node/edge graph from signature
+    # Example: 'z = x + y' -> nodes: ['z', 'x', 'y'], edges: [('x','z'),('y','z')]
+    nodes = set()
+    edges = []
+    if m:
+        lhs = sig.split('=')[0].strip()
+        rhs_vars = [t for t in tokens if t and not t.isdigit()]
+        nodes.add(lhs)
+        for v in rhs_vars:
+            nodes.add(v)
+            edges.append((v, lhs))
+    BACKWARD_GRAPHS[opname] = {'nodes': list(nodes), 'edges': edges}
+
+# Now BACKWARD_FUNCTIONS[opname] is a callable for each op, and BACKWARD_GRAPHS[opname] is a simple graph
