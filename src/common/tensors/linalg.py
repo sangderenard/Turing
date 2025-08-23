@@ -149,7 +149,7 @@ def _lu_decompose_inplace(A: AbstractTensor):
         idxv = type(A).arange(col.get_shape()[-1], dtype=A.long_dtype_, device=U.get_device())
         idxv = idxv.unsqueeze(-2).expand(col.get_shape())
         piv_idx_rel = (piv_rel * idxv).max(dim=-1)  # max picks the first highest index
-        piv = (piv_idx_rel + k).to_dtype(A.long_dtype_)  # absolute pivot index
+        piv = AbstractTensor.tensor(piv_idx_rel + k).to_dtype(A.long_dtype_)  # absolute pivot index
         # swap rows k and piv in U
         # We need scalar pivot per batch; for simplicity, handle only no-batch or identical pivot → if not, loop batches
         if len(shp) == 2:
@@ -237,8 +237,8 @@ def solve(A: AbstractTensor, b: AbstractTensor) -> AbstractTensor:
     for k in range(n):
         col = abs(U[..., k:, k])
         maxv = col.max(dim=-1, keepdim=True)
-        piv_rel = (col == maxv).to_dtype(AbstractTensor.long_dtype_)
-        idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=AbstractTensor.long_dtype_, device=U.get_device())
+        piv_rel = (col == maxv).to_dtype(A.long_dtype_)
+        idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=A.long_dtype_, device=U.get_device())
         idxv = _unsqueeze(idxv, -2).expand(col.get_shape())
         piv_idx_rel = (piv_rel * idxv).max(dim=-1)
         if len(shp) == 2:
