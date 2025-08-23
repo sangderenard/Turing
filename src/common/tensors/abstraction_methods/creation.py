@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from enum import auto
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict
@@ -15,33 +14,39 @@ def empty(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=N
     inst.data = inst.empty_(size, dtype, device)
     return inst
 # Random tensor creation (fluent with other helpers)
-def random_tensor(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
     """
-    Create a tensor of the given shape filled with random floats in [0,1).
-    kind: RANDOM_KIND enum (SYSTEM, CSPRNG, PRNG)
-    algo: PRNG_ALGO or CSPRNG_ALGO (optional)
-    seed: int or bytes (optional)
+    Create a tensor of the given shape filled with random values using the requested random generator.
+    All arguments for random_generator (kind, algo, seed, dtype, distribution, batch_size, etc) should be passed as kwargs.
+    Only tensor-specific arguments (size, device, cls) are explicit.
     """
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
     cls = _resolve_cls(cls)
     total = 1
     for s in size:
         total *= s
-    rng = random_generator(kind=kind, algo=algo, seed=seed, dtype="float", batch_size=total)
+    # Always set batch_size for the generator
+    kwargs = dict(kwargs)  # copy to avoid mutating caller
+    kwargs.setdefault('batch_size', total)
+    rng = random_generator(**kwargs)
     vals = next(rng)
     inst = cls(vals, track_time=False)
     return inst.reshape(*size)
 
 
 
-def randint(size: Tuple[int, ...], low: int, high: int, dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+def randint(size: Tuple[int, ...], low: int, high: int, device: Any = None, *, cls=None, **kwargs):
     """Create a tensor of the given shape filled with random integers in [low, high)."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
     cls = _resolve_cls(cls)
     total = 1
     for s in size:
         total *= s
-    rng = random_generator(kind=kind, algo=algo, seed=seed, dtype="float", batch_size=total)
+    if 'batch_size' not in kwargs:
+        kwargs['batch_size'] = total
+    if 'dtype' not in kwargs:
+        kwargs['dtype'] = 'float'
+    rng = random_generator(**kwargs)
     vals = next(rng)
     # Map floats in [0,1) to [low, high)
     int_vals = [int(low + (high - low) * v) for v in vals]
@@ -49,9 +54,12 @@ def randint(size: Tuple[int, ...], low: int, high: int, dtype: Any = None, devic
     return inst.reshape(*size)
 
 
-def randint_like(tensor, low: int, high: int, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+def randint_like(tensor, low: int, high: int, device: Any = None, *, cls=None, **kwargs):
     """Return a random integer tensor with the same shape as `tensor` and values in [low, high)."""
-    return randint(likeness(tensor), low, high, dtype, device, cls=type(tensor), kind=kind, algo=algo, seed=seed)
+    size, _cls = likeness(tensor)
+    if cls is None:
+        cls = type(tensor)
+    return randint(size, low, high, device, cls=cls, **kwargs)
 
 
 def linspace(start, stop, steps, dtype=None, device=None):
@@ -178,6 +186,22 @@ def _resolve_cls(cls):
         backend_cls = BACKEND_REGISTRY.get(backend_name)
         if backend_cls is not None:
             return backend_cls
+        
+    try:
+        from .. import numpy_backend
+        backend_cls = BACKEND_REGISTRY.get("numpy")
+        if backend_cls is not None:
+            return backend_cls
+
+    except ModuleNotFoundError:
+        try:
+            from .. import pure_python_backend
+            backend_cls = BACKEND_REGISTRY.get("pure_python")
+            if backend_cls is not None:
+                return backend_cls
+        except ModuleNotFoundError:
+            print("[ERROR] Could not import pure Python backend. Ensure you have the necessary dependencies installed.")
+            
     raise RuntimeError("No tensor backend available for tensor creation.")
 
 def zero(cls):
@@ -202,9 +226,9 @@ def zeros(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=N
     return zero(cls).repeat(size)
 
 
-def randoms(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+def randoms(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
     """Alias for random_tensor for API symmetry with zeros/ones/full."""
-    return random_tensor(size, dtype, device, cls=cls, kind=kind, algo=algo, seed=seed)
+    return random_tensor(size, device, cls=cls, **kwargs)
 
 
 def ones(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
@@ -275,7 +299,28 @@ def full_like(tensor, fill_value: Any, dtype: Any = None, device: Any = None):
         device = tensor.get_device() if isinstance(tensor, AbstractTensor) else getattr(tensor, "device", None)
     return full(size, fill_value, dtype, device, cls=cls)
 
-def rand_like(tensor, dtype: Any = None, device: Any = None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
+def rand_like(tensor, device: Any = None, *, cls=None, **kwargs):
     """Return a random tensor with the same shape as `tensor`."""
-    size, cls = likeness(tensor)
-    return random_tensor(size, dtype, device, cls=cls, kind=kind, algo=algo, seed=seed)
+    size, _cls = likeness(tensor)
+    if cls is None:
+        cls = type(tensor)
+    return random_tensor(size, device, cls=cls, **kwargs)
+# Standard normal (mean=0, std=1) tensor creation using scalar gauss from Random
+def randn(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
+    """
+    Create a tensor of the given shape filled with standard normal (mean=0, std=1) values.
+    Uses the scalar gauss algorithm from the Random class.
+    """
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+    cls = _resolve_cls(cls)
+    total = 1
+    for s in size:
+        total *= s
+    if 'batch_size' not in kwargs:
+        kwargs = {**kwargs, 'batch_size': total}
+    if 'distribution' not in kwargs:
+        kwargs = {**kwargs, 'distribution': 'normal'}
+    rng = random_generator(**kwargs)
+    vals = next(rng)
+    inst = cls(vals, track_time=False)
+    return inst.reshape(*size)

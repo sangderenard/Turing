@@ -560,6 +560,8 @@ class PyTorchTensorOperations(AbstractTensor):
         return result
 
     def to_dtype_(self, dtype: str = "float"):
+        if isinstance(dtype, torch.dtype):
+            return self.data.to(dtype)
         if dtype in ("float", "float32", "f32"):
             return self.data.float()
         elif dtype in ("float64", "double", "f64"):

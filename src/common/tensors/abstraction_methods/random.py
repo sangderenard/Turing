@@ -756,74 +756,107 @@ class RANDOM_KIND(Enum):
     CSPRNG = auto()      # Cryptographic PRNG (ChaCha20, HMAC_DRBG, etc)
     PRNG = auto()        # Fast non-crypto PRNG (Xoroshiro, PCG, etc)
 
-def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float", batch_size=1):
+def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float", batch_size=1, distribution="uniform"):
     """
-    Returns a generator yielding random numbers of the requested type.
+    Returns a generator yielding random numbers of the requested type and distribution.
     kind: RANDOM_KIND enum (SYSTEM, CSPRNG, PRNG)
     algo: PRNG_ALGO or CSPRNG_ALGO (optional, for PRNG/CSPRNG kinds)
     seed: int or bytes (optional)
     dtype: "float" (default) for [0,1), "int" for 64-bit unsigned ints
     batch_size: number of values per yield
+    distribution: "uniform" (default), "normal", or a callable/histogram
     """
-    if kind == RANDOM_KIND.SYSTEM:
-        # Use OS CSPRNG directly
-        def sys_iter():
+    import math
+    def get_uniforms():
+        if kind == RANDOM_KIND.SYSTEM:
+            def sys_iter():
+                while True:
+                    vals = []
+                    for _ in range(batch_size):
+                        if dtype == "int":
+                            x = int.from_bytes(get_entropy(8, PRNG_SYS.OS_URANDOM), "little")
+                            vals.append(x)
+                        else:
+                            x = int.from_bytes(get_entropy(8, PRNG_SYS.OS_URANDOM), "little") >> 11
+                            vals.append(x / float(1 << 53))
+                    yield vals if batch_size > 1 else vals[0]
+            return sys_iter()
+        elif kind == RANDOM_KIND.CSPRNG:
+            csprng = make_csprng(algo or CSPRNG_ALGO.CHACHA20, seed)
+            def csprng_iter():
+                while True:
+                    vals = []
+                    for _ in range(batch_size):
+                        if dtype == "int":
+                            x = int.from_bytes(csprng.random_bytes(8), "little")
+                            vals.append(x)
+                        else:
+                            x = int.from_bytes(csprng.random_bytes(8), "little") >> 11
+                            vals.append(x / float(1 << 53))
+                    yield vals if batch_size > 1 else vals[0]
+            return csprng_iter()
+        elif kind == RANDOM_KIND.PRNG:
+            prng = make_prng(algo or PRNG_ALGO.XOROSHIRO128SS, seed)
+            def prng_iter():
+                while True:
+                    vals = []
+                    for _ in range(batch_size):
+                        if dtype == "int":
+                            x = prng.next_u64()
+                            vals.append(x)
+                        else:
+                            x = prng.next_u64() >> 11
+                            vals.append(x / float(1 << 53))
+                    yield vals if batch_size > 1 else vals[0]
+            return prng_iter()
+        else:
+            raise ValueError("Unknown RANDOM_KIND for random_generator")
+
+    uniforms = get_uniforms()
+
+    def normal_batch():
+        # Box-Muller for normal distribution
+        vals = []
+        n = batch_size
+        while len(vals) < n:
+            u1 = next(uniforms)
+            u2 = next(uniforms)
+            z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+            vals.append(z0)
+            if len(vals) < n:
+                z1 = math.sqrt(-2.0 * math.log(u1)) * math.sin(2.0 * math.pi * u2)
+                vals.append(z1)
+        return vals[:n]
+
+    if callable(distribution):
+        def custom_iter():
             while True:
-                if dtype == "float":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = int.from_bytes(get_entropy(8, PRNG_SYS.OS_URANDOM), "little") >> 11
-                        vals.append(x / float(1 << 53))
-                    yield vals if batch_size > 1 else vals[0]
-                elif dtype == "int":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = int.from_bytes(get_entropy(8, PRNG_SYS.OS_URANDOM), "little")
-                        vals.append(x)
-                    yield vals if batch_size > 1 else vals[0]
-                else:
-                    raise ValueError("Unsupported dtype for random_generator")
-        return sys_iter()
-    elif kind == RANDOM_KIND.CSPRNG:
-        csprng = make_csprng(algo or CSPRNG_ALGO.CHACHA20, seed)
-        def csprng_iter():
+                vals = [distribution() for _ in range(batch_size)]
+                if dtype == "int":
+                    vals = [int(v) for v in vals]
+                yield vals if batch_size > 1 else vals[0]
+        return custom_iter()
+    elif isinstance(distribution, (list, tuple)):
+        import random
+        def hist_iter():
             while True:
-                if dtype == "float":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = int.from_bytes(csprng.random_bytes(8), "little") >> 11
-                        vals.append(x / float(1 << 53))
-                    yield vals if batch_size > 1 else vals[0]
-                elif dtype == "int":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = int.from_bytes(csprng.random_bytes(8), "little")
-                        vals.append(x)
-                    yield vals if batch_size > 1 else vals[0]
-                else:
-                    raise ValueError("Unsupported dtype for random_generator")
-        return csprng_iter()
-    elif kind == RANDOM_KIND.PRNG:
-        prng = make_prng(algo or PRNG_ALGO.XOROSHIRO128SS, seed)
-        def prng_iter():
+                vals = random.choices(distribution, k=batch_size)
+                if dtype == "int":
+                    vals = [int(v) for v in vals]
+                yield vals if batch_size > 1 else vals[0]
+        return hist_iter()
+    elif distribution == "normal":
+        def normal_iter():
             while True:
-                if dtype == "float":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = prng.next_u64() >> 11
-                        vals.append(x / float(1 << 53))
-                    yield vals if batch_size > 1 else vals[0]
-                elif dtype == "int":
-                    vals = []
-                    for _ in range(batch_size):
-                        x = prng.next_u64()
-                        vals.append(x)
-                    yield vals if batch_size > 1 else vals[0]
-                else:
-                    raise ValueError("Unsupported dtype for random_generator")
-        return prng_iter()
+                vals = normal_batch()
+                if dtype == "int":
+                    vals = [int(v) for v in vals]
+                yield vals if batch_size > 1 else vals[0]
+        return normal_iter()
+    elif distribution == "uniform":
+        return uniforms
     else:
-        raise ValueError("Unknown RANDOM_KIND for random_generator")
+        raise ValueError(f"Unknown distribution: {distribution}")
 
 
 # --- Python-random-like interface using project PRNG infra ---
@@ -889,3 +922,49 @@ class Random:
         return self.gauss(mu, sigma)
 
     # Add more methods as needed for your use case
+
+
+    # ------------------------------------------------------------------------------
+    # Human-friendly test main for quick validation and demonstration
+    # ------------------------------------------------------------------------------
+    if __name__ == "__main__":
+        print("[random.py] Human-friendly test main: Random tensor creation demo\n")
+        import sys
+        import importlib
+        # Lazy import AbstractTensor and creation helpers
+        
+
+        # Helper to call random_tensor with universal kwargs support
+        def call_random_tensor(*args, **kwargs):
+            from .creation import random_tensor
+            import inspect
+            sig = inspect.signature(random_tensor)
+            # Only pass kwargs that are accepted by random_tensor
+            filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return random_tensor(*args, **filtered)
+
+        print("Random float tensor (uniform, shape=(3, 4)):")
+        t1 = call_random_tensor((3, 4), dtype="float", distribution="uniform", seed=42)
+        print(t1)
+
+        print("\nRandom int tensor (uniform, shape=(3, 4)):")
+        t2 = call_random_tensor((3, 4), dtype="int", distribution="uniform", seed=42)
+        print(t2)
+
+        print("\nRandom float tensor (normal, shape=(3, 4)):")
+        t3 = call_random_tensor((3, 4), dtype="float", distribution="normal", seed=42)
+        print(t3)
+
+        print("\nRandom int tensor (normal, shape=(3, 4)):")
+        t4 = call_random_tensor((3, 4), dtype="int", distribution="normal", seed=42)
+        print(t4)
+
+        print("\nRandom tensor from histogram [10, 20, 30] (int, shape=(2, 5)):")
+        t5 = call_random_tensor((2, 5), dtype="int", distribution=[10, 20, 30], seed=42)
+        print(t5)
+
+        print("\nRandom tensor from custom callable (lambda: 99), shape=(2, 2):")
+        t6 = call_random_tensor((2, 2), dtype="int", distribution=lambda: 99, seed=42)
+        print(t6)
+
+        print("\nAll done!\n")

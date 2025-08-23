@@ -841,6 +841,9 @@ class HodgeStarBuilder:
         for i, edge in enumerate(edges):
             # Find faces containing this edge
             mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
+            mask = mask.to_dtype(mask.bool_dtype_)
+            print(f"mask.bool_dtype_: {mask.bool_dtype_}")
+            print(mask)
             shared_faces = face_tensor[mask]
             dual_area = 0.0
             for f in shared_faces:
@@ -1452,10 +1455,11 @@ class GridDomain:
 
     @staticmethod
     def generate_grid_domain(coordinate_system, N_u, N_v, N_w, u_mode=None, v_mode=None, w_mode=None,
-                            device='cpu', precision=AbstractTensor.float_dtype_, **kwargs):
+                            device='cpu', precision=None, **kwargs):
         """
         Generates a GridDomain object based on the coordinate system and its parameters.
         """
+        
         # Set default modes if u_mode, v_mode, or w_mode not provided
         u_mode = u_mode or {'method': 'linear', 'p': 1}
         v_mode = v_mode or {'method': 'linear', 'p': 1}
@@ -1489,15 +1493,15 @@ class GridDomain:
             # Generate u_grid, v_grid, w_grid using the respective mode dictionaries
             u_grid, _ = generate_grid(
                 N=N_u, L=uextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[1], **u_mode
+                keep_end=grid_boundaries[1], cls=type(U), **u_mode
             )
             v_grid, _ = generate_grid(
                 N=N_v, L=vextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[3], **v_mode
+                keep_end=grid_boundaries[3], cls=type(V), **v_mode
             )
             w_grid, _ = generate_grid(
                 N=N_w, L=wextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[5], **w_mode
+                keep_end=grid_boundaries[5], cls=type(W), **w_mode
             )
 
             # Create U, V, W meshgrids
@@ -1536,6 +1540,7 @@ class GridDomain:
             L=self.U.max(),
             device=self.U.device,  # Keep the device same as the original grid
             dtype=self.U.dtype,
+            cls=type(self.U),
             **self.u_mode
         )
 
@@ -1544,6 +1549,7 @@ class GridDomain:
             L=self.V.max(),
             device=self.V.device,
             dtype=self.V.dtype,
+            cls=type(self.V),
             **self.v_mode
         )
 
@@ -1648,13 +1654,17 @@ class GridDomain:
     
 def generate_grid(N, L, method='linear', p=2.0, min_density=0.5,
                   max_density=1.5, num_oscillations=1, keep_end=True, periodic=False,
-                  oscillation_type='sin', device='cpu', dtype=AbstractTensor.float_dtype_):
+                  oscillation_type='sin', device='cpu', dtype=None, cls=None):
     """
     Generates a grid with various spacing methods and calculates infinitesimal values.
     
     Parameters are the same as before, with `oscillation_type` specifying
     the desired periodic pattern if `method` is 'periodic'.
     """
+    if dtype is None:
+        if cls is None:
+            raise ValueError("Either dtype or cls must be specified.")
+        dtype = cls.dtype
     if N < 2:
         raise ValueError("N must be at least 2.")
 
@@ -1699,7 +1709,7 @@ def generate_full_meshgrid(N_u, L_u, N_v, L_v, N_w, L_w, periodic_u=True, period
     U, U_prime = generate_grid(N_u, L_u, method=umethod, p=upow, periodic=periodic_u, keep_end=not periodic_u, device=device, **kwargs)
     V, V_prime = generate_grid(N_v, L_v, method=vmethod, p=vpow, periodic=periodic_v, keep_end=not periodic_v, device=device, **kwargs)
     W, W_prime = generate_grid(N_w, L_w, method=wmethod, p=wpow, periodic=periodic_w, keep_end=not periodic_w, device=device, **kwargs)
-    
+
     # Create full 3D meshgrid for U, V, W
     U_mesh, V_mesh, W_mesh = AbstractTensor.meshgrid(U, V, W, indexing='ij')
     
@@ -1776,7 +1786,7 @@ class Transform(TransformHub):
             return U, V
 
     
-    def create_grid_mesh(self, resolution_u, resolution_v, resolution_w):
+    def create_grid_mesh(self, resolution_u, resolution_v, resolution_w, cls, dtype):
         # Derive periodicity based on endpoint exclusion in grid boundaries
         periodic_u = not (self.grid_boundaries[0] and self.grid_boundaries[1])  # True if either endpoint is excluded for U
         periodic_v = not (self.grid_boundaries[2] and self.grid_boundaries[3])  # True if either endpoint is excluded for V
@@ -1793,7 +1803,9 @@ class Transform(TransformHub):
             periodic_u=periodic_u,
             periodic_v=periodic_v,
             periodic_w=periodic_w,
-            device=self.device
+            device=self.device,
+            cls=cls,
+            dtype=dtype
         )
         return U_mesh, V_mesh, W_mesh
     def generate_triangle_indices(self, resolution_u, resolution_v):
@@ -1897,6 +1909,10 @@ def test_build_laplace3d():
     print(f"Grid V shape: {grid_v.shape}")
     print(f"Grid W shape: {grid_w.shape}")
     
+    sample_tensor = AbstractTensor.tensor([1.0], device=device)
+    cls = type(sample_tensor)
+    precision = sample_tensor.dtype
+
     grid_domain = GridDomain.generate_grid_domain(
         coordinate_system='rectangular',
         N_u=N_u,
@@ -1905,7 +1921,9 @@ def test_build_laplace3d():
         Lx=Lx,
         Ly=Ly,
         Lz=Lz,
-        device=device
+        device=device,
+        cls=cls,
+        precision=precision
     )
 
     # Initialize BuildLaplace3D with Dirichlet boundary conditions
@@ -2126,6 +2144,10 @@ if __name__ == "__main__":
 
     # Create a Laplacian matrix using the earlier code
     transform = RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device='cpu')
+    test_tensor = AbstractTensor.randn((N_u, N_v, N_w), device='cpu')
+    cls = type(test_tensor)
+    dtype = test_tensor.dtype
+
     grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
     grid_domain = GridDomain.generate_grid_domain(
         coordinate_system='rectangular',
@@ -2135,7 +2157,9 @@ if __name__ == "__main__":
         Lx=Lx,
         Ly=Ly,
         Lz=Lz,
-        device='cpu'
+        device='cpu',
+        cls=cls,
+        dtype=dtype
     )
     boundary_conditions = ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')
 
