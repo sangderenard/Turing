@@ -109,6 +109,10 @@ class JAXTensorOperations(AbstractTensor):
         import jax.numpy as jnp
         return jnp.minimum(self.data, max_val)
 
+    def prod_(self, dim=None, keepdim: bool = False):
+        import jax.numpy as jnp
+        return jnp.prod(self.data, axis=dim, keepdims=keepdim)
+
     def greater_(self, value):
         value = value.data if hasattr(value, 'data') else value
         return self.data > value

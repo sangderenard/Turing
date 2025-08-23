@@ -569,6 +569,7 @@ class NumPyTensorOperations(AbstractTensor):
         return np.sum(self.data, axis=dim, keepdims=keepdim)
 
     def prod_(self, dim=None, keepdim=False):
+        """Return the product of tensor elements along a dimension."""
         import numpy as np
         return np.prod(self.data, axis=dim, keepdims=keepdim)
 

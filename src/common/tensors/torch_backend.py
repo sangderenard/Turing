@@ -417,6 +417,12 @@ class PyTorchTensorOperations(AbstractTensor):
             out = x.sum()
             return out if not keepdim else out.view(*([1] * x.dim()))
         return x.sum(dim=dim, keepdim=keepdim)
+    def prod_(self, dim=None, keepdim=False):
+        x = self.data
+        if dim is None:
+            out = x.prod()
+            return out if not keepdim else out.view(*([1] * x.dim()))
+        return x.prod(dim=dim, keepdim=keepdim)
     def min_(self, dim=None, keepdim=False):
         x = self.data
         if dim is None:
