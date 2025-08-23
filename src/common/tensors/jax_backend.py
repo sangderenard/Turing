@@ -416,16 +416,26 @@ class JAXTensorOperations(AbstractTensor):
         tensors = [self._to_jnp(t) for t in tensors]
         return jnp.stack(tensors, axis=dim).tolist()
 
-    def repeat_interleave_(self, tensor: Any, repeats: int, dim: Optional[int] = None) -> Any:
-        return jnp.repeat(self._to_jnp(tensor), repeats, axis=dim).tolist()
+    def repeat_interleave_(self, repeats: int = 1, dim: Optional[int] = None) -> Any:
+        return jnp.repeat(self._to_jnp(self.data), repeats, axis=dim).tolist()
 
     def cumsum_(self, dim: int = 0) -> Any:
         import jax.numpy as jnp
         return jnp.cumsum(self.data, axis=dim)
 
     def repeat_(self, repeats: Any = None, dim: int = 0) -> Any:
-        """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
-        raise NotImplementedError("repeat not implemented for JAX backend")
+        """Repeat tensor along ``dim`` ``repeats`` times using JAX."""
+        if repeats is None:
+            raise ValueError("repeats must be specified for JAX backend")
+        arr = self._to_jnp(self.data)
+        if isinstance(repeats, int):
+            reps = [1] * arr.ndim
+            reps[dim] = repeats
+            return jnp.tile(arr, reps).tolist()
+        elif isinstance(repeats, (tuple, list)):
+            return jnp.tile(arr, repeats).tolist()
+        else:
+            raise TypeError("repeats must be int or tuple for JAX backend")
 
     def view_flat_(self, tensor: Any) -> Any:
         return jnp.ravel(self._to_jnp(tensor)).tolist()

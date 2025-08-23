@@ -781,10 +781,11 @@ class PurePythonTensorOperations(AbstractTensor):
         if dim is None or dim == 0:
             tensor = self.data
             if not isinstance(tensor, list):
-                return [tensor] * repeats
-            result = []
+                return [self._clone_recursive(tensor) for _ in range(repeats)]
+            result: List[Any] = []
             for item in tensor:
-                result.extend([item] * repeats)
+                for _ in range(repeats):
+                    result.append(self._clone_recursive(item))
             return result
         raise NotImplementedError("repeat_interleave only implemented for dim 0 or None")
 
@@ -827,7 +828,10 @@ class PurePythonTensorOperations(AbstractTensor):
 
             def rep_axis(lst, axis):
                 if axis == dim:
-                    return [self._clone_recursive(lst) for _ in range(repeats)]
+                    out: List[Any] = []
+                    for _ in range(repeats):
+                        out.extend(self._clone_recursive(lst))
+                    return out
                 if not isinstance(lst, list):
                     raise TypeError("repeat_ expects list input along non-scalar dims")
                 return [rep_axis(sub, axis + 1) for sub in lst]
@@ -836,13 +840,17 @@ class PurePythonTensorOperations(AbstractTensor):
 
         if isinstance(repeats, (tuple, list)):
             reps = list(repeats)
+
             def tile(lst, axis):
                 if axis == len(reps):
                     return self._clone_recursive(lst)
                 if not isinstance(lst, list):
                     return [self._clone_recursive(lst) for _ in range(reps[axis])]
                 tiled_sub = [tile(sub, axis + 1) for sub in lst]
-                return tiled_sub * reps[axis]
+                out: List[Any] = []
+                for _ in range(reps[axis]):
+                    out.extend(self._clone_recursive(tiled_sub))
+                return out
 
             return tile(data, 0)
 
