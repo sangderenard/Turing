@@ -49,6 +49,11 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    def empty_(self, size, dtype=None, device=None):
+        import jax.numpy as jnp
+        import jax
+        arr = jnp.empty(size, dtype=dtype)
+        return jax.device_put(arr, device or self.default_device)
     def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
         import jax.numpy as jnp
         if not isinstance(other, type(self)):

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from enum import auto
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict
@@ -6,7 +7,13 @@ from .random import random_generator, RANDOM_KIND, PRNG_ALGO, CSPRNG_ALGO
 # Helper to take n items from an iterable and return as a list/array
 def take_n(iterable, n):
     return [next(iterable) for _ in range(n)]
-
+def empty(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
+    """Create an uninitialized tensor of the given shape using the requested backend."""
+    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
+    cls = _resolve_cls(cls)
+    inst = cls(track_time=False)
+    inst.data = inst.empty_(size, dtype, device)
+    return inst
 # Random tensor creation (fluent with other helpers)
 def random_tensor(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, kind=RANDOM_KIND.SYSTEM, algo=None, seed=None):
     """

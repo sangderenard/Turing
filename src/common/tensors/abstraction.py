@@ -136,6 +136,9 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    def empty_(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
+        """Create an uninitialized tensor of the given shape (backend hook)."""
+        raise NotImplementedError(f"{self.__class__.__name__} must implement empty_()")
     @staticmethod
     def backend_class_from_backend_data(data):
         """
@@ -1326,7 +1329,16 @@ class AbstractTensor:
             raise NotImplementedError("__setitem__ not implemented for CTensor backend")
         if isinstance(value, AbstractTensor):
             value = value.data
-        index = self._AbstractTensor__unwrap(idx)
+                
+        if isinstance(idx, tuple):
+            index = tuple(
+                item._AbstractTensor__unwrap() if isinstance(item, AbstractTensor) else item
+                for item in idx
+            )
+        elif isinstance(idx, AbstractTensor):
+            index = idx._AbstractTensor__unwrap()
+        else:
+            index = idx
         data[index] = value
 
     def __bool__(self):
@@ -1337,6 +1349,10 @@ class AbstractTensor:
         if n != 1:
             raise ValueError("The truth value of a tensor with more than one element is ambiguous.")
         return bool(self.item())
+
+    def numpy(self):
+        """Convert the tensor to a NumPy array."""
+        return np.array(self.data)
 
     @staticmethod
     def benchmark(
@@ -1560,6 +1576,7 @@ from .abstraction_methods.creation import (
     rand_like,
     randint,
     randint_like,
+    empty as create_empty,
 )
 from .abstraction_methods.reduction import (
     max as reduction_max,
@@ -1668,6 +1685,7 @@ AbstractTensor.meshgrid = staticmethod(meshgrid)
 AbstractTensor.zeros = staticmethod(create_zeros)
 AbstractTensor.ones = staticmethod(create_ones)
 AbstractTensor.full = staticmethod(create_full)
+AbstractTensor.empty = staticmethod(create_empty)
 from .abstraction_methods.random import Random as _RandomClass
 AbstractTensor.random = _RandomClass()
 AbstractTensor.randoms = staticmethod(randoms)

@@ -54,6 +54,9 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    def empty_(self, size, dtype=None, device=None):
+        import numpy as np
+        return np.empty(size, dtype=self._torch_dtype_to_numpy(dtype) if dtype is not None else None)
     def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
         import numpy as np
         if not isinstance(other, type(self)):

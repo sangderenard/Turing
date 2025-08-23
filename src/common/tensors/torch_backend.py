@@ -43,6 +43,12 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    def empty_(self, size, dtype=None, device=None):
+        import torch
+        return torch.empty(size, dtype=dtype, device=device or self.default_device)
+    def diag_(self, offset: int = 0):
+        import torch
+        return torch.diag(self.data, diagonal=offset)
     def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
         import torch
         if not isinstance(other, type(self)):

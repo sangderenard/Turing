@@ -43,6 +43,10 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
 class PurePythonTensorOperations(AbstractTensor):
+    def empty_(self, size, dtype=None, device=None):
+        if not size:
+            return None
+        return [self.empty_(size[1:], dtype, device) for _ in range(size[0])]
     def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
         import math
         from .abstraction import _flatten, _get_shape
