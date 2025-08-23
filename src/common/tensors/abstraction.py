@@ -988,6 +988,19 @@ class AbstractTensor:
     def tolist(self) -> List[Any]:
         return self.tolist_()
 
+    @property
+    def pi(self) -> float:
+        if not hasattr(self, "_pi"):
+            return self._pi
+        else:
+            return self.long_pi()
+        
+    def long_pi(self):
+        # Pi to 50 decimal places
+        return AbstractTensor.tensor(
+            3.14159265358979323846264338327950288419716939937510,
+            dtype=self.float_dtype, device=self.get_device()
+        )
 
     def index_select(self, dim: int = 0, indices: Any = None) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))

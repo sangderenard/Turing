@@ -606,6 +606,10 @@ class NumPyTensorOperations(AbstractTensor):
         m = self._AbstractTensor__unwrap(mask)
         return tensor[m]
 
+    @property
+    def _pi(self):
+        return np.pi
+
     def tolist_(self):
         return self._AbstractTensor__unwrap(self.data).tolist()
 

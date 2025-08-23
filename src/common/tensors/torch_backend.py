@@ -172,6 +172,10 @@ class PyTorchTensorOperations(AbstractTensor):
     def ceil_(self):
         import torch
         return torch.ceil(self.data)
+    
+    @property
+    def _pi(self):
+        return torch.pi
 
     def __trunc__(self):
         import torch
