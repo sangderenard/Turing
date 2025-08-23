@@ -48,8 +48,8 @@ class GLBuffer:
 class OpenGLTensorOperations(AbstractTensor):
     """Stub OpenGL backend using buffers and compute shaders."""
 
-    def __init__(self, track_time: bool = False) -> None:
-        super().__init__(track_time=track_time)
+    def __init__(self, track_time: bool = False, tape=None) -> None:
+        super().__init__(track_time=track_time, tape=tape)
         if GL is None:
             raise RuntimeError("PyOpenGL is required for the OpenGL backend")
 

@@ -79,7 +79,10 @@ def test_autograd_complex_sequence():
     grad_w = autograd.grad(w, [x, y, z])
 
     # PyTorch reference computation for parity validation
-    import torch
+    try:
+        import torch  # type: ignore
+    except Exception:
+        pytest.skip("torch not available")
     x_t = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
     y_t = torch.tensor([4.0, 5.0, 6.0], requires_grad=True)
     z_t = torch.tensor([7.0, 8.0, 9.0], requires_grad=True)

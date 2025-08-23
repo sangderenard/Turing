@@ -233,8 +233,8 @@ class NumPyTensorOperations(AbstractTensor):
         if np.isscalar(self.data) or (isinstance(self.data, np.ndarray) and self.data.ndim == 0):
             return tuple(int(x) for x in result)
         return result
-    def __init__(self, track_time: bool = False):
-        super().__init__(track_time=track_time)
+    def __init__(self, track_time: bool = False, tape=None):
+        super().__init__(track_time=track_time, tape=tape)
 
     def _apply_operator__(self, op: str, left: Any, right: Any):
         """Apply arithmetic operators on NumPy arrays."""

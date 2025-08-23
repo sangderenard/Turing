@@ -31,7 +31,7 @@ def grad(self):
 
 
 def detach(self):
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.data
     result._requires_grad = False
     return result
@@ -81,11 +81,14 @@ recorded graph in reverse to accumulate gradients for requested inputs.
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
 
+import networkx as nx
+
 # Integrate the lightweight backward registry so that backward rules are
 # resolved dynamically rather than being baked into the tape at record time.
 from .backward import BACKWARD_REGISTRY
 
 import math
+import statistics
 
 try:  # NumPy is an optional dependency for the repository
     import numpy as np
@@ -113,6 +116,20 @@ class GradTape:
 
     def __init__(self) -> None:
         self._nodes: Dict[int, GradNode] = {}
+        self.graph = nx.DiGraph()
+        self._op_index = 0
+
+    # ------------------------------------------------------------------
+    # node utilities
+    # ------------------------------------------------------------------
+    def create_tensor_node(self, tensor: Any) -> None:
+        """Register ``tensor`` as a root node in the graph."""
+        tid = id(tensor)
+        self.graph.add_node(tid, kind="tensor")
+        try:
+            tensor._tape = self  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # recording utilities
@@ -122,8 +139,26 @@ class GradTape:
         op: str,
         inputs: Iterable[Any],
         result: Any,
+        *,
+        start: float | None = None,
+        end: float | None = None,
     ) -> Any:
-        """Append a new node representing ``op`` to the tape."""
+        """Append a new node representing ``op`` to the tape.
+
+        Parameters
+        ----------
+        op:
+            Name of the operator being recorded.
+        inputs:
+            Operands participating in the operation.
+        result:
+            Tensor produced by the operation.
+        start, end:
+            Optional timestamps captured immediately before and after the
+            operator executed.  When provided, they are stored on both the
+            ``GradNode`` and the corresponding graph node for later
+            benchmarking.
+        """
 
         # Ensure a sequence of inputs; a single tensor should not be iterated elementwise.
         if isinstance(inputs, (list, tuple, set)):
@@ -131,19 +166,46 @@ class GradTape:
         else:
             inputs = [inputs]
         parent_ids = [(id(t), pos) for pos, t in enumerate(inputs)]
+        elapsed = None
+        if start is not None and end is not None:
+            elapsed = end - start
         ctx = {
             "inputs": [x.data if hasattr(x, "data") else x for x in inputs],
             "result": result.data if hasattr(result, "data") else result,
             "input_shapes": [getattr(x, "shape", None) for x in inputs],
             "result_shape": getattr(result, "shape", None),
+            "start": start,
+            "end": end,
+            "elapsed": elapsed,
         }
         node = GradNode(op=op, parents=parent_ids, ctx=ctx)
         self._nodes[id(result)] = node
-        # Attach graph references to the tensor itself so that each tensor knows
-        # about its generating node and tape.
+
+        # Build the global operation graph
+        op_name = f"op_{self._op_index}"
+        self._op_index += 1
+        self.graph.add_node(
+            op_name,
+            kind="op",
+            op=op,
+            start=start,
+            end=end,
+            elapsed=elapsed,
+            ctx=ctx,
+        )
+        for t in inputs:
+            tid = id(t)
+            self.graph.add_node(tid, kind="tensor")
+            self.graph.add_edge(tid, op_name)
+        rid = id(result)
+        self.graph.add_node(rid, kind="tensor")
+        self.graph.add_edge(op_name, rid)
+
+        # Attach graph references so tensors know their generating node and tape.
         try:
             result._grad_node = node  # type: ignore[attr-defined]
-            result._grad_tape = self  # type: ignore[attr-defined]
+            result._tape = self  # type: ignore[attr-defined]
+            result._grad_tape = self  # legacy alias expected by some tests
         except Exception:
             pass
         return result
@@ -182,6 +244,120 @@ class GradTape:
             yield item
 
 
+class TapeProfiler:
+    """Compute basic timing statistics from a :class:`GradTape`.
+
+    The profiler groups recorded operations by opcode and reports summary
+    statistics.  If ``normalize`` is requested the elapsed time for each
+    operation is divided by the total number of elements across all operands
+    participating in that operation.
+    """
+
+    def __init__(self, tape: GradTape) -> None:
+        self.tape = tape
+
+    def per_op(self, normalize: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Return per-operation timing statistics.
+
+        Parameters
+        ----------
+        normalize:
+            When ``True`` divide each timing measurement by the total flat size
+            of all input operands.
+        """
+
+        groups: Dict[str, List[float]] = {}
+        for _, data in self.tape.graph.nodes(data=True):
+            if data.get("kind") != "op":
+                continue
+            elapsed = data.get("elapsed")
+            if elapsed is None:
+                continue
+            if normalize:
+                ctx = data.get("ctx", {})
+                shapes = ctx.get("input_shapes", [])
+                size = 0
+                for shp in shapes:
+                    if isinstance(shp, tuple):
+                        n = 1
+                        for dim in shp:
+                            n *= int(dim)
+                        size += n
+                    elif shp is not None:
+                        size += int(shp)
+                    else:
+                        size += 1
+                if size > 0:
+                    elapsed = elapsed / size
+            groups.setdefault(data.get("op"), []).append(elapsed)
+
+        stats: Dict[str, Dict[str, Any]] = {}
+        for op, times in groups.items():
+            times.sort()
+            mean = sum(times) / len(times)
+            if len(times) >= 2:
+                q1, median, q3 = statistics.quantiles(times, n=4)
+            else:
+                q1 = median = q3 = times[0]
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outliers = [t for t in times if t < lower or t > upper]
+            stats[op] = {
+                "count": len(times),
+                "mean": mean,
+                "q1": q1,
+                "median": median,
+                "q3": q3,
+                "outliers": outliers,
+            }
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# Primitive backward implementations
+# ---------------------------------------------------------------------------
+
+
+def _arr(x):
+    return np.asarray(x)
+
+
+def bw_add(g, a, b):
+    g = _arr(g)
+    return g, g
+
+
+def bw_sub(g, a, b):
+    g = _arr(g)
+    return g, -g
+
+
+def bw_mul(g, a, b):
+    g, a, b = _arr(g), _arr(a), _arr(b)
+    return g * b, g * a
+
+
+def bw_truediv(g, a, b):
+    g, a, b = _arr(g), _arr(a), _arr(b)
+    return g / b, -g * a / (b * b)
+
+
+def bw_pow(g, a, b):
+    g, a, b = _arr(g), _arr(a), _arr(b)
+    return g * b * (a ** (b - 1)), g * (a ** b) * np.log(a)
+
+
+def bw_sin(g, x):
+    g, x = _arr(g), _arr(x)
+    return g * np.cos(x)
+
+
+def bw_cos(g, x):
+    g, x = _arr(g), _arr(x)
+    return -g * np.sin(x)
+
+
 ## All primitive backward rules have been removed from this file.
 ## The BACKWARD_REGISTRY should be populated externally (e.g., in a backend-specific module).
 
@@ -197,12 +373,28 @@ class Autograd:
     def __init__(self) -> None:
         self.tape = GradTape()
 
-    def record(self, op: str, inputs: Iterable[Any], result: Any) -> Any:
-        """Record an operation on the tape if a backward rule exists."""
+    def record(
+        self,
+        op: str,
+        inputs: Iterable[Any],
+        result: Any,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+    ) -> Any:
+        """Record an operation on the appropriate tape if supported."""
 
         if op not in BACKWARD_REGISTRY._methods:
             return result
-        self.tape.record(op, inputs, result)
+        tape = getattr(result, "_tape", None)
+        if tape is None:
+            for t in inputs:
+                tape = getattr(t, "_tape", None)
+                if tape is not None:
+                    break
+        if tape is None:
+            tape = self.tape
+        tape.record(op, inputs, result, start=start, end=end)
         return result
 
     def grad(
@@ -221,16 +413,18 @@ class Autograd:
         if out_grad is None:
             out_grad = output.ones_like()
 
+        tape = getattr(output, "_tape", self.tape)
         grad_map: Dict[int, Any] = {id(output): out_grad}
 
-        for tid, node in self.tape.traverse(output):
+        for tid, node in tape.traverse(output):
             grad_out = grad_map.get(tid)
             if grad_out is None:
                 continue
             bw = BACKWARD_REGISTRY._methods.get(node.op)
             if bw is None:
                 continue
-            parent_grads = bw(grad_out, *node.ctx["inputs"])
+            go = grad_out.data if hasattr(grad_out, "data") else grad_out
+            parent_grads = bw(go, *node.ctx["inputs"])
             for (pid, _), g in zip(node.parents, parent_grads):
                 if g is None:
                     continue
@@ -259,7 +453,12 @@ class Autograd:
                 pass
 
         if not retain_graph:
-            self.tape = GradTape()
+            if tape is self.tape:
+                self.tape = GradTape()
+            else:
+                tape._nodes.clear()
+                tape.graph.clear()
+                tape._op_index = 0
         return results
 
 
