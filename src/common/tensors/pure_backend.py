@@ -93,6 +93,55 @@ class PurePythonTensorOperations(AbstractTensor):
             return [[math.isnan(x) for x in row] for row in data]
         else:
             raise NotImplementedError("isnan_ only implemented for 1D/2D in pure backend")
+    def reshape_(self, shape):
+        """Pure-Python reshape that returns nested lists.
+
+        - Supports exactly one -1 in `shape` (inferred dim).
+        - Raises ValueError on incompatible sizes.
+        - Returns a scalar when shape == ().
+        """
+        from .abstraction import _flatten  # pure-python helper
+
+        # normalize shape to a list
+        if isinstance(shape, int):
+            new_shape = [shape]
+        else:
+            new_shape = list(shape)
+
+        # flatten input
+        flat = list(_flatten(self.data))
+        total = len(flat)
+
+        # infer -1 if present
+        minus_ones = new_shape.count(-1)
+        if minus_ones > 1:
+            raise ValueError("Only one dimension can be -1 in reshape")
+        known = 1
+        for s in new_shape:
+            if s == -1:
+                continue
+            if s < 0:
+                raise ValueError("reshape dimensions must be >= -1")
+            known *= s
+        if minus_ones == 1:
+            if known == 0 and total != 0:
+                raise ValueError("cannot infer dimension with zero known product")
+            if known != 0 and total % known != 0:
+                raise ValueError("cannot reshape: element count mismatch")
+            new_shape[new_shape.index(-1)] = 0 if known == 0 else total // known
+        else:
+            if known != total:
+                raise ValueError("cannot reshape: element count mismatch")
+
+        it = iter(flat)
+
+        def build(s):
+            if not s:           # scalar
+                return next(it)
+            n = s[0]
+            return [build(s[1:]) for _ in range(n)]
+
+        return build(new_shape)
 
     def isinf_(self):
         import math

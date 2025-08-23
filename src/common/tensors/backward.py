@@ -34,28 +34,50 @@ class BackwardPipeline:
                 result = fn(result, **kwargs)
         return result
 
+# in backward.py
 
 class BackwardRegistry:
     def register_from_backward_rules(self, rules: dict):
         """Register backward functions from BACKWARD_RULES using the 'python' key only."""
+        # import here to avoid cycles
+        from . import backward_registry as br
+
+        # Everything the code snippets may reference:
+        helper_globs = {
+            # tensor surface
+            "AbstractTensor": br.AbstractTensor,
+
+            # registry helpers
+            "unbroadcast": br.unbroadcast,
+            "expand_to": br.expand_to,
+            "indicator": br.indicator,
+            "eps": br.eps,
+            "T": br.T,
+
+            # optional helper used by 'trace'
+            "I_like": getattr(br, "I_like", None),
+        }
+
         for opname, rule in rules.items():
             python_dict = rule.get("python", {})
             python_code = python_dict.get("body", "")
-            if python_code:
-                parameters = rule.get("python", {}).get("parameters", [])
-                parameter_string = ", ".join(parameters)
-                func_code = f"def bw_{opname}({parameter_string}):\n"
-                for line in python_code.split(';'):
-                    func_code += f"    {line.strip()}\n"
-                
-                local_env = {}
-                try:
-                    exec(func_code, {}, local_env)
-                    fn = local_env[f"bw_{opname}"]
-                    self.register(f"{opname}", fn)
-                except Exception as e:
-                    pass
-    """Maintain a mapping of primitive names to backward callables."""
+            if not python_code:
+                continue
+
+            parameters = python_dict.get("parameters", [])
+            parameter_string = ", ".join(parameters)
+            func_code = f"def bw_{opname}({parameter_string}):\n"
+            for line in python_code.split(';'):
+                func_code += f"    {line.strip()}\n"
+
+            local_env = {}
+            try:
+                # <-- inject helpers here
+                exec(func_code, helper_globs, local_env)
+                fn = local_env[f"bw_{opname}"]
+                self.register(f"{opname}", fn)
+            except Exception as e:
+                raise RuntimeError(f"Failed to register backward function for {opname}: {e}")
 
     def __init__(self) -> None:
         self._methods: Dict[str, Callable[..., Any]] = {}

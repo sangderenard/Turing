@@ -122,14 +122,64 @@ helpers_spec: Dict[str, str] = {
         "T(X): transpose last two dims of X (matrix transpose).",
 }
 
-def unbroadcast(G, shape):
-    return G.sum(axis=tuple(i for i in range(G.ndim) if i not in shape))
+def unbroadcast(G, target_shape):
+    # Reduce extra leading dims
+    g_shape = list(getattr(G, "shape", ()))
+    t_shape = list(target_shape)
+    if len(g_shape) > len(t_shape):
+        reduce_axes = tuple(range(len(g_shape) - len(t_shape)))
+        G = AbstractTensor.sum(G, axis=reduce_axes)
+
+    # Now same rank: sum where target has size 1 but grad has >1
+    g_shape = list(getattr(G, "shape", ()))
+    for ax, (gs, ts) in enumerate(zip(g_shape, t_shape)):
+        if ts == 1 and gs != 1:
+            G = AbstractTensor.sum(G, axis=ax, keepdim=True)
+
+    return AbstractTensor.reshape(G, tuple(t_shape))
 
 def expand_to(G, shape):
-    return G.reshape(shape)
+    # Prefer a native broadcast_to if available
+    try:
+        return AbstractTensor.broadcast_to(G, shape)
+    except Exception:
+        # Fallback: multiply by ones of target shape to force broadcast
+        ones = AbstractTensor.ones(shape, dtype=getattr(G, "dtype", None), device=getattr(G, "device", None))
+        return ones * G
 
-def indicator(G, cond):
-    return G.where(cond, 1, 0)
+def indicator(cond):
+    return AbstractTensor.where(cond, 1, 0)
+
+def I_like(X):
+    *batch, m, n = X.shape
+    dtype = getattr(X, "dtype", None)
+    device = getattr(X, "device", None)
+    k = m if m < n else n
+
+    # 1) Best case: backend provides an eye()
+    try:
+        I = AbstractTensor.eye(m, n, dtype=dtype, device=device)  # shape (m, n)
+    except Exception:
+        # 2) Fallback: build via arange equality if available
+        try:
+            i = AbstractTensor.arange(m, dtype="int64", device=device).reshape(m, 1)
+            j = AbstractTensor.arange(n, dtype="int64", device=device).reshape(1, n)
+            ones = AbstractTensor.ones((m, n), dtype=dtype, device=device)
+            zeros = AbstractTensor.zeros((m, n), dtype=dtype, device=device)
+            I = AbstractTensor.where(i == j, ones, zeros)
+        except Exception:
+            # 3) Last resort: explicit scatter along the diagonal
+            I = AbstractTensor.zeros((m, n), dtype=dtype, device=device)
+            # Note: uses setitem semantics your tensors already support in slice backward
+            for t in range(k):
+                I[(slice(None),) * 0 + (t, t)] = 1  # i.e., I[t, t] = 1
+
+    # Broadcast over batch dims if needed
+    if batch:
+        I = AbstractTensor.broadcast_to(I, tuple(batch) + (m, n))
+
+    return I
+
 
 def eps():
     return 1e-12
@@ -339,6 +389,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g, x.shape)",
             "y": "gy = unbroadcast(g, y.shape)",
         },
+        "python": {"parameters": ["g", "x", "y"], "body": "gx=unbroadcast(g, x.shape); gy=unbroadcast(g, y.shape); return gx, gy"},
         "domain": "x,y: any real; broadcasting allowed",
         "notes": "Pure passthrough with broadcasting unrolled.",
         "tags": ["elementwise", "binary"],
@@ -351,6 +402,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g, x.shape)",
             "y": "gy = unbroadcast(-g, y.shape)",
         },
+        "python": {"parameters": ["g", "x", "y"], "body": "gx=unbroadcast(g, x.shape); gy=unbroadcast(-g, y.shape); return gx, gy"},
         "domain": "x,y: any real; broadcasting allowed",
         "notes": "",
         "tags": ["elementwise", "binary"],
@@ -363,6 +415,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g * y, x.shape)",
             "y": "gy = unbroadcast(g * x, y.shape)",
         },
+        "python": {"parameters": ["g", "x", "y"], "body": "return unbroadcast(g*y, x.shape), unbroadcast(g*x, y.shape)"},
         "domain": "x,y: any real; broadcasting allowed",
         "notes": "",
         "tags": ["elementwise", "binary"],
@@ -375,6 +428,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g / (y + eps), x.shape)",
             "y": "gy = unbroadcast(-g * x / ((y + eps)*(y + eps)), y.shape)",
         },
+        "python": {"parameters": ["g", "x", "y"], "body": "ys=y+eps(); return unbroadcast(g/ys, x.shape), unbroadcast(-g*x/(ys*ys), y.shape)"},
         "domain": "y != 0; practical: |y| >= eps",
         "notes": "Guard division by zero with eps.",
         "tags": ["elementwise", "binary"],
@@ -390,6 +444,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g * p * (x + eps)**(p - 1), x.shape)",
             "p": "gp = unbroadcast(g * (x + eps)**p * log(x + eps), p.shape)",
         },
+        "python": {
+            "parameters": ["g", "x", "p"],
+            "body": "xs=x+eps(); ys=xs**p; gx=unbroadcast(g*p*(xs**(p-1)), x.shape); gp=unbroadcast(g*ys*AbstractTensor.log(xs), p.shape); return gx, gp"
+        },
         "domain": "x>0 if p varies; if p is integer constant, extend by continuity.",
         "notes": "When p is constant, only x-branch is needed.",
         "tags": ["elementwise", "binary", "domain"],
@@ -402,6 +460,14 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = unbroadcast(g * where(x>y, 1, where(x<y, 0, 0.5)), x.shape)",
             "y": "gy = unbroadcast(g * where(y>x, 1, where(y<x, 0, 0.5)), y.shape)",
         },
+        "python": {
+            "parameters": ["g", "x", "y"],
+            "body": (
+                "mx0=AbstractTensor.where(x>y,1,AbstractTensor.where(x<y,0,0.5)); "
+                "mx1=AbstractTensor.where(y>x,1,AbstractTensor.where(y<x,0,0.5)); "
+                "return unbroadcast(g*mx0, x.shape), unbroadcast(g*mx1, y.shape)"
+            )
+        },
         "domain": "x,y: any real",
         "notes": "At ties (x==y) we choose to split gradient equally (0.5/0.5).",
         "tags": ["elementwise", "binary", "nonsmooth"],
@@ -413,6 +479,14 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * where(x<y, 1, where(x>y, 0, 0.5)), x.shape)",
             "y": "gy = unbroadcast(g * where(y<x, 1, where(y>x, 0, 0.5)), y.shape)",
+        },
+        "python": {
+            "parameters": ["g", "x", "y"],
+            "body": (
+                "mn0=AbstractTensor.where(x<y,1,AbstractTensor.where(x>y,0,0.5)); "
+                "mn1=AbstractTensor.where(y<x,1,AbstractTensor.where(y>x,0,0.5)); "
+                "return unbroadcast(g*mn0, x.shape), unbroadcast(g*mn1, y.shape)"
+            )
         },
         "domain": "x,y: any real",
         "notes": "At ties (x==y) split the gradient 0.5/0.5.",
@@ -429,6 +503,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = expand_to(g, x.shape)"
         },
+        "python": {
+            "parameters": ["g", "x", "axis", "keepdim"],
+            "body": "return expand_to(g, x.shape)"
+        },
         "domain": "x: any real",
         "notes": "If axis is specified and keepdim=False, conceptually unsqueeze `g` on the reduced axes before expand.",
         "tags": ["reduction", "linear"],
@@ -439,6 +517,13 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \frac{1}{N}\sum_{i \in \mathcal{I}} x_i",
         "backward": {
             "x": "N = number_of_elements_reduced; gx = expand_to(g, x.shape) / N"
+        },
+        "python": {
+            "parameters": ["g", "x", "axis", "keepdim"],
+            "body": (
+                "N = max(1, x.numel() // max(1, g.numel())); "
+                "return expand_to(g, x.shape) / N"
+            )
         },
         "domain": "x: any real",
         "notes": "Same broadcasting mechanics as `sum`, scaled by 1/N.",
@@ -451,6 +536,14 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "mu = mean(x, axis, keepdim=True); gx = expand_to(g, x.shape) * 2*(x - mu)/N"
         },
+        "python": {
+            "parameters": ["g", "x", "axis", "keepdim", "unbiased"],
+            "body": (
+                "mu = AbstractTensor.mean(x, axis=axis, keepdim=True); "
+                "N  = max(1, x.numel() // max(1, g.numel())); "
+                "return expand_to(g, x.shape) * 2*(x - mu) / N"
+            )
+        },
         "domain": "x: any real",
         "notes": "For unbiased=True replace N by (N-1) in forward; backward uses population scaling in many libs; match your forward exactly.",
         "tags": ["reduction", "statistics"],
@@ -461,6 +554,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \sqrt{\mathrm{var}(x)}",
         "backward": {
             "x": "mu = mean(x, axis, keepdim=True); v = mean((x - mu)**2, axis, keepdim=True); gx = expand_to(g, x.shape) * (x - mu) / (sqrt(v) * N + eps)"
+        },
+        "python": {
+            "parameters": ["g", "x", "axis", "keepdim", "unbiased"],
+            "body": (
+                "mu = AbstractTensor.mean(x, axis=axis, keepdim=True); "
+                "v  = AbstractTensor.mean((x - mu)**2, axis=axis, keepdim=True); "
+                "N  = max(1, x.numel() // max(1, g.numel())); "
+                "return expand_to(g, x.shape) * (x - mu) / (AbstractTensor.sqrt(v) * N + eps())"
+            )
         },
         "domain": "x: any real",
         "notes": "Derives via chain rule from var -> sqrt.",
@@ -477,6 +579,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = reshape(g, x.shape)"
         },
+        "python": {
+            "parameters": ["g", "x", "new_shape"],
+            "body": "return AbstractTensor.reshape(g, x.shape)"
+        },
         "domain": "Same number of elements.",
         "notes": "Gradient reshapes back.",
         "tags": ["shape"],
@@ -487,6 +593,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = x^\top,\quad \mathrm{(last\ two\ dims)}",
         "backward": {
             "x": "gx = T(g)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return T(g)"
         },
         "domain": "Tensor with rank >=2",
         "notes": "For general permutes use `permute` rule.",
@@ -499,6 +609,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "inv = inverse_permutation(perm); gx = permute(g, inv)"
         },
+        "python": {
+            "parameters": ["g", "x", "perm"],
+            "body": "inv=[0]*len(perm);for i,pv in enumerate(perm): inv[pv]=i;return AbstractTensor.permute(g, inv)"
+        },
         "domain": "Any rank",
         "notes": "Pure reindexing; inverse permutation for backward.",
         "tags": ["shape", "linear"],
@@ -509,6 +623,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \mathrm{Broadcast}(x)",
         "backward": {
             "x": "gx = unbroadcast(g, x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x", "shape"],
+            "body": "return unbroadcast(g, x.shape)"
         },
         "domain": "Target shape is broadcast-compatible.",
         "notes": "Right-inverse of broadcasting via summation.",
@@ -521,6 +639,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = zeros_like(x); gx[slices] = g"
         },
+        "python": {
+            "parameters": ["g", "x", "slices"],
+            "body": "gx=AbstractTensor.zeros_like(x); gx[slices]=g; return gx"
+        },
         "domain": "Any real; slices valid.",
         "notes": "Implements a simple scatter into the sliced region.",
         "tags": ["shape", "indexing"],
@@ -532,6 +654,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x*": "gs = split(g, [xi.shape[dim] for xi in xs], dim)"
         },
+        "python": {
+            "parameters": ["g", "xs", "dim"],
+            "body": "sizes=[x.shape[dim] for x in xs]; parts=AbstractTensor.split(g, sizes, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
+        },
         "domain": "Shapes must align on all dims except `dim`.",
         "notes": "Backward is a split of `g` into per-input gradients.",
         "tags": ["shape", "layout"],
@@ -542,6 +668,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \mathrm{Stack}(x_1,x_2,\ldots; \mathrm{dim})",
         "backward": {
             "x*": "gx_k = unstack(g, dim)[k]"
+        },
+        "python": {
+            "parameters": ["g", "xs", "dim"],
+            "body": "parts=AbstractTensor.unstack(g, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
         },
         "domain": "All inputs same shape.",
         "notes": "Backward is unstack along the stacking dim.",
@@ -559,6 +689,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "a": "ga = unbroadcast(g * indicator(cond), a.shape)",
             "b": "gb = unbroadcast(g * (1 - indicator(cond)), b.shape)"
         },
+        "python":{
+            "parameters": ["g", "cond", "a", "b"],
+            "body": (
+                "mask = AbstractTensor.where(cond, 1, 0); "
+                "ga = unbroadcast(g * mask, a.shape); "
+                "gb = unbroadcast(g * (1 - mask), b.shape); "
+                "return None, ga, gb"
+            )
+        },
         "domain": "cond is boolean/tensor; a,b broadcast-compatible.",
         "notes": "No gradient w.r.t. cond (discrete).",
         "tags": ["selection"],
@@ -569,6 +708,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \min(\max(x, m), M)",
         "backward": {
             "x": "gx = unbroadcast(g * indicator((min is None or x>min) and (max is None or x<max)), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x", "min", "max"],
+            "body": (
+                "left  = AbstractTensor.ones_like(x) if (min is None) else AbstractTensor.where(x>min, 1, 0); "
+                "right = AbstractTensor.ones_like(x) if (max is None) else AbstractTensor.where(x<max, 1, 0); "
+                "mask = left * right; "
+                "return unbroadcast(g * mask, x.shape)"
+            )
         },
         "domain": "x real; min<=max if provided.",
         "notes": "Zero gradient outside the open interval; subgradient at endpoints set to 0.",
@@ -589,6 +737,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
             "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
         },
+        "python": {
+            "parameters": ["g", "A", "B"],
+            "body": "gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
+        },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
         "tags": ["linear-algebra"],
@@ -601,6 +753,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "a": "ga = unbroadcast(g * b, a.shape)",
             "b": "gb = unbroadcast(g * a, b.shape)"
         },
+        "python": {
+            "parameters": ["g", "a", "b"],
+            "body": "return unbroadcast(g*b, a.shape), unbroadcast(g*a, b.shape)"
+        },
         "domain": "a,b same shape along `dim`.",
         "notes": "Equivalent to reduce(sum(a*b, dim)).",
         "tags": ["linear-algebra"],
@@ -611,6 +767,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \sqrt{\sum_i x_i^2},\quad \frac{\partial y}{\partial x} = \frac{x}{\|x\|_2}",
         "backward": {
             "x": "gx = expand_to(g, x.shape) * x / (norm2(x, axis, keepdim=True) + eps)"
+        },
+        "python": {
+            "parameters": ["g", "x", "axis"],
+            "body": "n = AbstractTensor.sqrt(AbstractTensor.sum(x*x, axis=axis, keepdim=True)) + eps(); return expand_to(g, x.shape) * x / n"
         },
         "domain": "x real; handle zero norm via eps.",
         "notes": "For axis=None treat as scalar norm; else vectorized by axis.",
@@ -623,6 +783,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "X": "gX = - matmul(T(inverse(X)), matmul(g, T(inverse(X))))"
         },
+        "python": {
+            "parameters": ["g", "X"],
+            "body": "iXT = T(AbstractTensor.inverse(X)); return - AbstractTensor.matmul(iXT, AbstractTensor.matmul(g, iXT))"
+        },
         "domain": "X square and nonsingular.",
         "notes": "Uses the identity d(X^{-1}) = -X^{-1}(dX)X^{-1}.",
         "tags": ["linear-algebra", "matrix-calculus", "advanced"],
@@ -634,6 +798,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "X": "gX = g * det(X) * T(inverse(X))"
         },
+        "python": {
+            "parameters": ["g", "X"],
+            "body": "return g * AbstractTensor.det(X) * T(AbstractTensor.inverse(X))"
+        },
         "domain": "X square and nonsingular.",
         "notes": "When X is singular, gradient is undefined; practical handling may return NaNs or zeros.",
         "tags": ["linear-algebra", "matrix-calculus", "advanced"],
@@ -644,6 +812,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"dy = \mathrm{tr}(dX) \Rightarrow \frac{\partial y}{\partial X} = I",
         "backward": {
             "X": "gX = g * I_like(X)"
+        },
+        "python": {
+            "parameters": ["g", "X"],
+            "body": "return g * I_like(X)"
         },
         "domain": "Square last-two-dims assumed; otherwise trace over min(n,m).",
         "notes": "Implement I_like(X) as an identity on the last two dims, broadcast over batch dims.",
@@ -660,6 +832,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "s = softmax(x, dim); dot = sum(g * s, dim, keepdim=True); gx = (g - dot) * s"
         },
+        "python":{
+            "parameters": ["g", "x", "dim"],
+            "body": "s=AbstractTensor.softmax(x, dim); dot=AbstractTensor.sum(g*s, axis=dim, keepdim=True); return (g - dot) * s"
+        },
         "domain": "x real; `dim` valid.",
         "notes": "Classic VJP form avoids an explicit Jacobian.",
         "tags": ["nn", "softmax"],
@@ -670,6 +846,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"\frac{\partial y}{\partial x} = I - \mathbf{1} y^\top_{\exp} \quad\text{with } y_{\exp}=\mathrm{softmax}(x)",
         "backward": {
             "x": "s = softmax(x, dim); dot = sum(g, dim, keepdim=True); gx = g - dot * s"
+        },
+        "python":{
+            "parameters": ["g", "x", "dim"],
+            "body": "s=AbstractTensor.softmax(x, dim); dot=AbstractTensor.sum(g, axis=dim, keepdim=True); return g - dot * s"
         },
         "domain": "x real; `dim` valid.",
         "notes": "Derived from softmax and the chain rule of log.",
