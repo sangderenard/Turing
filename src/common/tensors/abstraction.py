@@ -1050,6 +1050,11 @@ class AbstractTensor:
         from . import autograd as _autograd
 
         inputs = list(inputs)
+        # Promote non-tensor operands to tensors so backward rules always see wrappers.
+        first = next((t for t in inputs if isinstance(t, AbstractTensor)), None)
+        if first is not None:
+            inputs = [x if isinstance(x, AbstractTensor) else first.ensure_tensor(x) for x in inputs]
+
         tape = None
         for t in inputs:
             if isinstance(t, AbstractTensor):
@@ -1076,7 +1081,8 @@ class AbstractTensor:
                         result._requires_grad = True  # type: ignore[attr-defined]
                     except Exception:
                         pass
-                tape.record(op, inputs, result, start=start, end=end)
+                if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) == 0:
+                    AbstractTensor.autograd.record(op, inputs, result, start=start, end=end)
                 return result
 
             return finalize

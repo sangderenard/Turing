@@ -80,6 +80,7 @@ recorded graph in reverse to accumulate gradients for requested inputs.
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
+from contextlib import contextmanager
 
 import networkx as nx
 
@@ -170,8 +171,10 @@ class GradTape:
         if start is not None and end is not None:
             elapsed = end - start
         ctx = {
-            "inputs": [x.data if hasattr(x, "data") else x for x in inputs],
-            "result": result.data if hasattr(result, "data") else result,
+            "inputs": list(inputs),
+            "result": result,
+            "inputs_data": [x.data if hasattr(x, "data") else x for x in inputs],
+            "result_data": result.data if hasattr(result, "data") else result,
             "input_shapes": [getattr(x, "shape", None) for x in inputs],
             "result_shape": getattr(result, "shape", None),
             "start": start,
@@ -324,6 +327,16 @@ class Autograd:
 
     def __init__(self) -> None:
         self.tape = GradTape()
+        self._no_grad_depth = 0
+
+    @contextmanager
+    def no_grad(self) -> Generator[None, None, None]:
+        """Context manager to temporarily disable gradient recording."""
+        self._no_grad_depth += 1
+        try:
+            yield
+        finally:
+            self._no_grad_depth -= 1
 
     def record(
         self,
@@ -336,7 +349,8 @@ class Autograd:
     ) -> Any:
         """Record an operation on the appropriate tape if supported."""
 
-        if op not in BACKWARD_REGISTRY._methods:
+        op = {"truediv": "div"}.get(op, op)
+        if op not in BACKWARD_REGISTRY._methods or self._no_grad_depth > 0:
             return result
         tape = getattr(result, "_tape", None)
         if tape is None:
@@ -368,22 +382,23 @@ class Autograd:
         tape = getattr(output, "_tape", self.tape)
         grad_map: Dict[int, Any] = {id(output): out_grad}
 
-        for tid, node in tape.traverse(output):
-            grad_out = grad_map.get(tid)
-            if grad_out is None:
-                continue
-            bw = BACKWARD_REGISTRY._methods.get(node.op)
-            if bw is None:
-                continue
-            go = grad_out.data if hasattr(grad_out, "data") else grad_out
-            parent_grads = bw(go, *node.ctx["inputs"])
-            for (pid, _), g in zip(node.parents, parent_grads):
-                if g is None:
+        with self.no_grad():
+            for tid, node in tape.traverse(output):
+                grad_out = grad_map.get(tid)
+                if grad_out is None:
                     continue
-                if pid in grad_map:
-                    grad_map[pid] = grad_map[pid] + g
-                else:
-                    grad_map[pid] = g
+                bw = BACKWARD_REGISTRY._methods.get(node.op)
+                if bw is None:
+                    continue
+                go = grad_out
+                parent_grads = bw(go, *node.ctx["inputs"])
+                for (pid, _), g in zip(node.parents, parent_grads):
+                    if g is None:
+                        continue
+                    if pid in grad_map:
+                        grad_map[pid] = grad_map[pid] + g
+                    else:
+                        grad_map[pid] = g
 
         results: List[Any] = []
         for inp in inputs:
