@@ -314,54 +314,6 @@ class TapeProfiler:
         return stats
 
 
-# ---------------------------------------------------------------------------
-# Primitive backward implementations
-# ---------------------------------------------------------------------------
-
-
-def _arr(x):
-    return np.asarray(x)
-
-
-def bw_add(g, a, b):
-    g = _arr(g)
-    return g, g
-
-
-def bw_sub(g, a, b):
-    g = _arr(g)
-    return g, -g
-
-
-def bw_mul(g, a, b):
-    g, a, b = _arr(g), _arr(a), _arr(b)
-    return g * b, g * a
-
-
-def bw_truediv(g, a, b):
-    g, a, b = _arr(g), _arr(a), _arr(b)
-    return g / b, -g * a / (b * b)
-
-
-def bw_pow(g, a, b):
-    g, a, b = _arr(g), _arr(a), _arr(b)
-    return g * b * (a ** (b - 1)), g * (a ** b) * np.log(a)
-
-
-def bw_sin(g, x):
-    g, x = _arr(g), _arr(x)
-    return g * np.cos(x)
-
-
-def bw_cos(g, x):
-    g, x = _arr(g), _arr(x)
-    return -g * np.sin(x)
-
-
-## All primitive backward rules have been removed from this file.
-## The BACKWARD_REGISTRY should be populated externally (e.g., in a backend-specific module).
-
-
 # ----------------------------------------------------------------------------
 # Autograd engine
 # ----------------------------------------------------------------------------

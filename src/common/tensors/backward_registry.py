@@ -148,6 +148,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(-g, x.shape)"
         },
+        "python": {
+            "parameters" : ["g", "x"],
+            "body" : "return unbroadcast(-g, x.shape)"
+        },
         "domain": "x: any real",
         "notes": "Pure sign flip.",
         "tags": ["elementwise", "unary"],
@@ -159,6 +163,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * y, x.shape)"
         },
+        "python":  {"parameters": ["g", "x", "y"], "body": "return unbroadcast(g * y, x.shape)"},
         "domain": "x: any real",
         "notes": "Use forward output `y` if available for efficiency.",
         "tags": ["elementwise", "unary", "smooth"],
@@ -170,6 +175,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g / (x + eps), x.shape)"
         },
+        "python": {"parameters": ["g", "x"], "body": "return unbroadcast(g / (x + eps()), x.shape)"},
         "domain": "x > 0 (strict); practical: x >= eps",
         "notes": "Guard at 0 with eps to avoid NaNs.",
         "tags": ["elementwise", "unary", "smooth", "domain"],
@@ -181,6 +187,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(0.5 * g / (y + eps), x.shape)"
         },
+        "python": {"parameters": ["g", "x", "y"], "body": "return unbroadcast(0.5 * g / (y + eps()), x.shape)"},
         "domain": "x >= 0; practical: x >= 0 with eps guard",
         "notes": "Prefer using forward output `y` for stability.",
         "tags": ["elementwise", "unary", "smooth", "domain"],
@@ -191,6 +198,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = |x|, \quad \frac{\partial y}{\partial x} = \mathrm{sign}(x) \text{ for } x \neq 0",
         "backward": {
             "x": "gx = unbroadcast(g * where(x>0, 1, where(x<0, -1, 0)), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.where(x>0, 1, AbstractTensor.where(x<0, -1, 0)), x.shape)",
         },
         "domain": "x: any real",
         "notes": "Subgradient at x=0 set to 0. Other choices are valid but less common.",
@@ -203,6 +214,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * cos(x), x.shape)"
         },
+        "python": {
+                    "parameters": ["g", "x"],
+                    "body": "return unbroadcast(g * AbstractTensor.cos(x), x.shape)"
+                },
         "domain": "x: any real",
         "notes": "",
         "tags": ["elementwise", "unary", "smooth", "trig"],
@@ -213,6 +228,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \cos x, \quad \frac{\partial y}{\partial x} = -\sin x",
         "backward": {
             "x": "gx = unbroadcast(-g * sin(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(-g * AbstractTensor.sin(x), x.shape)"
         },
         "domain": "x: any real",
         "notes": "",
@@ -225,6 +244,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * (1 + y*y), x.shape)"
         },
+        "python": {
+                    "parameters": ["g", "x", "y"],
+                    "body": "return unbroadcast(g * (1 + y*y), x.shape)"
+                },
         "domain": "x != (pi/2 + k*pi)",
         "notes": "Use forward output `y` to compute 1 + tan^2(x).",
         "tags": ["elementwise", "unary", "smooth", "trig"],
@@ -235,6 +258,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \tanh x, \quad \frac{\partial y}{\partial x} = 1 - \tanh^2 x = 1 - y^2",
         "backward": {
             "x": "gx = unbroadcast(g * (1 - y*y), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x", "y"],
+            "body": "return unbroadcast(g * (1 - y*y), x.shape)"
         },
         "domain": "x: any real",
         "notes": "",
@@ -247,6 +274,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * y * (1 - y), x.shape)"
         },
+        "python":{
+            "parameters": ["g", "x", "y"],
+            "body": "return unbroadcast(g * y * (1 - y), x.shape)"
+        },
         "domain": "x: any real",
         "notes": "Use numerically stable sigmoid implementation in forward.",
         "tags": ["elementwise", "unary", "smooth", "nn"],
@@ -257,6 +288,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \max(x,0), \quad \frac{\partial y}{\partial x} = \mathbf{1}_{x>0}",
         "backward": {
             "x": "gx = unbroadcast(g * indicator(x>0), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.where(x>0, 1, 0), x.shape)"
         },
         "domain": "x: any real",
         "notes": "At x=0 use subgradient 0 by convention.",
@@ -269,6 +304,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * where(x>0, 1, alpha), x.shape)"
         },
+        "python": {
+            "parameters": ["g", "x", "alpha"],
+            "body": "return unbroadcast(g * AbstractTensor.where(x>0, 1, alpha), x.shape)"
+        },
         "domain": "alpha in (0,1) typically",
         "notes": "Alpha passed as parameter to forward. Same value used in backward.",
         "tags": ["elementwise", "unary", "nonsmooth", "nn"],
@@ -279,6 +318,10 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "latex": r"y = \log(1+e^{x}),\quad \frac{\partial y}{\partial x} = \sigma(x)",
         "backward": {
             "x": "gx = unbroadcast(g * sigmoid(x), x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return unbroadcast(g * AbstractTensor.sigmoid(x), x.shape)"
         },
         "domain": "x: any real",
         "notes": "Use numerically stable softplus in forward.",
@@ -633,164 +676,4 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "tags": ["nn", "softmax"],
     },
 }
-
-# --- Runtime loader: build BACKWARD_FUNCTIONS from BACKWARD_RULES ---
-import types
-import re
-from typing import Callable
-
-def _make_backward_func(code: str, argnames: list, helpers: dict) -> Callable:
-    # Build a function that takes all args in argnames and runs the code string
-    # The code string should end with 'return ...'
-    env = dict(helpers)
-    # Build function definition string
-    params = ', '.join(argnames)
-    func_code = f'def _backward({params}):\n'
-    for line in code.split(';'):
-        func_code += f'    {line.strip()}\n'
-    # Compile in env
-    exec(func_code, env)
-    return env['_backward']
-
-# Provide minimal helpers (replace with real implementations in your runtime)
-def unbroadcast(G, shape):
-    # Dummy: just return G
-    return G
-
-def expand_to(G, shape):
-    return G
-
-def indicator(cond):
-    return cond
-
-def where(cond, a, b):
-    return a if cond else b
-
-def zeros_like(x):
-    return 0
-
-def ones_like(x):
-    return 1
-
-def T(x):
-    return x
-
-def log(x):
-    import math
-    return math.log(x)
-
-def mean(x, axis=None, keepdim=False):
-    return x
-
-def sqrt(x):
-    import math
-    return math.sqrt(x)
-
-def softmax(x, dim=None):
-    return x
-
-def sum(x, axis=None, keepdim=False):
-    return x
-
-def matmul(a, b):
-    return a
-
-def inverse_permutation(perm):
-    return perm
-
-def det(x):
-    return x
-
-def I_like(x):
-    return x
-
-def inverse(x):
-    return x
-
-def permute(x, perm):
-    return x
-
-def reshape(x, shape):
-    return x
-
-def split(x, sizes, dim):
-    return [x]
-
-def unstack(x, dim):
-    return [x]
-
-def stack(xs, dim):
-    return xs
-
-def concat(xs, dim):
-    return xs
-
-def number_of_elements_reduced():
-    return 1
-
-def log_softmax(x, dim):
-    return x
-
-def norm2(x, axis=None, keepdim=False):
-    return x
-
-def mean(x, axis=None, keepdim=False):
-    return x
-
-def sigmoid(x):
-    return x
-
-def tanh(x):
-    return x
-
-def abs(x):
-    return x
-
-def maximum(x, y):
-    return x if x > y else y
-
-def minimum(x, y):
-    return x if x < y else y
-
-_helpers = locals().copy()
-_helpers['eps'] = 1e-12
-
-BACKWARD_FUNCTIONS = {}
-BACKWARD_GRAPHS = {}
-
-for opname, rule in BACKWARD_RULES.items():
-    code = rule['backward']
-    # Parse signature to get argnames (e.g. 'y = -x' -> ['g', 'x'])
-    sig = rule.get('signature', '')
-    # Find all variable names after '=' and before operators/commas
-    m = re.match(r"\\s*\\w+\\s*=\\s*(.*)", sig)
-    if m:
-        rhs = m.group(1)
-        # crude split on operators and commas
-        tokens = re.split(r'[^a-zA-Z0-9_]', rhs)
-        argnames = ['g'] + [t for t in tokens if t and not t.isdigit() and t != 'g']
-    else:
-        argnames = ['g']
-    # Remove duplicates, preserve order
-    seen = set()
-    argnames = [x for x in argnames if not (x in seen or seen.add(x))]
-    # Build the function
-    try:
-        BACKWARD_FUNCTIONS[opname] = _make_backward_func(code, argnames, _helpers)
-    except Exception as e:
-        BACKWARD_FUNCTIONS[opname] = None
-        print(f"Failed to build backward for {opname}: {e}")
-    # Build a simple node/edge graph from signature
-    # Example: 'z = x + y' -> nodes: ['z', 'x', 'y'], edges: [('x','z'),('y','z')]
-    nodes = set()
-    edges = []
-    if m:
-        lhs = sig.split('=')[0].strip()
-        rhs_vars = [t for t in tokens if t and not t.isdigit()]
-        nodes.add(lhs)
-        for v in rhs_vars:
-            nodes.add(v)
-            edges.append((v, lhs))
-    BACKWARD_GRAPHS[opname] = {'nodes': list(nodes), 'edges': edges}
-
-# Now BACKWARD_FUNCTIONS[opname] is a callable for each op, and BACKWARD_GRAPHS[opname] is a simple graph
+# End of BACKWARD_RULES

@@ -36,6 +36,25 @@ class BackwardPipeline:
 
 
 class BackwardRegistry:
+    def register_from_backward_rules(self, rules: dict):
+        """Register backward functions from BACKWARD_RULES using the 'python' key only."""
+        for opname, rule in rules.items():
+            python_dict = rule.get("python", {})
+            python_code = python_dict.get("body", "")
+            if python_code:
+                parameters = rule.get("python", {}).get("parameters", [])
+                parameter_string = ", ".join(parameters)
+                func_code = f"def bw_{opname}({parameter_string}):\n"
+                for line in python_code.split(';'):
+                    func_code += f"    {line.strip()}\n"
+                
+                local_env = {}
+                try:
+                    exec(func_code, {}, local_env)
+                    fn = local_env[f"bw_{opname}"]
+                    self.register(f"{opname}", fn)
+                except Exception as e:
+                    pass
     """Maintain a mapping of primitive names to backward callables."""
 
     def __init__(self) -> None:
@@ -64,3 +83,7 @@ class BackwardRegistry:
 
 # Global registry used by the tensor abstraction
 BACKWARD_REGISTRY = BackwardRegistry()
+
+
+from .backward_registry import BACKWARD_RULES
+BACKWARD_REGISTRY.register_from_backward_rules(BACKWARD_RULES)
