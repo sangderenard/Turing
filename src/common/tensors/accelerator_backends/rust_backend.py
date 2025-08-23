@@ -59,3 +59,6 @@ class RustTensorOperations:
             "unravel_index not implemented for Rust backend"
         )
 
+    def __trunc__(self):
+        raise NotImplementedError("trunc not implemented for Rust backend")
+

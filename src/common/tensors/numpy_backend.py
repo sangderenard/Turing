@@ -189,6 +189,12 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.ceil(self.data)
 
+    def __trunc__(self):
+        import numpy as np
+        if self.data.size != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+        return int(np.trunc(self.data).item())
+
     def softmax_(self, dim):
         import numpy as np
         x = self.data

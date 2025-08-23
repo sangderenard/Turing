@@ -172,6 +172,12 @@ class JAXTensorOperations(AbstractTensor):
         import jax.numpy as jnp
         return jnp.ceil(self.data)
 
+    def __trunc__(self):
+        import jax.numpy as jnp
+        if self.data.size != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+        return int(jnp.trunc(self.data).item())
+
     def softmax_(self, dim):
         import jax.numpy as jnp
         x = self.data
