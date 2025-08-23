@@ -184,7 +184,7 @@ class PyTorchTensorOperations(AbstractTensor):
         return torch.softmax(self.data, dim=dim)
 
     def reshape_(self, shape):
-        return self.data.reshape(*shape)
+        return self.data.reshape(shape)
 
     def transpose_(self, dim0, dim1):
         return self.data.transpose(dim0, dim1)

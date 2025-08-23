@@ -93,7 +93,7 @@ def _v2_valuewise(
     K = self._scalar_kernel(op)
     out = [K(self._as_scalar(a[i]), self._as_scalar(b[i])) for i in range(target)]
     shape = self.get_shape() if na == target else other_t.get_shape()
-    out = self.ensure_tensor(out).reshape(*shape)
+    out = self.ensure_tensor(out).reshape(shape)
     out = finalize(out)
     tape = getattr(out, "_tape", None)
     if tape and annotate:
