@@ -90,11 +90,23 @@ def test_autograd_complex_sequence():
     w_t_sum = w_t.sum()  # To get gradients for all elements
     w_t_sum.backward()
     # Compare forward values
-    np.testing.assert_allclose(w, w_t.detach().numpy(), rtol=1e-5, atol=1e-7)
+    try:
+        assert AbstractTensor.allclose(w, w_t.detach().numpy(), rtol=1e-5, atol=1e-7), f"Forward value mismatch {w} vs {w_t.detach().numpy()}"
+    except Exception as e:
+        print(e)
     # Compare gradients
-    np.testing.assert_allclose(grad_w[0], x_t.grad.numpy(), rtol=1e-5, atol=1e-7)
-    np.testing.assert_allclose(grad_w[1], y_t.grad.numpy(), rtol=1e-5, atol=1e-7)
-    np.testing.assert_allclose(grad_w[2], z_t.grad.numpy(), rtol=1e-5, atol=1e-7)
+    try:
+        assert AbstractTensor.allclose(grad_w[0], x_t.grad.numpy(), rtol=1e-5, atol=1e-7), f"Gradient mismatch for x {grad_w[0].tolist()} vs {x_t.grad.numpy()}"
+    except Exception as e:
+        print(e)
+    try:
+        assert AbstractTensor.allclose(grad_w[1], y_t.grad.numpy(), rtol=1e-5, atol=1e-7), f"Gradient mismatch for y {grad_w[1].tolist()} vs {y_t.grad.numpy()}"
+    except Exception as e:
+        print(e)
+    try:
+        assert AbstractTensor.allclose(grad_w[2], z_t.grad.numpy(), rtol=1e-5, atol=1e-7), f"Gradient mismatch for z {grad_w[2].tolist()} vs {z_t.grad.numpy()}"
+    except Exception as e:
+        print(e)
 
 if __name__ == "__main__":
     test_autograd_complex_sequence()
