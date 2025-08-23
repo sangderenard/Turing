@@ -834,7 +834,9 @@ class HodgeStarBuilder:
         else:
             # No faces were detected; fall back to an empty tensor so downstream
             # operations become no-ops instead of crashing with a stack error.
-            face_tensor = AbstractTensor.empty((0, 3), dtype=AbstractTensor.long, device=self.device)
+            face_tensor = AbstractTensor.empty(
+                (0, 3), dtype=AbstractTensor.long_dtype_, device=self.device
+            )
         for i, edge in enumerate(edges):
             # Find faces containing this edge
             mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
@@ -1313,8 +1315,8 @@ def validate_transform_hub():
     # Simple edge index: connect each vertex to next in a line for demonstration
     edges = []
     for i in range(num_vertices-1):
-        edges.append([i, i+1])
-    edge_index = AbstractTensor.tensor(edges, dtype=AbstractTensor.long)
+        edges.append([i, i + 1])
+    edge_index = AbstractTensor.tensor(edges, dtype=AbstractTensor.long_dtype_)
 
     hub = IdentityTransform(1.0, 1.0, (True, True, True, True))
     geometry = hub.calculate_geometry(U, V, W, edge_index=edge_index, detect_faces=True)
