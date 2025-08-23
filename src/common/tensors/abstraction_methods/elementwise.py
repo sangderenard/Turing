@@ -58,6 +58,22 @@ def _v2_valuewise(
     a = self.reshape(-1).tolist()
     b = other_t.reshape(-1).tolist()
     na, nb = len(a), len(b)
+
+    # Explicitly handle zero-length operands to avoid div-by-zero
+    if na == 0 or nb == 0:
+        if na == nb == 0:
+            shape = self.get_shape()
+        elif allow_scalar and ((na == 0 and nb == 1) or (nb == 0 and na == 1)):
+            shape = self.get_shape() if na == 0 else other_t.get_shape()
+        else:
+            raise ValueError(f"{op}: incompatible lengths {na} vs {nb}")
+        out = self.ensure_tensor([]).reshape(*shape)
+        out = finalize(out)
+        tape = getattr(out, "_tape", None)
+        if tape and annotate:
+            tape.annotate(out, **({"eval_mode":"valuewise","v":"v2","length":0,"scalar_lift":{"left":False,"right":False}} | annotate))
+        return out
+
     target = max(na, nb)
 
     def lift(lst, name):
