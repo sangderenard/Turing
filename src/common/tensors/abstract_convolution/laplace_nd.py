@@ -763,7 +763,7 @@ class HodgeStarBuilder:
             face_list.sort(key=lambda x: x[0])
             faces_data = str(face_list).encode()
 
-        topology_data = (vertices.shape, edges.cpu().numpy().tobytes(), faces_data)
+        topology_data = (vertices.shape, edges.tobytes(), faces_data)
         return hashlib.sha256(b''.join([str(t).encode() for t in topology_data])).hexdigest()
 
     def build_basic_hodge_star(self, vertices, edges):

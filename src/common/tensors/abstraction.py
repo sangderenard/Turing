@@ -934,6 +934,57 @@ class AbstractTensor:
         result.data = self.boolean_mask_select_(mask)
         return result
 
+    def tobytes(self) -> bytes:
+        """Serialize tensor data to bytes by serializing each item in the list."""
+        items = self.tolist()
+        # If items is a list of tensors, recursively call tobytes; otherwise, bytes(items)
+        if hasattr(items, '__iter__') and not isinstance(items, (bytes, bytearray)):
+            # Flatten the list and convert each item to bytes
+            flat = []
+            def _flatten(x):
+                if isinstance(x, (list, tuple)):
+                    for y in x:
+                        _flatten(y)
+                else:
+                    flat.append(x)
+            _flatten(items)
+            # Try to convert each item to bytes, if possible
+            result = b''
+            for v in flat:
+                if hasattr(v, 'tobytes'):
+                    result += v.tobytes()
+                elif isinstance(v, (int, float, bool)):
+                    import struct
+                    # Use double for float, long long for int, ? for bool
+                    if isinstance(v, float):
+                        result += struct.pack('d', v)
+                    elif isinstance(v, int):
+                        result += struct.pack('q', v)
+                    elif isinstance(v, bool):
+                        result += struct.pack('?', v)
+                elif isinstance(v, bytes):
+                    result += v
+                else:
+                    # fallback: try str encoding
+                    result += str(v).encode('utf-8')
+            return result
+        else:
+            # Not a list, just try to convert directly
+            if hasattr(items, 'tobytes'):
+                return items.tobytes()
+            elif isinstance(items, (int, float, bool)):
+                import struct
+                if isinstance(items, float):
+                    return struct.pack('d', items)
+                elif isinstance(items, int):
+                    return struct.pack('q', items)
+                elif isinstance(items, bool):
+                    return struct.pack('?', items)
+            elif isinstance(items, bytes):
+                return items
+            else:
+                return str(items).encode('utf-8')
+
     def tolist(self) -> List[Any]:
         return self.tolist_()
 
