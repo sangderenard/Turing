@@ -136,6 +136,18 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    @staticmethod
+    def _normalize_shape_args(*shape):
+        """
+        Accepts: reshape(-1), reshape(2,3), reshape([2,3]), reshape((2,3))
+        Returns a tuple shape (e.g., (-1,), (2,3))
+        """
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+            return tuple(int(s) for s in shape[0])
+        if len(shape) == 1 and isinstance(shape[0], int):
+            return (int(shape[0]),)
+        return tuple(int(s) for s in shape)
+
     def empty_(self, size: Tuple[int, ...], dtype: Any = None, device: Any = None):
         """Create an uninitialized tensor of the given shape (backend hook)."""
         raise NotImplementedError(f"{self.__class__.__name__} must implement empty_()")
@@ -1558,6 +1570,7 @@ class AbstractF:
             return AbstractTensor.get_tensor(out)
 
 
+
 # Attach to AbstractTensor
 AbstractTensor.F = AbstractF
 
@@ -1740,7 +1753,7 @@ _bind_and_wrap({
     "less_equal": comp_less_equal,
     "equal": comp_equal,
     "not_equal": comp_not_equal,
-    "where": comp_where,
+    #"where": comp_where, this is now handled by the elementwise set
     "all": comp_all,
     "any": comp_any,
     "nonzero": comp_nonzero,
@@ -1899,4 +1912,37 @@ def get_tensor_operations(
 
 
 # --- Delayed backend registration to avoid circular imports ---
+from .abstraction_methods.elementwise import (
+    __eq__ as elementwise_eq,
+    __ne__ as elementwise_ne,
+    __lt__ as elementwise_lt,
+    __le__ as elementwise_le,
+    __gt__ as elementwise_gt,
+    __ge__ as elementwise_ge,
+    __and__ as elementwise_and,
+    __or__ as elementwise_or,
+    __xor__ as elementwise_xor,
+    __invert__ as elementwise_invert,
+    where as elementwise_where,
+    _as_scalar, _scalar_kernel, 
+    _v1_valuewise, _v2_valuewise, _v3_valuewise
+)
 
+# --- Elementwise operator assignments (from abstraction_methods/elementwise.py) ---
+AbstractTensor.__eq__    = elementwise_eq
+AbstractTensor.__ne__    = elementwise_ne
+AbstractTensor.__lt__    = elementwise_lt
+AbstractTensor.__le__    = elementwise_le
+AbstractTensor.__gt__    = elementwise_gt
+AbstractTensor.__ge__    = elementwise_ge
+AbstractTensor.__and__   = elementwise_and
+AbstractTensor.__or__    = elementwise_or
+AbstractTensor.__xor__   = elementwise_xor
+AbstractTensor.__invert__= elementwise_invert
+AbstractTensor.where     = staticmethod(elementwise_where)
+
+AbstractTensor._as_scalar   = staticmethod(_as_scalar)
+AbstractTensor._scalar_kernel = staticmethod(_scalar_kernel)
+AbstractTensor._v1_valuewise  = _v1_valuewise
+AbstractTensor._v2_valuewise  = _v2_valuewise
+AbstractTensor._v3_valuewise  = _v3_valuewise

@@ -11,26 +11,30 @@ def _wrap_result(self, result):
     out.data = result
     return out
 
-
-def reshape(self, shape: int) -> "AbstractTensor":
+def reshape(self, *shape) -> "AbstractTensor":
     """Return a reshaped tensor as an AbstractTensor."""
+    from ..abstraction import AbstractTensor, BACKEND_REGISTRY
+
+    shape_tuple = AbstractTensor._normalize_shape_args(*shape)
+
     if hasattr(self, "reshape_"):
-        return _wrap_result(self, self.reshape_(shape))
+        return _wrap_result(self, self.reshape_(shape_tuple))
+
+    # numpy fallback (kept intact, but now passes a tuple)
     try:
-        from ..abstraction import BACKEND_REGISTRY
         backend_cls = BACKEND_REGISTRY.get("numpy")
         if backend_cls is not None:
             numpy_tensor = backend_cls(track_time=getattr(self, "track_time", False))
             numpy_tensor = numpy_tensor.ensure_tensor(self.data)
             if hasattr(numpy_tensor.data, "reshape"):
-                reshaped_data = numpy_tensor.data.reshape(shape)
+                reshaped_data = numpy_tensor.data.reshape(shape_tuple)
                 reshaped_tensor = backend_cls(track_time=getattr(self, "track_time", False))
                 reshaped_tensor.data = reshaped_data
                 return reshaped_tensor.to_backend(self)
     except Exception:
         pass
-    raise NotImplementedError("Reshape fallback not implemented for pure python backend.")
 
+    raise NotImplementedError("Reshape fallback not implemented for pure python backend.")
 
 def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
     """Return a transposed tensor as an AbstractTensor."""
@@ -68,6 +72,13 @@ def squeeze(self, dim: int | None = None) -> "AbstractTensor":
 
 def flatten(self) -> "AbstractTensor":
     """Return a flattened version of the tensor as an AbstractTensor."""
+    if hasattr(self, "flatten_"):
+        return _wrap_result(self, self.flatten_())
+    # Fast common path: use reshape(-1). The new normalizer makes this robust.
+    try:
+        return self.reshape(-1)
+    except Exception:
+        pass
     if hasattr(self, "flatten_"):
         return _wrap_result(self, self.flatten_())
     try:
@@ -113,8 +124,6 @@ def repeat(self, repeats: Any = None, dim: int = 0) -> "AbstractTensor":
     """Repeat ``self`` along ``dim`` ``repeats`` times."""
     return _wrap_result(self, self.repeat_(repeats, dim))
 
-
 def repeat_interleave(self, repeats: int = 1, dim: Optional[int] = None) -> "AbstractTensor":
-    from ..abstraction import AbstractTensor
-    result = AbstractTensor.get_tensor(self.repeat_interleave_(repeats, dim))
-    return result
+    return _wrap_result(self, self.repeat_interleave_(repeats, dim))
+

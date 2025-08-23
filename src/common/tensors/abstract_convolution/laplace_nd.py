@@ -810,6 +810,7 @@ class HodgeStarBuilder:
         Build full hodge star including faces. With face information, we can
         properly compute areas and thus refine the Hodge star operators.
         """
+        dtype = vertices.long_dtype_
         hash_key = self._hash_topology(vertices, edges, faces)
         if hash_key in self.hodge_cache:
             return self.hodge_cache[hash_key]
@@ -835,7 +836,7 @@ class HodgeStarBuilder:
             # No faces were detected; fall back to an empty tensor so downstream
             # operations become no-ops instead of crashing with a stack error.
             face_tensor = AbstractTensor.empty(
-                (0, 3), dtype=AbstractTensor.long_dtype_, device=self.device
+                (0, 3), dtype=dtype, device=self.device
             )
         for i, edge in enumerate(edges):
             # Find faces containing this edge
