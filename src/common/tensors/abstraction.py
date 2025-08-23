@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from abc import ABC, abstractmethod
-from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable
+from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
 import time
 from collections import deque
@@ -38,6 +38,9 @@ except ImportError:
 
 # TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, _get_ops_for_class
 from . import DEBUG
+
+if TYPE_CHECKING:  # pragma: no cover - type hints only
+    from .autograd import GradTape
 def register_conversion(*args, **kwargs):
     pass
 CONVERSION_REGISTRY = dict()
@@ -46,7 +49,7 @@ CONVERSION_REGISTRY = dict()
 
 # ---- diagnostics ------------------------------------------------------------
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 DIAG_LEVEL = os.environ.get("ABSTRACT_TENSOR_DIAG", "auto")  # 'concise' | 'auto' | 'verbose'
 
@@ -84,65 +87,6 @@ class TensorShapeError(ValueError):
         if want_hint:
             return head + "\n" + line1 + (f"\nHint: {d.hint}" if d.hint else "")
         return head + "\n" + line1
-
-
-@dataclass
-class TimeNode:
-    """Single timing record within a :class:`TimeTape`."""
-
-    start: float
-    end: float
-    parents: list[tuple[int, int]] = field(default_factory=list)
-
-    @property
-    def elapsed(self) -> float:
-        return self.end - self.start
-
-
-class TimeTape:
-    """Minimal tape that mirrors :class:`GradTape` but for timestamps."""
-
-    def __init__(self) -> None:
-        self._nodes: dict[int, TimeNode] = {}
-        self._last_id: int | None = None
-
-    def record(self, start: float, end: float) -> int:
-        """Append a new timing node to the tape."""
-
-        node_id = len(self._nodes)
-        parents = [(self._last_id, 0)] if self._last_id is not None else []
-        self._nodes[node_id] = TimeNode(start=start, end=end, parents=parents)
-        self._last_id = node_id
-        return node_id
-
-    def traverse(self):
-        """Yield ``(node_id, TimeNode)`` in chronological order."""
-
-        for nid in sorted(self._nodes):
-            yield nid, self._nodes[nid]
-
-
-@dataclass
-class BenchmarkResult:
-    """Timing statistics and graph returned by :meth:`AbstractTensor.benchmark`."""
-
-    times: List[float]
-    tape: TimeTape
-
-    @property
-    def mean(self) -> float:
-        """Return the mean runtime in seconds."""
-        return sum(self.times) / len(self.times) if self.times else 0.0
-
-    @property
-    def best(self) -> float:
-        """Return the shortest observed runtime."""
-        return min(self.times) if self.times else 0.0
-
-    @property
-    def worst(self) -> float:
-        """Return the longest observed runtime."""
-        return max(self.times) if self.times else 0.0
 
 
 
@@ -278,7 +222,7 @@ class AbstractTensor:
     # --- Clamping ---
     def clamp(self, min: float | None = None, max: float | None = None) -> "AbstractTensor":
         """Return ``self`` clamped between ``min`` and ``max``."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.clamp_(min_val=min, max_val=max)
         return result
 
@@ -287,7 +231,7 @@ class AbstractTensor:
 
     def clamp_min(self, min_val: float) -> "AbstractTensor":
         """Clamp values below ``min_val`` up to ``min_val``."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.clamp_min_(min_val)
         return result
 
@@ -296,7 +240,7 @@ class AbstractTensor:
 
     def clamp_max(self, max_val: float) -> "AbstractTensor":
         """Clamp values above ``max_val`` down to ``max_val``."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.clamp_max_(max_val)
         return result
 
@@ -337,7 +281,7 @@ class AbstractTensor:
 
     # --- Logical ---
     def logical_not(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.logical_not_()
         return result
 
@@ -347,7 +291,7 @@ class AbstractTensor:
     # --- Unary math ---
     def sqrt(self) -> "AbstractTensor":
         if isinstance(self, AbstractTensor):
-            result = type(self)(track_time=self.track_time)
+            result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         else:
             result = AbstractTensor.get_tensor(self.data, track_time=False)
         result.data = self.sqrt_()
@@ -357,7 +301,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement sqrt_()")
 
     def exp(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.exp_()
         return result
 
@@ -365,7 +309,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement exp_()")
 
     def log(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_()
         return result
 
@@ -374,7 +318,7 @@ class AbstractTensor:
 
     # --- Softmax utilities ---
     def softmax(self, dim: int = -1) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.softmax_(dim)
         return result
 
@@ -382,7 +326,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement softmax_()")
 
     def log_softmax(self, dim: int = -1) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_softmax_(dim)
         return result
 
@@ -392,25 +336,25 @@ class AbstractTensor:
     # --- Basic layout ---
     def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.mean_(dim=dim, keepdim=keepdim)
         return result
 
     def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.sum_(dim=dim, keepdim=keepdim)
         return result
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
         """Return the cumulative sum of the tensor along a dimension."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.cumsum_(dim)
         return result
 
     def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.min_(dim=dim, keepdim=keepdim)
         return result
 
@@ -442,8 +386,25 @@ class AbstractTensor:
         if isinstance(obj, AbstractTensor):
             return obj.data
         return obj
-    def __init__(self, track_time: bool = False):
+    def __init__(self, track_time: bool = False, tape: "GradTape" | None = None):
+        """Create a new tensor wrapper.
+
+        Parameters
+        ----------
+        track_time:
+            Unused placeholder retained for API compatibility.
+        tape:
+            Optional :class:`GradTape` the tensor should attach to. If omitted,
+            the global ``autograd`` tape is used and the tensor registers itself
+            as a root node on that graph.
+        """
+
         self.track_time = track_time
+        if tape is None:
+            from . import autograd as _autograd  # local import to avoid cycle
+            tape = _autograd.autograd.tape
+        self._tape = tape
+        self._tape.create_tensor_node(self)
 
 
     def tensor_from_list_(self, data, dtype=None, device=None):
@@ -523,7 +484,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement full_like_()")
 
     def clone(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.clone_()
         return result
 
@@ -532,7 +493,7 @@ class AbstractTensor:
         return self.clone()
 
     def to_device(self, device: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_device_(device)
         return result
 
@@ -713,17 +674,17 @@ class AbstractTensor:
     def select_by_indices(
         self, indices_dim0: Any = None, indices_dim1: Any = None
     ) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.select_by_indices_(indices_dim0, indices_dim1)
         return result
 
     def log_softmax(self, dim: int = -1) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_softmax_(dim)
         return result
 
     def pad(self, pad: Tuple[int, ...] = (0, 0), value: float = 0) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.pad_(pad, value)
         return result
 
@@ -738,7 +699,7 @@ class AbstractTensor:
         value:
             Constant fill value for padded regions.
         """
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.pad2d_(pad, value)
         return result
 
@@ -755,7 +716,7 @@ class AbstractTensor:
         dilation: Union[int, Tuple[int, int]] = 1,
     ) -> "AbstractTensor":
         """Extract sliding local blocks as columns (im2col)."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.unfold2d_(kernel_size, stride, padding, dilation)
         return result
 
@@ -870,7 +831,7 @@ class AbstractTensor:
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
     def expand(self, shape: tuple) -> "AbstractTensor":
         """Backend-agnostic expand/broadcast_to (view when possible)."""
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.expand_(shape)
         return result
     # in AbstractTensor (abstraction.py)
@@ -928,7 +889,7 @@ class AbstractTensor:
         )
 
     def view_flat(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.view_flat_()
         return result
 
@@ -938,14 +899,14 @@ class AbstractTensor:
         indices_dim1: Any = None,
         values_to_assign: Any = None,
     ) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.assign_at_indices_(
             indices_dim0, indices_dim1, values_to_assign
         )
         return result
 
     def increment_at_indices(self, mask: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.increment_at_indices_(mask)
         return result
 
@@ -954,7 +915,7 @@ class AbstractTensor:
     
 
     def boolean_mask_select(self, mask: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.boolean_mask_select_(mask)
         return result
 
@@ -963,17 +924,17 @@ class AbstractTensor:
 
 
     def index_select(self, dim: int = 0, indices: Any = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.index_select_(dim, indices)
         return result
 
     def argmin(self, dim: Optional[int] = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.argmin_(dim)
         return result
 
     def interpolate(self, size: Tuple[int, ...] = None) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.interpolate_(size)
         return result
 
@@ -983,12 +944,12 @@ class AbstractTensor:
     def load(
         self, filepath: str, dtype: Any = None, device: Any = None
     ) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.load_(filepath, dtype, device)
         return result
 
     def to_dtype(self, dtype: str = "float") -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
         return result
 
@@ -1089,11 +1050,37 @@ class AbstractTensor:
         from . import autograd as _autograd
 
         inputs = list(inputs)
-        if any(getattr(x, "requires_grad", False) for x in inputs if isinstance(x, AbstractTensor)):
+        tape = None
+        for t in inputs:
+            if isinstance(t, AbstractTensor):
+                tape = getattr(t, "_tape", None)
+                if tape is not None:
+                    break
+        if tape is None:
+            tape = _autograd.autograd.tape
+
+        requires = any(
+            getattr(x, "requires_grad", False) for x in inputs if isinstance(x, AbstractTensor)
+        )
+        track = any(
+            getattr(x, "track_time", False) for x in inputs if isinstance(x, AbstractTensor)
+        )
+
+        if requires or track:
+            start = time.perf_counter() if track else None
+
             def finalize(result: Any):
-                _autograd.autograd.record(op, inputs, result)
+                end = time.perf_counter() if track else None
+                if requires:
+                    try:
+                        result._requires_grad = True  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                tape.record(op, inputs, result, start=start, end=end)
                 return result
+
             return finalize
+
         return lambda result: result
 
     def _apply_operator(self, op: str, left: Any, right: Any):
@@ -1174,7 +1161,7 @@ class AbstractTensor:
         l = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
         r = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
 
-        result = type(self)(track_time=self.track_time)
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self._apply_operator__(op, l, r)
         return finalize(result)
 
@@ -1309,7 +1296,7 @@ class AbstractTensor:
 
         result = data[index]
         if isinstance(result, self.tensor_type):
-            wrapped = type(self)(track_time=self.track_time)
+            wrapped = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
             wrapped.data = result
             return wrapped
         return result
@@ -1346,34 +1333,28 @@ class AbstractTensor:
         return bool(self.item())
 
     @staticmethod
-    def benchmark(fn: Callable, *args, repeat: int = 10, warmup: int = 1, **kwargs) -> BenchmarkResult:
-        """Benchmark a callable and return timing statistics.
+    def benchmark(
+        fn: Callable, *args, repeat: int = 1, warmup: int = 0, **kwargs
+    ) -> "TapeProfiler":
+        """Run ``fn`` repeatedly and profile recorded operations.
 
-        Args:
-            fn: The callable to execute. It is invoked as ``fn(*args, **kwargs)``.
-            *args: Positional arguments passed to ``fn``.
-            repeat: Number of timed iterations to run.
-            warmup: Number of initial iterations to run before timing begins.
-            **kwargs: Keyword arguments forwarded to ``fn``.
-
-        Returns:
-            :class:`BenchmarkResult` containing per-iteration runtimes in seconds
-            and a timestamp graph mirroring autograd's accounting.
+        The callable is executed ``warmup`` times without recording to allow the
+        runtime to stabilise.  A fresh :class:`GradTape` is then installed on the
+        global autograd engine and ``fn`` is executed ``repeat`` additional
+        times.  The returned :class:`TapeProfiler` exposes statistics for all
+        operations that were recorded on the tape.
         """
-        import time
+
+        from . import autograd as _autograd
 
         for _ in range(max(warmup, 0)):
             fn(*args, **kwargs)
 
-        times: List[float] = []
-        tape = TimeTape()
+        tape = _autograd.GradTape()
+        _autograd.autograd.tape = tape
         for _ in range(max(repeat, 0)):
-            start = time.perf_counter()
             fn(*args, **kwargs)
-            end = time.perf_counter()
-            times.append(end - start)
-            tape.record(start, end)
-        return BenchmarkResult(times, tape)
+        return _autograd.TapeProfiler(tape)
 
     def data_or(self, obj: Any = None) -> Any:
         """Return self.data if no argument is passed, otherwise return the argument unchanged."""

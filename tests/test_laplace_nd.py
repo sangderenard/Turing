@@ -39,6 +39,7 @@ def _laplace_power_section(backend_name, backend_cls, N=8):
         except NotImplementedError:
             pass
         x = backend_cls.linspace(0, 1, N)
+        x.track_time = True
         return (x - 0.5) ** 2
     finally:
         BACKEND_REGISTRY.clear()
@@ -46,11 +47,13 @@ def _laplace_power_section(backend_name, backend_cls, N=8):
 
 
 def test_power_operation_average_time_pure_vs_numpy():
-    pure_res = PurePythonTensorOperations.benchmark(
+    pure_prof = PurePythonTensorOperations.benchmark(
         lambda: _laplace_power_section("pure_python", PurePythonTensorOperations), repeat=3
     )
-    numpy_res = NumPyTensorOperations.benchmark(
+    numpy_prof = NumPyTensorOperations.benchmark(
         lambda: _laplace_power_section("numpy", NumPyTensorOperations), repeat=3
     )
-    assert pure_res.mean > 0 and numpy_res.mean > 0
-    assert pure_res.mean != numpy_res.mean
+    pure_mean = pure_prof.per_op()["pow"]["mean"]
+    numpy_mean = numpy_prof.per_op()["pow"]["mean"]
+    assert pure_mean > 0 and numpy_mean > 0
+    assert pure_mean != numpy_mean
