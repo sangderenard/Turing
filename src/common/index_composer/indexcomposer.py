@@ -67,41 +67,38 @@ class GeneralIndexComposer:
         return patterns
 
     def compose_indices(self, grid_shape, patterns, boundary_mask=None):
-        """
-        Generates row/column indices and masks for neighbor relationships, 
-        returning pattern-specific boundary masks.
-
-        Args:
-            grid_shape (tuple): Shape of the grid.
-            patterns (list): List of pattern dictionaries.
-
-        Returns:
-            dict: Contains row indices, column indices, masks for each pattern, 
-                and boundary masks specific to each pattern.
-        """
         device = self.device
         ndim = len(grid_shape)
 
-        grid_ranges = [
-            AbstractTensor.arange(s, dtype=AbstractTensor.long_dtype_, device=device)
-            for s in grid_shape
-        ]
-        grid_indices = AbstractTensor.meshgrid(*grid_ranges, indexing='ij')
+        # float tensor just to pull backend + float dtype if needed later
+        test_tensor = AbstractTensor.zeros(grid_shape, dtype=AbstractTensor.float_dtype_, device=device)
+        ops = type(test_tensor)
+
+        # Always use an *instance-derived* integer dtype (falls back to AbstractTensor)
+        int_dtype = getattr(test_tensor, "long_dtype_", getattr(AbstractTensor, "long_dtype_", None))
+        if int_dtype is None:
+            raise RuntimeError("Could not resolve long/integer dtype for current backend.")
+
+        # Build integer coordinate grids for safe advanced indexing
+        grid_ranges = [ops.arange(s, dtype=int_dtype, device=device) for s in grid_shape]
+        grid_indices = ops.meshgrid(*grid_ranges, indexing='ij')
+
         total_size = math.prod(grid_shape)
-        flat_indices = (
-            AbstractTensor.arange(total_size, dtype=AbstractTensor.long_dtype_, device=device)
-            .reshape(grid_shape)
-        )
+        flat_indices = ops.arange(total_size, dtype=int_dtype, device=device).reshape(grid_shape)
+
         results = {'row_indices': {}, 'col_indices': {}, 'masks': {}, 'boundary_masks': {}}
+
         for pattern in patterns:
             label = pattern['label']
             offset = pattern['offset']
             periodic = pattern['periodic']
+
             bm_accum = (
-                AbstractTensor.zeros(grid_shape, dtype=AbstractTensor.long_dtype_, device=device)
+                ops.zeros(grid_shape, dtype=int_dtype, device=device)
                 if boundary_mask is None
-                else boundary_mask.astype(AbstractTensor.long_dtype_)
+                else boundary_mask.astype(int_dtype)
             )
+
             neighbor_indices = []
             for dim in range(ndim):
                 new_index = grid_indices[dim] + offset[dim]
@@ -111,21 +108,26 @@ class GeneralIndexComposer:
                     base = grid_indices[dim] + offset[dim]
                     if offset[dim] > 0:
                         cond = base >= grid_shape[dim]
-                        bm_accum = bm_accum + cond.astype(AbstractTensor.long_dtype_)
+                        bm_accum = bm_accum + cond.astype(int_dtype)
                     elif offset[dim] < 0:
                         cond = base < 0
-                        bm_accum = bm_accum + cond.astype(AbstractTensor.long_dtype_)
-                    new_index = AbstractTensor.clamp(new_index, min=0, max=grid_shape[dim] - 1)
+                        bm_accum = bm_accum + cond.astype(int_dtype)
+                    new_index = ops.clamp(new_index, min=0, max=grid_shape[dim] - 1)
                 neighbor_indices.append(new_index)
+
             bm = bm_accum.greater(0)
             valid_mask = bm.logical_not()
+
             row_indices = flat_indices[valid_mask]
             col_indices = flat_indices[tuple(neighbor_indices)][valid_mask]
+
             results['row_indices'][label] = row_indices
             results['col_indices'][label] = col_indices
             results['masks'][label] = valid_mask
             results['boundary_masks'][label] = bm
+
         return results
+
 
     def validate(self, grid_shape):
         """

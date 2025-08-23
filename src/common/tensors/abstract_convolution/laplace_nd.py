@@ -1854,8 +1854,8 @@ class Transform(TransformHub):
         Z_flat = Z.flatten()
         return AbstractTensor.stack([X_flat, Y_flat, Z_flat], dim=-1)
 
-    @classmethod
-    def create_transform(cls, type_of_transform, **kwargs):
+    @staticmethod
+    def create_transform(type_of_transform, **kwargs):
         #metric_transform = MetricTransform.create_metric_transform(type_of_transform, **kwargs)
         #if metric_transform is not None:
         #    return metric_transform
@@ -1873,7 +1873,7 @@ class Transform(TransformHub):
 
 
 class RectangularTransform(Transform):
-    def __init__(self, Lx, Ly, Lz, device='cpu', N_u=None, N_v=None, N_w=None, u_mode=None, v_mode=None, w_mode=None, precision=None):
+    def __init__(self, Lx, Ly, Lz, device='cpu', N_u=None, N_v=None, N_w=None, u_mode=None, v_mode=None, w_mode=None, precision=None, **kwargs):
         """
         Initialize the RectangularTransform with extents and optional grid modes.
         """
