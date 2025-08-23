@@ -133,6 +133,18 @@ class GradTape:
             pass
 
     # ------------------------------------------------------------------
+    # annotation utilities
+    # ------------------------------------------------------------------
+    def annotate(self, tensor: Any, **metadata: Any) -> None:
+        """Attach ``metadata`` to ``tensor``'s graph node if present."""
+        tid = id(tensor)
+        if tid not in self.graph:
+            return
+        node = self.graph.nodes[tid]
+        annotations = node.setdefault("annotations", {})
+        annotations.update(metadata)
+
+    # ------------------------------------------------------------------
     # recording utilities
     # ------------------------------------------------------------------
     def record(

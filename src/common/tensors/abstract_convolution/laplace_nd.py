@@ -487,9 +487,9 @@ class BuildLaplace3D:
             col_indices.extend(col_indices_map.flatten().tolist())
             values.extend(laplacian_contrib[self.index_map['masks'][label].cpu()].flatten().tolist())
 
-            print(f"row_indices_map shape {row_indices_map.shape}" )
-            print(f"col_indices_map shape {col_indices_map.shape}" )
-            print(f"laplacian_contrib flattened shape {laplacian_contrib.flatten().shape}" )
+            logger.debug("row_indices_map shape %s", row_indices_map.shape)
+            logger.debug("col_indices_map shape %s", col_indices_map.shape)
+            logger.debug("laplacian_contrib flattened shape %s", laplacian_contrib.flatten().shape)
 
         # 3. Add Diagonal Contributions
         flat_diag_indices = AbstractTensor.arange(total_size, device='cpu')
@@ -526,7 +526,7 @@ class BuildLaplace3D:
 
             # Validate perturbed dense Laplace tensor
             logger.debug("Validating dense Laplacian tensor.")
-            self.validate_laplace_tensor(laplacian_tensor)
+            self.validate_laplace_tensor(laplacian_tensor, verbose=False)
             logger.debug("Dense Laplacian tensor validated.")
         else:
             laplacian_tensor = None
@@ -549,7 +549,7 @@ class BuildLaplace3D:
 
         # Validate perturbed sparse Laplace tensor
         logger.debug("Validating sparse Laplacian matrix.")
-        self.validate_laplace_tensor(laplacian)
+        self.validate_laplace_tensor(laplacian, verbose=False)
         logger.debug("Sparse Laplacian matrix validated.")
 
         logger.debug("Completed build_general_laplace.")
