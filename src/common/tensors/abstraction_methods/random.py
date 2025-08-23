@@ -249,7 +249,8 @@ def seed_from_bytes(b: bytes) -> int:
 
 def ensure_seed64(seed: Optional[Union[int, bytes]] = None) -> int:
     if seed is None:
-        return int.from_bytes(get_entropy(8, PRNG_SYS.OS_URANDOM), "little")
+        cs = make_csprng(CSPRNG_ALGO.CHACHA20)
+        return int.from_bytes(cs.random_bytes(8), "little")
     if isinstance(seed, bytes):
         return seed_from_bytes(seed)
     return u64(seed)
@@ -767,6 +768,11 @@ def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float
     distribution: "uniform" (default), "normal", or a callable/histogram
     """
     import math
+    if seed is None and kind != RANDOM_KIND.PRNG:
+        kind = RANDOM_KIND.CSPRNG
+    if kind == RANDOM_KIND.PRNG and seed is None:
+        cs = make_csprng(CSPRNG_ALGO.CHACHA20)
+        seed = int.from_bytes(cs.random_bytes(8), "little")
     def get_uniforms():
         if kind == RANDOM_KIND.SYSTEM:
             def sys_iter():
@@ -812,7 +818,17 @@ def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float
         else:
             raise ValueError("Unknown RANDOM_KIND for random_generator")
 
-    uniforms = get_uniforms()
+    uniform_batches = get_uniforms()
+
+    def uniform_scalars():
+        for batch in uniform_batches:
+            if isinstance(batch, list):
+                for v in batch:
+                    yield v
+            else:
+                yield batch
+
+    uniforms = uniform_scalars()
 
     def normal_batch():
         # Box-Muller for normal distribution
@@ -854,7 +870,13 @@ def random_generator(kind=RANDOM_KIND.SYSTEM, algo=None, seed=None, dtype="float
                 yield vals if batch_size > 1 else vals[0]
         return normal_iter()
     elif distribution == "uniform":
-        return uniforms
+        def uniform_iter():
+            while True:
+                vals = [next(uniforms) for _ in range(batch_size)]
+                if dtype == "int":
+                    vals = [int(v) for v in vals]
+                yield vals if batch_size > 1 else vals[0]
+        return uniform_iter()
     else:
         raise ValueError(f"Unknown distribution: {distribution}")
 

@@ -8,7 +8,6 @@ def take_n(iterable, n):
     return [next(iterable) for _ in range(n)]
 def empty(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
     """Create an uninitialized tensor of the given shape using the requested backend."""
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
     cls = _resolve_cls(cls)
     inst = cls(track_time=False)
     inst.data = inst.empty_(size, dtype, device)
@@ -20,7 +19,6 @@ def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwar
     All arguments for random_generator (kind, algo, seed, dtype, distribution, batch_size, etc) should be passed as kwargs.
     Only tensor-specific arguments (size, device, cls) are explicit.
     """
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
     cls = _resolve_cls(cls)
     total = 1
     for s in size:
@@ -28,16 +26,23 @@ def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwar
     # Always set batch_size for the generator
     kwargs = dict(kwargs)  # copy to avoid mutating caller
     kwargs.setdefault('batch_size', total)
+    if 'kind' not in kwargs:
+        if kwargs.get('seed') is not None:
+            kwargs['kind'] = RANDOM_KIND.PRNG
+        else:
+            kwargs['kind'] = RANDOM_KIND.CSPRNG
     rng = random_generator(**kwargs)
     vals = next(rng)
-    inst = cls(vals, track_time=False)
+    if not isinstance(vals, list):
+        vals = [vals]
+    inst = cls(track_time=False)
+    inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)
     return inst.reshape(*size)
 
 
 
 def randint(size: Tuple[int, ...], low: int, high: int, device: Any = None, *, cls=None, **kwargs):
     """Create a tensor of the given shape filled with random integers in [low, high)."""
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
     cls = _resolve_cls(cls)
     total = 1
     for s in size:
@@ -46,11 +51,19 @@ def randint(size: Tuple[int, ...], low: int, high: int, device: Any = None, *, c
         kwargs['batch_size'] = total
     if 'dtype' not in kwargs:
         kwargs['dtype'] = 'float'
+    if 'kind' not in kwargs:
+        if kwargs.get('seed') is not None:
+            kwargs['kind'] = RANDOM_KIND.PRNG
+        else:
+            kwargs['kind'] = RANDOM_KIND.CSPRNG
     rng = random_generator(**kwargs)
     vals = next(rng)
+    if not isinstance(vals, list):
+        vals = [vals]
     # Map floats in [0,1) to [low, high)
     int_vals = [int(low + (high - low) * v) for v in vals]
-    inst = cls(int_vals, track_time=False)
+    inst = cls(track_time=False)
+    inst.data = inst.tensor_from_list_(int_vals, 'int', device)
     return inst.reshape(*size)
 
 
@@ -320,7 +333,15 @@ def randn(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
         kwargs = {**kwargs, 'batch_size': total}
     if 'distribution' not in kwargs:
         kwargs = {**kwargs, 'distribution': 'normal'}
+    if 'kind' not in kwargs:
+        if kwargs.get('seed') is not None:
+            kwargs = {**kwargs, 'kind': RANDOM_KIND.PRNG}
+        else:
+            kwargs = {**kwargs, 'kind': RANDOM_KIND.CSPRNG}
     rng = random_generator(**kwargs)
     vals = next(rng)
-    inst = cls(vals, track_time=False)
+    if not isinstance(vals, list):
+        vals = [vals]
+    inst = cls(track_time=False)
+    inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)
     return inst.reshape(*size)
