@@ -25,9 +25,13 @@ def _unsqueeze(x: AbstractTensor, dim: int) -> AbstractTensor:
 
 def eye(n: int, *, dtype=None, device=None, batch_shape: Tuple[int, ...] = ()) -> AbstractTensor:
     """Vectorized I_n using arange/equality; supports broadcasting to batch_shape."""
-    i = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((n, 1)).expand((n, n))
-    j = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((1, n)).expand((n, n))
-    E = (i == j).to_dtype(dtype or AbstractTensor.float_dtype_)
+    test_tensor = AbstractTensor.tensor([1])
+    cls = type(test_tensor)
+    long_type = test_tensor.long_dtype_
+    float_type = test_tensor.float_dtype_
+    i = AbstractTensor.arange(n, dtype=long_type, device=device).reshape((n, 1)).expand((n, n))
+    j = AbstractTensor.arange(n, dtype=long_type, device=device).reshape((1, n)).expand((n, n))
+    E = (i == j).to_dtype(dtype or float_type)
     if batch_shape:
         # expand: (1,1,n,n) -> (*batch, n, n)
         E = E.reshape((1, 1, n, n)).expand(tuple(batch_shape) + (n, n))
@@ -139,13 +143,13 @@ def _lu_decompose_inplace(A: AbstractTensor):
         # find index of max along the row-axis (last-but-one of the sliced view)
         # We take the first occurrence; implement argmax via max + equality trick
         maxv = col.max(dim=-1, keepdim=True)
-        piv_rel = (col == maxv).to_dtype(AbstractTensor.long_dtype_)  # mask
+        piv_rel = (col == maxv).to_dtype(A.long_dtype_)  # mask
         # compute first index where mask==1; simple fallback: sum of prefix
         # Build running index vector [0..]
-        idxv = AbstractTensor.arange(col.get_shape()[-1], dtype=AbstractTensor.long_dtype_, device=U.get_device())
-        idxv = _unsqueeze(idxv, -2).expand(col.get_shape())
+        idxv = type(A).arange(col.get_shape()[-1], dtype=A.long_dtype_, device=U.get_device())
+        idxv = idxv.unsqueeze(-2).expand(col.get_shape())
         piv_idx_rel = (piv_rel * idxv).max(dim=-1)  # max picks the first highest index
-        piv = (piv_idx_rel + k).astype(np.int64)  # absolute pivot index
+        piv = (piv_idx_rel + k).to_dtype(A.long_dtype_)  # absolute pivot index
         # swap rows k and piv in U
         # We need scalar pivot per batch; for simplicity, handle only no-batch or identical pivot → if not, loop batches
         if len(shp) == 2:

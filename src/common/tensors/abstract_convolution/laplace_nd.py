@@ -376,7 +376,7 @@ class BuildLaplace3D:
             local_state = LocalStateNetwork(metric_tensor_func, (N_u, N_v, N_w), DEFAULT_CONFIGURATION)
             
             # Move to CPU and convert to numpy for processing
-            logger.debug("Moving metric tensors to CPU and converting to numpy.")
+            #logger.debug("Moving metric tensors to CPU and converting to numpy.")
             #g_ij = g_ij.clone().detach().cpu().numpy()  # Shape: (N_u, N_v, N_w, 3, 3)
             #g_inv = g_inv.clone().detach().cpu().numpy()  # Shape: (N_u, N_v, N_w, 3, 3)
             #det_g_all = det_g.clone().detach().cpu().numpy()  # Shape: (N_u, N_v, N_w)
