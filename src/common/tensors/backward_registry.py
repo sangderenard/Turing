@@ -446,12 +446,12 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             r"\frac{\partial z}{\partial p} = x^p \log x \quad (x>0)"
         ],
         "backward": {
-            "x": "gx = unbroadcast(g * p * (x + eps)**(p - 1), x.shape)",
-            "p": "gp = unbroadcast(g * (x + eps)**p * log(x + eps), p.shape)",
+            "x": "gx = unbroadcast(g * p * (x)**(p - 1), x.shape)",
+            "p": "gp = unbroadcast(g * (x)**p * log(abs(x) + eps), p.shape)",
         },
         "python": {
             "parameters": ["g", "x", "p"],
-            "body": "xs=x+eps(); ys=xs**p; gx=unbroadcast(g*p*(xs**(p-1)), x.shape); gp=unbroadcast(g*ys*AbstractTensor.log(xs), p.shape); return gx, gp"
+            "body": "absx=abs(x); xs=absx+eps(); ys=x**p; gx=unbroadcast(g*p*(x**(p-1)), x.shape); gp=unbroadcast(g*ys*AbstractTensor.log(xs), p.shape); return gx, gp"
         },
         "domain": "x>0 if p varies; if p is integer constant, extend by continuity.",
         "notes": "When p is constant, only x-branch is needed.",
