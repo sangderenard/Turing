@@ -1,6 +1,7 @@
 import numpy as np
 from src.common.tensors.numpy_backend import NumPyTensorOperations  # noqa: F401
 from src.common.tensors.pure_backend import PurePythonTensorOperations  # noqa: F401
+from src.common.tensors.abstraction import AbstractTensor
 import pytest
 from src.common.tensors.abstract_convolution import laplace_nd as laplace
 
@@ -25,6 +26,19 @@ def test_laplace_builds_with_numpy():
         f=0.0,
     )
     assert L_dense is not None or L_scipy is not None
+
+
+def test_edge_index_dtype_long():
+    if not hasattr(laplace, "TransformHub"):
+        pytest.skip("TransformHub not available")
+
+    edges = [[0, 1], [1, 2]]
+    edge_index = AbstractTensor.tensor(edges, dtype=AbstractTensor.long_dtype_)
+
+    data = AbstractTensor.arange(3, dtype=AbstractTensor.long_dtype_)
+    _ = data[edge_index]
+
+    assert edge_index.dtype == AbstractTensor.long_dtype_
 
 
 def _laplace_power_section(backend_name, backend_cls, N=8):
