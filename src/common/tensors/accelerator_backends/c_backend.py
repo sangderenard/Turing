@@ -341,6 +341,13 @@ class CTensorOperations(AbstractTensor):
     def numel_(self, tensor: CTensor) -> int:
         return tensor.size
 
+    def __trunc__(self):
+        import math
+        tensor = self.data
+        if tensor.size != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+        return int(math.trunc(tensor.buffer[0]))
+
     def mean_(self, tensor: Any, dim: Optional[int] = None) -> Any:
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))

@@ -173,6 +173,12 @@ class PyTorchTensorOperations(AbstractTensor):
         import torch
         return torch.ceil(self.data)
 
+    def __trunc__(self):
+        import torch
+        if self.data.numel() != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+        return int(torch.trunc(self.data).item())
+
     def softmax_(self, dim):
         import torch
         return torch.softmax(self.data, dim=dim)

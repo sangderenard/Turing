@@ -127,6 +127,9 @@ class OpenGLTensorOperations(AbstractTensor):
             "unravel_index not implemented for OpenGL backend"
         )
 
+    def __trunc__(self):
+        raise NotImplementedError("trunc not implemented for OpenGL backend")
+
     def repeat_interleave_(self, repeats: int = 1, dim: int | None = None):
         raise NotImplementedError
 

@@ -1433,6 +1433,13 @@ class PurePythonTensorOperations(AbstractTensor):
         import math
         return self._map_unary(math.ceil, self.data)
 
+    def __trunc__(self):
+        import math
+        if self.numel_() != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+        value = self.item_(self.data)
+        return int(math.trunc(value))
+
     def exp_(self):
         import math
         return self._map_unary(math.exp, self.data)
