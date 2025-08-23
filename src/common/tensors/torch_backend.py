@@ -583,6 +583,8 @@ class PyTorchTensorOperations(AbstractTensor):
         result = type(self)(default_device=self.default_device)
         result.data = repeated
         return result
+    def unsqueeze_(self, dim: int):
+        return self.data.unsqueeze(dim)
 
     @classmethod
     def tensor_from_list(cls, data, dtype=None, device=None):
