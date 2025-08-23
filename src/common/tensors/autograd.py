@@ -392,6 +392,8 @@ class Autograd:
                     continue
                 go = grad_out
                 parent_grads = bw(go, *node.ctx["inputs"])
+                if not isinstance(parent_grads, (list, tuple)):
+                    parent_grads = (parent_grads,)
                 for (pid, _), g in zip(node.parents, parent_grads):
                     if g is None:
                         continue
