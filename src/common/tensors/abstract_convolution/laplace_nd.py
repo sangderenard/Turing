@@ -1490,18 +1490,23 @@ class GridDomain:
         if getattr(transform, 'autogrid', False):
             U, V, W = transform.obtain_autogrid()
         else:
+            from ..abstraction_methods.creation import _resolve_cls
+            cls = _resolve_cls(None)
+            if precision is None:
+                inst = cls(track_time=False)
+                precision = getattr(inst, 'float_dtype_', None)
             # Generate u_grid, v_grid, w_grid using the respective mode dictionaries
             u_grid, _ = generate_grid(
                 N=N_u, L=uextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[1], cls=type(U), **u_mode
+                keep_end=grid_boundaries[1], cls=cls, **u_mode
             )
             v_grid, _ = generate_grid(
                 N=N_v, L=vextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[3], cls=type(V), **v_mode
+                keep_end=grid_boundaries[3], cls=cls, **v_mode
             )
             w_grid, _ = generate_grid(
                 N=N_w, L=wextent, device=device, dtype=precision,
-                keep_end=grid_boundaries[5], cls=type(W), **w_mode
+                keep_end=grid_boundaries[5], cls=cls, **w_mode
             )
 
             # Create U, V, W meshgrids
@@ -1786,7 +1791,12 @@ class Transform(TransformHub):
             return U, V
 
     
-    def create_grid_mesh(self, resolution_u, resolution_v, resolution_w, cls, dtype):
+    def create_grid_mesh(self, resolution_u, resolution_v, resolution_w, cls=None, dtype=None):
+        from ..abstraction_methods.creation import _resolve_cls
+        cls = _resolve_cls(cls)
+        if dtype is None:
+            inst = cls(track_time=False)
+            dtype = getattr(inst, 'float_dtype_', None)
         # Derive periodicity based on endpoint exclusion in grid boundaries
         periodic_u = not (self.grid_boundaries[0] and self.grid_boundaries[1])  # True if either endpoint is excluded for U
         periodic_v = not (self.grid_boundaries[2] and self.grid_boundaries[3])  # True if either endpoint is excluded for V
