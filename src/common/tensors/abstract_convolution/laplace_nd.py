@@ -948,6 +948,8 @@ class TransformHub:
         Z_flat = Z.flatten()
 
         source, target = edge_index[:, 0], edge_index[:, 1]
+        print(source)
+        print(target)
         edge_lengths = AbstractTensor.sqrt((X_flat[source] - X_flat[target])**2 +
                                 (Y_flat[source] - Y_flat[target])**2 +
                                 (Z_flat[source] - Z_flat[target])**2)
