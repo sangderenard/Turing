@@ -58,20 +58,30 @@ def _v2_valuewise(
     a = self.reshape(-1).tolist()
     b = other_t.reshape(-1).tolist()
     na, nb = len(a), len(b)
-    lifted = {"left": False, "right": False}
-    if na != nb:
-        if not allow_scalar: raise ValueError(f"{op}: size mismatch {na} vs {nb}")
-        if na == 1 and nb > 1: a, na, lifted["left"]  = [a[0]] * nb, nb, True
-        elif nb == 1 and na > 1: b, nb, lifted["right"] = [b[0]] * na, na, True
-        else: raise ValueError(f"{op}: incompatible lengths {na} vs {nb}")
+    target = max(na, nb)
+
+    def lift(lst, name):
+        if len(lst) == target:
+            return lst, False
+        if allow_scalar and len(lst) == 1:
+            return [lst[0]] * target, True
+        if target % len(lst) == 0:
+            k = target // len(lst)
+            return [lst[i // k] for i in range(target)], True
+        raise ValueError(f"{op}: incompatible lengths {na} vs {nb}")
+
+    a, left_lift = lift(a, "left")
+    b, right_lift = lift(b, "right")
+    lifted = {"left": left_lift, "right": right_lift}
 
     K = self._scalar_kernel(op)
-    out = [K(self._as_scalar(a[i]), self._as_scalar(b[i])) for i in range(na)]
-    out = self.ensure_tensor(out).reshape(*self.get_shape())
+    out = [K(self._as_scalar(a[i]), self._as_scalar(b[i])) for i in range(target)]
+    shape = self.get_shape() if na == target else other_t.get_shape()
+    out = self.ensure_tensor(out).reshape(*shape)
     out = finalize(out)
     tape = getattr(out, "_tape", None)
     if tape and annotate:
-        tape.annotate(out, **({"eval_mode":"valuewise","v":"v2","length":na,"scalar_lift":lifted} | annotate))
+        tape.annotate(out, **({"eval_mode":"valuewise","v":"v2","length":target,"scalar_lift":lifted} | annotate))
     return out
 
 # --------------- v3: ternary (where) (NO implicit broadcast) ---------------
@@ -92,22 +102,32 @@ def _v3_valuewise(
     c = self.reshape(-1).tolist()
     A = a_t.reshape(-1).tolist()
     B = b_t.reshape(-1).tolist()
-    n = len(c)
 
-    def lift(lst, name):
-        if len(lst) == n: return lst, False
-        if allow_scalar and len(lst) == 1: return [lst[0]] * n, True
-        raise ValueError(f"{op}: {name} length {len(lst)} != {n}")
+    target = max(len(c), len(A), len(B))
 
-    A, liftA = lift(A, "a"); B, liftB = lift(B, "b")
+    def lift(lst, name, *, allow_div: bool = False):
+        if len(lst) == target:
+            return lst, False
+        if allow_div and len(lst) > 0 and target % len(lst) == 0:
+            k = target // len(lst)
+            return [lst[i // k] for i in range(target)], True
+        if allow_scalar and len(lst) == 1:
+            return [lst[0]] * target, True
+        raise ValueError(f"{op}: {name} length {len(lst)} != {target}")
+
+    A, liftA = lift(A, "a")
+    B, liftB = lift(B, "b")
+    c, liftC = lift(c, "cond", allow_div=True)
 
     K = self._scalar_kernel("where")
-    out = [K(self._as_scalar(c[i]), self._as_scalar(A[i]), self._as_scalar(B[i])) for i in range(n)]
-    out = self.ensure_tensor(out).reshape(*self.get_shape())
+    out = [K(self._as_scalar(c[i]), self._as_scalar(A[i]), self._as_scalar(B[i])) for i in range(target)]
+    # Result shape follows whichever operand carried the target length
+    shape = a_t.get_shape() if len(A) == target else b_t.get_shape()
+    out = self.ensure_tensor(out).reshape(*shape)
     out = finalize(out)
     tape = getattr(out, "_tape", None)
     if tape and annotate:
-        tape.annotate(out, **({"eval_mode":"valuewise","v":"v3","length":n,"scalar_lift":{"a":liftA,"b":liftB}} | annotate))
+        tape.annotate(out, **({"eval_mode":"valuewise","v":"v3","length":target,"scalar_lift":{"a":liftA,"b":liftB,"cond":liftC}} | annotate))
     return out
 
 # ----------------- Tiny user-facing shims (preserve real op names) ----------
@@ -125,6 +145,7 @@ def __invert__(self):            return self._v1_valuewise("invert", annotate={"
 
 @staticmethod
 def where(cond, a, b, *, allow_scalar: bool = True):
+    from ..abstraction import AbstractTensor
     if not isinstance(cond, AbstractTensor):
         raise TypeError("AbstractTensor.where expects first arg to be an AbstractTensor condition")
     return cond._v3_valuewise("where", a, b, allow_scalar=allow_scalar, annotate={"op":"where"})

@@ -214,6 +214,38 @@ class GradTape:
         return result
 
     # ------------------------------------------------------------------
+    # metadata utilities
+    # ------------------------------------------------------------------
+    def annotate(self, tensor: Any, **metadata: Any) -> None:
+        """Attach ``metadata`` to the :class:`GradNode` for ``tensor``.
+
+        The elementwise helpers use this to stash bookkeeping information
+        (e.g. evaluation mode and scalar lifting).  Missing nodes are ignored
+        so callers may unconditionally attempt to annotate intermediates.
+        """
+
+        tid = id(tensor)
+        node = self._nodes.get(tid)
+        if node is None:
+            return
+
+        anns = node.ctx.setdefault("annotations", {})
+        anns.update(metadata)
+
+        if self.graph.has_node(tid):
+            g_anns = self.graph.nodes[tid].setdefault("annotations", {})
+            g_anns.update(metadata)
+
+            # Also annotate the generating op node if present.
+            try:
+                for pred in self.graph.predecessors(tid):
+                    if self.graph.nodes[pred].get("kind") == "op":
+                        p_anns = self.graph.nodes[pred].setdefault("annotations", {})
+                        p_anns.update(metadata)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
     # traversal utilities
     # ------------------------------------------------------------------
     def node(self, tensor: Any) -> Optional[GradNode]:
