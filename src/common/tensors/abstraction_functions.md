@@ -118,6 +118,10 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.coth()
 - AbstractTensor.sinc()
 
+## Spectral Transforms
+- AbstractTensor.fft()
+- AbstractTensor.ifft()
+
 ## Persistence
 - AbstractTensor.save()
 - AbstractTensor.load()

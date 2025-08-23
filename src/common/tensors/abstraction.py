@@ -1648,6 +1648,10 @@ from .abstraction_methods.trigonometry import (
     coth as trig_coth,
     sinc as trig_sinc,
 )
+from .abstraction_methods.fourier import (
+    fft as fourier_fft,
+    ifft as fourier_ifft,
+)
 from .abstraction_methods.properties import (
     numel as prop_numel,
     item as prop_item,
@@ -1780,6 +1784,8 @@ _bind_and_wrap({
     "csch": trig_csch,
     "coth": trig_coth,
     "sinc": trig_sinc,
+    "fft": fourier_fft,
+    "ifft": fourier_ifft,
 })
 
 AbstractTensor.numel   = prop_numel

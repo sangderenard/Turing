@@ -25,8 +25,8 @@ def _unsqueeze(x: AbstractTensor, dim: int) -> AbstractTensor:
 
 def eye(n: int, *, dtype=None, device=None, batch_shape: Tuple[int, ...] = ()) -> AbstractTensor:
     """Vectorized I_n using arange/equality; supports broadcasting to batch_shape."""
-    i = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((n, 1))
-    j = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((1, n))
+    i = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((n, 1)).expand((n, n))
+    j = AbstractTensor.arange(n, dtype=AbstractTensor.long_dtype_, device=device).reshape((1, n)).expand((n, n))
     E = (i == j).to_dtype(dtype or AbstractTensor.float_dtype_)
     if batch_shape:
         # expand: (1,1,n,n) -> (*batch, n, n)
