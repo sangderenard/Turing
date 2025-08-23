@@ -2044,7 +2044,7 @@ class HeatEngine(DtCompatibleEngine):
     def __init__(self, laplacian_tensor, initial_temperature, alpha=0.01):
         self.laplacian_tensor = laplacian_tensor
         self.alpha = alpha
-        self.temperature = initial_temperature.flatten().copy()
+        self.temperature = initial_temperature.flatten().copy() if initial_temperature.ndim > 1 else initial_temperature.copy()
         self.N_u = int(AbstractTensor.cbrt(len(self.temperature)))
         self.prev_temperature = self.temperature.copy()
         self.step_count = 0
