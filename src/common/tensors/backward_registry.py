@@ -136,7 +136,7 @@ def unbroadcast(G, target_shape):
         if ts == 1 and gs != 1:
             G = AbstractTensor.sum(G, axis=ax, keepdim=True)
 
-    return AbstractTensor.reshape(G, tuple(t_shape))
+    return G.reshape(tuple(t_shape))
 
 def expand_to(G, shape):
     # Prefer a native broadcast_to if available

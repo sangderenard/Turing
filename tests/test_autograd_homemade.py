@@ -96,4 +96,5 @@ def test_autograd_complex_sequence():
     np.testing.assert_allclose(grad_w[1], y_t.grad.numpy(), rtol=1e-5, atol=1e-7)
     np.testing.assert_allclose(grad_w[2], z_t.grad.numpy(), rtol=1e-5, atol=1e-7)
 
-    
+if __name__ == "__main__":
+    test_autograd_complex_sequence()
