@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from ..tensors.abstraction import AbstractTensor
 from .dt_scaler import Metrics
 
 
@@ -54,8 +55,8 @@ class SuperstepPlan:
         Numerical tolerance for deciding when the target window has been
         satisfied.
     """
-    round_max: float
-    dt_init: float
+    round_max: float | AbstractTensor
+    dt_init: float | AbstractTensor
     allow_increase_mid_round: bool = False
     eps: float = 1e-15
 
@@ -79,8 +80,8 @@ class SuperstepResult:
         The last-step :class:`~src.common.dt_scaler.Metrics` for UI or
         logging. Optional and engine-dependent.
     """
-    advanced: float
-    dt_next: float
+    advanced: float | AbstractTensor
+    dt_next: float | AbstractTensor
     steps: int
     clamped: bool
     metrics: Optional[Metrics] = None
