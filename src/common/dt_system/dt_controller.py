@@ -8,9 +8,28 @@ import time
 
 from ..tensors.abstraction import AbstractTensor
 
+try:  # NumPy is the canonical lightweight backend
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    np = None
+
 from .dt_scaler import Metrics
 from .dt import SuperstepPlan, SuperstepResult
 from .debug import dbg, is_enabled, pretty_metrics
+
+
+def _restore_type(value, ref):
+    """Return ``value`` converted to the type of ``ref``."""
+    if isinstance(ref, AbstractTensor):
+        return value
+    val = float(value.item() if isinstance(value, AbstractTensor) else value)
+    if np is not None and isinstance(ref, np.ndarray):
+        return np.array(val, dtype=ref.dtype)
+    if isinstance(ref, list):
+        return [val]
+    if isinstance(ref, tuple):
+        return (val,)
+    return val
 
 
 @dataclass
@@ -36,7 +55,8 @@ class STController:
         max_vel_t = max_vel if isinstance(max_vel, AbstractTensor) else AbstractTensor.tensor(max_vel)
         self.max_vel_ever = AbstractTensor.maximum(max_vel_t, 0.95 * self.max_vel_ever)
         dx_t = dx if isinstance(dx, AbstractTensor) else AbstractTensor.tensor(dx)
-        self.dt_max = dx_t / AbstractTensor.maximum(self.max_vel_ever, 1e-30)
+        dt_max_t = dx_t / AbstractTensor.maximum(self.max_vel_ever, 1e-30)
+        self.dt_max = _restore_type(dt_max_t, dx)
         if is_enabled():
             dbg("ctrl").debug(
                 f"update_dt_max: max_vel={float(max_vel_t.item() if isinstance(max_vel_t, AbstractTensor) else max_vel_t):.3e} "
@@ -48,6 +68,7 @@ class STController:
     def pi_update(self, dt_prev, dt_pen, osc: bool,
                   *, dt_min: float | AbstractTensor | None = None,
                   dt_max: float | AbstractTensor | None = None):
+        ref_prev = dt_prev
         dt_prev = dt_prev if isinstance(dt_prev, AbstractTensor) else AbstractTensor.tensor(dt_prev)
         dt_pen = dt_pen if isinstance(dt_pen, AbstractTensor) else AbstractTensor.tensor(dt_pen)
         self.acc = self.acc if isinstance(self.acc, AbstractTensor) else AbstractTensor.tensor(self.acc)
@@ -74,7 +95,7 @@ class STController:
                 f"pi_update: dt_prev={float(dt_prev.item()):.6g} dt_pen={float(dt_pen.item()):.6g} osc={osc} -> dt_new={float(dt_new.item()):.6g}"
                 f" (bounds: dt_min={dt_min} dt_max={dt_max}) acc={float(self.acc.item()):.3f}"
             )
-        return dt_new
+        return _restore_type(dt_new, ref_prev)
 
 
 def step_with_dt_control_used(state,
@@ -84,19 +105,25 @@ def step_with_dt_control_used(state,
                              ctrl: STController,
                              advance,
                              retries: int = 0,
-                             failures: list[tuple[float, Metrics]] | None = None):
+                             failures: list[tuple[float, Metrics]] | None = None,
+                             ref=None):
     if failures is None:
         failures = []
+    if ref is None:
+        ref = dt
+
+    dt_tensor = dt if isinstance(dt, AbstractTensor) else AbstractTensor.tensor(dt)
+    dt_for_advance = _restore_type(dt_tensor, ref)
 
     saved = state.copy_shallow()
     if is_enabled():
         dbg("ctrl").debug(
-            f"advance try: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} dx={float(dx.item() if isinstance(dx, AbstractTensor) else dx):.6g} retries={retries}"
+            f"advance try: dt={float(dt_for_advance):.6g} dx={float(dx.item() if isinstance(dx, AbstractTensor) else dx):.6g} retries={retries}"
         )
-    ok, metrics = advance(state, dt)
+    ok, metrics = advance(state, dt_for_advance)
     if (not ok) or (metrics.mass_err > targets.mass_max) or (metrics.div_inf > targets.div_max * 10.0):
         state.restore(saved)
-        failures.append((float(dt.item() if isinstance(dt, AbstractTensor) else dt), metrics))
+        failures.append((float(dt_for_advance), metrics))
         if is_enabled():
             dbg("ctrl").warning(
                 f"advance failed: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} metrics=({pretty_metrics(metrics)})"
@@ -110,14 +137,14 @@ def step_with_dt_control_used(state,
                 )
             print("\n".join(lines))
             raise RuntimeError("adaptive timestep controller failed")
-        dt_half = dt * 0.5
+        dt_half = dt_tensor * 0.5
         if ctrl.dt_min is not None:
             dt_half = AbstractTensor.maximum(dt_half, ctrl.dt_min)
         if is_enabled():
             dbg("ctrl").debug(
                 f"retry with dt_half={float(dt_half.item() if isinstance(dt_half, AbstractTensor) else dt_half):.6g}"
             )
-        return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures)
+        return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures, ref=ref)
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
     penalty = max(
@@ -127,7 +154,7 @@ def step_with_dt_control_used(state,
     )
     dt_pen = dt_cfl / penalty
     dt_next = ctrl.pi_update(
-        dt_prev=dt,
+        dt_prev=dt_tensor,
         dt_pen=dt_pen,
         osc=(metrics.osc_flag or metrics.stiff_flag),
     )
@@ -141,17 +168,17 @@ def step_with_dt_control_used(state,
             + (f" dt_limit={metrics.dt_limit:.6g}" if metrics.dt_limit is not None else "")
             + f" -> dt_next={float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next):.6g} | {pretty_metrics(metrics)}"
         )
-    return metrics, dt_next, dt
+    return metrics, _restore_type(dt_next, ref), _restore_type(dt_tensor, ref)
 
 
 def step_with_dt_control(state, dt, dx, targets: Targets, ctrl: STController, advance, retries: int = 0):
-    metrics, dt_next, _dt_used = step_with_dt_control_used(state, dt, dx, targets, ctrl, advance, retries)
+    metrics, dt_next, _dt_used = step_with_dt_control_used(state, dt, dx, targets, ctrl, advance, retries, ref=dt)
     return metrics, dt_next
 
 
 def run_superstep(state,
-                  round_max: float,
-                  dt_init: float,
+                  round_max: float | AbstractTensor,
+                  dt_init: float | AbstractTensor,
                   dx: float,
                   targets: Targets,
                   ctrl: STController,
@@ -160,6 +187,8 @@ def run_superstep(state,
                   allow_increase_mid_round: bool = False,
                   max_iters: int = 10000,
                   eps: float = 1e-15):
+    ref_dt = dt_init
+    round_max_t = round_max if isinstance(round_max, AbstractTensor) else AbstractTensor.tensor(round_max)
     total = AbstractTensor.tensor(0.0)
     dt_cap = dt_init if isinstance(dt_init, AbstractTensor) else AbstractTensor.tensor(dt_init)
     if ctrl.dt_min is not None:
@@ -172,13 +201,13 @@ def run_superstep(state,
     iters = 0
     if is_enabled():
         dbg("ctrl").debug(
-            f"run_superstep: round_max={round_max:.6g} dt_init={dt_init:.6g} dx={dx:.6g}"
+            f"run_superstep: round_max={float(round_max_t.item()):.6g} dt_init={float(dt_cap.item()):.6g} dx={dx:.6g}"
         )
-    while (round_max - total).item() > eps and iters < max_iters:
+    while (round_max_t - total).item() > eps and iters < max_iters:
         iters += 1
-        remainder = round_max - total
+        remainder = round_max_t - total
         dt_try = AbstractTensor.minimum(dt_cap, remainder)
-        metrics, dt_next, dt_used = step_with_dt_control_used(state, dt_try, dx, targets, ctrl, advance)
+        metrics, dt_next, dt_used = step_with_dt_control_used(state, dt_try, dx, targets, ctrl, advance, ref=ref_dt)
         last_metrics = metrics
         if dt_used <= 0.0:
             break
@@ -197,7 +226,9 @@ def run_superstep(state,
                 f"  iter={iters} used={float(dt_used.item() if isinstance(dt_used, AbstractTensor) else dt_used):.6g} total={float(total.item()):.6g}/{round_max:.6g} next_cap={float(dt_cap.item()):.6g}"
             )
 
-    return total, last_dt_next, last_metrics
+    total_out = _restore_type(total, ref_dt)
+    dt_next_out = _restore_type(last_dt_next, ref_dt)
+    return total_out, dt_next_out, last_metrics
 
 
 def run_superstep_plan(state,
@@ -219,19 +250,20 @@ def run_superstep_plan(state,
     )
     total_val = float(total.item() if isinstance(total, AbstractTensor) else total)
     dt_next_val = float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next)
-    ref = plan.dt_init
+    plan_dt_init_val = float(plan.dt_init.item() if isinstance(plan.dt_init, AbstractTensor) else plan.dt_init)
+    ref = plan_dt_init_val
     if ctrl.dt_min is not None:
-        ref = max(ref, ctrl.dt_min)
+        ref = max(ref, float(ctrl.dt_min.item() if isinstance(ctrl.dt_min, AbstractTensor) else ctrl.dt_min))
     clamped = bool(dt_next_val < ref)
-    steps = max(1, int(round(total_val / max(plan.dt_init, 1e-30)))) if total_val > 0 else 0
-    return SuperstepResult(advanced=total_val, dt_next=dt_next_val, steps=steps, clamped=clamped, metrics=metrics)
+    steps = max(1, int(round(total_val / max(plan_dt_init_val, 1e-30)))) if total_val > 0 else 0
+    return SuperstepResult(advanced=total, dt_next=dt_next, steps=steps, clamped=clamped, metrics=metrics)
 
 
 # ------------------------- Realtime mode (single-step) -----------------------
 
 def step_realtime_once(
     state,
-    dt_current: float,
+    dt_current,
     dx: float,
     targets: Targets,
     ctrl: STController,
@@ -251,8 +283,10 @@ def step_realtime_once(
     within the allocation if it demonstrably reduces penalty.
     """
     # Single attempt only; no rollback or halving in realtime mode.
+    ref_dt = dt_current
+    dt_val = float(dt_current.item() if isinstance(dt_current, AbstractTensor) else dt_current)
     t0 = time.perf_counter()
-    ok, metrics = advance(state, float(dt_current))
+    ok, metrics = advance(state, dt_val)
     t1 = time.perf_counter()
     elapsed_ms = max((t1 - t0) * 1000.0, 0.0)
     # Attach timing to metrics generically
@@ -266,9 +300,9 @@ def step_realtime_once(
         dt_baseline = ctrl.dt_min if ctrl.dt_min is not None else 1e-6
         if is_enabled():
             dbg("ctrl").warning(
-                f"rt advance failed: dt={dt_current:.6g} -> next={dt_baseline:.6g} ({pretty_metrics(metrics)})"
+                f"rt advance failed: dt={dt_val:.6g} -> next={float(dt_baseline if not isinstance(dt_baseline, AbstractTensor) else dt_baseline.item()):.6g} ({pretty_metrics(metrics)})"
             )
-        return metrics, float(dt_baseline), float(dt_current)
+        return metrics, _restore_type(dt_baseline, ref_dt), _restore_type(dt_val, ref_dt)
 
     # Base proposal from allocation (thumbnailing simulated time to budget)
     # Ignore engine hard limit (dt_limit) in realtime to maintain pacing.
@@ -280,11 +314,11 @@ def step_realtime_once(
     if is_enabled():
         dbg("ctrl").debug(
             "rt: "
-            f"used_dt={float(dt_current):.6g} alloc={alloc_ms:.3f}ms cost={elapsed_ms:.3f}ms "
+            f"used_dt={dt_val:.6g} alloc={alloc_ms:.3f}ms cost={elapsed_ms:.3f}ms "
             + (f"dt_limit={metrics.dt_limit:.6g} " if metrics.dt_limit is not None else "")
             + f"-> dt_next={dt_next:.6g} | {pretty_metrics(metrics)}"
         )
 
-    return metrics, float(dt_next), float(dt_current)
+    return metrics, _restore_type(dt_next, ref_dt), _restore_type(dt_val, ref_dt)
 
  

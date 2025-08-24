@@ -11,6 +11,7 @@ from ...common.tensors.abstract_nn.core import Model, Linear
 from ...common.tensors.abstract_convolution.ndpca3conv import NDPCA3Conv3d
 from ...common.tensors.abstract_nn.losses import MSELoss
 from ...common.tensors.abstract_nn.optimizer import Adam
+from ...common.tensors.abstract_nn.utils import set_seed
 try:  # optional torch backend
     from ...common.tensors.torch_backend import PyTorchTensorOperations
 except Exception:  # pragma: no cover - torch is optional
@@ -105,6 +106,7 @@ class AsciiKernelClassifier:
         return x, y
 
     def _train_nn(self) -> None:
+        set_seed(0)
         train_x, train_y = self._prepare_nn_data()
         n_classes = train_y.shape[1]
         like = train_x[0]
