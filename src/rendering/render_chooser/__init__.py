@@ -17,6 +17,10 @@ import threading
 import time
 from typing import Any, Dict, Iterable, Tuple, List, Set
 from src.common.double_buffer import DoubleBuffer
+from src.rendering.ascii_diff import (
+    ThreadedAsciiDiffPrinter,
+    full_clear_and_reset_cursor,
+)
 
 __all__ = ["RenderChooser"]
 
@@ -30,6 +34,8 @@ class RenderChooser:
         self.mode = "ascii"
         self.renderer: Any
         self.screen = None
+        self._ascii_printer: ThreadedAsciiDiffPrinter | None = None
+        self._ascii_queue = None
 
         preferred = (mode or os.environ.get("TURING_RENDERER", "ascii")).lower()
 
@@ -96,6 +102,9 @@ class RenderChooser:
 
         self.renderer = AsciiRenderer(width, height)
         self.mode = "ascii"
+        self._ascii_printer = ThreadedAsciiDiffPrinter()
+        self._ascii_queue = self._ascii_printer.get_queue()
+        full_clear_and_reset_cursor()
 
         # Input and rendering thread state
         self._buffer = DoubleBuffer()
@@ -139,6 +148,8 @@ class RenderChooser:
                 close_fn()
         except Exception:
             pass
+        if self._ascii_printer is not None:
+            self._ascii_printer.stop()
         if self.mode in ("pygame", "opengl"):
             try:
                 import pygame
@@ -208,7 +219,9 @@ class RenderChooser:
                 (int(tri[1][0]), int(tri[1][1])),
                 (int(tri[2][0]), int(tri[2][1])),
             )
-        print(r.to_ascii())
+        ascii_out = r.to_ascii_diff()
+        if ascii_out and self._ascii_queue is not None:
+            self._ascii_queue.put(ascii_out)
 
     # ------------------------------------------------------------------
     def _render_opengl(self, state: Dict[str, Any]) -> None:

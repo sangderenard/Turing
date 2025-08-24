@@ -13,6 +13,7 @@ from .clock_renderer import ClockRenderer
 from .theme_manager import ThemeManager
 from .time_units import TimeUnit
 from .render_backend import RenderingBackend
+from .threaded_printer import ThreadedAsciiDiffPrinter
 
 __all__ = [
     "AsciiKernelClassifier",
@@ -28,5 +29,6 @@ __all__ = [
     "ThemeManager",
     "TimeUnit",
     "RenderingBackend",
+    "ThreadedAsciiDiffPrinter",
 ]
 
