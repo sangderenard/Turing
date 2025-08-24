@@ -21,8 +21,8 @@ def init_colorama_for_windows() -> None:
 
 def full_clear_and_reset_cursor() -> None:
     """Clear the terminal screen and move the cursor to the top-left."""
-    print(ansi.clear_screen() + Cursor.POS(0, 0), end="")
+    print(ansi.clear_screen() + Cursor.POS(0, 0), end="", flush=True)
 
 def reset_cursor_to_top() -> None:
     """Move the cursor to the top-left of the terminal screen."""
-    print(Cursor.POS(0, 0), end="")
+    print(Cursor.POS(0, 0), end="", flush=True)
