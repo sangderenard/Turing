@@ -114,7 +114,8 @@ class BuildLaplace3D:
                               singularity_dirichlet_func=None, singularity_neumann_func=None, k=0.0, 
                               metric_tensor_func=None, density_func=None, tension_func=None, 
                               device=None, grid_boundaries=(True, True, True, True, True, True), 
-                              artificial_stability=None, f=0, normalize=False, deploy_mode="raw", dense=False):
+                              artificial_stability=None, f=0, normalize=False, deploy_mode="raw", dense=False,
+                              return_package: bool = False):
         """
         Builds the Laplacian matrix for a 3D coordinate system using the provided u, v, w grids.
         Handles singularities using custom Dirichlet/Neumann conditions.
@@ -554,7 +555,87 @@ class BuildLaplace3D:
         logger.debug("Sparse Laplacian matrix validated.")
 
         logger.debug("Completed build_general_laplace.")
-        return laplacian_tensor, laplacian
+
+        # --- Package all computed data if requested ---
+        # Try to gather all partials, metric, steps, and COO triplets
+        J = None
+        try:
+            J = AbstractTensor.stack([
+                AbstractTensor.stack([dXdu, dXdv, dXdw], dim=-1),
+                AbstractTensor.stack([dYdu, dYdv, dYdw], dim=-1),
+                AbstractTensor.stack([dZdu, dZdv, dZdw], dim=-1),
+            ], dim=-2)
+        except Exception:
+            pass
+
+        sqrt_det_g = None
+        try:
+            sqrt_det_g = det_g.sqrt()
+        except Exception:
+            pass
+
+        normals_safe = None
+        try:
+            normals_safe = locals()["normals"]
+        except Exception:
+            pass
+
+        steps = {}
+        for k in ("du", "dv", "dw", "h2_u", "h2_v", "h2_w"):
+            if k in locals():
+                steps[k] = locals()[k]
+
+        grid_shape = (grid_u.shape[-1], grid_v.shape[-1], grid_w.shape[-1]) if hasattr(grid_u, "shape") else None
+
+        # COO triplets: row_indices, col_indices, values
+        coo_rows = None
+        coo_cols = None
+        coo_vals = None
+        try:
+            coo_rows = AbstractTensor.tensor(row_indices) if 'row_indices' in locals() else None
+            coo_cols = AbstractTensor.tensor(col_indices) if 'col_indices' in locals() else None
+            coo_vals = AbstractTensor.tensor(values) if 'values' in locals() else None
+        except Exception:
+            pass
+
+        package = {
+            "shape": {
+                "grid": grid_shape,
+                "spatial_nd": 3,
+                "nnz": int(coo_rows.shape[0]) if coo_rows is not None else None,
+            },
+            "partials": {
+                "dXdu": locals().get("dXdu"), "dYdu": locals().get("dYdu"), "dZdu": locals().get("dZdu"),
+                "dXdv": locals().get("dXdv"), "dYdv": locals().get("dYdv"), "dZdv": locals().get("dZdv"),
+                "dXdw": locals().get("dXdw"), "dYdw": locals().get("dYdw"), "dZdw": locals().get("dZdw"),
+            },
+            "jacobian": J,
+            "metric": {
+                "g":     locals().get("g_ij"),
+                "inv_g": locals().get("g_inv"),
+                "det_g": locals().get("det_g"),
+                "sqrt_det_g": sqrt_det_g,
+            },
+            "frame": {
+                "normals": normals_safe,
+            },
+            "steps": steps,
+            "coo": {
+                "rows": coo_rows,
+                "cols": coo_cols,
+                "vals": coo_vals,
+            },
+            "config": {
+                "stencil": INT_LAPLACEBELTRAMI_STENCIL if 'INT_LAPLACEBELTRAMI_STENCIL' in globals() else None,
+                "dtype": str(self.precision) if hasattr(self, 'precision') else None,
+                "device": str(device) if device is not None else None,
+            },
+        }
+
+        if return_package:
+            return laplacian_tensor, laplacian, package
+        else:
+            return laplacian_tensor, laplacian
 
 
     def validate_laplace_tensor(self, laplace_tensor, check_diagonal=True, check_off_diagonal=True, verbose=True):
