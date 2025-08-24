@@ -2,6 +2,8 @@
 from pathlib import Path
 import numpy as np
 from PIL import Image
+import os
+os.environ['TURING_DEBUG'] = '1'
 
 from .console import full_clear_and_reset_cursor
 from .theme_manager import ThemeManager
