@@ -8,9 +8,8 @@ from src.rendering.ascii_diff import ThreadedAsciiDiffPrinter
 def test_queue_join_prints_before_prompt(capfd):
     printer = ThreadedAsciiDiffPrinter()
     try:
-        q = printer.get_queue()
-        q.put("FRAME\n")
-        q.join()
+        printer.enqueue("FRAME\n")
+        printer.wait_until_empty()
         print("PROMPT")
     finally:
         printer.stop()

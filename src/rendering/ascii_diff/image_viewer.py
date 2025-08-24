@@ -20,29 +20,6 @@ def load_pixels(path: str) -> np.ndarray:
     return np.array(img)
 
 
-def _downsample(frame: np.ndarray, char_h: int, char_w: int) -> np.ndarray:
-    """Reduce ``frame`` to character-cell resolution.
-
-    The ``RenderChooser`` and underlying :class:`AsciiRenderer` operate on a
-    single pixel per terminal cell.  ``ascii_diff`` historically allowed each
-    character to represent a block of pixels.  To retain this behaviour we
-    average blocks of ``char_h``×``char_w`` pixels down to one value.
-    """
-
-    if char_h <= 1 and char_w <= 1:
-        return frame
-    h, w, c = frame.shape
-    new_h = h // char_h
-    new_w = w // char_w
-    if new_h == 0 or new_w == 0:
-        return frame
-    cropped = frame[: new_h * char_h, : new_w * char_w]
-    reshaped = cropped.reshape(new_h, char_h, new_w, char_w, c)
-    reduced = reshaped.mean(axis=(1, 3)).astype(np.uint8)
-    return reduced
-
-
-
 
 def menu():
     theme_manager = ThemeManager()
@@ -115,9 +92,10 @@ def menu():
             theme_manager.set_post_processing(post_processing)
             img = Image.open(image_path).convert("RGB")
             img = theme_manager.apply_theme(img)
-            frame = _downsample(np.array(img), char_h, char_w)
+            frame = np.array(img)
             h, w, _ = frame.shape
-            # Pass char cell and color settings to RenderChooser and AsciiRenderer
+            # Pass char cell and color settings to RenderChooser and AsciiRenderer.
+            # Each character cell corresponds to ``char_h``×``char_w`` pixels on the canvas.
             rc = RenderChooser(w, h, mode="ascii")
             rc.char_cell_pixel_height = char_h
             rc.char_cell_pixel_width = char_w

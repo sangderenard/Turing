@@ -29,15 +29,26 @@ __all__ = ["RenderChooser"]
 class RenderChooser:
     """Select a renderer backend, defaulting to ASCII."""
 
-    def __init__(self, width: int, height: int, mode: str | None = None) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        mode: str | None = None,
+        *,
+        sync_per_frame: bool = False,
+        queue_maxsize: int = 0,
+        block_on_queue_full: bool = True,
+    ) -> None:
         self.width = width
         self.height = height
         self.mode = "ascii"
         self.renderer: Any
         self.screen = None
         self._ascii_printer: ThreadedAsciiDiffPrinter | None = None
-        self._ascii_queue = None
         self._sync_event = threading.Event()
+        self.sync_per_frame = sync_per_frame
+        self._queue_maxsize = queue_maxsize
+        self._block_on_queue_full = block_on_queue_full
 
         preferred = (mode or os.environ.get("TURING_RENDERER", "ascii")).lower()
 
@@ -108,14 +119,19 @@ class RenderChooser:
             self.char_cell_pixel_width = 16
             self.enable_fg_color = True
             self.enable_bg_color = True
-            self.renderer = AsciiRenderer(width, height,
-                                         char_cell_pixel_height=self.char_cell_pixel_height,
-                                         char_cell_pixel_width=self.char_cell_pixel_width,
-                                         enable_fg_color=self.enable_fg_color,
-                                         enable_bg_color=self.enable_bg_color)
+            self.renderer = AsciiRenderer(
+                width,
+                height,
+                char_cell_pixel_height=self.char_cell_pixel_height,
+                char_cell_pixel_width=self.char_cell_pixel_width,
+                enable_fg_color=self.enable_fg_color,
+                enable_bg_color=self.enable_bg_color,
+            )
             self.mode = "ascii"
-            self._ascii_printer = ThreadedAsciiDiffPrinter()
-            self._ascii_queue = self._ascii_printer.get_queue()
+            self._ascii_printer = ThreadedAsciiDiffPrinter(
+                queue_maxsize=self._queue_maxsize,
+                block_on_full=self._block_on_queue_full,
+            )
             full_clear_and_reset_cursor()
 
         # Input and rendering thread state
@@ -133,6 +149,12 @@ class RenderChooser:
         """Queue ``state`` for rendering on the worker thread."""
 
         self._buffer.write_frame(state)
+        if self.sync_per_frame and self.mode == "ascii":
+            self._sync_event.clear()
+            self._buffer.write_frame({"__sync__": True})
+            self._sync_event.wait()
+            if self._ascii_printer is not None:
+                self._ascii_printer.wait_until_empty()
 
     # ------------------------------------------------------------------
     def poll_input(self) -> Tuple[Set[str], List[str]]:
@@ -172,14 +194,14 @@ class RenderChooser:
     # ------------------------------------------------------------------
     def sync(self) -> None:
         """Block until pending frames have been rendered and printed."""
-        if self.mode != "ascii" or self._ascii_queue is None:
+        if self.mode != "ascii" or self._ascii_printer is None:
             return
         self._sync_event.clear()
         # Send a sentinel frame that causes the worker thread to signal when
         # all previous frames have been processed.
-        self.render({"__sync__": True})
+        self._buffer.write_frame({"__sync__": True})
         self._sync_event.wait()
-        self._ascii_queue.join()
+        self._ascii_printer.wait_until_empty()
 
     # ------------------------------------------------------------------
     def _loop(self) -> None:
@@ -258,8 +280,8 @@ class RenderChooser:
             enable_fg_color=getattr(r, 'enable_fg_color', False),
             enable_bg_color=getattr(r, 'enable_bg_color', False),
         )
-        if ascii_out and self._ascii_queue is not None:
-            self._ascii_queue.put(ascii_out)
+        if ascii_out and self._ascii_printer is not None:
+            self._ascii_printer.enqueue(ascii_out)
 
     # ------------------------------------------------------------------
     def _render_opengl(self, state: Dict[str, Any]) -> None:
