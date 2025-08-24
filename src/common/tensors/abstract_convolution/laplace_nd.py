@@ -3,6 +3,7 @@ from ..abstraction import AbstractTensor
 import math
 import logging
 from src.common.tensors.coo_matrix import COOMatrix
+import numpy as np
 
 
 # Configure the logger at the module level
@@ -2108,6 +2109,8 @@ def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.
     x = AbstractTensor.linspace(0, 1, N_u)
     y = AbstractTensor.linspace(0, 1, N_u)
     X, Y = AbstractTensor.meshgrid(x, y)
+    X_np = np.array(X.tolist()).reshape(N_u, N_u)
+    Y_np = np.array(Y.tolist()).reshape(N_u, N_u)
     surface = None
     plot_state = {"surface": None}
 
@@ -2133,9 +2136,10 @@ def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.
             engine.step(dt)
         temp_grid = engine.temperature.reshape(N_u, N_u, N_u)
         Z = temp_grid[:, :, N_u // 2]
+        Z_np = np.array(Z.tolist()).reshape(N_u, N_u)
         if plot_state["surface"] is not None:
             plot_state["surface"].remove()
-        plot_state["surface"] = ax.plot_surface(X, Y, Z, cmap='viridis')
+        plot_state["surface"] = ax.plot_surface(X_np, Y_np, Z_np, cmap='viridis')
         ax.set_title(f"Time: {time:.4f}, Frame: {frame}")
         ax.set_zlim(0, initial_temperature.max())
         time += dt
