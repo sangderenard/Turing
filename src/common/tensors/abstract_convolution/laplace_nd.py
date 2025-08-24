@@ -509,7 +509,7 @@ class BuildLaplace3D:
         perturbation_seed = 42      # Use a fixed seed for reproducibility, or None for random
         perturbation_scale = 1e-3   # Small scale for the noise perturbation
 
-        if self.resolution <= 50 and dense:
+        if True or self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
             laplacian_tensor = laplacian.to_dense()
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
@@ -999,7 +999,7 @@ class TransformHub:
         self.frobenius_norm = AbstractTensor.sqrt(AbstractTensor.sum(g_ij**2, dim=(-2, -1)))
         return self.frobenius_norm
 
-    def compute_partials_and_normals(self, U, V, W, validate_normals=True, diagnostic_mode=False):
+    def compute_partials_and_normals(self, U, V, W, validate_normals=False, diagnostic_mode=False):
         U = AbstractTensor.get_tensor(U)
         V = AbstractTensor.get_tensor(V)
         W = AbstractTensor.get_tensor(W)

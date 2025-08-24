@@ -149,7 +149,8 @@ def fit_metric_pca(
 # -----------------------------------------------------------------------------
 # Transform: (U,V,W) → PCA3(X,Y,Z) with metric callback
 # -----------------------------------------------------------------------------
-class PCANDTransform:
+from .laplace_nd import Transform
+class PCANDTransform(Transform):
     """N-D PCA-based transform that acts on a 3-parameter grid (U,V,W).
 
     - Spatial map: (U,V,W) --phi--> u ∈ R^n  →  (X,Y,Z) = top-3 PCs of (u-μ).
@@ -322,18 +323,27 @@ if __name__ == "__main__":
 
     X, Y, Z = xform.transform_spatial(U, V, W)
 
+
     print("PCA basis n=", basis.n)
     print("mu shape:", basis.mu.shape, "P shape:", basis.P.shape)
     print("Grid X/Y/Z shapes:", X.shape, Y.shape, Z.shape)
 
+
     # ---- 6) (Optional) try to build a Laplace operator if available ----
     try:
-        # Lazy import: your laplace_nd module should accept a transform with
-        # transform_spatial + metric_tensor_func
-        from .laplace_nd import BuildLaplace3D  # type: ignore
+        # Import GridDomain and BuildLaplace3D
+        from .laplace_nd import GridDomain, BuildLaplace3D  # type: ignore
+
+        # Create a GridDomain using the grid and the transform
+        grid_domain = GridDomain(
+            U, V, W,
+            grid_boundaries=(True, True, True, True, True, True),
+            transform=xform,
+            coordinate_system="rectangular"
+        )
 
         build = BuildLaplace3D(
-            grid_domain=xform,
+            grid_domain=grid_domain,
             wave_speed=343,
             precision=getattr(AT, "float_dtype_", None) or X.dtype,
             resolution=Nu,  # assumes cubic resolution for demo
@@ -342,8 +352,58 @@ if __name__ == "__main__":
             artificial_stability=1e-10,
             device=getattr(X, "device", None),
         )
-        L_dense, L_sparse = build.build_general_laplace()
+        L_dense, L_sparse = build.build_general_laplace(
+            grid_u=U, grid_v=V, grid_w=W
+        )
         print("Built Laplace: dense shape:", getattr(L_dense, "shape", None))
+
+        # --- Visualize the lowest-magnitude eigenmode of the Laplacian ---
+        try:
+            import numpy as np
+            import matplotlib.pyplot as plt
+            # Use scipy if available for sparse eigs, else fallback to numpy
+            try:
+                from scipy.sparse.linalg import eigsh
+                use_scipy = True
+            except ImportError:
+                use_scipy = False
+
+            # Convert L_dense to numpy if needed
+            if hasattr(L_dense, 'cpu'):
+                L_np = L_dense.cpu().numpy()
+            else:
+                L_np = np.array(L_dense)
+
+            N = L_np.shape[0]
+            nev = 3  # number of eigenmodes to compute
+            if use_scipy and N > 20:
+                # Use sparse eigensolver for larger matrices
+                vals, vecs = eigsh(L_np, k=nev, which='SM')
+            else:
+                # Use dense eigensolver
+                vals, vecs = np.linalg.eigh(L_np)
+                # Sort by magnitude
+                idx = np.argsort(np.abs(vals))
+                vals = vals[idx]
+                vecs = vecs[:, idx]
+
+            # Take the first nontrivial eigenmode (skip the constant mode if present)
+            mode = vecs[:, 1] if N > 1 else vecs[:, 0]
+            # Reshape to grid
+            mode_grid = mode.reshape((Nu, Nv, Nw))
+            # Plot a central slice
+            central_slice = Nw // 2
+            plt.figure(figsize=(6, 5))
+            plt.imshow(mode_grid[:, :, central_slice], origin='lower', aspect='auto',
+                       cmap='coolwarm')
+            plt.colorbar(label='Eigenmode value')
+            plt.title('Central slice of 1st nontrivial Laplacian eigenmode')
+            plt.xlabel('V index')
+            plt.ylabel('U index')
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print("(Demo note) Laplacian eigenmode visualization failed:", str(e))
     except Exception as e:
         print("(Demo note) laplace_nd.BuildLaplace3D not available or failed:", str(e))
         print("Proceeding without Laplace build.")
