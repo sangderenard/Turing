@@ -5,10 +5,14 @@ from __future__ import annotations
 import threading
 import queue
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:  # Windows-only fast console; fallback to normal print if unavailable
     from src.common.fast_console import cffiPrinter
-except Exception:  # pragma: no cover - non-Windows or missing deps
+except Exception as e:  # pragma: no cover - non-Windows or missing deps
+    logger.warning("fast console unavailable; fallback mode active: %s", e)
     cffiPrinter = None  # type: ignore
 
 from src.common.double_buffer import DoubleBuffer
