@@ -7,21 +7,29 @@ from ..abstract_nn.core import Linear  # for optional 1x1 mixing
 
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 
-def _shift3d(arr: np.ndarray, axis: int, step: int, bc: Tuple[Boundary, Boundary]) -> np.ndarray:
-    """
-    Cheap 3D shift with boundary handling on one axis.
-    axis: 0/1/2 over the (D,H,W) spatial dims.
-    step: +1 or -1 (you can stack calls for bigger radii later)
-    bc: (minus_bc, plus_bc) for that axis.
+
+def _shift3d(arr: AbstractTensor, axis: int, step: int, bc: Tuple[Boundary, Boundary]) -> AbstractTensor:
+    """Shift ``arr`` by one voxel along ``axis`` with boundary conditions.
+
+    This helper mirrors the small NumPy function it replaces but operates
+    entirely on :class:`AbstractTensor` instances so it can run on any backend.
+    Only step sizes of ``±1`` are supported.
     """
     assert step in (-1, +1)
+
+    # Periodic wrap: concatenate edge slice to the opposite side
     if (step == +1 and bc[1] == "periodic") or (step == -1 and bc[0] == "periodic"):
-        # Roll keeps values; emulate periodic wrap
-        return np.roll(arr, shift=step, axis=axis)
-    # zero-pad for non-periodic (Neumann Dirichlet variants can be refined later)
-    out = np.zeros_like(arr)
+        if step == +1:
+            head = arr[(slice(None),) * axis + (slice(-1, None),)]
+            body = arr[(slice(None),) * axis + (slice(0, -1),)]
+            return AbstractTensor.cat([head, body], dim=axis)
+        else:  # step == -1
+            tail = arr[(slice(None),) * axis + (slice(0, 1),)]
+            body = arr[(slice(None),) * axis + (slice(1, None),)]
+            return AbstractTensor.cat([body, tail], dim=axis)
+
+    out = AbstractTensor.zeros_like(arr)
     if step == +1:
-        # pull values from the lower slice into the upper interior
         sl_src = [slice(None)] * arr.ndim
         sl_dst = [slice(None)] * arr.ndim
         sl_src[axis] = slice(0, -1)
@@ -33,8 +41,8 @@ def _shift3d(arr: np.ndarray, axis: int, step: int, bc: Tuple[Boundary, Boundary
         sl_src[axis] = slice(1, None)
         sl_dst[axis] = slice(0, -1)
         out[tuple(sl_dst)] = arr[tuple(sl_src)]
+
     if (step == +1 and bc[1] == "neumann") or (step == -1 and bc[0] == "neumann"):
-        # copy boundary value outward (simple mirror of the edge)
         if step == +1:
             edge_src = [slice(None)] * arr.ndim
             edge_dst = [slice(None)] * arr.ndim
@@ -167,15 +175,19 @@ class NDPCA3Conv3d:
         metric = package["metric"]["inv_g"] if self.eig_from == "inv_g" else package["metric"]["g"]
         wU, wV, wW = self._principal_axis_blend(metric)  # (D,H,W) each
 
+        # convert axis weights to tensors
+        wU = self.like.ensure_tensor(wU)
+        wV = self.like.ensure_tensor(wV)
+        wW = self.like.ensure_tensor(wW)
+
         # ---- 2) assemble per-voxel 3-tap weights mapped to lattice axes
-        taps = self.taps.data  # (k,3) numpy
-        # Accumulate center/± coefficients across k with equal importance
-        center = float(taps[:, 1].sum())
-        w_minus = float(taps[:, 0].sum())
-        w_plus  = float(taps[:, 2].sum())
+        taps = self.taps
+        center = (taps[:, 1]).sum().item()
+        w_minus = (taps[:, 0]).sum().item()
+        w_plus = (taps[:, 2]).sum().item()
 
         # Broadcast weights to (1,1,D,H,W)
-        def _bcast(w):
+        def _bcast(w: AbstractTensor) -> AbstractTensor:
             return w.reshape(1, 1, D, H, W)
 
         wU_b = _bcast(wU);  wV_b = _bcast(wV);  wW_b = _bcast(wW)
@@ -184,7 +196,7 @@ class NDPCA3Conv3d:
         wW_m = w_minus * wW_b;  wW_p = w_plus * wW_b
 
         # ---- 3) do the oriented depthwise spatial pass
-        arr = x.data  # numpy array (B,C,D,H,W)
+        arr = x  # (B,C,D,H,W) AbstractTensor
 
         # boundary tuples for each axis
         bcu = (self.bc[0], self.bc[1])
@@ -236,11 +248,12 @@ class NDPCA3Conv3d:
 
 
         # gradients w.r.t taps
-        g_center = AbstractTensor.sum(g * self._arr)
-        g_minus = AbstractTensor.sum(g * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m))
-        g_plus  = AbstractTensor.sum(g * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p))
-        g_taps_np = np.tile([g_minus, g_center, g_plus], (self.k, 1))
-        self.g_taps = self.like.ensure_tensor(g_taps_np)
+        g_center = (g * self._arr).sum().item()
+        g_minus = (g * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m)).sum().item()
+        g_plus = (g * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p)).sum().item()
+
+        g_vec = self.like.ensure_tensor([g_minus, g_center, g_plus]).reshape(1, 3)
+        self.g_taps = g_vec.repeat_interleave(self.k, dim=0)
 
         # gradient w.r.t input
         bcu = (self.bc[0], self.bc[1])
