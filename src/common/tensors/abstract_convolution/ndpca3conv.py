@@ -234,12 +234,11 @@ class NDPCA3Conv3d:
             g = self.pointwise.backward(g)
             g = g.reshape(B, self.in_channels, D, H, W)
 
-        g_arr = g.data
 
         # gradients w.r.t taps
-        g_center = np.sum(g_arr * self._arr)
-        g_minus = np.sum(g_arr * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m))
-        g_plus  = np.sum(g_arr * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p))
+        g_center = AbstractTensor.sum(g * self._arr)
+        g_minus = AbstractTensor.sum(g * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m))
+        g_plus  = AbstractTensor.sum(g * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p))
         g_taps_np = np.tile([g_minus, g_center, g_plus], (self.k, 1))
         self.g_taps = self.like.ensure_tensor(g_taps_np)
 
@@ -254,13 +253,13 @@ class NDPCA3Conv3d:
         wW_m = self._wW * self._w_minus
         wW_p = self._wW * self._w_plus
 
-        dx = self._center * g_arr
-        dx += wU_m * _shift3d(g_arr, axis=2, step=+1, bc=(bcu[1], bcu[0]))
-        dx += wU_p * _shift3d(g_arr, axis=2, step=-1, bc=(bcu[1], bcu[0]))
-        dx += wV_m * _shift3d(g_arr, axis=3, step=+1, bc=(bcv[1], bcv[0]))
-        dx += wV_p * _shift3d(g_arr, axis=3, step=-1, bc=(bcv[1], bcv[0]))
-        dx += wW_m * _shift3d(g_arr, axis=4, step=+1, bc=(bcw[1], bcw[0]))
-        dx += wW_p * _shift3d(g_arr, axis=4, step=-1, bc=(bcw[1], bcw[0]))
+        dx = self._center * g
+        dx += wU_m * _shift3d(g, axis=2, step=+1, bc=(bcu[1], bcu[0]))
+        dx += wU_p * _shift3d(g, axis=2, step=-1, bc=(bcu[1], bcu[0]))
+        dx += wV_m * _shift3d(g, axis=3, step=+1, bc=(bcv[1], bcv[0]))
+        dx += wV_p * _shift3d(g, axis=3, step=-1, bc=(bcv[1], bcv[0]))
+        dx += wW_m * _shift3d(g, axis=4, step=+1, bc=(bcw[1], bcw[0]))
+        dx += wW_p * _shift3d(g, axis=4, step=-1, bc=(bcw[1], bcw[0]))
 
         # clear cache
         self._arr = None
