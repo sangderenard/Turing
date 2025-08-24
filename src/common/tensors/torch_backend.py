@@ -303,7 +303,62 @@ class PyTorchTensorOperations(AbstractTensor):
     def item_(self):
         return self.data.item()
 
+    def get_item_(self, data, index):
+        """
+        Backend-aware indexing that supports negative-step slices by translating
+        them to index_select with an appropriate reversed arange. Falls back to
+        native indexing when no negative steps are present.
+        """
+        # Normalize index to a tuple
+        if not isinstance(index, tuple):
+            index = (index,)
 
+        # Expand Ellipsis to full set of slices
+        index = self._expand_ellipsis(index, data.dim())
+
+        # Quick path: no negative steps -> let PyTorch handle it
+        has_neg = any(isinstance(s, slice) and s.step is not None and s.step < 0 for s in index)
+        if not has_neg:
+            return data[index]
+
+        # We need to process dims with negative step manually using index_select.
+        out = data
+        # We apply components one-by-one so we can turn negative slices into
+        # explicit index tensors while preserving other components.
+        for dim, comp in enumerate(index):
+            if isinstance(comp, slice) and comp.step is not None and comp.step < 0:
+                # Python slice semantics
+                n = out.size(dim)
+                start = comp.start
+                stop  = comp.stop
+                step  = comp.step  # negative
+
+                # Translate None/negative to concrete indices
+                start = n - 1 if start is None else (start if start >= 0 else n + start)
+                stop  = -1   if stop  is None else (stop  if stop  >= 0 else n + stop)
+
+                idx = torch.arange(start, stop, step, device=out.device)
+                out = out.index_select(dim, idx)
+            else:
+                # For non-negative slices / ints / tensors, apply directly along this dim
+                # Build a selection tuple that is all ":" except this dim.
+                sel = (slice(None),) * dim + (comp,)
+                out = out[sel]
+        return out
+
+    @staticmethod
+    def _expand_ellipsis(index, nd):
+        """Expand a single Ellipsis into the correct number of full slices."""
+        if Ellipsis not in index:
+            return index
+        i = index.index(Ellipsis)
+        # everything except the ellipsis occupies k entries
+        k = len(index) - 1
+        fill = nd - k
+        if fill < 0:
+            # Too many explicit components; let PyTorch raise later for consistency
+            return index
+        return index[:i] + (slice(None),) * fill + index[i+1:]
 
     def long_cast_(self):
         return self.data.long()

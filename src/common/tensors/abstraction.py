@@ -1367,24 +1367,15 @@ class AbstractTensor:
         """
         if DEBUG:
             print(f"__getitem__ called with idx={idx} on {self.__class__.__name__}")
+
         data = self.data
         if data is None:
             raise ValueError("__getitem__ called on empty tensor")
 
-        # Ensure backend-native tensor type for indexing
-        if CTensor is not None and isinstance(data, CTensor):
-            # CTensor might require special handling or might not support all Python slicing.
-            # For now, assume it needs unwrapped indices if idx contains AbstractTensors.
-            # This placeholder allows future CTensor-specific indexing logic.
-            pass  # Fall through to generic index processing for now
-
+        # ---- unwrap any AbstractTensor indices ----
         if isinstance(idx, tuple):
             index = tuple(
-                (
-                    item._AbstractTensor__unwrap()
-                    if isinstance(item, AbstractTensor)
-                    else item
-                )
+                (item._AbstractTensor__unwrap() if isinstance(item, AbstractTensor) else item)
                 for item in idx
             )
         elif isinstance(idx, AbstractTensor):
@@ -1392,12 +1383,27 @@ class AbstractTensor:
         else:
             index = idx
 
-        result = data[index]
+        if DEBUG:
+            print(f"Unwrapped index: {index}")
+            print(f"Data type: {type(data)}")
+
+        # ---- prefer backend-specific get_item_ if available ----
+        # Try to locate the ops/backend object (name may vary in your codebase)
+        
+
+        if hasattr(self, "get_item_"):
+            result = self.get_item_(data, index)
+        else:
+            # generic fallback: direct indexing on the raw tensor/array
+            result = data[index]
+
+        # ---- wrap result if it's the native tensor type for this backend ----
         if isinstance(result, self.tensor_type):
-            wrapped = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+            wrapped = type(self)(track_time=getattr(self, "track_time", False), tape=getattr(self, "_tape", None))
             wrapped.data = result
             return wrapped
         return result
+
 
 
     def __setitem__(self, idx, value):

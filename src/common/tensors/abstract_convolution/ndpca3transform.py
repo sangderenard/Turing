@@ -330,7 +330,7 @@ if __name__ == "__main__":
     try:
         # Lazy import: your laplace_nd module should accept a transform with
         # transform_spatial + metric_tensor_func
-        from laplace_nd import BuildLaplace3D  # type: ignore
+        from .laplace_nd import BuildLaplace3D  # type: ignore
 
         build = BuildLaplace3D(
             grid_domain=xform,
