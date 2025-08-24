@@ -1,0 +1,43 @@
+import numpy as np
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.abstract_convolution.local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION
+
+
+def dummy_metric(*args):
+    return None, None, None
+
+
+def test_local_state_network_forward_backward_consistency():
+    np.random.seed(0)
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=1,
+    )
+    padded_raw_np = np.random.randn(1, 1, 1, 1, 3, 3, 3).astype(np.float32)
+    padded_raw = AbstractTensor.get_tensor(padded_raw_np)
+
+    weighted, modulated = net.forward(padded_raw)
+
+    grad_w_np = np.random.randn(*weighted.shape).astype(np.float32)
+    grad_m_np = np.random.randn(*modulated.shape).astype(np.float32)
+    grad_w = AbstractTensor.get_tensor(grad_w_np)
+    grad_m = AbstractTensor.get_tensor(grad_m_np)
+
+    # Expected gradient (manual computation)
+    weight_layer = net.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+    expected_from_weight = grad_w * weight_layer
+    grad_m_view = grad_m.reshape((1, 1, 1, 1, -1))
+    flat_grad = grad_m_view.reshape((-1, grad_m_view.shape[-1]))
+    WT = net.spatial_layer.W.transpose(0, 1)
+    grad_flat_in = flat_grad @ WT
+    expected_from_mod = grad_flat_in.reshape((1, 1, 1, 1, 3, 3, 3))
+    expected_grad = expected_from_weight + expected_from_mod
+
+    grad_input = net.backward(grad_w, grad_m)
+
+    assert np.allclose(grad_input.data, expected_grad.data, atol=1e-5)
+
+    expected_g_weight = (grad_w * padded_raw).sum(dim=(0, 1, 2, 3))
+    assert np.allclose(net.g_weight_layer.data, expected_g_weight.data, atol=1e-5)
