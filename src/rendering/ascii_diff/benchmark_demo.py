@@ -35,7 +35,7 @@ def _summary_stats(data: list[float]) -> dict[str, float]:
 
 
 def run(
-    iterations: int = 100,
+    iterations: int = 500,
     width: int = 64,
     height: int = 32,
     *,
@@ -74,7 +74,8 @@ def run(
             patch_meta.append({"patch_type": "full", "patch_size": (width, height)})
 
         start = time.perf_counter()
-        renderer.to_ascii_diff()
+        ascii_img = renderer.to_ascii_diff()
+        print(ascii_img)
         ascii_times.append((time.perf_counter() - start) * 1000.0)
 
         classifier = _classifier_cache.get("classifier")
@@ -106,7 +107,7 @@ def run(
 
     if profiler:
         print("\nTop functions by cumulative time:")
-        pstats.Stats(profiler).sort_stats("cumulative").print_stats(10)
+        pstats.Stats(profiler).sort_stats("cumulative").print_stats(40)
 
 
 if __name__ == "__main__":
