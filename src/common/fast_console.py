@@ -6,6 +6,19 @@ import cffi
 import threading
 import queue
 import time
+import logging
+import os
+
+
+logger = logging.getLogger(__name__)
+if os.getenv("TURING_DEBUG"):
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.addHandler(logging.NullHandler())
 
 class cffiPrinter:
     def __init__(self, mode: str = 'A', threaded: bool = False, queue_size: int = 128):
@@ -43,6 +56,8 @@ class cffiPrinter:
     def print(self, s: str) -> None:
         if not isinstance(s, str):
             s = str(s)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("printing %d chars", len(s))
         if self.threaded:
             try:
                 self._queue.put(s, block=False)
@@ -67,6 +82,8 @@ class cffiPrinter:
         while not self._stop_event.is_set():
             try:
                 s = self._queue.get(timeout=0.1)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("worker printing %d chars", len(s))
                 self._print_direct(s)
                 self._queue.task_done()
             except queue.Empty:
