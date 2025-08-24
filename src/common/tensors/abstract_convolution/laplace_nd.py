@@ -2058,7 +2058,9 @@ class HeatEngine(DtCompatibleEngine):
         self.prev_temperature = self.temperature.copy()
         print(f"alpha: {self.alpha}, dt: {dt}, temperature: {self.temperature}")
         print(f"temp shape: {self.temperature.shape}, laplacian_tensor {self.laplacian_tensor.shape}")
-        self.temperature += -self.alpha * dt * (self.laplacian_tensor @ self.temperature)
+        prod = self.laplacian_tensor @ self.temperature
+        print(f"product shape: {prod.shape}")
+        self.temperature += -self.alpha * dt * prod
         # Relative system energy change (L2 norm)
         prev_energy = AbstractTensor.linalg.norm(self.prev_temperature)
         curr_energy = AbstractTensor.linalg.norm(self.temperature)
@@ -2095,8 +2097,6 @@ def heat_evolution_demo(laplacian_tensor, initial_temperature, alpha=0.01, dt=0.
     Simulates heat evolution on a 3D grid using a precomputed Laplacian matrix, with optional adaptive dt.
     Returns the FuncAnimation object for display or further use.
     """
-    if hasattr(laplacian_tensor, 'cpu'):
-        laplacian_tensor = laplacian_tensor.cpu().numpy()
 
     initial_temperature = initial_temperature.flatten()
     N_u = int(AbstractTensor.cbrt(len(initial_temperature)))
