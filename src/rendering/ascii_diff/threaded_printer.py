@@ -61,24 +61,26 @@ class ThreadedAsciiDiffPrinter:
 
     def _render_loop(self) -> None:
         agent_writer, agent_reader = 0, 1
+        print("Starting render loop")
         while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=0.1)
-                logger.debug("Retrieved frame from queue")
+                print("Retrieved frame from queue")
             except queue.Empty:
+                print("Queue is empty")
                 continue
             if item is None:
-                logger.debug("Stop sentinel received")
+                print("Stop sentinel received")
                 self._queue.task_done()
                 break
             self._db.write_frame(item, agent_idx=agent_writer)
             frame = self._db.read_frame(agent_idx=agent_reader)
             if frame is not None:
-                logger.debug("Sending frame to cffiPrinter: %d chars", len(frame))
+                print("Sending frame to cffiPrinter: %d chars", len(frame))
                 self._printer.print(frame)
             self._queue.task_done()
         self._printer.flush()
-
+        
     def stop(self) -> None:
         """Signal the rendering thread to terminate and wait for it."""
         self._stop.set()

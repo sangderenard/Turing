@@ -70,11 +70,11 @@ def default_subunit_batch_to_chars(
     subunit_batch: np.ndarray,
     ramp: str = DEFAULT_DRAW_ASCII_RAMP,
     char_width: int = 16, # Add parameters for desired char_size
-    char_height: int = 16, # These will be the actual cell_w, cell_h from clock_demo
+    char_height: int = 32, # These will be the actual cell_w, cell_h from clock_demo
     *,
     use_nn: bool = True,
     epsilon: float = 1e-4,
-    max_epochs: int = 200,
+    max_epochs: int = 500,
 ) -> list[str]:
     """Return characters for ``subunit_batch`` using a cached classifier."""
     # Removed: (subunit_height, subunit_width) = get_char_cell_dims(),

@@ -114,6 +114,7 @@ def menu():
                     return np.roll(np.roll(f, shift_y, axis=0), shift_x, axis=1)
 
                 while True:
+                    print(f"Rendering image with char cell {char_h}x{char_w}, ramp '{ramp_style}', post-processing '{post_processing}'")
                     white = np.ones_like(frame) * 255
                     rc.render({"image": white})
                     time.sleep(0.01)

@@ -51,7 +51,7 @@ class AsciiKernelClassifier:
         *,
         use_nn: bool = True,
         epsilon: float = 1e-4,
-        max_epochs: int = 300,
+        max_epochs: int = 1,
     ) -> None:
         self.ramp = ramp
         self.vocab_size = len(ramp)
@@ -73,7 +73,7 @@ class AsciiKernelClassifier:
         self.profile_stats: dict[str, float] = {"train_ms": 0.0, "classify_ms": 0.0}
         # Store per-call classification durations when profiling
         self.classify_durations: list[float] = []
-        self._prepare_reference_bitmasks()
+        self.set_font(font_path=self.font_path, font_size=self.font_size, char_size=self.char_size)
 
     def set_font(self, font_path=None, font_size=None, char_size=None):
         """Set font parameters and regenerate reference bitmasks."""
@@ -84,6 +84,8 @@ class AsciiKernelClassifier:
         if char_size is not None:
             self.char_size = char_size
         self._prepare_reference_bitmasks()
+        self._prepare_nn_data()
+        self._train_nn()
 
     def _prepare_reference_bitmasks(self) -> None:
         # Always use the ramp as the preset_charset so all ramp characters are attempted
@@ -113,6 +115,7 @@ class AsciiKernelClassifier:
         return x, y
 
     def _train_nn(self) -> None:
+        
         start = time.perf_counter() if self.profile else None
         set_seed(0)
         train_x, train_y = self._prepare_nn_data()
@@ -169,6 +172,9 @@ class AsciiKernelClassifier:
                     layer_params[j].data[...] = new_params[i].data
                     i += 1
             model.zero_grad()
+            # ascii_kernel_classifier.py, inside training loop
+            import sys
+            print(f"Epoch {epoch}: loss={float(loss.data):.6f}", file=sys.__stderr__, flush=True)
             if float(loss.data) < self.epsilon:
                 break
 

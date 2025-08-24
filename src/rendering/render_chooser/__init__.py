@@ -35,8 +35,8 @@ class RenderChooser:
         height: int,
         mode: str | None = None,
         *,
-        sync_per_frame: bool = False,
-        queue_maxsize: int = 0,
+        sync_per_frame: bool = True,
+        queue_maxsize: int = 1024,
         block_on_queue_full: bool = True,
     ) -> None:
         self.width = width
@@ -44,7 +44,9 @@ class RenderChooser:
         self.mode = "ascii"
         self.renderer: Any
         self.screen = None
-        self._ascii_printer: ThreadedAsciiDiffPrinter | None = None
+        self._ascii_printer = None
+   # <<< start the consumer thread
+        full_clear_and_reset_cursor()
         self._sync_event = threading.Event()
         self.sync_per_frame = sync_per_frame
         self._queue_maxsize = queue_maxsize
@@ -132,7 +134,7 @@ class RenderChooser:
                 queue_maxsize=self._queue_maxsize,
                 block_on_full=self._block_on_queue_full,
             )
-            full_clear_and_reset_cursor()
+            #full_clear_and_reset_cursor()
 
         # Input and rendering thread state
         self._buffer = DoubleBuffer()
