@@ -202,7 +202,7 @@ class AsciiRenderer:
             rgb[..., : tensor.shape[2]] = tensor
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         self._fb.update_render(rgb)
-        updates = self._fb.get_diff_and_promote()
+        updates = self._fb.get_diff_and_promote(mode="pixel", include_data=True)
         if not updates:
             return ""
 

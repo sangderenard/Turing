@@ -447,6 +447,41 @@ class PyTorchTensorOperations(AbstractTensor):
             dim = 0
         return self.data.repeat_interleave(repeats, dim=dim)
 
+    def copyto_(self, src, *, where=None, casting="same_kind"):
+        import torch
+        import numpy as np
+        from .abstraction import AbstractTensor
+        s = src.data if isinstance(src, AbstractTensor) else src
+        dtype_map = {
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.float16: np.float16,
+            torch.int64: np.int64,
+            torch.int32: np.int32,
+            torch.int16: np.int16,
+            torch.int8: np.int8,
+            torch.uint8: np.uint8,
+            torch.bool: np.bool_,
+        }
+        dst_np_dtype = dtype_map.get(self.data.dtype)
+        src_np_dtype = dtype_map.get(s.dtype)
+        if dst_np_dtype is not None and src_np_dtype is not None:
+            if not np.can_cast(src_np_dtype, dst_np_dtype, casting=casting):
+                raise TypeError(
+                    f"Cannot cast from {s.dtype} to {self.data.dtype} with casting='{casting}'"
+                )
+        s = s.to(self.data.dtype)
+        if s.shape != self.data.shape:
+            s = s.expand_as(self.data)
+        if where is None:
+            self.data.copy_(s)
+        else:
+            m = where.data if isinstance(where, AbstractTensor) else where
+            if m.shape != self.data.shape:
+                m = m.expand_as(self.data)
+            self.data = torch.where(m, s, self.data)
+        return self.data
+
     def cumsum_(self, dim=0):
         import torch
         return torch.cumsum(self.data, dim=dim)
