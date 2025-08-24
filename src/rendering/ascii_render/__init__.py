@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Tuple
 from io import StringIO
 from contextlib import redirect_stdout
+import os
+import time
 
 import numpy as np
 
@@ -45,6 +47,9 @@ class AsciiRenderer:
         self.canvas = np.zeros((height, width, depth), dtype=dtype)
         # Maintain a persistent frame buffer for diffing
         self._fb = PixelFrameBuffer((height, width))
+        # Profiling support toggled via the TURING_PROFILE env var
+        self.profile = bool(int(os.getenv("TURING_PROFILE", "0")))
+        self.profile_stats: dict[str, float] = {"to_ascii_diff_ms": 0.0}
 
     # -- canvas helpers -------------------------------------------------
     def clear(self, value: float | int = 0) -> None:
@@ -157,6 +162,7 @@ class AsciiRenderer:
 
         Only regions that changed since the last call are emitted.
         """
+        start = time.perf_counter() if self.profile else None
         # Convert canvas to 2D if needed (collapse depth)
         if self.canvas.shape[2] == 1:
             tensor = self.canvas[..., 0]
@@ -188,4 +194,9 @@ class AsciiRenderer:
                 enable_fg_color=False,
                 enable_bg_color=False,
             )
-        return buffer.getvalue()
+        ascii_out = buffer.getvalue()
+        if self.profile and start is not None:
+            self.profile_stats["to_ascii_diff_ms"] += (
+                time.perf_counter() - start
+            ) * 1000.0
+        return ascii_out

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 from pathlib import Path
+import os
+import time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from ...common.tensors import AbstractTensor, Faculty
@@ -66,6 +68,9 @@ class AsciiKernelClassifier:
         self.nn_trained = False
         self.nn_metric = None
         self.nn_grid_shape = None
+        # Profiling support toggled via the TURING_PROFILE env var
+        self.profile = bool(int(os.getenv("TURING_PROFILE", "0")))
+        self.profile_stats: dict[str, float] = {"train_ms": 0.0, "classify_ms": 0.0}
         self._prepare_reference_bitmasks()
 
     def set_font(self, font_path=None, font_size=None, char_size=None):
@@ -106,6 +111,7 @@ class AsciiKernelClassifier:
         return x, y
 
     def _train_nn(self) -> None:
+        start = time.perf_counter() if self.profile else None
         set_seed(0)
         train_x, train_y = self._prepare_nn_data()
         n_classes = train_y.shape[1]
@@ -167,6 +173,8 @@ class AsciiKernelClassifier:
         self.nn_model = model
         self.nn_metric = metric
         self.nn_trained = True
+        if self.profile and start is not None:
+            self.profile_stats["train_ms"] += (time.perf_counter() - start) * 1000.0
 
     def _resize_tensor_to_char(self, tensor: AbstractTensor) -> AbstractTensor:
         # self.char_size is (W, H), interpolate expects (H, W) for size
@@ -192,6 +200,7 @@ class AsciiKernelClassifier:
         )
 
     def classify_batch(self, subunit_batch: np.ndarray) -> dict:
+        start = time.perf_counter() if self.profile else None
         batch = AbstractTensor.get_tensor(subunit_batch).to_dtype("float")
         batch_shape = tuple(batch.shape)
         N = batch_shape[0]
@@ -216,12 +225,17 @@ class AsciiKernelClassifier:
             logits = self.nn_model.forward(inputs)
             idxs = logits.argmax(dim=1)
             chars = [self.charset[int(i)] for i in idxs.tolist()]
-            return {
+            result = {
                 "indices": idxs,
                 "chars": chars,
                 "losses": None,
                 "logits": logits,
             }
+            if self.profile and start is not None:
+                self.profile_stats["classify_ms"] += (
+                    time.perf_counter() - start
+                ) * 1000.0
+            return result
 
         refs = AbstractTensor.get_tensor().stack(self.charBitmasks, dim=0)
         expanded_inputs = luminance_tensor[:, None, :, :].repeat_interleave(repeats=refs.shape[0], dim=1)
@@ -233,12 +247,17 @@ class AsciiKernelClassifier:
         row_indices = AbstractTensor.get_tensor(np.arange(N, dtype=np.int64))
         selected_losses = losses[row_indices, idxs]
         chars = [self.charset[int(i)] for i in idxs.tolist()]
-        return {
+        result = {
             "indices": idxs,
             "chars": chars,
             "losses": selected_losses,
             "logits": None,
         }
+        if self.profile and start is not None:
+            self.profile_stats["classify_ms"] += (
+                time.perf_counter() - start
+            ) * 1000.0
+        return result
 if __name__ == "__main__":
     import argparse
     from .charset_ops import obtain_charset
