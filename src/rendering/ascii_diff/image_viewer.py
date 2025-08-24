@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .console import reset_cursor_to_top
+from .console import full_clear_and_reset_cursor
 from .theme_manager import ThemeManager
 from ..render_chooser import RenderChooser
 
@@ -70,6 +70,7 @@ def menu():
         print("9. Exit")
 
     while True:
+        full_clear_and_reset_cursor()
         print_menu()
         choice = input("Select option (1-9,10): ").strip()
         if choice == "1":
@@ -149,8 +150,10 @@ def menu():
 
                     rc.render({"image": frame})
                     # Ensure all pending frames have been printed before prompting the user.
+
                     if rc.mode == "ascii":
                         rc.sync()
+
                     user_input = (
                         input("\nPress Enter to continue, or type 'repeat' to play again: ")
                         .strip()
@@ -158,7 +161,7 @@ def menu():
                     )
                     if user_input == "repeat":
                         continue
-                    reset_cursor_to_top()
+                    full_clear_and_reset_cursor()
                     break
             except Exception as e:
                 print(f"Error rendering image: {e}")
