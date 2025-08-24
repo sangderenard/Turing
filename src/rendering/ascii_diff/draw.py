@@ -74,7 +74,7 @@ def default_subunit_batch_to_chars(
     *,
     use_nn: bool = True,
     epsilon: float = 1e-4,
-    max_epochs: int = 500,
+    max_epochs: int = 50,
 ) -> list[str]:
     """Return characters for ``subunit_batch`` using a cached classifier."""
     # Removed: (subunit_height, subunit_width) = get_char_cell_dims(),
@@ -138,11 +138,12 @@ def draw_diff(
     if char_cell_pixel_height <= 0: char_cell_pixel_height = 1
     if char_cell_pixel_width <= 0: char_cell_pixel_width = 1
     if not changed_subunits:
+        print("No changed subunits to draw")
         return
     subunit_batch = np.stack([data for _, _, data in changed_subunits], axis=0)
     # Pass the actual char_cell_pixel_width and char_cell_pixel_height to the kernel
     chars = subunit_to_char_kernel(subunit_batch, active_ascii_ramp, char_cell_pixel_width, char_cell_pixel_height)
-
+    print(f"Drawing {len(changed_subunits)} changed subunits")
     for (y_pixel, x_pixel, subunit_data), char_to_draw in zip(changed_subunits, chars):
         char_y = y_pixel // char_cell_pixel_height
         char_x = x_pixel // char_cell_pixel_width

@@ -219,8 +219,9 @@ class AsciiRenderer:
         c_w = char_cell_pixel_width if char_cell_pixel_width is not None else self.char_cell_pixel_width
         fg = enable_fg_color if enable_fg_color is not None else self.enable_fg_color
         bg = enable_bg_color if enable_bg_color is not None else self.enable_bg_color
-        with redirect_stdout(buffer):
-            draw_diff(
+        #with redirect_stdout(buffer):
+        print("draw diff starting")
+        draw_diff(
                 changed_subunits,
                 char_cell_pixel_height=c_h,
                 char_cell_pixel_width=c_w,
@@ -229,6 +230,7 @@ class AsciiRenderer:
                 enable_fg_color=fg,
                 enable_bg_color=bg,
             )
+        print("draw diff over")
         ascii_out = buffer.getvalue()
         if self.profile and start is not None:
             elapsed = (time.perf_counter() - start) * 1000.0
