@@ -99,23 +99,32 @@ class RenderChooser:
             except Exception:
                 preferred = "ascii"
 
-        from src.ascii_render import AsciiRenderer
+    from src.ascii_render import AsciiRenderer
 
-        self.renderer = AsciiRenderer(width, height)
-        self.mode = "ascii"
-        self._ascii_printer = ThreadedAsciiDiffPrinter()
-        self._ascii_queue = self._ascii_printer.get_queue()
-        full_clear_and_reset_cursor()
+    # Allow char cell and color settings to be passed via environment or args in future
+    self.char_cell_pixel_height = 1
+    self.char_cell_pixel_width = 1
+    self.enable_fg_color = False
+    self.enable_bg_color = False
+    self.renderer = AsciiRenderer(width, height,
+                     char_cell_pixel_height=self.char_cell_pixel_height,
+                     char_cell_pixel_width=self.char_cell_pixel_width,
+                     enable_fg_color=self.enable_fg_color,
+                     enable_bg_color=self.enable_bg_color)
+    self.mode = "ascii"
+    self._ascii_printer = ThreadedAsciiDiffPrinter()
+    self._ascii_queue = self._ascii_printer.get_queue()
+    full_clear_and_reset_cursor()
 
-        # Input and rendering thread state
-        self._buffer = DoubleBuffer()
-        self._events: List[str] = []
-        self._keys: Set[str] = set()
-        self._lock = threading.Lock()
-        self._running = True
+    # Input and rendering thread state
+    self._buffer = DoubleBuffer()
+    self._events = []
+    self._keys = set()
+    self._lock = threading.Lock()
+    self._running = True
 
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+    self._thread = threading.Thread(target=self._loop, daemon=True)
+    self._thread.start()
 
     # ------------------------------------------------------------------
     def render(self, state: Dict[str, Any]) -> None:
@@ -226,7 +235,12 @@ class RenderChooser:
                 (int(tri[1][0]), int(tri[1][1])),
                 (int(tri[2][0]), int(tri[2][1])),
             )
-        ascii_out = r.to_ascii_diff()
+        ascii_out = r.to_ascii_diff(
+            char_cell_pixel_height=getattr(r, 'char_cell_pixel_height', 1),
+            char_cell_pixel_width=getattr(r, 'char_cell_pixel_width', 1),
+            enable_fg_color=getattr(r, 'enable_fg_color', False),
+            enable_bg_color=getattr(r, 'enable_bg_color', False),
+        )
         if ascii_out and self._ascii_queue is not None:
             self._ascii_queue.put(ascii_out)
 

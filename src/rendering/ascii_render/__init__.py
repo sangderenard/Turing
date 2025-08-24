@@ -42,7 +42,9 @@ class AsciiRenderer:
 
     ramp = np.asarray(list(" .:-=+*#%@"))
 
-    def __init__(self, width: int, height: int, depth: int = 1, *, float_mode: bool = False) -> None:
+    def __init__(self, width: int, height: int, depth: int = 1, *, float_mode: bool = False,
+                 char_cell_pixel_height: int = 1, char_cell_pixel_width: int = 1,
+                 enable_fg_color: bool = False, enable_bg_color: bool = False) -> None:
         dtype = float if float_mode else np.uint8
         self.canvas = np.zeros((height, width, depth), dtype=dtype)
         # Maintain a persistent frame buffer for diffing
@@ -52,6 +54,11 @@ class AsciiRenderer:
         self.profile_stats: dict[str, float] = {"to_ascii_diff_ms": 0.0}
         # Record per-call durations when profiling
         self.to_ascii_diff_durations: list[float] = []
+        # Char cell and color settings
+        self.char_cell_pixel_height = char_cell_pixel_height
+        self.char_cell_pixel_width = char_cell_pixel_width
+        self.enable_fg_color = enable_fg_color
+        self.enable_bg_color = enable_bg_color
 
     # -- canvas helpers -------------------------------------------------
     def clear(self, value: float | int = 0) -> None:
@@ -173,7 +180,11 @@ class AsciiRenderer:
         return "\n".join(rows)
 
     # -- ascii_diff integration ------------------------------------------------
-    def to_ascii_diff(self, ramp: str | None = None) -> str:
+    def to_ascii_diff(self, ramp: str | None = None,
+                      char_cell_pixel_height: int = None,
+                      char_cell_pixel_width: int = None,
+                      enable_fg_color: bool = None,
+                      enable_bg_color: bool = None) -> str:
         """
         Return an ASCII diff of the current canvas using a persistent frame buffer.
 
@@ -203,15 +214,20 @@ class AsciiRenderer:
 
         ascii_ramp = ramp or DEFAULT_DRAW_ASCII_RAMP
         buffer = StringIO()
+        # Use instance settings unless overridden
+        c_h = char_cell_pixel_height if char_cell_pixel_height is not None else self.char_cell_pixel_height
+        c_w = char_cell_pixel_width if char_cell_pixel_width is not None else self.char_cell_pixel_width
+        fg = enable_fg_color if enable_fg_color is not None else self.enable_fg_color
+        bg = enable_bg_color if enable_bg_color is not None else self.enable_bg_color
         with redirect_stdout(buffer):
             draw_diff(
                 changed_subunits,
-                char_cell_pixel_height=1,
-                char_cell_pixel_width=1,
+                char_cell_pixel_height=c_h,
+                char_cell_pixel_width=c_w,
                 subunit_to_char_kernel=default_subunit_batch_to_chars,
                 active_ascii_ramp=ascii_ramp,
-                enable_fg_color=False,
-                enable_bg_color=False,
+                enable_fg_color=fg,
+                enable_bg_color=bg,
             )
         ascii_out = buffer.getvalue()
         if self.profile and start is not None:

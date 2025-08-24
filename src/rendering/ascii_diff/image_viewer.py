@@ -117,7 +117,18 @@ def menu():
             img = theme_manager.apply_theme(img)
             frame = _downsample(np.array(img), char_h, char_w)
             h, w, _ = frame.shape
+            # Pass char cell and color settings to RenderChooser and AsciiRenderer
             rc = RenderChooser(w, h, mode="ascii")
+            rc.char_cell_pixel_height = char_h
+            rc.char_cell_pixel_width = char_w
+            rc.enable_fg_color = show_fg
+            rc.enable_bg_color = show_bg
+            # Also update the AsciiRenderer instance if present
+            if hasattr(rc, 'renderer') and hasattr(rc.renderer, 'char_cell_pixel_height'):
+                rc.renderer.char_cell_pixel_height = char_h
+                rc.renderer.char_cell_pixel_width = char_w
+                rc.renderer.enable_fg_color = show_fg
+                rc.renderer.enable_bg_color = show_bg
             try:
                 def roll_frame(f: np.ndarray, shift_y: int = 0, shift_x: int = 0) -> np.ndarray:
                     return np.roll(np.roll(f, shift_y, axis=0), shift_x, axis=1)
