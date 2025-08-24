@@ -2004,7 +2004,9 @@ from .abstraction_methods.elementwise import (
     __xor__ as elementwise_xor,
     __invert__ as elementwise_invert,
     where as elementwise_where,
-    _as_scalar, _scalar_kernel, 
+    maximum as elementwise_maximum,
+    minimum as elementwise_minimum,
+    _as_scalar, _scalar_kernel,
     _v1_valuewise, _v2_valuewise, _v3_valuewise
 )
 
@@ -2020,6 +2022,8 @@ AbstractTensor.__or__    = elementwise_or
 AbstractTensor.__xor__   = elementwise_xor
 AbstractTensor.__invert__= elementwise_invert
 AbstractTensor.where     = staticmethod(elementwise_where)
+AbstractTensor.maximum   = elementwise_maximum
+AbstractTensor.minimum   = elementwise_minimum
 
 AbstractTensor._as_scalar   = staticmethod(_as_scalar)
 AbstractTensor._scalar_kernel = staticmethod(_scalar_kernel)
