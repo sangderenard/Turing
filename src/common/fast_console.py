@@ -50,11 +50,16 @@ class cffiPrinter:
             if self.mode == "A":
                 self.ffi.cdef(
                     """
+
                     int __stdcall WriteConsoleA(void* hConsoleOutput, const char* lpBuffer,
                                                unsigned long nNumberOfCharsToWrite,
                                                unsigned long* lpNumberOfCharsWritten,
                                                void* lpReserved);
                     void* __stdcall GetStdHandle(int nStdHandle);
+
+                    int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
+                    int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
+
                     """
                 )
             elif self.mode == "W":
@@ -65,6 +70,8 @@ class cffiPrinter:
                                                unsigned long* lpNumberOfCharsWritten,
                                                void* lpReserved);
                     void* __stdcall GetStdHandle(int nStdHandle);
+                    int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
+                    int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
                     """
                 )
             else:  # pragma: no cover - defensive clause
@@ -75,6 +82,13 @@ class cffiPrinter:
             self._handle = self.C.GetStdHandle(self.STD_OUTPUT_HANDLE)
             if self._handle == self.ffi.NULL or self._handle == self.ffi.cast("void*", -1):
                 raise OSError("GetStdHandle failed")
+            mode = self.ffi.new("unsigned long *")
+            if self.C.GetConsoleMode(self._handle, mode):
+                new_mode = mode[0] | 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if not self.C.SetConsoleMode(self._handle, new_mode):
+                    logger.error("SetConsoleMode failed")
+            else:
+                logger.error("GetConsoleMode failed")
         else:
             # POSIX: stream bytes directly to stdout via write(2)
             self.ffi.cdef("ssize_t write(int fd, const void* buf, size_t count);")
