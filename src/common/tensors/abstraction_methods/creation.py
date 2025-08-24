@@ -217,26 +217,26 @@ def _resolve_cls(cls):
             
     raise RuntimeError("No tensor backend available for tensor creation.")
 
-def zero(cls):
+def zero(cls, dtype: Any = None, device: Any = None):
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
     cls = _resolve_cls(cls)
-    return AbstractTensor.get_tensor([0], cls=cls)
+    return AbstractTensor.get_tensor([0.0], dtype=dtype, device=device, cls=cls)
 
-def one(cls):
+def one(cls, dtype: Any = None, device: Any = None):
     """Create a tensor filled with ones using the requested backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
     cls = _resolve_cls(cls)
-    inst = zero(cls) + 1
-    
+    inst = zero(cls, dtype=dtype, device=device) + 1
+
     return inst
 
 def zeros(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None):
     """Create a tensor filled with zeros using the requested backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    return zero(cls).repeat(size)
+    return zero(cls, dtype=dtype, device=device).repeat(size)
 
 
 def randoms(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
@@ -248,7 +248,7 @@ def ones(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=No
     """Create a tensor filled with ones using the requested backend."""
     from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
 
-    return one(cls).repeat(size)
+    return one(cls, dtype=dtype, device=device).repeat(size)
 
 
 def full(
