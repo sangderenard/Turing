@@ -1,7 +1,10 @@
 import numpy as np
+import os
+import pytest
 from src.rendering.ascii_render import AsciiRenderer
 from src.rendering.ascii_diff import ThreadedAsciiDiffPrinter
 
+@pytest.mark.skipif(os.name != "nt", reason="fast console requires Windows")
 def test_ascii_diff_animation():
     width, height = 32, 16
     r = AsciiRenderer(width, height)

@@ -1,7 +1,10 @@
 import numpy as np
+import os
+import pytest
 from src.rendering.render_chooser import RenderChooser
 
 
+@pytest.mark.skipif(os.name != "nt", reason="fast console requires Windows")
 def test_render_chooser_sync_drains_buffers(capfd):
     rc = RenderChooser(2, 2, mode="ascii")
     try:
