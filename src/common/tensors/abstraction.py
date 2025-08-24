@@ -183,6 +183,11 @@ class AbstractTensor:
         # +tensor is a no-op, return self
         return self
 
+    def sign(self):
+        return self._apply_operator("sign", self, None)
+
+    def abs(self):
+        return self._apply_operator("abs", self, None)
 
     def __abs__(self):
         return self._apply_operator("abs", self, None)
@@ -1656,6 +1661,7 @@ from .abstraction_methods.creation import (
     zeros_like as create_zeros_like,
     ones_like as create_ones_like,
     full_like as create_full_like,
+    eye_like,
     random_tensor,
     randoms,
     rand_like,
@@ -1804,8 +1810,10 @@ _bind_and_wrap({
     "transpose": _reshape_methods.transpose,
     "unsqueeze": _reshape_methods.unsqueeze,
     "squeeze": _reshape_methods.squeeze,
+    "swapaxes": _reshape_methods.swapaxes,
     "repeat": _reshape_methods.repeat,
     "repeat_interleave": _reshape_methods.repeat_interleave,
+    "eye_like": eye_like,
     "zeros_like": create_zeros_like,
     "ones_like": create_ones_like,
     "full_like": create_full_like,
@@ -1886,6 +1894,8 @@ from .linalg import (
     solve as linalg_solve,
     inv as linalg_inv,
     eye as linalg_eye,
+    eigh as linalg_eigh,
+    cholesky as linalg_cholesky,
 )
 
 class _LinalgNS:
@@ -1903,6 +1913,8 @@ AbstractTensor.linalg.det   = staticmethod(linalg_det)
 AbstractTensor.linalg.solve = staticmethod(linalg_solve)
 AbstractTensor.linalg.inv   = staticmethod(linalg_inv)
 AbstractTensor.linalg.eye   = staticmethod(linalg_eye)
+AbstractTensor.linalg.eigh  = staticmethod(linalg_eigh)
+AbstractTensor.linalg.cholesky = staticmethod(linalg_cholesky)
 
 # optional top-level shorthands used by your code already
 AbstractTensor.dot   = staticmethod(linalg_dot)
@@ -1914,6 +1926,8 @@ AbstractTensor.solve = staticmethod(linalg_solve)
 AbstractTensor.inv   = staticmethod(linalg_inv)
 AbstractTensor.eye   = staticmethod(linalg_eye)
 AbstractTensor.inverse = staticmethod(linalg_inv)
+AbstractTensor.eigh  = staticmethod(linalg_eigh)
+AbstractTensor.cholesky = staticmethod(linalg_cholesky)
 
 def _cbrt(x):
     import numpy as np
@@ -2004,6 +2018,7 @@ from .abstraction_methods.elementwise import (
     __xor__ as elementwise_xor,
     __invert__ as elementwise_invert,
     where as elementwise_where,
+    sign as elementwise_sign,
     maximum as elementwise_maximum,
     minimum as elementwise_minimum,
     _as_scalar, _scalar_kernel,
@@ -2022,6 +2037,7 @@ AbstractTensor.__or__    = elementwise_or
 AbstractTensor.__xor__   = elementwise_xor
 AbstractTensor.__invert__= elementwise_invert
 AbstractTensor.where     = staticmethod(elementwise_where)
+AbstractTensor.sign      = elementwise_sign
 AbstractTensor.maximum   = elementwise_maximum
 AbstractTensor.minimum   = elementwise_minimum
 

@@ -19,6 +19,7 @@ def _scalar_kernel(op: str):
         "logical_xor":   lambda a, b, **k: bool(bool(a) ^    bool(b)),
         "invert":        lambda a,     **k: bool(not bool(a)),
         "where":         lambda c, a, b, **k: (a if bool(c) else b),
+        "sign":          lambda a,     **k: (a if (a != a) else (1 if a > 0 else (-1 if a < 0 else 0)))
     }
     if op not in tbl: raise NotImplementedError(op)
     return tbl[op]
@@ -191,3 +192,6 @@ def where(cond, a, b, *, allow_scalar: bool = True):
     if not isinstance(cond, AbstractTensor):
         raise TypeError("AbstractTensor.where expects first arg to be an AbstractTensor condition")
     return cond._v3_valuewise("where", a, b, allow_scalar=allow_scalar, annotate={"op":"where"})
+
+def sign(self):
+    return self._v1_valuewise("sign", annotate={"op":"sign"})

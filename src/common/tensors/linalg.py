@@ -1,8 +1,7 @@
 from __future__ import annotations
 from typing import Optional, Tuple, Union, List
 from .abstraction import AbstractTensor
-import numpy as np
-
+from .abstraction_methods.eigen import eigh, cholesky
 # ----------------------- small helpers -----------------------
 def _axis(dim: int, nd: int) -> int:
     d = dim if dim >= 0 else dim + nd
@@ -278,3 +277,4 @@ def inv(A: AbstractTensor) -> AbstractTensor:
     n = shp[-1]
     I = eye(n, dtype=A.get_dtype(), device=A.get_device(), batch_shape=tuple(shp[:-2]))
     return solve(A, I)
+

@@ -54,6 +54,8 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    def swapaxes_(self, axis1, axis2):
+        return self.data.swapaxes(axis1, axis2)
     def empty_(self, size, dtype=None, device=None):
         import numpy as np
         return np.empty(size, dtype=self._torch_dtype_to_numpy(dtype) if dtype is not None else None)

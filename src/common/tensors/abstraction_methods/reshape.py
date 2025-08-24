@@ -50,6 +50,10 @@ def unsqueeze(self, dim: int) -> "AbstractTensor":
 
     raise NotImplementedError("Unsqueeze fallback not implemented for this backend.")
 
+def swapaxes(self, axis1: int, axis2: int) -> "AbstractTensor":
+    if hasattr(self, "swapaxes_"):
+        return _wrap_result(self, self.swapaxes_(axis1, axis2))
+    raise NotImplementedError("swapaxes fallback not implemented for this backend.")
 
 def squeeze(self, dim: int | None = None) -> "AbstractTensor":
     """Return a tensor with all (or one) dimensions of size 1 removed."""

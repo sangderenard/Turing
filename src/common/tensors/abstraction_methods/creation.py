@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from enum import auto
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict
@@ -39,7 +40,14 @@ def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwar
     inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)
     return inst.reshape(*size)
 
-
+def eye_like(A, n=None):
+    """Create an identity matrix tensor like A, with optional size n."""
+    from ..abstraction import AbstractTensor
+    n = n if n is not None else A.get_shape()[-1]
+    I = AbstractTensor.zeros_like(A)
+    for i in range(n):
+        I[..., i, i] = (I[..., i, i] * 0) + 1
+    return I
 
 def randint(size: Tuple[int, ...], low: int, high: int, device: Any = None, *, cls=None, **kwargs):
     """Create a tensor of the given shape filled with random integers in [low, high)."""
@@ -276,6 +284,8 @@ def likeclass(tensor, dtype: Any = None, device: Any = None):
     if cls is None:
         cls = AbstractTensor.check_or_build_registry()
     return cls
+
+
 
 def zeros_like(tensor, dtype: Any = None, device: Any = None):
     """Return a zeros tensor with the same shape as ``tensor``."""

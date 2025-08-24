@@ -43,6 +43,24 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
 class PurePythonTensorOperations(AbstractTensor):
+    def swapaxes_(self, axis1, axis2):
+        # Only works for 2D or 3D nested lists; for higher dims, extend as needed
+        from .abstraction import _get_shape
+        shape = _get_shape(self.data)
+        if len(shape) < 2:
+            return self.data  # nothing to swap
+        def recursive_swap(data, axis1, axis2, depth=0):
+            if depth == axis1:
+                # Move axis2 to axis1 position
+                if axis2 > axis1:
+                    for _ in range(axis2 - axis1):
+                        data = list(map(list, zip(*data)))
+                else:
+                    for _ in range(axis1 - axis2):
+                        data = list(map(list, zip(*data)))
+                return data
+            return [recursive_swap(sub, axis1, axis2, depth+1) for sub in data]
+        return recursive_swap(self.data, axis1, axis2)
     def empty_(self, size, dtype=None, device=None):
         if not size:
             return None
