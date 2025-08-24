@@ -27,19 +27,37 @@ class ThreadedAsciiDiffPrinter:
 
     Frames are written through a :class:`DoubleBuffer` to decouple producers
     from the rendering thread. Output is sent to a fast console printer.
+
+    ``queue_maxsize`` controls the underlying queue capacity.  When ``0`` the
+    queue is unbounded.  ``block_on_full`` selects whether producers block or
+    drop frames when the queue is full.
     """
 
-    def __init__(self, buffer_size: int = 2) -> None:
+    def __init__(
+        self,
+        buffer_size: int = 2,
+        *,
+        queue_maxsize: int = 0,
+        block_on_full: bool = True,
+    ) -> None:
         self._db = DoubleBuffer(roll_length=buffer_size, num_agents=2)
-        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._queue: "queue.Queue[str | None]" = queue.Queue(maxsize=queue_maxsize)
+        self._block_on_full = block_on_full
         self._stop = threading.Event()
         self._printer = cffiPrinter(threaded=True)
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
         self._thread.start()
 
-    def get_queue(self) -> "queue.Queue[str | None]":
-        """Return the input queue for ASCII frames."""
-        return self._queue
+    def enqueue(self, frame: str) -> None:
+        """Queue ``frame`` for printing, obeying the saturation policy."""
+        try:
+            self._queue.put(frame, block=self._block_on_full)
+        except queue.Full:
+            logger.debug("Dropping frame due to full queue")
+
+    def wait_until_empty(self) -> None:
+        """Block until all queued frames have been processed."""
+        self._queue.join()
 
     def _render_loop(self) -> None:
         agent_writer, agent_reader = 0, 1
@@ -64,6 +82,7 @@ class ThreadedAsciiDiffPrinter:
     def stop(self) -> None:
         """Signal the rendering thread to terminate and wait for it."""
         self._stop.set()
-        self._queue.put(None)
+        # Ensure the sentinel is enqueued even if the queue is full.
+        self._queue.put(None, block=True)
         self._thread.join()
         self._printer.stop()

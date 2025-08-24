@@ -9,7 +9,6 @@ def test_ascii_diff_animation():
     width, height = 32, 16
     r = AsciiRenderer(width, height)
     printer = ThreadedAsciiDiffPrinter()
-    q = printer.get_queue()
     frames = 10
     for frame in range(frames):
         r.clear()
@@ -19,6 +18,6 @@ def test_ascii_diff_animation():
         r.line(frame % width, 0, width - 1 - (frame % width), height - 1, value=1)
         ascii_out = r.to_ascii_diff()
         if ascii_out:
-            q.put(ascii_out)
-    q.join()
+            printer.enqueue(ascii_out)
+    printer.wait_until_empty()
     printer.stop()
