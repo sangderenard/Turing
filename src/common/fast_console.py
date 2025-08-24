@@ -50,23 +50,26 @@ class cffiPrinter:
             if self.mode == "A":
                 self.ffi.cdef(
                     """
-                    int WriteConsoleA(void* hConsoleOutput, const char* lpBuffer,
-                                     unsigned long nNumberOfCharsToWrite,
-                                     unsigned long* lpNumberOfCharsWritten,
-                                     void* lpReserved);
-                    void* GetStdHandle(int nStdHandle);
+
+                    int __stdcall WriteConsoleA(void* hConsoleOutput, const char* lpBuffer,
+                                               unsigned long nNumberOfCharsToWrite,
+                                               unsigned long* lpNumberOfCharsWritten,
+                                               void* lpReserved);
+                    void* __stdcall GetStdHandle(int nStdHandle);
+
                     int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
                     int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
+
                     """
                 )
             elif self.mode == "W":
                 self.ffi.cdef(
                     """
-                    int WriteConsoleW(void* hConsoleOutput, const wchar_t* lpBuffer,
-                                     unsigned long nNumberOfCharsToWrite,
-                                     unsigned long* lpNumberOfCharsWritten,
-                                     void* lpReserved);
-                    void* GetStdHandle(int nStdHandle);
+                    int __stdcall WriteConsoleW(void* hConsoleOutput, const wchar_t* lpBuffer,
+                                               unsigned long nNumberOfCharsToWrite,
+                                               unsigned long* lpNumberOfCharsWritten,
+                                               void* lpReserved);
+                    void* __stdcall GetStdHandle(int nStdHandle);
                     int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
                     int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
                     """
@@ -77,6 +80,8 @@ class cffiPrinter:
             self.C = self.ffi.dlopen("kernel32.dll")
             self.STD_OUTPUT_HANDLE = -11
             self._handle = self.C.GetStdHandle(self.STD_OUTPUT_HANDLE)
+            if self._handle == self.ffi.NULL or self._handle == self.ffi.cast("void*", -1):
+                raise OSError("GetStdHandle failed")
             mode = self.ffi.new("unsigned long *")
             if self.C.GetConsoleMode(self._handle, mode):
                 new_mode = mode[0] | 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -127,17 +132,21 @@ class cffiPrinter:
             if self.mode == "A":
                 b = s.encode("utf-8")
                 n = len(b)
-                self.C.WriteConsoleA(self._handle, b, n, written, self.ffi.NULL)
+                ret = self.C.WriteConsoleA(self._handle, b, n, written, self.ffi.NULL)
+                if ret == 0:
+                    raise OSError("WriteConsoleA failed")
             else:
                 w = s.encode("utf-16-le")
                 n = len(w) // 2
-                self.C.WriteConsoleW(
+                ret = self.C.WriteConsoleW(
                     self._handle,
                     self.ffi.from_buffer("wchar_t[]", w),
                     n,
                     written,
                     self.ffi.NULL,
                 )
+                if ret == 0:
+                    raise OSError("WriteConsoleW failed")
         else:
             b = s.encode("utf-8")
             self.C.write(self._fd, b, len(b))
