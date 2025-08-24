@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .console import reset_cursor_to_top
+from .console import full_clear_and_reset_cursor
 from .theme_manager import ThemeManager
 from ..render_chooser import RenderChooser
 
@@ -70,6 +70,7 @@ def menu():
         print("9. Exit")
 
     while True:
+        full_clear_and_reset_cursor()
         print_menu()
         choice = input("Select option (1-9,10): ").strip()
         if choice == "1":
@@ -155,7 +156,7 @@ def menu():
                     )
                     if user_input == "repeat":
                         continue
-                    reset_cursor_to_top()
+                    full_clear_and_reset_cursor()
                     break
             except Exception as e:
                 print(f"Error rendering image: {e}")
