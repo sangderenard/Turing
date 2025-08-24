@@ -100,32 +100,33 @@ class RenderChooser:
             except Exception:
                 preferred = "ascii"
 
-    from src.ascii_render import AsciiRenderer
+        # Only select ASCII renderer if requested or fallback
+        if preferred == "ascii" or True:  # fallback if nothing else worked
+            from src.ascii_render import AsciiRenderer
+            # Sensible defaults for ASCII mode
+            self.char_cell_pixel_height = 32
+            self.char_cell_pixel_width = 16
+            self.enable_fg_color = True
+            self.enable_bg_color = True
+            self.renderer = AsciiRenderer(width, height,
+                                         char_cell_pixel_height=self.char_cell_pixel_height,
+                                         char_cell_pixel_width=self.char_cell_pixel_width,
+                                         enable_fg_color=self.enable_fg_color,
+                                         enable_bg_color=self.enable_bg_color)
+            self.mode = "ascii"
+            self._ascii_printer = ThreadedAsciiDiffPrinter()
+            self._ascii_queue = self._ascii_printer.get_queue()
+            full_clear_and_reset_cursor()
 
-    # Allow char cell and color settings to be passed via environment or args in future
-    self.char_cell_pixel_height = 1
-    self.char_cell_pixel_width = 1
-    self.enable_fg_color = False
-    self.enable_bg_color = False
-    self.renderer = AsciiRenderer(width, height,
-                     char_cell_pixel_height=self.char_cell_pixel_height,
-                     char_cell_pixel_width=self.char_cell_pixel_width,
-                     enable_fg_color=self.enable_fg_color,
-                     enable_bg_color=self.enable_bg_color)
-    self.mode = "ascii"
-    self._ascii_printer = ThreadedAsciiDiffPrinter()
-    self._ascii_queue = self._ascii_printer.get_queue()
-    full_clear_and_reset_cursor()
+        # Input and rendering thread state
+        self._buffer = DoubleBuffer()
+        self._events = []
+        self._keys = set()
+        self._lock = threading.Lock()
+        self._running = True
 
-    # Input and rendering thread state
-    self._buffer = DoubleBuffer()
-    self._events = []
-    self._keys = set()
-    self._lock = threading.Lock()
-    self._running = True
-
-    self._thread = threading.Thread(target=self._loop, daemon=True)
-    self._thread.start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     # ------------------------------------------------------------------
     def render(self, state: Dict[str, Any]) -> None:

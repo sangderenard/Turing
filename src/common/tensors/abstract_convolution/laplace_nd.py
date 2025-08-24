@@ -924,8 +924,7 @@ class HodgeStarBuilder:
             # Find faces containing this edge
             mask = (face_tensor == edge[0]).any(dim=1) & (face_tensor == edge[1]).any(dim=1)
             mask = mask.to_dtype(mask.bool_dtype_)
-            print(f"mask.bool_dtype_: {mask.bool_dtype_}")
-            print(mask)
+
             shared_faces = face_tensor[mask]
             dual_area = 0.0
             for f in shared_faces:

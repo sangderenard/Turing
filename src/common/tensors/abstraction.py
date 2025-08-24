@@ -164,7 +164,7 @@ class AbstractTensor:
                 return backend_cls
             
             tensor_type = backend_cls.tensor_type_
-            print(tensor_type)
+            
             if tensor_type is not None and isinstance(data, tensor_type):
                 return backend_cls
         return None
