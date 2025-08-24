@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, Literal, List
 import numpy as np
 
 from ..abstraction import AbstractTensor
@@ -124,10 +124,27 @@ class NDPCA3Conv3d:
             ps.extend(self.pointwise.parameters())
         return ps
 
+    def grads(self) -> List[AbstractTensor]:
+        gs: List[AbstractTensor] = [self.g_taps]
+        if self.pointwise is not None:
+            gs.append(self.pointwise.gW)
+            if getattr(self.pointwise, "gb", None) is not None:
+                gs.append(self.pointwise.gb)
+        return gs
+
     def zero_grad(self):
         self.g_taps = AbstractTensor.zeros_like(self.taps)
         if self.pointwise is not None:
             self.pointwise.zero_grad()
+
+    # backward compatibility alias
+    @property
+    def gW(self) -> AbstractTensor:
+        return self.g_taps
+
+    @gW.setter
+    def gW(self, val: AbstractTensor) -> None:
+        self.g_taps = val
 
     # --- helpers ---
     def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
