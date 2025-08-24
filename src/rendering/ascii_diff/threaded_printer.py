@@ -7,10 +7,14 @@ import queue
 import logging
 import os
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:  # Windows-only fast console; fallback to normal print if unavailable
     from src.common.fast_console import cffiPrinter
-except Exception:  # pragma: no cover - non-Windows or missing deps
+except Exception as e:  # pragma: no cover - non-Windows or missing deps
+    logger.warning("fast console unavailable; fallback mode active: %s", e)
     cffiPrinter = None  # type: ignore
 
 from src.common.double_buffer import DoubleBuffer
@@ -70,7 +74,7 @@ class ThreadedAsciiDiffPrinter:
                     self._printer.print(frame)
                 else:  # pragma: no cover - fallback path
                     logger.debug("Fallback printing path used")
-                    print(frame, end="")
+                    print(frame, end="", flush=True)
             self._queue.task_done()
         if self._printer is not None:
             self._printer.flush()
