@@ -71,6 +71,8 @@ class AsciiKernelClassifier:
         # Profiling support toggled via the TURING_PROFILE env var
         self.profile = bool(int(os.getenv("TURING_PROFILE", "0")))
         self.profile_stats: dict[str, float] = {"train_ms": 0.0, "classify_ms": 0.0}
+        # Store per-call classification durations when profiling
+        self.classify_durations: list[float] = []
         self._prepare_reference_bitmasks()
 
     def set_font(self, font_path=None, font_size=None, char_size=None):
@@ -232,9 +234,9 @@ class AsciiKernelClassifier:
                 "logits": logits,
             }
             if self.profile and start is not None:
-                self.profile_stats["classify_ms"] += (
-                    time.perf_counter() - start
-                ) * 1000.0
+                elapsed = (time.perf_counter() - start) * 1000.0
+                self.profile_stats["classify_ms"] += elapsed
+                self.classify_durations.append(elapsed)
             return result
 
         refs = AbstractTensor.get_tensor().stack(self.charBitmasks, dim=0)
@@ -254,9 +256,9 @@ class AsciiKernelClassifier:
             "logits": None,
         }
         if self.profile and start is not None:
-            self.profile_stats["classify_ms"] += (
-                time.perf_counter() - start
-            ) * 1000.0
+            elapsed = (time.perf_counter() - start) * 1000.0
+            self.profile_stats["classify_ms"] += elapsed
+            self.classify_durations.append(elapsed)
         return result
 if __name__ == "__main__":
     import argparse

@@ -50,6 +50,8 @@ class AsciiRenderer:
         # Profiling support toggled via the TURING_PROFILE env var
         self.profile = bool(int(os.getenv("TURING_PROFILE", "0")))
         self.profile_stats: dict[str, float] = {"to_ascii_diff_ms": 0.0}
+        # Record per-call durations when profiling
+        self.to_ascii_diff_durations: list[float] = []
 
     # -- canvas helpers -------------------------------------------------
     def clear(self, value: float | int = 0) -> None:
@@ -196,7 +198,7 @@ class AsciiRenderer:
             )
         ascii_out = buffer.getvalue()
         if self.profile and start is not None:
-            self.profile_stats["to_ascii_diff_ms"] += (
-                time.perf_counter() - start
-            ) * 1000.0
+            elapsed = (time.perf_counter() - start) * 1000.0
+            self.profile_stats["to_ascii_diff_ms"] += elapsed
+            self.to_ascii_diff_durations.append(elapsed)
         return ascii_out
