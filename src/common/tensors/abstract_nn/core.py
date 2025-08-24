@@ -413,9 +413,14 @@ class Model:
     def grads(self) -> List[AbstractTensor]:
         gs: List[AbstractTensor] = []
         for l in self.layers:
-            gs.append(l.gW)
-            if l.b is not None:
-                gs.append(l.gb)
+            layer_grads = getattr(l, "grads", None)
+            if callable(layer_grads):
+                gs.extend(layer_grads())
+            else:
+                gs.append(l.gW)
+                if l.b is not None:
+                    gs.append(l.gb)
+        assert len(gs) == len(self.parameters()), "grads count must match parameters count"
         return gs
 
     def zero_grad(self) -> None:
