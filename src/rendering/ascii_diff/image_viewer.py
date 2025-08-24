@@ -149,6 +149,9 @@ def menu():
                             time.sleep(1.0 / fps)
 
                     rc.render({"image": frame})
+                    # Ensure all pending frames have been printed before prompting the user.
+                    if rc.mode == "ascii" and getattr(rc, "_ascii_queue", None) is not None:
+                        rc._ascii_queue.join()
                     user_input = (
                         input("\nPress Enter to continue, or type 'repeat' to play again: ")
                         .strip()
