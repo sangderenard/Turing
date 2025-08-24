@@ -1171,7 +1171,6 @@ class TransformHub:
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdv, dYdv, dZdv], dim=-1), AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), dim=-1),
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), AbstractTensor.stack([dXdu, dYdu, dZdu], dim=-1), dim=-1)
         ], dim=-1)
-        print(type(normals))
         # Compute distances from the origin
         distances = AbstractTensor.sqrt(X**2 + Y**2 + Z**2)
 
@@ -1212,7 +1211,6 @@ class TransformHub:
 
         # Continue with normalization and validation
         norm_magnitudes = AbstractTensor.get_tensor(AbstractTensor.norm(normals, dim=-2, keepdim=True))
-        print(type(norm_magnitudes))
         # Normalize normals, avoid division by zero for zero-magnitude normals
         normals = AbstractTensor.where(norm_magnitudes > 1e-16, normals / norm_magnitudes, normals)
 
