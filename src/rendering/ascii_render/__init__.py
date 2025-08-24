@@ -128,9 +128,9 @@ class AsciiRenderer:
     def paint(self, image: np.ndarray, x: int = 0, y: int = 0) -> None:
         """Blit ``image`` onto the canvas with the top-left corner at ``(x, y)``.
 
-        The image's channel depth must match the canvas depth.  Values outside
-        the canvas bounds are clipped.  This is a placeholder for more advanced
-        composition routines.
+        The image is broadcast or reduced to match the canvas depth.  Values
+        outside the canvas bounds are clipped.  This is a placeholder for more
+        advanced composition routines.
         """
 
         h, w = image.shape[:2]
@@ -138,7 +138,22 @@ class AsciiRenderer:
         y_end = min(self.canvas.shape[0], y + h)
         if x_end <= x or y_end <= y:
             return
-        self.canvas[y:y_end, x:x_end, ...] = image[: y_end - y, : x_end - x, ...]
+
+        target = self.canvas[y:y_end, x:x_end, ...]
+        src = image[: y_end - y, : x_end - x, ...]
+
+        if src.ndim == 2:
+            src = src[..., None]
+
+        if src.shape[2] == target.shape[2]:
+            target[...] = src
+        elif target.shape[2] == 1:
+            target[..., 0] = src.mean(axis=2)
+        elif src.shape[2] == 1:
+            target[...] = np.repeat(src, target.shape[2], axis=2)
+        else:
+            depth = min(src.shape[2], target.shape[2])
+            target[..., :depth] = src[..., :depth]
 
     # -- ASCII conversion ------------------------------------------------
     def to_ascii(self) -> str:
@@ -165,14 +180,16 @@ class AsciiRenderer:
         Only regions that changed since the last call are emitted.
         """
         start = time.perf_counter() if self.profile else None
-        # Convert canvas to 2D if needed (collapse depth)
-        if self.canvas.shape[2] == 1:
-            tensor = self.canvas[..., 0]
-        else:
-            tensor = self.canvas.mean(axis=2)
 
-        # Update the persistent frame buffer with the new RGB data
-        rgb = np.repeat(tensor[..., None], 3, axis=2).astype(np.uint8)
+        tensor = self.canvas
+        if tensor.shape[2] == 1:
+            rgb = np.repeat(tensor, 3, axis=2)
+        elif tensor.shape[2] >= 3:
+            rgb = tensor[..., :3]
+        else:
+            rgb = np.zeros((*tensor.shape[:2], 3), dtype=tensor.dtype)
+            rgb[..., : tensor.shape[2]] = tensor
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         self._fb.update_render(rgb)
         updates = self._fb.get_diff_and_promote()
         if not updates:
