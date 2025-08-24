@@ -55,6 +55,8 @@ class cffiPrinter:
                                      unsigned long* lpNumberOfCharsWritten,
                                      void* lpReserved);
                     void* GetStdHandle(int nStdHandle);
+                    int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
+                    int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
                     """
                 )
             elif self.mode == "W":
@@ -65,6 +67,8 @@ class cffiPrinter:
                                      unsigned long* lpNumberOfCharsWritten,
                                      void* lpReserved);
                     void* GetStdHandle(int nStdHandle);
+                    int GetConsoleMode(void* hConsoleHandle, unsigned long* lpMode);
+                    int SetConsoleMode(void* hConsoleHandle, unsigned long dwMode);
                     """
                 )
             else:  # pragma: no cover - defensive clause
@@ -73,6 +77,13 @@ class cffiPrinter:
             self.C = self.ffi.dlopen("kernel32.dll")
             self.STD_OUTPUT_HANDLE = -11
             self._handle = self.C.GetStdHandle(self.STD_OUTPUT_HANDLE)
+            mode = self.ffi.new("unsigned long *")
+            if self.C.GetConsoleMode(self._handle, mode):
+                new_mode = mode[0] | 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if not self.C.SetConsoleMode(self._handle, new_mode):
+                    logger.error("SetConsoleMode failed")
+            else:
+                logger.error("GetConsoleMode failed")
         else:
             # POSIX: stream bytes directly to stdout via write(2)
             self.ffi.cdef("ssize_t write(int fd, const void* buf, size_t count);")
