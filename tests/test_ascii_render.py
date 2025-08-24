@@ -25,3 +25,22 @@ def test_ascii_ramp():
     r.canvas[0, 1, 0] = 1
     art = r.to_ascii()
     assert art == " @"
+
+
+def test_paint_channel_mismatch():
+    r = AsciiRenderer(4, 4, depth=1)
+    img = np.zeros((2, 2, 3), dtype=np.uint8)
+    img[..., 1] = 128
+    img[..., 2] = 255
+    r.paint(img, 0, 0)
+    expected = img.mean(axis=2, keepdims=True).astype(r.canvas.dtype)
+    assert np.array_equal(r.canvas[:2, :2], expected)
+
+
+def test_to_ascii_diff_preserves_color():
+    r = AsciiRenderer(2, 1, depth=3)
+    r.canvas[0, 0] = [10, 20, 30]
+    r.canvas[0, 1] = [30, 40, 50]
+    r.to_ascii_diff()
+    assert np.array_equal(r._fb.buffer_display[0, 0], [10, 20, 30])
+    assert np.array_equal(r._fb.buffer_display[0, 1], [30, 40, 50])
