@@ -53,7 +53,7 @@ class ThreadedAsciiDiffPrinter:
                 if self._printer is not None:
                     self._printer.print(frame)
                 else:  # pragma: no cover - fallback path
-                    print(frame, end="")
+                    print(frame, end="", flush=True)
             self._queue.task_done()
         if self._printer is not None:
             self._printer.flush()
