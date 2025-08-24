@@ -1,3 +1,12 @@
+# Novel Idea:
+
+Title idea:
+Data-Driven Riemannian Metrics for Convolutional Layers: Learning Geometry from Latent Manifolds
+
+Abstract (sketch):
+We introduce a new class of convolutional neural networks where the Riemannian metric tensor of the feature space is learned directly from the data manifold. Unlike prior manifold CNNs that fix geometry a priori, our approach dynamically adapts the Laplace–Beltrami operator to the latent structure. We demonstrate stable convergence to below 1e-6 training error within 235 epochs on an 8-class dataset and strong generalization on 100-class classification. This shows that data-driven metric learning can serve as both a geometric prior and a numerical preconditioner, unifying geometric deep learning with learned differential geometry.
+
+
 # Turing
 
 This project simulates a cassette-driven "survival computer" using a compile and run flow.
