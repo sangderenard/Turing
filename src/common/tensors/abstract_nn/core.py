@@ -136,6 +136,8 @@ class RectConv2d:
         self._x = None
         self._cols = None
         self._x_shape = None
+        self._cols = None
+        self._x_shape = None
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -150,7 +152,7 @@ class RectConv2d:
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         self._x = x
-        self._x_shape = x.shape()
+        self._x_shape = x.shape
         cols = x.unfold2d(
             self.kernel_size,
             stride=self.stride,
@@ -180,9 +182,9 @@ class RectConv2d:
         grad_mat = grad_out.reshape(N, self.out_channels, L)
         cols_T = self._cols.transpose(1, 2)
         gW = grad_mat @ cols_T
-        self.gW = gW.sum(dim=0).reshape(*self.W.shape())
+        self.gW = gW.sum(dim=0).reshape(*self.W.shape)
         if self.b is not None:
-            self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape())
+            self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape)
         Wm = self.W.reshape(self.out_channels, -1)
         WT = Wm.transpose(0, 1)
         dcols = WT @ grad_mat
@@ -247,25 +249,79 @@ class RectConv3d:
         if self.b is not None:
             self.gb = zeros_like(self.b)
         self._x = None
+        self._cols = None
+        self._x_shape = None
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         import numpy as np
         from numpy.lib.stride_tricks import sliding_window_view
 
         self._x = x
+        self._x_shape = x.shape
         arr = x.data
         pD, pH, pW = self.padding
         arr_p = np.pad(arr, ((0, 0), (0, 0), (pD, pD), (pH, pH), (pW, pW)))
         kD, kH, kW = self.kernel_size
-        windows = sliding_window_view(arr_p, (kD, kH, kW), axis=(2, 3, 4))
-        out = np.tensordot(windows, self.W.data, axes=([1, 5, 6, 7], [1, 2, 3, 4]))
-        out = np.moveaxis(out, -1, 1)
+        sD, sH, sW = self.stride
+        dD, dH, dW = self.dilation
+        eKD = dD * (kD - 1) + 1
+        eKH = dH * (kH - 1) + 1
+        eKW = dW * (kW - 1) + 1
+        win = sliding_window_view(arr_p, (eKD, eKH, eKW), axis=(2, 3, 4))
+        win = win[:, :, ::sD, ::sH, ::sW, ::dD, ::dH, ::dW]
+        N = self._x_shape[0]
+        Dout, Hout, Wout = win.shape[2], win.shape[3], win.shape[4]
+        cols = np.transpose(win, (0, 1, 5, 6, 7, 2, 3, 4)).reshape(
+            N, self.in_channels * kD * kH * kW, Dout * Hout * Wout
+        )
+        cols_t = x.ensure_tensor(cols)
+        self._cols = cols_t
+        Wm = self.W.reshape(self.out_channels, -1)
+        out = Wm @ cols_t
         if self.b is not None:
-            out = out + self.b.data.reshape(1, -1, 1, 1, 1)
-        return x.ensure_tensor(out)
+            out = out + self.b.reshape(1, -1, 1)
+        return out.reshape(N, self.out_channels, Dout, Hout, Wout)
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        raise NotImplementedError("RectConv3d.backward is not implemented")
+        import numpy as np
+        if self._x is None or self._cols is None or self._x_shape is None:
+            raise RuntimeError("RectConv3d.backward called before forward")
+        N, _, Dout, Hout, Wout = grad_out.shape
+        L = Dout * Hout * Wout
+        grad_mat = grad_out.reshape(N, self.out_channels, L)
+        cols_T = self._cols.transpose(1, 2)
+        gW = grad_mat @ cols_T
+        self.gW = gW.sum(dim=0).reshape(*self.W.shape)
+        if self.b is not None:
+            self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape)
+        Wm = self.W.reshape(self.out_channels, -1)
+        WT = Wm.transpose(0, 1)
+        dcols = WT @ grad_mat
+        dcols_np = dcols.data
+        C = self.in_channels
+        kD, kH, kW = self.kernel_size
+        sD, sH, sW = self.stride
+        pD, pH, pW = self.padding
+        dD, dH, dW = self.dilation
+        D, H, W = self._x_shape[2], self._x_shape[3], self._x_shape[4]
+        dcols_np = dcols_np.reshape(N, C, kD, kH, kW, Dout, Hout, Wout)
+        grad_win = np.transpose(dcols_np, (0, 1, 5, 6, 7, 2, 3, 4))
+        dx_p = np.zeros((N, C, D + 2 * pD, H + 2 * pH, W + 2 * pW), dtype=dcols_np.dtype)
+        for kd in range(kD):
+            d_slice = slice(kd * dD, kd * dD + sD * Dout, sD)
+            for kh in range(kH):
+                h_slice = slice(kh * dH, kh * dH + sH * Hout, sH)
+                for kw in range(kW):
+                    w_slice = slice(kw * dW, kw * dW + sW * Wout, sW)
+                    dx_p[:, :, d_slice, h_slice, w_slice] += grad_win[
+                        :, :, :, :, :, kd, kh, kw
+                    ]
+        dx = dx_p[:, :, pD : pD + D, pH : pH + H, pW : pW + W]
+        result = self._x.ensure_tensor(dx)
+        self._x = None
+        self._cols = None
+        self._x_shape = None
+        return result
 
 
 class MaxPool2d:
