@@ -1242,6 +1242,14 @@ class AbstractTensor:
             if isinstance(right, bool):
                 right = 1.0 if (op in div_ops or "float" in (lk,)) else 1
 
+        if op == "matmul":
+            lk, rk = kind(left), kind(right)
+            if "float" in (lk, rk) and "int" in (lk, rk):
+                if isinstance(left, AbstractTensor) and lk == "int":
+                    left = left.to_dtype("float")
+                if isinstance(right, AbstractTensor) and rk == "int":
+                    right = right.to_dtype("float")
+
         # unwrap AFTER promotion
         l = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left
         r = right._AbstractTensor__unwrap() if isinstance(right, AbstractTensor) else right
