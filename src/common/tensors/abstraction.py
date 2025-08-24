@@ -827,6 +827,23 @@ class AbstractTensor:
         return result
 
     @staticmethod
+    def copyto(
+        dst: Any,
+        src: Any,
+        *,
+        where: Any | None = None,
+        casting: str = "same_kind",
+    ) -> "AbstractTensor":
+        """Copy ``src`` into ``dst`` with NumPy ``copyto`` semantics."""
+        dst_tensor = dst if isinstance(dst, AbstractTensor) else AbstractTensor.get_tensor(dst)
+        src_tensor = dst_tensor.ensure_tensor(src)
+        where_tensor = dst_tensor.ensure_tensor(where) if where is not None else None
+        dst_tensor.data = dst_tensor.copyto_(
+            src_tensor, where=where_tensor, casting=casting
+        )
+        return dst_tensor
+
+    @staticmethod
     def diag(tensor: Any, offset: int = 0) -> "AbstractTensor":
         """Extract or construct a diagonal.
 
@@ -906,6 +923,17 @@ class AbstractTensor:
     ):  # pragma: no cover - backend required
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement repeat_interleave_()"
+        )
+
+    def copyto_(
+        self,
+        src: Any,
+        *,
+        where: Any | None = None,
+        casting: str = "same_kind",
+    ):  # pragma: no cover - backend required
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement copyto_()"
         )
 
     def view_flat(self) -> "AbstractTensor":

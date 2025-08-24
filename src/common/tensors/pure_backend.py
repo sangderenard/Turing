@@ -807,6 +807,47 @@ class PurePythonTensorOperations(AbstractTensor):
             return result
         raise NotImplementedError("repeat_interleave only implemented for dim 0 or None")
 
+    def copyto_(self, src, *, where=None, casting="same_kind"):
+        s = self._AbstractTensor__unwrap(src)
+        t = self.data
+        if isinstance(s, list) and len(s) == 1 and not isinstance(s[0], list):
+            s = s[0]
+        if where is None:
+            if isinstance(s, (int, float, bool)):
+                def fill(d):
+                    if isinstance(d, list):
+                        for i in range(len(d)):
+                            d[i] = fill(d[i])
+                        return d
+                    return s
+                return fill(t)
+            else:
+                def copy(d, srcv):
+                    if isinstance(d, list):
+                        for i in range(len(d)):
+                            d[i] = copy(d[i], srcv[i])
+                        return d
+                    return srcv
+                return copy(t, s)
+        else:
+            m = self._AbstractTensor__unwrap(where)
+            if isinstance(s, (int, float, bool)):
+                def apply(d, mask):
+                    if isinstance(d, list):
+                        for i in range(len(d)):
+                            d[i] = apply(d[i], mask[i])
+                        return d
+                    return s if mask else d
+                return apply(t, m)
+            else:
+                def apply(d, srcv, mask):
+                    if isinstance(d, list):
+                        for i in range(len(d)):
+                            d[i] = apply(d[i], srcv[i], mask[i])
+                        return d
+                    return srcv if mask else d
+                return apply(t, s, m)
+
     def cumsum_(self, dim: int = 0) -> Any:
         try:
             import numpy as np  # type: ignore

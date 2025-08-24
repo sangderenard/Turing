@@ -421,6 +421,26 @@ class JAXTensorOperations(AbstractTensor):
     def repeat_interleave_(self, repeats: int = 1, dim: Optional[int] = None) -> Any:
         return jnp.repeat(self._to_jnp(self.data), repeats, axis=dim).tolist()
 
+    def copyto_(self, src, *, where=None, casting="same_kind"):
+        import jax.numpy as jnp
+        import numpy as np
+        dst = self._to_jnp(self.data)
+        s = self._to_jnp(src)
+        if not np.can_cast(s.dtype, dst.dtype, casting=casting):
+            raise TypeError(
+                f"Cannot cast from {s.dtype} to {dst.dtype} with casting='{casting}'"
+            )
+        if s.dtype != dst.dtype:
+            s = s.astype(dst.dtype)
+        s = jnp.broadcast_to(s, dst.shape)
+        if where is None:
+            updated = s
+        else:
+            m = self._to_jnp(where)
+            m = jnp.broadcast_to(m, dst.shape)
+            updated = jnp.where(m, s, dst)
+        return updated
+
     def cumsum_(self, dim: int = 0) -> Any:
         import jax.numpy as jnp
         return jnp.cumsum(self.data, axis=dim)

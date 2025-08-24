@@ -515,6 +515,13 @@ class NumPyTensorOperations(AbstractTensor):
             dim = 0
         return np.repeat(self.data, repeats, axis=dim)
 
+    def copyto_(self, src, *, where=None, casting="same_kind"):
+        import numpy as np
+        s = self._AbstractTensor__unwrap(src)
+        w = True if where is None else self._AbstractTensor__unwrap(where)
+        np.copyto(self.data, s, casting=casting, where=w)
+        return self.data
+
     def cumsum_(self, dim=0):
         import numpy as np
         return np.cumsum(self.data, axis=dim)

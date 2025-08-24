@@ -21,9 +21,9 @@ class PixelFrameBuffer:
         self.lock = threading.Lock()
         self.buffer_shape = (shape[0], shape[1], 3)  # rows, cols, RGB
         self.default_pixel = AbstractTensor.get_tensor([0, 0, 0], dtype=integer_type)  # Black
-        self.buffer_render = AbstractTensor.get_tensor(AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type))
-        self.buffer_next = AbstractTensor.get_tensor(AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type))
-        self.buffer_display = AbstractTensor.get_tensor(AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type))
+        self.buffer_render = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
+        self.buffer_next = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
+        self.buffer_display = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
         self.diff_threshold = max(0, diff_threshold)
         self.tile_shape = (max(1, int(tile_shape[0])), max(1, int(tile_shape[1])))
         self._force_full_diff_next_call = True
@@ -37,9 +37,9 @@ class PixelFrameBuffer:
     def _resize(self, shape: tuple[int, int]) -> None:
         """Resize internal buffers to ``shape`` without acquiring the lock."""
         self.buffer_shape = (shape[0], shape[1], 3)
-        self.buffer_render = AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type)
-        self.buffer_next = AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type)
-        self.buffer_display = AbstractTensor.full(self.buffer_shape, self.default_pixel, dtype=integer_type)
+        self.buffer_render = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
+        self.buffer_next = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
+        self.buffer_display = AbstractTensor.full(self.buffer_shape, 0, dtype=integer_type)
         self._force_full_diff_next_call = True
 
     def resize(self, shape: tuple[int, int]) -> None:
@@ -113,8 +113,14 @@ class PixelFrameBuffer:
         if self._force_full_diff_next_call:
             self._force_full_diff_next_call = False
             if mode == "pixel":
-                ys, xs = AbstractTensor.meshgrid(AbstractTensor.arange(rows), AbstractTensor.arange(cols), indexing="ij")
-                coords = AbstractTensor.stack([ys.ravel(), xs.ravel()], axis=1)
+                ys, xs = AbstractTensor.meshgrid(
+                    AbstractTensor.arange(rows),
+                    AbstractTensor.arange(cols),
+                    indexing="ij",
+                )
+                coords = AbstractTensor.stack(
+                    [ys.view_flat(), xs.view_flat()], dim=1
+                )
                 updates = [
                     (int(y), int(x), tuple(int(v) for v in self.buffer_next[y, x]))
                     for y, x in coords
@@ -122,7 +128,14 @@ class PixelFrameBuffer:
             elif mode == "tile":
                 tiles_y = (rows + th - 1) // th
                 tiles_x = (cols + tw - 1) // tw
-                tcoords = AbstractTensor.stack(AbstractTensor.meshgrid(AbstractTensor.arange(tiles_y), AbstractTensor.arange(tiles_x), indexing="ij"), axis=-1).reshape(-1, 2)
+                tcoords = AbstractTensor.stack(
+                    AbstractTensor.meshgrid(
+                        AbstractTensor.arange(tiles_y),
+                        AbstractTensor.arange(tiles_x),
+                        indexing="ij",
+                    ),
+                    dim=-1,
+                ).reshape(-1, 2)
                 updates = []
                 for ty, tx in tcoords:
                     if include_data:

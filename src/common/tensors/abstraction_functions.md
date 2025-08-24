@@ -46,6 +46,7 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.boolean_mask_select()
 - AbstractTensor.argmin()
 - AbstractTensor.assign_at_indices()
+- AbstractTensor.copyto()
 - AbstractTensor.increment_at_indices()
 - AbstractTensor.__getitem__()
 - AbstractTensor.__setitem__()
