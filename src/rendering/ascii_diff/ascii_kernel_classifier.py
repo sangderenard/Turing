@@ -50,8 +50,8 @@ class AsciiKernelClassifier:
         loss_mode: str = "sad",
         *,
         use_nn: bool = True,
-        epsilon: float = 1e-4,
-        max_epochs: int = 200,
+        epsilon: float = 1e-12,
+        max_epochs: int = 1000,
     ) -> None:
         self.ramp = ramp
         self.vocab_size = len(ramp)
