@@ -37,6 +37,7 @@ class RenderChooser:
         self.screen = None
         self._ascii_printer: ThreadedAsciiDiffPrinter | None = None
         self._ascii_queue = None
+        self._sync_event = threading.Event()
 
         preferred = (mode or os.environ.get("TURING_RENDERER", "ascii")).lower()
 
@@ -168,6 +169,18 @@ class RenderChooser:
                 pass
 
     # ------------------------------------------------------------------
+    def sync(self) -> None:
+        """Block until pending frames have been rendered and printed."""
+        if self.mode != "ascii" or self._ascii_queue is None:
+            return
+        self._sync_event.clear()
+        # Send a sentinel frame that causes the worker thread to signal when
+        # all previous frames have been processed.
+        self.render({"__sync__": True})
+        self._sync_event.wait()
+        self._ascii_queue.join()
+
+    # ------------------------------------------------------------------
     def _loop(self) -> None:
         """Worker thread body: poll input and process render requests."""
 
@@ -176,6 +189,9 @@ class RenderChooser:
             state = self._buffer.read_frame(agent_idx=1)
             if state is None:
                 time.sleep(0.05)
+                continue
+            if state.get("__sync__"):
+                self._sync_event.set()
                 continue
             if self.mode == "opengl":  # pragma: no cover - requires GL context
                 self._render_opengl(state)
