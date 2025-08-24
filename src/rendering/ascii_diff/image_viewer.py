@@ -148,6 +148,9 @@ def menu():
                             time.sleep(1.0 / fps)
 
                     rc.render({"image": frame})
+                    # Ensure all pending frames have been printed before prompting the user.
+                    if rc.mode == "ascii":
+                        rc.sync()
                     user_input = (
                         input("\nPress Enter to continue, or type 'repeat' to play again: ")
                         .strip()
