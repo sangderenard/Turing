@@ -230,6 +230,7 @@ class AsciiKernelClassifier:
                 self._train_nn()
             inputs = luminance_tensor.reshape(N, 1, 1, expected_hw_shape[0], expected_hw_shape[1])
             self.nn_model.package = {"metric": {"g": self.nn_metric, "inv_g": self.nn_metric}}
+            print(f"Classifying batch of size {N} with input shape {inputs.shape}")
             logits = self.nn_model.forward(inputs)
             idxs = logits.argmax(dim=1)
             chars = [self.charset[int(i)] for i in idxs.tolist()]

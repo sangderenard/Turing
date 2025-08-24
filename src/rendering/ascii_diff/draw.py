@@ -86,12 +86,14 @@ def default_subunit_batch_to_chars(
     if _classifier_cache["ramp_char_size_use_nn"] != cache_key or _classifier_cache["classifier"] is None:
         classifier = AsciiKernelClassifier(
             ramp,
+            font_path=str(DEFAULT_FONT_PATH),
+            font_size=16,
             char_size=(char_width, char_height),
             use_nn=use_nn,
             epsilon=epsilon,
             max_epochs=max_epochs,
         )
-        classifier.set_font(font_path=str(DEFAULT_FONT_PATH), font_size=16, char_size=(char_width, char_height))
+        
         _classifier_cache["ramp_char_size_use_nn"] = cache_key
         _classifier_cache["classifier"] = classifier
     else:
