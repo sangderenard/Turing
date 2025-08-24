@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 import queue
+import logging
+import os
 from typing import Optional
 
 try:  # Windows-only fast console; fallback to normal print if unavailable
@@ -12,6 +14,17 @@ except Exception:  # pragma: no cover - non-Windows or missing deps
     cffiPrinter = None  # type: ignore
 
 from src.common.double_buffer import DoubleBuffer
+
+
+logger = logging.getLogger(__name__)
+if os.getenv("TURING_DEBUG"):
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.addHandler(logging.NullHandler())
 
 
 class ThreadedAsciiDiffPrinter:
@@ -42,17 +55,21 @@ class ThreadedAsciiDiffPrinter:
         while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=0.1)
+                logger.debug("Retrieved frame from queue")
             except queue.Empty:
                 continue
             if item is None:
+                logger.debug("Stop sentinel received")
                 self._queue.task_done()
                 break
             self._db.write_frame(item, agent_idx=agent_writer)
             frame = self._db.read_frame(agent_idx=agent_reader)
             if frame is not None:
                 if self._printer is not None:
+                    logger.debug("Sending frame to cffiPrinter: %d chars", len(frame))
                     self._printer.print(frame)
                 else:  # pragma: no cover - fallback path
+                    logger.debug("Fallback printing path used")
                     print(frame, end="")
             self._queue.task_done()
         if self._printer is not None:
