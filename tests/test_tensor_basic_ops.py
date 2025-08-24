@@ -63,3 +63,11 @@ def test_prod(backend_name, Backend):
     assert to_list(a.prod(dim=0)) == [3, 8]
     assert to_list(a.prod(dim=1, keepdim=True)) == [[2], [12]]
     assert to_list(a.prod(dim=-1)) == [2, 12]
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_view_flat_handles_non_contiguous(backend_name, Backend):
+    # swapaxes produces a non-contiguous view for some backends (e.g., PyTorch)
+    t = Backend.tensor_from_list([[1, 2], [3, 4]]).swapaxes(0, 1)
+    flat = t.view_flat()
+    assert flat.tolist() == [1, 3, 2, 4]

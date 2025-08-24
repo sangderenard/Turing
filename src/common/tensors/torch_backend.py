@@ -488,7 +488,7 @@ class PyTorchTensorOperations(AbstractTensor):
         
 
     def view_flat_(self):
-        return self.data.view(-1)
+        return self.data.reshape(-1)
 
     def flatten_(self):
         return self.data.flatten()
