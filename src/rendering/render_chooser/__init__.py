@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from typing import Any, Dict, Iterable, Tuple, List, Set
+import numpy as np
 from src.common.double_buffer import DoubleBuffer
 from src.rendering.ascii_diff import (
     ThreadedAsciiDiffPrinter,
@@ -209,6 +210,12 @@ class RenderChooser:
     def _render_ascii(self, state: Dict[str, Any]) -> None:
         r = self.renderer
         r.clear()
+        image = state.get("image")
+        if image is not None:
+            arr = np.asarray(image)
+            if arr.ndim == 2:
+                arr = arr[..., None]
+            r.paint(arr)
         for x, y in state.get("points", []):
             r.point(int(x), int(y))
         for (x0, y0), (x1, y1) in state.get("edges", []):
