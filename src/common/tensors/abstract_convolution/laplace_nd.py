@@ -2057,10 +2057,7 @@ class HeatEngine(DtCompatibleEngine):
 
     def step(self, dt, state=None, state_table=None):
         self.prev_temperature = self.temperature.copy()
-        print(f"alpha: {self.alpha}, dt: {dt}, temperature: {self.temperature}")
-        print(f"temp shape: {self.temperature.shape}, laplacian_tensor {self.laplacian_tensor.shape}")
         prod = self.laplacian_tensor @ self.temperature
-        print(f"product shape: {prod.shape}")
         self.temperature += -self.alpha * dt * prod
         # Relative system energy change (L2 norm)
         prev_energy = AbstractTensor.linalg.norm(self.prev_temperature)
