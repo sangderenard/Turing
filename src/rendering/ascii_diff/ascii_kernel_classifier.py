@@ -46,7 +46,7 @@ class AsciiKernelClassifier:
         char_size: tuple[int, int] = (16, 16),
         loss_mode: str = "sad",
         *,
-        use_nn: bool = False,
+        use_nn: bool = True,
         epsilon: float = 1e-4,
         max_epochs: int = 200,
     ) -> None:

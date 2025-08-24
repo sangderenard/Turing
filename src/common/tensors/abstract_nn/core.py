@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing import List
+from pathlib import Path
+import json
 from ..abstraction import AbstractTensor
 import random, math
 from .utils import from_list_like, zeros_like, transpose2d
@@ -422,6 +424,36 @@ class Model:
                     gs.append(l.gb)
         assert len(gs) == len(self.parameters()), "grads count must match parameters count"
         return gs
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+    def state_dict(self) -> list:
+        """Return a JSON-serializable representation of model parameters."""
+        state: list[list] = []
+        for layer in self.layers:
+            layer_state = [p.tolist() for p in layer.parameters()]
+            state.append(layer_state)
+        return state
+
+    def load_state_dict(self, state: list) -> None:
+        """Load parameters from ``state`` produced by :meth:`state_dict`."""
+        for layer, layer_state in zip(self.layers, state):
+            params = layer.parameters()
+            for p, data in zip(params, layer_state):
+                tensor = from_list_like(data, like=p)
+                p.data[...] = tensor.data
+
+    def save_state(self, path: str | Path) -> None:
+        """Serialize model parameters to ``path`` as JSON."""
+        with open(Path(path), "w", encoding="utf-8") as fh:
+            json.dump(self.state_dict(), fh)
+
+    def load_state(self, path: str | Path) -> None:
+        """Restore model parameters from a JSON file at ``path``."""
+        with open(Path(path), "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.load_state_dict(state)
 
     def zero_grad(self) -> None:
         for layer in self.layers:

@@ -72,7 +72,7 @@ def default_subunit_batch_to_chars(
     char_width: int = 16, # Add parameters for desired char_size
     char_height: int = 16, # These will be the actual cell_w, cell_h from clock_demo
     *,
-    use_nn: bool = False,
+    use_nn: bool = True,
     epsilon: float = 1e-4,
     max_epochs: int = 200,
 ) -> list[str]:
