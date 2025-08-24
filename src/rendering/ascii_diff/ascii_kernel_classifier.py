@@ -7,6 +7,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from ...common.tensors import AbstractTensor, Faculty
 from ...common.tensors.numpy_backend import NumPyTensorOperations
+from ...common.tensors.abstract_nn.core import Model, Linear
+from ...common.tensors.abstract_convolution.ndpca3conv import NDPCA3Conv3d
+from ...common.tensors.abstract_nn.losses import MSELoss
+from ...common.tensors.abstract_nn.optimizer import Adam
 try:  # optional torch backend
     from ...common.tensors.torch_backend import PyTorchTensorOperations
 except Exception:  # pragma: no cover - torch is optional
@@ -41,6 +45,10 @@ class AsciiKernelClassifier:
         font_size: int = 16,
         char_size: tuple[int, int] = (16, 16),
         loss_mode: str = "sad",
+        *,
+        use_nn: bool = False,
+        epsilon: float = 1e-4,
+        max_epochs: int = 200,
     ) -> None:
         self.ramp = ramp
         self.vocab_size = len(ramp)
@@ -50,6 +58,13 @@ class AsciiKernelClassifier:
         self.loss_mode = loss_mode  # "sad" or "ssim"
         self.charset: list[str] | None = None
         self.charBitmasks: list[AbstractTensor] | None = None
+        self.use_nn = use_nn
+        self.epsilon = epsilon
+        self.max_epochs = max_epochs
+        self.nn_model: Model | None = None
+        self.nn_trained = False
+        self.nn_metric = None
+        self.nn_grid_shape = None
         self._prepare_reference_bitmasks()
 
     def set_font(self, font_path=None, font_size=None, char_size=None):
@@ -71,6 +86,85 @@ class AsciiKernelClassifier:
         self.charset = [c for c, _ in filtered] # type: ignore
         # self.char_size is (W, H), interpolate expects (H, W) for size
         self.charBitmasks = [AbstractTensor.F.interpolate(AbstractTensor.get_tensor(bm).to_dtype("float") / 255.0, size=(self.char_size[1], self.char_size[0])) for _, bm in filtered] # type: ignore
+
+    def _prepare_nn_data(self):
+        bitmasks = self.charBitmasks or []
+        n_classes = len(bitmasks)
+        h, w = self.char_size[1], self.char_size[0]
+        inputs: list[AbstractTensor] = []
+        targets: list[np.ndarray] = []
+        for idx, bm in enumerate(bitmasks):
+            arr = bm.reshape(1, h, w)
+            arr = arr.unsqueeze(0)
+            inputs.append(arr)
+            target_row = np.zeros((n_classes,), dtype=np.float32)
+            target_row[idx] = 1.0
+            targets.append(target_row)
+        x = AbstractTensor.stack(inputs, dim=0)
+        y = AbstractTensor.get_tensor(np.stack(targets, axis=0))
+        return x, y
+
+    def _train_nn(self) -> None:
+        train_x, train_y = self._prepare_nn_data()
+        n_classes = train_y.shape[1]
+        like = train_x[0]
+        h, w = self.char_size[1], self.char_size[0]
+        self.nn_grid_shape = (1, h, w)
+        metric_np = np.tile(np.eye(3, dtype=np.float32), (1, h, w, 1, 1))
+        metric = AbstractTensor.get_tensor(metric_np)
+        package = {"metric": {"g": metric, "inv_g": metric}}
+
+        class CharClassifier(Model):
+            def __init__(self, like, grid_shape):
+                conv = NDPCA3Conv3d(
+                    in_channels=1,
+                    out_channels=16,
+                    like=like,
+                    grid_shape=grid_shape,
+                    boundary_conditions=("neumann",) * 6,
+                    k=3,
+                    eig_from="g",
+                    pointwise=True,
+                )
+                flatten = lambda t: t.reshape(t.shape[0], -1)
+                fc = Linear(16 * grid_shape[0] * grid_shape[1] * grid_shape[2], n_classes, like=like, bias=True)
+                super().__init__(layers=[conv, fc], activations=[None, None])
+                self.flatten = flatten
+                self.conv = conv
+                self.fc = fc
+                self.package = None
+
+            def forward(self, x: AbstractTensor):
+                x = self.conv.forward(x, package=self.package)
+                x = self.flatten(x)
+                return self.fc.forward(x)
+
+        model = CharClassifier(like, self.nn_grid_shape)
+        model.package = package
+        loss_fn = MSELoss()
+        optimizer = Adam(model.parameters(), lr=1e-2)
+
+        for epoch in range(1, self.max_epochs + 1):
+            logits = model.forward(train_x)
+            loss = loss_fn.forward(logits, train_y)
+            grad_pred = loss_fn.backward(logits, train_y)
+            model.backward(grad_pred)
+            params = model.parameters()
+            grads = model.grads()
+            new_params = optimizer.step(params, grads)
+            i = 0
+            for layer in model.layers:
+                layer_params = layer.parameters()
+                for j in range(len(layer_params)):
+                    layer_params[j].data[...] = new_params[i].data
+                    i += 1
+            model.zero_grad()
+            if float(loss.data) < self.epsilon:
+                break
+
+        self.nn_model = model
+        self.nn_metric = metric
+        self.nn_trained = True
 
     def _resize_tensor_to_char(self, tensor: AbstractTensor) -> AbstractTensor:
         # self.char_size is (W, H), interpolate expects (H, W) for size
@@ -104,22 +198,35 @@ class AsciiKernelClassifier:
         elif len(batch_shape) == 3:
             luminance_tensor = batch / 255.0
         else:
-            # self.char_size is (W,H), tensor shape should be (N,H,W)
             luminance_tensor = AbstractTensor.get_tensor().zeros((N, self.char_size[1], self.char_size[0]), dtype=batch.float_dtype)
-        
-        # Compare tensor's (H,W) with classifier's (target_H, target_W)
+
         expected_hw_shape = (self.char_size[1], self.char_size[0])
         luminance_tensor = AbstractTensor.get_tensor(luminance_tensor)
         if luminance_tensor.shape[1:] != expected_hw_shape:
             resized = [AbstractTensor.F.interpolate(luminance_tensor[i], size=expected_hw_shape) for i in range(N)]
             luminance_tensor = AbstractTensor.get_tensor().stack(resized, dim=0)
+
+        if self.use_nn:
+            if not self.nn_trained:
+                self._train_nn()
+            inputs = luminance_tensor.reshape(N, 1, 1, expected_hw_shape[0], expected_hw_shape[1])
+            self.nn_model.package = {"metric": {"g": self.nn_metric, "inv_g": self.nn_metric}}
+            logits = self.nn_model.forward(inputs)
+            idxs = logits.argmax(dim=1)
+            chars = [self.charset[int(i)] for i in idxs.tolist()]
+            return {
+                "indices": idxs,
+                "chars": chars,
+                "losses": None,
+                "logits": logits,
+            }
+
         refs = AbstractTensor.get_tensor().stack(self.charBitmasks, dim=0)
         expanded_inputs = luminance_tensor[:, None, :, :].repeat_interleave(repeats=refs.shape[0], dim=1)
         expanded_refs = refs[None, :, :, :].repeat_interleave(repeats=N, dim=0)
         diff = expanded_inputs - expanded_refs
         abs_diff = (diff ** 2) ** 0.5
         losses = AbstractTensor.get_tensor(abs_diff.mean(dim=(2, 3)))
-        #print(losses)
         idxs = losses.argmin(dim=1)
         row_indices = AbstractTensor.get_tensor(np.arange(N, dtype=np.int64))
         selected_losses = losses[row_indices, idxs]

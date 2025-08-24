@@ -59,7 +59,7 @@ def flexible_subunit_kernel(
 
 # Module-level cache for classifier and ramp
 _classifier_cache = {
-    "ramp_char_size": None, # Cache key will be a tuple (ramp, char_width, char_height)
+    "ramp_char_size_use_nn": None,  # Cache key will be a tuple (ramp, char_width, char_height, use_nn)
     "classifier": None,
 }
 
@@ -71,6 +71,10 @@ def default_subunit_batch_to_chars(
     ramp: str = DEFAULT_DRAW_ASCII_RAMP,
     char_width: int = 16, # Add parameters for desired char_size
     char_height: int = 16, # These will be the actual cell_w, cell_h from clock_demo
+    *,
+    use_nn: bool = False,
+    epsilon: float = 1e-4,
+    max_epochs: int = 200,
 ) -> list[str]:
     """Return characters for ``subunit_batch`` using a cached classifier."""
     # Removed: (subunit_height, subunit_width) = get_char_cell_dims(),
@@ -78,13 +82,17 @@ def default_subunit_batch_to_chars(
     # Removed: exit()
     # Now use the passed-in char_width and char_height
 
-    cache_key = (ramp, char_width, char_height)
-    if _classifier_cache["ramp_char_size"] != cache_key or _classifier_cache["classifier"] is None:
-        # AsciiKernelClassifier expects char_size as (width, height)
-        classifier = AsciiKernelClassifier(ramp, char_size=(char_width, char_height))
-        # font_size is for rendering reference characters, which are then scaled to char_size
+    cache_key = (ramp, char_width, char_height, use_nn)
+    if _classifier_cache["ramp_char_size_use_nn"] != cache_key or _classifier_cache["classifier"] is None:
+        classifier = AsciiKernelClassifier(
+            ramp,
+            char_size=(char_width, char_height),
+            use_nn=use_nn,
+            epsilon=epsilon,
+            max_epochs=max_epochs,
+        )
         classifier.set_font(font_path=str(DEFAULT_FONT_PATH), font_size=16, char_size=(char_width, char_height))
-        _classifier_cache["ramp_char_size"] = cache_key
+        _classifier_cache["ramp_char_size_use_nn"] = cache_key
         _classifier_cache["classifier"] = classifier
     else:
         classifier = _classifier_cache["classifier"]
