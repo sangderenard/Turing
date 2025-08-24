@@ -178,9 +178,10 @@ class NDPCA3Conv3d:
         def _bcast(w):
             return w.reshape(1, 1, D, H, W)
 
-        wU_m = _bcast(w_minus * wU);  wU_p = _bcast(w_plus * wU)
-        wV_m = _bcast(w_minus * wV);  wV_p = _bcast(w_plus * wV)
-        wW_m = _bcast(w_minus * wW);  wW_p = _bcast(w_plus * wW)
+        wU_b = _bcast(wU);  wV_b = _bcast(wV);  wW_b = _bcast(wW)
+        wU_m = w_minus * wU_b;  wU_p = w_plus * wU_b
+        wV_m = w_minus * wV_b;  wV_p = w_plus * wV_b
+        wW_m = w_minus * wW_b;  wW_p = w_plus * wW_b
 
         # ---- 3) do the oriented depthwise spatial pass
         arr = x.data  # numpy array (B,C,D,H,W)
@@ -202,6 +203,15 @@ class NDPCA3Conv3d:
             + wV_m * x_v_m + wV_p * x_v_p \
             + wW_m * x_w_m + wW_p * x_w_p
 
+        # cache intermediates for backward
+        self._arr = arr
+        self._x_u_m, self._x_u_p = x_u_m, x_u_p
+        self._x_v_m, self._x_v_p = x_v_m, x_v_p
+        self._x_w_m, self._x_w_p = x_w_m, x_w_p
+        self._wU, self._wV, self._wW = wU_b, wV_b, wW_b
+        self._center, self._w_minus, self._w_plus = center, w_minus, w_plus
+        self._shape = (B, C, D, H, W)
+
         y_t = x.ensure_tensor(y)  # back to AbstractTensor
 
         # ---- 4) optional 1x1 mixing to get out_channels
@@ -212,3 +222,52 @@ class NDPCA3Conv3d:
             y_t = z.reshape(B, self.out_channels, D, H, W)
 
         return y_t
+
+    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        if not hasattr(self, "_arr") or self._arr is None:
+            raise RuntimeError("NDPCA3Conv3d.backward called before forward")
+
+        B, C, D, H, W = self._shape
+        g = grad_out
+        if self.pointwise is not None:
+            g = g.reshape(B * D * H * W, self.out_channels)
+            g = self.pointwise.backward(g)
+            g = g.reshape(B, self.in_channels, D, H, W)
+
+        g_arr = g.data
+
+        # gradients w.r.t taps
+        g_center = np.sum(g_arr * self._arr)
+        g_minus = np.sum(g_arr * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m))
+        g_plus  = np.sum(g_arr * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p))
+        g_taps_np = np.tile([g_minus, g_center, g_plus], (self.k, 1))
+        self.g_taps = self.like.ensure_tensor(g_taps_np)
+
+        # gradient w.r.t input
+        bcu = (self.bc[0], self.bc[1])
+        bcv = (self.bc[2], self.bc[3])
+        bcw = (self.bc[4], self.bc[5])
+        wU_m = self._wU * self._w_minus
+        wU_p = self._wU * self._w_plus
+        wV_m = self._wV * self._w_minus
+        wV_p = self._wV * self._w_plus
+        wW_m = self._wW * self._w_minus
+        wW_p = self._wW * self._w_plus
+
+        dx = self._center * g_arr
+        dx += wU_m * _shift3d(g_arr, axis=2, step=+1, bc=(bcu[1], bcu[0]))
+        dx += wU_p * _shift3d(g_arr, axis=2, step=-1, bc=(bcu[1], bcu[0]))
+        dx += wV_m * _shift3d(g_arr, axis=3, step=+1, bc=(bcv[1], bcv[0]))
+        dx += wV_p * _shift3d(g_arr, axis=3, step=-1, bc=(bcv[1], bcv[0]))
+        dx += wW_m * _shift3d(g_arr, axis=4, step=+1, bc=(bcw[1], bcw[0]))
+        dx += wW_p * _shift3d(g_arr, axis=4, step=-1, bc=(bcw[1], bcw[0]))
+
+        # clear cache
+        self._arr = None
+        self._x_u_m = self._x_u_p = None
+        self._x_v_m = self._x_v_p = None
+        self._x_w_m = self._x_w_p = None
+        self._wU = self._wV = self._wW = None
+        self._shape = None
+
+        return grad_out.ensure_tensor(dx)
