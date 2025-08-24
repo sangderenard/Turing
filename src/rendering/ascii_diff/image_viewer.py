@@ -1,12 +1,11 @@
 """Image viewer that dumps an image to the ASCII renderer with ramp and post-processing preset."""
 from pathlib import Path
-import sys
 import numpy as np
 from PIL import Image
 
-from .draw import get_changed_subunits, draw_diff, default_subunit_batch_to_chars
-from .console import full_clear_and_reset_cursor, reset_cursor_to_top
+from .console import reset_cursor_to_top
 from .theme_manager import ThemeManager
+from ..render_chooser import RenderChooser
 
 # Default settings
 DEFAULT_IMAGE_PATH = Path(__file__).with_name("analogback.png")
@@ -19,6 +18,28 @@ DEFAULT_POST_PROCESSING = "high_contrast"  # Can be changed to any preset in pos
 def load_pixels(path: str) -> np.ndarray:
     img = Image.open(path).convert("RGB")
     return np.array(img)
+
+
+def _downsample(frame: np.ndarray, char_h: int, char_w: int) -> np.ndarray:
+    """Reduce ``frame`` to character-cell resolution.
+
+    The ``RenderChooser`` and underlying :class:`AsciiRenderer` operate on a
+    single pixel per terminal cell.  ``ascii_diff`` historically allowed each
+    character to represent a block of pixels.  To retain this behaviour we
+    average blocks of ``char_h``×``char_w`` pixels down to one value.
+    """
+
+    if char_h <= 1 and char_w <= 1:
+        return frame
+    h, w, c = frame.shape
+    new_h = h // char_h
+    new_w = w // char_w
+    if new_h == 0 or new_w == 0:
+        return frame
+    cropped = frame[: new_h * char_h, : new_w * char_w]
+    reshaped = cropped.reshape(new_h, char_h, new_w, char_w, c)
+    reduced = reshaped.mean(axis=(1, 3)).astype(np.uint8)
+    return reduced
 
 
 
@@ -89,105 +110,57 @@ def menu():
             print(f"Show Foreground Color set to {'ON' if show_fg else 'OFF'}.")
         elif choice == "8":
             import time
-            while True:
-                try:
-                    theme_manager.current_theme.ascii_style = ramp_style
-                    theme_manager.set_post_processing(post_processing)
-                    img = Image.open(image_path).convert("RGB")
-                    img = theme_manager.apply_theme(img)
-                    frame = np.array(img)
-                    h, w, c = frame.shape
-                    # 1. Clear with all white (no terminal clear, just diff)
-                    old_frame = np.zeros_like(frame)
+            theme_manager.current_theme.ascii_style = ramp_style
+            theme_manager.set_post_processing(post_processing)
+            img = Image.open(image_path).convert("RGB")
+            img = theme_manager.apply_theme(img)
+            frame = _downsample(np.array(img), char_h, char_w)
+            h, w, _ = frame.shape
+            rc = RenderChooser(w, h, mode="ascii")
+            try:
+                def roll_frame(f: np.ndarray, shift_y: int = 0, shift_x: int = 0) -> np.ndarray:
+                    return np.roll(np.roll(f, shift_y, axis=0), shift_x, axis=1)
+
+                while True:
                     white = np.ones_like(frame) * 255
-                    changed = get_changed_subunits(old_frame, white, char_h, char_w)
-                    draw_diff(
-                        changed,
-                        char_cell_pixel_height=char_h,
-                        char_cell_pixel_width=char_w,
-                        subunit_to_char_kernel=default_subunit_batch_to_chars,
-                        active_ascii_ramp=theme_manager.get_current_ascii_ramp(),
-                        enable_fg_color=show_fg,
-                        enable_bg_color=show_bg,
-                    )
-                    sys.stdout.flush()
-                    # Minimal delay for speed
+                    rc.render({"image": white})
                     time.sleep(0.01)
-                    # 2. Clear with all black
-                    old_frame = white.copy()
-                    black = np.zeros_like(frame)
-                    changed = get_changed_subunits(old_frame, black, char_h, char_w)
-                    draw_diff(
-                        changed,
-                        char_cell_pixel_height=char_h,
-                        char_cell_pixel_width=char_w,
-                        subunit_to_char_kernel=default_subunit_batch_to_chars,
-                        active_ascii_ramp=theme_manager.get_current_ascii_ramp(),
-                        enable_fg_color=show_fg,
-                        enable_bg_color=show_bg,
-                    )
-                    sys.stdout.flush()
+                    rc.render({"image": np.zeros_like(frame)})
                     time.sleep(0.01)
-                    # 3. Animate image
-                    def roll_frame(f, shift_y=0, shift_x=0):
-                        return np.roll(np.roll(f, shift_y, axis=0), shift_x, axis=1)
-                    def animate(frames, mode_name):
-                        for idx, (oldf, newf) in enumerate(frames):
-                            changed = get_changed_subunits(oldf, newf, char_h, char_w)
-                            draw_diff(
-                                changed,
-                                char_cell_pixel_height=char_h,
-                                char_cell_pixel_width=char_w,
-                                subunit_to_char_kernel=default_subunit_batch_to_chars,
-                                active_ascii_ramp=theme_manager.get_current_ascii_ramp(),
-                                enable_fg_color=show_fg,
-                                enable_bg_color=show_bg,
-                            )
-                            #sys.stdout.flush()
-                            if fps > 0:
-                                time.sleep(1.0 / fps)
-                    # Vertical roll (quarter stride of char_h)
-                    frames = []
-                    v_stride = max(1, char_h // 4)
+
+                    v_stride = max(1, h // 4)
                     for i in range(0, h, v_stride):
-                        frames.append((frame if i == 0 else roll_frame(frame, i-v_stride, 0), roll_frame(frame, i, 0)))
-                    animate(frames, "vertical")
-                    # Horizontal roll (quarter stride of char_w)
-                    frames = []
-                    h_stride = max(1, char_w // 4)
+                        rc.render({"image": roll_frame(frame, i, 0)})
+                        if fps > 0:
+                            time.sleep(1.0 / fps)
+
+                    h_stride = max(1, w // 4)
                     for i in range(0, w, h_stride):
-                        frames.append((frame if i == 0 else roll_frame(frame, 0, i-h_stride), roll_frame(frame, 0, i)))
-                    animate(frames, "horizontal")
-                    # Sinusoidal roll
-                    frames = []
+                        rc.render({"image": roll_frame(frame, 0, i)})
+                        if fps > 0:
+                            time.sleep(1.0 / fps)
+
                     for t in range(max(h, w)):
                         y_shift = int((np.sin(2 * np.pi * t / h) * h / 4))
-                        x_shift = int((np.sin(2 * np.pi * t / w + np.pi/2) * w / 4))
-                        prev_y = int((np.sin(2 * np.pi * (t-1) / h) * h / 4)) if t > 0 else 0
-                        prev_x = int((np.sin(2 * np.pi * (t-1) / w + np.pi/2) * w / 4)) if t > 0 else 0
-                        frames.append((roll_frame(frame, prev_y, prev_x), roll_frame(frame, y_shift, x_shift)))
-                    animate(frames, "sinusoidal")
-                    # Stationary hold
-                    changed = get_changed_subunits(frames[-1][1], frame, char_h, char_w)
-                    draw_diff(
-                        changed,
-                        char_cell_pixel_height=char_h,
-                        char_cell_pixel_width=char_w,
-                        subunit_to_char_kernel=default_subunit_batch_to_chars,
-                        active_ascii_ramp=theme_manager.get_current_ascii_ramp(),
-                        enable_fg_color=show_fg,
-                        enable_bg_color=show_bg,
+                        x_shift = int((np.sin(2 * np.pi * t / w + np.pi / 2) * w / 4))
+                        rc.render({"image": roll_frame(frame, y_shift, x_shift)})
+                        if fps > 0:
+                            time.sleep(1.0 / fps)
+
+                    rc.render({"image": frame})
+                    user_input = (
+                        input("\nPress Enter to continue, or type 'repeat' to play again: ")
+                        .strip()
+                        .lower()
                     )
-                    sys.stdout.flush()
-                    # Prompt for repeat or continue
-                    user_input = input("\nPress Enter to continue, or type 'repeat' to play again: ").strip().lower()
                     if user_input == "repeat":
-                        continue  # Replay animation
+                        continue
                     reset_cursor_to_top()
-                    break  # Exit animation loop
-                except Exception as e:
-                    print(f"Error rendering image: {e}")
                     break
+            except Exception as e:
+                print(f"Error rendering image: {e}")
+            finally:
+                rc.close()
         elif choice == "10":
             try:
                 val = input("Enter FPS for animation (-1 for max speed): ").strip()
