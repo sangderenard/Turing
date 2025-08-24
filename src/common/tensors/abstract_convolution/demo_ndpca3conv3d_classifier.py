@@ -16,7 +16,7 @@ from src.common.tensors.abstract_nn.optimizer import Adam
 BATCH_SIZE = 1
 IN_CHANNELS = 3   # e.g., RGB
 IMG_D, IMG_H, IMG_W = 1, 32, 32  # For 2D images, set D=1
-NUM_CLASSES = 10
+NUM_CLASSES = 100
 
 # --- Placeholder: Load your image as a numpy array of shape (B, C, D, H, W) ---
 # Replace this with your own image loading logic
@@ -60,7 +60,7 @@ class SimpleClassifierModel(Model):
         return x
 
 # --- Training demo ---
-EPOCHS = 20
+EPOCHS = 400
 LEARNING_RATE = 1e-2
 
 # Dummy target: random one-hot for classification (for demo)
@@ -98,7 +98,7 @@ for epoch in range(1, EPOCHS + 1):
     model.zero_grad()
     # Print loss
     if epoch == 1 or epoch == EPOCHS or epoch % 5 == 0:
-        print(f"Epoch {epoch:2d}: loss = {float(loss.data):.6f}")
+        print(f"Epoch {epoch:2d}: loss = {float(loss.data):.20f}")
 
 # Final prediction
 logits = model.forward(img)
