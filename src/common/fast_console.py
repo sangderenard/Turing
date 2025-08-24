@@ -1,13 +1,17 @@
 
+"""Fast console output using CFFI with per-platform back-ends.
+
+On Windows the :mod:`kernel32` ``WriteConsole`` APIs are used while POSIX
+platforms emit bytes directly via the C library ``write`` call.  A small
+threaded queue is available to offload formatting work when needed.
 """
-Fast console output using CFFI and Windows API (WriteConsoleA/WriteConsoleW).
-"""
+
 import cffi
 import threading
 import queue
-import time
 import logging
 import os
+from typing import Optional
 
 
 logger = logging.getLogger(__name__)
@@ -20,30 +24,69 @@ if os.getenv("TURING_DEBUG"):
 else:
     logger.addHandler(logging.NullHandler())
 
+
 class cffiPrinter:
-    def __init__(self, mode: str = 'A', threaded: bool = False, queue_size: int = 128):
+    def __init__(self, mode: str = "A", threaded: bool = False, queue_size: int = 128):
+        """Create a new fast printer instance.
+
+        Parameters
+        ----------
+        mode:
+            Only relevant on Windows.  ``"A"`` routes to ``WriteConsoleA`` while
+            ``"W"`` uses the wide-character variant.  POSIX platforms always emit
+            UTF-8 bytes through ``write``.
+        threaded:
+            If ``True`` a background thread pulls strings from a queue to avoid
+            blocking the caller.
+        queue_size:
+            Maximum number of queued print jobs when ``threaded`` is ``True``.
         """
-        mode: 'A' for WriteConsoleA (ANSI), 'W' for WriteConsoleW (Unicode)
-        threaded: if True, use a background thread to print from a queue
-        queue_size: max number of queued print jobs (threaded mode)
-        """
+
         self.ffi = cffi.FFI()
         self.mode = mode.upper()
-        if self.mode == 'A':
-            self.ffi.cdef('''
-                int WriteConsoleA(void* hConsoleOutput, const char* lpBuffer, unsigned long nNumberOfCharsToWrite, unsigned long* lpNumberOfCharsWritten, void* lpReserved);
-                void* GetStdHandle(int nStdHandle);
-            ''')
-        elif self.mode == 'W':
-            self.ffi.cdef('''
-                int WriteConsoleW(void* hConsoleOutput, const wchar_t* lpBuffer, unsigned long nNumberOfCharsToWrite, unsigned long* lpNumberOfCharsWritten, void* lpReserved);
-                void* GetStdHandle(int nStdHandle);
-            ''')
+        self._is_windows = os.name == "nt"
+
+        if self._is_windows:
+            if self.mode == "A":
+                self.ffi.cdef(
+                    """
+                    int WriteConsoleA(void* hConsoleOutput, const char* lpBuffer,
+                                     unsigned long nNumberOfCharsToWrite,
+                                     unsigned long* lpNumberOfCharsWritten,
+                                     void* lpReserved);
+                    void* GetStdHandle(int nStdHandle);
+                    """
+                )
+            elif self.mode == "W":
+                self.ffi.cdef(
+                    """
+                    int WriteConsoleW(void* hConsoleOutput, const wchar_t* lpBuffer,
+                                     unsigned long nNumberOfCharsToWrite,
+                                     unsigned long* lpNumberOfCharsWritten,
+                                     void* lpReserved);
+                    void* GetStdHandle(int nStdHandle);
+                    """
+                )
+            else:  # pragma: no cover - defensive clause
+                raise ValueError("mode must be 'A' or 'W'")
+
+            self.C = self.ffi.dlopen("kernel32.dll")
+            self.STD_OUTPUT_HANDLE = -11
+            self._handle = self.C.GetStdHandle(self.STD_OUTPUT_HANDLE)
         else:
-            raise ValueError("mode must be 'A' or 'W'")
-        self.C = self.ffi.dlopen('kernel32.dll')
-        self.STD_OUTPUT_HANDLE = -11
-        self._handle = self.C.GetStdHandle(self.STD_OUTPUT_HANDLE)
+            # POSIX: stream bytes directly to stdout via write(2)
+            self.ffi.cdef("ssize_t write(int fd, const void* buf, size_t count);")
+            libc: Optional[object] = None
+            for lib in (None, "libc.so.6", "libc.dylib"):
+                try:
+                    libc = self.ffi.dlopen(lib) if lib is not None else self.ffi.dlopen(None)
+                    break
+                except OSError:  # pragma: no cover - varies by platform
+                    continue
+            if libc is None:  # pragma: no cover - defensive
+                raise OSError("Unable to load C library for write")
+            self.C = libc
+            self._fd = 1  # STDOUT
 
         self.threaded = threaded
         self._queue = queue.Queue(maxsize=queue_size) if threaded else None
@@ -68,15 +111,25 @@ class cffiPrinter:
             self._print_direct(s)
 
     def _print_direct(self, s: str) -> None:
-        written = self.ffi.new('unsigned long *')
-        if self.mode == 'A':
-            b = s.encode('utf-8')
-            n = len(b)
-            self.C.WriteConsoleA(self._handle, b, n, written, self.ffi.NULL)
+        if self._is_windows:
+            written = self.ffi.new("unsigned long *")
+            if self.mode == "A":
+                b = s.encode("utf-8")
+                n = len(b)
+                self.C.WriteConsoleA(self._handle, b, n, written, self.ffi.NULL)
+            else:
+                w = s.encode("utf-16-le")
+                n = len(w) // 2
+                self.C.WriteConsoleW(
+                    self._handle,
+                    self.ffi.from_buffer("wchar_t[]", w),
+                    n,
+                    written,
+                    self.ffi.NULL,
+                )
         else:
-            w = s.encode('utf-16-le')
-            n = len(w) // 2
-            self.C.WriteConsoleW(self._handle, self.ffi.from_buffer('wchar_t[]', w), n, written, self.ffi.NULL)
+            b = s.encode("utf-8")
+            self.C.write(self._fd, b, len(b))
 
     def _worker(self):
         while not self._stop_event.is_set():
