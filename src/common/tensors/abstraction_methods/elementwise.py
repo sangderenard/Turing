@@ -146,6 +146,28 @@ def _v3_valuewise(
         tape.annotate(out, **({"eval_mode":"valuewise","v":"v3","length":target,"scalar_lift":{"a":liftA,"b":liftB,"cond":liftC}} | annotate))
     return out
 
+# ---------------------- elementwise max/min helpers -------------------------
+def maximum(self, other):
+    """Elementwise maximum with automatic promotion."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    other_arg = other.data if isinstance(other, AbstractTensor) else other
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+    result.data = self.maximum_(other_arg)
+    return result
+
+
+def minimum(self, other):
+    """Elementwise minimum with automatic promotion."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    other_arg = other.data if isinstance(other, AbstractTensor) else other
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+    result.data = self.minimum_(other_arg)
+    return result
+
 # ----------------- Tiny user-facing shims (preserve real op names) ----------
 def __eq__(self, other):         return self._v2_valuewise("equal", other, annotate={"op":"equal"})
 def __ne__(self, other):         return self._v2_valuewise("not_equal", other, annotate={"op":"not_equal"})

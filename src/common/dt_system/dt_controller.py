@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import numpy as np
 import time
+
+from ..tensors.abstraction import AbstractTensor
 
 from .dt_scaler import Metrics
 from .dt import SuperstepPlan, SuperstepResult
@@ -32,36 +33,48 @@ class STController:
     clamp_events: int = 0
 
     def update_dt_max(self, max_vel: float, dx: float) -> None:
-        self.max_vel_ever = max(max_vel, 0.95 * self.max_vel_ever)
-        self.dt_max = 1.0 * dx / max(self.max_vel_ever, 1e-30)
+        max_vel_t = max_vel if isinstance(max_vel, AbstractTensor) else AbstractTensor.tensor(max_vel)
+        self.max_vel_ever = AbstractTensor.maximum(max_vel_t, 0.95 * self.max_vel_ever)
+        dx_t = dx if isinstance(dx, AbstractTensor) else AbstractTensor.tensor(dx)
+        self.dt_max = dx_t / AbstractTensor.maximum(self.max_vel_ever, 1e-30)
         if is_enabled():
             dbg("ctrl").debug(
-                f"update_dt_max: max_vel={max_vel:.3e} -> max_vel_ever={self.max_vel_ever:.3e} dt_max={self.dt_max:.3e} dx={dx:.3e}"
+                f"update_dt_max: max_vel={float(max_vel_t.item() if isinstance(max_vel_t, AbstractTensor) else max_vel_t):.3e} "
+                f"-> max_vel_ever={float(self.max_vel_ever.item() if isinstance(self.max_vel_ever, AbstractTensor) else self.max_vel_ever):.3e} "
+                f"dt_max={float(self.dt_max.item() if isinstance(self.dt_max, AbstractTensor) else self.dt_max):.3e} "
+                f"dx={float(dx_t.item() if isinstance(dx_t, AbstractTensor) else dx_t):.3e}"
             )
 
-    def pi_update(self, dt_prev: float, dt_pen: float, osc: bool,
-                  *, dt_min: float | None = None, dt_max: float | None = None) -> float:
+    def pi_update(self, dt_prev, dt_pen, osc: bool,
+                  *, dt_min: float | AbstractTensor | None = None,
+                  dt_max: float | AbstractTensor | None = None):
+        dt_prev = dt_prev if isinstance(dt_prev, AbstractTensor) else AbstractTensor.tensor(dt_prev)
+        dt_pen = dt_pen if isinstance(dt_pen, AbstractTensor) else AbstractTensor.tensor(dt_pen)
+        self.acc = self.acc if isinstance(self.acc, AbstractTensor) else AbstractTensor.tensor(self.acc)
         dt_min = self.dt_min if dt_min is None else dt_min
         dt_max = self.dt_max if dt_max is None else dt_max
         floor = dt_min if dt_min is not None else 1e-30
-        e = math.log(max(dt_pen, floor)) - math.log(max(dt_prev, floor))
-        self.acc = float(np.clip(self.acc + self.Ki * e, -self.A, self.A))
-        log_dt = math.log(max(dt_prev, floor)) + self.Kp * e + self.acc
-        dt_new = math.exp(log_dt)
+        floor_t = floor if isinstance(floor, AbstractTensor) else AbstractTensor.tensor(floor)
+        e = (AbstractTensor.maximum(dt_pen, floor_t).log() - AbstractTensor.maximum(dt_prev, floor_t).log())
+        self.acc = (self.acc + self.Ki * e).clamp(min=-self.A, max=self.A)
+        log_dt = AbstractTensor.maximum(dt_prev, floor_t).log() + self.Kp * e + self.acc
+        dt_new = log_dt.exp()
         if dt_min is not None:
-            dt_new = max(dt_new, dt_min)
+            dt_min_t = dt_min if isinstance(dt_min, AbstractTensor) else AbstractTensor.tensor(dt_min)
+            dt_new = AbstractTensor.maximum(dt_new, dt_min_t)
         if dt_max is not None:
-            dt_new = min(dt_new, dt_max)
+            dt_max_t = dt_max if isinstance(dt_max, AbstractTensor) else AbstractTensor.tensor(dt_max)
+            dt_new = AbstractTensor.minimum(dt_new, dt_max_t)
         if osc:
-            dt_new *= self.shrink
+            dt_new = dt_new * self.shrink
             if dt_min is not None:
-                dt_new = max(dt_new, dt_min)
+                dt_new = AbstractTensor.maximum(dt_new, dt_min_t)
         if is_enabled():
             dbg("ctrl").debug(
-                f"pi_update: dt_prev={dt_prev:.6g} dt_pen={dt_pen:.6g} osc={osc} -> dt_new={dt_new:.6g}"
-                f" (bounds: dt_min={dt_min} dt_max={dt_max}) acc={self.acc:.3f}"
+                f"pi_update: dt_prev={float(dt_prev.item()):.6g} dt_pen={float(dt_pen.item()):.6g} osc={osc} -> dt_new={float(dt_new.item()):.6g}"
+                f" (bounds: dt_min={dt_min} dt_max={dt_max}) acc={float(self.acc.item()):.3f}"
             )
-        return float(dt_new)
+        return dt_new
 
 
 def step_with_dt_control_used(state,
@@ -78,15 +91,15 @@ def step_with_dt_control_used(state,
     saved = state.copy_shallow()
     if is_enabled():
         dbg("ctrl").debug(
-            f"advance try: dt={float(dt):.6g} dx={float(dx):.6g} retries={retries}"
+            f"advance try: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} dx={float(dx.item() if isinstance(dx, AbstractTensor) else dx):.6g} retries={retries}"
         )
     ok, metrics = advance(state, dt)
     if (not ok) or (metrics.mass_err > targets.mass_max) or (metrics.div_inf > targets.div_max * 10.0):
         state.restore(saved)
-        failures.append((float(dt), metrics))
+        failures.append((float(dt.item() if isinstance(dt, AbstractTensor) else dt), metrics))
         if is_enabled():
             dbg("ctrl").warning(
-                f"advance failed: dt={float(dt):.6g} metrics=({pretty_metrics(metrics)})"
+                f"advance failed: dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} metrics=({pretty_metrics(metrics)})"
             )
         if retries >= 3:
             ctrl.clamp_events += 1
@@ -99,9 +112,11 @@ def step_with_dt_control_used(state,
             raise RuntimeError("adaptive timestep controller failed")
         dt_half = dt * 0.5
         if ctrl.dt_min is not None:
-            dt_half = max(dt_half, ctrl.dt_min)
+            dt_half = AbstractTensor.maximum(dt_half, ctrl.dt_min)
         if is_enabled():
-            dbg("ctrl").debug(f"retry with dt_half={float(dt_half):.6g}")
+            dbg("ctrl").debug(
+                f"retry with dt_half={float(dt_half.item() if isinstance(dt_half, AbstractTensor) else dt_half):.6g}"
+            )
         return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures)
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
@@ -118,15 +133,15 @@ def step_with_dt_control_used(state,
     )
     # Sidechain limiter: clamp dt_next to any engine-provided absolute limit
     if metrics.dt_limit is not None:
-        dt_next = min(dt_next, float(metrics.dt_limit))
+        dt_next = AbstractTensor.minimum(dt_next, metrics.dt_limit)
     ctrl.update_dt_max(metrics.max_vel, dx)
     if is_enabled():
         dbg("ctrl").debug(
-            f"advance ok: used_dt={float(dt):.6g} cfl_dt={dt_cfl:.6g} penalty={penalty:.3f}"
+            f"advance ok: used_dt={float(dt.item() if isinstance(dt, AbstractTensor) else dt):.6g} cfl_dt={dt_cfl:.6g} penalty={penalty:.3f}"
             + (f" dt_limit={metrics.dt_limit:.6g}" if metrics.dt_limit is not None else "")
-            + f" -> dt_next={dt_next:.6g} | {pretty_metrics(metrics)}"
+            + f" -> dt_next={float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next):.6g} | {pretty_metrics(metrics)}"
         )
-    return metrics, dt_next, float(dt)
+    return metrics, dt_next, dt
 
 
 def step_with_dt_control(state, dt, dx, targets: Targets, ctrl: STController, advance, retries: int = 0):
@@ -145,12 +160,12 @@ def run_superstep(state,
                   allow_increase_mid_round: bool = False,
                   max_iters: int = 10000,
                   eps: float = 1e-15):
-    total = 0.0
-    dt_cap = float(dt_init)
+    total = AbstractTensor.tensor(0.0)
+    dt_cap = dt_init if isinstance(dt_init, AbstractTensor) else AbstractTensor.tensor(dt_init)
     if ctrl.dt_min is not None:
-        dt_cap = max(dt_cap, ctrl.dt_min)
+        dt_cap = AbstractTensor.maximum(dt_cap, ctrl.dt_min)
     if ctrl.dt_max is not None:
-        dt_cap = min(dt_cap, ctrl.dt_max)
+        dt_cap = AbstractTensor.minimum(dt_cap, ctrl.dt_max)
     last_dt_next = dt_cap
     last_metrics = None
 
@@ -159,10 +174,10 @@ def run_superstep(state,
         dbg("ctrl").debug(
             f"run_superstep: round_max={round_max:.6g} dt_init={dt_init:.6g} dx={dx:.6g}"
         )
-    while (round_max - total) > eps and iters < max_iters:
+    while (round_max - total).item() > eps and iters < max_iters:
         iters += 1
         remainder = round_max - total
-        dt_try = min(dt_cap, remainder)
+        dt_try = AbstractTensor.minimum(dt_cap, remainder)
         metrics, dt_next, dt_used = step_with_dt_control_used(state, dt_try, dx, targets, ctrl, advance)
         last_metrics = metrics
         if dt_used <= 0.0:
@@ -171,15 +186,15 @@ def run_superstep(state,
         if allow_increase_mid_round:
             dt_cap = dt_next
         else:
-            dt_cap = min(dt_cap, dt_next)
+            dt_cap = AbstractTensor.minimum(dt_cap, dt_next)
         if ctrl.dt_min is not None:
-            dt_cap = max(ctrl.dt_min, dt_cap)
+            dt_cap = AbstractTensor.maximum(ctrl.dt_min, dt_cap)
         if ctrl.dt_max is not None:
-            dt_cap = min(ctrl.dt_max, dt_cap)
+            dt_cap = AbstractTensor.minimum(ctrl.dt_max, dt_cap)
         last_dt_next = dt_next
         if is_enabled():
             dbg("ctrl").debug(
-                f"  iter={iters} used={dt_used:.6g} total={total:.6g}/{round_max:.6g} next_cap={dt_cap:.6g}"
+                f"  iter={iters} used={float(dt_used.item() if isinstance(dt_used, AbstractTensor) else dt_used):.6g} total={float(total.item()):.6g}/{round_max:.6g} next_cap={float(dt_cap.item()):.6g}"
             )
 
     return total, last_dt_next, last_metrics
@@ -202,12 +217,14 @@ def run_superstep_plan(state,
         allow_increase_mid_round=plan.allow_increase_mid_round,
         eps=plan.eps,
     )
+    total_val = float(total.item() if isinstance(total, AbstractTensor) else total)
+    dt_next_val = float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next)
     ref = plan.dt_init
     if ctrl.dt_min is not None:
         ref = max(ref, ctrl.dt_min)
-    clamped = bool(dt_next < ref)
-    steps = max(1, int(round(total / max(plan.dt_init, 1e-30)))) if total > 0 else 0
-    return SuperstepResult(advanced=float(total), dt_next=float(dt_next), steps=steps, clamped=clamped, metrics=metrics)
+    clamped = bool(dt_next_val < ref)
+    steps = max(1, int(round(total_val / max(plan.dt_init, 1e-30)))) if total_val > 0 else 0
+    return SuperstepResult(advanced=total_val, dt_next=dt_next_val, steps=steps, clamped=clamped, metrics=metrics)
 
 
 # ------------------------- Realtime mode (single-step) -----------------------
