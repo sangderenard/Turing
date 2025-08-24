@@ -152,7 +152,9 @@ def maximum(self, other):
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    other_arg = other.data if isinstance(other, AbstractTensor) else other
+    if not isinstance(other, AbstractTensor):
+        other = AbstractTensor.tensor(other)
+    other_arg = other.data
     result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.maximum_(other_arg)
     return result
@@ -163,7 +165,9 @@ def minimum(self, other):
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    other_arg = other.data if isinstance(other, AbstractTensor) else other
+    if not isinstance(other, AbstractTensor):
+        other = AbstractTensor.tensor(other)
+    other_arg = other.data
     result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.minimum_(other_arg)
     return result
