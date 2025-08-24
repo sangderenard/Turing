@@ -115,8 +115,9 @@ def fit_metric_pca(
     # centered
     Xc = X - mu  # (B, n)
 
-    # weighted covariance: Sigma = Xc^T diag(w) Xc
-    Sigma = (Xc.swapaxes(-1, -2) * w.reshape(B, 1, 1)) @ Xc  # (n, n)
+    # weighted covariance: Sigma = (w * Xc)^T Xc
+    # ensure weights apply along the sample axis only
+    Sigma = (w.reshape(B, 1) * Xc).swapaxes(-1, -2) @ Xc  # (n, n)
 
     if metric_M is None:
         # Euclidean PCA: eig(Sigma)
