@@ -113,6 +113,8 @@ class LocalStateNetwork:
         num_parameters = 27
         # NN Integration Manager
         self.weight_layer = AbstractTensor.get_tensor(np.ones((3, 3, 3), dtype=np.float32))
+        self.g_weight_layer = AbstractTensor.get_tensor(np.zeros((3, 3, 3), dtype=np.float32))
+        self._cached_padded_raw = None
         like = AbstractTensor.get_tensor(np.zeros((1, num_parameters), dtype=np.float32))
         if recursion_depth < max_depth - 1:
             self.spatial_layer = RectConv3d(
@@ -152,6 +154,8 @@ class LocalStateNetwork:
         if len(padded_raw.shape) == 6:
             padded_raw = padded_raw.unsqueeze(0)
 
+        self._cached_padded_raw = padded_raw
+
         B, D, H, W, _, _, _ = padded_raw.shape
 
         weight_layer = self.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
@@ -179,6 +183,57 @@ class LocalStateNetwork:
             _, modulated_padded = self.inner_state.forward(modulated_padded)
 
         return weighted_padded, modulated_padded
+
+    def backward(self, grad_weighted_padded, grad_modulated_padded):
+        """Backward pass for ``LocalStateNetwork``.
+
+        Args:
+            grad_weighted_padded: Gradient from the weighted branch.
+            grad_modulated_padded: Gradient from the modulated branch.
+
+        Returns:
+            Gradient with respect to the original ``padded_raw`` input.
+        """
+        if self._cached_padded_raw is None:
+            raise RuntimeError("LocalStateNetwork.backward called before forward")
+
+        padded_raw = self._cached_padded_raw
+        B, D, H, W, _, _, _ = padded_raw.shape
+
+        # Gradient through weight layer
+        weight_layer = self.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        grad_from_weight = grad_weighted_padded * weight_layer
+        self.g_weight_layer = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
+
+        # Propagate through any inner state network
+        grad_mod = grad_modulated_padded
+        if self.inner_state is not None:
+            zero = grad_mod * 0
+            grad_mod = self.inner_state.backward(zero, grad_mod)
+
+        grad_mod = grad_mod.reshape((B, D, H, W, -1))
+
+        # Backward through spatial layer
+        if isinstance(self.spatial_layer, RectConv3d):
+            grad_mod = grad_mod.transpose(1, 4)
+            grad_mod = grad_mod.transpose(2, 4)
+            grad_mod = grad_mod.transpose(3, 4)
+            grad_padded_view = self.spatial_layer.backward(grad_mod)
+            grad_padded_view = grad_padded_view.transpose(3, 4)
+            grad_padded_view = grad_padded_view.transpose(2, 4)
+            grad_padded_view = grad_padded_view.transpose(1, 4)
+            grad_from_mod = grad_padded_view.reshape((B, D, H, W, 3, 3, 3))
+        else:
+            flat_grad = grad_mod.reshape((-1, grad_mod.shape[-1]))
+            grad_flat_in = self.spatial_layer.backward(flat_grad)
+            grad_from_mod = grad_flat_in.reshape((B, D, H, W, 3, 3, 3))
+
+        grad_input = grad_from_weight + grad_from_mod
+
+        # Clear cached tensors
+        self._cached_padded_raw = None
+
+        return grad_input
     # --------- CACHE MANAGER --------- #
     def check_or_compute(self, pos_hash, *inputs):
         """
