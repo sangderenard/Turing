@@ -87,9 +87,11 @@ import networkx as nx
 # Integrate the lightweight backward registry so that backward rules are
 # resolved dynamically rather than being baked into the tape at record time.
 from .backward import BACKWARD_REGISTRY
+from .backward_registry import BACKWARD_RULES
 
 import math
 import statistics
+import re
 
 try:  # NumPy is an optional dependency for the repository
     import numpy as np
@@ -322,6 +324,28 @@ class GradTape:
         dfs(id(result))
         for item in reversed(order):
             yield item
+
+    def required_cache(self, result: Any) -> set[int]:
+        """Return tensor IDs whose ``data`` must be kept for backward."""
+
+        required: set[int] = set()
+        for tid, node in self.traverse(result):
+            rule = BACKWARD_RULES.get(node.op, {})
+            py = rule.get("python", {})
+            params = list(py.get("parameters", []))[1:]
+            body = py.get("body", "")
+            num_inputs = len(node.parents)
+            for idx, param in enumerate(params):
+                if not param:
+                    continue
+                if not re.search(rf"\b{re.escape(param)}\b(?!\.shape)", body):
+                    continue
+                if idx < num_inputs:
+                    pid, _ = node.parents[idx]
+                    required.add(pid)
+                else:
+                    required.add(tid)
+        return required
 
 
 class TapeProfiler:

@@ -137,10 +137,27 @@ def _register_all_conversions():
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
     def __index__(self):
-        """Allow AbstractTensor to be used in slice contexts (e.g., arr[tensor]).
-        Returns the integer value of the tensor if it is scalar-like.
-        """
-        return int(self.item())
+        """Allow use in slice contexts by returning a scalar ``int``.
+
+        Non-scalar tensors raise ``TypeError`` mirroring PyTorch/NumPy."""
+
+        try:
+            n = self.numel()
+        except Exception:
+            n = 1
+        if n != 1:
+            raise TypeError("Only scalar tensors can be converted to int")
+
+        item_fn = getattr(self, "item_")
+        try:
+            import inspect
+            if len(inspect.signature(item_fn).parameters) == 0:
+                value = item_fn()
+            else:
+                value = item_fn(self.data)
+        except Exception:
+            value = item_fn(self.data)
+        return int(value)
     def argwhere(self) -> "AbstractTensor":
         """Return the indices where condition is True. Like np.argwhere, always returns a 2D array of indices."""
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
