@@ -5,10 +5,23 @@ import sys
 import numpy as AbstractTensor
 from colorama import Style, Fore, Back
 from pathlib import Path
+import logging
+import os
 from .ascii_kernel_classifier import AsciiKernelClassifier
 from src.common.tensors.abstraction import AbstractTensor
 test_tensor = AbstractTensor.get_tensor([0])
 integer_type = test_tensor.long_dtype_
+
+
+logger = logging.getLogger(__name__)
+if os.getenv("TURING_DEBUG"):
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.addHandler(logging.NullHandler())
 
 # Default ASCII ramp used if no specific ramp is provided to drawing functions.
 DEFAULT_DRAW_ASCII_RAMP = " .:░▒▓█"
@@ -140,12 +153,12 @@ def draw_diff(
     if char_cell_pixel_height <= 0: char_cell_pixel_height = 1
     if char_cell_pixel_width <= 0: char_cell_pixel_width = 1
     if not changed_subunits:
-        print("No changed subunits to draw")
+        logger.debug("No changed subunits to draw")
         return
     subunit_batch = AbstractTensor.stack([data for _, _, data in changed_subunits], dim=0)
     # Pass the actual char_cell_pixel_width and char_cell_pixel_height to the kernel
     chars = subunit_to_char_kernel(subunit_batch, active_ascii_ramp, char_cell_pixel_width, char_cell_pixel_height)
-    print(f"Drawing {len(changed_subunits)} changed subunits")
+    logger.debug("Drawing %d changed subunits", len(changed_subunits))
     for (y_pixel, x_pixel, subunit_data), char_to_draw in zip(changed_subunits, chars):
         char_y = y_pixel // char_cell_pixel_height
         char_x = x_pixel // char_cell_pixel_width
