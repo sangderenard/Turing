@@ -13,6 +13,7 @@ from io import StringIO
 from contextlib import redirect_stdout
 import os
 import time
+import logging
 
 import numpy as np
 
@@ -26,6 +27,15 @@ from src.rendering.ascii_diff import (
 
 __all__ = ["AsciiRenderer"]
 
+logger = logging.getLogger(__name__)
+if os.getenv("TURING_DEBUG"):
+    if not logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.addHandler(logging.NullHandler())
 
 class AsciiRenderer:
     """Draw simple shapes onto a numpy canvas and render ASCII art.
@@ -220,7 +230,7 @@ class AsciiRenderer:
         fg = enable_fg_color if enable_fg_color is not None else self.enable_fg_color
         bg = enable_bg_color if enable_bg_color is not None else self.enable_bg_color
         #with redirect_stdout(buffer):
-        print("draw diff starting")
+        logger.debug("draw diff starting")
         draw_diff(
                 changed_subunits,
                 char_cell_pixel_height=c_h,
@@ -230,7 +240,7 @@ class AsciiRenderer:
                 enable_fg_color=fg,
                 enable_bg_color=bg,
             )
-        print("draw diff over")
+        logger.debug("draw diff over")
         ascii_out = buffer.getvalue()
         if self.profile and start is not None:
             elapsed = (time.perf_counter() - start) * 1000.0
