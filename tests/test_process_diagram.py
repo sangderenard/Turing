@@ -1,3 +1,5 @@
+import networkx as nx
+
 from src.common.tensors import AbstractTensor
 from src.common.tensors.autograd_process import AutogradProcess
 from src.common.tensors.process_diagram import build_training_diagram, render_training_diagram
@@ -28,6 +30,6 @@ def test_process_diagram_build_and_render(tmp_path):
     assert "loss" in diagram
     assert any(n.startswith("cache_") for n in diagram.nodes)
 
-    out_file = tmp_path / "diagram.png"
-    render_training_diagram(proc, out_file)
-    assert out_file.exists() and out_file.stat().st_size > 0
+    rendered = render_training_diagram(proc, tmp_path / "diagram.png")
+    assert isinstance(rendered, nx.DiGraph)
+    assert "loss" in rendered
