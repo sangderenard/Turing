@@ -13,6 +13,7 @@ omitted to keep the module light-weight.
 from pathlib import Path
 from typing import Dict, Iterable, List
 
+import matplotlib.pyplot as plt
 import networkx as nx
 
 from .autograd_process import AutogradProcess
@@ -92,18 +93,31 @@ def render_training_diagram(
 ) -> nx.DiGraph:
     """Return a combined process diagram for ``proc``.
 
-    Image generation has been stubbed out; this function now simply returns the
-    :class:`networkx.DiGraph` produced by :func:`build_training_diagram` that
-    combines forward, cached values, the loss node and the backward pass.
+    The diagram is drawn using :mod:`matplotlib`. If ``filename`` is provided
+    the image is written to that path. Otherwise a window will be shown so the
+    caller can visually inspect the graph.
 
     Parameters
     ----------
     proc:
         The :class:`AutogradProcess` whose computation will be represented.
     filename:
-        Ignored placeholder for the previous PNG output path.
+        Optional output location for a PNG snapshot of the diagram. When
+        omitted a GUI window is opened instead.
     figsize:
-        Retained for backwards compatibility and unused.
+        Figure size passed through to :func:`matplotlib.pyplot.figure`.
     """
 
-    return build_training_diagram(proc)
+    g = build_training_diagram(proc)
+
+    pos = nx.multipartite_layout(g, subset_key="layer")
+    plt.figure(figsize=figsize)
+    nx.draw_networkx(g, pos, with_labels=True)
+
+    if filename is not None:
+        plt.savefig(Path(filename))
+        plt.close()
+    else:
+        plt.show()
+
+    return g
