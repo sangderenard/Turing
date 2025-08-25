@@ -611,6 +611,7 @@ class Autograd:
     def __init__(self) -> None:
         self.tape = GradTape()
         self._no_grad_depth = 0
+        self.capture_all = False
 
     @contextmanager
     def no_grad(self) -> Generator[None, None, None]:

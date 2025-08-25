@@ -96,8 +96,10 @@ def main() -> None:
 
     # --- capture autograd process on a fresh tape ---
     autograd.tape = GradTape()
+    autograd.capture_all = True
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
+    autograd.capture_all = False
     autograd.tape.mark_loss(loss)
 
     proc = AutogradProcess(autograd.tape)

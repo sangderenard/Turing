@@ -35,3 +35,26 @@ def test_process_diagram_build_and_render(tmp_path):
     assert isinstance(rendered, nx.DiGraph)
     assert "loss" in rendered
     assert out_file.exists()
+
+
+def test_capture_all_records_without_requires_grad():
+    autograd = AbstractTensor.autograd
+    tape = autograd.tape
+    tape._nodes.clear()
+    tape.graph.clear()
+
+    autograd.capture_all = True
+    x = AbstractTensor.tensor([1.0, 2.0])
+    y = AbstractTensor.tensor([3.0, 4.0])
+    z = x + y
+    loss = z.sum()
+    autograd.capture_all = False
+
+    tape.mark_loss(loss)
+    proc = AutogradProcess(tape)
+    proc.build(loss)
+
+    assert proc.forward_graph.number_of_edges() > 0
+
+    tape._nodes.clear()
+    tape.graph.clear()

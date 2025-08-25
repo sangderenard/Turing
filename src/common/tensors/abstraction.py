@@ -1213,7 +1213,7 @@ class AbstractTensor:
             getattr(x, "track_time", False) for x in inputs if isinstance(x, AbstractTensor)
         )
 
-        if requires or track:
+        if requires or track or getattr(AbstractTensor.autograd, "capture_all", False):
             start = time.perf_counter() if track else None
 
             def finalize(result: Any):
