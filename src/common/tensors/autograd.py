@@ -360,6 +360,59 @@ class GradTape:
                     required.add(tid)
         return required
 
+    def export_forward_graph(self) -> nx.DiGraph:
+        """Return a forward computation graph of recorded operations.
+
+        The returned graph is a :class:`networkx.DiGraph` where nodes are
+        keyed by ``id(tensor)``.  Each node carries three attributes:
+
+        ``op``
+            Name of the operator that produced the tensor or ``None`` for
+            leaf inputs.
+        ``cached``
+            ``True`` when the tensor has been annotated with a ``cache`` flag
+            via :meth:`annotate` and therefore must retain its ``data`` for
+            backward computations.
+        ``metadata``
+            Free-form dictionary of any additional annotations associated with
+            the tensor.  It is copied verbatim from the internal tape.
+
+        Edges denote data dependencies from input tensors to the tensors they
+        help produce.
+        """
+
+        g = nx.DiGraph()
+
+        # First populate nodes using the existing global graph which already
+        # stores annotations.  Operation names are resolved by examining the
+        # generating op node, if present.
+        for tid, data in self.graph.nodes(data=True):
+            if data.get("kind") != "tensor":
+                continue
+            anns = data.get("annotations", {})
+            op_name = None
+            try:
+                for pred in self.graph.predecessors(tid):
+                    pdata = self.graph.nodes[pred]
+                    if pdata.get("kind") == "op":
+                        op_name = pdata.get("op")
+                        break
+            except Exception:
+                pass
+            g.add_node(
+                tid,
+                op=op_name,
+                cached=bool(anns.get("cache")),
+                metadata=anns,
+            )
+
+        # Now add edges between tensors based on the recorded parent links.
+        for tid, node in self._nodes.items():
+            for pid, _ in node.parents:
+                g.add_edge(pid, tid)
+
+        return g
+
 
 class TapeProfiler:
     """Compute basic timing statistics from a :class:`GradTape`.
