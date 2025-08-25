@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-"""Render training loop diagrams for :mod:`autograd` tensors.
+"""Build network diagrams for :mod:`autograd` tensors.
 
-This helper builds a layered graph from :class:`~src.common.tensors.autograd_process.AutogradProcess`
-instances and writes the result to a PNG image.  The diagram exposes the
-relationship between forward computations, cached values, the loss node and the
-backward pass.  Each operation is drawn in a box with its operator label so the
-entire optimisation step can be visually inspected.
+This helper constructs a layered :class:`networkx.DiGraph` from
+:class:`~src.common.tensors.autograd_process.AutogradProcess` instances. The
+diagram exposes the relationship between forward computations, cached values,
+the loss node and the backward pass so the entire optimisation step can be
+visually inspected or further analysed. Image generation is intentionally
+omitted to keep the module light-weight.
 """
 
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-import matplotlib.pyplot as plt
 import networkx as nx
 
 from .autograd_process import AutogradProcess
@@ -84,46 +84,26 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
     return g
 
 
-def _row_layout(diagram: nx.DiGraph) -> Dict[str, tuple[float, float]]:
-    """Lay out ``diagram`` with layers on the Y axis."""
+def render_training_diagram(
+    proc: AutogradProcess,
+    filename: str | Path | None = None,
+    *,
+    figsize: tuple[int, int] = (20, 12),
+) -> nx.DiGraph:
+    """Return a combined process diagram for ``proc``.
 
-    layers: Dict[int, List[str]] = {}
-    for node, data in diagram.nodes(data=True):
-        layer = int(data.get("layer", 0))
-        layers.setdefault(layer, []).append(node)
+    Image generation has been stubbed out; this function now simply returns the
+    :class:`networkx.DiGraph` produced by :func:`build_training_diagram` that
+    combines forward, cached values, the loss node and the backward pass.
 
-    pos: Dict[str, tuple[float, float]] = {}
-    for layer, nodes in layers.items():
-        for i, node in enumerate(nodes):
-            pos[node] = (i, -layer)
-    return pos
+    Parameters
+    ----------
+    proc:
+        The :class:`AutogradProcess` whose computation will be represented.
+    filename:
+        Ignored placeholder for the previous PNG output path.
+    figsize:
+        Retained for backwards compatibility and unused.
+    """
 
-
-def render_training_diagram(proc: AutogradProcess, filename: str | Path, *, figsize: tuple[int, int] = (20, 12)) -> None:
-    """Render ``proc`` as a PNG file at ``filename``."""
-
-    diagram = build_training_diagram(proc)
-    pos = _row_layout(diagram)
-    labels = {n: d.get("label", str(n)) for n, d in diagram.nodes(data=True)}
-
-    layers = sorted({data.get("layer", 0) for _, data in diagram.nodes(data=True)})
-    cmap = plt.get_cmap("Pastel1")
-    layer_colors = {layer: cmap(i % cmap.N) for i, layer in enumerate(layers)}
-    node_color = [layer_colors[data.get("layer", 0)] for _, data in diagram.nodes(data=True)]
-
-    plt.figure(figsize=figsize)
-    nx.draw(
-        diagram,
-        pos,
-        with_labels=True,
-        labels=labels,
-        node_shape="s",
-        node_size=3000,
-        font_size=8,
-        arrows=True,
-        node_color=node_color,
-    )
-    plt.axis("off")
-    filename = Path(filename)
-    plt.savefig(filename, bbox_inches="tight")
-    plt.close()
+    return build_training_diagram(proc)
