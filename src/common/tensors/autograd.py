@@ -155,6 +155,7 @@ class GradTape:
         *,
         start: float | None = None,
         end: float | None = None,
+        params: Dict[str, Any] | None = None,
     ) -> Any:
         """Append a new node representing ``op`` to the tape.
 
@@ -179,9 +180,32 @@ class GradTape:
         else:
             inputs = [inputs]
         parent_ids = [(id(t), pos) for pos, t in enumerate(inputs)]
+
+        def _dtype(x: Any) -> Any:
+            try:
+                return x.get_dtype()  # type: ignore[attr-defined]
+            except Exception:
+                data = getattr(x, "data", x)
+                return getattr(data, "dtype", getattr(x, "dtype", None))
+
+        def _device(x: Any) -> Any:
+            try:
+                return x.get_device()  # type: ignore[attr-defined]
+            except Exception:
+                data = getattr(x, "data", x)
+                return getattr(data, "device", getattr(x, "device", None))
+
+        def _backend(x: Any) -> Any:
+            return type(x).__name__
+
+        def _strides(x: Any) -> Any:
+            data = getattr(x, "data", x)
+            return getattr(data, "strides", None)
+
         elapsed = None
         if start is not None and end is not None:
             elapsed = end - start
+
         ctx = {
             "inputs": list(inputs),
             "result": result,
@@ -189,9 +213,18 @@ class GradTape:
             "result_data": result.data if hasattr(result, "data") else result,
             "input_shapes": [getattr(x, "shape", None) for x in inputs],
             "result_shape": getattr(result, "shape", None),
+            "input_dtypes": [_dtype(x) for x in inputs],
+            "result_dtype": _dtype(result),
+            "input_devices": [_device(x) for x in inputs],
+            "result_device": _device(result),
+            "input_backends": [_backend(x) for x in inputs],
+            "result_backend": _backend(result),
+            "input_strides": [_strides(x) for x in inputs],
+            "result_strides": _strides(result),
             "start": start,
             "end": end,
             "elapsed": elapsed,
+            "params": params or {},
         }
         node = GradNode(op=op, parents=parent_ids, ctx=ctx)
         self._nodes[id(result)] = node
@@ -390,6 +423,7 @@ class Autograd:
         *,
         start: float | None = None,
         end: float | None = None,
+        params: Dict[str, Any] | None = None,
     ) -> Any:
         """Record an operation on the appropriate tape if supported."""
 
@@ -404,7 +438,7 @@ class Autograd:
                     break
         if tape is None:
             tape = self.tape
-        tape.record(op, inputs, result, start=start, end=end)
+        tape.record(op, inputs, result, start=start, end=end, params=params)
         return result
 
     def grad(
