@@ -50,3 +50,35 @@ def test_autograd_process_training_and_tables():
     backward_children = list(tree.successors("backward"))
     assert set(forward_children) == set(proc.forward_schedule)
     assert set(backward_children) == set(proc.backward_schedule)
+
+
+def test_autograd_process_concurrent_levels():
+    autograd = AbstractTensor.autograd
+    tape = autograd.tape
+    tape._nodes.clear()
+    tape.graph.clear()
+
+    x = AbstractTensor.tensor([1.0, 2.0])
+    y = AbstractTensor.tensor([3.0, 4.0])
+    w = AbstractTensor.tensor([1.0])
+    w.requires_grad = True
+
+    # two independent branches that can run concurrently
+    a = x * w
+    b = y * w
+    c = a + b
+    loss = c.sum()
+
+    proc = AutogradProcess(tape)
+    proc.build(loss)
+
+    # schedules should match a topological sort of the forward graph
+    assert proc.forward_schedule == list(nx.topological_sort(proc.forward_graph))
+
+    levels = list(nx.topological_generations(proc.forward_graph))
+    # graph should have multiple levels with an intermediate concurrent level
+    assert len(levels) > 2
+    assert any(len(level) > 1 for level in levels[1:-1])
+
+    tape._nodes.clear()
+    tape.graph.clear()
