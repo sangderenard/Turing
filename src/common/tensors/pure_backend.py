@@ -43,6 +43,23 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
 
 class PurePythonTensorOperations(AbstractTensor):
+    def argwhere_(self):
+        from .abstraction import _get_shape
+        data = self.data
+        shape = _get_shape(data)
+        indices = []
+        if len(shape) == 1:
+            for i, v in enumerate(data):
+                if v:
+                    indices.append([i])
+        elif len(shape) == 2:
+            for i, row in enumerate(data):
+                for j, v in enumerate(row):
+                    if v:
+                        indices.append([i, j])
+        else:
+            raise NotImplementedError("argwhere_ only implemented for 1D/2D in pure backend")
+        return indices
     def swapaxes_(self, axis1, axis2):
         # Only works for 2D or 3D nested lists; for higher dims, extend as needed
         from .abstraction import _get_shape

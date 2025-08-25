@@ -136,6 +136,19 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    def __index__(self):
+        """Allow AbstractTensor to be used in slice contexts (e.g., arr[tensor]).
+        Returns the integer value of the tensor if it is scalar-like.
+        """
+        return int(self.item())
+    def argwhere(self) -> "AbstractTensor":
+        """Return the indices where condition is True. Like np.argwhere, always returns a 2D array of indices."""
+        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+        result.data = self.argwhere_()
+        return result
+
+    def argwhere_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement argwhere_()")
     @staticmethod
     def _normalize_shape_args(*shape):
         """
@@ -1725,6 +1738,7 @@ from .abstraction_methods.type_ops import (
     cuda as type_cuda,
 )
 from .abstraction_methods.comparison import (
+    argwhere as comp_argwhere,
     greater as comp_greater,
     greater_equal as comp_greater_equal,
     less as comp_less,
@@ -1881,6 +1895,7 @@ _bind_and_wrap({
     "isnan": comp_isnan,
     "isinf": comp_isinf,
     "allclose": comp_allclose,
+    "argwhere": comp_argwhere,
     "sin": trig_sin,
     "cos": trig_cos,
     "tan": trig_tan,

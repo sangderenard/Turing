@@ -49,6 +49,9 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    def argwhere_(self):
+        import jax.numpy as jnp
+        return jnp.argwhere(self.data)
     def swapaxes_(self, axis1, axis2):
         return jnp.swapaxes(self.data, axis1, axis2)
     def empty_(self, size, dtype=None, device=None):

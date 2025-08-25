@@ -154,9 +154,9 @@ class RenderChooser:
         if self.sync_per_frame and self.mode == "ascii":
             self._sync_event.clear()
             self._buffer.write_frame({"__sync__": True})
-            self._sync_event.wait()
-            if self._ascii_printer is not None:
-                self._ascii_printer.wait_until_empty()
+            #self._sync_event.wait()
+            #if self._ascii_printer is not None:
+            #    self._ascii_printer.wait_until_empty()
 
     # ------------------------------------------------------------------
     def poll_input(self) -> Tuple[Set[str], List[str]]:

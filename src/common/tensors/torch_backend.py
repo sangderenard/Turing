@@ -43,6 +43,9 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    def argwhere_(self):
+        import torch
+        return torch.nonzero(self.data, as_tuple=False)
     def swapaxes_(self, axis1, axis2):
         return self.data.swapaxes(axis1, axis2)
     def empty_(self, size, dtype=None, device=None):

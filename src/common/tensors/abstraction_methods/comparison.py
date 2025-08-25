@@ -11,6 +11,14 @@ def where(self, x: Any, y: Any) -> "AbstractTensor":
     result = type(self)(track_time=self.track_time)
     result.data = self.where_(x, y)
     return result
+def argwhere(self) -> "AbstractTensor":
+    """Return the indices where condition is True. Like np.argwhere, always returns a 2D array of indices."""
+    from ..abstraction import AbstractTensor
+    if not isinstance(self, AbstractTensor):
+        self = AbstractTensor.tensor(self)
+    result = type(self)(track_time=self.track_time)
+    result.data = self.argwhere_()
+    return result
 
 def all(self, dim=None) -> Any:
     """Return True if all elements of the tensor are True."""

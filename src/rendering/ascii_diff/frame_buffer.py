@@ -62,11 +62,11 @@ class PixelFrameBuffer:
     def _compute_pixel_diff_mask(self) -> AbstractTensor:
         """Return a boolean mask (rows, cols) where pixels differ vs display."""
         if self.diff_threshold == 0:
-            return AbstractTensor.any(self.buffer_next != self.buffer_display, axis=2)
+            return AbstractTensor.any(self.buffer_next != self.buffer_display, dim=2)
         abs_diff = AbstractTensor.abs(
             self.buffer_next - self.buffer_display
         )
-        sum_abs = AbstractTensor.sum(abs_diff, axis=2)
+        sum_abs = AbstractTensor.sum(abs_diff, dim=2)
         return sum_abs > self.diff_threshold
 
     def _mask_to_tile_mask(self, diff_mask: AbstractTensor) -> AbstractTensor:
@@ -141,6 +141,7 @@ class PixelFrameBuffer:
                     if include_data:
                         y0, x0 = ty * th, tx * tw
                         y1, x1 = min(y0 + th, rows), min(x0 + tw, cols)
+                        
                         payload = self.buffer_next[y0:y1, x0:x1].copy()
                         updates.append((int(ty), int(tx), payload))
                     else:
