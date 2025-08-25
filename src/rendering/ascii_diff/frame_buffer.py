@@ -83,7 +83,7 @@ class PixelFrameBuffer:
         R, C = diff_padded.shape
         ty, tx = R // th, C // tw
         # Reshape to (ty, th, tx, tw) and reduce within each tile
-        tile_mask = diff_padded.reshape(ty, th, tx, tw).any(axis=(1, 3))
+        tile_mask = diff_padded.reshape(ty, th, tx, tw).any(dim=(1, 3))
         return tile_mask  # shape: (tiles_y, tiles_x)
 
     def get_diff_and_promote(

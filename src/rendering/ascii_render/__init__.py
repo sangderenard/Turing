@@ -208,8 +208,8 @@ class AsciiRenderer:
 
         # Convert updates to the subunit format expected by draw_diff
         changed_subunits = [
-            (y, x, np.array([[[r, g, b]]], dtype=np.uint8))
-            for y, x, (r, g, b) in updates
+            (y, x, d)
+            for y, x, d in updates
         ]
 
         ascii_ramp = ramp or DEFAULT_DRAW_ASCII_RAMP

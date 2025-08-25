@@ -67,7 +67,8 @@ class ThreadedAsciiDiffPrinter:
                 item = self._queue.get(timeout=0.1)
                 print("Retrieved frame from queue")
             except queue.Empty:
-                print("Queue is empty")
+                import time
+                time.sleep(0.01)
                 continue
             if item is None:
                 print("Stop sentinel received")

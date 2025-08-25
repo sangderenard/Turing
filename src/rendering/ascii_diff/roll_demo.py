@@ -20,7 +20,7 @@ def roll_image(img: np.ndarray, t: int, period_y: int, period_x: int) -> np.ndar
 
 
 def main() -> None:
-    width, height = 64, 32
+    width, height = 128, 128
     base = np.indices((height, width)).sum(axis=0) % 2 * 255
 
     chooser = RenderChooser(width, height, mode="ascii")

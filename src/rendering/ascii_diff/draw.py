@@ -2,21 +2,23 @@
 from __future__ import annotations
 
 import sys
-import numpy as np
+import numpy as AbstractTensor
 from colorama import Style, Fore, Back
 from pathlib import Path
 from .ascii_kernel_classifier import AsciiKernelClassifier
-
+from src.common.tensors.abstraction import AbstractTensor
+test_tensor = AbstractTensor.get_tensor([0])
+integer_type = test_tensor.long_dtype_
 
 # Default ASCII ramp used if no specific ramp is provided to drawing functions.
 DEFAULT_DRAW_ASCII_RAMP = " .:░▒▓█"
 
 
 def flexible_subunit_kernel(
-    subunit_data: np.ndarray,
+    subunit_data: AbstractTensor,
     ramp: str,
     mode: str = "ascii",
-) -> str | np.ndarray:
+) -> str | AbstractTensor:
     """Return a representation for ``subunit_data`` based on ``mode``.
 
     Parameters
@@ -33,7 +35,7 @@ def flexible_subunit_kernel(
     if mode == "raw":
         return subunit_data
     char = default_subunit_batch_to_chars(
-        np.expand_dims(subunit_data, axis=0), ramp
+        AbstractTensor.expand_dims(subunit_data, dim=0), ramp
     )[0]
     if mode == "ascii":
         return char
@@ -54,7 +56,7 @@ def flexible_subunit_kernel(
         x = (w - (bbox[2] - bbox[0])) // 2
         y = (h - (bbox[3] - bbox[1])) // 2
         draw.text((x, y), char, fill=(255, 255, 255), font=font)
-        return np.array(img)
+        return AbstractTensor.array(img)
     raise ValueError(f"Unknown mode: {mode}")
 
 # Module-level cache for classifier and ramp
@@ -67,7 +69,7 @@ _classifier_cache = {
 DEFAULT_FONT_PATH = Path(__file__).with_name("consola.ttf")
 
 def default_subunit_batch_to_chars(
-    subunit_batch: np.ndarray,
+    subunit_batch: AbstractTensor,
     ramp: str = DEFAULT_DRAW_ASCII_RAMP,
     char_width: int = 16, # Add parameters for desired char_size
     char_height: int = 32, # These will be the actual cell_w, cell_h from clock_demo
@@ -115,10 +117,10 @@ def draw_text_overlay(
     sys.stdout.flush()
 
 def draw_diff(
-    changed_subunits: list[tuple[int, int, np.ndarray]],  # List of (y_pixel, x_pixel, subunit_pixel_data)
+    changed_subunits: list[tuple[int, int, AbstractTensor]],  # List of (y_pixel, x_pixel, subunit_pixel_data)
     char_cell_pixel_height: int = 1,  # The height of a character cell in pixels
     char_cell_pixel_width: int = 1,  # The width of a character cell in pixels
-    subunit_to_char_kernel: callable[[np.ndarray, str, int, int], list[str]] = default_subunit_batch_to_chars, # Update signature
+    subunit_to_char_kernel: callable[[AbstractTensor, str, int, int], list[str]] = default_subunit_batch_to_chars, # Update signature
     active_ascii_ramp: str = DEFAULT_DRAW_ASCII_RAMP,  # The ASCII ramp to use for character conversion
     base_row: int = 1, 
     base_col: int = 1,
@@ -140,7 +142,7 @@ def draw_diff(
     if not changed_subunits:
         print("No changed subunits to draw")
         return
-    subunit_batch = np.stack([data for _, _, data in changed_subunits], axis=0)
+    subunit_batch = AbstractTensor.stack([data for _, _, data in changed_subunits], dim=0)
     # Pass the actual char_cell_pixel_width and char_cell_pixel_height to the kernel
     chars = subunit_to_char_kernel(subunit_batch, active_ascii_ramp, char_cell_pixel_width, char_cell_pixel_height)
     print(f"Drawing {len(changed_subunits)} changed subunits")
@@ -151,10 +153,10 @@ def draw_diff(
         ansi_color_bg = ""
         ansi_color_fg = ""
         if subunit_data.ndim == 3 and subunit_data.shape[2] == 3:
-            avg_color = np.mean(subunit_data, axis=(0, 1)).astype(int)
+            avg_color = AbstractTensor.mean(subunit_data.to_dtype(test_tensor.float_dtype), dim=(0, 1)).to_dtype(integer_type)
             r, g, b = avg_color[0], avg_color[1], avg_color[2]
             if enable_bg_color:
-                ansi_color_bg = f"\x1b[48;2;{r};{g};{b}m"
+                ansi_color_bg = f"\x1b[48;2;{r.item()};{g.item()};{b.item()}m"
             if enable_fg_color:
                 ansi_color_fg = "\x1b[38;2;255;255;255m"
         else:
@@ -173,12 +175,12 @@ def draw_diff(
 from typing import List, Tuple
 
 def get_changed_subunits(
-    old_frame: np.ndarray,
-    new_frame: np.ndarray,
+    old_frame: AbstractTensor,
+    new_frame: AbstractTensor,
     subunit_height: int,
     subunit_width: int,
     loss_threshold: float = 0.0,
-) -> List[Tuple[int, int, np.ndarray]]:
+) -> List[Tuple[int, int, AbstractTensor]]:
     """
     Compares two frames and returns subunits from the new_frame that have changed.
 
@@ -213,7 +215,7 @@ def get_changed_subunits(
         raise ValueError("Subunit height and width must be positive integers.")
 
     frame_height, frame_width = new_frame.shape[0], new_frame.shape[1]
-    changed_subunits_list: List[Tuple[int, int, np.ndarray]] = []
+    changed_subunits_list: List[Tuple[int, int, AbstractTensor]] = []
 
     # Vectorized difference computation for regions that align to the subunit
     # grid. Any leftover edge regions fall back to the original loop logic.
@@ -221,9 +223,9 @@ def get_changed_subunits(
     w_full = frame_width - (frame_width % subunit_width)
 
     if h_full > 0 and w_full > 0:
-        diff = np.abs(
-            old_frame[:h_full, :w_full].astype(np.int16)
-            - new_frame[:h_full, :w_full].astype(np.int16)
+        diff = AbstractTensor.abs(
+            old_frame[:h_full, :w_full].to_dtype(integer_type)
+            - new_frame[:h_full, :w_full].to_dtype(integer_type)
         )
         reshaped = diff.reshape(
             h_full // subunit_height,
@@ -232,8 +234,8 @@ def get_changed_subunits(
             subunit_width,
             -1,
         )
-        losses = reshaped.mean(axis=(1, 3, 4))
-        coords = np.argwhere(losses > loss_threshold)
+        losses = reshaped.mean(dim=(1, 3, 4))
+        coords = AbstractTensor.argwhere(losses > loss_threshold)
         for by, bx in coords:
             y = int(by * subunit_height)
             x = int(bx * subunit_width)
