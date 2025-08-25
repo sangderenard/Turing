@@ -30,6 +30,8 @@ def test_process_diagram_build_and_render(tmp_path):
     assert "loss" in diagram
     assert any(n.startswith("cache_") for n in diagram.nodes)
 
-    rendered = render_training_diagram(proc, tmp_path / "diagram.png")
+    out_file = tmp_path / "diagram.png"
+    rendered = render_training_diagram(proc, out_file)
     assert isinstance(rendered, nx.DiGraph)
     assert "loss" in rendered
+    assert out_file.exists()
