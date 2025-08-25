@@ -413,6 +413,49 @@ class GradTape:
 
         return g
 
+    def export_backward_graph(self, result: Any) -> nx.DiGraph:
+        """Return a backward computation graph starting at ``result``.
+
+        The returned graph is a :class:`networkx.DiGraph` whose nodes are
+        keyed by ``id(tensor)``.  Each node describes the backward operator
+        associated with the tensor that produced it during the forward pass.
+
+        ``op``
+            Name of the forward operator or ``None`` for leaf inputs.
+        ``fn``
+            Callable retrieved from :data:`BACKWARD_REGISTRY` implementing the
+            backward rule for ``op``.  ``None`` for leaves or unregistered ops.
+        ``required``
+            List of tensor IDs whose ``data`` must be retained in order to
+            execute this backward operation.  This list is derived from the
+            per-operator requirements in :data:`BACKWARD_RULES`.
+
+        Edges are directed from each tensor to the tensors it depends on for
+        gradient propagation (i.e. reverse of the forward graph).
+        """
+
+        g = nx.DiGraph()
+        required = self.required_cache(result)
+
+        for tid, node in self.traverse(result):
+            fn = BACKWARD_REGISTRY._methods.get(node.op)
+
+            needed: List[int] = []
+            for pid, _ in node.parents:
+                if pid in required:
+                    needed.append(pid)
+            if tid in required:
+                needed.append(tid)
+
+            g.add_node(tid, op=node.op, fn=fn, required=needed)
+
+            for pid, _ in node.parents:
+                if pid not in g:
+                    g.add_node(pid, op=None, fn=None, required=[pid] if pid in required else [])
+                g.add_edge(tid, pid)
+
+        return g
+
 
 class TapeProfiler:
     """Compute basic timing statistics from a :class:`GradTape`.
