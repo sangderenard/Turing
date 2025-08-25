@@ -109,3 +109,9 @@ class AbstractNNGraphCore(ABC):
             if hasattr(nn, 'in_nodes') and hasattr(nn, 'out_nodes'):
                 self.in_nodes = nn.in_nodes
                 self.out_nodes = nn.out_nodes
+        if not self.is_graph_complete():
+            raise ValueError("NN graph is incomplete or disconnected.")
+
+    def is_graph_complete(self) -> bool:
+        """Return True if the internal graph is weakly connected."""
+        return self.backing.number_of_nodes() > 0 and nx.is_weakly_connected(self.backing)

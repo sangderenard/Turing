@@ -139,6 +139,17 @@
     void floordiv_double(const double* a, const double* b, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = floor(a[i] / b[i]);
     }
+    void matmul_double(const double* a, const double* b, double* out, int m, int n, int p) {
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < p; ++j) {
+                double sum = 0.0;
+                for (int k = 0; k < n; ++k) {
+                    sum += a[i * n + k] * b[k * p + j];
+                }
+                out[i * p + j] = sum;
+            }
+        }
+    }
     // Scalar ops
     void add_scalar(const double* a, double b, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = a[i] + b;

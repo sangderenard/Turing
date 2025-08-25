@@ -48,6 +48,7 @@ ffi.cdef("""
     void pow_double(const double* a, const double* b, double* out, int n);
     void mod_double(const double* a, const double* b, double* out, int n);
     void floordiv_double(const double* a, const double* b, double* out, int n);
+    void matmul_double(const double* a, const double* b, double* out, int m, int n, int p);
     // Scalar ops
     void add_scalar(const double* a, double b, double* out, int n);
     void subtract_const(const double* a, double b, double* out, int n);
@@ -219,6 +220,22 @@ class CTensorOperations(AbstractTensor):
     def _apply_operator__(self, op: str, left: CTensor, right: Any):
         """Operate on ``CTensor`` objects or scalars."""
         if isinstance(right, CTensor) and isinstance(left, CTensor):
+            if op in ('matmul', 'rmatmul', 'imatmul'):
+                a, b = (left, right) if op != 'rmatmul' else (right, left)
+                if len(a.shape) != 2 or len(b.shape) != 2:
+                    raise ValueError("matmul expects 2D tensors")
+                m, n = a.shape
+                n2, p = b.shape
+                if n != n2:
+                    raise ValueError("Shape mismatch for matmul")
+                out = CTensor((m, p))
+                C.matmul_double(a.as_c_ptr(), b.as_c_ptr(), out.as_c_ptr(), m, n, p)
+                if op == 'imatmul':
+                    left.buffer = out.buffer
+                    left.shape = out.shape
+                    left.size = out.size
+                    return left
+                return out
             if left.shape != right.shape:
                 raise ValueError("Shape mismatch")
             out = CTensor(left.shape)
@@ -329,6 +346,21 @@ class CTensorOperations(AbstractTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
         out = CTensor(tensor.shape)
         C.sqrt_double(tensor.as_c_ptr(), out.as_c_ptr(), tensor.size)
+        return out
+
+    def matmul_(self, tensor: Any, other: Any) -> CTensor:
+        if not isinstance(tensor, CTensor):
+            tensor = CTensor.from_list(tensor, _get_shape(tensor))
+        if not isinstance(other, CTensor):
+            other = CTensor.from_list(other, _get_shape(other))
+        if len(tensor.shape) != 2 or len(other.shape) != 2:
+            raise ValueError("matmul expects 2D tensors")
+        m, n = tensor.shape
+        n2, p = other.shape
+        if n != n2:
+            raise ValueError("Shape mismatch for matmul")
+        out = CTensor((m, p))
+        C.matmul_double(tensor.as_c_ptr(), other.as_c_ptr(), out.as_c_ptr(), m, n, p)
         return out
 
     def tensor_from_list_(self, data: List[Any], dtype: Any, device: Any) -> CTensor:
