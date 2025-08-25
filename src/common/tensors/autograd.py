@@ -6,6 +6,9 @@ from __future__ import annotations
 def requires_grad_(self, requires_grad: bool = True):
     """Enable or disable gradient tracking on this tensor."""
     self._requires_grad = requires_grad
+    tape = getattr(self, "_tape", None)
+    if tape is not None:
+        tape.create_tensor_node(self)
     return self
 
 
@@ -96,6 +99,7 @@ from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tup
 from contextlib import contextmanager
 
 import networkx as nx
+from .nested_pack import pack_nested_to_tensor
 
 # Integrate the lightweight backward registry so that backward rules are
 # resolved dynamically rather than being baked into the tape at record time.
@@ -134,6 +138,11 @@ class GradTape:
         self._nodes: Dict[int, GradNode] = {}
         self.graph = nx.DiGraph()
         self._op_index = 0
+        self._parameters: Dict[int, int] = {}
+        self._tensor_refs: Dict[int, Any] = {}
+        self._param_index = 0
+        self._loss_tensor: Any | None = None
+        self._loss_id: int | None = None
 
     # ------------------------------------------------------------------
     # node utilities
@@ -142,10 +151,23 @@ class GradTape:
         """Register ``tensor`` as a root node in the graph."""
         tid = id(tensor)
         self.graph.add_node(tid, kind="tensor")
+        self._tensor_refs[tid] = tensor
         try:
             tensor._tape = self  # type: ignore[attr-defined]
         except Exception:
             pass
+        if getattr(tensor, "requires_grad", False):
+            if tid not in self._parameters:
+                pid = self._param_index
+                self._param_index += 1
+                self._parameters[tid] = pid
+            pid = self._parameters[tid]
+            node = self.graph.nodes[tid]
+            node["param_id"] = pid
+            node["stateful"] = True
+        else:
+            node = self.graph.nodes[tid]
+            node.setdefault("stateful", False)
 
     # ------------------------------------------------------------------
     # annotation utilities
@@ -158,6 +180,36 @@ class GradTape:
         node = self.graph.nodes[tid]
         annotations = node.setdefault("annotations", {})
         annotations.update(metadata)
+
+    # ------------------------------------------------------------------
+    # loss/parameter utilities
+    # ------------------------------------------------------------------
+    def mark_loss(self, tensor: Any) -> None:
+        """Declare ``tensor`` as the loss node for training."""
+        tid = id(tensor)
+        self._loss_tensor = tensor
+        self._loss_id = tid
+        self.graph.add_node(tid, kind="tensor")
+        self.graph.nodes[tid]["loss"] = True
+        self._tensor_refs[tid] = tensor
+
+    def parameter_tensors(self) -> List[Any]:
+        return [self._tensor_refs[tid] for tid, _ in sorted(self._parameters.items(), key=lambda x: x[1])]
+
+    def parameters(self) -> Tuple[Any | None, Dict[int, int]]:
+        params = self.parameter_tensors()
+        if not params:
+            return None, {}
+        tensor = pack_nested_to_tensor(params, cls=type(params[0]))
+        return tensor, dict(self._parameters)
+
+    def export_training_state(self) -> Tuple[nx.DiGraph, nx.DiGraph, Any | None, Dict[int, int]]:
+        if self._loss_tensor is None:
+            raise ValueError("Loss tensor has not been marked")
+        fwd = self.export_forward_graph()
+        bwd = self.export_backward_graph(self._loss_tensor)
+        params_tensor, id_map = self.parameters()
+        return fwd, bwd, params_tensor, id_map
 
     # ------------------------------------------------------------------
     # recording utilities
@@ -399,11 +451,15 @@ class GradTape:
                         break
             except Exception:
                 pass
+            pid = self._parameters.get(tid)
             g.add_node(
                 tid,
                 op=op_name,
                 cached=bool(anns.get("cache")),
                 metadata=anns,
+                param_id=pid,
+                stateful=bool(data.get("stateful")),
+                loss=(tid == self._loss_id),
             )
 
         # Now add edges between tensors based on the recorded parent links.
@@ -447,12 +503,29 @@ class GradTape:
             if tid in required:
                 needed.append(tid)
 
-            g.add_node(tid, op=node.op, fn=fn, required=needed)
+            pid = self._parameters.get(tid)
+            g.add_node(
+                tid,
+                op=node.op,
+                fn=fn,
+                required=needed,
+                param_id=pid,
+                stateful=tid in self._parameters,
+                loss=(tid == self._loss_id),
+            )
 
-            for pid, _ in node.parents:
-                if pid not in g:
-                    g.add_node(pid, op=None, fn=None, required=[pid] if pid in required else [])
-                g.add_edge(tid, pid)
+            for pid2, _ in node.parents:
+                if pid2 not in g:
+                    g.add_node(
+                        pid2,
+                        op=None,
+                        fn=None,
+                        required=[pid2] if pid2 in required else [],
+                        param_id=self._parameters.get(pid2),
+                        stateful=pid2 in self._parameters,
+                        loss=(pid2 == self._loss_id),
+                    )
+                g.add_edge(tid, pid2)
 
         return g
 
@@ -652,6 +725,28 @@ class Autograd:
                 tape.graph.clear()
                 tape._op_index = 0
         return results
+
+    def train(
+        self,
+        loss_fn: Callable[[], Any],
+        epochs: int,
+        lr: float = 1e-2,
+        params: Optional[List[Any]] = None,
+    ) -> None:
+        """Stub for graph-based training using recorded tape metadata.
+
+        The intended design is to translate the metadata captured on the
+        ``GradTape`` into a standalone forward/backward execution graph and
+        perform parameter updates by walking that graph directly.  No tape
+        playback should occur once the graphs are materialised.
+
+        This function currently serves as a placeholder and does not execute
+        any training loop.
+        """
+
+        raise NotImplementedError(
+            "Graph-based training is not yet implemented"
+        )
 
 
 autograd = Autograd()
