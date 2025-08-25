@@ -51,8 +51,21 @@ def grad_fn(self):
     return getattr(self, "_grad_node", None)
 
 
-def zero_grad(self):  # pragma: no cover - simple helper
+def zero_grad(self, *, clear_cache: bool = False):  # pragma: no cover - simple helper
     self._grad = None
+    if clear_cache:
+        tape = getattr(self, "_tape", None)
+        if tape is not None:
+            tid = id(self)
+            if tape.graph.has_node(tid):
+                anns = tape.graph.nodes[tid].get("annotations")
+                if anns and "cache" in anns:
+                    del anns["cache"]
+            node = tape._nodes.get(tid)
+            if node is not None:
+                ctx_anns = node.ctx.get("annotations")
+                if ctx_anns and "cache" in ctx_anns:
+                    del ctx_anns["cache"]
     return self
 
 
@@ -463,6 +476,18 @@ class Autograd:
         if tape is None:
             tape = self.tape
         tape.record(op, inputs, result, start=start, end=end, params=params)
+        try:
+            required = tape.required_cache(result)
+            for tid in required:
+                if tape.graph.has_node(tid):
+                    anns = tape.graph.nodes[tid].setdefault("annotations", {})
+                    anns["cache"] = True
+                node = tape._nodes.get(tid)
+                if node is not None:
+                    ctx_anns = node.ctx.setdefault("annotations", {})
+                    ctx_anns["cache"] = True
+        except Exception:
+            pass
         return result
 
     def grad(
