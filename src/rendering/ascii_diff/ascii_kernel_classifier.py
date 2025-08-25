@@ -284,8 +284,8 @@ if __name__ == "__main__":
 
     # Stack bitmasks into a batch (N, H, W)
     batch = np.stack(bitmasks, axis=0)
-    classifier = AsciiKernelClassifier(args.ramp, font_path=args.font, font_size=args.size, char_size=(max_w, max_h))
+    classifier = AsciiKernelClassifier(args.ramp, font_path=args.font, font_size=args.size, char_size=(max_w, max_h),max_epochs=1000)
     result = classifier.classify_batch(batch)
-    for i, (expected, predicted, loss) in enumerate(zip(charset, result["chars"], result["losses"])):
+    for i, (expected, predicted) in enumerate(zip(charset, result["chars"])):
         status = "OK" if expected == predicted else "FAIL"
-        print(f"[{status}] idx={i} expected='{expected}' classified='{predicted}' loss={loss:.4f}")
+        print(f"[{status}] idx={i} expected='{expected}' classified='{predicted}'")# loss={loss:.4f}")

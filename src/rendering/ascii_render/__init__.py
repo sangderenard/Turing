@@ -48,7 +48,7 @@ class AsciiRenderer:
         dtype = float if float_mode else np.uint8
         self.canvas = np.zeros((height, width, depth), dtype=dtype)
         # Maintain a persistent frame buffer for diffing
-        self._fb = PixelFrameBuffer((height, width))
+        self._fb = PixelFrameBuffer((height, width), .12, tile_shape=(char_cell_pixel_height, char_cell_pixel_width))
         # Profiling support toggled via the TURING_PROFILE env var
         self.profile = bool(int(os.getenv("TURING_PROFILE", "0")))
         self.profile_stats: dict[str, float] = {"to_ascii_diff_ms": 0.0}
@@ -237,3 +237,4 @@ class AsciiRenderer:
             self.profile_stats["to_ascii_diff_ms"] += elapsed
             self.to_ascii_diff_durations.append(elapsed)
         return ascii_out
+

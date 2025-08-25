@@ -135,9 +135,10 @@ class RenderChooser:
                 block_on_full=self._block_on_queue_full,
             )
             #full_clear_and_reset_cursor()
+            self._buffer = self._ascii_printer._db
 
         # Input and rendering thread state
-        self._buffer = DoubleBuffer()
+        self._buffer = DoubleBuffer() if hasattr(self, "_buffer") is False else self._buffer
         self._events = []
         self._keys = set()
         self._lock = threading.Lock()
