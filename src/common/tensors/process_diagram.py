@@ -85,6 +85,54 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
     return g
 
 
+def _layered_grid_layout(
+    g: nx.DiGraph,
+    *,
+    max_nodes_per_col: int = 8,
+    layer_gap: float = 3.0,
+    col_gap: float = 0.5,
+    row_gap: float = 1.0,
+) -> Dict[str, tuple[float, float]]:
+    """Return coordinates for ``g`` arranging each ``layer`` in a grid.
+
+    ``nx.multipartite_layout`` tends to stack all nodes for a layer along a
+    single line which can make dense graphs unreadable.  This helper spreads
+    nodes within the same layer vertically and wraps to new columns once the
+    number of nodes exceeds ``max_nodes_per_col``.
+
+    Parameters
+    ----------
+    g:
+        Graph with ``layer`` metadata on each node.
+    max_nodes_per_col:
+        Number of nodes to place in a single column for a layer before
+        wrapping to a new column.
+    layer_gap:
+        Horizontal distance between successive layers.
+    col_gap:
+        Additional horizontal offset applied when wrapping to a new column
+        inside a layer.
+    row_gap:
+        Vertical distance between nodes within the same column.
+    """
+
+    layers: Dict[int, List[str]] = {}
+    for node, data in g.nodes(data=True):
+        layer = int(data.get("layer", 0))
+        layers.setdefault(layer, []).append(node)
+
+    pos: Dict[str, tuple[float, float]] = {}
+    for layer, nodes in layers.items():
+        for idx, node in enumerate(nodes):
+            col = idx // max_nodes_per_col
+            row = idx % max_nodes_per_col
+            x = layer * layer_gap + col * col_gap
+            y = -row * row_gap
+            pos[node] = (x, y)
+
+    return pos
+
+
 def render_training_diagram(
     proc: AutogradProcess,
     filename: str | Path | None = None,
@@ -110,9 +158,16 @@ def render_training_diagram(
 
     g = build_training_diagram(proc)
 
-    pos = nx.multipartite_layout(g, subset_key="layer")
+    pos = _layered_grid_layout(g)
     plt.figure(figsize=figsize)
-    nx.draw_networkx(g, pos, with_labels=True)
+    node_artists = nx.draw_networkx_nodes(g, pos)
+    node_artists.set_zorder(1)
+    edge_artists = nx.draw_networkx_edges(g, pos)
+    for artist in edge_artists:
+        artist.set_zorder(2)
+    label_artists = nx.draw_networkx_labels(g, pos)
+    for artist in label_artists.values():
+        artist.set_zorder(3)
 
     if filename is not None:
         plt.savefig(Path(filename))
