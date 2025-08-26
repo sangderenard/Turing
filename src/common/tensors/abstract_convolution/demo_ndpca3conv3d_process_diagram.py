@@ -64,6 +64,14 @@ class DemoModel(Model):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render training diagram for NDPCA3Conv3d demo")
     parser.add_argument("--format", choices=["png", "svg", "pdf"], default="png", help="Output image format")
+    parser.add_argument("--dpi", type=float, default=None, help="Raster resolution for PNG output")
+    parser.add_argument(
+        "--spacing",
+        type=float,
+        default=1.5,
+        help="Distance between nodes to give edges more room",
+    )
+
     args = parser.parse_args()
 
     np.random.seed(0)
@@ -120,7 +128,10 @@ def main() -> None:
     proc.build(loss)
 
     out_file = Path(__file__).with_name(f"ndpca3conv3d_training.{args.format}")
-    render_training_diagram(proc, out_file, format=args.format)
+    render_training_diagram(
+        proc, out_file, format=args.format, dpi=args.dpi, node_spacing=args.spacing
+    )
+
     print(f"Process diagram written to {out_file}")
 
 

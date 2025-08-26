@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+from matplotlib.patches import Rectangle
 
 from .autograd_process import AutogradProcess
 
@@ -101,7 +102,7 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
 def _leveled_grid_layout(
     g: nx.DiGraph,
     *,
-    max_nodes_per_row: int = 8,
+    max_nodes_per_row: int | None = None,
     level_gap: float = 3.0,
     col_gap: float = 1.5,
     row_gap: float = 1.5,
@@ -111,16 +112,18 @@ def _leveled_grid_layout(
 
     ``nx.multipartite_layout`` tends to stack all nodes for a level along a
     single line which can make dense graphs unreadable. This helper spreads
-    nodes within the same level horizontally and wraps to new rows once the
-    number of nodes exceeds ``max_nodes_per_row``.
+    nodes within the same level horizontally and wraps to new rows. If
+    ``max_nodes_per_row`` is ``None`` the function chooses a square-ish grid
+    for each level so the final image is closer to a balanced aspect ratio.
 
     Parameters
     ----------
     g:
         Graph with ``level`` metadata on each node.
     max_nodes_per_row:
-        Number of nodes to place in a single row for a level before
-        wrapping to a new row.
+        Optional override for the number of nodes to place in a single row
+        for a level before wrapping. When ``None`` a heuristic based on the
+        square‑root of the level size is used.
     level_gap:
         Horizontal distance between successive levels.
     col_gap:
@@ -142,16 +145,19 @@ def _leveled_grid_layout(
     rng = np.random.default_rng(0)
     for i, level in enumerate(sorted_levels):
         nodes = levels[level]
-        cols = min(max_nodes_per_row, len(nodes))
-        rows = (len(nodes) + max_nodes_per_row - 1) // max_nodes_per_row
+        if max_nodes_per_row is None:
+            cols = int(np.ceil(np.sqrt(len(nodes)))) or 1
+        else:
+            cols = min(max_nodes_per_row, len(nodes))
+        rows = int(np.ceil(len(nodes) / cols))
 
         if i > 0:
             y_base -= level_gap + prev_rows * row_gap
 
         x_offset = -((cols - 1) * col_gap) / 2
         for idx, node in enumerate(nodes):
-            row = idx // max_nodes_per_row
-            col = idx % max_nodes_per_row
+            row = idx // cols
+            col = idx % cols
             x = x_offset + col * col_gap
             y = y_base - row * row_gap
             if jitter:
@@ -169,6 +175,8 @@ def render_training_diagram(
     *,
     format: str | None = None,
     figsize: tuple[int, int] | None = None,
+    dpi: float | None = None,
+    node_spacing: float = 1.5,
 ) -> nx.DiGraph:
     """Return a combined process diagram for ``proc``.
 
@@ -189,15 +197,29 @@ def render_training_diagram(
         Optional file format passed to :func:`matplotlib.pyplot.savefig`.
         When ``None`` the format is inferred from ``filename``. Use ``"svg"``
         or ``"pdf"`` for vector output.
+
+    dpi:
+        Dots-per-inch used when rasterising formats such as PNG. If ``None``
+        the value from :rc:`savefig.dpi` is used and may be automatically
+        reduced to stay within backend limits.
+
     figsize:
         Optional figure size passed through to
         :func:`matplotlib.pyplot.figure`. When omitted the size is determined
         from the graph layout so nodes do not crowd one another.
+    node_spacing:
+        Distance between nodes within the same level. Larger values space the
+        graph out to give edges more room.
     """
 
     g = build_training_diagram(proc)
-
-    pos = _leveled_grid_layout(g)
+    pos = _leveled_grid_layout(
+        g,
+        col_gap=node_spacing,
+        row_gap=node_spacing,
+        level_gap=node_spacing * 2,
+        jitter=node_spacing / 5,
+    )
     if figsize is None:
         xs = [x for x, _ in pos.values()]
         ys = [y for _, y in pos.values()]
@@ -205,11 +227,43 @@ def render_training_diagram(
         height = (max(ys) - min(ys) if ys else 1) + 2
         figsize = (width, height)
     plt.figure(figsize=figsize)
-    # Colour nodes by their level to make execution order visually obvious.
+    ax = plt.gca()
+    ax.axis("off")
+    cmap = plt.cm.viridis
     levels = [data.get("level", 0) for _, data in g.nodes(data=True)]
-    node_artists = nx.draw_networkx_nodes(g, pos, node_color=levels, cmap=plt.cm.viridis)
+    min_lvl, max_lvl = min(levels), max(levels)
+
+    # Lightly shade the background behind each level.
+    for lvl in sorted({data.get("level", 0) for _, data in g.nodes(data=True)}):
+        nodes = [n for n, d in g.nodes(data=True) if d.get("level", 0) == lvl]
+        xs = [pos[n][0] for n in nodes]
+        ys = [pos[n][1] for n in nodes]
+        if not xs or not ys:
+            continue
+        pad = node_spacing * 0.6
+        rect = Rectangle(
+            (min(xs) - pad, min(ys) - pad),
+            (max(xs) - min(xs)) + 2 * pad,
+            (max(ys) - min(ys)) + 2 * pad,
+            color=cmap((lvl - min_lvl) / (max_lvl - min_lvl or 1)),
+            alpha=0.05,
+            zorder=0,
+        )
+        ax.add_patch(rect)
+
+    # Colour nodes by their level to make execution order visually obvious.
+    node_artists = nx.draw_networkx_nodes(g, pos, node_color=levels, cmap=cmap)
     node_artists.set_zorder(1)
-    edge_artists = nx.draw_networkx_edges(g, pos)
+    edge_levels = [g.nodes[u].get("level", 0) for u, _ in g.edges()]
+    edge_artists = nx.draw_networkx_edges(
+        g,
+        pos,
+        edge_color=edge_levels,
+        edge_cmap=cmap,
+        edge_vmin=min_lvl,
+        edge_vmax=max_lvl,
+        width=0.8,
+    )
     for artist in edge_artists:
         artist.set_zorder(2)
     label_artists = nx.draw_networkx_labels(g, pos)
@@ -217,7 +271,25 @@ def render_training_diagram(
         artist.set_zorder(3)
 
     if filename is not None:
-        save_kwargs = {"format": format} if format else {}
+
+        save_kwargs: dict[str, object] = {"format": format} if format else {}
+        # Matplotlib's Agg backend limits each dimension to < 2**16 pixels.
+        # When saving PNGs we may need to lower the DPI so the rasterised
+        # image stays within that constraint.
+        if dpi is None:
+            dpi = plt.rcParams.get("savefig.dpi", 100)
+            if isinstance(dpi, str):
+                dpi = plt.rcParams.get("figure.dpi", 100)
+        save_kwargs["dpi"] = dpi
+        fmt = format or Path(filename).suffix.lstrip(".").lower()
+        if fmt == "png" and figsize is not None:
+            max_pixels = 2**16 - 1
+            width, height = figsize
+            max_inches = max(width, height)
+            if max_inches * dpi > max_pixels:
+                dpi = max_pixels / max_inches
+                save_kwargs["dpi"] = dpi
+
         plt.savefig(Path(filename), **save_kwargs)
         plt.close()
     else:

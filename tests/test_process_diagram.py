@@ -37,9 +37,26 @@ def test_process_diagram_build_and_render(tmp_path):
     assert min(d_levels) == 0 and max(d_levels) > 0
 
     out_file = tmp_path / "diagram.png"
-    rendered = render_training_diagram(proc, out_file)
+    rendered = render_training_diagram(proc, out_file, node_spacing=2.0)
     assert isinstance(rendered, nx.DiGraph)
     assert "loss" in rendered
+    assert out_file.exists()
+
+
+def test_png_auto_dpi_scaling(tmp_path):
+    autograd = AbstractTensor.autograd
+    tape = autograd.tape
+    tape._nodes.clear()
+    tape.graph.clear()
+
+    x = AbstractTensor.tensor([1.0])
+    tape.mark_loss(x)
+    proc = AutogradProcess(tape)
+    proc.build(x)
+
+    out_file = tmp_path / "big.png"
+    # Use an exaggerated figure height to trigger DPI scaling logic.
+    render_training_diagram(proc, out_file, figsize=(1, 700))
     assert out_file.exists()
 
 
