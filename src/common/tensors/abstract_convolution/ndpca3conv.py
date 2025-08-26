@@ -199,9 +199,9 @@ class NDPCA3Conv3d:
 
         # ---- 2) assemble per-voxel 3-tap weights mapped to lattice axes
         taps = self.taps
-        center = (taps[:, 1]).sum().item()
-        w_minus = (taps[:, 0]).sum().item()
-        w_plus = (taps[:, 2]).sum().item()
+        center = (taps[:, 1]).sum().reshape(1, 1, 1, 1, 1)
+        w_minus = (taps[:, 0]).sum().reshape(1, 1, 1, 1, 1)
+        w_plus = (taps[:, 2]).sum().reshape(1, 1, 1, 1, 1)
 
         # Broadcast weights to (1,1,D,H,W)
         def _bcast(w: AbstractTensor) -> AbstractTensor:

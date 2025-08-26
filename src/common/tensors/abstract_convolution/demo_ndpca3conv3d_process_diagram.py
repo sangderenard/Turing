@@ -132,6 +132,8 @@ def main() -> None:
 
     proc = AutogradProcess(autograd.tape)
     proc.build(loss)
+    loss_id = proc.tape._loss_id
+    autograd.tape = GradTape()
 
     out_file = Path(__file__).with_name(f"ndpca3conv3d_training.{args.format}")
     render_training_diagram(
@@ -182,7 +184,7 @@ def main() -> None:
         for tid, idx in proc.tape._parameters.items():
             feed[tid] = params[idx]
         values = replay_forward(proc, feed)
-        loss_val = values[autograd.tape._loss_id]
+        loss_val = values[loss_id]
         grads = AbstractTensor.autograd.grad(
             loss_val,
             params,
@@ -216,9 +218,9 @@ def main() -> None:
     for tid, idx in proc.tape._parameters.items():
         feed[tid] = model.parameters()[idx]
     vals = replay_forward(proc, feed)
-    logits_tid = next(proc.forward_graph.predecessors(autograd.tape._loss_id))
+    logits_tid = next(proc.forward_graph.predecessors(loss_id))
     logits_replay = vals[logits_tid]
-    loss_replay = vals[autograd.tape._loss_id]
+    loss_replay = vals[loss_id]
     assert np.allclose(logits_model.data, logits_replay.data, atol=1e-6)
     assert np.allclose(loss_model.data, loss_replay.data, atol=1e-6)
 
