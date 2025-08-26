@@ -24,14 +24,14 @@ def _format_label(data: Dict) -> str:
     """Return a readable label for a node ``data`` dict."""
 
     op = data.get("op") or "input"
-    lines: List[str] = [str(op)]
+    lines: List[str] = [f"Operation: {op}"]
     meta = data.get("metadata") or {}
     for k, v in meta.items():
-        lines.append(f"{k}={v}")
+        lines.append(f"{k}: {v}")
     if data.get("required"):
-        lines.append(f"requires={data['required']}")
+        lines.append(f"Requires Grad: {data['required']}")
     if data.get("param_id") is not None:
-        lines.append(f"param={data['param_id']}")
+        lines.append(f"Parameter ID: {data['param_id']}")
     return "\n".join(lines)
 
 

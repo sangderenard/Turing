@@ -159,13 +159,12 @@ class NDPCA3Conv3d:
             M = metric  # already inv_g
         else:
             M = metric
-        # Convert to numpy for fast batched eigh
-        Mnp = M.data  # (D,H,W,3,3)
-        D, H, W, _, _ = Mnp.shape
+        
+        D, H, W, _, _ = M.shape
         # Flatten spatial for a vectorized eigh
-        Ms = Mnp.reshape(-1, 3, 3)
+        Ms = M.reshape(-1, 3, 3)
         # np.linalg.eigh is batched on last two dims
-        evals, evecs = np.linalg.eigh(Ms)         # ascending
+        evals, evecs = Ms.linalg.eigh(Ms)         # ascending
         # take largest k
         idx = np.argsort(evals, axis=-1)[:, ::-1][:, : self.k]  # (N, k)
         # Gather eigenvectors for top-k into shape (N, 3, k)

@@ -102,6 +102,13 @@ def main() -> None:
     autograd.capture_all = False
     autograd.tape.mark_loss(loss)
 
+    # Add metadata for better visualization
+    for node_id, node_data in autograd.tape.graph.nodes(data=True):
+        node_data['metadata'] = {
+            'operation': node_data.get('op', 'unknown'),
+            'description': f"Node {node_id} performing {node_data.get('op', 'unknown')}"
+        }
+
     proc = AutogradProcess(autograd.tape)
     proc.build(loss)
 

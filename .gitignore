@@ -3,3 +3,5 @@ __pycache__
 .vscode
 *.zip
 pytest_run_times.log
+.vs
+env
