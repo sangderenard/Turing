@@ -234,12 +234,18 @@ def main() -> None:
                     continue
                 _compare_tensors(f"grad_{idx}", g_ref, g_val)
         with AbstractTensor.autograd.no_grad():
-            for idx, (p, g) in enumerate(zip(params, grads)):
-                if g is None:
-                    continue
-                AbstractTensor.copyto(p, p - LEARNING_RATE * g)
+            optimizer = Adam(params, lr=LEARNING_RATE)
+            grads_for_opt = [
+                g if g is not None else AbstractTensor.zeros_like(p)
+                for p, g in zip(params, grads)
+            ]
+            new_params = optimizer.step(params, grads_for_opt)
+            for idx, (p, new_p) in enumerate(zip(params, new_params)):
+                AbstractTensor.copyto(p, new_p)
                 if reference:
-                    _compare_tensors(f"param_{idx}", reference["updated_params"][idx], p)
+                    _compare_tensors(
+                        f"param_{idx}", reference["updated_params"][idx], p
+                    )
         rng_after = np.random.get_state()
         if reference and repr(reference.get("rng_state")) != repr(rng_after):
             print("Replay consumed RNG differently")
