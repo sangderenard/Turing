@@ -46,7 +46,7 @@ def test_export_training_state():
 
 
 @pytest.mark.skipif(Tensor is None, reason="NumPy backend not available")
-def test_train_is_stubbed():
+def test_train_updates_parameter():
     w = _param(0.0)
     x = Tensor.tensor_from_list([1.0])
     y = Tensor.tensor_from_list([2.0])
@@ -56,5 +56,6 @@ def test_train_is_stubbed():
         loss = (pred - y) * (pred - y)
         return loss
 
-    with pytest.raises(NotImplementedError):
-        autograd.train(loss_fn, epochs=1, lr=0.1, params=[w])
+    proc = autograd.train(loss_fn, epochs=1, lr=0.1, params=[w])
+    assert isinstance(proc.forward_graph, nx.DiGraph)
+    assert abs(w.data[0] - 0.4) < 1e-6

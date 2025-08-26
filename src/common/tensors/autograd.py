@@ -750,20 +750,24 @@ class Autograd:
         lr: float = 1e-2,
         params: Optional[List[Any]] = None,
     ) -> None:
-        """Stub for graph-based training using recorded tape metadata.
+        """Train ``params`` by repeatedly evaluating ``loss_fn``.
 
-        The intended design is to translate the metadata captured on the
-        ``GradTape`` into a standalone forward/backward execution graph and
-        perform parameter updates by walking that graph directly.  No tape
-        playback should occur once the graphs are materialised.
-
-        This function currently serves as a placeholder and does not execute
-        any training loop.
+        This thin wrapper delegates to :meth:`AutogradProcess.training_loop`
+        so callers can quickly execute self-contained optimisation runs using
+        the existing :class:`GradTape`.  The returned
+        :class:`~src.common.tensors.autograd_process.AutogradProcess` carries
+        the full forward/backward graphs and execution schedules for the final
+        iteration which can be used for further analysis or replay.
         """
 
-        raise NotImplementedError(
-            "Graph-based training is not yet implemented"
-        )
+        if params is None:
+            params = []
+
+        from .autograd_process import AutogradProcess
+
+        proc = AutogradProcess(self.tape)
+        proc.training_loop(loss_fn, params, steps=epochs, lr=lr)
+        return proc
 
 
 autograd = Autograd()
