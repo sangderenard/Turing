@@ -4,6 +4,11 @@ from src.common.tensors import AbstractTensor
 from src.common.tensors.autograd_process import AutogradProcess
 
 
+def _is_topological(graph, order):
+    pos = {n: i for i, n in enumerate(order)}
+    return all(pos[u] < pos[v] for u, v in graph.edges())
+
+
 def test_autograd_process_training_and_tables():
     autograd = AbstractTensor.autograd
     tape = autograd.tape
@@ -33,8 +38,9 @@ def test_autograd_process_training_and_tables():
     # graphs and schedules populated
     assert isinstance(proc.forward_graph, nx.DiGraph)
     assert isinstance(proc.backward_graph, nx.DiGraph)
-    assert proc.forward_schedule == list(nx.topological_sort(proc.forward_graph))
-    assert proc.backward_schedule == list(nx.topological_sort(proc.backward_graph))
+
+    assert _is_topological(proc.forward_graph, proc.forward_schedule)
+    assert _is_topological(proc.backward_graph, proc.backward_schedule)
 
     tables = proc.summary_table()
     graph_df = tables["graph"]
@@ -72,13 +78,16 @@ def test_autograd_process_concurrent_levels():
     proc = AutogradProcess(tape)
     proc.build(loss)
 
-    # schedules should match a topological sort of the forward graph
-    assert proc.forward_schedule == list(nx.topological_sort(proc.forward_graph))
+    # schedules should still respect dependencies
+    assert _is_topological(proc.forward_graph, proc.forward_schedule)
 
-    levels = list(nx.topological_generations(proc.forward_graph))
     # graph should have multiple levels with an intermediate concurrent level
-    assert len(levels) > 2
-    assert any(len(level) > 1 for level in levels[1:-1])
+    layer_map = {}
+    for nid, data in proc.forward_graph.nodes(data=True):
+        layer_map.setdefault(data["layer"], []).append(nid)
+    assert len(layer_map) > 2
+    layers = list(layer_map.values())
+    assert any(len(level) > 1 for level in layers[1:-1])
 
     tape._nodes.clear()
     tape.graph.clear()

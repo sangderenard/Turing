@@ -18,6 +18,7 @@ import pandas as pd
 
 from .autograd import GradTape
 from .abstraction import AbstractTensor
+from .graph_translator import GraphTranslator
 
 
 @dataclass
@@ -47,19 +48,13 @@ class AutogradProcess:
 
         self.forward_graph = self.tape.export_forward_graph()
         self.backward_graph = self.tape.export_backward_graph(result)
-        self.forward_schedule = list(nx.topological_sort(self.forward_graph))
-        self.backward_schedule = list(nx.topological_sort(self.backward_graph))
 
-        # Annotate each graph node with its execution layer.  Many graphs
-        # produced by the autograd tape omit explicit dependency edges, which
-        # causes ``nx.topological_generations`` to collapse everything into a
-        # single layer.  By storing the order returned from
-        # :func:`nx.topological_sort` we provide a stable layering for
-        # visualisation utilities and downstream analysis.
-        for lvl, tid in enumerate(self.forward_schedule):
-            self.forward_graph.nodes[tid]["layer"] = lvl
-        for lvl, tid in enumerate(self.backward_schedule):
-            self.backward_graph.nodes[tid]["layer"] = lvl
+        # Use the project's ILP scheduler to determine execution order and
+        # layer assignments for both graphs.
+        f_sched = GraphTranslator(self.forward_graph)
+        self.forward_schedule = f_sched.schedule()
+        b_sched = GraphTranslator(self.backward_graph)
+        self.backward_schedule = b_sched.schedule()
 
         self.cache = self.tape.required_cache(result)
         self.stages["forward"] = self.forward_schedule
