@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 
 from .autograd_process import AutogradProcess
 
@@ -104,6 +105,7 @@ def _layered_grid_layout(
     layer_gap: float = 3.0,
     col_gap: float = 1.5,
     row_gap: float = 1.5,
+    jitter: float = 0.3,
 ) -> Dict[str, tuple[float, float]]:
     """Return coordinates for ``g`` arranging each ``layer`` in a grid.
 
@@ -134,17 +136,29 @@ def _layered_grid_layout(
         layers.setdefault(layer, []).append(node)
 
     pos: Dict[str, tuple[float, float]] = {}
-    for layer in sorted(layers):
+    sorted_layers = sorted(layers)
+    prev_rows = 0
+    y_base = 0.0
+    rng = np.random.default_rng(0)
+    for i, layer in enumerate(sorted_layers):
         nodes = layers[layer]
         cols = min(max_nodes_per_row, len(nodes))
+        rows = (len(nodes) + max_nodes_per_row - 1) // max_nodes_per_row
+
+        if i > 0:
+            y_base -= layer_gap + prev_rows * row_gap
+
         x_offset = -((cols - 1) * col_gap) / 2
         for idx, node in enumerate(nodes):
             row = idx // max_nodes_per_row
             col = idx % max_nodes_per_row
             x = x_offset + col * col_gap
-            y = -layer * layer_gap - row * row_gap
-
+            y = y_base - row * row_gap
+            if jitter:
+                y += rng.uniform(-jitter, jitter)
             pos[node] = (x, y)
+
+        prev_rows = rows
 
     return pos
 
