@@ -115,6 +115,9 @@ def main() -> None:
     img_id, target_id = id(img), id(target)
     autograd.tape = GradTape()
     autograd.capture_all = True
+    # Register all root tensors so their identities are preserved when replaying
+    for tensor in [img, target, metric, *model.parameters()]:
+        autograd.tape.create_tensor_node(tensor)
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
     autograd.capture_all = False
@@ -159,31 +162,23 @@ def main() -> None:
 
             node = proc.tape._nodes.get(tid)
             if node is None:
-                # ``tid`` corresponds to a leaf constant which does not require
-                # evaluation.  Skip it – any operation that depends on this
-                # constant will retrieve its value from the recorded context
-                # below when needed.
+                # Leaf tensor – pull original reference from the tape
+                tensor = proc.tape._tensor_refs.get(tid)
+                if tensor is None:
+                    raise KeyError(tid)
+                values[tid] = tensor
                 continue
+            args = [values[parent] for parent, _ in node.parents]
+            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
 
-            args = []
-            for idx, (parent, _pos) in enumerate(node.parents):
-                if parent in values:
-                    args.append(values[parent])
-                else:
-                    # The parent was a constant value.  Use the captured input
-                    # directly and seed it into ``values`` so downstream nodes
-                    # can reference it.
-                    const_val = node.ctx["inputs"][idx]
-                    values[parent] = const_val
-                    args.append(const_val)
-
-            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get("params", {}))
             values[tid] = result
 
         return values
 
     def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
-        feed = {img_id: img_tensor, target_id: target_tensor}
+        # Seed feed with any tensors recorded on the tape (e.g. metrics)
+        feed = dict(proc.tape._tensor_refs)
+        feed.update({img_id: img_tensor, target_id: target_tensor})
         for tid, idx in proc.tape._parameters.items():
             feed[tid] = params[idx]
         values = replay_forward(proc, feed)
