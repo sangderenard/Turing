@@ -140,14 +140,46 @@ def main() -> None:
     # --- replay and validate ---
 
     def replay_forward(proc: AutogradProcess, feed: dict[int, AbstractTensor]):
+        """Replay a forward pass using the schedule from ``proc``.
+
+        ``GradTape`` only records ``GradNode`` entries for tensors that are the
+        result of an operation.  Leaf constants appear in the exported forward
+        graph (and therefore in ``forward_schedule``) but have no corresponding
+        entry in ``tape._nodes``.  The original implementation attempted to look
+        up every scheduled ID in ``_nodes`` which raised a ``KeyError`` when such
+        constants were encountered.  During replay we lazily inject these
+        constant values from the recorded operation context instead.
+        """
+
         values = dict(feed)
         for tid in proc.forward_schedule:
+            # Pre-supplied inputs and parameters already have values.
             if tid in values:
                 continue
-            node = proc.tape._nodes[tid]
-            args = [values[parent] for parent, _ in node.parents]
-            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
+
+            node = proc.tape._nodes.get(tid)
+            if node is None:
+                # ``tid`` corresponds to a leaf constant which does not require
+                # evaluation.  Skip it – any operation that depends on this
+                # constant will retrieve its value from the recorded context
+                # below when needed.
+                continue
+
+            args = []
+            for idx, (parent, _pos) in enumerate(node.parents):
+                if parent in values:
+                    args.append(values[parent])
+                else:
+                    # The parent was a constant value.  Use the captured input
+                    # directly and seed it into ``values`` so downstream nodes
+                    # can reference it.
+                    const_val = node.ctx["inputs"][idx]
+                    values[parent] = const_val
+                    args.append(const_val)
+
+            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get("params", {}))
             values[tid] = result
+
         return values
 
     def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
