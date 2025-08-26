@@ -150,8 +150,8 @@ class NDPCA3Conv3d:
     def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Compute soft weights (per voxel) mapping each principal dir into lattice axes.
-        Returns three arrays wU, wV, wW with shape (D,H,W) that sum (over axes) to k
-        after tap-weight accumulation in forward().
+        Returns three tensors ``wU``, ``wV``, ``wW`` with shape ``(D,H,W)`` that sum
+        (over axes) to ``k`` after tap-weight accumulation in ``forward``.
         """
         # metric: (..., 3, 3)
         # choose source: g or inv_g
@@ -163,18 +163,23 @@ class NDPCA3Conv3d:
         D, H, W, _, _ = M.shape
         # Flatten spatial for a vectorized eigh
         Ms = M.reshape(-1, 3, 3)
-        # np.linalg.eigh is batched on last two dims
-        evals, evecs = Ms.linalg.eigh(Ms)         # ascending
-        # take largest k
-        idx = np.argsort(evals, axis=-1)[:, ::-1][:, : self.k]  # (N, k)
-        # Gather eigenvectors for top-k into shape (N, 3, k)
-        ar = np.arange(Ms.shape[0])[:, None]
-        E = evecs[ar, :, idx]                     # (N, 3, k)
-        E = np.abs(E)
+        # AbstractTensor.linalg.eigh is batched on the last two dims
+        evals, evecs = Ms.linalg.eigh(Ms)  # ascending
+
+        # select largest k eigenvectors without leaving AbstractTensor
+        topk = AbstractTensor.topk(evals, k=self.k, dim=-1)
+        idx = topk.indices  # (N, k)
+        N = evals.shape[0]
+        ar = list(range(N))
+        vecs = []
+        for j in range(self.k):
+            vec_j = evecs[ar, :, idx[:, j]]
+            vecs.append(vec_j)
+        E = AbstractTensor.stack(vecs, dim=-1).abs()
         # Normalize each principal vector's projection across lattice axes
-        E = E / (E.sum(axis=1, keepdims=True) + 1e-12)  # (N, 3, k)
+        E = E / (E.sum(dim=1, keepdim=True) + 1e-12)  # (N, 3, k)
         # Sum over k; this produces per-axis weights in [0,k]
-        w_axes = E.sum(axis=-1).reshape(D, H, W, 3)     # (D,H,W,3)
+        w_axes = E.sum(dim=-1).reshape(D, H, W, 3)     # (D,H,W,3)
         wU = w_axes[..., 0]
         wV = w_axes[..., 1]
         wW = w_axes[..., 2]
@@ -190,11 +195,6 @@ class NDPCA3Conv3d:
         # ---- 1) metric → per-axis soft blend weights
         metric = package["metric"]["inv_g"] if self.eig_from == "inv_g" else package["metric"]["g"]
         wU, wV, wW = self._principal_axis_blend(metric)  # (D,H,W) each
-
-        # convert axis weights to tensors
-        wU = self.like.ensure_tensor(wU)
-        wV = self.like.ensure_tensor(wV)
-        wW = self.like.ensure_tensor(wW)
 
         # ---- 2) assemble per-voxel 3-tap weights mapped to lattice axes
         taps = self.taps
