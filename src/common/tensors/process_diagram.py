@@ -167,21 +167,28 @@ def render_training_diagram(
     proc: AutogradProcess,
     filename: str | Path | None = None,
     *,
+    format: str | None = None,
     figsize: tuple[int, int] | None = None,
 ) -> nx.DiGraph:
     """Return a combined process diagram for ``proc``.
 
     The diagram is drawn using :mod:`matplotlib`. If ``filename`` is provided
     the image is written to that path. Otherwise a window will be shown so the
-    caller can visually inspect the graph.
+    caller can visually inspect the graph. The output format is inferred from
+    the filename extension but can be explicitly set via ``format`` to force
+    vector formats like SVG or PDF.
 
     Parameters
     ----------
     proc:
         The :class:`AutogradProcess` whose computation will be represented.
     filename:
-        Optional output location for a PNG snapshot of the diagram. When
-        omitted a GUI window is opened instead.
+        Optional output location for a snapshot of the diagram. When omitted a
+        GUI window is opened instead.
+    format:
+        Optional file format passed to :func:`matplotlib.pyplot.savefig`.
+        When ``None`` the format is inferred from ``filename``. Use ``"svg"``
+        or ``"pdf"`` for vector output.
     figsize:
         Optional figure size passed through to
         :func:`matplotlib.pyplot.figure`. When omitted the size is determined
@@ -210,7 +217,8 @@ def render_training_diagram(
         artist.set_zorder(3)
 
     if filename is not None:
-        plt.savefig(Path(filename))
+        save_kwargs = {"format": format} if format else {}
+        plt.savefig(Path(filename), **save_kwargs)
         plt.close()
     else:
         plt.show()
