@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Build network diagrams for :mod:`autograd` tensors.
 
-This helper constructs a layered :class:`networkx.DiGraph` from
+This helper constructs an execution‑levelled :class:`networkx.DiGraph` from
 :class:`~src.common.tensors.autograd_process.AutogradProcess` instances. The
 diagram exposes the relationship between forward computations, cached values,
 the loss node and the backward pass so the entire optimisation step can be
@@ -43,48 +43,48 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
 
     g = nx.DiGraph()
 
-    # Determine forward layering from explicit annotations.  All nodes are
-    # expected to carry a ``layer`` value populated by the scheduler.
-    if any("layer" not in data for _, data in proc.forward_graph.nodes(data=True)):
-        raise RuntimeError("forward graph missing layer annotations")
-    layer_map: Dict[int, List[int]] = {}
+    # Determine forward levels from explicit annotations. All nodes are
+    # expected to carry a ``level`` value populated by the scheduler.
+    if any("level" not in data for _, data in proc.forward_graph.nodes(data=True)):
+        raise RuntimeError("forward graph missing level annotations")
+    level_map: Dict[int, List[int]] = {}
     for tid, data in proc.forward_graph.nodes(data=True):
-        layer_map.setdefault(int(data["layer"]), []).append(tid)
-    f_levels = [layer_map[idx] for idx in sorted(layer_map)]
-    inter_layer = len(f_levels)
-    for lvl, nodes in enumerate(f_levels):
+        level_map.setdefault(int(data["level"]), []).append(tid)
+    max_f_level = max(level_map)
+    loss_level = getattr(proc, "loss_level", None)
+    if loss_level is None:
+        loss_level = max_f_level + 1
+    for lvl in sorted(level_map):
+        nodes = level_map[lvl]
         for tid in nodes:
             data = proc.forward_graph.nodes[tid]
             fnode = f"f{tid}"
-            g.add_node(fnode, label=_format_label(data), layer=lvl)
+            g.add_node(fnode, label=_format_label(data), level=lvl)
             for src in proc.forward_graph.predecessors(tid):
                 g.add_edge(f"f{src}", fnode)
             if data.get("loss"):
-                g.add_node("loss", label="loss", layer=inter_layer)
+                g.add_node("loss", label="loss", level=loss_level)
                 g.add_edge(fnode, "loss")
             if tid in proc.cache:
                 cache_node = f"cache_{tid}"
-                g.add_node(cache_node, label=f"cache[{tid}]", layer=inter_layer)
+                cache_level = proc.cache_levels.get(tid, max_f_level + 1)
+                g.add_node(cache_node, label=f"cache[{tid}]", level=cache_level)
                 g.add_edge(fnode, cache_node)
 
-    # Build backward layers following the forward/intermediate sections using
+    # Build backward levels following the forward/intermediate sections using
     # the scheduler-provided annotations.
-    if any("layer" not in data for _, data in proc.backward_graph.nodes(data=True)):
-        raise RuntimeError("backward graph missing layer annotations")
-    b_map: Dict[int, List[int]] = {}
+    if any("level" not in data for _, data in proc.backward_graph.nodes(data=True)):
+        raise RuntimeError("backward graph missing level annotations")
     for tid, data in proc.backward_graph.nodes(data=True):
-        b_map.setdefault(int(data["layer"]), []).append(tid)
-    b_levels = [b_map[idx] for idx in sorted(b_map)]
-    b_offset = inter_layer + 1
-    for lvl, nodes in enumerate(b_levels, start=b_offset):
-        for tid in nodes:
-            data = proc.backward_graph.nodes[tid]
-            bnode = f"b{tid}"
-            g.add_node(bnode, label=_format_label(data), layer=lvl)
-            for src in proc.backward_graph.predecessors(tid):
-                g.add_edge(f"b{src}", bnode)
-            if proc.forward_graph.has_node(tid):
-                g.add_edge(f"f{tid}", bnode)
+        lvl = int(data["level"])
+        bnode = f"b{tid}"
+        g.add_node(bnode, label=_format_label(data), level=lvl)
+        for src in proc.backward_graph.predecessors(tid):
+            g.add_edge(f"b{src}", bnode)
+        if proc.forward_graph.has_node(tid):
+            g.add_edge(f"f{tid}", bnode)
+        if tid in proc.cache:
+            g.add_edge(f"cache_{tid}", bnode)
 
     # route loss to the roots of the backward graph
     roots: Iterable[int] = [
@@ -98,55 +98,55 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
     return g
 
 
-def _layered_grid_layout(
+def _leveled_grid_layout(
     g: nx.DiGraph,
     *,
     max_nodes_per_row: int = 8,
-    layer_gap: float = 3.0,
+    level_gap: float = 3.0,
     col_gap: float = 1.5,
     row_gap: float = 1.5,
     jitter: float = 0.3,
 ) -> Dict[str, tuple[float, float]]:
-    """Return coordinates for ``g`` arranging each ``layer`` in a grid.
+    """Return coordinates for ``g`` arranging each ``level`` in a grid.
 
-    ``nx.multipartite_layout`` tends to stack all nodes for a layer along a
+    ``nx.multipartite_layout`` tends to stack all nodes for a level along a
     single line which can make dense graphs unreadable. This helper spreads
-    nodes within the same layer horizontally and wraps to new rows once the
+    nodes within the same level horizontally and wraps to new rows once the
     number of nodes exceeds ``max_nodes_per_row``.
 
     Parameters
     ----------
     g:
-        Graph with ``layer`` metadata on each node.
+        Graph with ``level`` metadata on each node.
     max_nodes_per_row:
-        Number of nodes to place in a single row for a layer before
+        Number of nodes to place in a single row for a level before
         wrapping to a new row.
-    layer_gap:
-        Horizontal distance between successive layers.
+    level_gap:
+        Horizontal distance between successive levels.
     col_gap:
         Additional horizontal offset applied when wrapping to a new column
-        inside a layer.
+        inside a level.
     row_gap:
         Vertical distance between nodes within the same column.
     """
 
-    layers: Dict[int, List[str]] = {}
+    levels: Dict[int, List[str]] = {}
     for node, data in g.nodes(data=True):
-        layer = int(data.get("layer", 0))
-        layers.setdefault(layer, []).append(node)
+        level = int(data.get("level", 0))
+        levels.setdefault(level, []).append(node)
 
     pos: Dict[str, tuple[float, float]] = {}
-    sorted_layers = sorted(layers)
+    sorted_levels = sorted(levels)
     prev_rows = 0
     y_base = 0.0
     rng = np.random.default_rng(0)
-    for i, layer in enumerate(sorted_layers):
-        nodes = layers[layer]
+    for i, level in enumerate(sorted_levels):
+        nodes = levels[level]
         cols = min(max_nodes_per_row, len(nodes))
         rows = (len(nodes) + max_nodes_per_row - 1) // max_nodes_per_row
 
         if i > 0:
-            y_base -= layer_gap + prev_rows * row_gap
+            y_base -= level_gap + prev_rows * row_gap
 
         x_offset = -((cols - 1) * col_gap) / 2
         for idx, node in enumerate(nodes):
@@ -190,7 +190,7 @@ def render_training_diagram(
 
     g = build_training_diagram(proc)
 
-    pos = _layered_grid_layout(g)
+    pos = _leveled_grid_layout(g)
     if figsize is None:
         xs = [x for x, _ in pos.values()]
         ys = [y for _, y in pos.values()]
@@ -198,9 +198,9 @@ def render_training_diagram(
         height = (max(ys) - min(ys) if ys else 1) + 2
         figsize = (width, height)
     plt.figure(figsize=figsize)
-    # Colour nodes by their layer to make execution order visually obvious.
-    layers = [data.get("layer", 0) for _, data in g.nodes(data=True)]
-    node_artists = nx.draw_networkx_nodes(g, pos, node_color=layers, cmap=plt.cm.viridis)
+    # Colour nodes by their level to make execution order visually obvious.
+    levels = [data.get("level", 0) for _, data in g.nodes(data=True)]
+    node_artists = nx.draw_networkx_nodes(g, pos, node_color=levels, cmap=plt.cm.viridis)
     node_artists.set_zorder(1)
     edge_artists = nx.draw_networkx_edges(g, pos)
     for artist in edge_artists:

@@ -82,12 +82,12 @@ def test_autograd_process_concurrent_levels():
     assert _is_topological(proc.forward_graph, proc.forward_schedule)
 
     # graph should have multiple levels with an intermediate concurrent level
-    layer_map = {}
+    level_map = {}
     for nid, data in proc.forward_graph.nodes(data=True):
-        layer_map.setdefault(data["layer"], []).append(nid)
-    assert len(layer_map) > 2
-    layers = list(layer_map.values())
-    assert any(len(level) > 1 for level in layers[1:-1])
+        level_map.setdefault(data["level"], []).append(nid)
+    assert len(level_map) > 2
+    levels = list(level_map.values())
+    assert any(len(level) > 1 for level in levels[1:-1])
 
     tape._nodes.clear()
     tape.graph.clear()

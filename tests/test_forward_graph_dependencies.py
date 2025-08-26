@@ -31,6 +31,6 @@ def test_forward_graph_tracks_dependencies():
     assert (id(x), id(loss)) in edges
     assert (id(y), id(loss)) in edges
 
-    lx = proc.forward_graph.nodes[id(x)]["layer"]
-    ly = proc.forward_graph.nodes[id(y)]["layer"]
+    lx = proc.forward_graph.nodes[id(x)]["level"]
+    ly = proc.forward_graph.nodes[id(y)]["level"]
     assert lx == ly

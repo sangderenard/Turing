@@ -34,10 +34,13 @@ class AutogradProcess:
     tape: GradTape
     forward_graph: nx.DiGraph | None = None
     backward_graph: nx.DiGraph | None = None
+    combined_graph: nx.DiGraph | None = None
     forward_schedule: List[int] = field(default_factory=list)
     backward_schedule: List[int] = field(default_factory=list)
     stages: Dict[str, List[int]] = field(default_factory=dict)
     cache: set[int] = field(default_factory=set)
+    cache_levels: Dict[int, int] = field(default_factory=dict)
+    loss_level: int | None = None
     training_log: List[Dict[str, Any]] = field(default_factory=list)
 
     # ------------------------------------------------------------------
@@ -48,15 +51,62 @@ class AutogradProcess:
 
         self.forward_graph = self.tape.export_forward_graph()
         self.backward_graph = self.tape.export_backward_graph(result)
-
-        # Use the project's ILP scheduler to determine execution order and
-        # layer assignments for both graphs.
-        f_sched = GraphTranslator(self.forward_graph)
-        self.forward_schedule = f_sched.schedule()
-        b_sched = GraphTranslator(self.backward_graph)
-        self.backward_schedule = b_sched.schedule()
-
         self.cache = self.tape.required_cache(result)
+
+        combined = nx.DiGraph()
+        # forward nodes and edges
+        for tid, data in self.forward_graph.nodes(data=True):
+            combined.add_node(("f", tid), **data)
+        for u, v in self.forward_graph.edges():
+            combined.add_edge(("f", u), ("f", v))
+        # cache and loss nodes
+        for tid in self.cache:
+            combined.add_node(("c", tid))
+            combined.add_edge(("f", tid), ("c", tid))
+        for tid, data in self.forward_graph.nodes(data=True):
+            if data.get("loss"):
+                combined.add_node("loss")
+                combined.add_edge(("f", tid), "loss")
+
+        # backward nodes and edges
+        for tid, data in self.backward_graph.nodes(data=True):
+            combined.add_node(("b", tid), **data)
+        for u, v in self.backward_graph.edges():
+            combined.add_edge(("b", u), ("b", v))
+        for tid in self.backward_graph.nodes:
+            if self.forward_graph.has_node(tid):
+                combined.add_edge(("f", tid), ("b", tid))
+            if tid in self.cache:
+                combined.add_edge(("c", tid), ("b", tid))
+        if combined.has_node("loss"):
+            roots = [nid for nid in self.backward_graph.nodes if self.backward_graph.in_degree(nid) == 0]
+            for r in roots:
+                combined.add_edge("loss", ("b", r))
+
+        self.combined_graph = combined
+
+        # Schedule combined graph once
+        sched = GraphTranslator(combined)
+        order = sched.schedule()
+        levels = sched.levels()
+
+        # Populate levels back to individual graphs
+        for nid, lvl in levels.items():
+            if isinstance(nid, tuple):
+                kind, tid = nid
+                if kind == "f" and self.forward_graph.has_node(tid):
+                    self.forward_graph.nodes[tid]["level"] = lvl
+                elif kind == "b" and self.backward_graph.has_node(tid):
+                    self.backward_graph.nodes[tid]["level"] = lvl
+                elif kind == "c":
+                    self.cache_levels[tid] = lvl
+            elif nid == "loss":
+                self.loss_level = lvl
+
+        # Derive forward/backward schedules from combined order
+        self.forward_schedule = [tid for nid in order if isinstance(nid, tuple) and nid[0] == "f" for tid in [nid[1]]]
+        self.backward_schedule = [tid for nid in order if isinstance(nid, tuple) and nid[0] == "b" for tid in [nid[1]]]
+
         self.stages["forward"] = self.forward_schedule
         self.stages["backward"] = self.backward_schedule
 
