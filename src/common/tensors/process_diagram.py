@@ -42,8 +42,16 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
 
     g = nx.DiGraph()
 
-    # Determine forward layering using topological generations
-    f_levels = list(nx.topological_generations(proc.forward_graph))
+    # Determine forward layering.  Prefer explicit ``layer`` annotations on
+    # the original graph if present; otherwise fall back to topological
+    # generations.
+    if all("layer" in data for _, data in proc.forward_graph.nodes(data=True)):
+        layer_map: Dict[int, List[int]] = {}
+        for tid, data in proc.forward_graph.nodes(data=True):
+            layer_map.setdefault(int(data["layer"]), []).append(tid)
+        f_levels = [layer_map[idx] for idx in sorted(layer_map)]
+    else:
+        f_levels = list(nx.topological_generations(proc.forward_graph))
     inter_layer = len(f_levels)
     for lvl, nodes in enumerate(f_levels):
         for tid in nodes:
@@ -60,8 +68,16 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
                 g.add_node(cache_node, label=f"cache[{tid}]", layer=inter_layer)
                 g.add_edge(fnode, cache_node)
 
-    # Build backward layers following the forward/intermediate sections
-    b_levels = list(nx.topological_generations(proc.backward_graph))
+    # Build backward layers following the forward/intermediate sections.  As
+    # with the forward pass, honour explicit ``layer`` annotations when they
+    # exist.
+    if all("layer" in data for _, data in proc.backward_graph.nodes(data=True)):
+        b_map: Dict[int, List[int]] = {}
+        for tid, data in proc.backward_graph.nodes(data=True):
+            b_map.setdefault(int(data["layer"]), []).append(tid)
+        b_levels = [b_map[idx] for idx in sorted(b_map)]
+    else:
+        b_levels = list(nx.topological_generations(proc.backward_graph))
     b_offset = inter_layer + 1
     for lvl, nodes in enumerate(b_levels, start=b_offset):
         for tid in nodes:
@@ -160,7 +176,9 @@ def render_training_diagram(
 
     pos = _layered_grid_layout(g)
     plt.figure(figsize=figsize)
-    node_artists = nx.draw_networkx_nodes(g, pos)
+    # Colour nodes by their layer to make execution order visually obvious.
+    layers = [data.get("layer", 0) for _, data in g.nodes(data=True)]
+    node_artists = nx.draw_networkx_nodes(g, pos, node_color=layers, cmap=plt.cm.viridis)
     node_artists.set_zorder(1)
     edge_artists = nx.draw_networkx_edges(g, pos)
     for artist in edge_artists:
