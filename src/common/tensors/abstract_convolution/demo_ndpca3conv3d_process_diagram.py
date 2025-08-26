@@ -2,14 +2,16 @@
 
 This demo builds a tiny classifier using the metric-driven
 :class:`~src.common.tensors.abstract_convolution.ndpca3conv.NDPCA3Conv3d`
-layer and renders the recorded autograd process to a PNG image.  The
+layer and renders the recorded autograd process to an image. The
 network is the same Riemannian convolution used by ``AsciiKernelClassifier``
 so the resulting diagram reflects the data flow through that classifier.
+The output format can be selected at runtime (PNG, SVG, or PDF).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import numpy as np
 
 from src.common.tensors.abstraction import AbstractTensor
@@ -60,6 +62,17 @@ class DemoModel(Model):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Render training diagram for NDPCA3Conv3d demo")
+    parser.add_argument("--format", choices=["png", "svg", "pdf"], default="png", help="Output image format")
+    parser.add_argument("--dpi", type=float, default=None, help="Raster resolution for PNG output")
+    parser.add_argument(
+        "--spacing",
+        type=float,
+        default=1.5,
+        help="Distance between nodes to give edges more room",
+    )
+    args = parser.parse_args()
+
     np.random.seed(0)
     img_np = np.random.rand(BATCH_SIZE, IN_CHANNELS, IMG_D, IMG_H, IMG_W).astype(np.float32)
     img = AbstractTensor.get_tensor(img_np)
@@ -113,8 +126,10 @@ def main() -> None:
     proc = AutogradProcess(autograd.tape)
     proc.build(loss)
 
-    out_file = Path(__file__).with_name("ndpca3conv3d_training.png")
-    render_training_diagram(proc, out_file)
+    out_file = Path(__file__).with_name(f"ndpca3conv3d_training.{args.format}")
+    render_training_diagram(
+        proc, out_file, format=args.format, dpi=args.dpi, node_spacing=args.spacing
+    )
     print(f"Process diagram written to {out_file}")
 
 
