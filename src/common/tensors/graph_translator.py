@@ -58,7 +58,7 @@ class GraphTranslator:
             self._levels = sched.compute_levels("asap", "dependency")
             for nid, lvl in self._levels.items():
                 if self.graph.has_node(nid):
-                    self.graph.nodes[nid]["layer"] = lvl
+                    self.graph.nodes[nid]["level"] = lvl
             # Order nodes by level (stable for repeated runs)
             self._order = [nid for nid, _ in sorted(self._levels.items(), key=lambda x: x[1])]
         return self._order

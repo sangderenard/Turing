@@ -29,12 +29,12 @@ def test_process_diagram_build_and_render(tmp_path):
     diagram = build_training_diagram(proc)
     assert "loss" in diagram
     assert any(n.startswith("cache_") for n in diagram.nodes)
-    # Forward graph nodes should carry layered execution metadata so that the
+    # Forward graph nodes should carry levelled execution metadata so that the
     # diagram arranges operations sequentially.
-    f_layers = {data.get("layer") for _, data in proc.forward_graph.nodes(data=True)}
-    assert len(f_layers) > 1
-    d_layers = {data.get("layer") for _, data in diagram.nodes(data=True)}
-    assert min(d_layers) == 0 and max(d_layers) > 0
+    f_levels = {data.get("level") for _, data in proc.forward_graph.nodes(data=True)}
+    assert len(f_levels) > 1
+    d_levels = {data.get("level") for _, data in diagram.nodes(data=True)}
+    assert min(d_levels) == 0 and max(d_levels) > 0
 
     out_file = tmp_path / "diagram.png"
     rendered = render_training_diagram(proc, out_file)
