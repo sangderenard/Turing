@@ -29,7 +29,8 @@ class GraphTranslator:
 
     def __init__(self, graph: nx.DiGraph) -> None:
         self.graph = graph
-        self._order: List = None
+        self._order: List | None = None
+        self._levels: Dict | None = None
 
     # ------------------------------------------------------------------
     # Graph -> ProcessGraph adapter
@@ -54,10 +55,19 @@ class GraphTranslator:
         if self._order is None:
             proc = self._to_process_graph()
             sched = scheduler_cls(proc)
-            levels = sched.compute_levels("asap", "dependency")
+            self._levels = sched.compute_levels("asap", "dependency")
+            for nid, lvl in self._levels.items():
+                if self.graph.has_node(nid):
+                    self.graph.nodes[nid]["layer"] = lvl
             # Order nodes by level (stable for repeated runs)
-            self._order = [nid for nid, _ in sorted(levels.items(), key=lambda x: x[1])]
+            self._order = [nid for nid, _ in sorted(self._levels.items(), key=lambda x: x[1])]
         return self._order
+
+    def levels(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> Dict:
+        """Return level assignments, computing them if needed."""
+        if self._levels is None:
+            self.schedule(scheduler_cls)
+        return self._levels  # type: ignore[return-value]
 
     def execute(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> None:
         """Execute callables attached to nodes in scheduled order."""
