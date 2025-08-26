@@ -28,7 +28,7 @@ BATCH_SIZE = 1
 IN_CHANNELS = 3
 IMG_D, IMG_H, IMG_W = 1, 8, 8
 NUM_CLASSES = 4
-EPOCHS = 5
+EPOCHS = 1
 LEARNING_RATE = 1e-2
 
 
@@ -91,25 +91,28 @@ def main() -> None:
     target_np[0, 0] = 1.0
     target = AbstractTensor.get_tensor(target_np)
 
-    # --- train the model using the manual backward helpers ---
-    for _ in range(EPOCHS):
-        logits = model.forward(img)
-        loss = loss_fn.forward(logits, target)
-        grad_pred = loss_fn.backward(logits, target)
-        model.backward(grad_pred)
-        params = model.parameters()
-        grads = model.grads()
-        with autograd.no_grad():
-            new_params = optimizer.step(params, grads)
-            i = 0
-            for layer in model.layers:
-                layer_params = layer.parameters()
-                for j in range(len(layer_params)):
-                    AbstractTensor.copyto(layer_params[j], new_params[i])
-                    i += 1
-        model.zero_grad()
+    # Preserve initial parameters for later validation
+    initial_params = [p.clone() for p in model.parameters()]
+
+    # --- single training epoch ---
+    logits = model.forward(img)
+    loss = loss_fn.forward(logits, target)
+    grad_pred = loss_fn.backward(logits, target)
+    model.backward(grad_pred)
+    params = model.parameters()
+    grads = model.grads()
+    with autograd.no_grad():
+        new_params = optimizer.step(params, grads)
+        i = 0
+        for layer in model.layers:
+            layer_params = layer.parameters()
+            for j in range(len(layer_params)):
+                AbstractTensor.copyto(layer_params[j], new_params[i])
+                i += 1
+    model.zero_grad()
 
     # --- capture autograd process on a fresh tape ---
+    img_id, target_id = id(img), id(target)
     autograd.tape = GradTape()
     autograd.capture_all = True
     logits = model.forward(img)
@@ -133,6 +136,59 @@ def main() -> None:
     )
 
     print(f"Process diagram written to {out_file}")
+
+    # --- replay and validate ---
+
+    def replay_forward(proc: AutogradProcess, feed: dict[int, AbstractTensor]):
+        values = dict(feed)
+        for tid in proc.forward_schedule:
+            if tid in values:
+                continue
+            node = proc.tape._nodes[tid]
+            args = [values[parent] for parent, _ in node.parents]
+            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
+            values[tid] = result
+        return values
+
+    def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
+        feed = {img_id: img_tensor, target_id: target_tensor}
+        for tid, idx in proc.tape._parameters.items():
+            feed[tid] = params[idx]
+        values = replay_forward(proc, feed)
+        loss_val = values[autograd.tape._loss_id]
+        grads = AbstractTensor.autograd.grad(loss_val, params, retain_graph=True)
+        with AbstractTensor.autograd.no_grad():
+            for p, g in zip(params, grads):
+                AbstractTensor.copyto(p, p - LEARNING_RATE * g)
+        return loss_val
+
+    # Validate that replayed training reaches the same weights
+    model_replay = DemoModel(like=img, grid_shape=(IMG_D, IMG_H, IMG_W))
+    model_replay.package = package
+    for p_new, p_old in zip(model_replay.parameters(), initial_params):
+        AbstractTensor.copyto(p_new, p_old)
+    replay_training_step(img, target, model_replay.parameters())
+
+    expected = model.parameters()
+    obtained = model_replay.parameters()
+    assert all(np.allclose(e.data, o.data, atol=1e-6) for e, o in zip(expected, obtained)), "Replay weight update mismatch"
+
+    # Validate new input path
+    new_img_np = np.random.rand(BATCH_SIZE, IN_CHANNELS, IMG_D, IMG_H, IMG_W).astype(np.float32)
+    new_img = AbstractTensor.get_tensor(new_img_np)
+    logits_model = model.forward(new_img)
+    loss_model = loss_fn.forward(logits_model, target)
+    feed = {img_id: new_img, target_id: target}
+    for tid, idx in proc.tape._parameters.items():
+        feed[tid] = model.parameters()[idx]
+    vals = replay_forward(proc, feed)
+    logits_tid = next(proc.forward_graph.predecessors(autograd.tape._loss_id))
+    logits_replay = vals[logits_tid]
+    loss_replay = vals[autograd.tape._loss_id]
+    assert np.allclose(logits_model.data, logits_replay.data, atol=1e-6)
+    assert np.allclose(loss_model.data, loss_replay.data, atol=1e-6)
+
+    print("Replay validation succeeded")
 
 
 if __name__ == "__main__":
