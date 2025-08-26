@@ -20,8 +20,8 @@ def test_process_diagram_build_and_render(tmp_path):
         pred = x * w
         err = pred - y
         sq = err * err
-        loss_val = sq.sum().item()
-        return sq, loss_val
+        loss_val = sq.sum()
+        return loss_val, loss_val.detach()
 
     proc = AutogradProcess(tape)
     proc.training_loop(forward_fn, [w], steps=1, lr=0.1)

@@ -85,13 +85,14 @@ def main() -> None:
         model.backward(grad_pred)
         params = model.parameters()
         grads = model.grads()
-        new_params = optimizer.step(params, grads)
-        i = 0
-        for layer in model.layers:
-            layer_params = layer.parameters()
-            for j in range(len(layer_params)):
-                layer_params[j].data[...] = new_params[i].data
-                i += 1
+        with autograd.no_grad():
+            new_params = optimizer.step(params, grads)
+            i = 0
+            for layer in model.layers:
+                layer_params = layer.parameters()
+                for j in range(len(layer_params)):
+                    AbstractTensor.copyto(layer_params[j], new_params[i])
+                    i += 1
         model.zero_grad()
 
     # --- capture autograd process on a fresh tape ---
