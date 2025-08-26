@@ -352,9 +352,13 @@ class PyTorchTensorOperations(AbstractTensor):
     @staticmethod
     def _expand_ellipsis(index, nd):
         """Expand a single Ellipsis into the correct number of full slices."""
-        if Ellipsis not in index:
+        # ``in`` on a tuple containing NumPy arrays can trigger ambiguous
+        # truth-value errors because equality is applied elementwise.  Use
+        # identity checks instead so arrays in the index do not break
+        # Ellipsis detection.
+        if not any(comp is Ellipsis for comp in index):
             return index
-        i = index.index(Ellipsis)
+        i = next(i for i, comp in enumerate(index) if comp is Ellipsis)
         # everything except the ellipsis occupies k entries
         k = len(index) - 1
         fill = nd - k
