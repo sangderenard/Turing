@@ -115,6 +115,9 @@ def main() -> None:
     img_id, target_id = id(img), id(target)
     autograd.tape = GradTape()
     autograd.capture_all = True
+    # Register all root tensors so their identities are preserved when replaying
+    for tensor in [img, target, metric, *model.parameters()]:
+        autograd.tape.create_tensor_node(tensor)
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
     autograd.capture_all = False
@@ -144,14 +147,23 @@ def main() -> None:
         for tid in proc.forward_schedule:
             if tid in values:
                 continue
-            node = proc.tape._nodes[tid]
+            node = proc.tape._nodes.get(tid)
+            if node is None:
+                # Leaf tensor – pull original reference from the tape
+                tensor = proc.tape._tensor_refs.get(tid)
+                if tensor is None:
+                    raise KeyError(tid)
+                values[tid] = tensor
+                continue
             args = [values[parent] for parent, _ in node.parents]
             result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
             values[tid] = result
         return values
 
     def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
-        feed = {img_id: img_tensor, target_id: target_tensor}
+        # Seed feed with any tensors recorded on the tape (e.g. metrics)
+        feed = dict(proc.tape._tensor_refs)
+        feed.update({img_id: img_tensor, target_id: target_tensor})
         for tid, idx in proc.tape._parameters.items():
             feed[tid] = params[idx]
         values = replay_forward(proc, feed)
