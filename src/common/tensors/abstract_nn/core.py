@@ -34,8 +34,11 @@ class Linear:
             f"Linear layer init: in_dim={in_dim}, out_dim={out_dim}, bias={bias}, init={init}, scale={scale}"
         )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
+        self.W.requires_grad_(True)
         # Seed a small positive bias to avoid symmetric stall at init
         self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
+        if self.b is not None:
+            self.b.requires_grad_(True)
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
