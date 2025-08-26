@@ -716,13 +716,15 @@ class Autograd:
                         grad_map[pid] = g
 
         results: List[Any] = []
-        for inp in inputs:
+        for idx, inp in enumerate(inputs):
             g = grad_map.get(id(inp))
             if g is None:
                 if allow_unused:
                     results.append(None)
                 else:
-                    raise ValueError("No gradient found for one of the inputs")
+                    raise ValueError(
+                        f"No gradient found for input at index {idx} with id={id(inp)}"
+                    )
             else:
                 if hasattr(inp, "data") and isinstance(inp.data, list):
                     g = g.tolist()
