@@ -386,13 +386,18 @@ class AbstractTensor:
     # --- Basic layout ---
     def mean(self, dim=None, keepdim: bool = False):
         """Return the mean of the tensor along the specified dimension(s)."""
+        finalize = AbstractTensor._pre_autograd(
+            "mean", [self], params={"axis": dim, "keepdim": keepdim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.mean_(dim=dim, keepdim=keepdim)
-        return result
+        return finalize(result)
 
     def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
-        finalize = AbstractTensor._pre_autograd("sum", [self])
+        finalize = AbstractTensor._pre_autograd(
+            "sum", [self], params={"axis": dim, "keepdim": keepdim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.sum_(dim=dim, keepdim=keepdim)
         return finalize(result)
@@ -1180,7 +1185,7 @@ class AbstractTensor:
 
     # --- Operator routing ---
     @staticmethod
-    def _pre_autograd(op: str, inputs: Iterable[Any]):
+    def _pre_autograd(op: str, inputs: Iterable[Any], params: Dict[str, Any] | None = None):
         """Return a callback that records ``op`` on the autograd tape.
 
         Parameters
@@ -1225,7 +1230,9 @@ class AbstractTensor:
                     except Exception:
                         pass
                 if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) == 0:
-                    AbstractTensor.autograd.record(op, inputs, result, start=start, end=end)
+                    AbstractTensor.autograd.record(
+                        op, inputs, result, start=start, end=end, params=params
+                    )
                 return result
 
             return finalize
@@ -1448,7 +1455,10 @@ class AbstractTensor:
 
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
-        
+
+        finalize = AbstractTensor._pre_autograd(
+            "slice", [self], params={"slices": index}
+        )
 
         if hasattr(self, "get_item_"):
             result = self.get_item_(data, index)
@@ -1460,7 +1470,7 @@ class AbstractTensor:
         if isinstance(result, self.tensor_type):
             wrapped = type(self)(track_time=getattr(self, "track_time", False), tape=getattr(self, "_tape", None))
             wrapped.data = result
-            return wrapped
+            return finalize(wrapped)
         return result
 
 
