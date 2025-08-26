@@ -71,6 +71,7 @@ def main() -> None:
         default=1.5,
         help="Distance between nodes to give edges more room",
     )
+
     args = parser.parse_args()
 
     np.random.seed(0)
@@ -130,6 +131,7 @@ def main() -> None:
     render_training_diagram(
         proc, out_file, format=args.format, dpi=args.dpi, node_spacing=args.spacing
     )
+
     print(f"Process diagram written to {out_file}")
 
 

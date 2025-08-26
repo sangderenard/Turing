@@ -197,10 +197,12 @@ def render_training_diagram(
         Optional file format passed to :func:`matplotlib.pyplot.savefig`.
         When ``None`` the format is inferred from ``filename``. Use ``"svg"``
         or ``"pdf"`` for vector output.
+
     dpi:
         Dots-per-inch used when rasterising formats such as PNG. If ``None``
         the value from :rc:`savefig.dpi` is used and may be automatically
         reduced to stay within backend limits.
+
     figsize:
         Optional figure size passed through to
         :func:`matplotlib.pyplot.figure`. When omitted the size is determined
@@ -269,6 +271,7 @@ def render_training_diagram(
         artist.set_zorder(3)
 
     if filename is not None:
+
         save_kwargs: dict[str, object] = {"format": format} if format else {}
         # Matplotlib's Agg backend limits each dimension to < 2**16 pixels.
         # When saving PNGs we may need to lower the DPI so the rasterised
@@ -286,6 +289,7 @@ def render_training_diagram(
             if max_inches * dpi > max_pixels:
                 dpi = max_pixels / max_inches
                 save_kwargs["dpi"] = dpi
+
         plt.savefig(Path(filename), **save_kwargs)
         plt.close()
     else:
