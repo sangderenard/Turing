@@ -143,6 +143,7 @@ def _layered_grid_layout(
             col = idx % max_nodes_per_row
             x = x_offset + col * col_gap
             y = -layer * layer_gap - row * row_gap
+
             pos[node] = (x, y)
 
     return pos
