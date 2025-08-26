@@ -143,10 +143,23 @@ def main() -> None:
     # --- replay and validate ---
 
     def replay_forward(proc: AutogradProcess, feed: dict[int, AbstractTensor]):
+        """Replay a forward pass using the schedule from ``proc``.
+
+        ``GradTape`` only records ``GradNode`` entries for tensors that are the
+        result of an operation.  Leaf constants appear in the exported forward
+        graph (and therefore in ``forward_schedule``) but have no corresponding
+        entry in ``tape._nodes``.  The original implementation attempted to look
+        up every scheduled ID in ``_nodes`` which raised a ``KeyError`` when such
+        constants were encountered.  During replay we lazily inject these
+        constant values from the recorded operation context instead.
+        """
+
         values = dict(feed)
         for tid in proc.forward_schedule:
+            # Pre-supplied inputs and parameters already have values.
             if tid in values:
                 continue
+
             node = proc.tape._nodes.get(tid)
             if node is None:
                 # Leaf tensor – pull original reference from the tape
@@ -157,7 +170,9 @@ def main() -> None:
                 continue
             args = [values[parent] for parent, _ in node.parents]
             result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
+
             values[tid] = result
+
         return values
 
     def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
