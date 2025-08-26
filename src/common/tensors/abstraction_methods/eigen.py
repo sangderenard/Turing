@@ -8,13 +8,13 @@ def _diag_extract(A):
     return AbstractTensor.stack(parts, dim=-1)
 
 def _masked_swap_vec(v, i, j, mnum):
-    vi, vj = v[..., i], v[..., j]
+    vi, vj = v[..., i].clone(), v[..., j].clone()
     v[..., i] = mnum * vj + (1 - mnum) * vi
     v[..., j] = mnum * vi + (1 - mnum) * vj
 
 def _masked_swap_cols(M, i, j, mnum):
     # swap columns i and j under mask
-    ci, cj = M[..., :, i], M[..., :, j]
+    ci, cj = M[..., :, i].clone(), M[..., :, j].clone()
     mexp = mnum.unsqueeze(-1)
     M[..., :, i] = mexp * cj + (1 - mexp) * ci
     M[..., :, j] = mexp * ci + (1 - mexp) * cj
@@ -111,26 +111,28 @@ def eigh(A, sweeps: int = 24, tol: float = 1e-12, sort: bool = True):
                 s = c * t
 
                 # Right-multiply (update rows p,q)
-                row_p = S[..., p, :]
-                row_q = S[..., q, :]
-                S[..., p, :] = c * row_p - s * row_q
-                S[..., q, :] = s * row_p + c * row_q
+                c_exp = c.unsqueeze(-1)
+                s_exp = s.unsqueeze(-1)
+                row_p = S[..., p, :].clone()
+                row_q = S[..., q, :].clone()
+                S[..., p, :] = c_exp * row_p - s_exp * row_q
+                S[..., q, :] = s_exp * row_p + c_exp * row_q
 
                 # Left-multiply (update cols p,q)
-                col_p = S[..., :, p]
-                col_q = S[..., :, q]
-                S[..., :, p] = c * col_p - s * col_q
-                S[..., :, q] = s * col_p + c * col_q
+                col_p = S[..., :, p].clone()
+                col_q = S[..., :, q].clone()
+                S[..., :, p] = c_exp * col_p - s_exp * col_q
+                S[..., :, q] = s_exp * col_p + c_exp * col_q
 
                 # Force exact symmetry on the affected off-diagonals
                 S[..., p, q] = zero
                 S[..., q, p] = zero
 
                 # Accumulate eigenvectors: V = V @ G
-                Vp = V[..., :, p]
-                Vq = V[..., :, q]
-                V[..., :, p] = c * Vp - s * Vq
-                V[..., :, q] = s * Vp + c * Vq
+                Vp = V[..., :, p].clone()
+                Vq = V[..., :, q].clone()
+                V[..., :, p] = c_exp * Vp - s_exp * Vq
+                V[..., :, q] = s_exp * Vp + c_exp * Vq
 
     # Diagonal of S are eigenvalues
     w = _diag_extract(S)
