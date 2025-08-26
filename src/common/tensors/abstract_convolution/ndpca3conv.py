@@ -110,6 +110,7 @@ class NDPCA3Conv3d:
         # shape: (k, 3) for [-1, 0, +1]
         init = np.array([[0.25, 0.50, 0.25] for _ in range(k)], dtype=np.float32)
         self.taps = like.ensure_tensor(init)
+        self.taps.requires_grad_(True)
         self.g_taps = AbstractTensor.zeros_like(self.taps)
 
         # optional 1x1 channel mix after spatial pass
