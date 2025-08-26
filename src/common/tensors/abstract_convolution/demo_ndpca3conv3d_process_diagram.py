@@ -183,9 +183,16 @@ def main() -> None:
             feed[tid] = params[idx]
         values = replay_forward(proc, feed)
         loss_val = values[autograd.tape._loss_id]
-        grads = AbstractTensor.autograd.grad(loss_val, params, retain_graph=True)
+        grads = AbstractTensor.autograd.grad(
+            loss_val,
+            params,
+            retain_graph=True,
+            allow_unused=True,
+        )
         with AbstractTensor.autograd.no_grad():
             for p, g in zip(params, grads):
+                if g is None:
+                    continue
                 AbstractTensor.copyto(p, p - LEARNING_RATE * g)
         return loss_val
 
