@@ -692,9 +692,33 @@ class PyTorchTensorOperations(AbstractTensor):
         else:
             return self.data.float()
 
-    def repeat_(self, repeats = None, dim: int = 0):
+    def repeat_(self, repeats: Any = None, dim: int = 0):
+        """Repeat tensor data along ``dim`` ``repeats`` times.
+
+        ``repeats`` may be:
+        - ``None`` or an empty sequence to simply clone ``self``.
+        - an ``int`` specifying how many copies to make along a single
+          dimension ``dim``.
+        - a sequence providing the repeat count for each dimension.
+        """
         t = self.data
-        repeated = t.repeat(*repeats) if isinstance(repeats, (list, tuple)) else t.repeat(repeats)
+        if repeats is None or (isinstance(repeats, (list, tuple)) and len(repeats) == 0):
+            repeated = t.clone()
+        elif isinstance(repeats, int):
+            if t.dim() == 0:
+                repeated = t.repeat(repeats)
+            else:
+                if dim < 0:
+                    dim += t.dim()
+                if dim < 0 or dim >= t.dim():
+                    raise IndexError("dim out of range for repeat_")
+                sizes = [1] * t.dim()
+                sizes[dim] = repeats
+                repeated = t.repeat(*sizes)
+        elif isinstance(repeats, (list, tuple)):
+            repeated = t.repeat(*repeats)
+        else:
+            repeated = t.repeat(repeats)
         result = type(self)(default_device=self.default_device)
         result.data = repeated
         return result
