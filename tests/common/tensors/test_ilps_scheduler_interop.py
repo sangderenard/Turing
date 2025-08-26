@@ -42,6 +42,7 @@ def test_ilps_scheduler_interop():
     f_trans.execute(CountingScheduler)
     assert f_trace == ["a", "b", "a", "b"]
     assert CountingScheduler.calls == 1
+    assert {f_graph.nodes[n]["layer"] for n in f_graph} == {0, 1}
 
     # Backward graph scheduling and execution
     b_trace: list[str] = []
@@ -54,3 +55,4 @@ def test_ilps_scheduler_interop():
     b_trans.execute(CountingScheduler)
     assert b_trace == ["b", "a", "b", "a"]
     assert CountingScheduler.calls == 1
+    assert {b_graph.nodes[n]["layer"] for n in b_graph} == {0, 1}
