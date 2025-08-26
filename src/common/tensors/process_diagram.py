@@ -104,25 +104,25 @@ def build_training_diagram(proc: AutogradProcess) -> nx.DiGraph:
 def _layered_grid_layout(
     g: nx.DiGraph,
     *,
-    max_nodes_per_col: int = 8,
+    max_nodes_per_row: int = 8,
     layer_gap: float = 3.0,
-    col_gap: float = 0.5,
-    row_gap: float = 1.0,
+    col_gap: float = 1.5,
+    row_gap: float = 1.5,
 ) -> Dict[str, tuple[float, float]]:
     """Return coordinates for ``g`` arranging each ``layer`` in a grid.
 
     ``nx.multipartite_layout`` tends to stack all nodes for a layer along a
-    single line which can make dense graphs unreadable.  This helper spreads
-    nodes within the same layer vertically and wraps to new columns once the
-    number of nodes exceeds ``max_nodes_per_col``.
+    single line which can make dense graphs unreadable. This helper spreads
+    nodes within the same layer horizontally and wraps to new rows once the
+    number of nodes exceeds ``max_nodes_per_row``.
 
     Parameters
     ----------
     g:
         Graph with ``layer`` metadata on each node.
-    max_nodes_per_col:
-        Number of nodes to place in a single column for a layer before
-        wrapping to a new column.
+    max_nodes_per_row:
+        Number of nodes to place in a single row for a layer before
+        wrapping to a new row.
     layer_gap:
         Horizontal distance between successive layers.
     col_gap:
@@ -140,8 +140,8 @@ def _layered_grid_layout(
     pos: Dict[str, tuple[float, float]] = {}
     for layer, nodes in layers.items():
         for idx, node in enumerate(nodes):
-            col = idx // max_nodes_per_col
-            row = idx % max_nodes_per_col
+            row = idx // max_nodes_per_row
+            col = idx % max_nodes_per_row
             x = layer * layer_gap + col * col_gap
             y = -row * row_gap
             pos[node] = (x, y)
@@ -153,7 +153,7 @@ def render_training_diagram(
     proc: AutogradProcess,
     filename: str | Path | None = None,
     *,
-    figsize: tuple[int, int] = (20, 12),
+    figsize: tuple[int, int] | None = None,
 ) -> nx.DiGraph:
     """Return a combined process diagram for ``proc``.
 
@@ -169,12 +169,20 @@ def render_training_diagram(
         Optional output location for a PNG snapshot of the diagram. When
         omitted a GUI window is opened instead.
     figsize:
-        Figure size passed through to :func:`matplotlib.pyplot.figure`.
+        Optional figure size passed through to
+        :func:`matplotlib.pyplot.figure`. When omitted the size is determined
+        from the graph layout so nodes do not crowd one another.
     """
 
     g = build_training_diagram(proc)
 
     pos = _layered_grid_layout(g)
+    if figsize is None:
+        xs = [x for x, _ in pos.values()]
+        ys = [y for _, y in pos.values()]
+        width = (max(xs) - min(xs) if xs else 1) + 2
+        height = (max(ys) - min(ys) if ys else 1) + 2
+        figsize = (width, height)
     plt.figure(figsize=figsize)
     # Colour nodes by their layer to make execution order visually obvious.
     layers = [data.get("layer", 0) for _, data in g.nodes(data=True)]
