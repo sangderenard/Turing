@@ -462,10 +462,26 @@ class GradTape:
                 loss=(tid == self._loss_id),
             )
 
-        # Now add edges between tensors based on the recorded parent links.
-        for tid, node in self._nodes.items():
-            for pid, _ in node.parents:
-                g.add_edge(pid, tid)
+        # Add edges by following the operation nodes in the global graph so
+        # dependencies are captured directly from the tape rather than from
+        # the chronological recording order.  Each op connects its input
+        # tensors to every tensor it produces.
+        for nid, data in self.graph.nodes(data=True):
+            if data.get("kind") != "op":
+                continue
+            inputs = [
+                src
+                for src in self.graph.predecessors(nid)
+                if self.graph.nodes[src].get("kind") == "tensor"
+            ]
+            outputs = [
+                dst
+                for dst in self.graph.successors(nid)
+                if self.graph.nodes[dst].get("kind") == "tensor"
+            ]
+            for src in inputs:
+                for dst in outputs:
+                    g.add_edge(src, dst)
 
         return g
 
