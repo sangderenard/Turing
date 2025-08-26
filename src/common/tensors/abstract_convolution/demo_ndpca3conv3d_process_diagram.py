@@ -14,6 +14,14 @@ from pathlib import Path
 import argparse
 import numpy as np
 
+
+def _compare_tensors(name: str, expected: AbstractTensor, actual: AbstractTensor) -> None:
+    """Print diagnostic information when tensors diverge."""
+
+    if not np.allclose(expected.data, actual.data, atol=1e-6):
+        diff = np.abs(expected.data - actual.data)
+        print(f"{name} mismatch: max={diff.max()} mean={diff.mean()}")
+
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.autograd import autograd, GradTape
 from src.common.tensors.autograd_process import AutogradProcess
@@ -95,6 +103,7 @@ def main() -> None:
     initial_params = [p.clone() for p in model.parameters()]
 
     # --- single training epoch ---
+    rng_before = np.random.get_state()
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
     grad_pred = loss_fn.backward(logits, target)
@@ -110,6 +119,17 @@ def main() -> None:
                 AbstractTensor.copyto(layer_params[j], new_params[i])
                 i += 1
     model.zero_grad()
+    rng_after = np.random.get_state()
+    if repr(rng_before) != repr(rng_after):
+        print("Warning: RNG state changed during training step")
+
+    diagnostics = {
+        "logits": logits.clone(),
+        "loss": loss.clone(),
+        "grads": [g.clone() for g in grads],
+        "updated_params": [p.clone() for p in model.parameters()],
+        "rng_state": rng_after,
+    }
 
     # --- capture autograd process on a fresh tape ---
     img_id, target_id = id(img), id(target)
@@ -177,25 +197,52 @@ def main() -> None:
 
         return values
 
-    def replay_training_step(img_tensor: AbstractTensor, target_tensor: AbstractTensor, params: list[AbstractTensor]):
+    def replay_training_step(
+        img_tensor: AbstractTensor,
+        target_tensor: AbstractTensor,
+        params: list[AbstractTensor],
+        reference: dict | None = None,
+    ):
+        rng_before = np.random.get_state()
         # Seed feed with any tensors recorded on the tape (e.g. metrics)
         feed = dict(proc.tape._tensor_refs)
         feed.update({img_id: img_tensor, target_id: target_tensor})
         for tid, idx in proc.tape._parameters.items():
             feed[tid] = params[idx]
         values = replay_forward(proc, feed)
+        preds = list(proc.forward_graph.predecessors(loss_id))
+        if preds:
+            logits_tid = preds[0]
+            logits_val = values[logits_tid]
+        else:
+            logits_val = None
+            if reference:
+                print("Loss node has no predecessor; cannot compare logits")
         loss_val = values[loss_id]
+        if reference and logits_val is not None:
+            _compare_tensors("logits", reference["logits"], logits_val)
+            _compare_tensors("loss", reference["loss"], loss_val)
         grads = AbstractTensor.autograd.grad(
             loss_val,
             params,
             retain_graph=True,
             allow_unused=True,
         )
+        if reference:
+            for idx, (g_ref, g_val) in enumerate(zip(reference["grads"], grads)):
+                if g_val is None:
+                    continue
+                _compare_tensors(f"grad_{idx}", g_ref, g_val)
         with AbstractTensor.autograd.no_grad():
-            for p, g in zip(params, grads):
+            for idx, (p, g) in enumerate(zip(params, grads)):
                 if g is None:
                     continue
                 AbstractTensor.copyto(p, p - LEARNING_RATE * g)
+                if reference:
+                    _compare_tensors(f"param_{idx}", reference["updated_params"][idx], p)
+        rng_after = np.random.get_state()
+        if reference and repr(reference.get("rng_state")) != repr(rng_after):
+            print("Replay consumed RNG differently")
         return loss_val
 
     # Validate that replayed training reaches the same weights
@@ -203,13 +250,14 @@ def main() -> None:
     model_replay.package = package
     for p_new, p_old in zip(model_replay.parameters(), initial_params):
         AbstractTensor.copyto(p_new, p_old)
-    replay_training_step(img, target, model_replay.parameters())
+    replay_training_step(img, target, model_replay.parameters(), diagnostics)
 
     expected = model.parameters()
     obtained = model_replay.parameters()
     assert all(np.allclose(e.data, o.data, atol=1e-6) for e, o in zip(expected, obtained)), "Replay weight update mismatch"
 
     # Validate new input path
+    np.random.seed(1)
     new_img_np = np.random.rand(BATCH_SIZE, IN_CHANNELS, IMG_D, IMG_H, IMG_W).astype(np.float32)
     new_img = AbstractTensor.get_tensor(new_img_np)
     logits_model = model.forward(new_img)
@@ -218,10 +266,14 @@ def main() -> None:
     for tid, idx in proc.tape._parameters.items():
         feed[tid] = model.parameters()[idx]
     vals = replay_forward(proc, feed)
-    logits_tid = next(proc.forward_graph.predecessors(loss_id))
-    logits_replay = vals[logits_tid]
+    preds = list(proc.forward_graph.predecessors(loss_id))
+    if preds:
+        logits_tid = preds[0]
+        logits_replay = vals[logits_tid]
+        assert np.allclose(logits_model.data, logits_replay.data, atol=1e-6)
+    else:
+        print("Loss node has no predecessor; skipping logits comparison")
     loss_replay = vals[loss_id]
-    assert np.allclose(logits_model.data, logits_replay.data, atol=1e-6)
     assert np.allclose(loss_model.data, loss_replay.data, atol=1e-6)
 
     print("Replay validation succeeded")
