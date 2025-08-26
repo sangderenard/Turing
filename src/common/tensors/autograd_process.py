@@ -145,13 +145,17 @@ class AutogradProcess:
             result = forward_fn()
             if isinstance(result, tuple):
                 loss, meta_loss = result
+                if not isinstance(meta_loss, (int, float)):
+                    meta_loss = meta_loss.detach()
             else:
-                loss, meta_loss = result, float(result.item())
+                loss, meta_loss = result, result.detach()
             self.tape.mark_loss(loss)
             grads = AbstractTensor.autograd.grad(loss, params, retain_graph=True)
-            for p, g in zip(params, grads):
-                p.data = p.data - lr * g
-            self.training_log.append({"step": step, "loss": float(meta_loss)})
+            with AbstractTensor.autograd.no_grad():
+                for p, g in zip(params, grads):
+                    AbstractTensor.copyto(p, p - lr * g)
+            log_val = meta_loss if isinstance(meta_loss, (int, float)) else meta_loss.item()
+            self.training_log.append({"step": step, "loss": float(log_val)})
 
         # Use the final iteration to populate graphs and schedules
         self.build(loss)

@@ -392,9 +392,10 @@ class AbstractTensor:
 
     def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
+        finalize = AbstractTensor._pre_autograd("sum", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.sum_(dim=dim, keepdim=keepdim)
-        return result
+        return finalize(result)
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
         """Return the cumulative sum of the tensor along a dimension."""

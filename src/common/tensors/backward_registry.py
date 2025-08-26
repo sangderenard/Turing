@@ -509,7 +509,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = expand_to(g, x.shape)"
         },
         "python": {
-            "parameters": ["g", "x", "axis", "keepdim"],
+            "parameters": ["g", "x"],
             "body": "return expand_to(g, x.shape)"
         },
         "domain": "x: any real",
