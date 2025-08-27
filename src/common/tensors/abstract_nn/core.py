@@ -22,8 +22,6 @@ def _to_tuple3(x):
     return (x, x, x) if isinstance(x, int) else x
 
 class Linear:
-    def grads(self) -> List[AbstractTensor]:
-        return [g for g in (self.gW, self.gb) if g is not None]
     def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu", _label_prefix=None):
         self.like = like
         if init == "he" or init == "auto_relu":
@@ -49,22 +47,17 @@ class Linear:
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
-        self.gW = zeros_like(self.W)
-        self.gb = zeros_like(self.b) if self.b is not None else None
-        self._x = None
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
 
     def zero_grad(self):
-        self.gW = zeros_like(self.W)
+        self.W.zero_grad()
         if self.b is not None:
-            self.gb = zeros_like(self.b)
-        self._x = None
+            self.b.zero_grad()
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         logger.debug(f"Linear.forward called with input shape: {getattr(x, 'shape', None)}")
-        self._x = x
         out = x @ self.W
         logger.debug(f"Linear matmul output shape: {getattr(out, 'shape', None)}")
         if self.b is not None:
@@ -72,20 +65,6 @@ class Linear:
             logger.debug(f"Linear bias broadcasted shape: {getattr(b, 'shape', None)}")
             out = out + b
         return out
-
-
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        if self._x is None:
-            raise RuntimeError("Linear.backward called before forward; self._x is None")
-        xT = self._x.transpose(0, 1)
-        self.gW = xT @ grad_out
-        if self.b is not None:
-            gb_raw = grad_out.sum(dim=0, keepdim=True)
-            self.gb = grad_out.ensure_tensor(gb_raw)
-        WT = self.W.transpose(0, 1)
-        grad_in = grad_out @ WT
-        self._x = None
-        return grad_in
 
 
 class Flatten:
@@ -165,6 +144,10 @@ class RectConv2d:
         self.gW = zeros_like(self.W)
         if self.b is not None:
             self.gb = zeros_like(self.b)
+        # Clear autograd gradients on parameters
+        self.W.zero_grad()
+        if self.b is not None:
+            self.b.zero_grad()
         self._x = None
         self._cols = None
         self._x_shape = None
@@ -204,6 +187,14 @@ class RectConv2d:
         self.gW = gW.sum(dim=0).reshape(*self.W.shape)
         if self.b is not None:
             self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape)
+        # Mirror gradients to parameters
+        self.W._grad = self.gW
+        if self.b is not None:
+            self.b._grad = self.gb
+        # Mirror gradients to parameters
+        self.W._grad = self.gW
+        if self.b is not None:
+            self.b._grad = self.gb
         Wm = self.W.reshape(self.out_channels, -1)
         WT = Wm.transpose(0, 1)
         dcols = WT @ grad_mat
@@ -274,6 +265,10 @@ class RectConv3d:
         self.gW = zeros_like(self.W)
         if self.b is not None:
             self.gb = zeros_like(self.b)
+        # Clear autograd gradients on parameters
+        self.W.zero_grad()
+        if self.b is not None:
+            self.b.zero_grad()
         self._x = None
         self._cols = None
         self._x_shape = None
@@ -436,19 +431,6 @@ class Model:
             ps.extend(layer.parameters())
         return ps
 
-    def grads(self) -> List[AbstractTensor]:
-        gs: List[AbstractTensor] = []
-        for l in self.layers:
-            layer_grads = getattr(l, "grads", None)
-            if callable(layer_grads):
-                gs.extend(layer_grads())
-            else:
-                gs.append(l.gW)
-                if l.b is not None:
-                    gs.append(l.gb)
-        assert len(gs) == len(self.parameters()), "grads count must match parameters count"
-        return gs
-
     # ------------------------------------------------------------------
     # Serialization helpers
     # ------------------------------------------------------------------
@@ -495,14 +477,6 @@ class Model:
             logger.debug(f"Model.forward: after activation, shape: {getattr(x, 'shape', None)}")
         return x
 
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        g = grad_out
-        for i in reversed(range(len(self.layers))):
-            act = self.activations[i]
-            if act is not None:
-                g = act.backward(self._pre[i], g)
-            g = self.layers[i].backward(g)
-        return g
 
 class Sequential(Model):
     pass

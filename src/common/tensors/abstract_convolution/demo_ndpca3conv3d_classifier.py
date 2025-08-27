@@ -82,11 +82,10 @@ for epoch in range(1, EPOCHS + 1):
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
     # Backward
-    grad_pred = loss_fn.backward(logits, target)
-    model.backward(grad_pred)
+    loss.backward()
     # Optimizer step
     params = model.parameters()
-    grads = model.grads()
+    grads = [p.grad for p in params]
     new_params = optimizer.step(params, grads)
     # Update model params
     i = 0

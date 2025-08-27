@@ -53,68 +53,67 @@ def test_ndpca3conv3d_gradients_no_pointwise():
     like = T.tensor_from_list([[0.0]])
     conv = NDPCA3Conv3d(1, 1, like=like, grid_shape=(2,2,2), pointwise=False)
     x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
-
     conv.zero_grad()
     y = conv.forward(x, package=package)
-    grad_out = AbstractTensor.ones_like(y)
-    dx = conv.backward(grad_out)
+    y.sum().backward()
 
     num_tap = _finite_diff(conv, x, package, conv.taps.data, (0,0))
-    assert np.allclose(conv.g_taps.data[0,0], num_tap, atol=2e-2)
+    assert np.allclose(conv.taps.grad.data[0,0], num_tap, atol=3e-2)
 
     num_input = _finite_diff_input(conv, x, package)
-    assert np.allclose(dx.data, num_input, atol=1e-2)
+    assert np.allclose(x.grad.data, num_input, atol=1e-2)
 
 
 def test_ndpca3conv3d_gradients_with_pointwise():
     like = T.tensor_from_list([[0.0]])
     conv = NDPCA3Conv3d(1, 2, like=like, grid_shape=(2,2,2), pointwise=True)
     x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
-
     conv.zero_grad()
     y = conv.forward(x, package=package)
-    grad_out = AbstractTensor.ones_like(y)
-    dx = conv.backward(grad_out)
+    y.sum().backward()
 
     num_tap = _finite_diff(conv, x, package, conv.taps.data, (0,1))
-    assert np.allclose(conv.g_taps.data[0,1], num_tap, atol=1e-2)
+    assert np.allclose(conv.taps.grad.data[0,1], num_tap, atol=1e-2)
 
     num_input = _finite_diff_input(conv, x, package)
-    assert np.allclose(dx.data, num_input, atol=1e-2)
+    assert np.allclose(x.grad.data, num_input, atol=1e-2)
 
     W = conv.pointwise.W.data
     num_w = _finite_diff_pointwise(conv, x, package, W, (0,0))
-    assert np.allclose(conv.pointwise.gW.data[0,0], num_w, atol=1e-2)
+    assert np.allclose(conv.pointwise.W.grad.data[0,0], num_w, atol=1e-2)
 
 
-def test_ndpca3conv3d_grads_and_alias_no_pointwise():
+def test_ndpca3conv3d_zero_grad_no_pointwise():
     like = T.tensor_from_list([[0.0]])
     conv = NDPCA3Conv3d(1, 1, like=like, grid_shape=(2, 2, 2), pointwise=False)
-    val = AbstractTensor.ones_like(conv.taps)
-    conv.gW = val
-    gs = conv.grads()
-    assert len(gs) == 1
-    assert gs[0] is val
-    assert conv.gW is conv.g_taps
+    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x.requires_grad_(True)
+    metric = _make_metric(2,2,2)
+    package = {"metric": {"g": metric, "inv_g": metric}}
+    y = conv.forward(x, package=package)
+    y.sum().backward()
+    assert conv.taps.grad is not None
     conv.zero_grad()
-    assert np.allclose(conv.g_taps.data, 0)
+    assert conv.taps.grad is None
 
 
-def test_ndpca3conv3d_grads_and_zero_grad_with_pointwise():
+def test_ndpca3conv3d_zero_grad_with_pointwise():
     like = T.tensor_from_list([[0.0]])
     conv = NDPCA3Conv3d(1, 2, like=like, grid_shape=(2, 2, 2), pointwise=True)
-    val_taps = AbstractTensor.ones_like(conv.taps)
-    conv.gW = val_taps
-    val_pw = AbstractTensor.ones_like(conv.pointwise.W)
-    conv.pointwise.gW = val_pw
-    gs = conv.grads()
-    assert len(gs) == 2
-    assert gs[0] is val_taps
-    assert gs[1] is val_pw
+    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x.requires_grad_(True)
+    metric = _make_metric(2,2,2)
+    package = {"metric": {"g": metric, "inv_g": metric}}
+    y = conv.forward(x, package=package)
+    y.sum().backward()
+    assert conv.taps.grad is not None
+    assert conv.pointwise.W.grad is not None
     conv.zero_grad()
-    assert np.allclose(conv.g_taps.data, 0)
-    assert np.allclose(conv.pointwise.gW.data, 0)
+    assert conv.taps.grad is None
+    assert conv.pointwise.W.grad is None

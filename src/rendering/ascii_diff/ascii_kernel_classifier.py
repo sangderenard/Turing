@@ -160,10 +160,9 @@ class AsciiKernelClassifier:
         for epoch in range(1, self.max_epochs + 1):
             logits = model.forward(train_x)
             loss = loss_fn.forward(logits, train_y)
-            grad_pred = loss_fn.backward(logits, train_y)
-            model.backward(grad_pred)
+            loss.backward()
             params = model.parameters()
-            grads = model.grads()
+            grads = [p.grad for p in params]
             new_params = optimizer.step(params, grads)
             i = 0
             for layer in model.layers:

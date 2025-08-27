@@ -205,10 +205,9 @@ def main() -> None:
     
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
-    grad_pred = loss_fn.backward(logits, target)
-    model.backward(grad_pred)
+    loss.backward()
     params = model.parameters()
-    grads = model.grads()
+    grads = [p.grad for p in params]
     with autograd.no_grad():
         new_params = optimizer.step(params, grads)
         i = 0
