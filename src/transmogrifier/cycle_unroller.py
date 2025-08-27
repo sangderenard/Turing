@@ -191,4 +191,4 @@ def unroll_all_cycles_once(graph: nx.DiGraph) -> bool:
     if mutated:
         rebuild_parents_children(graph)
         graph.graph["source_map"] = {n: graph.nodes[n].get("source", n) for n in graph.nodes}
-    return mutated
+    return graph.graph["source_map"]
