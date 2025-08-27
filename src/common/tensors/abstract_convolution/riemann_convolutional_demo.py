@@ -69,22 +69,40 @@ def main():
         params, grads = [], []
         # Convolutional weights
         if hasattr(layer.conv, 'parameters'):
-            for p in layer.conv.parameters():
-                params.append(p)
-                grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+            if hasattr(layer.conv, 'grads') and callable(layer.conv.grads):
+                conv_grads = layer.conv.grads()
+                for p, g in zip(layer.conv.parameters(), conv_grads):
+                    params.append(p)
+                    grads.append(g)
+            else:
+                for p in layer.conv.parameters():
+                    params.append(p)
+                    grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
         # LocalStateNetwork (if present)
         lsn = layer.laplace_package.get('local_state_network', None) if isinstance(layer.laplace_package, dict) else None
         if lsn and hasattr(lsn, 'parameters'):
-            for p in lsn.parameters():
-                params.append(p)
-                grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+            if hasattr(lsn, 'grads') and callable(lsn.grads):
+                lsn_grads = lsn.grads()
+                for p, g in zip(lsn.parameters(), lsn_grads):
+                    params.append(p)
+                    grads.append(g)
+            else:
+                for p in lsn.parameters():
+                    params.append(p)
+                    grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
         # Fallback: any other objects with .parameters
         if isinstance(layer.laplace_package, dict):
             for v in layer.laplace_package.values():
                 if hasattr(v, 'parameters'):
-                    for p in v.parameters():
-                        params.append(p)
-                        grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+                    if hasattr(v, 'grads') and callable(v.grads):
+                        v_grads = v.grads()
+                        for p, g in zip(v.parameters(), v_grads):
+                            params.append(p)
+                            grads.append(g)
+                    else:
+                        for p in v.parameters():
+                            params.append(p)
+                            grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
             logger.info(f"Param {i}: shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
@@ -114,8 +132,17 @@ def main():
         for p in params:
             assert hasattr(p, 'grad') or hasattr(p, 'gW'), f"Parameter {p} has no grad attribute"
             if hasattr(p, 'grad'):
+                if p.grad is None:
+                    if not hasattr(p, 'grads') or not callable(p.grads):
+                        raise ValueError(f"Parameter {p} has no grads() method to compute gW")
+
+                    p.grad = p.grads()
                 assert p.grad.shape == p.shape, f"Parameter {p} has incorrect grad shape"
             if hasattr(p, 'gW'):
+                if p.gW is None:
+                    if not hasattr(p, 'grads') or not callable(p.grads):
+                        raise ValueError(f"Parameter {p} has no grads() method to compute gW")
+                    p.gW = p.grads()
                 assert p.gW.shape == p.shape, f"Parameter {p} has incorrect gW shape"
         for g in grads:
             assert hasattr(g, 'shape'), f"Gradient {g} has no shape attribute"
