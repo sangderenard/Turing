@@ -29,6 +29,11 @@ def test_unroll_self_edges_basic():
     assert unrolled.nodes["A_v0"]["color"] == "red"
     assert unrolled.nodes["A_v0"]["source"] == "A"
     assert unrolled.nodes["A_v1"]["version"] == 1
+    # Rebuilt parent/child metadata
+    assert {p for p, _ in unrolled.nodes["A_v1"]["parents"]} == {"A_v0"}
+    assert {c for c, _ in unrolled.nodes["A_v1"]["children"]} == {"B"}
+    assert {p for p, _ in unrolled.nodes["A_v0"]["parents"]} == {"B"}
+    assert {c for c, _ in unrolled.nodes["A_v0"]["children"]} == {"A_v1"}
 
 
 def test_unroll_all_cycles_once_multinode():
@@ -61,6 +66,21 @@ def test_unroll_all_cycles_once_multinode():
     for n in ["A", "B", "C"]:
         assert g.has_edge(f"{n}_v0", f"{n}_v1")
     assert nx.is_directed_acyclic_graph(g)
+    # Parent/child reconstruction matches edge structure
+    for node in g.nodes:
+        parents = {p for p, _ in g.nodes[node]["parents"]}
+        children = {c for c, _ in g.nodes[node]["children"]}
+        assert parents == set(g.predecessors(node))
+        assert children == set(g.successors(node))
+
+    class Dummy:
+        def __init__(self, G):
+            self.G = G
+
+    scheduler = ILPScheduler(Dummy(g))
+    levels = scheduler.compute_asap_levels()
+    assert levels["X"] == 0
+    assert levels["Y"] == 2
 
 
 def test_compute_asap_levels_cycle_detection():

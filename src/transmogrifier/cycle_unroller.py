@@ -24,6 +24,25 @@ from typing import Dict, Iterable, Set
 import networkx as nx
 
 
+def rebuild_parents_children(graph: nx.DiGraph) -> None:
+    """Reconstruct ``parents`` and ``children`` node attributes from edges.
+
+    Many passes expect each node to expose ``"parents"`` and ``"children"``
+    lists of ``(node_id, edge_data)`` tuples.  After structural rewrites these
+    attributes may become stale, so this helper wipes existing entries and
+    rebuilds them directly from the graph's edge set.
+    """
+
+    for n in graph.nodes:
+        graph.nodes[n]["parents"] = []
+        graph.nodes[n]["children"] = []
+
+    for u, v, data in graph.edges(data=True):
+        payload = dict(data) if data else None
+        graph.nodes[v]["parents"].append((u, payload))
+        graph.nodes[u]["children"].append((v, payload))
+
+
 def unroll_self_edges(graph: nx.DiGraph) -> nx.DiGraph:
     """Return a copy of ``graph`` with self-loops removed via node versioning.
 
@@ -87,6 +106,7 @@ def unroll_self_edges(graph: nx.DiGraph) -> nx.DiGraph:
         source_map[n] = unrolled.nodes[n]["source"]
     unrolled.graph["source_map"] = source_map
 
+    rebuild_parents_children(unrolled)
     return unrolled
 
 
@@ -168,4 +188,7 @@ def unroll_all_cycles_once(graph: nx.DiGraph) -> bool:
             continue
         unroll_scc_once(graph, nodes)
         mutated = True
+    if mutated:
+        rebuild_parents_children(graph)
+        graph.graph["source_map"] = {n: graph.nodes[n].get("source", n) for n in graph.nodes}
     return mutated
