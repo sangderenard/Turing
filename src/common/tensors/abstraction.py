@@ -1,4 +1,4 @@
-"""Abstraction layer for tensor operations."""
+
 from __future__ import annotations
 
 
@@ -201,7 +201,12 @@ class AbstractTensor:
             if tensor_type is not None and isinstance(data, tensor_type):
                 return backend_cls
         return None
+    # Redirect backward to autograd implementation for user convenience
 
+    def backward(self, *args, **kwargs):
+        from .autograd import backward as _autograd_backward
+        return _autograd_backward(self, *args, **kwargs)
+    """Abstraction layer for tensor operations."""
     # --- Sentinel dtypes for use before backend is set ---
     float_dtype_ = 'float32'  # Default sentinel, can be replaced by backend
     long_dtype_ = 'int64'     # Default sentinel, can be replaced by backend

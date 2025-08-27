@@ -108,7 +108,20 @@ def main():
         if hasattr(loss, 'backward'):
             loss.backward()
         # Re-collect params and grads (in case new tensors were created)
+        
         params, grads = collect_params_and_grads()
+
+        for p in params:
+            assert hasattr(p, 'grad') or hasattr(p, 'gW'), f"Parameter {p} has no grad attribute"
+            if hasattr(p, 'grad'):
+                assert p.grad.shape == p.shape, f"Parameter {p} has incorrect grad shape"
+            if hasattr(p, 'gW'):
+                assert p.gW.shape == p.shape, f"Parameter {p} has incorrect gW shape"
+        for g in grads:
+            assert hasattr(g, 'shape'), f"Gradient {g} has no shape attribute"
+            assert g.shape == p.shape, f"Gradient {g} has incorrect shape"
+
+
         optimizer.step(params, grads)
         if epoch % 100 == 0 or loss.item() < 1e-6:
             print(f"Epoch {epoch}: loss={loss.item():.2e}")
