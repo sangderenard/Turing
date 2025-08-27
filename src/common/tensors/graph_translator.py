@@ -61,11 +61,11 @@ class GraphTranslator:
     def schedule(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> List:
         """Compute and cache execution order using ``scheduler_cls``."""
         if self._order is None:
-            sched_graph = unroll_all_cycles_once(self.graph)
-            proc = self._to_process_graph(sched_graph)
+            changed = unroll_all_cycles_once(self.graph)
+            proc = self._to_process_graph(self.graph)
             sched = scheduler_cls(proc)
             raw_levels = sched.compute_levels("asap", "dependency")
-            source_map: Dict[Any, Any] = sched_graph.graph.get("source_map", {})
+            source_map: Dict[Any, Any] = self.graph.get("source_map", {})
 
             collapsed: Dict[Any, int] = {}
             for vid, lvl in raw_levels.items():
