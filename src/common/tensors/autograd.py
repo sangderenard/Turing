@@ -22,10 +22,29 @@ def requires_grad(self, value: bool) -> None:  # pragma: no cover - simple sette
     self._requires_grad = value
 
 
-def backward(self, *args, **kwargs):  # pragma: no cover - not yet implemented
-    raise NotImplementedError(
-        "backward not supported; use AbstractTensor.autograd.grad instead"
+def backward(
+    self,
+    grad_output=None,
+    *,
+    retain_graph: bool = False,
+):
+    """Compute gradients for parameters with respect to this scalar tensor."""
+    tape = getattr(self, "_tape", None) or autograd.tape
+    try:
+        tape.mark_loss(self)
+    except Exception:
+        pass
+    params = tape.parameter_tensors()
+    if not params:
+        return None
+    autograd.grad(
+        self,
+        params,
+        grad_outputs=grad_output,
+        retain_graph=retain_graph,
+        allow_unused=True,
     )
+    return None
 
 
 @property
