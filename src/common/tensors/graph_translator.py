@@ -9,10 +9,11 @@ subsequent executions.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Type
+from typing import Any, Dict, List, Type
 
 import networkx as nx
 
+from ...transmogrifier.cycle_unroller import unroll_self_edges
 from ...transmogrifier.ilpscheduler import ILPScheduler
 
 
@@ -35,13 +36,14 @@ class GraphTranslator:
     # ------------------------------------------------------------------
     # Graph -> ProcessGraph adapter
     # ------------------------------------------------------------------
-    def _to_process_graph(self) -> MinimalProcessGraph:
+    def _to_process_graph(self, graph: nx.DiGraph | None = None) -> MinimalProcessGraph:
+        src = self.graph if graph is None else graph
         G = nx.DiGraph()
-        for nid, data in self.graph.nodes(data=True):
+        for nid, data in src.nodes(data=True):
             # copy all attrs except the executable op
             attrs = {k: v for k, v in data.items() if k != "op"}
             G.add_node(nid, label=str(nid), parents=[], children=[], **attrs)
-        for u, v in self.graph.edges():
+        for u, v in src.edges():
             G.add_edge(u, v)
             G.nodes[u]["children"].append((v, "dep"))
             G.nodes[v]["parents"].append((u, "dep"))
@@ -53,14 +55,35 @@ class GraphTranslator:
     def schedule(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> List:
         """Compute and cache execution order using ``scheduler_cls``."""
         if self._order is None:
-            proc = self._to_process_graph()
+            sched_graph = unroll_self_edges(self.graph)
+            proc = self._to_process_graph(sched_graph)
             sched = scheduler_cls(proc)
-            self._levels = sched.compute_levels("asap", "dependency")
+            raw_levels = sched.compute_levels("asap", "dependency")
+            source_map: Dict[Any, Any] = sched_graph.graph.get("source_map", {})
+
+            collapsed: Dict[Any, int] = {}
+            for vid, lvl in raw_levels.items():
+                orig = source_map.get(vid, vid)
+                collapsed[orig] = min(collapsed.get(orig, lvl), lvl)
+
+            unique = sorted(set(collapsed.values()))
+            remap = {lvl: i for i, lvl in enumerate(unique)}
+            self._levels = {nid: remap[lvl] for nid, lvl in collapsed.items()}
+
             for nid, lvl in self._levels.items():
                 if self.graph.has_node(nid):
                     self.graph.nodes[nid]["level"] = lvl
-            # Order nodes by level (stable for repeated runs)
-            self._order = [nid for nid, _ in sorted(self._levels.items(), key=lambda x: x[1])]
+
+            order_raw = [
+                source_map.get(nid, nid)
+                for nid, _ in sorted(raw_levels.items(), key=lambda x: x[1])
+            ]
+            seen: set[Any] = set()
+            self._order = []
+            for nid in order_raw:
+                if nid not in seen:
+                    self._order.append(nid)
+                    seen.add(nid)
         return self._order
 
     def levels(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> Dict:
