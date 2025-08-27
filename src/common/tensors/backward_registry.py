@@ -607,8 +607,8 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "gx = reshape(g, x.shape)"
         },
         "python": {
-            "parameters": ["g", "x", "new_shape"],
-            "body": "return AbstractTensor.reshape(g, x.shape)"
+            "parameters": ["g", "x", "new_shape=None"],
+            "body": "return AbstractTensor.reshape(g, getattr(x, 'shape', new_shape))"
         },
         "domain": "Same number of elements.",
         "notes": "Gradient reshapes back.",
