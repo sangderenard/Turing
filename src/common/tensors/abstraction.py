@@ -1951,6 +1951,13 @@ _bind_and_wrap({
     "ifft": fourier_ifft,
 })
 
+AbstractTensor.reshape = _reshape_methods.reshape
+AbstractTensor.flatten = _reshape_methods.flatten
+AbstractTensor.transpose = _reshape_methods.transpose
+AbstractTensor.unsqueeze = _reshape_methods.unsqueeze
+AbstractTensor.squeeze = _reshape_methods.squeeze
+AbstractTensor.swapaxes = _reshape_methods.swapaxes
+
 AbstractTensor.numel   = prop_numel
 AbstractTensor.item    = prop_item
 AbstractTensor.shape   = property(prop_shape)
