@@ -16,12 +16,12 @@ def reshape(self, *shape) -> "AbstractTensor":
     from ..abstraction import AbstractTensor, BACKEND_REGISTRY
 
     shape_tuple = AbstractTensor._normalize_shape_args(*shape)
-    finalize = AbstractTensor._pre_autograd(
-        "reshape", [self], params={"new_shape": shape_tuple}
-    )
 
     if hasattr(self, "reshape_"):
         out = _wrap_result(self, self.reshape_(shape_tuple))
+        finalize = AbstractTensor._pre_autograd(
+            "reshape", [self], params={"new_shape": out.shape}
+        )
         return finalize(out)
 
     # numpy fallback (kept intact, but now passes a tuple)
@@ -34,6 +34,9 @@ def reshape(self, *shape) -> "AbstractTensor":
                 reshaped_data = numpy_tensor.data.reshape(shape_tuple)
                 reshaped_tensor = backend_cls(track_time=getattr(self, "track_time", False))
                 reshaped_tensor.data = reshaped_data
+                finalize = AbstractTensor._pre_autograd(
+                    "reshape", [self], params={"new_shape": reshaped_tensor.shape}
+                )
                 return finalize(reshaped_tensor.to_backend(self))
     except Exception:
         pass
