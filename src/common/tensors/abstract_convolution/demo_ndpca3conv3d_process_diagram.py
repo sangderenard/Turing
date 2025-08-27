@@ -188,12 +188,9 @@ def main() -> None:
     img_np = np.random.rand(BATCH_SIZE, IN_CHANNELS, IMG_D, IMG_H, IMG_W).astype(np.float32)
     img = AbstractTensor.get_tensor(img_np)
 
-    metric_np = np.tile(np.eye(3, dtype=np.float32), (IMG_D, IMG_H, IMG_W, 1, 1))
-    metric = AbstractTensor.get_tensor(metric_np)
-    package = {"metric": {"g": metric, "inv_g": metric}}
 
     model = DemoModel(like=img, grid_shape=(IMG_D, IMG_H, IMG_W))
-    model.package = package
+    
     loss_fn = MSELoss()
     optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -205,7 +202,7 @@ def main() -> None:
     initial_params = [p.clone() for p in model.parameters()]
 
     # --- single training epoch ---
-    rng_before = np.random.get_state()
+    
     logits = model.forward(img)
     loss = loss_fn.forward(logits, target)
     grad_pred = loss_fn.backward(logits, target)
@@ -221,16 +218,12 @@ def main() -> None:
                 AbstractTensor.copyto(layer_params[j], new_params[i])
                 i += 1
     model.zero_grad()
-    rng_after = np.random.get_state()
-    if repr(rng_before) != repr(rng_after):
-        print("Warning: RNG state changed during training step")
-
+    
     diagnostics = {
         "logits": logits.clone(),
         "loss": loss.clone(),
         "grads": [g.clone() for g in grads],
         "updated_params": [p.clone() for p in model.parameters()],
-        "rng_state": rng_after,
     }
 
     # --- capture autograd process on a fresh tape ---
@@ -268,7 +261,7 @@ def main() -> None:
 
     # Validate that replayed training reaches the same weights
     model_replay = DemoModel(like=img, grid_shape=(IMG_D, IMG_H, IMG_W))
-    model_replay.package = package
+    
     for p_new, p_old in zip(model_replay.parameters(), initial_params):
         AbstractTensor.copyto(p_new, p_old)
     replay_training_step(
