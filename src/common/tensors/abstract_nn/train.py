@@ -99,16 +99,15 @@ def train_step(
     hook_panel.run('forward', model=model, x=x, pred=pred)
     loss = loss_fn.forward(pred, y)
     hook_panel.run('loss', model=model, pred=pred, y=y, loss=loss)
-    grad_pred = loss_fn.backward(pred, y)
-    hook_panel.run('backward', model=model, grad_pred=grad_pred)
-    model.backward(grad_pred)
+    loss.backward()
+    hook_panel.run('backward', model=model, grad_pred=None)
     if debug:
         def norms(t: AbstractTensor) -> float:
             return float(((t * t).sum()).sqrt().item())
 
         for i, l in enumerate(model.layers):
             b0 = float(l.b[0, 0].item()) if l.b is not None else None
-            hook_panel.run('debug', layer=l, i=i, W=l.W, gW=l.gW, b0=b0)
+            hook_panel.run('debug', layer=l, i=i, W=l.W, gW=getattr(l.W, 'grad', None), b0=b0)
 
 
     # Collect params/grads in a stable order
@@ -116,11 +115,12 @@ def train_step(
     grads: List[AbstractTensor] = []
     per_layer_norms_before = []
     for layer in model.layers:
-        params.extend([p for p in layer.parameters()])
-        g_list = [layer.gW] + ([layer.gb] if layer.b is not None else [])
+        layer_params = list(layer.parameters())
+        params.extend(layer_params)
+        g_list = [getattr(p, 'grad') for p in layer_params]
         grads.extend(g_list)
-        w_n = _l2(layer.gW)
-        b_n = _l2(layer.gb) if layer.b is not None else None
+        w_n = _l2(g_list[0]) if g_list else 0.0
+        b_n = _l2(g_list[1]) if len(g_list) > 1 and g_list[1] is not None else None
         per_layer_norms_before.append({"W": w_n, "b": b_n})
 
     global_grad_norm_preclip = _global_l2(grads)
@@ -267,19 +267,12 @@ def train_loop(
             # After all subbatches, do optimizer step if accumulating
             if grad_accum_steps > 1:
                 params: List[AbstractTensor] = []
-                grads: List[AbstractTensor] = []
                 for layer in model.layers:
-                    params.extend([p for p in layer.parameters()])
-                    g_list = [layer.gW] + ([layer.gb] if layer.b is not None else [])
-                    grads.extend(g_list)
+                    params.extend(list(layer.parameters()))
+                grads = [p.grad for p in params]
                 new_params = optimizer.step(params, grads)
-                i = 0
-                for layer in model.layers:
-                    layer.W = new_params[i]
-                    i += 1
-                    if layer.b is not None:
-                        layer.b = new_params[i]
-                        i += 1
+                for p, new_p in zip(params, new_params):
+                    AbstractTensor.copyto(p, new_p)
                 model.zero_grad()
                 hook_panel.run('optimizer_step', epoch=e)
             l = sum(subbatch_losses) / len(subbatch_losses)
@@ -300,19 +293,12 @@ def train_loop(
             # After grad_accum_steps, do optimizer step
             if grad_accum_steps > 1:
                 params: List[AbstractTensor] = []
-                grads: List[AbstractTensor] = []
                 for layer in model.layers:
-                    params.extend([p for p in layer.parameters()])
-                    g_list = [layer.gW] + ([layer.gb] if layer.b is not None else [])
-                    grads.extend(g_list)
+                    params.extend(list(layer.parameters()))
+                grads = [p.grad for p in params]
                 new_params = optimizer.step(params, grads)
-                i = 0
-                for layer in model.layers:
-                    layer.W = new_params[i]
-                    i += 1
-                    if layer.b is not None:
-                        layer.b = new_params[i]
-                        i += 1
+                for p, new_p in zip(params, new_params):
+                    AbstractTensor.copyto(p, new_p)
                 model.zero_grad()
                 hook_panel.run('optimizer_step', epoch=e)
         losses.append(l)

@@ -24,18 +24,6 @@ class RiemannConvolutional3D:
             params.extend(self.laplace_package.parameters())
         return params
 
-    def grads(self):
-        grads = []
-        if hasattr(self.conv, 'grads') and callable(self.conv.grads):
-            grads.extend(self.conv.grads())
-        if isinstance(self.laplace_package, dict):
-            for v in self.laplace_package.values():
-                if hasattr(v, 'grads') and callable(v.grads):
-                    grads.extend(v.grads())
-        elif hasattr(self.laplace_package, 'grads') and callable(self.laplace_package.grads):
-            grads.extend(self.laplace_package.grads())
-        return grads
-
     def zero_grad(self):
         if hasattr(self.conv, 'zero_grad') and callable(self.conv.zero_grad):
             self.conv.zero_grad()

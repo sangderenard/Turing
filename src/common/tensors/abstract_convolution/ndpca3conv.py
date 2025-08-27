@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, Optional, Literal, List
+from typing import Tuple, Literal
 import numpy as np
 
 from ..abstraction import AbstractTensor
@@ -116,7 +116,6 @@ class NDPCA3Conv3d:
         self.taps._tape = autograd.tape
         autograd.tape.create_tensor_node(self.taps)
         self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
-        self.g_taps = AbstractTensor.zeros_like(self.taps)
 
         # optional 1x1 channel mix after spatial pass
         self.pointwise = None
@@ -130,35 +129,10 @@ class NDPCA3Conv3d:
             ps.extend(self.pointwise.parameters())
         return ps
 
-    def grad(self) -> List[AbstractTensor]:
-        gs: List[AbstractTensor] = [self.g_taps]
-        if self.pointwise is not None:
-            if hasattr(self.pointwise, 'grad') and callable(self.pointwise.grad):
-                gs.extend(self.pointwise.grad())
-            else:
-                if hasattr(self.pointwise, 'gW'):
-                    gs.append(self.pointwise.gW)
-                if getattr(self.pointwise, "gb", None) is not None:
-                    gs.append(self.pointwise.gb)
-        return gs
-
-    # Backward compatibility: plural alias expected by tests
-    def grads(self) -> List[AbstractTensor]:
-        return self.grad()
-
     def zero_grad(self):
-        self.g_taps = AbstractTensor.zeros_like(self.taps)
+        self.taps.zero_grad()
         if self.pointwise is not None:
             self.pointwise.zero_grad()
-
-    # backward compatibility alias
-    @property
-    def gW(self) -> AbstractTensor:
-        return self.g_taps
-
-    @gW.setter
-    def gW(self, val: AbstractTensor) -> None:
-        self.g_taps = val
 
     # --- helpers ---
     def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -245,71 +219,11 @@ class NDPCA3Conv3d:
             + wV_m * x_v_m + wV_p * x_v_p \
             + wW_m * x_w_m + wW_p * x_w_p
 
-        # cache intermediates for backward
-        self._arr = arr
-        self._x_u_m, self._x_u_p = x_u_m, x_u_p
-        self._x_v_m, self._x_v_p = x_v_m, x_v_p
-        self._x_w_m, self._x_w_p = x_w_m, x_w_p
-        self._wU, self._wV, self._wW = wU_b, wV_b, wW_b
-        self._center, self._w_minus, self._w_plus = center, w_minus, w_plus
-        self._shape = (B, C, D, H, W)
-
-        y_t = x.ensure_tensor(y)  # back to AbstractTensor
-
         # ---- 4) optional 1x1 mixing to get out_channels
         if self.pointwise is not None:
             # reshape (B, C, D, H, W) → (B*D*H*W, C)
-            z = y_t.reshape(B * D * H * W, C)
+            z = y.reshape(B * D * H * W, C)
             z = self.pointwise.forward(z)
-            y_t = z.reshape(B, self.out_channels, D, H, W)
+            y = z.reshape(B, self.out_channels, D, H, W)
 
-        return y_t
-
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        if not hasattr(self, "_arr") or self._arr is None:
-            raise RuntimeError("NDPCA3Conv3d.backward called before forward")
-
-        B, C, D, H, W = self._shape
-        g = grad_out
-        if self.pointwise is not None:
-            g = g.reshape(B * D * H * W, self.out_channels)
-            g = self.pointwise.backward(g)
-            g = g.reshape(B, self.in_channels, D, H, W)
-
-
-        # gradients w.r.t taps
-        g_center = (g * self._arr).sum().item()
-        g_minus = (g * (self._wU * self._x_u_m + self._wV * self._x_v_m + self._wW * self._x_w_m)).sum().item()
-        g_plus = (g * (self._wU * self._x_u_p + self._wV * self._x_v_p + self._wW * self._x_w_p)).sum().item()
-
-        g_vec = self.like.ensure_tensor([g_minus, g_center, g_plus]).reshape(1, 3)
-        self.g_taps = g_vec.repeat_interleave(self.k, dim=0)
-
-        # gradient w.r.t input
-        bcu = (self.bc[0], self.bc[1])
-        bcv = (self.bc[2], self.bc[3])
-        bcw = (self.bc[4], self.bc[5])
-        wU_m = self._wU * self._w_minus
-        wU_p = self._wU * self._w_plus
-        wV_m = self._wV * self._w_minus
-        wV_p = self._wV * self._w_plus
-        wW_m = self._wW * self._w_minus
-        wW_p = self._wW * self._w_plus
-
-        dx = self._center * g
-        dx += wU_m * _shift3d(g, axis=2, step=+1, bc=(bcu[1], bcu[0]))
-        dx += wU_p * _shift3d(g, axis=2, step=-1, bc=(bcu[1], bcu[0]))
-        dx += wV_m * _shift3d(g, axis=3, step=+1, bc=(bcv[1], bcv[0]))
-        dx += wV_p * _shift3d(g, axis=3, step=-1, bc=(bcv[1], bcv[0]))
-        dx += wW_m * _shift3d(g, axis=4, step=+1, bc=(bcw[1], bcw[0]))
-        dx += wW_p * _shift3d(g, axis=4, step=-1, bc=(bcw[1], bcw[0]))
-
-        # clear cache
-        self._arr = None
-        self._x_u_m = self._x_u_p = None
-        self._x_v_m = self._x_v_p = None
-        self._x_w_m = self._x_w_p = None
-        self._wU = self._wV = self._wW = None
-        self._shape = None
-
-        return grad_out.ensure_tensor(dx)
+        return y
