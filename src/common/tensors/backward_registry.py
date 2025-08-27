@@ -674,6 +674,22 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Implements a simple scatter into the sliced region.",
         "tags": ["shape", "indexing"],
     },
+    "index_set": {
+        "arity": "binary",
+        "signature": "y = x; y[idx] = v",
+        "latex": r"y = x; y[\\text{idx}] = v",
+        "backward": {
+            "x": "gx = g.clone()",
+            "v": "gv = g[idx]"
+        },
+        "python": {
+            "parameters": ["g", "x", "v", "idx"],
+            "body": "gx=g.clone(); gv=g[idx]; return gx, gv"
+        },
+        "domain": "Any real; idx valid.",
+        "notes": "Scatter assignment; gradient flows from selected region to the value.",
+        "tags": ["indexing"],
+    },
     "concat": {
         "arity": "n-ary",
         "signature": "y = concat([x1, x2, ...], dim)",
