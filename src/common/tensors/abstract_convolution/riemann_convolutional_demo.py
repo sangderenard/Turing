@@ -63,6 +63,8 @@ def main():
     # Input: random
     x = AT.randn((B, C, *grid_shape))
     # --- Parameter and gradient collection helpers ---
+    from ..logger import get_tensors_logger
+    logger = get_tensors_logger()
     def collect_params_and_grads():
         params, grads = [], []
         # Convolutional weights
@@ -83,9 +85,10 @@ def main():
                     for p in v.parameters():
                         params.append(p)
                         grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
-        # Remove Nones (in case some params don't have grads yet)
-        params, grads = zip(*[(p, g) for p, g in zip(params, grads) if p is not None and g is not None]) if params else ([],[])
-        return list(params), list(grads)
+        # Log all params and grads, including Nones
+        for i, (p, g) in enumerate(zip(params, grads)):
+            logger.info(f"Param {i}: shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
+        return params, grads
 
     params, _ = collect_params_and_grads()
     optimizer = Adam(params, lr=1e-3)
