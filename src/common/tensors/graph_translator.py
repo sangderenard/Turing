@@ -41,8 +41,14 @@ class GraphTranslator:
         G = nx.DiGraph()
         for nid, data in src.nodes(data=True):
             # copy all attrs except the executable op
-            attrs = {k: v for k, v in data.items() if k != "op"}
-            G.add_node(nid, label=str(nid), parents=[], children=[], **attrs)
+            attrs = {
+                k: v
+                for k, v in data.items()
+                if k not in {"op", "parents", "children", "label"}
+            }
+            attrs.setdefault("parents", [])
+            attrs.setdefault("children", [])
+            G.add_node(nid, label=str(nid), **attrs)
         for u, v in src.edges():
             G.add_edge(u, v)
             G.nodes[u]["children"].append((v, "dep"))
