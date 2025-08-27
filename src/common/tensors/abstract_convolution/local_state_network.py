@@ -4,6 +4,7 @@ import threading
 
 from ..abstraction import AbstractTensor
 from ..abstract_nn import Linear, RectConv3d
+from ..autograd import autograd
 
 # ``LocalStateNetwork`` intentionally avoids heavyweight frameworks like
 # PyTorch.  Convolutional support will be wired in once an abstract 3D
@@ -151,6 +152,9 @@ class LocalStateNetwork:
         num_parameters = 27
         # NN Integration Manager
         self.weight_layer = AbstractTensor.get_tensor(np.ones((3, 3, 3), dtype=np.float32))
+        self.weight_layer.requires_grad_(True)
+        self.weight_layer._tape = autograd.tape
+        autograd.tape.create_tensor_node(self.weight_layer)
         self.weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.weight_layer"
         self.g_weight_layer = AbstractTensor.get_tensor(np.zeros((3, 3, 3), dtype=np.float32))
         self._cached_padded_raw = None

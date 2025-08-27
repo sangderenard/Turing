@@ -4,6 +4,7 @@ import numpy as np
 
 from ..abstraction import AbstractTensor
 from ..abstract_nn.core import Linear  # for optional 1x1 mixing
+from ..autograd import autograd
 
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 
@@ -112,6 +113,8 @@ class NDPCA3Conv3d:
         init = np.array([[0.25, 0.50, 0.25] for _ in range(k)], dtype=np.float32)
         self.taps = like.ensure_tensor(init)
         self.taps.requires_grad_(True)
+        self.taps._tape = autograd.tape
+        autograd.tape.create_tensor_node(self.taps)
         self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
         self.g_taps = AbstractTensor.zeros_like(self.taps)
 
@@ -138,6 +141,10 @@ class NDPCA3Conv3d:
                 if getattr(self.pointwise, "gb", None) is not None:
                     gs.append(self.pointwise.gb)
         return gs
+
+    # Backward compatibility: plural alias expected by tests
+    def grads(self) -> List[AbstractTensor]:
+        return self.grad()
 
     def zero_grad(self):
         self.g_taps = AbstractTensor.zeros_like(self.taps)
