@@ -96,6 +96,7 @@ class NDPCA3Conv3d:
         k: int = 3,
         eig_from: Literal["g", "inv_g"] = "g",
         pointwise: bool = True,
+        _label_prefix=None
     ):
         assert 1 <= k <= 3
         self.like = like
@@ -111,12 +112,13 @@ class NDPCA3Conv3d:
         init = np.array([[0.25, 0.50, 0.25] for _ in range(k)], dtype=np.float32)
         self.taps = like.ensure_tensor(init)
         self.taps.requires_grad_(True)
+        self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
         self.g_taps = AbstractTensor.zeros_like(self.taps)
 
         # optional 1x1 channel mix after spatial pass
         self.pointwise = None
         if pointwise and out_channels != in_channels:
-            self.pointwise = Linear(in_channels, out_channels, like=like, bias=False)
+            self.pointwise = Linear(in_channels, out_channels, like=like, bias=False, _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.pointwise")
 
     # --- standard layer API ---
     def parameters(self):

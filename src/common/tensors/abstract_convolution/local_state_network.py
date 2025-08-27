@@ -125,7 +125,7 @@ class LocalStateNetwork:
         if self.inner_state is not None and hasattr(self.inner_state, 'parameters'):
             params.extend(self.inner_state.parameters())
         return params
-    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2):
+    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
 
@@ -151,6 +151,7 @@ class LocalStateNetwork:
         num_parameters = 27
         # NN Integration Manager
         self.weight_layer = AbstractTensor.get_tensor(np.ones((3, 3, 3), dtype=np.float32))
+        self.weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.weight_layer"
         self.g_weight_layer = AbstractTensor.get_tensor(np.zeros((3, 3, 3), dtype=np.float32))
         self._cached_padded_raw = None
         like = AbstractTensor.get_tensor(np.zeros((1, num_parameters), dtype=np.float32))
@@ -163,6 +164,7 @@ class LocalStateNetwork:
                 like=like,
                 bias=False,
             )
+            # RectConv3d does not have learnable parameters by default, but if it did, label them here
             self.inner_state = LocalStateNetwork(
                 metric_tensor_func,
                 grid_shape,
@@ -171,9 +173,10 @@ class LocalStateNetwork:
                 custom_hooks=custom_hooks,
                 recursion_depth=recursion_depth + 1,
                 max_depth=max_depth,
+                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.inner_state"
             )
         else:
-            self.spatial_layer = Linear(num_parameters, num_parameters, like=like, bias=False)
+            self.spatial_layer = Linear(num_parameters, num_parameters, like=like, bias=False, _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.spatial_layer")
             self.inner_state = None
 
         self.nn_generators = defaultdict(deque)

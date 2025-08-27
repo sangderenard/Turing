@@ -69,43 +69,26 @@ def main():
         params, grads = [], []
         # Convolutional weights
         if hasattr(layer.conv, 'parameters'):
-            if hasattr(layer.conv, 'grads') and callable(layer.conv.grads):
-                conv_grads = layer.conv.grads()
-                for p, g in zip(layer.conv.parameters(), conv_grads):
-                    params.append(p)
-                    grads.append(g)
-            else:
-                for p in layer.conv.parameters():
-                    params.append(p)
-                    grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+            for p in layer.conv.parameters():
+                params.append(p)
+                grads.append(getattr(p, 'grad', None))
         # LocalStateNetwork (if present)
         lsn = layer.laplace_package.get('local_state_network', None) if isinstance(layer.laplace_package, dict) else None
         if lsn and hasattr(lsn, 'parameters'):
-            if hasattr(lsn, 'grads') and callable(lsn.grads):
-                lsn_grads = lsn.grads()
-                for p, g in zip(lsn.parameters(), lsn_grads):
-                    params.append(p)
-                    grads.append(g)
-            else:
-                for p in lsn.parameters():
-                    params.append(p)
-                    grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+            for p in lsn.parameters():
+                params.append(p)
+                grads.append(getattr(p, 'grad', None))
         # Fallback: any other objects with .parameters
         if isinstance(layer.laplace_package, dict):
             for v in layer.laplace_package.values():
                 if hasattr(v, 'parameters'):
-                    if hasattr(v, 'grads') and callable(v.grads):
-                        v_grads = v.grads()
-                        for p, g in zip(v.parameters(), v_grads):
-                            params.append(p)
-                            grads.append(g)
-                    else:
-                        for p in v.parameters():
-                            params.append(p)
-                            grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+                    for p in v.parameters():
+                        params.append(p)
+                        grads.append(getattr(p, 'grad', None))
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
-            logger.info(f"Param {i}: shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
+            label = getattr(p, '_label', None)
+            logger.info(f"Param {i}: label={label}, shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
         return params, grads
 
     params, _ = collect_params_and_grads()
@@ -116,39 +99,24 @@ def main():
         for p in params:
             if hasattr(p, 'zero_grad'):
                 p.zero_grad()
-            elif hasattr(p, 'gW'):
-                p.gW = AbstractTensor.zeros_like(p.gW)
             elif hasattr(p, 'grad'):
                 p.grad = AbstractTensor.zeros_like(p.grad)
         y = layer.forward(x)
         loss = loss_fn(y, target)
-        # Backward pass (assume .backward() populates .grad or .gW)
+        # Backward pass (assume .backward() populates .grad)
         if hasattr(loss, 'backward'):
             loss.backward()
         # Re-collect params and grads (in case new tensors were created)
-        
         params, grads = collect_params_and_grads()
-
         for p in params:
-            assert hasattr(p, 'grad') or hasattr(p, 'gW'), f"Parameter {p} has no grad attribute"
-            if hasattr(p, 'grad'):
-                if p.grad is None:
-                    if not hasattr(p, 'grads') or not callable(p.grads):
-                        raise ValueError(f"Parameter {p} has no grads() method to compute gW")
-
-                    p.grad = p.grads()
-                assert p.grad.shape == p.shape, f"Parameter {p} has incorrect grad shape"
-            if hasattr(p, 'gW'):
-                if p.gW is None:
-                    if not hasattr(p, 'grads') or not callable(p.grads):
-                        raise ValueError(f"Parameter {p} has no grads() method to compute gW")
-                    p.gW = p.grads()
-                assert p.gW.shape == p.shape, f"Parameter {p} has incorrect gW shape"
-        for g in grads:
-            assert hasattr(g, 'shape'), f"Gradient {g} has no shape attribute"
-            assert g.shape == p.shape, f"Gradient {g} has incorrect shape"
-
-
+            label = getattr(p, '_label', None)
+            assert hasattr(p, 'grad'), f"Parameter {label or p} has no grad attribute"
+            assert p.grad is not None, f"Parameter {label or p} grad is None after backward()"
+            assert p.grad.shape == p.shape, f"Parameter {label or p} has incorrect grad shape: grad.shape={getattr(p.grad, 'shape', None)}, param.shape={getattr(p, 'shape', None)}"
+        for g, p in zip(grads, params):
+            label = getattr(p, '_label', None)
+            assert hasattr(g, 'shape'), f"Gradient for {label or p} has no shape attribute"
+            assert g.shape == p.shape, f"Gradient for {label or p} has incorrect shape: grad.shape={getattr(g, 'shape', None)}, param.shape={getattr(p, 'shape', None)}"
         optimizer.step(params, grads)
         if epoch % 100 == 0 or loss.item() < 1e-6:
             print(f"Epoch {epoch}: loss={loss.item():.2e}")

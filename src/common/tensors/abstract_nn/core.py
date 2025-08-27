@@ -23,12 +23,11 @@ def _to_tuple3(x):
 class Linear:
     def grads(self) -> List[AbstractTensor]:
         return [g for g in (self.gW, self.gb) if g is not None]
-    def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu"):
+    def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu", _label_prefix=None):
         self.like = like
         if init == "he" or init == "auto_relu":
             scale = math.sqrt(2.0 / float(in_dim))
         elif init == "xavier":
-            # Use a tanh-friendly Xavier gain by default
             scale = math.sqrt(1.0 / float(in_dim + out_dim))
         else:
             scale = 0.02
@@ -37,10 +36,11 @@ class Linear:
         )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
         self.W.requires_grad_(True)
-        # Seed a small positive bias to avoid symmetric stall at init
+        self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.W"
         self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
         if self.b is not None:
             self.b.requires_grad_(True)
+            self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.b"
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
