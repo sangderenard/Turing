@@ -1239,6 +1239,10 @@ class AbstractTensor:
 
         return lambda result: result
 
+    def matmul(self, other: AbstractTensor) -> AbstractTensor:
+        """Matrix multiplication."""
+        return self._apply_operator("matmul", self, other)
+
     def _apply_operator(self, op: str, left: Any, right: Any):
         """
         Arithmetic with bool tensors:

@@ -524,7 +524,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x": "N = number_of_elements_reduced; gx = expand_to(g, x.shape) / N"
         },
         "python": {
-            "parameters": ["g", "x", "axis", "keepdim"],
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
             "body": (
                 "N = max(1, x.numel() // max(1, g.numel())); "
                 "return expand_to(g, x.shape) / N"
@@ -534,6 +534,28 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Same broadcasting mechanics as `sum`, scaled by 1/N.",
         "tags": ["reduction", "linear"],
     },
+    "matmul": {
+        "arity": "binary",
+        "signature": "Y = matmul(A, B)  # ... x m x k  @  ... x k x n",
+        "latex": [
+            r"Y = A B,\quad dA = G B^\top,\quad dB = A^\top G",
+            r"(Broadcasted batch dims require summing over broadcast axes.)"
+        ],
+        "backward": {
+            "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
+            "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
+        },
+        "python": {
+            "parameters": ["g", "A", "B"],
+            "body": "gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); "
+                    "gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); "
+                    "return gA, gB"
+        },
+        "domain": "Inner dims match; batch dims broadcastable.",
+        "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
+        "tags": ["linear-algebra"],
+    },
+
     "var": {
         "arity": "unary",
         "signature": "y = var(x, axis=None, keepdim=False, unbiased=False)",
