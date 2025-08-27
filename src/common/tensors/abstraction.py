@@ -1871,6 +1871,41 @@ AbstractTensor.retain_grad    = _autograd_methods.retain_grad
 AbstractTensor.grad_fn        = _autograd_methods.grad_fn
 AbstractTensor.zero_grad      = _autograd_methods.zero_grad
 
+
+def grads(self):
+    """Return or compute the gradient for this tensor.
+
+    Priority is given to dynamic calculation via the lightweight autograd
+    engine.  Legacy attributes (``g``, ``gW``, ``gb``) are consulted only when
+    autograd cannot supply a gradient.
+    """
+
+    g = getattr(self, "grad", None)
+    if g is not None:
+        return g
+
+    # Attempt autograd if a loss has been recorded on the active tape.
+    tape = getattr(self, "_tape", None) or getattr(self.autograd, "tape", None)
+    loss = getattr(tape, "_loss_tensor", None) if tape is not None else None
+    if loss is not None:
+        try:
+            self.autograd.grad(loss, [self], allow_unused=True, retain_graph=True)
+            g = getattr(self, "grad", None)
+            if g is not None:
+                return g
+        except Exception:
+            pass
+
+    for name in ("g", "gW", "gb"):
+        alt = getattr(self, name, None)
+        if alt is not None:
+            return alt
+
+    raise AttributeError(f"{type(self).__name__} has no gradient information")
+
+
+AbstractTensor.grads = grads
+
 # Register backward algorithms and expose a helper for building pipelines
 _BACKWARD = BACKWARD_REGISTRY.register_from_module(_autograd_methods)
 
