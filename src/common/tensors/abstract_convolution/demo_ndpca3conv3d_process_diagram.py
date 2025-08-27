@@ -69,6 +69,108 @@ class DemoModel(Model):
         return x
 
 
+def replay_forward(proc: AutogradProcess, feed: dict[int, AbstractTensor]):
+    """Replay a forward pass using the schedule from ``proc``.
+
+    ``GradTape`` only records ``GradNode`` entries for tensors that are the
+    result of an operation. Leaf constants appear in the exported forward
+    graph (and therefore in ``forward_schedule``) but have no corresponding
+    entry in ``tape._nodes``. During replay we lazily inject these constant
+    values from the recorded operation context instead.
+    """
+
+    values = dict(feed)
+    for tid in proc.forward_schedule:
+        # Pre-supplied inputs and parameters already have values.
+        if tid in values:
+            continue
+
+        node = proc.tape._nodes.get(tid)
+        if node is None:
+            # Leaf tensor – pull original reference from the tape
+            tensor = proc.tape._tensor_refs.get(tid)
+            if tensor is None:
+                raise KeyError(tid)
+            values[tid] = tensor
+            continue
+        args = [values[parent] for parent, _ in node.parents]
+        result = getattr(args[0], node.op)(*args[1:], **node.ctx.get("params", {}))
+
+        values[tid] = result
+
+    return values
+
+
+def replay_training_step(
+    proc: AutogradProcess,
+    loss_id: int,
+    img_id: int,
+    target_id: int,
+    img_tensor: AbstractTensor,
+    target_tensor: AbstractTensor,
+    params: list[AbstractTensor],
+    reference: dict | None = None,
+):
+    rng_before = np.random.get_state()
+    feed = {
+        tid: ref
+        for tid, ref in proc.tape._tensor_refs.items()
+        if tid not in proc.tape._parameters
+    }
+    feed[img_id] = img_tensor
+    feed[target_id] = target_tensor
+    for tid, idx in proc.tape._parameters.items():
+        feed[tid] = params[idx]
+    values = replay_forward(proc, feed)
+    preds = list(proc.forward_graph.predecessors(loss_id))
+    if preds:
+        logits_tid = preds[0]
+        logits_val = values[logits_tid]
+    else:
+        logits_val = None
+        if reference:
+            print("Loss node has no predecessor; cannot compare logits")
+    loss_val = values[loss_id]
+    if reference and logits_val is not None:
+        _compare_tensors("logits", reference["logits"], logits_val)
+        _compare_tensors("loss", reference["loss"], loss_val)
+        assert np.allclose(
+            reference["logits"].data, logits_val.data, atol=1e-6
+        )
+        assert np.allclose(reference["loss"].data, loss_val.data, atol=1e-6)
+    grads = AbstractTensor.autograd.grad(
+        loss_val,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    if reference:
+        for idx, (g_ref, g_val) in enumerate(zip(reference["grads"], grads)):
+            if g_val is None:
+                continue
+            _compare_tensors(f"grad_{idx}", g_ref, g_val)
+    with AbstractTensor.autograd.no_grad():
+        optimizer = Adam(params, lr=LEARNING_RATE)
+        grads_for_opt = [
+            g if g is not None else AbstractTensor.zeros_like(p)
+            for p, g in zip(params, grads)
+        ]
+        new_params = optimizer.step(params, grads_for_opt)
+        for idx, (p, new_p) in enumerate(zip(params, new_params)):
+            AbstractTensor.copyto(p, new_p)
+            if reference:
+                _compare_tensors(
+                    f"param_{idx}", reference["updated_params"][idx], p
+                )
+                assert np.allclose(
+                    reference["updated_params"][idx].data, p.data, atol=1e-6
+                )
+    rng_after = np.random.get_state()
+    if reference and repr(reference.get("rng_state")) != repr(rng_after):
+        print("Replay consumed RNG differently")
+    return loss_val
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render training diagram for NDPCA3Conv3d demo")
     parser.add_argument("--format", choices=["png", "svg", "pdf"], default="png", help="Output image format")
@@ -164,99 +266,21 @@ def main() -> None:
 
     # --- replay and validate ---
 
-    def replay_forward(proc: AutogradProcess, feed: dict[int, AbstractTensor]):
-        """Replay a forward pass using the schedule from ``proc``.
-
-        ``GradTape`` only records ``GradNode`` entries for tensors that are the
-        result of an operation.  Leaf constants appear in the exported forward
-        graph (and therefore in ``forward_schedule``) but have no corresponding
-        entry in ``tape._nodes``.  The original implementation attempted to look
-        up every scheduled ID in ``_nodes`` which raised a ``KeyError`` when such
-        constants were encountered.  During replay we lazily inject these
-        constant values from the recorded operation context instead.
-        """
-
-        values = dict(feed)
-        for tid in proc.forward_schedule:
-            # Pre-supplied inputs and parameters already have values.
-            if tid in values:
-                continue
-
-            node = proc.tape._nodes.get(tid)
-            if node is None:
-                # Leaf tensor – pull original reference from the tape
-                tensor = proc.tape._tensor_refs.get(tid)
-                if tensor is None:
-                    raise KeyError(tid)
-                values[tid] = tensor
-                continue
-            args = [values[parent] for parent, _ in node.parents]
-            result = getattr(args[0], node.op)(*args[1:], **node.ctx.get('params', {}))
-
-            values[tid] = result
-
-        return values
-
-    def replay_training_step(
-        img_tensor: AbstractTensor,
-        target_tensor: AbstractTensor,
-        params: list[AbstractTensor],
-        reference: dict | None = None,
-    ):
-        rng_before = np.random.get_state()
-        # Seed feed with any tensors recorded on the tape (e.g. metrics)
-        feed = dict(proc.tape._tensor_refs)
-        feed.update({img_id: img_tensor, target_id: target_tensor})
-        for tid, idx in proc.tape._parameters.items():
-            feed[tid] = params[idx]
-        values = replay_forward(proc, feed)
-        preds = list(proc.forward_graph.predecessors(loss_id))
-        if preds:
-            logits_tid = preds[0]
-            logits_val = values[logits_tid]
-        else:
-            logits_val = None
-            if reference:
-                print("Loss node has no predecessor; cannot compare logits")
-        loss_val = values[loss_id]
-        if reference and logits_val is not None:
-            _compare_tensors("logits", reference["logits"], logits_val)
-            _compare_tensors("loss", reference["loss"], loss_val)
-        grads = AbstractTensor.autograd.grad(
-            loss_val,
-            params,
-            retain_graph=True,
-            allow_unused=True,
-        )
-        if reference:
-            for idx, (g_ref, g_val) in enumerate(zip(reference["grads"], grads)):
-                if g_val is None:
-                    continue
-                _compare_tensors(f"grad_{idx}", g_ref, g_val)
-        with AbstractTensor.autograd.no_grad():
-            optimizer = Adam(params, lr=LEARNING_RATE)
-            grads_for_opt = [
-                g if g is not None else AbstractTensor.zeros_like(p)
-                for p, g in zip(params, grads)
-            ]
-            new_params = optimizer.step(params, grads_for_opt)
-            for idx, (p, new_p) in enumerate(zip(params, new_params)):
-                AbstractTensor.copyto(p, new_p)
-                if reference:
-                    _compare_tensors(
-                        f"param_{idx}", reference["updated_params"][idx], p
-                    )
-        rng_after = np.random.get_state()
-        if reference and repr(reference.get("rng_state")) != repr(rng_after):
-            print("Replay consumed RNG differently")
-        return loss_val
-
     # Validate that replayed training reaches the same weights
     model_replay = DemoModel(like=img, grid_shape=(IMG_D, IMG_H, IMG_W))
     model_replay.package = package
     for p_new, p_old in zip(model_replay.parameters(), initial_params):
         AbstractTensor.copyto(p_new, p_old)
-    replay_training_step(img, target, model_replay.parameters(), diagnostics)
+    replay_training_step(
+        proc,
+        loss_id,
+        img_id,
+        target_id,
+        img,
+        target,
+        model_replay.parameters(),
+        diagnostics,
+    )
 
     expected = model.parameters()
     obtained = model_replay.parameters()
