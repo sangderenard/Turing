@@ -21,6 +21,8 @@ def _to_tuple3(x):
     return (x, x, x) if isinstance(x, int) else x
 
 class Linear:
+    def grads(self) -> List[AbstractTensor]:
+        return [g for g in (self.gW, self.gb) if g is not None]
     def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu"):
         self.like = like
         if init == "he" or init == "auto_relu":

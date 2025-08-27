@@ -11,9 +11,11 @@ Demo: Trains a RiemannConvolutional3D layer on a synthetic regression task, ensu
 This demo audits the full geometry-driven learning pipeline.
 """
 
+
 from .riemann_convolutional import RiemannConvolutional3D
 from .ndpca3transform import PCABasisND, fit_metric_pca, PCANDTransform
 from ..abstraction import AbstractTensor
+from src.common.tensors.abstract_nn.optimizer import Adam
 import numpy as np
 
 # --- 1. Build a synthetic PCA transform and grid ---
@@ -60,28 +62,51 @@ def main():
     target = (U + V + W).unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1, -1)
     # Input: random
     x = AT.randn((B, C, *grid_shape))
-    # Optimizer: all parameters including LocalStateNetwork
-    params = []
-    # Add convolutional weights
-    if hasattr(layer.conv, 'parameters'):
-        params += list(layer.conv.parameters())
-    # Add LocalStateNetwork parameters (if present)
-    if hasattr(layer.laplace_package, 'local_state_network') and hasattr(layer.laplace_package['local_state_network'], 'parameters'):
-        params += list(layer.laplace_package['local_state_network'].parameters())
-    # Fallback: try to collect from builder
-    if hasattr(layer, 'laplace_package') and isinstance(layer.laplace_package, dict):
-        for v in layer.laplace_package.values():
-            if hasattr(v, 'parameters'):
-                params += list(v.parameters())
-    # Use a simple SGD optimizer
-    optimizer = AT.optim.SGD(params, lr=1e-2)
+    # --- Parameter and gradient collection helpers ---
+    def collect_params_and_grads():
+        params, grads = [], []
+        # Convolutional weights
+        if hasattr(layer.conv, 'parameters'):
+            for p in layer.conv.parameters():
+                params.append(p)
+                grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+        # LocalStateNetwork (if present)
+        lsn = layer.laplace_package.get('local_state_network', None) if isinstance(layer.laplace_package, dict) else None
+        if lsn and hasattr(lsn, 'parameters'):
+            for p in lsn.parameters():
+                params.append(p)
+                grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+        # Fallback: any other objects with .parameters
+        if isinstance(layer.laplace_package, dict):
+            for v in layer.laplace_package.values():
+                if hasattr(v, 'parameters'):
+                    for p in v.parameters():
+                        params.append(p)
+                        grads.append(getattr(p, 'grad', None) if hasattr(p, 'grad') else getattr(p, 'g', None) or getattr(p, 'gW', None) or getattr(p, 'gb', None))
+        # Remove Nones (in case some params don't have grads yet)
+        params, grads = zip(*[(p, g) for p, g in zip(params, grads) if p is not None and g is not None]) if params else ([],[])
+        return list(params), list(grads)
+
+    params, _ = collect_params_and_grads()
+    optimizer = Adam(params, lr=1e-3)
     loss_fn = lambda y, t: ((y - t) ** 2).mean()
     for epoch in range(1, 10001):
-        optimizer.zero_grad()
+        # Zero gradients for all params
+        for p in params:
+            if hasattr(p, 'zero_grad'):
+                p.zero_grad()
+            elif hasattr(p, 'gW'):
+                p.gW = AbstractTensor.zeros_like(p.gW)
+            elif hasattr(p, 'grad'):
+                p.grad = AbstractTensor.zeros_like(p.grad)
         y = layer.forward(x)
         loss = loss_fn(y, target)
-        loss.backward()
-        optimizer.step()
+        # Backward pass (assume .backward() populates .grad or .gW)
+        if hasattr(loss, 'backward'):
+            loss.backward()
+        # Re-collect params and grads (in case new tensors were created)
+        params, grads = collect_params_and_grads()
+        optimizer.step(params, grads)
         if epoch % 100 == 0 or loss.item() < 1e-6:
             print(f"Epoch {epoch}: loss={loss.item():.2e}")
         if loss.item() < 1e-6:

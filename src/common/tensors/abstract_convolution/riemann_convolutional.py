@@ -10,6 +10,41 @@ from .ndpca3conv import NDPCA3Conv3d
 from ..abstraction import AbstractTensor
 
 class RiemannConvolutional3D:
+
+    def parameters(self):
+        params = []
+        if hasattr(self.conv, 'parameters') and callable(self.conv.parameters):
+            params.extend(self.conv.parameters())
+        # laplace_package may be a dict of modules
+        if isinstance(self.laplace_package, dict):
+            for v in self.laplace_package.values():
+                if hasattr(v, 'parameters') and callable(v.parameters):
+                    params.extend(v.parameters())
+        elif hasattr(self.laplace_package, 'parameters') and callable(self.laplace_package.parameters):
+            params.extend(self.laplace_package.parameters())
+        return params
+
+    def grads(self):
+        grads = []
+        if hasattr(self.conv, 'grads') and callable(self.conv.grads):
+            grads.extend(self.conv.grads())
+        if isinstance(self.laplace_package, dict):
+            for v in self.laplace_package.values():
+                if hasattr(v, 'grads') and callable(v.grads):
+                    grads.extend(v.grads())
+        elif hasattr(self.laplace_package, 'grads') and callable(self.laplace_package.grads):
+            grads.extend(self.laplace_package.grads())
+        return grads
+
+    def zero_grad(self):
+        if hasattr(self.conv, 'zero_grad') and callable(self.conv.zero_grad):
+            self.conv.zero_grad()
+        if isinstance(self.laplace_package, dict):
+            for v in self.laplace_package.values():
+                if hasattr(v, 'zero_grad') and callable(v.zero_grad):
+                    v.zero_grad()
+        elif hasattr(self.laplace_package, 'zero_grad') and callable(self.laplace_package.zero_grad):
+            self.laplace_package.zero_grad()
     """
     Metric-aware 3D convolutional layer using a Riemannian geometry pipeline.
 

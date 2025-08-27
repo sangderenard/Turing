@@ -128,9 +128,13 @@ class NDPCA3Conv3d:
     def grads(self) -> List[AbstractTensor]:
         gs: List[AbstractTensor] = [self.g_taps]
         if self.pointwise is not None:
-            gs.append(self.pointwise.gW)
-            if getattr(self.pointwise, "gb", None) is not None:
-                gs.append(self.pointwise.gb)
+            if hasattr(self.pointwise, 'grads') and callable(self.pointwise.grads):
+                gs.extend(self.pointwise.grads())
+            else:
+                if hasattr(self.pointwise, 'gW'):
+                    gs.append(self.pointwise.gW)
+                if getattr(self.pointwise, "gb", None) is not None:
+                    gs.append(self.pointwise.gb)
         return gs
 
     def zero_grad(self):

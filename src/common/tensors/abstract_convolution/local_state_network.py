@@ -87,6 +87,44 @@ DEFAULT_CONFIGURATION = {
             'modulated_padded': [{'func': lambda modulated: modulated, 'args': ['modulated_padded']}]
         }
 class LocalStateNetwork:
+    def grads(self):
+        """
+        Return a flat list of all gradients corresponding to parameters().
+        """
+        grads = [self.g_weight_layer]
+        # If spatial_layer has grads(), include them
+        if hasattr(self.spatial_layer, 'grads') and callable(self.spatial_layer.grads):
+            grads.extend(self.spatial_layer.grads())
+        # Recursively include inner_state grads if present
+        if self.inner_state is not None and hasattr(self.inner_state, 'grads'):
+            grads.extend(self.inner_state.grads())
+        return grads
+
+    def zero_grad(self):
+        """
+        Zero all gradients for this network and submodules.
+        """
+        if hasattr(self.g_weight_layer, 'zero_'):
+            self.g_weight_layer.zero_()
+        else:
+            self.g_weight_layer = AbstractTensor.zeros_like(self.g_weight_layer)
+        if hasattr(self.spatial_layer, 'zero_grad') and callable(self.spatial_layer.zero_grad):
+            self.spatial_layer.zero_grad()
+        if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
+            self.inner_state.zero_grad()
+    def parameters(self):
+        """
+        Return a flat list of all learnable parameters in this network, including weight_layer,
+        spatial_layer parameters, and recursively from inner_state if present.
+        """
+        params = [self.weight_layer]
+        # If spatial_layer has parameters(), include them
+        if hasattr(self.spatial_layer, 'parameters') and callable(self.spatial_layer.parameters):
+            params.extend(self.spatial_layer.parameters())
+        # Recursively include inner_state parameters if present
+        if self.inner_state is not None and hasattr(self.inner_state, 'parameters'):
+            params.extend(self.inner_state.parameters())
+        return params
     def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
