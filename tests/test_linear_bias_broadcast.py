@@ -47,3 +47,11 @@ def test_expand_is_view_on_numpy():
     t = NumPyTensorOperations.tensor_from_list([[1.0, 2.0]])
     expanded = t.expand((3, 2))
     assert np.shares_memory(expanded.data, t.data)
+
+
+def test_expand_accepts_varargs():
+    if NumPyTensorOperations is None:
+        pytest.skip("numpy backend not available")
+    t = NumPyTensorOperations.tensor_from_list([[1.0, 2.0]])
+    expanded = t.expand(3, 2)
+    assert expanded.shape == (3, 2)

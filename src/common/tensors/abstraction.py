@@ -905,8 +905,20 @@ class AbstractTensor:
 
 
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
-    def expand(self, shape: tuple) -> "AbstractTensor":
-        """Backend-agnostic expand/broadcast_to (view when possible)."""
+    def expand(self, *shape) -> "AbstractTensor":
+        """Backend-agnostic expand/broadcast_to (view when possible).
+
+        Accepts either a single iterable ``shape`` or multiple integer
+        dimensions, mirroring ``torch.Tensor.expand``.  All provided values are
+        collapsed into a single ``tuple`` before delegating to
+        :meth:`expand_`.
+        """
+
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        else:
+            shape = tuple(shape)
+
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.expand_(shape)
         return result
