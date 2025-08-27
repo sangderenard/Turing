@@ -127,11 +127,11 @@ class NDPCA3Conv3d:
             ps.extend(self.pointwise.parameters())
         return ps
 
-    def grads(self) -> List[AbstractTensor]:
+    def grad(self) -> List[AbstractTensor]:
         gs: List[AbstractTensor] = [self.g_taps]
         if self.pointwise is not None:
-            if hasattr(self.pointwise, 'grads') and callable(self.pointwise.grads):
-                gs.extend(self.pointwise.grads())
+            if hasattr(self.pointwise, 'grad') and callable(self.pointwise.grad):
+                gs.extend(self.pointwise.grad())
             else:
                 if hasattr(self.pointwise, 'gW'):
                     gs.append(self.pointwise.gW)
