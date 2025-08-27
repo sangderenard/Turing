@@ -704,7 +704,14 @@ class Autograd:
                 if bw is None:
                     continue
                 go = grad_out
-                parent_grads = bw(go, *node.ctx["inputs"])
+                params = node.ctx.get("params", {})
+                if params:
+                    import inspect
+                    sig = inspect.signature(bw)
+                    allowed = {k: v for k, v in params.items() if k in sig.parameters}
+                else:
+                    allowed = {}
+                parent_grads = bw(go, *node.ctx["inputs"], **allowed)
                 if not isinstance(parent_grads, (list, tuple)):
                     parent_grads = (parent_grads,)
                 for (pid, _), g in zip(node.parents, parent_grads):
