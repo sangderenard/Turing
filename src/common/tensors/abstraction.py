@@ -1458,7 +1458,7 @@ class AbstractTensor:
         if DEBUG:
             print(f"Unwrapped index: {index}")
             print(f"Data type: {type(data)}")
-        logger.info("getitem idx=%s tensor_id=%s", index, id(self))
+        logger.debug("getitem idx=%s tensor_id=%s", index, id(self))
 
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
@@ -1511,7 +1511,7 @@ class AbstractTensor:
         if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) > 0:
             raw_value = value.data if isinstance(value, AbstractTensor) else value
             data[index] = raw_value
-            logger.info("setitem idx=%s tensor_id=%s", index, id(self))
+            logger.debug("setitem idx=%s tensor_id=%s", index, id(self))
             return
 
         finalize = AbstractTensor._pre_autograd("index_set", [self, value], params={"idx": index})
@@ -1519,7 +1519,7 @@ class AbstractTensor:
         raw_value = value.data if isinstance(value, AbstractTensor) else value
         data[index] = raw_value
         finalize(self)
-        logger.info("setitem idx=%s tensor_id=%s", index, id(self))
+        logger.debug("setitem idx=%s tensor_id=%s", index, id(self))
 
     def __bool__(self):
         try:
