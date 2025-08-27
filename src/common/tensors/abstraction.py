@@ -38,6 +38,9 @@ except ImportError:
 
 # TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, _get_ops_for_class
 from . import DEBUG
+from .logger import get_tensors_logger
+
+logger = get_tensors_logger()
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     from .autograd import GradTape
@@ -1452,10 +1455,10 @@ class AbstractTensor:
             index = idx._AbstractTensor__unwrap()
         else:
             index = idx
-
         if DEBUG:
             print(f"Unwrapped index: {index}")
             print(f"Data type: {type(data)}")
+        logger.info("getitem idx=%s tensor_id=%s", index, id(self))
 
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
@@ -1495,9 +1498,6 @@ class AbstractTensor:
             raise ValueError("__setitem__ called on empty tensor")
         if CTensor is not None and isinstance(data, CTensor):
             raise NotImplementedError("__setitem__ not implemented for CTensor backend")
-        if isinstance(value, AbstractTensor):
-            value = value.data
-                
         if isinstance(idx, tuple):
             index = tuple(
                 item._AbstractTensor__unwrap() if isinstance(item, AbstractTensor) else item
@@ -1507,7 +1507,19 @@ class AbstractTensor:
             index = idx._AbstractTensor__unwrap()
         else:
             index = idx
-        data[index] = value
+
+        if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) > 0:
+            raw_value = value.data if isinstance(value, AbstractTensor) else value
+            data[index] = raw_value
+            logger.info("setitem idx=%s tensor_id=%s", index, id(self))
+            return
+
+        finalize = AbstractTensor._pre_autograd("index_set", [self, value], params={"idx": index})
+
+        raw_value = value.data if isinstance(value, AbstractTensor) else value
+        data[index] = raw_value
+        finalize(self)
+        logger.info("setitem idx=%s tensor_id=%s", index, id(self))
 
     def __bool__(self):
         try:
