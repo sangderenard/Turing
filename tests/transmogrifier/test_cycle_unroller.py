@@ -1,6 +1,11 @@
 import networkx as nx
+import pytest
 
-from src.transmogrifier.cycle_unroller import unroll_self_edges
+from src.transmogrifier.cycle_unroller import (
+    unroll_self_edges,
+    unroll_all_cycles_once,
+)
+from src.transmogrifier.ilpscheduler import ILPScheduler
 
 
 def test_unroll_self_edges_basic():
@@ -24,20 +29,71 @@ def test_unroll_self_edges_basic():
     assert unrolled.nodes["A_v0"]["color"] == "red"
     assert unrolled.nodes["A_v0"]["source"] == "A"
     assert unrolled.nodes["A_v1"]["version"] == 1
+    # Rebuilt parent/child metadata
+    assert {p for p, _ in unrolled.nodes["A_v1"]["parents"]} == {"A_v0"}
+    assert {c for c, _ in unrolled.nodes["A_v1"]["children"]} == {"B"}
+    assert {p for p, _ in unrolled.nodes["A_v0"]["parents"]} == {"B"}
+    assert {c for c, _ in unrolled.nodes["A_v0"]["children"]} == {"A_v1"}
 
 
-def test_unroll_multiple_self_loops():
+def test_unroll_all_cycles_once_multinode():
     g = nx.DiGraph()
-    g.add_edge("X", "X")
-    g.add_edge("X", "Y")
-    g.add_edge("Y", "X")
-    g.add_edge("Y", "Y")
+    g.add_edge("X", "A")  # incoming from outside
+    g.add_edge("A", "B")
+    g.add_edge("B", "C")
+    g.add_edge("C", "A")
+    g.add_edge("C", "Y")  # outgoing to outside
 
-    unrolled = unroll_self_edges(g)
+    unroll_all_cycles_once(g)
 
-    expected_nodes = {"X_v0", "X_v1", "Y_v0", "Y_v1"}
-    assert set(unrolled.nodes) == expected_nodes
-    assert unrolled.has_edge("X_v0", "X_v1")
-    assert unrolled.has_edge("Y_v0", "Y_v1")
-    assert unrolled.has_edge("X_v1", "Y_v0")
-    assert unrolled.has_edge("Y_v1", "X_v0")
+    expected_nodes = {
+        "A_v0",
+        "A_v1",
+        "B_v0",
+        "B_v1",
+        "C_v0",
+        "C_v1",
+        "X",
+        "Y",
+    }
+    assert set(g.nodes) == expected_nodes
+    assert g.has_edge("X", "A_v0")
+    assert g.has_edge("A_v0", "B_v1")
+    assert g.has_edge("B_v0", "C_v1")
+    assert g.has_edge("C_v0", "A_v1")
+    assert g.has_edge("C_v1", "Y")
+    # Stitch edges
+    for n in ["A", "B", "C"]:
+        assert g.has_edge(f"{n}_v0", f"{n}_v1")
+    assert nx.is_directed_acyclic_graph(g)
+    # Parent/child reconstruction matches edge structure
+    for node in g.nodes:
+        parents = {p for p, _ in g.nodes[node]["parents"]}
+        children = {c for c, _ in g.nodes[node]["children"]}
+        assert parents == set(g.predecessors(node))
+        assert children == set(g.successors(node))
+
+    class Dummy:
+        def __init__(self, G):
+            self.G = G
+
+    scheduler = ILPScheduler(Dummy(g))
+    levels = scheduler.compute_asap_levels()
+    assert levels["X"] == 0
+    assert levels["Y"] == 2
+
+
+def test_compute_asap_levels_cycle_detection():
+    g = nx.DiGraph()
+    g.add_node("A", parents=[("B", None)])
+    g.add_node("B", parents=[("A", None)])
+    g.add_edge("A", "B")
+    g.add_edge("B", "A")
+
+    class Dummy:
+        def __init__(self, G):
+            self.G = G
+
+    scheduler = ILPScheduler(Dummy(g))
+    with pytest.raises(ValueError):
+        scheduler.compute_asap_levels()
