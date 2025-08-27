@@ -7,6 +7,7 @@ import random, math
 from .utils import from_list_like, zeros_like, transpose2d
 from .activations import Identity
 from ..logger import get_tensors_logger
+from ..autograd import autograd
 
 logger = get_tensors_logger()
 
@@ -36,10 +37,14 @@ class Linear:
         )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
         self.W.requires_grad_(True)
+        self.W._tape = autograd.tape
+        autograd.tape.create_tensor_node(self.W)
         self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.W"
         self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
         if self.b is not None:
             self.b.requires_grad_(True)
+            self.b._tape = autograd.tape
+            autograd.tape.create_tensor_node(self.b)
             self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.b"
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
@@ -137,7 +142,14 @@ class RectConv2d:
             for _ in range(out_channels)
         ]
         self.W = from_list_like(w_data, like=like)
+        self.W.requires_grad_(True)
+        self.W._tape = autograd.tape
+        autograd.tape.create_tensor_node(self.W)
         self.b = from_list_like([0.0] * out_channels, like=like) if bias else None
+        if self.b is not None:
+            self.b.requires_grad_(True)
+            self.b._tape = autograd.tape
+            autograd.tape.create_tensor_node(self.b)
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
@@ -243,7 +255,14 @@ class RectConv3d:
             for _ in range(out_channels)
         ]
         self.W = from_list_like(w_data, like=like)
+        self.W.requires_grad_(True)
+        self.W._tape = autograd.tape
+        autograd.tape.create_tensor_node(self.W)
         self.b = from_list_like([0.0] * out_channels, like=like) if bias else None
+        if self.b is not None:
+            self.b.requires_grad_(True)
+            self.b._tape = autograd.tape
+            autograd.tape.create_tensor_node(self.b)
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
