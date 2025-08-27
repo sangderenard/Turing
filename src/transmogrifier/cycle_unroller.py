@@ -19,7 +19,7 @@ without maintaining a separate side table.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Iterable, Set
 
 import networkx as nx
 
@@ -88,3 +88,84 @@ def unroll_self_edges(graph: nx.DiGraph) -> nx.DiGraph:
     unrolled.graph["source_map"] = source_map
 
     return unrolled
+
+
+def sccs_with_cycles(graph: nx.DiGraph) -> Iterable[Set[str]]:
+    """Yield strongly connected components that contain at least one cycle.
+
+    Any SCC with more than one node necessarily contains a cycle.  A single
+    node component only represents a cycle if the node has a self-loop.  The
+    helper abstracts this logic and yields each qualifying component as a set
+    of node identifiers.
+    """
+
+    for scc in nx.strongly_connected_components(graph):
+        nodes = set(scc)
+        if len(nodes) > 1:
+            yield nodes
+        else:
+            n = next(iter(nodes))
+            if graph.has_edge(n, n):
+                yield nodes
+
+
+def unroll_scc_once(graph: nx.DiGraph, scc: Set[str]) -> None:
+    """Unroll a single strongly connected component in place.
+
+    Each node ``u`` in ``scc`` is replaced by two versions ``u_v0`` and
+    ``u_v1``.  Incoming edges from outside the component are redirected to
+    ``u_v0`` while outgoing edges to the outside originate from ``u_v1``.
+    Edges internal to the component now connect ``u_v0`` to ``v_v1`` which
+    breaks the cycle by enforcing a hop between versions.  Original nodes are
+    removed after rewiring.  Node attributes are copied verbatim and augmented
+    with ``"source"`` and ``"version"`` metadata.
+    """
+
+    v0 = {u: f"{u}_v0" for u in scc}
+    v1 = {u: f"{u}_v1" for u in scc}
+
+    # Create versioned nodes with copied attributes
+    for u in scc:
+        attrs = dict(graph.nodes[u])
+        for version, name in ((0, v0[u]), (1, v1[u])):
+            new_attrs = dict(attrs)
+            new_attrs["source"] = u
+            new_attrs["version"] = version
+            graph.add_node(name, **new_attrs)
+
+    # Rewire edges
+    for u in scc:
+        for pred in list(graph.predecessors(u)):
+            data = graph.get_edge_data(pred, u, default={})
+            if pred not in scc:
+                graph.add_edge(pred, v0[u], **data)
+        for succ in list(graph.successors(u)):
+            data = graph.get_edge_data(u, succ, default={})
+            if succ not in scc:
+                graph.add_edge(v1[u], succ, **data)
+            else:
+                graph.add_edge(v0[u], v1[succ], **data)
+
+    # Stitch per-node same-iteration step
+    for u in scc:
+        graph.add_edge(v0[u], v1[u])
+
+    # Remove originals
+    graph.remove_nodes_from(scc)
+
+
+def unroll_all_cycles_once(graph: nx.DiGraph) -> bool:
+    """Unroll every cyclic strongly connected component exactly once.
+
+    Returns ``True`` if any component was unrolled.
+    """
+
+    mutated = False
+    for scc in list(nx.strongly_connected_components(graph)):
+        nodes = set(scc)
+        has_cycle = len(nodes) > 1 or any(graph.has_edge(n, n) for n in nodes)
+        if not has_cycle:
+            continue
+        unroll_scc_once(graph, nodes)
+        mutated = True
+    return mutated

@@ -40,15 +40,25 @@ class ILPScheduler:
     # ----------------------
     def compute_asap_levels(self):
         levels = {}
+        state = {}  # white (default), gray, black
+
         def dfs(n):
-            if n in levels:
+            st = state.get(n, 'white')
+            if st == 'gray':
+                raise ValueError(f"Cycle detected during scheduling; node in cycle: {n}")
+            if st == 'black':
                 return levels[n]
+
+            state[n] = 'gray'
             preds = [p for p, _ in self.G.nodes[n]['parents']]
             lvl = 0 if not preds else 1 + max(dfs(p) for p in preds)
             levels[n] = lvl
+            state[n] = 'black'
             return lvl
+
         for nid in list(self.G.nodes):
-            dfs(nid)
+            if state.get(nid, 'white') == 'white':
+                dfs(nid)
         self.levels_asap = levels
         return levels
 
