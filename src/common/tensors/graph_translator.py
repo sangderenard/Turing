@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Type
 
 import networkx as nx
 
-from ...transmogrifier.cycle_unroller import unroll_self_edges
+from ...transmogrifier.cycle_unroller import unroll_all_cycles_once
 from ...transmogrifier.ilpscheduler import ILPScheduler
 
 
@@ -61,7 +61,7 @@ class GraphTranslator:
     def schedule(self, scheduler_cls: Type[ILPScheduler] = ILPScheduler) -> List:
         """Compute and cache execution order using ``scheduler_cls``."""
         if self._order is None:
-            sched_graph = unroll_self_edges(self.graph)
+            sched_graph = unroll_all_cycles_once(self.graph)
             proc = self._to_process_graph(sched_graph)
             sched = scheduler_cls(proc)
             raw_levels = sched.compute_levels("asap", "dependency")
