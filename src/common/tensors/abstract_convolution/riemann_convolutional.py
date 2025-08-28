@@ -52,10 +52,19 @@ class RiemannConvolutional3D:
     def __init__(self, in_channels, out_channels, grid_shape, transform, boundary_conditions=("dirichlet",)*6, k=3, eig_from="g", pointwise=True, laplace_kwargs=None):
         Nu, Nv, Nw = grid_shape
         self.transform = transform
+        U = AbstractTensor.linspace(-1.0, 1.0, Nu).reshape(Nu, 1, 1) * AbstractTensor.ones((1, Nv, Nw))
+        V = AbstractTensor.linspace(-1.0, 1.0, Nv).reshape(1, Nv, 1) * AbstractTensor.ones((Nu, 1, Nw))
+        W = AbstractTensor.linspace(-1.0, 1.0, Nw).reshape(1, 1, Nw) * AbstractTensor.ones((Nu, Nv, 1))
+        autograd.tape.annotate(U, label="RiemannConvolutional3D.grid_U")
+        autograd.tape.auto_annotate_eval(U)
+        autograd.tape.annotate(V, label="RiemannConvolutional3D.grid_V")
+        autograd.tape.auto_annotate_eval(V)
+        autograd.tape.annotate(W, label="RiemannConvolutional3D.grid_W")
+        autograd.tape.auto_annotate_eval(W)
         self.grid_domain = GridDomain(
-            AbstractTensor.linspace(-1.0, 1.0, Nu).reshape(Nu, 1, 1) * AbstractTensor.ones((1, Nv, Nw)),
-            AbstractTensor.linspace(-1.0, 1.0, Nv).reshape(1, Nv, 1) * AbstractTensor.ones((Nu, 1, Nw)),
-            AbstractTensor.linspace(-1.0, 1.0, Nw).reshape(1, 1, Nw) * AbstractTensor.ones((Nu, Nv, 1)),
+            U,
+            V,
+            W,
             grid_boundaries=(True,)*6,
             transform=transform,
             coordinate_system="rectangular"
@@ -93,8 +102,11 @@ class RiemannConvolutional3D:
         x: (B, C, Nu, Nv, Nw)
         Returns: (B, out_channels, Nu, Nv, Nw)
         """
+        autograd.tape.annotate(x, label="RiemannConvolutional3D.input")
+        autograd.tape.auto_annotate_eval(x)
         out = self.conv.forward(x, package=self.laplace_package)
         autograd.tape.annotate(out, label="RiemannConvolutional3D.output")
+        autograd.tape.auto_annotate_eval(out)
         return out
 
     def report_orphan_nodes(self, tape=None):
