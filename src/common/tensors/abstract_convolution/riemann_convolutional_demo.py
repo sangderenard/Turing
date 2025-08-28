@@ -15,6 +15,7 @@ This demo audits the full geometry-driven learning pipeline.
 from .riemann_convolutional import RiemannConvolutional3D
 from .ndpca3transform import PCABasisND, fit_metric_pca, PCANDTransform
 from ..abstraction import AbstractTensor
+from ..autograd import autograd
 from src.common.tensors.abstract_nn.optimizer import Adam
 import numpy as np
 
@@ -23,19 +24,39 @@ def build_transform_and_grid(Nu=8, Nv=8, Nw=8, n=8):
     AT = AbstractTensor
     B = 500
     t = AT.arange(0, B, 1)
+    autograd.tape.annotate(t, label="riemann_demo.t_arange")
+    autograd.tape.auto_annotate_eval(t)
     t = (t / (B - 1) - 0.5) * 6.283185307179586
+    autograd.tape.annotate(t, label="riemann_demo.t_scaled")
+    autograd.tape.auto_annotate_eval(t)
     base = AT.stack([
         t.sin(), t.cos(), (2 * t).sin(), (0.5 * t).cos(),
         (0.3 * t).sin(), (1.7 * t).cos(), (0.9 * t).sin(), (1.3 * t).cos()
     ], dim=-1)
+    autograd.tape.annotate(base, label="riemann_demo.base")
+    autograd.tape.auto_annotate_eval(base)
     scale = AT.get_tensor([2.0, 1.5, 1.2, 0.8, 0.5, 0.3, 0.2, 0.1])
+    autograd.tape.annotate(scale, label="riemann_demo.scale")
+    autograd.tape.auto_annotate_eval(scale)
     u_samples = base * scale
+    autograd.tape.annotate(u_samples, label="riemann_demo.u_samples")
+    autograd.tape.auto_annotate_eval(u_samples)
     weights = (-(t**2)).exp()
+    autograd.tape.annotate(weights, label="riemann_demo.weights")
+    autograd.tape.auto_annotate_eval(weights)
     M = AT.eye(n)
+    autograd.tape.annotate(M, label="riemann_demo.M_eye")
+    autograd.tape.auto_annotate_eval(M)
     diag = AT.get_tensor([1.0, 0.5, 0.25, 2.0, 1.0, 3.0, 0.8, 1.2])
+    autograd.tape.annotate(diag, label="riemann_demo.diag")
+    autograd.tape.auto_annotate_eval(diag)
     M = M * diag.reshape(1, -1)
     M = M.swapaxes(-1, -2) * diag.reshape(1, -1)
+    autograd.tape.annotate(M, label="riemann_demo.metric_M")
+    autograd.tape.auto_annotate_eval(M)
     basis = fit_metric_pca(u_samples, weights=weights, metric_M=M)
+    autograd.tape.annotate(basis, label="riemann_demo.basis")
+    autograd.tape.auto_annotate_eval(basis)
     def phi_fn(U, V, W):
         feats = [U, V, W, (U*V), (V*W), (W*U), (U.sin()), (V.cos())]
         return AT.stack(feats, dim=-1)
@@ -59,9 +80,19 @@ def main():
     )
     # Target: simple function of grid (e.g., sum of coordinates)
     U, V, W = layer.grid_domain.U, layer.grid_domain.V, layer.grid_domain.W
+    autograd.tape.annotate(U, label="riemann_demo.grid_U")
+    autograd.tape.auto_annotate_eval(U)
+    autograd.tape.annotate(V, label="riemann_demo.grid_V")
+    autograd.tape.auto_annotate_eval(V)
+    autograd.tape.annotate(W, label="riemann_demo.grid_W")
+    autograd.tape.auto_annotate_eval(W)
     target = (U + V + W).unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1, -1)
+    autograd.tape.annotate(target, label="riemann_demo.target")
+    autograd.tape.auto_annotate_eval(target)
     # Input: random
     x = AT.randn((B, C, *grid_shape), requires_grad=True)
+    autograd.tape.annotate(x, label="riemann_demo.input")
+    autograd.tape.auto_annotate_eval(x)
     # --- Parameter and gradient collection helpers ---
     from ..logger import get_tensors_logger
     logger = get_tensors_logger()
@@ -102,7 +133,10 @@ def main():
             elif hasattr(p, 'grad'):
                 p.grad = AbstractTensor.zeros_like(p.grad)
         y = layer.forward(x)
+        autograd.tape.auto_annotate_eval(y)
         loss = loss_fn(y, target)
+        autograd.tape.annotate(loss, label="riemann_demo.loss")
+        autograd.tape.auto_annotate_eval(loss)
         layer.report_orphan_nodes()
         # Backward pass (assume .backward() populates .grad)
         if hasattr(loss, 'backward'):

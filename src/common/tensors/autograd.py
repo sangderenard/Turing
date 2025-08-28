@@ -115,6 +115,7 @@ from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tup
 from contextlib import contextmanager
 
 import networkx as nx
+import hashlib
 from .nested_pack import pack_nested_to_tensor
 
 # Integrate the lightweight backward registry so that backward rules are
@@ -391,6 +392,41 @@ class GradTape:
                         p_anns.update(metadata)
             except Exception:
                 pass
+
+    def auto_annotate_eval(self, tensor: Any) -> None:
+        """Annotate ``tensor`` with an evaluation hash and lineage.
+
+        The evaluation hash is a SHA256 digest of the tensor's raw data when
+        available.  ``lineage`` captures all ancestor tensors contributing to
+        ``tensor``'s value, preferring previously assigned ``label`` metadata
+        and falling back to tensor ``id`` values.
+        """
+
+        meta: Dict[str, Any] = {}
+        data = getattr(tensor, "data", tensor)
+        try:
+            if hasattr(data, "tobytes"):
+                raw = data.tobytes()
+            else:
+                raw = str(data).encode()
+            meta["eval_hash"] = hashlib.sha256(raw).hexdigest()
+        except Exception:
+            pass
+
+        try:
+            lineage: List[Any] = []
+            names: List[Any] = []
+            for tid, _ in self.traverse(tensor):
+                anns = self.graph.nodes.get(tid, {}).get("annotations", {})
+                names.append(anns.get("label", tid))
+            lineage = list(reversed(names))
+            if lineage:
+                meta["lineage"] = lineage
+        except Exception:
+            pass
+
+        if meta:
+            self.annotate(tensor, **meta)
 
     # ------------------------------------------------------------------
     # traversal utilities
