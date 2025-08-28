@@ -4,3 +4,10 @@ from .losses import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
 from .optimizer import Adam
 from .train import train_step, train_loop
 from .utils import set_seed
+from .fused_program import (
+    Meta,
+    OpStep,
+    FusedProgram,
+    build_fused_program,
+    ProgramRunner,
+)
