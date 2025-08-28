@@ -36,10 +36,12 @@ class Linear:
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
         autograd.tape.create_tensor_node(self.W)
         self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.W"
+        autograd.tape.annotate(self.W, label=self.W._label)
         self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
         if self.b is not None:
             autograd.tape.create_tensor_node(self.b)
             self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.b"
+            autograd.tape.annotate(self.b, label=self.b._label)
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
@@ -55,11 +57,14 @@ class Linear:
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         logger.debug(f"Linear.forward called with input shape: {getattr(x, 'shape', None)}")
         out = x @ self.W
+        autograd.tape.annotate(out, label="Linear.forward.matmul")
         logger.debug(f"Linear matmul output shape: {getattr(out, 'shape', None)}")
         if self.b is not None:
             b = self.b.broadcast_rows(out.shape[0], label="Linear.forward(bias)")
+            autograd.tape.annotate(b, label="Linear.forward.bias_broadcast")
             logger.debug(f"Linear bias broadcasted shape: {getattr(b, 'shape', None)}")
             out = out + b
+        autograd.tape.annotate(out, label="Linear.forward.output")
         return out
 
 

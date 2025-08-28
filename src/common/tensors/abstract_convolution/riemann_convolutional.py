@@ -93,7 +93,9 @@ class RiemannConvolutional3D:
         x: (B, C, Nu, Nv, Nw)
         Returns: (B, out_channels, Nu, Nv, Nw)
         """
-        return self.conv.forward(x, package=self.laplace_package)
+        out = self.conv.forward(x, package=self.laplace_package)
+        autograd.tape.annotate(out, label="RiemannConvolutional3D.output")
+        return out
 
     def report_orphan_nodes(self, tape=None):
         """Print information about nodes with no children on ``tape``.
