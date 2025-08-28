@@ -112,6 +112,7 @@ accumulate gradients for requested inputs.
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
+import os
 from contextlib import contextmanager
 
 import networkx as nx
@@ -216,6 +217,35 @@ class GradTape:
         return fwd, bwd, params_tensor, id_map
 
     # ------------------------------------------------------------------
+    # strict validation utilities
+    # ------------------------------------------------------------------
+    def validate_backward_ops(self, result: Any) -> list[dict[str, Any]]:
+        """Return a list of missing-backward op diagnostics reachable from ``result``.
+
+        Walk the recorded graph from ``result`` and report any operation nodes
+        whose ``op`` is not registered in BACKWARD_REGISTRY. Each entry
+        includes the op name and basic context (shapes, dtypes) to aid debugging.
+        """
+        missing: list[dict[str, Any]] = []
+        for tid, node in self.traverse(result):
+            op = node.op
+            fn = BACKWARD_REGISTRY._methods.get(op)
+            if fn is not None:
+                continue
+            ctx = node.ctx
+            info = {
+                "tensor_id": tid,
+                "op": op,
+                "input_shapes": ctx.get("input_shapes"),
+                "result_shape": ctx.get("result_shape"),
+                "input_dtypes": ctx.get("input_dtypes"),
+                "result_dtype": ctx.get("result_dtype"),
+                "params": ctx.get("params", {}),
+            }
+            missing.append(info)
+        return missing
+
+    # ------------------------------------------------------------------
     # orphan detection utilities
     # ------------------------------------------------------------------
     def orphan_data(self) -> List[Dict[str, Any]]:
@@ -301,11 +331,33 @@ class GradTape:
         if start is not None and end is not None:
             elapsed = end - start
 
+        # Tape payload policy: reduce memory by avoiding raw data storage.
+        # AUTOGRAD_TAPE_DATA = 'none' | 'summary' | 'full'
+        _payload_mode = os.environ.get("AUTOGRAD_TAPE_DATA", "none").lower()
+
+        def _summarize(x: Any) -> Dict[str, Any]:
+            d = getattr(x, "data", x)
+            return {
+                "shape": getattr(d, "shape", getattr(x, "shape", None)),
+                "dtype": getattr(d, "dtype", getattr(x, "dtype", None)),
+                "device": getattr(d, "device", getattr(x, "device", None)),
+            }
+
+        if _payload_mode == "full":
+            inputs_payload = [x.data if hasattr(x, "data") else x for x in inputs]
+            result_payload = result.data if hasattr(result, "data") else result
+        elif _payload_mode == "summary":
+            inputs_payload = [_summarize(x) for x in inputs]
+            result_payload = _summarize(result)
+        else:  # 'none' (default)
+            inputs_payload = None
+            result_payload = None
+
         ctx = {
             "inputs": list(inputs),
             "result": result,
-            "inputs_data": [x.data if hasattr(x, "data") else x for x in inputs],
-            "result_data": result.data if hasattr(result, "data") else result,
+            "inputs_data": inputs_payload,
+            "result_data": result_payload,
             "input_shapes": [getattr(x, "shape", None) for x in inputs],
             "result_shape": getattr(result, "shape", None),
             "input_dtypes": [_dtype(x) for x in inputs],
@@ -699,6 +751,10 @@ class Autograd:
         self.tape = GradTape()
         self._no_grad_depth = 0
         self.capture_all = False
+        # Strict mode: when True validate that all recorded ops reachable from
+        # the loss have registered backward rules before attempting backprop.
+        import os
+        self.strict = os.environ.get("AUTOGRAD_STRICT", "0") not in ("0", "false", "False", None)
 
     @contextmanager
     def no_grad(self) -> Generator[None, None, None]:
@@ -755,6 +811,97 @@ class Autograd:
         retain_graph: bool = False,
         allow_unused: bool = False,
     ) -> List[Any]:
+        # Strict-mode preflight: fail fast on missing backward ops
+        if self.strict:
+            try:
+                missing = self.tape.validate_backward_ops(output)
+            except Exception:
+                missing = []
+            if missing:
+                lines = [
+                    f"missing backward for op='{m['op']}' result_shape={m.get('result_shape')} input_shapes={m.get('input_shapes')}"
+                    for m in missing
+                ]
+                detail = "\n".join(lines)
+                raise RuntimeError("Strict autograd: missing backward implementations for reachable ops:\n" + detail)
+            # Also validate parameter connectivity: any input not present in the backward graph
+            try:
+                bwd_graph = self.tape.export_backward_graph(output)
+            except Exception:
+                bwd_graph = None
+            if bwd_graph is not None and inputs is not None:
+                broken: list[str] = []
+                import networkx as nx
+                # Helper: describe immediate op neighbors and whether each has a backward rule and a path-to-loss
+                def _describe_neighbors(pid: int) -> list[dict[str, any]]:
+                    desc: list[dict[str, any]] = []
+                    G = self.tape.graph
+                    for op_node in G.successors(pid):
+                        node_data = G.nodes.get(op_node, {})
+                        if node_data.get("kind") != "op":
+                            continue
+                        op_name = node_data.get("op")
+                        has_bw = BACKWARD_REGISTRY._methods.get(op_name) is not None
+                        # find produced tensor(s)
+                        results = []
+                        for rid in G.successors(op_node):
+                            if G.nodes.get(rid, {}).get("kind") == "tensor":
+                                results.append(rid)
+                        # path to loss from any result
+                        to_loss = False
+                        for rid in results:
+                            try:
+                                if self.tape._loss_id is not None and nx.has_path(G, rid, self.tape._loss_id):
+                                    to_loss = True
+                                    break
+                            except Exception:
+                                pass
+                        desc.append({
+                            "op": op_name,
+                            "op_node": op_node,
+                            "has_backward": has_bw,
+                            "results": results,
+                            "result_shapes": [self.tape._nodes.get(rid, {}).ctx.get("result_shape") if rid in self.tape._nodes else None for rid in results],
+                            "path_to_loss_from_result": to_loss,
+                        })
+                    return desc
+                for idx, p in enumerate(inputs):
+                    try:
+                        pid = id(p)
+                    except Exception:
+                        continue
+                    if bwd_graph.has_node(pid):
+                        continue
+                    # Connectivity diagnostics: forward presence, consumers, path existence
+                    present = self.tape.graph.has_node(pid)
+                    consumers = []
+                    for rid, node in self.tape._nodes.items():
+                        ctx = node.ctx
+                        ins = ctx.get("inputs", [])
+                        in_ids = [id(t) for t in ins]
+                        if pid in in_ids:
+                            consumers.append({
+                                "op": node.op,
+                                "result_id": rid,
+                                "result_shape": ctx.get("result_shape"),
+                                "input_ids": in_ids,
+                            })
+                    try:
+                        to_loss = self.tape._loss_id is not None and nx.has_path(self.tape.graph, pid, self.tape._loss_id)
+                    except Exception:
+                        to_loss = None
+                    neighbors = _describe_neighbors(pid)
+                    lbl = getattr(p, "_label", None) or getattr(p, "shape", None) or f"input[{idx}]"
+                    broken.append(
+                        "\n".join([
+                            f"param index={idx} id={pid} label={lbl}",
+                            f"  on_forward={present} path_to_loss={to_loss}",
+                            f"  consumers={consumers}",
+                            f"  neighbor_ops={neighbors}",
+                        ])
+                    )
+                if broken:
+                    raise RuntimeError("Strict autograd: parameter(s) not connected to loss.\n" + "\n".join(broken))
         if isinstance(inputs, (list, tuple, set)):
             inputs = list(inputs)
         else:

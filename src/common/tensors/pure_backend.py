@@ -79,9 +79,13 @@ class PurePythonTensorOperations(AbstractTensor):
             return [recursive_swap(sub, axis1, axis2, depth+1) for sub in data]
         return recursive_swap(self.data, axis1, axis2)
     def empty_(self, size, dtype=None, device=None):
+        # Produce a nested Python list with the requested shape.
+        # Base case: scalar shape () → return an empty list as a placeholder to
+        # mirror "uninitialized" semantics in a list context.
         if not size:
-            return None
-        return [self.empty_(size[1:], dtype, device) for _ in range(size[0])]
+            return []
+        # If any leading dimension is zero, list comprehension naturally yields [].
+        return [self.empty_(size[1:], dtype, device) for _ in range(max(int(size[0]), 0))]
     def allclose_(self, other, rtol=1e-5, atol=1e-8, equal_nan=False):
         import math
         from .abstraction import _flatten, _get_shape

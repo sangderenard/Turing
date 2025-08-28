@@ -190,5 +190,7 @@ def unroll_all_cycles_once(graph: nx.DiGraph) -> bool:
         mutated = True
     if mutated:
         rebuild_parents_children(graph)
-        graph.graph["source_map"] = {n: graph.nodes[n].get("source", n) for n in graph.nodes}
+    # Always provide a source_map, even when no mutation occurred.
+    # Identity mapping when nodes were not versioned.
+    graph.graph["source_map"] = {n: graph.nodes[n].get("source", n) for n in graph.nodes}
     return graph.graph["source_map"]

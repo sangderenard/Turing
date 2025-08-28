@@ -34,29 +34,33 @@ class ManifoldPackage:
     def build(self) -> None:
         """Build the Laplace package (and optionally eigenpairs)."""
         from ..abstract_convolution.laplace_nd import BuildLaplace3D
+        from ..autograd import autograd
 
-        builder = BuildLaplace3D(
-            grid_domain=self.grid_domain,
-            metric_tensor_func=self.transform.metric_tensor_func,
-            **self.laplace_kwargs,
-        )
-        # Build dense Laplacian for small grids to enable AbstractTensor eigh
-        laplace_dense, _, package = builder.build_general_laplace(
-            self.grid_domain.U,
-            self.grid_domain.V,
-            self.grid_domain.W,
-            dense=True,
-            return_package=True,
-        )
-        self.package = package
-        # Eigenpairs (optional)
-        if self.num_eigenpairs and isinstance(laplace_dense, AbstractTensor):
-            # Compute full symmetric eigendecomposition (ascending eigenvalues)
-            w, V = AbstractTensor.linalg.eigh(laplace_dense)
-            # Keep the first num_eigenpairs (smallest magnitude modes)
-            k = max(1, int(self.num_eigenpairs))
-            self.evals = w[:k]
-            self.evecs = V[:, :k]
+        # Heavy geometry precompute should not be tracked by autograd.
+        # Wrap the entire build in no_grad to prevent tape growth and memory spikes.
+        with autograd.no_grad():
+            builder = BuildLaplace3D(
+                grid_domain=self.grid_domain,
+                metric_tensor_func=self.transform.metric_tensor_func,
+                **self.laplace_kwargs,
+            )
+            # Build dense Laplacian for small grids to enable AbstractTensor eigh
+            laplace_dense, _, package = builder.build_general_laplace(
+                self.grid_domain.U,
+                self.grid_domain.V,
+                self.grid_domain.W,
+                dense=True,
+                return_package=True,
+            )
+            self.package = package
+            # Eigenpairs (optional)
+            if self.num_eigenpairs and isinstance(laplace_dense, AbstractTensor):
+                # Compute full symmetric eigendecomposition (ascending eigenvalues)
+                w, V = AbstractTensor.linalg.eigh(laplace_dense)
+                # Keep the first num_eigenpairs (smallest magnitude modes)
+                k = max(1, int(self.num_eigenpairs))
+                self.evals = w[:k]
+                self.evecs = V[:, :k]
 
     def laplace_package(self) -> dict:
         if self.package is None:

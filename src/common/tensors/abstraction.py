@@ -688,7 +688,22 @@ class AbstractTensor:
         # Use the specific backend class
         inst = cls(track_time=track_time, tape=tape)
         if data is None:
-            return inst  # handle-as-backend-handle case, like get_tensor(None)
+            # Initialize a concrete empty tensor on the selected backend so the
+            # object has a valid `.data` payload. This avoids leaking
+            # uninitialized "backend handles" into code paths that expect real
+            # tensors (numel/item/dtype/device).
+            try:  # backends implement empty_(shape, dtype, device)
+                empty_buf = inst.empty_((0,), dtype=dtype, device=device)
+                try:
+                    inst.data = empty_buf  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            except Exception:
+                # If backend lacks empty_ or assignment fails, fall back to
+                # returning the instance without data; callers must avoid
+                # truthiness/numel/item on it.
+                pass
+            return inst
 
         out = inst.ensure_tensor(data)
         if dtype is not None:
@@ -1401,11 +1416,20 @@ class AbstractTensor:
         elif isinstance(right, AbstractTensor) and isinstance(left, (list, tuple)):
             left = right.ensure_tensor(left)       # instead of get_tensor(... Faculty.NUMPY)
 
+        # Record first using the original operand wrappers so parameter identity
+        # is preserved on the tape (ids match actual model params).
         finalize = AbstractTensor._pre_autograd(op, [x for x in (left, right) if x is not None])
 
-        # Optional belt-and-suspenders: align mixed backends
+        # Optional belt-and-suspenders: align mixed backends AFTER recording so
+        # backend execution receives compatible operands without altering tape inputs.
         if isinstance(left, AbstractTensor) and isinstance(right, AbstractTensor) and (type(left) is not type(right)):
-            right = right.to_backend(left)
+            try:
+                right = right.to_backend(left)
+            except Exception:
+                try:
+                    left = left.to_backend(right)
+                except Exception:
+                    pass
 
         arithmetic_ops = {
             "add","sub","mul","truediv","floordiv","mod","pow",
