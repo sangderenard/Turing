@@ -96,21 +96,18 @@ def register_hook(self, hook):  # pragma: no cover - hooks not supported
 
 
 """Lightweight automatic differentiation helpers.
-
-The project purposely keeps the autograd core extremely small.  Only a tiny
-subset of primitive arithmetic operators are supported which is sufficient for
-educational examples and the pure/numpy backends.  Torch and JAX backends rely
-on their native autograd systems and therefore bypass this module entirely.
-
-The implementation below provides two main pieces:
-
-* ``GradTape`` – records a very small computation graph.
+\nThis module implements a backend-agnostic autograd system.  All tensor
+implementations in the repository use the same pure-Python tape mechanics; no
+external library is required for differentiation.  Only a limited set of
+primitive arithmetic operators is currently covered, matching the needs of the
+educational examples built on top of the tape.
+\nThe implementation below provides two main pieces:
+\n* ``GradTape`` – records a compact computation graph.
 * ``Autograd`` – exposes ``record`` and ``grad`` helpers and houses backward
   rules for primitive operators (``add``, ``mul``, ``truediv``, ``pow``, ...).
-
-Backends without a native autograd can call ``Autograd.record`` after executing
-an operator to append a node to the tape.  ``Autograd.grad`` then walks the
-recorded graph in reverse to accumulate gradients for requested inputs.
+\nBackends call ``Autograd.record`` after executing an operator to append a node
+to the tape.  ``Autograd.grad`` then walks the recorded graph in reverse to
+accumulate gradients for requested inputs.
 """
 
 from dataclasses import dataclass
@@ -229,6 +226,30 @@ class GradTape:
         bwd = self.export_backward_graph(self._loss_tensor)
         params_tensor, id_map = self.parameters()
         return fwd, bwd, params_tensor, id_map
+
+    # ------------------------------------------------------------------
+    # orphan detection utilities
+    # ------------------------------------------------------------------
+    def orphan_data(self) -> List[Dict[str, Any]]:
+        """Collect metadata for graph nodes that have no children.
+
+        Returns
+        -------
+        list of dict
+            Each entry contains the ``id`` of the tensor, a ``tensor``
+            reference if still alive, and any stored ``annotations``.
+        """
+
+        orphans: List[Dict[str, Any]] = []
+        for nid in self.graph.nodes:
+            if self.graph.out_degree(nid) == 0:
+                info = {
+                    "id": nid,
+                    "tensor": self._tensor_refs.get(nid),
+                    "annotations": self.graph.nodes[nid].get("annotations", {}),
+                }
+                orphans.append(info)
+        return orphans
 
     # ------------------------------------------------------------------
     # recording utilities
@@ -641,7 +662,7 @@ class TapeProfiler:
 
 
 class Autograd:
-    """Very small reverse-mode autodiff engine."""
+    """Reverse-mode autodiff engine."""
 
     def __init__(self) -> None:
         self.tape = GradTape()

@@ -8,6 +8,7 @@ Defines a RiemannConvolutional3D layer: a metric-aware 3D convolutional layer th
 from .laplace_nd import BuildLaplace3D, GridDomain
 from .ndpca3conv import NDPCA3Conv3d
 from ..abstraction import AbstractTensor
+from ..autograd import autograd
 
 class RiemannConvolutional3D:
 
@@ -93,3 +94,26 @@ class RiemannConvolutional3D:
         Returns: (B, out_channels, Nu, Nv, Nw)
         """
         return self.conv.forward(x, package=self.laplace_package)
+
+    def report_orphan_nodes(self, tape=None):
+        """Print information about nodes with no children on ``tape``.
+
+        Parameters
+        ----------
+        tape : GradTape, optional
+            Tape to inspect. Defaults to the global autograd tape.
+
+        Returns
+        -------
+        list of dict
+            Metadata describing orphan nodes.
+        """
+        tape = tape or autograd.tape
+        if tape is None:
+            return []
+        orphans = getattr(tape, "orphan_data", lambda: [])()
+        for info in orphans:
+            tid = info.get("id")
+            anns = info.get("annotations", {})
+            print(f"orphan node id={tid} annotations={anns}")
+        return orphans
