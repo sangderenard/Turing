@@ -511,6 +511,7 @@ class AbstractTensor:
 
         # 4. If all else fails, raise an error
         raise RuntimeError("No suitable tensor backend is available to create a tensor from list.")
+
     @classmethod
     def _tensor_from_list(
         cls,

@@ -8,7 +8,6 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.full()
 - AbstractTensor.zeros()
 - AbstractTensor.arange()
-- AbstractTensor.tensor_from_list()
 - AbstractTensor.clone()
 
 ## Device & Dtype Management
