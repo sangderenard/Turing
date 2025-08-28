@@ -37,7 +37,12 @@ class Linear:
         autograd.tape.create_tensor_node(self.W)
         self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.W"
         autograd.tape.annotate(self.W, label=self.W._label)
-        self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
+        # Bias should be a trainable parameter registered on the current tape
+        self.b = (
+            from_list_like([[0.01] * out_dim], like=like, requires_grad=True, tape=autograd.tape)
+            if bias
+            else None
+        )
         if self.b is not None:
             autograd.tape.create_tensor_node(self.b)
             self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.b"
@@ -55,15 +60,28 @@ class Linear:
             self.b.zero_grad()
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
+        # Ensure parameters are registered on the current tape so loss.backward()
+        # can discover them via the tape's parameter registry even after tape resets.
+        try:
+            tape = autograd.tape
+            for p in (self.W, self.b) if self.b is not None else (self.W,):
+                if p is None:
+                    continue
+                try:
+                    p._tape = tape  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                tape.create_tensor_node(p)
+        except Exception:
+            pass
         logger.debug(f"Linear.forward called with input shape: {getattr(x, 'shape', None)}")
         out = x @ self.W
         autograd.tape.annotate(out, label="Linear.forward.matmul")
         logger.debug(f"Linear matmul output shape: {getattr(out, 'shape', None)}")
         if self.b is not None:
-            b = self.b.broadcast_rows(out.shape[0], label="Linear.forward(bias)")
-            autograd.tape.annotate(b, label="Linear.forward.bias_broadcast")
-            logger.debug(f"Linear bias broadcasted shape: {getattr(b, 'shape', None)}")
-            out = out + b
+            # Rely on backend broadcasting for (N,D) + (1,D). The add backward
+            # rule will unbroadcast gradients back to the bias shape directly.
+            out = out + self.b
         autograd.tape.annotate(out, label="Linear.forward.output")
         return out
 
@@ -148,6 +166,19 @@ class RectConv2d:
         self._x_shape = None
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
+        # Re-register parameters on the current tape for this forward pass
+        try:
+            tape = autograd.tape
+            for p in (self.W, self.b) if self.b is not None else (self.W,):
+                if p is None:
+                    continue
+                try:
+                    p._tape = tape  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                tape.create_tensor_node(p)
+        except Exception:
+            pass
         self._x = x
         self._x_shape = x.shape
         cols = x.unfold2d(
@@ -269,43 +300,49 @@ class RectConv3d:
         self._x_shape = None
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
-        import numpy as np
-        from numpy.lib.stride_tricks import sliding_window_view
+        # Re-register parameters on the current tape for this forward pass
+        try:
+            tape = autograd.tape
+            for p in (self.W, self.b) if self.b is not None else (self.W,):
+                if p is None:
+                    continue
+                try:
+                    p._tape = tape  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                tape.create_tensor_node(p)
+        except Exception:
+            pass
 
         self._x = x
         self._x_shape = x.shape
-        arr = x.data
-        pD, pH, pW = self.padding
-        arr_p = np.pad(arr, ((0, 0), (0, 0), (pD, pD), (pH, pH), (pW, pW)))
+        # Unfold using AbstractTensor op
+        cols = x.unfold3d(
+            self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        self._cols = cols
+        N = self._x_shape[0]
         kD, kH, kW = self.kernel_size
         sD, sH, sW = self.stride
         dD, dH, dW = self.dilation
+        D, H, W = self._x_shape[2], self._x_shape[3], self._x_shape[4]
+        Dpad, Hpad, Wpad = D + 2 * self.padding[0], H + 2 * self.padding[1], W + 2 * self.padding[2]
         eKD = dD * (kD - 1) + 1
         eKH = dH * (kH - 1) + 1
         eKW = dW * (kW - 1) + 1
-        win = sliding_window_view(arr_p, (eKD, eKH, eKW), axis=(2, 3, 4))
-        win = win[:, :, ::sD, ::sH, ::sW, ::dD, ::dH, ::dW]
-        N = self._x_shape[0]
-        Dout, Hout, Wout = win.shape[2], win.shape[3], win.shape[4]
-        cols = np.transpose(win, (0, 1, 5, 6, 7, 2, 3, 4)).reshape(
-            N, self.in_channels * kD * kH * kW, Dout * Hout * Wout
-        )
-        # Wrap cols as a tensor on the same backend and tape as x
-        cols_t = AbstractTensor.get_tensor(
-            cols,
-            cls=type(x),
-            track_time=False,
-            tape=getattr(x, "_tape", None),
-        )
-        self._cols = cols_t
+        Dout = (Dpad - eKD) // sD + 1
+        Hout = (Hpad - eKH) // sH + 1
+        Wout = (Wpad - eKW) // sW + 1
         Wm = self.W.reshape(self.out_channels, -1)
-        out = Wm @ cols_t
+        out = Wm @ cols
         if self.b is not None:
             out = out + self.b.reshape(1, -1, 1)
         return out.reshape(N, self.out_channels, Dout, Hout, Wout)
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        import numpy as np
         if self._x is None or self._cols is None or self._x_shape is None:
             raise RuntimeError("RectConv3d.backward called before forward")
         N, _, Dout, Hout, Wout = grad_out.shape
@@ -319,37 +356,18 @@ class RectConv3d:
         Wm = self.W.reshape(self.out_channels, -1)
         WT = Wm.transpose(0, 1)
         dcols = WT @ grad_mat
-        dcols_np = dcols.data
-        C = self.in_channels
-        kD, kH, kW = self.kernel_size
-        sD, sH, sW = self.stride
-        pD, pH, pW = self.padding
-        dD, dH, dW = self.dilation
-        D, H, W = self._x_shape[2], self._x_shape[3], self._x_shape[4]
-        dcols_np = dcols_np.reshape(N, C, kD, kH, kW, Dout, Hout, Wout)
-        grad_win = np.transpose(dcols_np, (0, 1, 5, 6, 7, 2, 3, 4))
-        dx_p = np.zeros((N, C, D + 2 * pD, H + 2 * pH, W + 2 * pW), dtype=dcols_np.dtype)
-        for kd in range(kD):
-            d_slice = slice(kd * dD, kd * dD + sD * Dout, sD)
-            for kh in range(kH):
-                h_slice = slice(kh * dH, kh * dH + sH * Hout, sH)
-                for kw in range(kW):
-                    w_slice = slice(kw * dW, kw * dW + sW * Wout, sW)
-                    dx_p[:, :, d_slice, h_slice, w_slice] += grad_win[
-                        :, :, :, :, :, kd, kh, kw
-                    ]
-        dx = dx_p[:, :, pD : pD + D, pH : pH + H, pW : pW + W]
-        # Wrap dx as a tensor on the same backend and tape as the original input
-        result = AbstractTensor.get_tensor(
-            dx,
-            cls=type(self._x),
-            track_time=False,
-            tape=getattr(self._x, "_tape", None),
+        dx = AbstractTensor.fold3d(
+            dcols,
+            output_size=self._x_shape,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
         )
         self._x = None
         self._cols = None
         self._x_shape = None
-        return result
+        return dx
 
 
 class MaxPool2d:

@@ -1,8 +1,13 @@
 """
-riemann_convolutional.py
------------------------
+metric_steered_conv3d.py
+------------------------
 
-Defines a RiemannConvolutional3D layer: a metric-aware 3D convolutional layer that builds its geometry and Laplacian package from a user-supplied PCANDTransform (or compatible transform), using the canonical GridDomain pipeline. This is the intended, correct pattern for geometry-driven convolution.
+Wrapper that builds the geometry package (via Transform → GridDomain →
+BuildLaplace3D) and applies the metric‑steered separable conv (NDPCA3Conv3d).
+
+This is a rename/clarification of the former RiemannConvolutional3D wrapper:
+it orchestrates the correct pipeline but does not itself implement a full
+geodesic/Riemannian convolution; the primitive operator is metric‑steered.
 """
 
 from .laplace_nd import BuildLaplace3D, GridDomain
@@ -10,13 +15,28 @@ from .ndpca3conv import NDPCA3Conv3d
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
 
-class RiemannConvolutional3D:
+
+class MetricSteeredConv3DWrapper:
+    """
+    Metric‑aware 3D convolutional layer using the canonical geometry pipeline.
+
+    Parameters
+    ----------
+    in_channels : int
+    out_channels : int
+    grid_shape : (Nu, Nv, Nw)
+    transform : PCANDTransform or compatible (provides metric_tensor_func)
+    boundary_conditions : tuple[str, str, str, str, str, str]
+    k : int (number of principal directions)
+    eig_from : 'g' or 'inv_g'
+    pointwise : bool
+    laplace_kwargs : dict (optional, forwarded to BuildLaplace3D)
+    """
 
     def parameters(self):
         params = []
         if hasattr(self.conv, 'parameters') and callable(self.conv.parameters):
             params.extend(self.conv.parameters())
-        # laplace_package may be a dict of modules
         if isinstance(self.laplace_package, dict):
             for v in self.laplace_package.values():
                 if hasattr(v, 'parameters') and callable(v.parameters):
@@ -34,40 +54,37 @@ class RiemannConvolutional3D:
                     v.zero_grad()
         elif hasattr(self.laplace_package, 'zero_grad') and callable(self.laplace_package.zero_grad):
             self.laplace_package.zero_grad()
-    """
-    Metric-aware 3D convolutional layer using a Riemannian geometry pipeline.
 
-    Parameters
-    ----------
-    in_channels : int
-    out_channels : int
-    grid_shape : (Nu, Nv, Nw)
-    transform : PCANDTransform or compatible
-    boundary_conditions : tuple[str, str, str, str, str, str]
-    k : int (number of principal directions)
-    eig_from : 'g' or 'inv_g'
-    pointwise : bool
-    laplace_kwargs : dict (optional, for BuildLaplace3D)
-    """
-    def __init__(self, in_channels, out_channels, grid_shape, transform, boundary_conditions=("dirichlet",)*6, k=3, eig_from="g", pointwise=True, laplace_kwargs=None):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        grid_shape,
+        transform,
+        boundary_conditions=("dirichlet",) * 6,
+        k=3,
+        eig_from="g",
+        pointwise=True,
+        laplace_kwargs=None,
+    ):
         Nu, Nv, Nw = grid_shape
         self.transform = transform
         U = AbstractTensor.linspace(-1.0, 1.0, Nu).reshape(Nu, 1, 1) * AbstractTensor.ones((1, Nv, Nw))
         V = AbstractTensor.linspace(-1.0, 1.0, Nv).reshape(1, Nv, 1) * AbstractTensor.ones((Nu, 1, Nw))
         W = AbstractTensor.linspace(-1.0, 1.0, Nw).reshape(1, 1, Nw) * AbstractTensor.ones((Nu, Nv, 1))
-        autograd.tape.annotate(U, label="RiemannConvolutional3D.grid_U")
+        autograd.tape.annotate(U, label="MetricSteeredConv3DWrapper.grid_U")
         autograd.tape.auto_annotate_eval(U)
-        autograd.tape.annotate(V, label="RiemannConvolutional3D.grid_V")
+        autograd.tape.annotate(V, label="MetricSteeredConv3DWrapper.grid_V")
         autograd.tape.auto_annotate_eval(V)
-        autograd.tape.annotate(W, label="RiemannConvolutional3D.grid_W")
+        autograd.tape.annotate(W, label="MetricSteeredConv3DWrapper.grid_W")
         autograd.tape.auto_annotate_eval(W)
         self.grid_domain = GridDomain(
             U,
             V,
             W,
-            grid_boundaries=(True,)*6,
+            grid_boundaries=(True,) * 6,
             transform=transform,
-            coordinate_system="rectangular"
+            coordinate_system="rectangular",
         )
         self.laplace_kwargs = laplace_kwargs or {}
         self.laplace_package = self._build_laplace_package(boundary_conditions)
@@ -92,42 +109,18 @@ class RiemannConvolutional3D:
             boundary_conditions=boundary_conditions,
             artificial_stability=1e-10,
             device=getattr(self.grid_domain.U, "device", None),
-            **self.laplace_kwargs
+            **self.laplace_kwargs,
         )
-        _, _, package = builder.build_general_laplace(self.grid_domain.U, self.grid_domain.V, self.grid_domain.W, return_package=True)
+        _, _, package = builder.build_general_laplace(
+            self.grid_domain.U, self.grid_domain.V, self.grid_domain.W, return_package=True
+        )
         return package
 
     def forward(self, x):
-        """
-        x: (B, C, Nu, Nv, Nw)
-        Returns: (B, out_channels, Nu, Nv, Nw)
-        """
-        autograd.tape.annotate(x, label="RiemannConvolutional3D.input")
+        autograd.tape.annotate(x, label="MetricSteeredConv3DWrapper.input")
         autograd.tape.auto_annotate_eval(x)
         out = self.conv.forward(x, package=self.laplace_package)
-        autograd.tape.annotate(out, label="RiemannConvolutional3D.output")
+        autograd.tape.annotate(out, label="MetricSteeredConv3DWrapper.output")
         autograd.tape.auto_annotate_eval(out)
         return out
 
-    def report_orphan_nodes(self, tape=None):
-        """Print information about nodes with no children on ``tape``.
-
-        Parameters
-        ----------
-        tape : GradTape, optional
-            Tape to inspect. Defaults to the global autograd tape.
-
-        Returns
-        -------
-        list of dict
-            Metadata describing orphan nodes.
-        """
-        tape = tape or autograd.tape
-        if tape is None:
-            return []
-        orphans = getattr(tape, "orphan_data", lambda: [])()
-        for info in orphans:
-            tid = info.get("id")
-            anns = info.get("annotations", {})
-            print(f"orphan node id={tid} annotations={anns}")
-        return orphans

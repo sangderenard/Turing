@@ -698,8 +698,8 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x*": "gs = split(g, [xi.shape[dim] for xi in xs], dim)"
         },
         "python": {
-            "parameters": ["g", "xs", "dim"],
-            "body": "sizes=[x.shape[dim] for x in xs]; parts=AbstractTensor.split(g, sizes, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
+            "parameters": ["g", "*xs", "dim"],
+            "body": "xs=list(xs); sizes=[x.shape[dim] for x in xs]; parts=AbstractTensor.split(g, sizes, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
         },
         "domain": "Shapes must align on all dims except `dim`.",
         "notes": "Backward is a split of `g` into per-input gradients.",
@@ -713,8 +713,8 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "x*": "gx_k = unstack(g, dim)[k]"
         },
         "python": {
-            "parameters": ["g", "xs", "dim"],
-            "body": "parts=AbstractTensor.unstack(g, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
+            "parameters": ["g", "*xs", "dim"],
+            "body": "xs=list(xs); parts=AbstractTensor.unstack(g, dim); return tuple(unbroadcast(parts[i], xs[i].shape) for i in range(len(xs)))"
         },
         "domain": "All inputs same shape.",
         "notes": "Backward is unstack along the stacking dim.",

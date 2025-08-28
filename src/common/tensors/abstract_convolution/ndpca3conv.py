@@ -140,7 +140,7 @@ class NDPCA3Conv3d:
             self.pointwise.zero_grad()
 
     # --- helpers ---
-    def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[AbstractTensor, AbstractTensor, AbstractTensor]:
         """
         Compute soft weights (per voxel) mapping each principal dir into lattice axes.
         Returns three tensors ``wU``, ``wV``, ``wW`` with shape ``(D,H,W)`` that sum
@@ -187,6 +187,27 @@ class NDPCA3Conv3d:
         x: (B, C, D, H, W)
         package: dict from Laplace build; must contain metric at package["metric"]["g"] or ["inv_g"].
         """
+        # Ensure learnable parameters are registered on the current tape so that
+        # loss.backward()/autograd.grad can discover them even after tape resets.
+        try:
+            tape = autograd.tape
+            # taps is always present; pointwise may be None
+            param_list = [self.taps]
+            if getattr(self, "pointwise", None) is not None:
+                try:
+                    param_list += list(self.pointwise.parameters())
+                except Exception:
+                    pass
+            for p in param_list:
+                if p is None:
+                    continue
+                try:
+                    p._tape = tape  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                tape.create_tensor_node(p)
+        except Exception:
+            pass
         B, C, D, H, W = x.shape
         # ---- 1) metric → per-axis soft blend weights
         metric = package["metric"]["inv_g"] if self.eig_from == "inv_g" else package["metric"]["g"]

@@ -716,14 +716,50 @@ class AbstractTensor:
         return pack_nested_to_tensor(data, dtype=dtype, device=device, cls=cls)
 
     @staticmethod
-    def get_tensor(data=None, *, dtype=None, device=None, cls=None, track_time=False, tape: "GradTape" | None = None) -> "AbstractTensor":
+    def get_tensor(
+        data=None,
+        *,
+        dtype=None,
+        device=None,
+        cls=None,
+        track_time=False,
+        tape: "GradTape" | None = None,
+        requires_grad: bool = False,
+    ) -> "AbstractTensor":
         """
         Get the tensor data from this AbstractTensor or create a new one if data is provided.
         If data is None, return self.
         """
         if cls is None:
             cls = AbstractTensor.check_or_build_registry()
-        return cls.tensor(data, dtype=dtype, device=device, track_time=track_time, tape=tape)
+        # If caller wants gradients and did not provide a tape, use the global tape
+        if requires_grad and tape is None:
+            try:
+                from . import autograd as _autograd  # local import to avoid cycles
+                tape = _autograd.autograd.tape
+            except Exception:
+                tape = None
+        t = cls.tensor(data, dtype=dtype, device=device, track_time=track_time, tape=tape)
+        if requires_grad:
+            # Ensure the tensor is marked and registered on the chosen tape
+            try:
+                if getattr(t, "_tape", None) is None and tape is not None:
+                    t._tape = tape  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                t.requires_grad_(True)
+            except Exception:
+                try:
+                    setattr(t, "_requires_grad", True)
+                except Exception:
+                    pass
+            try:
+                if tape is not None:
+                    tape.create_tensor_node(t)
+            except Exception:
+                pass
+        return t
 
     def tensor_like(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":
         """
@@ -832,56 +868,6 @@ class AbstractTensor:
         # Default implementation delegates to generic ``pad``.
         return self.pad_(pad, value)
 
-    def unfold2d(
-        self,
-        kernel_size: Tuple[int, int],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int]] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
-    ) -> "AbstractTensor":
-        """Extract sliding local blocks as columns (im2col)."""
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.unfold2d_(kernel_size, stride, padding, dilation)
-        return result
-
-    def unfold2d_(
-        self,
-        kernel_size: Tuple[int, int],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int]] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
-    ):
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement unfold2d_()"
-        )
-
-    @staticmethod
-    def fold2d(
-        cols: "AbstractTensor",
-        output_size: Tuple[int, int, int, int],
-        kernel_size: Tuple[int, int],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int]] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
-    ) -> "AbstractTensor":
-        """Inverse of :meth:`unfold2d`, accumulating patches back to images."""
-        result = type(cols)(track_time=cols.track_time)
-        result.data = cols.fold2d_(
-            output_size, kernel_size, stride, padding, dilation
-        )
-        return result
-
-    def fold2d_(
-        self,
-        output_size: Tuple[int, int, int, int],
-        kernel_size: Tuple[int, int],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int]] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
-    ):
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement fold2d_()"
-        )
 
     @staticmethod
     def cat(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
@@ -917,18 +903,58 @@ class AbstractTensor:
 
     @staticmethod
     def stack(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
-        """Stack ``tensors`` along a new dimension ``dim``.
+        """Stack ``tensors`` along a new dimension ``dim`` with autograd support.
 
-        This is analogous to ``torch.stack`` and can be invoked as a class
-        method: ``AbstractTensor.stack([...])``.
+        - Records a "stack" node so gradients are properly distributed back to
+          each input via the registered backward rule (unstack along ``dim``).
+        - No explicit ``requires_grad`` flag: the result requires grad when any
+          input does; standard autograd semantics.
         """
         if not tensors:
             raise ValueError("stack requires at least one tensor")
         first = AbstractTensor.get_tensor(tensors[0])
-        tensors = [first.ensure_tensor(t) for t in tensors]
-        result = first.__class__(track_time=first.track_time)
-        result.data = first.stack_(tensors, dim)
-        return result
+        ts = [first.ensure_tensor(t) for t in tensors]
+        out = first.__class__(track_time=first.track_time, tape=getattr(first, "_tape", None))
+        out.data = first.stack_(ts, dim)
+        finalize = AbstractTensor._pre_autograd("stack", ts, params={"dim": dim})
+        return finalize(out)
+
+    @staticmethod
+    def unstack(tensor: Any, dim: int = 0) -> tuple:
+        """Split ``tensor`` into a tuple of slices along dimension ``dim``.
+
+        Utility used by backward rules; does not record autograd nodes.
+        """
+        t = AbstractTensor.get_tensor(tensor)
+        shape = t.shape
+        if dim < 0:
+            dim = len(shape) + dim
+        n = shape[dim]
+        parts = []
+        for i in range(n):
+            idx = [slice(None)] * len(shape)
+            idx[dim] = i
+            parts.append(t[tuple(idx)])
+        return tuple(parts)
+
+    @staticmethod
+    def split(tensor: Any, sizes: List[int], dim: int = 0) -> tuple:
+        """Split ``tensor`` into chunks with ``sizes`` along ``dim``.
+
+        Utility used by backward rules; does not record autograd nodes.
+        """
+        t = AbstractTensor.get_tensor(tensor)
+        shape = t.shape
+        if dim < 0:
+            dim = len(shape) + dim
+        parts = []
+        offset = 0
+        for s in sizes:
+            idx = [slice(None)] * len(shape)
+            idx[dim] = slice(offset, offset + s)
+            parts.append(t[tuple(idx)])
+            offset += s
+        return tuple(parts)
 
     @staticmethod
     def copyto(
@@ -977,6 +1003,9 @@ class AbstractTensor:
         dimensions, mirroring ``torch.Tensor.expand``.  All provided values are
         collapsed into a single ``tuple`` before delegating to
         :meth:`expand_`.
+
+        Also records an autograd node (as "broadcast_to") so gradients flow
+        back through broadcasted views via the standard unbroadcast rule.
         """
 
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
@@ -986,7 +1015,10 @@ class AbstractTensor:
 
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.expand_(shape)
-        return result
+        # Record on the tape so that grads flow back to the source tensor.
+        # Pass the target shape as a parameter for the backward rule signature (g, x, shape).
+        finalize = AbstractTensor._pre_autograd("broadcast_to", [self], params={"shape": shape})
+        return finalize(result)
     # in AbstractTensor (abstraction.py)
     def broadcast_rows(self, n: int, *, label: str | None = None) -> "AbstractTensor":
         """
@@ -1929,6 +1961,12 @@ from .abstraction_methods.fourier import (
     fft as fourier_fft,
     ifft as fourier_ifft,
 )
+from .abstraction_methods.fold import (
+    fold2d as fold2d_ref,
+    fold3d as fold3d_ref,
+    unfold2d as unfold2d_ref,
+    unfold3d as unfold3d_ref,
+)
 from .abstraction_methods.properties import (
     numel as prop_numel,
     item as prop_item,
@@ -2206,6 +2244,12 @@ AbstractTensor.__format__ = prop_format
 AbstractTensor.__repr__   = prop_repr
 AbstractTensor.__len__    = prop_len
 
+# Reference fold implementations (pure AbstractTensor). Bound as staticmethods.
+AbstractTensor.fold2d = staticmethod(fold2d_ref)
+AbstractTensor.fold3d = staticmethod(fold3d_ref)
+# Bind unfold as instance methods so `self` is passed and signatures match
+AbstractTensor.unfold2d = unfold2d_ref
+AbstractTensor.unfold3d = unfold3d_ref
 from .linalg import (
     dot as linalg_dot,
     norm as linalg_norm,

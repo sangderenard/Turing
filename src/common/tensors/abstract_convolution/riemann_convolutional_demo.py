@@ -12,7 +12,7 @@ This demo audits the full geometry-driven learning pipeline.
 """
 
 
-from .riemann_convolutional import RiemannConvolutional3D
+from .metric_steered_conv3d import MetricSteeredConv3DWrapper
 from .ndpca3transform import PCABasisND, fit_metric_pca, PCANDTransform
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
@@ -23,7 +23,7 @@ import numpy as np
 def build_transform_and_grid(Nu=8, Nv=8, Nw=8, n=8):
     AT = AbstractTensor
     B = 500
-    t = AT.arange(0, B, 1)
+    t = AT.arange(0, B, 1, requires_grad=True)
     autograd.tape.annotate(t, label="riemann_demo.t_arange")
     autograd.tape.auto_annotate_eval(t)
     t = (t / (B - 1) - 0.5) * 6.283185307179586
@@ -35,7 +35,7 @@ def build_transform_and_grid(Nu=8, Nv=8, Nw=8, n=8):
     ], dim=-1)
     autograd.tape.annotate(base, label="riemann_demo.base")
     autograd.tape.auto_annotate_eval(base)
-    scale = AT.get_tensor([2.0, 1.5, 1.2, 0.8, 0.5, 0.3, 0.2, 0.1])
+    scale = AT.get_tensor([2.0, 1.5, 1.2, 0.8, 0.5, 0.3, 0.2, 0.1], requires_grad=True)
     autograd.tape.annotate(scale, label="riemann_demo.scale")
     autograd.tape.auto_annotate_eval(scale)
     u_samples = base * scale
@@ -47,7 +47,7 @@ def build_transform_and_grid(Nu=8, Nv=8, Nw=8, n=8):
     M = AT.eye(n)
     autograd.tape.annotate(M, label="riemann_demo.M_eye")
     autograd.tape.auto_annotate_eval(M)
-    diag = AT.get_tensor([1.0, 0.5, 0.25, 2.0, 1.0, 3.0, 0.8, 1.2])
+    diag = AT.get_tensor([1.0, 0.5, 0.25, 2.0, 1.0, 3.0, 0.8, 1.2], requires_grad=True)
     autograd.tape.annotate(diag, label="riemann_demo.diag")
     autograd.tape.auto_annotate_eval(diag)
     M = M * diag.reshape(1, -1)
@@ -68,7 +68,7 @@ def main():
     AT = AbstractTensor
     xform, grid_shape = build_transform_and_grid(Nu=8, Nv=8, Nw=8)
     B, C = 4, 3
-    layer = RiemannConvolutional3D(
+    layer = MetricSteeredConv3DWrapper(
         in_channels=C,
         out_channels=C,
         grid_shape=grid_shape,
@@ -152,7 +152,12 @@ def main():
             label = getattr(p, '_label', None)
             assert hasattr(g, 'shape'), f"Gradient for {label or p} has no shape attribute"
             assert g.shape == p.shape, f"Gradient for {label or p} has incorrect shape: grad.shape={getattr(g, 'shape', None)}, param.shape={getattr(p, 'shape', None)}"
-        optimizer.step(params, grads)
+        # Optimizer returns updated tensors; copy values in-place to preserve
+        # parameter identity on the tape so they remain registered.
+        new_params = optimizer.step(params, grads)
+        from ..abstraction import AbstractTensor as _AT
+        for p, new_p in zip(params, new_params):
+            _AT.copyto(p, new_p)
         if epoch % 100 == 0 or loss.item() < 1e-6:
             print(f"Epoch {epoch}: loss={loss.item():.2e}")
         if loss.item() < 1e-6:

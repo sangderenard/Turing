@@ -1,16 +1,23 @@
 """
 ndpca3_laplace_demo.py
----------------------
+----------------------
 
-A minimal demo/wrapper that builds a 3D Laplace package using BuildLaplace3D and feeds it to NDPCA3Conv3d.
-This file demonstrates the intended workflow: build a metric-aware Laplacian package and use it as the 'package' argument for the NDPCA3Conv3d forward pass.
+Demonstration using the proper pipeline:
+- Build a PCA-based transform on a (U,V,W) grid
+- Use BuildLaplace3D to produce a metric-aware package (g, inv_g, etc.)
+- Train a standalone NDPCA3Conv3d to fit a simple target defined on the grid
+
+This verifies the NDPCA3Conv3d layer converges while receiving geometry from
+the transform/Laplace package. No ad-hoc metric or shift logic outside the
+layer — we follow the same structure as the Riemann demo, tailored for NDPCA3.
 """
 
 from .laplace_nd import BuildLaplace3D, GridDomain
 from .ndpca3conv import NDPCA3Conv3d
 from .ndpca3transform import PCABasisND, fit_metric_pca, PCANDTransform
 from ..abstraction import AbstractTensor
-import numpy as np
+from ..autograd import autograd
+from ..abstract_nn.optimizer import Adam
 
 
 def build_pca_transform_and_grid(Nu=8, Nv=8, Nw=8, n=8):
@@ -66,25 +73,72 @@ def build_laplace_package(grid_domain, xform, boundary_conditions=("dirichlet",)
 
 
 def main():
-    # 1. Build transform and canonical grid domain
-    xform, grid_domain = build_pca_transform_and_grid(Nu=8, Nv=8, Nw=8)
+    # 1) Transform + grid + Laplace package
+    Nu = Nv = Nw = 8
+    xform, grid_domain = build_pca_transform_and_grid(Nu=Nu, Nv=Nv, Nw=Nw)
     package = build_laplace_package(grid_domain, xform)
 
-    # 2. Build a dummy input and NDPCA3Conv3d
-    B, C = 2, 4
-    x = AbstractTensor.randn((B, C, grid_domain.resolution_u, grid_domain.resolution_v, grid_domain.resolution_w))
-    conv = NDPCA3Conv3d(
+    # 2) Build teacher/student NDPCA3Conv3d and a supervised target on the grid
+    # Target must depend on X via the same operator family; otherwise learning stalls.
+    B, C = 4, 2
+    like = AbstractTensor.get_tensor()
+    # Student to train
+    layer = NDPCA3Conv3d(
         in_channels=C,
         out_channels=C,
-        like=x,
+        like=like,
         grid_shape=(grid_domain.resolution_u, grid_domain.resolution_v, grid_domain.resolution_w),
         boundary_conditions=("dirichlet",)*6,
         k=3,
         eig_from="g",
-        pointwise=False,
+        pointwise=True,
     )
-    y = conv.forward(x, package=package)
-    print("Output shape:", y.shape)
+
+    # Teacher with fixed taps generates the target Y from X using the same package
+    teacher = NDPCA3Conv3d(
+        in_channels=C,
+        out_channels=C,
+        like=like,
+        grid_shape=(grid_domain.resolution_u, grid_domain.resolution_v, grid_domain.resolution_w),
+        boundary_conditions=("dirichlet",)*6,
+        k=3,
+        eig_from="g",
+        pointwise=True,
+    )
+    # Set teacher taps so that column sums equal desired 3‑tap values
+    t_minus, t_center, t_plus = -0.6, 1.8, 0.7
+    per_dir = [[t_minus / teacher.k, t_center / teacher.k, t_plus / teacher.k] for _ in range(teacher.k)]
+    teacher.taps = AbstractTensor.tensor_from_list(per_dir, tape=autograd.tape, like=like, requires_grad=False)
+    
+    # Inputs: random but fixed for training
+    X = AbstractTensor.randn((B, C, Nu, Nv, Nw), requires_grad=True)
+
+    # Target: teacher conv applied to X under the same geometry
+    with AbstractTensor.autograd.no_grad():
+        target = teacher.forward(X, package=package)
+
+    # 3) Train taps (and optional pointwise) to fit target
+    params = list(layer.parameters())
+    opt = Adam(params, lr=1e-2)
+    mse = lambda a, b: ((a - b) ** 2).mean()
+
+    for epoch in range(1, 2001):
+        # Zero gradients
+        for p in params:
+            if hasattr(p, "zero_grad"):
+                p.zero_grad()
+        Y = layer.forward(X, package=package)
+        loss = mse(Y, target)
+        # Compute grads explicitly for these params to avoid registry issues
+        autograd.grad(loss, params, retain_graph=False, allow_unused=False)
+        new_params = opt.step(params, [p.grad for p in params])
+        for p, np_ in zip(params, new_params):
+            AbstractTensor.copyto(p, np_)
+        if epoch % 100 == 0 or float(loss.item()) < 1e-6:
+            print(f"Epoch {epoch}: loss={float(loss.item()):.3e}")
+        if float(loss.item()) < 1e-5:
+            print("Converged.")
+            break
 
 if __name__ == "__main__":
     main()
