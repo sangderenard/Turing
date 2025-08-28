@@ -120,6 +120,7 @@ class NDPCA3Conv3d:
         self.taps = from_list_like(init_data, like=like, requires_grad=True, tape=autograd.tape)
         autograd.tape.create_tensor_node(self.taps)
         self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
+        autograd.tape.annotate(self.taps, label=self.taps._label)
 
         # optional 1x1 channel mix after spatial pass
         self.pointwise = None
@@ -175,6 +176,9 @@ class NDPCA3Conv3d:
         wU = w_axes[..., 0]
         wV = w_axes[..., 1]
         wW = w_axes[..., 2]
+        autograd.tape.annotate(wU, label="NDPCA3Conv3d.principal_weight_U")
+        autograd.tape.annotate(wV, label="NDPCA3Conv3d.principal_weight_V")
+        autograd.tape.annotate(wW, label="NDPCA3Conv3d.principal_weight_W")
         return wU, wV, wW
 
     # --- forward ---
@@ -193,6 +197,9 @@ class NDPCA3Conv3d:
         center = (taps[:, 1]).sum().reshape(1, 1, 1, 1, 1)
         w_minus = (taps[:, 0]).sum().reshape(1, 1, 1, 1, 1)
         w_plus = (taps[:, 2]).sum().reshape(1, 1, 1, 1, 1)
+        autograd.tape.annotate(center, label="NDPCA3Conv3d.center_weight")
+        autograd.tape.annotate(w_minus, label="NDPCA3Conv3d.minus_weight")
+        autograd.tape.annotate(w_plus, label="NDPCA3Conv3d.plus_weight")
 
         # Broadcast weights to (1,1,D,H,W)
         def _bcast(w: AbstractTensor) -> AbstractTensor:
@@ -202,6 +209,12 @@ class NDPCA3Conv3d:
         wU_m = w_minus * wU_b;  wU_p = w_plus * wU_b
         wV_m = w_minus * wV_b;  wV_p = w_plus * wV_b
         wW_m = w_minus * wW_b;  wW_p = w_plus * wW_b
+        autograd.tape.annotate(wU_m, label="NDPCA3Conv3d.weight_U_minus")
+        autograd.tape.annotate(wU_p, label="NDPCA3Conv3d.weight_U_plus")
+        autograd.tape.annotate(wV_m, label="NDPCA3Conv3d.weight_V_minus")
+        autograd.tape.annotate(wV_p, label="NDPCA3Conv3d.weight_V_plus")
+        autograd.tape.annotate(wW_m, label="NDPCA3Conv3d.weight_W_minus")
+        autograd.tape.annotate(wW_p, label="NDPCA3Conv3d.weight_W_plus")
 
         # ---- 3) do the oriented depthwise spatial pass
         arr = x  # (B,C,D,H,W) AbstractTensor
@@ -217,17 +230,26 @@ class NDPCA3Conv3d:
         x_v_p = _shift3d(arr, axis=3, step=+1, bc=bcv)
         x_w_m = _shift3d(arr, axis=4, step=-1, bc=bcw)
         x_w_p = _shift3d(arr, axis=4, step=+1, bc=bcw)
+        autograd.tape.annotate(x_u_m, label="NDPCA3Conv3d.shift_u_minus")
+        autograd.tape.annotate(x_u_p, label="NDPCA3Conv3d.shift_u_plus")
+        autograd.tape.annotate(x_v_m, label="NDPCA3Conv3d.shift_v_minus")
+        autograd.tape.annotate(x_v_p, label="NDPCA3Conv3d.shift_v_plus")
+        autograd.tape.annotate(x_w_m, label="NDPCA3Conv3d.shift_w_minus")
+        autograd.tape.annotate(x_w_p, label="NDPCA3Conv3d.shift_w_plus")
 
         y = center * arr \
             + wU_m * x_u_m + wU_p * x_u_p \
             + wV_m * x_v_m + wV_p * x_v_p \
             + wW_m * x_w_m + wW_p * x_w_p
+        autograd.tape.annotate(y, label="NDPCA3Conv3d.spatial_output")
 
         # ---- 4) optional 1x1 mixing to get out_channels
         if self.pointwise is not None:
             # reshape (B, C, D, H, W) → (B*D*H*W, C)
             z = y.reshape(B * D * H * W, C)
+            autograd.tape.annotate(z, label="NDPCA3Conv3d.pointwise_reshape")
             z = self.pointwise.forward(z)
+            autograd.tape.annotate(z, label="NDPCA3Conv3d.pointwise_output")
             y = z.reshape(B, self.out_channels, D, H, W)
-
+        autograd.tape.annotate(y, label="NDPCA3Conv3d.output")
         return y

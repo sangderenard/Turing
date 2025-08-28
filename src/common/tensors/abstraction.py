@@ -548,6 +548,32 @@ class AbstractTensor:
                 except Exception:
                     pass
         return inst
+
+    @classmethod
+    def tensor_from_list(
+        cls,
+        data,
+        dtype=None,
+        device=None,
+        tape: "GradTape" | None = None,
+        *,
+        like: "AbstractTensor" | None = None,
+        requires_grad: bool = False,
+    ):
+        """Public alias to :meth:`_tensor_from_list`.
+
+        This mirrors the historically exposed ``tensor_from_list`` constructor
+        so tests and callers can rely on a stable API. All arguments mirror
+        :meth:`_tensor_from_list` and are forwarded unchanged.
+        """
+        return cls._tensor_from_list(
+            data,
+            dtype=dtype,
+            device=device,
+            tape=tape,
+            like=like,
+            requires_grad=requires_grad,
+        )
     # --- Tensor creation and manipulation methods ---
 
     def full_(

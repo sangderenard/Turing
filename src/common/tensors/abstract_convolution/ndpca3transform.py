@@ -29,6 +29,7 @@ Notes
 """
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
+from ..autograd import autograd
 
 # --- Minimal import helper to locate AbstractTensor regardless of package layout ---
 def _get_AbstractTensor():
@@ -108,40 +109,56 @@ def fit_metric_pca(
     else:
         w = AT.get_tensor(weights).reshape(B)
     w = w / (w.sum() + AT.get_tensor(eps))
+    autograd.tape.annotate(w, label="fit_metric_pca.normalized_weights")
 
     # weighted mean
     mu = (w.reshape(B, 1) * X).sum(dim=-2)  # (n,)
+    autograd.tape.annotate(mu, label="fit_metric_pca.mean")
 
     # centered
     Xc = X - mu  # (B, n)
+    autograd.tape.annotate(Xc, label="fit_metric_pca.centered")
 
     # weighted covariance: Sigma = (w * Xc)^T Xc
     # ensure weights apply along the sample axis only
     Sigma = (w.reshape(B, 1) * Xc).swapaxes(-1, -2) @ Xc  # (n, n)
+    autograd.tape.annotate(Sigma, label="fit_metric_pca.covariance")
 
     if metric_M is None:
         # Euclidean PCA: eig(Sigma)
         # eigh returns ascending eigenvalues; reverse to descending
         evals, evecs = AT.linalg.eigh(Sigma)
+        autograd.tape.annotate(evals, label="fit_metric_pca.eigenvalues")
+        autograd.tape.annotate(evecs, label="fit_metric_pca.eigenvectors")
         P = evecs[:, ::-1]
+        autograd.tape.annotate(P, label="fit_metric_pca.P")
     else:
         # Metric PCA: generalized eig Sigma v = lambda M v ->
         # diagonalize S_tilde = M^{-1/2} Sigma M^{-1/2}
         M = AT.get_tensor(metric_M)
+        autograd.tape.annotate(M, label="fit_metric_pca.metric_M")
         # Eigen-decompose M (SPD): M = Q Λ Q^T, with Λ>0
         lam_M, Q_M = AT.linalg.eigh(M + eps * AT.eye(n, device=getattr(X, "device", None)))
+        autograd.tape.annotate(lam_M, label="fit_metric_pca.metric_eigenvalues")
+        autograd.tape.annotate(Q_M, label="fit_metric_pca.metric_eigenvectors")
         # M^{-1/2} = Q Λ^{-1/2} Q^T
         inv_sqrt_lam = lam_M.clamp_min(eps) ** (-0.5)
+        autograd.tape.annotate(inv_sqrt_lam, label="fit_metric_pca.inv_sqrt_lam")
         # Build Λ^{-1/2} as a diag via outer trick (AbstractTensor-friendly)
         # D = Q * inv_sqrt_lam (broadcast cols), then M^{-1/2} = D @ Q^T
         D = Q_M * inv_sqrt_lam.reshape(1, -1)
         Minv_half = D @ Q_M.swapaxes(-1, -2)
+        autograd.tape.annotate(Minv_half, label="fit_metric_pca.M_inv_half")
 
         S_tilde = Minv_half @ Sigma @ Minv_half.swapaxes(-1, -2)
+        autograd.tape.annotate(S_tilde, label="fit_metric_pca.S_tilde")
         lam_S, U = AT.linalg.eigh(S_tilde)
+        autograd.tape.annotate(lam_S, label="fit_metric_pca.S_eigenvalues")
+        autograd.tape.annotate(U, label="fit_metric_pca.S_eigenvectors")
         U = U[:, ::-1]  # descending
         # Map back: P = M^{-1/2} U  ⇒ columns of P are metric-orthonormal
         P = Minv_half @ U
+        autograd.tape.annotate(P, label="fit_metric_pca.P")
 
     return PCABasisND(mu=mu, P=P, n=n)
 
@@ -197,26 +214,38 @@ class PCANDTransform(Transform):
 
         # Embed to R^n
         u_nd = self.phi_fn(U, V, W)  # (..., n)
+        autograd.tape.annotate(u_nd, label="PCANDTransform.u_nd")
 
         # Center & project
         mu = self.pca_basis.mu  # (n,)
         P = self.pca_basis.P    # (n, n)
         y_full = (u_nd - mu) @ P  # (..., n)  [columns of P are PCs]
+        autograd.tape.annotate(y_full, label="PCANDTransform.y_full")
         y_vis = y_full[..., : self.d_visible]
+        autograd.tape.annotate(y_vis, label="PCANDTransform.y_vis")
 
         # Expand/pad to 3 outputs (X,Y,Z)
         if self.d_visible == 1:
             X = y_vis[..., 0]
             Y = AT.zeros_like(X)
             Z = AT.zeros_like(X)
+            autograd.tape.annotate(X, label="PCANDTransform.X")
+            autograd.tape.annotate(Y, label="PCANDTransform.Y_zero")
+            autograd.tape.annotate(Z, label="PCANDTransform.Z_zero")
         elif self.d_visible == 2:
             X = y_vis[..., 0]
             Y = y_vis[..., 1]
             Z = AT.zeros_like(X)
+            autograd.tape.annotate(X, label="PCANDTransform.X")
+            autograd.tape.annotate(Y, label="PCANDTransform.Y")
+            autograd.tape.annotate(Z, label="PCANDTransform.Z_zero")
         else:
             X = y_vis[..., 0]
             Y = y_vis[..., 1]
             Z = y_vis[..., 2]
+            autograd.tape.annotate(X, label="PCANDTransform.X")
+            autograd.tape.annotate(Y, label="PCANDTransform.Y")
+            autograd.tape.annotate(Z, label="PCANDTransform.Z")
 
         return X, Y, Z
 
@@ -239,14 +268,21 @@ class PCANDTransform(Transform):
         Ju = AT.stack([dXdu, dYdu, dZdu], dim=-1)
         Jv = AT.stack([dXdv, dYdv, dZdv], dim=-1)
         Jw = AT.stack([dXdw, dYdw, dZdw], dim=-1)
+        autograd.tape.annotate(Ju, label="PCANDTransform.Ju")
+        autograd.tape.annotate(Jv, label="PCANDTransform.Jv")
+        autograd.tape.annotate(Jw, label="PCANDTransform.Jw")
         J = AT.stack([Ju, Jv, Jw], dim=-1)  # (..., 3, 3)
+        autograd.tape.annotate(J, label="PCANDTransform.J")
 
         JT = J.swapaxes(-1, -2)
         g = JT @ J  # (..., 3, 3)
+        autograd.tape.annotate(g, label="PCANDTransform.metric_g")
 
         # Inverse + determinant
         g_inv = AT.inverse(g)
         det_g = AT.det(g)
+        autograd.tape.annotate(g_inv, label="PCANDTransform.metric_g_inv")
+        autograd.tape.annotate(det_g, label="PCANDTransform.metric_det_g")
         return g, g_inv, det_g
 
     # --------------------- utility: direct PCA coords ---------------
@@ -255,7 +291,10 @@ class PCANDTransform(Transform):
         AT = _get_AbstractTensor()
         u = AT.get_tensor(u_point)
         y_full = (u - self.pca_basis.mu) @ self.pca_basis.P
-        return y_full[..., : self.d_visible]
+        autograd.tape.annotate(y_full, label="PCANDTransform.embed_y_full")
+        out = y_full[..., : self.d_visible]
+        autograd.tape.annotate(out, label="PCANDTransform.embed_output")
+        return out
 
 
 # -----------------------------------------------------------------------------
