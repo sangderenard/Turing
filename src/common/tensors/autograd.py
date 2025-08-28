@@ -185,19 +185,6 @@ class GradTape:
             node = self.graph.nodes[tid]
             node.setdefault("stateful", False)
 
-    # ------------------------------------------------------------------
-    # annotation utilities
-    # ------------------------------------------------------------------
-    def annotate(self, tensor: Any, **metadata: Any) -> None:
-        """Attach ``metadata`` to ``tensor``'s graph node if present."""
-        tid = id(tensor)
-        if tid not in self.graph:
-            return
-        node = self.graph.nodes[tid]
-        annotations = node.setdefault("annotations", {})
-        annotations.update(metadata)
-
-    # ------------------------------------------------------------------
     # loss/parameter utilities
     # ------------------------------------------------------------------
     def mark_loss(self, tensor: Any) -> None:
@@ -363,30 +350,38 @@ class GradTape:
             result._grad_tape = self  # legacy alias expected by some tests
         except Exception:
             pass
+
+        # Ensure the result tensor carries at least the operation name as a label
+        anns = self.graph.nodes[rid].get("annotations", {})
+        if "label" not in anns:
+            self.annotate(result, label=op)
         return result
 
     # ------------------------------------------------------------------
     # metadata utilities
     # ------------------------------------------------------------------
     def annotate(self, tensor: Any, **metadata: Any) -> None:
-        """Attach ``metadata`` to the :class:`GradNode` for ``tensor``.
+        """Attach ``metadata`` to tape entries for ``tensor``.
 
-        The elementwise helpers use this to stash bookkeeping information
-        (e.g. evaluation mode and scalar lifting).  Missing nodes are ignored
-        so callers may unconditionally attempt to annotate intermediates.
+        The global graph node for ``tensor`` is always updated (creating it if
+        necessary).  When a corresponding :class:`GradNode` exists, its context
+        ``annotations`` are synchronised as well.  Callers may therefore
+        annotate tensors regardless of whether they have been recorded on the
+        tape yet.
         """
 
         tid = id(tensor)
+
+        # Always ensure the tensor exists in the global graph and update its
+        # annotations.
+        self.graph.add_node(tid, kind="tensor")
+        g_anns = self.graph.nodes[tid].setdefault("annotations", {})
+        g_anns.update(metadata)
+
         node = self._nodes.get(tid)
-        if node is None:
-            return
-
-        anns = node.ctx.setdefault("annotations", {})
-        anns.update(metadata)
-
-        if self.graph.has_node(tid):
-            g_anns = self.graph.nodes[tid].setdefault("annotations", {})
-            g_anns.update(metadata)
+        if node is not None:
+            anns = node.ctx.setdefault("annotations", {})
+            anns.update(metadata)
 
             # Also annotate the generating op node if present.
             try:
