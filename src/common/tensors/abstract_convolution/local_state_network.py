@@ -151,14 +151,12 @@ class LocalStateNetwork:
         self.cache_lock = threading.Lock()
         num_parameters = 27
         # NN Integration Manager
-        self.weight_layer = AbstractTensor.get_tensor(np.ones((3, 3, 3), dtype=np.float32))
-        self.weight_layer.requires_grad_(True)
-        self.weight_layer._tape = autograd.tape
+        self.weight_layer = AbstractTensor.ones((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
         autograd.tape.create_tensor_node(self.weight_layer)
         self.weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.weight_layer"
-        self.g_weight_layer = AbstractTensor.get_tensor(np.zeros((3, 3, 3), dtype=np.float32))
+        
         self._cached_padded_raw = None
-        like = AbstractTensor.get_tensor(np.zeros((1, num_parameters), dtype=np.float32))
+        like = AbstractTensor.zeros((1, num_parameters), dtype=AbstractTensor.float_dtype)
         if recursion_depth < max_depth - 1:
             self.spatial_layer = RectConv3d(
                 num_parameters,

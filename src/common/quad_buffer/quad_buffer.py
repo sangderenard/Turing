@@ -38,7 +38,8 @@ class QuadBuffer:
             self.gpu = {k: torch.zeros(s, dtype=tdtype).cuda() for k, s in zip(keys, shapes)}
         else:
             self.gpu = {} if use_torch else None
-        self.abstract = {k: AbstractTensor.tensor_from_list(np.zeros(s, dtype=npdtype).tolist()) for k, s in zip(keys, shapes)} if use_abstract else None
+        # Prefer creating tensors via high-level APIs; avoid private list-based factory
+        self.abstract = {k: AbstractTensor.get_tensor(np.zeros(s, dtype=npdtype)) for k, s in zip(keys, shapes)} if use_abstract else None
         self.video_buffers = {k: None for k in keys} if use_video else None
         self.compute_programs = {}  # For compute shaders
         self.storage_buffers = {}   # For SSBOs

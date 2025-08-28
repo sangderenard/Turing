@@ -649,11 +649,7 @@ class JAXTensorOperations(AbstractTensor):
     def get_ndims(self) -> int:
         return self.data.ndim
 
-    @classmethod
-    def tensor_from_list(cls, data, dtype=None, device=None):
-        inst = cls(track_time=False)
-        inst.data = inst.tensor_from_list_(data, dtype, device)
-        return inst
+    # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
 from .abstraction import register_backend
 register_backend("jax", JAXTensorOperations)

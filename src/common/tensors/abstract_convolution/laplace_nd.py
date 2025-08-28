@@ -1079,7 +1079,18 @@ class TransformHub:
         self.frobenius_norm = AbstractTensor.sqrt(AbstractTensor.sum(g_ij**2, dim=(-2, -1)))
         return self.frobenius_norm
 
-    def compute_partials_and_normals(self, U, V, W, validate_normals=False, diagnostic_mode=False):
+    def compute_partials_and_normals(
+        self,
+        U,
+        V,
+        W,
+        validate_normals=False,
+        diagnostic_mode=False,
+        *,
+        force_normal_repair=False,
+        verbose=False,
+        abandon_zero_ratio=0.95,
+    ):
         U = AbstractTensor.get_tensor(U)
         V = AbstractTensor.get_tensor(V)
         W = AbstractTensor.get_tensor(W)
@@ -1220,7 +1231,9 @@ class TransformHub:
             count_zero_normals = AbstractTensor.sum(zero_norm_mask).item()  # Number of grid points with zero-magnitude normals
             grid_shape = normals.shape[:3]
             total_points = grid_shape[0] * grid_shape[1] * grid_shape[2]
-            print(f"{count_zero_normals} out of {total_points} zero-magnitude normals detected.")
+            zero_ratio = (count_zero_normals / max(1, total_points)) if isinstance(count_zero_normals, (int, float)) else float(count_zero_normals) / max(1, total_points)
+            if verbose:
+                print(f"{count_zero_normals} out of {total_points} zero-magnitude normals detected (ratio={zero_ratio:.2%}).")
 
             if diagnostic_mode:
                 # Find the indices of the first zero-magnitude normal
@@ -1256,38 +1269,47 @@ class TransformHub:
                 print("Diagnostics complete. Exiting due to zero-magnitude normal.")
                 exit()
             else:
-                # Proceed to repair zero-magnitude normals if not in diagnostic mode
-                print("Repairing zero-magnitude normals.")
+                # Optionally abandon repair if zeros dominate and not forced
+                if not force_normal_repair and (count_zero_normals == total_points or zero_ratio >= abandon_zero_ratio):
+                    if verbose:
+                        reason = "all zeros" if count_zero_normals == total_points else f"zero ratio {zero_ratio:.2%} >= threshold {abandon_zero_ratio:.2%}"
+                        print(f"Skipping normal repair due to insufficient valid data ({reason}).")
+                else:
+                    # Proceed to repair zero-magnitude normals if not in diagnostic mode
+                    if verbose:
+                        print("Repairing zero-magnitude normals.")
 
-                # Repair zero-magnitude normals by averaging surrounding normals
-                zero_indices = AbstractTensor.nonzero(zero_norm_mask, as_tuple=True)
-                for idx in zip(*zero_indices):
-                    # Collect neighboring normals
-                    neighbors = []
-                    for di in [-1, 0, 1]:
-                        for dj in [-1, 0, 1]:
-                            for dk in [-1, 0, 1]:
-                                if di == 0 and dj == 0 and dk == 0:
-                                    continue  # Skip the center point
-                                ni, nj, nk = idx[0] + di, idx[1] + dj, idx[2] + dk
-                                if (
-                                    0 <= ni < grid_shape[0]
-                                    and 0 <= nj < grid_shape[1]
-                                    and 0 <= nk < grid_shape[2]
-                                ):
-                                    neighbor_normal = normals[ni, nj, nk]
-                                    neighbor_magnitude = norm_magnitudes[ni, nj, nk]
-                                    if AbstractTensor.any(neighbor_magnitude > 1e-16):
-                                        neighbors.append(neighbor_normal)
-                    if neighbors:
-                        avg_normal = AbstractTensor.mean(AbstractTensor.stack(neighbors), dim=0)
-                        avg_normal_norm = AbstractTensor.norm(avg_normal)
-                        if avg_normal_norm > 1e-16:
-                            normals[idx[0], idx[1], idx[2]] = avg_normal / avg_normal_norm  # Normalize average
+                    # Repair zero-magnitude normals by averaging surrounding normals
+                    zero_indices = AbstractTensor.nonzero(zero_norm_mask, as_tuple=True)
+                    for idx in zip(*zero_indices):
+                        # Collect neighboring normals
+                        neighbors = []
+                        for di in [-1, 0, 1]:
+                            for dj in [-1, 0, 1]:
+                                for dk in [-1, 0, 1]:
+                                    if di == 0 and dj == 0 and dk == 0:
+                                        continue  # Skip the center point
+                                    ni, nj, nk = idx[0] + di, idx[1] + dj, idx[2] + dk
+                                    if (
+                                        0 <= ni < grid_shape[0]
+                                        and 0 <= nj < grid_shape[1]
+                                        and 0 <= nk < grid_shape[2]
+                                    ):
+                                        neighbor_normal = normals[ni, nj, nk]
+                                        neighbor_magnitude = norm_magnitudes[ni, nj, nk]
+                                        if AbstractTensor.any(neighbor_magnitude > 1e-16):
+                                            neighbors.append(neighbor_normal)
+                        if neighbors:
+                            avg_normal = AbstractTensor.mean(AbstractTensor.stack(neighbors), dim=0)
+                            avg_normal_norm = AbstractTensor.norm(avg_normal)
+                            if avg_normal_norm > 1e-16:
+                                normals[idx[0], idx[1], idx[2]] = avg_normal / avg_normal_norm  # Normalize average
+                            else:
+                                if verbose:
+                                    print(f"Unable to repair normal at index {idx} due to zero magnitude of averaged normal.")
                         else:
-                            print(f"Unable to repair normal at index {idx} due to zero magnitude of averaged normal.")
-                    else:
-                        print(f"No valid neighbors to repair normal at index {idx}.")
+                            if verbose:
+                                print(f"No valid neighbors to repair normal at index {idx}.")
 
         if validate_normals:
             # Validation checks for the final normals
@@ -1305,7 +1327,8 @@ class TransformHub:
                 print("Validation failed: Normals are not unit length within tolerance after normalization.")
                 exit()
 
-            print("Validation passed: Normals are ideal.")
+            if verbose:
+                print("Validation passed: Normals are ideal.")
 
         return X, Y, Z, dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw, normals
 

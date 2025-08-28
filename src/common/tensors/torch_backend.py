@@ -725,11 +725,7 @@ class PyTorchTensorOperations(AbstractTensor):
     def unsqueeze_(self, dim: int):
         return self.data.unsqueeze(dim)
 
-    @classmethod
-    def tensor_from_list(cls, data, dtype=None, device=None):
-        inst = cls(track_time=False)
-        inst.data = inst.tensor_from_list_(data, dtype, device)
-        return inst
+    # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
 from .abstraction import register_backend
 register_backend("torch", PyTorchTensorOperations)

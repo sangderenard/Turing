@@ -11,9 +11,9 @@ from ..autograd import autograd
 
 logger = get_tensors_logger()
 
-def _randn_matrix(rows: int, cols: int, like: AbstractTensor, scale: float = 0.02) -> AbstractTensor:
+def _randn_matrix(rows: int, cols: int, like: AbstractTensor, scale: float = 0.02, requires_grad=True, tape=None) -> AbstractTensor:
     data = [[random.gauss(0.0, 1.0) * scale for _ in range(cols)] for _ in range(rows)]
-    return from_list_like(data, like=like)
+    return from_list_like(data, requires_grad=requires_grad, like=like, tape=tape)
 
 def _to_tuple2(x):
     return (x, x) if isinstance(x, int) else x
@@ -34,14 +34,10 @@ class Linear:
             f"Linear layer init: in_dim={in_dim}, out_dim={out_dim}, bias={bias}, init={init}, scale={scale}"
         )
         self.W = _randn_matrix(in_dim, out_dim, like=like, scale=scale)
-        self.W.requires_grad_(True)
-        self.W._tape = autograd.tape
         autograd.tape.create_tensor_node(self.W)
         self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.W"
         self.b = from_list_like([[0.01] * out_dim], like=like) if bias else None
         if self.b is not None:
-            self.b.requires_grad_(True)
-            self.b._tape = autograd.tape
             autograd.tape.create_tensor_node(self.b)
             self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}Linear.b"
         logger.debug(
@@ -120,15 +116,9 @@ class RectConv2d:
             ]
             for _ in range(out_channels)
         ]
-        self.W = from_list_like(w_data, like=like)
-        self.W.requires_grad_(True)
-        self.W._tape = autograd.tape
-        autograd.tape.create_tensor_node(self.W)
-        self.b = from_list_like([0.0] * out_channels, like=like) if bias else None
-        if self.b is not None:
-            self.b.requires_grad_(True)
-            self.b._tape = autograd.tape
-            autograd.tape.create_tensor_node(self.b)
+        # Create parameters directly with requires_grad on the current global tape
+        self.W = from_list_like(w_data, like=like, requires_grad=True, tape=autograd.tape)
+        self.b = from_list_like([0.0] * out_channels, like=like, requires_grad=True, tape=autograd.tape) if bias else None
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
@@ -295,7 +285,13 @@ class RectConv3d:
         cols = np.transpose(win, (0, 1, 5, 6, 7, 2, 3, 4)).reshape(
             N, self.in_channels * kD * kH * kW, Dout * Hout * Wout
         )
-        cols_t = x.ensure_tensor(cols)
+        # Wrap cols as a tensor on the same backend and tape as x
+        cols_t = AbstractTensor.get_tensor(
+            cols,
+            cls=type(x),
+            track_time=False,
+            tape=getattr(x, "_tape", None),
+        )
         self._cols = cols_t
         Wm = self.W.reshape(self.out_channels, -1)
         out = Wm @ cols_t
@@ -338,7 +334,13 @@ class RectConv3d:
                         :, :, :, :, :, kd, kh, kw
                     ]
         dx = dx_p[:, :, pD : pD + D, pH : pH + H, pW : pW + W]
-        result = self._x.ensure_tensor(dx)
+        # Wrap dx as a tensor on the same backend and tape as the original input
+        result = AbstractTensor.get_tensor(
+            dx,
+            cls=type(self._x),
+            track_time=False,
+            tape=getattr(self._x, "_tape", None),
+        )
         self._x = None
         self._cols = None
         self._x_shape = None

@@ -32,22 +32,49 @@ def set_seed(seed: int) -> None:
 def as_list(t: AbstractTensor) -> list:
     return t.tolist()
 
-def from_list_like(data: list, like: AbstractTensor) -> AbstractTensor:
-    return type(like).tensor_from_list(data, dtype=None, device=None)
+def from_list_like(
+    data: list,
+    like: AbstractTensor,
+    *,
+    requires_grad: bool = False,
+    tape=None,
+) -> AbstractTensor:
+    """Create a tensor from Python list data, matching ``like``'s backend.
+
+    Supports requires_grad and tape propagation without creating intermediate numpy arrays.
+    """
+    cls = type(like)
+    t = AbstractTensor.get_tensor(data, cls=cls, tape=tape)
+    if requires_grad:
+        try:
+            t.requires_grad_(True)
+        except Exception:
+            setattr(t, "_requires_grad", True)
+    return t
 
 def zeros_like(t: AbstractTensor) -> AbstractTensor:
-    def zmap(x):
-        if isinstance(x, list):
-            return [zmap(v) for v in x]
-        return 0.0
-    return from_list_like(zmap(as_list(t)), like=t)
+    """Return a zeros tensor with the same shape as t using t's backend/tape."""
+    try:
+        return t.zeros_like()
+    except Exception:
+        # Fallback: list route
+        def zmap(x):
+            if isinstance(x, list):
+                return [zmap(v) for v in x]
+            return 0.0
+        return from_list_like(zmap(as_list(t)), like=t, tape=getattr(t, "_tape", None))
 
 def ones_like(t: AbstractTensor) -> AbstractTensor:
-    def omap(x):
-        if isinstance(x, list):
-            return [omap(v) for v in x]
-        return 1.0
-    return from_list_like(omap(as_list(t)), like=t)
+    """Return a ones tensor with the same shape as t using t's backend/tape."""
+    try:
+        return t.ones_like()
+    except Exception:
+        # Fallback: list route
+        def omap(x):
+            if isinstance(x, list):
+                return [omap(v) for v in x]
+            return 1.0
+        return from_list_like(omap(as_list(t)), like=t, tape=getattr(t, "_tape", None))
 
 def map_unary(fn: Callable[[float], float], t: AbstractTensor) -> AbstractTensor:
     def rec(x):

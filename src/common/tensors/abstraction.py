@@ -512,9 +512,40 @@ class AbstractTensor:
         # 4. If all else fails, raise an error
         raise RuntimeError("No suitable tensor backend is available to create a tensor from list.")
     @classmethod
-    def tensor_from_list(cls, data, dtype=None, device=None):
-        inst = cls(track_time=False)
+    def _tensor_from_list(
+        cls,
+        data,
+        dtype=None,
+        device=None,
+        tape: "GradTape" | None = None,
+        *,
+        like: "AbstractTensor" | None = None,
+        requires_grad: bool = False,
+    ):
+        """Centralized list->tensor creation.
+
+        - If called on AbstractTensor, choose backend from ``like`` or registry.
+        - If called on a backend subclass, use it directly.
+        - Always attaches to ``tape`` if provided and sets requires_grad when requested.
+        """
+        # Resolve target backend
+        target_cls = cls
+        if cls is AbstractTensor:
+            if like is not None:
+                target_cls = type(like)
+            else:
+                target_cls = AbstractTensor.check_or_build_registry()
+
+        inst = target_cls(track_time=False, tape=tape)
         inst.data = inst.tensor_from_list_(data, dtype, device)
+        if requires_grad:
+            try:
+                inst.requires_grad_(True)
+            except Exception:
+                try:
+                    inst._requires_grad = True
+                except Exception:
+                    pass
         return inst
     # --- Tensor creation and manipulation methods ---
 
@@ -615,6 +646,7 @@ class AbstractTensor:
         device=None,
         track_time: bool = False,
         faculty: "Faculty" = None,
+        tape: "GradTape" | None = None,
     ) -> "AbstractTensor":
         """
         Create an AbstractTensor from `data`.
@@ -627,7 +659,7 @@ class AbstractTensor:
             cls = cls.check_or_build_registry()
 
         # Use the specific backend class
-        inst = cls(track_time=track_time)
+        inst = cls(track_time=track_time, tape=tape)
         if data is None:
             return inst  # handle-as-backend-handle case, like get_tensor(None)
 
@@ -657,14 +689,14 @@ class AbstractTensor:
         return pack_nested_to_tensor(data, dtype=dtype, device=device, cls=cls)
 
     @staticmethod
-    def get_tensor(data=None, *, dtype=None, device=None, cls=None, track_time=False) -> "AbstractTensor":
+    def get_tensor(data=None, *, dtype=None, device=None, cls=None, track_time=False, tape: "GradTape" | None = None) -> "AbstractTensor":
         """
         Get the tensor data from this AbstractTensor or create a new one if data is provided.
         If data is None, return self.
         """
         if cls is None:
             cls = AbstractTensor.check_or_build_registry()
-        return cls.tensor(data, dtype=dtype, device=device, track_time=track_time)
+        return cls.tensor(data, dtype=dtype, device=device, track_time=track_time, tape=tape)
 
     def tensor_like(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":
         """
@@ -676,8 +708,8 @@ class AbstractTensor:
         return self.tensor(data, dtype=dtype, device=device, track_time=self.track_time)
 
     @staticmethod
-    def range(start, end=None, step=1, *, dtype=None, device=None, cls=None):
-        return AbstractTensor.arange(start, end, step, dtype=dtype, device=device, cls=cls)
+    def range(start, end=None, step=1, *, dtype=None, device=None, cls=None, tape: "GradTape" | None = None):
+        return AbstractTensor.arange(start, end, step, dtype=dtype, device=device, cls=cls, tape=tape)
 
     @staticmethod
     def arange(
@@ -688,6 +720,7 @@ class AbstractTensor:
         dtype=None,
         device=None,
         cls=None,
+        tape: "GradTape" | None = None,
     ) -> "AbstractTensor":
         """
         Create an arange tensor using the best available backend if cls is None.
@@ -731,7 +764,7 @@ class AbstractTensor:
             if cls is None:
                 raise RuntimeError("No tensor backend available for arange.")
 
-        inst = cls(track_time=False)  # Assuming default track_time
+        inst = cls(track_time=False, tape=tape)  # Assuming default track_time
         inst.data = inst.arange_(start, end, step, dtype=dtype, device=device)
         return inst
 
@@ -1153,12 +1186,12 @@ class AbstractTensor:
                 return converted
             # No progress? Inject raw data into the target and bail.
             if type(converted) is type(self):
-                out = type(target_ops)(track_time=self.track_time)
+                out = type(target_ops)(track_time=self.track_time, tape=getattr(target_ops, "_tape", None))
                 out.data = converted.data
                 return out
             return converted.to_backend(target_ops)
 
-        new_tensor = type(target_ops)(track_time=self.track_time)
+        new_tensor = type(target_ops)(track_time=self.track_time, tape=getattr(target_ops, "_tape", None))
         new_tensor.data = converted
         return new_tensor
 
@@ -1172,36 +1205,65 @@ class AbstractTensor:
         if isinstance(tensor, AbstractTensor):
             return tensor.to_backend(self)
         if isinstance(tensor, self.tensor_type):
-            result = backend_cls(track_time=self.track_time)
+            result = backend_cls(track_time=self.track_time, tape=getattr(self, "_tape", None))
             result.data = tensor
             return result
         if torch is not None and isinstance(tensor, torch.Tensor):
             try:
                 from .torch_backend import PyTorchTensorOperations
-                torch_ops = AbstractTensor.get_tensor(cls=PyTorchTensorOperations)
-                tmp = torch_ops.__class__()
+                torch_ops = AbstractTensor.get_tensor(cls=PyTorchTensorOperations, tape=getattr(self, "_tape", None))
+                tmp = torch_ops.__class__(track_time=self.track_time, tape=getattr(self, "_tape", None))
                 tmp.data = tensor
                 return tmp.to_backend(self)
             except Exception:
                 pass
         if np is not None and isinstance(tensor, np.ndarray):
             from .numpy_backend import NumPyTensorOperations
-            numpy_ops = AbstractTensor.get_tensor(cls=NumPyTensorOperations)
-            numpy_tensor = numpy_ops.__class__()
+            numpy_ops = AbstractTensor.get_tensor(cls=NumPyTensorOperations, tape=getattr(self, "_tape", None))
+            numpy_tensor = numpy_ops.__class__(track_time=self.track_time, tape=getattr(self, "_tape", None))
             numpy_tensor.data = tensor
             return numpy_tensor.to_backend(self)
         if isinstance(tensor, (list, tuple)):
             # Mixed or nested sequences are routed through the nested packer
             if any(isinstance(elem, (list, tuple, AbstractTensor)) for elem in tensor):
-                return self.__class__.from_nested(tensor)
+                # Ensure nested creation attaches to this tensor's tape
+                from . import autograd as _autograd
+                prev = _autograd.autograd.tape
+                try:
+                    if getattr(self, "_tape", None) is not None:
+                        _autograd.autograd.tape = getattr(self, "_tape", None)
+                    return self.__class__.from_nested(tensor)
+                finally:
+                    _autograd.autograd.tape = prev
             try:
-                return self.tensor_from_list(tensor, dtype=None, device=None)
+                from . import autograd as _autograd
+                prev = _autograd.autograd.tape
+                try:
+                    if getattr(self, "_tape", None) is not None:
+                        _autograd.autograd.tape = getattr(self, "_tape", None)
+                    return type(self)._tensor_from_list(tensor, dtype=None, device=None, tape=getattr(self, "_tape", None))
+                finally:
+                    _autograd.autograd.tape = prev
             except Exception:
                 # numpy/pure backends may choke on ragged lists; fall back to nested pack
-                return self.__class__.from_nested(tensor)
+                from . import autograd as _autograd
+                prev = _autograd.autograd.tape
+                try:
+                    if getattr(self, "_tape", None) is not None:
+                        _autograd.autograd.tape = getattr(self, "_tape", None)
+                    return self.__class__.from_nested(tensor)
+                finally:
+                    _autograd.autograd.tape = prev
         if hasattr(tensor, "tolist"):
             return self.ensure_tensor(tensor.tolist())
-        return self.tensor_from_list([tensor], dtype=None, device=None)
+        from . import autograd as _autograd
+        prev = _autograd.autograd.tape
+        try:
+            if getattr(self, "_tape", None) is not None:
+                _autograd.autograd.tape = getattr(self, "_tape", None)
+            return type(self)._tensor_from_list([tensor], dtype=None, device=None, tape=getattr(self, "_tape", None))
+        finally:
+            _autograd.autograd.tape = prev
 
     # --- Operator routing ---
     @staticmethod
@@ -1902,6 +1964,117 @@ AbstractTensor.randint = staticmethod(randint)
 AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 
 
+# --- Creation helpers: tape + requires_grad + record ------------------------
+def _attach_requires_and_record(result, *, op: str, requires_grad: bool, params: dict | None = None):
+    from . import autograd as _autograd
+    tape = getattr(result, "_tape", None) or _autograd.autograd.tape
+    if requires_grad:
+        try:
+            result.requires_grad_(True)
+        except Exception:
+            try:
+                result._requires_grad = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) == 0:
+        AbstractTensor.autograd.record(op, [], result, start=None, end=None, params=params or {})
+    return result
+
+
+class _UseTape:
+    def __init__(self, tape):
+        from . import autograd as _autograd
+        self._autograd = _autograd
+        self._new = tape
+        self._prev = None
+    def __enter__(self):
+        self._prev = self._autograd.autograd.tape
+        self._autograd.autograd.tape = self._new
+        return self._new
+    def __exit__(self, exc_type, exc, tb):
+        self._autograd.autograd.tape = self._prev
+
+
+def _wrap_creation_fn(op_name: str, raw_fn):
+    """
+    Wrap a top-level creation function so it accepts:
+      - requires_grad: bool = False
+      - tape: Optional[GradTape] = None
+    and records the op.
+    """
+    def wrapped(*args, requires_grad: bool = False, tape=None, **kwargs):
+        from . import autograd as _autograd
+        # If requires_grad=True, force use of the global tape regardless of provided tape
+        desired_tape = _autograd.autograd.tape if requires_grad else tape
+        if desired_tape is None:
+            result = raw_fn(*args, **kwargs)
+        else:
+            prev = _autograd.autograd.tape
+            _autograd.autograd.tape = desired_tape
+            try:
+                result = raw_fn(*args, **kwargs)
+            finally:
+                _autograd.autograd.tape = prev
+
+        if not isinstance(result, AbstractTensor):
+            result = AbstractTensor.get_tensor(result, tape=desired_tape)
+
+        params = {}
+        try:
+            params["shape"] = tuple(getattr(result, "shape", ()))
+        except Exception:
+            pass
+        return _attach_requires_and_record(result, op=op_name, requires_grad=requires_grad, params=params)
+    return wrapped
+
+
+# Expose the tape context
+AbstractTensor.use_tape = staticmethod(lambda tape: _UseTape(tape))
+
+# Rebind top-level creations so they accept tape=/requires_grad= and record ops.
+try:
+    AbstractTensor.zeros = staticmethod(_wrap_creation_fn("zeros", AbstractTensor.zeros))
+except Exception:
+    pass
+try:
+    AbstractTensor.ones  = staticmethod(_wrap_creation_fn("ones",  AbstractTensor.ones))
+except Exception:
+    pass
+try:
+    AbstractTensor.full  = staticmethod(_wrap_creation_fn("full",  AbstractTensor.full))
+except Exception:
+    pass
+try:
+    AbstractTensor.empty = staticmethod(_wrap_creation_fn("empty", AbstractTensor.empty))
+except Exception:
+    pass
+try:
+    AbstractTensor.linspace = staticmethod(_wrap_creation_fn("linspace", AbstractTensor.linspace))
+except Exception:
+    pass
+try:
+    AbstractTensor.meshgrid = staticmethod(_wrap_creation_fn("meshgrid", AbstractTensor.meshgrid))
+except Exception:
+    pass
+try:
+    AbstractTensor.randint = staticmethod(_wrap_creation_fn("randint", AbstractTensor.randint))
+except Exception:
+    pass
+try:
+    AbstractTensor.randoms = staticmethod(_wrap_creation_fn("randoms", AbstractTensor.randoms))
+except Exception:
+    pass
+try:
+    # Ensure arange/range also support requires_grad + tape and force global tape when requested
+    AbstractTensor.arange = staticmethod(_wrap_creation_fn("arange", AbstractTensor.arange))
+except Exception:
+    pass
+try:
+    AbstractTensor.range = staticmethod(_wrap_creation_fn("range", AbstractTensor.range))
+except Exception:
+    pass
+
+
 def _wrap_with_autograd(name: str, func: Callable) -> Callable:
     def wrapped(self, *args, **kwargs):
         tensor_args = [a for a in args if isinstance(a, AbstractTensor)]
@@ -2108,12 +2281,21 @@ def default_to_backend(source_ops, tensor, target_ops):
     # Works if backend exposes either a classmethod, staticmethod, or instance method:
     import inspect
     cls = type(target_ops)
-    raw = inspect.getattr_static(cls, "tensor_from_list", None)
+    raw = inspect.getattr_static(cls, "_tensor_from_list", None)
+    if raw is None:
+        raw = inspect.getattr_static(cls, "tensor_from_list", None)
+    tape = getattr(target_ops, "_tape", None)
     if isinstance(raw, classmethod):
-        return raw.__func__(cls, data, dtype, device)
+        try:
+            return raw.__func__(cls, data, dtype, device, tape)
+        except TypeError:
+            return raw.__func__(cls, data, dtype, device)
     if isinstance(raw, staticmethod):
-        return raw.__func__(data, dtype, device)
-    return target_ops.tensor_from_list(data, dtype=dtype, device=device)
+        try:
+            return raw.__func__(data, dtype, device, tape)
+        except TypeError:
+            return raw.__func__(data, dtype, device)
+    return target_ops._tensor_from_list(data, dtype=dtype, device=device, tape=tape)
 
 
 def get_tensor_operations(

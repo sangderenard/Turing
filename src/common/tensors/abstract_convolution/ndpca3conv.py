@@ -4,6 +4,7 @@ import numpy as np
 
 from ..abstraction import AbstractTensor
 from ..abstract_nn.core import Linear  # for optional 1x1 mixing
+from ..abstract_nn.utils import from_list_like
 from ..autograd import autograd
 
 Boundary = Literal["dirichlet", "neumann", "periodic"]
@@ -110,10 +111,13 @@ class NDPCA3Conv3d:
 
         # Learnable 3-tap per principal direction (shared across channels)
         # shape: (k, 3) for [-1, 0, +1]
-        init = np.array([[0.25, 0.50, 0.25] for _ in range(k)], dtype=np.float32)
-        self.taps = like.ensure_tensor(init)
-        self.taps.requires_grad_(True)
-        self.taps._tape = autograd.tape
+        # IMPORTANT: initialize as a true leaf parameter (no post-multiply)
+        # to ensure grads are populated consistently across backends.
+        from ..abstraction_methods.random import Random
+        random = Random()
+        scale = 0.01
+        init_data = [[random.gauss(0.0, 1.0) * scale for _ in range(3)] for _ in range(k)]
+        self.taps = from_list_like(init_data, like=like, requires_grad=True, tape=autograd.tape)
         autograd.tape.create_tensor_node(self.taps)
         self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
 

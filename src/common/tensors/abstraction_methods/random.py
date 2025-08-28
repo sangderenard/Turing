@@ -932,16 +932,64 @@ class Random:
         self.shuffle(pool)
         return pool[:k]
 
-    def gauss(self, mu, sigma):
-        # Box-Muller transform
-        import math
-        u1 = next(self._gen)
+    def gauss(self, mu: float = 0.0, sigma: float = 1.0):
+        """Gaussian (normal) variate via Box–Muller.
+
+        Defaults to standard normal (mu=0, sigma=1), a scientifically
+        conventional baseline for measurement noise and aggregated effects
+        by the central limit theorem.
+        """
+        
+        # Guard u1 in (0,1] to avoid log(0); u2 in [0,1)
+        u1 = max(next(self._gen), 1e-12)
         u2 = next(self._gen)
+        import math
         z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
         return mu + z0 * sigma
 
     def normalvariate(self, mu, sigma):
         return self.gauss(mu, sigma)
+
+    # Energy-distribution helpers ------------------------------------------------
+    def sample_energy(self, kind: str = "thermal_boltzmann", **params):
+        """Sample a physically meaningful energy-like random variable.
+
+        Kinds:
+        - thermal_boltzmann: E ≥ 0 with P(E) ∝ exp(-E/kT)
+            params: kT (default 1.0)
+        - maxwell_boltzmann_energy: 3D kinetic energy with Gamma(3/2, kT)
+            params: kT (default 1.0)
+        - gaussian_energy: measurement-like around mean energy
+            params: mu (default 1.0), sigma (default 0.1)
+        - lognormal_energy: multiplicative processes; E = exp(N(mu_log, sigma_log))
+            params: mu_log (0.0), sigma_log (1.0)
+        """
+        import math
+        kind = (kind or "").lower()
+        if kind == "thermal_boltzmann":
+            kT = float(params.get("kT", 1.0))
+            # Exponential with mean kT: E = -kT * ln(1-u)
+            u = max(next(self._gen), 1e-12)
+            return -kT * math.log(1.0 - u)
+        elif kind in ("maxwell_boltzmann_energy", "maxwell-boltzmann-energy", "mb_energy"):
+            kT = float(params.get("kT", 1.0))
+            # If Z_i ~ N(0,1), S = sum Z_i^2 ~ ChiSquare(3) = Gamma(1.5, 2)
+            # Then E ~ Gamma(1.5, kT) by scaling: E = (kT/2) * S
+            z1 = self.gauss()
+            z2 = self.gauss()
+            z3 = self.gauss()
+            S = z1*z1 + z2*z2 + z3*z3
+            return 0.5 * kT * S
+        elif kind in ("gaussian_energy", "gaussian"):
+            mu = float(params.get("mu", 1.0))
+            sigma = float(params.get("sigma", 0.1))
+            return self.gauss(mu, sigma)
+        elif kind in ("lognormal_energy", "lognormal"):
+            mu_log = float(params.get("mu_log", 0.0))
+            sigma_log = float(params.get("sigma_log", 1.0))
+            return math.exp(self.gauss(mu_log, sigma_log))
+        else:
+            raise ValueError(f"Unknown energy distribution kind: {kind}")
 
     # Add more methods as needed for your use case
 

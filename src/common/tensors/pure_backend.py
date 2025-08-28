@@ -1550,10 +1550,6 @@ class PurePythonTensorOperations(AbstractTensor):
             return [self.to_dtype_(t, dtype) for t in tensor]
         return convert(tensor)
 
-    @classmethod
-    def tensor_from_list(cls, data, dtype=None, device=None):
-        inst = cls(track_time=False)
-        inst.data = inst.tensor_from_list_(data, dtype, device)
-        return inst
+    # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
 register_backend("pure_python", PurePythonTensorOperations)

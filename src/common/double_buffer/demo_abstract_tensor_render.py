@@ -6,7 +6,8 @@ from src.rendering.render_chooser import RenderChooser
 
 def make_texture_tensor(width, height):
     arr = np.random.randint(0, 256, (height, width), dtype=np.uint8)
-    return AbstractTensor.tensor_from_list(arr.tolist())
+    # Avoid private list-based factory; wrap NumPy array directly
+    return AbstractTensor.get_tensor(arr)
 
 if __name__ == "__main__":
     width, height = 16, 8
