@@ -103,6 +103,7 @@ def main():
                 p.grad = AbstractTensor.zeros_like(p.grad)
         y = layer.forward(x)
         loss = loss_fn(y, target)
+        layer.report_orphan_nodes()
         # Backward pass (assume .backward() populates .grad)
         if hasattr(loss, 'backward'):
             loss.backward()
