@@ -61,7 +61,7 @@ def main():
     U, V, W = layer.grid_domain.U, layer.grid_domain.V, layer.grid_domain.W
     target = (U + V + W).unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1, -1)
     # Input: random
-    x = AT.randn((B, C, *grid_shape))
+    x = AT.randn((B, C, *grid_shape), requires_grad=True)
     # --- Parameter and gradient collection helpers ---
     from ..logger import get_tensors_logger
     logger = get_tensors_logger()
