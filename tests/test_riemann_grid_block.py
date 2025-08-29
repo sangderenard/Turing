@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
 from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.autograd import autograd
+from src.common.tensors.abstract_convolution.ndpca3transform import PCABasisND
+from src.common.tensors.riemann.geometry_factory import build_geometry
 from src.common.tensors.riemann.grid_block import (
     RiemannGridBlock,
     validate_config,
@@ -26,6 +29,41 @@ def _example_config():
             "pointwise": True,
         },
         "post_linear": {"in_dim": 4, "out_dim": 2},
+    }
+
+
+def _identity_basis():
+    AT = AbstractTensor
+    mu = AT.zeros(3)
+    P = AT.eye(3)
+    return PCABasisND(mu=mu, P=P, n=3)
+
+
+def _phi(U, V, W):
+    AT = AbstractTensor
+    return AT.stack([U, V, W], dim=-1)
+
+
+def _pca_demo_config():
+    basis = _identity_basis()
+    return {
+        "geometry": {
+            "key": "pca_nd",
+            "grid_shape": (2, 2, 2),
+            "boundary_conditions": (True,) * 6,
+            "transform_args": {"pca_basis": basis, "phi_fn": _phi, "d_visible": 3},
+            "laplace_kwargs": {},
+        },
+        "casting": {"mode": "pre_linear"},
+        "conv": {
+            "in_channels": 2,
+            "out_channels": 3,
+            "k": 1,
+            "metric_source": "g",
+            "boundary_conditions": ("dirichlet",) * 6,
+            "pointwise": True,
+        },
+        "post_linear": {"in_dim": 3, "out_dim": 3},
     }
 
 
@@ -129,3 +167,47 @@ def test_validate_config_requires_channels():
     }
     with pytest.raises(ValueError):
         validate_config(cfg)
+
+
+def test_geometry_factory_pca_nd_demo_config():
+    cfg = _pca_demo_config()["geometry"]
+    _, grid, package = build_geometry(cfg)
+    assert grid.U.shape == (2, 2, 2)
+    assert isinstance(package, dict)
+
+
+def test_forward_shape_and_grad_pca_nd():
+    cfg = _pca_demo_config()
+    block = RiemannGridBlock.build_from_config(cfg)
+    B = 2
+    D, H, W = cfg["geometry"]["grid_shape"]
+    x = AbstractTensor.randn((B, cfg["conv"]["in_channels"], D, H, W), requires_grad=True)
+    y = block.forward(x)
+    assert y.shape == (B, cfg["conv"]["out_channels"], D, H, W)
+    loss = y.sum()
+    params = block.parameters()
+    grads = autograd.grad(loss, [x] + params)
+    assert grads[0].shape == x.shape
+    assert all(g is not None for g in grads)
+
+
+def test_parameter_counts_pca_nd():
+    cfg = _pca_demo_config()
+    block = RiemannGridBlock.build_from_config(cfg)
+    D, H, W = cfg["geometry"]["grid_shape"]
+    Cin = cfg["conv"]["in_channels"]
+    Cout = cfg["conv"]["out_channels"]
+    size = Cin * D * H * W
+
+    pre_params = sum(p.numel() for p in block.casting.pre_linear.parameters())
+    conv_params = sum(p.numel() for p in block.conv.parameters())
+    post_params = sum(p.numel() for p in block.post_linear.parameters())
+
+    assert pre_params == size * size + size
+    expected_conv = cfg["conv"]["k"] * len(block.conv.offsets) + Cin * Cout
+    assert conv_params == expected_conv
+    expected_post = (
+        cfg["post_linear"]["in_dim"] * cfg["post_linear"]["out_dim"]
+        + cfg["post_linear"]["out_dim"]
+    )
+    assert post_params == expected_post
