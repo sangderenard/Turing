@@ -10,50 +10,28 @@ from ..autograd import autograd
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 
 
-def _shift3d(
+
+def _shift3d_step(
     arr: AbstractTensor,
     axis: int,
     step: int,
     bc: Tuple[Boundary, Boundary],
-    length: int,
 ) -> Tuple[AbstractTensor, AbstractTensor]:
-    """Shift ``arr`` along ``axis`` by ``step`` voxels.
+    """Shift ``arr`` by a single voxel along ``axis``.
 
-    Parameters
-    ----------
-    arr : AbstractTensor
-        Tensor of shape ``(..., D, H, W)``.
-    axis : int
-        Spatial axis to shift (2 for ``u``, 3 for ``v``, 4 for ``w``).
-    step : int
-        Signed shift distance.  ``step > 0`` moves values toward increasing
-        indices.
-    bc : tuple[str, str]
-        Boundary conditions for the low/high side.
-    length : int
-        Maximum permitted absolute shift.  This bounds ``step``.
-
-    Returns
-    -------
-    shifted : AbstractTensor
-        The shifted tensor with boundary handling applied.
-    mask : AbstractTensor
-        A mask of the same shape with ones where data originated from inside
-        the domain and zeros where boundary padding was inserted.  ``mask`` is
-        useful for normalising tap weights near boundaries.
+    This helper only handles ``step`` values of ``+1`` or ``-1``. Boundary
+    conditions are applied for this one-step move.
     """
-    assert step != 0 and abs(step) <= length
+    assert abs(step) == 1
 
-    # Periodic wrap: concatenate edge slice to the opposite side
     if (step > 0 and bc[1] == "periodic") or (step < 0 and bc[0] == "periodic"):
         if step > 0:
-            head = arr[(slice(None),) * axis + (slice(-step, None),)]
-            body = arr[(slice(None),) * axis + (slice(0, -step),)]
+            head = arr[(slice(None),) * axis + (slice(-1, None),)]
+            body = arr[(slice(None),) * axis + (slice(0, -1),)]
             out = AbstractTensor.cat([head, body], dim=axis)
-        else:  # step < 0
-            step = -step
-            tail = arr[(slice(None),) * axis + (slice(0, step),)]
-            body = arr[(slice(None),) * axis + (slice(step, None),)]
+        else:
+            tail = arr[(slice(None),) * axis + (slice(0, 1),)]
+            body = arr[(slice(None),) * axis + (slice(1, None),)]
             out = AbstractTensor.cat([body, tail], dim=axis)
         mask = AbstractTensor.ones_like(arr)
         return out, mask
@@ -63,16 +41,15 @@ def _shift3d(
     if step > 0:
         sl_src = [slice(None)] * arr.ndim
         sl_dst = [slice(None)] * arr.ndim
-        sl_src[axis] = slice(0, -step)
-        sl_dst[axis] = slice(step, None)
+        sl_src[axis] = slice(0, -1)
+        sl_dst[axis] = slice(1, None)
         out[tuple(sl_dst)] = arr[tuple(sl_src)]
         mask[tuple(sl_dst)] = 1.0
-    else:  # step < 0
-        step = -step
+    else:
         sl_src = [slice(None)] * arr.ndim
         sl_dst = [slice(None)] * arr.ndim
-        sl_src[axis] = slice(step, None)
-        sl_dst[axis] = slice(0, -step)
+        sl_src[axis] = slice(1, None)
+        sl_dst[axis] = slice(0, -1)
         out[tuple(sl_dst)] = arr[tuple(sl_src)]
         mask[tuple(sl_dst)] = 1.0
 
@@ -81,14 +58,57 @@ def _shift3d(
         edge_dst = [slice(None)] * arr.ndim
         if step > 0:
             edge_src[axis] = slice(-1, None)
-            edge_dst[axis] = slice(0, step)
+            edge_dst[axis] = slice(0, 1)
         else:
             edge_src[axis] = slice(0, 1)
-            edge_dst[axis] = slice(-step, None)
+            edge_dst[axis] = slice(-1, None)
         out[tuple(edge_dst)] = arr[tuple(edge_src)]
         mask[tuple(edge_dst)] = 1.0
 
     return out, mask
+
+
+def _shift3d_var(
+    arr: AbstractTensor,
+    axis: int,
+    step: int,
+    bc: Tuple[Boundary, Boundary],
+    length: int,
+) -> Tuple[AbstractTensor, AbstractTensor]:
+    """Shift ``arr`` along ``axis`` by an arbitrary integer ``step``."""
+    assert abs(step) <= length
+    if step == 0:
+        return arr, AbstractTensor.ones_like(arr)
+
+    out = arr
+    mask_total = AbstractTensor.ones_like(arr)
+    direction = 1 if step > 0 else -1
+    for _ in range(abs(step)):
+        out, step_mask = _shift3d_step(out, axis, direction, bc)
+        mask_total, _ = _shift3d_step(mask_total, axis, direction, bc)
+        mask_total = mask_total * step_mask
+    return out, mask_total
+
+
+def _shift3d(
+    arr: AbstractTensor,
+    axis: int,
+    step: int = 1,
+    bc: Tuple[Boundary, Boundary] = ("dirichlet", "dirichlet"),
+    length: int | None = None,
+) -> Tuple[AbstractTensor, AbstractTensor]:
+    """Compatibility wrapper for legacy `_shift3d`.
+
+    Parameters mirror the original helper but default ``step`` to ``1`` so
+    calls without an explicit step maintain previous behaviour.  ``length``
+    bounds the allowable shift magnitude; if omitted it defaults to
+    ``abs(step)``.
+    """
+
+    if length is None:
+        length = abs(step)
+    assert step != 0 and abs(step) <= length
+    return _shift3d_var(arr, axis=axis, step=step, bc=bc, length=length)
 
 
 class NDPCA3Conv3d:
@@ -287,9 +307,9 @@ class NDPCA3Conv3d:
                     mask_total = mask_total + w_off
                 continue
 
-            xu, mu = _shift3d(arr, axis=2, step=off, bc=bcu, length=self.length)
-            xv, mv = _shift3d(arr, axis=3, step=off, bc=bcv, length=self.length)
-            xw, mw = _shift3d(arr, axis=4, step=off, bc=bcw, length=self.length)
+            xu, mu = _shift3d_var(arr, axis=2, step=off, bc=bcu, length=self.length)
+            xv, mv = _shift3d_var(arr, axis=3, step=off, bc=bcv, length=self.length)
+            xw, mw = _shift3d_var(arr, axis=4, step=off, bc=bcw, length=self.length)
             contrib = wU_b * xu + wV_b * xv + wW_b * xw
             y = y + w_off * contrib
             if mask_total is not None:
