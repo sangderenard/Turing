@@ -4,8 +4,8 @@ This file mirrors the previous riemann_convolutional_demo, using the
 MetricSteeredConv3DWrapper. The original demo remains available.
 """
 
-from .riemann_convolutional_demo import main
+from .riemann_convolutional_demo import main, build_config
 
 if __name__ == "__main__":
-    main()
+    main(build_config())
 

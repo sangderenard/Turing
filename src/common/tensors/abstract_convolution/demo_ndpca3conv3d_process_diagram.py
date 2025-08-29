@@ -190,6 +190,9 @@ def main() -> None:
 
 
     model = DemoModel(like=img, grid_shape=(IMG_D, IMG_H, IMG_W))
+    metric_np = np.tile(np.eye(3, dtype=np.float32), (IMG_D, IMG_H, IMG_W, 1, 1))
+    metric = AbstractTensor.get_tensor(metric_np)
+    model.package = {"metric": {"g": metric, "inv_g": metric}}
     
     loss_fn = MSELoss()
     optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
