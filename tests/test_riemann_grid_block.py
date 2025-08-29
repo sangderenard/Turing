@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.riemann.grid_block import RiemannGridBlock
@@ -72,3 +73,47 @@ def test_soft_assign_not_implemented():
     x = AbstractTensor.zeros((1, cfg["conv"]["in_channels"], D, H, W))
     with pytest.raises(NotImplementedError):
         block.forward(x)
+
+
+def test_casting_row_major_deterministic():
+    cfg = _example_config()
+    cfg["casting"] = {"mode": "pre_linear", "film": False, "map": "row_major"}
+    block = RiemannGridBlock.build_from_config(cfg)
+
+    C = cfg["conv"]["in_channels"]
+    D, H, W = cfg["geometry"]["grid_shape"]
+    size = C * D * H * W
+
+    eye = AbstractTensor.eye(size)
+    AbstractTensor.copyto(block.casting.pre_linear.W, eye)
+    AbstractTensor.copyto(block.casting.pre_linear.b, block.casting.pre_linear.b * 0)
+
+    x = AbstractTensor.arange(size).reshape(1, C, D, H, W)
+    y = block.casting.forward(x)
+
+    assert np.allclose(y.data, x.data)
+
+
+def test_casting_1to1_mapping():
+    cfg = _example_config()
+    cfg["casting"] = {"mode": "pre_linear", "film": False, "map": "1to1"}
+    block = RiemannGridBlock.build_from_config(cfg)
+
+    C = cfg["conv"]["in_channels"]
+    D, H, W = cfg["geometry"]["grid_shape"]
+    size = C * D * H * W
+
+    eye = AbstractTensor.eye(size)
+    AbstractTensor.copyto(block.casting.pre_linear.W, eye)
+    AbstractTensor.copyto(block.casting.pre_linear.b, block.casting.pre_linear.b * 0)
+
+    x = AbstractTensor.arange(size).reshape(1, C, D, H, W)
+    y = block.casting.forward(x)
+
+    flat = x.reshape(1, size)
+    expected = flat.reshape(1, D, H, W, C)
+    expected = expected.swapaxes(4, 3)
+    expected = expected.swapaxes(3, 2)
+    expected = expected.swapaxes(2, 1)
+
+    assert np.allclose(y.data, expected.data)
