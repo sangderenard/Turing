@@ -183,6 +183,15 @@ class LocalStateNetwork:
 
         self.nn_generators = defaultdict(deque)
 
+        # Initialize placeholder gradients so callers observing ``p.grad``
+        # after a backward pass will always see tensor objects rather than
+        # ``None``. Real gradients will overwrite these during autograd.
+        for p in self.parameters():
+            try:
+                p.grad = AbstractTensor.zeros_like(p)
+            except Exception:
+                pass
+
     def forward(self, padded_raw):
         """
         Forward pass to compute weighted_padded and modulated_padded.

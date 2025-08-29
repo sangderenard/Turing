@@ -37,23 +37,25 @@ class MetricSteeredConv3DWrapper:
         params = []
         if hasattr(self.conv, 'parameters') and callable(self.conv.parameters):
             params.extend(self.conv.parameters())
-        if isinstance(self.laplace_package, dict):
-            for v in self.laplace_package.values():
+        lp = getattr(self, 'laplace_package', None)
+        if isinstance(lp, dict):
+            for v in lp.values():
                 if hasattr(v, 'parameters') and callable(v.parameters):
                     params.extend(v.parameters())
-        elif hasattr(self.laplace_package, 'parameters') and callable(self.laplace_package.parameters):
-            params.extend(self.laplace_package.parameters())
+        elif hasattr(lp, 'parameters') and callable(lp.parameters):
+            params.extend(lp.parameters())
         return params
 
     def zero_grad(self):
         if hasattr(self.conv, 'zero_grad') and callable(self.conv.zero_grad):
             self.conv.zero_grad()
-        if isinstance(self.laplace_package, dict):
-            for v in self.laplace_package.values():
+        lp = getattr(self, 'laplace_package', None)
+        if isinstance(lp, dict):
+            for v in lp.values():
                 if hasattr(v, 'zero_grad') and callable(v.zero_grad):
                     v.zero_grad()
-        elif hasattr(self.laplace_package, 'zero_grad') and callable(self.laplace_package.zero_grad):
-            self.laplace_package.zero_grad()
+        elif hasattr(lp, 'zero_grad') and callable(lp.zero_grad):
+            lp.zero_grad()
 
     def __init__(
         self,
@@ -87,7 +89,8 @@ class MetricSteeredConv3DWrapper:
             coordinate_system="rectangular",
         )
         self.laplace_kwargs = laplace_kwargs or {}
-        self.laplace_package = self._build_laplace_package(boundary_conditions)
+        self.boundary_conditions = boundary_conditions
+        self.laplace_package = None
         self.conv = NDPCA3Conv3d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -109,16 +112,30 @@ class MetricSteeredConv3DWrapper:
             boundary_conditions=boundary_conditions,
             artificial_stability=1e-10,
             device=getattr(self.grid_domain.U, "device", None),
-            **self.laplace_kwargs,
         )
         _, _, package = builder.build_general_laplace(
-            self.grid_domain.U, self.grid_domain.V, self.grid_domain.W, return_package=True
+            self.grid_domain.U,
+            self.grid_domain.V,
+            self.grid_domain.W,
+            return_package=True,
+            **self.laplace_kwargs,
         )
+        lsn = package.get("local_state_network")
+        if lsn is not None:
+            for p in lsn.parameters():
+                if getattr(p, "grad", None) is None:
+                    try:
+                        p.grad = AbstractTensor.zeros_like(p)
+                    except Exception:
+                        pass
         return package
 
     def forward(self, x):
         autograd.tape.annotate(x, label="MetricSteeredConv3DWrapper.input")
         autograd.tape.auto_annotate_eval(x)
+        # Build the Laplace package inside the forward pass so gradients
+        # from LocalStateNetwork propagate correctly.
+        self.laplace_package = self._build_laplace_package(self.boundary_conditions)
         out = self.conv.forward(x, package=self.laplace_package)
         autograd.tape.annotate(out, label="MetricSteeredConv3DWrapper.output")
         autograd.tape.auto_annotate_eval(out)
