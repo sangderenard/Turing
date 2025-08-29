@@ -433,6 +433,9 @@ class BuildLaplace3D:
         else:
             raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
 
+        if selected_tensor.dim() == 7:
+            selected_tensor = selected_tensor.squeeze(0)
+
         # 4. Extract Components from Selected Tensor
         g_ij = selected_tensor[..., 0, :, :]      # Metric tensor
         g_inv = selected_tensor[..., 1, :, :]     # Inverse metric tensor
@@ -477,22 +480,16 @@ class BuildLaplace3D:
         laplacian_diag = -2.0 * (laplacian_off_diag_u + laplacian_off_diag_v + laplacian_off_diag_w)
 
 
-        # 20. Assemble the Sparse Laplacian Matrix
+        # 20. Assemble the Sparse Laplacian Matrix using tensor ops
 
-        # 1. Prepare Laplacian Matrix Contributions
-        row_indices = []
-        col_indices = []
-        values = []
+        total_size = det_g.numel()
+        device_coo = self.index_map['row_indices']['u+'].device if 'u+' in self.index_map['row_indices'] else 'cpu'
+        row_list = []
+        col_list = []
+        val_list = []
 
-        # Diagonal Entries Initialization
-        total_size = AbstractTensor.prod(AbstractTensor.tensor(det_g.shape)).item()
-        diagonal_entries = AbstractTensor.zeros(total_size, device='cpu')
-
-        # 2. Iterate Through the Index Map Patterns
         for label, row_indices_map in self.index_map['row_indices'].items():
             col_indices_map = self.index_map['col_indices'][label]
-
-            # Identify Contributions Based on Label
             if label in ['u+', 'u-']:
                 laplacian_contrib = laplacian_off_diag_u
             elif label in ['v+', 'v-']:
@@ -507,29 +504,31 @@ class BuildLaplace3D:
                 laplacian_contrib = inv_g_vw / density
             else:
                 raise ValueError("unsupported terms")
-                
 
-            # Flatten Values and Indices
-            row_indices.extend(row_indices_map.flatten().tolist())
-            col_indices.extend(col_indices_map.flatten().tolist())
-            values.extend(laplacian_contrib[self.index_map['masks'][label].cpu()].flatten().tolist())
+            mask = self.index_map['masks'][label].reshape(-1)
+            row_list.append(row_indices_map.reshape(-1))
+            col_list.append(col_indices_map.reshape(-1))
+            val_list.append(laplacian_contrib.reshape(-1)[mask])
 
             logger.debug("row_indices_map shape %s", row_indices_map.shape)
             logger.debug("col_indices_map shape %s", col_indices_map.shape)
             logger.debug("laplacian_contrib flattened shape %s", laplacian_contrib.flatten().shape)
 
-        # 3. Add Diagonal Contributions
-        flat_diag_indices = AbstractTensor.arange(total_size, device='cpu')
-        row_indices.extend(flat_diag_indices.tolist())
-        col_indices.extend(flat_diag_indices.tolist())
-        values.extend(laplacian_diag.flatten().tolist())
+        diag_indices = AbstractTensor.arange(total_size, device=device_coo)
+        row_list.append(diag_indices)
+        col_list.append(diag_indices)
+        val_list.append(laplacian_diag.reshape(-1))
 
-        # 4. Assemble Sparse Tensor
-        indices_tensor = AbstractTensor.tensor([row_indices, col_indices], device='cpu')
-        values_tensor = AbstractTensor.tensor(values, device='cpu')
+        row_indices = AbstractTensor.cat(row_list)
+        col_indices = AbstractTensor.cat(col_list)
+        values = AbstractTensor.cat(val_list)
+
+        indices_tensor = AbstractTensor.stack([row_indices, col_indices], dim=0)
         _label_tensor(indices_tensor, "laplace_nd.coo.indices")
-        _label_tensor(values_tensor, "laplace_nd.coo.values")
-        laplacian = COOMatrix(indices_tensor, values_tensor, (total_size, total_size))
+        _label_tensor(values, "laplace_nd.coo.values")
+        laplacian = COOMatrix(indices_tensor, values, (total_size, total_size))
+        # Expose COO components for downstream use
+        coo_rows, coo_cols, coo_vals = row_indices, col_indices, values
         # Now, use laplacian as needed in your application
 
         # Convert to dense tensor and move to specified device
@@ -658,6 +657,7 @@ class BuildLaplace3D:
                 "cols": coo_cols,
                 "vals": coo_vals,
             },
+            "local_state_network": local_state,
             "config": {
                 "stencil": INT_LAPLACEBELTRAMI_STENCIL if 'INT_LAPLACEBELTRAMI_STENCIL' in globals() else None,
                 "dtype": str(self.precision) if hasattr(self, 'precision') else None,
