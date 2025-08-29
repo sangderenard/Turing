@@ -27,6 +27,6 @@ if NumPyTensorOperations is not None:
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_linear_bias_shape_is_row_vector(backend_name, Backend):
-    like = Backend.tensor_from_list([[0.0]])
+    like = Backend.tensor([[0.0]])
     layer = Linear(in_dim=1, out_dim=1, like=like)
     assert tuple(layer.b.shape) == (1, 1)

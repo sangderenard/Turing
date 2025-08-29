@@ -98,7 +98,7 @@ def main(config=None):
     )
     t_minus, t_center, t_plus = -0.6, 1.8, 0.7
     per_dir = [[t_minus / teacher.k, t_center / teacher.k, t_plus / teacher.k] for _ in range(teacher.k)]
-    teacher.taps = AbstractTensor.tensor_from_list(per_dir, tape=autograd.tape, like=like, requires_grad=False)
+    teacher.taps = AbstractTensor.get_tensor(per_dir, tape=autograd.tape, like=like, requires_grad=False)
 
     X = AbstractTensor.randn((B, C, Nu, Nv, Nw), requires_grad=True)
     with AbstractTensor.autograd.no_grad():

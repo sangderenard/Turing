@@ -18,7 +18,7 @@ def _has_zero_column(data):
 
 @pytest.mark.parametrize("backend_cls", [PurePythonTensorOperations, NumPyTensorOperations])
 def test_repeat_no_alias_or_zero_column(backend_cls):
-    t = backend_cls.tensor_from_list([[1, 2], [3, 4]])
+    t = backend_cls.tensor([[1, 2], [3, 4]])
     r = t.repeat(repeats=2, dim=0)
     assert not _has_zero_column(r.data)
     r.data[0][0] = 99
@@ -28,7 +28,7 @@ def test_repeat_no_alias_or_zero_column(backend_cls):
 
 @pytest.mark.parametrize("backend_cls", [PurePythonTensorOperations, NumPyTensorOperations])
 def test_repeat_interleave_no_alias(backend_cls):
-    t = backend_cls.tensor_from_list([[1, 2], [3, 4]])
+    t = backend_cls.tensor([[1, 2], [3, 4]])
     r = t.repeat_interleave(repeats=2, dim=0)
     assert not _has_zero_column(r.data)
     r.data[0][0] = 99
@@ -36,7 +36,7 @@ def test_repeat_interleave_no_alias(backend_cls):
 
 
 def test_pure_repeat_tuple_no_alias():
-    t = PurePythonTensorOperations.tensor_from_list([[1, 2], [3, 4]])
+    t = PurePythonTensorOperations.tensor([[1, 2], [3, 4]])
     r = t.repeat(repeats=(2, 1))
     assert not _has_zero_column(r.data)
     r.data[0][0] = 99
@@ -45,7 +45,7 @@ def test_pure_repeat_tuple_no_alias():
 
 @pytest.mark.skipif(not _has_jax, reason="jax not available")
 def test_jax_repeat_no_alias_or_zero_column():
-    t = JAXTensorOperations.tensor_from_list([[1, 2], [3, 4]])
+    t = JAXTensorOperations.tensor([[1, 2], [3, 4]])
     r = t.repeat(repeats=2, dim=0)
     assert not _has_zero_column(r.data)
     r.data[0][0] = 99

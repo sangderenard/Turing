@@ -38,8 +38,8 @@ if JAXTensorOperations is not None:
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_bce_with_logits_forward_backward(backend_name, Backend):
-    logits = Backend.tensor_from_list([[0.0], [2.0], [-2.0]])
-    target = Backend.tensor_from_list([[0.0], [1.0], [0.0]])
+    logits = Backend.tensor([[0.0], [2.0], [-2.0]])
+    target = Backend.tensor([[0.0], [1.0], [0.0]])
     loss = BCEWithLogitsLoss()
     val = loss.forward(logits, target)
     if hasattr(val, "tolist"):

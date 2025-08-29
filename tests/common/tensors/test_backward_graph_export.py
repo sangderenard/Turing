@@ -15,7 +15,7 @@ def _reset_tape():
     autograd.tape = GradTape()
 
 def _tensor(data):
-    t = Tensor.tensor_from_list(data)
+    t = Tensor.tensor(data)
     t.requires_grad_(True)
     return t
 

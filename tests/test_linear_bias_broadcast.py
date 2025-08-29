@@ -28,14 +28,14 @@ if NumPyTensorOperations is not None:
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_linear_bias_broadcast_and_grad(backend_name, Backend):
-    like = Backend.tensor_from_list([[0.0]])
+    like = Backend.tensor([[0.0]])
     layer = Linear(in_dim=2, out_dim=2, like=like)
     layer.W = Backend.zeros((2, 2))
-    layer.b = Backend.tensor_from_list([[1.0, 2.0]])
-    x = Backend.tensor_from_list([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+    layer.b = Backend.tensor([[1.0, 2.0]])
+    x = Backend.tensor([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     out = layer.forward(x)
     assert out.tolist() == [[1.0, 2.0]] * 3
-    grad_out = Backend.tensor_from_list([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+    grad_out = Backend.tensor([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
     layer.backward(grad_out)
     assert tuple(layer.gb.shape) == (1, 2)
     assert layer.gb.tolist() == [[3.0, 3.0]]
@@ -44,7 +44,7 @@ def test_linear_bias_broadcast_and_grad(backend_name, Backend):
 def test_expand_is_view_on_numpy():
     if NumPyTensorOperations is None:
         pytest.skip("numpy backend not available")
-    t = NumPyTensorOperations.tensor_from_list([[1.0, 2.0]])
+    t = NumPyTensorOperations.tensor([[1.0, 2.0]])
     expanded = t.expand((3, 2))
     assert np.shares_memory(expanded.data, t.data)
 
@@ -52,6 +52,6 @@ def test_expand_is_view_on_numpy():
 def test_expand_accepts_varargs():
     if NumPyTensorOperations is None:
         pytest.skip("numpy backend not available")
-    t = NumPyTensorOperations.tensor_from_list([[1.0, 2.0]])
+    t = NumPyTensorOperations.tensor([[1.0, 2.0]])
     expanded = t.expand(3, 2)
     assert expanded.shape == (3, 2)

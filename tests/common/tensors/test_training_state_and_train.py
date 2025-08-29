@@ -17,7 +17,7 @@ def _reset_tape():
 
 
 def _param(value):
-    t = Tensor.tensor_from_list([value])
+    t = Tensor.tensor([value])
     t.requires_grad_(True)
     return t
 
@@ -26,8 +26,8 @@ def _param(value):
 def test_export_training_state():
     w = _param(1.0)
     b = _param(0.5)
-    x = Tensor.tensor_from_list([2.0])
-    y = Tensor.tensor_from_list([5.0])
+    x = Tensor.tensor([2.0])
+    y = Tensor.tensor([5.0])
     pred = w * x + b
     err = pred - y
     loss = err * err
@@ -48,8 +48,8 @@ def test_export_training_state():
 @pytest.mark.skipif(Tensor is None, reason="NumPy backend not available")
 def test_train_updates_parameter():
     w = _param(0.0)
-    x = Tensor.tensor_from_list([1.0])
-    y = Tensor.tensor_from_list([2.0])
+    x = Tensor.tensor([1.0])
+    y = Tensor.tensor([2.0])
 
     def loss_fn():
         pred = w * x
