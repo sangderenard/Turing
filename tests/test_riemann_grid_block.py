@@ -1,3 +1,4 @@
+import pytest
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.riemann.grid_block import RiemannGridBlock
 
@@ -11,8 +12,7 @@ def _example_config():
             "transform_args": {"Lx": 1.0, "Ly": 1.0, "Lz": 1.0},
             "laplace_kwargs": {},
         },
-        "pre_linear": {"in_dim": 2, "out_dim": 3},
-        "film": {"in_dim": 3, "out_dim": 3},
+        "casting": {"mode": "pre_linear", "film": True, "coords": "uv"},
         "conv": {
             "in_channels": 3,
             "out_channels": 4,
@@ -25,17 +25,17 @@ def _example_config():
     }
 
 
-def test_forward_output_shape():
+def test_forward_output_shape_pre_linear():
     cfg = _example_config()
     block = RiemannGridBlock.build_from_config(cfg)
     B = 1
     D, H, W = cfg["geometry"]["grid_shape"]
-    x = AbstractTensor.randn((B, cfg["pre_linear"]["in_dim"], D, H, W))
+    x = AbstractTensor.randn((B, cfg["conv"]["in_channels"], D, H, W))
     y = block.forward(x)
     assert y.shape == (B, cfg["post_linear"]["out_dim"], D, H, W)
 
 
-def test_parameters_registered():
+def test_parameters_registered_pre_linear():
     cfg = _example_config()
     block = RiemannGridBlock.build_from_config(cfg)
     params = block.parameters()
@@ -45,10 +45,30 @@ def test_parameters_registered():
         assert isinstance(p, AbstractTensor)
 
 
-def test_forward_end_to_end():
+def test_forward_end_to_end_pre_linear():
     cfg = _example_config()
     block = RiemannGridBlock.build_from_config(cfg)
     D, H, W = cfg["geometry"]["grid_shape"]
-    x = AbstractTensor.ones((1, cfg["pre_linear"]["in_dim"], D, H, W))
+    x = AbstractTensor.ones((1, cfg["conv"]["in_channels"], D, H, W))
     y = block.forward(x)
     assert y.shape == (1, cfg["post_linear"]["out_dim"], D, H, W)
+
+
+def test_forward_output_shape_fixed_mode():
+    cfg = _example_config()
+    cfg["casting"] = {"mode": "fixed"}
+    block = RiemannGridBlock.build_from_config(cfg)
+    D, H, W = cfg["geometry"]["grid_shape"]
+    x = AbstractTensor.randn((1, cfg["conv"]["in_channels"], D, H, W))
+    y = block.forward(x)
+    assert y.shape == (1, cfg["post_linear"]["out_dim"], D, H, W)
+
+
+def test_soft_assign_not_implemented():
+    cfg = _example_config()
+    cfg["casting"] = {"mode": "soft_assign"}
+    block = RiemannGridBlock.build_from_config(cfg)
+    D, H, W = cfg["geometry"]["grid_shape"]
+    x = AbstractTensor.zeros((1, cfg["conv"]["in_channels"], D, H, W))
+    with pytest.raises(NotImplementedError):
+        block.forward(x)
