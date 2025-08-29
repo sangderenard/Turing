@@ -117,6 +117,11 @@ def main(config=None):
     x = AT.randn((B, C, *grid_shape), requires_grad=True)
     autograd.tape.annotate(x, label="riemann_demo.input")
     autograd.tape.auto_annotate_eval(x)
+    # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
+    # Uncomment one of the lines below to relax those checks:
+    # autograd.strict = False                   # disable strict mode globally
+    # autograd.whitelist(x, target)             # or whitelist specific tensors
+    # autograd.whitelist_labels(r"riemann_demo.*")  # whitelist by label pattern
     # --- Parameter and gradient collection helpers ---
     from ..logger import get_tensors_logger
     logger = get_tensors_logger()
