@@ -10,53 +10,85 @@ from ..autograd import autograd
 Boundary = Literal["dirichlet", "neumann", "periodic"]
 
 
-def _shift3d(arr: AbstractTensor, axis: int, step: int, bc: Tuple[Boundary, Boundary]) -> AbstractTensor:
-    """Shift ``arr`` by one voxel along ``axis`` with boundary conditions.
+def _shift3d(
+    arr: AbstractTensor,
+    axis: int,
+    step: int,
+    bc: Tuple[Boundary, Boundary],
+    length: int,
+) -> Tuple[AbstractTensor, AbstractTensor]:
+    """Shift ``arr`` along ``axis`` by ``step`` voxels.
 
-    This helper mirrors the small NumPy function it replaces but operates
-    entirely on :class:`AbstractTensor` instances so it can run on any backend.
-    Only step sizes of ``±1`` are supported.
+    Parameters
+    ----------
+    arr : AbstractTensor
+        Tensor of shape ``(..., D, H, W)``.
+    axis : int
+        Spatial axis to shift (2 for ``u``, 3 for ``v``, 4 for ``w``).
+    step : int
+        Signed shift distance.  ``step > 0`` moves values toward increasing
+        indices.
+    bc : tuple[str, str]
+        Boundary conditions for the low/high side.
+    length : int
+        Maximum permitted absolute shift.  This bounds ``step``.
+
+    Returns
+    -------
+    shifted : AbstractTensor
+        The shifted tensor with boundary handling applied.
+    mask : AbstractTensor
+        A mask of the same shape with ones where data originated from inside
+        the domain and zeros where boundary padding was inserted.  ``mask`` is
+        useful for normalising tap weights near boundaries.
     """
-    assert step in (-1, +1)
+    assert step != 0 and abs(step) <= length
 
     # Periodic wrap: concatenate edge slice to the opposite side
-    if (step == +1 and bc[1] == "periodic") or (step == -1 and bc[0] == "periodic"):
-        if step == +1:
-            head = arr[(slice(None),) * axis + (slice(-1, None),)]
-            body = arr[(slice(None),) * axis + (slice(0, -1),)]
-            return AbstractTensor.cat([head, body], dim=axis)
-        else:  # step == -1
-            tail = arr[(slice(None),) * axis + (slice(0, 1),)]
-            body = arr[(slice(None),) * axis + (slice(1, None),)]
-            return AbstractTensor.cat([body, tail], dim=axis)
+    if (step > 0 and bc[1] == "periodic") or (step < 0 and bc[0] == "periodic"):
+        if step > 0:
+            head = arr[(slice(None),) * axis + (slice(-step, None),)]
+            body = arr[(slice(None),) * axis + (slice(0, -step),)]
+            out = AbstractTensor.cat([head, body], dim=axis)
+        else:  # step < 0
+            step = -step
+            tail = arr[(slice(None),) * axis + (slice(0, step),)]
+            body = arr[(slice(None),) * axis + (slice(step, None),)]
+            out = AbstractTensor.cat([body, tail], dim=axis)
+        mask = AbstractTensor.ones_like(arr)
+        return out, mask
 
     out = AbstractTensor.zeros_like(arr)
-    if step == +1:
+    mask = AbstractTensor.zeros_like(arr)
+    if step > 0:
         sl_src = [slice(None)] * arr.ndim
         sl_dst = [slice(None)] * arr.ndim
-        sl_src[axis] = slice(0, -1)
-        sl_dst[axis] = slice(1, None)
+        sl_src[axis] = slice(0, -step)
+        sl_dst[axis] = slice(step, None)
         out[tuple(sl_dst)] = arr[tuple(sl_src)]
-    else:  # step == -1
+        mask[tuple(sl_dst)] = 1.0
+    else:  # step < 0
+        step = -step
         sl_src = [slice(None)] * arr.ndim
         sl_dst = [slice(None)] * arr.ndim
-        sl_src[axis] = slice(1, None)
-        sl_dst[axis] = slice(0, -1)
+        sl_src[axis] = slice(step, None)
+        sl_dst[axis] = slice(0, -step)
         out[tuple(sl_dst)] = arr[tuple(sl_src)]
+        mask[tuple(sl_dst)] = 1.0
 
-    if (step == +1 and bc[1] == "neumann") or (step == -1 and bc[0] == "neumann"):
-        if step == +1:
-            edge_src = [slice(None)] * arr.ndim
-            edge_dst = [slice(None)] * arr.ndim
+    if (step > 0 and bc[1] == "neumann") or (step < 0 and bc[0] == "neumann"):
+        edge_src = [slice(None)] * arr.ndim
+        edge_dst = [slice(None)] * arr.ndim
+        if step > 0:
             edge_src[axis] = slice(-1, None)
-            edge_dst[axis] = slice(0, 1)
+            edge_dst[axis] = slice(0, step)
         else:
-            edge_src = [slice(None)] * arr.ndim
-            edge_dst = [slice(None)] * arr.ndim
             edge_src[axis] = slice(0, 1)
-            edge_dst[axis] = slice(-1, None)
+            edge_dst[axis] = slice(-step, None)
         out[tuple(edge_dst)] = arr[tuple(edge_src)]
-    return out
+        mask[tuple(edge_dst)] = 1.0
+
+    return out, mask
 
 
 class NDPCA3Conv3d:
@@ -98,6 +130,9 @@ class NDPCA3Conv3d:
         k: int = 3,
         eig_from: Literal["g", "inv_g"] = "g",
         pointwise: bool = True,
+        stencil_offsets: Tuple[int, ...] = (-1, 0, 1),
+        stencil_length: int = 1,
+        normalize_taps: bool = False,
         _label_prefix=None
     ):
         assert 1 <= k <= 3
@@ -108,15 +143,19 @@ class NDPCA3Conv3d:
         self.bc = boundary_conditions
         self.k = k
         self.eig_from = eig_from
+        self.offsets = tuple(stencil_offsets)
+        self.length = int(stencil_length)
+        self.normalize = normalize_taps
 
-        # Learnable 3-tap per principal direction (shared across channels)
-        # shape: (k, 3) for [-1, 0, +1]
-        # IMPORTANT: initialize as a true leaf parameter (no post-multiply)
-        # to ensure grads are populated consistently across backends.
+        # Learnable tap per principal direction (shared across channels)
+        # shape: (k, len(offsets))
         from ..abstraction_methods.random import Random
         random = Random()
         scale = 0.01
-        init_data = [[random.gauss(0.0, 1.0) * scale for _ in range(3)] for _ in range(k)]
+        init_data = [
+            [random.gauss(0.0, 1.0) * scale for _ in range(len(self.offsets))]
+            for _ in range(k)
+        ]
         self.taps = from_list_like(init_data, like=like, requires_grad=True, tape=autograd.tape)
         autograd.tape.create_tensor_node(self.taps)
         self.taps._label = f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.taps"
@@ -125,7 +164,13 @@ class NDPCA3Conv3d:
         # optional 1x1 channel mix after spatial pass
         self.pointwise = None
         if pointwise and out_channels != in_channels:
-            self.pointwise = Linear(in_channels, out_channels, like=like, bias=False, _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.pointwise")
+            self.pointwise = Linear(
+                in_channels,
+                out_channels,
+                like=like,
+                bias=False,
+                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.pointwise",
+            )
 
     # --- standard layer API ---
     def parameters(self):
@@ -213,55 +258,47 @@ class NDPCA3Conv3d:
         metric = package["metric"]["inv_g"] if self.eig_from == "inv_g" else package["metric"]["g"]
         wU, wV, wW = self._principal_axis_blend(metric)  # (D,H,W) each
 
-        # ---- 2) assemble per-voxel 3-tap weights mapped to lattice axes
+        # ---- 2) assemble per-voxel tap weights mapped to lattice axes
         taps = self.taps
-        center = (taps[:, 1]).sum().reshape(1, 1, 1, 1, 1)
-        w_minus = (taps[:, 0]).sum().reshape(1, 1, 1, 1, 1)
-        w_plus = (taps[:, 2]).sum().reshape(1, 1, 1, 1, 1)
-        autograd.tape.annotate(center, label="NDPCA3Conv3d.center_weight")
-        autograd.tape.annotate(w_minus, label="NDPCA3Conv3d.minus_weight")
-        autograd.tape.annotate(w_plus, label="NDPCA3Conv3d.plus_weight")
+        if self.normalize:
+            taps = taps / (taps.sum(dim=1, keepdim=True) + 1e-12)
+        tap_sums = taps.sum(dim=0).reshape(len(self.offsets), 1, 1, 1, 1)
 
-        # Broadcast weights to (1,1,D,H,W)
+        # Broadcast axis weights to (1,1,D,H,W)
         def _bcast(w: AbstractTensor) -> AbstractTensor:
             return w.reshape(1, 1, D, H, W)
 
         wU_b = _bcast(wU);  wV_b = _bcast(wV);  wW_b = _bcast(wW)
-        wU_m = w_minus * wU_b;  wU_p = w_plus * wU_b
-        wV_m = w_minus * wV_b;  wV_p = w_plus * wV_b
-        wW_m = w_minus * wW_b;  wW_p = w_plus * wW_b
-        autograd.tape.annotate(wU_m, label="NDPCA3Conv3d.weight_U_minus")
-        autograd.tape.annotate(wU_p, label="NDPCA3Conv3d.weight_U_plus")
-        autograd.tape.annotate(wV_m, label="NDPCA3Conv3d.weight_V_minus")
-        autograd.tape.annotate(wV_p, label="NDPCA3Conv3d.weight_V_plus")
-        autograd.tape.annotate(wW_m, label="NDPCA3Conv3d.weight_W_minus")
-        autograd.tape.annotate(wW_p, label="NDPCA3Conv3d.weight_W_plus")
 
-        # ---- 3) do the oriented depthwise spatial pass
+        # ---- 3) oriented depthwise spatial pass over all stencil offsets
         arr = x  # (B,C,D,H,W) AbstractTensor
-
-        # boundary tuples for each axis
         bcu = (self.bc[0], self.bc[1])
         bcv = (self.bc[2], self.bc[3])
         bcw = (self.bc[4], self.bc[5])
 
-        x_u_m = _shift3d(arr, axis=2, step=-1, bc=bcu)
-        x_u_p = _shift3d(arr, axis=2, step=+1, bc=bcu)
-        x_v_m = _shift3d(arr, axis=3, step=-1, bc=bcv)
-        x_v_p = _shift3d(arr, axis=3, step=+1, bc=bcv)
-        x_w_m = _shift3d(arr, axis=4, step=-1, bc=bcw)
-        x_w_p = _shift3d(arr, axis=4, step=+1, bc=bcw)
-        autograd.tape.annotate(x_u_m, label="NDPCA3Conv3d.shift_u_minus")
-        autograd.tape.annotate(x_u_p, label="NDPCA3Conv3d.shift_u_plus")
-        autograd.tape.annotate(x_v_m, label="NDPCA3Conv3d.shift_v_minus")
-        autograd.tape.annotate(x_v_p, label="NDPCA3Conv3d.shift_v_plus")
-        autograd.tape.annotate(x_w_m, label="NDPCA3Conv3d.shift_w_minus")
-        autograd.tape.annotate(x_w_p, label="NDPCA3Conv3d.shift_w_plus")
+        y = AbstractTensor.zeros_like(arr)
+        mask_total = AbstractTensor.zeros_like(arr) if self.normalize else None
 
-        y = center * arr \
-            + wU_m * x_u_m + wU_p * x_u_p \
-            + wV_m * x_v_m + wV_p * x_v_p \
-            + wW_m * x_w_m + wW_p * x_w_p
+        for idx, off in enumerate(self.offsets):
+            w_off = tap_sums[idx]
+            if off == 0:
+                y = y + w_off * arr
+                if mask_total is not None:
+                    mask_total = mask_total + w_off
+                continue
+
+            xu, mu = _shift3d(arr, axis=2, step=off, bc=bcu, length=self.length)
+            xv, mv = _shift3d(arr, axis=3, step=off, bc=bcv, length=self.length)
+            xw, mw = _shift3d(arr, axis=4, step=off, bc=bcw, length=self.length)
+            contrib = wU_b * xu + wV_b * xv + wW_b * xw
+            y = y + w_off * contrib
+            if mask_total is not None:
+                mask_contrib = wU_b * mu + wV_b * mv + wW_b * mw
+                mask_total = mask_total + w_off * mask_contrib
+
+        if mask_total is not None:
+            y = y / (mask_total + 1e-12)
+
         autograd.tape.annotate(y, label="NDPCA3Conv3d.spatial_output")
 
         # ---- 4) optional 1x1 mixing to get out_channels

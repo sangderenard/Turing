@@ -194,6 +194,7 @@ class RiemannGridBlock:
         bin_map = package.get("bin_map") if isinstance(package, dict) else None
 
         grid_shape = grid.U.shape
+        stencil_cfg = conv_cfg.get("stencil", {})
         conv = NDPCA3Conv3d(
             conv_cfg["in_channels"],
             conv_cfg["out_channels"],
@@ -203,6 +204,9 @@ class RiemannGridBlock:
             k=conv_cfg.get("k", 3),
             eig_from=conv_cfg.get("metric_source", "g"),
             pointwise=conv_cfg.get("pointwise", True),
+            stencil_offsets=tuple(stencil_cfg.get("offsets", (-1, 0, 1))),
+            stencil_length=stencil_cfg.get("length", 1),
+            normalize_taps=stencil_cfg.get("normalize", False),
         )
 
         post_cfg = config.get("post_linear")
