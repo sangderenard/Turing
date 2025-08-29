@@ -150,7 +150,17 @@ def run_eager_training_test(model, AT, args):
     targets = AT.ones(args.input_len) * 65.0  # ASCII 'A'
 
     for i in range(max_steps):
-        autograd.tape = autograd.__class__().tape
+        tape = autograd.tape
+        tape._nodes.clear()
+        tape.graph.clear()
+        tape._op_index = 0
+        tape._loss_tensor = None
+        tape._loss_id = None
+        params = model.parameters()
+        keep = {id(p) for p in params}
+        tape._tensor_refs = {tid: ref for tid, ref in tape._tensor_refs.items() if tid in keep}
+        for p in params:
+            tape.create_tensor_node(p)
         pred = model.forward(inputs)
         loss = loss_fn(pred, targets)
         try:
@@ -197,9 +207,11 @@ def run_eager_training_test(model, AT, args):
                     print("  (Suppressed strict mode for this step. Some gradients may be None.)")
                 finally:
                     autograd.strict = prev_strict
-            # Replace None gradients with zeros as a boundary condition
-            safe_grads = [g if g is not None else AT.zeros_like(p) for p, g in zip(params, grads)]
-            new_params = eager_optimizer.step(params, safe_grads)
+            unused = [idx for idx, g in enumerate(grads) if g is None]
+            if unused:
+                print(f"  {len(unused)} parameter(s) unused; replacing missing gradients with zeros.")
+                grads = [g if g is not None else AT.zeros_like(p) for p, g in zip(params, grads)]
+            new_params = eager_optimizer.step(params, grads)
             for p, np_ in zip(params, new_params):
                 AT.copyto(p, np_)
         except Exception as e:
