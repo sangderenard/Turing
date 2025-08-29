@@ -42,3 +42,4 @@ autograd.whitelist_labels(r"demo.*")    # allow labels matching the pattern
 ```
 
 Labels can be attached using `autograd.tape.annotate(tensor, label="name")`.
+
