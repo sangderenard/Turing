@@ -76,6 +76,7 @@ class Linear:
             pass
         logger.debug(f"Linear.forward called with input shape: {getattr(x, 'shape', None)}")
         out = x @ self.W
+        self._x = x
         autograd.tape.annotate(out, label="Linear.forward.matmul")
         logger.debug(f"Linear matmul output shape: {getattr(out, 'shape', None)}")
         if self.b is not None:
@@ -84,6 +85,21 @@ class Linear:
             out = out + self.b
         autograd.tape.annotate(out, label="Linear.forward.output")
         return out
+
+    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        if getattr(self, "_x", None) is None:
+            raise RuntimeError("Linear.backward called before forward")
+        x = self._x
+        xT = x.swapaxes(0, 1)
+        self.gW = xT @ grad_out
+        self.W._grad = self.gW
+        if self.b is not None:
+            self.gb = grad_out.sum(dim=0, keepdim=True)
+            self.b._grad = self.gb
+        WT = self.W.swapaxes(0, 1)
+        dx = grad_out @ WT
+        self._x = None
+        return dx
 
 
 class Flatten:

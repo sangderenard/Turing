@@ -372,10 +372,23 @@ class PurePythonTensorOperations(AbstractTensor):
         raise NotImplementedError(f"Operator {op} not implemented for pure Python backend.")
 
     def _elementwise_op(self, op: str, a, b):
-        # Recursively apply op to nested lists
+        # Recursively apply op to nested lists with basic broadcasting
         if not isinstance(a, list) and not isinstance(b, list):
             return self._apply_scalar_op(op, a, b)
-        return [self._elementwise_op(op, ai, bi) for ai, bi in zip(a, b)]
+        if not isinstance(a, list):
+            a = [a] * len(b)
+        if not isinstance(b, list):
+            b = [b] * len(a)
+        len_a, len_b = len(a), len(b)
+        if len_a == len_b:
+            pairs = zip(a, b)
+        elif len_a == 1:
+            pairs = ((a[0], bi) for bi in b)
+        elif len_b == 1:
+            pairs = ((ai, b[0]) for ai in a)
+        else:
+            raise ValueError("Shapes are not broadcastable")
+        return [self._elementwise_op(op, ai, bi) for ai, bi in pairs]
 
     def _elementwise_op_scalar(self, op: str, a, scalar):
         if not isinstance(a, list):

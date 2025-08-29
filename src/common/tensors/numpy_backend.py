@@ -124,8 +124,7 @@ class NumPyTensorOperations(AbstractTensor):
         return np.maximum(self.data, min_val)
 
     def clamp_min(self, min_val):
-        import numpy as np
-        return np.maximum(self.data, min_val)
+        return super().clamp_min(min_val)
 
     def clamp_max_(self, max_val):
         import numpy as np

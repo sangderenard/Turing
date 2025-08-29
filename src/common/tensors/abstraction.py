@@ -2117,6 +2117,29 @@ def _wrap_creation_fn(op_name: str, raw_fn):
     return wrapped
 
 
+def _wrap_meshgrid_fn(raw_fn):
+    """Special wrapper for ``meshgrid`` that preserves tuple output."""
+
+    def wrapped(*args, requires_grad: bool = False, tape=None, **kwargs):
+        from . import autograd as _autograd
+
+        desired_tape = _autograd.autograd.tape if requires_grad else tape
+        if desired_tape is not None:
+            prev = _autograd.autograd.tape
+            _autograd.autograd.tape = desired_tape
+            try:
+                result = raw_fn(*args, **kwargs)
+            finally:
+                _autograd.autograd.tape = prev
+        else:
+            result = raw_fn(*args, **kwargs)
+
+        tensors = [AbstractTensor.get_tensor(r, tape=desired_tape) for r in result]
+        return tuple(tensors)
+
+    return wrapped
+
+
 # Expose the tape context
 AbstractTensor.use_tape = staticmethod(lambda tape: _UseTape(tape))
 
@@ -2142,7 +2165,7 @@ try:
 except Exception:
     pass
 try:
-    AbstractTensor.meshgrid = staticmethod(_wrap_creation_fn("meshgrid", AbstractTensor.meshgrid))
+    AbstractTensor.meshgrid = staticmethod(_wrap_meshgrid_fn(AbstractTensor.meshgrid))
 except Exception:
     pass
 try:
