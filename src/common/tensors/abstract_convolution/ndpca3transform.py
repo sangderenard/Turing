@@ -96,6 +96,7 @@ def fit_metric_pca(
     AT = _get_AbstractTensor()
 
     X = AT.get_tensor(u_samples)
+    autograd.tape.annotate(X, label="fit_metric_pca.X")
     # Flatten any leading batch dims except the last two (B, n)
     if X.dim() > 2:
         B = X.shape[-2]
@@ -131,6 +132,7 @@ def fit_metric_pca(
         autograd.tape.annotate(evals, label="fit_metric_pca.eigenvalues")
         autograd.tape.annotate(evecs, label="fit_metric_pca.eigenvectors")
         P = evecs[:, ::-1]
+        autograd.tape.annotate(P, label="fit_metric_pca.eigenvectors_desc")
         autograd.tape.annotate(P, label="fit_metric_pca.P")
     else:
         # Metric PCA: generalized eig Sigma v = lambda M v ->
@@ -156,6 +158,7 @@ def fit_metric_pca(
         autograd.tape.annotate(lam_S, label="fit_metric_pca.S_eigenvalues")
         autograd.tape.annotate(U, label="fit_metric_pca.S_eigenvectors")
         U = U[:, ::-1]  # descending
+        autograd.tape.annotate(U, label="fit_metric_pca.S_eigenvectors_desc")
         # Map back: P = M^{-1/2} U  ⇒ columns of P are metric-orthonormal
         P = Minv_half @ U
         autograd.tape.annotate(P, label="fit_metric_pca.P")
@@ -219,6 +222,8 @@ class PCANDTransform(Transform):
         # Center & project
         mu = self.pca_basis.mu  # (n,)
         P = self.pca_basis.P    # (n, n)
+        autograd.tape.annotate(mu, label="PCANDTransform.mu")
+        autograd.tape.annotate(P, label="PCANDTransform.P")
         y_full = (u_nd - mu) @ P  # (..., n)  [columns of P are PCs]
         autograd.tape.annotate(y_full, label="PCANDTransform.y_full")
         y_vis = y_full[..., : self.d_visible]

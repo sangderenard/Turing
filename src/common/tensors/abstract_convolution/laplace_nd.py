@@ -1,6 +1,13 @@
 
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
+
+# Local helper to label tensors safely without breaking flows
+def _label_tensor(t, name, **extra):  # pragma: no cover - simple utility
+    try:
+        autograd.tape.annotate(t, label=name, **extra)
+    except Exception:
+        pass
 import math
 import logging
 from src.common.tensors.coo_matrix import COOMatrix
@@ -157,6 +164,9 @@ class BuildLaplace3D:
             raise ValueError("grid_u/v/w must all be 1D or all be 3D")
 
         grid_u, grid_v, grid_w = _to_mesh3d(grid_u, grid_v, grid_w)
+        _label_tensor(grid_u, "laplace_nd.meshgrid.U", strict_allow_unused=True)
+        _label_tensor(grid_v, "laplace_nd.meshgrid.V", strict_allow_unused=True)
+        _label_tensor(grid_w, "laplace_nd.meshgrid.W", strict_allow_unused=True)
 
         def default_metric_tensor(u, v, w, dxdu, dydu, dzdu, dxdv, dydv, dzdv, dxdw, dydw, dzdw):
             """
@@ -198,6 +208,9 @@ class BuildLaplace3D:
         # Apply the transformation function to the grid
         logger.debug("Applying transformation to the grid.")
         X, Y, Z = self.grid_domain.transform.transform(grid_u, grid_v, grid_w)[:3]  # Transform to physical space
+        _label_tensor(X, "laplace_nd.build.X")
+        _label_tensor(Y, "laplace_nd.build.Y")
+        _label_tensor(Z, "laplace_nd.build.Z")
         self.grid_u = grid_u
         self.grid_v = grid_v
         self.grid_w = grid_w
@@ -210,6 +223,12 @@ class BuildLaplace3D:
         # Compute partial derivatives
         logger.debug("Computing partial derivatives.")
         dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw = self.grid_domain.transform.get_or_compute_partials(grid_u, grid_v, grid_w)
+        for name, t in (
+            ("laplace_nd.partials.dXdu", dXdu), ("laplace_nd.partials.dYdu", dYdu), ("laplace_nd.partials.dZdu", dZdu),
+            ("laplace_nd.partials.dXdv", dXdv), ("laplace_nd.partials.dYdv", dYdv), ("laplace_nd.partials.dZdv", dZdv),
+            ("laplace_nd.partials.dXdw", dXdw), ("laplace_nd.partials.dYdw", dYdw), ("laplace_nd.partials.dZdw", dZdw),
+        ):
+            _label_tensor(t, name)
         logger.debug("Computed partial derivatives.")
 
         unique_u_values = grid_u[:, 0, 0]
@@ -224,12 +243,12 @@ class BuildLaplace3D:
         u_vals = unique_u_values
         v_vals = unique_v_values
         w_vals = unique_w_values
-        du = (u_vals[1:] - u_vals[:-1]).mean()
-        dv = (v_vals[1:] - v_vals[:-1]).mean()
-        dw = (w_vals[1:] - w_vals[:-1]).mean()
-        h2_u = du * du
-        h2_v = dv * dv
-        h2_w = dw * dw
+        du = (u_vals[1:] - u_vals[:-1]).mean(); _label_tensor(du, "laplace_nd.steps.du")
+        dv = (v_vals[1:] - v_vals[:-1]).mean(); _label_tensor(dv, "laplace_nd.steps.dv")
+        dw = (w_vals[1:] - w_vals[:-1]).mean(); _label_tensor(dw, "laplace_nd.steps.dw")
+        h2_u = du * du; _label_tensor(h2_u, "laplace_nd.steps.h2_u")
+        h2_v = dv * dv; _label_tensor(h2_v, "laplace_nd.steps.h2_v")
+        h2_w = dw * dw; _label_tensor(h2_w, "laplace_nd.steps.h2_w")
 
         final_u_row = wrap_u_row = None
         final_v_row = wrap_v_row = None
@@ -420,6 +439,11 @@ class BuildLaplace3D:
         det_g = selected_tensor[..., 2, 0, 0]     # Determinant of the metric tensor
         tension = selected_tensor[..., 2, 1, 1]
         density = selected_tensor[..., 2, 2, 2]
+        _label_tensor(g_ij, "laplace_nd.metric.g")
+        _label_tensor(g_inv, "laplace_nd.metric.g_inv")
+        _label_tensor(det_g, "laplace_nd.metric.det_g")
+        _label_tensor(tension, "laplace_nd.material.tension")
+        _label_tensor(density, "laplace_nd.material.density")
 
 
 
@@ -503,6 +527,8 @@ class BuildLaplace3D:
         # 4. Assemble Sparse Tensor
         indices_tensor = AbstractTensor.tensor([row_indices, col_indices], device='cpu')
         values_tensor = AbstractTensor.tensor(values, device='cpu')
+        _label_tensor(indices_tensor, "laplace_nd.coo.indices")
+        _label_tensor(values_tensor, "laplace_nd.coo.values")
         laplacian = COOMatrix(indices_tensor, values_tensor, (total_size, total_size))
         # Now, use laplacian as needed in your application
 
@@ -514,6 +540,7 @@ class BuildLaplace3D:
         if True or self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
             laplacian_tensor = laplacian.to_dense()
+            _label_tensor(laplacian_tensor, "laplace_nd.laplacian.dense")
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
 
             # Dense perturbation
@@ -566,12 +593,14 @@ class BuildLaplace3D:
                 AbstractTensor.stack([dYdu, dYdv, dYdw], dim=-1),
                 AbstractTensor.stack([dZdu, dZdv, dZdw], dim=-1),
             ], dim=-2)
+            _label_tensor(J, "laplace_nd.jacobian.J")
         except Exception:
             pass
 
         sqrt_det_g = None
         try:
             sqrt_det_g = det_g.sqrt()
+            _label_tensor(sqrt_det_g, "laplace_nd.metric.sqrt_det_g")
         except Exception:
             pass
 
@@ -596,6 +625,9 @@ class BuildLaplace3D:
             coo_rows = AbstractTensor.tensor(row_indices) if 'row_indices' in locals() else None
             coo_cols = AbstractTensor.tensor(col_indices) if 'col_indices' in locals() else None
             coo_vals = AbstractTensor.tensor(values) if 'values' in locals() else None
+            if coo_rows is not None: _label_tensor(coo_rows, "laplace_nd.coo.rows")
+            if coo_cols is not None: _label_tensor(coo_cols, "laplace_nd.coo.cols")
+            if coo_vals is not None: _label_tensor(coo_vals, "laplace_nd.coo.vals")
         except Exception:
             pass
 
@@ -873,6 +905,8 @@ class HodgeStarBuilder:
 
         hodge_0 = AbstractTensor.diag(vertex_volumes)
         hodge_1 = AbstractTensor.diag(dual_edge)
+        _label_tensor(hodge_0, "laplace_nd.DEC.hodge_0")
+        _label_tensor(hodge_1, "laplace_nd.DEC.hodge_1")
 
         # No faces => no hodge_2. Mark availability so downstream
         # consumers know higher-order operators are absent for this
@@ -947,6 +981,10 @@ class HodgeStarBuilder:
         hodge_0 = AbstractTensor.diag(vertex_volumes)
         hodge_1 = AbstractTensor.diag(edge_dual_areas)
         hodge_2 = AbstractTensor.diag(face_areas) if has_faces else None
+        _label_tensor(hodge_0, "laplace_nd.DEC.hodge_0.full")
+        _label_tensor(hodge_1, "laplace_nd.DEC.hodge_1.full")
+        if has_faces:
+            _label_tensor(hodge_2, "laplace_nd.DEC.hodge_2.full")
 
         availability = {"hodge_0": True, "hodge_1": True, "hodge_2": has_faces}
         hodge_stars = {
@@ -978,6 +1016,14 @@ class TransformHub:
             U, V, W, dX_dU, dY_dU, dZ_dU, dX_dV, dY_dV, dZ_dV, dX_dW, dY_dW, dZ_dW
         )
 
+        # Label immediate outputs for provenance
+        _label_tensor(X, "laplace_nd.geometry.X")
+        _label_tensor(Y, "laplace_nd.geometry.Y")
+        _label_tensor(Z, "laplace_nd.geometry.Z")
+        _label_tensor(g_ij, "laplace_nd.geometry.metric.g")
+        _label_tensor(g_inv, "laplace_nd.geometry.metric.g_inv")
+        _label_tensor(det_g, "laplace_nd.geometry.metric.det_g")
+
         geometry = {
             "coordinates": (X, Y, Z),
             "normals": normals,
@@ -992,6 +1038,7 @@ class TransformHub:
 
             # Now create a (num_vertices, 3) vertex array
             vertex_reference = AbstractTensor.stack([X_flat, Y_flat, Z_flat], dim=1)  # shape: (N*N*N, 3)
+            _label_tensor(vertex_reference, "laplace_nd.DEC.vertex_reference")
             
             network_profile = self.build_network_profile(edge_index, X, Y, Z)
             d_operators = self.build_d_operators(edge_index, network_profile)
@@ -1001,7 +1048,7 @@ class TransformHub:
 
             # Base Hodge star: without faces or volumes, can still do vertex and edge ops
             hodge_stars = hodge_builder.build_basic_hodge_star(vertex_reference, edge_index)
-
+            
             geometry["DEC"] = {
                 "network_profile": network_profile,
                 "d_operators": d_operators,
@@ -1041,6 +1088,8 @@ class TransformHub:
         edge_lengths = AbstractTensor.sqrt((X_flat[source] - X_flat[target])**2 +
                                 (Y_flat[source] - Y_flat[target])**2 +
                                 (Z_flat[source] - Z_flat[target])**2)
+        _label_tensor(edge_lengths, "laplace_nd.network.edge_lengths")
+        _label_tensor(edge_index, "laplace_nd.network.edge_index")
         num_vertices = X_flat.numel()
         return {
             "edge_index": edge_index,
@@ -1060,6 +1109,7 @@ class TransformHub:
         for i, (src, tgt) in enumerate(edge_index):
             d0[i, src] = -1
             d0[i, tgt] = 1
+        _label_tensor(d0, "laplace_nd.DEC.d0")
 
         # d1 placeholder if we have faces defined
         # This can be constructed similarly if face maps are available
@@ -1104,8 +1154,13 @@ class TransformHub:
             W.requires_grad_(True)
 
         # Mark mesh-grid tensors as intentionally unused for strict autograd
-        # connectivity checks and label them for clarity in traces.
+        # connectivity checks and as structural (non-trainable). Label them
+        # for clarity in traces.
         AbstractTensor.autograd.whitelist(U, V, W)
+        try:
+            AbstractTensor.autograd.structural(U, V, W)
+        except Exception:
+            pass
         try:  # pragma: no cover - annotation helper
             autograd.tape.annotate(U, label="laplace_nd.grid.U", strict_allow_unused=True)
             autograd.tape.annotate(V, label="laplace_nd.grid.V", strict_allow_unused=True)

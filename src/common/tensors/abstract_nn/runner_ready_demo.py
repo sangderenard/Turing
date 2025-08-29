@@ -18,6 +18,7 @@ import argparse
 from ....transmogrifier.ilpscheduler import ILPScheduler
 
 from ..abstraction import AbstractTensor as AT
+from ..autograd import autograd
 from .autograd_audit import AutogradAuditSession, AuditConfig
 from .core import Linear, RectConv3d
 from .activations import ReLU
@@ -60,9 +61,13 @@ class TinyLinearConv3DNet:
         N = X.shape[0]
         D, H, W = self.vol_shape
         Z = self.act0(self.linear.forward(X))
+        autograd.tape.annotate(Z, label="RunnerDemo.baseline.Z_linear_relu")
         V = Z.reshape(N, self.Cin, D, H, W)
+        autograd.tape.annotate(V, label="RunnerDemo.baseline.V_reshape")
         H1 = self.act1(self.conv1.forward(V))
+        autograd.tape.annotate(H1, label="RunnerDemo.baseline.H1_conv_relu")
         Yv = self.conv2.forward(H1)
+        autograd.tape.annotate(Yv, label="RunnerDemo.baseline.Yv_output")
         return Yv
 
 
@@ -113,12 +118,17 @@ class TinyLinearPCAConv3DNet:
         N = X.shape[0]
         D, H, W = self.vol_shape
         Z = self.act0(self.linear.forward(X))
+        autograd.tape.annotate(Z, label="RunnerDemo.pca.Z_linear_relu")
         V = Z.reshape(N, self.Cin, D, H, W)
+        autograd.tape.annotate(V, label="RunnerDemo.pca.V_reshape")
         # Identity metric per voxel for this demo
         I = AT.eye(3, batch_shape=(D, H, W))
+        autograd.tape.annotate(I, label="RunnerDemo.pca.metric_identity3")
         package = {"metric": {"g": I, "inv_g": I}}
         H1 = self.act1(self.pca.forward(V, package=package))
+        autograd.tape.annotate(H1, label="RunnerDemo.pca.H1_pcaconv_relu")
         Yv = self.conv2.forward(H1)
+        autograd.tape.annotate(Yv, label="RunnerDemo.pca.Yv_output")
         return Yv
 
 
@@ -151,6 +161,7 @@ def main():
     vol_shape = (4, 4, 4)
     like = AT.get_tensor()
     X = AT.randn((N, in_dim), requires_grad=True)
+    autograd.tape.annotate(X, label="RunnerDemo.X_input")
 
     def _menu() -> str:
         print("Select model variant:")
@@ -174,6 +185,7 @@ def main():
     # Teacher target
     with AT.autograd.no_grad():
         Y_target = teacher.forward(X)
+        autograd.tape.annotate(Y_target, label="RunnerDemo.Y_target")
 
     # Capture composed whole (strict per AUTOGRAD_STRICT)
     session = AutogradAuditSession(student, X, Y_target, config=AuditConfig())

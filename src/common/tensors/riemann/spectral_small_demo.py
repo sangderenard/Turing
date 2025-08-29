@@ -79,10 +79,12 @@ def main():
 
     # Inputs (fixed for training)
     X = AT.randn((B, Cin, Nu, Nv, Nw), requires_grad=True)
+    autograd.tape.annotate(X, label="SpectralSmallDemo.X_input")
 
     # Teacher target
     with autograd.no_grad():
         Yt = teacher.forward(X, manifold=manifold)
+        autograd.tape.annotate(Yt, label="SpectralSmallDemo.Y_target")
 
     # Train student to match teacher
     params = list(student.parameters())
@@ -94,7 +96,9 @@ def main():
             if hasattr(p, "zero_grad"):
                 p.zero_grad()
         Yp = student.forward(X, manifold=manifold)
+        autograd.tape.annotate(Yp, label="SpectralSmallDemo.Y_pred")
         loss = mse(Yp, Yt)
+        autograd.tape.annotate(loss, label="SpectralSmallDemo.loss")
         autograd.grad(loss, params, retain_graph=False, allow_unused=False)
         new_params = opt.step(params, [p.grad for p in params])
         for p, np_ in zip(params, new_params):

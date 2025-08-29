@@ -161,6 +161,22 @@ class GradTape:
         self._param_index = 0
         self._loss_tensor: Any | None = None
         self._loss_id: int | None = None
+        # Structural tensors are allowed to require_grad but are not treated
+        # as trainable parameters and are excluded from parameter lists and
+        # strict connectivity diagnostics.
+        self._structural: set[int] = set()
+        # Optional label exclude patterns for parameter registration.
+        self._param_exclude_labellist: list[re.Pattern[str]] = []
+        try:
+            allow_env = os.environ.get("AUTOGRAD_PARAM_EXCLUDE_LABELS")
+            if allow_env:
+                parts: list[str] = []
+                for chunk in allow_env.split(","):
+                    parts.extend([p for p in chunk.split("|") if p])
+                for pat in parts:
+                    self._param_exclude_labellist.append(re.compile(pat))
+        except Exception:
+            self._param_exclude_labellist = []
 
     # ------------------------------------------------------------------
     # node utilities
@@ -175,6 +191,22 @@ class GradTape:
         except Exception:
             pass
         if getattr(tensor, "requires_grad", False):
+            # Exclude structural tensors or those matching exclude label patterns
+            anns = self.graph.nodes[tid].get("annotations", {})
+            lbl = anns.get("label") or getattr(tensor, "_label", None)
+            excluded = tid in self._structural or bool(anns.get("structural"))
+            if not excluded and isinstance(lbl, str) and self._param_exclude_labellist:
+                try:
+                    for rx in self._param_exclude_labellist:
+                        if rx.search(lbl):
+                            excluded = True
+                            break
+                except Exception:
+                    pass
+            if excluded:
+                node = self.graph.nodes[tid]
+                node.setdefault("stateful", False)
+                return
             if tid not in self._parameters:
                 pid = self._param_index
                 self._param_index += 1
@@ -198,8 +230,37 @@ class GradTape:
         self.graph.nodes[tid]["loss"] = True
         self._tensor_refs[tid] = tensor
 
+    # Structural parameter utilities
+    # ------------------------------------------------------------------
+    def mark_structural(self, tensor: Any, *, label: str | None = None) -> None:
+        """Mark ``tensor`` as structural (non-trainable, excluded from params)."""
+        tid = id(tensor)
+        self._structural.add(tid)
+        self.graph.add_node(tid, kind="tensor")
+        anns = self.graph.nodes[tid].setdefault("annotations", {})
+        anns["structural"] = True
+        if label is not None:
+            anns.setdefault("label", label)
+        # If it was previously registered as a parameter, drop it
+        if tid in self._parameters:
+            try:
+                del self._parameters[tid]
+            except Exception:
+                pass
+
     def parameter_tensors(self) -> List[Any]:
-        return [self._tensor_refs[tid] for tid, _ in sorted(self._parameters.items(), key=lambda x: x[1])]
+        items = sorted(self._parameters.items(), key=lambda x: x[1])
+        result: List[Any] = []
+        for tid, _ in items:
+            if tid in self._structural:
+                continue
+            anns = self.graph.nodes.get(tid, {}).get("annotations", {})
+            if anns.get("structural"):
+                continue
+            ref = self._tensor_refs.get(tid)
+            if ref is not None:
+                result.append(ref)
+        return result
 
     def parameters(self) -> Tuple[Any | None, Dict[int, int]]:
         params = self.parameter_tensors()
@@ -798,6 +859,30 @@ class Autograd:
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # Structural parameter exclusion helpers
+    # ------------------------------------------------------------------
+    def structural(self, *tensors: Any, label: str | None = None) -> None:  # pragma: no cover - convenience
+        """Mark one or more tensors as structural (non-trainable)."""
+        for t in tensors:
+            tape = getattr(t, "_tape", self.tape)
+            try:
+                tape.mark_structural(t, label=label)
+            except Exception:
+                pass
+
+    def structural_labels(self, *patterns: str) -> None:  # pragma: no cover - convenience
+        """Exclude tensors with labels matching these regex patterns from params."""
+        for pat in patterns:
+            try:
+                rx = re.compile(pat)
+            except Exception:
+                continue
+            try:
+                self.tape._param_exclude_labellist.append(rx)
+            except Exception:
+                pass
+
     def record(
         self,
         op: str,
@@ -890,6 +975,16 @@ class Autograd:
                             except Exception:
                                 continue
                     return False
+                # Helper: structural check: if parameter is structural, skip
+                def _is_structural(t: Any) -> bool:
+                    try:
+                        tid = id(t)
+                        if tid in getattr(tape_v, "_structural", set()):
+                            return True
+                        anns = tape_v.graph.nodes.get(tid, {}).get("annotations", {})
+                        return bool(anns.get("structural"))
+                    except Exception:
+                        return False
                 # Helper: describe immediate op neighbors and whether each has a backward rule and a path-to-loss
                 def _describe_neighbors(pid: int) -> list[dict[str, any]]:
                     desc: list[dict[str, any]] = []
@@ -928,7 +1023,7 @@ class Autograd:
                         pid = id(p)
                     except Exception:
                         continue
-                    if bwd_graph.has_node(pid) or _is_strict_whitelisted(p):
+                    if bwd_graph.has_node(pid) or _is_strict_whitelisted(p) or _is_structural(p):
                         continue
                     # Connectivity diagnostics: forward presence, consumers, path existence
                     present = tape_v.graph.has_node(pid)

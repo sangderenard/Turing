@@ -143,6 +143,23 @@ def main():
         max_sample_age=2048,
         lr=args.lr,
         epochs=args.epochs,
+        # Conservative strict-mode whitelist for structural/non-differentiable labels
+        strict_whitelist_labels=[
+            r'^grid\.',
+            r'^laplace_nd\.grid\.',
+            r'^laplace_nd\.meshgrid\.',
+            r'^laplace_nd\.steps\.',
+            r'^laplace_nd\.partials\.',
+            r'^laplace_nd\.metric\.',
+            r'^laplace_nd\.geometry\.',
+            r'^laplace_nd\.DEC\.',
+            r'^laplace_nd\.coo\.',
+            r'^laplace_nd\.laplacian\.',
+            r'^laplace_nd\.transform_spatial\.',
+            r'^PCANDTransform\.',
+            r'^fit_metric_pca\.',
+            r'^SpectralConv3D\.(?!Wspec)',
+        ],
     )
 
     # Build FusedProgram once; training loop will use the selected mode

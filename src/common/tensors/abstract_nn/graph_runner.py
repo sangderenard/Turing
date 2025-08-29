@@ -91,11 +91,19 @@ class GraphRunner:
 
             # Forward + loss
             pred = layer.forward(X)
+            autograd.tape.annotate(pred, label="GraphRunner.pred")
             loss = mse(pred, Y)
+            autograd.tape.annotate(loss, label="GraphRunner.loss")
             # Backward and step
             loss.backward()
             params = list(layer.parameters())
             grads = [p.grad for p in params]
+            try:
+                for i, g in enumerate(grads):
+                    if g is not None:
+                        autograd.tape.annotate(g, label=f"GraphRunner.grad[{i}]")
+            except Exception:
+                pass
             new_params = self.opt.step(params, grads)
             for p, np_ in zip(params, new_params):
                 AT.copyto(p, np_)

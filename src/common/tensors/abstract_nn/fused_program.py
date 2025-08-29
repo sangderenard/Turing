@@ -426,6 +426,10 @@ class IRGraphedModel:
         self.opt_m: List[Any] = []
         self.opt_v: List[Any] = []
         self.opt_t: Any | None = None
+        # Strict-mode whitelist (labels). If set, these regex patterns are
+        # applied before connectivity checks to exempt known non-differentiable
+        # or intentionally unused tensors (e.g., shapes, grids) from strict.
+        self.strict_whitelist_labels: list[str] = []
 
     # ------------------------------ user surface -----------------------------
     def config(self, **kwargs) -> "IRGraphedModel":
@@ -455,6 +459,12 @@ class IRGraphedModel:
             self.queue_maxlen = int(kwargs["queue_maxlen"])
         if "max_sample_age" in kwargs:
             self.max_sample_age = int(kwargs["max_sample_age"])
+        # Optional strict whitelist labels (list[str] of regex patterns)
+        if "strict_whitelist_labels" in kwargs and kwargs["strict_whitelist_labels"]:
+            try:
+                self.strict_whitelist_labels = list(kwargs["strict_whitelist_labels"])  # type: ignore
+            except Exception:
+                pass
         return self
 
     # ---- training material management ---------------------------------
@@ -731,6 +741,19 @@ class IRGraphedModel:
         self.inputs_any = inputs
         self.targets_any = targets
 
+        # Normalize inputs/targets onto the fresh tape to avoid cross-tape graphs
+        try:
+            inputs = AT.get_tensor(inputs)
+            autograd.tape.create_tensor_node(inputs)
+        except Exception:
+            pass
+        if targets is not None:
+            try:
+                targets = AT.get_tensor(targets)
+                autograd.tape.create_tensor_node(targets)
+            except Exception:
+                pass
+
         # Forward
         fwd = getattr(self.model, "forward", None)
         model_callable = fwd if callable(fwd) else self.model
@@ -762,6 +785,12 @@ class IRGraphedModel:
                     params = list(self.model.parameters())
             except Exception:
                 params = []
+            # Apply configured strict-mode label whitelist if provided
+            if self.strict_whitelist_labels:
+                try:
+                    autograd.whitelist_labels(*self.strict_whitelist_labels)
+                except Exception:
+                    pass
             if params:
                 try:
                     grads = autograd.grad(loss, params, retain_graph=True)

@@ -55,20 +55,28 @@ class SpectralConv3D:
             eps = manifold.eigenpairs()
         assert eps is not None, "Manifold did not provide eigenpairs"
         evals, evecs = eps  # evals: (K,), evecs: (N, K)
+        autograd.tape.annotate(evals, label="SpectralConv3D.evals")
+        autograd.tape.annotate(evecs, label="SpectralConv3D.evecs")
         K = min(self.num_modes, int(evecs.shape[1]))
         E = evecs[:, :K]              # (N, K)
         Wspec = self.Wspec[:, :, :K]  # (C_out, C_in, K)
+        autograd.tape.annotate(E, label="SpectralConv3D.E_modes")
+        autograd.tape.annotate(Wspec, label="SpectralConv3D.Wspec_slice")
 
         # Flatten spatial and project: alpha = x_flat @ E  → (B, C, K)
         x_flat = x.reshape(B, C, N)            # (B, C, N)
         alpha = x_flat @ E                     # (B, C, K)
+        autograd.tape.annotate(x_flat, label="SpectralConv3D.x_flat")
+        autograd.tape.annotate(alpha, label="SpectralConv3D.alpha")
 
         # Apply spectral weights: Beta[b, co, k] = sum_ci alpha[b, ci, k] * Wspec[co, ci, k]
         a_exp = alpha.reshape(B, 1, C, K)                      # (B, 1, C, K)
         W_exp = Wspec.reshape(1, self.out_channels, C, K)      # (1, C_out, C, K)
         Beta = (a_exp * W_exp).sum(dim=2)                      # (B, C_out, K)
+        autograd.tape.annotate(Beta, label="SpectralConv3D.Beta")
 
         # Reconstruct: y_flat[b, co, :] = Beta[b, co, :] @ E^T
         y_flat = Beta @ E.swapaxes(0, 1)                       # (B, C_out, N)
         y = y_flat.reshape(B, self.out_channels, D, H, W)
+        autograd.tape.annotate(y, label="SpectralConv3D.output")
         return y
