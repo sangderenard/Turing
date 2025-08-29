@@ -19,3 +19,12 @@ Development priorities follow a strict order:
 3. Fill gaps in individual backends.
 4. Only after the above are complete do we expand the optional C backend, except for trivial
    stub replacements when time permits.
+
+## Autograd strict mode
+
+The autograd engine can operate in a strict validation mode that checks for
+missing backward implementations and verifies that all input parameters are
+connected to the loss. When `allow_unused=True` is passed to
+`autograd.grad`, those connectivity checks are skipped for the corresponding
+inputs, allowing gradients to be requested for tensors unrelated to the loss
+without triggering a `RuntimeError`.
