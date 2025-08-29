@@ -1,7 +1,10 @@
 import numpy as np
 import pytest
 from src.common.tensors.abstraction import AbstractTensor
-from src.common.tensors.riemann.grid_block import RiemannGridBlock
+from src.common.tensors.riemann.grid_block import (
+    RiemannGridBlock,
+    validate_config,
+)
 
 
 def _example_config():
@@ -117,3 +120,12 @@ def test_casting_1to1_mapping():
     expected = expected.swapaxes(2, 1)
 
     assert np.allclose(y.data, expected.data)
+
+
+def test_validate_config_requires_channels():
+    cfg = {
+        "geometry": {"key": "rect_euclidean"},
+        "conv": {"out_channels": 4},
+    }
+    with pytest.raises(ValueError):
+        validate_config(cfg)

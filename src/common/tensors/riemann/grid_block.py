@@ -21,6 +21,115 @@ from .geometry_factory import build_geometry
 from .regularization import smooth_bins, weight_decay
 
 
+def validate_config(config: Dict[str, Any]) -> None:
+    """Validate configuration for :class:`RiemannGridBlock`.
+
+    Parameters
+    ----------
+    config:
+        Configuration dictionary to validate.
+
+    Raises
+    ------
+    TypeError
+        If ``config`` or any sub-entries have incorrect types.
+    ValueError
+        If required keys are missing or values are out of the accepted range.
+    """
+
+    if not isinstance(config, dict):
+        raise TypeError("config must be a dict")
+
+    # Geometry -----------------------------------------------------------
+    geom = config.get("geometry")
+    if not isinstance(geom, dict):
+        raise ValueError("'geometry' section is required")
+    if not isinstance(geom.get("key"), str):
+        raise ValueError("geometry.key must be a string")
+    if "grid_shape" in geom:
+        gs = geom["grid_shape"]
+        if (
+            not isinstance(gs, (tuple, list))
+            or len(gs) != 3
+            or not all(isinstance(n, int) for n in gs)
+        ):
+            raise TypeError("geometry.grid_shape must be a 3-tuple of ints")
+
+    # Convolution --------------------------------------------------------
+    conv = config.get("conv")
+    if not isinstance(conv, dict):
+        raise ValueError("'conv' section is required")
+    for k in ("in_channels", "out_channels"):
+        if not isinstance(conv.get(k), int):
+            raise ValueError(f"conv.{k} must be an int")
+    if "boundary_conditions" in conv:
+        bc = conv["boundary_conditions"]
+        if not isinstance(bc, (tuple, list)) or len(bc) != 6:
+            raise TypeError("conv.boundary_conditions must be a 6-element sequence")
+    if "pointwise" in conv and not isinstance(conv["pointwise"], bool):
+        raise TypeError("conv.pointwise must be a bool")
+    if "k" in conv and not isinstance(conv["k"], int):
+        raise TypeError("conv.k must be an int")
+    if "metric_source" in conv and not isinstance(conv["metric_source"], str):
+        raise TypeError("conv.metric_source must be a string")
+    if "stencil" in conv:
+        st = conv["stencil"]
+        if not isinstance(st, dict):
+            raise TypeError("conv.stencil must be a dict")
+        if "offsets" in st and not isinstance(st["offsets"], (tuple, list)):
+            raise TypeError("stencil.offsets must be a sequence")
+        if "length" in st and not isinstance(st["length"], int):
+            raise TypeError("stencil.length must be an int")
+        if "normalize" in st and not isinstance(st["normalize"], bool):
+            raise TypeError("stencil.normalize must be a bool")
+
+    # Casting ------------------------------------------------------------
+    casting = config.get("casting")
+    if casting is not None:
+        if not isinstance(casting, dict):
+            raise TypeError("casting must be a dict")
+        mode = casting.get("mode", "fixed")
+        if mode not in {"pre_linear", "fixed", "soft_assign"}:
+            raise ValueError("casting.mode must be 'pre_linear', 'fixed' or 'soft_assign'")
+        if "film" in casting and not isinstance(casting["film"], bool):
+            raise TypeError("casting.film must be a bool")
+        if "coords" in casting and casting["coords"] is not None and not isinstance(
+            casting["coords"], str
+        ):
+            raise TypeError("casting.coords must be a string or None")
+        if "inject_coords" in casting and not isinstance(casting["inject_coords"], bool):
+            raise TypeError("casting.inject_coords must be a bool")
+        if "map" in casting and casting["map"] not in {"1to1", "row_major", "normalized_span"}:
+            raise ValueError(
+                "casting.map must be '1to1', 'row_major' or 'normalized_span'"
+            )
+
+    # Post-linear --------------------------------------------------------
+    post = config.get("post_linear")
+    if post is not None:
+        if not isinstance(post, dict):
+            raise TypeError("post_linear must be a dict")
+        for k in ("in_dim", "out_dim"):
+            if not isinstance(post.get(k), int):
+                raise ValueError(f"post_linear.{k} must be an int")
+
+    # Regularization -----------------------------------------------------
+    reg = config.get("regularization")
+    if reg is not None:
+        if not isinstance(reg, dict):
+            raise TypeError("regularization must be a dict")
+        if "smooth_bins" in reg and not isinstance(reg["smooth_bins"], (int, float)):
+            raise TypeError("regularization.smooth_bins must be numeric")
+        if "weight_decay" in reg:
+            wd = reg["weight_decay"]
+            if not isinstance(wd, dict):
+                raise TypeError("weight_decay must be a dict")
+            for v in wd.values():
+                if not isinstance(v, (int, float)):
+                    raise TypeError("weight_decay coefficients must be numeric")
+
+
+
 def soft_assign(*args: Any, **kwargs: Any) -> AbstractTensor:
     """Placeholder for a differentiable assignment routine.
 
@@ -217,6 +326,8 @@ class RiemannGridBlock:
         ``"conv"`` and follow :class:`NDPCA3Conv3d`'s constructor.  Optional
         casting behaviour is controlled by the ``"casting"`` dictionary.
         """
+
+        validate_config(config)
 
         geom_cfg = config.get("geometry", {})
         transform, grid, package = build_geometry(geom_cfg)

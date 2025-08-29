@@ -17,6 +17,7 @@ This project simulates a cassette-driven "survival computer" using a compile and
 - [Priming a tape and executing with TapeMachine](#priming-a-tape-and-executing-with-tapemachine)
 - [Reel animation demo](#reel-animation-demo)
 - [Live cassette demo](#live-cassette-demo)
+- [RiemannGridBlock quick start](#riemanngridblock-quick-start)
 - [Modules & capabilities](#modules--capabilities)
 - [Tests](#tests)
 - [Full module index](MODULES.md)
@@ -127,6 +128,25 @@ python -m src.visualizations.live_cassette_demo
 
 The window shows tape motion in real time as the simulator writes the program
 to a blank cassette and then executes it.
+
+## RiemannGridBlock quick start
+
+The `RiemannGridBlock` couples geometry packages with metric‑steered
+convolution.  Build one from a configuration dictionary and run it on any
+registered tensor backend:
+
+```python
+from src.common.tensors.riemann.grid_block import RiemannGridBlock
+
+cfg = {
+    "geometry": {"key": "rect_euclidean", "grid_shape": (2, 2, 2)},
+    "conv": {"in_channels": 3, "out_channels": 4},
+}
+block = RiemannGridBlock.build_from_config(cfg)
+```
+
+See [docs/riemann_grid_block.md](docs/riemann_grid_block.md) for the full
+configuration schema and defaults.
 
 ## Modules & capabilities
 
