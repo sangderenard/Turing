@@ -34,6 +34,23 @@ from ..abstract_convolution.ndpca3transform import fit_metric_pca, PCANDTransfor
 from ..abstract_nn.core import Linear
 from .activations import GELU, Sigmoid
 
+class LinearStackModel:
+    """Simple fallback: 30 → hidden → 30 via Linear layers only."""
+    def __init__(self, like: AT, hidden_dim: int = 64):
+        from ..abstract_nn.core import Linear, Model
+        from .activations import GELU, Sigmoid
+        self.model = Model(
+            layers=[
+                Linear(30, hidden_dim, like=like, init="xavier"),
+                Linear(hidden_dim, 30, like=like, init="xavier"),
+            ],
+            activations=[GELU(), Sigmoid()]
+        )
+    def parameters(self):
+        return self.model.parameters()
+    def forward(self, x):
+        return self.model.forward(x)
+
 
 class ConvTextModel:
     """30 → metric‑aware conv over (D,H,W) → 30 using a real transform/grid.
@@ -117,7 +134,81 @@ class ConvTextModel:
         y = self.post.forward(y).reshape(30)
         y = self.out_act.forward(y) * 255.0
         return y
+def run_eager_training_test(model, AT, args):
+    print("--- Running pre-capture eager training test ---")
+    from .optimizer import Adam
+    from ..autograd import autograd
+    eager_optimizer = Adam(model.parameters(), lr=args.lr)
+    loss_fn = lambda a, b: ((a - b) ** 2).mean()
+    epsilon = 1e-4
+    max_steps = 1000
+    patience = 20
+    patience_counter = patience
+    last_loss = None
+    best_loss = None
+    inputs = AT.randn((args.input_len,), requires_grad=True)
+    targets = AT.ones(args.input_len) * 65.0  # ASCII 'A'
 
+    for i in range(max_steps):
+        autograd.tape = autograd.__class__().tape
+        pred = model.forward(inputs)
+        loss = loss_fn(pred, targets)
+        try:
+            loss_val = float(loss.item())
+        except Exception:
+            loss_val = float('nan')
+        print(f"Eager step {i}, Loss: {loss_val}")
+
+        # Early stopping: epsilon or patience
+        if loss_val < epsilon:
+            print(f"Eager training reached epsilon {epsilon} at step {i}")
+            break
+        if best_loss is None or loss_val < best_loss - 1e-8:
+            best_loss = loss_val
+            patience_counter = patience
+            print(f"  [patience] New best loss {best_loss}. Patience reset to {patience}.")
+        else:
+            patience_counter -= 1
+            print(f"  [patience] No new best. Patience left: {patience_counter}")
+        last_loss = loss_val
+        if patience_counter <= 0:
+            print(f"Eager training stopped early due to patience at step {i}. Raising to trigger fallback.")
+            raise RuntimeError("Patience exhausted in eager training.")
+
+        try:
+            loss.backward()
+            params = model.parameters()
+            grads = [p.grad for p in params]
+            if any(g is None for g in grads):
+                print("!!! Some gradients were None. Retrying backward with allow_unused=True and strict mode off.")
+                for p_idx, p in enumerate(params):
+                    if p.grad is None:
+                        print(f"  - Param {p_idx} (label: {getattr(p, '_label', 'N/A')}) has no grad.")
+                prev_strict = autograd.strict
+                autograd.strict = False
+                try:
+                    for p in params:
+                        if hasattr(p, 'zero_grad'):
+                            p.zero_grad()
+                        elif hasattr(p, '_grad'):
+                            p._grad = None
+                    autograd.grad(loss, params, allow_unused=True)
+                    grads = [p.grad for p in params]
+                    print("  (Suppressed strict mode for this step. Some gradients may be None.)")
+                finally:
+                    autograd.strict = prev_strict
+            # Replace None gradients with zeros as a boundary condition
+            safe_grads = [g if g is not None else AT.zeros_like(p) for p, g in zip(params, grads)]
+            new_params = eager_optimizer.step(params, safe_grads)
+            for p, np_ in zip(params, new_params):
+                AT.copyto(p, np_)
+        except Exception as e:
+            print(f"!!! Eager training step failed: {e} !!!")
+            break
+    else:
+        print(f"Eager training finished after {max_steps} steps without reaching epsilon or patience.")
+
+    print("--- Eager training test finished ---")
 
 def main():
     parser = argparse.ArgumentParser(description="Fused Conv Text Demo")
@@ -131,10 +222,27 @@ def main():
     args = parser.parse_args()
 
     like = AT.get_tensor()
-    model = ConvTextModel(like=like, grid_shape=(3, 2, 5))
 
-    # Seed capture with a zero input of desired length (for shape + feeds)
-    x0 = AT.zeros(args.input_len)
+
+    # Try to initialize and ingest the complex model, fallback to linear if it fails (including deep failures)
+    try:
+        model = ConvTextModel(like=like, grid_shape=(3, 2, 5))
+        x0 = AT.zeros(args.input_len)
+        _ = model.forward(x0)
+        try:
+            run_eager_training_test(model, AT, args)
+        except Exception as e:
+            print(f"[WARNING] Eager training failed with ConvTextModel: {e}\nFalling back to LinearStackModel.")
+            model = LinearStackModel(like=like)
+            x0 = AT.zeros(args.input_len)
+            _ = model.forward(x0)
+            run_eager_training_test(model, AT, args)
+    except Exception as e:
+        print(f"[WARNING] Complex ConvTextModel failed to initialize or ingest: {e}\nFalling back to LinearStackModel.")
+        model = LinearStackModel(like=like)
+        x0 = AT.zeros(args.input_len)
+        _ = model.forward(x0)
+        run_eager_training_test(model, AT, args)
 
     gm = IRGraphedModel(model).config(
         interactive=args.interactive,
