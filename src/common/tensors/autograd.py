@@ -859,12 +859,17 @@ class Autograd:
                 ]
                 detail = "\n".join(lines)
                 raise RuntimeError("Strict autograd: missing backward implementations for reachable ops:\n" + detail)
-            # Also validate parameter connectivity: any input not present in the backward graph
+            # Also validate parameter connectivity: any input not present in the
+            # backward graph, unless unused params are explicitly allowed.
             try:
                 bwd_graph = tape_v.export_backward_graph(output)
             except Exception:
                 bwd_graph = None
-            if bwd_graph is not None and inputs is not None:
+            if (
+                not allow_unused
+                and bwd_graph is not None
+                and inputs is not None
+            ):
                 broken: list[str] = []
                 import networkx as nx
                 # Helper: whitelist check via per-tensor annotations or label allowlist
