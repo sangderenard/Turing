@@ -71,3 +71,30 @@ def test_power_operation_average_time_pure_vs_numpy():
     numpy_mean = numpy_prof.per_op()["pow"]["mean"]
     assert pure_mean > 0 and numpy_mean > 0
     assert pure_mean != numpy_mean
+
+
+def test_compute_partials_and_normals_strict(monkeypatch):
+    if not hasattr(laplace, "BuildLaplace3D"):
+        pytest.skip("BuildLaplace3D not available")
+    # Enable strict mode for autograd and ensure it is restored afterwards
+    monkeypatch.setenv("AUTOGRAD_STRICT", "1")
+    monkeypatch.setattr(AbstractTensor.autograd, "strict", True)
+
+    N = 3
+    Lx = Ly = Lz = 1.0
+    transform = laplace.RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device="cpu")
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N, N, N)
+    grid_domain = laplace.GridDomain.generate_grid_domain(
+        coordinate_system="rectangular", N_u=N, N_v=N, N_w=N, Lx=Lx, Ly=Ly, Lz=Lz, device="cpu"
+    )
+    BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=None, resolution=N)
+
+    laplacian_tensor, laplacian_sparse = BL.build_general_laplace(
+        grid_u=grid_u,
+        grid_v=grid_v,
+        grid_w=grid_w,
+        boundary_conditions=("dirichlet",) * 6,
+        device="cpu",
+        f=0.0,
+    )
+    assert laplacian_tensor is not None or laplacian_sparse is not None
