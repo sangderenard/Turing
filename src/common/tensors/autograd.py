@@ -1023,7 +1023,18 @@ class Autograd:
                         pid = id(p)
                     except Exception:
                         continue
-                    if bwd_graph.has_node(pid) or _is_strict_whitelisted(p) or _is_structural(p):
+                    path_exists = False
+                    if tape_v._loss_id is not None:
+                        try:
+                            path_exists = nx.has_path(tape_v.graph, pid, tape_v._loss_id)
+                        except Exception:
+                            path_exists = False
+                    if (
+                        bwd_graph.has_node(pid)
+                        or path_exists
+                        or _is_strict_whitelisted(p)
+                        or _is_structural(p)
+                    ):
                         continue
                     # Connectivity diagnostics: forward presence, consumers, path existence
                     present = tape_v.graph.has_node(pid)
@@ -1039,10 +1050,7 @@ class Autograd:
                                 "result_shape": ctx.get("result_shape"),
                                 "input_ids": in_ids,
                             })
-                    try:
-                        to_loss = tape_v._loss_id is not None and nx.has_path(tape_v.graph, pid, tape_v._loss_id)
-                    except Exception:
-                        to_loss = None
+                    to_loss = path_exists
                     neighbors = _describe_neighbors(pid)
                     lbl = getattr(p, "_label", None) or getattr(p, "shape", None) or f"input[{idx}]"
                     broken.append(
