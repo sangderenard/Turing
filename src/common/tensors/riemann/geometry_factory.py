@@ -11,6 +11,7 @@ simple config dictionary.
 from typing import Any, Callable, Dict, Tuple
 
 from ..abstraction import AbstractTensor
+from ..autograd import autograd
 from ..abstract_convolution.laplace_nd import GridDomain
 from ..abstract_convolution.ndpca3transform import PCANDTransform
 from .manifold import ManifoldPackage
@@ -50,6 +51,10 @@ def _build_pca_nd(config: Dict[str, Any]):
     U = AT.linspace(-1.0, 1.0, Nu).reshape(Nu, 1, 1) * AT.ones((1, Nv, Nw))
     V = AT.linspace(-1.0, 1.0, Nv).reshape(1, Nv, 1) * AT.ones((Nu, 1, Nw))
     W = AT.linspace(-1.0, 1.0, Nw).reshape(1, 1, Nw) * AT.ones((Nu, Nv, 1))
+    # Label and whitelist grid coordinates for strict connectivity
+    autograd.tape.annotate(U, label="grid.U", strict_allow_unused=True)
+    autograd.tape.annotate(V, label="grid.V", strict_allow_unused=True)
+    autograd.tape.annotate(W, label="grid.W", strict_allow_unused=True)
     grid = GridDomain(
         U,
         V,

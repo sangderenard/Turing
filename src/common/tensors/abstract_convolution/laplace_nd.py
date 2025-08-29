@@ -1,5 +1,6 @@
 
 from ..abstraction import AbstractTensor
+from ..autograd import autograd
 import math
 import logging
 from src.common.tensors.coo_matrix import COOMatrix
@@ -1104,6 +1105,13 @@ class TransformHub:
 
         # Forward pass: get transformed coordinates
         X, Y, Z = self.transform_spatial(U, V, W)
+        # Label transformed coordinates for provenance
+        try:
+            autograd.tape.annotate(X, label="laplace_nd.transform_spatial.X")
+            autograd.tape.annotate(Y, label="laplace_nd.transform_spatial.Y")
+            autograd.tape.annotate(Z, label="laplace_nd.transform_spatial.Z")
+        except Exception:
+            pass
 
         if diagnostic_mode:
             print("U Grid:")
@@ -1162,6 +1170,19 @@ class TransformHub:
         dXdw = AbstractTensor.get_tensor(dXdw) if dXdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
         dYdw = AbstractTensor.get_tensor(dYdw) if dYdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
         dZdw = AbstractTensor.get_tensor(dZdw) if dZdw is not None else AbstractTensor.zeros(target_shape, device=W.device)
+        # Annotate partial derivatives for traceability
+        try:
+            autograd.tape.annotate(dXdu, label="laplace_nd.partials.dXdu")
+            autograd.tape.annotate(dYdu, label="laplace_nd.partials.dYdu")
+            autograd.tape.annotate(dZdu, label="laplace_nd.partials.dZdu")
+            autograd.tape.annotate(dXdv, label="laplace_nd.partials.dXdv")
+            autograd.tape.annotate(dYdv, label="laplace_nd.partials.dYdv")
+            autograd.tape.annotate(dZdv, label="laplace_nd.partials.dZdv")
+            autograd.tape.annotate(dXdw, label="laplace_nd.partials.dXdw")
+            autograd.tape.annotate(dYdw, label="laplace_nd.partials.dYdw")
+            autograd.tape.annotate(dZdw, label="laplace_nd.partials.dZdw")
+        except Exception:
+            pass
 
         if diagnostic_mode:
             print("Partial Derivatives:")
@@ -1181,8 +1202,16 @@ class TransformHub:
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdv, dYdv, dZdv], dim=-1), AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), dim=-1),
             AbstractTensor.linalg.cross(AbstractTensor.stack([dXdw, dYdw, dZdw], dim=-1), AbstractTensor.stack([dXdu, dYdu, dZdu], dim=-1), dim=-1)
         ], dim=-1)
+        try:
+            autograd.tape.annotate(normals, label="laplace_nd.normals")
+        except Exception:
+            pass
         # Compute distances from the origin
         distances = AbstractTensor.sqrt(X**2 + Y**2 + Z**2)
+        try:
+            autograd.tape.annotate(distances, label="laplace_nd.distances")
+        except Exception:
+            pass
 
         # Select the top 10% farthest points
         top_10_percent_threshold = max(1, int(0.1 * distances.numel()))

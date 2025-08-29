@@ -755,6 +755,19 @@ class Autograd:
         # the loss have registered backward rules before attempting backprop.
         import os
         self.strict = os.environ.get("AUTOGRAD_STRICT", "0") not in ("0", "false", "False", None)
+        # Allowlisted labels for strict connectivity checks (regex patterns)
+        self._strict_label_allowlist: list[re.Pattern[str]] = []
+        try:
+            allow_env = os.environ.get("AUTOGRAD_STRICT_ALLOW_LABELS")
+            if allow_env:
+                parts: list[str] = []
+                for chunk in allow_env.split(","):
+                    parts.extend([p for p in chunk.split("|") if p])
+                for pat in parts:
+                    self._strict_label_allowlist.append(re.compile(pat))
+        except Exception:
+            # Non-fatal if env parsing fails
+            self._strict_label_allowlist = []
 
     @contextmanager
     def no_grad(self) -> Generator[None, None, None]:
@@ -764,6 +777,26 @@ class Autograd:
             yield
         finally:
             self._no_grad_depth -= 1
+
+    # ------------------------------------------------------------------
+    # Strict-mode allowlist helpers
+    # ------------------------------------------------------------------
+    def whitelist(self, *tensors: Any) -> None:  # pragma: no cover - convenience
+        """Mark tensors as allowed to be unused under strict connectivity checks."""
+        for t in tensors:
+            tape = getattr(t, "_tape", self.tape)
+            try:
+                tape.annotate(t, strict_allow_unused=True)
+            except Exception:
+                pass
+
+    def whitelist_labels(self, *patterns: str) -> None:  # pragma: no cover - convenience
+        """Add regex patterns to allowlist labels under strict mode."""
+        for pat in patterns:
+            try:
+                self._strict_label_allowlist.append(re.compile(pat))
+            except Exception:
+                pass
 
     def record(
         self,
@@ -834,6 +867,24 @@ class Autograd:
             if bwd_graph is not None and inputs is not None:
                 broken: list[str] = []
                 import networkx as nx
+                # Helper: whitelist check via per-tensor annotations or label allowlist
+                def _is_strict_whitelisted(t: Any) -> bool:
+                    try:
+                        tid = id(t)
+                        anns = tape_v.graph.nodes.get(tid, {}).get("annotations", {})
+                    except Exception:
+                        anns = {}
+                    if isinstance(anns.get("strict_allow_unused"), bool) and anns.get("strict_allow_unused"):
+                        return True
+                    lbl = anns.get("label") or getattr(t, "_label", None)
+                    if isinstance(lbl, str):
+                        for rx in self._strict_label_allowlist:
+                            try:
+                                if rx.search(lbl):
+                                    return True
+                            except Exception:
+                                continue
+                    return False
                 # Helper: describe immediate op neighbors and whether each has a backward rule and a path-to-loss
                 def _describe_neighbors(pid: int) -> list[dict[str, any]]:
                     desc: list[dict[str, any]] = []
@@ -872,7 +923,7 @@ class Autograd:
                         pid = id(p)
                     except Exception:
                         continue
-                    if bwd_graph.has_node(pid):
+                    if bwd_graph.has_node(pid) or _is_strict_whitelisted(p):
                         continue
                     # Connectivity diagnostics: forward presence, consumers, path existence
                     present = tape_v.graph.has_node(pid)

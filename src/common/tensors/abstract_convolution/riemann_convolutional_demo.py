@@ -161,7 +161,7 @@ def main(config=None):
         loss = loss_fn(y, target)
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
-        layer.report_orphan_nodes()
+        # layer.report_orphan_nodes()  # retired / no-op
         # Backward pass (assume .backward() populates .grad)
         if hasattr(loss, 'backward'):
             loss.backward()
