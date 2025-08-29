@@ -312,11 +312,11 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = tanh(x)",
         "latex": r"y = \tanh x, \quad \frac{\partial y}{\partial x} = 1 - \tanh^2 x = 1 - y^2",
         "backward": {
-            "x": "gx = unbroadcast(g * (1 - y*y), x.shape)"
+            "x": "gx = unbroadcast(g * (1 - (x.detach().tanh()*x.detach().tanh())), x.shape)"
         },
         "python": {
-            "parameters": ["g", "x", "y"],
-            "body": "return unbroadcast(g * (1 - y*y), x.shape)"
+            "parameters": ["g", "x"],
+            "body": "y = x.detach().tanh(); return unbroadcast(g * (1 - y*y), x.shape)"
         },
         "domain": "x: any real",
         "notes": "",
