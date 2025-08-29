@@ -18,4 +18,5 @@ from .geodesic import GeodesicConv3D
 from .transport import ParallelTransport
 from .heat import HeatKernel3D
 from .grid_block import RiemannGridBlock
+from .regularization import smooth_bins, weight_decay
 

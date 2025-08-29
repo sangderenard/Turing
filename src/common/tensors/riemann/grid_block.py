@@ -18,6 +18,7 @@ from ..abstraction import AbstractTensor
 from ..abstract_nn.core import Linear
 from ..abstract_convolution.ndpca3conv import NDPCA3Conv3d
 from .geometry_factory import build_geometry
+from .regularization import smooth_bins, weight_decay
 
 
 def soft_assign(*args: Any, **kwargs: Any) -> AbstractTensor:
@@ -195,12 +196,14 @@ class RiemannGridBlock:
         casting: Optional[_Casting] = None,
         bin_map: Optional[Any] = None,
         post_linear: Optional[Linear] = None,
+        regularization: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.conv = conv
         self.package = package
         self.casting = casting
         self.bin_map = bin_map
         self.post_linear = post_linear
+        self.regularization = regularization
 
     # ------------------------------------------------------------------
     # Construction
@@ -259,12 +262,15 @@ class RiemannGridBlock:
         if post_cfg is not None:
             post = Linear(post_cfg["in_dim"], post_cfg["out_dim"], like=like)
 
+        reg_cfg = config.get("regularization")
+
         return cls(
             conv=conv,
             package=package,
             casting=casting,
             bin_map=bin_map,
             post_linear=post,
+            regularization=reg_cfg,
         )
 
     # ------------------------------------------------------------------
@@ -293,3 +299,24 @@ class RiemannGridBlock:
             y = z.reshape(B, -1, D, H, W)
 
         return y
+
+    # ------------------------------------------------------------------
+    # Regularization
+    # ------------------------------------------------------------------
+    def regularization_loss(self) -> AbstractTensor:
+        """Return configured regularization penalties."""
+        if not self.regularization:
+            return AbstractTensor.get_tensor([0.0]).sum()
+
+        loss = AbstractTensor.get_tensor([0.0]).sum()
+        reg = self.regularization
+
+        lam = reg.get("smooth_bins")
+        if lam is not None and self.bin_map is not None:
+            loss = loss + smooth_bins(self.bin_map, float(lam))
+
+        wd_cfg = reg.get("weight_decay")
+        if wd_cfg is not None:
+            loss = loss + weight_decay(self.casting, self.conv, self.post_linear, wd_cfg)
+
+        return loss
