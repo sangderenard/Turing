@@ -68,9 +68,34 @@ class _Casting:
         film: bool = False,
         coords_mode: Optional[str] = None,
         inject_coords: bool = False,
+        map_strategy: str = "row_major",
     ) -> None:
+        """Create a casting module.
+
+        Args:
+            mode: Casting mode. ``"pre_linear"`` enables a learned linear
+                projection before convolution.
+            like: Backend tensor to mirror for parameter creation.
+            in_channels: Number of input channels (``C_in``).
+            grid: Geometry grid supplying ``(D,H,W)`` dimensions.
+            film: Whether to apply FiLM modulation.
+            coords_mode: Optional coordinate encoding strategy.
+            inject_coords: If ``True``, append coordinates as channels.
+            map_strategy: How to reshape the flattened ``pre_linear`` output
+                back into ``(C_in,D,H,W)``. Available strategies are:
+
+                - ``"1to1"`` – Treats each voxel as a contiguous block of
+                  ``C_in`` channels (voxel-major order).
+                - ``"row_major"`` – Standard C-major/row-major layout where all
+                  positions of channel 0 appear before channel 1. This is the
+                  default to preserve existing behaviour.
+                - ``"normalized_span"`` – Currently mirrors ``"row_major"`` but
+                  is reserved for future schemes based on normalized index
+                  spans.
+        """
         self.mode = mode
         self.inject_coords = inject_coords
+        self.map_strategy = map_strategy
 
         D, H, W = grid.U.shape
         self.pre_linear: Optional[Linear] = None
@@ -132,12 +157,31 @@ class _Casting:
             B, C, D, H, W = x.shape
             z = x.reshape(B, C * D * H * W)
             z = self.pre_linear.forward(z)
-            x = z.reshape(B, C, D, H, W)
+            x = self._reshape_pre_linear(z, B, C, D, H, W)
 
         if self.film is not None and self.coords is not None:
             x = self.film.forward(self.coords, x)
 
         return x
+
+    # ------------------------------------------------------------------
+    def _reshape_pre_linear(
+        self, z: AbstractTensor, B: int, C: int, D: int, H: int, W: int
+    ) -> AbstractTensor:
+        """Map flattened ``pre_linear`` output back to ``(B,C,D,H,W)``.
+
+        The mapping is controlled by ``self.map_strategy``.
+        """
+
+        if self.map_strategy == "row_major" or self.map_strategy == "normalized_span":
+            return z.reshape(B, C, D, H, W)
+        if self.map_strategy == "1to1":
+            z = z.reshape(B, D, H, W, C)
+            z = z.swapaxes(4, 3)
+            z = z.swapaxes(3, 2)
+            z = z.swapaxes(2, 1)
+            return z
+        raise ValueError(f"Unknown mapping strategy: {self.map_strategy}")
 
 
 class RiemannGridBlock:
@@ -189,6 +233,7 @@ class RiemannGridBlock:
                 film=casting_cfg.get("film", False),
                 coords_mode=casting_cfg.get("coords"),
                 inject_coords=casting_cfg.get("inject_coords", False),
+                map_strategy=casting_cfg.get("map", "row_major"),
             )
 
         bin_map = package.get("bin_map") if isinstance(package, dict) else None
