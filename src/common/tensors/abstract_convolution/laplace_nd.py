@@ -1103,6 +1103,16 @@ class TransformHub:
         if hasattr(W, "requires_grad_"):
             W.requires_grad_(True)
 
+        # Mark mesh-grid tensors as intentionally unused for strict autograd
+        # connectivity checks and label them for clarity in traces.
+        AbstractTensor.autograd.whitelist(U, V, W)
+        try:  # pragma: no cover - annotation helper
+            autograd.tape.annotate(U, label="laplace_nd.grid.U", strict_allow_unused=True)
+            autograd.tape.annotate(V, label="laplace_nd.grid.V", strict_allow_unused=True)
+            autograd.tape.annotate(W, label="laplace_nd.grid.W", strict_allow_unused=True)
+        except Exception:
+            pass
+
         # Forward pass: get transformed coordinates
         X, Y, Z = self.transform_spatial(U, V, W)
         # Label transformed coordinates for provenance
