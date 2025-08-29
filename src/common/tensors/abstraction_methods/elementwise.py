@@ -1,5 +1,9 @@
 # ---- Imports ----
 from typing import Dict, Any
+try:
+    from ..branch_oracle import BRANCH_ORACLE as _BRANCH_ORACLE
+except Exception:  # fallback if module not available
+    _BRANCH_ORACLE = None  # type: ignore
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..abstraction import AbstractTensor
@@ -33,6 +37,17 @@ def _as_scalar(x):
 def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
     from ..abstraction import AbstractTensor
     finalize = AbstractTensor._pre_autograd(op, [self])
+    # Branch override: if oracle forces this predicate, return full-mask tensor
+    if _BRANCH_ORACLE is not None:
+        forced = _BRANCH_ORACLE.maybe_mask(op)
+        if forced is not None:
+            mask_val = 1 if forced else 0
+            out = self.ensure_tensor([mask_val] * max(1, self.numel())).reshape(*self.get_shape())
+            out = finalize(out)
+            tape = getattr(out, "_tape", None)
+            if tape and annotate:
+                tape.annotate(out, **({"forced": True} | annotate))
+            return out
     flat = self.reshape(-1).tolist()
     K = self._scalar_kernel(op)
     out = [K(self._as_scalar(a)) for a in flat]
@@ -55,6 +70,21 @@ def _v2_valuewise(
     from ..abstraction import AbstractTensor
     other_t = other if isinstance(other, AbstractTensor) else self.ensure_tensor(other)
     finalize = AbstractTensor._pre_autograd(op, [self, other_t])
+    # Branch override: if oracle forces this predicate, return full-mask tensor
+    if _BRANCH_ORACLE is not None:
+        forced = _BRANCH_ORACLE.maybe_mask(op)
+        if forced is not None:
+            # Result shape follows broadcast rules; compute as below but with constants
+            a = self.reshape(-1).tolist(); b = other_t.reshape(-1).tolist()
+            target = max(len(a), len(b)) or 1
+            shape = self.get_shape() if len(a) == target else other_t.get_shape()
+            mask_val = 1 if forced else 0
+            out = self.ensure_tensor([mask_val] * target).reshape(*shape)
+            out = finalize(out)
+            tape = getattr(out, "_tape", None)
+            if tape and annotate:
+                tape.annotate(out, **({"forced": True} | annotate))
+            return out
 
     a = self.reshape(-1).tolist()
     b = other_t.reshape(-1).tolist()
@@ -115,6 +145,23 @@ def _v3_valuewise(
     a_t = a if isinstance(a, AbstractTensor) else self.ensure_tensor(a)
     b_t = b if isinstance(b, AbstractTensor) else self.ensure_tensor(b)
     finalize = AbstractTensor._pre_autograd(op, [self, a_t, b_t])
+    # Branch override: if oracle forces 'where', we still evaluate both a/b but gate with constant cond
+    if _BRANCH_ORACLE is not None:
+        forced = _BRANCH_ORACLE.maybe_mask(op)
+        if forced is not None:
+            # shape follows standard lift below
+            c = self.reshape(-1).tolist(); A = a_t.reshape(-1).tolist(); B = b_t.reshape(-1).tolist()
+            target = max(len(c), len(A), len(B)) or 1
+            shape = a_t.get_shape() if len(A) == target else b_t.get_shape()
+            # Evaluate branches normally
+            outA = a_t
+            outB = b_t
+            out = outA if forced else outB
+            out = finalize(out)
+            tape = getattr(out, "_tape", None)
+            if tape and annotate:
+                tape.annotate(out, **({"forced": True} | annotate))
+            return out
 
     c = self.reshape(-1).tolist()
     A = a_t.reshape(-1).tolist()

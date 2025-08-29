@@ -813,8 +813,10 @@ class Autograd:
     ) -> List[Any]:
         # Strict-mode preflight: fail fast on missing backward ops
         if self.strict:
+            # Always validate on the tape that produced the output, not the engine tape.
+            tape_v = getattr(output, "_tape", self.tape)
             try:
-                missing = self.tape.validate_backward_ops(output)
+                missing = tape_v.validate_backward_ops(output)
             except Exception:
                 missing = []
             if missing:
@@ -826,7 +828,7 @@ class Autograd:
                 raise RuntimeError("Strict autograd: missing backward implementations for reachable ops:\n" + detail)
             # Also validate parameter connectivity: any input not present in the backward graph
             try:
-                bwd_graph = self.tape.export_backward_graph(output)
+                bwd_graph = tape_v.export_backward_graph(output)
             except Exception:
                 bwd_graph = None
             if bwd_graph is not None and inputs is not None:
@@ -835,7 +837,7 @@ class Autograd:
                 # Helper: describe immediate op neighbors and whether each has a backward rule and a path-to-loss
                 def _describe_neighbors(pid: int) -> list[dict[str, any]]:
                     desc: list[dict[str, any]] = []
-                    G = self.tape.graph
+                    G = tape_v.graph
                     for op_node in G.successors(pid):
                         node_data = G.nodes.get(op_node, {})
                         if node_data.get("kind") != "op":
@@ -851,7 +853,7 @@ class Autograd:
                         to_loss = False
                         for rid in results:
                             try:
-                                if self.tape._loss_id is not None and nx.has_path(G, rid, self.tape._loss_id):
+                                if tape_v._loss_id is not None and nx.has_path(G, rid, tape_v._loss_id):
                                     to_loss = True
                                     break
                             except Exception:
@@ -861,7 +863,7 @@ class Autograd:
                             "op_node": op_node,
                             "has_backward": has_bw,
                             "results": results,
-                            "result_shapes": [self.tape._nodes.get(rid, {}).ctx.get("result_shape") if rid in self.tape._nodes else None for rid in results],
+                            "result_shapes": [tape_v._nodes.get(rid, {}).ctx.get("result_shape") if rid in tape_v._nodes else None for rid in results],
                             "path_to_loss_from_result": to_loss,
                         })
                     return desc
@@ -873,9 +875,9 @@ class Autograd:
                     if bwd_graph.has_node(pid):
                         continue
                     # Connectivity diagnostics: forward presence, consumers, path existence
-                    present = self.tape.graph.has_node(pid)
+                    present = tape_v.graph.has_node(pid)
                     consumers = []
-                    for rid, node in self.tape._nodes.items():
+                    for rid, node in tape_v._nodes.items():
                         ctx = node.ctx
                         ins = ctx.get("inputs", [])
                         in_ids = [id(t) for t in ins]
@@ -887,7 +889,7 @@ class Autograd:
                                 "input_ids": in_ids,
                             })
                     try:
-                        to_loss = self.tape._loss_id is not None and nx.has_path(self.tape.graph, pid, self.tape._loss_id)
+                        to_loss = tape_v._loss_id is not None and nx.has_path(tape_v.graph, pid, tape_v._loss_id)
                     except Exception:
                         to_loss = None
                     neighbors = _describe_neighbors(pid)

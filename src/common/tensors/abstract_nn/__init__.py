@@ -11,3 +11,9 @@ from .fused_program import (
     build_fused_program,
     ProgramRunner,
 )
+from .completion_training import (
+    CompletionTrainer,
+    sample_document_pairs,
+    encode_text,
+    decode_text,
+)
