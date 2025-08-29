@@ -90,13 +90,24 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise TypeError("casting must be a dict")
         mode = casting.get("mode", "fixed")
         if mode not in {"pre_linear", "fixed", "soft_assign"}:
-            raise ValueError("casting.mode must be 'pre_linear', 'fixed' or 'soft_assign'")
-        if "film" in casting and not isinstance(casting["film"], bool):
-            raise TypeError("casting.film must be a bool")
-        if "coords" in casting and casting["coords"] is not None and not isinstance(
-            casting["coords"], str
-        ):
-            raise TypeError("casting.coords must be a string or None")
+            raise ValueError(
+                "casting.mode must be 'pre_linear', 'fixed' or 'soft_assign'"
+            )
+        film_cfg = casting.get("film", {})
+        if not isinstance(film_cfg, dict):
+            raise TypeError("casting.film must be a dict")
+        if "enabled" in film_cfg and not isinstance(film_cfg["enabled"], bool):
+            raise TypeError("casting.film.enabled must be a bool")
+        coords_cfg = casting.get("coords")
+        if coords_cfg is not None:
+            if not isinstance(coords_cfg, dict):
+                raise TypeError("casting.coords must be a dict or None")
+            if "type" in coords_cfg and coords_cfg["type"] not in {"raw", "fourier"}:
+                raise ValueError(
+                    "casting.coords.type must be 'raw' or 'fourier'"
+                )
+            if "dims" in coords_cfg and not isinstance(coords_cfg["dims"], int):
+                raise TypeError("casting.coords.dims must be an int")
         if "inject_coords" in casting and not isinstance(casting["inject_coords"], bool):
             raise TypeError("casting.inject_coords must be a bool")
         if "map" in casting and casting["map"] not in {"1to1", "row_major", "normalized_span"}:
@@ -142,27 +153,24 @@ def soft_assign(*args: Any, **kwargs: Any) -> AbstractTensor:
 
 
 class _FiLM:
-    """Minimal feature-wise linear modulation using grid coordinates."""
+    """Feature-wise linear modulation with per-voxel parameters."""
 
-    def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor) -> None:
-        self.linear = Linear(in_dim, 2 * out_dim, like=like)
-        self.out_dim = out_dim
+    def __init__(self, channels: int, grid_shape, like: AbstractTensor) -> None:
+        cls = like.__class__
+        dtype = getattr(like, "dtype", None)
+        device = getattr(like, "device", None)
+        self.gamma = AbstractTensor.ones(
+            (1, channels, *grid_shape), dtype=dtype, device=device, cls=cls
+        )
+        self.beta = AbstractTensor.zeros(
+            (1, channels, *grid_shape), dtype=dtype, device=device, cls=cls
+        )
 
     def parameters(self) -> List[AbstractTensor]:
-        return self.linear.parameters()
+        return [self.gamma, self.beta]
 
-    def forward(self, coords: AbstractTensor, x: AbstractTensor) -> AbstractTensor:
-        """Apply modulation ``x * gamma + beta`` where ``gamma`` and ``beta``
-        are derived from ``coords`` via a learned linear map."""
-        D, H, W, C = coords.shape
-        flat = coords.reshape(D * H * W, C)
-        gamma_beta = self.linear.forward(flat)
-        gamma_beta = gamma_beta.reshape(D, H, W, 2 * self.out_dim)
-        gamma = gamma_beta[..., : self.out_dim]
-        beta = gamma_beta[..., self.out_dim :]
-        gamma = gamma.reshape(1, self.out_dim, D, H, W)
-        beta = beta.reshape(1, self.out_dim, D, H, W)
-        return x * gamma + beta
+    def forward(self, x: AbstractTensor) -> AbstractTensor:
+        return x * self.gamma + self.beta
 
 
 class _Casting:
@@ -175,8 +183,8 @@ class _Casting:
         like: AbstractTensor,
         in_channels: int,
         grid,
-        film: bool = False,
-        coords_mode: Optional[str] = None,
+        film_enabled: bool = False,
+        coords_cfg: Optional[Dict[str, Any]] = None,
         inject_coords: bool = False,
         map_strategy: str = "row_major",
     ) -> None:
@@ -188,8 +196,8 @@ class _Casting:
             like: Backend tensor to mirror for parameter creation.
             in_channels: Number of input channels (``C_in``).
             grid: Geometry grid supplying ``(D,H,W)`` dimensions.
-            film: Whether to apply FiLM modulation.
-            coords_mode: Optional coordinate encoding strategy.
+            film_enabled: Whether to apply FiLM modulation.
+            coords_cfg: Optional coordinate encoding strategy.
             inject_coords: If ``True``, append coordinates as channels.
             map_strategy: How to reshape the flattened ``pre_linear`` output
                 back into ``(C_in,D,H,W)``. Available strategies are:
@@ -223,29 +231,29 @@ class _Casting:
             raise ValueError(f"Unknown casting mode: {mode}")
 
         # Coordinate preparation -------------------------------------------------
-        self.coords: Optional[AbstractTensor] = None
         self.coords_as_channels: Optional[AbstractTensor] = None
-        coord_dim = 0
-        if coords_mode is not None or film or inject_coords:
-            base_ch = AbstractTensor.stack([grid.U, grid.V, grid.W], dim=0)  # (3,D,H,W)
-            if coords_mode == "fourier":
-                sin = base_ch.sin()
-                cos = base_ch.cos()
-                base_ch = AbstractTensor.cat([sin, cos], dim=0)  # (6,D,H,W)
-            self.coords_as_channels = base_ch.unsqueeze(0)  # (1,C,D,H,W)
-            coords = base_ch
-            coords = coords.swapaxes(0, 1)  # (D,C,H,W)
-            coords = coords.swapaxes(1, 2)  # (D,H,C,W)
-            coords = coords.swapaxes(2, 3)  # (D,H,W,C)
-            self.coords = coords
-            coord_dim = coords.shape[-1]
+        if coords_cfg is not None:
+            ctype = coords_cfg.get("type", "raw")
+            dims = coords_cfg.get("dims")
+            base = AbstractTensor.stack([grid.U, grid.V, grid.W], dim=0)
+            if ctype == "raw":
+                if dims is not None and dims != 3:
+                    raise ValueError("raw coords expect dims=3")
+                base_ch = base
+            elif ctype == "fourier":
+                if dims is not None and dims != 6:
+                    raise ValueError("fourier coords expect dims=6")
+                sin = base.sin()
+                cos = base.cos()
+                base_ch = AbstractTensor.cat([sin, cos], dim=0)
+            else:
+                raise ValueError(f"Unknown coords type: {ctype}")
+            self.coords_as_channels = base_ch.unsqueeze(0)
 
         # FiLM modulation --------------------------------------------------------
         self.film: Optional[_FiLM] = None
-        if film:
-            if self.coords is None:
-                raise ValueError("FiLM requires coordinates")
-            self.film = _FiLM(coord_dim, in_channels, like=like)
+        if film_enabled:
+            self.film = _FiLM(in_channels, (D, H, W), like=like)
 
     # -- API --------------------------------------------------------------------
     def parameters(self) -> List[AbstractTensor]:
@@ -269,8 +277,8 @@ class _Casting:
             z = self.pre_linear.forward(z)
             x = self._reshape_pre_linear(z, B, C, D, H, W)
 
-        if self.film is not None and self.coords is not None:
-            x = self.film.forward(self.coords, x)
+        if self.film is not None:
+            x = self.film.forward(x)
 
         return x
 
@@ -339,13 +347,16 @@ class RiemannGridBlock:
         casting = None
         conv_cfg = config.get("conv", {})
         if casting_cfg is not None:
+            film_cfg = casting_cfg.get("film", {})
+            film_enabled = film_cfg.get("enabled", False)
+            coords_cfg = casting_cfg.get("coords")
             casting = _Casting(
                 mode=casting_cfg.get("mode", "fixed"),
                 like=like,
                 in_channels=conv_cfg.get("in_channels", 1),
                 grid=grid,
-                film=casting_cfg.get("film", False),
-                coords_mode=casting_cfg.get("coords"),
+                film_enabled=film_enabled,
+                coords_cfg=coords_cfg,
                 inject_coords=casting_cfg.get("inject_coords", False),
                 map_strategy=casting_cfg.get("map", "row_major"),
             )

@@ -45,8 +45,8 @@ back to the defaults listed below.
 ```python
 {
     "mode": "pre_linear" | "fixed" | "soft_assign" = "fixed",
-    "film": bool = False,
-    "coords": str | None = None,
+    "film": {"enabled": bool} = {"enabled": False},
+    "coords": {"type": "raw"|"fourier", "dims": int} | None = None,
     "inject_coords": bool = False,
     "map": "row_major" | "1to1" | "normalized_span" = "row_major",
 }
@@ -78,7 +78,11 @@ cfg = {
         "grid_shape": (2, 2, 2),
         "boundary_conditions": (True,) * 6,
     },
-    "casting": {"mode": "pre_linear", "film": True, "coords": "uv"},
+    "casting": {
+        "mode": "pre_linear",
+        "film": {"enabled": True},
+        "coords": {"type": "raw", "dims": 3},
+    },
     "conv": {
         "in_channels": 3,
         "out_channels": 4,
