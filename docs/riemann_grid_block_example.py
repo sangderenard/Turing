@@ -9,7 +9,11 @@ cfg = {
         "grid_shape": (2, 2, 2),
         "boundary_conditions": (True,) * 6,
     },
-    "casting": {"mode": "pre_linear", "film": True, "coords": "uv"},
+    "casting": {
+        "mode": "pre_linear",
+        "film": {"enabled": True},
+        "coords": {"type": "raw", "dims": 3},
+    },
     "conv": {
         "in_channels": 3,
         "out_channels": 4,

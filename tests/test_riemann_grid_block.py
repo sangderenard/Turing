@@ -19,7 +19,11 @@ def _example_config():
             "transform_args": {"Lx": 1.0, "Ly": 1.0, "Lz": 1.0},
             "laplace_kwargs": {},
         },
-        "casting": {"mode": "pre_linear", "film": True, "coords": "uv"},
+        "casting": {
+            "mode": "pre_linear",
+            "film": {"enabled": True},
+            "coords": {"type": "raw", "dims": 3},
+        },
         "conv": {
             "in_channels": 3,
             "out_channels": 4,
@@ -118,7 +122,11 @@ def test_soft_assign_not_implemented():
 
 def test_casting_row_major_deterministic():
     cfg = _example_config()
-    cfg["casting"] = {"mode": "pre_linear", "film": False, "map": "row_major"}
+    cfg["casting"] = {
+        "mode": "pre_linear",
+        "film": {"enabled": False},
+        "map": "row_major",
+    }
     block = RiemannGridBlock.build_from_config(cfg)
 
     C = cfg["conv"]["in_channels"]
@@ -137,7 +145,11 @@ def test_casting_row_major_deterministic():
 
 def test_casting_1to1_mapping():
     cfg = _example_config()
-    cfg["casting"] = {"mode": "pre_linear", "film": False, "map": "1to1"}
+    cfg["casting"] = {
+        "mode": "pre_linear",
+        "film": {"enabled": False},
+        "map": "1to1",
+    }
     block = RiemannGridBlock.build_from_config(cfg)
 
     C = cfg["conv"]["in_channels"]
@@ -158,6 +170,15 @@ def test_casting_1to1_mapping():
     expected = expected.swapaxes(2, 1)
 
     assert np.allclose(y.data, expected.data)
+
+
+def test_coordinate_fourier_embedding_dims():
+    cfg = _example_config()
+    cfg["casting"]["coords"] = {"type": "fourier", "dims": 6}
+    cfg["casting"]["inject_coords"] = True
+    block = RiemannGridBlock.build_from_config(cfg)
+    assert block.casting.coords_as_channels is not None
+    assert block.casting.coords_as_channels.shape[1] == 6
 
 
 def test_validate_config_requires_channels():
