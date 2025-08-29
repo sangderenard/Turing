@@ -15,8 +15,7 @@ def _sigmoid_stable(x: AbstractTensor) -> AbstractTensor:
     return pos * y_pos + neg * y_neg
 
 def _tanh_stable(x: AbstractTensor) -> AbstractTensor:
-    # tanh(x) = 2*sigmoid(2x) - 1 (stable if sigmoid is stable)
-    return 2.0 * _sigmoid_stable(2.0 * x) - 1.0
+    return x.tanh()
 
 # -------- base --------
 
