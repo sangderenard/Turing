@@ -17,4 +17,5 @@ from .spectral import SpectralConv3D
 from .geodesic import GeodesicConv3D
 from .transport import ParallelTransport
 from .heat import HeatKernel3D
+from .grid_block import RiemannGridBlock
 
