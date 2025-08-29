@@ -746,13 +746,13 @@ class IRGraphedModel:
             inputs = AT.get_tensor(inputs)
             autograd.tape.create_tensor_node(inputs)
         except Exception:
-            pass
+            raise RuntimeError("Failed to create tensor node for inputs")
         if targets is not None:
             try:
                 targets = AT.get_tensor(targets)
                 autograd.tape.create_tensor_node(targets)
             except Exception:
-                pass
+                raise RuntimeError("Failed to create tensor node for targets")
 
         # Forward
         fwd = getattr(self.model, "forward", None)
@@ -776,7 +776,7 @@ class IRGraphedModel:
             try:
                 autograd.tape.mark_loss(loss)
             except Exception:
-                pass
+                raise RuntimeError("Failed to mark loss on autograd tape")
 
             # Use autograd.grad to get parameter gradients (recorded forward already exists)
             params: List[Any] = []
@@ -790,7 +790,7 @@ class IRGraphedModel:
                 try:
                     autograd.whitelist_labels(*self.strict_whitelist_labels)
                 except Exception:
-                    pass
+                    raise RuntimeError("Failed to apply strict whitelist labels")
             if params:
                 try:
                     grads = autograd.grad(loss, params, retain_graph=True)
@@ -814,7 +814,7 @@ class IRGraphedModel:
                 try:
                     autograd.tape.create_tensor_node(s)
                 except Exception:
-                    pass
+                    raise RuntimeError("Failed to create tensor node for optimizer state")
             # Record adam updates per param
             new_params: List[Any] = []
             new_m: List[Any] = []
@@ -848,12 +848,12 @@ class IRGraphedModel:
             pred_id = id(pred)
             out_map["pred"] = pred_id
         except Exception:
-            pass
+            raise RuntimeError("Failed to get id() of pred tensor")
         if loss is not None:
             try:
                 out_map["loss"] = id(loss)
             except Exception:
-                pass
+                raise RuntimeError("Failed to get id() of loss tensor")
         # Updated parameters from optimizer (if any)
         if extras:
             out_map.update(extras)
