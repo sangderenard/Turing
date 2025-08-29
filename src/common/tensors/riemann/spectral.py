@@ -27,7 +27,7 @@ class SpectralConv3D:
         w = [[[AbstractTensor.random.gauss(0.0, scale) for _ in range(self.num_modes)]
               for _ in range(self.in_channels)]
              for _ in range(self.out_channels)]
-        self.Wspec = AbstractTensor.tensor_from_list(w, requires_grad=True, tape=autograd.tape)
+        self.Wspec = AbstractTensor.get_tensor(w, requires_grad=True, tape=autograd.tape)
         autograd.tape.create_tensor_node(self.Wspec)
         self.Wspec._label = "SpectralConv3D.Wspec"
         autograd.tape.annotate(self.Wspec, label=self.Wspec._label)

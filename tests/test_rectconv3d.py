@@ -19,7 +19,7 @@ if NumPyTensorOperations is not None:
 def test_rectconv3d_backward_matches_numerical(backend_name, Backend):
     random.seed(0)
     np.random.seed(0)
-    like = Backend.tensor_from_list([0.0])
+    like = Backend.tensor([0.0])
     layer = RectConv3d(
         in_channels=1,
         out_channels=1,
@@ -28,7 +28,7 @@ def test_rectconv3d_backward_matches_numerical(backend_name, Backend):
         bias=True,
     )
     x_data = np.random.randn(1, 1, 3, 3, 3)
-    x = Backend.tensor_from_list(x_data.tolist())
+    x = Backend.tensor(x_data.tolist())
 
     y = layer.forward(x)
     grad_out = y * 0 + 1

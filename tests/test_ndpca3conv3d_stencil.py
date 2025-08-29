@@ -9,7 +9,7 @@ from src.common.tensors.abstract_convolution.ndpca3conv import (
 
 def _make_metric(D, H, W):
     g = np.tile(np.eye(3, dtype=np.float32), (D, H, W, 1, 1))
-    return T.tensor_from_list(g.tolist())
+    return T.tensor(g.tolist())
 
 
 def _numpy_shift(arr, axis, step):
@@ -45,7 +45,7 @@ def _manual_conv(x, offsets, weights):
 
 
 def test_ndpca3conv3d_asymmetric_stencil():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     offsets = (-2, -1, 0, 1, 2)
     conv = NDPCA3Conv3d(
         1,
@@ -60,7 +60,7 @@ def test_ndpca3conv3d_asymmetric_stencil():
     for i in range(conv.k):
         conv.taps.data[i] = np.array(weights) / conv.k
     x_np = np.arange(1 * 1 * 5 * 5 * 5, dtype=np.float32).reshape(1, 1, 5, 5, 5)
-    x = T.tensor_from_list(x_np.tolist())
+    x = T.tensor(x_np.tolist())
     metric = _make_metric(5, 5, 5)
     package = {"metric": {"g": metric, "inv_g": metric}}
     y = conv.forward(x, package=package)
@@ -69,7 +69,7 @@ def test_ndpca3conv3d_asymmetric_stencil():
 
 
 def test_ndpca3conv3d_three_tap_equivalence():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     offsets = (-1, 0, 1)
     conv = NDPCA3Conv3d(
         1,
@@ -84,7 +84,7 @@ def test_ndpca3conv3d_three_tap_equivalence():
     for i in range(conv.k):
         conv.taps.data[i] = np.array(weights) / conv.k
     x_np = np.arange(1 * 1 * 3 * 3 * 3, dtype=np.float32).reshape(1, 1, 3, 3, 3)
-    x = T.tensor_from_list(x_np.tolist())
+    x = T.tensor(x_np.tolist())
     metric = _make_metric(3, 3, 3)
     package = {"metric": {"g": metric, "inv_g": metric}}
     y = conv.forward(x, package=package)
@@ -93,7 +93,7 @@ def test_ndpca3conv3d_three_tap_equivalence():
 
 
 def test_ndpca3conv3d_normalizes_taps():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     conv = NDPCA3Conv3d(
         1,
         1,
@@ -107,7 +107,7 @@ def test_ndpca3conv3d_normalizes_taps():
     )
     conv.taps.data[0] = np.array([1.0, 1.0, 1.0])
     x_np = np.ones((1, 1, 3, 3, 3), dtype=np.float32)
-    x = T.tensor_from_list(x_np.tolist())
+    x = T.tensor(x_np.tolist())
     metric = _make_metric(3, 3, 3)
     package = {"metric": {"g": metric, "inv_g": metric}}
     y = conv.forward(x, package=package)
@@ -115,9 +115,9 @@ def test_ndpca3conv3d_normalizes_taps():
 
 
 def test_shift3d_wrapper_defaults_and_matches_var():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     arr_np = np.arange(1 * 1 * 3 * 3 * 3, dtype=np.float32).reshape(1, 1, 3, 3, 3)
-    arr = T.tensor_from_list(arr_np.tolist())
+    arr = T.tensor(arr_np.tolist())
     bc = ("dirichlet", "dirichlet")
 
     out_def, mask_def = _shift3d(arr, axis=2, bc=bc, length=1)

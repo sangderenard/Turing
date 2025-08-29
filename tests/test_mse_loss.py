@@ -37,7 +37,7 @@ if JAXTensorOperations is not None:
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_mse_loss_backward_multi_dim(backend_name, Backend):
-    pred = Backend.tensor_from_list([[1.0, 2.0], [3.0, 4.0]])
+    pred = Backend.tensor([[1.0, 2.0], [3.0, 4.0]])
     target = Backend.zeros((2, 2))
     loss = MSELoss()
     grad = loss.backward(pred, target)
@@ -46,7 +46,7 @@ def test_mse_loss_backward_multi_dim(backend_name, Backend):
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_mse_loss_forward_multi_dim(backend_name, Backend):
-    pred = Backend.tensor_from_list([[1.0, 2.0], [3.0, 4.0]])
+    pred = Backend.tensor([[1.0, 2.0], [3.0, 4.0]])
     target = Backend.zeros((2, 2))
     loss = MSELoss()
     val = loss.forward(pred, target)

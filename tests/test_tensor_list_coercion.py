@@ -37,6 +37,6 @@ if JAXTensorOperations is not None:
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_python_list_operands(backend_name, Backend):
-    t = Backend.tensor_from_list([1, 2, 3])
+    t = Backend.tensor([1, 2, 3])
     assert (t - [1, 1, 1]).tolist() == [0, 1, 2]
     assert ([1, 1, 1] - t).tolist() == [0, -1, -2]

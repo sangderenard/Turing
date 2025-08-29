@@ -18,7 +18,7 @@ if NumPyTensorOperations is not None:
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_benchmark_records_timings(backend_name, Backend):
     def workload():
-        x = Backend.tensor_from_list([1, 2, 3])
+        x = Backend.tensor([1, 2, 3])
         x.track_time = True
         _ = x + x
         time.sleep(0.001)

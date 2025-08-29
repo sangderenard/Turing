@@ -43,7 +43,7 @@ if JAXTensorOperations is not None:
 @pytest.mark.parametrize("backend_name,BackendCls", BACKENDS)
 def test_trigonometric_suite(backend_name, BackendCls):
     vals = [0.5, 0.8]
-    t = BackendCls.tensor_from_list(vals, dtype=None, device=None)
+    t = BackendCls.tensor(vals, dtype=None, device=None)
     arr = np.array(vals)
 
     np.testing.assert_allclose(t.sin().tolist(), np.sin(arr))
@@ -60,7 +60,7 @@ def test_trigonometric_suite(backend_name, BackendCls):
     np.testing.assert_allclose(t.atanh().tolist(), np.arctanh(arr))
 
     acosh_vals = [1.0, 2.0]
-    t_acosh = BackendCls.tensor_from_list(acosh_vals, dtype=None, device=None)
+    t_acosh = BackendCls.tensor(acosh_vals, dtype=None, device=None)
     np.testing.assert_allclose(t_acosh.acosh().tolist(), np.arccosh(np.array(acosh_vals)))
 
     np.testing.assert_allclose(t.sec().tolist(), 1 / np.cos(arr))

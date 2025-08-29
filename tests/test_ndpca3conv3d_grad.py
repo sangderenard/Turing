@@ -7,7 +7,7 @@ np.random.seed(0)
 
 def _make_metric(D,H,W):
     g = np.tile(np.eye(3, dtype=np.float32), (D, H, W, 1, 1))
-    return T.tensor_from_list(g.tolist())
+    return T.tensor(g.tolist())
 
 def _finite_diff(layer, x, package, param, idx, eps=1e-5):
     orig = param[idx]
@@ -50,9 +50,9 @@ def _finite_diff_pointwise(layer, x, package, W, idx, eps=1e-5):
 
 
 def test_ndpca3conv3d_gradients_no_pointwise():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     conv = NDPCA3Conv3d(1, 1, like=like, grid_shape=(2,2,2), pointwise=False)
-    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x = T.tensor(np.random.rand(1,1,2,2,2).tolist())
     x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
@@ -68,9 +68,9 @@ def test_ndpca3conv3d_gradients_no_pointwise():
 
 
 def test_ndpca3conv3d_gradients_with_pointwise():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     conv = NDPCA3Conv3d(1, 2, like=like, grid_shape=(2,2,2), pointwise=True)
-    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x = T.tensor(np.random.rand(1,1,2,2,2).tolist())
     x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
@@ -90,9 +90,9 @@ def test_ndpca3conv3d_gradients_with_pointwise():
 
 
 def test_ndpca3conv3d_zero_grad_no_pointwise():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     conv = NDPCA3Conv3d(1, 1, like=like, grid_shape=(2, 2, 2), pointwise=False)
-    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x = T.tensor(np.random.rand(1,1,2,2,2).tolist())
     x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
@@ -104,9 +104,9 @@ def test_ndpca3conv3d_zero_grad_no_pointwise():
 
 
 def test_ndpca3conv3d_zero_grad_with_pointwise():
-    like = T.tensor_from_list([[0.0]])
+    like = T.tensor([[0.0]])
     conv = NDPCA3Conv3d(1, 2, like=like, grid_shape=(2, 2, 2), pointwise=True)
-    x = T.tensor_from_list(np.random.rand(1,1,2,2,2).tolist())
+    x = T.tensor(np.random.rand(1,1,2,2,2).tolist())
     x.requires_grad_(True)
     metric = _make_metric(2,2,2)
     package = {"metric": {"g": metric, "inv_g": metric}}
