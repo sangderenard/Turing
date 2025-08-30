@@ -64,3 +64,18 @@ def test_local_state_network_additional_params():
     padded = out["padded_raw"]
     assert padded[0, 0, 0, 2, 1, 1].item() == pytest.approx(2.0)
     assert padded[0, 0, 0, 2, 2, 2].item() == pytest.approx(0.5)
+
+
+def test_zero_grad_preserves_parameters():
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=1,
+    )
+    initial = net.g_weight_layer.data.copy()
+    (net.g_weight_layer * 2).sum().backward()
+    assert net.g_weight_layer.grad is not None
+    net.zero_grad()
+    assert net.g_weight_layer.grad is None
+    assert np.allclose(net.g_weight_layer.data, initial)
