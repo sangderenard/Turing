@@ -320,6 +320,7 @@ class RectConv3d:
         dilation: int | tuple[int, int, int] = 1,
         like: AbstractTensor,
         bias: bool = True,
+        _label_prefix=None,
     ):
         self.like = like
         self.in_channels = in_channels
@@ -347,11 +348,15 @@ class RectConv3d:
         self.W.requires_grad_(True)
         self.W._tape = autograd.tape
         autograd.tape.create_tensor_node(self.W)
+        self.W._label = f"{_label_prefix+'.' if _label_prefix else ''}RectConv3d.W"
+        autograd.tape.annotate(self.W, label=self.W._label)
         self.b = from_list_like([0.0] * out_channels, like=like) if bias else None
         if self.b is not None:
             self.b.requires_grad_(True)
             self.b._tape = autograd.tape
             autograd.tape.create_tensor_node(self.b)
+            self.b._label = f"{_label_prefix+'.' if _label_prefix else ''}RectConv3d.b"
+            autograd.tape.annotate(self.b, label=self.b._label)
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
