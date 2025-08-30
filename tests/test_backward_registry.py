@@ -2,6 +2,8 @@ import numpy as np
 
 from src.common.tensors.abstraction import get_backward_tool
 from src.common.tensors.backward import BackwardRegistry
+from src.common.tensors.backward_registry import T as transpose_helper
+from src.common.tensors.numpy_backend import NumPyTensorOperations as T
 
 
 def test_get_backward_tool_add():
@@ -23,3 +25,10 @@ def test_backward_pipeline_sequence():
     reg.register('f2', f2)
     pipeline = reg.build(['f1', 'f2'])
     assert pipeline(3) == 8
+
+
+def test_T_handles_1d_input():
+    x = T.tensor([1.0, 2.0, 3.0])
+    y = transpose_helper(x)
+    assert y.shape == (3, 1)
+    assert np.allclose(y.data, np.array([[1.0], [2.0], [3.0]]))
