@@ -597,7 +597,7 @@ class Model:
             self._post[i] = x
             logger.debug(f"Model.forward: after activation, shape: {getattr(x, 'shape', None)}")
         if added:
-            shape = x.shape()
+            shape = x.shape
             x = x.reshape(shape[1]) if len(shape) == 2 else x.reshape(*shape[1:])
         return x
 

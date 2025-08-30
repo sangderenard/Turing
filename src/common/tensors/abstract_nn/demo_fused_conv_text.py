@@ -243,7 +243,6 @@ def main():
         x0 = AT.zeros(args.input_len)
         _ = model.forward(x0)
         try:
-            raise NotImplementedError("Testing fallback to LinearStackModel")
             run_eager_training_test(model, AT, args)
         except Exception as e:
             print(f"[WARNING] Eager training failed with ConvTextModel: {e}\nFalling back to LinearStackModel.")
