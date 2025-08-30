@@ -183,14 +183,6 @@ class LocalStateNetwork:
 
         self.nn_generators = defaultdict(deque)
 
-        # Initialize placeholder gradients so callers observing ``p.grad``
-        # after a backward pass will always see tensor objects rather than
-        # ``None``. Real gradients will overwrite these during autograd.
-        for p in self.parameters():
-            try:
-                p.grad = AbstractTensor.zeros_like(p)
-            except Exception:
-                pass
 
     def forward(self, padded_raw):
         """
@@ -210,9 +202,15 @@ class LocalStateNetwork:
 
         B, D, H, W, _, _, _ = padded_raw.shape
 
+        print(padded_raw.shape)
         g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        print(f"g_weight_layer requires grad: {g_weight_layer.requires_grad}")
+        print(g_weight_layer.shape)
         weighted_padded = padded_raw * g_weight_layer
-
+        print(weighted_padded.shape)
+        weighted_padded.backward()
+        print(g_weight_layer.grad)
+        exit()
         padded_view = padded_raw.reshape((B, D, H, W, -1))
 
         if isinstance(self.spatial_layer, RectConv3d):
