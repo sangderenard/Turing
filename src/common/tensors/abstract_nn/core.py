@@ -21,6 +21,35 @@ def _to_tuple2(x):
 def _to_tuple3(x):
     return (x, x, x) if isinstance(x, int) else x
 
+
+def _ensure_batch_dim(x: AbstractTensor, target_ndim: int = 2) -> tuple[AbstractTensor, bool]:
+    """Add a leading batch dimension if ``x`` is missing one.
+
+    Parameters
+    ----------
+    x:
+        Input tensor.
+    target_ndim:
+        Expected dimensionality including the batch dimension. If ``x`` has
+        ``target_ndim - 1`` dimensions, a new leading dimension of size 1 is
+        added.
+
+    Returns
+    -------
+    (tensor, bool)
+        The possibly reshaped tensor and a flag indicating whether a batch
+        dimension was added.
+    """
+    added = False
+    try:
+        if x.ndim == target_ndim - 1:
+            x = x.reshape(1, *x.shape())
+            added = True
+    except Exception:
+        # If ``x`` lacks ndim/shape metadata, leave it unchanged.
+        pass
+    return x, added
+
 class Linear:
     def __init__(self, in_dim: int, out_dim: int, like: AbstractTensor, bias: bool = True, init: str = "auto_relu", _label_prefix=None):
         self.like = like
@@ -75,6 +104,7 @@ class Linear:
         except Exception:
             pass
         logger.debug(f"Linear.forward called with input shape: {getattr(x, 'shape', None)}")
+        x, added = _ensure_batch_dim(x, target_ndim=2)
         out = x @ self.W
         self._x = x
         autograd.tape.annotate(out, label="Linear.forward.matmul")
@@ -84,11 +114,15 @@ class Linear:
             # rule will unbroadcast gradients back to the bias shape directly.
             out = out + self.b
         autograd.tape.annotate(out, label="Linear.forward.output")
+        if added:
+            shape = out.shape()
+            out = out.reshape(shape[1]) if len(shape) == 2 else out.reshape(*shape[1:])
         return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
         if getattr(self, "_x", None) is None:
             raise RuntimeError("Linear.backward called before forward")
+        grad_out, added = _ensure_batch_dim(grad_out, target_ndim=2)
         x = self._x
         xT = x.swapaxes(0, 1)
         self.gW = xT @ grad_out
@@ -99,6 +133,9 @@ class Linear:
         WT = self.W.swapaxes(0, 1)
         dx = grad_out @ WT
         self._x = None
+        if added:
+            shape = dx.shape()
+            dx = dx.reshape(shape[1]) if len(shape) == 2 else dx.reshape(*shape[1:])
         return dx
 
 
@@ -112,15 +149,26 @@ class Flatten:
 
     def zero_grad(self):
         self._shape = None
+        self._added = False
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
+        x, added = _ensure_batch_dim(x, target_ndim=2)
         self._shape = x.shape()
-        return x.reshape(self._shape[0], -1)
+        self._added = added
+        out = x.reshape(self._shape[0], -1)
+        if added:
+            shape = out.shape()
+            out = out.reshape(shape[1]) if len(shape) == 2 else out.reshape(*shape[1:])
+        return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
         if self._shape is None:
             raise RuntimeError("Flatten.backward called before forward")
-        return grad_out.reshape(*self._shape)
+        grad = grad_out.reshape(*self._shape)
+        if getattr(self, "_added", False):
+            shape = grad.shape()
+            grad = grad.reshape(shape[1]) if len(shape) == 2 else grad.reshape(*shape[1:])
+        return grad
 
 
 class RectConv2d:
@@ -163,8 +211,7 @@ class RectConv2d:
         self._x = None
         self._cols = None
         self._x_shape = None
-        self._cols = None
-        self._x_shape = None
+        self._added = False
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -180,6 +227,7 @@ class RectConv2d:
         self._x = None
         self._cols = None
         self._x_shape = None
+        self._added = False
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         # Re-register parameters on the current tape for this forward pass
@@ -195,6 +243,8 @@ class RectConv2d:
                 tape.create_tensor_node(p)
         except Exception:
             pass
+        x, added = _ensure_batch_dim(x, target_ndim=4)
+        self._added = added
         self._x = x
         self._x_shape = x.shape
         cols = x.unfold2d(
@@ -216,11 +266,16 @@ class RectConv2d:
         H, W = self._x_shape[2], self._x_shape[3]
         Hout = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         Wout = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
-        return out.reshape(N, self.out_channels, Hout, Wout)
+        out = out.reshape(N, self.out_channels, Hout, Wout)
+        if added:
+            out = out.reshape(*out.shape()[1:])
+        return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
         if self._x is None or self._cols is None or self._x_shape is None:
             raise RuntimeError("RectConv2d.backward called before forward")
+        if getattr(self, "_added", False):
+            grad_out = grad_out.reshape(1, *grad_out.shape())
         N, _, Hout, Wout = grad_out.shape()
         L = Hout * Wout
         grad_mat = grad_out.reshape(N, self.out_channels, L)
@@ -251,6 +306,8 @@ class RectConv2d:
         self._x = None
         self._cols = None
         self._x_shape = None
+        if getattr(self, "_added", False):
+            dx = dx.reshape(*dx.shape()[1:])
         return dx
 class RectConv3d:
     def __init__(
@@ -299,6 +356,9 @@ class RectConv3d:
         self.gW = zeros_like(self.W)
         self.gb = zeros_like(self.b) if self.b is not None else None
         self._x = None
+        self._cols = None
+        self._x_shape = None
+        self._added = False
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -314,6 +374,7 @@ class RectConv3d:
         self._x = None
         self._cols = None
         self._x_shape = None
+        self._added = False
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         # Re-register parameters on the current tape for this forward pass
@@ -329,7 +390,8 @@ class RectConv3d:
                 tape.create_tensor_node(p)
         except Exception:
             pass
-
+        x, added = _ensure_batch_dim(x, target_ndim=5)
+        self._added = added
         self._x = x
         self._x_shape = x.shape
         # Unfold using AbstractTensor op
@@ -356,11 +418,16 @@ class RectConv3d:
         out = Wm @ cols
         if self.b is not None:
             out = out + self.b.reshape(1, -1, 1)
-        return out.reshape(N, self.out_channels, Dout, Hout, Wout)
+        out = out.reshape(N, self.out_channels, Dout, Hout, Wout)
+        if added:
+            out = out.reshape(*out.shape()[1:])
+        return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
         if self._x is None or self._cols is None or self._x_shape is None:
             raise RuntimeError("RectConv3d.backward called before forward")
+        if getattr(self, "_added", False):
+            grad_out = grad_out.reshape(1, *grad_out.shape())
         N, _, Dout, Hout, Wout = grad_out.shape
         L = Dout * Hout * Wout
         grad_mat = grad_out.reshape(N, self.out_channels, L)
@@ -383,6 +450,8 @@ class RectConv3d:
         self._x = None
         self._cols = None
         self._x_shape = None
+        if getattr(self, "_added", False):
+            dx = dx.reshape(*dx.shape()[1:])
         return dx
 
 
@@ -403,6 +472,7 @@ class MaxPool2d:
         self._x_shape = None
         self._L = None
         self._kHW = None
+        self._added = False
 
     def parameters(self) -> List[AbstractTensor]:
         return []
@@ -412,8 +482,11 @@ class MaxPool2d:
         self._x_shape = None
         self._L = None
         self._kHW = None
+        self._added = False
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
+        x, added = _ensure_batch_dim(x, target_ndim=4)
+        self._added = added
         self._x_shape = x.shape()
         kH, kW = self.kernel_size
         patches = x.unfold2d(
@@ -433,11 +506,16 @@ class MaxPool2d:
         H, W = self._x_shape[2], self._x_shape[3]
         Hout = (H + 2 * pH - kH) // sH + 1
         Wout = (W + 2 * pW - kW) // sW + 1
-        return values.reshape(N, C, Hout, Wout)
+        out = values.reshape(N, C, Hout, Wout)
+        if added:
+            out = out.reshape(*out.shape()[1:])
+        return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
         if self._idxs is None or self._x_shape is None:
             raise RuntimeError("MaxPool2d.backward called before forward")
+        if getattr(self, "_added", False):
+            grad_out = grad_out.reshape(1, *grad_out.shape())
         N, C, Hout, Wout = grad_out.shape()
         grad_cols = grad_out.reshape(N, C, 1, self._L)
         ar = self.like.arange(0, self._kHW).reshape(1, 1, self._kHW, 1)
@@ -452,6 +530,8 @@ class MaxPool2d:
             padding=self.padding,
             dilation=1,
         )
+        if getattr(self, "_added", False):
+            dx = dx.reshape(*dx.shape()[1:])
         return dx
 
 class Model:
@@ -508,6 +588,7 @@ class Model:
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         logger.debug(f"Model.forward called with input shape: {getattr(x, 'shape', None)}")
+        x, added = _ensure_batch_dim(x, target_ndim=2)
         for i, layer in enumerate(self.layers):
             logger.debug(f"Model.forward: passing through layer {i} ({layer})")
             z = layer.forward(x)
@@ -516,6 +597,9 @@ class Model:
             x = act.forward(z) if act is not None else z
             self._post[i] = x
             logger.debug(f"Model.forward: after activation, shape: {getattr(x, 'shape', None)}")
+        if added:
+            shape = x.shape()
+            x = x.reshape(shape[1]) if len(shape) == 2 else x.reshape(*shape[1:])
         return x
 
 
