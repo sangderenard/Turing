@@ -102,16 +102,15 @@ def test_local_state_network_weighted_mode_gradient():
         device='cpu',
         dense=True,
         f=0.0,
+        deploy_mode="weighted",
         return_package=True
     )
     
     local_state_network = package["local_state_network"]
-    
+    metric_tensor = package["metric"]["g"]
 
     found_a_param = False
-    input_tensor = AbstractTensor.randn((1, N_u, N_v, N_w, 3, 3, 3), requires_grad=True)
-    weighted_tensor = local_state_network.forward(input_tensor)[0]
-    weighted_tensor.sum().backward()
+    metric_tensor.sum().backward()
 
     # Check gradients for LocalStateNetwork parameters
     for param in local_state_network.parameters():
