@@ -71,3 +71,45 @@ def test_view_flat_handles_non_contiguous(backend_name, Backend):
     t = Backend.tensor([[1, 2], [3, 4]]).swapaxes(0, 1)
     flat = t.view_flat()
     assert flat.tolist() == [1, 3, 2, 4]
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_transpose_negative_indices(backend_name, Backend):
+    t = Backend.tensor([[1, 2, 3], [4, 5, 6]])
+    neg = t.transpose(-2, -1)
+    pos = t.transpose(0, 1)
+    assert neg.tolist() == pos.tolist()
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_transpose_invalid_indices(backend_name, Backend):
+    t = Backend.tensor([[1, 2], [3, 4]])
+    with pytest.raises(ValueError):
+        t.transpose(2, 0)
+    with pytest.raises(ValueError):
+        t.transpose(0, 2)
+    with pytest.raises(ValueError):
+        t.transpose(-3, 0)
+    with pytest.raises(ValueError):
+        t.transpose(0, -3)
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_swapaxes_negative_indices(backend_name, Backend):
+    t = Backend.tensor([[1, 2, 3], [4, 5, 6]])
+    neg = t.swapaxes(-2, -1)
+    pos = t.swapaxes(0, 1)
+    assert neg.tolist() == pos.tolist()
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_swapaxes_invalid_indices(backend_name, Backend):
+    t = Backend.tensor([[1, 2], [3, 4]])
+    with pytest.raises(ValueError):
+        t.swapaxes(2, 0)
+    with pytest.raises(ValueError):
+        t.swapaxes(0, 2)
+    with pytest.raises(ValueError):
+        t.swapaxes(-3, 0)
+    with pytest.raises(ValueError):
+        t.swapaxes(0, -3)
