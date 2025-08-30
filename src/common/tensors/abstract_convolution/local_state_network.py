@@ -105,8 +105,8 @@ class LocalStateNetwork:
         """
         Zero all gradients for this network and submodules.
         """
-        if hasattr(self.g_weight_layer, 'zero_'):
-            self.g_weight_layer.zero_()
+        if hasattr(self.g_weight_layer, 'zero_grad'):
+            self.g_weight_layer.zero_grad()
         else:
             self.g_weight_layer = AbstractTensor.zeros_like(self.g_weight_layer)
         if hasattr(self.spatial_layer, 'zero_grad') and callable(self.spatial_layer.zero_grad):
