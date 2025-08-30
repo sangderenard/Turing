@@ -144,19 +144,33 @@ class MetricSteeredConv3DWrapper:
                         p.grad = AbstractTensor.zeros_like(p)
                     except Exception:
                         pass
+
+            unused = []
             if self.deploy_mode == "raw":
-                autograd.structural(*lsn.parameters(include_all=True, include_structural=True))
+                unused = lsn.parameters(include_all=True, include_structural=True)
             elif self.deploy_mode == "weighted":
-                extras = []
                 if hasattr(lsn, "spatial_layer") and hasattr(lsn.spatial_layer, "parameters"):
-                    extras.extend(lsn.spatial_layer.parameters())
-                if getattr(lsn, "inner_state", None) is not None and hasattr(lsn.inner_state, "parameters"):
+                    unused.extend(lsn.spatial_layer.parameters())
+                inner = getattr(lsn, "inner_state", None)
+                if inner is not None and hasattr(inner, "parameters"):
                     try:
-                        extras.extend(lsn.inner_state.parameters(include_all=True, include_structural=True))
+                        unused.extend(inner.parameters(include_all=True, include_structural=True))
                     except TypeError:
-                        extras.extend(lsn.inner_state.parameters(include_all=True))
-                if extras:
-                    autograd.structural(*extras)
+                        unused.extend(inner.parameters(include_all=True))
+            elif self.deploy_mode == "modulated":
+                def gather_weight_branch(net):
+                    params = [net.g_weight_layer, net.g_bias_layer]
+                    inner_net = getattr(net, "inner_state", None)
+                    if inner_net is not None:
+                        params.extend(gather_weight_branch(inner_net))
+                    return params
+
+                unused = gather_weight_branch(lsn)
+            else:
+                raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
+
+            if unused:
+                autograd.structural(*unused)
         return package
 
     def forward(self, x):
