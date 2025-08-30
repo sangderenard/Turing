@@ -250,6 +250,71 @@ def test_local_state_network_convolutional_modulator_gradient():
             f"{getattr(param, '_label', 'param')} (shape={shape}): grad={'present' if param.grad is not None else 'missing'}"
         )
 
+def test_local_state_network_with_regularization_loss():
+    """Test to ensure gradients of LocalStateNetwork parameters can be computed with regularization loss."""
+    N_u, N_v, N_w = 20, 20, 20  # Grid resolution
+    Lx, Ly, Lz = 1.0, 1.0, 1.0  # Domain size
+
+    transform = RectangularTransform(Lx=Lx, Ly=Ly, Lz=Lz, device='cpu')
+    test_tensor = AbstractTensor.randn((N_u, N_v, N_w), device='cpu')
+    cls = type(test_tensor)
+    dtype = test_tensor.dtype
+
+    grid_u, grid_v, grid_w = transform.create_grid_mesh(N_u, N_v, N_w)
+    grid_domain = GridDomain.generate_grid_domain(
+        coordinate_system='rectangular',
+        N_u=N_u,
+        N_v=N_v,
+        N_w=N_w,
+        Lx=Lx,
+        Ly=Ly,
+        Lz=Lz,
+        device='cpu',
+        cls=cls,
+        dtype=dtype
+    )
+    boundary_conditions = ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')
+
+    build_laplace = BuildLaplace3D(
+        grid_domain=grid_domain,
+        wave_speed=343,  # Arbitrary value
+        precision=cls.float_dtype,
+        resolution=N_u,  # Should match N_u, N_v, N_w
+        metric_tensor_func=None,  # Use default Euclidean metric
+        density_func=None,        # Uniform density
+        tension_func=None,        # Uniform tension
+        singularity_conditions=None,
+        boundary_conditions=boundary_conditions,
+        artificial_stability=1e-10
+    )
+
+    _, _, package = build_laplace.build_general_laplace(
+        grid_u=grid_u,
+        grid_v=grid_v,
+        grid_w=grid_w,
+        boundary_conditions=boundary_conditions,
+        grid_boundaries=(True, True, True, True, True, True),
+        device='cpu',
+        dense=True,
+        f=0.0,
+        deploy_mode="modulated",
+        return_package=True
+    )
+
+    metric_tensor = package["metric"]["g"]
+    local_state_network = package["local_state_network"]
+
+    # Add the LocalStateNetwork's regularization loss to the metric tensor
+    total_loss = metric_tensor.sum() + local_state_network._regularization_loss
+    total_loss.backward()
+
+    # Log gradient status for all parameters
+    for param in local_state_network.parameters(include_all=True):
+        shape = getattr(param, "shape", None)
+        print(
+            f"{getattr(param, '_label', 'param')} (shape={shape}): grad={'present' if param.grad is not None else 'missing'}"
+        )
+
 if __name__ == "__main__":
     import sys
     import argparse
@@ -259,7 +324,8 @@ if __name__ == "__main__":
         "test_laplace_gradient",
         "test_local_state_network_weighted_mode_gradient",
         "test_local_state_network_modulated_mode_gradient",
-        "test_local_state_network_convolutional_modulator_gradient"
+        "test_local_state_network_convolutional_modulator_gradient",
+        "test_local_state_network_with_regularization_loss"
     ], help="Specify the test to run.")
 
     args = parser.parse_args()
@@ -272,6 +338,8 @@ if __name__ == "__main__":
         test_local_state_network_modulated_mode_gradient()
     elif args.test == "test_local_state_network_convolutional_modulator_gradient":
         test_local_state_network_convolutional_modulator_gradient()
+    elif args.test == "test_local_state_network_with_regularization_loss":
+        test_local_state_network_with_regularization_loss()
     else:
         print("Running all tests...")
         print("Starting test_laplace_gradient")
@@ -290,3 +358,7 @@ if __name__ == "__main__":
         print("We are expecting gradients for the convolutional layer in the convolutional modulator mode, as it is the primary component utilized.")
         test_local_state_network_convolutional_modulator_gradient()
         print("Finished test_local_state_network_convolutional_modulator_gradient")
+        print("Starting test_local_state_network_with_regularization_loss")
+        print("We are expecting gradients for all parameters, including those in the local state network, with the regularization loss affecting the gradient computation.")
+        test_local_state_network_with_regularization_loss()
+        print("Finished test_local_state_network_with_regularization_loss")
