@@ -250,7 +250,11 @@ class LocalStateNetwork:
         # Regularisation bookkeeping
         self._lambda_reg = 0.0
         self._smoothness = False
-        self._regularization_loss = 0.0
+        self._regularization_loss = AbstractTensor.zeros(
+            (),
+            dtype=self.g_weight_layer.dtype,
+            device=getattr(self.g_weight_layer, 'device', None),
+        )
 
     # --------- Regularisation Helper --------- #
     @staticmethod
@@ -388,7 +392,11 @@ class LocalStateNetwork:
                 weighted_padded, modulated_padded
             )
         else:
-            self._regularization_loss = 0.0
+            self._regularization_loss = AbstractTensor.zeros(
+                (),
+                dtype=self.g_weight_layer.dtype,
+                device=getattr(self.g_weight_layer, 'device', None),
+            )
 
         return weighted_padded, modulated_padded
 
