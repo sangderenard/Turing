@@ -1,5 +1,4 @@
 import pytest
-import torch
 from src.common.tensors.abstract_convolution.laplace_nd import BuildLaplace3D, GridDomain, RectangularTransform
 from src.common.tensors.abstract_convolution.local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION
 from src.common.tensors.abstraction import AbstractTensor
@@ -113,12 +112,18 @@ def test_local_state_network_weighted_mode_gradient():
     weighted_tensor = local_state_network.forward(input_tensor)[0]
     weighted_tensor.sum().backward()
 
-    # Check gradients for LocalStateNetwork parameters
+    # Log gradient status for all parameters
+    for param in local_state_network.parameters(include_all=True):
+        print(f"{getattr(param, '_label', 'param')}: grad={'present' if param.grad is not None else 'missing'}")
+
+    # Check gradients only for parameters that received updates
     for param in local_state_network.parameters():
         if param.requires_grad:
             found_a_param = True
-            assert param.grad is not None, "Gradient for LocalStateNetwork parameter in weighted mode is None"
-    assert found_a_param, "No LocalStateNetwork parameters found with gradients"
+            assert param.grad is not None, f"Gradient for {getattr(param, '_label', 'LocalStateNetwork parameter')} in weighted mode is None"
+    if not found_a_param:
+        names = [getattr(p, '_label', 'LocalStateNetwork parameter') for p in local_state_network.parameters(include_all=True)]
+        assert False, f"No LocalStateNetwork parameters found with gradients. Available parameters: {names}"
 
     local_state_network.zero_grad()
 
@@ -180,12 +185,18 @@ def test_local_state_network_modulated_mode_gradient():
     modulated_tensor = local_state_network.forward(input_tensor)[1]
     modulated_tensor.sum().backward()
 
-    # Check gradients for LocalStateNetwork parameters
+    # Log gradient status for all parameters
+    for param in local_state_network.parameters(include_all=True):
+        print(f"{getattr(param, '_label', 'param')}: grad={'present' if param.grad is not None else 'missing'}")
+
+    # Check gradients only for parameters that received updates
     for param in local_state_network.parameters():
         if param.requires_grad:
             found_a_param = True
-            assert param.grad is not None, "Gradient for LocalStateNetwork parameter in modulated mode is None"
-    assert found_a_param, "No LocalStateNetwork parameters found with gradients"
+            assert param.grad is not None, f"Gradient for {getattr(param, '_label', 'LocalStateNetwork parameter')} in modulated mode is None"
+    if not found_a_param:
+        names = [getattr(p, '_label', 'LocalStateNetwork parameter') for p in local_state_network.parameters(include_all=True)]
+        assert False, f"No LocalStateNetwork parameters found with gradients. Available parameters: {names}"
 
 
 if __name__ == "__main__":

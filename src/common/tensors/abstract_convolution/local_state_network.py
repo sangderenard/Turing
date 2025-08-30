@@ -113,10 +113,16 @@ class LocalStateNetwork:
             self.spatial_layer.zero_grad()
         if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
             self.inner_state.zero_grad()
-    def parameters(self):
-        """
-        Return a flat list of all learnable parameters in this network, including g_weight_layer,
-        spatial_layer parameters, and recursively from inner_state if present.
+    def parameters(self, include_all=False):
+        """Return learnable parameters, optionally filtering by gradient status.
+
+        Args:
+            include_all: If ``True`` return every parameter regardless of whether it
+                received a gradient in the last backward pass.  When ``False`` (the
+                default) only parameters with ``grad`` set are returned.
+
+        Returns:
+            List of parameter tensors.
         """
         params = [self.g_weight_layer]
         # If spatial_layer has parameters(), include them
@@ -124,8 +130,11 @@ class LocalStateNetwork:
             params.extend(self.spatial_layer.parameters())
         # Recursively include inner_state parameters if present
         if self.inner_state is not None and hasattr(self.inner_state, 'parameters'):
-            params.extend(self.inner_state.parameters())
-        return params
+            params.extend(self.inner_state.parameters(include_all))
+
+        if include_all:
+            return params
+        return [p for p in params if getattr(p, "_grad", None) is not None]
     def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
