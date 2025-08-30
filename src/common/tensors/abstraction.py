@@ -450,7 +450,7 @@ class AbstractTensor:
         if isinstance(obj, AbstractTensor):
             return obj.data
         return obj
-    def __init__(self, track_time: bool = False, tape: "GradTape" | None = None):
+    def __init__(self, track_time: bool = False, requires_grad: bool = False, tape: "GradTape" | None = None):
         """Create a new tensor wrapper.
 
         Parameters
@@ -464,11 +464,12 @@ class AbstractTensor:
         """
 
         self.track_time = track_time
-        if tape is None:
+        if tape is None and requires_grad:
             from . import autograd as _autograd  # local import to avoid cycle
             tape = _autograd.autograd.tape
-        self._tape = tape
-        self._tape.create_tensor_node(self)
+        if requires_grad:
+            self._tape = tape
+            self._tape.create_tensor_node(self)
 
 
     def tensor_from_list_(self, data, dtype=None, device=None):
@@ -581,7 +582,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement full_like_()")
 
     def clone(self) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
+        result = type(self)(like=self)
         result.data = self.clone_()
         return result
 
@@ -648,6 +649,7 @@ class AbstractTensor:
         device=None,
         track_time: bool = False,
         faculty: "Faculty" = None,
+        requires_grad: bool = False,
         tape: "GradTape" | None = None,
     ) -> "AbstractTensor":
         """
@@ -657,11 +659,13 @@ class AbstractTensor:
         - If called on a backend subclass: use that backend directly.
         - dtype/device are applied best-effort after wrapping.
         """
+        if faculty is not None:
+            print("Faculty is depreciated and unused")
         if cls is AbstractTensor:
             cls = cls.check_or_build_registry()
 
         # Use the specific backend class
-        inst = cls(track_time=track_time, tape=tape)
+        inst = cls(track_time=track_time, requires_grad=requires_grad, tape=tape)
         if data is None:
             # Initialize a concrete empty tensor on the selected backend so the
             # object has a valid `.data` payload. This avoids leaking
@@ -712,6 +716,7 @@ class AbstractTensor:
         dtype=None,
         device=None,
         cls=None,
+        like=None,
         track_time=False,
         tape: "GradTape" | None = None,
         requires_grad: bool = False,
@@ -721,34 +726,24 @@ class AbstractTensor:
         If data is None, return self.
         """
         if cls is None:
-            cls = AbstractTensor.check_or_build_registry()
+            if like is not None:
+                cls = like.__class__
+            else:
+                cls = AbstractTensor.check_or_build_registry()
         # If caller wants gradients and did not provide a tape, use the global tape
         if requires_grad and tape is None:
-            try:
-                from . import autograd as _autograd  # local import to avoid cycles
-                tape = _autograd.autograd.tape
-            except Exception:
-                tape = None
-        t = cls.tensor(data, dtype=dtype, device=device, track_time=track_time, tape=tape)
-        if requires_grad:
-            # Ensure the tensor is marked and registered on the chosen tape
-            try:
-                if getattr(t, "_tape", None) is None and tape is not None:
-                    t._tape = tape  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                t.requires_grad_(True)
-            except Exception:
+            if like is not None:
+                tape = like._tape
+                requires_grad = like.requires_grad
+            if tape is None and requires_grad is not None:
                 try:
-                    setattr(t, "_requires_grad", True)
+                    from . import autograd as _autograd  # local import to avoid cycles
+                    tape = _autograd.autograd.tape
                 except Exception:
-                    pass
-            try:
-                if tape is not None:
-                    tape.create_tensor_node(t)
-            except Exception:
-                pass
+                    tape = None
+            else:
+                tape = None
+        t = cls.tensor(data, dtype=dtype, device=device, requires_grad=requires_grad, track_time=track_time, tape=tape)
         return t
 
     def tensor_like(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":

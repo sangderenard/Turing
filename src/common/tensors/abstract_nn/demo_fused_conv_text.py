@@ -142,7 +142,7 @@ def run_eager_training_test(model, AT, args):
     loss_fn = lambda a, b: ((a - b) ** 2).mean()
     epsilon = 1e-4
     max_steps = 1000
-    patience = 20
+    patience = 2
     patience_counter = patience
     last_loss = None
     best_loss = None

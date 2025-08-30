@@ -293,8 +293,8 @@ class PurePythonTensorOperations(AbstractTensor):
         return tuple(reversed(coords))
     """Educational tensor ops using nested Python lists."""
 
-    def __init__(self, track_time: bool = False, tape=None):
-        super().__init__(track_time=track_time, tape=tape)
+    def __init__(self, track_time: bool = False, tape=None, requires_grad: bool = False):
+        super().__init__(track_time=track_time, tape=tape, requires_grad=requires_grad)
         # ########## STUB: PurePythonTensorOperations.__init__ ##########
         # PURPOSE: Placeholder for any future initialization logic needed for
         #          the pure Python backend.

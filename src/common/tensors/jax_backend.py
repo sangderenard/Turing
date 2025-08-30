@@ -218,8 +218,8 @@ class JAXTensorOperations(AbstractTensor):
         return result
     """Tensor operations powered by `jax.numpy`."""
 
-    def __init__(self, default_device: Optional[Any] = None, track_time: bool = False, tape=None) -> None:
-        super().__init__(track_time=track_time, tape=tape)
+    def __init__(self, default_device: Optional[Any] = None, track_time: bool = False, tape=None, requires_grad: bool = False) -> None:
+        super().__init__(track_time=track_time, tape=tape, requires_grad=requires_grad)
         self.default_device = default_device
         self._validate_jax_setup()
 

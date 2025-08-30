@@ -118,7 +118,7 @@ def main(config=None):
         new_params = opt.step(params, [p.grad for p in params])
         for p, np_ in zip(params, new_params):
             AbstractTensor.copyto(p, np_)
-        if epoch % 100 == 0 or float(loss.item()) < 1e-6:
+        if epoch % 100 == 0 or float(loss.item()) < 1e-5:
             print(f"Epoch {epoch}: loss={float(loss.item()):.3e}")
         if float(loss.item()) < 1e-5:
             print("Converged.")
