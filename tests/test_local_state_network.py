@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.abstract_convolution.local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION
 
@@ -41,3 +42,25 @@ def test_local_state_network_forward_backward_consistency():
 
     expected_g_weight = (grad_w * padded_raw).sum(dim=(0, 1, 2, 3))
     assert np.allclose(net.g_weight_layer.data, expected_g_weight.data, atol=1e-5)
+
+
+def identity_metric(u, v, w):
+    eye = AbstractTensor.eye(3).reshape(1, 1, 1, 3, 3)
+    det = AbstractTensor.ones((1, 1, 1))
+    return eye, eye, det
+
+
+def test_local_state_network_additional_params():
+    net = LocalStateNetwork(
+        metric_tensor_func=identity_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=1,
+    )
+    grid = AbstractTensor.zeros((1, 1, 1))
+    tension = AbstractTensor.full((1, 1, 1), 2.0)
+    density = AbstractTensor.full((1, 1, 1), 0.5)
+    out = net(grid, grid, grid, partials=(), additional_params={"tension": tension, "density": density})
+    padded = out["padded_raw"]
+    assert padded[0, 0, 0, 2, 1, 1].item() == pytest.approx(2.0)
+    assert padded[0, 0, 0, 2, 2, 2].item() == pytest.approx(0.5)

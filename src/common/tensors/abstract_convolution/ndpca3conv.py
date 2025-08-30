@@ -303,6 +303,26 @@ class NDPCA3Conv3d:
         autograd.tape.annotate(wV_b, label="NDPCA3Conv3d.wV_b")
         autograd.tape.annotate(wW_b, label="NDPCA3Conv3d.wW_b")
 
+        # Optional scalars or grids modulating kernel strength
+        tension = package.get("tension")
+        if tension is not None:
+            if not isinstance(tension, AbstractTensor):
+                tension = from_list_like(tension, like=self.taps)
+            if tension.ndim <= 3:
+                tension = tension.reshape(1, 1, D, H, W)
+            autograd.tape.annotate(tension, label="NDPCA3Conv3d.tension")
+
+        density = package.get("density")
+        if density is not None:
+            if not isinstance(density, AbstractTensor):
+                density = from_list_like(density, like=self.taps)
+            if density.ndim <= 3:
+                density = density.reshape(1, 1, D, H, W)
+            wU_b = wU_b * density
+            wV_b = wV_b * density
+            wW_b = wW_b * density
+            autograd.tape.annotate(density, label="NDPCA3Conv3d.density")
+
         # ---- 3) oriented depthwise spatial pass over all stencil offsets
         arr = x  # (B,C,D,H,W) AbstractTensor
         bcu = (self.bc[0], self.bc[1])
@@ -314,6 +334,8 @@ class NDPCA3Conv3d:
 
         for idx, off in enumerate(self.offsets):
             w_off = tap_sums[idx]
+            if tension is not None:
+                w_off = w_off * tension
             if off == 0:
                 y = y + w_off * arr
                 if mask_total is not None:
