@@ -103,6 +103,7 @@ def main(config=None):
         k=train_cfg.get("k", 3),
         eig_from=train_cfg.get("eig_from", "g"),
         pointwise=train_cfg.get("pointwise", True),
+        deploy_mode="modulated",
     )
     U, V, W = grid.U, grid.V, grid.W
     autograd.tape.annotate(U, label="riemann_demo.grid_U")

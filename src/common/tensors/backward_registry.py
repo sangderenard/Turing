@@ -599,6 +599,22 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
     # Shape / layout ops
     # ----------------------------------------------------------------------
+    "clone": {
+        "arity": "unary",
+        "signature": "y = x.clone()",
+        "latex": r"y = \mathrm{clone}(x),\quad \frac{\partial y}{\partial x} = 1",
+        "backward": {
+            "x": "gx = g.clone()"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return g.clone() if hasattr(g, 'clone') else g"
+        },
+        "domain": "x: any real",
+        "notes": "Clone is an identity operation with independent storage; gradient passes through unchanged.",
+        "tags": ["shape"],
+    },
+    
     "reshape": {
         "arity": "unary",
         "signature": "y = reshape(x, new_shape)",

@@ -582,7 +582,7 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement full_like_()")
 
     def clone(self) -> "AbstractTensor":
-        result = type(self)(like=self)
+        result = AbstractTensor.get_tensor(like=self)
         result.data = self.clone_()
         return result
 
