@@ -139,6 +139,7 @@ class Linear:
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -201,6 +202,7 @@ class Flatten:
     def __init__(self, like: AbstractTensor):
         self.like = like
         self._shape = None
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return []
@@ -270,6 +272,7 @@ class RectConv2d:
         self._cols = None
         self._x_shape = None
         self._added = False
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -422,6 +425,7 @@ class RectConv3d:
         self._cols = None
         self._x_shape = None
         self._added = False
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -499,6 +503,9 @@ class RectConv3d:
         self.gW = gW.sum(dim=0).reshape(*self.W.shape)
         if self.b is not None:
             self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape)
+        self.W._grad = self.gW
+        if self.b is not None:
+            self.b._grad = self.gb
         Wm = self.W.reshape(self.out_channels, -1)
         WT = Wm.transpose(0, 1)
         dcols = WT @ grad_mat
@@ -536,6 +543,7 @@ class MaxPool2d:
         self._L = None
         self._kHW = None
         self._added = False
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return []

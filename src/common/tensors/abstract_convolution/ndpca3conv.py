@@ -3,7 +3,7 @@ from typing import Tuple, Literal
 import numpy as np
 
 from ..abstraction import AbstractTensor
-from ..abstract_nn.core import Linear  # for optional 1x1 mixing
+from ..abstract_nn.core import Linear, wrap_module  # for optional 1x1 mixing
 from ..abstract_nn.utils import from_list_like
 from ..autograd import autograd
 
@@ -191,6 +191,7 @@ class NDPCA3Conv3d:
                 bias=False,
                 _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}NDPCA3Conv3d.pointwise",
             )
+        wrap_module(self)
 
     # --- standard layer API ---
     def parameters(self):
