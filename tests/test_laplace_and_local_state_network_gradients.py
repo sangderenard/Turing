@@ -315,6 +315,17 @@ def test_local_state_network_with_regularization_loss():
             f"{getattr(param, '_label', 'param')} (shape={shape}): grad={'present' if param.grad is not None else 'missing'}"
         )
 
+
+def test_regularization_loss_backward_registers_grads():
+    """Calling _regularization_loss.backward should populate grads for all params."""
+    metric_tensor_func = lambda *args, **kwargs: None
+    net = LocalStateNetwork(metric_tensor_func, (2, 2, 2), DEFAULT_CONFIGURATION, max_depth=1)
+    padded_raw = AbstractTensor.randn((2, 2, 2, 3, 3, 3))
+    net.forward(padded_raw, lambda_reg=0.5)
+    net._regularization_loss.backward()
+    for p in net.parameters(include_all=True):
+        assert p.grad is not None
+
 if __name__ == "__main__":
     import sys
     import argparse
