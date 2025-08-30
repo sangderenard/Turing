@@ -50,7 +50,8 @@ def test_laplace_gradient():
         device='cpu',
         dense=True,
         f=0.0,
-        return_package=True
+        return_package=True,
+        lambda_reg=0.5
     )
 
     # Log gradient status for all parameters
@@ -320,24 +321,24 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run specific tests manually.")
     parser.add_argument("--test", type=str, choices=[
-        "test_laplace_gradient",
-        "test_local_state_network_weighted_mode_gradient",
-        "test_local_state_network_modulated_mode_gradient",
-        "test_local_state_network_convolutional_modulator_gradient",
-        "test_local_state_network_with_regularization_loss"
+        "0",
+        "1",
+        "2",
+        "3",
+        "4"
     ], help="Specify the test to run.")
 
     args = parser.parse_args()
 
-    if args.test == "test_laplace_gradient":
+    if args.test == "0":
         test_laplace_gradient()
-    elif args.test == "test_local_state_network_weighted_mode_gradient":
+    elif args.test == "1":
         test_local_state_network_weighted_mode_gradient()
-    elif args.test == "test_local_state_network_modulated_mode_gradient":
+    elif args.test == "2":
         test_local_state_network_modulated_mode_gradient()
-    elif args.test == "test_local_state_network_convolutional_modulator_gradient":
+    elif args.test == "3":
         test_local_state_network_convolutional_modulator_gradient()
-    elif args.test == "test_local_state_network_with_regularization_loss":
+    elif args.test == "4":
         test_local_state_network_with_regularization_loss()
     else:
         print("Running all tests...")

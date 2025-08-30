@@ -357,6 +357,11 @@ class LocalStateNetwork:
         self._cached_padded_raw = padded_raw
         self._lambda_reg = lambda_reg
         self._smoothness = smooth
+        # ensure LSN scalars are on the current tape (like Linear/RectConv do)
+        tape = getattr(autograd, "tape", None)
+        if tape is not None:
+            tape.create_tensor_node(self.g_weight_layer)  # keep as parameter
+            tape.create_tensor_node(self.g_bias_layer)    # keep as parameter
 
         B, D, H, W, _, _, _ = padded_raw.shape
 
@@ -385,13 +390,14 @@ class LocalStateNetwork:
         modulated_padded = modulated.reshape((B, D, H, W, 3, 3, 3))
 
         if self.inner_state is not None:
-            _, modulated_padded = self.inner_state.forward(modulated_padded)
+            _, modulated_padded = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
 
         if lambda_reg:
             self._regularization_loss = lambda_reg * self.regularization_loss(
                 weighted_padded, modulated_padded
             )
         else:
+            raise ValueError("Invalid lambda_reg value.")
             self._regularization_loss = AbstractTensor.zeros(
                 (),
                 dtype=self.g_weight_layer.dtype,
