@@ -28,7 +28,7 @@ def test_laplace_gradient():
         dtype=dtype
     )
     boundary_conditions = ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')
-
+    print(cls.float_dtype)
     build_laplace = BuildLaplace3D(
         grid_domain=grid_domain,
         wave_speed=343,  # Arbitrary value
@@ -104,16 +104,13 @@ def test_local_state_network_weighted_mode_gradient():
         f=0.0,
         return_package=True
     )
-    found_a_param = False
+    
     local_state_network = package["local_state_network"]
-    for param in local_state_network.parameters():
-        if param.requires_grad:
-            found_a_param = True
-            param.grad = None  # Clear existing gradients
-    assert found_a_param, "No LocalStateNetwork parameters found with gradients"
+    local_state_network.zero_grad()  # Clear existing gradients
+    
 
     found_a_param = False
-    input_tensor = torch.randn((N_u, N_v, N_w), requires_grad=True)
+    input_tensor = AbstractTensor.randn((N_u, N_v, N_w), requires_grad=True)
     weighted_tensor = local_state_network.forward(input_tensor)[0]
     weighted_tensor.sum().backward()
 

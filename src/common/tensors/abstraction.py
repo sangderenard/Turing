@@ -791,26 +791,8 @@ class AbstractTensor:
 
         # Backend selection (attempt to register common backends)
         if cls is None:
-            try:
-                from . import torch_backend  # noqa: F401
-            except Exception:
-                pass
-            try:
-                from . import numpy_backend  # noqa: F401
-            except Exception:
-                pass
-            try:
-                from . import pure_backend  # noqa: F401
-            except Exception:
-                pass
-
-            for backend_name in ("torch", "numpy", "pure_python"):
-                backend_cls = BACKEND_REGISTRY.get(backend_name)
-                if backend_cls is not None:
-                    cls = backend_cls
-                    break
-            if cls is None:
-                raise RuntimeError("No tensor backend available for arange.")
+            test_tensor = AbstractTensor.get_tensor(0)
+            cls = type(test_tensor)
 
         inst = cls(track_time=False, tape=tape)  # Assuming default track_time
         inst.data = inst.arange_(start, end, step, dtype=dtype, device=device)

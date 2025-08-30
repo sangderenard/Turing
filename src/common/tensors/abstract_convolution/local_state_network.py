@@ -115,10 +115,10 @@ class LocalStateNetwork:
             self.inner_state.zero_grad()
     def parameters(self):
         """
-        Return a flat list of all learnable parameters in this network, including weight_layer,
+        Return a flat list of all learnable parameters in this network, including g_weight_layer,
         spatial_layer parameters, and recursively from inner_state if present.
         """
-        params = [self.weight_layer]
+        params = [self.g_weight_layer]
         # If spatial_layer has parameters(), include them
         if hasattr(self.spatial_layer, 'parameters') and callable(self.spatial_layer.parameters):
             params.extend(self.spatial_layer.parameters())
@@ -151,9 +151,9 @@ class LocalStateNetwork:
         self.cache_lock = threading.Lock()
         num_parameters = 27
         # NN Integration Manager
-        self.weight_layer = AbstractTensor.ones((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
-        autograd.tape.create_tensor_node(self.weight_layer)
-        self.weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.weight_layer"
+        self.g_weight_layer = AbstractTensor.ones((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
+        autograd.tape.create_tensor_node(self.g_weight_layer)
+        self.g_weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_weight_layer"
         
         self._cached_padded_raw = None
         like = AbstractTensor.zeros((1, num_parameters), dtype=AbstractTensor.float_dtype)
@@ -210,8 +210,8 @@ class LocalStateNetwork:
 
         B, D, H, W, _, _, _ = padded_raw.shape
 
-        weight_layer = self.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
-        weighted_padded = padded_raw * weight_layer
+        g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        weighted_padded = padded_raw * g_weight_layer
 
         padded_view = padded_raw.reshape((B, D, H, W, -1))
 
@@ -253,8 +253,8 @@ class LocalStateNetwork:
         B, D, H, W, _, _, _ = padded_raw.shape
 
         # Gradient through weight layer
-        weight_layer = self.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
-        grad_from_weight = grad_weighted_padded * weight_layer
+        g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        grad_from_weight = grad_weighted_padded * g_weight_layer
         self.g_weight_layer = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
 
         # Propagate through any inner state network
@@ -311,7 +311,7 @@ class LocalStateNetwork:
         Generator-based asynchronous NN computation.
         """
         flattened_input = state_tensor.view(-1)
-        weight_output = self.weight_layer.unsqueeze(-1).unsqueeze(-1) * state_tensor
+        weight_output = self.g_weight_layer.unsqueeze(-1).unsqueeze(-1) * state_tensor
         spatial_output = self.spatial_layer(flattened_input).view(state_tensor.shape)
 
         self.nn_generators[process_id].append(weight_output)
