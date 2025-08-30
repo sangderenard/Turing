@@ -203,8 +203,14 @@ def test_local_state_network_convolutional_modulator_gradient():
     )
     boundary_conditions = ('dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet', 'dirichlet')
 
-    # Initialize LocalStateNetwork externally
-    local_state_network = LocalStateNetwork(metric_tensor_func=None, grid_shape=(N_u, N_v, N_w), switchboard_config=DEFAULT_CONFIGURATION, recursion_depth=2)
+    # Initialize LocalStateNetwork externally ensuring the top level uses RectConv3d
+    local_state_network = LocalStateNetwork(
+        metric_tensor_func=None,
+        grid_shape=(N_u, N_v, N_w),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        recursion_depth=0,
+        max_depth=3,
+    )
     
 
     build_laplace = BuildLaplace3D(
@@ -239,7 +245,10 @@ def test_local_state_network_convolutional_modulator_gradient():
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
-        print(f"{getattr(param, '_label', 'param')}: grad={'present' if param.grad is not None else 'missing'}")
+        shape = getattr(param, "shape", None)
+        print(
+            f"{getattr(param, '_label', 'param')} (shape={shape}): grad={'present' if param.grad is not None else 'missing'}"
+        )
 
 if __name__ == "__main__":
     import sys
