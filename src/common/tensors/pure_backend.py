@@ -836,19 +836,33 @@ class PurePythonTensorOperations(AbstractTensor):
         """Broadcast ``self.data`` to ``shape`` using pure Python lists."""
         data = self.data
         orig_shape = list(_get_shape(data))
-        try:
-            new_shape = tuple(
-                orig_shape[i] if s == -1 else s for i, s in enumerate(shape)
-            )
-        except IndexError as exc:
+        target_shape = list(shape)
+        if len(target_shape) < len(orig_shape):
             raise ValueError(
-                f"expand_ requires shape of length {len(orig_shape)}, got {len(shape)}"
-            ) from exc
-        if len(new_shape) != len(orig_shape):
-            raise ValueError(
-                f"expand_ requires shape of length {len(orig_shape)}, got {len(new_shape)}"
+                f"expand_ requires shape with at least {len(orig_shape)} dimensions, got {len(target_shape)}"
             )
-        target = list(new_shape)
+
+        if len(target_shape) > len(orig_shape):
+            for _ in range(len(target_shape) - len(orig_shape)):
+                data = [data]
+                orig_shape.insert(0, 1)
+
+        new_shape: List[int] = []
+        for i, (current, desired) in enumerate(zip(orig_shape, target_shape)):
+            if desired == -1:
+                new_shape.append(current)
+            elif current == desired or current == 1:
+                if desired < 0:
+                    raise ValueError(
+                        f"dimension {i} must be -1 or >= 0, got {desired}"
+                    )
+                new_shape.append(desired)
+            else:
+                raise ValueError(
+                    f"cannot expand dimension {i} from {current} to {desired}"
+                )
+
+        target = new_shape
 
         def expand_rec(lst, dim):
             if dim == len(target):
@@ -860,7 +874,9 @@ class PurePythonTensorOperations(AbstractTensor):
             if current == 1:
                 expanded_sub = expand_rec(lst[0], dim + 1)
                 return [self._clone_recursive(expanded_sub) for _ in range(desired)]
-            raise ValueError("cannot expand dimension {} from {} to {}".format(dim, current, desired))
+            raise ValueError(
+                "cannot expand dimension {} from {} to {}".format(dim, current, desired)
+            )
 
         return expand_rec(data, 0)
 
