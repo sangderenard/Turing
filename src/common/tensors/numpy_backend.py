@@ -214,6 +214,10 @@ class NumPyTensorOperations(AbstractTensor):
         softmax = e_x / np.sum(e_x, axis=dim, keepdims=True)
         return np.log(softmax)
 
+    def permute_(self, dims):
+        import numpy as np
+        return np.transpose(self.data, axes=dims)
+
     def transpose_(self, dim0, dim1):
         import numpy as np
         axes = list(range(self.data.ndim))

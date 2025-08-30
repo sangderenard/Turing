@@ -619,6 +619,31 @@ class PurePythonTensorOperations(AbstractTensor):
             indices.append(idxs)
         return values, indices
 
+    def permute_(self, dims):
+        from .abstraction import _get_shape
+        try:
+            import numpy as np  # type: ignore
+            arr = np.array(self.data)
+            return np.transpose(arr, axes=dims).tolist()
+        except Exception:
+            shape = _get_shape(self.data)
+            if len(dims) != len(shape):
+                raise ValueError("permute dims do not match tensor dimensions")
+            new_shape = [shape[d] for d in dims]
+
+            def build(idx, depth):
+                if depth == len(new_shape):
+                    orig_idx = [0] * len(dims)
+                    for i, d in enumerate(dims):
+                        orig_idx[d] = idx[i]
+                    val = self.data
+                    for j in orig_idx:
+                        val = val[j]
+                    return val
+                return [build(idx + [i], depth + 1) for i in range(new_shape[depth])]
+
+            return build([], 0)
+
     def transpose_(self, dim0: int, dim1: int):
         data = self.data
         if dim0 == 0 and dim1 == 1:

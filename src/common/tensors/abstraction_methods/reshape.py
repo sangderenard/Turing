@@ -64,6 +64,40 @@ def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
     raise NotImplementedError("Transpose fallback not implemented for this backend.")
 
 
+def permute(self, *dims: int) -> "AbstractTensor":
+    """Return a tensor with its dimensions permuted according to ``dims``."""
+    from ..abstraction import AbstractTensor, BACKEND_REGISTRY
+
+    perm = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
+    shape = getattr(self, "shape", ())
+    if len(perm) != len(shape):
+        raise ValueError("permute requires dims to match tensor dimensions")
+
+    if hasattr(self, "permute_"):
+        result = _wrap_result(self, self.permute_(perm))
+        finalize = AbstractTensor._pre_autograd(
+            "permute", [self], params={"perm": list(perm)}
+        )
+        return finalize(result)
+
+    try:
+        backend_cls = BACKEND_REGISTRY.get("numpy")
+        if backend_cls is not None:
+            numpy_tensor = backend_cls(track_time=getattr(self, "track_time", False))
+            numpy_tensor = numpy_tensor.ensure_tensor(self.data)
+            permuted = numpy_tensor.data.transpose(perm)
+            perm_tensor = backend_cls(track_time=getattr(self, "track_time", False))
+            perm_tensor.data = permuted
+            finalize = AbstractTensor._pre_autograd(
+                "permute", [self], params={"perm": list(perm)}
+            )
+            return finalize(perm_tensor.to_backend(self))
+    except Exception:
+        pass
+
+    raise NotImplementedError("permute fallback not implemented for this backend.")
+
+
 def unsqueeze(self, dim: int) -> "AbstractTensor":
     """Return a tensor with an inserted dimension of size 1 at ``dim``."""
     from ..abstraction import AbstractTensor

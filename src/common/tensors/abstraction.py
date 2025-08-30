@@ -2159,6 +2159,7 @@ _bind_and_wrap({
     "reshape": _reshape_methods.reshape,
     "flatten": _reshape_methods.flatten,
     "transpose": _reshape_methods.transpose,
+    "permute": _reshape_methods.permute,
     "unsqueeze": _reshape_methods.unsqueeze,
     "squeeze": _reshape_methods.squeeze,
     "swapaxes": _reshape_methods.swapaxes,
@@ -2225,6 +2226,7 @@ _bind_and_wrap({
 AbstractTensor.reshape = _reshape_methods.reshape
 AbstractTensor.flatten = _reshape_methods.flatten
 AbstractTensor.transpose = _reshape_methods.transpose
+AbstractTensor.permute = _reshape_methods.permute
 AbstractTensor.unsqueeze = _reshape_methods.unsqueeze
 AbstractTensor.squeeze = _reshape_methods.squeeze
 AbstractTensor.swapaxes = _reshape_methods.swapaxes
