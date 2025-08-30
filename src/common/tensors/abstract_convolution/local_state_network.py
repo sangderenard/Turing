@@ -385,7 +385,7 @@ class LocalStateNetwork:
 
         if lambda_reg:
             self._regularization_loss = lambda_reg * self.regularization_loss(
-                weighted_padded, modulated_padded, smooth
+                weighted_padded, modulated_padded
             )
         else:
             self._regularization_loss = 0.0

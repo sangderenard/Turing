@@ -108,7 +108,8 @@ def test_local_state_network_weighted_mode_gradient():
         dense=True,
         f=0.0,
         deploy_mode="weighted",
-        return_package=True
+        return_package=True,
+        lambda_reg=0.5,
     )
 
     local_state_network = package["local_state_network"]
@@ -166,7 +167,8 @@ def test_local_state_network_modulated_mode_gradient():
         dense=True,
         f=0.0,
         deploy_mode="modulated",
-        return_package=True
+        return_package=True,
+        lambda_reg=0.5,
     )
 
     local_state_network = package["local_state_network"]
@@ -235,7 +237,8 @@ def test_local_state_network_convolutional_modulator_gradient():
         f=0.0,
         return_package=True,
         deploy_mode="modulated",
-        local_state_network=local_state_network  # Pass the externally initialized LocalStateNetwork
+        local_state_network=local_state_network,  # Pass the externally initialized LocalStateNetwork
+        lambda_reg=0.5,
     )
 
     local_state_network = package["local_state_network"]
