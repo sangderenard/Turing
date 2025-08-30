@@ -47,10 +47,16 @@ def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
     """Return a transposed tensor as an AbstractTensor."""
     from ..abstraction import AbstractTensor
 
+    shape = getattr(self, "shape", ())
+    ndim = len(shape)
+    if not (-ndim <= dim0 < ndim) or not (-ndim <= dim1 < ndim):
+        raise ValueError("dim0 or dim1 out of range")
+    dim0 %= ndim
+    dim1 %= ndim
+
     if hasattr(self, "transpose_"):
-        perm = list(range(len(getattr(self, "shape", ()))))
-        if dim0 < len(perm) and dim1 < len(perm):
-            perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+        perm = list(range(ndim))
+        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
         finalize = AbstractTensor._pre_autograd(
             "permute", [self], params={"perm": perm}
         )
@@ -74,10 +80,16 @@ def unsqueeze(self, dim: int) -> "AbstractTensor":
 def swapaxes(self, axis1: int, axis2: int) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
 
+    shape = getattr(self, "shape", ())
+    ndim = len(shape)
+    if not (-ndim <= axis1 < ndim) or not (-ndim <= axis2 < ndim):
+        raise ValueError("axis1 or axis2 out of range")
+    axis1 %= ndim
+    axis2 %= ndim
+
     if hasattr(self, "swapaxes_"):
-        perm = list(range(len(getattr(self, "shape", ()))))
-        if axis1 < len(perm) and axis2 < len(perm):
-            perm[axis1], perm[axis2] = perm[axis2], perm[axis1]
+        perm = list(range(ndim))
+        perm[axis1], perm[axis2] = perm[axis2], perm[axis1]
         finalize = AbstractTensor._pre_autograd(
             "permute", [self], params={"perm": perm}
         )
