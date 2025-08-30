@@ -106,7 +106,6 @@ def test_local_state_network_weighted_mode_gradient():
     )
     
     local_state_network = package["local_state_network"]
-    local_state_network.zero_grad()  # Clear existing gradients
     
 
     found_a_param = False
@@ -120,6 +119,8 @@ def test_local_state_network_weighted_mode_gradient():
             found_a_param = True
             assert param.grad is not None, "Gradient for LocalStateNetwork parameter in weighted mode is None"
     assert found_a_param, "No LocalStateNetwork parameters found with gradients"
+
+    local_state_network.zero_grad()
 
 def test_local_state_network_modulated_mode_gradient():
     """Test to ensure gradients of LocalStateNetwork parameters can be computed in modulated mode."""
