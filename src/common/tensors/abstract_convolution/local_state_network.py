@@ -253,7 +253,13 @@ class LocalStateNetwork:
         # Gradient through weight layer
         g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
         grad_from_weight = grad_weighted_padded * g_weight_layer
-        self.g_weight_layer = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
+
+        # Accumulate gradient for g_weight_layer without altering the weight tensor
+        grad_weight = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
+        if getattr(self.g_weight_layer, "_grad", None) is None:
+            self.g_weight_layer._grad = grad_weight
+        else:
+            self.g_weight_layer._grad = self.g_weight_layer._grad + grad_weight
 
         # Propagate through any inner state network
         grad_mod = grad_modulated_padded
