@@ -108,7 +108,14 @@ class LocalStateNetwork:
         if hasattr(self.g_weight_layer, 'zero_grad'):
             self.g_weight_layer.zero_grad()
         else:
-            self.g_weight_layer = AbstractTensor.zeros_like(self.g_weight_layer)
+            # Clear gradient attributes without altering the underlying data
+            if hasattr(self.g_weight_layer, 'grad'):
+                try:
+                    self.g_weight_layer.grad = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if hasattr(self.g_weight_layer, '_grad'):
+                self.g_weight_layer._grad = None
         if hasattr(self.spatial_layer, 'zero_grad') and callable(self.spatial_layer.zero_grad):
             self.spatial_layer.zero_grad()
         if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
