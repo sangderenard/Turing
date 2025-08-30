@@ -109,3 +109,6 @@ BACKWARD_REGISTRY = BackwardRegistry()
 
 from .backward_registry import BACKWARD_RULES
 BACKWARD_REGISTRY.register_from_backward_rules(BACKWARD_RULES)
+
+# Expose permute backward function for direct imports
+bw_permute = BACKWARD_REGISTRY._methods["permute"]
