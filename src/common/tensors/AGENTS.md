@@ -9,6 +9,7 @@ This directory hosts the implementations of tensor operations for different nume
 ### Backend Policy
 
 - The **NumPy backend** is the default and canonical implementation.
+- Backend resolution loops must check for `"numpy"` before `"torch"`, ensuring NumPy is always preferred when available.
 - **Do not import, install, or rely on PyTorch (`torch`)**. The dependency is too heavy for this project.
 - If an operation is missing, implement it in the NumPy backend rather than reaching for PyTorch or other large frameworks.
 
