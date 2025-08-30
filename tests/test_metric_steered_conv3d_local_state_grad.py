@@ -13,6 +13,6 @@ def test_local_state_network_params_receive_grads(deploy_mode):
     x.requires_grad_(True)
     out = layer.forward(x)
     lsn = layer.laplace_package['local_state_network']
-    loss = out.sum() + lsn.weight_layer.sum()
+    loss = out.sum() + lsn.g_weight_layer.sum()
     loss.backward()
     assert any(p.grad is not None for p in lsn.parameters())

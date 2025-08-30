@@ -27,7 +27,7 @@ def test_local_state_network_forward_backward_consistency():
     grad_m = AbstractTensor.get_tensor(grad_m_np)
 
     # Expected gradient (manual computation)
-    weight_layer = net.weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+    weight_layer = net.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
     expected_from_weight = grad_w * weight_layer
     grad_m_view = grad_m.reshape((1, 1, 1, 1, -1))
     flat_grad = grad_m_view.reshape((-1, grad_m_view.shape[-1]))
@@ -41,7 +41,7 @@ def test_local_state_network_forward_backward_consistency():
     assert np.allclose(grad_input.data, expected_grad.data, atol=1e-5)
 
     expected_g_weight = (grad_w * padded_raw).sum(dim=(0, 1, 2, 3))
-    assert np.allclose(net.g_weight_layer.data, expected_g_weight.data, atol=1e-5)
+    assert np.allclose(net.g_weight_layer.grad.data, expected_g_weight.data, atol=1e-5)
 
 
 def identity_metric(u, v, w):
