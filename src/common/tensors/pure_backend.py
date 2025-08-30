@@ -835,10 +835,20 @@ class PurePythonTensorOperations(AbstractTensor):
     def expand_(self, shape):
         """Broadcast ``self.data`` to ``shape`` using pure Python lists."""
         data = self.data
-        target = list(shape)
         orig_shape = list(_get_shape(data))
-        if len(orig_shape) != len(target):
-            raise NotImplementedError("expand_ requires same number of dims as target shape")
+        try:
+            new_shape = tuple(
+                orig_shape[i] if s == -1 else s for i, s in enumerate(shape)
+            )
+        except IndexError as exc:
+            raise ValueError(
+                f"expand_ requires shape of length {len(orig_shape)}, got {len(shape)}"
+            ) from exc
+        if len(new_shape) != len(orig_shape):
+            raise ValueError(
+                f"expand_ requires shape of length {len(orig_shape)}, got {len(new_shape)}"
+            )
+        target = list(new_shape)
 
         def expand_rec(lst, dim):
             if dim == len(target):
