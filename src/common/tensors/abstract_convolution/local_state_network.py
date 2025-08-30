@@ -90,7 +90,8 @@ DEFAULT_CONFIGURATION = {
 class LocalStateNetwork:
     def grads(self, include_structural: bool = False):
         """Return gradients corresponding to non-structural parameters by default."""
-        grads = [self.g_weight_layer]
+        grads = [self.g_weight_layer, self.g_bias_layer]
+        # If spatial_layer has grads(), include them
         if hasattr(self.spatial_layer, 'grads') and callable(self.spatial_layer.grads):
             try:
                 grads.extend(self.spatial_layer.grads(include_structural=include_structural))
@@ -122,13 +123,35 @@ class LocalStateNetwork:
                     pass
             if hasattr(self.g_weight_layer, '_grad'):
                 self.g_weight_layer._grad = None
+        if hasattr(self.g_bias_layer, 'zero_grad'):
+            self.g_bias_layer.zero_grad()
+        else:
+            if hasattr(self.g_bias_layer, 'grad'):
+                try:
+                    self.g_bias_layer.grad = None  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if hasattr(self.g_bias_layer, '_grad'):
+                self.g_bias_layer._grad = None
         if hasattr(self.spatial_layer, 'zero_grad') and callable(self.spatial_layer.zero_grad):
             self.spatial_layer.zero_grad()
         if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
             self.inner_state.zero_grad()
     def parameters(self, include_all: bool = False, include_structural: bool = False):
-        """Return learnable parameters, excluding structural ones by default."""
-        params = [self.g_weight_layer]
+        """Return learnable parameters, excluding structural ones by default.
+        optionally filtering by gradient status.
+
+        Args:
+            include_all: If ``True`` return every parameter regardless of whether it
+                received a gradient in the last backward pass.  When ``False`` (the
+                default) only parameters with ``grad`` set are returned.
+
+        Returns:
+            List of parameter tensors.
+        """
+        params = [self.g_weight_layer, self.g_bias_layer]
+        # If spatial_layer has parameters(), include them
+
         if hasattr(self.spatial_layer, 'parameters') and callable(self.spatial_layer.parameters):
             params.extend(self.spatial_layer.parameters())
         if self.inner_state is not None and hasattr(self.inner_state, 'parameters'):
@@ -143,7 +166,7 @@ class LocalStateNetwork:
         if include_all:
             return params
         return [p for p in params if getattr(p, "_grad", None) is not None]
-    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None, disable_cache=True):
+    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None, disable_cache=True, spatial_bias=True):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
 
@@ -153,6 +176,7 @@ class LocalStateNetwork:
             switchboard_config: Dictionary defining procedural processing flows for desired outputs.
             cache_ttl: Time-to-live (TTL) for cached values (default: 5 iterations).
             custom_hooks: Dictionary of hooks for custom tensor metrics.
+            spatial_bias: If ``True`` include bias terms in the spatial layer.
         """
         self.metric_tensor_func = metric_tensor_func
         self.grid_shape = grid_shape
@@ -162,6 +186,7 @@ class LocalStateNetwork:
         self.recursion_depth = recursion_depth
         self.max_depth = max_depth
         self.disable_cache = disable_cache
+        self.spatial_bias = spatial_bias
         # Cache Manager
         self.state_cache = {}  # Key: hashed position, Value: (tensor, iteration_count)
         self.current_iteration = 0  # For cache freshness
@@ -171,7 +196,11 @@ class LocalStateNetwork:
         self.g_weight_layer = AbstractTensor.ones((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
         autograd.tape.create_tensor_node(self.g_weight_layer)
         self.g_weight_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_weight_layer"
-        
+
+        self.g_bias_layer = AbstractTensor.zeros((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
+        autograd.tape.create_tensor_node(self.g_bias_layer)
+        self.g_bias_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_bias_layer"
+
         self._cached_padded_raw = None
         like = AbstractTensor.zeros((1, num_parameters), dtype=AbstractTensor.float_dtype)
         if recursion_depth < max_depth - 1:
@@ -181,7 +210,7 @@ class LocalStateNetwork:
                 kernel_size=3,
                 padding=1,
                 like=like,
-                bias=False,
+                bias=spatial_bias,
             )
             # RectConv3d does not have learnable parameters by default, but if it did, label them here
             self.inner_state = LocalStateNetwork(
@@ -192,10 +221,18 @@ class LocalStateNetwork:
                 custom_hooks=custom_hooks,
                 recursion_depth=recursion_depth + 1,
                 max_depth=max_depth,
-                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.inner_state"
+                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.inner_state",
+                disable_cache=disable_cache,
+                spatial_bias=spatial_bias,
             )
         else:
-            self.spatial_layer = Linear(num_parameters, num_parameters, like=like, bias=False, _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.spatial_layer")
+            self.spatial_layer = Linear(
+                num_parameters,
+                num_parameters,
+                like=like,
+                bias=spatial_bias,
+                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.spatial_layer",
+            )
             self.inner_state = None
 
         self.nn_generators = defaultdict(deque)
@@ -221,8 +258,9 @@ class LocalStateNetwork:
 
 
         g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
+        g_bias_layer = self.g_bias_layer.reshape((1, 1, 1, 1, 3, 3, 3))
 
-        weighted_padded = padded_raw * g_weight_layer
+        weighted_padded = padded_raw * g_weight_layer + g_bias_layer
 
         padded_view = padded_raw.reshape((B, D, H, W, -1))
 
@@ -267,12 +305,18 @@ class LocalStateNetwork:
         g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
         grad_from_weight = grad_weighted_padded * g_weight_layer
 
-        # Accumulate gradient for g_weight_layer without altering the weight tensor
+        # Accumulate gradients for g_weight_layer and g_bias_layer
         grad_weight = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
         if getattr(self.g_weight_layer, "_grad", None) is None:
             self.g_weight_layer._grad = grad_weight
         else:
             self.g_weight_layer._grad = self.g_weight_layer._grad + grad_weight
+
+        grad_bias = grad_weighted_padded.sum(dim=(0, 1, 2, 3))
+        if getattr(self.g_bias_layer, "_grad", None) is None:
+            self.g_bias_layer._grad = grad_bias
+        else:
+            self.g_bias_layer._grad = self.g_bias_layer._grad + grad_bias
 
         # Propagate through any inner state network
         grad_mod = grad_modulated_padded
@@ -338,7 +382,10 @@ class LocalStateNetwork:
         Generator-based asynchronous NN computation.
         """
         flattened_input = state_tensor.view(-1)
-        weight_output = self.g_weight_layer.unsqueeze(-1).unsqueeze(-1) * state_tensor
+        weight_output = (
+            self.g_weight_layer.unsqueeze(-1).unsqueeze(-1) * state_tensor
+            + self.g_bias_layer.unsqueeze(-1).unsqueeze(-1)
+        )
         spatial_output = self.spatial_layer(flattened_input).view(state_tensor.shape)
 
         self.nn_generators[process_id].append(weight_output)
