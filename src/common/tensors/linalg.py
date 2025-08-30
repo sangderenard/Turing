@@ -32,8 +32,8 @@ def eye(n: int, *, dtype=None, device=None, batch_shape: Tuple[int, ...] = ()) -
     j = AbstractTensor.arange(n, dtype=long_type, device=device).reshape((1, n)).expand((n, n))
     E = (i == j).to_dtype(dtype or float_type)
     if batch_shape:
-        # expand: (1,1,n,n) -> (*batch, n, n)
-        E = E.reshape((1, 1, n, n)).expand(tuple(batch_shape) + (n, n))
+        # expand: (1,...,1,n,n) -> (*batch, n, n)
+        E = E.reshape((1,) * len(batch_shape) + (n, n)).expand(tuple(batch_shape) + (n, n))
     return E
 
 # ----------------------- vector ops --------------------------
