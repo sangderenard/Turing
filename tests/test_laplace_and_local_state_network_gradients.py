@@ -53,14 +53,12 @@ def test_laplace_gradient():
         return_package=True
     )
 
-    metric_tensor = package["metric"]["g"]
-    metric_tensor.sum().backward()
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
         print(f"{getattr(param, '_label', 'param')}: grad={'present' if param.grad is not None else 'missing'}")
 
     # Log gradient status for all parameters
-    print("Gradient computation for LaplaceND metric tensor completed.")
+    print("Gradient computation for LaplaceND regularization loss completed.")
 
 def test_local_state_network_weighted_mode_gradient():
     """Test to ensure gradients of LocalStateNetwork parameters can be computed in weighted mode."""
@@ -113,8 +111,8 @@ def test_local_state_network_weighted_mode_gradient():
         return_package=True
     )
 
-    metric_tensor = package["metric"]["g"]
-    metric_tensor.sum().backward()
+    local_state_network = package["local_state_network"]
+    local_state_network._regularization_loss.backward()
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
@@ -171,8 +169,8 @@ def test_local_state_network_modulated_mode_gradient():
         return_package=True
     )
 
-    metric_tensor = package["metric"]["g"]
-    metric_tensor.sum().backward()
+    local_state_network = package["local_state_network"]
+    local_state_network._regularization_loss.backward()
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
@@ -240,8 +238,8 @@ def test_local_state_network_convolutional_modulator_gradient():
         local_state_network=local_state_network  # Pass the externally initialized LocalStateNetwork
     )
 
-    metric_tensor = package["metric"]["g"]
-    metric_tensor.sum().backward()
+    local_state_network = package["local_state_network"]
+    local_state_network._regularization_loss.backward()
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
@@ -298,15 +296,13 @@ def test_local_state_network_with_regularization_loss():
         dense=True,
         f=0.0,
         deploy_mode="modulated",
-        return_package=True
+        return_package=True,
+        lambda_reg=.5
     )
 
     metric_tensor = package["metric"]["g"]
     local_state_network = package["local_state_network"]
-
-    # Add the LocalStateNetwork's regularization loss to the metric tensor
-    total_loss = metric_tensor.sum() + local_state_network._regularization_loss
-    total_loss.backward()
+    local_state_network._regularization_loss.backward()
 
     # Log gradient status for all parameters
     for param in local_state_network.parameters(include_all=True):

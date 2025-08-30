@@ -253,30 +253,84 @@ class LocalStateNetwork:
         self._regularization_loss = 0.0
 
     # --------- Regularisation Helper --------- #
-    def regularization_loss(self, weighted_padded, modulated_padded, smooth=False):
-        """Compute identity and optional smoothness penalties.
-
-        Parameters
-        ----------
-        weighted_padded, modulated_padded:
-            Currently unused placeholders for future extensions.
-        smooth:
-            When ``True`` also penalise local variations using finite
-            differences.
-        """
-        identity = AbstractTensor.zeros(self.g_weight_layer.shape, dtype=self.g_weight_layer.dtype)
-        center = tuple(s // 2 for s in self.g_weight_layer.shape)
-        identity[center] = 1.0
-        diff = self.g_weight_layer - identity
-        loss = (diff * diff).sum()
-
-        if smooth:
-            g = self.g_weight_layer
-            loss = loss + ((g[1:, :, :] - g[:-1, :, :]) ** 2).sum()
-            loss = loss + ((g[:, 1:, :] - g[:, :-1, :]) ** 2).sum()
-            loss = loss + ((g[:, :, 1:] - g[:, :, :-1]) ** 2).sum()
-
+    @staticmethod
+    def _tv3d_sum(x, axes=(0, 1, 2)):
+        """Quadratic TV over 3 spatial axes using simple forward diffs, preserving AbstractTensor graph."""
+        loss = None
+        nd = len(x.shape)
+        for ax in axes:
+            if ax < 0:
+                ax += nd
+            if x.shape[ax] <= 1:
+                continue
+            s1 = [slice(None)] * nd
+            s2 = [slice(None)] * nd
+            s1[ax] = slice(1, None)
+            s2[ax] = slice(0, -1)
+            dx = x[tuple(s1)] - x[tuple(s2)]
+            term = (dx * dx).sum()
+            if loss is None:
+                loss = term
+            else:
+                loss = loss + term
+        if loss is None:
+            # If no axes contributed, return a zero AbstractTensor
+            return AbstractTensor.zeros((), dtype=x.dtype, device=getattr(x, 'device', None))
         return loss
+
+    def regularization_loss(
+        self,
+        weighted_padded,
+        modulated_padded,
+        *,
+        lambda_id: float = 0.05,     # keep kernel near identity
+        lambda_w: float  = 0.08,     # TV on weighted output
+        lambda_m: float  = 0.12,     # stronger TV on modulated output
+        lambda_refine: float = 0.10, # modulated ~ weighted (then TV_m smooths)
+        spatial_axes: tuple[int, int, int] = (0, 1, 2),
+    ) -> "AbstractTensor":
+        """
+        Purpose-driven loss:
+        - identity on g_weight_layer
+        - TV(weighted_padded) and TV(modulated_padded)
+        - refinement L2: ||modulated - weighted||^2
+
+        Notes:
+        * We do NOT mix branches at the output. This only shapes learning signals.
+        * TV is quadratic for simplicity and stability.
+        """
+        total = None
+
+        # ---- (A) identity on the 3x3x3 weight kernel
+        if lambda_id:
+            g = self.g_weight_layer
+            identity = AbstractTensor.zeros(g.shape, dtype=g.dtype, device=g.device if hasattr(g, "device") else None)
+            center = tuple(s // 2 for s in g.shape)
+            identity[center] = 1.0
+            diff = g - identity
+            term = lambda_id * (diff * diff).sum()
+            total = term if total is None else total + term
+
+        # ---- (B) TV on weighted output field
+        if lambda_w and (weighted_padded is not None):
+            term = lambda_w * self._tv3d_sum(weighted_padded, axes=spatial_axes)
+            total = term if total is None else total + term
+
+        # ---- (C) TV on modulated output field
+        if lambda_m and (modulated_padded is not None):
+            term = lambda_m * self._tv3d_sum(modulated_padded, axes=spatial_axes)
+            total = term if total is None else total + term
+
+        # ---- (D) refinement tie: modulated ~ weighted
+        if lambda_refine and (weighted_padded is not None) and (modulated_padded is not None):
+            diff = modulated_padded - weighted_padded
+            term = lambda_refine * (diff * diff).sum()
+            total = term if total is None else total + term
+
+        if total is None:
+            # If no terms contributed, return a zero AbstractTensor
+            return AbstractTensor.zeros((), dtype=self.g_weight_layer.dtype, device=getattr(self.g_weight_layer, 'device', None))
+        return total
 
     def forward(self, padded_raw, lambda_reg: float = 0.0, smooth=False):
         """
@@ -560,7 +614,7 @@ class LocalStateNetwork:
             padded_raw[..., i, j] = hook_fn(grid_u, grid_v, grid_w, partials, additional_params)
 
         # Step 3: Forward pass through the network
-        weighted_padded, modulated_padded = self.forward(padded_raw)
+        weighted_padded, modulated_padded = self.forward(padded_raw, lambda_reg=additional_params.get("lambda_reg", 0.0))
 
         # Step 4: Return outputs
         return {

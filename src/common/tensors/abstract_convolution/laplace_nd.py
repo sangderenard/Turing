@@ -122,7 +122,8 @@ class BuildLaplace3D:
                               metric_tensor_func=None, density_func=None, tension_func=None, 
                               device=None, grid_boundaries=(True, True, True, True, True, True), 
                               artificial_stability=None, f=0, normalize=False, deploy_mode="raw", dense=False,
-                              return_package: bool = False, local_state_network: LocalStateNetwork = None, validating = False):
+                              return_package: bool = False, local_state_network: LocalStateNetwork = None,
+                              lambda_reg=0.0, validating = False):
         """
         Build the general Laplace operator with optional external LocalStateNetwork.
 
@@ -443,7 +444,8 @@ class BuildLaplace3D:
         state_outputs = local_state_network(
             grid_u, grid_v, grid_w,
             partials=(dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw),
-            additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL}
+            additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL,
+                               "lambda_reg": lambda_reg}
         )
 
         raw_tensor = state_outputs['padded_raw']
