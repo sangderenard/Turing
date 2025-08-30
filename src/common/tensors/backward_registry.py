@@ -119,7 +119,7 @@ helpers_spec: Dict[str, str] = {
     "eps":
         "A small positive constant to guard divisions/logs/square-roots (e.g., 1e-12).",
     "T":
-        "T(X): transpose last two dims of X (matrix transpose).",
+        "T(X): transpose last two dims of X (matrix transpose); vectors are treated as row matrices.",
 }
 
 def unbroadcast(G, target_shape):
@@ -190,6 +190,12 @@ def eps():
     return 1e-12
 
 def T(X):
+    ndim = getattr(X, "ndim", len(getattr(X, "shape", ())))
+    if ndim < 2:
+        if ndim == 0:
+            X = X.reshape((1, 1))
+        else:
+            X = X.reshape((1, X.shape[0]))
     return X.transpose(-2, -1)
 
 BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
