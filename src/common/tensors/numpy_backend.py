@@ -515,7 +515,21 @@ class NumPyTensorOperations(AbstractTensor):
         return np.concatenate(tensors, axis=dim)
 
     def expand_(self, shape):
-        return np.broadcast_to(self.data, shape)
+        import numpy as np
+        try:
+            new_shape = tuple(
+                self.data.shape[i] if s == -1 else s
+                for i, s in enumerate(shape)
+            )
+        except IndexError as exc:
+            raise ValueError(
+                f"expand_ requires shape of length {self.data.ndim}, got {len(shape)}"
+            ) from exc
+        if len(new_shape) != self.data.ndim:
+            raise ValueError(
+                f"expand_ requires shape of length {self.data.ndim}, got {len(new_shape)}"
+            )
+        return np.broadcast_to(self.data, new_shape)
     def repeat_interleave_(self, repeats=1, dim=None):
         if dim is None:
             dim = 0
