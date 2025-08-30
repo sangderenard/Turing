@@ -142,7 +142,7 @@ class LocalStateNetwork:
         if include_all:
             return params
         return [p for p in params if getattr(p, "_grad", None) is not None]
-    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None):
+    def __init__(self, metric_tensor_func, grid_shape, switchboard_config, cache_ttl=50, custom_hooks=None, recursion_depth=0, max_depth=2, _label_prefix=None, disable_cache=True):
         """
         A mini-network for local state management, caching, NN integration, and procedural switchboarding.
 
@@ -160,7 +160,7 @@ class LocalStateNetwork:
         self.custom_hooks = custom_hooks or {}
         self.recursion_depth = recursion_depth
         self.max_depth = max_depth
-
+        self.disable_cache = disable_cache
         # Cache Manager
         self.state_cache = {}  # Key: hashed position, Value: (tensor, iteration_count)
         self.current_iteration = 0  # For cache freshness
@@ -307,6 +307,8 @@ class LocalStateNetwork:
         """
         Check the cache for existing data or compute it if stale/missing.
         """
+        if self.disable_cache:
+            return self.metric_tensor_func(*inputs)
         with self.cache_lock:
             if pos_hash in self.state_cache:
                 value, timestamp = self.state_cache[pos_hash]
@@ -315,6 +317,14 @@ class LocalStateNetwork:
             value = self.metric_tensor_func(*inputs)
             self.state_cache[pos_hash] = (value, self.current_iteration)
             return value
+
+    def update_metric_function(self, new_metric_tensor_func):
+        """
+        Update the metric tensor function used by the local state network.
+        """
+        self.metric_tensor_func = new_metric_tensor_func
+        with self.cache_lock:
+            self.state_cache.clear()
 
     def update_iteration(self):
         """Increment the iteration for cache freshness checks."""

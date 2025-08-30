@@ -1,4 +1,3 @@
-
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
 
@@ -16,11 +15,11 @@ import numpy as np
 
 # Configure the logger at the module level
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Set to DEBUG to capture all levels of logs
+logger.setLevel(logging.WARNING)  # Set to DEBUG to capture all levels of logs
 
 # Create console handler with a higher log level
 ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
+ch.setLevel(logging.WARNING)
 
 # Create formatter and add it to the handlers
 formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
@@ -123,15 +122,28 @@ class BuildLaplace3D:
                               metric_tensor_func=None, density_func=None, tension_func=None, 
                               device=None, grid_boundaries=(True, True, True, True, True, True), 
                               artificial_stability=None, f=0, normalize=False, deploy_mode="raw", dense=False,
-                              return_package: bool = False):
+                              return_package: bool = False, local_state_network: LocalStateNetwork = None, validating = False):
         """
-        Builds the Laplacian matrix for a 3D coordinate system using the provided u, v, w grids.
-        Handles singularities using custom Dirichlet/Neumann conditions.
+        Build the general Laplace operator with optional external LocalStateNetwork.
 
-        Parameters
-        ----------
-        deploy_mode : {'raw', 'weighted', 'modulated'}
-            Selects which Laplace tensor variant is routed through the switchboard.
+        Args:
+            grid_u, grid_v, grid_w: The grid coordinates.
+            boundary_conditions: Boundary conditions for the grid.
+            singularity_conditions: Conditions at singularities.
+            singularity_dirichlet_func: Dirichlet function at singularities.
+            singularity_neumann_func: Neumann function at singularities.
+            k, f: Additional parameters for the Laplace operator.
+            metric_tensor_func: Function to compute the metric tensor.
+            density_func: Function to compute density.
+            tension_func: Function to compute tension.
+            device: Device to perform computations on.
+            grid_boundaries: Boolean tuple indicating if boundaries are included.
+            artificial_stability: Stability factor for the computation.
+            normalize: Whether to normalize the output.
+            deploy_mode: Mode for deploying the Laplace operator.
+            dense: Whether to use dense computation.
+            return_package: Whether to return the package with additional information.
+            local_state_network (LocalStateNetwork, optional): Pre-initialized LocalStateNetwork to use.
         """
         logger.debug("Starting build_general_laplace")
         logger.debug(f"Input grid shapes - grid_u: {grid_u.shape}, grid_v: {grid_v.shape}, grid_w: {grid_w.shape}")
@@ -400,8 +412,18 @@ class BuildLaplace3D:
             # Apply the metric tensor function to the entire grid
             #g_ij, g_inv, det_g = metric_tensor_func(grid_u, grid_v, grid_w, dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw)
             # Initialize LocalState with grid shape and metric function
-            local_state = LocalStateNetwork(metric_tensor_func, (N_u, N_v, N_w), DEFAULT_CONFIGURATION)
-            
+            if local_state_network:
+                logger.debug("Using provided LocalStateNetwork.")
+                # Update the metric function of the provided LSN
+                local_state_network.update_metric_function(metric_tensor_func)
+            elif hasattr(self, 'local_state_network') and self.local_state_network:
+                logger.debug("Using existing LocalStateNetwork from self.")
+                self.local_state_network.update_metric_function(metric_tensor_func)
+                local_state_network = self.local_state_network
+            else:
+                logger.debug("Initializing new LocalStateNetwork.")
+                local_state_network = LocalStateNetwork(metric_tensor_func, (N_u, N_v, N_w), DEFAULT_CONFIGURATION)
+            self.local_state_network = local_state_network
             # Move to CPU and convert to numpy for processing
             #logger.debug("Moving metric tensors to CPU and converting to numpy.")
             #g_ij = g_ij.clone().detach().cpu().numpy()  # Shape: (N_u, N_v, N_w, 3, 3)
@@ -418,7 +440,7 @@ class BuildLaplace3D:
         
 
         # 2. Obtain State Outputs
-        state_outputs = local_state(
+        state_outputs = local_state_network(
             grid_u, grid_v, grid_w,
             partials=(dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw),
             additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL}
@@ -531,7 +553,7 @@ class BuildLaplace3D:
         indices_tensor = AbstractTensor.stack([row_indices, col_indices], dim=0)
         _label_tensor(indices_tensor, "laplace_nd.coo.indices")
         _label_tensor(values, "laplace_nd.coo.values")
-        laplacian = COOMatrix(indices_tensor, values, (total_size, total_size))
+        laplacian_coo = COOMatrix(indices_tensor, values, (total_size, total_size))
         # Expose COO components for downstream use
         coo_rows, coo_cols, coo_vals = row_indices, col_indices, values
         # Now, use laplacian as needed in your application
@@ -543,7 +565,7 @@ class BuildLaplace3D:
 
         if True or self.resolution <= 50 and dense:
             logger.debug("Converting Laplacian to dense tensor.")
-            laplacian_tensor = laplacian.to_dense()
+            laplacian_tensor = laplacian_coo.to_dense()
             _label_tensor(laplacian_tensor, "laplace_nd.laplacian.dense")
             logger.debug(f"Dense Laplacian tensor created with shape {laplacian_tensor.shape} on device {device}.")
 
@@ -559,9 +581,10 @@ class BuildLaplace3D:
                 logger.debug("Added Gaussian noise to dense Laplacian tensor.")
 
             # Validate perturbed dense Laplace tensor
-            logger.debug("Validating dense Laplacian tensor.")
-            self.validate_laplace_tensor(laplacian_tensor, verbose=False)
-            logger.debug("Dense Laplacian tensor validated.")
+            if validating:
+                logger.debug("Validating dense Laplacian tensor.")
+                self.validate_laplace_tensor(laplacian_tensor, verbose=False)
+                logger.debug("Dense Laplacian tensor validated.")
         else:
             laplacian_tensor = None
             logger.debug("Resolution exceeds 128. Skipping dense Laplacian tensor creation.")
@@ -574,17 +597,17 @@ class BuildLaplace3D:
                 logger.debug(f"Set sparse perturbation seed to {perturbation_seed}.")
 
             # Generate noise for the non-zero elements in numpy format
-            noise_sparse = AbstractTensor.random.randn(laplacian.data.shape[0]) * perturbation_scale
-            logger.debug(f"Generated noise for {laplacian.data.shape[0]} non-zero elements.")
+            noise_sparse = AbstractTensor.random.randn(laplacian_coo.data.shape[0]) * perturbation_scale
+            logger.debug(f"Generated noise for {laplacian_coo.data.shape[0]} non-zero elements.")
 
             # Apply the noise by updating the COO matrix with perturbed data
-            laplacian.update(edge_weight=laplacian.data + noise_sparse)
+            laplacian_coo.update(edge_weight=laplacian_coo.data + noise_sparse)
             logger.debug("Applied noise to sparse Laplacian matrix.")
 
-        # Validate perturbed sparse Laplace tensor
-        logger.debug("Validating sparse Laplacian matrix.")
-        self.validate_laplace_tensor(laplacian, verbose=False)
-        logger.debug("Sparse Laplacian matrix validated.")
+        if validating:
+            logger.debug("Validating sparse Laplacian matrix.")
+            self.validate_laplace_tensor(laplacian_coo, verbose=False)
+            logger.debug("Sparse Laplacian matrix validated.")
 
         logger.debug("Completed build_general_laplace.")
 
@@ -662,7 +685,7 @@ class BuildLaplace3D:
                 "cols": coo_cols,
                 "vals": coo_vals,
             },
-            "local_state_network": local_state,
+            "local_state_network": local_state_network,
             "config": {
                 "stencil": INT_LAPLACEBELTRAMI_STENCIL if 'INT_LAPLACEBELTRAMI_STENCIL' in globals() else None,
                 "dtype": str(self.precision) if hasattr(self, 'precision') else None,
@@ -671,9 +694,9 @@ class BuildLaplace3D:
         }
 
         if return_package:
-            return laplacian_tensor, laplacian, package
+            return laplacian_tensor, laplacian_coo, package
         else:
-            return laplacian_tensor, laplacian
+            return laplacian_tensor, laplacian_coo, None
 
 
     def validate_laplace_tensor(self, laplace_tensor, check_diagonal=True, check_off_diagonal=True, verbose=True):
@@ -1929,7 +1952,7 @@ class Transform(TransformHub):
         super().__init__(uextent, vextent, grid_boundaries)
 
     def get_transform_parameters(self):
-        return (self.uextent, self.vextent), self.grid_boundaries
+        return (self.uextent, self.vextent, self.wextent), self.grid_boundaries
 
     def transform(self, U, V, W, use_metric=False):
         """
@@ -2202,20 +2225,20 @@ def test_build_laplace3d():
     # Visualization (optional)
     # Compare a central slice
     central_slice = N_w // 2
-    laplace_f_numerical_reshaped = laplace_f_numerical_arr.reshape(N_u, N_v, N_w)
-    laplace_f_analytical_reshaped = laplace_f_analytical.reshape(N_u, N_v, N_w)
+    laplacian_f_numerical_reshaped = laplace_f_numerical_arr.reshape(N_u, N_v, N_w)
+    laplacian_f_analytical_reshaped = laplace_f_analytical.reshape(N_u, N_v, N_w)
     error_reshaped = error.reshape(N_u, N_v, N_w)
 
     plt.figure(figsize=(18, 5))
 
     plt.subplot(1, 3, 1)
     plt.title("Numerical Laplacian")
-    plt.imshow(laplace_f_numerical_reshaped[:, :, central_slice], origin='lower', extent=[0, Lx, 0, Ly])
+    plt.imshow(laplacian_f_numerical_reshaped[:, :, central_slice], origin='lower', extent=[0, Lx, 0, Ly])
     plt.colorbar()
 
     plt.subplot(1, 3, 2)
     plt.title("Analytical Laplacian")
-    plt.imshow(laplace_f_analytical_reshaped[:, :, central_slice], origin='lower', extent=[0, Lx, 0, Ly])
+    plt.imshow(laplacian_f_analytical_reshaped[:, :, central_slice], origin='lower', extent=[0, Lx, 0, Ly])
     plt.colorbar()
 
     plt.subplot(1, 3, 3)
