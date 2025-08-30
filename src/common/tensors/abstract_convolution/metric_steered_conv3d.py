@@ -30,7 +30,10 @@ class MetricSteeredConv3DWrapper:
     k : int (number of principal directions)
     eig_from : 'g' or 'inv_g'
     pointwise : bool
-    laplace_kwargs : dict (optional, forwarded to BuildLaplace3D)
+    deploy_mode : {'raw', 'weighted', 'modulated'}, optional
+        Selects which Laplace tensor variant to use. Defaults to 'raw'.
+    laplace_kwargs : dict, optional
+        Additional keyword arguments forwarded to BuildLaplace3D.
     """
 
     def parameters(self):
@@ -67,6 +70,7 @@ class MetricSteeredConv3DWrapper:
         k=3,
         eig_from="g",
         pointwise=True,
+        deploy_mode="raw",
         laplace_kwargs=None,
     ):
         Nu, Nv, Nw = grid_shape
@@ -88,6 +92,7 @@ class MetricSteeredConv3DWrapper:
             transform=transform,
             coordinate_system="rectangular",
         )
+        self.deploy_mode = deploy_mode
         self.laplace_kwargs = laplace_kwargs or {}
         self.boundary_conditions = boundary_conditions
         self.laplace_package = None
@@ -118,6 +123,7 @@ class MetricSteeredConv3DWrapper:
             self.grid_domain.V,
             self.grid_domain.W,
             return_package=True,
+            deploy_mode=self.deploy_mode,
             **self.laplace_kwargs,
         )
         lsn = package.get("local_state_network")

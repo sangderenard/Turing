@@ -127,6 +127,11 @@ class BuildLaplace3D:
         """
         Builds the Laplacian matrix for a 3D coordinate system using the provided u, v, w grids.
         Handles singularities using custom Dirichlet/Neumann conditions.
+
+        Parameters
+        ----------
+        deploy_mode : {'raw', 'weighted', 'modulated'}
+            Selects which Laplace tensor variant is routed through the switchboard.
         """
         logger.debug("Starting build_general_laplace")
         logger.debug(f"Input grid shapes - grid_u: {grid_u.shape}, grid_v: {grid_v.shape}, grid_w: {grid_w.shape}")
