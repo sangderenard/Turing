@@ -254,7 +254,7 @@ def _resolve_cls(cls):
         return cls
     from ..abstraction import BACKEND_REGISTRY  # Local import to avoid circular dependency
 
-    for backend_name in ("torch", "numpy", "pure_python"):
+    for backend_name in ("numpy", "torch", "pure_python"):
         backend_cls = BACKEND_REGISTRY.get(backend_name)
         if backend_cls is not None:
             return backend_cls

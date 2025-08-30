@@ -617,13 +617,14 @@ class AbstractTensor:
 
     @staticmethod
     def check_or_build_registry():
+        cls = None
         if not BACKEND_REGISTRY:
             try:
-                from . import torch_backend  # noqa: F401
+                from . import numpy_backend  # noqa: F401
             except Exception:
                 pass
             try:
-                from . import numpy_backend  # noqa: F401
+                from . import torch_backend  # noqa: F401
             except Exception:
                 pass
             try:
@@ -631,7 +632,7 @@ class AbstractTensor:
             except Exception:
                 pass
 
-        for backend_name in ("torch", "numpy", "pure_python"):
+        for backend_name in ("numpy", "torch", "pure_python"):
             backend_cls = BACKEND_REGISTRY.get(backend_name)
             if backend_cls is not None:
                 cls = backend_cls
@@ -792,11 +793,11 @@ class AbstractTensor:
         # Backend selection (attempt to register common backends)
         if cls is None:
             try:
-                from . import torch_backend  # noqa: F401
+                from . import numpy_backend  # noqa: F401
             except Exception:
                 pass
             try:
-                from . import numpy_backend  # noqa: F401
+                from . import torch_backend  # noqa: F401
             except Exception:
                 pass
             try:
@@ -804,7 +805,7 @@ class AbstractTensor:
             except Exception:
                 pass
 
-            for backend_name in ("torch", "numpy", "pure_python"):
+            for backend_name in ("numpy", "torch", "pure_python"):
                 backend_cls = BACKEND_REGISTRY.get(backend_name)
                 if backend_cls is not None:
                     cls = backend_cls
