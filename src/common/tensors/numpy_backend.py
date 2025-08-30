@@ -516,20 +516,34 @@ class NumPyTensorOperations(AbstractTensor):
 
     def expand_(self, shape):
         import numpy as np
-        try:
-            new_shape = tuple(
-                self.data.shape[i] if s == -1 else s
-                for i, s in enumerate(shape)
-            )
-        except IndexError as exc:
+
+        target_shape = tuple(shape)
+        orig_ndim = self.data.ndim
+        if len(target_shape) < orig_ndim:
             raise ValueError(
-                f"expand_ requires shape of length {self.data.ndim}, got {len(shape)}"
-            ) from exc
-        if len(new_shape) != self.data.ndim:
-            raise ValueError(
-                f"expand_ requires shape of length {self.data.ndim}, got {len(new_shape)}"
+                f"expand_ requires shape with at least {orig_ndim} dimensions, got {len(target_shape)}"
             )
-        return np.broadcast_to(self.data, new_shape)
+
+        arr = self.data
+        if len(target_shape) > orig_ndim:
+            arr = arr.reshape((1,) * (len(target_shape) - orig_ndim) + arr.shape)
+
+        new_shape: List[int] = []
+        for i, (current, desired) in enumerate(zip(arr.shape, target_shape)):
+            if desired == -1:
+                new_shape.append(current)
+            elif current == desired or current == 1:
+                if desired < 0:
+                    raise ValueError(
+                        f"dimension {i} must be -1 or >= 0, got {desired}"
+                    )
+                new_shape.append(desired)
+            else:
+                raise ValueError(
+                    f"cannot expand dimension {i} from {current} to {desired}"
+                )
+
+        return np.broadcast_to(arr, tuple(new_shape))
     def repeat_interleave_(self, repeats=1, dim=None):
         if dim is None:
             dim = 0
