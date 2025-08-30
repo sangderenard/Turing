@@ -8,8 +8,67 @@ from .utils import from_list_like, zeros_like, transpose2d
 from .activations import Identity
 from ..logger import get_tensors_logger
 from ..autograd import autograd
+from ..backward import BACKWARD_REGISTRY
 
 logger = get_tensors_logger()
+
+
+def wrap_module(module):
+    """Wrap ``module`` so its ``forward``/``__call__`` run under ``no_grad`` and
+    register custom backward handlers.
+
+    The wrapper records the outer call on the autograd tape and uses the
+    module's own :meth:`backward` implementation when gradients are
+    propagated.  This allows network internals to remain free of autograd
+    bookkeeping while still participating in the global gradient flow.
+    """
+
+    if getattr(module, "_nncore_wrapped", False):
+        return module
+
+    name = module.__class__.__name__
+
+    orig_forward = getattr(module, "forward", None)
+    if callable(orig_forward):
+
+        def forward_wrapped(*args, **kwargs):
+            with autograd.no_grad():
+                out = orig_forward(*args, **kwargs)
+            autograd.record(f"{name}.forward", args, out, params={"module": module})
+            return out
+
+        module.forward = forward_wrapped  # type: ignore[assignment]
+
+    orig_call = getattr(module, "__call__", None)
+    if (
+        callable(orig_call)
+        and module.__class__.__call__ is not object.__call__  # type: ignore[attr-defined]
+    ):
+
+        def call_wrapped(*args, **kwargs):
+            with autograd.no_grad():
+                out = orig_call(*args, **kwargs)
+            if isinstance(out, AbstractTensor) or (
+                isinstance(out, (tuple, list))
+                and any(isinstance(o, AbstractTensor) for o in out)
+            ):
+                autograd.record(
+                    f"{name}.__call__", args, out, params={"module": module}
+                )
+            return out
+
+        module.__call__ = call_wrapped  # type: ignore[assignment]
+
+    def _bw(g, *inputs, module):
+        if isinstance(g, tuple):
+            return module.backward(*g)
+        return module.backward(g)
+
+    BACKWARD_REGISTRY.register(f"{name}.forward", _bw)
+    BACKWARD_REGISTRY.register(f"{name}.__call__", _bw)
+
+    module._nncore_wrapped = True  # type: ignore[attr-defined]
+    return module
 
 def _randn_matrix(rows: int, cols: int, like: AbstractTensor, scale: float = 0.02, requires_grad=True, tape=None) -> AbstractTensor:
     data = [[random.gauss(0.0, 1.0) * scale for _ in range(cols)] for _ in range(rows)]
@@ -549,6 +608,7 @@ class Model:
             self.activations = [activations] * len(layers)
         self._pre = [None] * len(layers)
         self._post = [None] * len(layers)
+        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         ps: List[AbstractTensor] = []

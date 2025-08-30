@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 import threading
 
 from ..abstraction import AbstractTensor
-from ..abstract_nn import Linear, RectConv3d
+from ..abstract_nn import Linear, RectConv3d, wrap_module
 from ..autograd import autograd
 
 # ``LocalStateNetwork`` intentionally avoids heavyweight frameworks like
@@ -147,6 +147,9 @@ class LocalStateNetwork:
             self.spatial_layer.zero_grad()
         if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
             self.inner_state.zero_grad()
+        self._reg_loss = None
+        self._weighted_padded = None
+        self._modulated_padded = None
     def parameters(self, include_all: bool = False, include_structural: bool = False):
         """Return learnable parameters, excluding structural ones by default.
         optionally filtering by gradient status.
@@ -255,6 +258,10 @@ class LocalStateNetwork:
             dtype=self.g_weight_layer.dtype,
             device=getattr(self.g_weight_layer, 'device', None),
         )
+        self._reg_loss = None
+        self._weighted_padded = None
+        self._modulated_padded = None
+        wrap_module(self)
 
     # --------- Regularisation Helper --------- #
     @staticmethod
@@ -392,12 +399,28 @@ class LocalStateNetwork:
         if self.inner_state is not None:
             _, modulated_padded = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
 
+        self._weighted_padded = weighted_padded
+        self._modulated_padded = modulated_padded
+
         if lambda_reg:
-            self._regularization_loss = lambda_reg * self.regularization_loss(
-                weighted_padded, modulated_padded
-            )
+            self._reg_loss = self.regularization_loss(weighted_padded, modulated_padded)
+            self._regularization_loss = lambda_reg * self._reg_loss
+            orig_backward = self._regularization_loss.backward
+
+            def _reg_backward(go=None, *, retain_graph=False):
+                orig_backward(go, retain_graph=retain_graph)
+                gw = AbstractTensor.zeros_like(self._weighted_padded)
+                gm = AbstractTensor.zeros_like(self._modulated_padded)
+                self.backward(
+                    self._lambda_reg * gw,
+                    self._lambda_reg * gm,
+                    lambda_reg=self._lambda_reg,
+                    smooth=self._smoothness,
+                )
+                return None
+
+            self._regularization_loss.backward = _reg_backward
         else:
-            raise ValueError("Invalid lambda_reg value.")
             self._regularization_loss = AbstractTensor.zeros(
                 (),
                 dtype=self.g_weight_layer.dtype,
