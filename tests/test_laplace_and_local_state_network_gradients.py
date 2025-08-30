@@ -2,6 +2,7 @@ import pytest
 from src.common.tensors.abstract_convolution.laplace_nd import BuildLaplace3D, GridDomain, RectangularTransform
 from src.common.tensors.abstract_convolution.local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION
 from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.abstract_nn import Linear
 
 def test_laplace_gradient():
     """Test to ensure gradients can be computed for LaplaceND."""
@@ -245,12 +246,15 @@ def test_local_state_network_convolutional_modulator_gradient():
     local_state_network = package["local_state_network"]
     local_state_network._regularization_loss.backward()
 
-    # Log gradient status for all parameters
-    for param in package["local_state_network"].parameters(include_all=True):
-        shape = getattr(param, "shape", None)
-        print(
-            f"{getattr(param, '_label', 'param')} (shape={shape}): grad={'present' if param.grad is not None else 'missing'}"
-        )
+    # Ensure recursion caps at max_depth
+    assert local_state_network.inner_state is not None
+    assert local_state_network.inner_state.inner_state is not None
+    assert getattr(local_state_network.inner_state.inner_state, "inner_state", None) is None
+    assert isinstance(local_state_network.inner_state.inner_state.spatial_layer, Linear)
+
+    # Assert gradients for all parameters, especially convolutional ones
+    for param in local_state_network.parameters(include_all=True):
+        assert param.grad is not None, f"{getattr(param, '_label', 'param')} missing grad"
 
 def test_local_state_network_with_regularization_loss():
     """Test to ensure gradients of LocalStateNetwork parameters can be computed with regularization loss."""

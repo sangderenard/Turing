@@ -14,6 +14,7 @@ from .laplace_nd import BuildLaplace3D, GridDomain
 from .ndpca3conv import NDPCA3Conv3d
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
+from ..abstract_nn import wrap_module
 
 
 class MetricSteeredConv3DWrapper:
@@ -116,6 +117,7 @@ class MetricSteeredConv3DWrapper:
             eig_from=eig_from,
             pointwise=pointwise,
         )
+        wrap_module(self)
 
     def _build_laplace_package(self, boundary_conditions):
         builder = BuildLaplace3D(
@@ -141,7 +143,7 @@ class MetricSteeredConv3DWrapper:
             for p in lsn.parameters(include_all=True, include_structural=True):
                 if getattr(p, "grad", None) is None:
                     try:
-                        p.grad = AbstractTensor.zeros_like(p)
+                        p._grad = AbstractTensor.zeros_like(p)
                     except Exception:
                         pass
 
