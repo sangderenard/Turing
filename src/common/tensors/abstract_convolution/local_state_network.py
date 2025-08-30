@@ -1,3 +1,13 @@
+"""Local state network utilities.
+
+This module implements :class:`LocalStateNetwork`, a lightweight component for
+per-voxel state processing.  In addition to weighting and modulation, the
+network now supports an optional regularisation term on the ``g_weight_layer``
+that encourages it to remain close to the identity kernel and, optionally, to
+vary smoothly.  The loss is exposed through the ``lambda_reg`` argument on both
+``forward`` and ``backward``.
+"""
+
 import numpy as np
 from collections import defaultdict, deque
 import threading
@@ -237,13 +247,47 @@ class LocalStateNetwork:
 
         self.nn_generators = defaultdict(deque)
 
+        # Regularisation bookkeeping
+        self._lambda_reg = 0.0
+        self._smoothness = False
+        self._regularization_loss = 0.0
 
-    def forward(self, padded_raw):
+    # --------- Regularisation Helper --------- #
+    def regularization_loss(self, weighted_padded, modulated_padded, smooth=False):
+        """Compute identity and optional smoothness penalties.
+
+        Parameters
+        ----------
+        weighted_padded, modulated_padded:
+            Currently unused placeholders for future extensions.
+        smooth:
+            When ``True`` also penalise local variations using finite
+            differences.
+        """
+        identity = AbstractTensor.zeros(self.g_weight_layer.shape, dtype=self.g_weight_layer.dtype)
+        center = tuple(s // 2 for s in self.g_weight_layer.shape)
+        identity[center] = 1.0
+        diff = self.g_weight_layer - identity
+        loss = (diff * diff).sum()
+
+        if smooth:
+            g = self.g_weight_layer
+            loss = loss + ((g[1:, :, :] - g[:-1, :, :]) ** 2).sum()
+            loss = loss + ((g[:, 1:, :] - g[:, :-1, :]) ** 2).sum()
+            loss = loss + ((g[:, :, 1:] - g[:, :, :-1]) ** 2).sum()
+
+        return loss
+
+    def forward(self, padded_raw, lambda_reg: float = 0.0, smooth=False):
         """
         Forward pass to compute weighted_padded and modulated_padded.
 
         Args:
             padded_raw: Raw state tensor of shape (B, D, H, W, 3, 3)
+            lambda_reg: Coefficient for the regularisation loss.  ``0`` disables
+                the penalty.
+            smooth: When ``True`` the regulariser also enforces spatial
+                smoothness of ``g_weight_layer``.
 
         Returns:
             weighted_padded: Weighted version of padded_raw.
@@ -253,6 +297,8 @@ class LocalStateNetwork:
             padded_raw = padded_raw.unsqueeze(0)
 
         self._cached_padded_raw = padded_raw
+        self._lambda_reg = lambda_reg
+        self._smoothness = smooth
 
         B, D, H, W, _, _, _ = padded_raw.shape
 
@@ -283,20 +329,41 @@ class LocalStateNetwork:
         if self.inner_state is not None:
             _, modulated_padded = self.inner_state.forward(modulated_padded)
 
+        if lambda_reg:
+            self._regularization_loss = lambda_reg * self.regularization_loss(
+                weighted_padded, modulated_padded, smooth
+            )
+        else:
+            self._regularization_loss = 0.0
+
         return weighted_padded, modulated_padded
 
-    def backward(self, grad_weighted_padded, grad_modulated_padded):
+    def backward(
+        self,
+        grad_weighted_padded,
+        grad_modulated_padded,
+        lambda_reg: float | None = None,
+        smooth: bool | None = None,
+    ):
         """Backward pass for ``LocalStateNetwork``.
 
         Args:
             grad_weighted_padded: Gradient from the weighted branch.
             grad_modulated_padded: Gradient from the modulated branch.
+            lambda_reg: Optional override for the regularisation coefficient used
+                during ``forward``.
+            smooth: Optional override for the smoothness flag.
 
         Returns:
             Gradient with respect to the original ``padded_raw`` input.
         """
         if self._cached_padded_raw is None:
             raise RuntimeError("LocalStateNetwork.backward called before forward")
+
+        if lambda_reg is None:
+            lambda_reg = self._lambda_reg
+        if smooth is None:
+            smooth = self._smoothness
 
         padded_raw = self._cached_padded_raw
         B, D, H, W, _, _, _ = padded_raw.shape
@@ -317,6 +384,29 @@ class LocalStateNetwork:
             self.g_bias_layer._grad = grad_bias
         else:
             self.g_bias_layer._grad = self.g_bias_layer._grad + grad_bias
+
+        if lambda_reg:
+            identity = AbstractTensor.zeros(self.g_weight_layer.shape, dtype=self.g_weight_layer.dtype)
+            center = tuple(s // 2 for s in self.g_weight_layer.shape)
+            identity[center] = 1.0
+            reg_grad = 2 * (self.g_weight_layer - identity)
+            if smooth:
+                g = self.g_weight_layer
+                grad_smooth = AbstractTensor.zeros_like(g)
+                diff = g[1:, :, :] - g[:-1, :, :]
+                grad_smooth[:-1, :, :] -= 2 * diff
+                grad_smooth[1:, :, :] += 2 * diff
+                diff = g[:, 1:, :] - g[:, :-1, :]
+                grad_smooth[:, :-1, :] -= 2 * diff
+                grad_smooth[:, 1:, :] += 2 * diff
+                diff = g[:, :, 1:] - g[:, :, :-1]
+                grad_smooth[:, :, :-1] -= 2 * diff
+                grad_smooth[:, :, 1:] += 2 * diff
+                reg_grad = reg_grad + grad_smooth
+            if getattr(self.g_weight_layer, "_grad", None) is None:
+                self.g_weight_layer._grad = lambda_reg * reg_grad
+            else:
+                self.g_weight_layer._grad = self.g_weight_layer._grad + lambda_reg * reg_grad
 
         # Propagate through any inner state network
         grad_mod = grad_modulated_padded

@@ -79,3 +79,24 @@ def test_zero_grad_preserves_parameters():
     net.zero_grad()
     assert net.g_weight_layer.grad is None
     assert np.allclose(net.g_weight_layer.data, initial)
+
+
+def test_regularization_modifies_weight_gradient():
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=1,
+    )
+    padded_raw = AbstractTensor.zeros((1, 1, 1, 1, 3, 3, 3))
+    zeros = AbstractTensor.zeros_like(padded_raw)
+
+    net.forward(padded_raw, lambda_reg=0.0)
+    net.backward(zeros, zeros, lambda_reg=0.0)
+    baseline = net.g_weight_layer.grad.data.copy()
+
+    net.zero_grad()
+    net.forward(padded_raw, lambda_reg=0.5)
+    net.backward(zeros, zeros, lambda_reg=0.5)
+
+    assert not np.allclose(net.g_weight_layer.grad.data, baseline)
