@@ -88,17 +88,24 @@ DEFAULT_CONFIGURATION = {
             'modulated_padded': [{'func': lambda modulated: modulated, 'args': ['modulated_padded']}]
         }
 class LocalStateNetwork:
-    def grads(self):
-        """
-        Return a flat list of all gradients corresponding to parameters().
-        """
+    def grads(self, include_structural: bool = False):
+        """Return gradients corresponding to non-structural parameters by default."""
         grads = [self.g_weight_layer, self.g_bias_layer]
         # If spatial_layer has grads(), include them
         if hasattr(self.spatial_layer, 'grads') and callable(self.spatial_layer.grads):
-            grads.extend(self.spatial_layer.grads())
-        # Recursively include inner_state grads if present
+            try:
+                grads.extend(self.spatial_layer.grads(include_structural=include_structural))
+            except TypeError:
+                grads.extend(self.spatial_layer.grads())
         if self.inner_state is not None and hasattr(self.inner_state, 'grads'):
-            grads.extend(self.inner_state.grads())
+            try:
+                grads.extend(self.inner_state.grads(include_structural=include_structural))
+            except TypeError:
+                grads.extend(self.inner_state.grads())
+        if not include_structural:
+            tape = getattr(autograd, 'tape', None)
+            if tape is not None:
+                grads = [g for g in grads if not tape.is_structural(g)]
         return grads
 
     def zero_grad(self):
@@ -130,8 +137,9 @@ class LocalStateNetwork:
             self.spatial_layer.zero_grad()
         if self.inner_state is not None and hasattr(self.inner_state, 'zero_grad'):
             self.inner_state.zero_grad()
-    def parameters(self, include_all=False):
-        """Return learnable parameters, optionally filtering by gradient status.
+    def parameters(self, include_all: bool = False, include_structural: bool = False):
+        """Return learnable parameters, excluding structural ones by default.
+        optionally filtering by gradient status.
 
         Args:
             include_all: If ``True`` return every parameter regardless of whether it
@@ -143,12 +151,18 @@ class LocalStateNetwork:
         """
         params = [self.g_weight_layer, self.g_bias_layer]
         # If spatial_layer has parameters(), include them
+
         if hasattr(self.spatial_layer, 'parameters') and callable(self.spatial_layer.parameters):
             params.extend(self.spatial_layer.parameters())
-        # Recursively include inner_state parameters if present
         if self.inner_state is not None and hasattr(self.inner_state, 'parameters'):
-            params.extend(self.inner_state.parameters(include_all))
-
+            try:
+                params.extend(self.inner_state.parameters(include_all=include_all, include_structural=include_structural))
+            except TypeError:
+                params.extend(self.inner_state.parameters(include_all))
+        if not include_structural:
+            tape = getattr(autograd, 'tape', None)
+            if tape is not None:
+                params = [p for p in params if not tape.is_structural(p)]
         if include_all:
             return params
         return [p for p in params if getattr(p, "_grad", None) is not None]

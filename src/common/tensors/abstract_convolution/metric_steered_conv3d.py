@@ -36,7 +36,7 @@ class MetricSteeredConv3DWrapper:
         Additional keyword arguments forwarded to BuildLaplace3D.
     """
 
-    def parameters(self):
+    def parameters(self, include_structural: bool = False):
         params = []
         if hasattr(self.conv, 'parameters') and callable(self.conv.parameters):
             params.extend(self.conv.parameters())
@@ -44,9 +44,19 @@ class MetricSteeredConv3DWrapper:
         if isinstance(lp, dict):
             for v in lp.values():
                 if hasattr(v, 'parameters') and callable(v.parameters):
-                    params.extend(v.parameters())
+                    try:
+                        params.extend(v.parameters(include_structural=include_structural))
+                    except TypeError:
+                        params.extend(v.parameters())
         elif hasattr(lp, 'parameters') and callable(lp.parameters):
-            params.extend(lp.parameters())
+            try:
+                params.extend(lp.parameters(include_structural=include_structural))
+            except TypeError:
+                params.extend(lp.parameters())
+        if not include_structural:
+            tape = getattr(autograd, 'tape', None)
+            if tape is not None:
+                params = [p for p in params if not tape.is_structural(p)]
         return params
 
     def zero_grad(self):
@@ -128,12 +138,25 @@ class MetricSteeredConv3DWrapper:
         )
         lsn = package.get("local_state_network")
         if lsn is not None:
-            for p in lsn.parameters():
+            for p in lsn.parameters(include_all=True, include_structural=True):
                 if getattr(p, "grad", None) is None:
                     try:
                         p.grad = AbstractTensor.zeros_like(p)
                     except Exception:
                         pass
+            if self.deploy_mode == "raw":
+                autograd.structural(*lsn.parameters(include_all=True, include_structural=True))
+            elif self.deploy_mode == "weighted":
+                extras = []
+                if hasattr(lsn, "spatial_layer") and hasattr(lsn.spatial_layer, "parameters"):
+                    extras.extend(lsn.spatial_layer.parameters())
+                if getattr(lsn, "inner_state", None) is not None and hasattr(lsn.inner_state, "parameters"):
+                    try:
+                        extras.extend(lsn.inner_state.parameters(include_all=True, include_structural=True))
+                    except TypeError:
+                        extras.extend(lsn.inner_state.parameters(include_all=True))
+                if extras:
+                    autograd.structural(*extras)
         return package
 
     def forward(self, x):

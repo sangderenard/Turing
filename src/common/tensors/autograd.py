@@ -248,6 +248,17 @@ class GradTape:
             except Exception:
                 pass
 
+    def is_structural(self, tensor: Any) -> bool:
+        """Return ``True`` if ``tensor`` has been marked structural on this tape."""
+        try:
+            tid = id(tensor)
+            if tid in self._structural:
+                return True
+            anns = self.graph.nodes.get(tid, {}).get("annotations", {})
+            return bool(anns.get("structural"))
+        except Exception:
+            return False
+
     def parameter_tensors(self) -> List[Any]:
         items = sorted(self._parameters.items(), key=lambda x: x[1])
         result: List[Any] = []
