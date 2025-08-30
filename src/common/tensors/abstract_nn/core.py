@@ -43,7 +43,8 @@ def _ensure_batch_dim(x: AbstractTensor, target_ndim: int = 2) -> tuple[Abstract
     added = False
     try:
         if x.ndim == target_ndim - 1:
-            x = x.reshape(1, *x.shape())
+            shape = x.shape() if callable(getattr(x, "shape", None)) else x.shape
+            x = x.reshape((1, *shape))
             added = True
     except Exception:
         # If ``x`` lacks ndim/shape metadata, leave it unchanged.
@@ -107,6 +108,7 @@ class Linear:
         x, added = _ensure_batch_dim(x, target_ndim=2)
         out = x @ self.W
         self._x = x
+        self._added_input = added
         autograd.tape.annotate(out, label="Linear.forward.matmul")
         logger.debug(f"Linear matmul output shape: {getattr(out, 'shape', None)}")
         if self.b is not None:
@@ -114,9 +116,6 @@ class Linear:
             # rule will unbroadcast gradients back to the bias shape directly.
             out = out + self.b
         autograd.tape.annotate(out, label="Linear.forward.output")
-        if added:
-            shape = out.shape()
-            out = out.reshape(shape[1]) if len(shape) == 2 else out.reshape(*shape[1:])
         return out
 
     def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
@@ -133,9 +132,9 @@ class Linear:
         WT = self.W.swapaxes(0, 1)
         dx = grad_out @ WT
         self._x = None
-        if added:
-            shape = dx.shape()
-            dx = dx.reshape(shape[1]) if len(shape) == 2 else dx.reshape(*shape[1:])
+        if getattr(self, "_added_input", False) or added:
+            shape = dx.shape() if callable(getattr(dx, "shape", None)) else dx.shape
+            dx = dx.reshape((shape[1],)) if len(shape) == 2 else dx.reshape(shape[1:])
         return dx
 
 

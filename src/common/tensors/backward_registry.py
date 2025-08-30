@@ -548,14 +548,12 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             r"(Broadcasted batch dims require summing over broadcast axes.)"
         ],
         "backward": {
-            "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
-            "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
+            "A": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g2 = g.reshape((1, *s)) if getattr(g, 'ndim', len(s)) == 1 else g; gA = unbroadcast(matmul(g2, T(B)), A.shape)",
+            "B": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g2 = g.reshape((1, *s)) if getattr(g, 'ndim', len(s)) == 1 else g; gB = unbroadcast(matmul(T(A), g2), B.shape)"
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); "
-                    "gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); "
-                    "return gA, gB"
+            "body": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g=g.reshape((1, *s)) if getattr(g, 'ndim', len(s))==1 else g; gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
@@ -799,12 +797,12 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             r"(Broadcasted batch dims require summing over broadcast axes.)"
         ],
         "backward": {
-            "A": "gA = unbroadcast(matmul(g, T(B)), A.shape)",
-            "B": "gB = unbroadcast(matmul(T(A), g), B.shape)"
+            "A": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g2 = g.reshape((1, *s)) if getattr(g, 'ndim', len(s)) == 1 else g; gA = unbroadcast(matmul(g2, T(B)), A.shape)",
+            "B": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g2 = g.reshape((1, *s)) if getattr(g, 'ndim', len(s)) == 1 else g; gB = unbroadcast(matmul(T(A), g2), B.shape)"
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
+            "body": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g=g.reshape((1, *s)) if getattr(g, 'ndim', len(s))==1 else g; gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
