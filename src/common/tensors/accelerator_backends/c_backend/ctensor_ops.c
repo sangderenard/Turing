@@ -2,6 +2,7 @@
     #include <math.h>
     #include <stdlib.h>
     #include <stddef.h>
+    #include <string.h>
 
     // Forward declarations for later functions so that Zig's C compiler
     // does not fail due to implicit declarations.
@@ -410,4 +411,52 @@
             }
         }
         free(strides);
+    }
+
+    void stack_double(
+        const double** tensors,
+        int num_tensors,
+        const int* shape,
+        int ndim,
+        int dim,
+        double* out) {
+        int before = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        int after = 1;
+        for (int i = dim; i < ndim; ++i) after *= shape[i];
+        int out_stride = num_tensors * after;
+        for (int b = 0; b < before; ++b) {
+            for (int t = 0; t < num_tensors; ++t) {
+                const double* src = tensors[t] + b * after;
+                double* dst = out + b * out_stride + t * after;
+                memcpy(dst, src, after * sizeof(double));
+            }
+        }
+    }
+
+    void cat_double(
+        const double** tensors,
+        const int* dim_sizes,
+        int num_tensors,
+        const int* shape,
+        int ndim,
+        int dim,
+        double* out) {
+        int before = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        int after = 1;
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        int total_dim = 0;
+        for (int t = 0; t < num_tensors; ++t) total_dim += dim_sizes[t];
+        int out_stride = total_dim * after;
+        for (int b = 0; b < before; ++b) {
+            int dest_offset = b * out_stride;
+            for (int t = 0; t < num_tensors; ++t) {
+                int dim_size = dim_sizes[t];
+                const double* src = tensors[t] + b * dim_size * after;
+                double* dst = out + dest_offset;
+                memcpy(dst, src, dim_size * after * sizeof(double));
+                dest_offset += dim_size * after;
+            }
+        }
     }
