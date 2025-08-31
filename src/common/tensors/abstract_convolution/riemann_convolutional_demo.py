@@ -25,7 +25,7 @@ def build_config():
     AT = AbstractTensor
     Nu = Nv = Nw = 8
     n = 8
-    B = 500
+    B = 50000
     t = AT.arange(0, B, 1, requires_grad=True)
     autograd.tape.annotate(t, label="riemann_demo.t_arange")
     autograd.tape.auto_annotate_eval(t)
@@ -103,7 +103,8 @@ def main(config=None):
         k=train_cfg.get("k", 3),
         eig_from=train_cfg.get("eig_from", "g"),
         pointwise=train_cfg.get("pointwise", True),
-        deploy_mode="modulated",
+        deploy_mode="raw",
+        laplace_kwargs={"lambda_reg": 0.5},
     )
     U, V, W = grid.U, grid.V, grid.W
     autograd.tape.annotate(U, label="riemann_demo.grid_U")
@@ -153,7 +154,7 @@ def main(config=None):
         return params, grads
 
     params, _ = collect_params_and_grads()
-    optimizer = Adam(params, lr=1e-3)
+    optimizer = Adam(params, lr=1e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean()
     for epoch in range(1, 10001):
         # Zero gradients for all params
@@ -165,6 +166,8 @@ def main(config=None):
         y = layer.forward(x)
         autograd.tape.auto_annotate_eval(y)
         loss = loss_fn(y, target)
+        LSN_loss = layer.laplace_package['local_state_network']._regularization_loss
+        loss = LSN_loss + loss
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
         # layer.report_orphan_nodes()  # retired / no-op
@@ -188,8 +191,21 @@ def main(config=None):
         from ..abstraction import AbstractTensor as _AT
         for p, new_p in zip(params, new_params):
             _AT.copyto(p, new_p)
-        if epoch % 100 == 0 or loss.item() < 1e-6:
+        if epoch % 1 == 0 or loss.item() < 1e-6:
             print(f"Epoch {epoch}: loss={loss.item():.2e}")
+            # Gradient report
+            for i, (p, g) in enumerate(zip(params, grads)):
+                label = getattr(p, '_label', f'param_{i}')
+                if g is not None:
+                    try:
+                        g_np = g.data if hasattr(g, 'data') else g
+                        g_mean = g_np.mean() if hasattr(g_np, 'mean') else 'n/a'
+                        g_norm = (g_np ** 2).sum() ** 0.5 if hasattr(g_np, '__pow__') else 'n/a'
+                        print(f"  Grad {i} ({label}): mean={g_mean:.2e}, norm={g_norm:.2e}")
+                    except Exception as e:
+                        print(f"  Grad {i} ({label}): error reporting grad: {e}")
+                else:
+                    print(f"  Grad {i} ({label}): None")
         if loss.item() < 1e-6:
             print("Converged.")
             break

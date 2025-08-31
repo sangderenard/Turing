@@ -1,3 +1,4 @@
+
 """NumPy implementation of :class:`AbstractTensor`."""
 
 # TENSOR BACKEND IMPLEMENTATION GUIDELINES:
@@ -54,6 +55,44 @@ def _to_tuple2(x):
     return (x, x) if isinstance(x, (int, np.integer)) else x
 
 class NumPyTensorOperations(AbstractTensor):
+    # Division mode constant: 'normal', 'zero', 'max', 'limit'
+    DIVIDE_MODE = 'zero'  # Change as needed or make configurable
+
+    def _safe_divide(self, a, b, mode=None):
+        import numpy as np
+        if mode is None:
+            mode = self.DIVIDE_MODE
+        # Always use at least float32 for division output
+        dtype = np.result_type(a, b, np.float32)
+        a = np.asarray(a, dtype=dtype)
+        b = np.asarray(b, dtype=dtype)
+        out = np.empty(np.broadcast(a, b).shape, dtype=dtype)
+        mask = b != 0
+        mask = np.broadcast_to(mask, out.shape)
+        if mode == 'normal':
+            # Standard numpy divide (will produce inf/nan for invalid denominators)
+            np.divide(a, b, out=out, where=mask)
+            out[~mask] = np.nan if np.issubdtype(dtype, np.floating) else 0
+        elif mode == 'zero':
+            np.divide(a, b, out=out, where=mask)
+            out[~mask] = 0
+        elif mode == 'max':
+            np.divide(a, b, out=out, where=mask)
+            if np.issubdtype(dtype, np.integer):
+                maxval = np.iinfo(dtype).max
+            else:
+                maxval = np.finfo(dtype).max
+            out[~mask] = maxval
+        elif mode == 'limit':
+            # Future-proof: return a tuple (value, is_limit)
+            np.divide(a, b, out=out, where=mask)
+            import collections
+            LimitResult = collections.namedtuple('LimitResult', ['value', 'is_limit'])
+            is_limit = ~mask
+            return LimitResult(out, is_limit)
+        else:
+            raise ValueError(f"Unknown divide mode: {mode}")
+        return out
     def argwhere_(self):
         import numpy as np
         return np.argwhere(self.data)
@@ -301,9 +340,7 @@ class NumPyTensorOperations(AbstractTensor):
         if op == "rmul":
             return a * b
         if op in ("truediv", "itruediv", "rtruediv"):
-            # coersion if we want it out = np.zeros(np.broadcast(a, b).shape, dtype=np.result_type(a, b))
-            #return np.divide(a, b, out=out, where=b != 0)
-            return np.divide(a, b)
+            return self._safe_divide(a, b)
         if op in ("floordiv", "ifloordiv"):
             return np.floor_divide(a, b)
         if op == "rfloordiv":
