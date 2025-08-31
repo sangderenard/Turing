@@ -189,7 +189,7 @@ All modes must share the same primitive op definitions; only orchestration diffe
 - **src/visualizations** — reel and cassette playback demos.
 - **tests** — pytest suite covering analogue fidelity, compiler features and machine behaviour.
 
-Always run `pytest` before committing; new code must emit audible PCM and honour §§6–7.
+Run targeted `pytest` suites for the modules you touch before committing; new code must emit audible PCM and honour §§6–7.
 
 ---
 
