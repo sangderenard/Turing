@@ -57,10 +57,14 @@ def _make_frame(input_sample, pred_sample, params, grads):
     n_params = len(params)
     n_rows = 2 + 2 * n_params
     fig, axes = plt.subplots(n_rows, 1, figsize=(4, n_rows * 2))
-    axes[0].imshow(_normalize(input_sample), cmap="viridis")
+    input_img_dict = render_nd_field(input_sample)
+    input_img = input_img_dict.get("scatter3d") or input_img_dict.get("heatmap")
+    axes[0].imshow(input_img)
     axes[0].set_title("Input")
     axes[0].axis("off")
-    axes[1].imshow(_normalize(pred_sample), cmap="viridis")
+    pred_img_dict = render_nd_field(pred_sample)
+    pred_img = pred_img_dict.get("scatter3d") or pred_img_dict.get("heatmap")
+    axes[1].imshow(pred_img)
     axes[1].set_title("Prediction")
     axes[1].axis("off")
     row = 2
@@ -97,7 +101,13 @@ def _pca_reduce(coords, k=3):
     return coords @ eigvecs[:, order]
 
 
-def render_nd_field(field, return_heatmap=False, return_figures=False):
+def render_nd_field(
+    field,
+    return_heatmap: bool = False,
+    return_figures: bool = False,
+    dim_reducer=_pca_reduce,
+    overlay_hooks=None,
+):
     """Render an ``n``-D tensor as a visual representation.
 
     Parameters
@@ -112,6 +122,16 @@ def render_nd_field(field, return_heatmap=False, return_figures=False):
         When ``True`` the returned values are ``matplotlib`` figures.
         Otherwise image buffers (``numpy`` arrays) compatible with the
         existing animation pipeline are returned.
+    dim_reducer: callable or ``None``, optional
+        Function used to reduce coordinates with ``ndim > 3`` down to
+        three dimensions. If ``None`` and the field has more than three
+        dimensions, a ``ValueError`` is raised. The default uses a PCA
+        projection.
+    overlay_hooks: iterable of callables, optional
+        Each hook is invoked as ``hook(ax, coords, values, reduced)``
+        allowing future feature overlays (bounding boxes, clustering,
+        etc.). ``coords`` are the original ``n``-D coordinates; ``reduced``
+        are the 3-D coordinates used for plotting.
 
     Returns
     -------
@@ -125,24 +145,32 @@ def render_nd_field(field, return_heatmap=False, return_figures=False):
     if arr.ndim < 2:
         raise ValueError("Field must be at least 2-D")
 
+    overlay_hooks = overlay_hooks or []
     figures = {}
+    coords = np.indices(arr.shape).reshape(arr.ndim, -1).T
+    values = arr.reshape(-1)
     if arr.ndim == 2:
         fig, ax = plt.subplots()
         hm = ax.imshow(arr, cmap="viridis")
         ax.axis("off")
         fig.colorbar(hm, ax=ax)
+        for hook in overlay_hooks:
+            hook(ax, coords, values, coords)
         figures["heatmap"] = fig
     else:
-        coords = np.indices(arr.shape).reshape(arr.ndim, -1).T
-        values = arr.reshape(-1)
+        reduced = coords
         if arr.ndim > 3:
-            coords = _pca_reduce(coords, 3)
-        x, y, z = coords.T[:3]
+            if dim_reducer is None:
+                raise ValueError("dim_reducer must be provided for ndim>3")
+            reduced = dim_reducer(coords, 3)
+        x, y, z = reduced.T[:3]
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
         sc = ax.scatter(x, y, z, c=values, cmap="viridis")
         fig.colorbar(sc, ax=ax)
         ax.set_title(f"{arr.ndim}D Field")
+        for hook in overlay_hooks:
+            hook(ax, coords, values, reduced)
         figures["scatter3d"] = fig
         if return_heatmap:
             heatmap = arr.mean(axis=0)
@@ -150,6 +178,8 @@ def render_nd_field(field, return_heatmap=False, return_figures=False):
             hm = hax.imshow(heatmap, cmap="viridis")
             hax.axis("off")
             hfig.colorbar(hm, ax=hax)
+            for hook in overlay_hooks:
+                hook(hax, coords, values, reduced)
             figures["heatmap"] = hfig
 
     if return_figures:
