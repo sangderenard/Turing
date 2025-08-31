@@ -123,3 +123,21 @@ def test_regularization_loss_backward_sets_grad():
     reg = net.regularization_loss(weighted, modulated)
     reg.backward()
     assert net.g_weight_layer._grad is not None
+
+
+def test_wrapper_coordinates_gradients_with_regularization():
+    """All parameters should receive gradients when lambda_reg is active."""
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=2,
+    )
+    padded_raw = AbstractTensor.ones((1, 1, 1, 1, 3, 3, 3))
+    net.zero_grad()
+    weighted, modulated, _ = net.forward(padded_raw, lambda_reg=0.5)
+    grad_w = AbstractTensor.ones_like(weighted)
+    grad_m = AbstractTensor.ones_like(modulated)
+    net.backward(grad_w, grad_m, lambda_reg=0.5)
+    for param in net.parameters(include_all=True, include_structural=True):
+        assert getattr(param, "_grad", None) is not None
