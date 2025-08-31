@@ -522,8 +522,37 @@ class LocalStateNetwork:
             else:
                 self.g_weight_layer._grad = self.g_weight_layer._grad + lambda_reg * reg_grad
 
-        # Gradient with respect to the original padded_raw
-        grad_input = total_grad * g_weight_layer
+
+        # Propagate through any inner state network
+        grad_mod = grad_modulated_padded
+        if self.inner_state is not None:
+            zero_grad = AbstractTensor.zeros_like(grad_mod)
+            grad_mod = self.inner_state.backward(
+                zero_grad,
+                grad_mod,
+                lambda_reg=lambda_reg,
+                smooth=smooth,
+            )
+
+        grad_mod = grad_mod.reshape((B, D, H, W, -1))
+
+        # Backward through spatial layer
+        if isinstance(self.spatial_layer, RectConv3d):
+            grad_mod = grad_mod.transpose(1, 4)
+            grad_mod = grad_mod.transpose(2, 4)
+            grad_mod = grad_mod.transpose(3, 4)
+            grad_padded_view = self.spatial_layer.backward(grad_mod)
+            grad_padded_view = grad_padded_view.transpose(3, 4)
+            grad_padded_view = grad_padded_view.transpose(2, 4)
+            grad_padded_view = grad_padded_view.transpose(1, 4)
+            grad_from_mod = grad_padded_view.reshape((B, D, H, W, 3, 3, 3))
+        else:
+            flat_grad = grad_mod.reshape((-1, grad_mod.shape[-1]))
+            grad_flat_in = self.spatial_layer.backward(flat_grad)
+            grad_from_mod = grad_flat_in.reshape((B, D, H, W, 3, 3, 3))
+
+        grad_input = grad_from_weight + grad_from_mod
+
 
         # Clear cached tensors
         self._cached_padded_raw = None
