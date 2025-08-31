@@ -653,7 +653,12 @@ def main(
                 pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
             if pairs:
-                params_grads_frame = np.concatenate(pairs, axis=0)
+                max_w = max(pair.shape[1] for pair in pairs)
+                padded_pairs = [
+                    np.pad(pair, ((0, 0), (0, max_w - pair.shape[1])), mode="constant")
+                    for pair in pairs
+                ]
+                params_grads_frame = np.concatenate(padded_pairs, axis=0)
             else:
                 params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
