@@ -21,3 +21,25 @@ def test_nn_graph_complete_and_cffi_forward_pass():
     B_tensor = ops.tensor_from_list_(B.tolist(), ops.float_dtype_, None)
     result = ops.matmul_(A_tensor, B_tensor)
     assert np.allclose(result.tolist(), expected.tolist())
+
+
+def test_c_backend_stack_and_cat():
+    ops = CTensorOperations()
+    t1 = ops.tensor_from_list_([[1.0, 2.0], [3.0, 4.0]], ops.float_dtype_, None)
+    t2 = ops.tensor_from_list_([[5.0, 6.0], [7.0, 8.0]], ops.float_dtype_, None)
+
+    stacked = ops.stack_([t1, t2], dim=0)
+    assert stacked.shape == (2, 2, 2)
+    assert stacked.tolist() == [
+        [[1.0, 2.0], [3.0, 4.0]],
+        [[5.0, 6.0], [7.0, 8.0]],
+    ]
+
+    cat = ops.cat_([t1, t2], dim=0)
+    assert cat.shape == (4, 2)
+    assert cat.tolist() == [
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+        [7.0, 8.0],
+    ]
