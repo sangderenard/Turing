@@ -4,15 +4,15 @@ from src.common.tensors.abstract_convolution.laplace_nd import RectangularTransf
 from src.common.tensors.autograd import autograd
 
 
-def test_raw_mode_excludes_local_state_network_params():
+def test_raw_mode_includes_local_state_network_params():
     N = 2
     transform = RectangularTransform(Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
     layer = MetricSteeredConv3DWrapper(1, 1, (N, N, N), transform, deploy_mode="raw")
     x = AbstractTensor.randn((1, 1, N, N, N))
-    out = layer.forward(x)
+    layer.forward(x)
     lsn = layer.laplace_package["local_state_network"]
     lsn_ids = {id(p) for p in lsn.parameters(include_all=True, include_structural=True)}
     layer_ids = {id(p) for p in layer.parameters()}
-    assert lsn_ids.isdisjoint(layer_ids)
+    assert lsn_ids <= layer_ids
     tape_ids = {id(p) for p in autograd.tape.parameter_tensors()}
-    assert lsn_ids.isdisjoint(tape_ids)
+    assert lsn_ids <= tape_ids
