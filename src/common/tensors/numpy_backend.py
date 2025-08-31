@@ -551,6 +551,38 @@ class NumPyTensorOperations(AbstractTensor):
         tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
         return np.concatenate(tensors, axis=dim)
 
+    def pad_cat_(self, tensors, dim=0, pad_value=0):
+        import numpy as np
+
+        arrays = [self._AbstractTensor__unwrap(t) for t in tensors]
+        if not arrays:
+            return np.array([])
+
+        ndim = arrays[0].ndim
+        for arr in arrays:
+            if arr.ndim != ndim:
+                raise ValueError("all tensors must have the same number of dimensions")
+
+        max_shape = list(arrays[0].shape)
+        for arr in arrays[1:]:
+            for i, size in enumerate(arr.shape):
+                if i == dim:
+                    continue
+                if size > max_shape[i]:
+                    max_shape[i] = size
+
+        padded = []
+        for arr in arrays:
+            pad_width = []
+            for i, size in enumerate(arr.shape):
+                if i == dim:
+                    pad_width.append((0, 0))
+                else:
+                    pad_width.append((0, max_shape[i] - size))
+            padded.append(np.pad(arr, pad_width, mode="constant", constant_values=pad_value))
+
+        return np.concatenate(padded, axis=dim)
+
     def expand_(self, shape):
         import numpy as np
 

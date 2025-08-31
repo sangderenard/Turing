@@ -852,6 +852,20 @@ class AbstractTensor:
         result.data = first.cat_(tensors, dim)
         return result
 
+    @staticmethod
+    def pad_cat(
+        tensors: List[Any], dim: int = 0, pad_value: float = 0
+    ) -> "AbstractTensor":
+        """Concatenate tensors, padding mismatched dimensions with ``pad_value``."""
+
+        if not tensors:
+            raise ValueError("pad_cat requires at least one tensor")
+        first = AbstractTensor.get_tensor(tensors[0])
+        tensors = [first.ensure_tensor(t) for t in tensors]
+        result = first.__class__(track_time=first.track_time)
+        result.data = first.pad_cat_(tensors, dim, pad_value)
+        return result
+
     class _TopKResult(NamedTuple):
         values: "AbstractTensor"
         indices: Any

@@ -832,6 +832,38 @@ class PurePythonTensorOperations(AbstractTensor):
             return result
         raise NotImplementedError("cat only implemented for dim 0 and 1")
 
+    def pad_cat_(self, tensors: List[Any], dim: int = 0, pad_value: float = 0) -> Any:
+        if not tensors:
+            return []
+        tensors = [self._AbstractTensor__unwrap(t) for t in tensors]
+        import numpy as np  # type: ignore
+
+        arrays = [np.array(t) for t in tensors]
+        ndim = arrays[0].ndim
+        for arr in arrays:
+            if arr.ndim != ndim:
+                raise ValueError("all tensors must have the same number of dimensions")
+
+        max_shape = list(arrays[0].shape)
+        for arr in arrays[1:]:
+            for i, size in enumerate(arr.shape):
+                if i == dim:
+                    continue
+                if size > max_shape[i]:
+                    max_shape[i] = size
+
+        padded = []
+        for arr in arrays:
+            pad_width = []
+            for i, size in enumerate(arr.shape):
+                if i == dim:
+                    pad_width.append((0, 0))
+                else:
+                    pad_width.append((0, max_shape[i] - size))
+            padded.append(np.pad(arr, pad_width, mode="constant", constant_values=pad_value))
+
+        return np.concatenate(padded, axis=dim).tolist()
+
     def expand_(self, shape):
         """Broadcast ``self.data`` to ``shape`` using pure Python lists."""
         data = self.data

@@ -57,6 +57,7 @@ This document groups available methods by theme for quick reference.
 - AbstractTensor.repeat_interleave()
 - AbstractTensor.stack()
 - AbstractTensor.cat()
+- AbstractTensor.pad_cat()
 - AbstractTensor.pad()
 - AbstractTensor.clamp()
 - AbstractTensor.topk()
@@ -156,12 +157,15 @@ This document groups available methods by theme for quick reference.
 - c_backend.interpolate_
 - c_backend.stack_
 - c_backend.cat_
+- c_backend.pad_cat_
 - jax_backend._apply_operator__
+- jax_backend.pad_cat_
 - torch_backend._apply_operator__
+- torch_backend.pad_cat_
 - numpy_backend._apply_operator__
 - pure_backend._apply_scalar_op
 - pure_backend._matmul
-- pure_backend.cat_
 - pure_backend.repeat_interleave_
 - pure_backend.mean_
+- pure_backend.index_select_
 - pure_backend.index_select_
