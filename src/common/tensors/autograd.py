@@ -7,7 +7,11 @@ def requires_grad_(self, requires_grad: bool = True):
     """Enable or disable gradient tracking on this tensor."""
     self._requires_grad = requires_grad
     tape = getattr(self, "_tape", None)
-    if tape is not None:
+    if requires_grad:
+        if tape is None:
+            from .autograd import autograd as _autograd  # lazy to avoid cycles
+            tape = _autograd.tape
+            self._tape = tape
         tape.create_tensor_node(self)
     return self
 
