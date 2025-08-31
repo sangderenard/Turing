@@ -387,19 +387,19 @@ class LocalStateNetwork:
 
         weighted_padded = padded_raw * g_weight_layer + g_bias_layer
 
-        padded_view = padded_raw.reshape((B, D, H, W, -1))
+        weighted_view = weighted_padded.reshape((B, D, H, W, -1))
 
         if isinstance(self.spatial_layer, RectConv3d):
-            padded_view = padded_view.transpose(1, 4)
-            padded_view = padded_view.transpose(2, 4)
-            padded_view = padded_view.transpose(3, 4)
-            modulated = self.spatial_layer.forward(padded_view)
+            weighted_view = weighted_view.transpose(1, 4)
+            weighted_view = weighted_view.transpose(2, 4)
+            weighted_view = weighted_view.transpose(3, 4)
+            modulated = self.spatial_layer.forward(weighted_view)
             modulated = modulated.transpose(3, 4)
             modulated = modulated.transpose(2, 4)
             modulated = modulated.transpose(1, 4)
             modulated = modulated.reshape((B, D, H, W, -1))
         else:
-            flat_view = padded_view.reshape((-1, padded_view.shape[-1]))
+            flat_view = weighted_view.reshape((-1, weighted_view.shape[-1]))
             modulated = self.spatial_layer.forward(flat_view)
             modulated = modulated.reshape((B, D, H, W, -1))
 
@@ -452,18 +452,48 @@ class LocalStateNetwork:
         padded_raw = self._cached_padded_raw
         B, D, H, W, _, _, _ = padded_raw.shape
 
-        # Gradient through weight layer
+        # Gradient from the weighted branch (pre-activation)
         g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
-        grad_from_weight = grad_weighted_padded * g_weight_layer
+        grad_weighted_branch = grad_weighted_padded
+
+        # Propagate through any inner state network
+        grad_mod = grad_modulated_padded
+        if self.inner_state is not None:
+            grad_mod = self.inner_state.backward(
+                grad_weighted_branch,
+                grad_mod,
+                lambda_reg=lambda_reg,
+                smooth=smooth,
+            )
+
+        grad_mod = grad_mod.reshape((B, D, H, W, -1))
+
+        # Backward through spatial layer (modulated branch)
+        if isinstance(self.spatial_layer, RectConv3d):
+            grad_mod = grad_mod.transpose(1, 4)
+            grad_mod = grad_mod.transpose(2, 4)
+            grad_mod = grad_mod.transpose(3, 4)
+            grad_padded_view = self.spatial_layer.backward(grad_mod)
+            grad_padded_view = grad_padded_view.transpose(3, 4)
+            grad_padded_view = grad_padded_view.transpose(2, 4)
+            grad_padded_view = grad_padded_view.transpose(1, 4)
+            grad_from_mod = grad_padded_view.reshape((B, D, H, W, 3, 3, 3))
+        else:
+            flat_grad = grad_mod.reshape((-1, grad_mod.shape[-1]))
+            grad_flat_in = self.spatial_layer.backward(flat_grad)
+            grad_from_mod = grad_flat_in.reshape((B, D, H, W, 3, 3, 3))
+
+        # Combine gradients from weighted and modulated branches
+        total_grad = grad_weighted_branch + grad_from_mod
 
         # Accumulate gradients for g_weight_layer and g_bias_layer
-        grad_weight = (grad_weighted_padded * padded_raw).sum(dim=(0, 1, 2, 3))
+        grad_weight = (total_grad * padded_raw).sum(dim=(0, 1, 2, 3))
         if getattr(self.g_weight_layer, "_grad", None) is None:
             self.g_weight_layer._grad = grad_weight
         else:
             self.g_weight_layer._grad = self.g_weight_layer._grad + grad_weight
 
-        grad_bias = grad_weighted_padded.sum(dim=(0, 1, 2, 3))
+        grad_bias = total_grad.sum(dim=(0, 1, 2, 3))
         if getattr(self.g_bias_layer, "_grad", None) is None:
             self.g_bias_layer._grad = grad_bias
         else:
@@ -491,6 +521,7 @@ class LocalStateNetwork:
                 self.g_weight_layer._grad = lambda_reg * reg_grad
             else:
                 self.g_weight_layer._grad = self.g_weight_layer._grad + lambda_reg * reg_grad
+
 
         # Propagate through any inner state network
         grad_mod = grad_modulated_padded
@@ -521,6 +552,7 @@ class LocalStateNetwork:
             grad_from_mod = grad_flat_in.reshape((B, D, H, W, 3, 3, 3))
 
         grad_input = grad_from_weight + grad_from_mod
+
 
         # Clear cached tensors
         self._cached_padded_raw = None
