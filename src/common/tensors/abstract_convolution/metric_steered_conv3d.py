@@ -107,6 +107,12 @@ class MetricSteeredConv3DWrapper:
         self.laplace_kwargs = laplace_kwargs or {}
         self.boundary_conditions = boundary_conditions
         self.laplace_package = None
+        # Cache builder and LocalStateNetwork so that their parameters are
+        # preserved across multiple forward calls.  This ensures gradients from
+        # the LocalStateNetwork accumulate instead of being re‑initialized with
+        # each package build.
+        self.laplace_builder = None
+        self.local_state_network = None
         self.conv = NDPCA3Conv3d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -120,36 +126,36 @@ class MetricSteeredConv3DWrapper:
         wrap_module(self)
 
     def _build_laplace_package(self, boundary_conditions):
-        builder = BuildLaplace3D(
-            grid_domain=self.grid_domain,
-            wave_speed=343,
-            precision=getattr(AbstractTensor, "float_dtype_", None) or self.grid_domain.U.dtype,
-            resolution=self.grid_domain.U.shape[0],
-            metric_tensor_func=self.transform.metric_tensor_func,
-            boundary_conditions=boundary_conditions,
-            artificial_stability=1e-10,
-            device=getattr(self.grid_domain.U, "device", None),
-        )
+        if self.laplace_builder is None:
+            self.laplace_builder = BuildLaplace3D(
+                grid_domain=self.grid_domain,
+                wave_speed=343,
+                precision=getattr(AbstractTensor, "float_dtype_", None) or self.grid_domain.U.dtype,
+                resolution=self.grid_domain.U.shape[0],
+                metric_tensor_func=self.transform.metric_tensor_func,
+                boundary_conditions=boundary_conditions,
+                artificial_stability=1e-10,
+                device=getattr(self.grid_domain.U, "device", None),
+            )
+        builder = self.laplace_builder
         _, _, package = builder.build_general_laplace(
             self.grid_domain.U,
             self.grid_domain.V,
             self.grid_domain.W,
             return_package=True,
             deploy_mode=self.deploy_mode,
+            local_state_network=self.local_state_network,
             **self.laplace_kwargs,
         )
         lsn = package.get("local_state_network")
+        # Preserve the LocalStateNetwork instance so its parameters persist
+        # across builds and accumulate gradients between forward passes.
         if lsn is not None:
-            for p in lsn.parameters(include_all=True, include_structural=True):
-                if getattr(p, "grad", None) is None:
-                    try:
-                        p._grad = AbstractTensor.zeros_like(p)
-                    except Exception:
-                        pass
-
+            self.local_state_network = lsn
+        if lsn is not None:
             unused = []
             if self.deploy_mode == "raw":
-                unused = lsn.parameters(include_all=True, include_structural=True)
+                unused = list(lsn.parameters(include_all=True, include_structural=True))
             elif self.deploy_mode == "weighted":
                 if hasattr(lsn, "spatial_layer") and hasattr(lsn.spatial_layer, "parameters"):
                     unused.extend(lsn.spatial_layer.parameters())
@@ -170,6 +176,16 @@ class MetricSteeredConv3DWrapper:
                 unused = gather_weight_branch(lsn)
             else:
                 raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
+
+            # Ensure all non-structural parameters have gradient placeholders
+            for p in lsn.parameters(include_all=True, include_structural=True):
+                if any(p is u for u in unused):
+                    continue
+                if getattr(p, "grad", None) is None:
+                    try:
+                        p._grad = AbstractTensor.zeros_like(p)
+                    except Exception:
+                        pass
 
             if unused:
                 autograd.structural(*unused)
