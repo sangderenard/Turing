@@ -21,10 +21,10 @@ from src.common.tensors.abstract_nn.optimizer import Adam
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-import matplotlib.animation as animation
 from pathlib import Path
 from skimage import measure
 from .laplace_nd import BuildLaplace3D
+import os
 
 
 def _normalize(arr):
@@ -55,43 +55,6 @@ def _low_entropy_variant(target_np, epoch):
     return x
 
 
-def _make_frame(input_sample, pred_sample, params, grads):
-    n_params = len(params)
-    n_rows = 2 + 2 * n_params
-    fig, axes = plt.subplots(n_rows, 1, figsize=(4, n_rows * 2))
-    input_img_dict = render_nd_field(input_sample)
-    input_img = input_img_dict.get("scatter3d") or input_img_dict.get("heatmap")
-    axes[0].imshow(input_img)
-    axes[0].set_title("Input")
-    axes[0].axis("off")
-    pred_img_dict = render_nd_field(pred_sample)
-    pred_img = pred_img_dict.get("scatter3d") or pred_img_dict.get("heatmap")
-    axes[1].imshow(pred_img)
-    axes[1].set_title("Prediction")
-    axes[1].axis("off")
-    row = 2
-    for p, g in zip(params, grads):
-        p_data = np.array(p.data if hasattr(p, "data") else p)
-        p_img = _normalize(p_data.reshape(p_data.shape[0], -1))
-        axes[row].imshow(p_img, cmap="magma")
-        axes[row].set_title(f"Param {getattr(p, '_label', '')}")
-        axes[row].axis("off")
-        row += 1
-        if g is not None:
-            g_data = np.array(g.data if hasattr(g, "data") else g)
-            g_img = _normalize(g_data.reshape(g_data.shape[0], -1))
-        else:
-            g_img = np.zeros_like(p_img)
-        axes[row].imshow(g_img, cmap="coolwarm")
-        axes[row].set_title(f"Grad {getattr(p, '_label', '')}")
-        axes[row].axis("off")
-        row += 1
-    fig.tight_layout()
-    fig.canvas.draw()
-    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close(fig)
-    return image
 
 
 def _pca_reduce(coords, k=3):
@@ -309,11 +272,13 @@ def main(
     config=None,
     viz_every=10,
     low_entropy_every=25,
-    anim_path="riemann_demo_training.gif",
+    max_epochs=10000,
+    output_dir="riemann_modular_renders",
     visualize_laplace=None,
     laplace_threshold=None,
     laplace_path=None,
     show_laplace=False,
+    dpi=200,
 ):
     AT = AbstractTensor
     if config is None:
@@ -378,7 +343,10 @@ def main(
     x = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)), requires_grad=True)
     autograd.tape.annotate(x, label="riemann_demo.input_init")
     autograd.tape.auto_annotate_eval(x)
-    frames = []
+    print(f"Preparing output directory structure at: '{output_dir}/'")
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(os.path.join(output_dir, "input")).mkdir(exist_ok=True)
+    Path(os.path.join(output_dir, "prediction")).mkdir(exist_ok=True)
     # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
     # Uncomment one of the lines below to relax those checks:
     # autograd.strict = False                   # disable strict mode globally
@@ -455,9 +423,15 @@ def main(
         )
 
     params, _ = collect_params_and_grads()
+    # Create subdirectories for each parameter and gradient
+    for i, p in enumerate(params):
+        param_label = getattr(p, '_label', f'param_{i}').replace('.', '_')
+        Path(os.path.join(output_dir, f"param_{i}_{param_label}")).mkdir(exist_ok=True)
+        Path(os.path.join(output_dir, f"grad_{i}_{param_label}")).mkdir(exist_ok=True)
+
     optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
-    for epoch in range(1, 10001):
+    for epoch in range(1, max_epochs + 1):
         # Zero gradients for all params
         for p in params:
             if hasattr(p, 'zero_grad'):
@@ -526,10 +500,38 @@ def main(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
-            input_sample = np.array(x[0, 0].data)
-            pred_sample = np.array(y[0, 0].data)
-            frame = _make_frame(input_sample, pred_sample, params, grads)
-            frames.append(frame)
+            print(f"  -> Exporting modular frames for epoch {epoch}...")
+            for name, sample in [("input", x), ("prediction", y)]:
+                img_dict = render_nd_field(np.array(sample[0, 0].data))
+                img_data = img_dict.get("scatter3d") or img_dict.get("heatmap")
+                fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
+                ax.imshow(img_data)
+                ax.set_title(f"{name.capitalize()} @ Epoch {epoch}")
+                ax.axis("off")
+                fig.savefig(os.path.join(output_dir, name, f"frame_{epoch:04d}.png"))
+                plt.close(fig)
+
+            for i, (p, g) in enumerate(zip(params, grads)):
+                param_label = getattr(p, '_label', f'param_{i}').replace('.', '_')
+                p_data = np.array(p.data if hasattr(p, "data") else p)
+                fig_p, ax_p = plt.subplots(figsize=(4, 4), dpi=dpi)
+                ax_p.imshow(_normalize(p_data.reshape(p_data.shape[0], -1)), cmap="magma", aspect='auto')
+                ax_p.set_title(f"Param: {param_label}\nEpoch {epoch}", fontsize=10)
+                ax_p.axis("off")
+                fig_p.savefig(os.path.join(output_dir, f"param_{i}_{param_label}", f"frame_{epoch:04d}.png"))
+                plt.close(fig_p)
+
+                fig_g, ax_g = plt.subplots(figsize=(4, 4), dpi=dpi)
+                if g is not None:
+                    g_data = np.array(g.data if hasattr(g, "data") else g)
+                    g_img = _normalize(g_data.reshape(g_data.shape[0], -1))
+                else:
+                    g_img = np.zeros_like(p_data.reshape(p_data.shape[0], -1))
+                ax_g.imshow(g_img, cmap="coolwarm", aspect='auto')
+                ax_g.set_title(f"Grad: {param_label}\nEpoch {epoch}", fontsize=10)
+                ax_g.axis("off")
+                fig_g.savefig(os.path.join(output_dir, f"grad_{i}_{param_label}", f"frame_{epoch:04d}.png"))
+                plt.close(fig_g)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -537,17 +539,7 @@ def main(
     print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
-    if frames:
-        fig = plt.figure()
-        plt.axis("off")
-        im = plt.imshow(frames[0])
-        def _update(i):
-            im.set_array(frames[i])
-            return [im]
-        ani = animation.FuncAnimation(fig, _update, frames=len(frames), interval=200, blit=True)
-        out_path = Path(anim_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        ani.save(out_path, writer="pillow")
+    print(f"Exported all modular frames to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
     import argparse
@@ -557,10 +549,20 @@ if __name__ == "__main__":
     parser.add_argument("--laplace-threshold", type=float, help="Isosurface threshold")
     parser.add_argument("--laplace-path", type=str, help="Path to save Laplace surface image")
     parser.add_argument("--show-laplace", action="store_true", help="Display Laplace surface instead of closing")
+    parser.add_argument("--viz-every", type=int, default=10, help="Visualization frequency")
+    parser.add_argument("--low-entropy-every", type=int, default=25, help="Low-entropy sample frequency")
+    parser.add_argument("--max-epochs", type=int, default=10000, help="Maximum training epochs")
+    parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
+    parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
     args = parser.parse_args()
 
     main(
         config=build_config(),
+        viz_every=args.viz_every,
+        low_entropy_every=args.low_entropy_every,
+        max_epochs=args.max_epochs,
+        output_dir=args.output_dir,
+        dpi=args.dpi,
         visualize_laplace=args.viz_laplace if args.viz_laplace else None,
         laplace_threshold=args.laplace_threshold,
         laplace_path=args.laplace_path,
