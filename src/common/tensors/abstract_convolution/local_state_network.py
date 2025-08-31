@@ -355,8 +355,11 @@ class LocalStateNetwork:
                 smoothness of ``g_weight_layer``.
 
         Returns:
-            weighted_padded: Weighted version of padded_raw.
+            weighted_padded: Weighted version of ``padded_raw``.
             modulated_padded: Modulated version with convolutional adjustment.
+            regularization_loss: The weighted regularisation penalty.  This is
+                returned so callers can add it directly to their overall loss,
+                preserving the autograd graph.
         """
         if len(padded_raw.shape) == 6:
             padded_raw = padded_raw.unsqueeze(0)
@@ -405,18 +408,14 @@ class LocalStateNetwork:
         if lambda_reg:
             self._reg_loss = self.regularization_loss(weighted_padded, modulated_padded)
             self._regularization_loss = lambda_reg * self._reg_loss
-            print(f"[DEBUG] LSN.forward: lambda_reg={lambda_reg} _reg_loss={self._reg_loss} _regularization_loss={self._regularization_loss}")
-            print(f"[DEBUG] LSN.forward: g_weight_layer id={id(self.g_weight_layer)} requires_grad={getattr(self.g_weight_layer, 'requires_grad', None)}")
-            print(f"[DEBUG] LSN.forward: g_bias_layer id={id(self.g_bias_layer)} requires_grad={getattr(self.g_bias_layer, 'requires_grad', None)}")
         else:
             self._regularization_loss = AbstractTensor.zeros(
                 (),
                 dtype=self.g_weight_layer.dtype,
                 device=getattr(self.g_weight_layer, 'device', None),
             )
-            print(f"[DEBUG] LSN.forward: lambda_reg is zero, _regularization_loss set to zero tensor")
 
-        return weighted_padded, modulated_padded
+        return weighted_padded, modulated_padded, self._regularization_loss
 
     def backward(
         self,
@@ -427,23 +426,19 @@ class LocalStateNetwork:
     ):
         """Backward pass for ``LocalStateNetwork``.
 
+        The ``lambda_reg`` and ``smooth`` parameters are kept for API
+        compatibility but no longer influence gradient computation; the
+        regularisation term is part of the forward graph.
+
         Args:
             grad_weighted_padded: Gradient from the weighted branch.
             grad_modulated_padded: Gradient from the modulated branch.
-            lambda_reg: Optional override for the regularisation coefficient used
-                during ``forward``.
-            smooth: Optional override for the smoothness flag.
 
         Returns:
             Gradient with respect to the original ``padded_raw`` input.
         """
         if self._cached_padded_raw is None:
             raise RuntimeError("LocalStateNetwork.backward called before forward")
-
-        if lambda_reg is None:
-            lambda_reg = self._lambda_reg
-        if smooth is None:
-            smooth = self._smoothness
 
         padded_raw = self._cached_padded_raw
         B, D, H, W, _, _, _ = padded_raw.shape
@@ -640,13 +635,17 @@ class LocalStateNetwork:
             padded_raw[..., i, j] = hook_fn(grid_u, grid_v, grid_w, partials, additional_params)
 
         # Step 3: Forward pass through the network
-        weighted_padded, modulated_padded = self.forward(padded_raw, lambda_reg=additional_params.get("lambda_reg", 0.0))
+        weighted_padded, modulated_padded, regularization_loss = self.forward(
+            padded_raw,
+            lambda_reg=additional_params.get("lambda_reg", 0.0),
+        )
 
         # Step 4: Return outputs
         return {
             'padded_raw': padded_raw,
             'weighted_padded': weighted_padded,
-            'modulated_padded': modulated_padded
+            'modulated_padded': modulated_padded,
+            'regularization_loss': regularization_loss,
         }
 
 

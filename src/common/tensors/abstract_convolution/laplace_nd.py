@@ -451,6 +451,7 @@ class BuildLaplace3D:
         raw_tensor = state_outputs['padded_raw']
         weighted_tensor = state_outputs['weighted_padded']
         modulated_tensor = state_outputs['modulated_padded']
+        regularization_loss = state_outputs.get('regularization_loss')
 
         # 3. Select Appropriate Tensor Based on deploy_mode
         if deploy_mode == 'raw':
@@ -688,6 +689,7 @@ class BuildLaplace3D:
                 "vals": coo_vals,
             },
             "local_state_network": local_state_network,
+            "regularization_loss": regularization_loss,
             "config": {
                 "stencil": INT_LAPLACEBELTRAMI_STENCIL if 'INT_LAPLACEBELTRAMI_STENCIL' in globals() else None,
                 "dtype": str(self.precision) if hasattr(self, 'precision') else None,
