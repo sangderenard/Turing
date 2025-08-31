@@ -132,32 +132,50 @@ def main(config=None):
     logger = get_tensors_logger()
     def collect_params_and_grads():
         params, grads = [], []
+        seen_params = set()
+        seen_objs = set()
+
+        def add_param(p):
+            pid = id(p)
+            if pid in seen_params:
+                return
+            seen_params.add(pid)
+            params.append(p)
+            grads.append(getattr(p, '_grad', None))
+
         # Convolutional weights
         if hasattr(layer.conv, 'parameters'):
+            seen_objs.add(id(layer.conv))
             for p in layer.conv.parameters():
-                params.append(p)
-                grads.append(getattr(p, '_grad', None))
+                add_param(p)
+
         # LocalStateNetwork (if present)
         lsn = layer.local_state_network if hasattr(layer, 'local_state_network') else None
         if lsn is None:
             raise ValueError("LocalStateNetwork not found")
         if lsn and hasattr(lsn, 'parameters'):
+            seen_objs.add(id(lsn))
             for p in lsn.parameters(include_all=True):
-                params.append(p)
-                grads.append(getattr(p, '_grad', None))
+                add_param(p)
         else:
             raise ValueError("LocalStateNetwork not found")
+
         # Fallback: any other objects with .parameters
         if isinstance(layer.laplace_package, dict):
             for v in layer.laplace_package.values():
+                vid = id(v)
+                if vid in seen_objs or vid in seen_params:
+                    continue
                 if hasattr(v, 'parameters'):
+                    seen_objs.add(vid)
                     for p in v.parameters():
-                        params.append(p)
-                        grads.append(getattr(p, '_grad', None))
+                        add_param(p)
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
             label = getattr(p, '_label', None)
-            logger.info(f"Param {i}: label={label}, shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
+            logger.info(
+                f"Param {i}: label={label}, shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}"
+            )
         return params, grads
     y = layer.forward(x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
