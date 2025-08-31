@@ -398,16 +398,19 @@ class LocalStateNetwork:
             modulated = modulated.reshape((B, D, H, W, -1))
 
         modulated_padded = modulated.reshape((B, D, H, W, 3, 3, 3))
-
+        inner_reg_loss = None
         if self.inner_state is not None:
-            _, modulated_padded = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
+            _, modulated_padded, inner_reg_loss = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
 
         self._weighted_padded = weighted_padded
         self._modulated_padded = modulated_padded
 
         if lambda_reg:
             self._reg_loss = self.regularization_loss(weighted_padded, modulated_padded)
-            self._regularization_loss = lambda_reg * self._reg_loss
+            if inner_reg_loss is not None:
+                self._regularization_loss = lambda_reg * self._reg_loss + inner_reg_loss
+            else:
+                self._regularization_loss = lambda_reg * self._reg_loss
         else:
             self._regularization_loss = AbstractTensor.zeros(
                 (),
