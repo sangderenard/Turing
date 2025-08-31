@@ -495,8 +495,7 @@ class LocalStateNetwork:
         # Propagate through any inner state network
         grad_mod = grad_modulated_padded
         if self.inner_state is not None:
-            zero = grad_mod * 0
-            grad_mod = self.inner_state.backward(zero, grad_mod)
+            grad_mod = self.inner_state.backward(grad_weighted_padded, grad_mod)
 
         grad_mod = grad_mod.reshape((B, D, H, W, -1))
 
