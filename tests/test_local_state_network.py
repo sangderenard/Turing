@@ -141,3 +141,24 @@ def test_wrapper_coordinates_gradients_with_regularization():
     net.backward(grad_w, grad_m, lambda_reg=0.5)
     for param in net.parameters(include_all=True, include_structural=True):
         assert getattr(param, "_grad", None) is not None
+
+
+def test_recursive_backward_propagates_regularization():
+    """Inner LocalStateNetwork layers receive regularisation gradients."""
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=2,
+    )
+    padded_raw = AbstractTensor.zeros((1, 1, 1, 1, 3, 3, 3))
+    net.zero_grad()
+    weighted, modulated, _ = net.forward(padded_raw, lambda_reg=0.5)
+    grad_w = AbstractTensor.ones_like(weighted)
+    grad_m = AbstractTensor.zeros_like(modulated)
+    net.backward(grad_w, grad_m, lambda_reg=0.5)
+    inner = net.inner_state
+    assert inner.g_weight_layer.grad is not None
+    assert inner.g_weight_layer.grad.abs().sum().item() > 0
+    assert inner.g_bias_layer.grad is not None
+    assert inner.g_bias_layer.grad.abs().sum().item() > 0
