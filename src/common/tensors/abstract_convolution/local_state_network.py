@@ -126,9 +126,9 @@ class LocalStateNetwork:
             self.g_weight_layer.zero_grad()
         else:
             # Clear gradient attributes without altering the underlying data
-            if hasattr(self.g_weight_layer, 'grad'):
+            if hasattr(self.g_weight_layer, '_grad'):
                 try:
-                    self.g_weight_layer.grad = None  # type: ignore[attr-defined]
+                    self.g_weight_layer._grad = None  # type: ignore[attr-defined]
                 except Exception:
                     pass
             if hasattr(self.g_weight_layer, '_grad'):
@@ -136,9 +136,9 @@ class LocalStateNetwork:
         if hasattr(self.g_bias_layer, 'zero_grad'):
             self.g_bias_layer.zero_grad()
         else:
-            if hasattr(self.g_bias_layer, 'grad'):
+            if hasattr(self.g_bias_layer, '_grad'):
                 try:
-                    self.g_bias_layer.grad = None  # type: ignore[attr-defined]
+                    self.g_bias_layer._grad = None  # type: ignore[attr-defined]
                 except Exception:
                     pass
             if hasattr(self.g_bias_layer, '_grad'):
@@ -405,27 +405,16 @@ class LocalStateNetwork:
         if lambda_reg:
             self._reg_loss = self.regularization_loss(weighted_padded, modulated_padded)
             self._regularization_loss = lambda_reg * self._reg_loss
-            orig_backward = self._regularization_loss.backward
-
-            def _reg_backward(go=None, *, retain_graph=False):
-                orig_backward(go, retain_graph=retain_graph)
-                gw = AbstractTensor.zeros_like(self._weighted_padded)
-                gm = AbstractTensor.zeros_like(self._modulated_padded)
-                self.backward(
-                    self._lambda_reg * gw,
-                    self._lambda_reg * gm,
-                    lambda_reg=self._lambda_reg,
-                    smooth=self._smoothness,
-                )
-                return None
-
-            self._regularization_loss.backward = _reg_backward
+            print(f"[DEBUG] LSN.forward: lambda_reg={lambda_reg} _reg_loss={self._reg_loss} _regularization_loss={self._regularization_loss}")
+            print(f"[DEBUG] LSN.forward: g_weight_layer id={id(self.g_weight_layer)} requires_grad={getattr(self.g_weight_layer, 'requires_grad', None)}")
+            print(f"[DEBUG] LSN.forward: g_bias_layer id={id(self.g_bias_layer)} requires_grad={getattr(self.g_bias_layer, 'requires_grad', None)}")
         else:
             self._regularization_loss = AbstractTensor.zeros(
                 (),
                 dtype=self.g_weight_layer.dtype,
                 device=getattr(self.g_weight_layer, 'device', None),
             )
+            print(f"[DEBUG] LSN.forward: lambda_reg is zero, _regularization_loss set to zero tensor")
 
         return weighted_padded, modulated_padded
 

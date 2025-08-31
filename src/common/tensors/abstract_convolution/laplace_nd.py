@@ -156,7 +156,7 @@ class BuildLaplace3D:
             self.device = device
             self.general_index_composer.device = device
         logger.debug(f"Device: {device}, Grid boundaries: {grid_boundaries}")
-
+        
         # Conditional reassignments, use method parameters if provided, otherwise use class attributes
         boundary_conditions = boundary_conditions if boundary_conditions is not None else self.boundary_conditions
         singularity_conditions = singularity_conditions if singularity_conditions is not None else self.singularity_conditions
