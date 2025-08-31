@@ -25,6 +25,7 @@ from pathlib import Path
 from skimage import measure
 from .laplace_nd import BuildLaplace3D
 import os
+from PIL import Image
 
 
 def _normalize(arr):
@@ -54,7 +55,18 @@ def _low_entropy_variant(target_np, epoch):
     x += np.random.normal(scale=0.01, size=x.shape)
     return x
 
+def _tensor_to_pil_image(t):
+    arr = np.array(t.data if hasattr(t, "data") else t)
+    arr = _normalize(arr) * 255
+    arr = arr.clip(0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
+
+def _save_animation(frames, path, duration=800):
+    if not frames:
+        return
+    images = [_tensor_to_pil_image(f) for f in frames]
+    images[0].save(path, save_all=True, append_images=images[1:], loop=0, duration=duration)
 
 
 def _pca_reduce(coords, k=3):
@@ -343,10 +355,8 @@ def main(
     x = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)), requires_grad=True)
     autograd.tape.annotate(x, label="riemann_demo.input_init")
     autograd.tape.auto_annotate_eval(x)
-    print(f"Preparing output directory structure at: '{output_dir}/'")
+    print(f"Preparing output directory at: '{output_dir}/'")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    Path(os.path.join(output_dir, "input")).mkdir(exist_ok=True)
-    Path(os.path.join(output_dir, "prediction")).mkdir(exist_ok=True)
     # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
     # Uncomment one of the lines below to relax those checks:
     # autograd.strict = False                   # disable strict mode globally
@@ -423,11 +433,7 @@ def main(
         )
 
     params, _ = collect_params_and_grads()
-    # Create subdirectories for each parameter and gradient
-    for i, p in enumerate(params):
-        param_label = getattr(p, '_label', f'param_{i}').replace('.', '_')
-        Path(os.path.join(output_dir, f"param_{i}_{param_label}")).mkdir(exist_ok=True)
-        Path(os.path.join(output_dir, f"grad_{i}_{param_label}")).mkdir(exist_ok=True)
+    frame_cache = {"input_prediction": [], "params": [], "grads": []}
 
     optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
@@ -500,45 +506,24 @@ def main(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
-            print(f"  -> Exporting modular frames for epoch {epoch}...")
-            for name, sample in [("input", x), ("prediction", y)]:
-                img_dict = render_nd_field(np.array(sample[0, 0].data))
-                img_data = None
-                if "scatter3d" in img_dict and img_dict["scatter3d"] is not None:
-                    img_data = img_dict["scatter3d"]
-                elif "heatmap" in img_dict and img_dict["heatmap"] is not None:
-                    img_data = img_dict["heatmap"]
-                else:
-                    # fallback: create a blank image or handle as needed
-                    img_data = np.zeros((10, 10))
-                fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
-                ax.imshow(img_data)
-                ax.set_title(f"{name.capitalize()} @ Epoch {epoch}")
-                ax.axis("off")
-                fig.savefig(os.path.join(output_dir, name, f"frame_{epoch:04d}.png"))
-                plt.close(fig)
-
-            for i, (p, g) in enumerate(zip(params, grads)):
-                param_label = getattr(p, '_label', f'param_{i}').replace('.', '_')
-                p_data = np.array(p.data if hasattr(p, "data") else p)
-                fig_p, ax_p = plt.subplots(figsize=(4, 4), dpi=dpi)
-                ax_p.imshow(_normalize(p_data.reshape(p_data.shape[0], -1)), cmap="magma", aspect='auto')
-                ax_p.set_title(f"Param: {param_label}\nEpoch {epoch}", fontsize=10)
-                ax_p.axis("off")
-                fig_p.savefig(os.path.join(output_dir, f"param_{i}_{param_label}", f"frame_{epoch:04d}.png"))
-                plt.close(fig_p)
-
-                fig_g, ax_g = plt.subplots(figsize=(4, 4), dpi=dpi)
-                if g is not None:
-                    g_data = np.array(g.data if hasattr(g, "data") else g)
-                    g_img = _normalize(g_data.reshape(g_data.shape[0], -1))
-                else:
-                    g_img = np.zeros_like(p_data.reshape(p_data.shape[0], -1))
-                ax_g.imshow(g_img, cmap="coolwarm", aspect='auto')
-                ax_g.set_title(f"Grad: {param_label}\nEpoch {epoch}", fontsize=10)
-                ax_g.axis("off")
-                fig_g.savefig(os.path.join(output_dir, f"grad_{i}_{param_label}", f"frame_{epoch:04d}.png"))
-                plt.close(fig_g)
+            low_entropy = AT.get_tensor(_low_entropy_variant(target_np, epoch))
+            inp = x[0, 0]
+            pred = y[0, 0]
+            H = inp.shape[0]
+            inp_img = inp.reshape(H, -1)
+            pred_img = pred.reshape(H, -1)
+            le_img = low_entropy.reshape(H, -1)
+            ip_frame = AT.cat([inp_img, pred_img, le_img], dim=1)
+            param_imgs = [p.reshape(p.shape[0], -1) for p in params]
+            params_frame = AT.cat(param_imgs, dim=1)
+            grad_imgs = []
+            for g, p in zip(grads, params):
+                g = g if g is not None else AT.zeros_like(p)
+                grad_imgs.append(g.reshape(g.shape[0], -1))
+            grads_frame = AT.cat(grad_imgs, dim=1)
+            frame_cache["input_prediction"].append(ip_frame)
+            frame_cache["params"].append(params_frame)
+            frame_cache["grads"].append(grads_frame)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -546,7 +531,10 @@ def main(
     print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
-    print(f"Exported all modular frames to the '{output_dir}/' directory.")
+    _save_animation(frame_cache["input_prediction"], os.path.join(output_dir, "input_prediction.png"))
+    _save_animation(frame_cache["params"], os.path.join(output_dir, "params.png"))
+    _save_animation(frame_cache["grads"], os.path.join(output_dir, "grads.png"))
+    print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
     import argparse
