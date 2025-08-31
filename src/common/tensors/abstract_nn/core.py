@@ -26,6 +26,13 @@ def wrap_module(module):
     if getattr(module, "_nncore_wrapped", False):
         return module
 
+    # Only wrap modules that provide an explicit backward implementation.
+    # Modules without ``backward`` should rely on their internal operations
+    # for autograd, so we leave them untouched to avoid suppressing gradient
+    # recording.
+    if not callable(getattr(module, "backward", None)):
+        return module
+
     name = module.__class__.__name__
 
     orig_forward = getattr(module, "forward", None)
