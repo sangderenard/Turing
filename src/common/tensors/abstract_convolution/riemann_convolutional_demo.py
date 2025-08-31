@@ -69,6 +69,10 @@ def _save_animation(frames, path, duration=800):
     images[0].save(path, save_all=True, append_images=images[1:], loop=0, duration=duration)
 
 
+def _to_numpy(t):
+    return np.array(t.data if hasattr(t, "data") else t)
+
+
 def _pca_reduce(coords, k=3):
     """Reduce coordinates to ``k`` dimensions using PCA."""
     coords = coords - coords.mean(axis=0, keepdims=True)
@@ -291,6 +295,7 @@ def main(
     laplace_path=None,
     show_laplace=False,
     dpi=200,
+    deep_research=False,
 ):
     AT = AbstractTensor
     if config is None:
@@ -453,6 +458,9 @@ def main(
         autograd.tape.auto_annotate_eval(x)
         y = layer.forward(x)
         autograd.tape.auto_annotate_eval(y)
+        if deep_research:
+            print("[DEEP-RESEARCH] input data:", _to_numpy(x))
+            print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
         loss = loss_fn(y, target)
         LSN_loss = layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
@@ -469,6 +477,19 @@ def main(
         lsn.backward(grad_w, grad_m, lambda_reg=0.5)
         # Re-collect params and grads (in case new tensors were created)
         params, grads = collect_params_and_grads()
+        if deep_research:
+            for i, p in enumerate(params):
+                print(f"[DEEP-RESEARCH] param {i}:", _to_numpy(p))
+            for i, (g, p) in enumerate(zip(grads, params)):
+                g = g if g is not None else AT.zeros_like(p)
+                print(f"[DEEP-RESEARCH] grad {i}:", _to_numpy(g))
+            stacked_params = np.concatenate([_to_numpy(p).reshape(-1) for p in params])
+            print("[DEEP-RESEARCH] all params stacked vertically:", stacked_params)
+            stacked_grads = np.concatenate([
+                _to_numpy(g if g is not None else AT.zeros_like(p)).reshape(-1)
+                for g, p in zip(grads, params)
+            ])
+            print("[DEEP-RESEARCH] all grads stacked vertically:", stacked_grads)
         for p in params:
             label = getattr(p, '_label', None)
             # print(p)
@@ -561,6 +582,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-epochs", type=int, default=25, help="Maximum training epochs")
     parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
     parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
+    parser.add_argument("--deep-research", action="store_true", help="Emit detailed tensor data")
     args = parser.parse_args()
 
     main(
@@ -574,4 +596,5 @@ if __name__ == "__main__":
         laplace_threshold=args.laplace_threshold,
         laplace_path=args.laplace_path,
         show_laplace=args.show_laplace,
+        deep_research=args.deep_research,
     )
