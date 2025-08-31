@@ -108,3 +108,18 @@ def test_regularization_produces_weight_gradient():
 
     assert np.allclose(baseline, 0.0)
     assert not np.allclose(grad, 0.0)
+
+
+def test_regularization_loss_backward_sets_grad():
+    net = LocalStateNetwork(
+        metric_tensor_func=dummy_metric,
+        grid_shape=(1, 1, 1),
+        switchboard_config=DEFAULT_CONFIGURATION,
+        max_depth=1,
+    )
+    weighted = AbstractTensor.zeros((1, 1, 1, 1, 3, 3, 3))
+    modulated = AbstractTensor.zeros_like(weighted)
+    net.zero_grad()
+    reg = net.regularization_loss(weighted, modulated)
+    reg.backward()
+    assert net.g_weight_layer._grad is not None
