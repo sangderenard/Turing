@@ -527,36 +527,97 @@ def main(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
-            # Top row: low-entropy input and its prediction
+            # --- High-quality 2D/3D heatmap quad frame rendering ---
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
+            from matplotlib.colors import Normalize
+            import io
+
+            def render_heatmap(arr, title=None, is3d=False):
+                fig = plt.figure(figsize=(4, 4))
+                if is3d and arr.ndim == 3:
+                    ax = fig.add_subplot(111, projection='3d')
+                    # Use a central slice for surface, or scatter for full volume
+                    z = arr.shape[2] // 2
+                    X, Y = np.meshgrid(np.arange(arr.shape[0]), np.arange(arr.shape[1]), indexing='ij')
+                    surf = ax.plot_surface(X, Y, arr[:, :, z], cmap='viridis', edgecolor='none')
+                    fig.colorbar(surf, ax=ax, shrink=0.5)
+                    ax.set_title(title or "3D Heatmap")
+                else:
+                    ax = fig.add_subplot(111)
+                    if arr.ndim == 3:
+                        # Use mean projection for 2D
+                        arr2d = arr.mean(axis=0)
+                    else:
+                        arr2d = arr
+                    im = ax.imshow(arr2d, cmap='viridis', aspect='auto')
+                    fig.colorbar(im, ax=ax)
+                    ax.set_title(title or "Heatmap")
+                    ax.axis('off')
+                buf = io.BytesIO()
+                plt.tight_layout()
+                fig.savefig(buf, format='png')
+                plt.close(fig)
+                buf.seek(0)
+                img = np.array(Image.open(buf))
+                return img
+
+            # Prepare data for each quadrant
             low_entropy = AT.get_tensor(_low_entropy_variant(target_np, epoch))
             with autograd.no_grad():
                 le_pred = layer.forward(low_entropy)
-
-            # Bottom row: gaussian input and its prediction
             gaussian = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)))
             with autograd.no_grad():
                 gauss_pred = layer.forward(gaussian)
 
-            le_inp = low_entropy[0, 0]
-            le_out = le_pred[0, 0]
-            ga_inp = gaussian[0, 0]
-            ga_out = gauss_pred[0, 0]
-            H = le_inp.shape[0]
+            # Use first batch/channel for visualization
+            le_inp = np.array(low_entropy[0, 0].data if hasattr(low_entropy[0, 0], 'data') else low_entropy[0, 0])
+            le_out = np.array(le_pred[0, 0].data if hasattr(le_pred[0, 0], 'data') else le_pred[0, 0])
+            ga_inp = np.array(gaussian[0, 0].data if hasattr(gaussian[0, 0], 'data') else gaussian[0, 0])
+            ga_out = np.array(gauss_pred[0, 0].data if hasattr(gauss_pred[0, 0], 'data') else gauss_pred[0, 0])
 
-            top_row = AT.cat([le_inp.reshape(H, -1), le_out.reshape(H, -1)], dim=1)
-            bottom_row = AT.cat([ga_inp.reshape(H, -1), ga_out.reshape(H, -1)], dim=1)
-            ip_frame = AT.cat([top_row, bottom_row], dim=0)
+            # Render each quadrant as a colorful heatmap (2D or 3D)
+            is3d = le_inp.ndim == 3
+            quad1 = render_heatmap(le_inp, title="Low-Entropy Input", is3d=is3d)
+            quad2 = render_heatmap(le_out, title="Low-Entropy Prediction", is3d=is3d)
+            quad3 = render_heatmap(ga_inp, title="Gaussian Input", is3d=is3d)
+            quad4 = render_heatmap(ga_out, title="Gaussian Prediction", is3d=is3d)
 
-            # Pair each parameter with its gradient side by side
+            # Ensure all quads are the same size
+            h, w, *_ = quad1.shape
+            def resize(img):
+                if img.shape[:2] != (h, w):
+                    return np.array(Image.fromarray(img).resize((w, h)))
+                return img
+            quad2 = resize(quad2)
+            quad3 = resize(quad3)
+            quad4 = resize(quad4)
+
+            # Compose into 2x2 grid
+            top = np.concatenate([quad1, quad2], axis=1)
+            bottom = np.concatenate([quad3, quad4], axis=1)
+            ip_frame = np.concatenate([top, bottom], axis=0)
+
+            # Parameter/gradient visualization (optional, keep as before)
             pairs = []
             for p, g in zip(params, grads):
                 g = g if g is not None else AT.zeros_like(p)
-                p_img = p.reshape(p.shape[0], -1)
-                g_img = g.reshape(g.shape[0], -1)
-                pairs.append(AT.cat([p_img, g_img], dim=1))
-            params_grads_frame = (
-                AT.pad_cat(pairs, dim=0) if pairs else AT.zeros((1, 1))
-            )
+                p_img = np.array(p.data if hasattr(p, 'data') else p)
+                g_img = np.array(g.data if hasattr(g, 'data') else g)
+                # Use mean projection for 2D
+                if p_img.ndim == 3:
+                    p_img = p_img.mean(axis=0)
+                if g_img.ndim == 3:
+                    g_img = g_img.mean(axis=0)
+                # Normalize and convert to RGB
+                p_img = (_normalize(p_img) * 255).astype(np.uint8)
+                g_img = (_normalize(g_img) * 255).astype(np.uint8)
+                pair = np.concatenate([p_img, g_img], axis=1)
+                pairs.append(pair)
+            if pairs:
+                params_grads_frame = np.concatenate(pairs, axis=0)
+            else:
+                params_grads_frame = np.zeros((h, w*2), dtype=np.uint8)
 
             frame_cache["input_prediction"].append(ip_frame)
             frame_cache["params_grads"].append(params_grads_frame)
@@ -580,8 +641,8 @@ if __name__ == "__main__":
     parser.add_argument("--laplace-path", type=str, help="Path to save Laplace surface image")
     parser.add_argument("--show-laplace", action="store_true", help="Display Laplace surface instead of closing")
     parser.add_argument("--viz-every", type=int, default=1, help="Visualization frequency")
-    parser.add_argument("--low-entropy-every", type=int, default=5, help="Low-entropy sample frequency")
-    parser.add_argument("--max-epochs", type=int, default=25, help="Maximum training epochs")
+    parser.add_argument("--low-entropy-every", type=int, default=1, help="Low-entropy sample frequency")
+    parser.add_argument("--max-epochs", type=int, default=250, help="Maximum training epochs")
     parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
     parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
     parser.add_argument("--deep-research", action="store_true", help="Emit detailed tensor data")
