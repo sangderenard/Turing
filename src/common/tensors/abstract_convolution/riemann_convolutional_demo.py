@@ -180,8 +180,8 @@ def main(config=None):
         )
 
     params, _ = collect_params_and_grads()
-    optimizer = Adam(params, lr=1e-2)
-    loss_fn = lambda y, t: ((y - t) ** 2).mean()
+    optimizer = Adam(params, lr=1e-1)
+    loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, 10001):
         # Zero gradients for all params
         for p in params:

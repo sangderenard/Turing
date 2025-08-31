@@ -426,7 +426,7 @@ class LocalStateNetwork:
 
         return weighted_padded, modulated_padded, self._regularization_loss
 
-    def _backward(
+    def backward(
         self,
         grad_weighted_padded,
         grad_modulated_padded,
