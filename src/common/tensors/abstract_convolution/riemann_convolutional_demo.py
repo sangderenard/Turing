@@ -20,6 +20,7 @@ from ..riemann.geometry_factory import build_geometry
 from src.common.tensors.abstract_nn.optimizer import Adam
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.animation as animation
 from pathlib import Path
 
@@ -85,6 +86,83 @@ def _make_frame(input_sample, pred_sample, params, grads):
     image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close(fig)
     return image
+
+
+def _pca_reduce(coords, k=3):
+    """Reduce coordinates to ``k`` dimensions using PCA."""
+    coords = coords - coords.mean(axis=0, keepdims=True)
+    cov = np.cov(coords, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1][:k]
+    return coords @ eigvecs[:, order]
+
+
+def render_nd_field(field, return_heatmap=False, return_figures=False):
+    """Render an ``n``-D tensor as a visual representation.
+
+    Parameters
+    ----------
+    field: array-like
+        The tensor or array to visualise. It must have at least two
+        dimensions.
+    return_heatmap: bool, optional
+        If ``True`` and ``field`` has three or more dimensions, a 2-D
+        heat-map view (mean across the first axis) is also returned.
+    return_figures: bool, optional
+        When ``True`` the returned values are ``matplotlib`` figures.
+        Otherwise image buffers (``numpy`` arrays) compatible with the
+        existing animation pipeline are returned.
+
+    Returns
+    -------
+    dict
+        Keys include ``"scatter3d"`` for 3-D scatter images and
+        optionally ``"heatmap"``. The values are either figures or
+        ``np.ndarray`` buffers depending on ``return_figures``.
+    """
+
+    arr = np.array(field)
+    if arr.ndim < 2:
+        raise ValueError("Field must be at least 2-D")
+
+    figures = {}
+    if arr.ndim == 2:
+        fig, ax = plt.subplots()
+        hm = ax.imshow(arr, cmap="viridis")
+        ax.axis("off")
+        fig.colorbar(hm, ax=ax)
+        figures["heatmap"] = fig
+    else:
+        coords = np.indices(arr.shape).reshape(arr.ndim, -1).T
+        values = arr.reshape(-1)
+        if arr.ndim > 3:
+            coords = _pca_reduce(coords, 3)
+        x, y, z = coords.T[:3]
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+        sc = ax.scatter(x, y, z, c=values, cmap="viridis")
+        fig.colorbar(sc, ax=ax)
+        ax.set_title(f"{arr.ndim}D Field")
+        figures["scatter3d"] = fig
+        if return_heatmap:
+            heatmap = arr.mean(axis=0)
+            hfig, hax = plt.subplots()
+            hm = hax.imshow(heatmap, cmap="viridis")
+            hax.axis("off")
+            hfig.colorbar(hm, ax=hax)
+            figures["heatmap"] = hfig
+
+    if return_figures:
+        return figures
+
+    images = {}
+    for key, fig in figures.items():
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        images[key] = buf
+        plt.close(fig)
+    return images
 
 
 def build_config():
