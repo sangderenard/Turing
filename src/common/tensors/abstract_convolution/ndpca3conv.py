@@ -292,7 +292,8 @@ class NDPCA3Conv3d:
         if self.normalize:
             taps = taps / (taps.sum(dim=1, keepdim=True) + 1e-12)
             autograd.tape.annotate(taps, label="NDPCA3Conv3d.taps_normalized")
-        tap_sums = taps.sum(dim=0).reshape(len(self.offsets), 1, 1, 1, 1)
+        tap_sums = taps.sum(dim=0, keepdim=True)
+        tap_sums = tap_sums.reshape(len(self.offsets), 1, 1, 1, 1)
         autograd.tape.annotate(tap_sums, label="NDPCA3Conv3d.tap_sums")
 
         # Broadcast axis weights to (1,1,D,H,W)
