@@ -152,41 +152,7 @@ class MetricSteeredConv3DWrapper:
         # across builds and accumulate gradients between forward passes.
         if lsn is not None:
             self.local_state_network = lsn
-        if lsn is not None:
-            unused = []
-            if self.deploy_mode == "weighted":
-                if hasattr(lsn, "spatial_layer") and hasattr(lsn.spatial_layer, "parameters"):
-                    unused.extend(lsn.spatial_layer.parameters())
-                inner = getattr(lsn, "inner_state", None)
-                if inner is not None and hasattr(inner, "parameters"):
-                    try:
-                        unused.extend(inner.parameters(include_all=True, include_structural=True))
-                    except TypeError:
-                        unused.extend(inner.parameters(include_all=True))
-            elif self.deploy_mode == "modulated":
-                def gather_weight_branch(net):
-                    params = [net.g_weight_layer, net.g_bias_layer]
-                    inner_net = getattr(net, "inner_state", None)
-                    if inner_net is not None:
-                        params.extend(gather_weight_branch(inner_net))
-                    return params
 
-                unused = gather_weight_branch(lsn)
-            elif self.deploy_mode != "raw":
-                raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
-
-            # Ensure all non-structural parameters have gradient placeholders
-            for p in lsn.parameters(include_all=True, include_structural=True):
-                if any(p is u for u in unused):
-                    continue
-                if getattr(p, "grad", None) is None:
-                    try:
-                        p._grad = AbstractTensor.zeros_like(p)
-                    except Exception:
-                        pass
-
-            if unused:
-                autograd.structural(*unused)
         return package
 
     def forward(self, x):

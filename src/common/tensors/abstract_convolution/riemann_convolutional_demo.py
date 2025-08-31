@@ -133,13 +133,13 @@ def main(config=None):
         if hasattr(layer.conv, 'parameters'):
             for p in layer.conv.parameters():
                 params.append(p)
-                grads.append(getattr(p, 'grad', None))
+                grads.append(getattr(p, '_grad', None))
         # LocalStateNetwork (if present)
-        lsn = layer.laplace_package.get('local_state_network', None) if isinstance(layer.laplace_package, dict) else None
+        lsn = layer.local_state_network if hasattr(layer, 'local_state_network') else None
         if lsn and hasattr(lsn, 'parameters'):
             for p in lsn.parameters():
                 params.append(p)
-                grads.append(getattr(p, 'grad', None))
+                grads.append(getattr(p, '_grad', None))
         # Fallback: any other objects with .parameters
         if isinstance(layer.laplace_package, dict):
             for v in layer.laplace_package.values():
@@ -166,7 +166,7 @@ def main(config=None):
         y = layer.forward(x)
         autograd.tape.auto_annotate_eval(y)
         loss = loss_fn(y, target)
-        LSN_loss = layer.laplace_package['local_state_network']._regularization_loss
+        LSN_loss = layer.local_state_network._regularization_loss
         loss = LSN_loss + loss
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
