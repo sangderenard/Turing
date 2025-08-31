@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 from ..abstraction import AbstractTensor as AT
 from .utils import zeros_like
+from ..bpid import BPID
 
 
 class Adam:
@@ -95,4 +96,18 @@ def adam_step(
     return p_new, m_new, v_new, t_new
 
 
-__all__ = ["Adam", "adam_step"]
+class BPIDSGD:
+    """SGD optimizer with broadcast PID gradient processing."""
+
+    def __init__(self, params: List[AT], lr: float = 1e-2,
+                 kp: float = 1.0, ki: float = 0.0, kd: float = 0.0):
+        self.lr = lr
+        self.pid = BPID(kp, ki, kd)
+
+    def step(self, params: List[AT], grads: List[AT]) -> List[AT]:
+        adj = self.pid.step(params, grads)
+        lr = self.lr
+        return [p - lr * g for p, g in zip(params, adj)]
+
+
+__all__ = ["Adam", "adam_step", "BPIDSGD"]
