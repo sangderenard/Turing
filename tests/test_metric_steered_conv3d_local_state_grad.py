@@ -52,3 +52,31 @@ def test_local_state_network_params_receive_grads_raw_mode():
     lsn.backward(zero_w, zero_m, lambda_reg=0.5)
     params = lsn.parameters(include_all=True, include_structural=True)
     assert all(getattr(p, "_grad", None) is not None for p in params)
+
+
+def test_wrapper_updates_lsn_params_with_combined_loss():
+    """Gradients should flow to LSN params from data + regularisation loss."""
+    N = 2
+    transform = RectangularTransform(Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
+    layer = MetricSteeredConv3DWrapper(
+        1,
+        1,
+        (N, N, N),
+        transform,
+        deploy_mode="weighted",
+        laplace_kwargs={"lambda_reg": 0.5},
+    )
+    layer.zero_grad()
+    x = AbstractTensor.randn((1, 1, N, N, N))
+    out = layer.forward(x)
+    reg_loss = layer.laplace_package["regularization_loss"]
+    target = AbstractTensor.zeros_like(out)
+    data_loss = ((out - target) ** 2).sum()
+    total = data_loss + reg_loss
+    total.backward()
+    lsn = layer.laplace_package["local_state_network"]
+    grad_w = getattr(lsn._weighted_padded, "_grad", AbstractTensor.zeros_like(lsn._weighted_padded))
+    grad_m = getattr(lsn._modulated_padded, "_grad", AbstractTensor.zeros_like(lsn._modulated_padded))
+    lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+    params = lsn.parameters(include_all=True, include_structural=True)
+    assert all(getattr(p, "_grad", None) is not None for p in params)
