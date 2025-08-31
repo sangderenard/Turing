@@ -300,10 +300,9 @@ class NumPyTensorOperations(AbstractTensor):
             return a * b
         if op == "rmul":
             return a * b
-        if op in ("truediv", "itruediv"):
-            return a / b
-        if op == "rtruediv":
-            return a / b
+        if op in ("truediv", "itruediv", "rtruediv"):
+            out = np.zeros(np.broadcast(a, b).shape, dtype=np.result_type(a, b))
+            return np.divide(a, b, out=out, where=b != 0)
         if op in ("floordiv", "ifloordiv"):
             return np.floor_divide(a, b)
         if op == "rfloordiv":
