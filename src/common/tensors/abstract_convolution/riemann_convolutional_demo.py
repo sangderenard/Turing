@@ -106,7 +106,9 @@ def main(config=None):
         deploy_mode="modulated",
         laplace_kwargs={"lambda_reg": 0.5},
     )
-    print(f"[DEBUG] LSN instance id at layer creation: {id(layer.local_state_network)}")
+    from ..abstraction import AbstractTensor as _AT
+    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
+    print(f"[DEBUG] LSN instance id at layer creation: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     U, V, W = grid.U, grid.V, grid.W
     autograd.tape.annotate(U, label="riemann_demo.grid_U")
     autograd.tape.auto_annotate_eval(U)
@@ -158,14 +160,18 @@ def main(config=None):
             logger.info(f"Param {i}: label={label}, shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}")
         return params, grads
     y = layer.forward(x)
-    print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)}")
+    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
+    print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     print(f"[DEBUG] LSN param ids: {[id(p) for p in layer.local_state_network.parameters(include_all=True)]}")
     print(f"[DEBUG] LSN param requires_grad: {[getattr(p, 'requires_grad', None) for p in layer.local_state_network.parameters(include_all=True)]}")
     print(f"[DEBUG] LSN _regularization_loss: {layer.local_state_network._regularization_loss}")
     print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(layer.local_state_network._regularization_loss, 'grad_fn', None)}")
+    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
+    print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
     layer.local_state_network._regularization_loss.backward()
     for i, p in enumerate(layer.local_state_network.parameters(include_all=True)):
-        print(f"[DEBUG] After backward: param {i} id={id(p)} grad={getattr(p, '_grad', None)}")
+        grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
+        print(f"[DEBUG] After backward: param {i} id={id(p)} grad={getattr(p, '_grad', None)} | grad_tracking_enabled={grad_enabled}")
 
     params, _ = collect_params_and_grads()
     optimizer = Adam(params, lr=1e-2)
@@ -193,8 +199,8 @@ def main(config=None):
         params, grads = collect_params_and_grads()
         for p in params:
             label = getattr(p, '_label', None)
-            print(p)
-            print(p._grad)
+            # print(p)
+            # print(p._grad)
             assert hasattr(p, '_grad'), f"Parameter {label or p} has no grad attribute"
             
             #assert p._grad is not None, f"Parameter {label or p} grad is None after backward()"
