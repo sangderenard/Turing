@@ -311,36 +311,42 @@ class LocalStateNetwork:
         * TV is quadratic for simplicity and stability.
         """
         total = None
+        g = self.g_weight_layer
+        dtype = g.dtype
+        device = g.device if hasattr(g, "device") else None
 
         # ---- (A) identity on the 3x3x3 weight kernel
         if lambda_id:
-            g = self.g_weight_layer
-            identity = AbstractTensor.zeros(g.shape, dtype=g.dtype, device=g.device if hasattr(g, "device") else None)
+            lambda_id_t = AbstractTensor.tensor(lambda_id, dtype=dtype, device=device)
+            identity = AbstractTensor.zeros(g.shape, dtype=dtype, device=device)
             center = tuple(s // 2 for s in g.shape)
-            identity[center] = 1.0
+            identity[center] = AbstractTensor.tensor(1.0, dtype=dtype, device=device)
             diff = g - identity
-            term = lambda_id * (diff * diff).sum()
+            term = lambda_id_t * (diff * diff).sum()
             total = term if total is None else total + term
 
         # ---- (B) TV on weighted output field
         if lambda_w and (weighted_padded is not None):
-            term = lambda_w * self._tv3d_sum(weighted_padded, axes=spatial_axes)
+            lambda_w_t = AbstractTensor.tensor(lambda_w, dtype=dtype, device=device)
+            term = lambda_w_t * self._tv3d_sum(weighted_padded, axes=spatial_axes)
             total = term if total is None else total + term
 
         # ---- (C) TV on modulated output field
         if lambda_m and (modulated_padded is not None):
-            term = lambda_m * self._tv3d_sum(modulated_padded, axes=spatial_axes)
+            lambda_m_t = AbstractTensor.tensor(lambda_m, dtype=dtype, device=device)
+            term = lambda_m_t * self._tv3d_sum(modulated_padded, axes=spatial_axes)
             total = term if total is None else total + term
 
         # ---- (D) refinement tie: modulated ~ weighted
         if lambda_refine and (weighted_padded is not None) and (modulated_padded is not None):
+            lambda_refine_t = AbstractTensor.tensor(lambda_refine, dtype=dtype, device=device)
             diff = modulated_padded - weighted_padded
-            term = lambda_refine * (diff * diff).sum()
+            term = lambda_refine_t * (diff * diff).sum()
             total = term if total is None else total + term
 
         if total is None:
             # If no terms contributed, return a zero AbstractTensor
-            return AbstractTensor.zeros((), dtype=self.g_weight_layer.dtype, device=getattr(self.g_weight_layer, 'device', None))
+            return AbstractTensor.zeros((), dtype=dtype, device=device)
         return total
 
     def forward(self, padded_raw, lambda_reg: float = 0.0, smooth=False):
