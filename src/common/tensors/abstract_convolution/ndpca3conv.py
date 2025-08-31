@@ -262,25 +262,29 @@ class NDPCA3Conv3d:
         """
         # Ensure learnable parameters are registered on the current tape so that
         # loss.backward()/autograd.grad can discover them even after tape resets.
+        tape = getattr(autograd, "tape", None)
+        if tape is None:
+            raise RuntimeError(
+                "NDPCA3Conv3d.forward requires an active autograd tape"
+            )  # pragma: no cover
+        self.taps.requires_grad_(True)
+        self.taps._grad = AbstractTensor.zeros_like(self.taps)
         try:
-            tape = autograd.tape
-            # taps is always present; pointwise may be None
-            param_list = [self.taps]
-            if getattr(self, "pointwise", None) is not None:
+            tape.create_tensor_node(self.taps)
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "Failed to register NDPCA3Conv3d.taps with autograd tape"
+            ) from e
+        if getattr(self, "pointwise", None) is not None:
+            for p in self.pointwise.parameters():
+                p.requires_grad_(True)
+                p._grad = AbstractTensor.zeros_like(p)
                 try:
-                    param_list += list(self.pointwise.parameters())
-                except Exception:
-                    pass
-            for p in param_list:
-                if p is None:
-                    continue
-                try:
-                    p._tape = tape  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                tape.create_tensor_node(p)
-        except Exception:
-            pass
+                    tape.create_tensor_node(p)
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError(
+                        "Failed to register pointwise parameter with autograd tape"
+                    ) from e
         B, C, D, H, W = x.shape
         # ---- 1) metric → per-axis soft blend weights
         metric = package["metric"]["inv_g"] if self.eig_from == "inv_g" else package["metric"]["g"]
