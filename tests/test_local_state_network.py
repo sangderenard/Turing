@@ -162,3 +162,66 @@ def test_recursive_backward_propagates_regularization():
     assert inner.g_weight_layer.grad.abs().sum().item() > 0
     assert inner.g_bias_layer.grad is not None
     assert inner.g_bias_layer.grad.abs().sum().item() > 0
+import pytest
+from src.common.tensors.abstract_convolution.metric_steered_conv3d import MetricSteeredConv3DWrapper
+from src.common.tensors.abstract_convolution.laplace_nd import RectangularTransform
+from src.common.tensors.abstraction import AbstractTensor
+
+
+def learnable_metric_tensor_func(u, v, w, dxdu, dydu, dzdu, dxdv, dydv, dzdv, dxdw, dydw, dzdw):
+    from src.common.tensors.abstraction import AbstractTensor
+    if not hasattr(learnable_metric_tensor_func, "a"):
+        learnable_metric_tensor_func.a = AbstractTensor.tensor(1.0, requires_grad=True)
+        learnable_metric_tensor_func.b = AbstractTensor.tensor(0.1, requires_grad=True)
+    I = AbstractTensor.eye(3).reshape(1, 1, 1, 3, 3)
+    uvw = AbstractTensor.stack([u, v, w], dim=-1).reshape(u.shape + (3,))
+    outer = uvw.unsqueeze(-1) * uvw.unsqueeze(-2)
+    g = learnable_metric_tensor_func.a * I + learnable_metric_tensor_func.b * outer
+    g_inv = g
+    det = AbstractTensor.ones(u.shape)
+    return g, g_inv, det
+
+def test_metric_steered_conv3dwrapper_all_params_get_grad():
+    grid_shape = (5, 5, 5)
+    in_channels = 2
+    out_channels = 2
+    transform = RectangularTransform(Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
+    wrapper = MetricSteeredConv3DWrapper(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        grid_shape=grid_shape,
+        transform=transform,
+        boundary_conditions=("dirichlet",) * 6,
+        k=3,
+        eig_from="g",
+        pointwise=True,
+        deploy_mode="modulated",
+        laplace_kwargs={"metric_tensor_func": learnable_metric_tensor_func, "lambda_reg": 0.5},
+    )
+    x = AbstractTensor.randn((1, in_channels, *grid_shape), device="cpu")
+    y = wrapper.forward(x)
+    lsn = wrapper.local_state_network
+    reg_loss = getattr(lsn, "_regularization_loss", None)
+    if reg_loss is not None:
+        loss = y.sum() + reg_loss
+    else:
+        loss = y.sum()
+    loss.backward()
+    grad_w = getattr(lsn, "_weighted_padded", None)
+    grad_m = getattr(lsn, "_modulated_padded", None)
+    if grad_w is not None and grad_m is not None:
+        grad_w = getattr(grad_w, "_grad", None) or AbstractTensor.zeros_like(lsn._weighted_padded)
+        grad_m = getattr(grad_m, "_grad", None) or AbstractTensor.zeros_like(lsn._modulated_padded)
+        lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+    all_params = list(wrapper.parameters(include_structural=True))
+    for name in ["a", "b"]:
+        p = getattr(learnable_metric_tensor_func, name, None)
+        if p is not None:
+            all_params.append(p)
+    for param in all_params:
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            grad = getattr(param, "_grad", None)
+        label = getattr(param, "_label", str(param))
+        assert grad is not None, f"Parameter {label} has no grad"
+        assert (grad.abs() > 0).any(), f"Parameter {label} grad is all zero"
