@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.animation as animation
 from pathlib import Path
+from skimage import measure
+from .laplace_nd import BuildLaplace3D
 
 
 def _normalize(arr):
@@ -195,6 +197,45 @@ def render_nd_field(
     return images
 
 
+def render_laplace_surface(laplace_tensor, grid_shape, threshold=0.0, output_path=None, show=False):
+    """Render an isosurface of the Laplace tensor's diagonal.
+
+    Parameters
+    ----------
+    laplace_tensor: array-like
+        Dense Laplace operator matrix.
+    grid_shape: tuple[int, int, int]
+        Spatial grid dimensions used to reshape the diagonal.
+    threshold: float, optional
+        Iso-value used when extracting the surface via marching cubes.
+    output_path: str or Path, optional
+        If provided, the figure is saved to this path.
+    show: bool, optional
+        When True, display the figure instead of closing it.
+    """
+
+    arr = np.array(laplace_tensor.data if hasattr(laplace_tensor, "data") else laplace_tensor)
+    diag_field = np.diag(arr).reshape(grid_shape)
+    level = float(threshold)
+    # Ensure level lies within the data range
+    min_val, max_val = diag_field.min(), diag_field.max()
+    if level < min_val or level > max_val:
+        level = float(diag_field.mean())
+    verts, faces, _, _ = measure.marching_cubes(diag_field, level=level)
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_trisurf(verts[:, 0], verts[:, 1], verts[:, 2], triangles=faces, cmap="viridis", lw=0.5)
+    ax.set_title(f"Laplace Surface (level={level:.2f})")
+    if output_path is not None:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
+
+
 def build_config():
     AT = AbstractTensor
     Nu = Nv = Nw = 8
@@ -255,16 +296,38 @@ def build_config():
             "eig_from": "g",
             "pointwise": True,
         },
+        "visualization": {
+            "render_laplace_surface": False,
+            "laplace_threshold": 0.0,
+            "laplace_path": "laplace_surface.png",
+        },
     }
     return config
 
 
-def main(config=None, viz_every=10, low_entropy_every=25, anim_path="riemann_demo_training.gif"):
+def main(
+    config=None,
+    viz_every=10,
+    low_entropy_every=25,
+    anim_path="riemann_demo_training.gif",
+    visualize_laplace=None,
+    laplace_threshold=None,
+    laplace_path=None,
+    show_laplace=False,
+):
     AT = AbstractTensor
     if config is None:
         config = build_config()
     geom_cfg = config["geometry"]
     train_cfg = config["training"]
+    viz_cfg = config.get("visualization", {})
+    if visualize_laplace is None:
+        visualize_laplace = viz_cfg.get("render_laplace_surface", False)
+    if laplace_threshold is None:
+        laplace_threshold = viz_cfg.get("laplace_threshold", 0.0)
+    if laplace_path is None:
+        laplace_path = viz_cfg.get("laplace_path", "laplace_surface.png")
+    laplace_path = Path(laplace_path)
     transform, grid, _ = build_geometry(geom_cfg)
     grid_shape = geom_cfg["grid_shape"]
     B, C = train_cfg["B"], train_cfg["C"]
@@ -280,6 +343,24 @@ def main(config=None, viz_every=10, low_entropy_every=25, anim_path="riemann_dem
         deploy_mode="modulated",
         laplace_kwargs={"lambda_reg": 0.5},
     )
+    if visualize_laplace:
+        with autograd.no_grad():
+            builder = BuildLaplace3D(
+                grid_domain=grid,
+                metric_tensor_func=transform.metric_tensor_func,
+                boundary_conditions=train_cfg.get("boundary_conditions", ("dirichlet",) * 6),
+                **geom_cfg.get("laplace_kwargs", {}),
+            )
+            laplace_tensor, _, _ = builder.build_general_laplace(
+                grid.U, grid.V, grid.W, dense=True, return_package=False
+            )
+        render_laplace_surface(
+            laplace_tensor,
+            grid_shape,
+            threshold=laplace_threshold,
+            output_path=laplace_path,
+            show=show_laplace,
+        )
     from ..abstraction import AbstractTensor as _AT
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id at layer creation: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
@@ -469,4 +550,19 @@ def main(config=None, viz_every=10, low_entropy_every=25, anim_path="riemann_dem
         ani.save(out_path, writer="pillow")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--viz-laplace", action="store_true", help="Render Laplace isosurface")
+    parser.add_argument("--laplace-threshold", type=float, help="Isosurface threshold")
+    parser.add_argument("--laplace-path", type=str, help="Path to save Laplace surface image")
+    parser.add_argument("--show-laplace", action="store_true", help="Display Laplace surface instead of closing")
+    args = parser.parse_args()
+
+    main(
+        config=build_config(),
+        visualize_laplace=args.viz_laplace if args.viz_laplace else None,
+        laplace_threshold=args.laplace_threshold,
+        laplace_path=args.laplace_path,
+        show_laplace=args.show_laplace,
+    )
