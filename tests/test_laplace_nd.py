@@ -17,7 +17,7 @@ def test_laplace_builds_with_numpy():
         coordinate_system="rectangular", N_u=N, N_v=N, N_w=N, Lx=Lx, Ly=Ly, Lz=Lz, device="cpu",
     )
     BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=None, resolution=N)
-    L_dense, L_scipy = BL.build_general_laplace(
+    L_dense, L_scipy, _ = BL.build_general_laplace(
         grid_u=grid_u,
         grid_v=grid_v,
         grid_w=grid_w,
@@ -89,7 +89,7 @@ def test_compute_partials_and_normals_strict(monkeypatch):
     )
     BL = laplace.BuildLaplace3D(grid_domain=grid_domain, precision=None, resolution=N)
 
-    laplacian_tensor, laplacian_sparse = BL.build_general_laplace(
+    laplacian_tensor, laplacian_sparse, _ = BL.build_general_laplace(
         grid_u=grid_u,
         grid_v=grid_v,
         grid_w=grid_w,
