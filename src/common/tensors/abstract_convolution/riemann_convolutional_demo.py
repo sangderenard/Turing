@@ -168,10 +168,16 @@ def main(config=None):
     print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(layer.local_state_network._regularization_loss, 'grad_fn', None)}")
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
-    layer.local_state_network._regularization_loss.backward()
-    for i, p in enumerate(layer.local_state_network.parameters(include_all=True)):
+    lsn = layer.local_state_network
+    lsn._regularization_loss.backward()
+    grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
+    grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
+    lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+    for i, p in enumerate(lsn.parameters(include_all=True)):
         grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
-        print(f"[DEBUG] After backward: param {i} id={id(p)} grad={getattr(p, '_grad', None)} | grad_tracking_enabled={grad_enabled}")
+        print(
+            f"[DEBUG] After backward: param {i} id={id(p)} grad={getattr(p, '_grad', None)} | grad_tracking_enabled={grad_enabled}"
+        )
 
     params, _ = collect_params_and_grads()
     optimizer = Adam(params, lr=1e-2)
@@ -195,6 +201,10 @@ def main(config=None):
         # layer.report_orphan_nodes()  # retired / no-op
         # Backward pass (assume .backward() populates ._grad)
         loss.backward()
+        lsn = layer.local_state_network
+        grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
+        grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
+        lsn.backward(grad_w, grad_m, lambda_reg=0.5)
         # Re-collect params and grads (in case new tensors were created)
         params, grads = collect_params_and_grads()
         for p in params:
