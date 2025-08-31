@@ -37,6 +37,40 @@ def _normalize(arr):
     return (arr - min_val) / (max_val - min_val)
 
 
+def normalize_for_visualization(arr):
+    """Prepare an array for image/volume visualisation.
+
+    Parameters
+    ----------
+    arr : array-like
+        Input tensor.  The output is guaranteed to be either 2-D (heatmap) or
+        3-D (volume) data suitable for visualisation.
+    """
+
+    arr = _to_numpy(arr)
+
+    # Collapse leading batch/channel dimensions for 4D/5D (or higher) inputs
+    if arr.ndim in (4, 5):
+        arr = arr.mean(axis=(0, 1))
+    elif arr.ndim > 5:
+        leading = tuple(range(arr.ndim - 3))
+        arr = arr.mean(axis=leading)
+
+    # Flatten 1-D vectors to the nearest square for heatmap display
+    if arr.ndim == 1:
+        n = arr.size
+        side = int(np.ceil(np.sqrt(n)))
+        padded = np.zeros(side * side, dtype=arr.dtype)
+        padded[:n] = arr
+        arr = padded.reshape(side, side)
+
+    # Ensure we only ever return 2-D or 3-D data
+    if arr.ndim > 3:
+        arr = arr.reshape(arr.shape[-3:])
+
+    return arr
+
+
 def _random_spectral_gaussian(shape):
     """Return gaussian noise with randomized spectrum."""
     arr = np.random.randn(*shape)
@@ -598,29 +632,30 @@ def main(
             bottom = np.concatenate([quad3, quad4], axis=1)
             ip_frame = np.concatenate([top, bottom], axis=0)
 
-            # Parameter/gradient visualization (optional, keep as before)
+            # Parameter/gradient visualization
             pairs = []
             for p, g in zip(params, grads):
                 g = g if g is not None else AT.zeros_like(p)
-                p_img = np.array(p.data if hasattr(p, 'data') else p)
-                g_img = np.array(g.data if hasattr(g, 'data') else g)
-                # Use mean projection for 2D
+                p_img = normalize_for_visualization(p)
+                g_img = normalize_for_visualization(g)
                 if p_img.ndim == 3:
                     p_img = p_img.mean(axis=0)
                 if g_img.ndim == 3:
                     g_img = g_img.mean(axis=0)
-                # Ensure images have at least 2 dimensions for concatenation
                 p_img = np.atleast_2d(p_img)
                 g_img = np.atleast_2d(g_img)
-                # Normalize and convert to RGB
+                min_h = min(p_img.shape[0], g_img.shape[0])
+                min_w = min(p_img.shape[1], g_img.shape[1])
+                p_img = p_img[:min_h, :min_w]
+                g_img = g_img[:min_h, :min_w]
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
-                pair = np.concatenate([p_img, g_img], axis=1)
+                pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
             if pairs:
                 params_grads_frame = np.concatenate(pairs, axis=0)
             else:
-                params_grads_frame = np.zeros((h, w*2), dtype=np.uint8)
+                params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
             frame_cache["input_prediction"].append(ip_frame)
             frame_cache["params_grads"].append(params_grads_frame)
