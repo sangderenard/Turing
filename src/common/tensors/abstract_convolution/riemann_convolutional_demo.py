@@ -17,7 +17,7 @@ from .ndpca3transform import PCABasisND, fit_metric_pca
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
-from src.common.tensors.abstract_nn.optimizer import Adam
+from src.common.tensors.abstract_nn.optimizer import BPIDSGD
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -455,7 +455,7 @@ def main(
         )
 
     params, _ = collect_params_and_grads()
-    optimizer = Adam(params, lr=5e-2)
+    optimizer = BPIDSGD(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, 10001):
         # Zero gradients for all params
