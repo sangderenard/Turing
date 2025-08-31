@@ -17,7 +17,7 @@ from .ndpca3transform import PCABasisND, fit_metric_pca
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
-from src.common.tensors.abstract_nn.optimizer import BPIDSGD
+from src.common.tensors.abstract_nn.optimizer import BPIDSGD, Adam
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -270,9 +270,9 @@ def build_config():
 
 def main(
     config=None,
-    viz_every=10,
-    low_entropy_every=25,
-    max_epochs=10000,
+    viz_every=1,
+    low_entropy_every=5,
+    max_epochs=25,
     output_dir="riemann_modular_renders",
     visualize_laplace=None,
     laplace_threshold=None,
@@ -429,7 +429,7 @@ def main(
         Path(os.path.join(output_dir, f"param_{i}_{param_label}")).mkdir(exist_ok=True)
         Path(os.path.join(output_dir, f"grad_{i}_{param_label}")).mkdir(exist_ok=True)
 
-    optimizer = BPIDSGD(params, lr=5e-2)
+    optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, max_epochs + 1):
         # Zero gradients for all params
@@ -503,7 +503,14 @@ def main(
             print(f"  -> Exporting modular frames for epoch {epoch}...")
             for name, sample in [("input", x), ("prediction", y)]:
                 img_dict = render_nd_field(np.array(sample[0, 0].data))
-                img_data = img_dict.get("scatter3d") or img_dict.get("heatmap")
+                img_data = None
+                if "scatter3d" in img_dict and img_dict["scatter3d"] is not None:
+                    img_data = img_dict["scatter3d"]
+                elif "heatmap" in img_dict and img_dict["heatmap"] is not None:
+                    img_data = img_dict["heatmap"]
+                else:
+                    # fallback: create a blank image or handle as needed
+                    img_data = np.zeros((10, 10))
                 fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
                 ax.imshow(img_data)
                 ax.set_title(f"{name.capitalize()} @ Epoch {epoch}")
@@ -549,9 +556,9 @@ if __name__ == "__main__":
     parser.add_argument("--laplace-threshold", type=float, help="Isosurface threshold")
     parser.add_argument("--laplace-path", type=str, help="Path to save Laplace surface image")
     parser.add_argument("--show-laplace", action="store_true", help="Display Laplace surface instead of closing")
-    parser.add_argument("--viz-every", type=int, default=10, help="Visualization frequency")
-    parser.add_argument("--low-entropy-every", type=int, default=25, help="Low-entropy sample frequency")
-    parser.add_argument("--max-epochs", type=int, default=10000, help="Maximum training epochs")
+    parser.add_argument("--viz-every", type=int, default=1, help="Visualization frequency")
+    parser.add_argument("--low-entropy-every", type=int, default=5, help="Low-entropy sample frequency")
+    parser.add_argument("--max-epochs", type=int, default=25, help="Maximum training epochs")
     parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
     parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
     args = parser.parse_args()
