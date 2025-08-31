@@ -27,10 +27,14 @@ def wrap_module(module):
         return module
 
     # Only wrap modules that provide an explicit backward implementation.
-    # Modules without ``backward`` should rely on their internal operations
-    # for autograd, so we leave them untouched to avoid suppressing gradient
-    # recording.
-    if not callable(getattr(module, "backward", None)):
+    # Modules relying on a parent class's ``backward`` (or having none) should
+    # execute normally so autograd can trace their internals.  Check both the
+    # instance and the concrete class to ensure the method originates from the
+    # module itself.
+    backward = getattr(module, "backward", None)
+    if not callable(backward):
+        return module
+    if "backward" not in module.__dict__ and "backward" not in module.__class__.__dict__:
         return module
 
     name = module.__class__.__name__
