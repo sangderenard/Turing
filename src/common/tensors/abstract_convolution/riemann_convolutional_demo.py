@@ -554,7 +554,9 @@ def main(
                 p_img = p.reshape(p.shape[0], -1)
                 g_img = g.reshape(g.shape[0], -1)
                 pairs.append(AT.cat([p_img, g_img], dim=1))
-            params_grads_frame = AT.cat(pairs, dim=0) if pairs else AT.zeros((1, 1))
+            params_grads_frame = (
+                AT.pad_cat(pairs, dim=0) if pairs else AT.zeros((1, 1))
+            )
 
             frame_cache["input_prediction"].append(ip_frame)
             frame_cache["params_grads"].append(params_grads_frame)
