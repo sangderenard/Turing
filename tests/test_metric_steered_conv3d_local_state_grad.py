@@ -30,3 +30,22 @@ def test_local_state_network_params_receive_grads(deploy_mode):
         assert all(getattr(p, "_grad", None) is not None for p in spatial_params)
         assert getattr(lsn.g_weight_layer, "_grad", None) is None
         assert getattr(lsn.g_bias_layer, "_grad", None) is None
+
+
+def test_local_state_network_params_receive_grads_raw_mode():
+    N = 2
+    transform = RectangularTransform(Lx=1.0, Ly=1.0, Lz=1.0, device="cpu")
+    layer = MetricSteeredConv3DWrapper(
+        1,
+        1,
+        (N, N, N),
+        transform,
+        deploy_mode="raw",
+        laplace_kwargs={"lambda_reg": 0.5},
+    )
+    x = AbstractTensor.randn((1, 1, N, N, N))
+    layer.forward(x)
+    lsn = layer.laplace_package["local_state_network"]
+    lsn._regularization_loss.backward()
+    params = lsn.parameters(include_all=True, include_structural=True)
+    assert all(getattr(p, "_grad", None) is not None for p in params)

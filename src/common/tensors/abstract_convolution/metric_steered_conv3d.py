@@ -154,9 +154,7 @@ class MetricSteeredConv3DWrapper:
             self.local_state_network = lsn
         if lsn is not None:
             unused = []
-            if self.deploy_mode == "raw":
-                unused = list(lsn.parameters(include_all=True, include_structural=True))
-            elif self.deploy_mode == "weighted":
+            if self.deploy_mode == "weighted":
                 if hasattr(lsn, "spatial_layer") and hasattr(lsn.spatial_layer, "parameters"):
                     unused.extend(lsn.spatial_layer.parameters())
                 inner = getattr(lsn, "inner_state", None)
@@ -174,7 +172,7 @@ class MetricSteeredConv3DWrapper:
                     return params
 
                 unused = gather_weight_branch(lsn)
-            else:
+            elif self.deploy_mode != "raw":
                 raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
 
             # Ensure all non-structural parameters have gradient placeholders
