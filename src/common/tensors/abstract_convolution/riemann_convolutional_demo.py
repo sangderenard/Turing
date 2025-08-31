@@ -19,6 +19,72 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 from src.common.tensors.abstract_nn.optimizer import Adam
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from pathlib import Path
+
+
+def _normalize(arr):
+    arr = np.array(arr)
+    min_val = arr.min()
+    max_val = arr.max()
+    if max_val - min_val < 1e-8:
+        return np.zeros_like(arr)
+    return (arr - min_val) / (max_val - min_val)
+
+
+def _random_spectral_gaussian(shape):
+    """Return gaussian noise with randomized spectrum."""
+    arr = np.random.randn(*shape)
+    fft = np.fft.fftn(arr)
+    phase = np.angle(fft)
+    mag = np.random.randn(*shape)
+    fft_rand = mag * np.exp(1j * phase)
+    return np.fft.ifftn(fft_rand).real
+
+
+def _low_entropy_variant(target_np, epoch):
+    """Generate a low-entropy sample by rolling/flipping the target."""
+    x = np.roll(target_np, shift=1, axis=-1)
+    if (epoch // 2) % 2 == 0:
+        x = np.flip(x, axis=-2)
+    x += np.random.normal(scale=0.01, size=x.shape)
+    return x
+
+
+def _make_frame(input_sample, pred_sample, params, grads):
+    n_params = len(params)
+    n_rows = 2 + 2 * n_params
+    fig, axes = plt.subplots(n_rows, 1, figsize=(4, n_rows * 2))
+    axes[0].imshow(_normalize(input_sample), cmap="viridis")
+    axes[0].set_title("Input")
+    axes[0].axis("off")
+    axes[1].imshow(_normalize(pred_sample), cmap="viridis")
+    axes[1].set_title("Prediction")
+    axes[1].axis("off")
+    row = 2
+    for p, g in zip(params, grads):
+        p_data = np.array(p.data if hasattr(p, "data") else p)
+        p_img = _normalize(p_data.reshape(p_data.shape[0], -1))
+        axes[row].imshow(p_img, cmap="magma")
+        axes[row].set_title(f"Param {getattr(p, '_label', '')}")
+        axes[row].axis("off")
+        row += 1
+        if g is not None:
+            g_data = np.array(g.data if hasattr(g, "data") else g)
+            g_img = _normalize(g_data.reshape(g_data.shape[0], -1))
+        else:
+            g_img = np.zeros_like(p_img)
+        axes[row].imshow(g_img, cmap="coolwarm")
+        axes[row].set_title(f"Grad {getattr(p, '_label', '')}")
+        axes[row].axis("off")
+        row += 1
+    fig.tight_layout()
+    fig.canvas.draw()
+    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close(fig)
+    return image
 
 
 def build_config():
@@ -85,7 +151,7 @@ def build_config():
     return config
 
 
-def main(config=None):
+def main(config=None, viz_every=10, low_entropy_every=25, anim_path="riemann_demo_training.gif"):
     AT = AbstractTensor
     if config is None:
         config = build_config()
@@ -119,9 +185,11 @@ def main(config=None):
     target = (U + V + W).unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1, -1)
     autograd.tape.annotate(target, label="riemann_demo.target")
     autograd.tape.auto_annotate_eval(target)
-    x = AT.randn((B, C, *grid_shape), requires_grad=True)
-    autograd.tape.annotate(x, label="riemann_demo.input")
+    target_np = np.array(target.data if hasattr(target, "data") else target)
+    x = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)), requires_grad=True)
+    autograd.tape.annotate(x, label="riemann_demo.input_init")
     autograd.tape.auto_annotate_eval(x)
+    frames = []
     # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
     # Uncomment one of the lines below to relax those checks:
     # autograd.strict = False                   # disable strict mode globally
@@ -207,6 +275,13 @@ def main(config=None):
                 p.zero_grad()
             elif hasattr(p, '_grad'):
                 p._grad = AbstractTensor.zeros_like(p._grad)
+        if epoch % low_entropy_every == 0:
+            np_x = _low_entropy_variant(target_np, epoch)
+        else:
+            np_x = _random_spectral_gaussian((B, C, *grid_shape))
+        x = AT.get_tensor(np_x, requires_grad=True)
+        autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
+        autograd.tape.auto_annotate_eval(x)
         y = layer.forward(x)
         autograd.tape.auto_annotate_eval(y)
         loss = loss_fn(y, target)
@@ -261,6 +336,11 @@ def main(config=None):
                         print(f"  Grad {i} ({label}): error reporting grad: {e}")
                 else:
                     print(f"  Grad {i} ({label}): None")
+        if epoch % viz_every == 0:
+            input_sample = np.array(x[0, 0].data)
+            pred_sample = np.array(y[0, 0].data)
+            frame = _make_frame(input_sample, pred_sample, params, grads)
+            frames.append(frame)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -268,6 +348,17 @@ def main(config=None):
     print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
+    if frames:
+        fig = plt.figure()
+        plt.axis("off")
+        im = plt.imshow(frames[0])
+        def _update(i):
+            im.set_array(frames[i])
+            return [im]
+        ani = animation.FuncAnimation(fig, _update, frames=len(frames), interval=200, blit=True)
+        out_path = Path(anim_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ani.save(out_path, writer="pillow")
 
 if __name__ == "__main__":
     main()
