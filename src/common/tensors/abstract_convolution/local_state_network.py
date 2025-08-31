@@ -224,8 +224,8 @@ class LocalStateNetwork:
                 padding=1,
                 like=like,
                 bias=spatial_bias,
+                _label_prefix=f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.spatial_layer",
             )
-            # RectConv3d does not have learnable parameters by default, but if it did, label them here
             self.inner_state = LocalStateNetwork(
                 metric_tensor_func,
                 grid_shape,
