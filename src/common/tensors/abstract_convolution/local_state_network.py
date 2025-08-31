@@ -387,19 +387,19 @@ class LocalStateNetwork:
 
         weighted_padded = padded_raw * g_weight_layer + g_bias_layer
 
-        padded_view = padded_raw.reshape((B, D, H, W, -1))
+        weighted_view = weighted_padded.reshape((B, D, H, W, -1))
 
         if isinstance(self.spatial_layer, RectConv3d):
-            padded_view = padded_view.transpose(1, 4)
-            padded_view = padded_view.transpose(2, 4)
-            padded_view = padded_view.transpose(3, 4)
-            modulated = self.spatial_layer.forward(padded_view)
+            weighted_view = weighted_view.transpose(1, 4)
+            weighted_view = weighted_view.transpose(2, 4)
+            weighted_view = weighted_view.transpose(3, 4)
+            modulated = self.spatial_layer.forward(weighted_view)
             modulated = modulated.transpose(3, 4)
             modulated = modulated.transpose(2, 4)
             modulated = modulated.transpose(1, 4)
             modulated = modulated.reshape((B, D, H, W, -1))
         else:
-            flat_view = padded_view.reshape((-1, padded_view.shape[-1]))
+            flat_view = weighted_view.reshape((-1, weighted_view.shape[-1]))
             modulated = self.spatial_layer.forward(flat_view)
             modulated = modulated.reshape((B, D, H, W, -1))
 
