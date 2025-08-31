@@ -115,7 +115,10 @@ def test_local_state_network_weighted_mode_gradient():
     )
 
     local_state_network = package["local_state_network"]
-    local_state_network._regularization_loss.backward()
+    package["regularization_loss"].backward()
+    zero_w = AbstractTensor.zeros_like(local_state_network._weighted_padded)
+    zero_m = AbstractTensor.zeros_like(local_state_network._modulated_padded)
+    local_state_network.backward(zero_w, zero_m, lambda_reg=0.5)
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
@@ -174,7 +177,10 @@ def test_local_state_network_modulated_mode_gradient():
     )
 
     local_state_network = package["local_state_network"]
-    local_state_network._regularization_loss.backward()
+    package["regularization_loss"].backward()
+    zero_w = AbstractTensor.zeros_like(local_state_network._weighted_padded)
+    zero_m = AbstractTensor.zeros_like(local_state_network._modulated_padded)
+    local_state_network.backward(zero_w, zero_m, lambda_reg=0.5)
 
     # Log gradient status for all parameters
     for param in package["local_state_network"].parameters(include_all=True):
@@ -244,7 +250,10 @@ def test_local_state_network_convolutional_modulator_gradient():
     )
 
     local_state_network = package["local_state_network"]
-    local_state_network._regularization_loss.backward()
+    package["regularization_loss"].backward()
+    zero_w = AbstractTensor.zeros_like(local_state_network._weighted_padded)
+    zero_m = AbstractTensor.zeros_like(local_state_network._modulated_padded)
+    local_state_network.backward(zero_w, zero_m, lambda_reg=0.5)
 
     # Ensure recursion caps at max_depth
     assert local_state_network.inner_state is not None
@@ -310,7 +319,10 @@ def test_local_state_network_with_regularization_loss():
 
     metric_tensor = package["metric"]["g"]
     local_state_network = package["local_state_network"]
-    local_state_network._regularization_loss.backward()
+    package["regularization_loss"].backward()
+    zero_w = AbstractTensor.zeros_like(local_state_network._weighted_padded)
+    zero_m = AbstractTensor.zeros_like(local_state_network._modulated_padded)
+    local_state_network.backward(zero_w, zero_m, lambda_reg=0.5)
 
     # Log gradient status for all parameters
     for param in local_state_network.parameters(include_all=True):
@@ -321,12 +333,13 @@ def test_local_state_network_with_regularization_loss():
 
 
 def test_regularization_loss_backward_registers_grads():
-    """Calling _regularization_loss.backward should populate grads for all params."""
+    """Backwarding the returned regularisation loss populates grads."""
     metric_tensor_func = lambda *args, **kwargs: None
     net = LocalStateNetwork(metric_tensor_func, (2, 2, 2), DEFAULT_CONFIGURATION, max_depth=1)
     padded_raw = AbstractTensor.randn((2, 2, 2, 3, 3, 3))
     net.forward(padded_raw, lambda_reg=0.5)
-    net._regularization_loss.backward()
+    zero = AbstractTensor.zeros_like(padded_raw)
+    net.backward(zero, zero, lambda_reg=0.5)
     for p in net.parameters(include_all=True):
         assert p.grad is not None
 

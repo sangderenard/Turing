@@ -1,4 +1,5 @@
 import numpy as np
+import numpy as np
 import pytest
 from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.abstract_convolution.local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION
@@ -19,7 +20,7 @@ def test_local_state_network_forward_backward_consistency():
     padded_raw_np = np.random.randn(1, 1, 1, 1, 3, 3, 3).astype(np.float32)
     padded_raw = AbstractTensor.get_tensor(padded_raw_np)
 
-    weighted, modulated = net.forward(padded_raw)
+    weighted, modulated, _ = net.forward(padded_raw)
 
     grad_w_np = np.random.randn(*weighted.shape).astype(np.float32)
     grad_m_np = np.random.randn(*modulated.shape).astype(np.float32)
@@ -81,7 +82,8 @@ def test_zero_grad_preserves_parameters():
     assert np.allclose(net.g_weight_layer.data, initial)
 
 
-def test_regularization_modifies_weight_gradient():
+def test_regularization_produces_weight_gradient():
+    """Gradient on g_weight_layer should be non-zero when lambda_reg > 0."""
     net = LocalStateNetwork(
         metric_tensor_func=dummy_metric,
         grid_shape=(1, 1, 1),
@@ -89,14 +91,20 @@ def test_regularization_modifies_weight_gradient():
         max_depth=1,
     )
     padded_raw = AbstractTensor.zeros((1, 1, 1, 1, 3, 3, 3))
+
     zeros = AbstractTensor.zeros_like(padded_raw)
 
+    # Baseline with no regularisation
     net.forward(padded_raw, lambda_reg=0.0)
     net.backward(zeros, zeros, lambda_reg=0.0)
     baseline = net.g_weight_layer.grad.data.copy()
 
     net.zero_grad()
-    net.forward(padded_raw, lambda_reg=0.5)
-    net.backward(zeros, zeros, lambda_reg=0.5)
 
-    assert not np.allclose(net.g_weight_layer.grad.data, baseline)
+    # With regularisation enabled
+    _, _, reg = net.forward(padded_raw, lambda_reg=0.5)
+    net.backward(zeros, zeros, lambda_reg=0.5)
+    grad = net.g_weight_layer.grad.data
+
+    assert np.allclose(baseline, 0.0)
+    assert not np.allclose(grad, 0.0)

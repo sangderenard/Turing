@@ -46,6 +46,9 @@ def test_local_state_network_params_receive_grads_raw_mode():
     x = AbstractTensor.randn((1, 1, N, N, N))
     layer.forward(x)
     lsn = layer.laplace_package["local_state_network"]
-    lsn._regularization_loss.backward()
+    layer.laplace_package["regularization_loss"].backward()
+    zero_w = AbstractTensor.zeros_like(lsn._weighted_padded)
+    zero_m = AbstractTensor.zeros_like(lsn._modulated_padded)
+    lsn.backward(zero_w, zero_m, lambda_reg=0.5)
     params = lsn.parameters(include_all=True, include_structural=True)
     assert all(getattr(p, "_grad", None) is not None for p in params)
