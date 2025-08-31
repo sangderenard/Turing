@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from ..abstraction import AbstractTensor as AT
 from .utils import zeros_like
 
@@ -7,13 +7,12 @@ from .utils import zeros_like
 class Adam:
     """Simple Adam optimizer.
 
-    The previous implementation keyed internal state by ``id(param)``.  Since
-    model parameters are replaced with new tensor objects on every optimisation
-    step, Python may recycle object IDs, leading to state being incorrectly
-    reused across different parameters.  That manifested as biases suddenly
-    growing to the wrong shape (e.g. ``(1, 8)`` instead of ``(1, 1)``) once an
-    ID collision occurred.  We instead track state by parameter *index* in the
-    list supplied to ``step`` which is stable across updates.
+    The previous implementation keyed internal state by parameter index.  Some
+    calling code, however, generates a fresh parameter list each step and may
+    reorder entries.  Index-based bookkeeping would then associate the wrong
+    momentum/variance tensors with a parameter, causing shape mismatches.  We
+    now map state by the ``id`` of each parameter while retaining a strong
+    reference to avoid ID reuse once a tensor is garbage collected.
     """
 
     def __init__(
@@ -28,32 +27,39 @@ class Adam:
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
-        self.m: List[AT] = []
-        self.v: List[AT] = []
+        # Track optimizer state per parameter ID to remain robust even if the
+        # caller reorders the parameter list between steps.  We keep a strong
+        # reference to each parameter to avoid ``id`` reuse once an object is
+        # garbage‑collected.
+        self.m: Dict[int, AT] = {}
+        self.v: Dict[int, AT] = {}
+        self._param_refs: Dict[int, AT] = {}
         self.t: int = 0
         self._init_params(params)
 
     def _init_params(self, params: List[AT]):
-        # Lazily extend state lists to match the number of parameters.
-        while len(self.m) < len(params):
-            p = params[len(self.m)]
-            self.m.append(zeros_like(p))
-            self.v.append(zeros_like(p))
+        for p in params:
+            key = id(p)
+            if key not in self.m or self.m[key].shape != p.shape:
+                self.m[key] = zeros_like(p)
+                self.v[key] = zeros_like(p)
+                self._param_refs[key] = p
 
     def step(self, params: List[AT], grads: List[AT]):
         self._init_params(params)
         self.t += 1
         lr, b1, b2, eps = self.lr, self.beta1, self.beta2, self.eps
         out_params: List[AT] = []
-        for i, (p, g) in enumerate(zip(params, grads)):
-            m = self.m[i]
-            v = self.v[i]
+        for p, g in zip(params, grads):
+            key = id(p)
+            m = self.m[key]
+            v = self.v[key]
             m = b1 * m + (1.0 - b1) * g
             v = b2 * v + (1.0 - b2) * (g * g)
             m_hat = m / (1.0 - (b1 ** self.t))
             v_hat = v / (1.0 - (b2 ** self.t))
             p = p - lr * m_hat / ((v_hat ** 0.5) + eps)
-            self.m[i], self.v[i] = m, v
+            self.m[key], self.v[key] = m, v
             out_params.append(p)
         return out_params
 
