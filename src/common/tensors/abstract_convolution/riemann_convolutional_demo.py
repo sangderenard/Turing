@@ -433,7 +433,7 @@ def main(
         )
 
     params, _ = collect_params_and_grads()
-    frame_cache = {"input_prediction": [], "params": [], "grads": []}
+    frame_cache = {"input_prediction": [], "params_grads": []}
 
     optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
@@ -506,24 +506,37 @@ def main(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
+            # Top row: low-entropy input and its prediction
             low_entropy = AT.get_tensor(_low_entropy_variant(target_np, epoch))
-            inp = x[0, 0]
-            pred = y[0, 0]
-            H = inp.shape[0]
-            inp_img = inp.reshape(H, -1)
-            pred_img = pred.reshape(H, -1)
-            le_img = low_entropy.reshape(H, -1)
-            ip_frame = AT.cat([inp_img, pred_img, le_img], dim=1)
-            param_imgs = [p.reshape(p.shape[0], -1) for p in params]
-            params_frame = AT.cat(param_imgs, dim=1)
-            grad_imgs = []
-            for g, p in zip(grads, params):
+            with autograd.no_grad():
+                le_pred = layer.forward(low_entropy)
+
+            # Bottom row: gaussian input and its prediction
+            gaussian = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)))
+            with autograd.no_grad():
+                gauss_pred = layer.forward(gaussian)
+
+            le_inp = low_entropy[0, 0]
+            le_out = le_pred[0, 0]
+            ga_inp = gaussian[0, 0]
+            ga_out = gauss_pred[0, 0]
+            H = le_inp.shape[0]
+
+            top_row = AT.cat([le_inp.reshape(H, -1), le_out.reshape(H, -1)], dim=1)
+            bottom_row = AT.cat([ga_inp.reshape(H, -1), ga_out.reshape(H, -1)], dim=1)
+            ip_frame = AT.cat([top_row, bottom_row], dim=0)
+
+            # Pair each parameter with its gradient side by side
+            pairs = []
+            for p, g in zip(params, grads):
                 g = g if g is not None else AT.zeros_like(p)
-                grad_imgs.append(g.reshape(g.shape[0], -1))
-            grads_frame = AT.cat(grad_imgs, dim=1)
+                p_img = p.reshape(p.shape[0], -1)
+                g_img = g.reshape(g.shape[0], -1)
+                pairs.append(AT.cat([p_img, g_img], dim=1))
+            params_grads_frame = AT.cat(pairs, dim=0) if pairs else AT.zeros((1, 1))
+
             frame_cache["input_prediction"].append(ip_frame)
-            frame_cache["params"].append(params_frame)
-            frame_cache["grads"].append(grads_frame)
+            frame_cache["params_grads"].append(params_grads_frame)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -532,8 +545,7 @@ def main(
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
     _save_animation(frame_cache["input_prediction"], os.path.join(output_dir, "input_prediction.png"))
-    _save_animation(frame_cache["params"], os.path.join(output_dir, "params.png"))
-    _save_animation(frame_cache["grads"], os.path.join(output_dir, "grads.png"))
+    _save_animation(frame_cache["params_grads"], os.path.join(output_dir, "params_grads.png"))
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
