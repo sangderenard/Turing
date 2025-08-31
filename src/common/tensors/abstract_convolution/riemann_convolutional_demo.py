@@ -180,7 +180,7 @@ def main(config=None):
         )
 
     params, _ = collect_params_and_grads()
-    optimizer = Adam(params, lr=1e-1)
+    optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, 10001):
         # Zero gradients for all params
@@ -193,9 +193,9 @@ def main(config=None):
         autograd.tape.auto_annotate_eval(y)
         loss = loss_fn(y, target)
         LSN_loss = layer.local_state_network._regularization_loss
-        print(f"Epoch {epoch}: loss={loss.item():.2e}, LSN_loss={LSN_loss.item():.2e}")
+        print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
-        print(f"Total loss={loss.item():.2e}")
+        print(f"Total loss={loss.item()}")
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
         # layer.report_orphan_nodes()  # retired / no-op
