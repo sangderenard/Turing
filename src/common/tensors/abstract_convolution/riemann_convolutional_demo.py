@@ -609,6 +609,9 @@ def main(
                     p_img = p_img.mean(axis=0)
                 if g_img.ndim == 3:
                     g_img = g_img.mean(axis=0)
+                # Ensure images have at least 2 dimensions for concatenation
+                p_img = np.atleast_2d(p_img)
+                g_img = np.atleast_2d(g_img)
                 # Normalize and convert to RGB
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
