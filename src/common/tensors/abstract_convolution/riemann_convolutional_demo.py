@@ -19,7 +19,8 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 # from src.common.tensors.abstract_nn.optimizer import BPIDSGD  # TODO: optional later
 from src.common.tensors.abstract_nn.optimizer import Adam, SGD
-from src.common.tensors.abstract_nn.core import Linear
+from src.common.tensors.abstract_nn.linear_block import LinearBlock
+from src.common.tensors.abstract_nn.pca_layer import PCATransformLayer
 import numpy as np
 from pathlib import Path
 from skimage import measure
@@ -387,6 +388,8 @@ def training_worker(
         daemon=True,
     )
     pump_thread.start()
+    linear_layer = None
+    transform_layer = None
     if visualize_laplace:
         with autograd.no_grad():
             builder = BuildLaplace3D(
@@ -564,31 +567,66 @@ def training_worker(
         if not batch_inputs:
             break
         batch_arr = np.stack(batch_inputs)
-        if batch_arr.ndim == 3:
-            batch_arr = batch_arr[:, None, :, :, None]
-        if batch_arr.ndim == 4:
-            batch_arr = batch_arr[:, None, ...]
+        target_arr = np.stack(batch_targets)
+        sample_ndim = np.array(batch_inputs[0]).ndim
+        if sample_ndim <= 1:
+            if linear_layer is None:
+                in_dim = batch_arr.shape[-1] if sample_ndim == 1 else batch_arr.shape[0]
+                tgt_sample_ndim = np.array(batch_targets[0]).ndim
+                out_dim = target_arr.shape[-1] if tgt_sample_ndim == 1 else target_arr.shape[0]
+                linear_layer = LinearBlock(in_dim, out_dim, AT.zeros((1,)))
+                optimizer = init_optimizer(opt_name, linear_layer.parameters(), lr)
+            x = AT.get_tensor(batch_arr, requires_grad=True)
+            target = AT.get_tensor(target_arr)
+            y = linear_layer.forward(x)
+            loss = loss_composer(y, target, batch_cats)
+            print(f"Epoch {epoch}: loss={loss.item()}")
+            loss.backward()
+            optimizer.step()
+            continue
+
+        if transform_layer is None:
+            if sample_ndim == 2:
+                from src.common.tensors.abstract_nn.transform_layers import Transform2DLayer
+                transform_layer = Transform2DLayer()
+            elif sample_ndim == 3:
+                from src.common.tensors.abstract_nn.transform_layers import Transform3DLayer
+                transform_layer = Transform3DLayer()
+            else:
+                transform_layer = PCATransformLayer()
+
+        if sample_ndim > 3:
+            b = batch_arr.shape[0]
+            flat = batch_arr.reshape(b, -1)
+            reduced = transform_layer.forward(AT.get_tensor(flat))
+            batch_arr = _to_numpy(reduced).reshape(b, 1, 1, 1, -1)
+        else:
+            batch_arr = _to_numpy(transform_layer.forward(AT.get_tensor(batch_arr)))
+
         if batch_arr.ndim != 5:
             raise ValueError(f"training data must be 5D (B,C,D,H,W), got {batch_arr.shape}")
         exp_no_batch = tuple(1 if d is None else d for d in expected_shape[1:])
         exp_flat = int(np.prod(exp_no_batch))
         cur_flat = int(np.prod(batch_arr.shape[1:]))
         if cur_flat != exp_flat and input_shim is None:
-            input_shim = Linear(cur_flat, exp_flat, like=AT.zeros((1,)))
+            input_shim = LinearBlock(cur_flat, exp_flat, AT.zeros((1,)))
 
         x = AT.get_tensor(batch_arr, requires_grad=True)
 
-        target_arr = np.stack(batch_targets)
-        if target_arr.ndim == 3:
-            target_arr = target_arr[:, None, :, :, None]
-        if target_arr.ndim == 4:
-            target_arr = target_arr[:, None, ...]
+        if sample_ndim > 3:
+            b = target_arr.shape[0]
+            flat_t = target_arr.reshape(b, -1)
+            reduced_t = transform_layer.forward(AT.get_tensor(flat_t))
+            target_arr = _to_numpy(reduced_t).reshape(b, 1, 1, 1, -1)
+        else:
+            target_arr = _to_numpy(transform_layer.forward(AT.get_tensor(target_arr)))
+
         if target_arr.ndim != 5:
             raise ValueError(f"target data must be 5D (B,C,D,H,W), got {target_arr.shape}")
         tgt_no_batch = target_arr.shape[1:]
         tgt_flat = int(np.prod(tgt_no_batch))
         if cur_flat != exp_flat and output_shim is None:
-            output_shim = Linear(exp_flat, tgt_flat, like=AT.zeros((1,)))
+            output_shim = LinearBlock(exp_flat, tgt_flat, AT.zeros((1,)))
         target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
@@ -607,14 +645,11 @@ def training_worker(
         print(f"Total loss={loss.item()}")
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
-        # layer.report_orphan_nodes()  # retired / no-op
-        # Backward pass (assume .backward() populates ._grad)
         loss.backward()
         lsn = layer.local_state_network
         grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
         grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
         lsn.backward(grad_w, grad_m, lambda_reg=0.5)
-        # Re-collect params and grads (in case new tensors were created)
         params, grads = collect_params_and_grads()
         new_opt = shared_state.get("optimizer", current_opt)
         new_lr = shared_state.get("lr", current_lr)
