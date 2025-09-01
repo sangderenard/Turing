@@ -652,8 +652,9 @@ def training_worker(
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
-        pred = y[:, :C]
-        loss = loss_composer(y, target, batch_cats)
+        pred = y
+        autograd.tape.auto_annotate_eval(pred)
+        loss = loss_composer(pred, target, batch_cats)
         LSN_loss = conv_layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss

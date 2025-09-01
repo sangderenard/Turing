@@ -3,6 +3,9 @@ from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.abstract_convolution.ndpca3transform import fit_metric_pca
 from src.common.tensors.riemann.geometry_factory import build_geometry
 from src.common.tensors.abstract_convolution.metric_steered_conv3d import MetricSteeredConv3DWrapper
+from src.common.tensors.abstract_nn.linear_block import LinearBlock
+from src.common.tensors.abstract_nn.core import Model
+from src.common.tensors import autograd as _autograd
 
 TWOPI = 6.283185307179586
 
@@ -98,3 +101,29 @@ def test_riemann_pipeline_with_lsn_backward_updates_params():
     lsn.backward(grad_w, grad_m, lambda_reg=0.5)
     params = lsn.parameters(include_all=True, include_structural=True)
     assert all(getattr(p, "_grad", None) is not None for p in params)
+
+
+def test_riemann_pipeline_linear_block_params_receive_grads():
+    layer, grid, train_cfg = _build_demo_like_layer()
+    AT = AbstractTensor
+    B, C = train_cfg["B"], train_cfg["C"]
+    flat_target_size = C
+    for s in grid.U.shape:
+        flat_target_size *= s
+    end_linear = LinearBlock(C, flat_target_size, AT.zeros((1,)))
+    model = Model([layer, end_linear], [None, None])
+    for p in end_linear.parameters():
+        if hasattr(p, "zero_grad"):
+            p.zero_grad()
+        _autograd.autograd.tape.create_tensor_node(p)
+    x = AT.randn((B, C, *grid.U.shape), requires_grad=True)
+    y = model.forward(x)
+    _autograd.autograd.tape.auto_annotate_eval(y)
+    target = AT.randn(y.shape)
+    pred = y
+    loss = ((pred - target) ** 2).mean()
+    _autograd.autograd.tape.annotate(loss, label="riemann_linear_block.loss")
+    _autograd.autograd.tape.auto_annotate_eval(loss)
+    params = list(end_linear.parameters())
+    grads = _autograd.autograd.grad(loss, params, allow_unused=True)
+    assert len(grads) == len(params)
