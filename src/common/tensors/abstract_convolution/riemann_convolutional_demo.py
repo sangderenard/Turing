@@ -843,6 +843,8 @@ def display_worker(
 
     norm_var = tk.StringVar(value="none")
     tk.OptionMenu(controls, norm_var, "none", "min-max", "standard").pack(side=tk.RIGHT)
+    cmap_var = tk.StringVar(value="blue_fire")
+    tk.OptionMenu(controls, cmap_var, "blue_fire", "fire", "hue", "grayscale").pack(side=tk.RIGHT)
     auto_var = tk.BooleanVar(value=True)
     tk.Checkbutton(controls, text="Autoloop", variable=auto_var).pack(side=tk.RIGHT)
     speed_var = tk.IntVar(value=1)
@@ -873,6 +875,9 @@ def display_worker(
         return (data * 255).clip(0, 255).astype(np.uint8)
 
     last_opts: list[str] = []
+    last_layout: list[list[str]] = []
+    last_cmap = cmap_var.get()
+    last_norm = norm_var.get()
 
     def refresh_menus() -> None:
         nonlocal last_opts
@@ -891,15 +896,25 @@ def display_worker(
     frame_index = 0
 
     def update():
-        nonlocal frame_index
+        nonlocal frame_index, last_layout, last_cmap, last_norm
         if stop_event.is_set():
             root.quit()
             return
-        frame_cache.process_queue()
+        changed = frame_cache.process_queue()
         refresh_menus()
         layout = [[var.get() for var in row] for row in grid_vars]
+        current_cmap = cmap_var.get()
+        current_norm = norm_var.get()
+        if layout != last_layout or current_cmap != last_cmap or current_norm != last_norm or changed:
+            frame_index = 0
+            frame_cache.composite_cache.clear()
+            last_layout = [row[:] for row in layout]
+            last_cmap = current_cmap
+            last_norm = current_norm
         grid = frame_cache.compose_layout_at(layout, frame_index)
-        grid = _apply_norm(grid, norm_var.get())
+        if grid.ndim == 2 or (grid.ndim == 3 and grid.shape[2] == 1):
+            grid = apply_colormap(grid, current_cmap)
+        grid = _apply_norm(grid, current_norm)
         groups = frame_cache._group_labels()
         lengths: list[int] = []
         for row in grid_vars:

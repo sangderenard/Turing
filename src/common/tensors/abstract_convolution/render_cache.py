@@ -15,7 +15,14 @@ _VIGNETTE_CACHE: Dict[Tuple[int, int, float], np.ndarray] = {}
 
 _GRADIENTS = {
     "grayscale": np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
-    "fire": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+    "fire": np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+        dtype=np.float32,
+    ),
+    "blue_fire": np.array(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+        dtype=np.float32,
+    ),
 }
 
 
@@ -74,7 +81,7 @@ def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.nda
     return out[..., 0] if c == 1 else out
 
 
-def apply_colormap(frame: np.ndarray, cmap: str = "grayscale") -> np.ndarray:
+def apply_colormap(frame: np.ndarray, cmap: str = "blue_fire") -> np.ndarray:
     """Apply ``cmap`` to ``frame`` returning an RGB image."""
 
     arr = np.array(frame)
@@ -90,7 +97,7 @@ def apply_colormap(frame: np.ndarray, cmap: str = "grayscale") -> np.ndarray:
         flat = [colorsys.hsv_to_rgb(h, 1.0, 1.0) for h in hues.ravel()]
         colour = np.array(flat, dtype=np.float32).reshape(arr.shape + (3,))
     else:
-        grad = _GRADIENTS.get(cmap, _GRADIENTS["grayscale"])
+        grad = _GRADIENTS.get(cmap, _GRADIENTS["blue_fire"])
         n = grad.shape[0]
         idx = arr * (n - 1)
         lo = np.floor(idx).astype(int)
@@ -150,11 +157,16 @@ class FrameCache:
             arr = add_vignette(arr)
         self.queue.put(RenderItem(label, arr))
 
-    def process_queue(self) -> None:
+    def process_queue(self) -> bool:
         """Drain all pending frames into the cache.
 
         Any time new frames are processed the composite cache is cleared so
         that subsequent calls recompute layouts when necessary.
+
+        Returns
+        -------
+        bool
+            ``True`` if new frames were added to the cache.
         """
 
         changed = False
@@ -164,6 +176,15 @@ class FrameCache:
             changed = True
         if changed:
             self.composite_cache.clear()
+        return changed
+
+    def clear(self) -> None:
+        """Wipe all cached and queued frames."""
+
+        self.cache.clear()
+        self.composite_cache.clear()
+        while not self.queue.empty():
+            self.queue.get()
 
     def available_sources(self) -> List[str]:
         """Return sorted set of data sources derived from cached labels."""
