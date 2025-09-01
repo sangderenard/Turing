@@ -29,6 +29,24 @@ def _spectral_noise(img: np.ndarray) -> np.ndarray:
     return np.fft.ifftn(mag * phase).real
 
 
+def _corrupt_noise(img: np.ndarray, p: float = 0.1) -> np.ndarray:
+    """Return ``img`` with a fraction of pixels replaced by random noise.
+
+    Parameters
+    ----------
+    img:
+        The image to corrupt.
+    p:
+        Probability that each pixel will be replaced by a random value in
+        ``[0, 1]``.
+    """
+    mask = np.random.rand(*img.shape) < p
+    noise = np.random.rand(*img.shape)
+    corrupted = img.copy()
+    corrupted[mask] = noise[mask]
+    return corrupted
+
+
 def pump_queue(
     q: Queue,
     grid_shape: Tuple[int, int],
@@ -36,13 +54,25 @@ def pump_queue(
     *,
     stop_event: threading.Event | None = None,
     delay: float = 0.0,
+    noise_mode: str = "spectral",
 ) -> None:
-    """Continuously fill ``q`` with classification samples."""
+    """Continuously fill ``q`` with classification samples.
+
+    Parameters
+    ----------
+    noise_mode:
+        ``"spectral"`` (default) adds phase-randomized spectral noise sharing
+        the target's magnitude spectrum. ``"corrupt"`` randomly replaces a
+        fraction of pixels with uniform noise.
+    """
     while stop_event is None or not stop_event.is_set():
         idx = int(np.random.randint(len(SHAPE_NAMES)))
         name = SHAPE_NAMES[idx]
         shape = SHAPES[name][None, ...]
-        inp = shape + _spectral_noise(shape[0])
+        if noise_mode == "corrupt":
+            inp = _corrupt_noise(shape[0])[None, ...]
+        else:
+            inp = shape + _spectral_noise(shape[0])
         tgt = shape
         category: Dict[str, int | str] = {"label": idx, "name": name}
         q.put((inp, tgt, category))
