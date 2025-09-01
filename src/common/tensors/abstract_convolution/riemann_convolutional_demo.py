@@ -84,26 +84,16 @@ def pca_to_rgb(arr):
     arr = np.array(arr)
     if arr.ndim == 3:
         h, w, d = arr.shape
-        if d < 2:
-            # Not enough channels for PCA; fall back to grayscale.
-            arr2d = _normalize(arr.reshape(h, w))
-            img = np.stack([arr2d] * 3, axis=-1)
-        else:
-            flat = arr.reshape(-1, d)
-            flat = flat - flat.mean(axis=0, keepdims=True)
-            cov = np.cov(flat, rowvar=False)
-            if cov.ndim < 2:
-                # Covariance collapsed to scalar (e.g. constant input).
-                arr2d = _normalize(arr.reshape(h, w))
-                img = np.stack([arr2d] * 3, axis=-1)
-            else:
-                eigvals, eigvecs = np.linalg.eigh(cov)
-                comps = flat @ eigvecs[:, -2:]
-                comps = comps.reshape(h, w, 2)
-                r = _normalize(comps[..., 0])
-                g = _normalize(comps[..., 1])
-                b = np.zeros_like(r)
-                img = np.stack([r, g, b], axis=-1)
+        flat = arr.reshape(-1, d)
+        flat = flat - flat.mean(axis=0, keepdims=True)
+        cov = np.cov(flat, rowvar=False)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        comps = flat @ eigvecs[:, -2:]
+        comps = comps.reshape(h, w, 2)
+        r = _normalize(comps[..., 0])
+        g = _normalize(comps[..., 1])
+        b = np.zeros_like(r)
+        img = np.stack([r, g, b], axis=-1)
     else:
         arr2d = _normalize(arr)
         img = np.stack([arr2d] * 3, axis=-1)
@@ -389,7 +379,7 @@ def training_worker(
 
     loss_composer = task.build_loss_composer(C, num_logits)
 
-    data_queue: Queue = Queue()
+    data_queue: Queue = Queue(maxsize=10)
     pump_thread = threading.Thread(
         target=task.pump_queue,
         args=(data_queue, grid_shape, C),
@@ -495,10 +485,21 @@ def training_worker(
     # make an input of w/e to kick start the parameter recognition
     # first, to accomodate any network, you must poll the model
     # for the expected input shape
-    expected_shape = layer.get_input_shape()
+
+    from src.common.tensors.abstract_nn.core import Model
+    layer_list = []
+    if input_shim is not None:
+        layer_list.append(input_shim)
+    layer_list += [layer]
+    if output_shim is not None:
+        layer_list.append(output_shim)
+    activations = [None] * len(layer_list)
+    system = Model(layer_list, activations)
+
+    expected_shape = system.get_input_shape()
     concrete = tuple(1 if d is None else d for d in expected_shape)  # choose batch=1
     x = AbstractTensor.ones(concrete)
-    y = layer.forward(x)
+    y = system.forward(x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     print(f"[DEBUG] LSN param ids: {[id(p) for p in layer.local_state_network.parameters(include_all=True)]}")
@@ -574,22 +575,8 @@ def training_worker(
         cur_flat = int(np.prod(batch_arr.shape[1:]))
         if cur_flat != exp_flat and input_shim is None:
             input_shim = Linear(cur_flat, exp_flat, like=AT.zeros((1,)))
-            # Start as near-identity so data flows before learning tunes it
-            with autograd.no_grad():
-                W = AT.zeros((cur_flat, exp_flat))
-                m = min(cur_flat, exp_flat)
-                W[:m, :m] = AT.eye(m)
-                _AT.copyto(input_shim.W, W)
-                if input_shim.b is not None:
-                    _AT.copyto(input_shim.b, AT.zeros_like(input_shim.b))
-        if cur_flat != exp_flat:
-            x = AT.get_tensor(batch_arr.reshape(B, -1), requires_grad=True)
-            x = input_shim.forward(x)
-            x = x.reshape((B, *exp_no_batch))
-        else:
-            if batch_arr.shape[1:] != exp_no_batch:
-                raise ValueError(f"input shape {batch_arr.shape[1:]} does not match expected {exp_no_batch}")
-            x = AT.get_tensor(batch_arr, requires_grad=True)
+
+        x = AT.get_tensor(batch_arr, requires_grad=True)
 
         target_arr = np.stack(batch_targets)
         if target_arr.ndim == 3:
@@ -602,22 +589,12 @@ def training_worker(
         tgt_flat = int(np.prod(tgt_no_batch))
         if cur_flat != exp_flat and output_shim is None:
             output_shim = Linear(exp_flat, tgt_flat, like=AT.zeros((1,)))
-            # Identity initialisation mirrors input shims for stable training
-            with autograd.no_grad():
-                W = AT.zeros((exp_flat, tgt_flat))
-                m = min(exp_flat, tgt_flat)
-                W[:m, :m] = AT.eye(m)
-                _AT.copyto(output_shim.W, W)
-                if output_shim.b is not None:
-                    _AT.copyto(output_shim.b, AT.zeros_like(output_shim.b))
         target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
         autograd.tape.auto_annotate_eval(target)
-        y = layer.forward(x)
-        if output_shim is not None:
-            y = output_shim.forward(y.reshape(B, -1)).reshape((B, *tgt_no_batch))
+        y = system.forward(x)
         autograd.tape.auto_annotate_eval(y)
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))

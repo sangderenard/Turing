@@ -79,6 +79,19 @@ def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.nda
     h, w, c = arr.shape
 
     oversample = 4
+    # Cap the working-set size by reducing oversample if necessary.
+    # Estimate the intermediate working buffer as if each tile is rendered at
+    # (tile * oversample)^2 across all tiles, using float32 during blending.
+    # This is a conservative bound to avoid spikes on very large grids.
+    max_bytes = 8 * 1024 * 1024  # 8 MiB default ceiling for intermediate data
+    while oversample > 1:
+        big_tile = tile * oversample
+        est_bytes = (
+            h * w * big_tile * big_tile * c * np.dtype(np.float32).itemsize
+        )
+        if est_bytes <= max_bytes:
+            break
+        oversample //= 2
     big_tile = tile * oversample
 
     # Nearest neighbour oversample of source pixels to the output tile size
