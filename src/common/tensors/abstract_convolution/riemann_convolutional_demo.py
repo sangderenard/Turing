@@ -620,14 +620,19 @@ def training_worker(
             quad3 = resize(quad3)
             quad4 = resize(quad4)
 
-            # Compose into 2x2 grid
+            # Compose into 2x2 grid for legacy animation
             top = np.concatenate([quad1, quad2], axis=1)
             bottom = np.concatenate([quad3, quad4], axis=1)
             ip_frame = np.concatenate([top, bottom], axis=0)
+            # Store individual quadrants for flexible layout
+            frame_cache.enqueue("low_input", quad1)
+            frame_cache.enqueue("low_prediction", quad2)
+            frame_cache.enqueue("high_input", quad3)
+            frame_cache.enqueue("high_prediction", quad4)
 
             # Parameter/gradient visualization
             pairs = []
-            for p, g in zip(params, grads):
+            for idx, (p, g) in enumerate(zip(params, grads)):
                 g = g if g is not None else AT.zeros_like(p)
                 p_img = normalize_for_visualization(p)
                 g_img = normalize_for_visualization(g)
@@ -643,6 +648,9 @@ def training_worker(
                 g_img = g_img[:min_h, :min_w]
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
+                # Store individual param/grad visuals
+                frame_cache.enqueue(f"param{idx}_param", p_img)
+                frame_cache.enqueue(f"param{idx}_grad", g_img)
                 pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
             if pairs:
@@ -655,6 +663,7 @@ def training_worker(
             else:
                 params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
+            # Legacy composite frames for animation exports
             frame_cache.enqueue("input_prediction", ip_frame)
             frame_cache.enqueue("params_grads", params_grads_frame)
         if loss.item() < 1e-6:
