@@ -682,11 +682,9 @@ def training_worker(
                 g_img = g_img[:min_h, :min_w]
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
-                # Store individual param/grad visuals with different colour maps
-                frame_cache.enqueue(f"param{idx}_param", p_img, cmap="fire")
-                frame_cache.enqueue(
-                    f"param{idx}_grad", g_img, cmap="hue", mask_first=True
-                )
+                # Store individual param/grad visuals without colour maps
+                frame_cache.enqueue(f"param{idx}_param", p_img)
+                frame_cache.enqueue(f"param{idx}_grad", g_img)
                 pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
             if pairs:
@@ -912,8 +910,7 @@ def display_worker(
             last_cmap = current_cmap
             last_norm = current_norm
         grid = frame_cache.compose_layout_at(layout, frame_index)
-        if grid.ndim == 2 or (grid.ndim == 3 and grid.shape[2] == 1):
-            grid = apply_colormap(grid, current_cmap)
+        grid = apply_colormap(grid, current_cmap)
         grid = _apply_norm(grid, current_norm)
         groups = frame_cache._group_labels()
         lengths: list[int] = []
@@ -959,6 +956,7 @@ def main(
     target_height=512,
     target_width=512,
     update_ms: int = 100,
+    cmap: str = "hue",
 ):
     if config is None:
         config = build_config()
@@ -990,8 +988,8 @@ def main(
     display_worker(frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs)
     worker.join()
     frame_cache.process_queue()
-    frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"))
-    frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"))
+    frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"), cmap=cmap)
+    frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"), cmap=cmap)
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
@@ -1010,6 +1008,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-height", type=int, default=512, help="Render target height")
     parser.add_argument("--target-width", type=int, default=512, help="Render target width")
     parser.add_argument("--update-ms", type=int, default=100, help="UI refresh interval in milliseconds")
+    parser.add_argument("--cmap", type=str, default="hue", help="Colormap for exported animations")
     args = parser.parse_args()
 
     main(
@@ -1025,4 +1024,5 @@ if __name__ == "__main__":
         target_height=args.target_height,
         target_width=args.target_width,
         update_ms=args.update_ms,
+        cmap=args.cmap,
     )
