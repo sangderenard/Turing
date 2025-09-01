@@ -205,13 +205,23 @@ class FrameCache:
             self.composite_cache.clear()
         return changed
 
-    def clear(self) -> None:
-        """Wipe all cached and queued frames."""
+    def clear(self, *, preserve_composite: bool = True) -> None:
+        """Wipe cached frames and queued items.
+
+        Parameters
+        ----------
+        preserve_composite:
+            When ``True`` (default) previously composed layouts remain in
+            ``composite_cache`` so UIs can continue displaying the last
+            rendered frame without retaining the per‑label intermediates.
+            Set to ``False`` to drop everything.
+        """
 
         self.cache.clear()
-        self.composite_cache.clear()
         while not self.queue.empty():
             self.queue.get()
+        if not preserve_composite:
+            self.composite_cache.clear()
 
     def available_sources(self) -> List[str]:
         """Return sorted set of data sources derived from cached labels."""
@@ -394,30 +404,15 @@ class FrameCache:
     def _layout_hash(self, layout: List[List[str]], index: Optional[int]) -> int:
         """Return a hash describing ``layout`` and chosen frame indices."""
 
-        groups = self._group_labels()
         rows = []
         for row in layout:
             row_key = []
             for label_stat in row:
                 base, _, stat = label_stat.partition(":")
-                if base in groups:
-                    lengths = [len(self.cache[l]) for l in groups[base] if self.cache.get(l)]
-                    if not lengths:
-                        frame_idx = -1
-                    else:
-                        if stat != "sample" or index is None:
-                            frame_idx = -1
-                        else:
-                            frame_idx = index % min(lengths)
+                if stat == "sample" and index is not None:
+                    frame_idx = index
                 else:
-                    frames = self.cache.get(base)
-                    if not frames:
-                        frame_idx = -1
-                    else:
-                        if stat != "sample" or index is None:
-                            frame_idx = len(frames) - 1
-                        else:
-                            frame_idx = index % len(frames)
+                    frame_idx = -1
                 row_key.append((label_stat, frame_idx))
             rows.append(tuple(row_key))
         return hash(tuple(rows))

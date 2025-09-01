@@ -23,3 +23,16 @@ def test_linear_block_debug():
     outputs = model.forward(inputs)
     loss = ((outputs - targets) ** 2).mean()
     loss.backward()
+
+
+def test_linear_block_invalid_shape():
+    input_dim = 4
+    output_dim = 2
+    like = AT.get_tensor()
+
+    model = LinearBlock(input_dim, output_dim, like)
+
+    bad_input = AT.randn((3, input_dim + 1))
+
+    with pytest.raises(ValueError):
+        model.forward(bad_input)
