@@ -71,9 +71,19 @@ def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.nda
     if arr.ndim == 2:
         arr = arr[..., None]
     h, w, c = arr.shape
-    mask = _pixel_vignette(tile, power)
+
+    oversample = 2
+    size = tile * oversample
+    coords = (np.arange(size, dtype=np.float32) + 0.5) / size
+    coords = coords * 2.0 - 1.0
+    yy, xx = np.meshgrid(coords, coords, indexing="ij")
+    r = (np.abs(xx) ** power + np.abs(yy) ** power) ** (1.0 / power)
+    mask = np.clip(r, 0.0, 1.0) ** 2
+    mask = (mask * 255).astype(np.uint8)
+    if oversample > 1:
+        mask = FrameCache.nearest_neighbor_resize(mask, (tile, tile))
+    mask = mask.astype(np.float32) / 255.0
     mask_tiled = np.tile(mask, (h, w))
-    mask_tiled = mask_tiled.reshape(h, tile, w, tile).swapaxes(1, 2).reshape(h * tile, w * tile)
 
     up = arr.repeat(tile, axis=0).repeat(tile, axis=1).astype(np.float32)
     up *= (1.0 - mask_tiled)[..., None]
