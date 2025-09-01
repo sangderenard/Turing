@@ -853,23 +853,31 @@ def display_worker(
             data = (data - mn) / (mx - mn + 1e-8)
         return (data * 255).clip(0, 255).astype(np.uint8)
 
+    last_sources: list[str] = []
+    last_types: list[str] = []
+
     def refresh_menus():
+        nonlocal last_sources, last_types
         sources = frame_cache.available_sources()
-        for var, menu in zip(row_vars, row_menus):
-            m = menu["menu"]
-            m.delete(0, "end")
-            for s in sources:
-                m.add_command(label=s, command=tk._setit(var, s))
-            if var.get() not in sources and sources:
-                var.set(sources[0])
+        if sources != last_sources:
+            for var, menu in zip(row_vars, row_menus):
+                m = menu["menu"]
+                m.delete(0, "end")
+                for s in sources:
+                    m.add_command(label=s, command=tk._setit(var, s))
+                if var.get() not in sources and sources:
+                    var.set(sources[0])
+            last_sources = sources
         types = frame_cache.available_types()
-        for var, menu in zip(col_vars, col_menus):
-            m = menu["menu"]
-            m.delete(0, "end")
-            for t in types:
-                m.add_command(label=t, command=tk._setit(var, t))
-            if var.get() not in types and types:
-                var.set(types[0])
+        if types != last_types:
+            for var, menu in zip(col_vars, col_menus):
+                m = menu["menu"]
+                m.delete(0, "end")
+                for t in types:
+                    m.add_command(label=t, command=tk._setit(var, t))
+                if var.get() not in types and types:
+                    var.set(types[0])
+            last_types = types
 
     frame_index = 0
 
