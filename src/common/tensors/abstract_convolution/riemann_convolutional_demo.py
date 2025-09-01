@@ -740,10 +740,8 @@ def display_worker(
     controls = tk.Frame(root)
     controls.pack(side=tk.TOP, fill=tk.X)
 
-    row_frame = tk.Frame(controls)
-    row_frame.pack(side=tk.LEFT)
-    col_frame = tk.Frame(controls)
-    col_frame.pack(side=tk.LEFT)
+    grid_frame = tk.Frame(controls)
+    grid_frame.pack(side=tk.LEFT)
 
     # Optimizer selection
     opt_var = tk.StringVar(value=shared_state.get("optimizer", "Adam"))
@@ -798,26 +796,37 @@ def display_worker(
 
     epoch_cap_var.trace_add("write", on_epoch_change)
 
-    row_vars = []
-    row_menus = []
-    col_vars = []
-    col_menus = []
+    grid_vars: list[list[tk.StringVar]] = []
+    grid_menus: list[list[tk.OptionMenu]] = []
 
-    def add_row():
-        var = tk.StringVar()
-        opts = frame_cache.available_sources() or [""]
-        opt = tk.OptionMenu(row_frame, var, *opts)
-        opt.pack()
-        row_vars.append(var)
-        row_menus.append(opt)
+    def _options() -> list[str]:
+        return frame_cache.available_options() or [""]
 
-    def add_column():
+    def _make_cell(r: int, c: int) -> None:
         var = tk.StringVar()
-        opts = frame_cache.available_types() or [""]
-        opt = tk.OptionMenu(col_frame, var, *opts)
-        opt.pack(side=tk.LEFT)
-        col_vars.append(var)
-        col_menus.append(opt)
+        opts = _options()
+        if opts:
+            var.set(opts[0])
+        menu = tk.OptionMenu(grid_frame, var, *opts)
+        menu.grid(row=r, column=c)
+        grid_vars[r].append(var)
+        grid_menus[r].append(menu)
+
+    def add_row() -> None:
+        r = len(grid_vars)
+        grid_vars.append([])
+        grid_menus.append([])
+        cols = len(grid_vars[0]) if grid_vars and grid_vars[0] else 0
+        for c in range(cols):
+            _make_cell(r, c)
+
+    def add_column() -> None:
+        c = len(grid_vars[0]) if grid_vars and grid_vars[0] else 0
+        if not grid_vars:
+            grid_vars.append([])
+            grid_menus.append([])
+        for r in range(len(grid_vars)):
+            _make_cell(r, c)
 
     tk.Button(controls, text="Add Row", command=add_row).pack(side=tk.LEFT)
     tk.Button(controls, text="Add Column", command=add_column).pack(side=tk.LEFT)
@@ -853,31 +862,21 @@ def display_worker(
             data = (data - mn) / (mx - mn + 1e-8)
         return (data * 255).clip(0, 255).astype(np.uint8)
 
-    last_sources: list[str] = []
-    last_types: list[str] = []
+    last_opts: list[str] = []
 
-    def refresh_menus():
-        nonlocal last_sources, last_types
-        sources = frame_cache.available_sources()
-        if sources != last_sources:
-            for var, menu in zip(row_vars, row_menus):
-                m = menu["menu"]
-                m.delete(0, "end")
-                for s in sources:
-                    m.add_command(label=s, command=tk._setit(var, s))
-                if var.get() not in sources and sources:
-                    var.set(sources[0])
-            last_sources = sources
-        types = frame_cache.available_types()
-        if types != last_types:
-            for var, menu in zip(col_vars, col_menus):
-                m = menu["menu"]
-                m.delete(0, "end")
-                for t in types:
-                    m.add_command(label=t, command=tk._setit(var, t))
-                if var.get() not in types and types:
-                    var.set(types[0])
-            last_types = types
+    def refresh_menus() -> None:
+        nonlocal last_opts
+        opts = _options()
+        if opts != last_opts:
+            for row_vars, row_menus in zip(grid_vars, grid_menus):
+                for var, menu in zip(row_vars, row_menus):
+                    m = menu["menu"]
+                    m.delete(0, "end")
+                    for s in opts:
+                        m.add_command(label=s, command=tk._setit(var, s))
+                    if var.get() not in opts and opts:
+                        var.set(opts[0])
+            last_opts = opts
 
     frame_index = 0
 
@@ -888,26 +887,29 @@ def display_worker(
             return
         frame_cache.process_queue()
         refresh_menus()
-        layout = []
-        selected_labels = []
-        for r in row_vars:
-            row = []
-            for c in col_vars:
-                label = f"{r.get()}_{c.get()}"
-                row.append(label)
-                selected_labels.append(label)
-            layout.append(row)
+        layout = [[var.get() for var in row] for row in grid_vars]
         grid = frame_cache.compose_layout_at(layout, frame_index)
         grid = _apply_norm(grid, norm_var.get())
-        if selected_labels:
-            lengths = [len(frame_cache.cache.get(lbl, [])) for lbl in selected_labels if frame_cache.cache.get(lbl)]
-            if lengths:
-                max_len = min(lengths)
-                epoch_label.configure(text=f"Epoch {frame_index % max_len + 1}")
-                if auto_var.get():
-                    speed = speed_var.get()
-                    if speed:
-                        frame_index = (frame_index + speed) % max_len
+        groups = frame_cache._group_labels()
+        lengths: list[int] = []
+        for row in grid_vars:
+            for var in row:
+                label, _, stat = var.get().partition(":")
+                if stat not in ("", "sample"):
+                    continue
+                if label in frame_cache.cache:
+                    lengths.append(len(frame_cache.cache[label]))
+                elif label in groups:
+                    group_lengths = [len(frame_cache.cache[l]) for l in groups[label] if frame_cache.cache.get(l)]
+                    if group_lengths:
+                        lengths.append(min(group_lengths))
+        if lengths:
+            max_len = min(lengths)
+            epoch_label.configure(text=f"Epoch {frame_index % max_len + 1}")
+            if auto_var.get():
+                speed = speed_var.get()
+                if speed:
+                    frame_index = (frame_index + speed) % max_len
         pil = Image.fromarray(grid)
         photo = ImageTk.PhotoImage(pil)
         image_label.configure(image=photo)

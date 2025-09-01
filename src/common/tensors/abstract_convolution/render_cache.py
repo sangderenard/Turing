@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import colorsys
 import numpy as np
 from PIL import Image
+import re
 
 
 _VIGNETTE_CACHE: Dict[Tuple[int, int, float], np.ndarray] = {}
@@ -174,6 +175,53 @@ class FrameCache:
 
         return sorted({label.split("_")[1] for label in self.cache if "_" in label})
 
+    def _group_labels(self) -> Dict[str, List[str]]:
+        """Map high level group names to cached labels.
+
+        Groups are derived from naming conventions used in the demo:
+        ``param{n}_param``/``param{n}_grad`` for parameters and gradients and
+        ``*_input``/``*_prediction`` for inputs and predictions.
+        """
+
+        groups: Dict[str, List[str]] = {}
+        param_re = re.compile(r"param\d+_param")
+        grad_re = re.compile(r"param\d+_grad")
+        input_re = re.compile(r".*_input")
+        pred_re = re.compile(r".*_prediction")
+        for label in self.cache:
+            if param_re.fullmatch(label):
+                groups.setdefault("params", []).append(label)
+            if grad_re.fullmatch(label):
+                groups.setdefault("grads", []).append(label)
+            if input_re.fullmatch(label):
+                groups.setdefault("inputs", []).append(label)
+            if pred_re.fullmatch(label):
+                groups.setdefault("predictions", []).append(label)
+        return groups
+
+    def available_options(self, stats: Optional[List[str]] = None) -> List[str]:
+        """Return label/stat combinations for dropdown menus.
+
+        Parameters
+        ----------
+        stats:
+            Iterable of statistical reduction names.  Defaults to
+            ``["sample", "mean", "std", "min", "max"]``.
+        """
+
+        if stats is None:
+            stats = ["sample", "mean", "std", "min", "max"]
+        options: List[str] = []
+        labels = sorted(self.cache.keys())
+        groups = self._group_labels()
+        for lbl in labels:
+            for stat in stats:
+                options.append(f"{lbl}:{stat}")
+        for grp in sorted(groups):
+            for stat in stats:
+                options.append(f"{grp}:{stat}")
+        return options
+
     # ------------------------------------------------------------------
     # Rendering helpers
     # ------------------------------------------------------------------
@@ -258,16 +306,31 @@ class FrameCache:
     def _layout_hash(self, layout: List[List[str]], index: Optional[int]) -> int:
         """Return a hash describing ``layout`` and chosen frame indices."""
 
+        groups = self._group_labels()
         rows = []
         for row in layout:
             row_key = []
-            for label in row:
-                frames = self.cache.get(label)
-                if not frames:
-                    frame_idx = -1
+            for label_stat in row:
+                base, _, stat = label_stat.partition(":")
+                if base in groups:
+                    lengths = [len(self.cache[l]) for l in groups[base] if self.cache.get(l)]
+                    if not lengths:
+                        frame_idx = -1
+                    else:
+                        if stat != "sample" or index is None:
+                            frame_idx = -1
+                        else:
+                            frame_idx = index % min(lengths)
                 else:
-                    frame_idx = (len(frames) - 1) if index is None else index % len(frames)
-                row_key.append((label, frame_idx))
+                    frames = self.cache.get(base)
+                    if not frames:
+                        frame_idx = -1
+                    else:
+                        if stat != "sample" or index is None:
+                            frame_idx = len(frames) - 1
+                        else:
+                            frame_idx = index % len(frames)
+                row_key.append((label_stat, frame_idx))
             rows.append(tuple(row_key))
         return hash(tuple(rows))
 
@@ -283,15 +346,44 @@ class FrameCache:
         if cached is not None:
             return cached
 
+        groups = self._group_labels()
         rows: List[np.ndarray] = []
         for row in layout:
             imgs: List[np.ndarray] = []
             max_h = 0
-            for label in row:
-                frames = self.cache.get(label)
-                if not frames:
+            for label_stat in row:
+                base, _, stat = label_stat.partition(":")
+                frames_list: List[np.ndarray]
+                if base in groups:
+                    if stat == "sample":
+                        frames_list = [self.cache[l][index % len(self.cache[l])] for l in groups[base] if self.cache.get(l)]
+                    else:
+                        frames_list = [f for l in groups[base] for f in self.cache.get(l, [])]
+                else:
+                    frames = self.cache.get(base)
+                    if not frames:
+                        continue
+                    frames_list = frames if stat != "sample" else [frames[index % len(frames)]]
+                if not frames_list:
                     continue
-                img = frames[index % len(frames)]
+                if stat == "sample":
+                    if len(frames_list) == 1:
+                        stack = frames_list[0]
+                    else:
+                        stack = np.stack(frames_list, axis=0).mean(axis=0)
+                else:
+                    stack = np.stack(frames_list, axis=0).astype(np.float32)
+                    if stat == "mean":
+                        stack = stack.mean(axis=0)
+                    elif stat == "std":
+                        stack = stack.std(axis=0)
+                    elif stat == "min":
+                        stack = stack.min(axis=0)
+                    elif stat == "max":
+                        stack = stack.max(axis=0)
+                    else:
+                        stack = stack[0]
+                img = stack if stack.dtype == np.uint8 else np.clip(stack, 0, 255).astype(np.uint8)
                 max_h = max(max_h, img.shape[0])
                 imgs.append(img)
             if not imgs:
