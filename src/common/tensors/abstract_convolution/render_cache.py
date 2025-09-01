@@ -149,22 +149,15 @@ class FrameCache:
         self.composite_cache: Dict[int, np.ndarray] = {}
         self.target_height = target_height
         self.target_width = target_width
-        self.tile_height: Optional[int] = None
-        self.tile_width: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
     def enqueue(self, label: str, frame: np.ndarray) -> None:
-        """Place a new frame on the queue enforcing a common tile size."""
+        """Place a new frame on the queue."""
 
         arr = np.array(frame)
         arr = add_vignette(arr)
-        h, w = arr.shape[:2]
-        if self.tile_height is None or self.tile_width is None:
-            self.tile_height, self.tile_width = h, w
-        elif (h, w) != (self.tile_height, self.tile_width):
-            arr = self.nearest_neighbor_resize(arr, (self.tile_height, self.tile_width))
         self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> bool:
@@ -193,8 +186,6 @@ class FrameCache:
 
         self.cache.clear()
         self.composite_cache.clear()
-        self.tile_height = None
-        self.tile_width = None
         while not self.queue.empty():
             self.queue.get()
 
@@ -293,27 +284,35 @@ class FrameCache:
 
         labels = self._group_labels().get(group)
         if not labels:
-            h = self.tile_height or 1
-            w = self.tile_width or 1
-            return np.zeros((h, w), dtype=np.uint8)
+            return np.zeros((1, 1), dtype=np.uint8)
         if index is None:
             frames = [self.cache[l][-1] for l in labels if self.cache.get(l)]
         else:
             frames = [self.cache[l][index % len(self.cache[l])] for l in labels if self.cache.get(l)]
         if not frames:
-            h = self.tile_height or 1
-            w = self.tile_width or 1
-            return np.zeros((h, w), dtype=np.uint8)
-        if self.tile_height is None or self.tile_width is None:
-            self.tile_height, self.tile_width = frames[0].shape[:2]
-        cols = math.ceil(math.sqrt(len(frames)))
-        rows = math.ceil(len(frames) / cols)
-        h, w = self.tile_height, self.tile_width
-        ch = frames[0].shape[2:] if frames[0].ndim == 3 else ()
-        canvas = np.zeros((rows * h, cols * w) + ch, dtype=frames[0].dtype)
-        for i, img in enumerate(frames):
+            return np.zeros((1, 1), dtype=np.uint8)
+
+        # Determine common tile size and pad without resizing so each parameter
+        # occupies equal space regardless of its original dimensions.
+        tile_h = max(img.shape[0] for img in frames)
+        tile_w = max(img.shape[1] for img in frames)
+        padded: List[np.ndarray] = []
+        for img in frames:
+            h_, w_ = img.shape[:2]
+            pad_h = tile_h - h_
+            pad_w = tile_w - w_
+            if pad_h > 0 or pad_w > 0:
+                pad_cfg = ((0, pad_h), (0, pad_w)) + ((0, 0),) * (img.ndim - 2)
+                img = np.pad(img, pad_cfg, mode="constant")
+            padded.append(img)
+
+        cols = math.ceil(math.sqrt(len(padded)))
+        rows = math.ceil(len(padded) / cols)
+        ch = padded[0].shape[2:] if padded[0].ndim == 3 else ()
+        canvas = np.zeros((rows * tile_h, cols * tile_w) + ch, dtype=padded[0].dtype)
+        for i, img in enumerate(padded):
             r, c = divmod(i, cols)
-            canvas[r * h : (r + 1) * h, c * w : (c + 1) * w, ...] = img
+            canvas[r * tile_h : (r + 1) * tile_h, c * tile_w : (c + 1) * tile_w, ...] = img
         return canvas
 
     def compose_layout(self, layout: List[List[str]]) -> np.ndarray:
