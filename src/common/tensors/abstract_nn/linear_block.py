@@ -56,7 +56,7 @@ class LinearBlock:
         out_dim = int(self.model.layers[-1].W.shape[1])
 
         # Helper: robust shape tuple for AbstractTensor / numpy-backed
-        shape = xt.shape() if callable(getattr(xt, "shape", None)) else xt.shape
+        shape = x.shape() if callable(getattr(x, "shape", None)) else x.shape
         ndim = len(shape)
 
         # Case A: already 2D (N, in_dim) — just run the MLP.
