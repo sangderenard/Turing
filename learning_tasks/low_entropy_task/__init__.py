@@ -16,6 +16,11 @@ import time
 from queue import Queue
 from typing import Dict, Tuple
 import numpy as np
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.abstract_nn.losses import CrossEntropyLoss
+from learning_tasks.loss_composer import LossComposer
+
+NUM_LOGITS = 3
 
 
 def _random_spectral_gaussian(shape: Tuple[int, ...]) -> np.ndarray:
@@ -74,3 +79,25 @@ def pump_queue(
         seed += 1
         if delay:
             time.sleep(delay)
+
+
+def build_loss_composer(C: int, num_logits: int = NUM_LOGITS) -> LossComposer:
+    """Return a :class:`LossComposer` for the low-entropy task."""
+
+    ce_loss = CrossEntropyLoss()
+    AT = AbstractTensor
+    composer = LossComposer()
+
+    def mse(pred, tgt, _cats):
+        return ((pred - tgt) ** 2).mean() * 100
+
+    composer.add(slice(0, C), lambda tgt, _cats: tgt, mse)
+
+    def cat_target(_tgt, cats):
+        return AT.get_tensor(np.array([c["spectrum"] for c in cats]))
+
+    def ce(pred, tgt, cats):
+        return ce_loss(pred.reshape(len(cats), num_logits), tgt)
+
+    composer.add(slice(C, C + num_logits), cat_target, ce)
+    return composer

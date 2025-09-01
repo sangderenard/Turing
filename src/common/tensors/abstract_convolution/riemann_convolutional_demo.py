@@ -19,7 +19,6 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 # from src.common.tensors.abstract_nn.optimizer import BPIDSGD  # TODO: optional later
 from src.common.tensors.abstract_nn.optimizer import Adam, SGD
-from src.common.tensors.abstract_nn.losses import CrossEntropyLoss
 import numpy as np
 from pathlib import Path
 from skimage import measure
@@ -30,7 +29,7 @@ import time
 from PIL import Image
 import threading
 from queue import Queue, Empty
-from learning_tasks.low_entropy_task import pump_queue
+from learning_tasks import get_task
 from .render_cache import FrameCache, apply_colormap
 
 
@@ -315,7 +314,7 @@ def build_config():
         "training": {
             "B": 4,
             "C": 3,
-            "num_logits": 0,
+            "task": "md5_unrolled",
             "boundary_conditions": ("dirichlet",) * 6,
             "k": 3,
             "eig_from": "g",
@@ -360,7 +359,9 @@ def training_worker(
     transform, grid, _ = build_geometry(geom_cfg)
     grid_shape = geom_cfg["grid_shape"]
     B, C = train_cfg["B"], train_cfg["C"]
-    num_logits = train_cfg.get("num_logits", 0)
+    task_name = train_cfg.get("task", "md5_unrolled")
+    task = get_task(task_name)
+    num_logits = train_cfg.get("num_logits", task.num_logits)
 
     layer = MetricSteeredConv3DWrapper(
         in_channels=C,
@@ -375,9 +376,11 @@ def training_worker(
         laplace_kwargs={"lambda_reg": 0.5},
     )
 
+    loss_composer = task.build_loss_composer(C, num_logits)
+
     data_queue: Queue = Queue()
     pump_thread = threading.Thread(
-        target=pump_queue,
+        target=task.pump_queue,
         args=(data_queue, grid_shape, C),
         kwargs={"stop_event": stop_event},
         daemon=True,
@@ -508,8 +511,6 @@ def training_worker(
     lr = shared_state.get("lr", 5e-2)
     optimizer = init_optimizer(opt_name, params, lr)
     current_opt, current_lr = opt_name, lr
-    loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
-    ce_loss = CrossEntropyLoss() if num_logits > 0 else None
 
     for epoch in range(1, max_epochs + 1):
         if stop_event is not None and stop_event.is_set():
@@ -552,11 +553,7 @@ def training_worker(
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
         pred = y[:, :C]
-        loss = loss_fn(pred, target)
-        if ce_loss is not None:
-            logits = y[:, C:C + num_logits]
-            cat_tensor = AT.get_tensor(np.array([c["spectrum"] for c in batch_cats]))
-            loss = loss + ce_loss(logits.reshape(len(batch_inputs), num_logits), cat_tensor)
+        loss = loss_composer(y, target, batch_cats)
         LSN_loss = layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
