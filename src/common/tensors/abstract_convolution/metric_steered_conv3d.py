@@ -71,6 +71,11 @@ class MetricSteeredConv3DWrapper:
         elif hasattr(lp, 'zero_grad') and callable(lp.zero_grad):
             lp.zero_grad()
 
+    def get_input_shape(self):
+        if hasattr(self.conv, 'get_input_shape') and callable(self.conv.get_input_shape):
+            return self.conv.get_input_shape()
+        return (None, getattr(self.conv, 'in_channels', None), *getattr(self.conv, 'grid_shape', (None, None, None)))
+
     def __init__(
         self,
         in_channels,

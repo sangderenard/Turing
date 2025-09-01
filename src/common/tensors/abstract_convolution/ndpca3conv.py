@@ -205,6 +205,9 @@ class NDPCA3Conv3d:
         if self.pointwise is not None:
             self.pointwise.zero_grad()
 
+    def get_input_shape(self):
+        return (None, self.in_channels, *self.grid_shape)
+
     # --- helpers ---
     def _principal_axis_blend(self, metric: AbstractTensor) -> Tuple[AbstractTensor, AbstractTensor, AbstractTensor]:
         """
