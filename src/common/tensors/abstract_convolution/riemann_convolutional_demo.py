@@ -84,16 +84,26 @@ def pca_to_rgb(arr):
     arr = np.array(arr)
     if arr.ndim == 3:
         h, w, d = arr.shape
-        flat = arr.reshape(-1, d)
-        flat = flat - flat.mean(axis=0, keepdims=True)
-        cov = np.cov(flat, rowvar=False)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        comps = flat @ eigvecs[:, -2:]
-        comps = comps.reshape(h, w, 2)
-        r = _normalize(comps[..., 0])
-        g = _normalize(comps[..., 1])
-        b = np.zeros_like(r)
-        img = np.stack([r, g, b], axis=-1)
+        if d < 2:
+            # Not enough channels for PCA; fall back to grayscale.
+            arr2d = _normalize(arr.reshape(h, w))
+            img = np.stack([arr2d] * 3, axis=-1)
+        else:
+            flat = arr.reshape(-1, d)
+            flat = flat - flat.mean(axis=0, keepdims=True)
+            cov = np.cov(flat, rowvar=False)
+            if cov.ndim < 2:
+                # Covariance collapsed to scalar (e.g. constant input).
+                arr2d = _normalize(arr.reshape(h, w))
+                img = np.stack([arr2d] * 3, axis=-1)
+            else:
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                comps = flat @ eigvecs[:, -2:]
+                comps = comps.reshape(h, w, 2)
+                r = _normalize(comps[..., 0])
+                g = _normalize(comps[..., 1])
+                b = np.zeros_like(r)
+                img = np.stack([r, g, b], axis=-1)
     else:
         arr2d = _normalize(arr)
         img = np.stack([arr2d] * 3, axis=-1)
