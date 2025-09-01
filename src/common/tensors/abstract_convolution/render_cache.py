@@ -111,6 +111,45 @@ class FrameCache:
             grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
         return grid
 
+    def compose_layout_at(self, layout: List[List[str]], index: int) -> np.ndarray:
+        """Compose a grid using the ``index``-th frame for each label.
+
+        ``index`` is wrapped by the length of each label's cache so the
+        animation can loop seamlessly forward or backward.
+        """
+
+        rows: List[np.ndarray] = []
+        for row in layout:
+            imgs: List[np.ndarray] = []
+            max_h = 0
+            for label in row:
+                frames = self.cache.get(label)
+                if not frames:
+                    continue
+                img = frames[index % len(frames)]
+                max_h = max(max_h, img.shape[0])
+                imgs.append(img)
+            if not imgs:
+                continue
+            normed = [
+                img if img.shape[0] == max_h else self.nearest_neighbor_resize(img, (max_h, img.shape[1]))
+                for img in imgs
+            ]
+            rows.append(np.concatenate(normed, axis=1))
+        if not rows:
+            return np.zeros((1, 1), dtype=np.uint8)
+        max_w = max(r.shape[1] for r in rows)
+        padded = [
+            r
+            if r.shape[1] == max_w
+            else np.concatenate([r, np.zeros((r.shape[0], max_w - r.shape[1], *r.shape[2:]), dtype=r.dtype)], axis=1)
+            for r in rows
+        ]
+        grid = np.concatenate(padded, axis=0)
+        if self.target_height and self.target_width:
+            grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+        return grid
+
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
