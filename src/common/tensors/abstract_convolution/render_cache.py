@@ -5,8 +5,98 @@ from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
+import colorsys
 import numpy as np
 from PIL import Image
+
+
+_VIGNETTE_CACHE: Dict[Tuple[int, int, float], np.ndarray] = {}
+
+_GRADIENTS = {
+    "grayscale": np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+    "fire": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+}
+
+
+def _vignette_mask(height: int, width: int, power: float = 4.0) -> np.ndarray:
+    """Return a rounded‑square vignette mask in ``uint8``.
+
+    The mask smoothly darkens towards the edges using a squircle profile.
+    Results are cached by ``(height, width, power)``.
+    """
+
+    key = (height, width, power)
+    mask = _VIGNETTE_CACHE.get(key)
+    if mask is not None:
+        return mask
+
+    y = np.linspace(-1.0, 1.0, height)
+    x = np.linspace(-1.0, 1.0, width)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    r = (np.abs(xx) ** power + np.abs(yy) ** power) ** (1.0 / power)
+    mask = np.clip(r, 0.0, 1.0) ** 2
+    mask = (mask * 255).astype(np.uint8)
+    _VIGNETTE_CACHE[key] = mask
+    return mask
+
+
+def _pixel_vignette(tile: int, power: float = 4.0) -> np.ndarray:
+    """Return a single‑pixel bubble mask of size ``tile×tile``."""
+
+    return _vignette_mask(tile, tile, power) / 255.0
+
+
+def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.ndarray:
+    """Upscale ``frame`` and tint each pixel with a rounded bubble mask.
+
+    Parameters
+    ----------
+    frame:
+        Grayscale or RGB image.  A ``(H,W)`` array is treated as grayscale.
+    tile:
+        Output size of each input pixel.  Defaults to ``8``.
+    power:
+        Squircle power controlling corner roundness.
+    """
+
+    arr = np.array(frame)
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    h, w, c = arr.shape
+    mask = _pixel_vignette(tile, power)
+    mask_tiled = np.tile(mask, (h, w))
+    mask_tiled = mask_tiled.reshape(h, tile, w, tile).swapaxes(1, 2).reshape(h * tile, w * tile)
+
+    up = arr.repeat(tile, axis=0).repeat(tile, axis=1).astype(np.float32)
+    up *= (1.0 - mask_tiled)[..., None]
+    out = up.clip(0, 255).astype(np.uint8)
+    return out[..., 0] if c == 1 else out
+
+
+def apply_colormap(frame: np.ndarray, cmap: str = "grayscale") -> np.ndarray:
+    """Apply ``cmap`` to ``frame`` returning an RGB image."""
+
+    arr = np.array(frame)
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return arr.astype(np.uint8)
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr[..., 0]
+    arr = arr.astype(np.float32)
+    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    if cmap == "hue":
+        eps = 1.0 / 360.0
+        hues = eps + (1.0 - 2.0 * eps) * arr
+        flat = [colorsys.hsv_to_rgb(h, 1.0, 1.0) for h in hues.ravel()]
+        colour = np.array(flat, dtype=np.float32).reshape(arr.shape + (3,))
+    else:
+        grad = _GRADIENTS.get(cmap, _GRADIENTS["grayscale"])
+        n = grad.shape[0]
+        idx = arr * (n - 1)
+        lo = np.floor(idx).astype(int)
+        hi = np.clip(lo + 1, 0, n - 1)
+        t = (idx - lo)[..., None]
+        colour = grad[lo] * (1 - t) + grad[hi] * t
+    return (colour * 255).astype(np.uint8)
 
 
 @dataclass
@@ -39,10 +129,25 @@ class FrameCache:
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
-    def enqueue(self, label: str, frame: np.ndarray) -> None:
-        """Place a new frame on the queue."""
+    def enqueue(
+        self,
+        label: str,
+        frame: np.ndarray,
+        cmap: Optional[str] = None,
+        mask_first: bool = False,
+    ) -> None:
+        """Place a new frame on the queue applying optional colour and mask."""
 
-        self.queue.put(RenderItem(label, np.array(frame)))
+        arr = np.array(frame)
+        if mask_first:
+            arr = add_vignette(arr)
+            if cmap is not None:
+                arr = apply_colormap(arr, cmap)
+        else:
+            if cmap is not None:
+                arr = apply_colormap(arr, cmap)
+            arr = add_vignette(arr)
+        self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> None:
         """Drain all pending frames into the cache.
@@ -85,34 +190,20 @@ class FrameCache:
     # ------------------------------------------------------------------
     @staticmethod
     def _apply_alpha_map(img: np.ndarray) -> np.ndarray:
-        """Return ``img`` as RGB with an optional alpha map darkening overlay.
+        """Ensure ``img`` is an RGB ``uint8`` array.
 
-        Frames may include a fourth channel representing a depth mask.  The
-        mask is a 1‑channel texture applied **after** upscaling to darken the
-        colour channels and give a slight "bubble" appearance to tiles.  It is
-        *not* treated as a transparency layer.
+        Any extra channels are dropped; grayscale inputs are tiled to RGB.
         """
 
         arr = np.asarray(img)
         if arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-        # Grayscale inputs -> RGB
         if arr.ndim == 2:
-            arr = np.repeat(arr[..., None], 3, axis=2)
-            return arr
-
+            return np.repeat(arr[..., None], 3, axis=2)
         if arr.shape[2] == 1:
-            arr = np.repeat(arr, 3, axis=2)
-            return arr
-
-        if arr.shape[2] >= 4:
-            colour = arr[..., :3].astype(np.float32)
-            mask = arr[..., 3].astype(np.float32) / 255.0
-            shaded = colour * (1.0 - mask[..., None])
-            return shaded.clip(0, 255).astype(np.uint8)
-
-        # Already RGB
+            return np.repeat(arr, 3, axis=2)
+        if arr.shape[2] > 3:
+            return arr[..., :3]
         return arr
 
     def compose_layout(self, layout: List[List[str]]) -> np.ndarray:
@@ -247,4 +338,4 @@ class FrameCache:
         )
 
 
-__all__ = ["FrameCache", "RenderItem"]
+__all__ = ["FrameCache", "RenderItem", "apply_colormap", "add_vignette"]

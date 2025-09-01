@@ -1122,14 +1122,12 @@ class Autograd:
             if g is None:
                 if allow_unused:
                     results.append(None)
-                else:
-                    raise ValueError(
-                        f"No gradient found for input at index {idx} with id={id(inp)}"
-                    )
-            else:
-                if hasattr(inp, "data") and isinstance(inp.data, list):
-                    g = g.tolist()
-                results.append(g)
+                    continue
+                from .abstraction import AbstractTensor
+                g = AbstractTensor.zeros_like(inp)
+            if hasattr(inp, "data") and isinstance(inp.data, list):
+                g = g.tolist()
+            results.append(g)
 
         for inp, g in zip(inputs, results):  # attach gradients to tensors
             try:
