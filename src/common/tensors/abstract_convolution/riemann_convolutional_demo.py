@@ -474,8 +474,8 @@ def training_worker(
     # make an input of w/e to kick start the parameter recognition
     # first, to accomodate any network, you must poll the model
     # for the expected input shape
-    shape = layer.get_input_shape()
-    concrete = tuple(1 if d is None else d for d in shape)  # choose batch=1
+    expected_shape = layer.get_input_shape()
+    concrete = tuple(1 if d is None else d for d in expected_shape)  # choose batch=1
     x = AbstractTensor.ones(concrete)
     y = layer.forward(x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
@@ -541,8 +541,22 @@ def training_worker(
                 break
         if not batch_inputs:
             break
-        x = AT.get_tensor(np.stack(batch_inputs), requires_grad=True)
-        target = AT.get_tensor(np.stack(batch_targets))
+        batch_arr = np.stack(batch_inputs)
+        if batch_arr.ndim == 4:
+            batch_arr = batch_arr[:, None, ...]
+        if batch_arr.ndim != 5:
+            raise ValueError(f"training data must be 5D (B,C,D,H,W), got {batch_arr.shape}")
+        exp_no_batch = tuple(1 if d is None else d for d in expected_shape[1:])
+        if batch_arr.shape[1:] != exp_no_batch:
+            raise ValueError(f"input shape {batch_arr.shape[1:]} does not match expected {exp_no_batch}")
+        x = AT.get_tensor(batch_arr, requires_grad=True)
+
+        target_arr = np.stack(batch_targets)
+        if target_arr.ndim == 4:
+            target_arr = target_arr[:, None, ...]
+        if target_arr.ndim != 5:
+            raise ValueError(f"target data must be 5D (B,C,D,H,W), got {target_arr.shape}")
+        target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
