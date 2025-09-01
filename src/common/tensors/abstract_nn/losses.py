@@ -102,7 +102,7 @@ class CrossEntropyLoss(Loss):
             target = target.squeeze(-1)
         # Gather the log-probabilities at the target indices
         # Assume target is integer class indices
-        batch_indices = AbstractTensor.get_tensor(list(range(log_probs.shape[0])), faculty=None)
+        batch_indices = AbstractTensor.get_tensor(list(range(log_probs.shape[0])))
         nll = -log_probs[batch_indices, target]
         out = nll.mean()
         self.run_hooks('after_forward', pred=pred, target=target, output=out)

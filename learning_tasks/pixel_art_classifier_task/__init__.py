@@ -98,7 +98,7 @@ def build_loss_composer(C: int, num_logits: int = NUM_LOGITS) -> LossComposer:
     def ce(pred, tgt, _cats):
         # Collapse spatial dimensions so that CrossEntropyLoss sees
         # a tensor of shape (batch, num_logits).
-        pooled = pred.mean(axis=tuple(range(2, pred.ndim)))
+        pooled = pred.mean(dim=tuple(range(2, pred.ndim)))
         return ce_loss(pooled.reshape(len(tgt), num_logits), tgt)
 
     composer.add(slice(0, num_logits), cat_target, ce)

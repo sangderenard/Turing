@@ -50,7 +50,6 @@ class LinearBlock:
     def parameters(self):
         return self.model.parameters()
     def forward(self, x):
-        xt = AT.get_tensor(x)
 
         # Infer the adapter I/O once so we can route shapes correctly.
         in_dim = int(self.model.layers[0].W.shape[0])
@@ -62,7 +61,7 @@ class LinearBlock:
 
         # Case A: already 2D (N, in_dim) — just run the MLP.
         if ndim == 2 and int(shape[-1]) == in_dim:
-            return self.model.forward(xt)
+            return self.model.forward(x)
 
         # Case B: last axis is the feature axis (..., in_dim) — flatten leading dims.
         if int(shape[-1]) == in_dim:
@@ -70,7 +69,7 @@ class LinearBlock:
             batch = 1
             for s in shape[:-1]:
                 batch *= int(s)
-            y2 = self.model.forward(xt.reshape((batch, in_dim)))
+            y2 = self.model.forward(x.reshape((batch, in_dim)))
             return y2.reshape((*shape[:-1], out_dim))
 
         # Case C: channels-first tensor where channel axis = 1 (e.g., B,C,*,*,*).
@@ -81,7 +80,7 @@ class LinearBlock:
             for s in shape[2:]:
                 spatial *= int(s)
             # (B, C, S) -> (B*S, C) so Linear sees C as features.
-            xs = xt.reshape((B, C, spatial)).swapaxes(1, 2).reshape((B * spatial, C))
+            xs = x.reshape((B, C, spatial)).swapaxes(1, 2).reshape((B * spatial, C))
             ys = self.model.forward(xs)  # (B*S, out_dim)
             # Restore to (B, out_dim, *spatial_shape)
             y = ys.reshape((B, spatial, out_dim)).swapaxes(1, 2).reshape((B, out_dim, *shape[2:]))

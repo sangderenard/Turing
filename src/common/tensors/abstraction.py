@@ -1458,24 +1458,7 @@ class AbstractTensor:
                     right = right.to_dtype("float")
 
         if op == "matmul" and max(list(left.shape) + list(right.shape)) > 4096:
-            def matmul_chunked(left, right, Kt=1024, Nt=512):
-                B, Fin = left.shape
-                Fin2, Fout = right.shape
-                assert Fin == Fin2
-
-                y = left.like.zeros((B, Fout))
-
-                for j0 in range(0, Fout, Nt):
-                    j1 = min(j0 + Nt, Fout)
-                    yj = left.like.zeros((B, j1 - j0))
-                    for k0 in range(0, Fin, Kt):
-                        k1 = min(k0 + Kt, Fin)
-                        xk = left[:, k0:k1]         # (B, Kt)
-                        Wkj = right[k0:k1, j0:j1]   # (Kt, Nt)
-                        yj = yj + (xk @ Wkj)
-                    y[:, j0:j1] = yj
-                return y
-
+            from .batched_matmul import matmul_chunked
             return matmul_chunked(left, right, Kt=1024, Nt=512)
 
         # unwrap AFTER promotion
