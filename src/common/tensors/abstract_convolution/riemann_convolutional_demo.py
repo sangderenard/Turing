@@ -26,6 +26,8 @@ from skimage import measure
 from .laplace_nd import BuildLaplace3D
 import os
 from PIL import Image
+import threading
+from .render_cache import FrameCache
 
 
 def _normalize(arr):
@@ -94,14 +96,6 @@ def _tensor_to_pil_image(t):
     arr = _normalize(arr) * 255
     arr = arr.clip(0, 255).astype(np.uint8)
     return Image.fromarray(arr)
-
-
-def _save_animation(frames, path, duration=800):
-    if not frames:
-        return
-    images = [_tensor_to_pil_image(f) for f in frames]
-    images[0].save(path, save_all=True, append_images=images[1:], loop=0, duration=duration)
-
 
 def _to_numpy(t):
     return np.array(t.data if hasattr(t, "data") else t)
@@ -318,12 +312,12 @@ def build_config():
     return config
 
 
-def main(
+def training_worker(
+    frame_cache: FrameCache,
     config=None,
     viz_every=1,
     low_entropy_every=5,
     max_epochs=25,
-    output_dir="riemann_modular_renders",
     visualize_laplace=None,
     laplace_threshold=None,
     laplace_path=None,
@@ -394,8 +388,6 @@ def main(
     x = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)), requires_grad=True)
     autograd.tape.annotate(x, label="riemann_demo.input_init")
     autograd.tape.auto_annotate_eval(x)
-    print(f"Preparing output directory at: '{output_dir}/'")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
     # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
     # Uncomment one of the lines below to relax those checks:
     # autograd.strict = False                   # disable strict mode globally
@@ -472,7 +464,6 @@ def main(
         )
 
     params, _ = collect_params_and_grads()
-    frame_cache = {"input_prediction": [], "params_grads": []}
 
     optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
@@ -621,7 +612,9 @@ def main(
             h, w, *_ = quad1.shape
             def resize(img):
                 if img.shape[:2] != (h, w):
-                    return np.array(Image.fromarray(img).resize((w, h)))
+                    return np.array(
+                        Image.fromarray(img).resize((w, h), resample=Image.NEAREST)
+                    )
                 return img
             quad2 = resize(quad2)
             quad3 = resize(quad3)
@@ -662,8 +655,8 @@ def main(
             else:
                 params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
-            frame_cache["input_prediction"].append(ip_frame)
-            frame_cache["params_grads"].append(params_grads_frame)
+            frame_cache.enqueue("input_prediction", ip_frame)
+            frame_cache.enqueue("params_grads", params_grads_frame)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -671,8 +664,148 @@ def main(
     print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
-    _save_animation(frame_cache["input_prediction"], os.path.join(output_dir, "input_prediction.png"))
-    _save_animation(frame_cache["params_grads"], os.path.join(output_dir, "params_grads.png"))
+
+
+def display_worker(frame_cache: FrameCache) -> None:
+    """Simple Tkinter UI that streams cached frames to a live window."""
+
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    root = tk.Tk()
+    root.title("Riemann Demo")
+
+    controls = tk.Frame(root)
+    controls.pack(side=tk.TOP, fill=tk.X)
+
+    row_frame = tk.Frame(controls)
+    row_frame.pack(side=tk.LEFT)
+    col_frame = tk.Frame(controls)
+    col_frame.pack(side=tk.LEFT)
+
+    style_var = tk.StringVar(value="raw")
+    style_menu = tk.OptionMenu(controls, style_var, "raw", "matplotlib", "scatter3d")
+    style_menu.pack(side=tk.RIGHT)
+
+    row_vars = []
+    row_menus = []
+    col_vars = []
+    col_menus = []
+
+    def add_row():
+        var = tk.StringVar()
+        opts = frame_cache.available_sources() or [""]
+        opt = tk.OptionMenu(row_frame, var, *opts)
+        opt.pack()
+        row_vars.append(var)
+        row_menus.append(opt)
+
+    def add_column():
+        var = tk.StringVar()
+        opts = frame_cache.available_types() or [""]
+        opt = tk.OptionMenu(col_frame, var, *opts)
+        opt.pack(side=tk.LEFT)
+        col_vars.append(var)
+        col_menus.append(opt)
+
+    tk.Button(controls, text="Add Row", command=add_row).pack(side=tk.LEFT)
+    tk.Button(controls, text="Add Column", command=add_column).pack(side=tk.LEFT)
+
+    add_row()
+    add_column()
+
+    image_label = tk.Label(root)
+    image_label.pack()
+
+    def refresh_menus():
+        sources = frame_cache.available_sources()
+        for var, menu in zip(row_vars, row_menus):
+            m = menu["menu"]
+            m.delete(0, "end")
+            for s in sources:
+                m.add_command(label=s, command=tk._setit(var, s))
+            if var.get() not in sources and sources:
+                var.set(sources[0])
+        types = frame_cache.available_types()
+        for var, menu in zip(col_vars, col_menus):
+            m = menu["menu"]
+            m.delete(0, "end")
+            for t in types:
+                m.add_command(label=t, command=tk._setit(var, t))
+            if var.get() not in types and types:
+                var.set(types[0])
+
+    def apply_style(arr: np.ndarray) -> np.ndarray:
+        style = style_var.get()
+        if style == "raw":
+            return arr
+        try:
+            images = render_nd_field(arr, return_heatmap=True, return_figures=False)
+            return images.get("heatmap") or next(iter(images.values()))
+        except Exception:
+            return arr
+
+    def update():
+        frame_cache.process_queue()
+        refresh_menus()
+        layout = []
+        for r in row_vars:
+            row = []
+            for c in col_vars:
+                label = f"{r.get()}_{c.get()}"
+                row.append(label)
+            layout.append(row)
+        grid = frame_cache.compose_layout(layout)
+        grid = apply_style(grid)
+        pil = Image.fromarray(grid)
+        photo = ImageTk.PhotoImage(pil)
+        image_label.configure(image=photo)
+        image_label.image = photo
+        root.after(100, update)
+
+    update()
+    root.mainloop()
+
+
+def main(
+    config=None,
+    viz_every=1,
+    low_entropy_every=5,
+    max_epochs=25,
+    output_dir="riemann_modular_renders",
+    visualize_laplace=None,
+    laplace_threshold=None,
+    laplace_path=None,
+    show_laplace=False,
+    dpi=200,
+    deep_research=False,
+    target_height=512,
+    target_width=512,
+):
+    if config is None:
+        config = build_config()
+    frame_cache = FrameCache(target_height=target_height, target_width=target_width)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    args = (
+        frame_cache,
+        config,
+        viz_every,
+        low_entropy_every,
+        max_epochs,
+        visualize_laplace,
+        laplace_threshold,
+        laplace_path,
+        show_laplace,
+        dpi,
+        deep_research,
+    )
+    worker = threading.Thread(target=training_worker, args=args)
+    worker.start()
+    display_worker(frame_cache)
+    worker.join()
+    frame_cache.process_queue()
+    frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"))
+    frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"))
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
@@ -689,10 +822,11 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
     parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
     parser.add_argument("--deep-research", action="store_true", help="Emit detailed tensor data")
+    parser.add_argument("--target-height", type=int, default=512, help="Render target height")
+    parser.add_argument("--target-width", type=int, default=512, help="Render target width")
     args = parser.parse_args()
 
     main(
-        config=build_config(),
         viz_every=args.viz_every,
         low_entropy_every=args.low_entropy_every,
         max_epochs=args.max_epochs,
@@ -703,4 +837,6 @@ if __name__ == "__main__":
         laplace_path=args.laplace_path,
         show_laplace=args.show_laplace,
         deep_research=args.deep_research,
+        target_height=args.target_height,
+        target_width=args.target_width,
     )
