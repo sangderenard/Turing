@@ -15,7 +15,15 @@ _VIGNETTE_CACHE: Dict[Tuple[int, int, float], np.ndarray] = {}
 
 _GRADIENTS = {
     "grayscale": np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
-    "fire": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+    "fire": np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+        dtype=np.float32,
+    ),
+    # Blue variant of the fire gradient – black → blue → cyan → white
+    "blue_fire": np.array(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+        dtype=np.float32,
+    ),
 }
 
 
@@ -134,12 +142,14 @@ class FrameCache:
         self,
         label: str,
         frame: np.ndarray,
-        cmap: Optional[str] = None,
+        cmap: Optional[str] = "blue_fire",
         mask_first: bool = False,
     ) -> None:
         """Place a new frame on the queue applying optional colour and mask."""
 
         arr = np.array(frame)
+        if cmap is None:
+            cmap = "blue_fire"
         if mask_first:
             arr = add_vignette(arr)
             if cmap is not None:
@@ -164,6 +174,14 @@ class FrameCache:
             changed = True
         if changed:
             self.composite_cache.clear()
+
+    def clear_cache(self) -> None:
+        """Remove all cached frames and composites."""
+
+        while not self.queue.empty():
+            self.queue.get()
+        self.cache.clear()
+        self.composite_cache.clear()
 
     def available_sources(self) -> List[str]:
         """Return sorted set of data sources derived from cached labels."""
