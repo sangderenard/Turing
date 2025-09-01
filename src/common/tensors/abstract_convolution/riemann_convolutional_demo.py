@@ -471,7 +471,9 @@ def training_worker(
     # make an input of w/e to kick start the parameter recognition
     # first, to accomodate any network, you must poll the model
     # for the expected input shape
-    x = AbstractTensor.ones(layer.get_input_shape())
+    shape = layer.get_input_shape()
+    concrete = tuple(1 if d is None else d for d in shape)  # choose batch=1
+    x = AbstractTensor.ones(concrete)
     y = layer.forward(x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
