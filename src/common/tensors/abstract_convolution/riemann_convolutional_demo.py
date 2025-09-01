@@ -365,21 +365,9 @@ def training_worker(
     task = get_task(task_name)
     num_logits = train_cfg.get("num_logits", task.num_logits)
 
-    layer = MetricSteeredConv3DWrapper(
-        in_channels=C,
-        out_channels=C + num_logits,
-        grid_shape=grid_shape,
-        transform=transform,
-        boundary_conditions=train_cfg.get("boundary_conditions", ("dirichlet",) * 6),
-        k=train_cfg.get("k", 3),
-        eig_from=train_cfg.get("eig_from", "g"),
-        pointwise=train_cfg.get("pointwise", True),
-        deploy_mode="modulated",
-        laplace_kwargs={"lambda_reg": 0.5},
-    )
-
-    loss_composer = task.build_loss_composer(C, num_logits)
-
+    # -------------------------------
+    # Data queue (start producer)
+    # -------------------------------
     data_queue: Queue = Queue(maxsize=10)
     pump_thread = threading.Thread(
         target=task.pump_queue,
@@ -388,8 +376,7 @@ def training_worker(
         daemon=True,
     )
     pump_thread.start()
-    linear_layer = None
-    transform_layer = None
+    loss_composer = task.build_loss_composer(C, num_logits)
     if visualize_laplace:
         with autograd.no_grad():
             builder = BuildLaplace3D(
@@ -409,8 +396,6 @@ def training_worker(
             show=show_laplace,
         )
     from ..abstraction import AbstractTensor as _AT
-    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
-    print(f"[DEBUG] LSN instance id at layer creation: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     U, V, W = grid.U, grid.V, grid.W
     autograd.tape.annotate(U, label="riemann_demo.grid_U")
     autograd.tape.auto_annotate_eval(U)
@@ -427,13 +412,77 @@ def training_worker(
     # --- Parameter and gradient collection helpers ---
     from ..logger import get_tensors_logger
     logger = get_tensors_logger()
-    input_shim = None
-    output_shim = None
+    # ------------------------------------------------------------
+    # PRE-EPOCH MODEL CONSTRUCTION (instantiate every layer up front)
+    #   1) choose a transform layer (replaces former "input linear shim")
+    #   2) metric-steered conv wrapper
+    #   3) end LinearBlock (replaces former "output shim")
+    # ------------------------------------------------------------
+    # Block until we have a single sample to infer shapes (not an epoch)
+    sample_inp, sample_tgt, sample_cat = data_queue.get()
+    sample_ndim = np.array(sample_inp).ndim
+
+    # 1) Convolutional transform layer completely replaces the start linear shim
+    #    We keep the same selection logic you already used, but as a proper layer in the model.
+    transform_layer = None
+    if sample_ndim == 2:
+        from src.common.tensors.abstract_nn.transform_layers import Transform2DLayer
+        transform_layer = Transform2DLayer()
+    elif sample_ndim == 3 or sample_ndim == 5:
+        # Treat 3D fields (and already 5D BCHWD layouts) via 3D transform
+        from src.common.tensors.abstract_nn.transform_layers import Transform3DLayer
+        transform_layer = Transform3DLayer()
+    else:
+        # Fallback: dimensionality reduction to a 5D-compatible representation
+        transform_layer = PCATransformLayer()
+
+    # 2) Metric-steered conv (kept identical), BUT do not depend on runtime shims
+    conv_layer = MetricSteeredConv3DWrapper(
+        in_channels=C,
+        out_channels=C + num_logits,  # conv produces feature + logits channels
+        grid_shape=grid_shape,
+        transform=transform,
+        boundary_conditions=train_cfg.get("boundary_conditions", ("dirichlet",) * 6),
+        k=train_cfg.get("k", 3),
+        eig_from=train_cfg.get("eig_from", "g"),
+        pointwise=train_cfg.get("pointwise", True),
+        deploy_mode="modulated",
+        laplace_kwargs={"lambda_reg": 0.5},
+    )
+
+    # Build a provisional system to probe conv output shape after transform
+    from src.common.tensors.abstract_nn.core import Model
+    probe_layers = [transform_layer, conv_layer]
+    probe_activations = [None] * len(probe_layers)
+    probe_system = Model(probe_layers, probe_activations)
+    x0 = AbstractTensor.get_tensor(np.expand_dims(np.array(sample_inp), 0), requires_grad=True)
+    y0 = probe_system.forward(x0)
+
+    # Decide LinearBlock I/O sizes.
+    # End shim is now a real LinearBlock; operate along feature axis without calling it directly.
+    # We keep channel count stable by default; adjust here if your loss expects a different mapping.
+    # If y0 is BCHWD, take channels as in/out for channelwise linearization.
+    if hasattr(y0, "shape") and len(y0.shape) >= 2:
+        out_channels_after_conv = int(y0.shape[1])
+        end_linear = LinearBlock(out_channels_after_conv, out_channels_after_conv, AbstractTensor.zeros((1,)))
+    else:
+        # Fallback for unexpected shapes — still satisfy "end shim is LinearBlock"
+        flat = int(np.prod(y0.shape)) if hasattr(y0, "shape") else C + num_logits
+        end_linear = LinearBlock(flat, flat, AbstractTensor.zeros((1,)))
+
+    # Final training system: [transform -> conv -> linear]
+    layer_list = [transform_layer, conv_layer, end_linear]
+    activations = [None] * len(layer_list)
+    system = Model(layer_list, activations)
+
+    # Target shaping system (ONLY for targets; respects "only system.forward")
+    target_layers = [transform_layer.__class__()] if transform_layer is not None else []
+    target_system = Model(target_layers, [None]*len(target_layers)) if target_layers else None
 
     def collect_params_and_grads():
         params, grads = [], []
         seen_params = set()
-        seen_objs = set()
+       seen_objs = set()
 
         def add_param(p):
             pid = id(p)
@@ -443,14 +492,20 @@ def training_worker(
             params.append(p)
             grads.append(getattr(p, '_grad', None))
 
+        # Transform layer params (if any)
+        if transform_layer is not None and hasattr(transform_layer, 'parameters'):
+            seen_objs.add(id(transform_layer))
+            for p in transform_layer.parameters():
+                add_param(p)
+
         # Convolutional weights
-        if hasattr(layer.conv, 'parameters'):
-            seen_objs.add(id(layer.conv))
-            for p in layer.conv.parameters():
+        if hasattr(conv_layer, 'conv') and hasattr(conv_layer.conv, 'parameters'):
+            seen_objs.add(id(conv_layer.conv))
+            for p in conv_layer.conv.parameters():
                 add_param(p)
 
         # LocalStateNetwork (if present)
-        lsn = layer.local_state_network if hasattr(layer, 'local_state_network') else None
+        lsn = conv_layer.local_state_network if hasattr(conv_layer, 'local_state_network') else None
         if lsn is None:
             raise ValueError("LocalStateNetwork not found")
         if lsn and hasattr(lsn, 'parameters'):
@@ -461,8 +516,8 @@ def training_worker(
             raise ValueError("LocalStateNetwork not found")
 
         # Fallback: any other objects with .parameters
-        if isinstance(layer.laplace_package, dict):
-            for v in layer.laplace_package.values():
+        if isinstance(conv_layer.laplace_package, dict):
+            for v in conv_layer.laplace_package.values():
                 vid = id(v)
                 if vid in seen_objs or vid in seen_params:
                     continue
@@ -470,12 +525,9 @@ def training_worker(
                     seen_objs.add(vid)
                     for p in v.parameters():
                         add_param(p)
-        # Linear shims (if present)
-        if input_shim is not None:
-            for p in input_shim.parameters():
-                add_param(p)
-        if output_shim is not None:
-            for p in output_shim.parameters():
+        # End LinearBlock (always present now)
+        if end_linear is not None and hasattr(end_linear, 'parameters'):
+            for p in end_linear.parameters():
                 add_param(p)
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
@@ -489,29 +541,20 @@ def training_worker(
     # first, to accomodate any network, you must poll the model
     # for the expected input shape
 
-    from src.common.tensors.abstract_nn.core import Model
-    layer_list = []
-    if input_shim is not None:
-        layer_list.append(input_shim)
-    layer_list += [layer]
-    if output_shim is not None:
-        layer_list.append(output_shim)
-    activations = [None] * len(layer_list)
-    system = Model(layer_list, activations)
-
+    # Quick connectivity sanity: probe once before training
     expected_shape = system.get_input_shape()
-    concrete = tuple(1 if d is None else d for d in expected_shape)  # choose batch=1
-    x = AbstractTensor.ones(concrete)
-    y = system.forward(x)
+    concrete = tuple(1 if d is None else d for d in expected_shape)
+    _probe_x = AbstractTensor.ones(concrete)
+    _ = system.forward(_probe_x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
-    print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
-    print(f"[DEBUG] LSN param ids: {[id(p) for p in layer.local_state_network.parameters(include_all=True)]}")
-    print(f"[DEBUG] LSN param requires_grad: {[getattr(p, 'requires_grad', None) for p in layer.local_state_network.parameters(include_all=True)]}")
-    print(f"[DEBUG] LSN _regularization_loss: {layer.local_state_network._regularization_loss}")
-    print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(layer.local_state_network._regularization_loss, 'grad_fn', None)}")
+    print(f"[DEBUG] LSN instance id after forward: {id(conv_layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
+    print(f"[DEBUG] LSN param ids: {[id(p) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
+    print(f"[DEBUG] LSN param requires_grad: {[getattr(p, 'requires_grad', None) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
+    print(f"[DEBUG] LSN _regularization_loss: {conv_layer.local_state_network._regularization_loss}")
+    print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(conv_layer.local_state_network._regularization_loss, 'grad_fn', None)}")
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
-    lsn = layer.local_state_network
+    lsn = conv_layer.local_state_network
     lsn._regularization_loss.backward()
     grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
     grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
@@ -568,66 +611,14 @@ def training_worker(
             break
         batch_arr = np.stack(batch_inputs)
         target_arr = np.stack(batch_targets)
-        sample_ndim = np.array(batch_inputs[0]).ndim
-        if sample_ndim <= 1:
-            if linear_layer is None:
-                in_dim = batch_arr.shape[-1] if sample_ndim == 1 else batch_arr.shape[0]
-                tgt_sample_ndim = np.array(batch_targets[0]).ndim
-                out_dim = target_arr.shape[-1] if tgt_sample_ndim == 1 else target_arr.shape[0]
-                linear_layer = LinearBlock(in_dim, out_dim, AT.zeros((1,)))
-                optimizer = init_optimizer(opt_name, linear_layer.parameters(), lr)
-            x = AT.get_tensor(batch_arr, requires_grad=True)
-            target = AT.get_tensor(target_arr)
-            y = linear_layer.forward(x)
-            loss = loss_composer(y, target, batch_cats)
-            print(f"Epoch {epoch}: loss={loss.item()}")
-            loss.backward()
-            optimizer.step()
-            continue
 
-        if transform_layer is None:
-            if sample_ndim == 2:
-                from src.common.tensors.abstract_nn.transform_layers import Transform2DLayer
-                transform_layer = Transform2DLayer()
-            elif sample_ndim == 3:
-                from src.common.tensors.abstract_nn.transform_layers import Transform3DLayer
-                transform_layer = Transform3DLayer()
-            else:
-                transform_layer = PCATransformLayer()
-
-        if sample_ndim > 3:
-            b = batch_arr.shape[0]
-            flat = batch_arr.reshape(b, -1)
-            reduced = transform_layer.forward(AT.get_tensor(flat))
-            batch_arr = _to_numpy(reduced).reshape(b, 1, 1, 1, -1)
-        else:
-            batch_arr = _to_numpy(transform_layer.forward(AT.get_tensor(batch_arr)))
-
-        if batch_arr.ndim != 5:
-            raise ValueError(f"training data must be 5D (B,C,D,H,W), got {batch_arr.shape}")
-        exp_no_batch = tuple(1 if d is None else d for d in expected_shape[1:])
-        exp_flat = int(np.prod(exp_no_batch))
-        cur_flat = int(np.prod(batch_arr.shape[1:]))
-        if cur_flat != exp_flat and input_shim is None:
-            input_shim = LinearBlock(cur_flat, exp_flat, AT.zeros((1,)))
-
+        # Wrap inputs/targets; ONLY system.forward from here on
         x = AT.get_tensor(batch_arr, requires_grad=True)
-
-        if sample_ndim > 3:
-            b = target_arr.shape[0]
-            flat_t = target_arr.reshape(b, -1)
-            reduced_t = transform_layer.forward(AT.get_tensor(flat_t))
-            target_arr = _to_numpy(reduced_t).reshape(b, 1, 1, 1, -1)
+        if target_system is not None:
+            # Shape targets using the same family of transform, but via its own system
+            target = target_system.forward(AT.get_tensor(target_arr))
         else:
-            target_arr = _to_numpy(transform_layer.forward(AT.get_tensor(target_arr)))
-
-        if target_arr.ndim != 5:
-            raise ValueError(f"target data must be 5D (B,C,D,H,W), got {target_arr.shape}")
-        tgt_no_batch = target_arr.shape[1:]
-        tgt_flat = int(np.prod(tgt_no_batch))
-        if cur_flat != exp_flat and output_shim is None:
-            output_shim = LinearBlock(exp_flat, tgt_flat, AT.zeros((1,)))
-        target = AT.get_tensor(target_arr)
+            target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
@@ -639,14 +630,14 @@ def training_worker(
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
         pred = y[:, :C]
         loss = loss_composer(y, target, batch_cats)
-        LSN_loss = layer.local_state_network._regularization_loss
+        LSN_loss = conv_layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
         print(f"Total loss={loss.item()}")
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
         loss.backward()
-        lsn = layer.local_state_network
+        lsn = conv_layer.local_state_network
         grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
         grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
         lsn.backward(grad_w, grad_m, lambda_reg=0.5)
@@ -786,9 +777,9 @@ def training_worker(
             print("Converged.")
             break
     # Audit: check that metric and local state network are used
-    print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
-    if 'local_state_network' in layer.laplace_package:
-        print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
+    print("Metric at center voxel:", conv_layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
+    if 'local_state_network' in conv_layer.laplace_package:
+        print("LocalStateNetwork parameters:", list(conv_layer.laplace_package['local_state_network'].parameters()))
     if stop_event is not None:
         stop_event.set()
     if pump_thread.is_alive():
