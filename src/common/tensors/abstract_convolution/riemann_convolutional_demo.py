@@ -358,8 +358,6 @@ def training_worker(
     if laplace_path is None:
         laplace_path = viz_cfg.get("laplace_path", "laplace_surface.png")
     laplace_path = Path(laplace_path)
-    transform, grid, _ = build_geometry(geom_cfg)
-    grid_shape = geom_cfg["grid_shape"]
     B, C = train_cfg["B"], train_cfg["C"]
     task_name = train_cfg.get("task", "md5_unrolled")
     task = get_task(task_name)
@@ -371,11 +369,32 @@ def training_worker(
     data_queue: Queue = Queue(maxsize=10)
     pump_thread = threading.Thread(
         target=task.pump_queue,
-        args=(data_queue, grid_shape, C),
+        args=(data_queue, geom_cfg.get("grid_shape", (1, 1, 1)), C),
         kwargs={"stop_event": stop_event},
         daemon=True,
     )
     pump_thread.start()
+
+    # Grab one sample to infer grid shape and input dimensionality
+    sample_inp, sample_tgt, sample_cat = data_queue.get()
+    sample_ndim = np.array(sample_inp).ndim
+    if sample_ndim == 2:
+        inferred_grid_shape = (1, sample_inp.shape[0], sample_inp.shape[1])
+    elif sample_ndim == 3:
+        inferred_grid_shape = tuple(sample_inp.shape)
+    elif sample_ndim >= 5:
+        inferred_grid_shape = tuple(np.array(sample_inp).shape[-3:])
+    else:
+        inferred_grid_shape = geom_cfg.get("grid_shape", (1, 1, 1))
+    geom_cfg["grid_shape"] = inferred_grid_shape
+    grid_shape = inferred_grid_shape
+
+    # Reinsert the sample so training sees it later
+    data_queue.put((sample_inp, sample_tgt, sample_cat))
+
+    # Build geometry only after determining grid shape
+    transform, grid, _ = build_geometry(geom_cfg)
+
     loss_composer = task.build_loss_composer(C, num_logits)
     if visualize_laplace:
         with autograd.no_grad():
@@ -418,9 +437,6 @@ def training_worker(
     #   2) metric-steered conv wrapper
     #   3) end LinearBlock (replaces former "output shim")
     # ------------------------------------------------------------
-    # Block until we have a single sample to infer shapes (not an epoch)
-    sample_inp, sample_tgt, sample_cat = data_queue.get()
-    sample_ndim = np.array(sample_inp).ndim
 
     # 1) Convolutional transform layer completely replaces the start linear shim
     #    We keep the same selection logic you already used, but as a proper layer in the model.
