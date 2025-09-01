@@ -19,6 +19,7 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 # from src.common.tensors.abstract_nn.optimizer import BPIDSGD  # TODO: optional later
 from src.common.tensors.abstract_nn.optimizer import Adam, SGD
+from src.common.tensors.abstract_nn.core import Linear
 import numpy as np
 from pathlib import Path
 from skimage import measure
@@ -423,6 +424,9 @@ def training_worker(
     # --- Parameter and gradient collection helpers ---
     from ..logger import get_tensors_logger
     logger = get_tensors_logger()
+    input_shim = None
+    output_shim = None
+
     def collect_params_and_grads():
         params, grads = [], []
         seen_params = set()
@@ -463,6 +467,13 @@ def training_worker(
                     seen_objs.add(vid)
                     for p in v.parameters():
                         add_param(p)
+        # Linear shims (if present)
+        if input_shim is not None:
+            for p in input_shim.parameters():
+                add_param(p)
+        if output_shim is not None:
+            for p in output_shim.parameters():
+                add_param(p)
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
             label = getattr(p, '_label', None)
@@ -549,21 +560,38 @@ def training_worker(
         if batch_arr.ndim != 5:
             raise ValueError(f"training data must be 5D (B,C,D,H,W), got {batch_arr.shape}")
         exp_no_batch = tuple(1 if d is None else d for d in expected_shape[1:])
-        if batch_arr.shape[1:] != exp_no_batch:
-            raise ValueError(f"input shape {batch_arr.shape[1:]} does not match expected {exp_no_batch}")
-        x = AT.get_tensor(batch_arr, requires_grad=True)
+        exp_flat = int(np.prod(exp_no_batch))
+        cur_flat = int(np.prod(batch_arr.shape[1:]))
+        if cur_flat != exp_flat and input_shim is None:
+            input_shim = Linear(cur_flat, exp_flat, like=AT.zeros((1,)))
+        if cur_flat != exp_flat:
+            x = AT.get_tensor(batch_arr.reshape(B, -1), requires_grad=True)
+            x = input_shim.forward(x)
+            x = x.reshape((B, *exp_no_batch))
+        else:
+            if batch_arr.shape[1:] != exp_no_batch:
+                raise ValueError(f"input shape {batch_arr.shape[1:]} does not match expected {exp_no_batch}")
+            x = AT.get_tensor(batch_arr, requires_grad=True)
 
         target_arr = np.stack(batch_targets)
+        if target_arr.ndim == 3:
+            target_arr = target_arr[:, None, :, :, None]
         if target_arr.ndim == 4:
             target_arr = target_arr[:, None, ...]
         if target_arr.ndim != 5:
             raise ValueError(f"target data must be 5D (B,C,D,H,W), got {target_arr.shape}")
+        tgt_no_batch = target_arr.shape[1:]
+        tgt_flat = int(np.prod(tgt_no_batch))
+        if cur_flat != exp_flat and output_shim is None:
+            output_shim = Linear(exp_flat, tgt_flat, like=AT.zeros((1,)))
         target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
         autograd.tape.auto_annotate_eval(target)
         y = layer.forward(x)
+        if output_shim is not None:
+            y = output_shim.forward(y.reshape(B, -1)).reshape((B, *tgt_no_batch))
         autograd.tape.auto_annotate_eval(y)
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
