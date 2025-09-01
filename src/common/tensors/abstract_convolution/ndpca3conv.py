@@ -305,7 +305,13 @@ class NDPCA3Conv3d:
 
         # Broadcast axis weights to (1,1,D,H,W)
         def _bcast(w: AbstractTensor) -> AbstractTensor:
-            return w.reshape(1, 1, D, H, W)
+            try:
+                return w.reshape(1, 1, D, H, W)
+            except ValueError as exc:  # Provide clearer diagnostic on mismatch
+                raise ValueError(
+                    "Axis weight shape mismatch: "
+                    f"expected {(D, H, W)}, got {getattr(w, 'shape', None)}"
+                ) from exc
 
         wU_b = _bcast(wU);  wV_b = _bcast(wV);  wW_b = _bcast(wW)
         autograd.tape.annotate(wU_b, label="NDPCA3Conv3d.wU_b")

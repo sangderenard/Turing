@@ -4,6 +4,7 @@ from __future__ import annotations
 try:
     import os
     from enum import IntEnum
+    import importlib.util
 except Exception:
     import sys
     print("faculty.py: Failed to import required modules.")
@@ -37,23 +38,14 @@ def detect_faculty() -> Faculty:
         except KeyError as exc:  # pragma: no cover - env misuse
             raise ValueError(f"Unknown faculty override: {forced}") from exc
 
-    try:  # check for PyGeoMind requirements
-        import torch_geometric  # type: ignore
-        _ = torch_geometric  # silence lint
+    spec = importlib.util.find_spec
+    if spec("numpy") is not None:
+        return Faculty.NUMPY
+    if spec("torch_geometric") is not None:
         return Faculty.PYGEO
-    except ModuleNotFoundError:
-        pass
-    try:
-        import torch  # type: ignore
-        _ = torch
+    if spec("torch") is not None:
         return Faculty.TORCH
-    except ModuleNotFoundError:
-        try:
-            import numpy  # type: ignore
-            _ = numpy
-            return Faculty.NUMPY
-        except ModuleNotFoundError:
-            return Faculty.PURE_PYTHON
+    return Faculty.PURE_PYTHON
 
 
 DEFAULT_FACULTY = detect_faculty()
@@ -62,24 +54,15 @@ DEFAULT_FACULTY = detect_faculty()
 def available_faculties() -> list[Faculty]:
     """Return all faculty tiers available in the current environment."""
     levels = [Faculty.PURE_PYTHON]
-    try:
-        import numpy  # type: ignore
-        _ = numpy
-        levels.append(Faculty.NUMPY)
-    except ModuleNotFoundError:
+    spec = importlib.util.find_spec
+    if spec("numpy") is None:
         return levels
-    try:
-        import torch  # type: ignore
-        _ = torch
-        levels.append(Faculty.TORCH)
-    except ModuleNotFoundError:
+    levels.append(Faculty.NUMPY)
+    if spec("torch") is None:
         return levels
-    try:
-        import torch_geometric  # type: ignore
-        _ = torch_geometric
+    levels.append(Faculty.TORCH)
+    if spec("torch_geometric") is not None:
         levels.append(Faculty.PYGEO)
-    except ModuleNotFoundError:
-        pass
     try:
         from .c_backend import CTensorOperations  # noqa: F401
         levels.append(Faculty.CTENSOR)
