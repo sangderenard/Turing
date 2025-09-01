@@ -22,10 +22,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 from learning_tasks.loss_composer import LossComposer
-
+iterations = 64
 # MD5 constants
 S = [7, 12, 17, 22] * 4 + [5, 9, 14, 20] * 4 + [4, 11, 16, 23] * 4 + [6, 10, 15, 21] * 4
-K = [int(abs(math.sin(i + 1)) * (1 << 32)) & 0xFFFFFFFF for i in range(64)]
+K = [int(abs(math.sin(i + 1)) * (1 << 32)) & 0xFFFFFFFF for i in range(iterations)]
 
 NUM_LOGITS = 0
 
@@ -37,7 +37,7 @@ def _left_rotate(x: int, c: int) -> int:
 def _md5_pad(msg_bytes: bytes) -> bytes:
     ml = (8 * len(msg_bytes)) & 0xFFFFFFFFFFFFFFFF
     msg = msg_bytes + b"\x80"
-    while (len(msg) % 64) != 56:
+    while (len(msg) % iterations) != 56:
         msg += b"\x00"
     msg += struct.pack("<Q", ml)
     return msg
@@ -57,15 +57,15 @@ def md5_with_states(msg_bytes: bytes) -> Tuple[bytes, List[Tuple[int, int, int, 
     all_step_states: List[List[Tuple[int, int, int, int]]] = []
     first_block_words: List[int] | None = None
 
-    for i in range(0, len(msg), 64):
-        block = msg[i : i + 64]
+    for i in range(0, len(msg), iterations):
+        block = msg[i : i + iterations]
         M = list(struct.unpack("<16I", block))
         if first_block_words is None:
             first_block_words = M
         A, B, C, D = A0, B0, C0, D0
         step_states: List[Tuple[int, int, int, int]] = []
 
-        for j in range(64):
+        for j in range(iterations):
             if 0 <= j <= 15:
                 F = (B & C) | (~B & D)
                 g = j
@@ -111,8 +111,14 @@ def make_sample(msg_bytes: bytes, supervise_every: int = 1) -> Tuple[np.ndarray,
     step_states = step_states[::supervise_every]
     prev_states = prev_states[::supervise_every]
 
-    tgt = np.stack([words_to_bitplanes(s) for s in step_states], axis=-1)
-    prev = np.stack([words_to_bitplanes(s) for s in prev_states], axis=-1)
+    # vectorized bitplane extraction for step states
+    step_states_arr = np.array(step_states, dtype=np.uint32).T  # shape (4, T)
+    bits = ((step_states_arr[..., None] >> np.arange(32, dtype=np.uint32)) & 1).astype(np.uint8)
+    tgt = bits.transpose(0, 2, 1).reshape(-1, bits.shape[2])
+    # vectorized bitplane extraction for previous states
+    prev_states_arr = np.array(prev_states, dtype=np.uint32).T
+    bits_prev = ((prev_states_arr[..., None] >> np.arange(32, dtype=np.uint32)) & 1).astype(np.uint8)
+    prev = bits_prev.transpose(0, 2, 1).reshape(-1, bits_prev.shape[2])
     msg_bits = words_to_bitplanes(message_words)
     msg_bits = np.tile(msg_bits[:, None], (1, tgt.shape[1]))
     inp = np.concatenate([msg_bits, prev], axis=0)

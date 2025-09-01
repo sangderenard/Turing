@@ -498,7 +498,7 @@ def training_worker(
     def collect_params_and_grads():
         params, grads = [], []
         seen_params = set()
-       seen_objs = set()
+        seen_objs = set()
 
         def add_param(p):
             pid = id(p)
