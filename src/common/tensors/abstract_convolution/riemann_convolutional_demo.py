@@ -315,8 +315,8 @@ def build_config():
         },
         "training": {
             "B": 4,
-            "C": 3,
-            "task": "md5_unrolled",
+            "C": 1,
+            "task": "pixel_art_classifier",
             "boundary_conditions": ("dirichlet",) * 6,
             "k": 3,
             "eig_from": "g",
