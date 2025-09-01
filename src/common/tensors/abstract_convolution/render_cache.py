@@ -16,6 +16,10 @@ _VIGNETTE_CACHE: Dict[Tuple[int, int, float], np.ndarray] = {}
 _GRADIENTS = {
     "grayscale": np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
     "fire": np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+    "blue_fire": np.array(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+        dtype=np.float32,
+    ),
 }
 
 
@@ -74,7 +78,7 @@ def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.nda
     return out[..., 0] if c == 1 else out
 
 
-def apply_colormap(frame: np.ndarray, cmap: str = "grayscale") -> np.ndarray:
+def apply_colormap(frame: np.ndarray, cmap: str = "blue_fire") -> np.ndarray:
     """Apply ``cmap`` to ``frame`` returning an RGB image."""
 
     arr = np.array(frame)
@@ -90,7 +94,7 @@ def apply_colormap(frame: np.ndarray, cmap: str = "grayscale") -> np.ndarray:
         flat = [colorsys.hsv_to_rgb(h, 1.0, 1.0) for h in hues.ravel()]
         colour = np.array(flat, dtype=np.float32).reshape(arr.shape + (3,))
     else:
-        grad = _GRADIENTS.get(cmap, _GRADIENTS["grayscale"])
+        grad = _GRADIENTS.get(cmap, _GRADIENTS["blue_fire"])
         n = grad.shape[0]
         idx = arr * (n - 1)
         lo = np.floor(idx).astype(int)
@@ -127,6 +131,14 @@ class FrameCache:
         self.target_height = target_height
         self.target_width = target_width
 
+    def clear(self) -> None:
+        """Remove all cached and queued frames."""
+
+        while not self.queue.empty():
+            self.queue.get()
+        self.cache.clear()
+        self.composite_cache.clear()
+
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
@@ -134,7 +146,7 @@ class FrameCache:
         self,
         label: str,
         frame: np.ndarray,
-        cmap: Optional[str] = None,
+        cmap: Optional[str] = "blue_fire",
         mask_first: bool = False,
     ) -> None:
         """Place a new frame on the queue applying optional colour and mask."""

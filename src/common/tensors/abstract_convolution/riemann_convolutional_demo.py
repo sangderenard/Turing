@@ -659,10 +659,11 @@ def training_worker(
             bottom = np.concatenate([quad3, quad4], axis=1)
             ip_frame = np.concatenate([top, bottom], axis=0)
             # Store individual quadrants for flexible layout
-            frame_cache.enqueue("low_input", quad1)
-            frame_cache.enqueue("low_prediction", quad2)
-            frame_cache.enqueue("high_input", quad3)
-            frame_cache.enqueue("high_prediction", quad4)
+            cmap = shared_state.get("cmap", "blue_fire")
+            frame_cache.enqueue("low_input", quad1, cmap=cmap)
+            frame_cache.enqueue("low_prediction", quad2, cmap=cmap)
+            frame_cache.enqueue("high_input", quad3, cmap=cmap)
+            frame_cache.enqueue("high_prediction", quad4, cmap=cmap)
 
             # Parameter/gradient visualization
             pairs = []
@@ -683,9 +684,10 @@ def training_worker(
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
                 # Store individual param/grad visuals with different colour maps
-                frame_cache.enqueue(f"param{idx}_param", p_img, cmap="fire")
+                cmap = shared_state.get("cmap", "blue_fire")
+                frame_cache.enqueue(f"param{idx}_param", p_img, cmap=cmap)
                 frame_cache.enqueue(
-                    f"param{idx}_grad", g_img, cmap="hue", mask_first=True
+                    f"param{idx}_grad", g_img, cmap=cmap, mask_first=True
                 )
                 pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
@@ -700,8 +702,9 @@ def training_worker(
                 params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
             # Legacy composite frames for animation exports
-            frame_cache.enqueue("input_prediction", ip_frame)
-            frame_cache.enqueue("params_grads", params_grads_frame)
+            cmap = shared_state.get("cmap", "blue_fire")
+            frame_cache.enqueue("input_prediction", ip_frame, cmap=cmap)
+            frame_cache.enqueue("params_grads", params_grads_frame, cmap=cmap)
         if loss.item() < 1e-6:
             print("Converged.")
             break
@@ -806,6 +809,23 @@ def display_worker(
 
     epoch_cap_var.trace_add("write", on_epoch_change)
 
+    frame_index = 0
+
+    def reset_animation() -> None:
+        nonlocal frame_index
+        frame_index = 0
+
+    cmap_var = tk.StringVar(value=shared_state.get("cmap", "blue_fire"))
+    cmap_menu = tk.OptionMenu(controls, cmap_var, "fire", "blue_fire", "hue")
+    cmap_menu.pack(side=tk.LEFT)
+
+    def on_cmap_change(*_):
+        shared_state["cmap"] = cmap_var.get()
+        frame_cache.clear()
+        reset_animation()
+
+    cmap_var.trace_add("write", on_cmap_change)
+
     grid_vars: list[list[tk.StringVar]] = []
     grid_menus: list[list[tk.OptionMenu]] = []
 
@@ -821,6 +841,12 @@ def display_worker(
         menu.grid(row=r, column=c)
         grid_vars[r].append(var)
         grid_menus[r].append(menu)
+
+        def on_cell_change(*_):
+            frame_cache.clear()
+            reset_animation()
+
+        var.trace_add("write", on_cell_change)
 
     def add_row() -> None:
         r = len(grid_vars)
@@ -888,8 +914,6 @@ def display_worker(
                         var.set(opts[0])
             last_opts = opts
 
-    frame_index = 0
-
     def update():
         nonlocal frame_index
         if stop_event.is_set():
@@ -955,6 +979,7 @@ def main(
         "optimizer": "Adam",
         "lr": 5e-2,
         "reset_opt": False,
+        "cmap": "blue_fire",
     }
     args = (
         frame_cache,
