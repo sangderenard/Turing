@@ -19,6 +19,7 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 # from src.common.tensors.abstract_nn.optimizer import BPIDSGD  # TODO: optional later
 from src.common.tensors.abstract_nn.optimizer import Adam, SGD
+from src.common.tensors.abstract_nn.losses import CrossEntropyLoss
 import numpy as np
 from pathlib import Path
 from skimage import measure
@@ -28,6 +29,8 @@ import math
 import time
 from PIL import Image
 import threading
+from queue import Queue, Empty
+from learning_tasks.low_entropy_task import pump_queue
 from .render_cache import FrameCache, apply_colormap
 
 
@@ -97,23 +100,6 @@ def pca_to_rgb(arr):
     return (img * 255).astype(np.uint8)
 
 
-def _random_spectral_gaussian(shape):
-    """Return gaussian noise with randomized spectrum."""
-    arr = np.random.randn(*shape)
-    fft = np.fft.fftn(arr)
-    phase = np.angle(fft)
-    mag = np.random.randn(*shape)
-    fft_rand = mag * np.exp(1j * phase)
-    return np.fft.ifftn(fft_rand).real
-
-
-def _low_entropy_variant(target_np, epoch):
-    """Generate a low-entropy sample by rolling/flipping the target."""
-    x = np.roll(target_np, shift=1, axis=-1)
-    if (epoch // 2) % 2 == 0:
-        x = np.flip(x, axis=-2)
-    x += np.random.normal(scale=0.01, size=x.shape)
-    return x
 
 def _tensor_to_pil_image(t):
     arr = np.array(t.data if hasattr(t, "data") else t)
@@ -329,6 +315,7 @@ def build_config():
         "training": {
             "B": 4,
             "C": 3,
+            "num_logits": 0,
             "boundary_conditions": ("dirichlet",) * 6,
             "k": 3,
             "eig_from": "g",
@@ -348,7 +335,6 @@ def training_worker(
     shared_state: dict,
     config=None,
     viz_every=1,
-    low_entropy_every=5,
     max_epochs=25,
     visualize_laplace=None,
     laplace_threshold=None,
@@ -374,9 +360,11 @@ def training_worker(
     transform, grid, _ = build_geometry(geom_cfg)
     grid_shape = geom_cfg["grid_shape"]
     B, C = train_cfg["B"], train_cfg["C"]
+    num_logits = train_cfg.get("num_logits", 0)
+
     layer = MetricSteeredConv3DWrapper(
         in_channels=C,
-        out_channels=C,
+        out_channels=C + num_logits,
         grid_shape=grid_shape,
         transform=transform,
         boundary_conditions=train_cfg.get("boundary_conditions", ("dirichlet",) * 6),
@@ -386,6 +374,15 @@ def training_worker(
         deploy_mode="modulated",
         laplace_kwargs={"lambda_reg": 0.5},
     )
+
+    data_queue: Queue = Queue()
+    pump_thread = threading.Thread(
+        target=pump_queue,
+        args=(data_queue, grid_shape, C),
+        kwargs={"stop_event": stop_event},
+        daemon=True,
+    )
+    pump_thread.start()
     if visualize_laplace:
         with autograd.no_grad():
             builder = BuildLaplace3D(
@@ -414,13 +411,7 @@ def training_worker(
     autograd.tape.auto_annotate_eval(V)
     autograd.tape.annotate(W, label="riemann_demo.grid_W")
     autograd.tape.auto_annotate_eval(W)
-    target = (U + V + W).unsqueeze(0).unsqueeze(0).expand(B, C, -1, -1, -1)
-    autograd.tape.annotate(target, label="riemann_demo.target")
-    autograd.tape.auto_annotate_eval(target)
-    target_np = np.array(target.data if hasattr(target, "data") else target)
-    x = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)), requires_grad=True)
-    autograd.tape.annotate(x, label="riemann_demo.input_init")
-    autograd.tape.auto_annotate_eval(x)
+    # initial annotations for target and inputs are deferred to queue samples
     # When AUTOGRAD_STRICT=1, unused tensors trigger connectivity errors.
     # Uncomment one of the lines below to relax those checks:
     # autograd.strict = False                   # disable strict mode globally
@@ -511,6 +502,8 @@ def training_worker(
     optimizer = init_optimizer(opt_name, params, lr)
     current_opt, current_lr = opt_name, lr
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
+    ce_loss = CrossEntropyLoss() if num_logits > 0 else None
+
     for epoch in range(1, max_epochs + 1):
         if stop_event is not None and stop_event.is_set():
             break
@@ -527,19 +520,36 @@ def training_worker(
                 p.zero_grad()
             elif hasattr(p, '_grad'):
                 p._grad = AbstractTensor.zeros_like(p._grad)
-        if epoch % low_entropy_every == 0:
-            np_x = _low_entropy_variant(target_np, epoch)
-        else:
-            np_x = _random_spectral_gaussian((B, C, *grid_shape))
-        x = AT.get_tensor(np_x, requires_grad=True)
+        batch_inputs, batch_targets, batch_cats = [], [], []
+        while len(batch_inputs) < B and (stop_event is None or not stop_event.is_set()):
+            try:
+                inp, tgt, cat = data_queue.get(timeout=0.1)
+                batch_inputs.append(inp)
+                batch_targets.append(tgt)
+                batch_cats.append(cat)
+            except Empty:
+                if not batch_inputs:
+                    continue
+                break
+        if not batch_inputs:
+            break
+        x = AT.get_tensor(np.stack(batch_inputs), requires_grad=True)
+        target = AT.get_tensor(np.stack(batch_targets))
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
+        autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
+        autograd.tape.auto_annotate_eval(target)
         y = layer.forward(x)
         autograd.tape.auto_annotate_eval(y)
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
-        loss = loss_fn(y, target)
+        pred = y[:, :C]
+        loss = loss_fn(pred, target)
+        if ce_loss is not None:
+            logits = y[:, C:C + num_logits]
+            cat_tensor = AT.get_tensor(np.array([c["spectrum"] for c in batch_cats]))
+            loss = loss + ce_loss(logits.reshape(len(batch_inputs), num_logits), cat_tensor)
         LSN_loss = layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
@@ -615,24 +625,15 @@ def training_worker(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
-            # Prepare data for each quadrant
-            low_entropy = AT.get_tensor(_low_entropy_variant(target_np, epoch))
-            with autograd.no_grad():
-                le_pred = layer.forward(low_entropy)
-            gaussian = AT.get_tensor(_random_spectral_gaussian((B, C, *grid_shape)))
-            with autograd.no_grad():
-                gauss_pred = layer.forward(gaussian)
+            inp_np = np.array(x[0, 0].data if hasattr(x[0, 0], 'data') else x[0, 0])
+            pred_np = np.array(pred[0, 0].data if hasattr(pred[0, 0], 'data') else pred[0, 0])
+            tgt_np = np.array(target[0, 0].data if hasattr(target[0, 0], 'data') else target[0, 0])
+            diff_np = pred_np - tgt_np
 
-            # Use first batch/channel for visualization and apply PCA projection
-            le_inp = np.array(low_entropy[0, 0].data if hasattr(low_entropy[0, 0], 'data') else low_entropy[0, 0])
-            le_out = np.array(le_pred[0, 0].data if hasattr(le_pred[0, 0], 'data') else le_pred[0, 0])
-            ga_inp = np.array(gaussian[0, 0].data if hasattr(gaussian[0, 0], 'data') else gaussian[0, 0])
-            ga_out = np.array(gauss_pred[0, 0].data if hasattr(gauss_pred[0, 0], 'data') else gauss_pred[0, 0])
-
-            quad1 = pca_to_rgb(le_inp)
-            quad2 = pca_to_rgb(le_out)
-            quad3 = pca_to_rgb(ga_inp)
-            quad4 = pca_to_rgb(ga_out)
+            quad1 = pca_to_rgb(inp_np)
+            quad2 = pca_to_rgb(pred_np)
+            quad3 = pca_to_rgb(tgt_np)
+            quad4 = pca_to_rgb(diff_np)
 
             # Ensure all quads are the same size
             h, w, *_ = quad1.shape
@@ -703,6 +704,8 @@ def training_worker(
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
     if stop_event is not None:
         stop_event.set()
+    if pump_thread.is_alive():
+        pump_thread.join()
 
 
 def display_worker(
@@ -923,7 +926,6 @@ def display_worker(
 def main(
     config=None,
     viz_every=1,
-    low_entropy_every=5,
     max_epochs=25,
     output_dir="riemann_modular_renders",
     visualize_laplace=None,
@@ -952,7 +954,6 @@ def main(
         shared_state,
         config,
         viz_every,
-        low_entropy_every,
         max_epochs,
         visualize_laplace,
         laplace_threshold,
@@ -980,7 +981,6 @@ if __name__ == "__main__":
     parser.add_argument("--laplace-path", type=str, help="Path to save Laplace surface image")
     parser.add_argument("--show-laplace", action="store_true", help="Display Laplace surface instead of closing")
     parser.add_argument("--viz-every", type=int, default=1, help="Visualization frequency")
-    parser.add_argument("--low-entropy-every", type=int, default=1, help="Low-entropy sample frequency")
     parser.add_argument("--max-epochs", type=int, default=250, help="Maximum training epochs")
     parser.add_argument("--output-dir", type=str, default="riemann_modular_renders", help="Root directory for output frames")
     parser.add_argument("--dpi", type=int, default=200, help="Figure resolution")
@@ -992,7 +992,6 @@ if __name__ == "__main__":
 
     main(
         viz_every=args.viz_every,
-        low_entropy_every=args.low_entropy_every,
         max_epochs=args.max_epochs,
         output_dir=args.output_dir,
         dpi=args.dpi,

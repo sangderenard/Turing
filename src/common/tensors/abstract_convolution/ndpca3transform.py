@@ -171,19 +171,21 @@ def fit_metric_pca(
 # -----------------------------------------------------------------------------
 from .laplace_nd import Transform
 class PCANDTransform(Transform):
-    """N-D PCA-based transform that acts on a 3-parameter grid (U,V,W).
+    """N-D PCA-based transform mapping arbitrary parameter grids.
 
-    - Spatial map: (U,V,W) --phi--> u ∈ R^n  →  (X,Y,Z) = top-3 PCs of (u-μ).
-    - Metric: visible-space metric from J = [∂(X,Y,Z)/∂(U,V,W)] computed as g=J^T J.
+    - Spatial map: ``(u₁,u₂,...,u_D)`` --``phi``--> ``u ∈ R^n`` →
+      ``(X,Y,Z)`` = top-3 PCs of ``(u-μ)``.
+    - Metric: visible-space metric from the Jacobian ``J`` of the projection
+      computed as ``g = J^T J``.
 
     Parameters
     ----------
     pca_basis : PCABasisND
         Contains μ (n,), P (n,n), n
     phi_fn : callable
-        (U,V,W) -> (..., n) embedding into intrinsic space. Should be composed
-        of AbstractTensor ops so that autograd can differentiate it in pipelines
-        that support it.
+        Callable mapping parameter grids to the intrinsic ``n``-D space.  The
+        callable must be composed of AbstractTensor ops so that autograd can
+        differentiate it in downstream pipelines.
     d_visible : int (1..3)
         Number of principal components to expose as spatial coordinates.
     device : str
@@ -193,7 +195,7 @@ class PCANDTransform(Transform):
     def __init__(
         self,
         pca_basis: PCABasisND,
-        phi_fn: Callable[["object", "object", "object"], "object"],
+        phi_fn: Callable[..., "object"],
         d_visible: int = 3,
         device: str = "cpu",
     ) -> None:
@@ -203,20 +205,25 @@ class PCANDTransform(Transform):
         self.d_visible = int(d_visible)
         self.device = device
 
+        # Track number of intrinsic parameters for generic N-D support
+        self.param_count: int = getattr(phi_fn, "__code__", None).co_argcount if hasattr(phi_fn, "__code__") else 3
+
         # Conventions used by rectangular-style transforms
         self.uextent = self.vextent = self.wextent = 1.0
         self.grid_boundaries = (True, True, True, True, True, True)
 
     # --------------------- core spatial mapping ---------------------
-    def transform_spatial(self, U, V, W):
-        """Return X,Y,Z fields over the parameter grid via PCA projection."""
+    def transform_spatial(self, *params):
+        """Return X,Y,Z fields over the parameter grid via PCA projection.
+
+        Accepts an arbitrary number of parameter grids allowing the transform
+        to operate on N-dimensional inputs.
+        """
         AT = _get_AbstractTensor()
-        U = AT.get_tensor(U)
-        V = AT.get_tensor(V)
-        W = AT.get_tensor(W)
+        tensors = [p if hasattr(p, "requires_grad") else AT.get_tensor(p) for p in params]
 
         # Embed to R^n
-        u_nd = self.phi_fn(U, V, W)  # (..., n)
+        u_nd = self.phi_fn(*tensors)  # (..., n)
         autograd.tape.annotate(u_nd, label="PCANDTransform.u_nd")
 
         # Center & project
@@ -255,35 +262,34 @@ class PCANDTransform(Transform):
         return X, Y, Z
 
     # --------------------- visible metric callback ------------------
-    def metric_tensor_func(
-        self,
-        U, V, W,
-        dXdu, dYdu, dZdu,
-        dXdv, dYdv, dZdv,
-        dXdw, dYdw, dZdw,
-    ) -> Tuple["object", "object", "object"]:
-        """Compute visible-space metric g = J^T J from provided partials.
+    def metric_tensor_func(self, *args, **kwargs) -> Tuple["object", "object", "object"]:
+        """Compute visible-space metric ``g = J^T J`` generically.
 
-        J columns correspond to parameter directions (u,v,w) and rows are
-        visible spatial outputs (X,Y,Z). This is the standard construction for
-        Laplace–Beltrami over the visible coordinates.
+        The function expects precomputed partial derivatives of the projected
+        coordinates with respect to each intrinsic parameter.  This keeps the
+        routine lightweight while allowing callers to provide derivatives for
+        an arbitrary number of parameters.
         """
         AT = _get_AbstractTensor()
-        # Build J (..., 3, 3)
-        Ju = AT.stack([dXdu, dYdu, dZdu], dim=-1)
-        Jv = AT.stack([dXdv, dYdv, dZdv], dim=-1)
-        Jw = AT.stack([dXdw, dYdw, dZdw], dim=-1)
-        autograd.tape.annotate(Ju, label="PCANDTransform.Ju")
-        autograd.tape.annotate(Jv, label="PCANDTransform.Jv")
-        autograd.tape.annotate(Jw, label="PCANDTransform.Jw")
-        J = AT.stack([Ju, Jv, Jw], dim=-1)  # (..., 3, 3)
+        coord_count = self.param_count
+        deriv_args = args[coord_count:]
+        if len(deriv_args) != coord_count * 3:
+            raise ValueError("metric_tensor_func expects precomputed derivatives for each parameter")
+        cols = []
+        it = iter(deriv_args)
+        for _ in range(coord_count):
+            dX = next(it)
+            dY = next(it)
+            dZ = next(it)
+            cols.append(AT.stack([dX, dY, dZ], dim=-1))
+
+        J = AT.stack(cols, dim=-1)  # (..., 3, D)
         autograd.tape.annotate(J, label="PCANDTransform.J")
 
         JT = J.swapaxes(-1, -2)
-        g = JT @ J  # (..., 3, 3)
+        g = JT @ J  # (..., D, D)
         autograd.tape.annotate(g, label="PCANDTransform.metric_g")
 
-        # Inverse + determinant
         g_inv = AT.inverse(g)
         det_g = AT.det(g)
         autograd.tape.annotate(g_inv, label="PCANDTransform.metric_g_inv")
