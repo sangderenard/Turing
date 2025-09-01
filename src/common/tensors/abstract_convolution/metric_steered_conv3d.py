@@ -215,24 +215,59 @@ class MetricSteeredConv3DWrapper:
         return out
 
     def _canonicalize_laplace_package(self, package: dict) -> dict:
+        """
+        Coerce any axis-weight tensors in `package` to (1,1,D,H,W) on the wrapper/conv grid.
+
+        Accepts common producer layouts:
+        • (D,H,W)                         → (1,1,D,H,W)
+        • (1,H,W) with D==1              → (1,1,1,H,W)
+        • (H*W, W) with D==1             → (1,1,1,H,W)
+        • (D*H, W)                        → (1,1,D,H,W)
+        • (D,H,W,W)  (tail)              → reduce tail via diagonal (fallback: mean) → (1,1,D,H,W)
+        • fully flat of size D*H*W       → (1,1,D,H,W)
+        • already (1,1,D,H,W)            → unchanged
+        """
         if not isinstance(package, dict):
             return package
+
         D, H, W = self.grid_shape
         want5 = (1, 1, D, H, W)
 
         def _to_5d(w):
             sh = self._shape_tuple(w)
+
+            # Direct hits / trivial broadcasts
             if sh == (D, H, W):
                 return w.reshape(want5)
             if sh == want5:
                 return w
             if D == 1 and sh == (1, H, W):
                 return w.reshape(want5)
+
+            # Flattened 2-D producer forms
+            if D == 1 and sh == (H * W, W):
+                # (H*W, W) -> (1,H,W) -> (1,1,1,H,W)
+                return w.reshape(1, H, W).reshape(want5)
+            if sh == (D * H, W):
+                # (D*H, W) -> (D,H,W) -> (1,1,D,H,W)
+                return w.reshape(D, H, W).reshape(want5)
+
+            # Extra tail: (D,H,W,W) → prefer diagonal over last two W dims; fallback to mean
+            if len(sh) == 4 and sh[:3] == (D, H, W) and sh[3] == W:
+                if hasattr(w, "diagonal") and callable(getattr(w, "diagonal", None)):
+                    # Take diag over the last two axes (…, W, W) -> (…, W)
+                    w3 = w.diagonal(axis1=-2, axis2=-1)  # result: (D,H,W)
+                else:
+                    w3 = w.mean(axis=-1)  # (D,H,W) fallback if no diagonal
+                return w3.reshape(want5)
+
+            # Fully flat fallback
             n = 1
             for s in sh:
                 n *= int(s)
             if n == D * H * W:
                 return w.reshape((D, H, W)).reshape(want5)
+
             raise ValueError(f"Axis weight shape {sh} not compatible with grid {(D, H, W)}")
 
         out = dict(package)
@@ -241,6 +276,7 @@ class MetricSteeredConv3DWrapper:
             if any(s in kl for s in ("wu", "wv", "ww", "axis_u", "axis_v", "axis_w", "weight_u", "weight_v", "weight_w")):
                 out[k] = _to_5d(package[k])
         return out
+
 
     def _build_laplace_package(self, boundary_conditions):
         if self.grid_domain is None or tuple(self.grid_domain.U.shape) != self.grid_shape:
