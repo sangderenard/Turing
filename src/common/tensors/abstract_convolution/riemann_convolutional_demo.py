@@ -265,7 +265,7 @@ def build_config():
     AT = AbstractTensor
     Nu = Nv = Nw = 8
     n = 8
-    B = 50000
+    B = 500
     t = AT.arange(0, B, 1, requires_grad=True)
     autograd.tape.annotate(t, label="riemann_demo.t_arange")
     autograd.tape.auto_annotate_eval(t)
