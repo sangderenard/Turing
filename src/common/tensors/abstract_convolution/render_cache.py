@@ -6,6 +6,7 @@ from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
 import colorsys
+import math
 import numpy as np
 from PIL import Image
 import re
@@ -143,15 +144,22 @@ class FrameCache:
         self.composite_cache: Dict[int, np.ndarray] = {}
         self.target_height = target_height
         self.target_width = target_width
+        self.tile_height: Optional[int] = None
+        self.tile_width: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
     def enqueue(self, label: str, frame: np.ndarray) -> None:
-        """Place a new frame on the queue storing only a grayscale image."""
+        """Place a new frame on the queue enforcing a common tile size."""
 
         arr = np.array(frame)
         arr = add_vignette(arr)
+        h, w = arr.shape[:2]
+        if self.tile_height is None or self.tile_width is None:
+            self.tile_height, self.tile_width = h, w
+        elif (h, w) != (self.tile_height, self.tile_width):
+            arr = self.nearest_neighbor_resize(arr, (self.tile_height, self.tile_width))
         self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> bool:
@@ -180,6 +188,8 @@ class FrameCache:
 
         self.cache.clear()
         self.composite_cache.clear()
+        self.tile_height = None
+        self.tile_width = None
         while not self.queue.empty():
             self.queue.get()
 
@@ -229,6 +239,7 @@ class FrameCache:
 
         if stats is None:
             stats = ["sample", "mean", "std", "min", "max"]
+        group_stats = stats + ["grid"]
         options: List[str] = []
         labels = sorted(self.cache.keys())
         groups = self._group_labels()
@@ -236,7 +247,7 @@ class FrameCache:
             for stat in stats:
                 options.append(f"{lbl}:{stat}")
         for grp in sorted(groups):
-            for stat in stats:
+            for stat in group_stats:
                 options.append(f"{grp}:{stat}")
         return options
 
@@ -271,6 +282,34 @@ class FrameCache:
         if arr.shape[2] > 3:
             return arr[..., :3]
         return arr
+
+    def compose_group(self, group: str, index: Optional[int] = None) -> np.ndarray:
+        """Compose all frames in ``group`` into a near-square grid."""
+
+        labels = self._group_labels().get(group)
+        if not labels:
+            h = self.tile_height or 1
+            w = self.tile_width or 1
+            return np.zeros((h, w), dtype=np.uint8)
+        if index is None:
+            frames = [self.cache[l][-1] for l in labels if self.cache.get(l)]
+        else:
+            frames = [self.cache[l][index % len(self.cache[l])] for l in labels if self.cache.get(l)]
+        if not frames:
+            h = self.tile_height or 1
+            w = self.tile_width or 1
+            return np.zeros((h, w), dtype=np.uint8)
+        if self.tile_height is None or self.tile_width is None:
+            self.tile_height, self.tile_width = frames[0].shape[:2]
+        cols = math.ceil(math.sqrt(len(frames)))
+        rows = math.ceil(len(frames) / cols)
+        h, w = self.tile_height, self.tile_width
+        ch = frames[0].shape[2:] if frames[0].ndim == 3 else ()
+        canvas = np.zeros((rows * h, cols * w) + ch, dtype=frames[0].dtype)
+        for i, img in enumerate(frames):
+            r, c = divmod(i, cols)
+            canvas[r * h : (r + 1) * h, c * w : (c + 1) * w, ...] = img
+        return canvas
 
     def compose_layout(self, layout: List[List[str]]) -> np.ndarray:
         """Compose a grid according to ``layout``.
@@ -374,6 +413,11 @@ class FrameCache:
                 if base in groups:
                     if stat == "sample":
                         frames_list = [self.cache[l][index % len(self.cache[l])] for l in groups[base] if self.cache.get(l)]
+                    elif stat == "grid":
+                        img = self.compose_group(base, index)
+                        max_h = max(max_h, img.shape[0])
+                        imgs.append(img)
+                        continue
                     else:
                         frames_list = [f for l in groups[base] for f in self.cache.get(l, [])]
                 else:
