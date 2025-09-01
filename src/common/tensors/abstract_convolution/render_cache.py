@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -82,6 +80,41 @@ class FrameCache:
         pil = pil.resize((size[1], size[0]), resample=Image.NEAREST)
         return np.array(pil)
 
+    # ------------------------------------------------------------------
+    # Format helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _apply_alpha_map(img: np.ndarray) -> np.ndarray:
+        """Return ``img`` as RGB with an optional alpha map darkening overlay.
+
+        Frames may include a fourth channel representing a depth mask.  The
+        mask is a 1‑channel texture applied **after** upscaling to darken the
+        colour channels and give a slight "bubble" appearance to tiles.  It is
+        *not* treated as a transparency layer.
+        """
+
+        arr = np.asarray(img)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        # Grayscale inputs -> RGB
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)
+            return arr
+
+        if arr.shape[2] == 1:
+            arr = np.repeat(arr, 3, axis=2)
+            return arr
+
+        if arr.shape[2] >= 4:
+            colour = arr[..., :3].astype(np.float32)
+            mask = arr[..., 3].astype(np.float32) / 255.0
+            shaded = colour * (1.0 - mask[..., None])
+            return shaded.clip(0, 255).astype(np.uint8)
+
+        # Already RGB
+        return arr
+
     def compose_layout(self, layout: List[List[str]]) -> np.ndarray:
         """Compose a grid according to ``layout``.
 
@@ -127,6 +160,7 @@ class FrameCache:
             grid = np.concatenate(padded, axis=0)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+        grid = self._apply_alpha_map(grid)
         self.composite_cache[key] = grid
         return grid
 
@@ -189,6 +223,7 @@ class FrameCache:
             grid = np.concatenate(padded, axis=0)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+        grid = self._apply_alpha_map(grid)
         self.composite_cache[key] = grid
         return grid
 
