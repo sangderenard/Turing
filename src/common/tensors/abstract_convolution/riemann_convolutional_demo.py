@@ -665,8 +665,9 @@ def training_worker(
             frame_cache.enqueue("high_prediction", quad4)
 
             # Parameter/gradient visualization
-            pairs = []
-            for idx, (p, g) in enumerate(zip(params, grads)):
+            p_imgs: list[np.ndarray] = []
+            g_imgs: list[np.ndarray] = []
+            for p, g in zip(params, grads):
                 g = g if g is not None else AT.zeros_like(p)
                 p_img = normalize_for_visualization(p)
                 g_img = normalize_for_visualization(g)
@@ -674,26 +675,28 @@ def training_worker(
                     p_img = p_img.mean(axis=0)
                 if g_img.ndim == 3:
                     g_img = g_img.mean(axis=0)
-                p_img = np.atleast_2d(p_img)
-                g_img = np.atleast_2d(g_img)
-                min_h = min(p_img.shape[0], g_img.shape[0])
-                min_w = min(p_img.shape[1], g_img.shape[1])
-                p_img = p_img[:min_h, :min_w]
-                g_img = g_img[:min_h, :min_w]
-                p_img = (_normalize(p_img) * 255).astype(np.uint8)
-                g_img = (_normalize(g_img) * 255).astype(np.uint8)
-                # Store individual param/grad visuals without colour maps
-                frame_cache.enqueue(f"param{idx}_param", p_img)
-                frame_cache.enqueue(f"param{idx}_grad", g_img)
-                pair = np.concatenate([p_img, g_img], axis=-1)
-                pairs.append(pair)
-            if pairs:
-                max_w = max(pair.shape[1] for pair in pairs)
-                padded_pairs = [
-                    np.pad(pair, ((0, 0), (0, max_w - pair.shape[1])), mode="constant")
-                    for pair in pairs
-                ]
-                params_grads_frame = np.concatenate(padded_pairs, axis=0)
+                p_imgs.append(np.atleast_2d((_normalize(p_img) * 255).astype(np.uint8)))
+                g_imgs.append(np.atleast_2d((_normalize(g_img) * 255).astype(np.uint8)))
+            if p_imgs or g_imgs:
+                target_h = max(img.shape[0] for img in p_imgs + g_imgs)
+                target_w = max(img.shape[1] for img in p_imgs + g_imgs)
+
+                def pad(img: np.ndarray) -> np.ndarray:
+                    h_, w_ = img.shape[:2]
+                    pad_h = target_h - h_
+                    pad_w = target_w - w_
+                    if pad_h or pad_w:
+                        return np.pad(img, ((0, pad_h), (0, pad_w)), mode="constant")
+                    return img
+
+                pairs = []
+                for idx, (p_img, g_img) in enumerate(zip(p_imgs, g_imgs)):
+                    p_img = pad(p_img)
+                    g_img = pad(g_img)
+                    frame_cache.enqueue(f"param{idx}_param", p_img)
+                    frame_cache.enqueue(f"param{idx}_grad", g_img)
+                    pairs.append(np.concatenate([p_img, g_img], axis=-1))
+                params_grads_frame = np.concatenate(pairs, axis=0) if pairs else np.zeros((target_h, target_w * 2), dtype=np.uint8)
             else:
                 params_grads_frame = np.zeros((h, w * 2), dtype=np.uint8)
 
@@ -917,7 +920,7 @@ def display_worker(
         for row in grid_vars:
             for var in row:
                 label, _, stat = var.get().partition(":")
-                if stat not in ("", "sample"):
+                if stat not in ("", "sample", "grid"):
                     continue
                 if label in frame_cache.cache:
                     lengths.append(len(frame_cache.cache[label]))
