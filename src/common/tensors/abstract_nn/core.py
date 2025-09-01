@@ -629,6 +629,12 @@ class Model:
         self._post = [None] * len(layers)
         wrap_module(self)
 
+    def get_input_shape(self) -> tuple[int, int, int]:
+        if not self.layers:
+            raise ValueError("Model is not built yet")
+        first_layer = self.layers[0]
+        return first_layer.get_input_shape()
+
     def parameters(self) -> List[AbstractTensor]:
         ps: List[AbstractTensor] = []
         for layer in self.layers:

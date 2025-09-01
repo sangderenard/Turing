@@ -467,6 +467,11 @@ def training_worker(
                 f"Param {i}: label={label}, shape={getattr(p, 'shape', None)}, grad is None={g is None}, grad shape={getattr(g, 'shape', None) if g is not None else None}"
             )
         return params, grads
+    # get the expected input shape for the architecture
+    # make an input of w/e to kick start the parameter recognition
+    # first, to accomodate any network, you must poll the model
+    # for the expected input shape
+    x = AbstractTensor.ones(layer.get_input_shape())
     y = layer.forward(x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id after forward: {id(layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
