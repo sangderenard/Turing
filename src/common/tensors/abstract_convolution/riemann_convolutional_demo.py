@@ -478,13 +478,19 @@ def training_worker(
     # End shim is now a real LinearBlock; operate along feature axis without calling it directly.
     # We keep channel count stable by default; adjust here if your loss expects a different mapping.
     # If y0 is BCHWD, take channels as in/out for channelwise linearization.
+    
+    def compute_F(tensor):
+        B, C, *spatial_dims = tensor.shape
+        F = 1
+        for d in spatial_dims:
+            F *= d
+        return F
+    flat_target_size = compute_F(sample_tgt)
+    
     if hasattr(y0, "shape") and len(y0.shape) >= 2:
         out_channels_after_conv = int(y0.shape[1])
-        end_linear = LinearBlock(out_channels_after_conv, out_channels_after_conv, AbstractTensor.zeros((1,)))
-    else:
-        # Fallback for unexpected shapes — still satisfy "end shim is LinearBlock"
-        flat = int(np.prod(y0.shape)) if hasattr(y0, "shape") else C + num_logits
-        end_linear = LinearBlock(flat, flat, AbstractTensor.zeros((1,)))
+        end_linear = LinearBlock(out_channels_after_conv, flat_target_size, AbstractTensor.zeros((1,)))
+
 
     # Final training system: [transform -> conv -> linear]
     layer_list = [transform_layer, conv_layer, end_linear]
