@@ -150,10 +150,19 @@ class FrameCache:
     The training thread enqueues :class:`RenderItem` instances while the GUI
     thread drains the queue and stores the frames.  Images can later be saved
     as animations or combined via layout descriptors.  A target height/width
-    can be supplied so composed layouts always match the display surface.
+    can be supplied so composed layouts always match the display surface.  By
+    default frames are stored at their original resolution and only upscaled
+    with a vignette when rendered.  Set ``store_scaled=True`` to apply the
+    vignette immediately and retain the upscaled result in memory.
     """
 
-    def __init__(self, target_height: Optional[int] = None, target_width: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        target_height: Optional[int] = None,
+        target_width: Optional[int] = None,
+        *,
+        store_scaled: bool = False,
+    ) -> None:
         self.queue: "Queue[RenderItem]" = Queue()
         self.cache: Dict[str, List[np.ndarray]] = {}
         # Cache of composed layouts keyed by a hash of their configuration
@@ -162,6 +171,7 @@ class FrameCache:
         self.composite_cache: Dict[int, np.ndarray] = {}
         self.target_height = target_height
         self.target_width = target_width
+        self.store_scaled = store_scaled
 
     # ------------------------------------------------------------------
     # Queue helpers
@@ -170,8 +180,8 @@ class FrameCache:
         """Place a new frame on the queue."""
 
         arr = np.array(frame)
-        # Store only the original resolution; any upscaling is deferred until
-        # the frame is rendered for display or export.
+        if self.store_scaled:
+            arr = add_vignette(arr)
         self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> bool:
@@ -374,7 +384,8 @@ class FrameCache:
             grid = np.concatenate(padded, axis=0)
             # Upscale only once the full grid is assembled to avoid keeping
             # large intermediates in memory.
-            grid = add_vignette(grid)
+            if not self.store_scaled:
+                grid = add_vignette(grid)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
         self.composite_cache[key] = grid
@@ -487,7 +498,8 @@ class FrameCache:
             ]
             grid = np.concatenate(padded, axis=0)
             # Apply vignette/upscaling only to the final composite.
-            grid = add_vignette(grid)
+            if not self.store_scaled:
+                grid = add_vignette(grid)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
         self.composite_cache[key] = grid
@@ -517,8 +529,8 @@ class FrameCache:
         if not frames:
             return
         # Upscale only when writing to disk so the cache retains compact
-        # representations of each frame.
-        upscaled = [add_vignette(f) for f in frames]
+        # representations of each frame unless frames were pre-scaled.
+        upscaled = frames if self.store_scaled else [add_vignette(f) for f in frames]
         if cmap is not None:
             images = [Image.fromarray(apply_colormap(f, cmap)) for f in upscaled]
         else:
