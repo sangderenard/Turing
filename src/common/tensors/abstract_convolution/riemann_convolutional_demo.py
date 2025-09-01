@@ -480,12 +480,14 @@ def training_worker(
     # If y0 is BCHWD, take channels as in/out for channelwise linearization.
     
     def compute_F(tensor):
-        B, C, *spatial_dims = tensor.shape
+        spatial_dims = tensor.shape
         F = 1
         for d in spatial_dims:
             F *= d
         return F
     flat_target_size = compute_F(sample_tgt)
+    print(f"[DEBUG] sample_tgt.shape={sample_tgt.shape}, flat_target_size={flat_target_size}")
+    print(f"[DEBUG] y0.shape={y0.shape}, y0_flat_size={compute_F(y0)}")
     
     if hasattr(y0, "shape") and len(y0.shape) >= 2:
         out_channels_after_conv = int(y0.shape[1])
