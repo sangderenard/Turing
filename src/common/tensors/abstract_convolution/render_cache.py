@@ -31,6 +31,10 @@ class FrameCache:
     def __init__(self, target_height: Optional[int] = None, target_width: Optional[int] = None) -> None:
         self.queue: "Queue[RenderItem]" = Queue()
         self.cache: Dict[str, List[np.ndarray]] = {}
+        # Cache of composed layouts keyed by a hash of their configuration
+        # and selected frame indices. This avoids re-rendering identical
+        # composites in the GUI.
+        self.composite_cache: Dict[int, np.ndarray] = {}
         self.target_height = target_height
         self.target_width = target_width
 
@@ -43,11 +47,19 @@ class FrameCache:
         self.queue.put(RenderItem(label, np.array(frame)))
 
     def process_queue(self) -> None:
-        """Drain all pending frames into the cache."""
+        """Drain all pending frames into the cache.
 
+        Any time new frames are processed the composite cache is cleared so
+        that subsequent calls recompute layouts when necessary.
+        """
+
+        changed = False
         while not self.queue.empty():
             item = self.queue.get()
             self.cache.setdefault(item.label, []).append(item.frame)
+            changed = True
+        if changed:
+            self.composite_cache.clear()
 
     def available_sources(self) -> List[str]:
         """Return sorted set of data sources derived from cached labels."""
@@ -80,6 +92,11 @@ class FrameCache:
             frame for each label is used.  Missing labels are skipped.
         """
 
+        key = self._layout_hash(layout, None)
+        cached = self.composite_cache.get(key)
+        if cached is not None:
+            return cached
+
         rows: List[np.ndarray] = []
         for row in layout:
             imgs: List[np.ndarray] = []
@@ -98,18 +115,36 @@ class FrameCache:
             ]
             rows.append(np.concatenate(normed, axis=1))
         if not rows:
-            return np.zeros((1, 1), dtype=np.uint8)
-        max_w = max(r.shape[1] for r in rows)
-        padded = [
-            r
-            if r.shape[1] == max_w
-            else np.concatenate([r, np.zeros((r.shape[0], max_w - r.shape[1], *r.shape[2:]), dtype=r.dtype)], axis=1)
-            for r in rows
-        ]
-        grid = np.concatenate(padded, axis=0)
-        if self.target_height and self.target_width:
-            grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+            grid = np.zeros((1, 1), dtype=np.uint8)
+        else:
+            max_w = max(r.shape[1] for r in rows)
+            padded = [
+                r
+                if r.shape[1] == max_w
+                else np.concatenate([r, np.zeros((r.shape[0], max_w - r.shape[1], *r.shape[2:]), dtype=r.dtype)], axis=1)
+                for r in rows
+            ]
+            grid = np.concatenate(padded, axis=0)
+            if self.target_height and self.target_width:
+                grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+        self.composite_cache[key] = grid
         return grid
+
+    def _layout_hash(self, layout: List[List[str]], index: Optional[int]) -> int:
+        """Return a hash describing ``layout`` and chosen frame indices."""
+
+        rows = []
+        for row in layout:
+            row_key = []
+            for label in row:
+                frames = self.cache.get(label)
+                if not frames:
+                    frame_idx = -1
+                else:
+                    frame_idx = (len(frames) - 1) if index is None else index % len(frames)
+                row_key.append((label, frame_idx))
+            rows.append(tuple(row_key))
+        return hash(tuple(rows))
 
     def compose_layout_at(self, layout: List[List[str]], index: int) -> np.ndarray:
         """Compose a grid using the ``index``-th frame for each label.
@@ -117,6 +152,11 @@ class FrameCache:
         ``index`` is wrapped by the length of each label's cache so the
         animation can loop seamlessly forward or backward.
         """
+
+        key = self._layout_hash(layout, index)
+        cached = self.composite_cache.get(key)
+        if cached is not None:
+            return cached
 
         rows: List[np.ndarray] = []
         for row in layout:
@@ -137,17 +177,19 @@ class FrameCache:
             ]
             rows.append(np.concatenate(normed, axis=1))
         if not rows:
-            return np.zeros((1, 1), dtype=np.uint8)
-        max_w = max(r.shape[1] for r in rows)
-        padded = [
-            r
-            if r.shape[1] == max_w
-            else np.concatenate([r, np.zeros((r.shape[0], max_w - r.shape[1], *r.shape[2:]), dtype=r.dtype)], axis=1)
-            for r in rows
-        ]
-        grid = np.concatenate(padded, axis=0)
-        if self.target_height and self.target_width:
-            grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+            grid = np.zeros((1, 1), dtype=np.uint8)
+        else:
+            max_w = max(r.shape[1] for r in rows)
+            padded = [
+                r
+                if r.shape[1] == max_w
+                else np.concatenate([r, np.zeros((r.shape[0], max_w - r.shape[1], *r.shape[2:]), dtype=r.dtype)], axis=1)
+                for r in rows
+            ]
+            grid = np.concatenate(padded, axis=0)
+            if self.target_height and self.target_width:
+                grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
+        self.composite_cache[key] = grid
         return grid
 
     # ------------------------------------------------------------------
