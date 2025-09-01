@@ -19,8 +19,6 @@ from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
 from src.common.tensors.abstract_nn.optimizer import BPIDSGD, Adam
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from pathlib import Path
 from skimage import measure
 from .laplace_nd import BuildLaplace3D
@@ -73,6 +71,29 @@ def normalize_for_visualization(arr):
     return arr
 
 
+def pca_to_rgb(arr):
+    """Project ``arr`` to two principal components and return an RGB image."""
+
+    arr = normalize_for_visualization(arr)
+    arr = np.array(arr)
+    if arr.ndim == 3:
+        h, w, d = arr.shape
+        flat = arr.reshape(-1, d)
+        flat = flat - flat.mean(axis=0, keepdims=True)
+        cov = np.cov(flat, rowvar=False)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        comps = flat @ eigvecs[:, -2:]
+        comps = comps.reshape(h, w, 2)
+        r = _normalize(comps[..., 0])
+        g = _normalize(comps[..., 1])
+        b = np.zeros_like(r)
+        img = np.stack([r, g, b], axis=-1)
+    else:
+        arr2d = _normalize(arr)
+        img = np.stack([arr2d] * 3, axis=-1)
+    return (img * 255).astype(np.uint8)
+
+
 def _random_spectral_gaussian(shape):
     """Return gaussian noise with randomized spectrum."""
     arr = np.random.randn(*shape)
@@ -119,6 +140,8 @@ def render_nd_field(
 ):
     """Render an ``n``-D tensor as a visual representation.
 
+    Imports ``matplotlib`` lazily to avoid conflicting with Tkinter.
+
     Parameters
     ----------
     field: array-like
@@ -149,6 +172,9 @@ def render_nd_field(
         optionally ``"heatmap"``. The values are either figures or
         ``np.ndarray`` buffers depending on ``return_figures``.
     """
+
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     arr = np.array(field)
     if arr.ndim < 2:
@@ -220,6 +246,8 @@ def render_laplace_surface(laplace_tensor, grid_shape, threshold=0.0, output_pat
     show: bool, optional
         When True, display the figure instead of closing it.
     """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     arr = np.array(laplace_tensor.data if hasattr(laplace_tensor, "data") else laplace_tensor)
     diag_field = np.diag(arr).reshape(grid_shape)
@@ -552,41 +580,6 @@ def training_worker(
                 else:
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
-            # --- High-quality 2D/3D heatmap quad frame rendering ---
-            import matplotlib.pyplot as plt
-            from mpl_toolkits.mplot3d import Axes3D
-            from matplotlib.colors import Normalize
-            import io
-
-            def render_heatmap(arr, title=None, is3d=False):
-                fig = plt.figure(figsize=(4, 4))
-                if is3d and arr.ndim == 3:
-                    ax = fig.add_subplot(111, projection='3d')
-                    # Use a central slice for surface, or scatter for full volume
-                    z = arr.shape[2] // 2
-                    X, Y = np.meshgrid(np.arange(arr.shape[0]), np.arange(arr.shape[1]), indexing='ij')
-                    surf = ax.plot_surface(X, Y, arr[:, :, z], cmap='viridis', edgecolor='none')
-                    fig.colorbar(surf, ax=ax, shrink=0.5)
-                    ax.set_title(title or "3D Heatmap")
-                else:
-                    ax = fig.add_subplot(111)
-                    if arr.ndim == 3:
-                        # Use mean projection for 2D
-                        arr2d = arr.mean(axis=0)
-                    else:
-                        arr2d = arr
-                    im = ax.imshow(arr2d, cmap='viridis', aspect='auto')
-                    fig.colorbar(im, ax=ax)
-                    ax.set_title(title or "Heatmap")
-                    ax.axis('off')
-                buf = io.BytesIO()
-                plt.tight_layout()
-                fig.savefig(buf, format='png')
-                plt.close(fig)
-                buf.seek(0)
-                img = np.array(Image.open(buf))
-                return img
-
             # Prepare data for each quadrant
             low_entropy = AT.get_tensor(_low_entropy_variant(target_np, epoch))
             with autograd.no_grad():
@@ -595,18 +588,16 @@ def training_worker(
             with autograd.no_grad():
                 gauss_pred = layer.forward(gaussian)
 
-            # Use first batch/channel for visualization
+            # Use first batch/channel for visualization and apply PCA projection
             le_inp = np.array(low_entropy[0, 0].data if hasattr(low_entropy[0, 0], 'data') else low_entropy[0, 0])
             le_out = np.array(le_pred[0, 0].data if hasattr(le_pred[0, 0], 'data') else le_pred[0, 0])
             ga_inp = np.array(gaussian[0, 0].data if hasattr(gaussian[0, 0], 'data') else gaussian[0, 0])
             ga_out = np.array(gauss_pred[0, 0].data if hasattr(gauss_pred[0, 0], 'data') else gauss_pred[0, 0])
 
-            # Render each quadrant as a colorful heatmap (2D or 3D)
-            is3d = le_inp.ndim == 3
-            quad1 = render_heatmap(le_inp, title="Low-Entropy Input", is3d=is3d)
-            quad2 = render_heatmap(le_out, title="Low-Entropy Prediction", is3d=is3d)
-            quad3 = render_heatmap(ga_inp, title="Gaussian Input", is3d=is3d)
-            quad4 = render_heatmap(ga_out, title="Gaussian Prediction", is3d=is3d)
+            quad1 = pca_to_rgb(le_inp)
+            quad2 = pca_to_rgb(le_out)
+            quad3 = pca_to_rgb(ga_inp)
+            quad4 = pca_to_rgb(ga_out)
 
             # Ensure all quads are the same size
             h, w, *_ = quad1.shape
@@ -692,10 +683,6 @@ def display_worker(frame_cache: FrameCache) -> None:
     col_frame = tk.Frame(controls)
     col_frame.pack(side=tk.LEFT)
 
-    style_var = tk.StringVar(value="raw")
-    style_menu = tk.OptionMenu(controls, style_var, "raw", "matplotlib", "scatter3d")
-    style_menu.pack(side=tk.RIGHT)
-
     row_vars = []
     row_menus = []
     col_vars = []
@@ -720,9 +707,16 @@ def display_worker(frame_cache: FrameCache) -> None:
     tk.Button(controls, text="Add Row", command=add_row).pack(side=tk.LEFT)
     tk.Button(controls, text="Add Column", command=add_column).pack(side=tk.LEFT)
 
+    auto_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(controls, text="Autoloop", variable=auto_var).pack(side=tk.RIGHT)
+    speed_var = tk.IntVar(value=1)
+    tk.Scale(controls, from_=-5, to=5, orient=tk.HORIZONTAL, variable=speed_var, label="Speed").pack(side=tk.RIGHT)
+
     add_row()
     add_column()
 
+    epoch_label = tk.Label(root, text="Epoch 0", font=("Arial", 16))
+    epoch_label.pack()
     image_label = tk.Label(root)
     image_label.pack()
 
@@ -744,28 +738,31 @@ def display_worker(frame_cache: FrameCache) -> None:
             if var.get() not in types and types:
                 var.set(types[0])
 
-    def apply_style(arr: np.ndarray) -> np.ndarray:
-        style = style_var.get()
-        if style == "raw":
-            return arr
-        try:
-            images = render_nd_field(arr, return_heatmap=True, return_figures=False)
-            return images.get("heatmap") or next(iter(images.values()))
-        except Exception:
-            return arr
+    frame_index = 0
 
     def update():
+        nonlocal frame_index
         frame_cache.process_queue()
         refresh_menus()
         layout = []
+        selected_labels = []
         for r in row_vars:
             row = []
             for c in col_vars:
                 label = f"{r.get()}_{c.get()}"
                 row.append(label)
+                selected_labels.append(label)
             layout.append(row)
-        grid = frame_cache.compose_layout(layout)
-        grid = apply_style(grid)
+        grid = frame_cache.compose_layout_at(layout, frame_index)
+        if selected_labels:
+            lengths = [len(frame_cache.cache.get(lbl, [])) for lbl in selected_labels if frame_cache.cache.get(lbl)]
+            if lengths:
+                max_len = min(lengths)
+                epoch_label.configure(text=f"Epoch {frame_index % max_len + 1}")
+                if auto_var.get():
+                    speed = speed_var.get()
+                    if speed:
+                        frame_index = (frame_index + speed) % max_len
         pil = Image.fromarray(grid)
         photo = ImageTk.PhotoImage(pil)
         image_label.configure(image=photo)
