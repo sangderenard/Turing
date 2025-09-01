@@ -2,7 +2,7 @@
 
 This learning task emits simple 8×8 pixel art shapes with configurable noise.
 Models receive a noisy version of one of the shapes and must classify which
-shape was chosen.
+shape was chosen. Available shapes include a square, triangle, X and diamond.
 
 Two noise modes are available:
 

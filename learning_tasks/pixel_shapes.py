@@ -47,10 +47,25 @@ X_SHAPE = np.array(
     dtype=np.float32,
 )
 
+DIAMOND = np.array(
+    [
+        [0, 0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0],
+        [0, 1, 1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 1, 1, 1, 1, 1, 1, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0],
+        [0, 0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    dtype=np.float32,
+)
+
 SHAPES = {
     "square": SQUARE,
     "triangle": TRIANGLE,
     "x": X_SHAPE,
+    "diamond": DIAMOND,
 }
 
 SHAPE_NAMES = list(SHAPES.keys())
