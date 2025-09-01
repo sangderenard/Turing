@@ -25,7 +25,7 @@ from .laplace_nd import BuildLaplace3D
 import os
 from PIL import Image
 import threading
-from .render_cache import FrameCache
+from .render_cache import FrameCache, apply_colormap
 
 
 def _normalize(arr):
@@ -642,9 +642,11 @@ def training_worker(
                 g_img = g_img[:min_h, :min_w]
                 p_img = (_normalize(p_img) * 255).astype(np.uint8)
                 g_img = (_normalize(g_img) * 255).astype(np.uint8)
-                # Store individual param/grad visuals
-                frame_cache.enqueue(f"param{idx}_param", p_img)
-                frame_cache.enqueue(f"param{idx}_grad", g_img)
+                # Store individual param/grad visuals with different colour maps
+                frame_cache.enqueue(f"param{idx}_param", p_img, cmap="fire")
+                frame_cache.enqueue(
+                    f"param{idx}_grad", g_img, cmap="hue", mask_first=True
+                )
                 pair = np.concatenate([p_img, g_img], axis=-1)
                 pairs.append(pair)
             if pairs:
@@ -729,6 +731,8 @@ def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_
     tk.Button(controls, text="Add Row", command=add_row).pack(side=tk.LEFT)
     tk.Button(controls, text="Add Column", command=add_column).pack(side=tk.LEFT)
 
+    norm_var = tk.StringVar(value="none")
+    tk.OptionMenu(controls, norm_var, "none", "min-max", "standard").pack(side=tk.RIGHT)
     auto_var = tk.BooleanVar(value=True)
     tk.Checkbutton(controls, text="Autoloop", variable=auto_var).pack(side=tk.RIGHT)
     speed_var = tk.IntVar(value=1)
@@ -741,6 +745,22 @@ def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_
     epoch_label.pack()
     image_label = tk.Label(root)
     image_label.pack()
+
+    def _apply_norm(arr: np.ndarray, method: str) -> np.ndarray:
+        if method == "none":
+            return arr
+        data = arr.astype(np.float32)
+        if method == "min-max":
+            mn, mx = data.min(), data.max()
+            if mx - mn > 1e-8:
+                data = (data - mn) / (mx - mn)
+            else:
+                data = np.zeros_like(data)
+        elif method == "standard":
+            data = (data - data.mean()) / (data.std() + 1e-8)
+            mn, mx = data.min(), data.max()
+            data = (data - mn) / (mx - mn + 1e-8)
+        return (data * 255).clip(0, 255).astype(np.uint8)
 
     def refresh_menus():
         sources = frame_cache.available_sources()
@@ -779,6 +799,7 @@ def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_
                 selected_labels.append(label)
             layout.append(row)
         grid = frame_cache.compose_layout_at(layout, frame_index)
+        grid = _apply_norm(grid, norm_var.get())
         if selected_labels:
             lengths = [len(frame_cache.cache.get(lbl, [])) for lbl in selected_labels if frame_cache.cache.get(lbl)]
             if lengths:
