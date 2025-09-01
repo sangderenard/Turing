@@ -8,10 +8,14 @@ from learning_tasks.pixel_art_reconstruct_task import pump_queue as rec_pump
 from learning_tasks.pixel_shapes import SHAPE_NAMES, SHAPES
 
 
-def _get_one(pump):
+def _get_one(pump, **kwargs):
     q: Queue = Queue()
     stop = threading.Event()
-    thread = threading.Thread(target=pump, args=(q, (8, 8), 1), kwargs={"stop_event": stop})
+    thread = threading.Thread(
+        target=pump,
+        args=(q, (8, 8), 1),
+        kwargs={"stop_event": stop, **kwargs},
+    )
     thread.start()
     item = q.get(timeout=2)
     stop.set()
@@ -25,6 +29,13 @@ def test_classifier_pump_queue_shapes():
     assert tgt.shape == (1, 8, 8)
     assert cat["name"] in SHAPE_NAMES
     assert 0 <= cat["label"] < len(SHAPE_NAMES)
+
+
+def test_classifier_corrupt_mode():
+    inp, tgt, _ = _get_one(clf_pump, noise_mode="corrupt")
+    assert inp.shape == (1, 8, 8)
+    assert tgt.shape == (1, 8, 8)
+    assert not np.allclose(inp, tgt)
 
 
 def test_reconstruct_pump_queue_shapes():
