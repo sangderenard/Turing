@@ -170,7 +170,8 @@ class FrameCache:
         """Place a new frame on the queue."""
 
         arr = np.array(frame)
-        arr = add_vignette(arr)
+        # Store only the original resolution; any upscaling is deferred until
+        # the frame is rendered for display or export.
         self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> bool:
@@ -371,6 +372,9 @@ class FrameCache:
                 for r in rows
             ]
             grid = np.concatenate(padded, axis=0)
+            # Upscale only once the full grid is assembled to avoid keeping
+            # large intermediates in memory.
+            grid = add_vignette(grid)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
         self.composite_cache[key] = grid
@@ -482,6 +486,8 @@ class FrameCache:
                 for r in rows
             ]
             grid = np.concatenate(padded, axis=0)
+            # Apply vignette/upscaling only to the final composite.
+            grid = add_vignette(grid)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
         self.composite_cache[key] = grid
@@ -510,10 +516,13 @@ class FrameCache:
         frames = self.cache.get(label)
         if not frames:
             return
+        # Upscale only when writing to disk so the cache retains compact
+        # representations of each frame.
+        upscaled = [add_vignette(f) for f in frames]
         if cmap is not None:
-            images = [Image.fromarray(apply_colormap(f, cmap)) for f in frames]
+            images = [Image.fromarray(apply_colormap(f, cmap)) for f in upscaled]
         else:
-            images = [Image.fromarray(f) for f in frames]
+            images = [Image.fromarray(f) for f in upscaled]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         images[0].save(
             path,
