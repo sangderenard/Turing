@@ -126,7 +126,7 @@ class MetricSteeredConv3DWrapper:
         self.conv = NDPCA3Conv3d(
             in_channels=in_channels,
             out_channels=out_channels,
-            like=AbstractTensor.zeros((1, in_channels, Nu, Nv, Nw)),
+            like=AbstractTensor.get_tensor(0, requires_grad=True),
             grid_shape=(Nu, Nv, Nw),
             boundary_conditions=boundary_conditions,
             k=k,

@@ -731,20 +731,32 @@ class AbstractTensor:
                 cls = like.__class__
             else:
                 cls = AbstractTensor.check_or_build_registry()
-        # If caller wants gradients and did not provide a tape, use the global tape
+
+        # Inherit tape/gradient intent from ``like`` but do not override an
+        # explicit requires_grad=True request.
+        if like is not None:
+            if tape is None:
+                tape = getattr(like, "_tape", None)
+            if not requires_grad and getattr(like, "requires_grad", False):
+                requires_grad = True
+
+        # If gradients are requested and no tape has been supplied yet, fall
+        # back to the global tape when available.
         if requires_grad and tape is None:
-            if like is not None:
-                tape = like._tape
-                requires_grad = like.requires_grad
-            if tape is None and requires_grad is not None:
-                try:
-                    from . import autograd as _autograd  # local import to avoid cycles
-                    tape = _autograd.autograd.tape
-                except Exception:
-                    tape = None
-            else:
+            try:
+                from . import autograd as _autograd  # local import to avoid cycles
+                tape = _autograd.autograd.tape
+            except Exception:
                 tape = None
-        t = cls.tensor(data, dtype=dtype, device=device, requires_grad=requires_grad, track_time=track_time, tape=tape)
+
+        t = cls.tensor(
+            data,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+            track_time=track_time,
+            tape=tape,
+        )
         return t
 
     def tensor_like(self, data=None, *, dtype=None, device=None, cls=None) -> "AbstractTensor":

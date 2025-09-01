@@ -491,7 +491,8 @@ def training_worker(
     
     if hasattr(y0, "shape") and len(y0.shape) >= 2:
         out_channels_after_conv = int(y0.shape[1])
-        end_linear = LinearBlock(out_channels_after_conv, flat_target_size, AbstractTensor.zeros((1,)))
+        like = AbstractTensor.get_tensor(0, requires_grad=True)
+        end_linear = LinearBlock(out_channels_after_conv, flat_target_size, like)
 
 
     # Final training system: [transform -> conv -> linear]
