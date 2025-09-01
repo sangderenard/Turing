@@ -542,6 +542,8 @@ def training_worker(
         if not batch_inputs:
             break
         batch_arr = np.stack(batch_inputs)
+        if batch_arr.ndim == 3:
+            batch_arr = batch_arr[:, None, :, :, None]
         if batch_arr.ndim == 4:
             batch_arr = batch_arr[:, None, ...]
         if batch_arr.ndim != 5:
