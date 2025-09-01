@@ -58,6 +58,11 @@ def _pixel_vignette(tile: int, power: float = 4.0) -> np.ndarray:
 def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.ndarray:
     """Upscale ``frame`` and tint each pixel with a rounded bubble mask.
 
+    To emphasise the vignette, the source pixels are first oversampled using
+    nearest‑neighbour expansion.  The vignette mask is then upscaled with a
+    high quality filter before being applied.  Finally the image is reduced to
+    the target tile size using a high quality downsampling filter.
+
     Parameters
     ----------
     frame:
@@ -73,20 +78,20 @@ def add_vignette(frame: np.ndarray, tile: int = 8, power: float = 4.0) -> np.nda
         arr = arr[..., None]
     h, w, c = arr.shape
 
-    oversample = 2
-    size = tile * oversample
-    coords = (np.arange(size, dtype=np.float32) + 0.5) / size
-    coords = coords * 2.0 - 1.0
-    yy, xx = np.meshgrid(coords, coords, indexing="ij")
-    r = (np.abs(xx) ** power + np.abs(yy) ** power) ** (1.0 / power)
-    mask = np.clip(r, 0.0, 1.0) ** 2
-    mask = (mask * 255).astype(np.uint8)
-    if oversample > 1:
-        mask = FrameCache.nearest_neighbor_resize(mask, (tile, tile))
-    mask = mask.astype(np.float32) / 255.0
+    oversample = 4
+    big_tile = tile * oversample
+
+    # Nearest neighbour oversample of source pixels to the output tile size
+    up = arr.repeat(tile, axis=0).repeat(tile, axis=1).astype(np.float32)
+
+    # Oversample the vignette mask at high quality then downsample back
+    base_mask = (_pixel_vignette(tile, power) * 255).astype(np.uint8)
+    pil_mask = Image.fromarray(base_mask)
+    pil_mask = pil_mask.resize((big_tile, big_tile), resample=Image.LANCZOS)
+    pil_mask = pil_mask.resize((tile, tile), resample=Image.LANCZOS)
+    mask = np.array(pil_mask, dtype=np.float32) / 255.0
     mask_tiled = np.tile(mask, (h, w))
 
-    up = arr.repeat(tile, axis=0).repeat(tile, axis=1).astype(np.float32)
     up *= (1.0 - mask_tiled)[..., None]
     out = up.clip(0, 255).astype(np.uint8)
     return out[..., 0] if c == 1 else out
