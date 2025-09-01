@@ -316,7 +316,7 @@ def build_config():
         "training": {
             "B": 4,
             "C": 1,
-            "task": "pixel_art_classifier",
+            "task": "pixel_art_reconstruct",
             "boundary_conditions": ("dirichlet",) * 6,
             "k": 3,
             "eig_from": "g",
@@ -359,7 +359,7 @@ def training_worker(
         laplace_path = viz_cfg.get("laplace_path", "laplace_surface.png")
     laplace_path = Path(laplace_path)
     B, C = train_cfg["B"], train_cfg["C"]
-    task_name = train_cfg.get("task", "md5_unrolled")
+    task_name = train_cfg.get("task", "pixel_art_reconstruct")
     task = get_task(task_name)
     num_logits = train_cfg.get("num_logits", task.num_logits)
 
