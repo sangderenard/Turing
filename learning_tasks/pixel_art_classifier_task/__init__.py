@@ -81,7 +81,13 @@ def pump_queue(
 
 
 def build_loss_composer(C: int, num_logits: int = NUM_LOGITS) -> LossComposer:
-    """Return a :class:`LossComposer` for the classifier task."""
+    """Return a :class:`LossComposer` for the classifier task.
+
+    The cross-entropy loss expects ``num_logits`` predictions per sample. Any
+    spatial dimensions in ``pred`` are globally pooled (mean) before the loss is
+    evaluated, so callers should provide logits with shape ``(batch, num_logits,
+    *spatial)``.
+    """
     ce_loss = CrossEntropyLoss()
     AT = AbstractTensor
     composer = LossComposer()
@@ -90,7 +96,10 @@ def build_loss_composer(C: int, num_logits: int = NUM_LOGITS) -> LossComposer:
         return AT.get_tensor(np.array([c["label"] for c in cats]))
 
     def ce(pred, tgt, _cats):
-        return ce_loss(pred.reshape(len(tgt), num_logits), tgt)
+        # Collapse spatial dimensions so that CrossEntropyLoss sees
+        # a tensor of shape (batch, num_logits).
+        pooled = pred.mean(axis=tuple(range(2, pred.ndim)))
+        return ce_loss(pooled.reshape(len(tgt), num_logits), tgt)
 
     composer.add(slice(0, num_logits), cat_target, ce)
     return composer

@@ -19,4 +19,6 @@ where:
 * `category` – dictionary with `label` and `name` entries for the shape.
 
 The loss composer exposes `NUM_LOGITS` equal to the number of shapes and
-returns a cross‑entropy loss over the logits slice.
+returns a cross‑entropy loss over the logits slice. Logits may include spatial
+dimensions; these are globally averaged before classification so each sample
+contributes one ``num_logits`` vector.
