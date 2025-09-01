@@ -215,7 +215,7 @@ class LocalStateNetwork:
         self.g_bias_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_bias_layer"
 
         self._cached_padded_raw = None
-        like = AbstractTensor.zeros((1, num_parameters), dtype=AbstractTensor.float_dtype)
+        like = AbstractTensor.get_tensor(0, dtype=AbstractTensor.float_dtype, requires_grad=True)
         if recursion_depth < max_depth - 1:
             self.spatial_layer = RectConv3d(
                 num_parameters,
