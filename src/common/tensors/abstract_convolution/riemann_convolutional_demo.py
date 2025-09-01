@@ -17,12 +17,15 @@ from .ndpca3transform import PCABasisND, fit_metric_pca
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
 from ..riemann.geometry_factory import build_geometry
-from src.common.tensors.abstract_nn.optimizer import BPIDSGD, Adam
+# from src.common.tensors.abstract_nn.optimizer import BPIDSGD  # TODO: optional later
+from src.common.tensors.abstract_nn.optimizer import Adam, SGD
 import numpy as np
 from pathlib import Path
 from skimage import measure
 from .laplace_nd import BuildLaplace3D
 import os
+import math
+import time
 from PIL import Image
 import threading
 from .render_cache import FrameCache, apply_colormap
@@ -342,6 +345,7 @@ def build_config():
 
 def training_worker(
     frame_cache: FrameCache,
+    shared_state: dict,
     config=None,
     viz_every=1,
     low_entropy_every=5,
@@ -494,11 +498,29 @@ def training_worker(
 
     params, _ = collect_params_and_grads()
 
-    optimizer = Adam(params, lr=5e-2)
+    def init_optimizer(name: str, params, lr: float):
+        name_l = name.lower()
+        if name_l == "sgd":
+            return SGD(params, lr=lr)
+        # if name_l == "bpidsgd":
+        #     return BPIDSGD(params, lr=lr)  # disabled: produces NaNs
+        return Adam(params, lr=lr)
+
+    opt_name = shared_state.get("optimizer", "Adam")
+    lr = shared_state.get("lr", 5e-2)
+    optimizer = init_optimizer(opt_name, params, lr)
+    current_opt, current_lr = opt_name, lr
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, max_epochs + 1):
         if stop_event is not None and stop_event.is_set():
             break
+        while shared_state.get("epoch_limit", max_epochs) < epoch:
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(0.1)
+        if stop_event is not None and stop_event.is_set():
+            break
+        params, _ = collect_params_and_grads()
         # Zero gradients for all params
         for p in params:
             if hasattr(p, 'zero_grad'):
@@ -533,6 +555,16 @@ def training_worker(
         lsn.backward(grad_w, grad_m, lambda_reg=0.5)
         # Re-collect params and grads (in case new tensors were created)
         params, grads = collect_params_and_grads()
+        new_opt = shared_state.get("optimizer", current_opt)
+        new_lr = shared_state.get("lr", current_lr)
+        if (
+            shared_state.get("reset_opt")
+            or new_opt != current_opt
+            or new_lr != current_lr
+        ):
+            optimizer = init_optimizer(new_opt, params, new_lr)
+            current_opt, current_lr = new_opt, new_lr
+            shared_state["reset_opt"] = False
         if deep_research:
             for i, p in enumerate(params):
                 print(f"[DEEP-RESEARCH] param {i}:", _to_numpy(p))
@@ -673,7 +705,13 @@ def training_worker(
         stop_event.set()
 
 
-def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_ms: int = 100) -> None:
+def display_worker(
+    frame_cache: FrameCache,
+    stop_event: threading.Event,
+    shared_state: dict,
+    update_ms: int = 100,
+    max_epochs: int | None = None,
+) -> None:
     """Simple Tkinter UI that streams cached frames to a live window.
 
     Parameters
@@ -706,6 +744,59 @@ def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_
     row_frame.pack(side=tk.LEFT)
     col_frame = tk.Frame(controls)
     col_frame.pack(side=tk.LEFT)
+
+    # Optimizer selection
+    opt_var = tk.StringVar(value=shared_state.get("optimizer", "Adam"))
+    opt_menu = tk.OptionMenu(controls, opt_var, "Adam", "SGD")  # "BPIDSGD" disabled
+    opt_menu.pack(side=tk.LEFT)
+
+    def on_opt_change(*_):
+        shared_state["optimizer"] = opt_var.get()
+        shared_state["reset_opt"] = True
+
+    opt_var.trace_add("write", on_opt_change)
+    tk.Button(controls, text="Reset Optimizer", command=lambda: shared_state.__setitem__("reset_opt", True)).pack(side=tk.LEFT)
+
+    # Learning rate logarithmic slider
+    lr_var = tk.DoubleVar(value=math.log10(shared_state.get("lr", 5e-2)))
+    lr_scale = tk.Scale(
+        controls,
+        from_=-5,
+        to=0,
+        resolution=0.1,
+        orient=tk.HORIZONTAL,
+        variable=lr_var,
+        label="log10 lr",
+    )
+    lr_scale.pack(side=tk.LEFT)
+    lr_label = tk.Label(controls, text=f"lr={shared_state.get('lr', 5e-2):.1e}")
+    lr_label.pack(side=tk.LEFT)
+
+    def on_lr_change(*_):
+        lr = 10 ** lr_var.get()
+        shared_state["lr"] = lr
+        shared_state["reset_opt"] = True
+        lr_label.config(text=f"lr={lr:.1e}")
+
+    lr_var.trace_add("write", on_lr_change)
+
+    # Epoch limit slider
+    cap_max = max_epochs if max_epochs is not None else 1
+    epoch_cap_var = tk.IntVar(value=shared_state.get("epoch_limit", cap_max))
+    epoch_scale = tk.Scale(
+        controls,
+        from_=1,
+        to=cap_max,
+        orient=tk.HORIZONTAL,
+        variable=epoch_cap_var,
+        label="Epoch Limit",
+    )
+    epoch_scale.pack(side=tk.LEFT)
+
+    def on_epoch_change(*_):
+        shared_state["epoch_limit"] = epoch_cap_var.get()
+
+    epoch_cap_var.trace_add("write", on_epoch_change)
 
     row_vars = []
     row_menus = []
@@ -840,8 +931,15 @@ def main(
     frame_cache = FrameCache(target_height=target_height, target_width=target_width)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     stop_event = threading.Event()
+    shared_state = {
+        "epoch_limit": max_epochs,
+        "optimizer": "Adam",
+        "lr": 5e-2,
+        "reset_opt": False,
+    }
     args = (
         frame_cache,
+        shared_state,
         config,
         viz_every,
         low_entropy_every,
@@ -856,7 +954,7 @@ def main(
     )
     worker = threading.Thread(target=training_worker, args=args)
     worker.start()
-    display_worker(frame_cache, stop_event, update_ms=update_ms)
+    display_worker(frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs)
     worker.join()
     frame_cache.process_queue()
     frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"))

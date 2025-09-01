@@ -96,6 +96,17 @@ def adam_step(
     return p_new, m_new, v_new, t_new
 
 
+class SGD:
+    """Vanilla stochastic gradient descent optimizer."""
+
+    def __init__(self, params: List[AT], lr: float = 1e-2):
+        self.lr = lr
+
+    def step(self, params: List[AT], grads: List[AT]) -> List[AT]:
+        lr = self.lr
+        return [p - lr * g for p, g in zip(params, grads)]
+
+
 class BPIDSGD:
     """SGD optimizer with broadcast PID gradient processing."""
 
@@ -110,4 +121,4 @@ class BPIDSGD:
         return [p - lr * g for p, g in zip(params, adj)]
 
 
-__all__ = ["Adam", "adam_step", "BPIDSGD"]
+__all__ = ["Adam", "adam_step", "BPIDSGD", "SGD"]
