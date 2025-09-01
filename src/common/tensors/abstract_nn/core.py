@@ -160,6 +160,10 @@ class Linear:
         if self.b is not None:
             self.b.zero_grad()
 
+    def get_input_shape(self):
+        # For Linear, input shape is (batch, in_dim)
+        return (None, self.W.shape[0])
+
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         # Ensure parameters are registered on the current tape so loss.backward()
         # can discover them via the tape's parameter registry even after tape resets.
@@ -241,6 +245,12 @@ class Flatten:
             grad = grad.reshape(shape[1]) if len(shape) == 2 else grad.reshape(*shape[1:])
         return grad
 
+    def get_input_shape(self):
+        # Returns the shape before flattening (excluding batch if added)
+        if self._shape is None:
+            return None
+        return self._shape[1:] if getattr(self, "_added", False) else self._shape
+
 
 class RectConv2d:
     def __init__(
@@ -283,6 +293,7 @@ class RectConv2d:
         self._cols = None
         self._x_shape = None
         self._added = False
+
         wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
@@ -300,6 +311,10 @@ class RectConv2d:
         self._cols = None
         self._x_shape = None
         self._added = False
+
+    def get_input_shape(self):
+        # (batch, in_channels, H, W)
+        return (None, self.in_channels, None, None)
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         # Re-register parameters on the current tape for this forward pass
@@ -454,6 +469,10 @@ class RectConv3d:
         self._x_shape = None
         self._added = False
 
+    def get_input_shape(self):
+        # (batch, in_channels, D, H, W)
+        return (None, self.in_channels, None, None, None)
+
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         # Re-register parameters on the current tape for this forward pass
         try:
@@ -566,6 +585,10 @@ class MaxPool2d:
         self._kHW = None
         self._added = False
 
+    def get_input_shape(self):
+        # (batch, channels, H, W)
+        return (None, None, None, None)
+
     def forward(self, x: AbstractTensor) -> AbstractTensor:
         x, added = _ensure_batch_dim(x, target_ndim=4)
         self._added = added
@@ -629,7 +652,7 @@ class Model:
         self._post = [None] * len(layers)
         wrap_module(self)
 
-    def get_input_shape(self) -> tuple[int, int, int]:
+    def get_input_shape(self) -> tuple[int, ...]:
         if not self.layers:
             raise ValueError("Model is not built yet")
         first_layer = self.layers[0]
