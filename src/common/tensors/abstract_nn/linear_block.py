@@ -87,3 +87,6 @@ class LinearBlock:
             y = ys.reshape((B, spatial, out_dim)).swapaxes(1, 2).reshape((B, out_dim, *shape[2:]))
             return y
 
+        else:
+            raise ValueError(f"Unexpected input shape {shape}")
+
