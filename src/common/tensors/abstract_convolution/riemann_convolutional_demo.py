@@ -574,6 +574,14 @@ def training_worker(
         cur_flat = int(np.prod(batch_arr.shape[1:]))
         if cur_flat != exp_flat and input_shim is None:
             input_shim = Linear(cur_flat, exp_flat, like=AT.zeros((1,)))
+            # Start as near-identity so data flows before learning tunes it
+            with autograd.no_grad():
+                W = AT.zeros((cur_flat, exp_flat))
+                m = min(cur_flat, exp_flat)
+                W[:m, :m] = AT.eye(m)
+                _AT.copyto(input_shim.W, W)
+                if input_shim.b is not None:
+                    _AT.copyto(input_shim.b, AT.zeros_like(input_shim.b))
         if cur_flat != exp_flat:
             x = AT.get_tensor(batch_arr.reshape(B, -1), requires_grad=True)
             x = input_shim.forward(x)
@@ -594,6 +602,14 @@ def training_worker(
         tgt_flat = int(np.prod(tgt_no_batch))
         if cur_flat != exp_flat and output_shim is None:
             output_shim = Linear(exp_flat, tgt_flat, like=AT.zeros((1,)))
+            # Identity initialisation mirrors input shims for stable training
+            with autograd.no_grad():
+                W = AT.zeros((exp_flat, tgt_flat))
+                m = min(exp_flat, tgt_flat)
+                W[:m, :m] = AT.eye(m)
+                _AT.copyto(output_shim.W, W)
+                if output_shim.b is not None:
+                    _AT.copyto(output_shim.b, AT.zeros_like(output_shim.b))
         target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
