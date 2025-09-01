@@ -21,10 +21,13 @@ from queue import Queue
 from typing import Dict, List, Tuple
 
 import numpy as np
+from learning_tasks.loss_composer import LossComposer
 
 # MD5 constants
 S = [7, 12, 17, 22] * 4 + [5, 9, 14, 20] * 4 + [4, 11, 16, 23] * 4 + [6, 10, 15, 21] * 4
 K = [int(abs(math.sin(i + 1)) * (1 << 32)) & 0xFFFFFFFF for i in range(64)]
+
+NUM_LOGITS = 0
 
 
 def _left_rotate(x: int, c: int) -> int:
@@ -134,3 +137,15 @@ def pump_queue(
         q.put((inp, tgt, category))
         if delay:
             time.sleep(delay)
+
+
+def build_loss_composer(C: int, num_logits: int = NUM_LOGITS) -> LossComposer:
+    """Return a :class:`LossComposer` for the MD5 task."""
+
+    composer = LossComposer()
+
+    def mse(pred, tgt, _cats):
+        return ((pred - tgt) ** 2).mean()
+
+    composer.add(slice(0, C), lambda tgt, _cats: tgt, mse)
+    return composer
