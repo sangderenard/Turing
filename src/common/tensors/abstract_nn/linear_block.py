@@ -10,22 +10,41 @@ from ..abstract_nn.core import Linear, Model
 from .activations import GELU, Sigmoid
 
 class LinearBlock:
-    """
-    A simple linear block model that can be used as a standalone network.
+    """Flexible three-layer linear adapter stack.
 
-    Args:
-        input_dim (int): The size of the input dimension.
-        hidden_dim (int): The size of the hidden layer.
-        output_dim (int): The size of the output dimension.
-        like (AT): AbstractTensor-like object for tensor creation.
+    The block accepts arbitrary input and output sizes.  A hidden dimension is
+    chosen as the integer mean of ``input_dim`` and ``output_dim`` when not
+    explicitly provided.  Three ``Linear`` layers are chained so the block can
+    expand or contract between mismatched endpoints.
+
+    Parameters
+    ----------
+    input_dim : int
+        Size of the incoming feature dimension.
+    output_dim : int
+        Desired output feature size.
+    like : AT
+        AbstractTensor-like object used for parameter initialisation.
+    hidden_dim : int, optional
+        Manually override the intermediate feature size.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, like: AT):
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        like: AT,
+        hidden_dim: int | None = None,
+    ):
+        if hidden_dim is None:
+            hidden_dim = int((input_dim + output_dim) / 2)
         self.model = Model(
             layers=[
                 Linear(input_dim, hidden_dim, like=like, init="xavier"),
+                Linear(hidden_dim, hidden_dim, like=like, init="xavier"),
                 Linear(hidden_dim, output_dim, like=like, init="xavier"),
             ],
-            activations=[GELU(), Sigmoid()]
+            activations=[GELU(), GELU(), Sigmoid()],
         )
 
     def parameters(self):
