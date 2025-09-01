@@ -137,24 +137,11 @@ class FrameCache:
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
-    def enqueue(
-        self,
-        label: str,
-        frame: np.ndarray,
-        cmap: Optional[str] = None,
-        mask_first: bool = False,
-    ) -> None:
-        """Place a new frame on the queue applying optional colour and mask."""
+    def enqueue(self, label: str, frame: np.ndarray) -> None:
+        """Place a new frame on the queue storing only a grayscale image."""
 
         arr = np.array(frame)
-        if mask_first:
-            arr = add_vignette(arr)
-            if cmap is not None:
-                arr = apply_colormap(arr, cmap)
-        else:
-            if cmap is not None:
-                arr = apply_colormap(arr, cmap)
-            arr = add_vignette(arr)
+        arr = add_vignette(arr)
         self.queue.put(RenderItem(label, arr))
 
     def process_queue(self) -> bool:
@@ -320,7 +307,6 @@ class FrameCache:
             grid = np.concatenate(padded, axis=0)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
-        grid = self._apply_alpha_map(grid)
         self.composite_cache[key] = grid
         return grid
 
@@ -427,20 +413,36 @@ class FrameCache:
             grid = np.concatenate(padded, axis=0)
             if self.target_height and self.target_width:
                 grid = self.nearest_neighbor_resize(grid, (self.target_height, self.target_width))
-        grid = self._apply_alpha_map(grid)
         self.composite_cache[key] = grid
         return grid
 
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
-    def save_animation(self, label: str, path: str | Path, duration: int = 800) -> None:
-        """Save the frames for ``label`` as a GIF animation."""
+    def save_animation(
+        self, label: str, path: str | Path, duration: int = 800, cmap: Optional[str] = None
+    ) -> None:
+        """Save the frames for ``label`` as a GIF animation.
+
+        Parameters
+        ----------
+        label:
+            Key identifying which cached frames to save.
+        path:
+            Output file path. Parent directories are created automatically.
+        duration:
+            Duration of each frame in milliseconds. Defaults to ``800``.
+        cmap:
+            Optional colour map name applied to each frame prior to export.
+        """
 
         frames = self.cache.get(label)
         if not frames:
             return
-        images = [Image.fromarray(f) for f in frames]
+        if cmap is not None:
+            images = [Image.fromarray(apply_colormap(f, cmap)) for f in frames]
+        else:
+            images = [Image.fromarray(f) for f in frames]
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         images[0].save(
             path,
