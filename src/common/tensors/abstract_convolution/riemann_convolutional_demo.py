@@ -352,6 +352,7 @@ def training_worker(
     show_laplace=False,
     dpi=200,
     deep_research=False,
+    stop_event: threading.Event | None = None,
 ):
     AT = AbstractTensor
     if config is None:
@@ -496,6 +497,8 @@ def training_worker(
     optimizer = Adam(params, lr=5e-2)
     loss_fn = lambda y, t: ((y - t) ** 2).mean() * 100
     for epoch in range(1, max_epochs + 1):
+        if stop_event is not None and stop_event.is_set():
+            break
         # Zero gradients for all params
         for p in params:
             if hasattr(p, 'zero_grad'):
@@ -664,16 +667,35 @@ def training_worker(
     print("Metric at center voxel:", layer.laplace_package['metric']['g'][grid_shape[0]//2, grid_shape[1]//2, grid_shape[2]//2])
     if 'local_state_network' in layer.laplace_package:
         print("LocalStateNetwork parameters:", list(layer.laplace_package['local_state_network'].parameters()))
+    if stop_event is not None:
+        stop_event.set()
 
 
-def display_worker(frame_cache: FrameCache) -> None:
-    """Simple Tkinter UI that streams cached frames to a live window."""
+def display_worker(frame_cache: FrameCache, stop_event: threading.Event, update_ms: int = 100) -> None:
+    """Simple Tkinter UI that streams cached frames to a live window.
+
+    Parameters
+    ----------
+    frame_cache:
+        Shared cache of frames produced by the training thread.
+    stop_event:
+        Event used to signal the GUI to exit.  This allows the training thread
+        or window close event to request a clean shutdown.
+    update_ms:
+        Refresh period for the UI in milliseconds.
+    """
 
     import tkinter as tk
     from PIL import Image, ImageTk
 
     root = tk.Tk()
     root.title("Riemann Demo")
+
+    def on_close() -> None:
+        stop_event.set()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     controls = tk.Frame(root)
     controls.pack(side=tk.TOP, fill=tk.X)
@@ -742,6 +764,9 @@ def display_worker(frame_cache: FrameCache) -> None:
 
     def update():
         nonlocal frame_index
+        if stop_event.is_set():
+            root.quit()
+            return
         frame_cache.process_queue()
         refresh_menus()
         layout = []
@@ -767,7 +792,7 @@ def display_worker(frame_cache: FrameCache) -> None:
         photo = ImageTk.PhotoImage(pil)
         image_label.configure(image=photo)
         image_label.image = photo
-        root.after(100, update)
+        root.after(update_ms, update)
 
     update()
     root.mainloop()
@@ -787,11 +812,13 @@ def main(
     deep_research=False,
     target_height=512,
     target_width=512,
+    update_ms: int = 100,
 ):
     if config is None:
         config = build_config()
     frame_cache = FrameCache(target_height=target_height, target_width=target_width)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    stop_event = threading.Event()
     args = (
         frame_cache,
         config,
@@ -804,10 +831,11 @@ def main(
         show_laplace,
         dpi,
         deep_research,
+        stop_event,
     )
     worker = threading.Thread(target=training_worker, args=args)
     worker.start()
-    display_worker(frame_cache)
+    display_worker(frame_cache, stop_event, update_ms=update_ms)
     worker.join()
     frame_cache.process_queue()
     frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"))
@@ -830,6 +858,7 @@ if __name__ == "__main__":
     parser.add_argument("--deep-research", action="store_true", help="Emit detailed tensor data")
     parser.add_argument("--target-height", type=int, default=512, help="Render target height")
     parser.add_argument("--target-width", type=int, default=512, help="Render target width")
+    parser.add_argument("--update-ms", type=int, default=100, help="UI refresh interval in milliseconds")
     args = parser.parse_args()
 
     main(
@@ -845,4 +874,5 @@ if __name__ == "__main__":
         deep_research=args.deep_research,
         target_height=args.target_height,
         target_width=args.target_width,
+        update_ms=args.update_ms,
     )
