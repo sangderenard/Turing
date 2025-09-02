@@ -107,10 +107,6 @@ def test_riemann_pipeline_linear_block_params_receive_grads():
     layer, grid, train_cfg = _build_demo_like_layer()
     AT = AbstractTensor
     B, C = train_cfg["B"], train_cfg["C"]
-    spatial = 1
-    for s in grid.U.shape:
-        spatial *= s
-    flat_target_size = C * spatial
     end_linear = LinearBlock(C, C, AT.zeros((1,)))
     model = Model([layer, end_linear], [None, None])
     for p in end_linear.parameters():
@@ -120,10 +116,11 @@ def test_riemann_pipeline_linear_block_params_receive_grads():
     x = AT.randn((B, C, *grid.U.shape), requires_grad=True)
     y = model.forward(x)
     _autograd.autograd.tape.auto_annotate_eval(y)
-    assert y.shape == (B, flat_target_size)
+    assert y.shape == (B, C, *grid.U.shape)
     target = AT.randn(y.shape)
-    pred = y
-    loss = ((pred - target) ** 2).mean()
+    pred = y.reshape(B, -1)
+    target_flat = target.reshape(B, -1)
+    loss = ((pred - target_flat) ** 2).mean()
     loss.backward()
     for layer in end_linear.model.layers:
         assert getattr(layer, "gW", None) is not None and layer.gW.abs().sum().item() != 0
