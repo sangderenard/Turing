@@ -42,12 +42,11 @@ class PCATransformLayer:
         self._components = evecs[:, -self.n_components :]
 
     def forward(self, x):
-        xt = AT.get_tensor(x)
         if self._components is None or self._mean is None:
-            self._fit(xt)
-        x2d = xt.reshape(-1, xt.shape[-1])
+            self._fit(x)
+        x2d = x.reshape(-1, x.shape[-1])
         transformed = (x2d - self._mean) @ self._components
-        return transformed.reshape(*xt.shape[:-1], self.n_components)
+        return transformed.reshape(*x.shape[:-1], self.n_components)
 
     def parameters(self):  # pragma: no cover - no trainable params
         return []

@@ -89,3 +89,6 @@ class LinearBlock:
         else:
             raise ValueError(f"Unexpected input shape {shape}")
 
+    def get_input_shape(self):
+        """Return the expected input shape for the model."""
+        return (None, int(self.model.layers[0].W.shape[0]))

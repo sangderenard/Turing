@@ -570,7 +570,7 @@ def training_worker(
     expected_shape = system.get_input_shape()
     concrete = tuple(1 if d is None else d for d in expected_shape)
     _probe_x = AbstractTensor.ones(concrete)
-    _ = system.forward(_probe_x)
+    _probe_y = system.forward(_probe_x)
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id after forward: {id(conv_layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     print(f"[DEBUG] LSN param ids: {[id(p) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
@@ -580,7 +580,7 @@ def training_worker(
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
     lsn = conv_layer.local_state_network
-    lsn._regularization_loss.backward()
+    (_probe_y + lsn._regularization_loss).mean().backward()
     grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
     grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
     lsn.backward(grad_w, grad_m, lambda_reg=0.5)
@@ -1086,9 +1086,9 @@ def main(
     worker.start()
     display_worker(frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs)
     worker.join()
-    frame_cache.process_queue()
-    frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"), cmap=cmap)
-    frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"), cmap=cmap)
+    #frame_cache.process_queue()
+    #frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"), cmap=cmap)
+    #frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"), cmap=cmap)
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":

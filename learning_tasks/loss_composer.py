@@ -37,7 +37,8 @@ class LossComposer:
         self._components.append((pred_slice, target_fn, loss_fn))
 
     def __call__(self, y, target, categories) -> object:
-        total = 0
+        from src.common.tensors import AbstractTensor
+        total = AbstractTensor.get_tensor([0])
         for pred_slice, target_fn, loss_fn in self._components:
             pred_part = y[:, pred_slice]
             tgt_part = target_fn(target, categories)
