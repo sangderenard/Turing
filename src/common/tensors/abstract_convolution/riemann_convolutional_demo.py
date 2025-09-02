@@ -501,9 +501,7 @@ def training_worker(
     activations = [None] * len(layer_list)
     system = Model(layer_list, activations)
 
-    # Target shaping system (ONLY for targets; respects "only system.forward")
-    target_layers = [transform_layer.__class__()] if transform_layer is not None else []
-    target_system = Model(target_layers, [None]*len(target_layers)) if target_layers else None
+    
 
     def collect_params_and_grads():
         params, grads = [], []
@@ -640,11 +638,7 @@ def training_worker(
 
         # Wrap inputs/targets; ONLY system.forward from here on
         x = AT.get_tensor(batch_arr, requires_grad=True)
-        if target_system is not None:
-            # Shape targets using the same family of transform, but via its own system
-            target = target_system.forward(AT.get_tensor(target_arr))
-        else:
-            target = AT.get_tensor(target_arr)
+        target = AT.get_tensor(target_arr)
         autograd.tape.annotate(x, label=f"riemann_demo.input_epoch_{epoch}")
         autograd.tape.annotate(target, label=f"riemann_demo.target_epoch_{epoch}")
         autograd.tape.auto_annotate_eval(x)
