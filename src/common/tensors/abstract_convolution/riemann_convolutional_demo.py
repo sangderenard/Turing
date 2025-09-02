@@ -495,7 +495,13 @@ def training_worker(
         like = AbstractTensor.get_tensor(0, requires_grad=True)
         target_channels = int(getattr(sample_tgt, "shape", (out_channels_after_conv,))[0])
         end_linear = LinearBlock(out_channels_after_conv, target_channels, like)
+        # Ensure all parameters participate in autograd.
         for p in end_linear.parameters():
+            # Explicitly require gradients for safety in case the initializer
+            # provided a non-trainable tensor.
+            setattr(p, "requires_grad", True)
+            # Register the parameter on the current tape so it survives tape
+            # resets between epochs.
             autograd.tape.create_tensor_node(p)
     assert end_linear is not None, "end_linear failed to construct"
 
@@ -594,6 +600,12 @@ def training_worker(
         )
 
     params, _ = collect_params_and_grads()
+    # Re-register LinearBlock parameters with the active tape before training
+    # begins.  Some integration tests reset ``autograd.tape`` which can drop
+    # existing nodes.
+    if end_linear is not None:
+        for p in end_linear.parameters():
+            autograd.tape.create_tensor_node(p)
 
     def init_optimizer(name: str, params, lr: float):
         name_l = name.lower()
@@ -618,6 +630,10 @@ def training_worker(
         if stop_event is not None and stop_event.is_set():
             break
         params, _ = collect_params_and_grads()
+        # Ensure end_linear parameters remain on the tape even if it was reset
+        if end_linear is not None:
+            for p in end_linear.parameters():
+                autograd.tape.create_tensor_node(p)
         # Zero gradients for all params
         for p in params:
             if hasattr(p, 'zero_grad'):
