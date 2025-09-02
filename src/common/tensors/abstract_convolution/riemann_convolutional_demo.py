@@ -489,11 +489,15 @@ def training_worker(
     print(f"[DEBUG] sample_tgt.shape={sample_tgt.shape}, flat_target_size={flat_target_size}")
     print(f"[DEBUG] y0.shape={y0.shape}, y0_flat_size={compute_F(y0)}")
 
+    end_linear = None
     if hasattr(y0, "shape") and len(y0.shape) >= 2:
         out_channels_after_conv = int(y0.shape[1])
         like = AbstractTensor.get_tensor(0, requires_grad=True)
         target_channels = int(getattr(sample_tgt, "shape", (out_channels_after_conv,))[0])
         end_linear = LinearBlock(out_channels_after_conv, target_channels, like)
+        for p in end_linear.parameters():
+            autograd.tape.create_tensor_node(p)
+    assert end_linear is not None, "end_linear failed to construct"
 
 
     # Final training system: [transform -> conv -> linear]
@@ -666,6 +670,9 @@ def training_worker(
         grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
         grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
         lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+        if end_linear is not None:
+            for p in end_linear.parameters():
+                assert getattr(p, '_grad', None) is not None, f"end_linear parameter {getattr(p, '_label', p)} has no gradient"
         params, grads = collect_params_and_grads()
         new_opt = shared_state.get("optimizer", current_opt)
         new_lr = shared_state.get("lr", current_lr)
