@@ -326,25 +326,22 @@ class FrameCache:
         if not frames:
             return np.zeros((1, 1), dtype=np.uint8)
 
-        # Determine common tile size and pad without resizing so each parameter
-        # occupies equal space regardless of its original dimensions.
+        # Determine common tile size and resize so each parameter occupies
+        # equal space regardless of its original dimensions.
         tile_h = max(img.shape[0] for img in frames)
         tile_w = max(img.shape[1] for img in frames)
-        padded: List[np.ndarray] = []
-        for img in frames:
-            h_, w_ = img.shape[:2]
-            pad_h = tile_h - h_
-            pad_w = tile_w - w_
-            if pad_h > 0 or pad_w > 0:
-                pad_cfg = ((0, pad_h), (0, pad_w)) + ((0, 0),) * (img.ndim - 2)
-                img = np.pad(img, pad_cfg, mode="constant")
-            padded.append(img)
+        resized: List[np.ndarray] = [
+            img
+            if img.shape[:2] == (tile_h, tile_w)
+            else self.nearest_neighbor_resize(img, (tile_h, tile_w))
+            for img in frames
+        ]
 
-        cols = math.ceil(math.sqrt(len(padded)))
-        rows = math.ceil(len(padded) / cols)
-        ch = padded[0].shape[2:] if padded[0].ndim == 3 else ()
-        canvas = np.zeros((rows * tile_h, cols * tile_w) + ch, dtype=padded[0].dtype)
-        for i, img in enumerate(padded):
+        cols = math.ceil(math.sqrt(len(resized)))
+        rows = math.ceil(len(resized) / cols)
+        ch = resized[0].shape[2:] if resized[0].ndim == 3 else ()
+        canvas = np.zeros((rows * tile_h, cols * tile_w) + ch, dtype=resized[0].dtype)
+        for i, img in enumerate(resized):
             r, c = divmod(i, cols)
             canvas[r * tile_h : (r + 1) * tile_h, c * tile_w : (c + 1) * tile_w, ...] = img
         return canvas
@@ -367,17 +364,21 @@ class FrameCache:
         rows: List[np.ndarray] = []
         for row in layout:
             imgs: List[np.ndarray] = []
-            max_h = 0
+            tile_h = 0
+            tile_w = 0
             for label in row:
                 if label not in self.cache or not self.cache[label]:
                     continue
                 img = self.cache[label][-1]
-                max_h = max(max_h, img.shape[0])
+                tile_h = max(tile_h, img.shape[0])
+                tile_w = max(tile_w, img.shape[1])
                 imgs.append(img)
             if not imgs:
                 continue
             normed = [
-                img if img.shape[0] == max_h else self.nearest_neighbor_resize(img, (max_h, img.shape[1]))
+                img
+                if img.shape[:2] == (tile_h, tile_w)
+                else self.nearest_neighbor_resize(img, (tile_h, tile_w))
                 for img in imgs
             ]
             rows.append(np.concatenate(normed, axis=1))
@@ -433,7 +434,8 @@ class FrameCache:
         rows: List[np.ndarray] = []
         for row in layout:
             imgs: List[np.ndarray] = []
-            max_h = 0
+            tile_h = 0
+            tile_w = 0
             for label_stat in row:
                 base, _, stat = label_stat.partition(":")
                 frames_list: List[np.ndarray]
@@ -442,7 +444,8 @@ class FrameCache:
                         frames_list = [self.cache[l][index % len(self.cache[l])] for l in groups[base] if self.cache.get(l)]
                     elif stat == "grid":
                         img = self.compose_group(base, index)
-                        max_h = max(max_h, img.shape[0])
+                        tile_h = max(tile_h, img.shape[0])
+                        tile_w = max(tile_w, img.shape[1])
                         imgs.append(img)
                         continue
                     else:
@@ -472,12 +475,15 @@ class FrameCache:
                     else:
                         stack = stack[0]
                 img = stack if stack.dtype == np.uint8 else np.clip(stack, 0, 255).astype(np.uint8)
-                max_h = max(max_h, img.shape[0])
+                tile_h = max(tile_h, img.shape[0])
+                tile_w = max(tile_w, img.shape[1])
                 imgs.append(img)
             if not imgs:
                 continue
             normed = [
-                img if img.shape[0] == max_h else self.nearest_neighbor_resize(img, (max_h, img.shape[1]))
+                img
+                if img.shape[:2] == (tile_h, tile_w)
+                else self.nearest_neighbor_resize(img, (tile_h, tile_w))
                 for img in imgs
             ]
             rows.append(np.concatenate(normed, axis=1))
