@@ -7,7 +7,7 @@ A simple linear block model for testing and training.
 
 from ..abstraction import AbstractTensor as AT
 from ..abstract_nn.core import Linear, Model
-from .activations import GELU, Sigmoid
+from .activations import GELU, Identity
 
 class LinearBlock:
     """Flexible three-layer linear adapter stack.
@@ -44,7 +44,9 @@ class LinearBlock:
                 Linear(hidden_dim, hidden_dim, like=like, init="xavier"),
                 Linear(hidden_dim, output_dim, like=like, init="xavier"),
             ],
-            activations=[GELU(), GELU(), Sigmoid()],
+            # Use a non-saturating activation on the final layer so gradients do not
+            # vanish when the block is trained in larger systems.
+            activations=[GELU(), GELU(), Identity()],
         )
 
     def parameters(self):
