@@ -80,7 +80,7 @@ class LinearBlock:
             for s in shape[2:]:
                 spatial *= int(s)
             # (B, C, S) -> (B*S, C) so Linear sees C as features.
-            xs = x.reshape((B, C, spatial)).swapaxes(1, 2).reshape((B * spatial, C))
+            xs = x.reshape((B, C, spatial)).permute((0, 2, 1)).reshape((B * spatial, C))
             ys = self.model.forward(xs)  # (B*S, out_dim)
             # Return 2-D tensor: collapse spatial locations into the feature axis.
             y = ys.reshape((B, out_dim * spatial))
