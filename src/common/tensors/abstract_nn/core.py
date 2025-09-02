@@ -150,7 +150,7 @@ class Linear:
         logger.debug(
             f"Linear layer weights shape: {getattr(self.W, 'shape', None)}; bias shape: {getattr(self.b, 'shape', None) if self.b is not None else None}"
         )
-        wrap_module(self)
+        
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -194,25 +194,7 @@ class Linear:
         autograd.tape.annotate(out, label="Linear.forward.output")
         return out
 
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        if getattr(self, "_x", None) is None:
-            raise RuntimeError("Linear.backward called before forward")
 
-        grad_out, added = _ensure_batch_dim(grad_out, target_ndim=2)
-        x = self._x
-        xT = x.permute(1, 0)
-        self.gW = xT @ grad_out
-        self.W._grad = self.gW
-        if self.b is not None:
-            self.gb = grad_out.sum(dim=0, keepdim=True)
-            self.b._grad = self.gb
-        WT = self.W.permute(1, 0)
-        dx = grad_out @ WT
-        self._x = None
-        if getattr(self, "_added_input", False) or added:
-            shape = dx.shape() if callable(getattr(dx, "shape", None)) else dx.shape
-            dx = dx.reshape((shape[1],)) if len(shape) == 2 else dx.reshape(shape[1:])
-        return dx
 
 
 class Flatten:
@@ -453,7 +435,6 @@ class RectConv3d:
         self._cols = None
         self._x_shape = None
         self._added = False
-        wrap_module(self)
 
     def parameters(self) -> List[AbstractTensor]:
         return [p for p in (self.W, self.b) if p is not None]
@@ -521,40 +502,6 @@ class RectConv3d:
         if added:
             out = out.reshape(*out.shape()[1:])
         return out
-
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        if self._x is None or self._cols is None or self._x_shape is None:
-            raise RuntimeError("RectConv3d.backward called before forward")
-        if getattr(self, "_added", False):
-            grad_out = grad_out.reshape(1, *grad_out.shape())
-        N, _, Dout, Hout, Wout = grad_out.shape
-        L = Dout * Hout * Wout
-        grad_mat = grad_out.reshape(N, self.out_channels, L)
-        cols_T = self._cols.transpose(1, 2)
-        gW = grad_mat @ cols_T
-        self.gW = gW.sum(dim=0).reshape(*self.W.shape)
-        if self.b is not None:
-            self.gb = grad_mat.sum(dim=(0, 2)).reshape(*self.b.shape)
-        self.W._grad = self.gW
-        if self.b is not None:
-            self.b._grad = self.gb
-        Wm = self.W.reshape(self.out_channels, -1)
-        WT = Wm.transpose(0, 1)
-        dcols = WT @ grad_mat
-        dx = AbstractTensor.fold3d(
-            dcols,
-            output_size=self._x_shape,
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-        )
-        self._x = None
-        self._cols = None
-        self._x_shape = None
-        if getattr(self, "_added", False):
-            dx = dx.reshape(*dx.shape()[1:])
-        return dx
 
 
 class MaxPool2d:

@@ -167,26 +167,25 @@ class MetricSteeredConv3DWrapper:
                 print(f"[MetricSteeredConv3DWrapper] grid -> {new_grid}")
 
     def _pad_to_cube(self, x):
-        # Optional experiment mode: pad to SxSxS (not required by the math)
         Din, Hin, Win = self._shape_tuple(x)[-3:]
         S = max(Din, Hin, Win)
         padD, padH, padW = S - Din, S - Hin, S - Win
         if (padD | padH | padW) == 0:
             return x, (Din, Hin, Win)
-        shape = self._shape_tuple(x)
-        B = shape[0] if len(shape) >= 5 else 1
-        C = shape[1] if len(shape) >= 5 else (shape[1] if len(shape) >= 2 else 1)
-        dtype = x.get_dtype() if hasattr(x, "get_dtype") else getattr(x, "dtype", None)
-        device = x.get_device() if hasattr(x, "get_device") else getattr(x, "device", None)
-        out = AbstractTensor.full((B, C, S, S, S), self.pad_value, dtype=dtype, device=device)
-        d0 = padD // 2
-        h0 = padH // 2
-        w0 = padW // 2
-        d1 = d0 + Din
-        h1 = h0 + Hin
-        w1 = w0 + Win
-        out[..., d0:d1, h0:h1, w0:w1] = x
-        return out, (S, S, S)
+
+        # Construct symmetric padding (low, high) for each dim
+        pad_d = (padD // 2, padD - padD // 2)
+        pad_h = (padH // 2, padH - padH // 2)
+        pad_w = (padW // 2, padW - padW // 2)
+
+        # Assume x is (..., D, H, W)
+        padding = [(0, 0)] * (x.ndim - 3) + [pad_d, pad_h, pad_w]
+
+        # You need a backend-safe pad function that obeys autograd
+        x_padded = x.pad(padding, value=self.pad_value)
+
+        return x_padded, (S, S, S)
+
 
     def _resample_geometry_to(self, package, src_grid, dst_grid, mode="nearest"):
         # If you prefer to keep geometry at some canonical resolution and map to input,
@@ -343,7 +342,7 @@ class MetricSteeredConv3DWrapper:
 
         # 2) Build geometry on self.grid_shape
         package = self._build_laplace_package(self.boundary_conditions)
-
+        lsn_output = package.get("state_output")
         # 3) If keeping a canonical geometry grid, resample to the input grid
         if self.grid_sync_mode == "resample_geometry":
             Din, Hin, Win = self._shape_tuple(x)[-3:]
@@ -360,5 +359,5 @@ class MetricSteeredConv3DWrapper:
         out = self.conv.forward(x, package=package)
         autograd.tape.annotate(out, label="MetricSteeredConv3DWrapper.output")
         autograd.tape.auto_annotate_eval(out)
-        return out
+        return out * lsn_output.mean() if lsn_output is not None else out
 

@@ -441,37 +441,22 @@ class BuildLaplace3D:
         
 
         # 2. Obtain State Outputs
-        state_outputs = local_state_network(
+        state_output = local_state_network(
             grid_u, grid_v, grid_w,
             partials=(dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw),
             additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL,
                                "lambda_reg": lambda_reg}
         )
 
-        raw_tensor = state_outputs['padded_raw']
-        weighted_tensor = state_outputs['weighted_padded']
-        modulated_tensor = state_outputs['modulated_padded']
-        regularization_loss = state_outputs.get('regularization_loss')
-
-        # 3. Select Appropriate Tensor Based on deploy_mode
-        if deploy_mode == 'raw':
-            selected_tensor = raw_tensor
-        elif deploy_mode == 'weighted':
-            selected_tensor = weighted_tensor
-        elif deploy_mode == 'modulated':
-            selected_tensor = modulated_tensor
-        else:
-            raise ValueError("Invalid deploy_mode. Use 'raw', 'weighted', or 'modulated'.")
-
-        if selected_tensor.dim() == 7:
-            selected_tensor = selected_tensor.squeeze(0)
-
+        if state_output.dim() == 7:
+            state_output = state_output.squeeze(0)
+        #print(state_output)
         # 4. Extract Components from Selected Tensor
-        g_ij = selected_tensor[..., 0, :, :]      # Metric tensor
-        g_inv = selected_tensor[..., 1, :, :]     # Inverse metric tensor
-        det_g = selected_tensor[..., 2, 0, 0]     # Determinant of the metric tensor
-        tension = selected_tensor[..., 2, 1, 1]
-        density = selected_tensor[..., 2, 2, 2]
+        g_ij = state_output[..., 0, :, :]      # Metric tensor
+        g_inv = state_output[..., 1, :, :]     # Inverse metric tensor
+        det_g = state_output[..., 2, 0, 0]     # Determinant of the metric tensor
+        tension = state_output[..., 2, 1, 1]
+        density = state_output[..., 2, 2, 2]
         _label_tensor(g_ij, "laplace_nd.metric.g")
         _label_tensor(g_inv, "laplace_nd.metric.g_inv")
         _label_tensor(det_g, "laplace_nd.metric.det_g")
@@ -689,14 +674,14 @@ class BuildLaplace3D:
                 "vals": coo_vals,
             },
             "local_state_network": local_state_network,
-            "regularization_loss": regularization_loss,
+            "network_output": state_output,
             "config": {
                 "stencil": INT_LAPLACEBELTRAMI_STENCIL if 'INT_LAPLACEBELTRAMI_STENCIL' in globals() else None,
                 "dtype": str(self.precision) if hasattr(self, 'precision') else None,
                 "device": str(device) if device is not None else None,
             },
         }
-
+        #print(state_output)
         if return_package:
             return laplacian_tensor, laplacian_coo, package
         else:
