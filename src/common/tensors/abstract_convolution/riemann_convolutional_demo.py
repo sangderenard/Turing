@@ -650,16 +650,17 @@ def training_worker(
         autograd.tape.auto_annotate_eval(x)
         autograd.tape.auto_annotate_eval(target)
         y = system.forward(x)
-        # Flatten both prediction and target to 2-D
-        pred = y.reshape(y.shape[0], -1)
-        target = target.reshape(target.shape[0], -1)
+        viz_pred = y[0, 0].reshape(target.shape[1:])
+        batch = y.shape[0]
+        pred = y.reshape(batch, -1)
+        target_flat = target.reshape(batch, -1)
         autograd.tape.auto_annotate_eval(pred)
-        autograd.tape.auto_annotate_eval(target)
+        autograd.tape.auto_annotate_eval(target_flat)
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(pred))
         # Use a simple mean squared error on the flattened tensors
-        loss = ((pred - target) ** 2).mean()
+        loss = ((pred - target_flat) ** 2).mean()
         LSN_loss = conv_layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
@@ -733,7 +734,7 @@ def training_worker(
                     print(f"  Grad {i} ({label}): None")
         if epoch % viz_every == 0:
             inp_np = np.array(x[0, 0].data if hasattr(x[0, 0], 'data') else x[0, 0])
-            pred_np = np.array(pred[0, 0].data if hasattr(pred[0, 0], 'data') else pred[0, 0])
+            pred_np = np.array(viz_pred.data if hasattr(viz_pred, 'data') else viz_pred)
             tgt_np = np.array(target[0, 0].data if hasattr(target[0, 0], 'data') else target[0, 0])
             diff_np = pred_np - tgt_np
 

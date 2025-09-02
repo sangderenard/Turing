@@ -74,7 +74,7 @@ def test_linear_block_channels_first_grad():
     spatial = 2 * 2
     targets = AT.ones((4, output_dim * spatial))
 
-    outputs = model.forward(inputs)
+    outputs = model.forward(inputs, flatten_spatial=True)
     assert outputs.shape == (4, output_dim * spatial)
     loss = ((outputs - targets) ** 2).sum()
     loss.backward()
@@ -83,3 +83,26 @@ def test_linear_block_channels_first_grad():
         assert getattr(layer, "gW", None) is not None
         if layer.b is not None:
             assert getattr(layer, "gb", None) is not None
+
+
+def test_linear_block_channels_first_pca_image():
+    input_dim = 3
+    output_dim = 2
+    like = AT.get_tensor()
+    model = LinearBlock(input_dim, output_dim, like)
+
+    inputs = AT.randn((2, input_dim, 4, 4), requires_grad=True)
+    outputs = model.forward(inputs)
+    assert outputs.shape == (2, output_dim, 4, 4)
+    loss = outputs.sum()
+    loss.backward()
+
+    for layer in model.model.layers:
+        assert getattr(layer, "gW", None) is not None
+        if layer.b is not None:
+            assert getattr(layer, "gb", None) is not None
+
+    from src.common.tensors.abstract_convolution.riemann_convolutional_demo import pca_to_rgb
+
+    img = pca_to_rgb(outputs[0].swapaxes(0, 2))
+    assert img.shape[-1] == 3

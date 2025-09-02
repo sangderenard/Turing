@@ -49,7 +49,7 @@ class LinearBlock:
 
     def parameters(self):
         return self.model.parameters()
-    def forward(self, x):
+    def forward(self, x, flatten_spatial: bool = False):
 
         # Infer the adapter I/O once so we can route shapes correctly.
         in_dim = int(self.model.layers[0].W.shape[0])
@@ -74,16 +74,18 @@ class LinearBlock:
 
         # Case C: channels-first tensor where channel axis = 1 (e.g., B,C,*,*,*).
         if ndim >= 3 and int(shape[1]) == in_dim:
-            B = int(shape[0]); C = int(shape[1])
-            # Flatten spatial dims to one axis.
+            B = int(shape[0])
+            C = int(shape[1])
             spatial = 1
             for s in shape[2:]:
                 spatial *= int(s)
             # (B, C, S) -> (B*S, C) so Linear sees C as features.
             xs = x.reshape((B, C, spatial)).permute((0, 2, 1)).reshape((B * spatial, C))
             ys = self.model.forward(xs)  # (B*S, out_dim)
-            # Return 2-D tensor: collapse spatial locations into the feature axis.
-            y = ys.reshape((B, out_dim * spatial))
+            y = ys.reshape((B, spatial, out_dim)).swapaxes(1, 2)
+            y = y.reshape((B, out_dim, *shape[2:]))
+            if flatten_spatial:
+                return y.reshape((B, out_dim * spatial))
             return y
 
         else:
