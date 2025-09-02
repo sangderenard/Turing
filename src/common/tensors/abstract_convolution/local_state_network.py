@@ -261,7 +261,7 @@ class LocalStateNetwork:
         self._reg_loss = None
         self._weighted_padded = None
         self._modulated_padded = None
-
+        wrap_module(self)
     # --------- Regularisation Helper --------- #
     @staticmethod
     def _tv3d_sum(x, axes=(0, 1, 2)):
@@ -429,6 +429,7 @@ class LocalStateNetwork:
         #print(f"Padded_raw: {padded_raw}")
         #print(padded_raw)
         output = padded_raw @ weighted_padded @ modulated_padded @ (inner_output+1)
+        output = self._regularization_loss + output
         #print(f"Output: {output}")
         #print(output)
         #output.backward()

@@ -602,7 +602,7 @@ def training_worker(
         return Adam(params, lr=lr)
 
     opt_name = shared_state.get("optimizer", "Adam")
-    lr = shared_state.get("lr", 5e-2)
+    lr = shared_state.get("lr", 1e-3)
     optimizer = init_optimizer(opt_name, params, lr)
     current_opt, current_lr = opt_name, lr
 
