@@ -342,7 +342,7 @@ class MetricSteeredConv3DWrapper:
 
         # 2) Build geometry on self.grid_shape
         package = self._build_laplace_package(self.boundary_conditions)
-        lsn_output = package.get("state_output")
+        lsn_output = package.get("network_output")
         # 3) If keeping a canonical geometry grid, resample to the input grid
         if self.grid_sync_mode == "resample_geometry":
             Din, Hin, Win = self._shape_tuple(x)[-3:]
@@ -353,11 +353,11 @@ class MetricSteeredConv3DWrapper:
             self.laplace_builder = None
             self._refresh_conv_like()
         package = self._canonicalize_laplace_package(package)
-
+        
         # 4) Call the conv (package and conv grid now align with x)
         self.laplace_package = package
         out = self.conv.forward(x, package=package)
         autograd.tape.annotate(out, label="MetricSteeredConv3DWrapper.output")
         autograd.tape.auto_annotate_eval(out)
-        return out * lsn_output.mean() if lsn_output is not None else out
+        return out * lsn_output.mean()
 
