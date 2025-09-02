@@ -194,11 +194,12 @@ class Linear:
         autograd.tape.annotate(out, label="Linear.forward.output")
         return out
 
-    def backward(self, grad_out: AbstractTensor, x) -> AbstractTensor:
-        #if getattr(self, "_x", None) is None:
-        #    raise RuntimeError("Linear.backward called before forward")
+    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
+        if getattr(self, "_x", None) is None:
+            raise RuntimeError("Linear.backward called before forward")
+
         grad_out, added = _ensure_batch_dim(grad_out, target_ndim=2)
-        
+        x = self._x
         xT = x.permute(1, 0)
         self.gW = xT @ grad_out
         self.W._grad = self.gW
