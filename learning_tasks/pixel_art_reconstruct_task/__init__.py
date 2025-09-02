@@ -34,7 +34,8 @@ def pump_queue(
         idx = int(np.random.randint(len(SHAPE_NAMES)))
         name = SHAPE_NAMES[idx]
         shape = SHAPES[name][None, ...]
-        inp = _spectral_noise(shape[0])[None, ...]
+        from src.common.tensors.abstraction import AbstractTensor
+        inp = AbstractTensor.get_tensor(_spectral_noise(shape[0])[None, ...], requires_grad=True)
         tgt = shape
         category: Dict[str, int | str] = {"label": idx, "name": name}
         q.put((inp, tgt, category))

@@ -35,6 +35,9 @@ class Transform3DLayer:
     def parameters(self):  # pragma: no cover - no trainable params
         return []
 
+    def zero_grad(self):
+        pass
+
     def forward(self, x):
         xt = AT.get_tensor(x)
         if xt.ndim != 4:

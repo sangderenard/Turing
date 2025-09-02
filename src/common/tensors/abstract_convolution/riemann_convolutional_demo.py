@@ -455,7 +455,7 @@ def training_worker(
     # 2) Metric-steered conv (kept identical), BUT do not depend on runtime shims
     conv_layer = MetricSteeredConv3DWrapper(
         in_channels=C,
-        out_channels=C + num_logits,  # conv produces feature + logits channels
+        out_channels=C,  # conv produces feature + logits channels
         grid_shape=grid_shape,
         transform=transform,
         boundary_conditions=train_cfg.get("boundary_conditions", ("dirichlet",) * 6),
@@ -472,7 +472,8 @@ def training_worker(
     probe_activations = [None] * len(probe_layers)
     probe_system = Model(probe_layers, probe_activations)
     x0 = AbstractTensor.get_tensor(np.expand_dims(np.array(sample_inp), 0), requires_grad=True)
-    y0 = probe_system.forward(x0)
+    with autograd.no_grad():
+        y0 = probe_system.forward(x0)
 
     # Decide LinearBlock I/O sizes.
     # End shim is now a real LinearBlock; operate along feature axis without calling it directly.
@@ -511,7 +512,7 @@ def training_worker(
     activations = [None] * len(layer_list)
     system = Model(layer_list, activations)
 
-    
+    y1 = system.forward(x0)  # warm up the system
 
     def collect_params_and_grads():
         params, grads = [], []
@@ -593,6 +594,7 @@ def training_worker(
     grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
     grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
     lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+    (lsn._regularization_loss + y1.mean()).backward(AbstractTensor.ones_like(y1))
     for i, p in enumerate(lsn.parameters(include_all=True)):
         grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
         print(
