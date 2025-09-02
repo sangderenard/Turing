@@ -71,10 +71,11 @@ def test_linear_block_channels_first_grad():
     model = LinearBlock(input_dim, output_dim, like)
 
     inputs = AT.randn((4, input_dim, 2, 2), requires_grad=True)
-    targets = AT.ones((4, output_dim, 2, 2))
+    spatial = 2 * 2
+    targets = AT.ones((4, output_dim * spatial))
 
     outputs = model.forward(inputs)
-    assert outputs.shape == (4, output_dim, 2, 2)
+    assert outputs.shape == (4, output_dim * spatial)
     loss = ((outputs - targets) ** 2).sum()
     loss.backward()
 

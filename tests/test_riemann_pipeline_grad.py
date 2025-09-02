@@ -107,10 +107,11 @@ def test_riemann_pipeline_linear_block_params_receive_grads():
     layer, grid, train_cfg = _build_demo_like_layer()
     AT = AbstractTensor
     B, C = train_cfg["B"], train_cfg["C"]
-    flat_target_size = C
+    spatial = 1
     for s in grid.U.shape:
-        flat_target_size *= s
-    end_linear = LinearBlock(C, flat_target_size, AT.zeros((1,)))
+        spatial *= s
+    flat_target_size = C * spatial
+    end_linear = LinearBlock(C, C, AT.zeros((1,)))
     model = Model([layer, end_linear], [None, None])
     for p in end_linear.parameters():
         if hasattr(p, "zero_grad"):
@@ -119,11 +120,12 @@ def test_riemann_pipeline_linear_block_params_receive_grads():
     x = AT.randn((B, C, *grid.U.shape), requires_grad=True)
     y = model.forward(x)
     _autograd.autograd.tape.auto_annotate_eval(y)
+    assert y.shape == (B, flat_target_size)
     target = AT.randn(y.shape)
     pred = y
     loss = ((pred - target) ** 2).mean()
-    _autograd.autograd.tape.annotate(loss, label="riemann_linear_block.loss")
-    _autograd.autograd.tape.auto_annotate_eval(loss)
-    params = list(end_linear.parameters())
-    grads = _autograd.autograd.grad(loss, params, allow_unused=True)
-    assert len(grads) == len(params)
+    loss.backward()
+    for layer in end_linear.model.layers:
+        assert getattr(layer, "gW", None) is not None and layer.gW.abs().sum().item() != 0
+        if layer.b is not None:
+            assert getattr(layer, "gb", None) is not None and layer.gb.abs().sum().item() != 0

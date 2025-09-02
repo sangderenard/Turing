@@ -488,11 +488,12 @@ def training_worker(
     flat_target_size = compute_F(sample_tgt)
     print(f"[DEBUG] sample_tgt.shape={sample_tgt.shape}, flat_target_size={flat_target_size}")
     print(f"[DEBUG] y0.shape={y0.shape}, y0_flat_size={compute_F(y0)}")
-    
+
     if hasattr(y0, "shape") and len(y0.shape) >= 2:
         out_channels_after_conv = int(y0.shape[1])
         like = AbstractTensor.get_tensor(0, requires_grad=True)
-        end_linear = LinearBlock(out_channels_after_conv, flat_target_size, like)
+        target_channels = int(getattr(sample_tgt, "shape", (out_channels_after_conv,))[0])
+        end_linear = LinearBlock(out_channels_after_conv, target_channels, like)
 
 
     # Final training system: [transform -> conv -> linear]
@@ -649,13 +650,16 @@ def training_worker(
         autograd.tape.auto_annotate_eval(x)
         autograd.tape.auto_annotate_eval(target)
         y = system.forward(x)
-        autograd.tape.auto_annotate_eval(y)
+        # Flatten both prediction and target to 2-D
+        pred = y.reshape(y.shape[0], -1)
+        target = target.reshape(target.shape[0], -1)
+        autograd.tape.auto_annotate_eval(pred)
+        autograd.tape.auto_annotate_eval(target)
         if deep_research:
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
-            print("[DEEP-RESEARCH] predicted data:", _to_numpy(y))
-        pred = y
-        autograd.tape.auto_annotate_eval(pred)
-        loss = loss_composer(pred, target, batch_cats)
+            print("[DEEP-RESEARCH] predicted data:", _to_numpy(pred))
+        # Use a simple mean squared error on the flattened tensors
+        loss = ((pred - target) ** 2).mean()
         LSN_loss = conv_layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
