@@ -658,7 +658,7 @@ def training_worker(
             print("[DEEP-RESEARCH] input data:", _to_numpy(x))
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(pred))
         # Use a simple mean squared error on the flattened tensors
-        loss = ((pred - target_flat) ** 2).mean()
+        loss = loss_composer(pred, target_flat, batch_cats)
         LSN_loss = conv_layer.local_state_network._regularization_loss
         print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
         loss = LSN_loss + loss
@@ -669,7 +669,7 @@ def training_worker(
         lsn = conv_layer.local_state_network
         grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
         grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
-        lsn.backward(grad_w, grad_m, lambda_reg=0.5)
+        #lsn.backward(grad_w, grad_m, lambda_reg=0.5)
         if end_linear is not None:
             for p in end_linear.parameters():
                 assert getattr(p, '_grad', None) is not None, f"end_linear parameter {getattr(p, '_label', p)} has no gradient"

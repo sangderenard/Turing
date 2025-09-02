@@ -6,7 +6,7 @@ A simple linear block model for testing and training.
 """
 
 from ..abstraction import AbstractTensor as AT
-from ..abstract_nn.core import Linear, Model
+from ..abstract_nn.core import Linear, Model, wrap_module
 from .activations import GELU, Identity
 
 class LinearBlock:
@@ -48,7 +48,7 @@ class LinearBlock:
             # vanish when the block is trained in larger systems.
             activations=[GELU(), GELU(), Identity()],
         )
-
+        wrap_module(self)
     def parameters(self):
         return self.model.parameters()
     def forward(self, x, flatten_spatial: bool = False):
