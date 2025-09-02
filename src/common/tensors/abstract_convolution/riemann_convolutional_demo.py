@@ -496,14 +496,7 @@ def training_worker(
         like = AbstractTensor.get_tensor(0, requires_grad=True)
         target_channels = int(getattr(sample_tgt, "shape", (out_channels_after_conv,))[0])
         end_linear = LinearBlock(out_channels_after_conv, target_channels, like)
-        # Ensure all parameters participate in autograd.
-        for p in end_linear.parameters():
-            # Explicitly require gradients for safety in case the initializer
-            # provided a non-trainable tensor.
-            setattr(p, "requires_grad", True)
-            # Register the parameter on the current tape so it survives tape
-            # resets between epochs.
-            autograd.tape.create_tensor_node(p)
+
     assert end_linear is not None, "end_linear failed to construct"
 
 
@@ -511,8 +504,8 @@ def training_worker(
     layer_list = [transform_layer, conv_layer, end_linear]
     activations = [None] * len(layer_list)
     system = Model(layer_list, activations)
-
-    y1 = system.forward(x0)  # warm up the system
+    x1 = AbstractTensor.get_tensor(np.expand_dims(np.array(sample_inp), 0), requires_grad=True)
+    y1 = system.forward(x1)  # warm up the system
 
     def collect_params_and_grads():
         params, grads = [], []
@@ -562,8 +555,11 @@ def training_worker(
                         add_param(p)
         # End LinearBlock (always present now)
         if end_linear is not None and hasattr(end_linear, 'parameters'):
+            print(f"End LinearBlock parameters:")
             for p in end_linear.parameters():
                 add_param(p)
+        else:
+            raise ValueError("end_linear not found")
         # Log all params and grads, including Nones
         for i, (p, g) in enumerate(zip(params, grads)):
             label = getattr(p, '_label', None)
@@ -576,11 +572,7 @@ def training_worker(
     # first, to accomodate any network, you must poll the model
     # for the expected input shape
 
-    # Quick connectivity sanity: probe once before training
-    expected_shape = system.get_input_shape()
-    concrete = tuple(1 if d is None else d for d in expected_shape)
-    _probe_x = AbstractTensor.ones(concrete)
-    _probe_y = system.forward(_probe_x)
+
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] LSN instance id after forward: {id(conv_layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
     print(f"[DEBUG] LSN param ids: {[id(p) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
@@ -590,11 +582,11 @@ def training_worker(
     grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
     print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
     lsn = conv_layer.local_state_network
-    (_probe_y + lsn._regularization_loss).mean().backward()
+    
     grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
     grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
     lsn.backward(grad_w, grad_m, lambda_reg=0.5)
-    (lsn._regularization_loss + y1.mean()).backward(AbstractTensor.ones_like(y1))
+    (lsn._regularization_loss + y1.flatten().mean()).backward()
     for i, p in enumerate(lsn.parameters(include_all=True)):
         grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
         print(
@@ -605,9 +597,6 @@ def training_worker(
     # Re-register LinearBlock parameters with the active tape before training
     # begins.  Some integration tests reset ``autograd.tape`` which can drop
     # existing nodes.
-    if end_linear is not None:
-        for p in end_linear.parameters():
-            autograd.tape.create_tensor_node(p)
 
     def init_optimizer(name: str, params, lr: float):
         name_l = name.lower()
@@ -633,9 +622,7 @@ def training_worker(
             break
         params, _ = collect_params_and_grads()
         # Ensure end_linear parameters remain on the tape even if it was reset
-        if end_linear is not None:
-            for p in end_linear.parameters():
-                autograd.tape.create_tensor_node(p)
+
         # Zero gradients for all params
         for p in params:
             if hasattr(p, 'zero_grad'):

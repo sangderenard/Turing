@@ -165,6 +165,7 @@ class Linear:
         return (None, self.W.shape[0])
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
+        print("=== Linear.forward called ===")
         # Ensure parameters are registered on the current tape so loss.backward()
         # can discover them via the tape's parameter registry even after tape resets.
         try:
@@ -193,18 +194,18 @@ class Linear:
         autograd.tape.annotate(out, label="Linear.forward.output")
         return out
 
-    def backward(self, grad_out: AbstractTensor) -> AbstractTensor:
-        if getattr(self, "_x", None) is None:
-            raise RuntimeError("Linear.backward called before forward")
+    def backward(self, grad_out: AbstractTensor, x) -> AbstractTensor:
+        #if getattr(self, "_x", None) is None:
+        #    raise RuntimeError("Linear.backward called before forward")
         grad_out, added = _ensure_batch_dim(grad_out, target_ndim=2)
-        x = self._x
-        xT = x.swapaxes(0, 1)
+        
+        xT = x.permute(1, 0)
         self.gW = xT @ grad_out
         self.W._grad = self.gW
         if self.b is not None:
             self.gb = grad_out.sum(dim=0, keepdim=True)
             self.b._grad = self.gb
-        WT = self.W.swapaxes(0, 1)
+        WT = self.W.permute(1, 0)
         dx = grad_out @ WT
         self._x = None
         if getattr(self, "_added_input", False) or added:

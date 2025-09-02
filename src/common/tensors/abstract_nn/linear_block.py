@@ -41,19 +41,20 @@ class LinearBlock:
             hidden_dim = int((input_dim + output_dim) / 2)
         self.model = Model(
             layers=[
-                Linear(input_dim, hidden_dim, like=like, init="xavier"),
-                Linear(hidden_dim, hidden_dim, like=like, init="xavier"),
-                Linear(hidden_dim, output_dim, like=like, init="xavier"),
+                Linear(input_dim, hidden_dim, like=like, init="identity"),
+                Linear(hidden_dim, hidden_dim, like=like, init="identity"),
+                Linear(hidden_dim, output_dim, like=like, init="identity"),
             ],
             # Use a non-saturating activation on the final layer so gradients do not
             # vanish when the block is trained in larger systems.
             activations=[GELU(), GELU(), Identity()],
         )
-        wrap_module(self)
+        
     def parameters(self):
         return self.model.parameters()
     def forward(self, x, flatten_spatial: bool = False):
-        
+        autograd.tape.annotate(x, label="LinearBlock.input")
+        autograd.tape.auto_annotate_eval(x)
         # Infer the adapter I/O once so we can route shapes correctly.
         in_dim = int(self.model.layers[0].W.shape[0])
         out_dim = int(self.model.layers[-1].W.shape[1])
@@ -62,10 +63,18 @@ class LinearBlock:
         shape = x.shape() if callable(getattr(x, "shape", None)) else x.shape
         ndim = len(shape)
         return_val = None
+        print("=== LinearBlock.forward debug ===")
+        print(f"Input shape: {shape}")
+        print(f"self.model.layers: {self.model.layers}")
+        print(f"self.model.layers[0].W.shape: {self.model.layers[0].W.shape}")
+        print(f"Input ndim: {ndim}")
+        print(f"Input dims: {in_dim}")
+        print(f"Output dims: {out_dim}")
+
         # Case A: already 2D (N, in_dim) — just run the MLP.
         if ndim == 2 and int(shape[-1]) == in_dim:
             return_val = self.model.forward(x)
-
+        
         # Case B: last axis is the feature axis (..., in_dim) — flatten leading dims.
         if int(shape[-1]) == in_dim:
             # Collapse everything but the last (=features) axis into batch.
@@ -77,6 +86,7 @@ class LinearBlock:
 
         # Case C: channels-first tensor where channel axis = 1 (e.g., B,C,*,*,*).
         if ndim >= 3 and int(shape[1]) == in_dim:
+            
             B = int(shape[0])
             C = int(shape[1])
             spatial = 1
@@ -85,7 +95,7 @@ class LinearBlock:
             # (B, C, S) -> (B*S, C) so Linear sees C as features.
             xs = x.reshape((B, C, spatial)).permute((0, 2, 1)).reshape((B * spatial, C))
             ys = self.model.forward(xs)  # (B*S, out_dim)
-            y = ys.reshape((B, spatial, out_dim)).swapaxes(1, 2)
+            y = ys.reshape((B, spatial, out_dim)).permute(0, 2, 1)
             y = y.reshape((B, out_dim, *shape[2:]))
             if flatten_spatial:
                 return_val = y.reshape((B, out_dim * spatial))
