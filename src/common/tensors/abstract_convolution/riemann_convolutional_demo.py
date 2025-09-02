@@ -1004,12 +1004,14 @@ def display_worker(
         layout = [[var.get() for var in row] for row in grid_vars]
         current_cmap = cmap_var.get()
         current_norm = norm_var.get()
-        if layout != last_layout or current_cmap != last_cmap or current_norm != last_norm or changed:
+        if layout != last_layout or current_cmap != last_cmap or current_norm != last_norm:
             frame_index = 0
             frame_cache.composite_cache.clear()
             last_layout = [row[:] for row in layout]
             last_cmap = current_cmap
             last_norm = current_norm
+        elif changed:
+            frame_cache.composite_cache.clear()
         grid = frame_cache.compose_layout_at(layout, frame_index)
         grid = apply_colormap(grid, current_cmap)
         grid = _apply_norm(grid, current_norm)
@@ -1088,9 +1090,13 @@ def main(
     worker.start()
     display_worker(frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs)
     worker.join()
-    #frame_cache.process_queue()
-    #frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"), cmap=cmap)
-    #frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"), cmap=cmap)
+    frame_cache.process_queue()
+    frame_cache.save_animation(
+        "input_prediction", os.path.join(output_dir, "input_prediction.gif"), cmap=cmap
+    )
+    frame_cache.save_animation(
+        "params_grads", os.path.join(output_dir, "params_grads.gif"), cmap=cmap
+    )
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
