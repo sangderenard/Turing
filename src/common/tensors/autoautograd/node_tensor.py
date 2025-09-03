@@ -4,6 +4,11 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Sequence, Optional, Union, Protocol
 import numpy as np
 
+try:
+    from ..abstraction import AbstractTensor
+except Exception:  # pragma: no cover - AbstractTensor may be unavailable
+    AbstractTensor = None  # type: ignore
+
 IndexLike = Union[None, Sequence[int], Iterable[int]]
 
 # ---- Policy interface ----------------------------------------------------
@@ -54,6 +59,14 @@ class AbstractTensorPolicy(NumpyPolicy):
             return self.AT.stack(xs, axis=axis)
         return np.stack([np.asarray(x) for x in xs], axis=axis)
 
+    def scatter_row(self, node: Any, attr: str, row_value: Any) -> None:
+        tensor = self.getter(node, attr)
+        idx = getattr(node, "row_index", None)
+        if idx is None:
+            self.setter(node, attr, row_value)
+        else:
+            tensor.scatter_row(idx, row_value)
+
 # ---- View with policy manager -------------------------------------------
 
 @dataclass
@@ -91,7 +104,25 @@ class NodeAttrView:
 
     # --- hook resolution ---
     def _resolve(self):
-        pol = self.policy or NumpyPolicy()
+        pol = self.policy
+        if pol is None:
+            sample = None
+            try:
+                first = self.nodes[0]
+            except Exception:
+                try:
+                    first = next(iter(self.nodes.values()))
+                except Exception:
+                    first = None
+            if first is not None:
+                try:
+                    sample = getattr(first, self.attr) if hasattr(first, self.attr) else first[self.attr]
+                except Exception:
+                    sample = None
+            if AbstractTensor is not None and isinstance(sample, AbstractTensor):
+                pol = AbstractTensorPolicy(AbstractTensor)
+            else:
+                pol = NumpyPolicy()
         def choose(name, local):
             if self.policy_overrides:
                 # Prefer backend policy if it implements the method; else local; else numpy default

@@ -1940,6 +1940,20 @@ from .abstraction_methods.indexing import (
     gather,
     scatter,
 )
+
+
+def scatter_row(x: "AbstractTensor", index: Any, row_value: Any, dim: int = 0):
+    """Replace row(s) of ``x`` at ``index`` with ``row_value``.
+
+    This is implemented purely in terms of existing ``gather`` and ``scatter``
+    primitives so no backend-specific code is required. The function gathers the
+    current values at ``index``, computes the delta to ``row_value`` and scatters
+    that delta back into ``x``.
+    """
+    row_value = x.ensure_tensor(row_value)
+    current = gather(x, index, dim=dim)
+    delta = row_value - current
+    return scatter(x, index, delta, dim=dim)
 from .abstraction_methods.type_ops import (
     to as type_to,
     astype as type_astype,
@@ -2062,6 +2076,7 @@ AbstractTensor.randint = staticmethod(randint)
 AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 AbstractTensor.gather = gather
 AbstractTensor.scatter = scatter
+AbstractTensor.scatter_row = scatter_row
 
 
 # --- Creation helpers: tape + requires_grad + record ------------------------
