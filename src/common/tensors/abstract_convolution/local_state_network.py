@@ -150,6 +150,15 @@ class LocalStateNetwork:
         self._reg_loss = None
         self._weighted_padded = None
         self._modulated_padded = None
+        if hasattr(self.a, '_grad'):
+            self.a._grad = None
+        if hasattr(self.b, '_grad'):
+            self.b._grad = None
+        if hasattr(self.c, '_grad'):
+            self.c._grad = None
+        if hasattr(self.d, '_grad'):
+            self.d._grad = None
+
     def parameters(self, include_all: bool = False, include_structural: bool = False):
         """Return learnable parameters, excluding structural ones by default.
         optionally filtering by gradient status.
@@ -214,6 +223,15 @@ class LocalStateNetwork:
         autograd.tape.create_tensor_node(self.g_bias_layer)
         self.g_bias_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_bias_layer"
 
+        self.a = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.a)
+        self.b = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.b)
+        self.c = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.c)
+        self.d = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.d)
+
         self._cached_padded_raw = None
         like = AbstractTensor.get_tensor(0, dtype=AbstractTensor.float_dtype, requires_grad=True)
         if recursion_depth < max_depth - 1:
@@ -262,7 +280,6 @@ class LocalStateNetwork:
         self._weighted_padded = None
         self._modulated_padded = None
         wrap_module(self)
-
     # --------- Regularisation Helper --------- #
     @staticmethod
     def _tv3d_sum(x, axes=(0, 1, 2)):
@@ -405,11 +422,9 @@ class LocalStateNetwork:
 
         modulated_padded = modulated.reshape((B, D, H, W, 3, 3, 3))
         inner_reg_loss = None
+        inner_output = AbstractTensor.zeros_like(weighted_padded)
         if self.inner_state is not None:
-            _, modulated_padded, inner_reg_loss = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
-
-        self._weighted_padded = weighted_padded
-        self._modulated_padded = modulated_padded
+            inner_output = self.inner_state.forward(modulated_padded, lambda_reg=lambda_reg, smooth=smooth)
 
         if lambda_reg:
             self._reg_loss = self.regularization_loss(weighted_padded, modulated_padded)
@@ -423,131 +438,33 @@ class LocalStateNetwork:
                 dtype=self.g_weight_layer.dtype,
                 device=getattr(self.g_weight_layer, 'device', None),
             )
+        #print(f"Inner output: {inner_output}")
+        #print(inner_output)
+        #print(f"Weighted padded: {weighted_padded}")
+        #print(weighted_padded)
+        #print(f"Modulated padded: {modulated_padded}")
+        #print(modulated_padded)
+        #print(f"Padded_raw: {padded_raw}")
+        #print(padded_raw)
 
-        return weighted_padded, modulated_padded, self._regularization_loss
+        autograd.tape.create_tensor_node(self.a)
+        autograd.tape.create_tensor_node(self.b)
+        autograd.tape.create_tensor_node(self.c)
+        autograd.tape.create_tensor_node(self.d)
 
-    def backward(
-        self,
-        grad_weighted_padded,
-        grad_modulated_padded,
-        lambda_reg: float | None = None,
-        smooth: bool | None = None,
-    ):
-        """Backward pass for ``LocalStateNetwork``.
+        sum = self.a + self.b + self.c + self.d
+        self.a = self.a / sum
+        self.b = self.b / sum
+        self.c = self.c / sum
+        self.d = self.d / sum
+        
+        output = self.a * padded_raw + self.b * weighted_padded + self.c * modulated_padded + self.d * inner_output
+        output = self._regularization_loss + output
+        #print(f"Output: {output}")
+        #print(output)
+        #output.backward()
+        return output
 
-        The ``lambda_reg`` and ``smooth`` parameters are kept for API
-        compatibility but no longer influence gradient computation; the
-        regularisation term is part of the forward graph.
-
-        Args:
-            grad_weighted_padded: Gradient from the weighted branch.
-            grad_modulated_padded: Gradient from the modulated branch.
-
-        Returns:
-            Gradient with respect to the original ``padded_raw`` input.
-        """
-        if self._cached_padded_raw is None:
-            raise RuntimeError("LocalStateNetwork.backward called before forward")
-
-        padded_raw = self._cached_padded_raw
-        B, D, H, W, _, _, _ = padded_raw.shape
-
-        # Gradient from the weighted branch (pre-activation)
-        g_weight_layer = self.g_weight_layer.reshape((1, 1, 1, 1, 3, 3, 3))
-        grad_from_weight = grad_weighted_padded * g_weight_layer
-        grad_weighted_branch = grad_weighted_padded
-
-        # Propagate through any inner state network
-        grad_mod = grad_modulated_padded
-        if lambda_reg:
-            reg_term = 2 * 0.10 * (self._modulated_padded - self._weighted_padded)
-            grad_mod = grad_mod + lambda_reg * reg_term
-        if self.inner_state is not None:
-            grad_mod = self.inner_state.backward(
-                grad_weighted_branch,
-                grad_mod,
-                lambda_reg=lambda_reg,
-                smooth=smooth,
-            )
-
-        grad_mod = grad_mod.reshape((B, D, H, W, -1))
-
-        # Backward through spatial layer (modulated branch)
-        if isinstance(self.spatial_layer, RectConv3d):
-            grad_mod = grad_mod.transpose(1, 4)
-            grad_mod = grad_mod.transpose(2, 4)
-            grad_mod = grad_mod.transpose(3, 4)
-            grad_padded_view = self.spatial_layer.backward(grad_mod)
-            grad_padded_view = grad_padded_view.transpose(3, 4)
-            grad_padded_view = grad_padded_view.transpose(2, 4)
-            grad_padded_view = grad_padded_view.transpose(1, 4)
-            grad_from_mod = grad_padded_view.reshape((B, D, H, W, 3, 3, 3))
-        else:
-            flat_grad = grad_mod.reshape((-1, grad_mod.shape[-1]))
-            grad_flat_in = self.spatial_layer.backward(flat_grad)
-            grad_from_mod = grad_flat_in.reshape((B, D, H, W, 3, 3, 3))
-
-        # Combine gradients from weighted and modulated branches
-        total_grad = grad_weighted_branch + grad_from_mod
-
-        # Accumulate gradients for g_weight_layer and g_bias_layer
-        grad_weight = (grad_weighted_branch * padded_raw).sum(dim=(0, 1, 2, 3))
-        if getattr(self.g_weight_layer, "_grad", None) is None:
-            self.g_weight_layer._grad = grad_weight
-        else:
-            self.g_weight_layer._grad = self.g_weight_layer._grad + grad_weight
-
-        grad_bias = total_grad.sum(dim=(0, 1, 2, 3))
-        if getattr(self.g_bias_layer, "_grad", None) is None:
-            self.g_bias_layer._grad = grad_bias
-        else:
-            self.g_bias_layer._grad = self.g_bias_layer._grad + grad_bias
-
-        if lambda_reg:
-            identity = AbstractTensor.zeros(self.g_weight_layer.shape, dtype=self.g_weight_layer.dtype)
-            center = tuple(s // 2 for s in self.g_weight_layer.shape)
-            identity[center] = 1.0
-            reg_grad = 2 * (self.g_weight_layer - identity)
-            if smooth:
-                g = self.g_weight_layer
-                grad_smooth = AbstractTensor.zeros_like(g)
-                diff = g[1:, :, :] - g[:-1, :, :]
-                grad_smooth[:-1, :, :] -= 2 * diff
-                grad_smooth[1:, :, :] += 2 * diff
-                diff = g[:, 1:, :] - g[:, :-1, :]
-                grad_smooth[:, :-1, :] -= 2 * diff
-                grad_smooth[:, 1:, :] += 2 * diff
-                diff = g[:, :, 1:] - g[:, :, :-1]
-                grad_smooth[:, :, :-1] -= 2 * diff
-                grad_smooth[:, :, 1:] += 2 * diff
-                reg_grad = reg_grad + grad_smooth
-            if getattr(self.g_weight_layer, "_grad", None) is None:
-                self.g_weight_layer._grad = lambda_reg * reg_grad
-            else:
-                self.g_weight_layer._grad = self.g_weight_layer._grad + lambda_reg * reg_grad
-
-            diff_bias = self._weighted_padded - self._modulated_padded
-            grad_bias_reg = 2 * 0.10 * diff_bias.sum(dim=(0, 1, 2, 3))
-            if getattr(self.g_bias_layer, "_grad", None) is None:
-                self.g_bias_layer._grad = lambda_reg * grad_bias_reg
-            else:
-                self.g_bias_layer._grad = self.g_bias_layer._grad + lambda_reg * grad_bias_reg
-
-        # Combine gradients from both branches to propagate to the input
-        grad_from_mod = grad_from_mod * g_weight_layer
-        grad_input = grad_from_weight + grad_from_mod
-
-        # Clear cached tensors
-        self._cached_padded_raw = None
-        self._weighted_padded = None
-        self._modulated_padded = None
-
-        for name in ("a", "b"):
-            param = getattr(self.metric_tensor_func, name, None)
-            if param is not None and getattr(param, "_grad", None) is None:
-                param._grad = AbstractTensor.ones_like(param)
-
-        return grad_input
     # --------- CACHE MANAGER --------- #
     def check_or_compute(self, pos_hash, *inputs):
         """
@@ -671,19 +588,13 @@ class LocalStateNetwork:
             padded_raw[..., i, j] = hook_fn(grid_u, grid_v, grid_w, partials, additional_params)
 
         # Step 3: Forward pass through the network
-        weighted_padded, modulated_padded, regularization_loss = self.forward(
+        network_output = self.forward(
             padded_raw,
             lambda_reg=additional_params.get("lambda_reg", 0.0),
         )
 
         # Step 4: Return outputs
-        return {
-            'padded_raw': padded_raw,
-            'weighted_padded': weighted_padded,
-            'modulated_padded': modulated_padded,
-            'regularization_loss': regularization_loss,
-        }
-
+        return network_output
 
 
 

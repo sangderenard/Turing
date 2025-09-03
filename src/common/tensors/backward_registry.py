@@ -710,6 +710,37 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Scatter assignment; gradient flows from selected region to the value.",
         "tags": ["indexing"],
     },
+    "gather": {
+        "arity": "binary",
+        "signature": "y = gather(x, index, dim)",
+        "latex": r"y_i = x_{index_i}",
+        "backward": {
+            "x": "gx = zeros_like(x); gx[index] = g"
+        },
+        "python": {
+            "parameters": ["g", "x", "index"],
+            "body": "gx=AbstractTensor.zeros_like(x); gx[index]=g; return gx"
+        },
+        "domain": "Any real; index valid.",
+        "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index or dim.",
+        "tags": ["indexing"],
+    },
+    "scatter": {
+        "arity": "ternary",
+        "signature": "y = scatter(x, index, src, dim)",
+        "latex": r"y_i = x_i + src_j \text{ for } i = index_j, \; y_i = x_i \text{ otherwise}",
+        "backward": {
+            "x": "gx = g.clone()",
+            "src": "gsrc = g[index]"
+        },
+        "python": {
+            "parameters": ["g", "x", "src", "index"],
+            "body": "gx=g.clone(); gsrc=g[index]; return gx, gsrc"
+        },
+        "domain": "Any real; index valid.",
+        "notes": "Backward of scatter: pass gradient through x; gather gradient for src at index positions.",
+        "tags": ["indexing"],
+    },
     "concat": {
         "arity": "n-ary",
         "signature": "y = concat([x1, x2, ...], dim)",

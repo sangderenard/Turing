@@ -573,26 +573,21 @@ def training_worker(
     # for the expected input shape
 
 
-    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
-    print(f"[DEBUG] LSN instance id after forward: {id(conv_layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
-    print(f"[DEBUG] LSN param ids: {[id(p) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
-    print(f"[DEBUG] LSN param requires_grad: {[getattr(p, 'requires_grad', None) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
-    print(f"[DEBUG] LSN _regularization_loss: {conv_layer.local_state_network._regularization_loss}")
-    print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(conv_layer.local_state_network._regularization_loss, 'grad_fn', None)}")
-    grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
-    print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
     lsn = conv_layer.local_state_network
     
-    grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
-    grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
-    lsn.backward(grad_w, grad_m, lambda_reg=0.5)
-    (lsn._regularization_loss + y1.flatten().mean()).backward()
+    
     for i, p in enumerate(lsn.parameters(include_all=True)):
         grad_enabled = getattr(_AT.autograd, '_no_grad_depth', 0) == 0
         print(
             f"[DEBUG] After backward: param {i} id={id(p)} grad={getattr(p, '_grad', None)} | grad_tracking_enabled={grad_enabled}"
         )
-
+    print(f"[DEBUG] LSN instance id after forward: {id(conv_layer.local_state_network)} | grad_tracking_enabled={grad_enabled}")
+    print(f"[DEBUG] LSN param ids: {[id(p) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
+    print(f"[DEBUG] LSN param requires_grad: {[getattr(p, 'requires_grad', None) for p in conv_layer.local_state_network.parameters(include_all=True)]}")
+    print(f"[DEBUG] LSN _regularization_loss: {conv_layer.local_state_network._regularization_loss}")
+    print(f"[DEBUG] LSN _regularization_loss grad_fn: {getattr(conv_layer.local_state_network._regularization_loss, 'grad_fn', None)}")
+    print(f"[DEBUG] About to call backward on LSN _regularization_loss | grad_tracking_enabled={grad_enabled}")
+    y1.flatten().mean().backward()
     params, _ = collect_params_and_grads()
     # Re-register LinearBlock parameters with the active tape before training
     # begins.  Some integration tests reset ``autograd.tape`` which can drop
@@ -607,7 +602,7 @@ def training_worker(
         return Adam(params, lr=lr)
 
     opt_name = shared_state.get("optimizer", "Adam")
-    lr = shared_state.get("lr", 5e-2)
+    lr = shared_state.get("lr", 1e-3)
     optimizer = init_optimizer(opt_name, params, lr)
     current_opt, current_lr = opt_name, lr
 
@@ -664,20 +659,16 @@ def training_worker(
             print("[DEEP-RESEARCH] predicted data:", _to_numpy(pred))
         # Use a simple mean squared error on the flattened tensors
         loss = loss_composer(pred, target_flat, batch_cats)
-        LSN_loss = conv_layer.local_state_network._regularization_loss
-        print(f"Epoch {epoch}: loss={loss.item()}, LSN_loss={LSN_loss.item()}")
-        loss = LSN_loss + loss
         print(f"Total loss={loss.item()}")
         autograd.tape.annotate(loss, label="riemann_demo.loss")
         autograd.tape.auto_annotate_eval(loss)
         loss.backward()
         lsn = conv_layer.local_state_network
-        grad_w = getattr(lsn._weighted_padded, '_grad', AbstractTensor.zeros_like(lsn._weighted_padded))
-        grad_m = getattr(lsn._modulated_padded, '_grad', AbstractTensor.zeros_like(lsn._modulated_padded))
         #lsn.backward(grad_w, grad_m, lambda_reg=0.5)
-        if end_linear is not None:
-            for p in end_linear.parameters():
-                assert getattr(p, '_grad', None) is not None, f"end_linear parameter {getattr(p, '_label', p)} has no gradient"
+        #if end_linear is not None:
+            #for p in end_linear.parameters():
+                #print(p)
+                #assert getattr(p, '_grad', None) is not None, f"end_linear parameter {getattr(p, '_label', p)} has no gradient"
         params, grads = collect_params_and_grads()
         new_opt = shared_state.get("optimizer", current_opt)
         new_lr = shared_state.get("lr", current_lr)
@@ -874,10 +865,10 @@ def display_worker(
     tk.Button(controls, text="Reset Optimizer", command=lambda: shared_state.__setitem__("reset_opt", True)).pack(side=tk.LEFT)
 
     # Learning rate logarithmic slider
-    lr_var = tk.DoubleVar(value=math.log10(shared_state.get("lr", 5e-2)))
+    lr_var = tk.DoubleVar(value=math.log10(shared_state.get("lr", 1e-10)))
     lr_scale = tk.Scale(
         controls,
-        from_=-5,
+        from_=-10,
         to=0,
         resolution=0.1,
         orient=tk.HORIZONTAL,
@@ -1013,12 +1004,18 @@ def display_worker(
         layout = [[var.get() for var in row] for row in grid_vars]
         current_cmap = cmap_var.get()
         current_norm = norm_var.get()
-        if layout != last_layout or current_cmap != last_cmap or current_norm != last_norm or changed:
+        if layout != last_layout or current_cmap != last_cmap or current_norm != last_norm:
             frame_index = 0
             frame_cache.composite_cache.clear()
             last_layout = [row[:] for row in layout]
             last_cmap = current_cmap
             last_norm = current_norm
+        elif changed:
+            # New frames require a recomposition of the layout but should not
+            # rewind the animation.  `process_queue` already cleared the
+            # composite cache when draining the queue, so simply ensure the
+            # next composition rebuilds without resetting ``frame_index``.
+            frame_cache.composite_cache.clear()
         grid = frame_cache.compose_layout_at(layout, frame_index)
         grid = apply_colormap(grid, current_cmap)
         grid = _apply_norm(grid, current_norm)
@@ -1055,7 +1052,7 @@ def display_worker(
 def main(
     config=None,
     viz_every=1,
-    max_epochs=25,
+    max_epochs=1,
     output_dir="riemann_modular_renders",
     visualize_laplace=None,
     laplace_threshold=None,
@@ -1076,7 +1073,7 @@ def main(
     shared_state = {
         "epoch_limit": max_epochs,
         "optimizer": "Adam",
-        "lr": 5e-2,
+        "lr": 1e-10,
         "reset_opt": False,
     }
     args = (
@@ -1095,11 +1092,18 @@ def main(
     )
     worker = threading.Thread(target=training_worker, args=args)
     worker.start()
-    display_worker(frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs)
+    display_worker(
+        frame_cache, stop_event, shared_state, update_ms=update_ms, max_epochs=max_epochs
+    )
     worker.join()
-    #frame_cache.process_queue()
-    #frame_cache.save_animation("input_prediction", os.path.join(output_dir, "input_prediction.png"), cmap=cmap)
-    #frame_cache.save_animation("params_grads", os.path.join(output_dir, "params_grads.png"), cmap=cmap)
+    # Drain any remaining frames and export cached animations.
+    frame_cache.process_queue()
+    frame_cache.save_animation(
+        "input_prediction", os.path.join(output_dir, "input_prediction.gif"), cmap=cmap
+    )
+    frame_cache.save_animation(
+        "params_grads", os.path.join(output_dir, "params_grads.gif"), cmap=cmap
+    )
     print(f"Exported animations to the '{output_dir}/' directory.")
 
 if __name__ == "__main__":
