@@ -1,90 +1,59 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Hashable, Protocol
+from typing import Dict, Tuple, Sequence, Any, Optional, Iterable
+import math
 
+_DEF_Q = 1e-6
+
+def _quantise(x: Optional[float], q: float = _DEF_Q) -> float:
+    if x is None:
+        return math.nan
+    return float(round(x / q) * q)
 
 @dataclass(frozen=True)
 class ParamSig:
-    """Node-local causality token for caching.
-
-    Tracks the node identifier and either a version number or a value digest.
-    """
-
     node_id: int
-    attr: str
-    version: Optional[int] = None
-    value_digest8: Optional[bytes] = None
-
+    version: int
 
 @dataclass(frozen=True)
 class OpKey:
-    """Stable cache key for a local op.
-
-    Composes the operator identity with shape information, weighting policy,
-    quantized scale and residual values, and an ordered tuple of ``ParamSig``
-    instances aligned with the source identifiers.
-    """
-
-    op: str
-    k: int
-    F: int
-    weight: str
-    scale_q: int
-    residual_q: int
+    op_name: str
+    fan_in: int
+    feat_shape: Tuple[int, ...]
+    weight: str | None
+    scale: float
+    residual: float
     params: Tuple[ParamSig, ...]
 
-
-class CacheBackend(Protocol):
-    """Key→package storage with bounded footprint."""
-
-    def get(self, key: OpKey) -> Optional[Tuple[Any, Any]]:  # pragma: no cover - protocol stub
-        """Retrieve a cached package if available."""
-
-    def put(self, key: OpKey, y: Any, g: Any) -> None:  # pragma: no cover - protocol stub
-        """Store a cache package."""
-
-
 class WhiteboardCache:
-    """Hashed and versioned package cache.
+    """Naive in-memory cache for (forward, grads) packages."""
 
-    This class is a light wrapper that constructs cache keys and delegates
-    storage duties to a provided backend implementation.
-    """
-
-    def __init__(self, store: CacheBackend) -> None:
-        """Initialize the cache with a backend store."""
-        # TODO: Wire up the backend store and any bookkeeping structures.
-        raise NotImplementedError
+    def __init__(self, store: Optional[Dict[OpKey, Tuple[Any, Tuple[Any, ...]]]] = None):
+        self._store = store if store is not None else {}
+        self.hits = 0
+        self.misses = 0
 
     def make_key(
         self,
+        op_name: str,
+        param_sigs: Sequence[ParamSig],
         *,
-        op: str,
-        src_ids: Sequence[int],
-        F: int,
-        weight: str,
-        scale: float,
-        residual: float,
-        get_attr: callable,
-        get_attr_version: Optional[callable] = None,
-        attr_name: str = "theta",
+        fan_in: int,
+        feat_shape: Iterable[int] = (),
+        weight: str | None = None,
+        scale: float = 1.0,
+        residual: Optional[float] = None,
     ) -> OpKey:
-        """Build an ``OpKey`` for a job.
+        s = _quantise(scale)
+        r = _quantise(residual)
+        return OpKey(op_name, fan_in, tuple(feat_shape), weight, s, r, tuple(param_sigs))
 
-        The key incorporates node-local versions or value digests to maintain
-        cache correctness without reference to global epochs.
-        """
-        # TODO: Implement key construction with quantization and version lookups.
-        raise NotImplementedError
+    def get(self, key: OpKey):
+        if key in self._store:
+            self.hits += 1
+            return self._store[key]
+        self.misses += 1
+        return None
 
-    def get(self, key: OpKey) -> Optional[Tuple[Any, Any]]:
-        """Return a cached package if present."""
-        # TODO: Delegate to the backend store.
-        raise NotImplementedError
-
-    def put(self, key: OpKey, y: Any, g: Any) -> None:
-        """Insert a package into the cache."""
-        # TODO: Delegate to the backend store.
-        raise NotImplementedError
-
+    def put(self, key: OpKey, value):
+        self._store[key] = value

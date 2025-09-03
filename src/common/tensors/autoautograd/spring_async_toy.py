@@ -22,7 +22,8 @@ Notes:
   positions back into parameter scalars.
 """
 from __future__ import annotations
-from .adapters_autograd_bridge import push_impulses_from_op
+from .integration.bridge_v2 import push_impulses_from_op_v2
+from .whiteboard_cache import WhiteboardCache
 
 import time
 import math
@@ -117,12 +118,14 @@ class Node:
     v: np.ndarray  # shape (2,)
     M0: float = 1.0
     last_commit: float = 0.0
+    version: int = 0
     # History for inertial dampener (positions)
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
 
     # Mapping pos->parameter (identity on x component for clarity)
     def commit(self):
         self.theta = interpret_vec(self.p)
+        self.version += 1
 
 
 
@@ -1015,6 +1018,7 @@ def fwd_scatter(sys, src, outs):
 # If residual is None, we print a WARNING and emit no impulses.
 
 class Ops:
+    _cache = WhiteboardCache()
     @staticmethod
     def _need_residual_warn(op_name: str):
         print(f"[WARNING] {op_name}: residual required for impulse; skipping impulses.")
@@ -1022,11 +1026,16 @@ class Ops:
     @staticmethod
     def call(sys, op_name: str, src_ids, out_id, *, residual=None, scale=1.0,
              write_out: bool = True, weight: str = "none"):
-        if weight == "inv_length":
-            po = sys.nodes[out_id].p
-            w = [1.0 / max(np.linalg.norm(po - sys.nodes[i].p), 1e-8) for i in src_ids]
-            scale *= float(np.mean(w)) if w else 1.0
-        y = push_impulses_from_op(sys, op_name, src_ids, out_id, residual=residual, scale=scale)
+        y = push_impulses_from_op_v2(
+            sys,
+            op_name,
+            src_ids,
+            out_id,
+            residual=residual,
+            scale=scale,
+            weight=weight,
+            cache=Ops._cache,
+        )
         if write_out and out_id in sys.nodes:
             sys.nodes[out_id].theta = y
         return y
