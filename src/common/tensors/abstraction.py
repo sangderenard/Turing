@@ -904,7 +904,7 @@ class AbstractTensor:
         indices: integer tensor of indices
         fn:      callable; will be invoked as fn(gathered, *args, **kwargs)
         """
-        g = x.gather(dim, indices)
+        g = x.gather(indices, dim)
         return fn(g, *args, **kwargs)
     def scatter_and(out, dim, index, src, fn, *args, **kwargs):
         """
@@ -916,7 +916,7 @@ class AbstractTensor:
         src:   values to scatter
         fn:    callable; invoked as fn(scattered, *args, **kwargs)
         """
-        y = out.scatter(dim, index, src)
+        y = out.scatter(index, src, dim)
         return fn(y, *args, **kwargs)
 
     @staticmethod
@@ -2060,8 +2060,8 @@ AbstractTensor.random = _RandomClass()
 AbstractTensor.randoms = staticmethod(randoms)
 AbstractTensor.randint = staticmethod(randint)
 AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
-AbstractTensor.gather = staticmethod(gather)
-AbstractTensor.scatter = staticmethod(scatter)
+AbstractTensor.gather = gather
+AbstractTensor.scatter = scatter
 
 
 # --- Creation helpers: tape + requires_grad + record ------------------------
