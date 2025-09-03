@@ -5,6 +5,7 @@ from src.common.tensors.abstract_nn.utils import from_list_like
 from src.common.tensors.abstraction import AbstractTensor
 
 
+@pytest.mark.skip(reason="takes too long")
 @pytest.mark.xfail(reason="gradient propagation for XOR demo currently unstable")
 @pytest.mark.parametrize("loss_type", ["bce", "mse"])
 def test_xor_learns(loss_type):

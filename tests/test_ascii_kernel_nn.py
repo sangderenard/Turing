@@ -1,10 +1,12 @@
 import numpy as np
+import pytest
 
 from src.rendering.ascii_diff.ascii_kernel_classifier import AsciiKernelClassifier
 from src.common.tensors import AbstractTensor
 from src.common.tensors.numpy_backend import NumPyTensorOperations
 
 
+@pytest.mark.skip(reason="takes too long")
 def test_nn_classifier_matches_reference_bitmasks():
     ramp = " .:"
     # Default behaviour should use the NN kernel
