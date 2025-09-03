@@ -1,0 +1,91 @@
+# adapters_autograd_bridge.py
+
+from typing import Sequence, Tuple, Callable, Any
+import numpy as np
+
+from ..abstraction import AbstractTensor
+from ..autograd import autograd
+
+# a few operator aliases when there's no named method on AbstractTensor
+_BIN_ALIASES = {
+    "add":      lambda a, b: a + b,
+    "sub":      lambda a, b: a - b,
+    "mul":      lambda a, b: a * b,
+    "truediv":  lambda a, b: a / b,
+    "pow":      lambda a, b: a ** b,
+}
+
+def _as_np(x: Any):
+    # unwrap AbstractTensor -> backend buffer -> numpy
+    if isinstance(x, AbstractTensor):
+        x = x.data
+    return np.asarray(x)
+
+def run_op_and_grads(
+    op_name: str,
+    *np_inputs: np.ndarray,
+    loss: Callable[[AbstractTensor], AbstractTensor] | str = "sum",
+) -> Tuple[np.ndarray, Tuple[np.ndarray, ...]]:
+    """
+    Execute one forward op and return (forward_output_numpy, grads_per_input_numpy).
+
+    - op_name: name of the forward operator (e.g., "maximum", "relu", "sum", "add", "mul"...).
+    - np_inputs: numpy scalars/arrays.
+    - loss: "sum" (default) or a callable mapping the op output -> scalar loss tensor.
+    """
+    # 1) wrap numpy -> AbstractTensor on the global tape with grads enabled
+    ats = [AbstractTensor.get_tensor(x, requires_grad=True) for x in np_inputs]  # attaches to tape
+    # 2) find and run the op
+    if hasattr(AbstractTensor, op_name):              # e.g., maximum(x,y), sigmoid(x), sum(x)...
+        fn = getattr(AbstractTensor, op_name)
+        y = fn(*ats)
+    elif op_name in _BIN_ALIASES and len(ats) == 2:   # add/mul/etc via Python operators
+        y = _BIN_ALIASES[op_name](ats[0], ats[1])
+    else:
+        raise ValueError(f"Unknown op '{op_name}' for {len(ats)} inputs")
+
+    # 3) build a scalar loss so gradients are well-defined
+    L = y.sum() if loss == "sum" else loss(y)
+
+    # (optional) catch missing backward rules early
+    missing = autograd.tape.validate_backward_ops(L)
+    if missing:
+        names = sorted({m['op'] for m in missing if m.get('op')})
+        raise RuntimeError(f"Missing backward rules for: {names}")
+
+    # 4) differentiate w.r.t. the provided inputs, then read .grad
+    autograd.grad(L, ats, retain_graph=False, allow_unused=True)
+    grads = tuple(_as_np(a.grad) for a in ats)
+
+    return _as_np(y), grads
+
+
+# ---- bridge to your spring edges ------------------------------------------------
+
+def push_impulses_from_op(
+    sys,
+    op_name: str,
+    src_ids: Sequence[int],
+    out_id: int,
+    *,
+    residual: float | None = None,
+    scale: float = 1.0,
+) -> float:
+    """
+    Compute local grads for a single op on node thetas and push impulses onto edges.
+    Returns the forward value so you can write it to the out node if you want.
+
+    residual: if you already have (y - target) locally, pass it; otherwise None.
+    """
+    # gather current scalar parameters from nodes
+    vals = [np.array(sys.nodes[i].theta, dtype=float) for i in src_ids]
+
+    y_np, grads_np = run_op_and_grads(op_name, *vals)  # grads in same order as src_ids
+
+    # push impulses (classic "local jacobian^T * residual" pattern)
+    if residual is not None:
+        for i, g in zip(src_ids, grads_np):
+            g_scalar = float(np.asarray(g))
+            sys.impulse(i, out_id, op_name, scale * g_scalar * float(-residual))
+
+    return float(np.asarray(y_np))

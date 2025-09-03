@@ -865,10 +865,10 @@ def display_worker(
     tk.Button(controls, text="Reset Optimizer", command=lambda: shared_state.__setitem__("reset_opt", True)).pack(side=tk.LEFT)
 
     # Learning rate logarithmic slider
-    lr_var = tk.DoubleVar(value=math.log10(shared_state.get("lr", 5e-2)))
+    lr_var = tk.DoubleVar(value=math.log10(shared_state.get("lr", 1e-10)))
     lr_scale = tk.Scale(
         controls,
-        from_=-5,
+        from_=-10,
         to=0,
         resolution=0.1,
         orient=tk.HORIZONTAL,
@@ -1052,7 +1052,7 @@ def display_worker(
 def main(
     config=None,
     viz_every=1,
-    max_epochs=25,
+    max_epochs=1,
     output_dir="riemann_modular_renders",
     visualize_laplace=None,
     laplace_threshold=None,
@@ -1073,7 +1073,7 @@ def main(
     shared_state = {
         "epoch_limit": max_epochs,
         "optimizer": "Adam",
-        "lr": 5e-2,
+        "lr": 1e-10,
         "reset_opt": False,
     }
     args = (

@@ -150,6 +150,15 @@ class LocalStateNetwork:
         self._reg_loss = None
         self._weighted_padded = None
         self._modulated_padded = None
+        if hasattr(self.a, '_grad'):
+            self.a._grad = None
+        if hasattr(self.b, '_grad'):
+            self.b._grad = None
+        if hasattr(self.c, '_grad'):
+            self.c._grad = None
+        if hasattr(self.d, '_grad'):
+            self.d._grad = None
+
     def parameters(self, include_all: bool = False, include_structural: bool = False):
         """Return learnable parameters, excluding structural ones by default.
         optionally filtering by gradient status.
@@ -213,6 +222,15 @@ class LocalStateNetwork:
         self.g_bias_layer = AbstractTensor.zeros((3, 3, 3), dtype=AbstractTensor.float_dtype, requires_grad=True)
         autograd.tape.create_tensor_node(self.g_bias_layer)
         self.g_bias_layer._label = f"{_label_prefix+'.' if _label_prefix else ''}LocalStateNetwork.g_bias_layer"
+
+        self.a = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.a)
+        self.b = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.b)
+        self.c = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.c)
+        self.d = AbstractTensor.get_tensor(1, requires_grad=True)
+        autograd.tape.create_tensor_node(self.d)
 
         self._cached_padded_raw = None
         like = AbstractTensor.get_tensor(0, dtype=AbstractTensor.float_dtype, requires_grad=True)
@@ -428,7 +446,19 @@ class LocalStateNetwork:
         #print(modulated_padded)
         #print(f"Padded_raw: {padded_raw}")
         #print(padded_raw)
-        output = padded_raw @ weighted_padded @ modulated_padded @ (inner_output+1)
+
+        autograd.tape.create_tensor_node(self.a)
+        autograd.tape.create_tensor_node(self.b)
+        autograd.tape.create_tensor_node(self.c)
+        autograd.tape.create_tensor_node(self.d)
+
+        sum = self.a + self.b + self.c + self.d
+        self.a = self.a / sum
+        self.b = self.b / sum
+        self.c = self.c / sum
+        self.d = self.d / sum
+        
+        output = self.a * padded_raw + self.b * weighted_padded + self.c * modulated_padded + self.d * inner_output
         output = self._regularization_loss + output
         #print(f"Output: {output}")
         #print(output)

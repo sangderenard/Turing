@@ -894,6 +894,30 @@ class AbstractTensor:
         result = tensor.__class__(track_time=tensor.track_time)
         result.data = values
         return AbstractTensor._TopKResult(result, idxs)
+    def gather_and(x, dim, indices, fn, *args, **kwargs):
+        """
+        Gather from `x` along `dim` using `indices`, then pass the gathered tensor
+        straight into `fn` and return whatever it returns.
+
+        x:       tensor (e.g., AbstractTensor)
+        dim:     int, axis in x to gather from
+        indices: integer tensor of indices
+        fn:      callable; will be invoked as fn(gathered, *args, **kwargs)
+        """
+        g = x.gather(dim, indices)
+        return fn(g, *args, **kwargs)
+    def scatter_and(out, dim, index, src, fn, *args, **kwargs):
+        """
+        Scatter `src` into `out` along `dim` using `index`, then pass the result to `fn`.
+
+        out:   destination tensor (preallocated)
+        dim:   int, axis in `out` to scatter along
+        index: integer tensor of destinations (same shape as `src` along `dim`)
+        src:   values to scatter
+        fn:    callable; invoked as fn(scattered, *args, **kwargs)
+        """
+        y = out.scatter(dim, index, src)
+        return fn(y, *args, **kwargs)
 
     @staticmethod
     def stack(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
@@ -1913,6 +1937,8 @@ from .abstraction_methods.reduction import (
 )
 from .abstraction_methods.indexing import (
     unravel_index as indexing_unravel_index,
+    gather,
+    scatter,
 )
 from .abstraction_methods.type_ops import (
     to as type_to,
@@ -2034,6 +2060,8 @@ AbstractTensor.random = _RandomClass()
 AbstractTensor.randoms = staticmethod(randoms)
 AbstractTensor.randint = staticmethod(randint)
 AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
+AbstractTensor.gather = staticmethod(gather)
+AbstractTensor.scatter = staticmethod(scatter)
 
 
 # --- Creation helpers: tape + requires_grad + record ------------------------
