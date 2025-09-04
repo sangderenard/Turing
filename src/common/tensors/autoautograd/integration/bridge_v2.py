@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, Any, Callable, List, Tuple, Dict
 
-import numpy as np
 
 from ..whiteboard_runtime import run_batched_vjp
 from ..whiteboard_cache import WhiteboardCache
@@ -48,7 +47,7 @@ def _inv_length_scale(sys, out_id: int, src_ids: Sequence[int]) -> float:
         item = getattr(n, "item_", None)
         n_val = float(item()) if callable(item) else float(n)
         ws.append(1.0 / max(n_val, 1e-8))
-    return float(np.mean(ws)) if ws else 1.0
+    return float(AbstractTensor.mean(ws)) if ws else 1.0
 
 
 def push_impulses_from_op_v2(

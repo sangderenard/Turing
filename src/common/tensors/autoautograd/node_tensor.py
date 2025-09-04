@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Sequence, Optional, Union, Protocol
-import numpy as np
 
 try:
     from ..abstraction import AbstractTensor
@@ -26,12 +25,12 @@ class BackendPolicy(Protocol):
     def pre_commit(self, view: "NodeAttrView") -> None: ...
     def post_commit(self, view: "NodeAttrView") -> None: ...
 
-# Sensible NumPy policy (works for plain arrays & array-likes)
+# Sensible AbstractTensor policy (works for plain arrays & array-likes)
 class NumpyPolicy:
     def asarray(self, x: Any) -> Any:
-        return np.asarray(x)
+        return AbstractTensor.asarray(x)
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
-        return np.stack(xs, axis=axis)
+        return AbstractTensor.stack(xs, axis=axis)
     def getter(self, node: Any, attr: str) -> Any:
         return getattr(node, attr) if hasattr(node, attr) else node[attr]
     def setter(self, node: Any, attr: str, value: Any) -> None:
@@ -42,18 +41,18 @@ class NumpyPolicy:
 # Example AbstractTensor-ish policy (adjust to your API as needed)
 class AbstractTensorPolicy(NumpyPolicy):
     """
-    Falls back to NumPy for stack/asarray if your AbstractTensor lacks them.
-    Swap in your real constructors (e.g., AbstractTensor.stack / from_numpy).
+    Falls back to AbstractTensor for stack/asarray if your AbstractTensor lacks them.
+    Swap in your real constructors (e.g., AbstractTensor.stack / from_AbstractTensor).
     """
     def __init__(self, AT):
         self.AT = AT
     def asarray(self, x: Any) -> Any:
-        # Prefer existing AbstractTensor values; otherwise wrap numpy
+        # Prefer existing AbstractTensor values; otherwise wrap AbstractTensor
         if isinstance(x, self.AT):
             return x
-        if hasattr(self.AT, "numpy"):
-            return self.AT.numpy(np.asarray(x))
-        return np.asarray(x)
+        if hasattr(self.AT, "AbstractTensor"):
+            return self.AT.AbstractTensor(AbstractTensor.asarray(x))
+        return AbstractTensor.asarray(x)
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
         if hasattr(self.AT, "stack"):
             try:
@@ -67,8 +66,8 @@ class AbstractTensorPolicy(NumpyPolicy):
             if isinstance(x, self.AT):
                 arrs.append(getattr(x, "data", x))
             else:
-                arrs.append(np.asarray(x))
-        stacked = np.stack(arrs, axis=axis)
+                arrs.append(AbstractTensor.asarray(x))
+        stacked = AbstractTensor.stack(arrs, axis=axis)
         t = self.AT(track_time=False, tape=getattr(xs[0], "_tape", None))
         t.data = stacked
         return t
@@ -92,7 +91,7 @@ class NodeAttrView:
       - If policy_overrides=True (default), use policy hook when available,
         ignoring per-instance hooks.
       - If policy_overrides=False, use provided hooks when set; otherwise
-        fall back to policy, then to NumPy defaults.
+        fall back to policy, then to AbstractTensor defaults.
 
     Extra hook: `scatter_row` lets a backend control how rows are written back.
     """
@@ -139,20 +138,20 @@ class NodeAttrView:
                 pol = NumpyPolicy()
         def choose(name, local):
             if self.policy_overrides:
-                # Prefer backend policy if it implements the method; else local; else numpy default
+                # Prefer backend policy if it implements the method; else local; else AbstractTensor default
                 if hasattr(pol, name):
                     return getattr(pol, name)
                 if local is not None:
                     return local
             else:
-                # Prefer local if provided; else backend; else numpy default
+                # Prefer local if provided; else backend; else AbstractTensor default
                 if local is not None:
                     return local
                 if hasattr(pol, name):
                     return getattr(pol, name)
             # Fallbacks for core hooks
-            if name == "asarray":  return np.asarray
-            if name == "stack":    return lambda xs, axis=0: np.stack(xs, axis=axis)
+            if name == "asarray":  return AbstractTensor.asarray
+            if name == "stack":    return lambda xs, axis=0: AbstractTensor.stack(xs, axis=axis)
             if name == "getter":   return lambda n, a: getattr(n, a) if hasattr(n, a) else n[a]
             if name == "setter":   return lambda n, a, v: setattr(n, a, v) if hasattr(n, a) else n.__setitem__(a, v)
             # Optional hooks default to no-op/None
