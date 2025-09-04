@@ -1134,11 +1134,13 @@ class LinearBlock:
     ops: List[Tuple[str, List[int], int]]  # (op_name, src_ids, out_id)
 
 class LinearBlockFactory:
-    def __init__(self, n_in: int, n_out: int, *, spacing: float = 0.35, seed: int = 0):
+    def __init__(self, n_in: int, n_out: int, *, spacing: float = 0.35, seed: int = 0, rows=1, gather_operators=["add", "mul"]):
         self.n_in = int(n_in)
         self.n_out = int(n_out)
         self.spacing = float(spacing)
-        self.rng = AbstractTensor.random.default_rng(seed)
+        self.rng = AbstractTensor.random
+        self.rng.set_seed(int(seed))
+        self.rows = int(rows)
 
     def _mk_edge(self, i, j, op):
         bands = [
@@ -1171,36 +1173,39 @@ class LinearBlockFactory:
             for i in range(self.n_in):
                 mid_ids[(i, j)] = nid; nid += 1
 
+        
         # --- place nodes in 3D for clarity (inputs left, mids center slab, outs right) ---
-        def jitter(s=0.07): return self.rng.uniform(-s, s, size=(3,))
+        def jitter(s=0.07):
+            random_tensor = AbstractTensor.random_tensor(size=(3,), scope=(-s, s))
+            return random_tensor
         # inputs
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
             nodes.append(Node(id=i_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # outputs
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
             nodes.append(Node(id=o_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # weights near the mids
         for (i,j), w_id in w_ids.items():
             x = -0.6; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.05*self.rng.standard_normal()
             z = z_level + 0.15*self.rng.standard_normal()
             nodes.append(Node(id=w_id, theta=self.rng.uniform(-0.3,0.3),
-                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # biases near output column
         for j, b_id in b_ids.items():
             x = +1.1; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.03*self.rng.standard_normal()
             z = z_level + 0.15*self.rng.standard_normal()
             nodes.append(Node(id=b_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # intermediates column
         for (i,j), m_id in mid_ids.items():
             x = +0.3; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.02*(i - 0.5*(self.n_in-1))
             z = z_level + 0.05*self.rng.standard_normal()
             nodes.append(Node(id=m_id, theta=0.0,
-                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
 
         # --- wire edges & ops: m_ij = in_i * w_ij ; out_j = sum_i m_ij + b_j ---
         # mul edges + ops
@@ -1241,7 +1246,7 @@ def ascii_targets_for(phrase: str, out_ids: List[int]) -> Dict[int, Callable[[fl
 
 
 def build_toy_system(seed=0):
-    rng = AbstractTensor.random.default_rng(seed)
+    rng = AbstractTensor.random.set_seed(seed)
     nodes = []   # <- list, not dict
     edges = []   # <- list, not dict
     outputs = {}
@@ -1249,10 +1254,12 @@ def build_toy_system(seed=0):
     TEXT = "I am one million monkeys typing on a keyboard"
 
     lb = LinearBlockFactory(
-        n_in=8,
+        n_in=len(TEXT),
         n_out=len(TEXT),
         spacing=0.28,
-        seed=123
+        rows=1,
+        gather_operators=["fused_add_mul"],
+        seed=seed
     ).build(start_id=0, z_level=0.0)
 
     # Install the block

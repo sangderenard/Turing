@@ -56,7 +56,7 @@ def empty(
         inst.data = inst.empty_(size, dtype, device)
     return _finalize_requires(inst, requires_grad)
 # Random tensor creation (fluent with other helpers)
-def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
+def random_tensor(size: Tuple[int, ...], device: Any = None, scope: Tuple[Any, ...] = [0, 1], *, cls=None, **kwargs):
     """
     Create a tensor of the given shape filled with random values using the requested random generator.
     All arguments for random_generator (kind, algo, seed, dtype, distribution, batch_size, etc) should be passed as kwargs.
@@ -78,9 +78,10 @@ def random_tensor(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwar
         else:
             kwargs['kind'] = RANDOM_KIND.CSPRNG
     rng = random_generator(**kwargs)
-    vals = next(rng)
-    if not isinstance(vals, list):
-        vals = [vals]
+    
+    vals = [next(rng) for _ in range(total)]
+    
+
     with _CreationTapeCtx(requires_grad=requires_grad, tape=tape):
         inst = cls(track_time=False)
         inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)

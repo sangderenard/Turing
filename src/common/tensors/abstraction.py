@@ -2077,7 +2077,7 @@ AbstractTensor.unravel_index = staticmethod(indexing_unravel_index)
 AbstractTensor.gather = gather
 AbstractTensor.scatter = scatter
 AbstractTensor.scatter_row = scatter_row
-
+AbstractTensor.random_tensor = staticmethod(random_tensor)
 
 # --- Creation helpers: tape + requires_grad + record ------------------------
 def _attach_requires_and_record(result, *, op: str, requires_grad: bool, params: dict | None = None):
@@ -2211,8 +2211,10 @@ try:
     AbstractTensor.range = staticmethod(_wrap_creation_fn("range", AbstractTensor.range))
 except Exception:
     pass
-
-
+try:   # Ensure random also supports requires_grad + tape and force global tape when requested
+    AbstractTensor.random_tensor = staticmethod(_wrap_creation_fn("random_tensor", AbstractTensor.random_tensor))
+except Exception:
+    pass
 def _wrap_with_autograd(name: str, func: Callable) -> Callable:
     def wrapped(self, *args, **kwargs):
         tensor_args = [a for a in args if isinstance(a, AbstractTensor)]

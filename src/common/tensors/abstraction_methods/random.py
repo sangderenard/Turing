@@ -8,6 +8,68 @@ from typing import Optional, Tuple, Iterable, Callable, Union
 import os, time, hmac, hashlib, struct, socket, tempfile
 
 # ======================================================================================
+# Module-level default seed control
+# ======================================================================================
+
+# When set via seed(), this value is used as the default seed for all
+# PRNG/CSPRNG constructions in this module when a seed is not explicitly
+# supplied by the caller.
+_MODULE_SEED: Optional[Union[int, bytes]] = None
+
+def seed(value: Optional[Union[int, bytes, str]] = None) -> None:
+    """Set or clear the module-level default seed.
+
+    - value: int | bytes | str to set a deterministic default seed.
+             Use None to clear and return to non-deterministic defaults.
+
+    This affects:
+      - ensure_seed64(None)
+      - make_prng(..., seed=None)
+      - make_csprng(..., seed_material=None)
+      - random_generator(..., seed=None)
+    """
+    global _MODULE_SEED
+    if value is None:
+        _MODULE_SEED = None
+    elif isinstance(value, (bytes, bytearray)):
+        _MODULE_SEED = bytes(value)
+    elif isinstance(value, str):
+        _MODULE_SEED = hashlib.sha256(value.encode("utf-8")).digest()
+    elif isinstance(value, int):
+        _MODULE_SEED = value
+    else:
+        raise TypeError(f"Unsupported seed type: {type(value)}")
+
+def _module_seed_int() -> Optional[int]:
+    """Return module seed as a 64-bit int, if set."""
+    if _MODULE_SEED is None:
+        return None
+    if isinstance(_MODULE_SEED, int):
+        return (_MODULE_SEED & ((1 << 64) - 1))
+    # bytes-like → fold via SHA256 to 64-bit
+    h = hashlib.sha256(_MODULE_SEED).digest()
+    return int.from_bytes(h[:8], "little")
+
+def _expand_seed_bytes(n: int, base: bytes) -> bytes:
+    """Deterministically expand base bytes to n bytes using SHA256 chaining."""
+    out = bytearray()
+    ctr = 0
+    while len(out) < n:
+        ctr += 1
+        out.extend(hashlib.sha256(b"MODULE_SEED" + base + ctr.to_bytes(4, "little")).digest())
+    return bytes(out[:n])
+
+def _module_seed_bytes(n: int) -> Optional[bytes]:
+    """Return module seed material as bytes of length n, if set."""
+    if _MODULE_SEED is None:
+        return None
+    if isinstance(_MODULE_SEED, int):
+        base = (_MODULE_SEED & ((1 << 64) - 1)).to_bytes(8, "little")
+    else:
+        base = bytes(_MODULE_SEED)
+    return _expand_seed_bytes(n, base)
+
+# ======================================================================================
 # Enums (as given)
 # ======================================================================================
 
@@ -249,6 +311,10 @@ def seed_from_bytes(b: bytes) -> int:
 
 def ensure_seed64(seed: Optional[Union[int, bytes]] = None) -> int:
     if seed is None:
+        # If a module-level seed is set, prefer it; otherwise draw from CSPRNG
+        ms = _module_seed_int()
+        if ms is not None:
+            return ms
         cs = make_csprng(CSPRNG_ALGO.CHACHA20)
         return int.from_bytes(cs.random_bytes(8), "little")
     if isinstance(seed, bytes):
@@ -710,7 +776,12 @@ class CSPRNG:
 
 def make_csprng(algo: CSPRNG_ALGO, seed_material: Optional[bytes] = None) -> CSPRNG:
     if seed_material is None:
-        seed_material = get_entropy(48, PRNG_SYS.OS_URANDOM)
+        # Prefer module-level seed material, else fall back to OS entropy
+        ms = _module_seed_bytes(48)
+        if ms is not None:
+            seed_material = ms
+        else:
+            seed_material = get_entropy(48, PRNG_SYS.OS_URANDOM)
 
     match algo:
         case CSPRNG_ALGO.CHACHA20:
@@ -897,7 +968,7 @@ class Random:
     def _reset_gen(self):
         self._gen = random_generator(kind=self.kind, algo=self.algo, seed=self.seed, dtype="float", batch_size=1)
 
-    def seed(self, seed=None):
+    def set_seed(self, seed=None):
         self.seed = seed
         self._reset_gen()
 
@@ -931,6 +1002,7 @@ class Random:
         pool = list(population)
         self.shuffle(pool)
         return pool[:k]
+
 
     def gauss(self, mu: float = 0.0, sigma: float = 1.0):
         """Gaussian (normal) variate via Box–Muller.
