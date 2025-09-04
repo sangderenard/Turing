@@ -38,8 +38,7 @@ from typing import Dict, Tuple, List, Optional, Callable
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib import cm, colors as mcolors
-
-import numpy as np
+from ..abstraction import AbstractTensor
 
 L_MIN = 0.05
 L_MAX = 3.0
@@ -227,7 +226,7 @@ class Edge:
           spring.consume by adding an equal-and-opposite transient (-sgn * POP_QUANTUM)
         """
         # current target uses cached _last_reduce set by target_length() this tick
-        L_star = float(np.clip(self.l0 + self._last_reduce, L_MIN, L_MAX))
+        L_star = float(AbstractTensor.clip(self.l0 + self._last_reduce, L_MIN, L_MAX))
         frustration = abs(L_current - L_star)
         agg_mag = abs(self._last_reduce)
         if frustration < POP_FRUSTRATION_TH or agg_mag < POP_AGG_TH:
@@ -306,7 +305,7 @@ class SpringRepulsorSystem:
     # ----------------- Physics tick -----------------
     def tick(self):
         # Force accumulator
-        F: Dict[int, np.ndarray] = {i: np.zeros(self.D, dtype=float) for i in self.nodes}
+        F: Dict[int, AbstractTensor.ndarray] = {i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes}
 
 
         t_now = now_s()
@@ -314,12 +313,12 @@ class SpringRepulsorSystem:
         for key, e in self.edges.items():
             ni, nj = self.nodes[e.i], self.nodes[e.j]
             d = nj.p - ni.p
-            L = float(np.linalg.norm(d))
+            L = AbstractTensor.linalg.norm(d)
             if L < 1e-9:
                 continue
             u = d / (L + 1e-12)
             Lstar = e.target_length()  # also caches _last_reduce
-            Ksum = sum(b.K for b in e.bands)
+            Ksum = AbstractTensor.sum(b.K for b in e.bands)
             Fel = Ksum * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
             F[e.i] += (Fel - Rep) * scale
@@ -335,12 +334,12 @@ class SpringRepulsorSystem:
             # Dirichlet spring toward target
             if b.alpha > 0.0 and b.target_fn is not None:
                 tvec = b.target_fn(t_now)
-                if np.isfinite(tvec).all():
+                if AbstractTensor.isfinite(tvec).all():
                     F[n.id] += -b.alpha * (n.p - tvec)
             # Neumann traction force
             if b.beta > 0.0 and b.force_fn is not None:
                 fvec = b.force_fn(t_now)
-                if np.isfinite(fvec).all():
+                if AbstractTensor.isfinite(fvec).all():
                     F[n.id] += b.beta * fvec
 
         # Integrate with heavy damping
@@ -348,18 +347,18 @@ class SpringRepulsorSystem:
             # spectral response (ND) → smoothing force
             resp, _, _ = self._spectral_inertia(n)
             if not np.isfinite(resp).all():
-                resp = np.zeros_like(n.p)
+                resp = AbstractTensor.zeros_like(n.p)
             F[n.id] += -resp
             n.v = self.gamma * n.v + self.dt * F[n.id] / n.M0
 
             # cap velocity
-            speed = float(np.linalg.norm(n.v))
+            speed = AbstractTensor.linalg.norm(n.v)
             if speed > V_MAX:
                 n.v *= V_MAX / (speed + 1e-12)
 
             # cap per-step displacement
             dp = -self.dt * n.v
-            step = float(np.linalg.norm(dp))
+            step = float(AbstractTensor.linalg.norm(dp))
             if step > STEP_MAX:
                 dp *= STEP_MAX / (step + 1e-12)
             n.p = n.p + dp
@@ -402,7 +401,7 @@ class SpringRepulsorSystem:
         # AFTER: xs = xs - xs.mean(...)
 
         # normalize to avoid huge FFT magnitudes
-        scale = max(1.0, float(np.linalg.norm(xs, ord=np.inf)))
+        scale = max(1.0, float(AbstractTensor.linalg.norm(xs, ord=AbstractTensor.inf)))
         xs = xs / scale
 
         D = xs.shape[1]
@@ -701,11 +700,11 @@ class LiveVizGLPoints:
     @staticmethod
     def _look_at(eye, center, up) -> np.ndarray:
         f = center - eye
-        f = f / (np.linalg.norm(f) + 1e-12)
-        upn = up / (np.linalg.norm(up) + 1e-12)
-        s = np.cross(f, upn)
-        s = s / (np.linalg.norm(s) + 1e-12)
-        u = np.cross(s, f)
+        f = f / (AbstractTensor.linalg.norm(f) + 1e-12)
+        upn = up / (AbstractTensor.linalg.norm(up) + 1e-12)
+        s = AbstractTensor.cross(f, upn)
+        s = s / (AbstractTensor.linalg.norm(s) + 1e-12)
+        u = AbstractTensor.cross(s, f)
 
         M = np.eye(4, dtype=np.float32)
         M[0, :3] = s
