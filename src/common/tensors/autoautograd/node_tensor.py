@@ -56,8 +56,22 @@ class AbstractTensorPolicy(NumpyPolicy):
         return np.asarray(x)
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
         if hasattr(self.AT, "stack"):
-            return self.AT.stack(xs, axis=axis)
-        return np.stack([np.asarray(x) for x in xs], axis=axis)
+            try:
+                return self.AT.stack(xs, axis=axis)
+            except TypeError:
+                # Some backends expose stack(xs, axis) without keyword support
+                return self.AT.stack(xs, axis)
+        # Fallback: build an AbstractTensor by stacking underlying data
+        arrs: list[Any] = []
+        for x in xs:
+            if isinstance(x, self.AT):
+                arrs.append(getattr(x, "data", x))
+            else:
+                arrs.append(np.asarray(x))
+        stacked = np.stack(arrs, axis=axis)
+        t = self.AT(track_time=False, tape=getattr(xs[0], "_tape", None))
+        t.data = stacked
+        return t
 
     def scatter_row(self, node: Any, attr: str, row_value: Any) -> None:
         tensor = self.getter(node, attr)

@@ -22,7 +22,11 @@ Notes:
   positions back into parameter scalars.
 """
 from __future__ import annotations
-from .integration.bridge_v2 import push_impulses_from_op_v2
+from .integration.bridge_v2 import (
+    push_impulses_from_op_v2,
+    batched_forward_v2,
+    push_impulses_from_ops_batched,
+)
 from .whiteboard_cache import WhiteboardCache
 
 import time
@@ -1063,7 +1067,7 @@ class Reflector(threading.Thread):
             # Sleep to maintain approx tick rate
             elapsed = now_s() - t0
             to_sleep = max(0.0, self.tick_dt - elapsed)
-            print("Reflector tick")
+            #print("Reflector tick")
             time.sleep(to_sleep)
 
 
@@ -1090,16 +1094,26 @@ class Experiencer(threading.Thread):
         t0 = now_s()
         while not self.stop.is_set():
             t = now_s() - t0
+            # 1) Update intermediate mul ops (write outputs), no impulses
             for (name, srcs, out) in self.ops_program:
-                # 1) forward-only to get prediction (no impulses)
-                y_hat = Ops.call(self.sys, name, srcs, out,
-                                 residual=None, write_out=False, scale=0.1)
-                # 2) compute residual and push impulses via the bridge
-                r = self._residual_for_out(out, y_hat, t)
-                y = Ops.call(self.sys, name, srcs, out,
-                             residual=r, write_out=True, scale=0.1)
-                print(f"Residual for {out}: {r}")
-            print("Experiencer tick")
+                if str(name).lower() in ("mul", "prod", "mul2", "prod_k"):
+                    _ = Ops.call(self.sys, name, srcs, out, residual=None, write_out=True, scale=0.0)
+
+            # 2) Batched forward + impulses for outputs with targets
+            out_specs: list[tuple[str, list[int], int]] = []
+            for (name, srcs, out) in self.ops_program:
+                if out in self.outputs:
+                    out_specs.append((name, srcs, out))
+            if out_specs:
+                ys_hat = batched_forward_v2(self.sys, out_specs, weight=None, scale=0.1)
+                residuals: list[float] = []
+                for (name, srcs, out), y_hat in zip(out_specs, ys_hat):
+                    target = self.outputs.get(out)
+                    r = float(y_hat) - float(target(t)) if target is not None else 0.0
+                    residuals.append(r)
+                ys = push_impulses_from_ops_batched(self.sys, out_specs, residuals, weight=None, scale=0.1)
+                for (name, srcs, out), y in zip(out_specs, ys):
+                    self.sys.nodes[out].theta = float(y)
             time.sleep(self.dt)
 
 
@@ -1272,8 +1286,8 @@ def main(duration_s: float = 8.0):
     sys, outputs = build_toy_system(seed=42)
 
     stop = threading.Event()
-    refl = Reflector(sys, stop, tick_hz=333.0, commit_every_s=0.01)
-    expr = Experiencer(sys, stop, outputs, schedule_hz=444.0, ops_program=sys.ops_program)
+    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=1.00)
+    expr = Experiencer(sys, stop, outputs, schedule_hz=60.0, ops_program=sys.ops_program)
 
     print("[INFO] Starting threads…")
     refl.start(); expr.start()
@@ -1293,7 +1307,7 @@ def main(duration_s: float = 8.0):
             mae = np.mean([abs(err) for err in errors])
             error_str = ''.join([f"{chr(int((err + 1) * 127.5))}" for err in errors])
             print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae: .3f}, Error Phrase: {error_str}")
-            viz.step(0.0)
+            viz.step(0.5)
 
     finally:
         stop.set()
