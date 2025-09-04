@@ -1,5 +1,5 @@
 """
-Spring-Repulsor Async Toy (NumPy)
+Spring-Repulsor Async Toy (AbstractTensor)
 ---------------------------------
 Minimal, threadful prototype of the "spring–repulsor, multiband gradient acoustics" learner.
 
@@ -15,7 +15,7 @@ Run:
     python spring_async_toy.py
 
 Notes:
-- This is a toy: no external deps beyond numpy. Threading is cooperative and simple.
+- This is a toy: no external deps beyond AbstractTensor. Threading is cooperative and simple.
 - Impulses require a residual (sign + magnitude). If no residual is available, the op
   emits **no** impulse and logs a WARNING (clear & explicit).
 - The Reflector integrates geometry at steady ticks and periodically "commits" node
@@ -30,7 +30,6 @@ from .integration.bridge_v2 import (
 from .whiteboard_cache import WhiteboardCache
 
 import time
-import math
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
@@ -63,26 +62,26 @@ def now_s() -> float:
 
 def as_x_target(fn, D: int = 3):  # scalar → Dirichlet target on x in D-D
     def _t(t):
-        v = np.zeros(D, dtype=float)
+        v = AbstractTensor.zeros(D, dtype=float)
         v[0] = float(fn(t))
         return v
     return _t
 
 def as_x_force(fn, D: int = 3):   # scalar → Neumann force on x in D-D
     def _f(t):
-        v = np.zeros(D, dtype=float)
+        v = AbstractTensor.zeros(D, dtype=float)
         v[0] = float(fn(t))
         return v
     return _f
 
-def interpret_vec(v: np.ndarray) -> float:
+def interpret_vec(v: AbstractTensor) -> float:
     # scalar meaning of a locational vector (keep it simple: x-component)
     return float(READOUT_SCALE * v[0] + READOUT_BIAS)
 
 def inv_weight(sys: SpringRepulsorSystem, src: int, dst: int) -> float:
-    d = float(np.linalg.norm(sys.nodes[dst].p - sys.nodes[src].p))
+    d = float(AbstractTensor.linalg.norm(sys.nodes[dst].p - sys.nodes[src].p))
     w = 1.0 / (W_EPS + d)
-    return float(np.clip(w, W_MIN, W_MAX))
+    return float(AbstractTensor.clip(w, W_MIN, W_MAX))
 
 def norm_weights(ws):
     s = float(sum(ws))
@@ -117,8 +116,8 @@ class Node:
     # Parameter scalar for this toy; real system could be vector-valued
     theta: float
     # Geometry (2D for easy intuition)
-    p: np.ndarray  # shape (2,)
-    v: np.ndarray  # shape (2,)
+    p: AbstractTensor  # shape (2,)
+    v: AbstractTensor  # shape (2,)
     M0: float = 1.0
     last_commit: float = 0.0
     version: int = 0
@@ -199,12 +198,12 @@ class Edge:
         # Update band EMAs
         for b in self.bands:
             b.m += (abs(g_scalar) - b.m) * (dt / max(b.tau, 1e-6))
-            b.s += (np.sign(g_scalar) - b.s) * (dt / max(b.tau, 1e-6))
+            b.s += (AbstractTensor.sign(g_scalar) - b.s) * (dt / max(b.tau, 1e-6))
             # Also push a composite contribution (post-knee)
             # AFTER
             y = soft_knee(b.m, b.th, b.ratio, b.knee)
-            sgn = 1.0 if MAGNITUDE_ONLY else np.sign(b.s)
-            dl = float(np.clip(b.kappa * sgn * y, -DL_CAP, DL_CAP))
+            sgn = 1.0 if MAGNITUDE_ONLY else AbstractTensor.sign(b.s)
+            dl = float(AbstractTensor.clip(b.kappa * sgn * y, -DL_CAP, DL_CAP))
             self.spring.add(dl)
 
 
@@ -217,7 +216,7 @@ class Edge:
         # cache current transient aggregate, then clamp total target length
         agg = self.spring.reduce()
         self._last_reduce = float(agg)
-        return float(np.clip(self.l0 + agg, L_MIN, L_MAX))
+        return float(AbstractTensor.clip(self.l0 + agg, L_MIN, L_MAX))
 
     def maybe_pop(self, L_current: float):
         """
@@ -250,8 +249,8 @@ class BoundaryPort:
     nid: int
     alpha: float = 0.0                     # Dirichlet spring strength
     beta: float = 0.0                      # Neumann (traction) gain
-    target_fn: Optional[Callable[[float], np.ndarray]] = None  # t -> R^D
-    force_fn: Optional[Callable[[float], np.ndarray]]  = None  # t -> R^D
+    target_fn: Optional[Callable[[float], AbstractTensor]] = None  # t -> R^D
+    force_fn: Optional[Callable[[float], AbstractTensor]]  = None  # t -> R^D
     enabled: bool = True
 
 
@@ -305,7 +304,7 @@ class SpringRepulsorSystem:
     # ----------------- Physics tick -----------------
     def tick(self):
         # Force accumulator
-        F: Dict[int, AbstractTensor.ndarray] = {i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes}
+        F: Dict[int, AbstractTensor] = {i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes}
 
 
         t_now = now_s()
@@ -346,7 +345,7 @@ class SpringRepulsorSystem:
         for n in self.nodes.values():
             # spectral response (ND) → smoothing force
             resp, _, _ = self._spectral_inertia(n)
-            if not np.isfinite(resp).all():
+            if not AbstractTensor.isfinite(resp).all():
                 resp = AbstractTensor.zeros_like(n.p)
             F[n.id] += -resp
             n.v = self.gamma * n.v + self.dt * F[n.id] / n.M0
@@ -389,14 +388,14 @@ class SpringRepulsorSystem:
         H = len(n.hist_p)
         if H < 32:
             D = n.p.shape[0]
-            return np.zeros(D, float), np.zeros((D, D), float), []
+            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
 
         # --- gather window & detrend ---
         W = min(H, 128)
-        xs = np.stack(list(n.hist_p)[-W:])           # (W, D)
-        if not np.isfinite(xs).all():
+        xs = AbstractTensor.stack(list(n.hist_p)[-W:])           # (W, D)
+        if not AbstractTensor.isfinite(xs).all():
             D = xs.shape[1]
-            return np.zeros(D, float), np.zeros((D, D), float), []
+            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
         xs = xs - xs.mean(axis=0, keepdims=True)
         # AFTER: xs = xs - xs.mean(...)
 
@@ -407,16 +406,16 @@ class SpringRepulsorSystem:
         D = xs.shape[1]
         dt = float(getattr(self, "dt", 1.0))
 
-        # Optional Hann to reduce leakage (pure NumPy)
-        w = np.hanning(W) if W > 1 else np.ones(W)
+        # Optional Hann to reduce leakage (pure AbstractTensor)
+        w = AbstractTensor.hanning(W) if W > 1 else AbstractTensor.ones(W)
         xw = (w[:, None] * xs)
 
         # --- 1) coarse FFT ---
-        C0 = np.fft.rfft(xw, axis=0)                 # (F0, D)
-        w0 = 2.0 * np.pi * np.fft.rfftfreq(W, d=dt)  # (F0,)
-        P0 = np.sum(np.abs(C0)**2, axis=1)           # (F0,)
+        C0 = AbstractTensor.fft.rfft(xw, axis=0)                 # (F0, D)
+        w0 = 2.0 * AbstractTensor.pi * AbstractTensor.fft.rfftfreq(W, d=dt)  # (F0,)
+        P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, axis=1)           # (F0,)
         if P0.sum() <= 1e-12 or len(P0) <= 2:
-            return np.zeros(D, float), np.zeros((D, D), float), []
+            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
 
         # prune empty bins: absolute & relative thresholds
         rel = 0.01 * float(P0.max())
@@ -440,27 +439,27 @@ class SpringRepulsorSystem:
             else:
                 i += 1
         if not bands_idx:
-            return np.zeros(D, float), np.zeros((D, D), float), []
+            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
 
         # --- 2) high-res zoom via zero-padding ---
         Z = 8  # zero-pad factor
         Wz = W * Z
         # zero-pad the windowed signal in time
-        xpad = np.pad(xw, ((0, Wz - W), (0, 0)))
-        Cz = np.fft.rfft(xpad, axis=0)                 # (Fz, D)
-        wz = 2.0 * np.pi * np.fft.rfftfreq(Wz, d=dt)   # (Fz,)
+        xpad = AbstractTensor.pad(xw, ((0, Wz - W), (0, 0)))
+        Cz = AbstractTensor.fft.rfft(xpad, axis=0)                 # (Fz, D)
+        wz = 2.0 * AbstractTensor.pi * AbstractTensor.fft.rfftfreq(Wz, d=dt)   # (Fz,)
 
         # helper to map coarse indices to high-res frequency indices
         def coarse_band_to_w(b_lo, b_hi):
             return w0[b_lo], w0[min(b_hi, len(w0)-1)]
 
         def w_to_hi_idx(wlo, whi):
-            i0 = int(np.clip(np.searchsorted(wz, wlo, side="left"), 0, len(wz)-1))
-            i1 = int(np.clip(np.searchsorted(wz, whi, side="right"), 0, len(wz)))
+            i0 = int(AbstractTensor.clip(AbstractTensor.searchsorted(wz, wlo, side="left"), 0, len(wz)-1))
+            i1 = int(AbstractTensor.clip(AbstractTensor.searchsorted(wz, whi, side="right"), 0, len(wz)))
             return i0, max(i1, i0+1)
 
         # --- 3) build high-res rotation bivector across active bands ---
-        J = np.zeros((D, D), float)
+        J = AbstractTensor.zeros((D, D), float)
         bands_meta = []
         total_power = 0.0
 
@@ -470,23 +469,23 @@ class SpringRepulsorSystem:
             Cz_band = Cz[hi_lo:hi_hi, :]               # (Fb, D)
             if Cz_band.shape[0] < 1:
                 continue
-            Pw = np.sum(np.abs(Cz_band)**2, axis=1) + 1e-12  # (Fb,)
-            if not np.isfinite(Pw).all() or Pw.sum() <= 1e-12:
+            Pw = AbstractTensor.sum(AbstractTensor.abs(Cz_band)**2, axis=1) + 1e-12  # (Fb,)
+            if not AbstractTensor.isfinite(Pw).all() or Pw.sum() <= 1e-12:
                 continue
             Ww = Pw / Pw.sum()
             wgrid = wz[hi_lo:hi_hi]                    # (Fb,)
 
             # integrate rotation bivector over refined grid
             for c, wght, omg in zip(Cz_band, Ww, wgrid):
-                a = np.real(c)                         # (D,)
-                b = np.imag(c)                         # (D,)
-                J += wght * omg * (np.outer(a, b) - np.outer(b, a))
+                a = AbstractTensor.real(c)                         # (D,)
+                b = AbstractTensor.imag(c)                         # (D,)
+                J += wght * omg * (AbstractTensor.outer(a, b) - AbstractTensor.outer(b, a))
             band_power = float(Pw.sum())
             total_power += band_power
             bands_meta.append((w_lo, w_hi, band_power))
 
         if total_power <= 1e-12:
-            return np.zeros(D, float), np.zeros((D, D), float), []
+            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
 
         # immediate ND response on current state
         x_t = xs[-1]                                   # (D,)
@@ -500,7 +499,6 @@ class SpringRepulsorSystem:
 # - No edges/lines; autoscaled camera; non-blocking window
 
 
-import numpy as np
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT
 from OpenGL.GL import *
@@ -538,12 +536,12 @@ class LiveVizGLPoints:
         self._num_points = 0
 
         self._u_mvp = None  # uniform location
-        self._mvp = np.eye(4, dtype=np.float32)  # updated each frame
+        self._mvp = AbstractTensor.eye(4, dtype=AbstractTensor.float32)  # updated each frame
 
     # ---------- data snapshot ----------
     def _snapshot(self):
         # lock-free minimal copy
-        nodes = {i: (np.asarray(n.p, dtype=np.float32).copy(), float(n.theta))
+        nodes = {i: (AbstractTensor.asarray(n.p, dtype=AbstractTensor.float32).copy(), float(n.theta))
                  for i, n in self.sys.nodes.items()}
         bset = set(self.sys.boundaries.keys())
         return nodes, bset
@@ -640,35 +638,35 @@ class LiveVizGLPoints:
     # ---------- geometry packing ----------
     def _pack_points(self):
         nodes, bset = self._snapshot()
-        ids = np.array(sorted(nodes.keys()))
+        ids = AbstractTensor.array(sorted(nodes.keys()))
         if ids.size == 0:
-            return (np.zeros((0, 3), np.float32),
-                    np.zeros((0, 3), np.float32),
-                    np.zeros((0,), np.float32),
-                    np.zeros((0, 3), np.float32))
+            return (AbstractTensor.zeros((0, 3), AbstractTensor.float32),
+                    AbstractTensor.zeros((0, 3), AbstractTensor.float32),
+                    AbstractTensor.zeros((0,), AbstractTensor.float32),
+                    AbstractTensor.zeros((0, 3), AbstractTensor.float32))
 
-        P = np.stack([nodes[i][0] for i in ids]).astype(np.float32, copy=False)
+        P = AbstractTensor.stack([nodes[i][0] for i in ids]).astype(AbstractTensor.float32, copy=False)
 
         # NEW: pad to 3D if needed
         if P.shape[1] == 2:
-            P = np.pad(P, ((0,0),(0,1)), constant_values=0.0)
+            P = AbstractTensor.pad(P, ((0,0),(0,1)), constant_values=0.0)
 
         # NEW: replace NaN/Inf early to avoid NaN bounds
-        P = np.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
+        P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
-        thetas = np.array([nodes[i][1] for i in ids], dtype=np.float32)
-        is_b = np.array([i in bset for i in ids], dtype=bool)
+        thetas = AbstractTensor.array([nodes[i][1] for i in ids], dtype=AbstractTensor.float32)
+        is_b = AbstractTensor.array([i in bset for i in ids], dtype=bool)
 
         # Color map around 0.0 with TwoSlopeNorm
-        vmin = float(np.min(thetas))
-        vmax = float(np.max(thetas))
+        vmin = float(AbstractTensor.min(thetas))
+        vmax = float(AbstractTensor.max(thetas))
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-        C = self.node_cmap(norm(thetas))[:, :3].astype(np.float32)  # RGB
+        C = self.node_cmap(norm(thetas))[:, :3].astype(AbstractTensor.float32)  # RGB
 
         # Point sizes (boundary nodes larger)
-        sizes = np.full(ids.shape, self.base_point_size, dtype=np.float32)
+        sizes = AbstractTensor.full(ids.shape, self.base_point_size, dtype=AbstractTensor.float32)
         sizes[is_b] *= self.boundary_scale
 
         return P, C, sizes, P  # return P twice; last is for autoscale
@@ -698,7 +696,7 @@ class LiveVizGLPoints:
 
     # ---------- camera / MVP ----------
     @staticmethod
-    def _look_at(eye, center, up) -> np.ndarray:
+    def _look_at(eye, center, up) -> AbstractTensor:
         f = center - eye
         f = f / (AbstractTensor.linalg.norm(f) + 1e-12)
         upn = up / (AbstractTensor.linalg.norm(up) + 1e-12)
@@ -706,18 +704,18 @@ class LiveVizGLPoints:
         s = s / (AbstractTensor.linalg.norm(s) + 1e-12)
         u = AbstractTensor.cross(s, f)
 
-        M = np.eye(4, dtype=np.float32)
+        M = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
         M[0, :3] = s
         M[1, :3] = u
         M[2, :3] = -f
-        T = np.eye(4, dtype=np.float32)
+        T = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
         T[:3, 3] = -eye
         return M @ T
 
     @staticmethod
-    def _perspective(fovy_deg, aspect, znear, zfar) -> np.ndarray:
-        f = 1.0 / np.tan(np.deg2rad(fovy_deg) / 2.0)
-        M = np.zeros((4, 4), dtype=np.float32)
+    def _perspective(fovy_deg, aspect, znear, zfar) -> AbstractTensor:
+        f = 1.0 / AbstractTensor.tan(AbstractTensor.deg2rad(fovy_deg) / 2.0)
+        M = AbstractTensor.zeros((4, 4), dtype=AbstractTensor.float32)
         M[0, 0] = f / max(aspect, 1e-6)
         M[1, 1] = f
         M[2, 2] = (zfar + znear) / (znear - zfar)
@@ -725,22 +723,23 @@ class LiveVizGLPoints:
         M[3, 2] = -1.0
         return M
 
-    def _compute_mvp(self, P: np.ndarray):
+    def _compute_mvp(self, P: AbstractTensor):
         if P.size == 0:
-            self._mvp = np.eye(4, dtype=np.float32)
+            self._mvp = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
             return
-        P = np.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)  # NEW
+        P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)  # NEW
 
-        lo = np.min(P, axis=0)
-        hi = np.max(P, axis=0)
+        lo = AbstractTensor.min(P, axis=0)
+        hi = AbstractTensor.max(P, axis=0)
         ctr = 0.5 * (lo + hi)
-        extent = float(np.max(hi - lo))
-        if not np.isfinite(extent) or extent <= 1e-6:
-            extent = 1.0  # NEW: avoid zero/NaN extent
+        extent_t = AbstractTensor.get_tensor(AbstractTensor.max(hi - lo))
+        if not extent_t.isfinite().item() or extent_t.item() <= 1e-6:
+            extent_t = AbstractTensor.get_tensor(1.0)  # NEW: avoid zero/NaN extent
+        extent = float(extent_t.item())
 
         rad = extent * 0.6 + 1e-3
-        eye = ctr + np.array([rad * 1.6, rad * 1.6, rad * 1.6], dtype=np.float32)
-        up  = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        eye = ctr + AbstractTensor.array([rad * 1.6, rad * 1.6, rad * 1.6], dtype=AbstractTensor.float32)
+        up  = AbstractTensor.array([0.0, 1.0, 0.0], dtype=AbstractTensor.float32)
 
         V  = self._look_at(eye, ctr, up)
         aspect = self._w / max(self._h, 1)
@@ -862,7 +861,7 @@ class LiveViz3D:
     def _compute_edge_energy(self, e, nodes):
         pi = nodes[e.i][0]; pj = nodes[e.j][0]
         d = pj - pi
-        L = float(np.linalg.norm(d) + 1e-12)
+        L = float(AbstractTensor.linalg.norm(d) + 1e-12)
         Lstar = e.target_length()
         Ksum = sum(b.K for b in e.bands)
         return 0.5 * Ksum * (L - Lstar) ** 2, (pi, pj)
@@ -874,14 +873,14 @@ class LiveViz3D:
 
     def _init_artists(self):
         nodes, edges, bset = self._snapshot()
-        P = np.stack([nodes[i][0] for i in sorted(nodes.keys())])
-        ids = np.array(sorted(nodes.keys()))
-        is_b = np.array([i in bset for i in ids])
+        P = AbstractTensor.stack([nodes[i][0] for i in sorted(nodes.keys())])
+        ids = AbstractTensor.array(sorted(nodes.keys()))
+        is_b = AbstractTensor.array([i in bset for i in ids])
 
         # split boundary vs non-boundary
         Pn = P[~is_b]; Pb = P[is_b]
-        thetas = np.array([nodes[i][1] for i in ids])
-        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=np.min(thetas), vcenter=0.0, vmax=np.max(thetas))
+        thetas = AbstractTensor.array([nodes[i][1] for i in ids])
+        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=AbstractTensor.min(thetas), vcenter=0.0, vmax=AbstractTensor.max(thetas))
 
         if Pn.size:
             self.scat_nodes = self.ax.scatter(Pn[:,0], Pn[:,1], Pn[:,2],
@@ -904,9 +903,9 @@ class LiveViz3D:
             U, (pi, pj) = self._compute_edge_energy(e, nodes)
             U_vals.append(U); segs.append((pi, pj))
         if U_vals:
-            U_vals = np.array(U_vals)
-            self.norm_edges = mcolors.Normalize(vmin=float(np.percentile(U_vals, 5)),
-                                                vmax=float(np.percentile(U_vals, 95)))
+            U_vals = AbstractTensor.array(U_vals)
+            self.norm_edges = mcolors.Normalize(vmin=float(AbstractTensor.percentile(U_vals, 5)),
+                                                vmax=float(AbstractTensor.percentile(U_vals, 95)))
             for (pi, pj), U in zip(segs, U_vals):
                 col = self.edge_cmap(self.norm_edges(U))
                 art, = self.ax.plot([pi[0], pj[0]], [pi[1], pj[1]], [pi[2], pj[2]],
@@ -917,23 +916,23 @@ class LiveViz3D:
         self._autoscale(P)
 
     def _autoscale(self, P):
-        lo = np.min(P, axis=0); hi = np.max(P, axis=0)
+        lo = AbstractTensor.min(P, axis=0); hi = AbstractTensor.max(P, axis=0)
         ctr = 0.5 * (lo + hi)
-        rad = float(np.max(hi - lo) * 0.6 + 1e-3)
+        rad = float(AbstractTensor.max(hi - lo) * 0.6 + 1e-3)
         self.ax.set_xlim(ctr[0] - rad, ctr[0] + rad)
         self.ax.set_ylim(ctr[1] - rad, ctr[1] + rad)
         self.ax.set_zlim(ctr[2] - rad, ctr[2] + rad)
 
     def _update(self, _frame):
         nodes, edges, bset = self._snapshot()
-        ids = np.array(sorted(nodes.keys()))
-        P = np.stack([nodes[i][0] for i in ids])
-        thetas = np.array([nodes[i][1] for i in ids])
-        is_b = np.array([i in bset for i in ids])
+        ids = AbstractTensor.array(sorted(nodes.keys()))
+        P = AbstractTensor.stack([nodes[i][0] for i in ids])
+        thetas = AbstractTensor.array([nodes[i][1] for i in ids])
+        is_b = AbstractTensor.array([i in bset for i in ids])
 
         # update node colors/positions
-        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(np.min(thetas)))
-        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(np.max(thetas)))
+        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(AbstractTensor.min(thetas)))
+        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(AbstractTensor.max(thetas)))
         C_all = self.node_cmap(self.norm_nodes(thetas))
 
         Pn = P[~is_b]; Cn = C_all[~is_b]
@@ -956,8 +955,8 @@ class LiveViz3D:
             U, (pi, pj) = self._compute_edge_energy(e, nodes)
             U_vals.append(U); segs.append((pi, pj))
         if U_vals:
-            U_vals = np.array(U_vals)
-            lo = float(np.percentile(U_vals, 5)); hi = float(np.percentile(U_vals, 95))
+            U_vals = AbstractTensor.array(U_vals)
+            lo = float(AbstractTensor.percentile(U_vals, 5)); hi = float(AbstractTensor.percentile(U_vals, 95))
             if hi <= lo: hi = lo + 1e-12
             self.norm_edges.vmin = lo; self.norm_edges.vmax = hi
             for (pi, pj), U in zip(segs, U_vals):
@@ -1121,7 +1120,6 @@ class Experiencer(threading.Thread):
 # ----- linear_block_factory.py -----
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-import numpy as np
 
 @dataclass
 class LinearBlock:
@@ -1140,7 +1138,7 @@ class LinearBlockFactory:
         self.n_in = int(n_in)
         self.n_out = int(n_out)
         self.spacing = float(spacing)
-        self.rng = np.random.default_rng(seed)
+        self.rng = AbstractTensor.random.default_rng(seed)
 
     def _mk_edge(self, i, j, op):
         bands = [
@@ -1179,30 +1177,30 @@ class LinearBlockFactory:
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
             nodes.append(Node(id=i_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=np.array([x,y,z]) + jitter(), v=np.zeros(3)))
+                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # outputs
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
             nodes.append(Node(id=o_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=np.array([x,y,z]) + jitter(), v=np.zeros(3)))
+                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # weights near the mids
         for (i,j), w_id in w_ids.items():
             x = -0.6; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.05*self.rng.standard_normal()
             z = z_level + 0.15*self.rng.standard_normal()
             nodes.append(Node(id=w_id, theta=self.rng.uniform(-0.3,0.3),
-                              p=np.array([x,y,z]) + jitter(), v=np.zeros(3)))
+                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # biases near output column
         for j, b_id in b_ids.items():
             x = +1.1; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.03*self.rng.standard_normal()
             z = z_level + 0.15*self.rng.standard_normal()
             nodes.append(Node(id=b_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=np.array([x,y,z]) + jitter(), v=np.zeros(3)))
+                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # intermediates column
         for (i,j), m_id in mid_ids.items():
             x = +0.3; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.02*(i - 0.5*(self.n_in-1))
             z = z_level + 0.05*self.rng.standard_normal()
             nodes.append(Node(id=m_id, theta=0.0,
-                              p=np.array([x,y,z]) + jitter(), v=np.zeros(3)))
+                              p=AbstractTensor.array([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
 
         # --- wire edges & ops: m_ij = in_i * w_ij ; out_j = sum_i m_ij + b_j ---
         # mul edges + ops
@@ -1243,7 +1241,7 @@ def ascii_targets_for(phrase: str, out_ids: List[int]) -> Dict[int, Callable[[fl
 
 
 def build_toy_system(seed=0):
-    rng = np.random.default_rng(seed)
+    rng = AbstractTensor.random.default_rng(seed)
     nodes = []   # <- list, not dict
     edges = []   # <- list, not dict
     outputs = {}
@@ -1265,8 +1263,10 @@ def build_toy_system(seed=0):
 
     # Drive inputs
     def sin_at(freq, amp=0.4):
-        return lambda t, f=freq, a=amp: a * math.sin(f * t)
-    freqs = np.linspace(0.3, 1.1, len(lb.in_ids))
+        def _s(t, f=freq, a=amp):
+            return float((AbstractTensor.get_tensor(f * t).sin() * a).item())
+        return _s
+    freqs = AbstractTensor.linspace(0.3, 1.1, len(lb.in_ids))
     for nid, f in zip(lb.in_ids, freqs):
         sys.add_boundary(BoundaryPort(nid=nid, beta=0.8, force_fn=as_x_force(sin_at(f), D=sys.D)))
 
@@ -1303,7 +1303,7 @@ def main(duration_s: float = 8.0):
             # sample first few outputs
             sample = list(outputs.keys())
             errors = [sys.nodes[oid].theta - outputs[oid](t) for oid in sample]
-            mae = np.mean([abs(err) for err in errors])
+            mae = AbstractTensor.mean([abs(err) for err in errors])
             error_str = ''.join([f"{chr(int((err + 1) * 127.5))}" for err in errors])
             print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae: .3f}, Error Phrase: {error_str}")
             viz.step(0.5)

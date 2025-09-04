@@ -181,3 +181,68 @@ def run_batched_vjp(
         grads_full=grads_full,
         grads_per_source=grads_per_source,
     )
+
+
+def run_op_and_grads_cached(
+    sys: Any,
+    op_name: str,
+    src_ids: Sequence[int],
+    *,
+    scale: float = 1.0,
+    residual: Optional[float] = None,
+    cache: Optional[MutableMapping] = None,
+    backend: Any | None = None,
+    weight: Optional[str] = None,
+):
+    """Execute a simple op on node attributes with optional caching.
+
+    Currently supports scalar add and mul and returns a Python float forward
+    result alongside a tuple of per-source gradient scalars.  The cache, when
+    provided, expects the ``WhiteboardCache`` interface.
+    """
+    versions = [sys.nodes[i].version for i in src_ids]
+    feat_shape: Tuple[int, ...] = ()
+
+    key = None
+    if cache is not None:
+        key = cache.make_key(
+            op_name=op_name,
+            src_ids=src_ids,
+            versions=versions,
+            feat_shape=feat_shape,
+            weight=weight,
+            scale=scale,
+            residual=residual,
+            backend_tag=backend,
+        )
+        pkg = cache.get(key)
+        if pkg is not None:
+            return pkg
+
+    with whiteboard_tape():
+        xs = []
+        for i in src_ids:
+            t = AbstractTensor.tensor(sys.nodes[i].theta)
+            t.requires_grad_(True)
+            xs.append(t)
+        if op_name == "add":
+            y = xs[0]
+            for x in xs[1:]:
+                y = y + x
+        elif op_name == "mul":
+            y = xs[0]
+            for x in xs[1:]:
+                y = y * x
+        else:
+            raise NotImplementedError(f"op '{op_name}' not implemented")
+
+        y = y * scale
+        L = y if residual is None else y * residual
+        grads = autograd.grad(L, xs, allow_unused=False)
+
+    y_val = float(y.item() if hasattr(y, "item") else y)
+    g_vals = tuple(float(g.item() if hasattr(g, "item") else g) for g in grads)
+
+    if cache is not None and key is not None:
+        cache.put(key, (y_val, g_vals))
+    return y_val, g_vals

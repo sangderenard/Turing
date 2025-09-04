@@ -2271,6 +2271,7 @@ _bind_and_wrap({
     "isfinite": comp_isfinite,
     "isnan": comp_isnan,
     "isinf": comp_isinf,
+    "isinfinite": comp_isinf,
     "allclose": comp_allclose,
     "argwhere": comp_argwhere,
     "sin": trig_sin,

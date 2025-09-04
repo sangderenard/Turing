@@ -1,7 +1,6 @@
 # adapters_autograd_bridge.py
 
 from typing import Sequence, Tuple, Callable, Any
-import numpy as np
 
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
@@ -15,26 +14,26 @@ _BIN_ALIASES = {
     "pow":      lambda a, b: a ** b,
 }
 
-def _as_np(x: Any):
-    # unwrap AbstractTensor -> backend buffer -> numpy
+def _as_at(x: Any):
+    # unwrap AbstractTensor -> backend buffer -> tensor
     if isinstance(x, AbstractTensor):
         x = x.data
-    return np.asarray(x)
+    return AbstractTensor.asarray(x)
 
 def run_op_and_grads(
     op_name: str,
-    *np_inputs: np.ndarray,
+    *at_inputs: AbstractTensor,
     loss: Callable[[AbstractTensor], AbstractTensor] | str = "sum",
-) -> Tuple[np.ndarray, Tuple[np.ndarray, ...]]:
+) -> Tuple[AbstractTensor, Tuple[AbstractTensor, ...]]:
     """
-    Execute one forward op and return (forward_output_numpy, grads_per_input_numpy).
+    Execute one forward op and return (forward_output_tensor, grads_per_input_tensor).
 
     - op_name: name of the forward operator (e.g., "maximum", "relu", "sum", "add", "mul"...).
-    - np_inputs: numpy scalars/arrays.
+    - at_inputs: tensor scalars/arrays.
     - loss: "sum" (default) or a callable mapping the op output -> scalar loss tensor.
     """
-    # 1) wrap numpy -> AbstractTensor on the global tape with grads enabled
-    ats = [AbstractTensor.get_tensor(x, requires_grad=True) for x in np_inputs]  # attaches to tape
+    # 1) wrap tensor -> AbstractTensor on the global tape with grads enabled
+    ats = [AbstractTensor.get_tensor(x, requires_grad=True) for x in at_inputs]  # attaches to tape
     # 2) find and run the op
     if hasattr(AbstractTensor, op_name):              # e.g., maximum(x,y), sigmoid(x), sum(x)...
         fn = getattr(AbstractTensor, op_name)
@@ -55,9 +54,9 @@ def run_op_and_grads(
 
     # 4) differentiate w.r.t. the provided inputs, then read .grad
     autograd.grad(L, ats, retain_graph=False, allow_unused=True)
-    grads = tuple(_as_np(a.grad) for a in ats)
+    grads = tuple(_as_at(a.grad) for a in ats)
 
-    return _as_np(y), grads
+    return _as_at(y), grads
 
 
 # ---- bridge to your spring edges ------------------------------------------------
@@ -78,14 +77,14 @@ def push_impulses_from_op(
     residual: if you already have (y - target) locally, pass it; otherwise None.
     """
     # gather current scalar parameters from nodes
-    vals = [np.array(sys.nodes[i].theta, dtype=float) for i in src_ids]
+    vals = [AbstractTensor.array(sys.nodes[i].theta, dtype=float) for i in src_ids]
 
-    y_np, grads_np = run_op_and_grads(op_name, *vals)  # grads in same order as src_ids
+    y_at, grads_at = run_op_and_grads(op_name, *vals)  # grads in same order as src_ids
 
     # push impulses (classic "local jacobian^T * residual" pattern)
     if residual is not None:
-        for i, g in zip(src_ids, grads_np):
-            g_scalar = float(np.asarray(g))
+        for i, g in zip(src_ids, grads_at):
+            g_scalar = float(AbstractTensor.asarray(g))
             sys.impulse(i, out_id, op_name, scale * g_scalar * float(-residual))
 
-    return float(np.asarray(y_np))
+    return float(AbstractTensor.asarray(y_at))
