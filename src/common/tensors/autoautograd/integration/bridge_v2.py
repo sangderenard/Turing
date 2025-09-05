@@ -12,96 +12,31 @@ from ...linalg import norm as at_norm
 @dataclass(frozen=True)
 class _Job:
     job_id: str
-    op: str
+    op: Callable[[Any], Any]
     src_ids: tuple[int, ...]
+    op_args: Optional[Dict[str, Any]]
     residual: float | None
-    scale: float
+    scale: float | None
     weight: str | None
     backend_tag: Any = None
 
 
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
-# tokens we accept in op_args
-OpToken = Union[
-    str,                             # name of an AT tensor instance method: "sum", "mean", ...
-    Callable[[Any], Any],            # direct callable: lambda x: ...
-    Tuple[str, Tuple, Dict],         # ("sum", (args,), {"axis": 0})
-    Tuple[str, Tuple],               # ("sum", (args,))
-    Tuple[str, Dict],                # ("sum", {"axis": 0})
-    Tuple[str, Any],                 # ('add', c) | ('mul', c) sugar
-]
-
-def _compile_token(token: OpToken, *, AT: Any | None) -> Callable[[Any], Any]:
-    """Compile one token into f(x)->y. All validation happens HERE (not hot)."""
-    if callable(token):
-        def _f(x, _f=token): return _f(x)
-        return _f
-
-    if isinstance(token, str):
-        name = token
-        def _f(x, _name=name):
-            return getattr(x, _name)()
-        return _f
-
-    if isinstance(token, tuple) and token:
-        name = token[0]
-
-        # sugar for ('add', c) and ('mul', c)
-        if name in ("add", "mul") and len(token) == 2:
-            c = token[1]
-            k = AT.asarray(c) if (AT is not None and hasattr(AT, "asarray")) else c
-            if name == "add":
-                def _f(x, _k=k): return x + _k
-            else:
-                def _f(x, _k=k): return x * _k
-            return _f
-
-        # structured call with args/kwargs
-        args: Tuple = ()
-        kwargs: Dict[str, Any] = {}
-        if len(token) == 3 and isinstance(token[1], tuple) and isinstance(token[2], dict):
-            args, kwargs = token[1], token[2]
-        elif len(token) == 2 and isinstance(token[1], tuple):
-            args = token[1]
-        elif len(token) == 2 and isinstance(token[1], dict):
-            kwargs = token[1]
-        else:
-            raise ValueError(f"Unsupported op tuple form: {token!r}")
-
-        def _f(x, _name=name, _args=args, _kwargs=kwargs):
-            return getattr(x, _name)(* _args, ** _kwargs)
-        return _f
-
-    raise ValueError(f"Unsupported op token: {token!r}")
-
-def _normalize_chain(op_name: str, op_args: Optional[Union[OpToken, Sequence[OpToken]]], *, AT: Any | None):
+def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     """One-time normalization → list[callable]."""
-    name = str(op_name).lower()
-    defaults = {
-        "sum_k": ["sum"],    # reduce fully (or let backend default axes)
-        "prod_k": ["prod"],
-        "identity": [],
-    }
-    if op_args is None:
-        tokens: Sequence[OpToken] = defaults.get(name, [])
-    elif isinstance(op_args, (list, tuple)):
-        tokens = list(op_args)
-    else:
-        tokens = [op_args]
-    return tuple(_compile_token(tok, AT=AT) for tok in tokens)
+    
+    fns = [getattr(AbstractTensor, op, None) for op in ops]
+    return tuple(f for f in fns if callable(f))
 
 def _op_apply_factory(
-    op_name: str,
-    op_args: Optional[Union[OpToken, Sequence[OpToken]]] = None,
-    *,
-    AT: Any | None = None,     # pass your AbstractTensor module/class if you want constant lifting
+    ops: Sequence[str], args: Optional[Sequence[Dict]] = None
 ) -> Callable[[Any], Any]:
     """
     Build a tiny, ultra-hot f(x)->y that applies a precompiled chain.
     No getattr/validation in hot path.
     """
-    chain = _normalize_chain(op_name, op_args, AT=AT)
+    chain = _normalize_chain(ops)
     if not chain:
         def _apply_identity(x): return x
         return _apply_identity
@@ -109,8 +44,8 @@ def _op_apply_factory(
     chain_local = chain  # closure binding
     def _apply(x, _chain=chain_local):
         y = x
-        for f in _chain:
-            y = f(y)
+        for i, f in enumerate(_chain):
+            y = f(y, **(args[i] if args and i < len(args) and isinstance(args[i], dict) else {}))
         return y
     return _apply
 
@@ -145,9 +80,12 @@ def push_impulses_from_op_v2(
     if weight == "inv_length":
         scale *= _inv_length_scale(sys, out_id, src_ids)
 
+    
+
     job = _Job(
         job_id=f"{op_name}:{tuple(src_ids)}->{out_id}",
-        op=str(op_name),
+        op=getattr(AbstractTensor, op_name),
+        op_args=op_args,
         src_ids=tuple(int(i) for i in src_ids),
         residual=None if residual is None else float(residual),
         scale=float(scale),
@@ -157,9 +95,7 @@ def push_impulses_from_op_v2(
     def get_attr(i: int):
         return sys.nodes[i].theta
 
-    op_apply = _op_apply_factory(op_name, op_args)
-
-    batch = run_batched_vjp(sys=sys, jobs=(job,), op_apply=op_apply, get_attr=get_attr, backend=None)
+    batch = run_batched_vjp(sys=sys, jobs=(job,), get_attr=get_attr, backend=None)
     y = batch.ys[0]
     grads = batch.grads_per_source[0]
     y_host = float(getattr(y, "item_", lambda: y)()) if hasattr(y, "item_") else float(y)
@@ -198,12 +134,11 @@ def batched_forward_v2(
     ys_buffer: Dict[int, Any] = {}
     for (op_name, key_args), items in by_op.items():
         op_args = {k: v for (k, v) in (key_args or ())} if key_args is not None else None
-        op_apply = _op_apply_factory(op_name, op_args)
         jobs: List[_Job] = []
         for idx, src_ids, out_id, _args in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, src_ids=src_ids, residual=None, scale=sc, weight=weight))
-        batch = run_batched_vjp(sys=sys, jobs=jobs, op_apply=op_apply, get_attr=get_attr, backend=None)
+            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, op_args=op_args, src_ids=src_ids, residual=None, scale=sc, weight=weight))
+        batch = run_batched_vjp(sys=sys, jobs=jobs, get_attr=get_attr, backend=None)
         for (idx, _src, _out, _args), y in zip(items, batch.ys):
             ys_buffer[idx] = y
     for i in range(len(specs)):
@@ -239,14 +174,13 @@ def push_impulses_from_ops_batched(
 
     for (op_name, key_args), items in by_op.items():
         op_args = {k: v for (k, v) in (key_args or ())} if key_args is not None else None
-        op_apply = _op_apply_factory(op_name, op_args)
         jobs: List[_Job] = []
         scales: List[float] = []
         for idx, src_ids, out_id, r, _args in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
             scales.append(sc)
-            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, src_ids=src_ids, residual=r, scale=sc, weight=weight))
-        batch = run_batched_vjp(sys=sys, jobs=jobs, op_apply=op_apply, get_attr=get_attr, backend=None)
+            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, op_args=op_args, src_ids=src_ids, residual=r, scale=sc, weight=weight))
+        batch = run_batched_vjp(sys=sys, jobs=jobs, get_attr=get_attr, backend=None)
         for (idx, src_ids, out_id, r, _args), y, grads, sc in zip(items, batch.ys, batch.grads_per_source, scales):
             ys_out[idx] = y
             for i, g in zip(src_ids, grads):

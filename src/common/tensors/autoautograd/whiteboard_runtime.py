@@ -50,8 +50,7 @@ def _reduce_per_source(g: Any) -> Tuple[float, ...]:
 def run_batched_vjp(
     *,
     sys: Any,
-    jobs: Sequence[Any],                 # expects: job_id, src_ids, residual
-    op_name: str,                        # tensor method/property to call
+    jobs: Sequence[Any],                 # expects: job_id, src_ids, residual                        # tensor method/property to call
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
     get_attr: Callable[[int], Any],      # e.g., lambda i: sys.nodes[i].theta
@@ -66,7 +65,7 @@ def run_batched_vjp(
     Then L = sum_j <residual_j, y_j> and grads = dL/dx_j for all j via a single autograd.grad.
     """
     op_kwargs = op_kwargs or {}
-
+    op_name = jobs[0].op if jobs else ""
     if not jobs:
         return BatchVJPResult(
             slices=BatchSlices(index_of={}, job_ids=()),

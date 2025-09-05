@@ -81,7 +81,7 @@ def interpret_vec(v: AbstractTensor) -> float:
 def inv_weight(sys: SpringRepulsorSystem, src: int, dst: int) -> float:
     d = float(AbstractTensor.linalg.norm(sys.nodes[dst].p - sys.nodes[src].p))
     w = 1.0 / (W_EPS + d)
-    return float(AbstractTensor.clip(w, W_MIN, W_MAX))
+    return float(AbstractTensor.get_tensor(w).clip(W_MIN, W_MAX))
 
 def norm_weights(ws):
     s = float(sum(ws))
@@ -101,6 +101,24 @@ def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
     # Smooth transition within knee
     a = (x - lo) / max(knee, 1e-6)
     return x + ((1.0 / max(ratio, 1e-6) - 1.0) * (x - th)) * a * (2 - a)
+
+# ----------------------------- Boundary helpers ------------------------------
+
+def attach_dirichlet(sys: 'SpringRepulsorSystem', nid: int,
+                     value_fn: Callable[[float], float],
+                     *, D: Optional[int] = None, alpha: float = 2.0) -> None:
+    """Clamp node `nid` by a Dirichlet spring on x, target = value_fn(t)."""
+    D = sys.D if D is None else int(D)
+    sys.add_boundary(BoundaryPort(nid=nid, alpha=alpha, target_fn=as_x_target(value_fn, D)))
+
+def attach_neumann_noop(sys: 'SpringRepulsorSystem', nid: int,
+                        *, D: Optional[int] = None, beta: float = 1.0) -> None:
+    """Attach a traction-capable boundary that exerts no force (pass-through)."""
+    D = sys.D if D is None else int(D)
+    sys.add_boundary(BoundaryPort(nid=nid, beta=beta, force_fn=as_x_force(lambda _t: 0.0, D)))
+
+def _fresh_node_id(sys: 'SpringRepulsorSystem') -> int:
+    return (max(sys.nodes.keys()) + 1) if sys.nodes else 0
 
 def enliven_feature_edges(sys: SpringRepulsorSystem, in_ids: List[int], out_ids: List[int]):
     # seed physical ties so forces/learning can flow
@@ -203,7 +221,7 @@ class Edge:
             # AFTER
             y = soft_knee(b.m, b.th, b.ratio, b.knee)
             sgn = 1.0 if MAGNITUDE_ONLY else AbstractTensor.sign(b.s)
-            dl = float(AbstractTensor.clip(b.kappa * sgn * y, -DL_CAP, DL_CAP))
+            dl = float(AbstractTensor.get_tensor(b.kappa * sgn * y).clip(-DL_CAP, DL_CAP))
             self.spring.add(dl)
 
 
@@ -225,7 +243,7 @@ class Edge:
           spring.consume by adding an equal-and-opposite transient (-sgn * POP_QUANTUM)
         """
         # current target uses cached _last_reduce set by target_length() this tick
-        L_star = float(AbstractTensor.clip(self.l0 + self._last_reduce, L_MIN, L_MAX))
+        L_star = float(AbstractTensor.get_tensor(self.l0 + self._last_reduce).clip(L_MIN, L_MAX))
         frustration = abs(L_current - L_star)
         agg_mag = abs(self._last_reduce)
         if frustration < POP_FRUSTRATION_TH or agg_mag < POP_AGG_TH:
@@ -268,6 +286,8 @@ class SpringRepulsorSystem:
         self.edge_locks: Dict[Tuple[int, int, str], threading.Lock] = defaultdict(threading.Lock)
         self.boundaries: Dict[int, BoundaryPort] = {}
         self.D = int(next(iter(self.nodes.values())).p.shape[0])
+        # loop-back loss plumbing (optional)
+        self.feedback_edge: Optional[Tuple[int, int, str]] = None
 
     def add_boundary(self, port: BoundaryPort):
         self.boundaries[port.nid] = port
@@ -301,6 +321,10 @@ class SpringRepulsorSystem:
         with self.edge_locks[key]:
             e.ingest_impulse(g_scalar, self.dt)
 
+    def set_feedback_edge(self, src: int, dst: int, op_id: str = "loss_fb") -> None:
+        """Arm a single ring edge that will receive global loss impulses."""
+        self.feedback_edge = (int(src), int(dst), str(op_id))
+
     # ----------------- Physics tick -----------------
     def tick(self):
         # Force accumulator
@@ -317,7 +341,7 @@ class SpringRepulsorSystem:
                 continue
             u = d / (L + 1e-12)
             Lstar = e.target_length()  # also caches _last_reduce
-            Ksum = AbstractTensor.sum(b.K for b in e.bands)
+            Ksum = AbstractTensor.get_tensor([b.K for b in e.bands]).sum()
             Fel = Ksum * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
             F[e.i] += (Fel - Rep) * scale
@@ -454,8 +478,8 @@ class SpringRepulsorSystem:
             return w0[b_lo], w0[min(b_hi, len(w0)-1)]
 
         def w_to_hi_idx(wlo, whi):
-            i0 = int(AbstractTensor.clip(AbstractTensor.searchsorted(wz, wlo, side="left"), 0, len(wz)-1))
-            i1 = int(AbstractTensor.clip(AbstractTensor.searchsorted(wz, whi, side="right"), 0, len(wz)))
+            i0 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, wlo, side="left")).clip(0, len(wz)-1)
+            i1 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, whi, side="right")).clip(0, len(wz))
             return i0, max(i1, i0+1)
 
         # --- 3) build high-res rotation bivector across active bands ---
@@ -536,12 +560,14 @@ class LiveVizGLPoints:
         self._num_points = 0
 
         self._u_mvp = None  # uniform location
-        self._mvp = AbstractTensor.eye(4, dtype=AbstractTensor.float32)  # updated each frame
+        tensor = AbstractTensor.get_tensor(0)
+        dtype = tensor.get_dtype()
+        self._mvp = AbstractTensor.eye(4, dtype=dtype)  # updated each frame
 
     # ---------- data snapshot ----------
     def _snapshot(self):
         # lock-free minimal copy
-        nodes = {i: (AbstractTensor.asarray(n.p, dtype=AbstractTensor.float32).copy(), float(n.theta))
+        nodes = {i: (AbstractTensor.get_tensor(n.p), float(n.theta))
                  for i, n in self.sys.nodes.items()}
         bset = set(self.sys.boundaries.keys())
         return nodes, bset
@@ -1092,28 +1118,112 @@ class Experiencer(threading.Thread):
         t0 = now_s()
         while not self.stop.is_set():
             t = now_s() - t0
-            # 1) Update intermediate mul ops (write outputs), no impulses
-            for (name, srcs, out) in self.ops_program:
-                if str(name).lower() in ("mul", "prod", "mul2", "prod_k"):
-                    _ = Ops.call(self.sys, name, srcs, out, residual=None, write_out=True, scale=0.0)
-
+            
             # 2) Batched forward + impulses for outputs with targets
-            out_specs: list[tuple[str, list[int], int]] = []
-            for (name, srcs, out) in self.ops_program:
+            out_specs: list[tuple[str, list[int], int, Optional[dict]]] = []
+            for (name, srcs, out, args) in self.ops_program:
                 if out in self.outputs:
-                    out_specs.append((name, srcs, out))
+                    out_specs.append((name, srcs, out, args))
             if out_specs:
                 ys_hat = batched_forward_v2(self.sys, out_specs, weight=None, scale=0.1)
                 residuals: list[float] = []
-                for (name, srcs, out), y_hat in zip(out_specs, ys_hat):
+                for (name, srcs, out, args), y_hat in zip(out_specs, ys_hat):
                     target = self.outputs.get(out)
                     r = float(y_hat) - float(target(t)) if target is not None else 0.0
                     residuals.append(r)
                 ys = push_impulses_from_ops_batched(self.sys, out_specs, residuals, weight=None, scale=0.1)
-                for (name, srcs, out), y in zip(out_specs, ys):
+                for (name, srcs, out, args), y in zip(out_specs, ys):
                     self.sys.nodes[out].theta = float(y)
+                # Close the loop: push a scalar loss impulse around the ring
+                if self.sys.feedback_edge is not None and residuals:
+                    L = 0.0
+                    for r in residuals:
+                        L += 0.5 * float(r) * float(r)
+                    i, j, op_id = self.sys.feedback_edge
+                    try:
+                        self.sys.impulse(i, j, op_id, g_scalar=L)
+                    except Exception:
+                        pass
             time.sleep(self.dt)
 
+
+# ----------------------------- High-level wiring -----------------------------
+
+def build_dirichlet_neumann_pipeline(
+    sys: 'SpringRepulsorSystem',
+    X_batch,                  # shape (B, Fin) – any AbstractTensor-ish
+    y_batch,                  # shape (B, Fout)
+    in_ids: List[int],        # node ids for inputs (one per feature)
+    *,
+    layers: int = 1,
+    alpha_in: float = 2.0,
+    beta_link: float = 1.0,
+    alpha_out: float = 2.0,
+) -> Tuple[List[Tuple[str, List[int], int]], Dict[int, Callable[[float], float]]]:
+    """
+    Wire the system as:
+      Dirichlet(input_feature_mean) -> (edge) -> Neumann(noop) -> ... L layers (gather) ...
+      -> Neumann(noop) -> (edge) -> Dirichlet(output_target)
+      and arm a loop-back loss edge from last Neumann to first Neumann.
+    Returns (ops_program, outputs_map) for the Experiencer.
+    """
+    AT = AbstractTensor
+    shape_x = getattr(X_batch, "shape", (0, 0))
+    shape_y = getattr(y_batch, "shape", (0, 0))
+    B, Fin = (int(shape_x[0]), int(shape_x[1])) if len(shape_x) >= 2 else (0, 0)
+    _B2, Fout = (int(shape_y[0]), int(shape_y[1])) if len(shape_y) >= 2 else (0, 0)
+    D = sys.D
+
+    # 1) Input anchors (Dirichlet) at batch means; bridge to noop-Neumann nodes
+    means_in = [float(AT.get_tensor(X_batch[:, f]).mean()) for f in range(Fin)] if Fin > 0 else []
+    in_bridge_neu: list[int] = []
+    for nid, m in zip(in_ids, means_in):
+        attach_dirichlet(sys, nid, lambda _t, m=m: m, D=D, alpha=alpha_in)
+        neu = _fresh_node_id(sys)
+        sys.nodes[neu] = Node(id=neu, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
+        attach_neumann_noop(sys, neu, D=D, beta=beta_link)
+        sys.ensure_edge(nid, neu, "in_link")
+        in_bridge_neu.append(neu)
+
+    # 2) Middle: stack 'layers' of gather; each new row gathers all previous
+    ops_program: List[Tuple[str, List[int], int]] = []
+    prev_row = in_bridge_neu if in_bridge_neu else list(in_ids)
+    for _ in range(max(0, int(layers))):
+        next_row: List[int] = []
+        if not prev_row:
+            break
+        # one output per previous node (keeps the row width stable & easy)
+        for _k in range(len(prev_row)):
+            out = _fresh_node_id(sys)
+            sys.nodes[out] = Node(id=out, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
+            ops_program.append(("sum_k", prev_row, out))
+            next_row.append(out)
+        prev_row = next_row
+
+    # 3) Outputs: for each last-row unit, Neumann(noop) -> Dirichlet(target)
+    means_out = [float(AT.get_tensor(y_batch[:, f]).mean()) for f in range(Fout)] if Fout > 0 else []
+    outputs: Dict[int, Callable[[float], float]] = {}
+    last_neu: List[int] = []
+    for src, y_m in zip(prev_row, means_out):
+        neu = _fresh_node_id(sys)
+        sys.nodes[neu] = Node(id=neu, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
+        attach_neumann_noop(sys, neu, D=D, beta=beta_link)
+        sys.ensure_edge(src, neu, "out_link")
+        # Dirichlet anchor to the target location (x := mean target)
+        anchor = _fresh_node_id(sys)
+        sys.nodes[anchor] = Node(id=anchor, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
+        attach_dirichlet(sys, anchor, lambda _t, y=y_m: y, D=D, alpha=alpha_out)
+        sys.ensure_edge(neu, anchor, "readout")
+        # The Experiencer's supervised target for this output is the same scalar
+        outputs[neu] = (lambda _t, y=y_m: y)
+        last_neu.append(neu)
+
+    # 4) Loss loop: last Neumann → first Neumann
+    if last_neu and in_bridge_neu:
+        sys.ensure_edge(last_neu[-1], in_bridge_neu[0], "loss_fb")
+        sys.set_feedback_edge(last_neu[-1], in_bridge_neu[0], op_id="loss_fb")
+
+    return ops_program, outputs
 
 # ----------------------------- Demo -----------------------------------------
 
@@ -1151,6 +1261,7 @@ class LinearBlockFactory:
         return Edge(key=(i, j, op), i=i, j=j, op_id=op, bands=bands, l0=1.0)
 
     def build(self, start_id: int = 0, *, z_level: float = 0.0) -> LinearBlock:
+        from .integration.bridge_v2 import _op_apply_factory
         nid = int(start_id)
         nodes: List[Node] = []
         edges: List[Edge] = []
@@ -1207,21 +1318,18 @@ class LinearBlockFactory:
             nodes.append(Node(id=m_id, theta=0.0,
                               p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
 
-        # --- wire edges & ops: m_ij = in_i * w_ij ; out_j = sum_i m_ij + b_j ---
-        # mul edges + ops
-        for j in range(self.n_out):
-            for i in range(self.n_in):
-                ii = in_ids[i]; wij = w_ids[(i,j)]; mij = mid_ids[(i,j)]
-                edges.append(self._mk_edge(ii,  mij, "mul"))
-                edges.append(self._mk_edge(wij, mij, "mul"))
-                ops.append(("mul", [ii, wij], mij))
-        # gather edges + ops per output j
+
         for j in range(self.n_out):
             srcs = [mid_ids[(i,j)] for i in range(self.n_in)] + [b_ids[j]]
             oj = out_ids[j]
             for s in srcs:
                 edges.append(self._mk_edge(s, oj, "gather_and"))
-            ops.append(("gather_and", srcs, oj))
+            args = {
+                "indices": srcs,
+                "dim": 0,
+                "fn": _op_apply_factory(["__add__", "__mul__"]),
+            }
+            ops.append(("gather_and", srcs, oj, args))
 
         return LinearBlock(
             base_id=start_id,

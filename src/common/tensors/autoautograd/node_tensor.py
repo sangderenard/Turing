@@ -25,21 +25,8 @@ class BackendPolicy(Protocol):
     def pre_commit(self, view: "NodeAttrView") -> None: ...
     def post_commit(self, view: "NodeAttrView") -> None: ...
 
-# Sensible AbstractTensor policy (works for plain arrays & array-likes)
-class NumpyPolicy:
-    def asarray(self, x: Any) -> Any:
-        return AbstractTensor.asarray(x)
-    def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
-        return AbstractTensor.stack(xs, axis=axis)
-    def getter(self, node: Any, attr: str) -> Any:
-        return getattr(node, attr) if hasattr(node, attr) else node[attr]
-    def setter(self, node: Any, attr: str, value: Any) -> None:
-        if hasattr(node, attr): setattr(node, attr, value)
-        else: node[attr] = value
-    # Optional hooks: omit for defaults
-
 # Example AbstractTensor-ish policy (adjust to your API as needed)
-class AbstractTensorPolicy(NumpyPolicy):
+class AbstractTensorPolicy(BackendPolicy):
     """
     Falls back to AbstractTensor for stack/asarray if your AbstractTensor lacks them.
     Swap in your real constructors (e.g., AbstractTensor.stack / from_AbstractTensor).
@@ -47,30 +34,9 @@ class AbstractTensorPolicy(NumpyPolicy):
     def __init__(self, AT):
         self.AT = AT
     def asarray(self, x: Any) -> Any:
-        # Prefer existing AbstractTensor values; otherwise wrap AbstractTensor
-        if isinstance(x, self.AT):
-            return x
-        if hasattr(self.AT, "AbstractTensor"):
-            return self.AT.AbstractTensor(AbstractTensor.asarray(x))
-        return AbstractTensor.asarray(x)
+        return AbstractTensor.get_tensor(x)
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
-        if hasattr(self.AT, "stack"):
-            try:
-                return self.AT.stack(xs, axis=axis)
-            except TypeError:
-                # Some backends expose stack(xs, axis) without keyword support
-                return self.AT.stack(xs, axis)
-        # Fallback: build an AbstractTensor by stacking underlying data
-        arrs: list[Any] = []
-        for x in xs:
-            if isinstance(x, self.AT):
-                arrs.append(getattr(x, "data", x))
-            else:
-                arrs.append(AbstractTensor.asarray(x))
-        stacked = AbstractTensor.stack(arrs, axis=axis)
-        t = self.AT(track_time=False, tape=getattr(xs[0], "_tape", None))
-        t.data = stacked
-        return t
+        return AbstractTensor.stack(xs, dim=axis)
 
     def scatter_row(self, node: Any, attr: str, row_value: Any) -> None:
         tensor = self.getter(node, attr)
@@ -132,10 +98,8 @@ class NodeAttrView:
                     sample = getattr(first, self.attr) if hasattr(first, self.attr) else first[self.attr]
                 except Exception:
                     sample = None
-            if AbstractTensor is not None and isinstance(sample, AbstractTensor):
-                pol = AbstractTensorPolicy(AbstractTensor)
-            else:
-                pol = NumpyPolicy()
+            pol = AbstractTensorPolicy(AbstractTensor)
+
         def choose(name, local):
             if self.policy_overrides:
                 # Prefer backend policy if it implements the method; else local; else AbstractTensor default
