@@ -11,7 +11,7 @@ import math
 import logging
 from src.common.tensors.coo_matrix import COOMatrix
 import numpy as np
-
+from typing import Optional
 
 # Configure the logger at the module level
 logger = logging.getLogger(__name__)
@@ -33,6 +33,52 @@ if not logger.handlers:
 
 from .local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_LAPLACEBELTRAMI_STENCIL
 from src.common.index_composer.indexcomposer import GeneralIndexComposer
+
+
+class BuildGraphLaplace:
+    """Construct a graph Laplacian using ``AbstractTensor`` primitives.
+
+    Parameters
+    ----------
+    adjacency:
+        Symmetric adjacency matrix of shape ``(V, V)`` describing the graph
+        connectivity.
+    """
+
+    def __init__(self, adjacency: AbstractTensor):
+        A = AbstractTensor.get_tensor(adjacency)
+        if A.ndim != 2 or A.shape[0] != A.shape[1]:
+            raise ValueError("adjacency must be a square matrix")
+        self.adjacency = A
+        self.n = A.shape[0]
+        self.degree: Optional[AbstractTensor] = None
+
+    def build(self):
+        """Return dense and COO representations of the Laplacian."""
+        A = self.adjacency
+        deg = A.sum(-1)
+        L = AbstractTensor.diag(deg) - A
+
+        rows: list[int] = []
+        cols: list[int] = []
+        vals: list[float] = []
+        for i in range(self.n):
+            for j in range(self.n):
+                val = L[i, j]
+                if val != 0:
+                    rows.append(i)
+                    cols.append(j)
+                    vals.append(val)
+
+        edge_index = AbstractTensor.stack([
+            AbstractTensor.tensor(rows, dtype=AbstractTensor.long_dtype_),
+            AbstractTensor.tensor(cols, dtype=AbstractTensor.long_dtype_),
+        ], dim=0)
+        edge_weight = AbstractTensor.tensor(vals, dtype=A.dtype)
+        coo = COOMatrix(edge_index, edge_weight, (self.n, self.n))
+        self.degree = deg
+        return L, coo, {"degree": deg}
+
 
 class BuildLaplace3D:
     def __init__(self, grid_domain, wave_speed=343, precision=AbstractTensor.float_dtype_, resolution=68,

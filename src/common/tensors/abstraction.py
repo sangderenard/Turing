@@ -1906,7 +1906,30 @@ class AbstractF:
                     )
             return AbstractTensor.get_tensor(out)
 
+    @staticmethod
+    def filtered_poisson(
+        rhs,
+        *,
+        iterations: int = 50,
+        filter_strength: float = 0.0,
+        mode: str = "manifold",
+        adjacency=None,
+    ):
+        """Solve a Poisson problem with optional RHS smoothing."""
+        from .filtered_poisson import (
+            filtered_poisson as _filtered_poisson,
+        )
 
+        rhs = AbstractTensor.get_tensor(rhs)
+        if adjacency is not None:
+            adjacency = AbstractTensor.get_tensor(adjacency, like=rhs)
+        return _filtered_poisson(
+            rhs,
+            iterations=iterations,
+            filter_strength=filter_strength,
+            mode=mode,
+            adjacency=adjacency,
+        )
 
 # Attach to AbstractTensor
 AbstractTensor.F = AbstractF

@@ -136,6 +136,7 @@ This document groups available methods by theme for quick reference.
 
 ## Functional Interface
 - AbstractF.interpolate()
+- AbstractF.filtered_poisson()
 
 ## Module-Level Helpers
 - register_conversion()
