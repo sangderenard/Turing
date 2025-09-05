@@ -995,7 +995,30 @@ class Random:
         for i in reversed(range(1, len(x))):
             j = int(next(self._gen) * (i + 1))
             x[i], x[j] = x[j], x[i]
+    
+    def standard_normal(self, size=None):
+        """Draw samples from N(0, 1).
 
+        Returns a Python float when ``size`` is ``None``.  When a shape is
+        provided, an :class:`AbstractTensor` of that shape is populated with
+        Gaussian values generated from this instance's underlying RNG.
+        """
+        if size is None:
+            return self.gauss()
+
+        if isinstance(size, int):
+            size = (size,)
+
+        total = 1
+        for s in size:
+            total *= s
+        vals = [self.gauss() for _ in range(total)]
+
+        from ..abstraction import AbstractTensor
+
+        t = AbstractTensor.get_tensor(vals)
+        return t.reshape(*size)
+    
     def sample(self, population, k):
         if k > len(population):
             raise ValueError("Sample larger than population")

@@ -79,9 +79,10 @@ def random_tensor(size: Tuple[int, ...], device: Any = None, scope: Tuple[Any, .
             kwargs['kind'] = RANDOM_KIND.CSPRNG
     rng = random_generator(**kwargs)
     
-    vals = [next(rng) for _ in range(total)]
-    
-
+    vals = next(rng)
+    if not isinstance(vals, list):
+        vals = [vals]
+        
     with _CreationTapeCtx(requires_grad=requires_grad, tape=tape):
         inst = cls(track_time=False)
         inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)

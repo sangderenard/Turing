@@ -216,7 +216,7 @@ class Edge:
         # cache current transient aggregate, then clamp total target length
         agg = self.spring.reduce()
         self._last_reduce = float(agg)
-        return float(AbstractTensor.clip(self.l0 + agg, L_MIN, L_MAX))
+        return float(AbstractTensor.get_tensor(self.l0 + agg).clip(L_MIN, L_MAX))
 
     def maybe_pop(self, L_current: float):
         """
