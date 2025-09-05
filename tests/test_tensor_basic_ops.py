@@ -95,6 +95,14 @@ def test_transpose_invalid_indices(backend_name, Backend):
 
 
 @pytest.mark.parametrize("backend_name,Backend", BACKENDS)
+def test_T_is_transpose_alias(backend_name, Backend):
+    t = Backend.tensor([[1, 2, 3], [4, 5, 6]])
+    alias = t.T()
+    transposed = t.transpose(-2, -1)
+    assert alias.tolist() == transposed.tolist()
+
+
+@pytest.mark.parametrize("backend_name,Backend", BACKENDS)
 def test_swapaxes_negative_indices(backend_name, Backend):
     t = Backend.tensor([[1, 2, 3], [4, 5, 6]])
     neg = t.swapaxes(-2, -1)
