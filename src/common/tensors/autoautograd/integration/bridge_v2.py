@@ -12,16 +12,17 @@ from ...linalg import norm as at_norm
 @dataclass(frozen=True)
 class _Job:
     job_id: str
-    op: Callable[[Any], Any]
+    op: str
     src_ids: tuple[int, ...]
-    op_args: Optional[Dict[str, Any]]
+    op_args: Optional[Tuple[Any, ...]]
+    op_kwargs: Optional[Dict[str, Any]]
     residual: float | None
     scale: float | None
     weight: str | None
     backend_tag: Any = None
 
 
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     """One-time normalization → list[callable]."""
@@ -74,7 +75,8 @@ def push_impulses_from_op_v2(
     scale: float = 1.0,
     weight: str | None = None,
     cache: WhiteboardCache | None = None,
-    op_args: Optional[Dict[str, Any]] = None,
+    op_args: Optional[Tuple[Any, ...]] = None,
+    op_kwargs: Optional[Dict[str, Any]] = None,
 ) -> float:
     """Single op call via batched VJP; preserved for compatibility."""
     if weight == "inv_length":
@@ -84,8 +86,9 @@ def push_impulses_from_op_v2(
 
     job = _Job(
         job_id=f"{op_name}:{tuple(src_ids)}->{out_id}",
-        op=getattr(AbstractTensor, op_name),
-        op_args=op_args,
+        op=str(op_name),
+        op_args=tuple(op_args) if op_args is not None else None,
+        op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
         src_ids=tuple(int(i) for i in src_ids),
         residual=None if residual is None else float(residual),
         scale=float(scale),
@@ -95,7 +98,14 @@ def push_impulses_from_op_v2(
     def get_attr(i: int):
         return sys.nodes[i].theta
 
-    batch = run_batched_vjp(sys=sys, jobs=(job,), get_attr=get_attr, backend=None)
+    batch = run_batched_vjp(
+        sys=sys,
+        jobs=(job,),
+        op_args=job.op_args or (),
+        op_kwargs=job.op_kwargs,
+        get_attr=get_attr,
+        backend=None,
+    )
     y = batch.ys[0]
     grads = batch.grads_per_source[0]
     y_host = float(getattr(y, "item_", lambda: y)()) if hasattr(y, "item_") else float(y)
@@ -113,33 +123,54 @@ def batched_forward_v2(
     weight: str | None = None,
     scale: float = 1.0,
 ) -> List[Any]:
-    """Forward-only for specs of form (op_name, src_ids, out_id[, op_args]), grouped by (op,args)."""
+    """Forward-only for specs of form `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = []
-    by_op: Dict[Tuple[str, Tuple[Tuple[str, Any], ...] | None], List[Tuple[int, Tuple[int, ...], int, Optional[Dict[str, Any]]]]] = {}
+    by_op: Dict[
+        Tuple[str, Optional[Tuple[Any, ...]], Optional[Tuple[Tuple[str, Any], ...]]],
+        List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
+    ] = {}
     for idx, spec in enumerate(specs):
-        if len(spec) >= 4:
-            op_name, src_ids, out_id, op_args = spec[0], spec[1], spec[2], spec[3]
-        else:
-            op_name, src_ids, out_id = spec
-            op_args = None
-        key_args: Optional[Tuple[Tuple[str, Any], ...]] = None
-        if isinstance(op_args, dict):
-            key_args = tuple(sorted((str(k), tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in op_args.items()))
-        key = (str(op_name), key_args)
-        by_op.setdefault(key, []).append((idx, tuple(int(i) for i in src_ids), int(out_id), op_args))
+        op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
+        op_args = tuple(op_args) if isinstance(op_args, (list, tuple)) else None
+        key_kwargs: Optional[Tuple[Tuple[str, Any], ...]] = None
+        if isinstance(op_kwargs, dict):
+            key_kwargs = tuple(sorted((str(k), v) for k, v in op_kwargs.items()))
+        key = (str(op_name), op_args, key_kwargs)
+        by_op.setdefault(key, []).append(
+            (idx, tuple(int(i) for i in src_ids), int(out_id), op_args, op_kwargs if isinstance(op_kwargs, dict) else None)
+        )
 
     def get_attr(i: int):
         return sys.nodes[i].theta
 
     ys_buffer: Dict[int, Any] = {}
-    for (op_name, key_args), items in by_op.items():
-        op_args = {k: v for (k, v) in (key_args or ())} if key_args is not None else None
+    for (op_name, key_args, key_kwargs), items in by_op.items():
+        op_args = key_args or ()
+        op_kwargs = {k: v for (k, v) in (key_kwargs or ())} if key_kwargs is not None else None
         jobs: List[_Job] = []
-        for idx, src_ids, out_id, _args in items:
+        for idx, src_ids, out_id, _args, _kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, op_args=op_args, src_ids=src_ids, residual=None, scale=sc, weight=weight))
-        batch = run_batched_vjp(sys=sys, jobs=jobs, get_attr=get_attr, backend=None)
-        for (idx, _src, _out, _args), y in zip(items, batch.ys):
+            jobs.append(
+                _Job(
+                    job_id=f"{op_name}:{src_ids}->{out_id}",
+                    op=op_name,
+                    src_ids=src_ids,
+                    op_args=op_args,
+                    op_kwargs=op_kwargs,
+                    residual=None,
+                    scale=sc,
+                    weight=weight,
+                )
+            )
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=jobs,
+            op_args=op_args,
+            op_kwargs=op_kwargs,
+            get_attr=get_attr,
+            backend=None,
+        )
+        for (idx, _src, _out, _args, _kwargs), y in zip(items, batch.ys):
             ys_buffer[idx] = y
     for i in range(len(specs)):
         ys_out.append(ys_buffer[i])
@@ -154,34 +185,57 @@ def push_impulses_from_ops_batched(
     weight: str | None = None,
     scale: float = 1.0,
 ) -> List[Any]:
-    """Batched impulse push for specs (op_name, src_ids, out_id[, op_args])."""
+    """Batched impulse push for specs `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = [None] * len(specs)
-    by_op: Dict[Tuple[str, Tuple[Tuple[str, Any], ...] | None], List[Tuple[int, Tuple[int, ...], int, float, Optional[Dict[str, Any]]]]] = {}
+    by_op: Dict[
+        Tuple[str, Optional[Tuple[Any, ...]], Optional[Tuple[Tuple[str, Any], ...]]],
+        List[Tuple[int, Tuple[int, ...], int, float, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
+    ] = {}
     for idx, (spec, r) in enumerate(zip(specs, residuals)):
-        if len(spec) >= 4:
-            op_name, src_ids, out_id, op_args = spec[0], spec[1], spec[2], spec[3]
-        else:
-            op_name, src_ids, out_id = spec
-            op_args = None
-        key_args: Optional[Tuple[Tuple[str, Any], ...]] = None
-        if isinstance(op_args, dict):
-            key_args = tuple(sorted((str(k), tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in op_args.items()))
-        key = (str(op_name), key_args)
-        by_op.setdefault(key, []).append((idx, tuple(int(i) for i in src_ids), int(out_id), float(r), op_args))
+        op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
+        op_args = tuple(op_args) if isinstance(op_args, (list, tuple)) else None
+        key_kwargs: Optional[Tuple[Tuple[str, Any], ...]] = None
+        if isinstance(op_kwargs, dict):
+            key_kwargs = tuple(sorted((str(k), v) for k, v in op_kwargs.items()))
+        key = (str(op_name), op_args, key_kwargs)
+        by_op.setdefault(key, []).append(
+            (idx, tuple(int(i) for i in src_ids), int(out_id), float(r), op_args, op_kwargs if isinstance(op_kwargs, dict) else None)
+        )
 
     def get_attr(i: int):
         return sys.nodes[i].theta
 
-    for (op_name, key_args), items in by_op.items():
-        op_args = {k: v for (k, v) in (key_args or ())} if key_args is not None else None
+    for (op_name, key_args, key_kwargs), items in by_op.items():
+        op_args = key_args or ()
+        op_kwargs = {k: v for (k, v) in (key_kwargs or ())} if key_kwargs is not None else None
         jobs: List[_Job] = []
         scales: List[float] = []
-        for idx, src_ids, out_id, r, _args in items:
+        for idx, src_ids, out_id, r, _args, _kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
             scales.append(sc)
-            jobs.append(_Job(job_id=f"{op_name}:{src_ids}->{out_id}", op=op_name, op_args=op_args, src_ids=src_ids, residual=r, scale=sc, weight=weight))
-        batch = run_batched_vjp(sys=sys, jobs=jobs, get_attr=get_attr, backend=None)
-        for (idx, src_ids, out_id, r, _args), y, grads, sc in zip(items, batch.ys, batch.grads_per_source, scales):
+            jobs.append(
+                _Job(
+                    job_id=f"{op_name}:{src_ids}->{out_id}",
+                    op=op_name,
+                    src_ids=src_ids,
+                    op_args=op_args,
+                    op_kwargs=op_kwargs,
+                    residual=r,
+                    scale=sc,
+                    weight=weight,
+                )
+            )
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=jobs,
+            op_args=op_args,
+            op_kwargs=op_kwargs,
+            get_attr=get_attr,
+            backend=None,
+        )
+        for (idx, src_ids, out_id, r, _args, _kwargs), y, grads, sc in zip(
+            items, batch.ys, batch.grads_per_source, scales
+        ):
             ys_out[idx] = y
             for i, g in zip(src_ids, grads):
                 g_host = float(getattr(g, "item_", lambda: g)()) if hasattr(g, "item_") else float(g)

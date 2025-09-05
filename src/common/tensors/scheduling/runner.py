@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -124,25 +124,15 @@ class BulkOpRunner:
         """
         spec = self.registry.get(op)  # enforce whitelist (raises if unknown)
 
-        def op_apply(x: Any) -> Any:
-            # Prefer class-level AbstractTensor function if available (records properly)
-            AT = type(x)
-            fn_cls = getattr(AT, spec.symbol, None)
-            if callable(fn_cls):
-                try:
-                    return fn_cls(x)
-                except TypeError:
-                    return fn_cls(x,)
-            # Fallback to instance method
-            fn = getattr(x, spec.symbol)
-            return fn()
-
         sys_obj = getattr(get_attr, "__self__", None)
+
+        jobs_rt = [replace(j, op=spec.symbol) for j in jobs]
 
         batch = run_batched_vjp(
             sys=sys_obj,
-            jobs=jobs,
-            op_apply=op_apply,
+            jobs=jobs_rt,
+            op_args=(),
+            op_kwargs=None,
             get_attr=get_attr,
             backend=backend,
         )
