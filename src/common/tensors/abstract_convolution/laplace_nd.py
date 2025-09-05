@@ -63,7 +63,7 @@ class BuildGraphLaplace:
 
     def __init__(
         self,
-        adjacency: AbstractTensor,
+        adjacency: AbstractTensor | COOMatrix,
         *,
         normalization: str = "none",
         positions: Optional[AbstractTensor] = None,
@@ -71,11 +71,17 @@ class BuildGraphLaplace:
         boundary_mask: Optional[AbstractTensor] = None,
         boundary_flux: Optional[AbstractTensor] = None,
     ):
-        A = AbstractTensor.get_tensor(adjacency)
-        if A.ndim != 2 or A.shape[0] != A.shape[1]:
-            raise ValueError("adjacency must be a square matrix")
-        self.adjacency = A
-        self.n = A.shape[0]
+        if isinstance(adjacency, COOMatrix):
+            if adjacency.shape[0] != adjacency.shape[1]:
+                raise ValueError("adjacency must be a square matrix")
+            self.adjacency = adjacency
+            self.n = adjacency.shape[0]
+        else:
+            A = AbstractTensor.get_tensor(adjacency)
+            if A.ndim != 2 or A.shape[0] != A.shape[1]:
+                raise ValueError("adjacency must be a square matrix")
+            self.adjacency = A
+            self.n = A.shape[0]
         self.normalization = normalization
         self.positions = None if positions is None else AbstractTensor.get_tensor(positions)
         self.metric = None if metric is None else AbstractTensor.get_tensor(metric)
@@ -89,7 +95,16 @@ class BuildGraphLaplace:
 
     def build(self):
         """Return dense and COO representations of the Laplacian."""
-        A = self.adjacency
+        if isinstance(self.adjacency, COOMatrix):
+            idx = self.adjacency.edge_index
+            vals = self.adjacency.edge_weight
+            A = AbstractTensor.zeros(
+                (self.n, self.n), dtype=vals.dtype, device=getattr(vals, "device", None)
+            )
+            if idx.shape[1] > 0:
+                A[(idx[0], idx[1])] = vals
+        else:
+            A = self.adjacency
 
         # Metric weighting based on node positions
         if self.positions is not None:
@@ -114,39 +129,53 @@ class BuildGraphLaplace:
             A = A * scale[:, None]
 
         deg = A.sum(-1)
+        nz = AbstractTensor.get_tensor(A.nonzero())
+        row = nz[:, 0]
+        col = nz[:, 1]
+        off_mask = row != col
+        row = row[off_mask]
+        col = col[off_mask]
 
         if self.normalization == "none":
-            L = AbstractTensor.diag(deg) - A
+            edge_vals = A[row, col]
+            off_weight = -edge_vals
+            diag_weight = deg
+            L = AbstractTensor.diag(diag_weight) - A
         elif self.normalization == "symmetric":
-            inv_sqrt_deg = 1.0 / AbstractTensor.sqrt(AbstractTensor.clamp(deg, min=1e-12))
+            inv_sqrt_deg = 1.0 / AbstractTensor.sqrt(
+                AbstractTensor.clamp(deg, min=1e-12)
+            )
+            edge_vals = inv_sqrt_deg[row] * A[row, col] * inv_sqrt_deg[col]
+            off_weight = -edge_vals
+            diag_weight = AbstractTensor.ones(
+                self.n, dtype=A.dtype, device=getattr(A, "device", None)
+            )
             A_norm = inv_sqrt_deg[:, None] * A * inv_sqrt_deg[None, :]
-            L = AbstractTensor.eye(self.n, dtype=A.dtype, device=A.device) - A_norm
+            L = AbstractTensor.eye(
+                self.n, dtype=A.dtype, device=getattr(A, "device", None)
+            ) - A_norm
         elif self.normalization == "random_walk":
             inv_deg = 1.0 / AbstractTensor.clamp(deg, min=1e-12)
+            edge_vals = inv_deg[row] * A[row, col]
+            off_weight = -edge_vals
+            diag_weight = AbstractTensor.ones(
+                self.n, dtype=A.dtype, device=getattr(A, "device", None)
+            )
             A_norm = inv_deg[:, None] * A
-            L = AbstractTensor.eye(self.n, dtype=A.dtype, device=A.device) - A_norm
+            L = AbstractTensor.eye(
+                self.n, dtype=A.dtype, device=getattr(A, "device", None)
+            ) - A_norm
         else:
             raise ValueError("normalization must be 'none', 'symmetric' or 'random_walk'")
 
-        rows: list[int] = []
-        cols: list[int] = []
-        vals: list[float] = []
-        for i in range(self.n):
-            for j in range(self.n):
-                val = L[i, j]
-                if val != 0:
-                    rows.append(i)
-                    cols.append(j)
-                    vals.append(val)
-
-        edge_index = AbstractTensor.stack(
-            [
-                AbstractTensor.tensor(rows, dtype=AbstractTensor.long_dtype_),
-                AbstractTensor.tensor(cols, dtype=AbstractTensor.long_dtype_),
-            ],
-            dim=0,
+        diag_idx = AbstractTensor.arange(
+            self.n, dtype=AbstractTensor.long_dtype_, device=getattr(A, "device", None)
         )
-        edge_weight = AbstractTensor.tensor(vals, dtype=A.dtype)
+        diag_edge_index = AbstractTensor.stack([diag_idx, diag_idx], dim=0)
+        off_edge_index = AbstractTensor.stack([row, col], dim=0)
+        edge_index = AbstractTensor.cat([off_edge_index, diag_edge_index], dim=1)
+        edge_weight = AbstractTensor.cat([off_weight, diag_weight], dim=0)
+
         coo = COOMatrix(edge_index, edge_weight, (self.n, self.n))
         self.degree = AbstractTensor.diag(L)
         return L, coo, {"degree": self.degree, "raw_degree": deg}
