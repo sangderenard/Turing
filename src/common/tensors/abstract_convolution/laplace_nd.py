@@ -43,21 +43,90 @@ class BuildGraphLaplace:
     adjacency:
         Symmetric adjacency matrix of shape ``(V, V)`` describing the graph
         connectivity.
+    normalization:
+        ``"none"`` (default) for the unnormalised Laplacian ``D - A``;
+        ``"symmetric"`` for ``I - D^{-1/2} A D^{-1/2}``; or ``"random_walk``
+        for ``I - D^{-1} A``.
+    positions:
+        Optional ``(V, d)`` tensor giving node coordinates.  When provided the
+        adjacency is weighted by the inverse metric distance between nodes.
+    metric:
+        Optional ``(d, d)`` tensor representing a metric tensor used with
+        ``positions``.  If ``None`` the Euclidean metric is used.
+    boundary_mask:
+        Optional boolean mask of shape ``(V,)`` marking Neumann boundaries.
+    boundary_flux:
+        Optional tensor of shape ``(V,)`` giving outward flux coefficients for
+        boundary nodes.  Outgoing edge weights from masked nodes are scaled by
+        ``(1 - flux)``.
     """
 
-    def __init__(self, adjacency: AbstractTensor):
+    def __init__(
+        self,
+        adjacency: AbstractTensor,
+        *,
+        normalization: str = "none",
+        positions: Optional[AbstractTensor] = None,
+        metric: Optional[AbstractTensor] = None,
+        boundary_mask: Optional[AbstractTensor] = None,
+        boundary_flux: Optional[AbstractTensor] = None,
+    ):
         A = AbstractTensor.get_tensor(adjacency)
         if A.ndim != 2 or A.shape[0] != A.shape[1]:
             raise ValueError("adjacency must be a square matrix")
         self.adjacency = A
         self.n = A.shape[0]
+        self.normalization = normalization
+        self.positions = None if positions is None else AbstractTensor.get_tensor(positions)
+        self.metric = None if metric is None else AbstractTensor.get_tensor(metric)
+        self.boundary_mask = (
+            None if boundary_mask is None else AbstractTensor.get_tensor(boundary_mask)
+        )
+        self.boundary_flux = (
+            None if boundary_flux is None else AbstractTensor.get_tensor(boundary_flux)
+        )
         self.degree: Optional[AbstractTensor] = None
 
     def build(self):
         """Return dense and COO representations of the Laplacian."""
         A = self.adjacency
+
+        # Metric weighting based on node positions
+        if self.positions is not None:
+            pos = self.positions
+            diff = pos[:, None, :] - pos[None, :, :]
+            if self.metric is not None:
+                diff_metric = AbstractTensor.matmul(diff, self.metric)
+                sqdist = (diff_metric * diff).sum(-1)
+            else:
+                sqdist = (diff * diff).sum(-1)
+            weight = 1.0 / AbstractTensor.sqrt(AbstractTensor.clamp(sqdist, min=1e-12))
+            A = A * weight
+
+        # Neumann boundary scaling
+        if self.boundary_mask is not None:
+            flux = (
+                self.boundary_flux
+                if self.boundary_flux is not None
+                else AbstractTensor.zeros_like(self.boundary_mask, dtype=A.dtype)
+            )
+            scale = 1.0 - self.boundary_mask * flux
+            A = A * scale[:, None]
+
         deg = A.sum(-1)
-        L = AbstractTensor.diag(deg) - A
+
+        if self.normalization == "none":
+            L = AbstractTensor.diag(deg) - A
+        elif self.normalization == "symmetric":
+            inv_sqrt_deg = 1.0 / AbstractTensor.sqrt(AbstractTensor.clamp(deg, min=1e-12))
+            A_norm = inv_sqrt_deg[:, None] * A * inv_sqrt_deg[None, :]
+            L = AbstractTensor.eye(self.n, dtype=A.dtype, device=A.device) - A_norm
+        elif self.normalization == "random_walk":
+            inv_deg = 1.0 / AbstractTensor.clamp(deg, min=1e-12)
+            A_norm = inv_deg[:, None] * A
+            L = AbstractTensor.eye(self.n, dtype=A.dtype, device=A.device) - A_norm
+        else:
+            raise ValueError("normalization must be 'none', 'symmetric' or 'random_walk'")
 
         rows: list[int] = []
         cols: list[int] = []
@@ -70,14 +139,17 @@ class BuildGraphLaplace:
                     cols.append(j)
                     vals.append(val)
 
-        edge_index = AbstractTensor.stack([
-            AbstractTensor.tensor(rows, dtype=AbstractTensor.long_dtype_),
-            AbstractTensor.tensor(cols, dtype=AbstractTensor.long_dtype_),
-        ], dim=0)
+        edge_index = AbstractTensor.stack(
+            [
+                AbstractTensor.tensor(rows, dtype=AbstractTensor.long_dtype_),
+                AbstractTensor.tensor(cols, dtype=AbstractTensor.long_dtype_),
+            ],
+            dim=0,
+        )
         edge_weight = AbstractTensor.tensor(vals, dtype=A.dtype)
         coo = COOMatrix(edge_index, edge_weight, (self.n, self.n))
-        self.degree = deg
-        return L, coo, {"degree": deg}
+        self.degree = AbstractTensor.diag(L)
+        return L, coo, {"degree": self.degree, "raw_degree": deg}
 
 
 class BuildLaplace3D:
