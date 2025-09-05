@@ -37,17 +37,56 @@ def test_filtered_poisson_residual_small():
     assert max_err < 1e-2
 
 
-def test_filtered_poisson_graph_mode():
+def test_filtered_poisson_graph_mode_inferred():
     rhs_np = np.array([-1.0, 2.0, -1.0], dtype=float)
     rhs = AbstractTensor.get_tensor(rhs_np)
     adj_np = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
     adjacency = AbstractTensor.get_tensor(adj_np, like=rhs)
     builder = BuildGraphLaplace(adjacency)
     L, _, _ = builder.build()
-    sol = filtered_poisson(rhs, iterations=200, mode="graph", adjacency=adjacency)
+    sol = filtered_poisson(rhs, iterations=200, adjacency=adjacency)
     residual = (L @ sol.reshape(-1)) - rhs
     max_err = abs(residual).max().item()
     assert max_err < 1e-2
+
+
+def test_filtered_poisson_graph_boundary_normalized():
+    rhs_np = np.array([-1.0, 2.0, -1.0], dtype=float)
+    rhs = AbstractTensor.get_tensor(rhs_np)
+    adj_np = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
+    adjacency = AbstractTensor.get_tensor(adj_np, like=rhs)
+    boundary_mask = AbstractTensor.get_tensor([1.0, 0.0, 0.0], like=rhs)
+    boundary_flux = AbstractTensor.get_tensor([1.0, 0.0, 0.0], like=rhs)
+    builder = BuildGraphLaplace(
+        adjacency,
+        normalization="symmetric",
+        boundary_mask=boundary_mask,
+        boundary_flux=boundary_flux,
+    )
+    L, _, _ = builder.build()
+    sol = filtered_poisson(
+        rhs,
+        iterations=200,
+        adjacency=adjacency,
+        boundary_mask=boundary_mask,
+        boundary_flux=boundary_flux,
+        normalization="symmetric",
+    )
+    residual = (L @ sol.reshape(-1)) - rhs
+    max_err = abs(residual).max().item()
+    assert max_err < 1e-2
+
+
+def test_filtered_poisson_convergence_tol():
+    rhs_np = np.array([1.0, 0.0, -1.0], dtype=float)
+    rhs = AbstractTensor.get_tensor(rhs_np)
+    adj_np = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
+    adjacency = AbstractTensor.get_tensor(adj_np, like=rhs)
+    sol_one = filtered_poisson(rhs, iterations=1, adjacency=adjacency)
+    sol_tol = filtered_poisson(rhs, iterations=50, adjacency=adjacency, tol=1e6)
+    sol_full = filtered_poisson(rhs, iterations=50, adjacency=adjacency)
+    assert AbstractTensor.allclose(sol_tol, sol_one)
+    assert not AbstractTensor.allclose(sol_tol, sol_full)
 
 
 @pytest.mark.parametrize(
