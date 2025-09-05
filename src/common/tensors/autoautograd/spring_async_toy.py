@@ -33,10 +33,12 @@ import time
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional, Callable, Any
+from typing import Dict, Tuple, List, Optional, Callable
+import matplotlib
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib import cm, colors as mcolors
+from matplotlib import colors as mcolors
 from ..abstraction import AbstractTensor
 
 L_MIN = 0.05
@@ -543,7 +545,7 @@ class LiveVizGLPoints:
                  boundary_scale: float = 1.8,
                  bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06)):
         self.sys = sys
-        self.node_cmap = cm.get_cmap(node_cmap)
+        self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
         self.base_point_size = float(base_point_size)
         self.boundary_scale = float(boundary_scale)
         self.bg_color = bg_color
