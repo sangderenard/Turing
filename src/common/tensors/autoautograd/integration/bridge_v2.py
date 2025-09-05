@@ -117,16 +117,18 @@ def batched_forward_v2(
     ys_out: List[Any] = []
     by_op: Dict[Tuple[str, Tuple[Tuple[str, Any], ...] | None], List[Tuple[int, Tuple[int, ...], int, Optional[Dict[str, Any]]]]] = {}
     for idx, spec in enumerate(specs):
-        if len(spec) >= 4:
+        if len(spec) >= 5:
+            op_name, src_ids, out_id, op_args, op_kwargs = spec[0], spec[1], spec[2], spec[3], spec[4]
+        elif len(spec) == 4:
             op_name, src_ids, out_id, op_args = spec[0], spec[1], spec[2], spec[3]
+            op_kwargs = None
         else:
             op_name, src_ids, out_id = spec
             op_args = None
-        key_args: Optional[Tuple[Tuple[str, Any], ...]] = None
-        if isinstance(op_args, dict):
-            key_args = tuple(sorted((str(k), tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in op_args.items()))
-        key = (str(op_name), key_args)
-        by_op.setdefault(key, []).append((idx, tuple(int(i) for i in src_ids), int(out_id), op_args))
+            op_kwargs = None
+
+        key = (str(op_name), op_args, op_kwargs)
+        by_op.setdefault(key, []).append((idx, tuple(int(i) for i in src_ids), int(out_id), op_args, op_kwargs))
 
     def get_attr(i: int):
         return sys.nodes[i].theta
