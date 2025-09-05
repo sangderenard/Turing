@@ -1276,7 +1276,15 @@ class LinearBlockFactory:
         nid = int(start_id)
         nodes: List[Node] = []
         edges: List[Edge] = []
-        ops: List[Tuple[str, List[int], int]] = []
+        ops: List[
+                    Tuple[
+                        str,
+                        List[int],
+                        int,
+                        Optional[Tuple[Any, ...]],
+                        Optional[Dict[str, Any]],
+                    ]
+                ] = []
 
         # --- allocate IDs ---
         in_ids  = [nid + k for k in range(self.n_in)]; nid += self.n_in
