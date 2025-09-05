@@ -33,7 +33,7 @@ import time
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional, Callable
+from typing import Dict, Tuple, List, Optional, Callable, Any
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib import cm, colors as mcolors
@@ -1096,10 +1096,16 @@ class Reflector(threading.Thread):
 
 
 class Experiencer(threading.Thread):
-    def __init__(self, sys: SpringRepulsorSystem, stop: threading.Event,
-                 outputs: Dict[int, Callable[[float], float]],
-                 schedule_hz: float = 30.0,
-                 ops_program: Optional[List[Tuple[str, List[int], int]]] = None):
+    def __init__(
+        self,
+        sys: SpringRepulsorSystem,
+        stop: threading.Event,
+        outputs: Dict[int, Callable[[float], float]],
+        schedule_hz: float = 30.0,
+        ops_program: Optional[
+            List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]]
+        ] = None,
+    ):
         super().__init__(daemon=True)
         self.sys = sys
         self.stop = stop
@@ -1120,19 +1126,19 @@ class Experiencer(threading.Thread):
             t = now_s() - t0
             
             # 2) Batched forward + impulses for outputs with targets
-            out_specs: list[tuple[str, list[int], int, Optional[dict]]] = []
-            for (name, srcs, out, args) in self.ops_program:
+            out_specs: list[tuple[str, list[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
+            for (name, srcs, out, args, kwargs) in self.ops_program:
                 if out in self.outputs:
-                    out_specs.append((name, srcs, out, args))
+                    out_specs.append((name, srcs, out, args, kwargs))
             if out_specs:
                 ys_hat = batched_forward_v2(self.sys, out_specs, weight=None, scale=0.1)
                 residuals: list[float] = []
-                for (name, srcs, out, args), y_hat in zip(out_specs, ys_hat):
+                for (name, srcs, out, args, kwargs), y_hat in zip(out_specs, ys_hat):
                     target = self.outputs.get(out)
                     r = float(y_hat) - float(target(t)) if target is not None else 0.0
                     residuals.append(r)
                 ys = push_impulses_from_ops_batched(self.sys, out_specs, residuals, weight=None, scale=0.1)
-                for (name, srcs, out, args), y in zip(out_specs, ys):
+                for (name, srcs, out, args, kwargs), y in zip(out_specs, ys):
                     self.sys.nodes[out].theta = float(y)
                 # Close the loop: push a scalar loss impulse around the ring
                 if self.sys.feedback_edge is not None and residuals:
@@ -1159,7 +1165,10 @@ def build_dirichlet_neumann_pipeline(
     alpha_in: float = 2.0,
     beta_link: float = 1.0,
     alpha_out: float = 2.0,
-) -> Tuple[List[Tuple[str, List[int], int]], Dict[int, Callable[[float], float]]]:
+) -> Tuple[
+    List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
+    Dict[int, Callable[[float], float]],
+]:
     """
     Wire the system as:
       Dirichlet(input_feature_mean) -> (edge) -> Neumann(noop) -> ... L layers (gather) ...
@@ -1186,7 +1195,7 @@ def build_dirichlet_neumann_pipeline(
         in_bridge_neu.append(neu)
 
     # 2) Middle: stack 'layers' of gather; each new row gathers all previous
-    ops_program: List[Tuple[str, List[int], int]] = []
+    ops_program: List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
     prev_row = in_bridge_neu if in_bridge_neu else list(in_ids)
     for _ in range(max(0, int(layers))):
         next_row: List[int] = []
@@ -1196,7 +1205,7 @@ def build_dirichlet_neumann_pipeline(
         for _k in range(len(prev_row)):
             out = _fresh_node_id(sys)
             sys.nodes[out] = Node(id=out, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
-            ops_program.append(("sum_k", prev_row, out))
+            ops_program.append(("sum_k", prev_row, out, None, None))
             next_row.append(out)
         prev_row = next_row
 

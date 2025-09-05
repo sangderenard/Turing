@@ -43,7 +43,7 @@ def _mk_jobs(n: int, *, k: int = 2, op: str = "sum_k", weight: str = "w0", tag: 
     return jobs
 
 
-def _stub_batched_vjp(*, sys, jobs, op_apply, get_attr, backend=None) -> BatchVJPResult:
+def _stub_batched_vjp(*, sys, jobs, op_args=(), op_kwargs=None, get_attr, backend=None) -> BatchVJPResult:
     # Deterministic fake values per job
     ys = tuple(f"y:{j.job_id}" for j in jobs)
     grads_per_source = tuple(tuple(float(i) for i in range(len(j.src_ids))) for j in jobs)
