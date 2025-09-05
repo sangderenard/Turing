@@ -2299,6 +2299,22 @@ _bind_and_wrap({
     "ifft": fourier_ifft,
 })
 
+def T(self) -> "AbstractTensor":
+    """Matrix transpose convenience alias.
+
+    Returns ``self`` transposed over its last two dimensions.  Vectors and
+    scalars are promoted to 2D before transposition to match NumPy's
+    ``.T`` semantics.
+    """
+    ndim = getattr(self, "ndim", len(getattr(self, "shape", ())))
+    if ndim < 2:
+        if ndim == 0:
+            base = self.reshape((1, 1))
+        else:
+            base = self.reshape((1, self.shape[0]))
+        return base.transpose(-2, -1)
+    return self.transpose(-2, -1)
+
 AbstractTensor.reshape = _reshape_methods.reshape
 AbstractTensor.flatten = _reshape_methods.flatten
 AbstractTensor.transpose = _reshape_methods.transpose
@@ -2306,6 +2322,8 @@ AbstractTensor.permute = _reshape_methods.permute
 AbstractTensor.unsqueeze = _reshape_methods.unsqueeze
 AbstractTensor.squeeze = _reshape_methods.squeeze
 AbstractTensor.swapaxes = _reshape_methods.swapaxes
+
+AbstractTensor.T = T
 
 AbstractTensor.numel   = prop_numel
 AbstractTensor.item    = prop_item
