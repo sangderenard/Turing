@@ -1340,7 +1340,7 @@ class LinearBlockFactory:
                 "dim": 0,
                 "fn": _op_apply_factory(["__add__", "__mul__"]),
             }
-            ops.append(("gather_and", srcs, oj, args))
+            ops.append(("gather_and", srcs, oj, None, args))
 
         return LinearBlock(
             base_id=start_id,
