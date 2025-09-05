@@ -52,6 +52,15 @@ def _op_apply_factory(
 
 
 
+def _freeze_for_key(obj: Any) -> Any:
+    """Recursively convert lists/dicts to tuples for hashing."""
+    if isinstance(obj, dict):
+        return tuple(sorted((str(k), _freeze_for_key(v)) for k, v in obj.items()))
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze_for_key(x) for x in obj)
+    return obj
+
+
 def _inv_length_scale(sys, out_id: int, src_ids: Sequence[int]) -> float:
     po = sys.nodes[out_id].p
     ws: List[float] = []
@@ -126,27 +135,29 @@ def batched_forward_v2(
     """Forward-only for specs of form `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = []
     by_op: Dict[
-        Tuple[str, Optional[Tuple[Any, ...]], Optional[Tuple[Tuple[str, Any], ...]]],
+        Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
     ] = {}
     for idx, spec in enumerate(specs):
         op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
-        op_args = tuple(op_args) if isinstance(op_args, (list, tuple)) else None
-        key_kwargs: Optional[Tuple[Tuple[str, Any], ...]] = None
-        if isinstance(op_kwargs, dict):
-            key_kwargs = tuple(sorted((str(k), v) for k, v in op_kwargs.items()))
-        key = (str(op_name), op_args, key_kwargs)
+        op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
+        op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
+        key = (
+            str(op_name),
+            _freeze_for_key(op_args_tuple) if op_args_tuple is not None else None,
+            _freeze_for_key(op_kwargs_dict) if op_kwargs_dict is not None else None,
+        )
         by_op.setdefault(key, []).append(
-            (idx, tuple(int(i) for i in src_ids), int(out_id), op_args, op_kwargs if isinstance(op_kwargs, dict) else None)
+            (idx, tuple(int(i) for i in src_ids), int(out_id), op_args_tuple, op_kwargs_dict)
         )
 
     def get_attr(i: int):
         return sys.nodes[i].theta
 
     ys_buffer: Dict[int, Any] = {}
-    for (op_name, key_args, key_kwargs), items in by_op.items():
-        op_args = key_args or ()
-        op_kwargs = {k: v for (k, v) in (key_kwargs or ())} if key_kwargs is not None else None
+    for (op_name, _key_args, _key_kwargs), items in by_op.items():
+        op_args = items[0][3] or ()
+        op_kwargs = items[0][4]
         jobs: List[_Job] = []
         for idx, src_ids, out_id, _args, _kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
@@ -188,26 +199,35 @@ def push_impulses_from_ops_batched(
     """Batched impulse push for specs `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = [None] * len(specs)
     by_op: Dict[
-        Tuple[str, Optional[Tuple[Any, ...]], Optional[Tuple[Tuple[str, Any], ...]]],
+        Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, float, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
     ] = {}
     for idx, (spec, r) in enumerate(zip(specs, residuals)):
         op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
-        op_args = tuple(op_args) if isinstance(op_args, (list, tuple)) else None
-        key_kwargs: Optional[Tuple[Tuple[str, Any], ...]] = None
-        if isinstance(op_kwargs, dict):
-            key_kwargs = tuple(sorted((str(k), v) for k, v in op_kwargs.items()))
-        key = (str(op_name), op_args, key_kwargs)
+        op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
+        op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
+        key = (
+            str(op_name),
+            _freeze_for_key(op_args_tuple) if op_args_tuple is not None else None,
+            _freeze_for_key(op_kwargs_dict) if op_kwargs_dict is not None else None,
+        )
         by_op.setdefault(key, []).append(
-            (idx, tuple(int(i) for i in src_ids), int(out_id), float(r), op_args, op_kwargs if isinstance(op_kwargs, dict) else None)
+            (
+                idx,
+                tuple(int(i) for i in src_ids),
+                int(out_id),
+                float(r),
+                op_args_tuple,
+                op_kwargs_dict,
+            )
         )
 
     def get_attr(i: int):
         return sys.nodes[i].theta
 
-    for (op_name, key_args, key_kwargs), items in by_op.items():
-        op_args = key_args or ()
-        op_kwargs = {k: v for (k, v) in (key_kwargs or ())} if key_kwargs is not None else None
+    for (op_name, _key_args, _key_kwargs), items in by_op.items():
+        op_args = items[0][4] or ()
+        op_kwargs = items[0][5]
         jobs: List[_Job] = []
         scales: List[float] = []
         for idx, src_ids, out_id, r, _args, _kwargs in items:
