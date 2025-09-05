@@ -1249,7 +1249,7 @@ class LinearBlock:
     out_ids: List[int]
     w_ids: Dict[Tuple[int, int], int]   # (i,j) -> node id
     b_ids: Dict[int, int]               # j -> node id
-    mid_ids: Dict[Tuple[int, int], int] # (i,j) -> node id
+    row_ids: List[int]                  # intermediate row nodes
     nodes: List[Node]
     edges: List[Edge]
     ops: List[Tuple[str, List[int], int]]  # (op_name, src_ids, out_id)
@@ -1289,22 +1289,14 @@ class LinearBlockFactory:
         # --- allocate IDs ---
         in_ids  = [nid + k for k in range(self.n_in)]; nid += self.n_in
         out_ids = [nid + k for k in range(self.n_out)]; nid += self.n_out
-        # weights (i,j)
-        w_ids: Dict[Tuple[int,int], int] = {}
-        for j in range(self.n_out):
-            for i in range(self.n_in):
-                w_ids[(i, j)] = nid; nid += 1
         # biases (j)
         b_ids: Dict[int, int] = {j: (nid + j) for j in range(self.n_out)}
         nid += self.n_out
-        # intermediates m_ij = in_i * w_ij
-        mid_ids: Dict[Tuple[int,int], int] = {}
-        for j in range(self.n_out):
-            for i in range(self.n_in):
-                mid_ids[(i, j)] = nid; nid += 1
+        # intermediate rows
+        row_ids: List[int] = [nid + k for k in range(self.rows)]; nid += self.rows
 
-        
-        # --- place nodes in 3D for clarity (inputs left, mids center slab, outs right) ---
+
+        # --- place nodes in 3D for clarity (inputs left, rows center slab, outs right) ---
         def jitter(s=0.07):
             random_tensor = AbstractTensor.random_tensor(size=(3,), scope=(-s, s))
             return random_tensor
@@ -1318,28 +1310,36 @@ class LinearBlockFactory:
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
             nodes.append(Node(id=o_id, theta=self.rng.uniform(-0.1,0.1),
                               p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
-        # weights near the mids
-        for (i,j), w_id in w_ids.items():
-            x = -0.6; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.05*self.rng.standard_normal()
-            z = z_level + 0.15*self.rng.standard_normal()
-            nodes.append(Node(id=w_id, theta=self.rng.uniform(-0.3,0.3),
-                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
         # biases near output column
         for j, b_id in b_ids.items():
             x = +1.1; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.03*self.rng.standard_normal()
             z = z_level + 0.15*self.rng.standard_normal()
             nodes.append(Node(id=b_id, theta=self.rng.uniform(-0.1,0.1),
                               p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
-        # intermediates column
-        for (i,j), m_id in mid_ids.items():
-            x = +0.3; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.02*(i - 0.5*(self.n_in-1))
+        # row nodes column
+        for r, r_id in enumerate(row_ids):
+            x = 0.3
+            y = (r - 0.5*(self.rows-1)) * self.spacing
             z = z_level + 0.05*self.rng.standard_normal()
-            nodes.append(Node(id=m_id, theta=0.0,
+            nodes.append(Node(id=r_id, theta=0.0,
                               p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
 
 
+        # connect inputs -> rows
+        for r_id in row_ids:
+            srcs = list(in_ids)
+            for s in srcs:
+                edges.append(self._mk_edge(s, r_id, "gather_and"))
+            args = {
+                "indices": srcs,
+                "dim": 0,
+                "fn": _op_apply_factory(["__add__", "__mul__"]),
+            }
+            ops.append(("gather_and", srcs, r_id, None, args))
+
+        # connect rows -> outputs
         for j in range(self.n_out):
-            srcs = [mid_ids[(i,j)] for i in range(self.n_in)] + [b_ids[j]]
+            srcs = list(row_ids) + [b_ids[j]]
             oj = out_ids[j]
             for s in srcs:
                 edges.append(self._mk_edge(s, oj, "gather_and"))
@@ -1354,9 +1354,9 @@ class LinearBlockFactory:
             base_id=start_id,
             in_ids=in_ids,
             out_ids=out_ids,
-            w_ids=w_ids,
+            w_ids={},
             b_ids=b_ids,
-            mid_ids=mid_ids,
+            row_ids=row_ids,
             nodes=nodes,
             edges=edges,
             ops=ops,
@@ -1394,6 +1394,20 @@ def build_toy_system(seed=0):
     edges.extend(lb.edges)
 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.08, gamma=0.93, dt=0.02)
+
+    # Dirichlet and Neumann/Robin boundaries for inputs and outputs
+    for idx, nid in enumerate(lb.in_ids):
+        mean = float(sys.nodes[nid].theta)
+        attach_dirichlet(sys, nid, lambda _t, m=mean: m)
+        if lb.row_ids:
+            rid = lb.row_ids[idx % len(lb.row_ids)]
+            attach_neumann_noop(sys, rid)
+    for idx, oid in enumerate(lb.out_ids):
+        mean = float(sys.nodes[oid].theta)
+        attach_dirichlet(sys, oid, lambda _t, m=mean: m)
+        if lb.row_ids:
+            rid = lb.row_ids[idx % len(lb.row_ids)]
+            attach_neumann_noop(sys, rid)
 
     # Drive inputs
     def sin_at(freq, amp=0.4):
