@@ -48,3 +48,33 @@ def test_filtered_poisson_graph_mode():
     residual = (L @ sol.reshape(-1)) - rhs
     max_err = abs(residual).max().item()
     assert max_err < 1e-2
+
+
+@pytest.mark.parametrize(
+    "norm,expected",
+    [
+        (
+            "none",
+            [[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]],
+        ),
+        (
+            "symmetric",
+            [
+                [1.0, -1.0 / np.sqrt(2.0), 0.0],
+                [-1.0 / np.sqrt(2.0), 1.0, -1.0 / np.sqrt(2.0)],
+                [0.0, -1.0 / np.sqrt(2.0), 1.0],
+            ],
+        ),
+        (
+            "random_walk",
+            [[1.0, -1.0, 0.0], [-0.5, 1.0, -0.5], [0.0, -1.0, 1.0]],
+        ),
+    ],
+)
+def test_graph_laplacian_normalization_variants(norm, expected):
+    adj_np = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
+    adjacency = AbstractTensor.get_tensor(adj_np)
+    builder = BuildGraphLaplace(adjacency, normalization=norm)
+    L, _, _ = builder.build()
+    expected_t = AbstractTensor.get_tensor(np.array(expected, dtype=float), like=adjacency)
+    assert AbstractTensor.allclose(L, expected_t)
