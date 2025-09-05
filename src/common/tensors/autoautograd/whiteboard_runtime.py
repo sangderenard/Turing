@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from .whiteboard_cache import WhiteboardCache
 
 from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
@@ -27,6 +28,14 @@ class BatchVJPResult:
     grads_full: Tuple[Any, ...]
     grads_per_source: Tuple[Tuple[float, ...], ...]
 
+
+@dataclass(frozen=True)
+class _WBJob:
+    job_id: str
+    op: str
+    src_ids: Tuple[int, ...]
+    residual: Optional[float]
+
 def _residual_like(y: Any, residual: Optional[Any], backend: Any | None) -> Optional[Any]:
     """Ensure residual is backend-typed/broadcastable to y."""
     if residual is None:
@@ -46,6 +55,67 @@ def _reduce_per_source(g: Any) -> Tuple[float, ...]:
     axes = tuple(range(1, ndim))
     gk = g.sum(axis=axes)
     return tuple(float(gi) for gi in gk)
+
+
+def run_op_and_grads_cached(
+    sys: Any,
+    op_name: str,
+    src_ids: Sequence[int],
+    *,
+    scale: float = 1.0,
+    residual: Optional[float] = None,
+    cache: Optional[WhiteboardCache] = None,
+    backend: Any | None = None,
+) -> Tuple[Any, Tuple[float, ...]]:
+    """Convenience wrapper: run single op with caching."""
+    cache = cache or WhiteboardCache()
+    versions = [int(getattr(sys.nodes[i], "version", 0)) for i in src_ids]
+    sample = sys.nodes[src_ids[0]].theta
+    feat_shape = getattr(sample, "shape", ())
+    key = cache.make_key(
+        op_name=op_name,
+        src_ids=src_ids,
+        versions=versions,
+        feat_shape=feat_shape if isinstance(feat_shape, tuple) else (),
+        weight=None,
+        scale=scale,
+        residual=residual,
+        backend_tag=None,
+    )
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+
+    vals = [sys.nodes[i].theta for i in src_ids]
+    if op_name == "add" and len(vals) == 2:
+        y = vals[0] + vals[1]
+        grads = (1.0, 1.0)
+    elif op_name == "mul" and len(vals) == 2:
+        y = vals[0] * vals[1]
+        grads = (float(vals[1]), float(vals[0]))
+    else:
+        job = _WBJob(
+            job_id=f"{op_name}:{tuple(src_ids)}",
+            op=op_name,
+            src_ids=tuple(int(i) for i in src_ids),
+            residual=residual,
+        )
+
+        def get_attr(i: int):
+            return sys.nodes[i].theta
+
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=(job,),
+            op_args=(),
+            op_kwargs=None,
+            get_attr=get_attr,
+            backend=backend,
+        )
+        y = batch.ys[0]
+        grads = batch.grads_per_source[0]
+    cache.put(key, (y, grads))
+    return y, grads
 
 def run_batched_vjp(
     *,
