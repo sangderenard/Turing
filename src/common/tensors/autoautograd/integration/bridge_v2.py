@@ -31,23 +31,50 @@ def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     return tuple(f for f in fns if callable(f))
 
 def _op_apply_factory(
-    ops: Sequence[str], args: Optional[Sequence[Dict]] = None
+    ops: Sequence[str], args: Optional[Sequence[Any]] = None
 ) -> Callable[[Any], Any]:
+    """Compile a tiny f(x)->y chain with optional per-op arguments.
+
+    Each entry in ``args`` may provide positional and/or keyword arguments for
+    the corresponding operation:
+
+    * ``(arg1, arg2, ...)`` → positional args
+    * ``{"kw": val}``       → keyword args
+    * ``((arg1, arg2), {"kw": val})`` → both positional and keyword args
     """
-    Build a tiny, ultra-hot f(x)->y that applies a precompiled chain.
-    No getattr/validation in hot path.
-    """
+
     chain = _normalize_chain(ops)
     if not chain:
-        def _apply_identity(x): return x
+        def _apply_identity(x):
+            return x
+
         return _apply_identity
 
     chain_local = chain  # closure binding
-    def _apply(x, _chain=chain_local):
+    args_local = args or ()
+
+    def _apply(x, _chain=chain_local, _args=args_local):
         y = x
         for i, f in enumerate(_chain):
-            y = f(y, **(args[i] if args and i < len(args) and isinstance(args[i], dict) else {}))
+            pos = ()
+            kw = {}
+            if i < len(_args):
+                spec = _args[i]
+                if (
+                    isinstance(spec, tuple)
+                    and len(spec) == 2
+                    and isinstance(spec[0], (list, tuple))
+                    and isinstance(spec[1], dict)
+                ):
+                    pos = tuple(spec[0])
+                    kw = spec[1]
+                elif isinstance(spec, dict):
+                    kw = spec
+                elif isinstance(spec, (list, tuple)):
+                    pos = tuple(spec)
+            y = f(y, *pos, **kw)
         return y
+
     return _apply
 
 

@@ -1333,7 +1333,7 @@ class LinearBlockFactory:
             args = {
                 "indices": srcs,
                 "dim": 0,
-                "fn": _op_apply_factory(["__add__", "__mul__"]),
+                "fn": _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)]),
             }
             ops.append(("gather_and", srcs, r_id, None, args))
 
@@ -1346,7 +1346,7 @@ class LinearBlockFactory:
             args = {
                 "indices": srcs,
                 "dim": 0,
-                "fn": _op_apply_factory(["__add__", "__mul__"]),
+                "fn": _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)]),
             }
             ops.append(("gather_and", srcs, oj, None, args))
 
