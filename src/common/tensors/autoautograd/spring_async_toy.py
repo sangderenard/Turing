@@ -62,19 +62,34 @@ POP_MAX_PER_TICK   = 1000      # safety cap per integrator tick
 def now_s() -> float:
     return time.perf_counter()
 
-def as_x_target(fn, D: int = 3):  # scalar → Dirichlet target on x in D-D
+def as_axis_target(fn, axis: int, D: int = 3):
+    """Scalar → Dirichlet target on ``axis`` in D-D space."""
+
     def _t(t):
         v = AbstractTensor.zeros(D, dtype=float)
-        v[0] = float(fn(t))
+        v[axis] = float(fn(t))
         return v
+
     return _t
 
-def as_x_force(fn, D: int = 3):   # scalar → Neumann force on x in D-D
+
+def as_axis_force(fn, axis: int, D: int = 3):
+    """Scalar → Neumann force on ``axis`` in D-D space."""
+
     def _f(t):
         v = AbstractTensor.zeros(D, dtype=float)
-        v[0] = float(fn(t))
+        v[axis] = float(fn(t))
         return v
+
     return _f
+
+
+def as_x_target(fn, D: int = 3):
+    return as_axis_target(fn, 0, D)
+
+
+def as_x_force(fn, D: int = 3):
+    return as_axis_force(fn, 0, D)
 
 def inv_weight(sys: SpringRepulsorSystem, src: int, dst: int) -> float:
     d = float(AbstractTensor.linalg.norm(sys.nodes[dst].p - sys.nodes[src].p))
@@ -102,18 +117,37 @@ def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
 
 # ----------------------------- Boundary helpers ------------------------------
 
-def attach_dirichlet(sys: 'SpringRepulsorSystem', nid: int,
-                     value_fn: Callable[[float], float],
-                     *, D: Optional[int] = None, alpha: float = 2.0) -> None:
-    """Clamp node `nid` by a Dirichlet spring on x, target = value_fn(t)."""
-    D = sys.D if D is None else int(D)
-    sys.add_boundary(BoundaryPort(nid=nid, alpha=alpha, target_fn=as_x_target(value_fn, D)))
+def attach_dirichlet(
+    sys: 'SpringRepulsorSystem',
+    nid: int,
+    value_fn: Callable[[float], float],
+    *,
+    D: Optional[int] = None,
+    alpha: float = 2.0,
+    axis: int = 0,
+) -> None:
+    """Clamp ``nid`` by a Dirichlet spring on ``axis`` toward ``value_fn(t)``."""
 
-def attach_neumann_noop(sys: 'SpringRepulsorSystem', nid: int,
-                        *, D: Optional[int] = None, beta: float = 1.0) -> None:
-    """Attach a traction-capable boundary that exerts no force (pass-through)."""
     D = sys.D if D is None else int(D)
-    sys.add_boundary(BoundaryPort(nid=nid, beta=beta, force_fn=as_x_force(lambda _t: 0.0, D)))
+    sys.add_boundary(
+        BoundaryPort(nid=nid, alpha=alpha, target_fn=as_axis_target(value_fn, axis, D))
+    )
+
+
+def attach_neumann_noop(
+    sys: 'SpringRepulsorSystem',
+    nid: int,
+    *,
+    D: Optional[int] = None,
+    beta: float = 1.0,
+    axis: int = 0,
+) -> None:
+    """Attach a traction-capable boundary that exerts no force (pass-through)."""
+
+    D = sys.D if D is None else int(D)
+    sys.add_boundary(
+        BoundaryPort(nid=nid, beta=beta, force_fn=as_axis_force(lambda _t: 0.0, axis, D))
+    )
 
 def _fresh_node_id(sys: 'SpringRepulsorSystem') -> int:
     return (max(sys.nodes.keys()) + 1) if sys.nodes else 0
@@ -1351,7 +1385,7 @@ class Ops:
             node = sys.nodes[out_id]
             y_t = AbstractTensor.get_tensor(0.0) if y is None else AbstractTensor.get_tensor(y)
             mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
-            node.p[0] = float(mean_val)
+            node.p[2] = float(mean_val)
         return y
 
 # ----------------------------- Threads --------------------------------------
@@ -1780,7 +1814,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
     in_mean_fn = group_data_mean_fn(input_force_fns)
 
     for idx, nid in enumerate(lb.in_ids):
-        attach_dirichlet(sys, nid, in_mean_fn)
+        attach_dirichlet(sys, nid, in_mean_fn, axis=0)
         # The demo previously attached extra Neumann "noop" boundaries to many
         # hidden row nodes.  Commenting this out reduces visual clutter and
         # keeps role tagging focused on true inputs/outputs.
@@ -1789,7 +1823,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
         #     attach_neumann_noop(sys, rid)
     for idx, oid in enumerate(lb.out_ids):
         target_fn = byte_targets[oid]
-        attach_dirichlet(sys, oid, lambda t, fn=target_fn: fn(t))
+        attach_dirichlet(sys, oid, lambda t, fn=target_fn: fn(t), axis=2)
         # if lb.row_ids:
         #     rid = lb.row_ids[idx % len(lb.row_ids)]
         #     attach_neumann_noop(sys, rid)
@@ -1858,10 +1892,10 @@ def main(duration_s: float = 8.0):
             mean_tgts  = target_batch.mean(dim=0)
 
             # adherence/loss over the whole batch (not a single scalar output vector)
-            error = mse_batch(actual_batch[..., 0], target_batch)
+            error = mse_batch(actual_batch[..., 2], target_batch)
 
-            # visualize both the averaged output and averaged target
-            output_str = ''.join(chr(_to_byte(v[0])) for v in mean_vals)
+            # visualize both the averaged output (z-axis) and averaged target
+            output_str = ''.join(chr(_to_byte(v[2])) for v in mean_vals)
             target_str = ''.join(chr(_to_byte(v)) for v in mean_tgts)
 
             print(f"[DBG] outputs→batch-mean Error: {error: .3f} | "
