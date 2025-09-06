@@ -99,6 +99,33 @@ def _inv_length_scale(sys, out_id: int, src_ids: Sequence[int]) -> float:
     return float(AbstractTensor.mean(ws)) if ws else 1.0
 
 
+def _preactivate_nodes(sys, node_ids: Sequence[int]) -> Dict[int, Tuple[Any, dict, Any]]:
+    """Build cache of preactivated nodes keyed by id.
+
+    Each entry stores ``(version, y, meta)`` so lookups can be refreshed when a
+    node's ``version`` changes.
+    """
+    cache: Dict[int, Tuple[Any, Any, dict]] = {}
+    for i in node_ids:
+        node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+        if hasattr(node, "p") and hasattr(node, "param"):
+            y, meta = preactivate_src(sys, int(i))
+            cache[int(i)] = (getattr(node, "version", None), y, meta)
+    return cache
+
+
+def _get_preactivation(sys, nid: int, cache: Dict[int, Tuple[Any, Any, dict]]) -> Tuple[Any, dict]:
+    """Fetch preactivation from cache, refreshing if the node changed."""
+    node = sys.nodes.get(int(nid)) if isinstance(sys.nodes, dict) else sys.nodes[int(nid)]
+    version = getattr(node, "version", None)
+    entry = cache.get(int(nid))
+    if entry is None or entry[0] != version:
+        y, meta = preactivate_src(sys, int(nid))
+        cache[int(nid)] = (version, y, meta)
+        return y, meta
+    return entry[1], entry[2]
+
+
 def push_impulses_from_op_v2(
     sys,
     op_name: str,
@@ -116,11 +143,12 @@ def push_impulses_from_op_v2(
     if weight == "inv_length":
         scale *= _inv_length_scale(sys, out_id, src_ids)
 
+    cache = _preactivate_nodes(sys, src_ids)
     metas: List[dict] = []
     for i in src_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
         if hasattr(node, "p") and hasattr(node, "param"):
-            _y, meta = preactivate_src(sys, int(i))
+            _y, meta = _get_preactivation(sys, int(i), cache)
         else:
             meta = {}
         metas.append(meta)
@@ -163,6 +191,8 @@ def batched_forward_v2(
 ) -> List[Any]:
     """Forward-only for specs of form `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = []
+    all_ids = {int(i) for _spec in specs for i in _spec[1]}
+    cache = _preactivate_nodes(sys, all_ids)
     by_op: Dict[
         Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
@@ -172,7 +202,7 @@ def batched_forward_v2(
         for i in src_ids:
             node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
             if hasattr(node, "p") and hasattr(node, "param"):
-                preactivate_src(sys, int(i))
+                _get_preactivation(sys, int(i), cache)
         op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
         op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
         key = (
@@ -235,6 +265,8 @@ def push_impulses_from_ops_batched(
     ys_out: List[Any] = [None] * len(specs)
     grads_out: List[Tuple[Any, ...]] = [tuple() for _ in range(len(specs))]
     metas_out: List[Tuple[dict, ...]] = [tuple() for _ in range(len(specs))]
+    all_ids = {int(i) for _spec in specs for i in _spec[1]}
+    cache = _preactivate_nodes(sys, all_ids)
     by_op: Dict[
         Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
@@ -267,7 +299,7 @@ def push_impulses_from_ops_batched(
             for i in src_ids:
                 node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
                 if hasattr(node, "p") and hasattr(node, "param"):
-                    _y, meta = preactivate_src(sys, int(i))
+                    _y, meta = _get_preactivation(sys, int(i), cache)
                 else:
                     meta = {}
                 metas.append(meta)
