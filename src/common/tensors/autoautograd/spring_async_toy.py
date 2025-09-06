@@ -409,6 +409,15 @@ class SpringRepulsorSystem:
         with self.edge_locks[key]:
             e.ingest_impulse(g_scalar, self.dt)
 
+    def impulse_batch(self, src_ids, dst_id: int, op_id: str, g_scalars):
+        g_vals = AbstractTensor.get_tensor(g_scalars).reshape(-1)
+        for i, g in zip(src_ids, g_vals):
+            try:
+                g_val = float(getattr(g, "item", lambda: g)())
+            except Exception:
+                g_val = float(g)
+            self.impulse(int(i), int(dst_id), op_id, g_val)
+
     def add_feedback_edge(self, src: int, dst: int, op_id: str = "loss_fb") -> None:
         """Register an edge that will receive global loss impulses."""
         self.feedback_edges.append((int(src), int(dst), str(op_id)))
@@ -1431,22 +1440,32 @@ class Experiencer(threading.Thread):
                 for (name, srcs, out, args, kwargs), y, g_list, r in zip(
                     out_specs, ys, grads, smoothed
                 ):
-                    for i, g_vec in zip(srcs, g_list):
-                        try:
-                            g_scalar = float((g_vec * r).sum())
-                        except Exception:
-                            g_scalar = 0.0
-                        self.sys.impulse(int(i), int(out), name, -g_scalar)
-                        p_node = self.sys.nodes.get(int(i))
-                        if p_node is not None and hasattr(p_node, "param"):
-                            try:
-                                update = g_vec * r
-                                if getattr(p_node.param, "shape", ()) == getattr(update, "shape", () ):
-                                    p_node.param += update
-                                else:
-                                    p_node.param += update.sum()
-                            except Exception:
-                                pass
+                    if not g_list:
+                        continue
+                    g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                    r_tensor = AbstractTensor.get_tensor(r)
+                    prod = g_stack * r_tensor
+                    g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
+                    self.sys.impulse_batch(srcs, out, name, -g_scalars)
+
+                    param_nodes = []
+                    param_idx = []
+                    for idx, i in enumerate(srcs):
+                        node = self.sys.nodes.get(int(i))
+                        if node is not None and hasattr(node, "param"):
+                            param_nodes.append(node)
+                            param_idx.append(idx)
+                    if param_nodes:
+                        params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+                        upd_full = prod[param_idx]
+                        if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
+                            params = params + upd_full
+                        else:
+                            extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
+                            params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
+                        for node, new_param in zip(param_nodes, params):
+                            node.param = new_param
+
                     node = self.sys.nodes[out]
                     y_t = (
                         AbstractTensor.get_tensor(0.0)
