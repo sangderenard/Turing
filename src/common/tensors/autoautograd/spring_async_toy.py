@@ -1247,7 +1247,8 @@ class Experiencer(threading.Thread):
                     node = self.sys.nodes[out]
                     y_t = AbstractTensor.get_tensor(0.0) if y is None else AbstractTensor.get_tensor(y)
                     mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
-                    node.p[0] = float(mean_val)
+                    # I keep going back and forth on how this should solve
+                    #node.p[0] = float(mean_val)
                 # Close the loop: push a scalar loss impulse along feedback edges
                 if self.sys.feedback_edges and smoothed:
                     L = AbstractTensor.zeroes_like(smoothed[0])
@@ -1551,8 +1552,8 @@ class LinearBlockFactory:
 def ascii_targets_for(phrase: str, out_ids: List[int]) -> Dict[int, Callable[[float], float]]:
     # scale bytes [0..255] → [-1,1] for your scalar residuals
     vals = [ord(c) for c in phrase]
-    def scale(v): return (v / 127.5) - 1.0
-    return {oid: (lambda t, v=scale(vals[k % len(vals)]): float(v)) 
+    def impulse_scale(v): return ((v / 127.5) - 1.0)
+    return {oid: (lambda t, v=impulse_scale(vals[k % len(vals)]): float(v))
             for k, oid in enumerate(out_ids)}
 
 
@@ -1671,7 +1672,7 @@ def main(duration_s: float = 8.0):
 
     def _to_byte(x):
         y = (float(x) + 1.0) * 127.5
-        return max(0, min(255, int(y)))
+        return max(0, min(255, round(y)))
 
     def mse_batch(a, b):
         d = a - b
