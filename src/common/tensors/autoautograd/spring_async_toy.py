@@ -564,11 +564,25 @@ class LiveVizGLPoints:
                  sys,
                  node_cmap: str = "coolwarm",
                  base_point_size: float = 6.0,
-                 boundary_scale: float = 1.8,
+                 boundary_scale: float = 1.3,
                  bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06)):
         self.sys = sys
         self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
         self.base_point_size = float(base_point_size)
+        self.role_palette = {
+            "input":    mcolors.to_rgb("#14b8a6"),  # teal-500
+            "neumann":  mcolors.to_rgb("#f59e0b"),  # amber-500
+            "output":   mcolors.to_rgb("#d946ef"),  # fuchsia-500
+            "anchor":   mcolors.to_rgb("#10b981"),  # emerald-500
+            "dirichlet":mcolors.to_rgb("#10b981"),
+        }
+        self.role_size_gain = {
+            "input":   1.3,
+            "neumann": 1.6,
+            "output":  1.8,
+            "anchor":  2.2,
+            "dirichlet": 2.0,
+        }
         self.boundary_scale = float(boundary_scale)
         self.bg_color = bg_color
 
@@ -687,7 +701,7 @@ class LiveVizGLPoints:
 
     # ---------- geometry packing ----------
     def _pack_points(self):
-        nodes, bset = self._snapshot()
+        nodes, _ = self._snapshot()
         ids = AbstractTensor.get_tensor(sorted(nodes.keys()))
         if ids.shape == (0,):
             return (AbstractTensor.zeros((0, 3), ids.float_dtype),
@@ -706,19 +720,17 @@ class LiveVizGLPoints:
         # NEW: replace NaN/Inf early to avoid NaN bounds
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # --- existing thetas & base colormap (KEEP this: learning nodes stay coolwarm) ---
         thetas = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype, like=ids)
-        is_b = AbstractTensor.get_tensor([i in bset for i in ids], dtype=ids.bool_dtype, like=ids)
-
-        # Color map around 0.0 with TwoSlopeNorm
         vmin = AbstractTensor.min(thetas)
         vmax = AbstractTensor.max(thetas)
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
         import numpy as np
-        C = self.node_cmap(norm(thetas))[:, :3].astype(np.float32)  # RGB
+        C = self.node_cmap(norm(thetas))[:, :3].astype(np.float32)  # (N,3) RGB
 
-        # Point sizes (boundary nodes larger)
+        # --- sizes (base) ---
         sizes = AbstractTensor.full(
             ids.shape,
             self.base_point_size,
@@ -726,7 +738,34 @@ class LiveVizGLPoints:
             device=ids.get_device(),
             cls=type(ids),
         )
-        # Ensure boolean mask dtype and backend/device alignment
+
+        # --- role inference ---
+        roles_map = getattr(self.sys, "roles", {})
+        roles = [roles_map.get(int(i), "") for i in ids]
+
+        # auto-tag boundary *type* if no explicit role:
+        btypes = {}
+        for nid, port in self.sys.boundaries.items():
+            if port.enabled:
+                if port.beta > 0.0 and port.alpha <= 0.0:
+                    btypes[nid] = "neumann"
+                elif port.alpha > 0.0 and port.beta <= 0.0:
+                    btypes[nid] = "dirichlet"
+                elif port.alpha > 0.0 and port.beta > 0.0:
+                    btypes[nid] = "robin"
+
+        # --- apply role color/size overrides ---
+        for idx, nid in enumerate(ids):
+            rid = int(nid)
+            role = roles[idx] or btypes.get(rid, "")
+            if role in self.role_palette:
+                C[idx] = np.array(self.role_palette[role], dtype=np.float32)
+            if role in self.role_size_gain:
+                sizes[idx] *= float(self.role_size_gain[role])
+
+        # (Optional) still emphasize anything marked as a boundary, lightly
+        bset = set(self.sys.boundaries.keys())
+        is_b = AbstractTensor.get_tensor([int(i) in bset for i in ids], dtype=ids.bool_dtype, like=ids)
         is_b = is_b.to_dtype("bool")
         sizes[is_b] *= self.boundary_scale
 
@@ -1590,6 +1629,13 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.08, gamma=0.93, dt=0.02)
 
+    # Tag roles for visualization
+    sys.roles = {}
+    for i in lb.in_ids:
+        sys.roles[i] = "input"
+    for o in lb.out_ids:
+        sys.roles[o] = "output"
+
     # ---------------- Random batch-driven inputs ----------------
     B = int(max(1, batch_size))
     N_in = int(len(lb.in_ids))
@@ -1630,15 +1676,18 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
     for idx, nid in enumerate(lb.in_ids):
         attach_dirichlet(sys, nid, in_mean_fn)
-        if lb.row_ids:
-            rid = lb.row_ids[idx % len(lb.row_ids)]
-            attach_neumann_noop(sys, rid)
+        # The demo previously attached extra Neumann "noop" boundaries to many
+        # hidden row nodes.  Commenting this out reduces visual clutter and
+        # keeps role tagging focused on true inputs/outputs.
+        # if lb.row_ids:
+        #     rid = lb.row_ids[idx % len(lb.row_ids)]
+        #     attach_neumann_noop(sys, rid)
     for idx, oid in enumerate(lb.out_ids):
         target_fn = byte_targets[oid]
         attach_dirichlet(sys, oid, lambda t, fn=target_fn: fn(t))
-        if lb.row_ids:
-            rid = lb.row_ids[idx % len(lb.row_ids)]
-            attach_neumann_noop(sys, rid)
+        # if lb.row_ids:
+        #     rid = lb.row_ids[idx % len(lb.row_ids)]
+        #     attach_neumann_noop(sys, rid)
 
     # Wire the op program
     sys.ops_program = lb.ops
