@@ -182,9 +182,7 @@ def run_batched_vjp(
             ).build().tensor
             if hasattr(x_j, "requires_grad_"):
                 x_j = x_j.requires_grad_()
-            xs.append(x_j)
-
-
+            slices_for_job.append([pos_of[int(s)] for s in j.src_ids])
             op = getattr(x_j, op_name)
             y_j = op(*op_args, **op_kwargs) if callable(op) else op
             ys.append(y_j)
@@ -210,7 +208,8 @@ def run_batched_vjp(
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(
-        _reduce_per_source(g) if g is not None else tuple() for g in grads_full
+        _reduce_per_source(g) if g is not None else tuple(0.0 for _ in idxs)
+        for g, idxs in zip(grads_full, slices_for_job)
     )
 
     return BatchVJPResult(
