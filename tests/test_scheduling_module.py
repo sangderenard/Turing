@@ -16,13 +16,14 @@ from src.common.tensors.autoautograd.whiteboard_runtime import BatchVJPResult, B
 @dataclass
 class _Node:
     param: Any
+    sphere: Any
     version: int = 0
 
 
 class _Sys:
     def __init__(self, params: List[Any], versions: List[int] | None = None) -> None:
         versions = versions or [0] * len(params)
-        self.nodes = [_Node(param=t, version=v) for t, v in zip(params, versions)]
+        self.nodes = [_Node(param=t, sphere=t, version=v) for t, v in zip(params, versions)]
 
 
 def _mk_jobs(n: int, *, k: int = 2, op: str = "sum_k", weight: str = "w0", tag: Any = None) -> List[OpJob]:
@@ -43,7 +44,7 @@ def _mk_jobs(n: int, *, k: int = 2, op: str = "sum_k", weight: str = "w0", tag: 
     return jobs
 
 
-def _stub_batched_vjp(*, sys, jobs, op_args=(), op_kwargs=None, get_attr, backend=None) -> BatchVJPResult:
+def _stub_batched_vjp(*, sys, jobs, op_args=(), op_kwargs=None, backend=None) -> BatchVJPResult:
     # Deterministic fake values per job
     ys = tuple(f"y:{j.job_id}" for j in jobs)
     grads_per_source = tuple(tuple(float(i) for i in range(len(j.src_ids))) for j in jobs)
@@ -55,7 +56,7 @@ def test_runner_cache_probe_and_update(monkeypatch):
     # Arrange a tiny system with scalar features (shape ())
     sys = _Sys([type("_S", (), {"shape": ()})(), type("_S", (), {"shape": ()})()])
     def get_attr(i: int):
-        return sys.nodes[i].param
+        return sys.nodes[i].sphere
     def get_version(i: int) -> int:
         return sys.nodes[i].version
 
@@ -86,7 +87,7 @@ def test_triage_bins_and_backend_scoping(monkeypatch):
     # System with vector features (shape (F,)) for F=3; triage infers F from shape
     sys = _Sys([type("_S", (), {"shape": (3,)})(), type("_S", (), {"shape": (3,)})()])
     def get_attr(i: int):
-        return sys.nodes[i].param
+        return sys.nodes[i].sphere
     def get_version(i: int) -> int:
         return sys.nodes[i].version
 

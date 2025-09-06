@@ -4,6 +4,7 @@ from src.common.tensors.autoautograd.integration import bridge_v2
 class DummyNode:
     def __init__(self):
         self.param = 0
+        self.sphere = 0
 
 
 class DummySys:
@@ -11,7 +12,7 @@ class DummySys:
         self.nodes = {0: DummyNode(), 1: DummyNode()}
 
 
-def _stub_batched_vjp(*, sys, jobs, op_args, op_kwargs, get_attr, backend):
+def _stub_batched_vjp(*, sys, jobs, op_args, op_kwargs, backend):
     class _Batch:
         def __init__(self, n):
             self.ys = [1] * n

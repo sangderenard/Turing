@@ -133,7 +133,6 @@ class BulkOpRunner:
             jobs=jobs_rt,
             op_args=(),
             op_kwargs=None,
-            get_attr=get_attr,
             backend=backend,
         )
 
