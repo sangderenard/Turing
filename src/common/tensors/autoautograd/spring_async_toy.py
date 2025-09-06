@@ -1176,33 +1176,6 @@ class LiveViz3D:
         except Exception:
             pass
 
-def fwd_plus(sys, a, b, out):
-    pa, pb = sys.nodes[a].p, sys.nodes[b].p
-    wa, wb = norm_weights([inv_weight(sys, a, out), inv_weight(sys, b, out)])
-    yv = wa * pa + wb * pb
-    return yv, interpret_vec(yv), (wa, wb)
-
-def fwd_mul(sys, a, b, out):
-    pa, pb = sys.nodes[a].p, sys.nodes[b].p
-    wa, wb = inv_weight(sys, a, out), inv_weight(sys, b, out)
-    pa_w, pb_w = wa * pa, wb * pb
-    yv = pa_w * pb_w  # elementwise
-    return yv, interpret_vec(yv), (pa_w, pb_w)
-
-def fwd_gather(sys, srcs, out):
-    ps = [sys.nodes[s].p for s in srcs]
-    ws = norm_weights([inv_weight(sys, s, out) for s in srcs])
-    yv = sum(w * p for w, p in zip(ws, ps))
-    return yv, interpret_vec(yv), ws
-
-def fwd_scatter(sys, src, outs):
-    p = sys.nodes[src].p
-    ws = [inv_weight(sys, src, o) for o in outs]
-    wn = norm_weights(ws)
-    yvs = [w * p for w in wn]
-    ys  = [interpret_vec(v) for v in yvs]
-    return yvs, ys, wn
-
 # ----------------------------- Operators ------------------------------------
 # Each op consumes source nodes and writes a single output node's scalar.
 # It also emits per-edge impulses proportional to local derivative * residual.
@@ -1360,101 +1333,6 @@ class Experiencer(threading.Thread):
             time.sleep(self.dt)
 
 
-# ----------------------------- High-level wiring -----------------------------
-
-def build_dirichlet_neumann_pipeline(
-    sys: 'SpringRepulsorSystem',
-    X_batch,                  # shape (B, Fin) – any AbstractTensor-ish
-    y_batch,                  # shape (B, Fout)
-    in_ids: List[int],        # node ids for inputs (one per feature)
-    *,
-    layers: int = 1,
-    alpha_in: float = 2.0,
-    beta_link: float = 1.0,
-    alpha_out: float = 2.0,
-    feedback: str = "none",
-) -> Tuple[
-    List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
-    Dict[int, Callable[[float], float]],
-]:
-    """
-    Wire the system as:
-      D_in -> N_in -> system_input -> ... L layers (gather) ... -> system_output -> N_out -> D_out
-      Optionally create feedback edges from output Neumann nodes back to input Neumann nodes.
-    Returns (ops_program, outputs_map) for the Experiencer.
-    """
-    AT = AbstractTensor
-    shape_x = getattr(X_batch, "shape", (0, 0))
-    shape_y = getattr(y_batch, "shape", (0, 0))
-    B, Fin = (int(shape_x[0]), int(shape_x[1])) if len(shape_x) >= 2 else (0, 0)
-    _B2, Fout = (int(shape_y[0]), int(shape_y[1])) if len(shape_y) >= 2 else (0, 0)
-    D = sys.D
-
-    # 1) Input chains: fresh D_in→N_in wired into each system input node
-    in_bridge_neu: list[int] = []
-    if Fin > 0:
-        for idx, nid in enumerate(in_ids):
-            m = float(AT.get_tensor(X_batch[:, idx]).mean())
-            n_in = wire_input_chain(
-                sys,
-                nid,
-                lambda _t, m=m: m,
-                D=D,
-                alpha=alpha_in,
-                beta=beta_link,
-            )
-            in_bridge_neu.append(n_in)
-
-    # 2) Middle: stack 'layers' of gather; each new row gathers all previous
-    ops_program: List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
-    prev_row = list(in_ids)
-    for _ in range(max(0, int(layers))):
-        next_row: List[int] = []
-        if not prev_row:
-            break
-        # one output per previous node (keeps the row width stable & easy)
-        for _k in range(len(prev_row)):
-            out = _fresh_node_id(sys)
-            sys.nodes[out] = Node(id=out, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
-            ops_program.append(("sum_k", prev_row, out, None, None))
-            next_row.append(out)
-        prev_row = next_row
-
-    # 3) Outputs: system_output -> N_out -> D_out, supervise system_output
-    means_out = [float(AT.get_tensor(y_batch[:, f]).mean()) for f in range(Fout)] if Fout > 0 else []
-    outputs: Dict[int, Callable[[float], float]] = {}
-    last_neu: List[int] = []
-    for src, y_m in zip(prev_row, means_out):
-        n_out = wire_output_chain(
-            sys,
-            src,
-            lambda _t, y=y_m: y,
-            D=D,
-            beta=beta_link,
-            alpha=alpha_out,
-        )
-        outputs[src] = (lambda _t, y=y_m: y)
-        last_neu.append(n_out)
-
-    # 4) Optional feedback edges from outputs back to inputs
-    if feedback != "none" and last_neu and in_bridge_neu:
-        pairs: list[tuple[int, int]] = []
-        if feedback == "paired":
-            for o, i in zip(last_neu, in_bridge_neu):
-                pairs.append((o, i))
-        elif feedback == "full":
-            for o in last_neu:
-                for i in in_bridge_neu:
-                    pairs.append((o, i))
-        else:
-            raise ValueError("feedback must be 'none', 'paired', or 'full'")
-        for o, i in pairs:
-            sys.ensure_edge(o, i, "loss_fb")
-            sys.add_feedback_edge(o, i, op_id="loss_fb")
-
-    return ops_program, outputs
-
-# ----------------------------- Demo -----------------------------------------
 
 # ----- linear_block_factory.py -----
 from dataclasses import dataclass
@@ -1756,7 +1634,7 @@ def main(duration_s: float = 8.0):
     sys, outputs = build_toy_system(seed=42, batch_size=1000, batch_refresh_hz=15.0)
 
     stop = threading.Event()
-    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=1.00)
+    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=0.01)
     expr = Experiencer(sys, stop, outputs, schedule_hz=60.0, ops_program=sys.ops_program)
 
     print("[INFO] Starting threads…")
