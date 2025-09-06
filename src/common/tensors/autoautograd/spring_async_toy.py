@@ -1125,7 +1125,10 @@ class Ops:
             cache=Ops._cache,
         )
         if write_out and out_id in sys.nodes:
-            sys.nodes[out_id].theta = y
+            node = sys.nodes[out_id]
+            y_t = AbstractTensor.get_tensor(0.0) if y is None else AbstractTensor.get_tensor(y)
+            mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
+            node.p[0] = float(mean_val)
         return y
 
 # ----------------------------- Threads --------------------------------------
@@ -1231,7 +1234,10 @@ class Experiencer(threading.Thread):
                             else float(g)
                         )
                         self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
-                    self.sys.nodes[out].theta = y if y is not None else 0.0
+                    node = self.sys.nodes[out]
+                    y_t = AbstractTensor.get_tensor(0.0) if y is None else AbstractTensor.get_tensor(y)
+                    mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
+                    node.p[0] = float(mean_val)
                 # Close the loop: push a scalar loss impulse along feedback edges
                 if self.sys.feedback_edges and smoothed:
                     L = AbstractTensor.zeroes_like(smoothed[0])
