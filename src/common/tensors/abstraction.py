@@ -396,6 +396,30 @@ class AbstractTensor:
     def log_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_()")
 
+    @staticmethod
+    def real(x) -> "AbstractTensor":
+        """Return the real part of a complex tensor."""
+        if not isinstance(x, AbstractTensor):
+            x = AbstractTensor.tensor(x)
+        result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
+        result.data = x.real_()
+        return result
+
+    def real_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement real_()")
+
+    @staticmethod
+    def imag(x) -> "AbstractTensor":
+        """Return the imaginary part of a complex tensor."""
+        if not isinstance(x, AbstractTensor):
+            x = AbstractTensor.tensor(x)
+        result = type(x)(track_time=x.track_time, tape=getattr(x, "_tape", None))
+        result.data = x.imag_()
+        return result
+
+    def imag_(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement imag_()")
+
     # --- Softmax utilities ---
     def softmax(self, dim: int = -1) -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))

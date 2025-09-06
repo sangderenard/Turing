@@ -722,7 +722,7 @@ class LiveVizGLPoints:
 
         # positions
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_pos)
-        glBufferData(GL_ARRAY_BUFFER, P.nbytes, P, GL_DYNAMIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, P.nbytes, P.data, GL_DYNAMIC_DRAW)
 
         # colors
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_col)
@@ -730,7 +730,7 @@ class LiveVizGLPoints:
 
         # sizes
         glBindBuffer(GL_ARRAY_BUFFER, self._vbo_size)
-        glBufferData(GL_ARRAY_BUFFER, S.nbytes, S, GL_DYNAMIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, S.nbytes, S.data, GL_DYNAMIC_DRAW)
 
         glBindVertexArray(0)
 
