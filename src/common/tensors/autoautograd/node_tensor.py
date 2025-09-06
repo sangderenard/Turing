@@ -60,6 +60,11 @@ class NodeAttrView:
         fall back to policy, then to AbstractTensor defaults.
 
     Extra hook: `scatter_row` lets a backend control how rows are written back.
+
+    Resolved hooks are cached per instance.  Pass a pre-resolved mapping via
+    ``hooks`` when constructing multiple views to avoid recomputing.  Set
+    ``check_shapes=False`` if the caller can guarantee that all selected node
+    attributes share the same shape.
     """
     nodes: Any
     attr: str
@@ -80,9 +85,21 @@ class NodeAttrView:
     # internal
     _tensor: Any = None
     _order: list[int] | None = None
+    hooks: dict[str, Any] | None = None
+    check_shapes: bool = True
+    _hooks: dict[str, Any] | None = None
+
+    def __post_init__(self):
+        if self.hooks is not None:
+            self._hooks = self.hooks
 
     # --- hook resolution ---
+    def resolve(self) -> dict[str, Any]:
+        return self._resolve()
+
     def _resolve(self):
+        if self._hooks is not None:
+            return self._hooks
         pol = self.policy
         if pol is None:
             sample = None
@@ -102,29 +119,25 @@ class NodeAttrView:
 
         def choose(name, local):
             if self.policy_overrides:
-                # Prefer backend policy if it implements the method; else local; else AbstractTensor default
                 if hasattr(pol, name):
                     return getattr(pol, name)
                 if local is not None:
                     return local
             else:
-                # Prefer local if provided; else backend; else AbstractTensor default
                 if local is not None:
                     return local
                 if hasattr(pol, name):
                     return getattr(pol, name)
-            # Fallbacks for core hooks
             if name == "asarray":  return AbstractTensor.asarray
             if name == "stack":    return lambda xs, axis=0: AbstractTensor.stack(xs, axis=axis)
             if name == "getter":   return lambda n, a: getattr(n, a) if hasattr(n, a) else n[a]
             if name == "setter":   return lambda n, a, v: setattr(n, a, v) if hasattr(n, a) else n.__setitem__(a, v)
-            # Optional hooks default to no-op/None
             if name in ("pre_build","post_build","pre_commit","post_commit"):
                 return lambda *_args, **_kw: None
             if name == "scatter_row":
                 return None
             raise RuntimeError(f"No default for hook '{name}'")
-        return {
+        self._hooks = {
             "asarray":    choose("asarray", self.asarray_fn),
             "stack":      choose("stack", self.stack_fn),
             "getter":     choose("getter", self.getter),
@@ -135,6 +148,7 @@ class NodeAttrView:
             "pre_commit": choose("pre_commit", None),
             "post_commit":choose("post_commit", None),
         }
+        return self._hooks
 
     # --- core ops ---
     def build(self) -> "NodeAttrView":
@@ -161,10 +175,11 @@ class NodeAttrView:
         # Homogeneity check
         if not cols:
             raise ValueError("No nodes selected.")
-        ref_shape = getattr(cols[0], "shape", None)
-        for c in cols:
-            if getattr(c, "shape", None) != ref_shape:
-                raise ValueError("Node attributes are ragged; provide select() or normalize shapes.")
+        if self.check_shapes:
+            ref_shape = getattr(cols[0], "shape", None)
+            for c in cols:
+                if getattr(c, "shape", None) != ref_shape:
+                    raise ValueError("Node attributes are ragged; provide select() or normalize shapes.")
 
         self._tensor = H["stack"](cols, axis=0)  # (len(ids), *attr_shape)
         self._order = ids
