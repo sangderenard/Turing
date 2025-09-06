@@ -913,6 +913,10 @@ class AbstractTensor:
         # Default implementation delegates to generic ``pad``.
         return self.pad_(pad, value)
 
+    @staticmethod
+    def concatenate(*args, **kwargs):
+        print("Warning: AbstractTensor.concatenate is deprecated, use AbstractTensor.cat instead.")
+        return AbstractTensor.cat(*args, **kwargs)
 
     @staticmethod
     def cat(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
@@ -1385,7 +1389,9 @@ class AbstractTensor:
 
         finalize = AbstractTensor._pre_autograd("searchsorted", [seq, vals], params={"side": side})
         return finalize(counts)
-
+    @staticmethod
+    def concat(*args, **kwargs):
+        return AbstractTensor.cat(*args, **kwargs)
     # --- Order statistics --------------------------------------------------
     def percentile(
         self,
