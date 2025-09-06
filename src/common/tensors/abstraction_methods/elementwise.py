@@ -167,7 +167,11 @@ def _v3_valuewise(
     A = a_t.reshape(-1).tolist()
     B = b_t.reshape(-1).tolist()
 
-    target = max(len(c), len(A), len(B))
+    orig_len_c = len(c)
+    orig_len_a = len(A)
+    orig_len_b = len(B)
+
+    target = max(orig_len_c, orig_len_a, orig_len_b)
 
     def lift(lst, name, *, allow_div: bool = False):
         if len(lst) == target:
@@ -185,8 +189,17 @@ def _v3_valuewise(
 
     K = self._scalar_kernel("where")
     out = [K(self._as_scalar(c[i]), self._as_scalar(A[i]), self._as_scalar(B[i])) for i in range(target)]
-    # Result shape follows whichever operand carried the target length
-    shape = a_t.get_shape() if len(A) == target else b_t.get_shape()
+
+    # Determine result shape using the operand that originally carried the target length
+    if orig_len_a == target and orig_len_a != 1:
+        shape = a_t.get_shape()
+    elif orig_len_b == target and orig_len_b != 1:
+        shape = b_t.get_shape()
+    elif orig_len_c == target:
+        shape = self.get_shape()
+    else:
+        shape = (target,)
+
     out = self.ensure_tensor(out).reshape(*shape)
     out = finalize(out)
     tape = getattr(out, "_tape", None)
