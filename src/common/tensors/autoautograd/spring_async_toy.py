@@ -1527,7 +1527,8 @@ def build_toy_system(seed=0):
     outputs.update(byte_targets)
 
     # Dirichlet and Neumann/Robin boundaries for inputs and outputs.
-    # Clamp nodes to the live mean of their batch data so positions follow the data.
+    # Inputs clamp to the live mean of their batch data; outputs track their
+    # individual byte targets.
     def group_data_mean_fn(fn_map):
         def _mean(t, fn_map=fn_map):
             vals = [fn(t) for fn in fn_map.values()]
@@ -1535,7 +1536,6 @@ def build_toy_system(seed=0):
         return _mean
 
     in_mean_fn = group_data_mean_fn(input_force_fns)
-    out_mean_fn = group_data_mean_fn(byte_targets)
 
     for idx, nid in enumerate(lb.in_ids):
         attach_dirichlet(sys, nid, in_mean_fn)
@@ -1543,7 +1543,8 @@ def build_toy_system(seed=0):
             rid = lb.row_ids[idx % len(lb.row_ids)]
             attach_neumann_noop(sys, rid)
     for idx, oid in enumerate(lb.out_ids):
-        attach_dirichlet(sys, oid, out_mean_fn)
+        target_fn = byte_targets[oid]
+        attach_dirichlet(sys, oid, lambda t, fn=target_fn: fn(t))
         if lb.row_ids:
             rid = lb.row_ids[idx % len(lb.row_ids)]
             attach_neumann_noop(sys, rid)
