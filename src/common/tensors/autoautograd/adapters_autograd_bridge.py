@@ -67,14 +67,14 @@ def push_impulses_from_op(
     src_ids: Sequence[int],
     out_id: int,
     *,
-    residual: float | None = None,
+    residual: AbstractTensor | None = None,
     scale: float = 1.0,
 ) -> float:
     """
     Compute local grads for a single op on node thetas and push impulses onto edges.
     Returns the forward value so you can write it to the out node if you want.
 
-    residual: if you already have (y - target) locally, pass it; otherwise None.
+    residual: full-vector `(y - target)` if already computed; otherwise ``None``.
     """
     # gather current scalar parameters from nodes
     vals = [AbstractTensor.array(sys.nodes[i].param, dtype=float) for i in src_ids]
@@ -83,8 +83,13 @@ def push_impulses_from_op(
 
     # push impulses (classic "local jacobian^T * residual" pattern)
     if residual is not None:
+        r = AbstractTensor.tensor(residual)
         for i, g in zip(src_ids, grads_at):
-            g_scalar = float(AbstractTensor.asarray(g))
-            sys.impulse(i, out_id, op_name, scale * g_scalar * float(-residual))
+            g_vec = AbstractTensor.asarray(g)
+            try:
+                g_scalar = float((g_vec * r).sum())
+            except Exception:
+                g_scalar = 0.0
+            sys.impulse(i, out_id, op_name, scale * (-g_scalar))
 
     return float(AbstractTensor.asarray(y_at))

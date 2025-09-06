@@ -1418,6 +1418,8 @@ class Experiencer(threading.Thread):
                     )
                     residuals.append(r)
 
+                # Apply any desired smoothing on the vector residuals before
+                # scalarization (e.g., operate on ||r|| or per-channel norms).
                 smoothed = residuals
 
                 for (name, srcs, out, args, kwargs), y, g_list, r in zip(
@@ -1448,17 +1450,18 @@ class Experiencer(threading.Thread):
                     mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
                     # node.param could also be updated here if desired
                 if self.sys.feedback_edges and smoothed:
+                    # Aggregate vector residuals into a scalar loss before feedback.
                     L = AbstractTensor.get_tensor(0.0)
                     for r in smoothed:
                         L += 0.5 * (r * r).sum()
-                    L_host = (
+                    L_scalar = (
                         float(getattr(L, "item_", lambda: L)())
                         if hasattr(L, "item_")
                         else float(L)
                     )
                     for i, j, op_id in self.sys.feedback_edges:
                         try:
-                            self.sys.impulse(i, j, op_id, g_scalar=L_host)
+                            self.sys.impulse(i, j, op_id, g_scalar=L_scalar)
                         except Exception:
                             pass
             time.sleep(self.dt)
