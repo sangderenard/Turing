@@ -1386,6 +1386,198 @@ class AbstractTensor:
         finalize = AbstractTensor._pre_autograd("searchsorted", [seq, vals], params={"side": side})
         return finalize(counts)
 
+    # --- Order statistics --------------------------------------------------
+    def percentile(
+        self,
+        n: float,
+        dim: int | None = None,
+        *,
+        which: str | None = None,
+        group: str | None = None,
+        inclusive: bool = True,
+        e: float | None = None,
+        return_mask: bool = False,
+    ):
+        """Percentile utilities: values and percentile-defined selection.
+
+        Value mode (when ``group is None``):
+        - When ``dim is None`` returns a Python ``float`` (global percentile).
+        - When ``dim`` is provided, returns an ``AbstractTensor`` reduced over
+          that dimension.
+        - ``which`` chooses the return relative to the target percentile:
+          "value" (default), "under" (lower bracket), "over" (upper bracket),
+          or "margin" (over-under).
+
+        Selection mode (when ``group`` provided):
+        - Returns a boolean mask (``return_mask=True``) or selected elements
+          (``False``, default) corresponding to a percentile-defined slice.
+        - ``group`` one of: "under"/"0-n" (<= n%), "over"/"n-100" (>= n%),
+          "band"/"margin" (between n-e and n+e percent, requires ``e``).
+        - ``inclusive`` controls boundary inclusion.
+
+        Implementation is backend-agnostic and composed from existing
+        high-level tensor operations in this module:
+        - ``flatten`` to 1D
+        - ``min``/``max`` fast paths for 0%/100%
+        - ``topk`` + ``min`` on the negated array to compute order statistics
+        - linear interpolation between adjacent order statistics
+
+        Notes:
+        - For empty inputs, returns ``float('nan')`` (or a nan tensor/mask of
+          all False in selection mode).
+        - For single-element inputs, returns that element (or a mask selecting it).
+        - Interpolation uses NumPy's traditional "linear" scheme with
+          rank = p/100 * (N-1).
+        """
+        # Parse percentile and behaviour flags
+        try:
+            p = float(n)
+        except Exception:
+            raise TypeError("percentile requires a numeric percentile value")
+        which = (which or "value").lower()
+        if which not in ("value", "under", "over", "margin"):
+            raise ValueError("which must be one of: 'value', 'under', 'over', 'margin'")
+
+        # If selection mode requested, normalise group alias and branch later
+        if group is not None:
+            g = (group or "under").lower()
+            if g in ("0-n", "below"): g = "under"
+            if g in ("n-100", "above"): g = "over"
+            if g in ("window", "margin"): g = "band"
+            if g not in ("under", "over", "band"):
+                raise ValueError("group must be one of: 'under', 'over', 'band'")
+        else:
+            g = None
+
+        # Axis/global setup
+        if dim is None and g is None:
+            x = self.flatten()
+            try:
+                N = int(x.numel())
+            except Exception:
+                N = 0
+            if N == 0:
+                # Global empty -> NaN float
+                return float("nan")
+            if N == 1:
+                return float(x.item())
+
+            if p <= 0.0:
+                return float(x.min().item())
+            if p >= 100.0:
+                return float(x.max().item())
+
+            rank = (p / 100.0) * (N - 1)
+            lo_i = int(math.floor(rank))
+            hi_i = int(math.ceil(rank))
+            alpha = rank - lo_i
+
+            def kth_smallest_1d(vec: "AbstractTensor", k: int) -> "AbstractTensor":
+                y = -vec
+                y_topk = AbstractTensor.topk(y, k=k, dim=0).values  # (k,)
+                y_k = y_topk.min()  # scalar
+                return -y_k
+
+            v_lo = kth_smallest_1d(x, lo_i + 1)
+            v_hi = kth_smallest_1d(x, hi_i + 1)
+
+            if which == "under":
+                return float(v_lo.item())
+            if which == "over":
+                return float(v_hi.item())
+            if which == "margin":
+                return float((v_hi - v_lo).item())
+
+            if lo_i == hi_i:
+                return float(v_lo.item())
+            out = (1.0 - alpha) * v_lo + alpha * v_hi
+            return float(out.item())
+
+        # Dimension-aware value mode, or any selection mode
+        x = self
+        nd = int(x.ndim) if hasattr(x, "ndim") else len(getattr(x, "shape", ()))
+        axis = dim if dim >= 0 else (nd + dim)
+
+        try:
+            shape = x.shape
+            N = int(shape[axis])
+        except Exception:
+            # Fallback: attempt to reduce over dim; if fails, treat as empty
+            N = 0
+
+        if g is None:
+            # Value mode along axis
+            if N == 0:
+                out_shape = tuple(shape[i] for i in range(len(shape)) if i != axis) if isinstance(shape, tuple) else ()
+                return AbstractTensor.full(out_shape, float("nan"), dtype=float)
+            if p <= 0.0:
+                return x.min(dim=axis)
+            if p >= 100.0:
+                return x.max(dim=axis)
+
+            rank = (p / 100.0) * (N - 1)
+            lo_i = int(math.floor(rank))
+            hi_i = int(math.ceil(rank))
+            alpha = rank - lo_i
+
+            def kth_smallest_along(vec: "AbstractTensor", k: int, d: int) -> "AbstractTensor":
+                y = -vec
+                y_topk = AbstractTensor.topk(y, k=k, dim=d).values  # replace axis d by k
+                y_k = y_topk.min(dim=d)  # reduce the k-axis
+                return -y_k
+
+            v_lo = kth_smallest_along(x, lo_i + 1, axis)
+            v_hi = kth_smallest_along(x, hi_i + 1, axis)
+
+            if which == "under":
+                return v_lo
+            if which == "over":
+                return v_hi
+            if which == "margin":
+                return v_hi - v_lo
+
+            if lo_i == hi_i:
+                return v_lo
+            return (1.0 - alpha) * v_lo + alpha * v_hi
+
+        # Selection mode (group present): build mask then optionally compact
+        # Compute thresholds per group
+        if g == "band":
+            if e is None:
+                raise ValueError("percentile(group='band') requires e (half-width)")
+            lo_p = max(0.0, p - float(e))
+            hi_p = min(100.0, p + float(e))
+            t_lo = self.percentile(lo_p, dim=dim)
+            t_hi = self.percentile(hi_p, dim=dim)
+        else:
+            t = self.percentile(p, dim=dim)
+
+        # Build mask with broadcasting over axis
+        if dim is None:
+            if g == "under":
+                mask = self.less_equal(t) if inclusive else self.less(t)
+            elif g == "over":
+                mask = self.greater_equal(t) if inclusive else self.greater(t)
+            else:  # band
+                m1 = self.greater_equal(t_lo) if inclusive else self.greater(t_lo)
+                m2 = self.less_equal(t_hi) if inclusive else self.less(t_hi)
+                mask = (m1.to_dtype(self.long_dtype) * m2.to_dtype(self.long_dtype)).to_dtype(self.bool_dtype)
+        else:
+            if g == "band":
+                t_lo = t_lo.unsqueeze(axis)
+                t_hi = t_hi.unsqueeze(axis)
+                m1 = self.greater_equal(t_lo) if inclusive else self.greater(t_lo)
+                m2 = self.less_equal(t_hi) if inclusive else self.less(t_hi)
+                mask = (m1.to_dtype(self.long_dtype) * m2.to_dtype(self.long_dtype)).to_dtype(self.bool_dtype)
+            else:
+                t = t.unsqueeze(axis)
+                if g == "under":
+                    mask = self.less_equal(t) if inclusive else self.less(t)
+                else:
+                    mask = self.greater_equal(t) if inclusive else self.greater(t)
+
+        return mask if return_mask else self.boolean_mask_select(mask)
+
     # --- Dtype helpers ---
     @property
     def long_dtype(self) -> Any:
