@@ -123,7 +123,9 @@ def enliven_feature_edges(sys: SpringRepulsorSystem, in_ids: List[int], out_ids:
     for i in in_ids:
         for o in out_ids:
             sys.ensure_edge(i, o, "feat")  # op_id tag just to distinguish
-
+def empty_param_generator():
+    while True:
+        yield AbstractTensor.get_tensor([0.0, 1.0, 0.0])
 
 def wire_input_chain(
     sys: "SpringRepulsorSystem",
@@ -139,10 +141,11 @@ def wire_input_chain(
     D = sys.D if D is None else int(D)
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = AT.zeros(1, dtype=float)
+    param_generator = empty_param_generator()
+    
     sys.nodes[d] = Node(
         id=d,
-        param=param,
+        param=param_generator.__next__(),
         p=p,
         v=AT.zeros(D, dtype=float),
         sphere=AbstractTensor.concat([p, param], dim=0),
@@ -150,10 +153,10 @@ def wire_input_chain(
     attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = AT.zeros(1, dtype=float)
+    
     sys.nodes[n] = Node(
         id=n,
-        param=param,
+        param=param_generator.__next__(),
         p=p,
         v=AT.zeros(D, dtype=float),
         sphere=AbstractTensor.concat([p, param], dim=0),
@@ -291,7 +294,7 @@ class Edge:
         # Update band EMAs
         for b in self.bands:
             b.m += (abs(g_scalar) - b.m) * (dt / max(b.tau, 1e-6))
-            b.s += (AbstractTensor.sign(g_scalar) - b.s) * (dt / max(b.tau, 1e-6))
+            b.s += (AbstractTensor.sign(AbstractTensor.get_tensor(g_scalar)) - b.s) * (dt / max(b.tau, 1e-6))
             # Also push a composite contribution (post-knee)
             # AFTER
             y = soft_knee(b.m, b.th, b.ratio, b.knee)
@@ -687,7 +690,7 @@ class LiveVizGLPoints:
     def _snapshot(self):
         # lock-free minimal copy
         nodes = {
-            i: (AbstractTensor.get_tensor(n.p), float(AbstractTensor.get_tensor(n.param)))
+            i: (n.p.clone(), n.param.clone())
             for i, n in self.sys.nodes.items()
         }
         edges = list(self.sys.edges.values())
@@ -829,9 +832,12 @@ class LiveVizGLPoints:
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
         # --- existing params & base colormap (KEEP this: learning nodes stay coolwarm) ---
-        params = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype, like=ids)
+        params = AbstractTensor.get_tensor([nodes[i][1][1] for i in ids])
+        
         vmin = AbstractTensor.min(params)
         vmax = AbstractTensor.max(params)
+        if vmin > 0.0:
+            vmin = 0.0 - 1e-6
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
@@ -1544,7 +1550,8 @@ class LinearBlockFactory:
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])
+            param_generator = empty_param_generator()
+            param = param_generator.__next__()
             nodes.append(
                 Node(
                     id=i_id,
@@ -1559,7 +1566,7 @@ class LinearBlockFactory:
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])
+            param = param_generator.__next__()
             nodes.append(
                 Node(
                     id=o_id,
@@ -1577,7 +1584,7 @@ class LinearBlockFactory:
             y = (j - 0.5*(self.n_out-1)) * self.spacing
             z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])  # bias value seed
+            param = param_generator.__next__()
             nodes.append(
                 Node(
                     id=b_id,
@@ -1596,7 +1603,7 @@ class LinearBlockFactory:
                 y = (r - 0.5*(self.rows-1)) * self.spacing
                 z = z_level + 0.05 * self.rng.standard_normal()
                 p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-                param = AbstractTensor.zeros(1)
+                param = param_generator.__next__()
                 nodes.append(
                     Node(
                         id=n_id,
@@ -1812,8 +1819,8 @@ def main(duration_s: float = 8.0):
             t = now_s() - t0
 
             # (F,) feature rows for this tick
-            actual_row = AbstractTensor.get_tensor([
-                float(AbstractTensor.get_tensor(sys.nodes[oid].param))
+            actual_row = AbstractTensor.stack([
+                AbstractTensor.cat([sys.nodes[oid].p.clone(), sys.nodes[oid].param.clone()]) if sys.nodes.get(oid) is not None else AbstractTensor.get_tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
                 for oid in sample
             ])
 
@@ -1828,14 +1835,14 @@ def main(duration_s: float = 8.0):
             target_batch = AbstractTensor.get_tensor([row for row in batch_target_q])
 
             # mean across batch (dim=0) → (F,) per-feature means (what you print as a string)
-            mean_vals  = actual_batch.mean(dim=0)
+            mean_vals  = actual_batch.mean(dim=1)
             mean_tgts  = target_batch.mean(dim=0)
 
             # adherence/loss over the whole batch (not a single scalar output vector)
-            error = mse_batch(actual_batch, target_batch)
+            error = mse_batch(actual_batch[..., 0], target_batch)
 
             # visualize both the averaged output and averaged target
-            output_str = ''.join(chr(_to_byte(v)) for v in mean_vals)
+            output_str = ''.join(chr(_to_byte(v[0])) for v in mean_vals)
             target_str = ''.join(chr(_to_byte(v)) for v in mean_tgts)
 
             print(f"[DBG] outputs→batch-mean Error: {error: .3f} | "

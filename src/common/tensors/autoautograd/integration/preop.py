@@ -29,7 +29,7 @@ def preactivate_src(sys: Any, nid: int) -> Tuple[AbstractTensor, dict]:
     """
     n = sys.nodes[nid]
     x = n.p
-    ecc_raw, w, b = n.param[0], n.param[1], n.param[2]
+    ecc_raw, w, b = AbstractTensor.get_tensor(n.param[0]), AbstractTensor.get_tensor(n.param[1]), AbstractTensor.get_tensor(n.param[2])
     gate = _sigmoid(ecc_raw)
     z = x * w + b
     act_name = getattr(n, "activation", "tanh")
