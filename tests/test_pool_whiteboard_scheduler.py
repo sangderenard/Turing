@@ -47,13 +47,14 @@ class PoolATAdapter:
 @dataclass
 class _Node:
     param: Any
+    sphere: Any
     version: int = 0
 
 
 class _Sys:
     def __init__(self, params: List[Any], versions: List[int] | None = None) -> None:
         versions = versions or [0] * len(params)
-        self.nodes = [_Node(param=t, version=v) for t, v in zip(params, versions)]
+        self.nodes = [_Node(param=t, sphere=t, version=v) for t, v in zip(params, versions)]
 
 
 def _mk_jobs(n: int, *, k: int = 2, residual: float | None = 1.0, op: str = "sum_k", weight: str = "w0") -> List[OpJob]:
@@ -88,7 +89,7 @@ def test_full_pipeline_with_tensor_pool():
     sys = _Sys([t0, t1])
 
     import types
-    get_attr = types.MethodType(lambda self, i: self.nodes[i].param, sys)
+    get_attr = types.MethodType(lambda self, i: self.nodes[i].sphere, sys)
     get_version = types.MethodType(lambda self, i: self.nodes[i].version, sys)
 
     runner = BulkOpRunner()
@@ -127,7 +128,7 @@ def test_cache_hits_with_tensor_pool():
     sys = _Sys([t0, t1])
 
     import types
-    get_attr = types.MethodType(lambda self, i: self.nodes[i].param, sys)
+    get_attr = types.MethodType(lambda self, i: self.nodes[i].sphere, sys)
     get_version = types.MethodType(lambda self, i: self.nodes[i].version, sys)
 
     runner = BulkOpRunner()

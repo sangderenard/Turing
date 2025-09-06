@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .whiteboard_cache import WhiteboardCache
 
 from ..autograd import autograd, GradTape
@@ -70,8 +70,8 @@ def run_op_and_grads_cached(
     """Convenience wrapper: run single op with caching."""
     cache = cache or WhiteboardCache()
     versions = [int(getattr(sys.nodes[i], "version", 0)) for i in src_ids]
-    sample = sys.nodes[src_ids[0]].param
-    feat_shape = getattr(sample, "shape", ())
+    sample = sys.nodes[src_ids[0]].sphere
+    feat_shape = getattr(sample, "shape", ())  # full vector shape drives cache binning
     key = cache.make_key(
         op_name=op_name,
         src_ids=src_ids,
@@ -86,7 +86,7 @@ def run_op_and_grads_cached(
     if hit is not None:
         return hit
 
-    vals = [sys.nodes[i].param for i in src_ids]
+    vals = [sys.nodes[i].sphere for i in src_ids]
     if op_name == "add" and len(vals) == 2:
         y = vals[0] + vals[1]
         grads = (1.0, 1.0)
@@ -101,15 +101,11 @@ def run_op_and_grads_cached(
             residual=residual,
         )
 
-        def get_attr(i: int):
-            return sys.nodes[i].param
-
         batch = run_batched_vjp(
             sys=sys,
             jobs=(job,),
             op_args=(),
             op_kwargs=None,
-            get_attr=get_attr,
             backend=backend,
         )
         y = batch.ys[0]
@@ -123,13 +119,12 @@ def run_batched_vjp(
     jobs: Sequence[Any],                 # expects: job_id, src_ids, residual                        # tensor method/property to call
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
-    get_attr: Callable[[int], Any],      # e.g., lambda i: sys.nodes[i].param
     backend: Any | None = None,
 ) -> BatchVJPResult:
     """
     One tape, one VJP over the whole bin.
 
-      x_j = NodeAttrView(...).tensor
+      x_j = NodeAttrView(sys.nodes, "sphere", indices=j.src_ids).build().tensor
       y_j = getattr(x_j, op_name)(*op_args, **op_kwargs)  # or property value if not callable
 
     Then L = sum_j <residual_j, y_j> and grads = dL/dx_j for all j via a single autograd.grad.
@@ -156,7 +151,7 @@ def run_batched_vjp(
 
     with scope, _tape():
         for j in jobs:
-            x_j = NodeAttrView(sys.nodes, "param", indices=j.src_ids).build().tensor
+            x_j = NodeAttrView(sys.nodes, "sphere", indices=j.src_ids).build().tensor
             if hasattr(x_j, "requires_grad_"):
                 x_j = x_j.requires_grad_()
             xs.append(x_j)

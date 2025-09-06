@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Sequence, Any, Callable, List, Tuple, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 from ..whiteboard_runtime import run_batched_vjp
@@ -20,9 +20,6 @@ class _Job:
     scale: float | None
     weight: str | None
     backend_tag: Any = None
-
-
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     """One-time normalization → list[callable]."""
@@ -88,11 +85,6 @@ def _freeze_for_key(obj: Any) -> Any:
     return obj
 
 
-def _node_tensor(sys, nid: int):
-    n = sys.nodes[int(nid)]
-    return AbstractTensor.concat([n.p, n.param], dim=0)
-
-
 def _inv_length_scale(sys, out_id: int, src_ids: Sequence[int]) -> float:
     po = sys.nodes[out_id].p
     ws: List[float] = []
@@ -136,15 +128,11 @@ def push_impulses_from_op_v2(
         weight=weight,
     )
 
-    def get_attr(i: int):
-        return sys.nodes[i].param
-
     batch = run_batched_vjp(
         sys=sys,
         jobs=(job,),
         op_args=job.op_args or (),
         op_kwargs=job.op_kwargs,
-        get_attr=get_attr,
         backend=None,
     )
     y = batch.ys[0]
@@ -184,9 +172,6 @@ def batched_forward_v2(
             (idx, tuple(int(i) for i in src_ids), int(out_id), op_args_tuple, op_kwargs_dict)
         )
 
-    def get_attr(i: int):
-        return sys.nodes[i].param
-
     ys_buffer: Dict[int, Any] = {}
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         op_args = items[0][3] or ()
@@ -211,7 +196,6 @@ def batched_forward_v2(
             jobs=jobs,
             op_args=op_args,
             op_kwargs=op_kwargs,
-            get_attr=get_attr,
             backend=None,
         )
         for (idx, _src, _out, _args, _kwargs), y in zip(items, batch.ys):
@@ -261,9 +245,6 @@ def push_impulses_from_ops_batched(
             )
         )
 
-    def get_attr(i: int):
-        return _node_tensor(sys, i)
-
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         op_args = items[0][3] or ()
         op_kwargs = items[0][4]
@@ -286,7 +267,6 @@ def push_impulses_from_ops_batched(
             jobs=jobs,
             op_args=op_args,
             op_kwargs=op_kwargs,
-            get_attr=get_attr,
             backend=None,
         )
         for (idx, src_ids, out_id, _args, _kwargs), y, grads in zip(
