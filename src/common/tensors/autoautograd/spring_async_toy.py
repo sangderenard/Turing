@@ -128,6 +128,60 @@ def enliven_feature_edges(sys: SpringRepulsorSystem, in_ids: List[int], out_ids:
         for o in out_ids:
             sys.ensure_edge(i, o, "feat")  # op_id tag just to distinguish
 
+
+def wire_input_chain(
+    sys: "SpringRepulsorSystem",
+    system_nid: int,
+    sample_fn: Callable[[float], float],
+    *,
+    D: Optional[int] = None,
+    alpha: float = 2.0,
+    beta: float = 1.0,
+) -> int:
+    """Create Dirichlet→Neumann chain feeding into an existing system node."""
+    AT = AbstractTensor
+    D = sys.D if D is None else int(D)
+    d = _fresh_node_id(sys)
+    sys.nodes[d] = Node(
+        id=d, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+    )
+    attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
+    n = _fresh_node_id(sys)
+    sys.nodes[n] = Node(
+        id=n, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+    )
+    attach_neumann_noop(sys, n, D=D, beta=beta)
+    sys.ensure_edge(d, n, "in_link")
+    sys.ensure_edge(n, system_nid, "in_link")
+    return n
+
+
+def wire_output_chain(
+    sys: "SpringRepulsorSystem",
+    system_nid: int,
+    target_fn: Callable[[float], float],
+    *,
+    D: Optional[int] = None,
+    beta: float = 1.0,
+    alpha: float = 2.0,
+) -> int:
+    """Create system_output→Neumann→Dirichlet chain anchored to `target_fn`."""
+    AT = AbstractTensor
+    D = sys.D if D is None else int(D)
+    n = _fresh_node_id(sys)
+    sys.nodes[n] = Node(
+        id=n, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+    )
+    attach_neumann_noop(sys, n, D=D, beta=beta)
+    sys.ensure_edge(system_nid, n, "out_link")
+    d = _fresh_node_id(sys)
+    sys.nodes[d] = Node(
+        id=d, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+    )
+    attach_dirichlet(sys, d, target_fn, D=D, alpha=alpha)
+    sys.ensure_edge(n, d, "readout")
+    return n
+
 # ----------------------------- Core data ------------------------------------
 
 @dataclass
@@ -1325,9 +1379,8 @@ def build_dirichlet_neumann_pipeline(
 ]:
     """
     Wire the system as:
-      Dirichlet(input_feature_mean) -> (edge) -> Neumann(noop) -> ... L layers (gather) ...
-      -> Neumann(noop) -> (edge) -> Dirichlet(output_target)
-      Optionally create feedback edges from output Neumann nodes back to inputs.
+      D_in -> N_in -> system_input -> ... L layers (gather) ... -> system_output -> N_out -> D_out
+      Optionally create feedback edges from output Neumann nodes back to input Neumann nodes.
     Returns (ops_program, outputs_map) for the Experiencer.
     """
     AT = AbstractTensor
@@ -1337,20 +1390,24 @@ def build_dirichlet_neumann_pipeline(
     _B2, Fout = (int(shape_y[0]), int(shape_y[1])) if len(shape_y) >= 2 else (0, 0)
     D = sys.D
 
-    # 1) Input anchors (Dirichlet) at batch means; bridge to noop-Neumann nodes
-    means_in = [float(AT.get_tensor(X_batch[:, f]).mean()) for f in range(Fin)] if Fin > 0 else []
+    # 1) Input chains: fresh D_in→N_in wired into each system input node
     in_bridge_neu: list[int] = []
-    for nid, m in zip(in_ids, means_in):
-        attach_dirichlet(sys, nid, lambda _t, m=m: m, D=D, alpha=alpha_in)
-        neu = _fresh_node_id(sys)
-        sys.nodes[neu] = Node(id=neu, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
-        attach_neumann_noop(sys, neu, D=D, beta=beta_link)
-        sys.ensure_edge(nid, neu, "in_link")
-        in_bridge_neu.append(neu)
+    if Fin > 0:
+        for idx, nid in enumerate(in_ids):
+            m = float(AT.get_tensor(X_batch[:, idx]).mean())
+            n_in = wire_input_chain(
+                sys,
+                nid,
+                lambda _t, m=m: m,
+                D=D,
+                alpha=alpha_in,
+                beta=beta_link,
+            )
+            in_bridge_neu.append(n_in)
 
     # 2) Middle: stack 'layers' of gather; each new row gathers all previous
     ops_program: List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
-    prev_row = in_bridge_neu if in_bridge_neu else list(in_ids)
+    prev_row = list(in_ids)
     for _ in range(max(0, int(layers))):
         next_row: List[int] = []
         if not prev_row:
@@ -1363,23 +1420,21 @@ def build_dirichlet_neumann_pipeline(
             next_row.append(out)
         prev_row = next_row
 
-    # 3) Outputs: for each last-row unit, Neumann(noop) -> Dirichlet(target)
+    # 3) Outputs: system_output -> N_out -> D_out, supervise system_output
     means_out = [float(AT.get_tensor(y_batch[:, f]).mean()) for f in range(Fout)] if Fout > 0 else []
     outputs: Dict[int, Callable[[float], float]] = {}
     last_neu: List[int] = []
     for src, y_m in zip(prev_row, means_out):
-        neu = _fresh_node_id(sys)
-        sys.nodes[neu] = Node(id=neu, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
-        attach_neumann_noop(sys, neu, D=D, beta=beta_link)
-        sys.ensure_edge(src, neu, "out_link")
-        # Dirichlet anchor to the target location (x := mean target)
-        anchor = _fresh_node_id(sys)
-        sys.nodes[anchor] = Node(id=anchor, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float))
-        attach_dirichlet(sys, anchor, lambda _t, y=y_m: y, D=D, alpha=alpha_out)
-        sys.ensure_edge(neu, anchor, "readout")
-        # The Experiencer's supervised target for this output is the same scalar
-        outputs[neu] = (lambda _t, y=y_m: y)
-        last_neu.append(neu)
+        n_out = wire_output_chain(
+            sys,
+            src,
+            lambda _t, y=y_m: y,
+            D=D,
+            beta=beta_link,
+            alpha=alpha_out,
+        )
+        outputs[src] = (lambda _t, y=y_m: y)
+        last_neu.append(n_out)
 
     # 4) Optional feedback edges from outputs back to inputs
     if feedback != "none" and last_neu and in_bridge_neu:
