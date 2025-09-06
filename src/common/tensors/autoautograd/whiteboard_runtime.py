@@ -159,15 +159,26 @@ def run_batched_vjp(
     scope_cm = getattr(backend, "scope", None)
     scope = scope_cm() if callable(scope_cm) else nullcontext()
 
+    hooks = NodeAttrView(sys.nodes, "sphere").resolve()
+
     with scope, _tape():
         view = NodeAttrView(sys.nodes, "sphere", indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
         for j in jobs:
-            idxs = [pos_of[int(s)] for s in j.src_ids]
-            slices_for_job.append(idxs)
-            x_j = x_all[idxs]
+            x_j = NodeAttrView(
+                sys.nodes,
+                "sphere",
+                indices=j.src_ids,
+                hooks=hooks,
+                check_shapes=False,
+            ).build().tensor
+            if hasattr(x_j, "requires_grad_"):
+                x_j = x_j.requires_grad_()
+            xs.append(x_j)
+
+
             op = getattr(x_j, op_name)
             y_j = op(*op_args, **op_kwargs) if callable(op) else op
             ys.append(y_j)
