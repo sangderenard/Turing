@@ -422,7 +422,7 @@ class SpringRepulsorSystem:
         if not AbstractTensor.isfinite(xs).all():
             D = xs.shape[1]
             return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-        xs = xs - xs.mean(axis=0, keepdims=True)
+        xs = xs - xs.mean(dim=0, keepdim=True)
         # AFTER: xs = xs - xs.mean(...)
 
         # normalize to avoid huge FFT magnitudes
@@ -439,7 +439,7 @@ class SpringRepulsorSystem:
         # --- 1) coarse FFT ---
         C0 = AbstractTensor.fft.rfft(xw, axis=0)                 # (F0, D)
         w0 = 2.0 * AbstractTensor.pi * AbstractTensor.fft.rfftfreq(W, d=dt)  # (F0,)
-        P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, axis=1)           # (F0,)
+        P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, dim=1)           # (F0,)
         if P0.sum() <= 1e-12 or len(P0) <= 2:
             return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
 
@@ -495,7 +495,7 @@ class SpringRepulsorSystem:
             Cz_band = Cz[hi_lo:hi_hi, :]               # (Fb, D)
             if Cz_band.shape[0] < 1:
                 continue
-            Pw = AbstractTensor.sum(AbstractTensor.abs(Cz_band)**2, axis=1) + 1e-12  # (Fb,)
+            Pw = AbstractTensor.sum(AbstractTensor.abs(Cz_band)**2, dim=1) + 1e-12  # (Fb,)
             if not AbstractTensor.isfinite(Pw).all() or Pw.sum() <= 1e-12:
                 continue
             Ww = Pw / Pw.sum()
@@ -666,14 +666,14 @@ class LiveVizGLPoints:
     # ---------- geometry packing ----------
     def _pack_points(self):
         nodes, bset = self._snapshot()
-        ids = AbstractTensor.array(sorted(nodes.keys()))
-        if ids.size == 0:
-            return (AbstractTensor.zeros((0, 3), AbstractTensor.float32),
-                    AbstractTensor.zeros((0, 3), AbstractTensor.float32),
-                    AbstractTensor.zeros((0,), AbstractTensor.float32),
-                    AbstractTensor.zeros((0, 3), AbstractTensor.float32))
+        ids = AbstractTensor.get_tensor(sorted(nodes.keys()))
+        if ids.shape == (0,):
+            return (AbstractTensor.zeros((0, 3), ids.float_dtype),
+                    AbstractTensor.zeros((0, 3), ids.float_dtype),
+                    AbstractTensor.zeros((0,), ids.float_dtype),
+                    AbstractTensor.zeros((0, 3), ids.float_dtype))
 
-        P = AbstractTensor.stack([nodes[i][0] for i in ids]).astype(AbstractTensor.float32, copy=False)
+        P = AbstractTensor.stack([nodes[i][0] for i in ids]).astype(ids.float_dtype)
 
         # NEW: pad to 3D if needed
         if P.shape[1] == 2:
@@ -682,19 +682,20 @@ class LiveVizGLPoints:
         # NEW: replace NaN/Inf early to avoid NaN bounds
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
-        thetas = AbstractTensor.array([nodes[i][1] for i in ids], dtype=AbstractTensor.float32)
-        is_b = AbstractTensor.array([i in bset for i in ids], dtype=bool)
+        thetas = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype)
+        is_b = AbstractTensor.get_tensor([i in bset for i in ids], dtype=ids.bool_dtype)
 
         # Color map around 0.0 with TwoSlopeNorm
-        vmin = float(AbstractTensor.min(thetas))
-        vmax = float(AbstractTensor.max(thetas))
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
+        vmin = AbstractTensor.min(thetas)
+        vmax = AbstractTensor.max(thetas)
+        vmax.where(vmin <= vmax, vmin + 1e-6)  # ensure vmax > vmin
+        vmax = vmax.mean().item()
+        vmin = vmin.mean().item()
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-        C = self.node_cmap(norm(thetas))[:, :3].astype(AbstractTensor.float32)  # RGB
+        C = self.node_cmap(norm(thetas))[:, :3].astype(thetas.float_dtype)  # RGB
 
         # Point sizes (boundary nodes larger)
-        sizes = AbstractTensor.full(ids.shape, self.base_point_size, dtype=AbstractTensor.float32)
+        sizes = AbstractTensor.full(ids.shape, self.base_point_size, dtype=AbstractTensor.float_dtype)
         sizes[is_b] *= self.boundary_scale
 
         return P, C, sizes, P  # return P twice; last is for autoscale
@@ -757,8 +758,8 @@ class LiveVizGLPoints:
             return
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)  # NEW
 
-        lo = AbstractTensor.min(P, axis=0)
-        hi = AbstractTensor.max(P, axis=0)
+        lo = AbstractTensor.min(P, dim=0)
+        hi = AbstractTensor.max(P, dim=0)
         ctr = 0.5 * (lo + hi)
         extent_t = AbstractTensor.get_tensor(AbstractTensor.max(hi - lo))
         if not extent_t.isfinite().item() or extent_t.item() <= 1e-6:
@@ -944,7 +945,7 @@ class LiveViz3D:
         self._autoscale(P)
 
     def _autoscale(self, P):
-        lo = AbstractTensor.min(P, axis=0); hi = AbstractTensor.max(P, axis=0)
+        lo = AbstractTensor.min(P, dim=0); hi = AbstractTensor.max(P, dim=0)
         ctr = 0.5 * (lo + hi)
         rad = float(AbstractTensor.max(hi - lo) * 0.6 + 1e-3)
         self.ax.set_xlim(ctr[0] - rad, ctr[0] + rad)
@@ -1134,19 +1135,19 @@ class Experiencer(threading.Thread):
                     out_specs.append((name, srcs, out, args, kwargs))
             if out_specs:
                 ys_hat = batched_forward_v2(self.sys, out_specs, weight=None, scale=0.1)
-                residuals: list[float] = []
+                residuals: list[AbstractTensor] = []
                 for (name, srcs, out, args, kwargs), y_hat in zip(out_specs, ys_hat):
                     target = self.outputs.get(out)
-                    r = float(y_hat) - float(target(t)) if target is not None else 0.0
+                    r = y_hat - target(t) if target is not None else 0.0
                     residuals.append(r)
                 ys = push_impulses_from_ops_batched(self.sys, out_specs, residuals, weight=None, scale=0.1)
                 for (name, srcs, out, args, kwargs), y in zip(out_specs, ys):
-                    self.sys.nodes[out].theta = float(y)
+                    self.sys.nodes[out].theta = y if y is not None else 0.0
                 # Close the loop: push a scalar loss impulse around the ring
                 if self.sys.feedback_edge is not None and residuals:
-                    L = 0.0
+                    L = AbstractTensor.zeroes_like(residuals[0])
                     for r in residuals:
-                        L += 0.5 * float(r) * float(r)
+                        L += 0.5 * r * r
                     i, j, op_id = self.sys.feedback_edge
                     try:
                         self.sys.impulse(i, j, op_id, g_scalar=L)

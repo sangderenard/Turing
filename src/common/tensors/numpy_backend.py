@@ -421,8 +421,11 @@ class NumPyTensorOperations(AbstractTensor):
     def long_cast_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).astype(np.int64)
 
-    def float_(self, tensor):
-        return self.to_dtype_(tensor, "float")
+    def float_(self, tensor=None):
+        if tensor is not None:
+            tensor.float()
+        else:
+            return self.to_dtype_("float")
 
     def double_(self, tensor):
         return self.to_dtype_(tensor, "double")

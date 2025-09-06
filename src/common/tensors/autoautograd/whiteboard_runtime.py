@@ -53,7 +53,7 @@ def _reduce_per_source(g: Any) -> Tuple[float, ...]:
     if ndim <= 1:
         return tuple(float(gi) for gi in g)
     axes = tuple(range(1, ndim))
-    gk = g.sum(axis=axes)
+    gk = g.sum(dim=axes)
     return tuple(float(gi) for gi in gk)
 
 
@@ -179,10 +179,10 @@ def run_batched_vjp(
                 for x_j in xs
             ]
         else:
-            grads_list = autograd.grad(L, xs, retain_graph=False, create_graph=False)
+            grads_list = autograd.grad(L, xs, retain_graph=False, allow_unused=True)
 
     grads_full = tuple(grads_list)
-    grads_per_source = tuple(_reduce_per_source(g) for g in grads_full)
+    grads_per_source = tuple(_reduce_per_source(g) for g in grads_full if g is not None)
 
     return BatchVJPResult(
         slices=BatchSlices(index_of=idx_of, job_ids=inv_ids),

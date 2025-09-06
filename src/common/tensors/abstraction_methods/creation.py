@@ -421,3 +421,66 @@ def randn(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
         inst.data = inst.tensor_from_list_(vals, kwargs.get('dtype'), device)
         inst = inst.reshape(*size)
     return _finalize_requires(inst, requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Window functions
+
+def hanning(
+    M: int,
+    *,
+    periodic: bool = True,
+    dtype: Any = None,
+    device: Any = None,
+    cls=None,
+    requires_grad: bool = False,
+    tape=None,
+):
+    """
+    Generate a 1-D Hann ("Hanning") window of length ``M`` without calling backend-specific APIs.
+
+    - If ``periodic=True``, produces a periodic window suitable for spectral analysis
+      (denominator ``N = M``). This matches common STFT usage.
+    - If ``periodic=False``, produces a symmetric window (denominator ``N = M-1``),
+      suitable for FIR filter design.
+
+    Edge cases follow NumPy/SciPy conventions:
+      - ``M == 0`` -> empty tensor
+      - ``M == 1`` -> tensor([1.0])
+
+    The implementation composes existing high-level ops (arange, cos) so it is
+    backend-agnostic and requires no direct backend call.
+    """
+    from ..abstraction import AbstractTensor  # local import to avoid cycles
+    import math
+
+    if M < 0:
+        raise ValueError("M must be non-negative")
+
+    # Handle degenerate cases first
+    if M == 0:
+        return AbstractTensor.zeros((0,), dtype=dtype, device=device, cls=cls,
+                                     requires_grad=requires_grad, tape=tape)
+    if M == 1:
+        return AbstractTensor.ones((1,), dtype=dtype, device=device, cls=cls,
+                                   requires_grad=requires_grad, tape=tape)
+
+    # Build index vector on the desired device/backend, ensure float math
+    n = AbstractTensor.arange(0, M, 1, device=device, cls=cls,
+                              requires_grad=requires_grad, tape=tape).float()
+
+    # Periodic vs symmetric denominator
+    N = float(M) if periodic else float(M - 1)
+
+    # Hann window: w[n] = 0.5 - 0.5*cos(2*pi*n / N)
+    # Compose from existing ops to stay backend-agnostic
+    w = 0.5 - 0.5 * ((2.0 * math.pi * n) / N).cos()
+
+    # Optional dtype conversion at the end
+    if dtype is not None:
+        try:
+            w = w.to(dtype=dtype)
+        except Exception:
+            pass
+
+    return w

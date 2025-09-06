@@ -139,7 +139,19 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    inf: float = float('inf')
+    ninf: float = float('-inf')  
+    nan: float = float('nan')
+
+    def nan_to_num(self, nan: float = 0.0, posinf: float = inf, neginf: float = ninf) -> "AbstractTensor":
+        self.where(self != self, nan)  # replace NaN
+        self.where(self == self.inf, posinf)
+        self.where(self == self.ninf, neginf)
+        return self
+
     def __index__(self):
+        
+
         """Allow use in slice contexts by returning a scalar ``int``.
 
         Non-scalar tensors raise ``TypeError`` mirroring PyTorch/NumPy."""
@@ -1964,6 +1976,7 @@ from .abstraction_methods.creation import (
     randint,
     randint_like,
     empty as create_empty,
+    hanning,
 )
 from .abstraction_methods.reduction import (
     max as reduction_max,
@@ -2104,6 +2117,7 @@ AbstractTensor.zeros = staticmethod(create_zeros)
 AbstractTensor.ones = staticmethod(create_ones)
 AbstractTensor.full = staticmethod(create_full)
 AbstractTensor.empty = staticmethod(create_empty)
+AbstractTensor.hanning = staticmethod(hanning)
 from .abstraction_methods.random import Random as _RandomClass
 AbstractTensor.random = _RandomClass()
 AbstractTensor.randoms = staticmethod(randoms)
@@ -2227,6 +2241,10 @@ except Exception:
     pass
 try:
     AbstractTensor.meshgrid = staticmethod(_wrap_meshgrid_fn(AbstractTensor.meshgrid))
+except Exception:
+    pass
+try:
+    AbstractTensor.hanning = staticmethod(_wrap_creation_fn("hanning", AbstractTensor.hanning))
 except Exception:
     pass
 try:

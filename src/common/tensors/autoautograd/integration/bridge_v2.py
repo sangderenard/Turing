@@ -107,7 +107,7 @@ def push_impulses_from_op_v2(
     src_ids: Sequence[int],
     out_id: int,
     *,
-    residual: float | None = None,
+    residual: AbstractTensor | None = None,
     scale: float = 1.0,
     weight: str | None = None,
     cache: WhiteboardCache | None = None,
@@ -126,7 +126,7 @@ def push_impulses_from_op_v2(
         op_args=tuple(op_args) if op_args is not None else None,
         op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
         src_ids=tuple(int(i) for i in src_ids),
-        residual=None if residual is None else float(residual),
+        residual=None if residual is None else residual,
         scale=float(scale),
         weight=weight,
     )
@@ -243,7 +243,7 @@ def push_impulses_from_ops_batched(
                 idx,
                 tuple(int(i) for i in src_ids),
                 int(out_id),
-                float(r),
+                r,
                 op_args_tuple,
                 op_kwargs_dict,
             )
