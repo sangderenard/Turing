@@ -1510,32 +1510,43 @@ def build_toy_system(seed=0):
 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.08, gamma=0.93, dt=0.02)
 
-    # Dirichlet and Neumann/Robin boundaries for inputs and outputs
-    for idx, nid in enumerate(lb.in_ids):
-        mean = float(sys.nodes[nid].theta)
-        attach_dirichlet(sys, nid, lambda _t, m=mean: m)
-        if lb.row_ids:
-            rid = lb.row_ids[idx % len(lb.row_ids)]
-            attach_neumann_noop(sys, rid)
-    for idx, oid in enumerate(lb.out_ids):
-        mean = float(sys.nodes[oid].theta)
-        attach_dirichlet(sys, oid, lambda _t, m=mean: m)
-        if lb.row_ids:
-            rid = lb.row_ids[idx % len(lb.row_ids)]
-            attach_neumann_noop(sys, rid)
-
-    # Drive inputs
+    # Drive inputs (store force fns so we can compute batch means)
     def sin_at(freq, amp=0.4):
         def _s(t, f=freq, a=amp):
             return float((AbstractTensor.get_tensor(f * t).sin() * a).item())
         return _s
     freqs = AbstractTensor.linspace(0.3, 1.1, len(lb.in_ids))
+    input_force_fns = {}
     for nid, f in zip(lb.in_ids, freqs):
-        sys.add_boundary(BoundaryPort(nid=nid, beta=0.8, force_fn=as_x_force(sin_at(f), D=sys.D)))
+        fn = sin_at(f)
+        input_force_fns[nid] = fn
+        sys.add_boundary(BoundaryPort(nid=nid, beta=0.8, force_fn=as_x_force(fn, D=sys.D)))
 
-    # ASCII targets
+    # ASCII targets (constant data fns for outputs)
     byte_targets = ascii_targets_for(TEXT, lb.out_ids)
     outputs.update(byte_targets)
+
+    # Dirichlet and Neumann/Robin boundaries for inputs and outputs.
+    # Clamp nodes to the live mean of their batch data so positions follow the data.
+    def group_data_mean_fn(fn_map):
+        def _mean(t, fn_map=fn_map):
+            vals = [fn(t) for fn in fn_map.values()]
+            return float(AbstractTensor.get_tensor(vals).mean()) if vals else 0.0
+        return _mean
+
+    in_mean_fn = group_data_mean_fn(input_force_fns)
+    out_mean_fn = group_data_mean_fn(byte_targets)
+
+    for idx, nid in enumerate(lb.in_ids):
+        attach_dirichlet(sys, nid, in_mean_fn)
+        if lb.row_ids:
+            rid = lb.row_ids[idx % len(lb.row_ids)]
+            attach_neumann_noop(sys, rid)
+    for idx, oid in enumerate(lb.out_ids):
+        attach_dirichlet(sys, oid, out_mean_fn)
+        if lb.row_ids:
+            rid = lb.row_ids[idx % len(lb.row_ids)]
+            attach_neumann_noop(sys, rid)
 
     # Wire the op program
     sys.ops_program = lb.ops
