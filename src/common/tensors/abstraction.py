@@ -1662,14 +1662,26 @@ class AbstractTensor:
 
     # inside AbstractTensor
     def __array__(self, dtype=None):
-        out = self.clone()
+        """Return a ``numpy`` view of this tensor's data.
+
+        The conversion only materialises when the current backend is not the
+        NumPy implementation.  In that case we delegate to ``to_backend`` to
+        obtain a NumPy-backed tensor and expose its underlying ``ndarray``.
+        """
+
         from .numpy_backend import NumPyTensorOperations
-        out.to_backend(AbstractTensor.get_tensor(0, cls=NumPyTensorOperations))
-        return out.data if dtype is None else out.data.astype(dtype)
+
+        tensor = self
+        if not isinstance(self, NumPyTensorOperations):
+            tensor = self.to_backend(
+                AbstractTensor.get_tensor(0, cls=NumPyTensorOperations)
+            )
+
+        arr = tensor.data
+        return arr if dtype is None else arr.astype(dtype)
 
     @property
     def __array_interface__(self):
-        import numpy as np
         return self.__array__().__array_interface__
 
 
