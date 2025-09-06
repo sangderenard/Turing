@@ -88,6 +88,11 @@ def _freeze_for_key(obj: Any) -> Any:
     return obj
 
 
+def _node_tensor(sys, nid: int):
+    n = sys.nodes[int(nid)]
+    return AbstractTensor.concat([n.p, n.param], dim=0)
+
+
 def _inv_length_scale(sys, out_id: int, src_ids: Sequence[int]) -> float:
     po = sys.nodes[out_id].p
     ws: List[float] = []
@@ -113,7 +118,7 @@ def push_impulses_from_op_v2(
     cache: WhiteboardCache | None = None,
     op_args: Optional[Tuple[Any, ...]] = None,
     op_kwargs: Optional[Dict[str, Any]] = None,
-) -> float:
+) -> Any:
     """Single op call via batched VJP; preserved for compatibility."""
     if weight == "inv_length":
         scale *= _inv_length_scale(sys, out_id, src_ids)
@@ -143,13 +148,14 @@ def push_impulses_from_op_v2(
         backend=None,
     )
     y = batch.ys[0]
-    grads = batch.grads_per_source[0]
-    y_host = float(getattr(y, "item_", lambda: y)()) if hasattr(y, "item_") else float(y)
+    grads = batch.grads_full[0]
     if residual is not None:
-        for i, g in zip(src_ids, grads):
-            g_host = float(getattr(g, "item_", lambda: g)()) if hasattr(g, "item_") else float(g)
-            sys.impulse(int(i), int(out_id), op_name, float(scale * g_host * (-float(residual))))
-    return y_host
+        for idx, i in enumerate(src_ids):
+            g = grads[idx]
+            g_val = g.sum() if hasattr(g, "sum") else g
+            g_val = float(getattr(g_val, "item_", lambda: g_val)())
+            sys.impulse(int(i), int(out_id), op_name, float(-scale * g_val))
+    return y
 
 
 def batched_forward_v2(
@@ -256,7 +262,7 @@ def push_impulses_from_ops_batched(
         )
 
     def get_attr(i: int):
-        return sys.nodes[i].param
+        return _node_tensor(sys, i)
 
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         op_args = items[0][3] or ()
@@ -284,8 +290,8 @@ def push_impulses_from_ops_batched(
             backend=None,
         )
         for (idx, src_ids, out_id, _args, _kwargs), y, grads in zip(
-            items, batch.ys, batch.grads_per_source
+            items, batch.ys, batch.grads_full
         ):
             ys_out[idx] = y
-            grads_out[idx] = grads
+            grads_out[idx] = tuple(grads[j] for j in range(len(src_ids)))
     return ys_out, grads_out

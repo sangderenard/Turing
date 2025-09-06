@@ -1436,10 +1436,11 @@ class Experiencer(threading.Thread):
                     )
                     sc = 1.0  # default scale
                     for i, g in zip(srcs, g_list):
+                        g_val = g.sum() if hasattr(g, "sum") else g
                         g_host = (
-                            float(getattr(g, "item_", lambda: g)())
-                            if hasattr(g, "item_")
-                            else float(g)
+                            float(getattr(g_val, "item_", lambda: g_val)())
+                            if hasattr(g_val, "item_")
+                            else float(g_val)
                         )
                         self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
                     node = self.sys.nodes[out]
