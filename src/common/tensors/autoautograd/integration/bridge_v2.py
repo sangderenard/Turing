@@ -132,7 +132,7 @@ def push_impulses_from_op_v2(
     )
 
     def get_attr(i: int):
-        return sys.nodes[i].theta
+        return sys.nodes[i].param
 
     batch = run_batched_vjp(
         sys=sys,
@@ -179,7 +179,7 @@ def batched_forward_v2(
         )
 
     def get_attr(i: int):
-        return sys.nodes[i].theta
+        return sys.nodes[i].param
 
     ys_buffer: Dict[int, Any] = {}
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
@@ -256,7 +256,7 @@ def push_impulses_from_ops_batched(
         )
 
     def get_attr(i: int):
-        return sys.nodes[i].theta
+        return sys.nodes[i].param
 
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         op_args = items[0][3] or ()

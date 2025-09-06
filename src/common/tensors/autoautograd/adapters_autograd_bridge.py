@@ -77,7 +77,7 @@ def push_impulses_from_op(
     residual: if you already have (y - target) locally, pass it; otherwise None.
     """
     # gather current scalar parameters from nodes
-    vals = [AbstractTensor.array(sys.nodes[i].theta, dtype=float) for i in src_ids]
+    vals = [AbstractTensor.array(sys.nodes[i].param, dtype=float) for i in src_ids]
 
     y_at, grads_at = run_op_and_grads(op_name, *vals)  # grads in same order as src_ids
 

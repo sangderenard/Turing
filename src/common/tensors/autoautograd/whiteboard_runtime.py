@@ -70,7 +70,7 @@ def run_op_and_grads_cached(
     """Convenience wrapper: run single op with caching."""
     cache = cache or WhiteboardCache()
     versions = [int(getattr(sys.nodes[i], "version", 0)) for i in src_ids]
-    sample = sys.nodes[src_ids[0]].theta
+    sample = sys.nodes[src_ids[0]].param
     feat_shape = getattr(sample, "shape", ())
     key = cache.make_key(
         op_name=op_name,
@@ -86,7 +86,7 @@ def run_op_and_grads_cached(
     if hit is not None:
         return hit
 
-    vals = [sys.nodes[i].theta for i in src_ids]
+    vals = [sys.nodes[i].param for i in src_ids]
     if op_name == "add" and len(vals) == 2:
         y = vals[0] + vals[1]
         grads = (1.0, 1.0)
@@ -102,7 +102,7 @@ def run_op_and_grads_cached(
         )
 
         def get_attr(i: int):
-            return sys.nodes[i].theta
+            return sys.nodes[i].param
 
         batch = run_batched_vjp(
             sys=sys,
@@ -123,7 +123,7 @@ def run_batched_vjp(
     jobs: Sequence[Any],                 # expects: job_id, src_ids, residual                        # tensor method/property to call
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
-    get_attr: Callable[[int], Any],      # e.g., lambda i: sys.nodes[i].theta
+    get_attr: Callable[[int], Any],      # e.g., lambda i: sys.nodes[i].param
     backend: Any | None = None,
 ) -> BatchVJPResult:
     """
@@ -156,7 +156,9 @@ def run_batched_vjp(
 
     with scope, _tape():
         for j in jobs:
-            x_j = NodeAttrView(sys.nodes, "theta", indices=j.src_ids).build().tensor
+            x_j = NodeAttrView(sys.nodes, "param", indices=j.src_ids).build().tensor
+            if hasattr(x_j, "requires_grad_"):
+                x_j = x_j.requires_grad_()
             xs.append(x_j)
 
             op = getattr(x_j, op_name)
