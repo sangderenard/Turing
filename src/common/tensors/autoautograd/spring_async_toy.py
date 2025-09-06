@@ -1322,7 +1322,7 @@ class Ops:
     @staticmethod
     def call(sys, op_name: str, src_ids, out_id, *, residual=None, scale=1.0,
              write_out: bool = False, weight: str = "none"):
-        y = push_impulses_from_op_v2(
+        y, _ = push_impulses_from_op_v2(
             sys,
             op_name,
             src_ids,
@@ -1402,7 +1402,7 @@ class Experiencer(threading.Thread):
                 if out in self.outputs:
                     out_specs.append((name, srcs, out, args, kwargs))
             if out_specs:
-                ys, grads = push_impulses_from_ops_batched(
+                ys, grads, _ = push_impulses_from_ops_batched(
                     self.sys, out_specs, weight=None, scale=1.0
                 )
                 # Collect residuals for smoothing

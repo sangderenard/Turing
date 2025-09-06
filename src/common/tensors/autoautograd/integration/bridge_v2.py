@@ -7,6 +7,7 @@ from ..whiteboard_runtime import run_batched_vjp
 from ..whiteboard_cache import WhiteboardCache
 from ...abstraction import AbstractTensor
 from ...linalg import norm as at_norm
+from .preop import preactivate_src
 
 
 @dataclass(frozen=True)
@@ -110,12 +111,19 @@ def push_impulses_from_op_v2(
     cache: WhiteboardCache | None = None,
     op_args: Optional[Tuple[Any, ...]] = None,
     op_kwargs: Optional[Dict[str, Any]] = None,
-) -> Any:
-    """Single op call via batched VJP; preserved for compatibility."""
+) -> Tuple[Any, Tuple[dict, ...]]:
+    """Single op call via batched VJP; returns output and per-source metadata."""
     if weight == "inv_length":
         scale *= _inv_length_scale(sys, out_id, src_ids)
 
-    
+    metas: List[dict] = []
+    for i in src_ids:
+        node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+        if hasattr(node, "p") and hasattr(node, "param"):
+            _y, meta = preactivate_src(sys, int(i))
+        else:
+            meta = {}
+        metas.append(meta)
 
     job = _Job(
         job_id=f"{op_name}:{tuple(src_ids)}->{out_id}",
@@ -143,7 +151,7 @@ def push_impulses_from_op_v2(
             g_val = g.sum() if hasattr(g, "sum") else g
             g_val = float(getattr(g_val, "item_", lambda: g_val)())
             sys.impulse(int(i), int(out_id), op_name, float(-scale * g_val))
-    return y
+    return y, tuple(metas)
 
 
 def batched_forward_v2(
@@ -161,6 +169,10 @@ def batched_forward_v2(
     ] = {}
     for idx, spec in enumerate(specs):
         op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
+        for i in src_ids:
+            node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+            if hasattr(node, "p") and hasattr(node, "param"):
+                preactivate_src(sys, int(i))
         op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
         op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
         key = (
@@ -211,8 +223,8 @@ def push_impulses_from_ops_batched(
     *,
     weight: str | None = None,
     scale: float = 1.0,
-) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
-    """Batched forward pass returning predictions and per-source gradients.
+) -> Tuple[List[Any], List[Tuple[Any, ...]], List[Tuple[dict, ...]]]:
+    """Batched forward pass returning predictions, gradients and metadata.
 
     Previously this helper also pushed impulses and required residuals to be
     supplied.  To avoid a separate forward pass, it now performs a single
@@ -222,6 +234,7 @@ def push_impulses_from_ops_batched(
     """
     ys_out: List[Any] = [None] * len(specs)
     grads_out: List[Tuple[Any, ...]] = [tuple() for _ in range(len(specs))]
+    metas_out: List[Tuple[dict, ...]] = [tuple() for _ in range(len(specs))]
     by_op: Dict[
         Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
@@ -250,6 +263,15 @@ def push_impulses_from_ops_batched(
         op_kwargs = items[0][4]
         jobs: List[_Job] = []
         for idx, src_ids, out_id, _args, _kwargs in items:
+            metas = []
+            for i in src_ids:
+                node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+                if hasattr(node, "p") and hasattr(node, "param"):
+                    _y, meta = preactivate_src(sys, int(i))
+                else:
+                    meta = {}
+                metas.append(meta)
+            metas_out[idx] = tuple(metas)
             jobs.append(
                 _Job(
                     job_id=f"{op_name}:{src_ids}->{out_id}",
@@ -274,4 +296,4 @@ def push_impulses_from_ops_batched(
         ):
             ys_out[idx] = y
             grads_out[idx] = tuple(grads[j] for j in range(len(src_ids)))
-    return ys_out, grads_out
+    return ys_out, grads_out, metas_out
