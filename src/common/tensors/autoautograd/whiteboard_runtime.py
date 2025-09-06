@@ -64,33 +64,39 @@ def run_op_and_grads_cached(
     *,
     scale: float = 1.0,
     residual: Optional[float] = None,
+    weight: Optional[str] = None,
     cache: Optional[WhiteboardCache] = None,
     backend: Any | None = None,
+    backend_tag: Any | None = None,
+    op_args: Tuple[Any, ...] = (),
+    op_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, Tuple[float, ...]]:
     """Convenience wrapper: run single op with caching."""
     cache = cache or WhiteboardCache()
     versions = [int(getattr(sys.nodes[i], "version", 0)) for i in src_ids]
     sample = sys.nodes[src_ids[0]].sphere
     feat_shape = getattr(sample, "shape", ())  # full vector shape drives cache binning
+    if backend_tag is None and backend is not None:
+        backend_tag = getattr(backend, "name", None) or getattr(backend, "__name__", None) or id(backend)
     key = cache.make_key(
         op_name=op_name,
         src_ids=src_ids,
         versions=versions,
         feat_shape=feat_shape if isinstance(feat_shape, tuple) else (),
-        weight=None,
+        weight=weight,
         scale=scale,
         residual=residual,
-        backend_tag=None,
+        backend_tag=backend_tag,
     )
     hit = cache.get(key)
     if hit is not None:
         return hit
 
     vals = [sys.nodes[i].sphere for i in src_ids]
-    if op_name == "add" and len(vals) == 2:
+    if op_name == "add" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] + vals[1]
         grads = (1.0, 1.0)
-    elif op_name == "mul" and len(vals) == 2:
+    elif op_name == "mul" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] * vals[1]
         grads = (float(vals[1]), float(vals[0]))
     else:
@@ -104,8 +110,8 @@ def run_op_and_grads_cached(
         batch = run_batched_vjp(
             sys=sys,
             jobs=(job,),
-            op_args=(),
-            op_kwargs=None,
+            op_args=op_args,
+            op_kwargs=op_kwargs,
             backend=backend,
         )
         y = batch.ys[0]

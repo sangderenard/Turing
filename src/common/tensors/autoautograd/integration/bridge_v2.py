@@ -1,26 +1,14 @@
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
-from ..whiteboard_runtime import run_batched_vjp
+from ..whiteboard_runtime import run_op_and_grads_cached
 from ..whiteboard_cache import WhiteboardCache
 from ...abstraction import AbstractTensor
 from ...linalg import norm as at_norm
 from .preop import preactivate_src
 
 
-@dataclass(frozen=True)
-class _Job:
-    job_id: str
-    op: str
-    src_ids: tuple[int, ...]
-    op_args: Optional[Tuple[Any, ...]]
-    op_kwargs: Optional[Dict[str, Any]]
-    residual: Any | None
-    scale: float | None
-    weight: str | None
-    backend_tag: Any = None
 
 def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     """One-time normalization → list[callable]."""
@@ -139,45 +127,37 @@ def push_impulses_from_op_v2(
     op_args: Optional[Tuple[Any, ...]] = None,
     op_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, Tuple[dict, ...]]:
-    """Single op call via batched VJP; returns output and per-source metadata."""
+    """Single op call with caching; returns output and per-source metadata."""
     if weight == "inv_length":
         scale *= _inv_length_scale(sys, out_id, src_ids)
 
-    cache = _preactivate_nodes(sys, src_ids)
+    pre_cache = _preactivate_nodes(sys, src_ids)
     metas: List[dict] = []
     for i in src_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
         if hasattr(node, "p") and hasattr(node, "param"):
-            _y, meta = _get_preactivation(sys, int(i), cache)
+            _y, meta = _get_preactivation(sys, int(i), pre_cache)
         else:
             meta = {}
         metas.append(meta)
 
-    job = _Job(
-        job_id=f"{op_name}:{tuple(src_ids)}->{out_id}",
-        op=str(op_name),
-        op_args=tuple(op_args) if op_args is not None else None,
-        op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
-        src_ids=tuple(int(i) for i in src_ids),
-        residual=None if residual is None else residual,
-        scale=float(scale),
+    wb_cache = cache or WhiteboardCache()
+    y, grads = run_op_and_grads_cached(
+        sys,
+        op_name,
+        tuple(int(i) for i in src_ids),
+        scale=scale,
+        residual=None if residual is None else float(residual),
         weight=weight,
-    )
-
-    batch = run_batched_vjp(
-        sys=sys,
-        jobs=(job,),
-        op_args=job.op_args or (),
-        op_kwargs=job.op_kwargs,
+        cache=wb_cache,
         backend=None,
+        backend_tag=None,
+        op_args=tuple(op_args) if op_args is not None else (),
+        op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
     )
-    y = batch.ys[0]
-    grads = batch.grads_full[0]
     if residual is not None:
         for idx, i in enumerate(src_ids):
-            g = grads[idx]
-            g_val = g.sum() if hasattr(g, "sum") else g
-            g_val = float(getattr(g_val, "item_", lambda: g_val)())
+            g_val = grads[idx]
             sys.impulse(int(i), int(out_id), op_name, float(-scale * g_val))
     return y, tuple(metas)
 
@@ -188,11 +168,13 @@ def batched_forward_v2(
     *,
     weight: str | None = None,
     scale: float = 1.0,
+    cache: WhiteboardCache | None = None,
 ) -> List[Any]:
     """Forward-only for specs of form `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
     ys_out: List[Any] = []
     all_ids = {int(i) for _spec in specs for i in _spec[1]}
-    cache = _preactivate_nodes(sys, all_ids)
+    pre_cache = _preactivate_nodes(sys, all_ids)
+    wb_cache = cache or WhiteboardCache()
     by_op: Dict[
         Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
@@ -202,7 +184,7 @@ def batched_forward_v2(
         for i in src_ids:
             node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
             if hasattr(node, "p") and hasattr(node, "param"):
-                _get_preactivation(sys, int(i), cache)
+                _get_preactivation(sys, int(i), pre_cache)
         op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
         op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
         key = (
@@ -216,31 +198,21 @@ def batched_forward_v2(
 
     ys_buffer: Dict[int, Any] = {}
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
-        op_args = items[0][3] or ()
-        op_kwargs = items[0][4]
-        jobs: List[_Job] = []
-        for idx, src_ids, out_id, _args, _kwargs in items:
+        for idx, src_ids, out_id, op_args, op_kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            jobs.append(
-                _Job(
-                    job_id=f"{op_name}:{src_ids}->{out_id}",
-                    op=op_name,
-                    src_ids=src_ids,
-                    op_args=op_args,
-                    op_kwargs=op_kwargs,
-                    residual=None,
-                    scale=sc,
-                    weight=weight,
-                )
+            y, _ = run_op_and_grads_cached(
+                sys,
+                op_name,
+                src_ids,
+                scale=sc,
+                residual=None,
+                weight=weight,
+                cache=wb_cache,
+                backend=None,
+                backend_tag=None,
+                op_args=op_args or (),
+                op_kwargs=op_kwargs,
             )
-        batch = run_batched_vjp(
-            sys=sys,
-            jobs=jobs,
-            op_args=op_args,
-            op_kwargs=op_kwargs,
-            backend=None,
-        )
-        for (idx, _src, _out, _args, _kwargs), y in zip(items, batch.ys):
             ys_buffer[idx] = y
     for i in range(len(specs)):
         ys_out.append(ys_buffer[i])
@@ -253,6 +225,7 @@ def push_impulses_from_ops_batched(
     *,
     weight: str | None = None,
     scale: float = 1.0,
+    cache: WhiteboardCache | None = None,
 ) -> Tuple[List[Any], List[Tuple[Any, ...]], List[Tuple[dict, ...]]]:
     """Batched forward pass returning predictions, gradients and metadata.
 
@@ -266,7 +239,8 @@ def push_impulses_from_ops_batched(
     grads_out: List[Tuple[Any, ...]] = [tuple() for _ in range(len(specs))]
     metas_out: List[Tuple[dict, ...]] = [tuple() for _ in range(len(specs))]
     all_ids = {int(i) for _spec in specs for i in _spec[1]}
-    cache = _preactivate_nodes(sys, all_ids)
+    pre_cache = _preactivate_nodes(sys, all_ids)
+    wb_cache = cache or WhiteboardCache()
     by_op: Dict[
         Tuple[str, Any, Any],
         List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
@@ -291,41 +265,30 @@ def push_impulses_from_ops_batched(
         )
 
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
-        op_args = items[0][3] or ()
-        op_kwargs = items[0][4]
-        jobs: List[_Job] = []
-        for idx, src_ids, out_id, _args, _kwargs in items:
+        for idx, src_ids, out_id, op_args, op_kwargs in items:
             metas = []
             for i in src_ids:
                 node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
                 if hasattr(node, "p") and hasattr(node, "param"):
-                    _y, meta = _get_preactivation(sys, int(i), cache)
+                    _y, meta = _get_preactivation(sys, int(i), pre_cache)
                 else:
                     meta = {}
                 metas.append(meta)
             metas_out[idx] = tuple(metas)
-            jobs.append(
-                _Job(
-                    job_id=f"{op_name}:{src_ids}->{out_id}",
-                    op=op_name,
-                    src_ids=src_ids,
-                    op_args=op_args,
-                    op_kwargs=op_kwargs,
-                    residual=1.0,
-                    scale=None,
-                    weight=weight,
-                )
+            sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
+            y, grads = run_op_and_grads_cached(
+                sys,
+                op_name,
+                src_ids,
+                scale=sc,
+                residual=1.0,
+                weight=weight,
+                cache=wb_cache,
+                backend=None,
+                backend_tag=None,
+                op_args=op_args or (),
+                op_kwargs=op_kwargs,
             )
-        batch = run_batched_vjp(
-            sys=sys,
-            jobs=jobs,
-            op_args=op_args,
-            op_kwargs=op_kwargs,
-            backend=None,
-        )
-        for (idx, src_ids, out_id, _args, _kwargs), y, grads in zip(
-            items, batch.ys, batch.grads_full
-        ):
             ys_out[idx] = y
-            grads_out[idx] = tuple(grads[j] for j in range(len(src_ids)))
+            grads_out[idx] = grads
     return ys_out, grads_out, metas_out
