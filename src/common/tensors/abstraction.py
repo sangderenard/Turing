@@ -143,11 +143,21 @@ class AbstractTensor:
     ninf: float = float('-inf')  
     nan: float = float('nan')
 
-    def nan_to_num(self, nan: float = 0.0, posinf: float = inf, neginf: float = ninf) -> "AbstractTensor":
-        self.where(self != self, nan)  # replace NaN
-        self.where(self == self.inf, posinf)
-        self.where(self == self.ninf, neginf)
-        return self
+    @staticmethod
+    def nan_to_num(x, nan: float = 0.0, posinf: float = inf, neginf: float = ninf) -> "AbstractTensor":
+        """Return a tensor with NaN and infinities replaced.
+
+        The function accepts either an :class:`AbstractTensor` instance or any
+        array-like object.  Replacements mirror ``numpy.nan_to_num`` with the
+        default behaviour matching NumPy's API.
+        """
+        if not isinstance(x, AbstractTensor):
+            x = AbstractTensor.tensor(x)
+
+        x = AbstractTensor.where(AbstractTensor.isnan(x), nan, x)
+        x = AbstractTensor.where(x == AbstractTensor.inf, posinf, x)
+        x = AbstractTensor.where(x == AbstractTensor.ninf, neginf, x)
+        return x
 
     def __index__(self):
         
@@ -455,6 +465,25 @@ class AbstractTensor:
 
     def tolist_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement tolist_() for conversion to list.")
+
+    # --- Fourier / FFT backend hooks --------------------------------------
+    def fft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement fft_()")
+
+    def ifft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement ifft_()")
+
+    def rfft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement rfft_()")
+
+    def irfft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement irfft_()")
+
+    def rfftfreq_(self, n: int, d: float = 1.0):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement rfftfreq_()")
+
+    def fftfreq_(self, n: int, d: float = 1.0):
+        raise NotImplementedError(f"{self.__class__.__name__} must implement fftfreq_()")
     def _AbstractTensor__unwrap(self, obj=None):
         """Return the underlying tensor data for this AbstractTensor or for another AbstractTensor instance."""
         if obj is None:
@@ -1199,7 +1228,7 @@ class AbstractTensor:
     def tolist(self) -> List[Any]:
         return self.tolist_()
 
-    @property
+    
     def pi(self) -> float:
         if not hasattr(self, "_pi"):
             return self._pi
@@ -2053,8 +2082,7 @@ from .abstraction_methods.trigonometry import (
     sinc as trig_sinc,
 )
 from .abstraction_methods.fourier import (
-    fft as fourier_fft,
-    ifft as fourier_ifft,
+    FFTNamespace,
 )
 from .abstraction_methods.fold import (
     fold2d as fold2d_ref,
@@ -2348,8 +2376,6 @@ _bind_and_wrap({
     "csch": trig_csch,
     "coth": trig_coth,
     "sinc": trig_sinc,
-    "fft": fourier_fft,
-    "ifft": fourier_ifft,
 })
 
 def T(self) -> "AbstractTensor":
@@ -2442,6 +2468,9 @@ AbstractTensor.eye   = staticmethod(linalg_eye)
 AbstractTensor.inverse = staticmethod(linalg_inv)
 AbstractTensor.eigh  = staticmethod(linalg_eigh)
 AbstractTensor.cholesky = staticmethod(linalg_cholesky)
+
+# --- FFT namespace (numpy-like) --------------------------------------------
+AbstractTensor.fft = FFTNamespace(AbstractTensor)
 
 def _cbrt(x):
     import numpy as np

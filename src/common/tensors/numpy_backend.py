@@ -849,6 +849,31 @@ class NumPyTensorOperations(AbstractTensor):
     def get_ndims(self) -> int:
         return self.data.ndim
 
+    # ---------------- FFT family -----------------
+    def fft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        import numpy as np
+        return np.fft.fft(self.data, n=n, axis=axis, norm=norm)
+
+    def ifft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        import numpy as np
+        return np.fft.ifft(self.data, n=n, axis=axis, norm=norm)
+
+    def rfft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        import numpy as np
+        return np.fft.rfft(self.data, n=n, axis=axis, norm=norm)
+
+    def irfft_(self, n: int | None = None, axis: int = -1, norm: str | None = None):
+        import numpy as np
+        return np.fft.irfft(self.data, n=n, axis=axis, norm=norm)
+
+    def rfftfreq_(self, n: int, d: float = 1.0):
+        import numpy as np
+        return np.fft.rfftfreq(n, d=d)
+
+    def fftfreq_(self, n: int, d: float = 1.0):
+        import numpy as np
+        return np.fft.fftfreq(n, d=d)
+
     # _tensor_from_list is provided centrally by AbstractTensor; do not duplicate here.
 
 register_backend("numpy", NumPyTensorOperations)

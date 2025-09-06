@@ -438,7 +438,7 @@ class SpringRepulsorSystem:
 
         # --- 1) coarse FFT ---
         C0 = AbstractTensor.fft.rfft(xw, axis=0)                 # (F0, D)
-        w0 = 2.0 * AbstractTensor.pi * AbstractTensor.fft.rfftfreq(W, d=dt)  # (F0,)
+        w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(W, d=dt)  # (F0,)
         P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, dim=1)           # (F0,)
         if P0.sum() <= 1e-12 or len(P0) <= 2:
             return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
@@ -473,7 +473,7 @@ class SpringRepulsorSystem:
         # zero-pad the windowed signal in time
         xpad = AbstractTensor.pad(xw, ((0, Wz - W), (0, 0)))
         Cz = AbstractTensor.fft.rfft(xpad, axis=0)                 # (Fz, D)
-        wz = 2.0 * AbstractTensor.pi * AbstractTensor.fft.rfftfreq(Wz, d=dt)   # (Fz,)
+        wz = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(Wz, d=dt)   # (Fz,)
 
         # helper to map coarse indices to high-res frequency indices
         def coarse_band_to_w(b_lo, b_hi):
