@@ -24,7 +24,6 @@ Notes:
 from __future__ import annotations
 from .integration.bridge_v2 import (
     push_impulses_from_op_v2,
-    batched_forward_v2,
     push_impulses_from_ops_batched,
 )
 from .whiteboard_cache import WhiteboardCache
@@ -1180,20 +1179,33 @@ class Experiencer(threading.Thread):
         while not self.stop.is_set():
             t = now_s() - t0
             
-            # 2) Batched forward + impulses for outputs with targets
+            # 2) Batched forward + gradients for outputs with targets
             out_specs: list[tuple[str, list[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
             for (name, srcs, out, args, kwargs) in self.ops_program:
                 if out in self.outputs:
                     out_specs.append((name, srcs, out, args, kwargs))
             if out_specs:
-                ys_hat = batched_forward_v2(self.sys, out_specs, weight=None, scale=0.1)
+                ys, grads = push_impulses_from_ops_batched(
+                    self.sys, out_specs, weight=None, scale=0.1
+                )
                 residuals: list[AbstractTensor] = []
-                for (name, srcs, out, args, kwargs), y_hat in zip(out_specs, ys_hat):
+                for (name, srcs, out, args, kwargs), y, g_list in zip(out_specs, ys, grads):
                     target = self.outputs.get(out)
-                    r = y_hat - target(t) if target is not None else 0.0
+                    r = y - target(t) if target is not None else 0.0
                     residuals.append(r)
-                ys = push_impulses_from_ops_batched(self.sys, out_specs, residuals, weight=None, scale=0.1)
-                for (name, srcs, out, args, kwargs), y in zip(out_specs, ys):
+                    r_host = (
+                        float(getattr(r, "item_", lambda: r)())
+                        if hasattr(r, "item_")
+                        else float(r)
+                    )
+                    sc = 0.1  # default scale
+                    for i, g in zip(srcs, g_list):
+                        g_host = (
+                            float(getattr(g, "item_", lambda: g)())
+                            if hasattr(g, "item_")
+                            else float(g)
+                        )
+                        self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
                     self.sys.nodes[out].theta = y if y is not None else 0.0
                 # Close the loop: push a scalar loss impulse around the ring
                 if self.sys.feedback_edge is not None and residuals:

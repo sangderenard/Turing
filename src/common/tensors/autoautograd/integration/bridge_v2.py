@@ -218,18 +218,25 @@ def batched_forward_v2(
 def push_impulses_from_ops_batched(
     sys,
     specs: Sequence[Tuple],
-    residuals: Sequence[float],
     *,
     weight: str | None = None,
     scale: float = 1.0,
-) -> List[Any]:
-    """Batched impulse push for specs `(op_name, src_ids, out_id, op_args, op_kwargs)`."""
+) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
+    """Batched forward pass returning predictions and per-source gradients.
+
+    Previously this helper also pushed impulses and required residuals to be
+    supplied.  To avoid a separate forward pass, it now performs a single
+    batched VJP with unit residuals and returns the raw gradients for each op.
+    Callers can compute residuals from the predictions and apply impulses as
+    needed.
+    """
     ys_out: List[Any] = [None] * len(specs)
+    grads_out: List[Tuple[Any, ...]] = [tuple() for _ in range(len(specs))]
     by_op: Dict[
         Tuple[str, Any, Any],
-        List[Tuple[int, Tuple[int, ...], int, float, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
+        List[Tuple[int, Tuple[int, ...], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
     ] = {}
-    for idx, (spec, r) in enumerate(zip(specs, residuals)):
+    for idx, spec in enumerate(specs):
         op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
         op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
         op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
@@ -243,7 +250,6 @@ def push_impulses_from_ops_batched(
                 idx,
                 tuple(int(i) for i in src_ids),
                 int(out_id),
-                r,
                 op_args_tuple,
                 op_kwargs_dict,
             )
@@ -253,13 +259,10 @@ def push_impulses_from_ops_batched(
         return sys.nodes[i].theta
 
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
-        op_args = items[0][4] or ()
-        op_kwargs = items[0][5]
+        op_args = items[0][3] or ()
+        op_kwargs = items[0][4]
         jobs: List[_Job] = []
-        scales: List[float] = []
-        for idx, src_ids, out_id, r, _args, _kwargs in items:
-            sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            scales.append(sc)
+        for idx, src_ids, out_id, _args, _kwargs in items:
             jobs.append(
                 _Job(
                     job_id=f"{op_name}:{src_ids}->{out_id}",
@@ -267,8 +270,8 @@ def push_impulses_from_ops_batched(
                     src_ids=src_ids,
                     op_args=op_args,
                     op_kwargs=op_kwargs,
-                    residual=r,
-                    scale=sc,
+                    residual=1.0,
+                    scale=None,
                     weight=weight,
                 )
             )
@@ -280,11 +283,9 @@ def push_impulses_from_ops_batched(
             get_attr=get_attr,
             backend=None,
         )
-        for (idx, src_ids, out_id, r, _args, _kwargs), y, grads, sc in zip(
-            items, batch.ys, batch.grads_per_source, scales
+        for (idx, src_ids, out_id, _args, _kwargs), y, grads in zip(
+            items, batch.ys, batch.grads_per_source
         ):
             ys_out[idx] = y
-            for i, g in zip(src_ids, grads):
-                g_host = float(getattr(g, "item_", lambda: g)()) if hasattr(g, "item_") else float(g)
-                sys.impulse(int(i), int(out_id), op_name, float(sc * g_host * (-float(r))))
-    return ys_out
+            grads_out[idx] = grads
+    return ys_out, grads_out
