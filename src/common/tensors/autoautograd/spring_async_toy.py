@@ -52,9 +52,9 @@ READOUT_BIAS  = 0.0
 W_EPS = 1e-3
 W_MIN, W_MAX = 0.25, 4.0 
 # --- threshold-pop optimizer knobs ---
-POP_FRUSTRATION_TH = 0.10   # how 'annoyed' an edge must be: |L - L*|
-POP_AGG_TH         = 0.12   # how large the transient aggregate must be: |sum(contribs)|
-POP_QUANTUM        = 0.2   # discrete ΔL moved per pop
+POP_FRUSTRATION_TH = 1e-6   # how 'annoyed' an edge must be: |L - L*|
+POP_AGG_TH         = 1e-6   # how large the transient aggregate must be: |sum(contribs)|
+POP_QUANTUM        = 1.0   # discrete ΔL moved per pop
 POP_MAX_PER_TICK   = 1000      # safety cap per integrator tick
 
 # ----------------------------- Utilities ------------------------------------
@@ -238,7 +238,7 @@ class Edge:
         self._last_reduce = float(agg)
         return float(AbstractTensor.get_tensor(self.l0 + agg).clip(L_MIN, L_MAX))
 
-    def maybe_pop(self, L_current: float):
+    def maybe_pop(self, L_current: float, quantized=False):
         """
         If both frustration and aggregate exceed thresholds, do 'integer' pops:
           l0 += sgn * POP_QUANTUM
@@ -258,10 +258,20 @@ class Edge:
 
         sgn = 1.0 if self._last_reduce >= 0.0 else -1.0
         for _ in range(want):
-            # commit ΔL into the permanent base
-            self.l0 += sgn * POP_QUANTUM
-            # consume the same amount from the transient buffer immediately
-            self.spring.add(-sgn * POP_QUANTUM)
+            if quantized:
+                # commit ΔL into the permanent base
+                self.l0 += sgn * POP_QUANTUM
+                # consume the same amount from the transient buffer immediately
+                self.spring.add(-sgn * POP_QUANTUM)
+            else:
+                # fractional pop (for testing)
+                delta = sgn * min(POP_QUANTUM, agg_mag)
+                self.l0 += delta
+                self.spring.add(-delta)
+                agg_mag -= delta
+                if agg_mag <= 0.0:
+                    break
+            
             self.pops += 1
 
 @dataclass
@@ -339,7 +349,7 @@ class SpringRepulsorSystem:
 
 
         t_now = now_s()
-        scale = -0.1
+        scale = -1.0
         for key, e in self.edges.items():
             ni, nj = self.nodes[e.i], self.nodes[e.j]
             d = nj.p - ni.p
@@ -1113,7 +1123,7 @@ class Ops:
 
     @staticmethod
     def call(sys, op_name: str, src_ids, out_id, *, residual=None, scale=1.0,
-             write_out: bool = True, weight: str = "none"):
+             write_out: bool = False, weight: str = "none"):
         y = push_impulses_from_op_v2(
             sys,
             op_name,
@@ -1125,7 +1135,7 @@ class Ops:
             cache=Ops._cache,
         )
         if write_out and out_id in sys.nodes:
-            sys.nodes[out_id].theta = y
+            sys.nodes[out_id].p = y
         return y
 
 # ----------------------------- Threads --------------------------------------
@@ -1192,14 +1202,14 @@ class Experiencer(threading.Thread):
                     out_specs.append((name, srcs, out, args, kwargs))
             if out_specs:
                 ys, grads = push_impulses_from_ops_batched(
-                    self.sys, out_specs, weight=None, scale=0.1
+                    self.sys, out_specs, weight=None, scale=1.0
                 )
                 # Collect residuals for smoothing
                 residuals: List[AbstractTensor] = []
                 for spec, y, g_list in zip(out_specs, ys, grads):
                     name, srcs, out, args, kwargs = spec
                     target = self.outputs.get(out)
-                    r = y - target(t) if target is not None else AbstractTensor.get_tensor(0.0)
+                    r = y - target(t) if target is not None and y is not None else AbstractTensor.get_tensor(0.0)
                     residuals.append(r)
 
                 if residuals:
@@ -1223,7 +1233,7 @@ class Experiencer(threading.Thread):
                         if hasattr(r_sm, "item_")
                         else float(r_sm)
                     )
-                    sc = 0.1  # default scale
+                    sc = 1.0  # default scale
                     for i, g in zip(srcs, g_list):
                         g_host = (
                             float(getattr(g, "item_", lambda: g)())
@@ -1231,7 +1241,7 @@ class Experiencer(threading.Thread):
                             else float(g)
                         )
                         self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
-                    self.sys.nodes[out].theta = y if y is not None else 0.0
+                    
                 # Close the loop: push a scalar loss impulse along feedback edges
                 if self.sys.feedback_edges and smoothed:
                     L = AbstractTensor.zeroes_like(smoothed[0])
@@ -1541,7 +1551,16 @@ def ascii_targets_for(phrase: str, out_ids: List[int]) -> Dict[int, Callable[[fl
 
 
 
-def build_toy_system(seed=0):
+def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float = 20.0):
+    """Build a toy spring–repulsor system where inputs are drawn from a large
+    random batch tensor.
+
+    - Generates X ~ U(-1,1) with shape (batch_size, n_in).
+    - Each input node i gets a Neumann force function that selects the current
+      sample s = floor(t * batch_refresh_hz) % batch_size and emits X[s, i].
+    - As before, inputs are also clamped by a Dirichlet spring to the live
+      batch mean across all input features for that sample.
+    """
     rng = AbstractTensor.random.set_seed(seed)
     nodes = []   # <- list, not dict
     edges = []   # <- list, not dict
@@ -1564,16 +1583,27 @@ def build_toy_system(seed=0):
 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.08, gamma=0.93, dt=0.02)
 
-    # Drive inputs (store force fns so we can compute batch means)
-    def sin_at(freq, amp=0.4):
-        def _s(t, f=freq, a=amp):
-            return float((AbstractTensor.get_tensor(f * t).sin() * a).item())
-        return _s
-    freqs = AbstractTensor.linspace(0.3, 1.1, len(lb.in_ids))
-    input_force_fns = {}
-    for nid, f in zip(lb.in_ids, freqs):
-        fn = sin_at(f)
+    # ---------------- Random batch-driven inputs ----------------
+    B = int(max(1, batch_size))
+    N_in = int(len(lb.in_ids))
+    # X ~ U(-1,1) of shape (B, N_in)
+    X = AbstractTensor.random_tensor(size=(B, N_in), scope=(-1.0, 1.0))
+
+    def make_batch_fn(col: int):
+        def _f(t, c=col):
+            # Select sample index based on wall time (shared across inputs)
+            s_idx = int((t * batch_refresh_hz)) % B
+            val = AbstractTensor.get_tensor(X[s_idx, c])
+            # Robust scalar extract across backends
+            v = float(getattr(val, "item_", getattr(val, "item", lambda: val))())
+            return v
+        return _f
+
+    input_force_fns: Dict[int, Callable[[float], float]] = {}
+    for nid, col in zip(lb.in_ids, range(N_in)):
+        fn = make_batch_fn(col)
         input_force_fns[nid] = fn
+        # Neumann traction with random sample value
         sys.add_boundary(BoundaryPort(nid=nid, beta=0.8, force_fn=as_x_force(fn, D=sys.D)))
 
     # ASCII targets (constant data fns for outputs)
@@ -1611,7 +1641,8 @@ def build_toy_system(seed=0):
 
 
 def main(duration_s: float = 8.0):
-    sys, outputs = build_toy_system(seed=42)
+    # Default to a large random batch driving the inputs
+    sys, outputs = build_toy_system(seed=42, batch_size=1000, batch_refresh_hz=15.0)
 
     stop = threading.Event()
     refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=1.00)
@@ -1624,18 +1655,61 @@ def main(duration_s: float = 8.0):
 #    viz.launch()
     viz = LiveVizGLPoints(sys, node_cmap="coolwarm", base_point_size=6.0)
     viz.launch()              # once
+    from collections import deque
 
+    BATCH = 16  # batch/window size for the running mean
+    batch_actual_q = deque(maxlen=BATCH)
+    batch_target_q = deque(maxlen=BATCH)
+
+    sample = [oid for oid in outputs.keys() if oid in sys.nodes]  # fixed feature order
+
+    def _to_byte(x):
+        y = (float(x) + 1.0) * 127.5
+        return max(0, min(255, int(y)))
+
+    def mse_batch(a, b):
+        d = a - b
+        return float(((d * d).mean()).item())
+
+    t0 = now_s()
     try:
-        t0 = now_s()
         while (now_s() - t0) < duration_s:
             t = now_s() - t0
-            # sample first few outputs
-            sample = list(outputs.keys())
-            errors = [sys.nodes[oid].theta - outputs[oid](t) for oid in sample]
-            mae = AbstractTensor.get_tensor([abs(err) for err in errors]).mean()
-            error_str = ''.join([f"{chr(int((err + 1) * 127.5))}" for err in errors])
-            print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae.mean().item(): .3f}, Error Phrase: {error_str}")
+
+            # (F,) feature rows for this tick
+            # (F,) feature rows for this tick
+            # was: actual_row = AbstractTensor.get_tensor([sys.nodes[oid].theta for oid in sample])
+            actual_row = AbstractTensor.get_tensor([
+                interpret_vec(sys.nodes[oid].p)  # committed meaning from geometry
+                for oid in sample
+            ])
+
+            target_row = AbstractTensor.get_tensor([outputs[oid](t)     for oid in sample])
+
+            # accumulate batch
+            batch_actual_q.append(actual_row)
+            batch_target_q.append(target_row)
+
+            # (B', F) batches (B' ≤ BATCH while warming up)
+            actual_batch = AbstractTensor.get_tensor([row for row in batch_actual_q])
+            target_batch = AbstractTensor.get_tensor([row for row in batch_target_q])
+
+            # mean across batch (dim=0) → (F,) per-feature means (what you print as a string)
+            mean_vals  = actual_batch.mean(dim=0)
+            mean_tgts  = target_batch.mean(dim=0)
+
+            # adherence/loss over the whole batch (not a single scalar output vector)
+            error = mse_batch(actual_batch, target_batch)
+
+            # visualize both the averaged output and averaged target
+            output_str = ''.join(chr(_to_byte(v)) for v in mean_vals)
+            target_str = ''.join(chr(_to_byte(v)) for v in mean_tgts)
+
+            print(f"[DBG] outputs→batch-mean Error: {error: .3f} | "
+                f"Out: {output_str} | Tgt: {target_str}")
+
             viz.step(0.5)
+
 
     finally:
         stop.set()
