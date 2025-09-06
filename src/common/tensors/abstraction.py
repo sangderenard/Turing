@@ -42,6 +42,72 @@ from .logger import get_tensors_logger
 
 logger = get_tensors_logger()
 
+# Global tensor pool ---------------------------------------------------------
+try:  # pragma: no cover - optional dependency
+    from .pooling.tensor_pool import TensorPool, PoolPolicy
+except Exception:  # pragma: no cover - pool is optional
+    TensorPool = None  # type: ignore
+    PoolPolicy = None  # type: ignore
+
+
+if TensorPool is not None and np is not None:
+    class _PoolATAdapter:
+        """Backend adapter so :class:`TensorPool` can allocate AbstractTensors."""
+
+        def __init__(self, AT_cls):
+            self.AT = AT_cls
+
+        def empty(self, shape, dtype=None, device=None):
+            t = self.AT(track_time=False, tape=None)
+            try:
+                t.data = t.empty_(shape, dtype=dtype, device=device)
+            except Exception:
+                t.data = np.empty(shape, dtype=dtype or np.float32)
+            return t
+
+        def fill0_(self, buf):
+            d = getattr(buf, "data", buf)
+            try:
+                d[...] = 0
+            except Exception:
+                if isinstance(d, list):
+                    def _fill(lst):
+                        for i, v in enumerate(lst):
+                            if isinstance(v, list):
+                                _fill(v)
+                            else:
+                                lst[i] = 0
+                    _fill(d)
+                else:
+                    try:
+                        np.asarray(d)[...] = 0
+                    except Exception:
+                        pass
+
+        def nbytes(self, buf):
+            d = getattr(buf, "data", buf)
+            return int(getattr(d, "nbytes", np.asarray(d).nbytes))
+
+        def detach(self, buf):
+            try:
+                return buf.detach()  # type: ignore[attr-defined]
+            except Exception:
+                return buf
+
+    _GLOBAL_TENSOR_POOL: TensorPool | None = None
+
+    def _get_tensor_pool(cls):
+        global _GLOBAL_TENSOR_POOL
+        if _GLOBAL_TENSOR_POOL is None or _GLOBAL_TENSOR_POOL.B.AT is not cls:
+            try:
+                _GLOBAL_TENSOR_POOL = TensorPool(backend=_PoolATAdapter(cls), policy=PoolPolicy())
+            except Exception:
+                _GLOBAL_TENSOR_POOL = None
+        return _GLOBAL_TENSOR_POOL
+else:  # pragma: no cover - pool not available
+    def _get_tensor_pool(cls):  # type: ignore[override]
+        return None
+
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     from .autograd import GradTape
 def register_conversion(*args, **kwargs):
@@ -813,6 +879,47 @@ class AbstractTensor:
                 tape = _autograd.autograd.tape
             except Exception:
                 tape = None
+        pool = _get_tensor_pool(cls)
+        if data is not None and pool is not None and np is not None:
+            if not isinstance(data, AbstractTensor):
+                try:
+                    arr = np.asarray(data, dtype=dtype if dtype is not None else None)
+                except Exception:
+                    try:
+                        pool.observe(np.shape(data), dtype=dtype, device=device)
+                    except Exception:
+                        pass
+                else:
+                    shape = arr.shape
+                    try:
+                        buf = pool.acquire(shape, dtype=arr.dtype, device=device)
+                        try:
+                            buf.data[...] = arr
+                        except Exception:
+                            try:
+                                buf.data = arr.tolist()
+                            except Exception:
+                                buf.data = arr
+                        buf.track_time = track_time
+                        if requires_grad:
+                            buf._tape = tape
+                            try:
+                                buf.requires_grad_(True)
+                            except Exception:
+                                buf._requires_grad = True  # type: ignore[attr-defined]
+                        return buf
+                    except Exception:
+                        try:
+                            pool.observe(shape, dtype=arr.dtype, device=device)
+                        except Exception:
+                            pass
+            else:
+                try:
+                    shape = getattr(data, "shape", ())
+                    dtype_key = getattr(getattr(data, "data", data), "dtype", None)
+                    pool.observe(shape, dtype=dtype_key, device=device)
+                except Exception:
+                    pass
 
         t = cls.tensor(
             data,
