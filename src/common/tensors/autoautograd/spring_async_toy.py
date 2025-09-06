@@ -39,6 +39,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib import colors as mcolors
 from ..abstraction import AbstractTensor
+from ..filtered_poisson import filtered_poisson
 
 L_MIN = 0.05
 L_MAX = 3.0
@@ -287,8 +288,8 @@ class SpringRepulsorSystem:
         self.edge_locks: Dict[Tuple[int, int, str], threading.Lock] = defaultdict(threading.Lock)
         self.boundaries: Dict[int, BoundaryPort] = {}
         self.D = int(next(iter(self.nodes.values())).p.shape[0])
-        # loop-back loss plumbing (optional)
-        self.feedback_edge: Optional[Tuple[int, int, str]] = None
+        # loop-back loss plumbing (optional) – support multiple edges
+        self.feedback_edges: List[Tuple[int, int, str]] = []
 
     def add_boundary(self, port: BoundaryPort):
         self.boundaries[port.nid] = port
@@ -322,9 +323,14 @@ class SpringRepulsorSystem:
         with self.edge_locks[key]:
             e.ingest_impulse(g_scalar, self.dt)
 
+    def add_feedback_edge(self, src: int, dst: int, op_id: str = "loss_fb") -> None:
+        """Register an edge that will receive global loss impulses."""
+        self.feedback_edges.append((int(src), int(dst), str(op_id)))
+
+    # Backwards compatibility helper
     def set_feedback_edge(self, src: int, dst: int, op_id: str = "loss_fb") -> None:
-        """Arm a single ring edge that will receive global loss impulses."""
-        self.feedback_edge = (int(src), int(dst), str(op_id))
+        """Reset feedback edges to a single connection."""
+        self.feedback_edges = [(int(src), int(dst), str(op_id))]
 
     # ----------------- Physics tick -----------------
     def tick(self):
@@ -1188,15 +1194,34 @@ class Experiencer(threading.Thread):
                 ys, grads = push_impulses_from_ops_batched(
                     self.sys, out_specs, weight=None, scale=0.1
                 )
-                residuals: list[AbstractTensor] = []
-                for (name, srcs, out, args, kwargs), y, g_list in zip(out_specs, ys, grads):
+                # Collect residuals for smoothing
+                residuals: List[AbstractTensor] = []
+                for spec, y, g_list in zip(out_specs, ys, grads):
+                    name, srcs, out, args, kwargs = spec
                     target = self.outputs.get(out)
-                    r = y - target(t) if target is not None else 0.0
+                    r = y - target(t) if target is not None else AbstractTensor.get_tensor(0.0)
                     residuals.append(r)
+
+                if residuals:
+                    r_vec = AbstractTensor.stack(residuals)
+                    n = int(r_vec.shape[0])
+                    if n > 1:
+                        adj = AbstractTensor.zeros((n, n), dtype=float)
+                        for k in range(n - 1):
+                            adj[k, k + 1] = 1.0
+                            adj[k + 1, k] = 1.0
+                        r_vec = filtered_poisson(r_vec, iterations=20, adjacency=adj).reshape(-1)
+                        smoothed = [r_vec[i] for i in range(n)]
+                    else:
+                        smoothed = [r_vec[0]]
+                else:
+                    smoothed = []
+
+                for (name, srcs, out, args, kwargs), y, g_list, r_sm in zip(out_specs, ys, grads, smoothed):
                     r_host = (
-                        float(getattr(r, "item_", lambda: r)())
-                        if hasattr(r, "item_")
-                        else float(r)
+                        float(getattr(r_sm, "item_", lambda: r_sm)())
+                        if hasattr(r_sm, "item_")
+                        else float(r_sm)
                     )
                     sc = 0.1  # default scale
                     for i, g in zip(srcs, g_list):
@@ -1207,16 +1232,21 @@ class Experiencer(threading.Thread):
                         )
                         self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
                     self.sys.nodes[out].theta = y if y is not None else 0.0
-                # Close the loop: push a scalar loss impulse around the ring
-                if self.sys.feedback_edge is not None and residuals:
-                    L = AbstractTensor.zeroes_like(residuals[0])
-                    for r in residuals:
+                # Close the loop: push a scalar loss impulse along feedback edges
+                if self.sys.feedback_edges and smoothed:
+                    L = AbstractTensor.zeroes_like(smoothed[0])
+                    for r in smoothed:
                         L += 0.5 * r * r
-                    i, j, op_id = self.sys.feedback_edge
-                    try:
-                        self.sys.impulse(i, j, op_id, g_scalar=L)
-                    except Exception:
-                        pass
+                    L_host = (
+                        float(getattr(L, "item_", lambda: L)())
+                        if hasattr(L, "item_")
+                        else float(L)
+                    )
+                    for i, j, op_id in self.sys.feedback_edges:
+                        try:
+                            self.sys.impulse(i, j, op_id, g_scalar=L_host)
+                        except Exception:
+                            pass
             time.sleep(self.dt)
 
 
@@ -1232,6 +1262,7 @@ def build_dirichlet_neumann_pipeline(
     alpha_in: float = 2.0,
     beta_link: float = 1.0,
     alpha_out: float = 2.0,
+    feedback: str = "none",
 ) -> Tuple[
     List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]],
     Dict[int, Callable[[float], float]],
@@ -1240,7 +1271,7 @@ def build_dirichlet_neumann_pipeline(
     Wire the system as:
       Dirichlet(input_feature_mean) -> (edge) -> Neumann(noop) -> ... L layers (gather) ...
       -> Neumann(noop) -> (edge) -> Dirichlet(output_target)
-      and arm a loop-back loss edge from last Neumann to first Neumann.
+      Optionally create feedback edges from output Neumann nodes back to inputs.
     Returns (ops_program, outputs_map) for the Experiencer.
     """
     AT = AbstractTensor
@@ -1294,10 +1325,21 @@ def build_dirichlet_neumann_pipeline(
         outputs[neu] = (lambda _t, y=y_m: y)
         last_neu.append(neu)
 
-    # 4) Loss loop: last Neumann → first Neumann
-    if last_neu and in_bridge_neu:
-        sys.ensure_edge(last_neu[-1], in_bridge_neu[0], "loss_fb")
-        sys.set_feedback_edge(last_neu[-1], in_bridge_neu[0], op_id="loss_fb")
+    # 4) Optional feedback edges from outputs back to inputs
+    if feedback != "none" and last_neu and in_bridge_neu:
+        pairs: list[tuple[int, int]] = []
+        if feedback == "paired":
+            for o, i in zip(last_neu, in_bridge_neu):
+                pairs.append((o, i))
+        elif feedback == "full":
+            for o in last_neu:
+                for i in in_bridge_neu:
+                    pairs.append((o, i))
+        else:
+            raise ValueError("feedback must be 'none', 'paired', or 'full'")
+        for o, i in pairs:
+            sys.ensure_edge(o, i, "loss_fb")
+            sys.add_feedback_edge(o, i, op_id="loss_fb")
 
     return ops_program, outputs
 
