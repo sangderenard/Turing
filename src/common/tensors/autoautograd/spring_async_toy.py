@@ -595,7 +595,8 @@ class SpringRepulsorSystem:
 # Minimal OpenGL point-field renderer (pygame + PyOpenGL)
 # - Keeps node colors from a matplotlib colormap (TwoSlopeNorm around 0)
 # - Boundary nodes drawn larger
-# - No edges/lines; autoscaled camera; non-blocking window
+# - Edges rendered as GL_LINES with spring energy colormap
+# - Autoscaled camera; non-blocking window
 
 
 import pygame
@@ -611,17 +612,19 @@ install_pyopengl_handlers()
 # Expecting SpringRepulsorSystem with:
 #   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.theta is scalar
 #   self.boundaries: Dict[int, Any] (keys are boundary node ids)
-# Edges ignored entirely in this GL version.
+#   self.edges: Dict[Tuple[int, int, str], Edge] spring edges rendered as GL_LINES
 
 class LiveVizGLPoints:
     def __init__(self,
                  sys,
                  node_cmap: str = "coolwarm",
+                 edge_cmap: str = "coolwarm",
                  base_point_size: float = 6.0,
                  boundary_scale: float = 1.3,
                  bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06)):
         self.sys = sys
         self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
+        self.edge_cmap = matplotlib.colormaps.get_cmap(edge_cmap)
         self.base_point_size = float(base_point_size)
         self.role_palette = {
             "input":    mcolors.to_rgb("#14b8a6"),  # teal-500
@@ -650,6 +653,11 @@ class LiveVizGLPoints:
         self._vbo_col = None
         self._vbo_size = None
         self._num_points = 0
+        self._edge_vao = None
+        self._edge_vbo_pos = None
+        self._edge_vbo_col = None
+        self._edge_vbo_size = None
+        self._num_edge_vertices = 0
 
         self._u_mvp = None  # uniform location
         tensor = AbstractTensor.get_tensor(0)
@@ -661,8 +669,9 @@ class LiveVizGLPoints:
         # lock-free minimal copy
         nodes = {i: (AbstractTensor.get_tensor(n.p), float(n.theta))
                  for i, n in self.sys.nodes.items()}
+        edges = list(self.sys.edges.values())
         bset = set(self.sys.boundaries.keys())
-        return nodes, bset
+        return nodes, edges, bset
 
     # ---------- GL bootstrap ----------
     def _create_window(self):
@@ -753,9 +762,33 @@ class LiveVizGLPoints:
 
         glBindVertexArray(0)
 
+        # edge buffers
+        self._edge_vao = glGenVertexArrays(1)
+        glBindVertexArray(self._edge_vao)
+
+        self._edge_vbo_pos = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_pos)
+        glBufferData(GL_ARRAY_BUFFER, 1, None, GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+        self._edge_vbo_col = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_col)
+        glBufferData(GL_ARRAY_BUFFER, 1, None, GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(1)
+
+        self._edge_vbo_size = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_size)
+        glBufferData(GL_ARRAY_BUFFER, 1, None, GL_DYNAMIC_DRAW)
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(2)
+
+        glBindVertexArray(0)
+
     # ---------- geometry packing ----------
     def _pack_points(self):
-        nodes, _ = self._snapshot()
+        nodes, _, _ = self._snapshot()
         ids = AbstractTensor.get_tensor(sorted(nodes.keys()))
         if ids.shape == (0,):
             return (AbstractTensor.zeros((0, 3), ids.float_dtype),
@@ -825,6 +858,47 @@ class LiveVizGLPoints:
 
         return P, C, sizes, P  # return P twice; last is for autoscale
 
+    def _compute_edge_energy(self, e, nodes):
+        pi = nodes[e.i][0]
+        pj = nodes[e.j][0]
+        d = pj - pi
+        L = float(AbstractTensor.linalg.norm(d) + 1e-12)
+        Lstar = e.target_length()
+        Ksum = sum(b.K for b in e.bands)
+        return 0.5 * Ksum * (L - Lstar) ** 2, (pi, pj)
+
+    def _pack_edges(self):
+        nodes, edges, _ = self._snapshot()
+        if not edges:
+            AT = AbstractTensor
+            return AT.zeros((0, 3), float), AT.zeros((0, 3), float), AT.zeros((0,), float)
+
+        P_segs = []
+        U_vals = []
+        for e in edges:
+            U, (pi, pj) = self._compute_edge_energy(e, nodes)
+            P_segs.extend([pi, pj])
+            U_vals.append(U)
+
+        AT = AbstractTensor
+        P = AT.stack(P_segs).astype(float)
+        if P.shape[1] == 2:
+            P = AT.pad(P, (0, 1, 0, 0), value=0.0)
+        P = AT.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
+
+        U_vals = AT.get_tensor(U_vals, dtype=float)
+        lo = float(AT.percentile(U_vals, 5))
+        hi = float(AT.percentile(U_vals, 95))
+        if hi <= lo:
+            hi = lo + 1e-12
+        norm = mcolors.Normalize(vmin=lo, vmax=hi)
+        import numpy as np
+        colors = self.edge_cmap(norm(U_vals))[:, :3].astype(np.float32)
+        C = np.repeat(colors, 2, axis=0)
+
+        S = AT.full((P.shape[0],), 1.0, dtype=float)
+        return P, C, S
+
     def _update_buffers(self):
         P, C, S, P_for_bounds = self._pack_points()
         self._num_points = P.shape[0]
@@ -847,6 +921,22 @@ class LiveVizGLPoints:
         # ``S`` is also an ``AbstractTensor``; ensure we pass the computed
         # integer byte size rather than the bound method object.
         glBufferData(GL_ARRAY_BUFFER, S.nbytes(), S.data, GL_DYNAMIC_DRAW)
+
+        glBindVertexArray(0)
+
+        PE, CE, SE = self._pack_edges()
+        self._num_edge_vertices = PE.shape[0]
+
+        glBindVertexArray(self._edge_vao)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_pos)
+        glBufferData(GL_ARRAY_BUFFER, PE.nbytes(), PE.data, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_col)
+        glBufferData(GL_ARRAY_BUFFER, CE.nbytes, CE, GL_DYNAMIC_DRAW)
+
+        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_size)
+        glBufferData(GL_ARRAY_BUFFER, SE.nbytes(), SE.data, GL_DYNAMIC_DRAW)
 
         glBindVertexArray(0)
 
@@ -952,11 +1042,17 @@ class LiveVizGLPoints:
             if self._vbo_col:  glDeleteBuffers(1, [self._vbo_col])
             if self._vbo_size: glDeleteBuffers(1, [self._vbo_size])
             if self._vao:      glDeleteVertexArrays(1, [self._vao])
+            if self._edge_vbo_pos: glDeleteBuffers(1, [self._edge_vbo_pos])
+            if self._edge_vbo_col: glDeleteBuffers(1, [self._edge_vbo_col])
+            if self._edge_vbo_size: glDeleteBuffers(1, [self._edge_vbo_size])
+            if self._edge_vao: glDeleteVertexArrays(1, [self._edge_vao])
             if self._program:  glDeleteProgram(self._program)
         except Exception:
             pass
         self._program = None
         self._vao = self._vbo_pos = self._vbo_col = self._vbo_size = None
+        self._edge_vao = self._edge_vbo_pos = self._edge_vbo_col = self._edge_vbo_size = None
+        self._num_edge_vertices = 0
 
         self._compile_shaders()
         self._create_buffers()
@@ -988,6 +1084,10 @@ class LiveVizGLPoints:
         glDrawArrays(GL_POINTS, 0, self._num_points)
         glBindVertexArray(0)
 
+        glBindVertexArray(self._edge_vao)
+        glDrawArrays(GL_LINES, 0, self._num_edge_vertices)
+        glBindVertexArray(0)
+
         pygame.display.flip()
 
 
@@ -1010,6 +1110,14 @@ class LiveVizGLPoints:
                 glDeleteBuffers(1, [self._vbo_size])
             if self._vao:
                 glDeleteVertexArrays(1, [self._vao])
+            if self._edge_vbo_pos:
+                glDeleteBuffers(1, [self._edge_vbo_pos])
+            if self._edge_vbo_col:
+                glDeleteBuffers(1, [self._edge_vbo_col])
+            if self._edge_vbo_size:
+                glDeleteBuffers(1, [self._edge_vbo_size])
+            if self._edge_vao:
+                glDeleteVertexArrays(1, [self._edge_vao])
             if self._program:
                 glDeleteProgram(self._program)
         except Exception:
