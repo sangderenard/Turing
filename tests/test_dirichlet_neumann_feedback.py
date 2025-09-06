@@ -17,10 +17,19 @@ from src.common.tensors import AbstractTensor
 
 def _make_sys(n_nodes: int) -> SpringRepulsorSystem:
     AT = AbstractTensor
-    nodes = [
-        Node(id=i, theta=0.0, p=AT.zeros(2, dtype=float), v=AT.zeros(2, dtype=float))
-        for i in range(n_nodes)
-    ]
+    nodes = []
+    for i in range(n_nodes):
+        p = AT.zeros(2, dtype=float)
+        param = AT.zeros(1, dtype=float)
+        nodes.append(
+            Node(
+                id=i,
+                param=param,
+                p=p,
+                v=AT.zeros(2, dtype=float),
+                sphere=AbstractTensor.concat([p, param], dim=0),
+            )
+        )
     return SpringRepulsorSystem(nodes, [])
 
 

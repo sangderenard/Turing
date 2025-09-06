@@ -2,8 +2,8 @@ from src.common.tensors.autoautograd.whiteboard_cache import WhiteboardCache
 from src.common.tensors.autoautograd.whiteboard_runtime import run_op_and_grads_cached
 
 class DummyNode:
-    def __init__(self, theta, version=0):
-        self.theta = theta
+    def __init__(self, param, version=0):
+        self.param = param
         self.version = version
 
 class DummySys:

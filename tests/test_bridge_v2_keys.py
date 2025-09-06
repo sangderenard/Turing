@@ -3,7 +3,7 @@ from src.common.tensors.autoautograd.integration import bridge_v2
 
 class DummyNode:
     def __init__(self):
-        self.theta = 0
+        self.param = 0
 
 
 class DummySys:

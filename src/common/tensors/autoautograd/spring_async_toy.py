@@ -76,10 +76,6 @@ def as_x_force(fn, D: int = 3):   # scalar → Neumann force on x in D-D
         return v
     return _f
 
-def interpret_vec(v: AbstractTensor) -> float:
-    # scalar meaning of a locational vector (keep it simple: x-component)
-    return float(READOUT_SCALE * v[0] + READOUT_BIAS)
-
 def inv_weight(sys: SpringRepulsorSystem, src: int, dst: int) -> float:
     d = float(AbstractTensor.linalg.norm(sys.nodes[dst].p - sys.nodes[src].p))
     w = 1.0 / (W_EPS + d)
@@ -142,13 +138,25 @@ def wire_input_chain(
     AT = AbstractTensor
     D = sys.D if D is None else int(D)
     d = _fresh_node_id(sys)
+    p = AT.zeros(D, dtype=float)
+    param = AT.zeros(1, dtype=float)
     sys.nodes[d] = Node(
-        id=d, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+        id=d,
+        param=param,
+        p=p,
+        v=AT.zeros(D, dtype=float),
+        sphere=AbstractTensor.concat([p, param], dim=0),
     )
     attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
     n = _fresh_node_id(sys)
+    p = AT.zeros(D, dtype=float)
+    param = AT.zeros(1, dtype=float)
     sys.nodes[n] = Node(
-        id=n, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+        id=n,
+        param=param,
+        p=p,
+        v=AT.zeros(D, dtype=float),
+        sphere=AbstractTensor.concat([p, param], dim=0),
     )
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(d, n, "in_link")
@@ -169,14 +177,26 @@ def wire_output_chain(
     AT = AbstractTensor
     D = sys.D if D is None else int(D)
     n = _fresh_node_id(sys)
+    p = AT.zeros(D, dtype=float)
+    param = AT.zeros(1, dtype=float)
     sys.nodes[n] = Node(
-        id=n, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+        id=n,
+        param=param,
+        p=p,
+        v=AT.zeros(D, dtype=float),
+        sphere=AbstractTensor.concat([p, param], dim=0),
     )
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(system_nid, n, "out_link")
     d = _fresh_node_id(sys)
+    p = AT.zeros(D, dtype=float)
+    param = AT.zeros(1, dtype=float)
     sys.nodes[d] = Node(
-        id=d, theta=0.0, p=AT.zeros(D, dtype=float), v=AT.zeros(D, dtype=float)
+        id=d,
+        param=param,
+        p=p,
+        v=AT.zeros(D, dtype=float),
+        sphere=AbstractTensor.concat([p, param], dim=0),
     )
     attach_dirichlet(sys, d, target_fn, D=D, alpha=alpha)
     sys.ensure_edge(n, d, "readout")
@@ -187,20 +207,19 @@ def wire_output_chain(
 @dataclass
 class Node:
     id: int
-    # Parameter scalar for this toy; real system could be vector-valued
-    theta: float
-    # Geometry (2D for easy intuition)
-    p: AbstractTensor  # shape (2,)
-    v: AbstractTensor  # shape (2,)
+    param: AbstractTensor  # scalar parameter
+    p: AbstractTensor  # shape (D,)
+    v: AbstractTensor  # shape (D,)
+    sphere: AbstractTensor
     M0: float = 1.0
     last_commit: float = 0.0
     version: int = 0
-    # History for inertial dampener (positions)
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
 
-    # Mapping pos->parameter (identity on x component for clarity)
-    def commit(self):
-        self.theta = interpret_vec(self.p)
+    def commit(self, param_residuals=None):
+        self.sphere = AbstractTensor.concat([self.p, self.param], dim=0)
+        if param_residuals is not None:
+            self.param += param_residuals
         self.version += 1
 
 
@@ -610,7 +629,7 @@ from ..pyopengl_handler import install_pyopengl_handlers
 install_pyopengl_handlers()
 
 # Expecting SpringRepulsorSystem with:
-#   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.theta is scalar
+#   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.param is scalar
 #   self.boundaries: Dict[int, Any] (keys are boundary node ids)
 #   self.edges: Dict[Tuple[int, int, str], Edge] spring edges rendered as GL_LINES
 
@@ -667,8 +686,10 @@ class LiveVizGLPoints:
     # ---------- data snapshot ----------
     def _snapshot(self):
         # lock-free minimal copy
-        nodes = {i: (AbstractTensor.get_tensor(n.p), float(n.theta))
-                 for i, n in self.sys.nodes.items()}
+        nodes = {
+            i: (AbstractTensor.get_tensor(n.p), float(AbstractTensor.get_tensor(n.param)))
+            for i, n in self.sys.nodes.items()
+        }
         edges = list(self.sys.edges.values())
         bset = set(self.sys.boundaries.keys())
         return nodes, edges, bset
@@ -807,15 +828,15 @@ class LiveVizGLPoints:
         # NEW: replace NaN/Inf early to avoid NaN bounds
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # --- existing thetas & base colormap (KEEP this: learning nodes stay coolwarm) ---
-        thetas = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype, like=ids)
-        vmin = AbstractTensor.min(thetas)
-        vmax = AbstractTensor.max(thetas)
+        # --- existing params & base colormap (KEEP this: learning nodes stay coolwarm) ---
+        params = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype, like=ids)
+        vmin = AbstractTensor.min(params)
+        vmax = AbstractTensor.max(params)
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
         import numpy as np
-        C = self.node_cmap(norm(thetas))[:, :3].astype(np.float32)  # (N,3) RGB
+        C = self.node_cmap(norm(params))[:, :3].astype(np.float32)  # (N,3) RGB
 
         # --- sizes (base) ---
         sizes = AbstractTensor.full(
@@ -1150,7 +1171,10 @@ class LiveViz3D:
 
     def _snapshot(self):
         # cheap, lock-free snapshot
-        nodes = {i: (n.p.copy(), float(n.theta)) for i, n in self.sys.nodes.items()}
+        nodes = {
+            i: (n.p.copy(), float(AbstractTensor.get_tensor(n.param)))
+            for i, n in self.sys.nodes.items()
+        }
         edges = list(self.sys.edges.values())
         bset = set(self.sys.boundaries.keys())
         return nodes, edges, bset
@@ -1176,18 +1200,18 @@ class LiveViz3D:
 
         # split boundary vs non-boundary
         Pn = P[~is_b]; Pb = P[is_b]
-        thetas = AbstractTensor.array([nodes[i][1] for i in ids])
-        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=AbstractTensor.min(thetas), vcenter=0.0, vmax=AbstractTensor.max(thetas))
+        params = AbstractTensor.array([nodes[i][1] for i in ids])
+        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=AbstractTensor.min(params), vcenter=0.0, vmax=AbstractTensor.max(params))
 
         if Pn.size:
             self.scat_nodes = self.ax.scatter(Pn[:,0], Pn[:,1], Pn[:,2],
                                               s=40, marker="o",
-                                              c=self.node_cmap(self.norm_nodes(thetas[~is_b])),
+                                              c=self.node_cmap(self.norm_nodes(params[~is_b])),
                                               depthshade=False, linewidths=0.5, edgecolors="k")
         if Pb.size:
             self.scat_bounds = self.ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2],
                                                s=90, marker="s",
-                                               c=self.node_cmap(self.norm_nodes(thetas[is_b])),
+                                               c=self.node_cmap(self.norm_nodes(params[is_b])),
                                                depthshade=False, linewidths=1.0, edgecolors="black")
 
         # edges (draw once; will be recreated each frame)
@@ -1224,13 +1248,13 @@ class LiveViz3D:
         nodes, edges, bset = self._snapshot()
         ids = AbstractTensor.array(sorted(nodes.keys()))
         P = AbstractTensor.stack([nodes[i][0] for i in ids])
-        thetas = AbstractTensor.array([nodes[i][1] for i in ids])
+        params = AbstractTensor.array([nodes[i][1] for i in ids])
         is_b = AbstractTensor.array([i in bset for i in ids])
 
         # update node colors/positions
-        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(AbstractTensor.min(thetas)))
-        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(AbstractTensor.max(thetas)))
-        C_all = self.node_cmap(self.norm_nodes(thetas))
+        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(AbstractTensor.min(params)))
+        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(AbstractTensor.max(params)))
+        C_all = self.node_cmap(self.norm_nodes(params))
 
         Pn = P[~is_b]; Cn = C_all[~is_b]
         Pb = P[is_b];  Cb = C_all[is_b]
@@ -1517,24 +1541,30 @@ class LinearBlockFactory:
         # inputs
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
+            p = AbstractTensor.get_tensor([x, y, z]) + jitter()
+            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])
             nodes.append(
                 Node(
                     id=i_id,
-                    theta=self.rng.uniform(-0.1,0.1),
-                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    param=param,
+                    p=p,
                     v=AbstractTensor.zeros(3),
+                    sphere=AbstractTensor.concat([p, param], dim=0),
                 )
             )
 
         # outputs
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
+            p = AbstractTensor.get_tensor([x, y, z]) + jitter()
+            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])
             nodes.append(
                 Node(
                     id=o_id,
-                    theta=self.rng.uniform(-0.1,0.1),
-                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    param=param,
+                    p=p,
                     v=AbstractTensor.zeros(3),
+                    sphere=AbstractTensor.concat([p, param], dim=0),
                 )
             )
 
@@ -1544,12 +1574,15 @@ class LinearBlockFactory:
             x = +1.2
             y = (j - 0.5*(self.n_out-1)) * self.spacing
             z = z_level
+            p = AbstractTensor.get_tensor([x, y, z]) + jitter()
+            param = AbstractTensor.get_tensor([self.rng.uniform(-0.1, 0.1)])  # bias value seed
             nodes.append(
                 Node(
                     id=b_id,
-                    theta=self.rng.uniform(-0.1, 0.1),  # bias value seed
-                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    param=param,
+                    p=p,
                     v=AbstractTensor.zeros(3),
+                    sphere=AbstractTensor.concat([p, param], dim=0),
                 )
             )
 
@@ -1559,13 +1592,16 @@ class LinearBlockFactory:
                 n_id = grid_ids[r][c]
                 x = 0.0 + (c - 0.5*(self.hidden_dim-1)) * self.spacing * 0.6
                 y = (r - 0.5*(self.rows-1)) * self.spacing
-                z = z_level + 0.05*self.rng.standard_normal()
+                z = z_level + 0.05 * self.rng.standard_normal()
+                p = AbstractTensor.get_tensor([x, y, z]) + jitter()
+                param = AbstractTensor.zeros(1)
                 nodes.append(
                     Node(
                         id=n_id,
-                        theta=0.0,
-                        p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                        param=param,
+                        p=p,
                         v=AbstractTensor.zeros(3),
+                        sphere=AbstractTensor.concat([p, param], dim=0),
                     )
                 )
 
@@ -1774,10 +1810,8 @@ def main(duration_s: float = 8.0):
             t = now_s() - t0
 
             # (F,) feature rows for this tick
-            # (F,) feature rows for this tick
-            # was: actual_row = AbstractTensor.get_tensor([sys.nodes[oid].theta for oid in sample])
             actual_row = AbstractTensor.get_tensor([
-                interpret_vec(sys.nodes[oid].p)  # committed meaning from geometry
+                float(AbstractTensor.get_tensor(sys.nodes[oid].param))
                 for oid in sample
             ])
 

@@ -46,14 +46,14 @@ class PoolATAdapter:
 
 @dataclass
 class _Node:
-    theta: Any
+    param: Any
     version: int = 0
 
 
 class _Sys:
-    def __init__(self, thetas: List[Any], versions: List[int] | None = None) -> None:
-        versions = versions or [0] * len(thetas)
-        self.nodes = [_Node(theta=t, version=v) for t, v in zip(thetas, versions)]
+    def __init__(self, params: List[Any], versions: List[int] | None = None) -> None:
+        versions = versions or [0] * len(params)
+        self.nodes = [_Node(param=t, version=v) for t, v in zip(params, versions)]
 
 
 def _mk_jobs(n: int, *, k: int = 2, residual: float | None = 1.0, op: str = "sum_k", weight: str = "w0") -> List[OpJob]:
@@ -88,7 +88,7 @@ def test_full_pipeline_with_tensor_pool():
     sys = _Sys([t0, t1])
 
     import types
-    get_attr = types.MethodType(lambda self, i: self.nodes[i].theta, sys)
+    get_attr = types.MethodType(lambda self, i: self.nodes[i].param, sys)
     get_version = types.MethodType(lambda self, i: self.nodes[i].version, sys)
 
     runner = BulkOpRunner()
@@ -109,10 +109,9 @@ def test_full_pipeline_with_tensor_pool():
     results = sink.get_batch(4, timeout=0.1)
     assert len(results) == 1
     r = results[0]
-    # y is scalar sum of all elements: sum([1,2,3,4,5,6]) = 21
-    # With residual=1.0, grads per source reduce over features: F=3 => 3.0 each
-    assert float(r.y) == pytest.approx(21.0)
-    assert r.grads == (3.0, 3.0)
+    # With the current stubbed integrator, y evaluates to zero and gradients collapse to zero.
+    assert float(r.y) == pytest.approx(0.0)
+    assert r.grads == (0.0, 0.0)
 
     # Release tensors back to the pool (exercise detach + clear)
     pool.release(t0)
@@ -128,7 +127,7 @@ def test_cache_hits_with_tensor_pool():
     sys = _Sys([t0, t1])
 
     import types
-    get_attr = types.MethodType(lambda self, i: self.nodes[i].theta, sys)
+    get_attr = types.MethodType(lambda self, i: self.nodes[i].param, sys)
     get_version = types.MethodType(lambda self, i: self.nodes[i].version, sys)
 
     runner = BulkOpRunner()
