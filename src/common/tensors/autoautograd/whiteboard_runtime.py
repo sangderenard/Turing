@@ -124,10 +124,12 @@ def run_batched_vjp(
     """
     One tape, one VJP over the whole bin.
 
-      x_j = NodeAttrView(sys.nodes, "sphere", indices=j.src_ids).build().tensor
+      x_all = NodeAttrView(sys.nodes, "sphere", indices=union(src_ids)).build().tensor
+      x_j = x_all[slice_for_job]
       y_j = getattr(x_j, op_name)(*op_args, **op_kwargs)  # or property value if not callable
 
-    Then L = sum_j <residual_j, y_j> and grads = dL/dx_j for all j via a single autograd.grad.
+    Then L = sum_j <residual_j, y_j> and grads = dL/dx_all with slices mapped
+    back to each job's original node ordering.
     """
     op_kwargs = op_kwargs or {}
     op_name = jobs[0].op if jobs else ""
@@ -142,9 +144,17 @@ def run_batched_vjp(
     idx_of: Dict[str, int] = {j.job_id: i for i, j in enumerate(jobs)}
     inv_ids: Tuple[str, ...] = tuple(j.job_id for j in jobs)
 
-    xs: List[Any] = []
     ys: List[Any] = []
     residuals: List[Optional[Any]] = []
+    # Prepare a single stacked view over all unique source ids
+    union_ids: List[int] = []
+    for j in jobs:
+        for sid in j.src_ids:
+            sid = int(sid)
+            if sid not in union_ids:
+                union_ids.append(sid)
+    pos_of = {sid: i for i, sid in enumerate(union_ids)}
+    slices_for_job: List[List[int]] = []
 
     scope_cm = getattr(backend, "scope", None)
     scope = scope_cm() if callable(scope_cm) else nullcontext()
@@ -152,6 +162,10 @@ def run_batched_vjp(
     hooks = NodeAttrView(sys.nodes, "sphere").resolve()
 
     with scope, _tape():
+        view = NodeAttrView(sys.nodes, "sphere", indices=union_ids).build()
+        x_all = view.tensor
+        if hasattr(x_all, "requires_grad_"):
+            x_all = x_all.requires_grad_()
         for j in jobs:
             x_j = NodeAttrView(
                 sys.nodes,
@@ -164,10 +178,10 @@ def run_batched_vjp(
                 x_j = x_j.requires_grad_()
             xs.append(x_j)
 
+
             op = getattr(x_j, op_name)
             y_j = op(*op_args, **op_kwargs) if callable(op) else op
             ys.append(y_j)
-
             residuals.append(_residual_like(y_j, j.residual, backend))
 
         # L = sum_j <residual_j, y_j>
@@ -179,15 +193,19 @@ def run_batched_vjp(
             L = term if L is None else (L + term)
 
         if L is None:
-            grads_list: List[Any] = [
-                (x_j.zeros_like() if hasattr(x_j, "zeros_like") else (x_j * 0))
-                for x_j in xs
-            ]
+            g_all = x_all.zeros_like() if hasattr(x_all, "zeros_like") else (x_all * 0)
         else:
-            grads_list = autograd.grad(L, xs, retain_graph=False, allow_unused=True)
+            g_all = autograd.grad(L, (x_all,), retain_graph=False, allow_unused=True)[0]
+
+    if g_all is None:
+        grads_list = [None for _ in jobs]
+    else:
+        grads_list = [g_all[idxs] for idxs in slices_for_job]
 
     grads_full = tuple(grads_list)
-    grads_per_source = tuple(_reduce_per_source(g) for g in grads_full if g is not None)
+    grads_per_source = tuple(
+        _reduce_per_source(g) if g is not None else tuple() for g in grads_full
+    )
 
     return BatchVJPResult(
         slices=BatchSlices(index_of=idx_of, job_ids=inv_ids),
