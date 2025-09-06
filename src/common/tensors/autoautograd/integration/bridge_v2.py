@@ -17,7 +17,7 @@ class _Job:
     src_ids: tuple[int, ...]
     op_args: Optional[Tuple[Any, ...]]
     op_kwargs: Optional[Dict[str, Any]]
-    residual: float | None
+    residual: Any | None
     scale: float | None
     weight: str | None
     backend_tag: Any = None
