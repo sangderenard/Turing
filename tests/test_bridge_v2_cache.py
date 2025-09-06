@@ -16,17 +16,12 @@ class DummySys:
         pass
 
 
-def _stub_batched_vjp(*, sys, jobs, op_args, op_kwargs, backend):
-    class _Batch:
-        def __init__(self, n):
-            self.ys = [0] * n
-            self.grads_full = [[0] * len(job.src_ids) for job in jobs]
-
-    return _Batch(len(jobs))
+def _stub_run_cached(sys, op_name, src_ids, **kwargs):
+    return 0, tuple(0 for _ in src_ids)
 
 
 def test_preactivation_cached(monkeypatch):
-    monkeypatch.setattr(bridge_v2, "run_batched_vjp", _stub_batched_vjp)
+    monkeypatch.setattr(bridge_v2, "run_op_and_grads_cached", _stub_run_cached)
     calls = []
 
     def _fake_preactivate(sys, nid):
