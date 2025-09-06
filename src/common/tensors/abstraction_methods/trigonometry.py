@@ -78,3 +78,14 @@ def coth(self) -> "AbstractTensor":
 def sinc(self) -> "AbstractTensor":
     return self.sin() / self
 
+def deg2rad(degrees: float | "AbstractTensor") -> "AbstractTensor":
+    if type(degrees) in (float, int):
+        from ..abstraction import AbstractTensor
+        degrees = AbstractTensor.get_tensor(degrees)
+    return degrees * (degrees.pi() / 180.0)
+
+def rad2deg(radians: float | "AbstractTensor") -> "AbstractTensor":
+    if type(radians) in (float, int):
+        from ..abstraction import AbstractTensor
+        radians = AbstractTensor.get_tensor(radians)
+    return radians * (180.0 / radians.pi())

@@ -62,15 +62,36 @@ def norm(x: AbstractTensor, ord: Union[int, str] = 2, dim: Optional[int] = None,
     raise NotImplementedError(f"norm ord={ord} with dim implemented for 1,2,inf only")
 
 def cross(a: AbstractTensor, b: AbstractTensor, dim: int = -1) -> AbstractTensor:
-    d = _axis(dim, a.dim())
-    if _axis(dim, b.dim()) != d or a.get_shape()[d] != 3 or b.get_shape()[d] != 3:
-        raise ValueError("cross expects both tensors to have size 3 along the same dim")
-    ax, ay, az = _take_along_dim(a, d, 0), _take_along_dim(a, d, 1), _take_along_dim(a, d, 2)
-    bx, by, bz = _take_along_dim(b, d, 0), _take_along_dim(b, d, 1), _take_along_dim(b, d, 2)
+    """
+    Vector cross product with axis auto-detection per input.
+
+    - Finds a length-3 axis in each input (prefers `dim` if valid).
+    - Computes axb using those axes; broadcasts other dims.
+    - Returns a 3-vector with the component axis placed at `a`'s chosen axis.
+    """
+    def _axis3(x, prefer):
+        d = _axis(prefer, x.dim())
+        sh = x.get_shape()
+        if 0 <= d < len(sh) and sh[d] == 3:
+            return d
+        # fall back: first axis of length 3
+        for i, s in enumerate(sh):
+            if s == 3:
+                return i
+        raise ValueError(f"cross expects a length-3 axis in tensor with shape {sh}")
+
+    da = _axis3(a, dim)  # component axis in a
+    db = _axis3(b, dim)  # component axis in b
+
+    ax = _take_along_dim(a, da, 0); ay = _take_along_dim(a, da, 1); az = _take_along_dim(a, da, 2)
+    bx = _take_along_dim(b, db, 0); by = _take_along_dim(b, db, 1); bz = _take_along_dim(b, db, 2)
+
     cx = ay * bz - az * by
     cy = az * bx - ax * bz
     cz = ax * by - ay * bx
-    return ax.stack([cx, cy, cz], dim=d)
+
+    return ax.stack([cx, cy, cz], dim=da)
+
 
 def trace(A: AbstractTensor) -> AbstractTensor:
     """Sum of diagonal over last two dims."""

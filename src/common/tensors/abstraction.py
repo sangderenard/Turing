@@ -1660,6 +1660,18 @@ class AbstractTensor:
         result.data = self._apply_operator__(op, l, r)
         return finalize(result)
 
+    # inside AbstractTensor
+    def __array__(self, dtype=None):
+        out = self.clone()
+        from .numpy_backend import NumPyTensorOperations
+        out.to_backend(AbstractTensor.get_tensor(0, cls=NumPyTensorOperations))
+        return out.data if dtype is None else out.data.astype(dtype)
+
+    @property
+    def __array_interface__(self):
+        import numpy as np
+        return self.__array__().__array_interface__
+
 
     def __add__(self, other):
         return self._apply_operator("add", self, other)
@@ -2198,6 +2210,8 @@ from .abstraction_methods.trigonometry import (
     csch as trig_csch,
     coth as trig_coth,
     sinc as trig_sinc,
+    deg2rad as trig_deg2rad,
+    rad2deg as trig_rad2deg,
 )
 from .abstraction_methods.fourier import (
     FFTNamespace,
@@ -2494,6 +2508,8 @@ _bind_and_wrap({
     "csch": trig_csch,
     "coth": trig_coth,
     "sinc": trig_sinc,
+    "deg2rad": trig_deg2rad,
+    "rad2deg": trig_rad2deg,
 })
 
 def T(self) -> "AbstractTensor":

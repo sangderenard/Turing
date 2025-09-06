@@ -535,6 +535,9 @@ from OpenGL.GL import *
 from OpenGL.GL.shaders import compileProgram, compileShader
 from matplotlib import cm, colors as mcolors
 from typing import Any, Tuple
+# spring_async_toy.py (top-level, before creating LiveVizGLPoints)
+from ..pyopengl_handler import install_pyopengl_handlers
+install_pyopengl_handlers()
 
 # Expecting SpringRepulsorSystem with:
 #   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.theta is scalar
@@ -743,27 +746,11 @@ class LiveVizGLPoints:
         self._compute_mvp(P_for_bounds)
 
     # ---------- camera / MVP ----------
-    @staticmethod
-    def _look_at(eye, center, up) -> AbstractTensor:
-        f = center - eye
-        f = f / (AbstractTensor.linalg.norm(f) + 1e-12)
-        upn = up / (AbstractTensor.linalg.norm(up) + 1e-12)
-        s = AbstractTensor.cross(f, upn)
-        s = s / (AbstractTensor.linalg.norm(s) + 1e-12)
-        u = AbstractTensor.cross(s, f)
-
-        M = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
-        M[0, :3] = s
-        M[1, :3] = u
-        M[2, :3] = -f
-        T = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
-        T[:3, 3] = -eye
-        return M @ T
 
     @staticmethod
     def _perspective(fovy_deg, aspect, znear, zfar) -> AbstractTensor:
         f = 1.0 / AbstractTensor.tan(AbstractTensor.deg2rad(fovy_deg) / 2.0)
-        M = AbstractTensor.zeros((4, 4), dtype=AbstractTensor.float32)
+        M = AbstractTensor.zeros((4, 4), dtype=f.float_dtype)
         M[0, 0] = f / max(aspect, 1e-6)
         M[1, 1] = f
         M[2, 2] = (zfar + znear) / (znear - zfar)
@@ -771,23 +758,68 @@ class LiveVizGLPoints:
         M[3, 2] = -1.0
         return M
 
+
+    @staticmethod
+    def _look_at(eye, center, up) -> AbstractTensor:
+        AT = AbstractTensor
+
+        def _vec3(x):
+            t = x.clone()
+            # Flatten anything like (1,3), (3,1), (3,3) into (3,)
+            if hasattr(t, "shape"):
+                if len(t.shape) > 1:
+                    t = t.reshape((t.shape[-1],))
+            return t
+
+        eye    = _vec3(eye)
+        center = _vec3(center)
+        up     = _vec3(up)
+
+        f = center - eye
+        f = f / (AT.linalg.norm(f) + 1e-12)
+        upn = up / (AT.linalg.norm(up) + 1e-12)
+
+        # Manual cross products → guaranteed (3,)
+        fx, fy, fz = f[0], f[1], f[2]
+        ux, uy, uz = upn[0], upn[1], upn[2]
+        s = AT.get_tensor([fy*uz - fz*uy, fz*ux - fx*uz, fx*uy - fy*ux])
+        s = s / (AT.linalg.norm(s) + 1e-12)
+
+        sx, sy, sz = s[0], s[1], s[2]
+        u = AT.get_tensor([sy*fz - sz*fy, sz*fx - sx*fz, sx*fy - sy*fx])
+
+        # NOTE: pass an int to eye()
+        M = AT.eye(4, dtype=s.float_dtype)
+        M[0, :3] = s
+        M[1, :3] = u
+        M[2, :3] = -f
+
+        T = AT.eye(4, dtype=s.float_dtype)
+        T[:3, 3] = -eye
+        return M @ T
+
     def _compute_mvp(self, P: AbstractTensor):
-        if P.size == 0:
-            self._mvp = AbstractTensor.eye(4, dtype=AbstractTensor.float32)
+        if P.shape == (0,):
+            self._mvp = AbstractTensor.eye(4, dtype=P.float_dtype)
             return
-        P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)  # NEW
+        P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
         lo = AbstractTensor.min(P, dim=0)
         hi = AbstractTensor.max(P, dim=0)
         ctr = 0.5 * (lo + hi)
-        extent_t = AbstractTensor.get_tensor(AbstractTensor.max(hi - lo))
-        if not extent_t.isfinite().item() or extent_t.item() <= 1e-6:
-            extent_t = AbstractTensor.get_tensor(1.0)  # NEW: avoid zero/NaN extent
-        extent = float(extent_t.item())
 
-        rad = extent * 0.6 + 1e-3
-        eye = ctr + AbstractTensor.array([rad * 1.6, rad * 1.6, rad * 1.6], dtype=AbstractTensor.float32)
-        up  = AbstractTensor.array([0.0, 1.0, 0.0], dtype=AbstractTensor.float32)
+        # safer extent
+        extent_t = AbstractTensor.get_tensor(hi - lo).max()
+        try:
+            finite = AbstractTensor.get_tensor(extent_t).isfinite()
+        except Exception:
+            finite = True
+        if (not finite) or float(extent_t) <= 1e-6:
+            extent_t = AbstractTensor.get_tensor(1.0)
+
+        rad = extent_t * 0.6 + 1e-3
+        eye = ctr + AbstractTensor.get_tensor([rad * 1.6, rad * 1.6, rad * 1.6], dtype=P.float_dtype)
+        up  = AbstractTensor.get_tensor([0.0, 1.0, 0.0], dtype=P.float_dtype)
 
         V  = self._look_at(eye, ctr, up)
         aspect = self._w / max(self._h, 1)
@@ -841,7 +873,7 @@ class LiveVizGLPoints:
 
         glUseProgram(self._program)
         # CHANGED: upload transpose so GLSL sees the right matrix
-        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, self._mvp.T)
+        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, self._mvp.T())
 
         glBindVertexArray(self._vao)
         glDrawArrays(GL_POINTS, 0, self._num_points)
@@ -1471,7 +1503,7 @@ def main(duration_s: float = 8.0):
             # sample first few outputs
             sample = list(outputs.keys())
             errors = [sys.nodes[oid].theta - outputs[oid](t) for oid in sample]
-            mae = AbstractTensor.mean([abs(err) for err in errors])
+            mae = AbstractTensor.get_tensor([abs(err) for err in errors]).mean()
             error_str = ''.join([f"{chr(int((err + 1) * 127.5))}" for err in errors])
             print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae: .3f}, Error Phrase: {error_str}")
             viz.step(0.5)
