@@ -1371,7 +1371,7 @@ class Experiencer(threading.Thread):
         self,
         sys: SpringRepulsorSystem,
         stop: threading.Event,
-        outputs: Dict[int, Callable[[float], float]],
+        outputs: Dict[int, Callable[[float], AbstractTensor]],
         schedule_hz: float = 30.0,
         ops_program: Optional[
             List[Tuple[str, List[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]]
@@ -1385,11 +1385,13 @@ class Experiencer(threading.Thread):
         # If none provided, fall back to the tiny demo. (We’ll pass one in.)
         self.ops_program = ops_program
 
-    def _residual_for_out(self, out_id: int, y_val: float, t: float) -> Optional[float]:
-        if out_id not in self.outputs:
+    def _residual_for_out(
+        self, out_id: int, y_val: AbstractTensor, t: float
+    ) -> Optional[AbstractTensor]:
+        if out_id not in self.outputs or y_val is None:
             return None
-        target = self.outputs[out_id](t)
-        return y_val - target
+        target_vec = self.outputs[out_id](t)
+        return y_val - target_vec
 
     def run(self):
         t0 = now_s()
@@ -1405,54 +1407,50 @@ class Experiencer(threading.Thread):
                 ys, grads, _ = push_impulses_from_ops_batched(
                     self.sys, out_specs, weight=None, scale=1.0
                 )
-                # Collect residuals for smoothing
                 residuals: List[AbstractTensor] = []
                 for spec, y, g_list in zip(out_specs, ys, grads):
                     name, srcs, out, args, kwargs = spec
-                    target = self.outputs.get(out)
-                    r = y - target(t) if target is not None and y is not None else AbstractTensor.get_tensor(0.0)
+                    target_fn = self.outputs.get(out)
+                    r = (
+                        y - target_fn(t)
+                        if target_fn is not None and y is not None
+                        else AbstractTensor.get_tensor(0.0)
+                    )
                     residuals.append(r)
 
-                if residuals:
-                    r_vec = AbstractTensor.stack(residuals)
-                    n = int(r_vec.shape[0])
-                    if n > 1:
-                        adj = AbstractTensor.zeros((n, n), dtype=float)
-                        for k in range(n - 1):
-                            adj[k, k + 1] = 1.0
-                            adj[k + 1, k] = 1.0
-                        r_vec = filtered_poisson(r_vec, iterations=20, adjacency=adj).reshape(-1)
-                        smoothed = [r_vec[i] for i in range(n)]
-                    else:
-                        smoothed = [r_vec[0]]
-                else:
-                    smoothed = []
+                smoothed = residuals
 
-                for (name, srcs, out, args, kwargs), y, g_list, r_sm in zip(out_specs, ys, grads, smoothed):
-                    r_host = (
-                        float(getattr(r_sm, "item_", lambda: r_sm)())
-                        if hasattr(r_sm, "item_")
-                        else float(r_sm)
-                    )
-                    sc = 1.0  # default scale
-                    for i, g in zip(srcs, g_list):
-                        g_val = g.sum() if hasattr(g, "sum") else g
-                        g_host = (
-                            float(getattr(g_val, "item_", lambda: g_val)())
-                            if hasattr(g_val, "item_")
-                            else float(g_val)
-                        )
-                        self.sys.impulse(int(i), int(out), name, float(sc * g_host * (-r_host)))
+                for (name, srcs, out, args, kwargs), y, g_list, r in zip(
+                    out_specs, ys, grads, smoothed
+                ):
+                    for i, g_vec in zip(srcs, g_list):
+                        try:
+                            g_scalar = float((g_vec * r).sum())
+                        except Exception:
+                            g_scalar = 0.0
+                        self.sys.impulse(int(i), int(out), name, -g_scalar)
+                        p_node = self.sys.nodes.get(int(i))
+                        if p_node is not None and hasattr(p_node, "param"):
+                            try:
+                                update = g_vec * r
+                                if getattr(p_node.param, "shape", ()) == getattr(update, "shape", () ):
+                                    p_node.param += update
+                                else:
+                                    p_node.param += update.sum()
+                            except Exception:
+                                pass
                     node = self.sys.nodes[out]
-                    y_t = AbstractTensor.get_tensor(0.0) if y is None else AbstractTensor.get_tensor(y)
+                    y_t = (
+                        AbstractTensor.get_tensor(0.0)
+                        if y is None
+                        else AbstractTensor.get_tensor(y)
+                    )
                     mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
-                    # I keep going back and forth on how this should solve
-                    #node.p[0] = float(mean_val)
-                # Close the loop: push a scalar loss impulse along feedback edges
+                    # node.param could also be updated here if desired
                 if self.sys.feedback_edges and smoothed:
-                    L = AbstractTensor.zeroes_like(smoothed[0])
+                    L = AbstractTensor.get_tensor(0.0)
                     for r in smoothed:
-                        L += 0.5 * r * r
+                        L += 0.5 * (r * r).sum()
                     L_host = (
                         float(getattr(L, "item_", lambda: L)())
                         if hasattr(L, "item_")
