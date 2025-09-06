@@ -943,6 +943,29 @@ class AbstractTensor:
         result.data = first.pad_cat_(tensors, dim, pad_value)
         return result
 
+    @staticmethod
+    def outer(a: Any, b: Any) -> "AbstractTensor":
+        """Return the outer product ``a ⊗ b`` as an :class:`AbstractTensor`.
+
+        The operation flattens both inputs to 1D, adds singleton dimensions,
+        and multiplies them using standard broadcasting.  This mirrors
+        ``numpy.outer``/``torch.outer`` semantics while reusing existing
+        reshape and multiply primitives so autograd can trace the computation
+        without additional backend hooks.
+
+        Parameters
+        ----------
+        a, b:
+            Tensor-like objects.  If plain arrays are provided they will be
+            converted to tensors using ``AbstractTensor.get_tensor`` and
+            ``ensure_tensor`` so both arguments share the same backend and
+            gradient tape.
+        """
+
+        at = AbstractTensor.get_tensor(a)
+        bt = at.ensure_tensor(b)
+        return at.flatten().unsqueeze(-1) * bt.flatten().unsqueeze(-2)
+
     class _TopKResult(NamedTuple):
         values: "AbstractTensor"
         indices: Any
