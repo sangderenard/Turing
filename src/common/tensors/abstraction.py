@@ -1228,14 +1228,41 @@ class AbstractTensor:
     def tolist(self) -> List[Any]:
         return self.tolist_()
 
+    def nbytes(self) -> int:
+        """Return the number of bytes consumed by the tensor's data buffer.
+
+        Delegates to the backend hook ``nbytes_``. This is a read-only query
+        and does not participate in autograd.
+        """
+        return int(self.nbytes_())
+
     
-    def pi(self) -> float:
-        if not hasattr(self, "_pi"):
-            return self._pi
-        else:
-            return self.long_pi()
+    def pi(self=None) -> float:
+        """Return pi as a numeric scalar.
+
+        Works when called as ``AbstractTensor.pi()`` or on a tensor instance.
+        Prefers a backend-provided constant ``_pi`` when available; otherwise
+        returns a high-precision float fallback.
+        """
+        # Allow class-call without an instance by delegating to a default backend
+        if self is None:
+            base = AbstractTensor.get_tensor(0)
+            return base.pi()
+        # Try backend-provided constant (may be a property returning a float)
+        try:
+            if hasattr(self, "_pi"):
+                val = getattr(self, "_pi")
+                # If it's a property/value, return it; if it's a callable, call it
+                return float(val() if callable(val) else val)
+        except Exception:
+            pass
+        # Fallback: numeric constant
+        return 3.14159265358979323846264338327950288419716939937510
         
-    def long_pi(self):
+    def long_pi(self=None):
+        if self is None:
+            base = AbstractTensor.get_tensor(0)
+            return base.long_pi()
         # Pi to 50 decimal places
         return AbstractTensor.tensor(
             3.14159265358979323846264338327950288419716939937510,
@@ -1271,6 +1298,46 @@ class AbstractTensor:
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
         return result
+
+    # --- Pure-abstraction utilities ---------------------------------------
+    @staticmethod
+    def searchsorted(a: Any, v: Any, side: str = "left") -> "AbstractTensor":
+        """Return insertion indices for ``v`` in sorted 1-D sequence ``a``.
+
+        Implemented in terms of existing elementwise comparisons and reductions
+        to preserve autograd tape semantics without backend-specific code.
+
+        - side='left': count of elements strictly less than v
+        - side='right': count of elements less than or equal to v
+        """
+        seq = AbstractTensor.get_tensor(a)
+        vals = seq.ensure_tensor(v)
+
+        # Flatten for a simple (N, M) broadcasted comparison, then reshape back
+        seq1 = seq.view_flat()
+        vals1 = vals.view_flat()
+
+        # Build broadcasted compare matrix: (N, 1) vs (1, M) -> (N, M)
+        A = seq1.unsqueeze(1)
+        B = vals1.unsqueeze(0)
+        if side == "left":
+            cmp = A < B
+        elif side == "right":
+            cmp = A <= B
+        else:
+            raise ValueError("side must be 'left' or 'right'")
+
+        # Sum boolean comparisons along the sequence axis to get insertion idx
+        counts = cmp.to_dtype(seq.long_dtype).sum(dim=0)
+        # Restore original vals shape
+        try:
+            vshape = vals.get_shape()
+            counts = counts.reshape(vshape)
+        except Exception:
+            pass
+
+        finalize = AbstractTensor._pre_autograd("searchsorted", [seq, vals], params={"side": side})
+        return finalize(counts)
 
     # --- Dtype helpers ---
     @property
@@ -1805,6 +1872,10 @@ class AbstractTensor:
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement unravel_index_()"
         )
+
+    def nbytes_(self) -> int:
+        """Backend hook for nbytes query."""
+        raise NotImplementedError(f"{self.__class__.__name__} must implement nbytes_()")
 
 
 class AbstractF:

@@ -739,6 +739,9 @@ class NumPyTensorOperations(AbstractTensor):
     def argmin_(self, dim=None, keepdim=False):
         return np.argmin(self.data, axis=dim, keepdims=keepdim)
 
+    def nbytes_(self) -> int:
+        return int(self.data.nbytes)
+
     def diag_(self, offset: int = 0):
         import numpy as np
         return np.diag(self.data, k=offset)

@@ -579,6 +579,12 @@ class PyTorchTensorOperations(AbstractTensor):
             return x.argmin()  # flattened index; keepdim not meaningful here
         return x.argmin(dim=dim, keepdim=keepdim)
 
+    def nbytes_(self) -> int:
+        try:
+            return int(self.data.element_size() * self.data.numel())
+        except Exception:
+            return int(self.data.nelement() * self.data.element_size())
+
     def get_shape(self):
         return tuple(self.data.shape)
     def get_ndims(self, data=None):

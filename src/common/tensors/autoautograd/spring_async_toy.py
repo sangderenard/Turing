@@ -438,7 +438,8 @@ class SpringRepulsorSystem:
 
         # --- 1) coarse FFT ---
         C0 = AbstractTensor.fft.rfft(xw, axis=0)                 # (F0, D)
-        w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(W, d=dt)  # (F0,)
+        # Frequency bins for real FFT with sample step dt, matched to xs backend
+        w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(int(W), d=dt, like=xs)  # (F0,)
         P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, dim=1)           # (F0,)
         if P0.sum() <= 1e-12 or len(P0) <= 2:
             return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
@@ -471,9 +472,12 @@ class SpringRepulsorSystem:
         Z = 8  # zero-pad factor
         Wz = W * Z
         # zero-pad the windowed signal in time
-        xpad = AbstractTensor.pad(xw, ((0, Wz - W), (0, 0)))
+        # Pad along time axis (axis 0) by Wz - W zeros at the end
+        # Note: numpy backend pad_ consumes flattened pads in reverse axis order
+        # so we pass (0,0, 0,Wz-W) to target axis0 only.
+        xpad = AbstractTensor.pad(xw, (0, 0, 0, Wz - W))
         Cz = AbstractTensor.fft.rfft(xpad, axis=0)                 # (Fz, D)
-        wz = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(Wz, d=dt)   # (Fz,)
+        wz = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(Wz, d=dt, like=xs)   # (Fz,)
 
         # helper to map coarse indices to high-res frequency indices
         def coarse_band_to_w(b_lo, b_hi):
@@ -677,25 +681,35 @@ class LiveVizGLPoints:
 
         # NEW: pad to 3D if needed
         if P.shape[1] == 2:
-            P = AbstractTensor.pad(P, ((0,0),(0,1)), constant_values=0.0)
+            # Add one column (axis 1) of zeros to promote (N,2) -> (N,3)
+            # Backend expects flattened pads in reverse axis order: (axis1, axis0)
+            P = AbstractTensor.pad(P, (0, 1, 0, 0), value=0.0)
 
         # NEW: replace NaN/Inf early to avoid NaN bounds
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
-        thetas = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype)
-        is_b = AbstractTensor.get_tensor([i in bset for i in ids], dtype=ids.bool_dtype)
+        thetas = AbstractTensor.get_tensor([nodes[i][1] for i in ids], dtype=ids.float_dtype, like=ids)
+        is_b = AbstractTensor.get_tensor([i in bset for i in ids], dtype=ids.bool_dtype, like=ids)
 
         # Color map around 0.0 with TwoSlopeNorm
         vmin = AbstractTensor.min(thetas)
         vmax = AbstractTensor.max(thetas)
-        vmax.where(vmin <= vmax, vmin + 1e-6)  # ensure vmax > vmin
-        vmax = vmax.mean().item()
-        vmin = vmin.mean().item()
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-        C = self.node_cmap(norm(thetas))[:, :3].astype(thetas.float_dtype)  # RGB
+        import numpy as np
+        C = self.node_cmap(norm(thetas))[:, :3].astype(np.float32)  # RGB
 
         # Point sizes (boundary nodes larger)
-        sizes = AbstractTensor.full(ids.shape, self.base_point_size, dtype=AbstractTensor.float_dtype)
+        sizes = AbstractTensor.full(
+            ids.shape,
+            self.base_point_size,
+            dtype=ids.float_dtype,
+            device=ids.get_device(),
+            cls=type(ids),
+        )
+        # Ensure boolean mask dtype and backend/device alignment
+        is_b = is_b.to_dtype("bool")
         sizes[is_b] *= self.boundary_scale
 
         return P, C, sizes, P  # return P twice; last is for autoscale
