@@ -205,6 +205,14 @@ class NumPyTensorOperations(AbstractTensor):
         import numpy as np
         return np.log(self.data)
 
+    def real_(self):
+        import numpy as np
+        return np.real(self.data)
+
+    def imag_(self):
+        import numpy as np
+        return np.imag(self.data)
+
     def neg_(self):
         return -self.data
 
