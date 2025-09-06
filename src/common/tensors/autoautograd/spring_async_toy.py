@@ -873,7 +873,8 @@ class LiveVizGLPoints:
 
         glUseProgram(self._program)
         # CHANGED: upload transpose so GLSL sees the right matrix
-        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, self._mvp.T())
+        import numpy as np
+        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, np.array(self._mvp.T(), dtype=np.float32))
 
         glBindVertexArray(self._vao)
         glDrawArrays(GL_POINTS, 0, self._num_points)
@@ -1307,13 +1308,15 @@ class LinearBlock:
     ops: List[Tuple[str, List[int], int]]  # (op_name, src_ids, out_id)
 
 class LinearBlockFactory:
-    def __init__(self, n_in: int, n_out: int, *, spacing: float = 0.35, seed: int = 0, rows=1, gather_operators=["add", "mul"]):
+    def __init__(self, n_in: int, n_out: int, *, spacing: float = 0.35, seed: int = 0, rows=1, hidden_dim: int = 64, gather_operators=["add", "mul"]):
         self.n_in = int(n_in)
         self.n_out = int(n_out)
         self.spacing = float(spacing)
         self.rng = AbstractTensor.random
         self.rng.set_seed(int(seed))
         self.rows = int(rows)
+        self.hidden_dim = int(hidden_dim)
+        self.gather_operators = list(gather_operators)
 
     def _mk_edge(self, i, j, op):
         bands = [
@@ -1325,82 +1328,142 @@ class LinearBlockFactory:
 
     def build(self, start_id: int = 0, *, z_level: float = 0.0) -> LinearBlock:
         from .integration.bridge_v2 import _op_apply_factory
+
         nid = int(start_id)
         nodes: List[Node] = []
         edges: List[Edge] = []
         ops: List[
-                    Tuple[
-                        str,
-                        List[int],
-                        int,
-                        Optional[Tuple[Any, ...]],
-                        Optional[Dict[str, Any]],
-                    ]
-                ] = []
+            Tuple[
+                str,
+                List[int],
+                int,
+                Optional[Tuple[Any, ...]],
+                Optional[Dict[str, Any]],
+            ]
+        ] = []
 
         # --- allocate IDs ---
         in_ids  = [nid + k for k in range(self.n_in)]; nid += self.n_in
         out_ids = [nid + k for k in range(self.n_out)]; nid += self.n_out
-        # biases (j)
+
+        # biases (j) -> give each output its own bias node ID
         b_ids: Dict[int, int] = {j: (nid + j) for j in range(self.n_out)}
         nid += self.n_out
-        # intermediate rows
-        row_ids: List[int] = [nid + k for k in range(self.rows)]; nid += self.rows
 
+        # inner grid (rows x hidden_dim)
+        # FIX: stride row bases by hidden_dim so IDs don't overlap across rows
+        row_ids: List[int] = [nid + r * self.hidden_dim for r in range(self.rows)]
+        grid_ids: List[List[int]] = [
+            [row_ids[r] + c for c in range(self.hidden_dim)] for r in range(self.rows)
+        ]
+        nid += self.rows * self.hidden_dim
 
-        # --- place nodes in 3D for clarity (inputs left, rows center slab, outs right) ---
+        # --- place nodes in 3D (inputs left, grid center slab, outs right) ---
         def jitter(s=0.07):
             random_tensor = AbstractTensor.random_tensor(size=(3,), scope=(-s, s))
             return random_tensor
+
         # inputs
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
-            nodes.append(Node(id=i_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+            nodes.append(
+                Node(
+                    id=i_id,
+                    theta=self.rng.uniform(-0.1,0.1),
+                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    v=AbstractTensor.zeros(3),
+                )
+            )
+
         # outputs
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
-            nodes.append(Node(id=o_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
-        # biases near output column
-        for j, b_id in b_ids.items():
-            x = +1.1; y = (j - 0.5*(self.n_out-1)) * self.spacing + 0.03*self.rng.standard_normal()
-            z = z_level + 0.15*self.rng.standard_normal()
-            nodes.append(Node(id=b_id, theta=self.rng.uniform(-0.1,0.1),
-                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
-        # row nodes column
-        for r, r_id in enumerate(row_ids):
-            x = 0.3
-            y = (r - 0.5*(self.rows-1)) * self.spacing
-            z = z_level + 0.05*self.rng.standard_normal()
-            nodes.append(Node(id=r_id, theta=0.0,
-                              p=AbstractTensor.get_tensor([x,y,z]) + jitter(), v=AbstractTensor.zeros(3)))
+            nodes.append(
+                Node(
+                    id=o_id,
+                    theta=self.rng.uniform(-0.1,0.1),
+                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    v=AbstractTensor.zeros(3),
+                )
+            )
 
-
-        # connect inputs -> rows
-        for r_id in row_ids:
-            srcs = list(in_ids)
-            for s in srcs:
-                edges.append(self._mk_edge(s, r_id, "gather_and"))
-            args = {
-                "indices": srcs,
-                "dim": 0,
-                "fn": _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)]),
-            }
-            ops.append(("gather_and", srcs, r_id, None, args))
-
-        # connect rows -> outputs
+        # biases: place near outputs but a bit inward
         for j in range(self.n_out):
-            srcs = list(row_ids) + [b_ids[j]]
-            oj = out_ids[j]
+            b_id = b_ids[j]
+            x = +1.2
+            y = (j - 0.5*(self.n_out-1)) * self.spacing
+            z = z_level
+            nodes.append(
+                Node(
+                    id=b_id,
+                    theta=self.rng.uniform(-0.1, 0.1),  # bias value seed
+                    p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                    v=AbstractTensor.zeros(3),
+                )
+            )
+
+        # inner grid nodes
+        for r in range(self.rows):
+            for c in range(self.hidden_dim):
+                n_id = grid_ids[r][c]
+                x = 0.0 + (c - 0.5*(self.hidden_dim-1)) * self.spacing * 0.6
+                y = (r - 0.5*(self.rows-1)) * self.spacing
+                z = z_level + 0.05*self.rng.standard_normal()
+                nodes.append(
+                    Node(
+                        id=n_id,
+                        theta=0.0,
+                        p=AbstractTensor.get_tensor([x,y,z]) + jitter(),
+                        v=AbstractTensor.zeros(3),
+                    )
+                )
+
+        # common agg fn for gather_and
+        agg_fn = _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)])
+
+        # --- connect: inputs -> first row (fully connected) ---
+        if self.rows > 0:
+            for tgt in grid_ids[0]:
+                srcs = list(in_ids)
+                for s in srcs:
+                    edges.append(self._mk_edge(s, tgt, "gather_and"))
+                ops.append((
+                    "gather_and",
+                    srcs,
+                    tgt,
+                    None,
+                    {"indices": srcs, "dim": 0, "fn": agg_fn},
+                ))
+
+        # --- connect: row r -> row r+1 (fully connected between consecutive rows) ---
+        for r in range(self.rows - 1):
+            prev_row = grid_ids[r]
+            next_row = grid_ids[r + 1]
+            for tgt in next_row:
+                srcs = list(prev_row)
+                for s in srcs:
+                    edges.append(self._mk_edge(s, tgt, "gather_and"))
+                ops.append((
+                    "gather_and",
+                    srcs,
+                    tgt,
+                    None,
+                    {"indices": srcs, "dim": 0, "fn": agg_fn},
+                ))
+
+        # --- connect: last row -> outputs (+ bias per output) ---
+        last_sources = grid_ids[-1] if self.rows > 0 else list(in_ids)
+        for j, oj in enumerate(out_ids):
+            srcs = list(last_sources) + [b_ids[j]]
             for s in srcs:
                 edges.append(self._mk_edge(s, oj, "gather_and"))
-            args = {
-                "indices": srcs,
-                "dim": 0,
-                "fn": _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)]),
-            }
-            ops.append(("gather_and", srcs, oj, None, args))
+            ops.append((
+                "gather_and",
+                srcs,
+                oj,
+                None,
+                {"indices": srcs, "dim": 0, "fn": agg_fn},
+            ))
 
         return LinearBlock(
             base_id=start_id,
@@ -1408,7 +1471,7 @@ class LinearBlockFactory:
             out_ids=out_ids,
             w_ids={},
             b_ids=b_ids,
-            row_ids=row_ids,
+            row_ids=row_ids,   # row bases (first column of each row); full grid is internal
             nodes=nodes,
             edges=edges,
             ops=ops,
@@ -1505,7 +1568,7 @@ def main(duration_s: float = 8.0):
             errors = [sys.nodes[oid].theta - outputs[oid](t) for oid in sample]
             mae = AbstractTensor.get_tensor([abs(err) for err in errors]).mean()
             error_str = ''.join([f"{chr(int((err + 1) * 127.5))}" for err in errors])
-            print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae: .3f}, Error Phrase: {error_str}")
+            print(f"[DBG] outputs MAE (first {len(sample)} chars): {mae.mean().item(): .3f}, Error Phrase: {error_str}")
             viz.step(0.5)
 
     finally:
@@ -1516,4 +1579,4 @@ def main(duration_s: float = 8.0):
         viz.close()
 
 if __name__ == "__main__":
-    main(600.0)
+    main(float('inf'))

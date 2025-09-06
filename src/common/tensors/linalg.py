@@ -24,7 +24,7 @@ def _unsqueeze(x: AbstractTensor, dim: int) -> AbstractTensor:
 
 def eye(n: int, *, dtype=None, device=None, batch_shape: Tuple[int, ...] = ()) -> AbstractTensor:
     """Vectorized I_n using arange/equality; supports broadcasting to batch_shape."""
-    test_tensor = AbstractTensor.tensor([1])
+    test_tensor = AbstractTensor.get_tensor(1)
     cls = type(test_tensor)
     long_type = test_tensor.long_dtype_
     float_type = test_tensor.float_dtype_
