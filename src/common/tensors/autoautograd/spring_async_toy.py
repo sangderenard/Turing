@@ -1899,7 +1899,7 @@ class LinearBlockFactory:
                     srcs,
                     tgt,
                     None,
-                    {"indices": srcs, "dim": 0, "fn": agg_fn},
+                    {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
                 ))
 
         # --- connect: row r -> row r+1 (fully connected between consecutive rows) ---
@@ -1915,7 +1915,7 @@ class LinearBlockFactory:
                     srcs,
                     tgt,
                     None,
-                    {"indices": srcs, "dim": 0, "fn": agg_fn},
+                    {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
                 ))
 
         # --- connect: last row -> outputs (+ bias per output) ---
@@ -1929,7 +1929,7 @@ class LinearBlockFactory:
                 srcs,
                 oj,
                 None,
-                {"indices": srcs, "dim": 0, "fn": agg_fn},
+                {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
             ))
 
         return LinearBlock(
