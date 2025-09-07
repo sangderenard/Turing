@@ -154,11 +154,19 @@ def run_op_and_grads_cached(
     }
 
     if grad_mode == "scalar":
-        grads = _reduce_per_source(grads_full)
+        if grads_full is None:
+            grads = tuple(0.0 for _ in src_ids)
+        else:
+            grads = _reduce_per_source(grads_full)
     elif grad_mode == "param":
-        grads = grads_full[:, D:] if P > 0 else grads_full[:, 0:0]
+        if grads_full is None:
+            grads = AbstractTensor.zeros((len(src_ids), P), float)
+        else:
+            grads = grads_full[:, D:] if P > 0 else grads_full[:, 0:0]
     else:  # "full"
-        grads = grads_full
+        grads = grads_full if grads_full is not None else AbstractTensor.zeros(
+            (len(src_ids), sphere_len), float
+        )
 
     entry = CacheEntry(y=y, grads=grads, meta=meta)
     cache.put(key, entry)
