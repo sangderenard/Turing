@@ -31,6 +31,76 @@ class BatchVJPResult:
 
 
 @dataclass(frozen=True)
+class SubFnMeta:
+    """Description of a post-op function in a composite kernel.
+
+    ``param_refs`` lists indices into the invoking node's ``param`` vector that
+    should be passed as positional operands.  Scalars broadcast according to the
+    backend's normal rules so no extra annotation is required for them.
+    """
+
+    name: str
+    param_refs: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class OpBatchMeta:
+    """Metadata describing how an op may be batched.
+
+    Attributes
+    ----------
+    shape:
+        Optional textual description of shape constraints.  Examples include
+        ``"all_equal"`` for elementwise ops or ``"matmul"`` for matrix
+        multiplication style contracts.  The value is advisory only and consumed
+        by higher level schedulers.
+    dim_params:
+        Names of keyword arguments that represent dimension selections (``dim``
+        or ``axis``) which must be offset when tensors are stacked for batching.
+    sub_fns:
+        Composite kernels may apply a tiny chain of backend operations after the
+        main op.  Each entry describes a method name and which parameters from
+        the destination node's ``param`` vector should be supplied.  For example
+        the current demo wires ``gather_and`` to ``__mul__`` then ``__add__``
+        with ``param[1]`` and ``param[2]`` respectively.  Scalars are assumed to
+        broadcast exactly as in the unbatched call; metadata merely records the
+        existence of the chain.
+    """
+
+    shape: Optional[str] = None
+    dim_params: Tuple[str, ...] = ()
+    sub_fns: Tuple[SubFnMeta, ...] = ()
+
+
+# Predefined metadata for the minimal set of elementwise ops currently used in
+# tests.  Additional kernels can be registered at runtime via
+# :func:`register_batchable_op`.
+BATCHABLE_OPS: Dict[str, OpBatchMeta] = {
+    "add": OpBatchMeta(shape="all_equal"),
+    "mul": OpBatchMeta(shape="all_equal"),
+    # `sum` accepts a `dim` argument so note it for callers that may need to
+    # adjust that parameter when stacking tensors for batching.
+    "sum": OpBatchMeta(shape="any", dim_params=("dim",)),
+    # ``matmul`` is included as an example of a non element-wise operator.
+    "matmul": OpBatchMeta(shape="matmul"),
+    # ``gather_and`` gathers then applies a tiny op chain such as
+    # ("__mul__", "__add__").  Parameter references mirror how the autoautograd
+    # demo wires weights then biases via ``param[1]`` and ``param[2]``.
+    "gather_and": OpBatchMeta(
+        shape="gather",
+        dim_params=("dim",),
+        sub_fns=(SubFnMeta("__mul__", (1,)), SubFnMeta("__add__", (2,))),
+    ),
+}
+
+
+def register_batchable_op(name: str, meta: OpBatchMeta) -> None:
+    """Register ``name`` as batchable with the provided ``meta`` description."""
+
+    BATCHABLE_OPS[name] = meta
+
+
+@dataclass(frozen=True)
 class _WBJob:
     job_id: str
     op: str
