@@ -25,10 +25,12 @@ class ResidualItem:
 
 
 class ResidualStore:
-    """Container grouping residuals by ``Space`` and node id."""
+    """Container grouping residuals by ``Space`` and node id/axis."""
 
     def __init__(self) -> None:
-        self._data: Dict[Space, Dict[int, ResidualItem]] = {space: {} for space in Space}
+        self._data: Dict[Space, Dict[int, Dict[Optional[int], ResidualItem]]] = {
+            space: {} for space in Space
+        }
 
     # ------------------------------------------------------------------
     def add(
@@ -42,52 +44,82 @@ class ResidualStore:
     ) -> None:
         """Accumulate a residual item for ``nid`` in ``space``."""
 
-        bucket = self._data[space]
-        if nid in bucket:
-            prev = bucket[nid]
+        bucket = self._data[space].setdefault(nid, {})
+        if axis in bucket:
+            prev = bucket[axis]
             if getattr(prev.value, "shape", None) == getattr(value, "shape", None):
                 new_val = prev.value + value
             else:
                 extra = tuple(range(value.ndim - getattr(prev.value, "ndim", 0)))
                 new_val = prev.value + value.sum(dim=extra).reshape(prev.value.shape)
-            bucket[nid] = ResidualItem(new_val, width, axis if axis is not None else prev.axis)
+            bucket[axis] = ResidualItem(new_val, width, axis)
         else:
-            bucket[nid] = ResidualItem(value, width, axis)
+            bucket[axis] = ResidualItem(value, width, axis)
 
     # ------------------------------------------------------------------
-    def get_bucket(self, space: Space) -> Dict[int, ResidualItem]:
-        """Return mapping of node id to residuals for ``space``."""
+    def put(
+        self,
+        nid: int,
+        value: AbstractTensor,
+        *,
+        space: Space,
+        width: int,
+        axis: Optional[int] = None,
+    ) -> None:
+        """Store residual for ``nid`` overwriting existing entry on ``axis``."""
+
+        bucket = self._data[space].setdefault(nid, {})
+        bucket[axis] = ResidualItem(value, width, axis)
+
+    # ------------------------------------------------------------------
+    def get_bucket(self, space: Space) -> Dict[int, Dict[Optional[int], ResidualItem]]:
+        """Return mapping of node id to axis -> residuals for ``space``."""
 
         return self._data[space]
 
     # ------------------------------------------------------------------
     def get(self, nid: int, space: Optional[Space] = None):
-        """Fetch residual for ``nid`` optionally scoped to ``space``."""
+        """Fetch aggregated residual for ``nid`` optionally scoped to ``space``."""
+
+        def _combine(items):
+            val = None
+            for item in items.values():
+                if val is None:
+                    val = item.value
+                else:
+                    if getattr(val, "shape", None) == getattr(item.value, "shape", None):
+                        val = val + item.value
+                    else:
+                        extra = tuple(range(item.value.ndim - getattr(val, "ndim", 0)))
+                        val = val + item.value.sum(dim=extra).reshape(val.shape)
+            return val
 
         if space is not None:
-            item = self._data[space].get(nid)
-            return item.value if item else None
+            items = self._data[space].get(nid)
+            return _combine(items) if items else None
 
         val = None
         for bucket in self._data.values():
-            item = bucket.get(nid)
-            if not item:
+            items = bucket.get(nid)
+            if not items:
                 continue
+            v = _combine(items)
             if val is None:
-                val = item.value
+                val = v
             else:
-                if getattr(val, "shape", None) == getattr(item.value, "shape", None):
-                    val = val + item.value
+                if getattr(val, "shape", None) == getattr(v, "shape", None):
+                    val = val + v
                 else:
-                    extra = tuple(range(item.value.ndim - getattr(val, "ndim", 0)))
-                    val = val + item.value.sum(dim=extra).reshape(val.shape)
+                    extra = tuple(range(v.ndim - getattr(val, "ndim", 0)))
+                    val = val + v.sum(dim=extra).reshape(val.shape)
         return val
 
     # ------------------------------------------------------------------
     def iter_values(self) -> Iterable[AbstractTensor]:
         for bucket in self._data.values():
-            for item in bucket.values():
-                yield item.value
+            for items in bucket.values():
+                for item in items.values():
+                    yield item.value
 
     # ------------------------------------------------------------------
     def any(self) -> bool:
