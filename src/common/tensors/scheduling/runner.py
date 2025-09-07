@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Local deps: keep this runner scheduler-local
-from ..autoautograd.whiteboard_cache import WhiteboardCache
+from ..autoautograd.whiteboard_cache import WhiteboardCache, CacheEntry
 from ..autoautograd.whiteboard_runtime import run_batched_vjp
 
 
@@ -107,8 +107,10 @@ class BulkOpRunner:
             scale=job.scale,
             residual=job.residual,
             backend_tag=job.backend_tag,
+            grad_mode="scalar",
         )
-        return self.cache.get(key)
+        entry = self.cache.get(key)
+        return (entry.y, entry.grads) if entry is not None else None
 
     def run_bin(
         self,
@@ -165,8 +167,9 @@ class BulkOpRunner:
                 scale=j.scale,
                 residual=j.residual,
                 backend_tag=j.backend_tag,
+                grad_mode="scalar",
             )
-            self.cache.put(key, (y, grads))
+            self.cache.put(key, CacheEntry(y=y, grads=grads, meta={}))
             out.append((y, grads))
         return out
 

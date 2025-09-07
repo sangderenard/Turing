@@ -17,7 +17,7 @@ class DummySys:
 
 
 def _stub_run_cached(sys, op_name, src_ids, **kwargs):
-    return 0, tuple(0 for _ in src_ids)
+    return 0, tuple(0 for _ in src_ids), {}
 
 
 def test_preactivation_cached(monkeypatch):

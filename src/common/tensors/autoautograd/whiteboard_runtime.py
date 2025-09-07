@@ -2,10 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from .whiteboard_cache import WhiteboardCache
+from .whiteboard_cache import WhiteboardCache, CacheEntry
 
 from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
+from ..abstraction import AbstractTensor
 
 @contextmanager
 def _tape():
@@ -70,7 +71,8 @@ def run_op_and_grads_cached(
     backend_tag: Any | None = None,
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[Any, Tuple[float, ...]]:
+    grad_mode: str = "scalar",
+) -> Tuple[Any, Any, Dict[str, Any]]:
     """Convenience wrapper: run single op with caching."""
     cache = cache or WhiteboardCache()
     versions = [int(getattr(sys.nodes[i], "version", 0)) for i in src_ids]
@@ -87,24 +89,29 @@ def run_op_and_grads_cached(
         scale=scale,
         residual=residual,
         backend_tag=backend_tag,
+        grad_mode=grad_mode,
     )
     hit = cache.get(key)
     if hit is not None:
-        return hit
+        return hit.y, hit.grads, hit.meta
 
     vals = [sys.nodes[i].sphere for i in src_ids]
     if op_name == "add" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] + vals[1]
-        grads = (1.0, 1.0)
+        ones0 = vals[0] * 0 + 1
+        ones1 = vals[1] * 0 + 1
+        grads_full = AbstractTensor.stack([ones0, ones1], dim=0)
     elif op_name == "mul" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] * vals[1]
-        grads = (float(vals[1]), float(vals[0]))
+        g0 = vals[1] * (vals[0] * 0 + 1)
+        g1 = vals[0] * (vals[1] * 0 + 1)
+        grads_full = AbstractTensor.stack([g0, g1], dim=0)
     else:
         job = _WBJob(
             job_id=f"{op_name}:{tuple(src_ids)}",
             op=op_name,
             src_ids=tuple(int(i) for i in src_ids),
-            residual=residual,
+            residual=1.0,
         )
 
         batch = run_batched_vjp(
@@ -115,9 +122,47 @@ def run_op_and_grads_cached(
             backend=backend,
         )
         y = batch.ys[0]
-        grads = batch.grads_per_source[0]
-    cache.put(key, (y, grads))
-    return y, grads
+        grads_full = batch.grads_full[0]
+
+    node0 = sys.nodes[src_ids[0]]
+    sphere = node0.sphere
+    sphere_shape = getattr(sphere, "shape", ())
+    if sphere_shape:
+        sphere_len = int(sphere_shape[0])
+    else:
+        try:
+            sphere_len = len(sphere)
+        except Exception:
+            sphere_len = 0
+    p_len = 0
+    if hasattr(node0, "p"):
+        p_shape = getattr(node0.p, "shape", ())
+        if p_shape:
+            p_len = int(p_shape[0])
+        else:
+            try:
+                p_len = len(node0.p)
+            except Exception:
+                p_len = 0
+    D = p_len
+    P = max(sphere_len - D, 0)
+    meta = {
+        "y_shape": tuple(getattr(y, "shape", ()) or ()),
+        "sphere_len": sphere_len,
+        "D": D,
+        "P": P,
+    }
+
+    if grad_mode == "scalar":
+        grads = _reduce_per_source(grads_full)
+    elif grad_mode == "param":
+        grads = grads_full[:, D:] if P > 0 else grads_full[:, 0:0]
+    else:  # "full"
+        grads = grads_full
+
+    entry = CacheEntry(y=y, grads=grads, meta=meta)
+    cache.put(key, entry)
+    return entry.y, entry.grads, entry.meta
 
 def run_batched_vjp(
     *,

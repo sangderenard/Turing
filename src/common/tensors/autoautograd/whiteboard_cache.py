@@ -24,16 +24,8 @@ class ParamSig:
 
 @dataclass(frozen=True)
 class OpKey:
-    """
-    Stable per-job cache key:
-      - op_name
-      - fan_in k
-      - input feature shape (tuple; () for scalar)
-      - weight policy tag (string or None)
-      - quantized scale & residual
-      - ordered param signatures aligned to src_ids
-      - optional backend tag (to avoid cross-backend reuse)
-    """
+    """Stable per-job cache key."""
+
     op: str
     k: int
     feat_shape: Tuple[int, ...]
@@ -42,16 +34,23 @@ class OpKey:
     residual_q: float
     params: Tuple[ParamSig, ...]
     backend_tag: Optional[Any] = None
+    grad_mode: str = "scalar"
+
+
+@dataclass
+class CacheEntry:
+    """Cached package: forward result, gradients and metadata."""
+
+    y: Any
+    grads: Any
+    meta: Dict[str, Any]
 
 
 class WhiteboardCache:
-    """
-    Naive in-memory cache for (forward, per-source grads) packages.
-    Store types are backend-agnostic as long as they are picklable or small.
-    """
+    """Naive in-memory cache for (forward, grads) packages."""
 
     def __init__(self) -> None:
-        self._store: Dict[OpKey, Tuple[Any, Tuple[float, ...]]] = {}
+        self._store: Dict[OpKey, CacheEntry] = {}
         self.hits = 0
         self.misses = 0
 
@@ -66,6 +65,7 @@ class WhiteboardCache:
         scale: float,
         residual: Optional[float],
         backend_tag: Optional[Any] = None,
+        grad_mode: str = "scalar",
     ) -> OpKey:
         if len(src_ids) != len(versions):
             raise ValueError("src_ids and versions length mismatch")
@@ -81,9 +81,10 @@ class WhiteboardCache:
             residual_q=_q(residual),
             params=params,
             backend_tag=backend_tag,
+            grad_mode=str(grad_mode),
         )
 
-    def get(self, key: OpKey) -> Optional[Tuple[Any, Tuple[float, ...]]]:
+    def get(self, key: OpKey) -> Optional[CacheEntry]:
         pkg = self._store.get(key)
         if pkg is not None:
             self.hits += 1
@@ -91,5 +92,5 @@ class WhiteboardCache:
             self.misses += 1
         return pkg
 
-    def put(self, key: OpKey, pkg: Tuple[Any, Tuple[float, ...]]) -> None:
+    def put(self, key: OpKey, pkg: CacheEntry) -> None:
         self._store[key] = pkg

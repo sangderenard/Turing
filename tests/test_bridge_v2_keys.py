@@ -13,7 +13,7 @@ class DummySys:
 
 
 def _stub_run_cached(*args, **kwargs):
-    return 1, (0,)
+    return 1, (0,), {}
 
 
 def test_batched_forward_handles_list_kwargs(monkeypatch):
