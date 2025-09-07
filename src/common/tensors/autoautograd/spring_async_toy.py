@@ -1494,7 +1494,9 @@ class Experiencer(threading.Thread):
         g_stack: AbstractTensor,
         g_list: List[AbstractTensor],
     ) -> None:
-        width = g_stack.shape[1] if getattr(g_stack, "ndim", 0) > 1 else 0
+
+        width = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 0
+
         if width != 0:
             return
         key = (name, int(out_id))
@@ -1543,8 +1545,16 @@ class Experiencer(threading.Thread):
                 tvec = port.target_fn(t)
                 if AbstractTensor.isfinite(tvec).all():
                     rb = node.p - tvec
-                    prev = residual_map.get(nid, AbstractTensor.zeros_like(rb))
-                    residual_map[nid] = prev + rb
+                    g_list = [rb]
+                    g_stack = AbstractTensor.stack(g_list, dim=0)
+                    if getattr(rb, "ndim", 0) > 0 and rb.shape[-1] == 0:
+                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
+                        continue
+                    prev = residual_map.get(nid)
+                    if prev is not None and getattr(prev, "shape", None) != getattr(rb, "shape", None):
+                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
+                        continue
+                    residual_map[nid] = rb if prev is None else prev + rb
 
             # --- Reverse sweep: propagate residuals upstream ---
             for (name, srcs, out, args, kwargs), g_list in reversed(
