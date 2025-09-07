@@ -326,7 +326,7 @@ class Edge:
     l0: float = 1.0
 
     def update_credit(self, amount: float, dt: float) -> None:
-        a = abs(amount)
+        a = abs(float(amount))
         self.credit_ema += (a - self.credit_ema) * (dt / max(self.credit_tau, 1e-6))
 
     def ingest_impulse(self, g_scalar: float, dt: float):
@@ -1485,38 +1485,112 @@ class Experiencer(threading.Thread):
         while not self.stop.is_set():
             t = now_s() - t0
             
-            # 2) Batched forward + gradients for outputs with targets
-            out_specs: list[tuple[str, list[int], int, Optional[Tuple[Any, ...]], Optional[Dict[str, Any]]]] = []
-            for (name, srcs, out, args, kwargs) in self.ops_program:
-                if out in self.outputs:
-                    out_specs.append((name, srcs, out, args, kwargs))
-            residual_map: Dict[int, AbstractTensor] = {}
-            if out_specs:
-                ys, grads, _ = push_impulses_from_ops_batched(
-                    self.sys, out_specs, weight=None, scale=1.0
-                )
-                for spec, y, g_list in zip(out_specs, ys, grads):
-                    name, srcs, out, args, kwargs = spec
-                    r = self._residual_for_out(out, y, t)
-                    if r is None:
-                        continue
-                    residual_map[out] = r
+            # --- Forward sweep: evaluate all ops once ---
+            specs = self.ops_program
+            ys, grads, _ = push_impulses_from_ops_batched(
+                self.sys, specs, weight=None, scale=1.0
+            )
 
-            # Residuals for any other nodes with targets (e.g. standalone boundaries)
-            for nid, target_fn in self.outputs.items():
-                if nid in residual_map:
+            # Map output id -> (spec, grads) for later reverse pass
+            # map by output if needed later (currently unused)
+
+            # Seed residuals at supervised outputs
+            residual_map: Dict[int, AbstractTensor] = {}
+            for spec, y in zip(specs, ys):
+                name, srcs, out, args, kwargs = spec
+                if out not in self.outputs:
+                    continue
+                r = self._residual_for_out(out, y, t)
+                if r is not None:
+                    residual_map[int(out)] = r
+
+            # Dirichlet boundaries (axis-wise)
+            for nid, port in getattr(self.sys, "boundaries", {}).items():
+                if (
+                    port is None
+                    or not getattr(port, "enabled", False)
+                    or getattr(port, "alpha", 0.0) <= 0.0
+                    or getattr(port, "target_fn", None) is None
+                ):
                     continue
                 node = self.sys.nodes.get(nid)
                 if node is None:
                     continue
-                cur = getattr(node, "param", None)
-                if cur is None:
-                    cur = getattr(node, "p", None)
-                if cur is None:
-                    continue
-                residual_map[nid] = AbstractTensor.get_tensor(cur) - target_fn(t)
+                tvec = port.target_fn(t)
+                if AbstractTensor.isfinite(tvec).all():
+                    rb = node.p - tvec
+                    prev = residual_map.get(nid, AbstractTensor.zeros_like(rb))
+                    residual_map[nid] = prev + rb
 
-            # Build adjacency among nodes with residuals
+            # --- Reverse sweep: propagate residuals upstream ---
+            for (name, srcs, out, args, kwargs), g_list in reversed(
+                list(zip(specs, grads))
+            ):
+                r = residual_map.get(int(out))
+                if r is None or not g_list:
+                    continue
+                g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                r_tensor = AbstractTensor.get_tensor(r)
+                prod = g_stack * r_tensor
+                g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
+                # Send impulses and update credits with locks
+                for src, g_val in zip(srcs, g_scalars):
+                    try:
+                        g_float = float(getattr(g_val, "item", lambda: g_val)())
+                    except Exception:
+                        g_float = float(g_val)
+                    key = (int(src), int(out), name)
+                    with self.sys.edge_locks[key]:
+                        e = self.sys.ensure_edge(int(src), int(out), name)
+                        e.update_credit(g_float, self.dt)
+                        e.ingest_impulse(-g_float, self.dt)
+
+                # Parameter updates for source nodes
+                param_nodes = []
+                param_idx = []
+                for idx_i, i in enumerate(srcs):
+                    node = self.sys.nodes.get(int(i))
+                    if node is not None and hasattr(node, "param"):
+                        param_nodes.append(node)
+                        param_idx.append(idx_i)
+                if param_nodes:
+                    params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+                    upd_full = prod[param_idx]
+                    if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
+                        params = params + upd_full
+                    else:
+                        extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
+                        params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
+                    for node, new_param in zip(param_nodes, params):
+                        node.param = new_param
+
+                # Transport residuals upstream: J^T * r_out
+                for idx_i, src in enumerate(srcs):
+                    r_in_full = prod[idx_i]
+                    node = self.sys.nodes.get(int(src))
+                    base = None
+                    if node is not None:
+                        base = getattr(node, "param", None)
+                        if base is None:
+                            base = getattr(node, "p", None)
+                    if base is None:
+                        base = r_in_full
+                    if getattr(base, "shape", ()) == getattr(r_in_full, "shape", () ):
+                        r_in = r_in_full
+                    else:
+                        extra_dims = tuple(range(r_in_full.ndim - getattr(base, "ndim", 0)))
+                        r_in = r_in_full.sum(dim=extra_dims).reshape(getattr(base, "shape", ()))
+                    if src in residual_map:
+                        prev = residual_map[src]
+                        if getattr(prev, "shape", ()) == getattr(r_in, "shape", () ):
+                            residual_map[src] = prev + r_in
+                        else:
+                            extra_dims = tuple(range(r_in.ndim - getattr(prev, "ndim", 0)))
+                            residual_map[src] = prev + r_in.sum(dim=extra_dims).reshape(prev.shape)
+                    else:
+                        residual_map[src] = r_in
+
+            # Optional Poisson redistribution across all residual nodes
             if residual_map:
                 nids = list(residual_map.keys())
                 idx = {nid: i for i, nid in enumerate(nids)}
@@ -1527,7 +1601,6 @@ class Experiencer(threading.Thread):
                         ii, jj = idx[e.i], idx[e.j]
                         adjacency[ii, jj] = adjacency[jj, ii] = 1.0
 
-                # Stack residuals and smooth per-parameter via filtered Poisson
                 R = AbstractTensor.stack([residual_map[n] for n in nids], dim=0)
                 if R.ndim == 1:
                     R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
@@ -1540,45 +1613,7 @@ class Experiencer(threading.Thread):
                 for nid, r_sm in zip(nids, R_sm):
                     residual_map[nid] = r_sm
 
-                # Impulses and param updates for ops whose outputs have residuals
-                if out_specs:
-                    for (name, srcs, out, args, kwargs), y, g_list in zip(
-                        out_specs, ys, grads
-                    ):
-                        r = residual_map.get(out)
-                        if r is None or not g_list:
-                            continue
-                        g_stack = AbstractTensor.stack(list(g_list), dim=0)
-                        r_tensor = AbstractTensor.get_tensor(r)
-                        prod = g_stack * r_tensor
-                        g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
-                        for src, g_val in zip(srcs, g_scalars):
-                            try:
-                                g_float = float(getattr(g_val, "item", lambda: g_val)())
-                            except Exception:
-                                g_float = float(g_val)
-                            e = self.sys.ensure_edge(int(src), int(out), name)
-                            e.update_credit(g_float, self.dt)
-                        self.sys.impulse_batch(srcs, out, name, -g_scalars)
-
-                        param_nodes = []
-                        param_idx = []
-                        for idx_i, i in enumerate(srcs):
-                            node = self.sys.nodes.get(int(i))
-                            if node is not None and hasattr(node, "param"):
-                                param_nodes.append(node)
-                                param_idx.append(idx_i)
-                        if param_nodes:
-                            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
-                            upd_full = prod[param_idx]
-                            if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
-                                params = params + upd_full
-                            else:
-                                extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
-                                params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
-                            for node, new_param in zip(param_nodes, params):
-                                node.param = new_param
-
+            # Global feedback edges seeded from aggregate residuals
             if self.sys.feedback_edges and residual_map:
                 L = AbstractTensor.get_tensor(0.0)
                 for r in residual_map.values():
@@ -1590,9 +1625,11 @@ class Experiencer(threading.Thread):
                 )
                 for i, j, op_id in self.sys.feedback_edges:
                     try:
-                        e = self.sys.ensure_edge(i, j, op_id)
-                        e.update_credit(L_scalar, self.dt)
-                        self.sys.impulse(i, j, op_id, g_scalar=L_scalar)
+                        key = (int(i), int(j), op_id)
+                        e = self.sys.ensure_edge(int(i), int(j), op_id)
+                        with self.sys.edge_locks[key]:
+                            e.update_credit(L_scalar, self.dt)
+                            e.ingest_impulse(L_scalar, self.dt)
                     except Exception:
                         pass
 
