@@ -27,12 +27,13 @@ from .integration.bridge_v2 import (
     push_impulses_from_ops_batched,
 )
 from .whiteboard_cache import WhiteboardCache
+from .residual_store import ResidualStore, Space
 
 import time
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional, Callable, Set
+from typing import Dict, Tuple, List, Optional, Callable
 import matplotlib
 
 import matplotlib.pyplot as plt
@@ -114,6 +115,66 @@ def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
     # Smooth transition within knee
     a = (x - lo) / max(knee, 1e-6)
     return x + ((1.0 / max(ratio, 1e-6) - 1.0) * (x - th)) * a * (2 - a)
+
+
+def _stack_grads_per_source(
+    name: str, out: int, srcs, g_list
+) -> Tuple[AbstractTensor, int]:
+    """Stack gradients per source ensuring equal width and count.
+
+    Parameters
+    ----------
+    name:
+        Operator name for error messages.
+    out:
+        Output node identifier for error messages.
+    srcs:
+        Sequence of source node identifiers.
+    g_list:
+        Gradients aligned to ``srcs``.
+
+    Returns
+    -------
+    Tuple[AbstractTensor, int]
+        Stacked gradients and inferred width ``C``.
+
+    Raises
+    ------
+    ValueError
+        If any gradient is missing or has a mismatched width. The error
+        message includes ``name``, ``out`` and the offending source index.
+    """
+
+    tensors: List[AbstractTensor] = []
+    C = None
+    for i, _ in enumerate(srcs):
+        try:
+            g = g_list[i]
+        except IndexError:
+            raise ValueError(
+                f"{name}: missing gradient for source index {i} (output {out})"
+            )
+        if g is None:
+            raise ValueError(
+                f"{name}: missing gradient for source index {i} (output {out})"
+            )
+        t = AbstractTensor.get_tensor(g)
+        width = t.shape[-1] if getattr(t, "ndim", 0) > 0 else 1
+        if C is None:
+            C = width
+        elif width != C:
+            raise ValueError(
+                f"{name}: grad width {width} for source index {i} mismatches {C} (output {out})"
+            )
+        tensors.append(t)
+
+    if len(g_list) != len(srcs):
+        raise ValueError(
+            f"{name}: expected {len(srcs)} gradients, got {len(g_list)} (output {out})"
+        )
+
+    g_stack = AbstractTensor.stack(tensors, dim=0)
+    return g_stack, C or 0
 
 # ----------------------------- Boundary helpers ------------------------------
 
@@ -1477,7 +1538,6 @@ class Experiencer(threading.Thread):
         self.outputs = outputs
         # If none provided, fall back to the tiny demo. (We’ll pass one in.)
         self.ops_program = ops_program
-        self._broken_ops_logged: Set[Tuple[str, int]] = set()
 
     def _residual_for_out(
         self, out_id: int, y_val: AbstractTensor, t: float
@@ -1486,25 +1546,6 @@ class Experiencer(threading.Thread):
             return None
         target_vec = self.outputs[out_id](t)
         return y_val - target_vec
-
-    def _warn_broken_op(
-        self,
-        name: str,
-        out_id: int,
-        g_stack: AbstractTensor,
-        g_list: List[AbstractTensor],
-    ) -> None:
-
-        width = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 0
-
-        if width != 0:
-            return
-        key = (name, int(out_id))
-        if key in self._broken_ops_logged:
-            return
-        shapes = [getattr(g, "shape", None) for g in g_list]
-        print(f"[BROKEN-OP] op={name} out={out_id} grad_shapes={shapes}")
-        self._broken_ops_logged.add(key)
 
     def run(self):
         t0 = now_s()
@@ -1521,137 +1562,167 @@ class Experiencer(threading.Thread):
             # map by output if needed later (currently unused)
 
             # Seed residuals at supervised outputs
-            residual_map: Dict[int, AbstractTensor] = {}
+            residuals = ResidualStore()
             for spec, y in zip(specs, ys):
                 name, srcs, out, args, kwargs = spec
                 if out not in self.outputs:
                     continue
                 r = self._residual_for_out(out, y, t)
                 if r is not None:
-                    residual_map[int(out)] = r
+                    width = r.shape[-1] if getattr(r, "ndim", 0) > 0 else 1
+                    residuals.add(int(out), r, space=Space.F, width=width)
 
-            # Dirichlet boundaries (axis-wise)
+            # Dirichlet and Neumann boundaries (axis-wise)
             for nid, port in getattr(self.sys, "boundaries", {}).items():
-                if (
-                    port is None
-                    or not getattr(port, "enabled", False)
-                    or getattr(port, "alpha", 0.0) <= 0.0
-                    or getattr(port, "target_fn", None) is None
-                ):
+                if port is None or not getattr(port, "enabled", False):
                     continue
                 node = self.sys.nodes.get(nid)
                 if node is None:
                     continue
-                tvec = port.target_fn(t)
-                if AbstractTensor.isfinite(tvec).all():
-                    rb = node.p - tvec
-                    g_list = [rb]
-                    g_stack = AbstractTensor.stack(g_list, dim=0)
-                    if getattr(rb, "ndim", 0) > 0 and rb.shape[-1] == 0:
-                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
-                        continue
-                    prev = residual_map.get(nid)
-                    if prev is not None and getattr(prev, "shape", None) != getattr(rb, "shape", None):
-                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
-                        continue
-                    residual_map[nid] = rb if prev is None else prev + rb
+                if port.target_fn is not None and port.alpha > 0.0:
+                    tvec = port.target_fn(t)
+                    if AbstractTensor.isfinite(tvec).all():
+                        rb = node.p - tvec
+                        if getattr(rb, "ndim", 0) == 0:
+                            residuals.put(nid, rb, space=Space.G, width=1, axis=0)
+                        else:
+                            for axis in range(rb.shape[-1]):
+                                residuals.put(
+                                    nid,
+                                    rb[axis],
+                                    space=Space.G,
+                                    width=1,
+                                    axis=axis,
+                                )
+
+                if port.force_fn is not None and getattr(port, "beta", 0.0) > 0.0:
+                    fvec = port.force_fn(t)
+                    if AbstractTensor.isfinite(fvec).all():
+                        if getattr(fvec, "ndim", 0) == 0:
+                            residuals.put(nid, fvec, space=Space.G, width=1, axis=0)
+                        else:
+                            for axis in range(fvec.shape[-1]):
+                                residuals.put(
+                                    nid,
+                                    fvec[axis],
+                                    space=Space.G,
+                                    width=1,
+                                    axis=axis,
+                                )
 
             # --- Reverse sweep: propagate residuals upstream ---
-            for (name, srcs, out, args, kwargs), g_list in reversed(
-                list(zip(specs, grads))
-            ):
-                r = residual_map.get(int(out))
-                if r is None or not g_list:
+            for space in Space:
+                bucket = residuals.get_bucket(space)
+                if not bucket:
                     continue
-                g_stack = AbstractTensor.stack(list(g_list), dim=0)
-                self._warn_broken_op(name, out, g_stack, g_list)
-                r_tensor = AbstractTensor.get_tensor(r)
-                prod = g_stack * r_tensor
-                g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
-                # Send impulses and update credits with locks
-                for src, g_val in zip(srcs, g_scalars):
-                    try:
-                        g_float = float(getattr(g_val, "item", lambda: g_val)())
-                    except Exception:
-                        g_float = float(g_val)
-                    key = (int(src), int(out), name)
-                    with self.sys.edge_locks[key]:
-                        e = self.sys.ensure_edge(int(src), int(out), name)
-                        e.update_credit(g_float, self.dt)
-                        e.ingest_impulse(-g_float, self.dt)
-
-                # Parameter updates for source nodes
-                param_nodes = []
-                param_idx = []
-                for idx_i, i in enumerate(srcs):
-                    node = self.sys.nodes.get(int(i))
-                    if node is not None and hasattr(node, "param"):
-                        param_nodes.append(node)
-                        param_idx.append(idx_i)
-                if param_nodes:
-                    params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
-                    upd_full = prod[param_idx]
-                    if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
-                        params = params + upd_full
-                    else:
-                        extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
-                        params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
-                    for node, new_param in zip(param_nodes, params):
-                        node.param = new_param
-
-                # Transport residuals upstream: J^T * r_out
-                for idx_i, src in enumerate(srcs):
-                    r_in_full = prod[idx_i]
-                    node = self.sys.nodes.get(int(src))
-                    base = None
-                    if node is not None:
-                        base = getattr(node, "param", None)
-                        if base is None:
-                            base = getattr(node, "p", None)
-                    if base is None:
-                        base = r_in_full
-                    if getattr(base, "shape", ()) == getattr(r_in_full, "shape", () ):
-                        r_in = r_in_full
-                    else:
-                        extra_dims = tuple(range(r_in_full.ndim - getattr(base, "ndim", 0)))
-                        r_in = r_in_full.sum(dim=extra_dims).reshape(getattr(base, "shape", ()))
-                    if src in residual_map:
-                        prev = residual_map[src]
-                        if getattr(prev, "shape", ()) == getattr(r_in, "shape", () ):
-                            residual_map[src] = prev + r_in
+                for (name, srcs, out, args, kwargs), g_list, y in reversed(
+                    list(zip(specs, grads, ys))
+                ):
+                    items = bucket.get(int(out))
+                    if not items or not g_list:
+                        continue
+                    g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)
+                    if g_stack.shape[0] != len(srcs):
+                        raise ValueError(
+                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})"
+                        )
+                    y_width = y.shape[-1] if getattr(y, "ndim", 0) > 0 else 1
+                    if y_width != C:
+                        raise ValueError(
+                            f"{name}: output width {y_width} mismatches grad width {C}"
+                        )
+                    for item in list(items.values()):
+                        if space is Space.F and item.width != C:
+                            raise ValueError(
+                                f"{name}: feature residual width {item.width} mismatches grad width {C}"
+                            )
+                        rF = AbstractTensor.get_tensor(item.value)
+                        if item.axis is not None:
+                            prod = g_stack[:, item.axis] * rF
+                            g_scalars = prod
                         else:
-                            extra_dims = tuple(range(r_in.ndim - getattr(prev, "ndim", 0)))
-                            residual_map[src] = prev + r_in.sum(dim=extra_dims).reshape(prev.shape)
-                    else:
-                        residual_map[src] = r_in
+                            prod = g_stack * rF
+                            g_scalars = prod.sum(dim=1)
+                        if space is Space.F:
+                            self.sys.impulse_batch(srcs, out, name, g_scalars)
+
+                        # Parameter updates for source nodes
+                        param_nodes = []
+                        param_idx = []
+                        for idx_i, i in enumerate(srcs):
+                            node = self.sys.nodes.get(int(i))
+                            if node is not None and hasattr(node, "param"):
+                                param_nodes.append(node)
+                                param_idx.append(idx_i)
+                        if param_nodes:
+                            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+                            upd_full = prod[param_idx]
+                            if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
+                                params = params + upd_full
+                            else:
+                                extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
+                                params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
+                            for node, new_param in zip(param_nodes, params):
+                                node.param = new_param
+
+                        # Transport residuals upstream: J^T * r_out
+                        for idx_i, src in enumerate(srcs):
+                            r_in_full = prod[idx_i]
+                            node = self.sys.nodes.get(int(src))
+                            base = None
+                            if node is not None:
+                                base = getattr(node, "param", None)
+                                if base is None:
+                                    base = getattr(node, "p", None)
+                            if base is None:
+                                base = r_in_full
+                            if getattr(base, "shape", ()) == getattr(r_in_full, "shape", () ):
+                                r_in = r_in_full
+                            else:
+                                extra_dims = tuple(range(getattr(r_in_full, "ndim", 0) - getattr(base, "ndim", 0)))
+                                r_in = r_in_full.sum(dim=extra_dims).reshape(getattr(base, "shape", ()))
+                            width = r_in.shape[-1] if getattr(r_in, "ndim", 0) > 0 else 1
+                            residuals.add(int(src), r_in, space=space, width=width)
 
             # Optional Poisson redistribution across all residual nodes
-            if residual_map:
-                nids = list(residual_map.keys())
-                idx = {nid: i for i, nid in enumerate(nids)}
-                N = len(nids)
-                adjacency = AbstractTensor.zeros((N, N), dtype=float)
-                for e in self.sys.edges.values():
-                    if e.i in idx and e.j in idx:
-                        ii, jj = idx[e.i], idx[e.j]
-                        adjacency[ii, jj] = adjacency[jj, ii] = 1.0
+            for space in Space:
+                bucket = residuals.get_bucket(space)
+                if not bucket:
+                    continue
+                groups: Dict[int, List[Tuple[int, ResidualItem]]] = {}
+                for nid, items in bucket.items():
+                    for item in items.values():
+                        groups.setdefault(item.width, []).append((nid, item))
+                for pairs in groups.values():
+                    if not pairs:
+                        continue
+                    nids = [nid for nid, _ in pairs]
+                    idx: Dict[int, List[int]] = {}
+                    for i, nid in enumerate(nids):
+                        idx.setdefault(nid, []).append(i)
+                    N = len(nids)
+                    adjacency = AbstractTensor.zeros((N, N), dtype=float)
+                    for e in self.sys.edges.values():
+                        for i in idx.get(e.i, []):
+                            for j in idx.get(e.j, []):
+                                adjacency[i, j] = adjacency[j, i] = 1.0
 
-                R = AbstractTensor.stack([residual_map[n] for n in nids], dim=0)
-                if R.ndim == 1:
-                    R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
-                else:
-                    cols = []
-                    for k in range(R.shape[1]):
-                        col = filtered_poisson(R[:, k], iterations=20, adjacency=adjacency)
-                        cols.append(col)
-                    R_sm = AbstractTensor.stack(cols, dim=1)
-                for nid, r_sm in zip(nids, R_sm):
-                    residual_map[nid] = r_sm
+                    R = AbstractTensor.stack([item.value for _, item in pairs], dim=0)
+                    if R.ndim == 1:
+                        R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
+                    else:
+                        cols = []
+                        for k in range(R.shape[1]):
+                            col = filtered_poisson(R[:, k], iterations=20, adjacency=adjacency)
+                            cols.append(col)
+                        R_sm = AbstractTensor.stack(cols, dim=1)
+                    for (nid, item), r_sm in zip(pairs, R_sm):
+                        item.value = r_sm
 
             # Global feedback edges seeded from aggregate residuals
-            if self.sys.feedback_edges and residual_map:
+            if self.sys.feedback_edges and residuals.any():
                 L = AbstractTensor.get_tensor(0.0)
-                for r in residual_map.values():
+                for r in residuals.iter_values():
                     L += 0.5 * (r * r).sum()
                 L_scalar = (
                     float(getattr(L, "item_", lambda: L)())
