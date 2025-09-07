@@ -1,6 +1,7 @@
 import threading
 import types
 import sys
+import pytest
 
 
 def _stub_dependencies():
@@ -62,20 +63,26 @@ def _stub_dependencies():
     sys.modules.setdefault("matplotlib.colors", mpl.colors)
 
 
+_stub_dependencies()
 
-def test_broken_op_log_emitted_once(capsys):
-    _stub_dependencies()
-    from src.common.tensors.abstraction import AbstractTensor
-    from src.common.tensors.autoautograd.spring_async_toy import Experiencer
+from src.common.tensors.abstraction import AbstractTensor
+from src.common.tensors.autoautograd.spring_async_toy import _stack_grads_per_source
 
-    class DummySys:
-        pass
 
-    exp = Experiencer(DummySys(), threading.Event(), {}, ops_program=[])
-    g_list = [AbstractTensor.get_tensor([])]
-    g_stack = AbstractTensor.stack(list(g_list), dim=0)
-    exp._warn_broken_op("noop", 7, g_stack, g_list)
-    exp._warn_broken_op("noop", 7, g_stack, g_list)
-    out = capsys.readouterr().out
-    assert out.count("[BROKEN-OP]") == 1
-    assert "op=noop" in out and "out=7" in out
+def test_stack_grads_width_mismatch_raises():
+    g1 = AbstractTensor.get_tensor([1.0, 2.0])
+    g2 = AbstractTensor.get_tensor([1.0])
+    with pytest.raises(ValueError) as e:
+        _stack_grads_per_source("add", 3, [1, 2], [g1, g2])
+    msg = str(e.value)
+    assert "add" in msg and "output 3" in msg
+    assert "source index 1" in msg
+
+
+def test_stack_grads_missing_gradient_raises():
+    g1 = AbstractTensor.get_tensor([1.0, 2.0])
+    with pytest.raises(ValueError) as e:
+        _stack_grads_per_source("mul", 5, [1, 2], [g1])
+    msg = str(e.value)
+    assert "mul" in msg and "output 5" in msg
+    assert "source index 1" in msg
