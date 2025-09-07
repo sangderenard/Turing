@@ -116,6 +116,27 @@ def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
     a = (x - lo) / max(knee, 1e-6)
     return x + ((1.0 / max(ratio, 1e-6) - 1.0) * (x - th)) * a * (2 - a)
 
+
+def _stack_grads_per_source(g_list) -> Tuple[AbstractTensor, int]:
+    """Stack gradients per source ensuring equal width.
+
+    Returns the stacked tensor and inferred width ``C``. Raises ``ValueError``
+    if any gradient has a mismatched width.
+    """
+
+    g_list = [AbstractTensor.get_tensor(g) for g in g_list]
+    if not g_list:
+        return AbstractTensor.stack([], dim=0), 0
+
+    widths = [g.shape[-1] if getattr(g, "ndim", 0) > 0 else 1 for g in g_list]
+    C = widths[0]
+    for w in widths[1:]:
+        if w != C:
+            raise ValueError(f"gradient width mismatch: expected {C}, got {w}")
+
+    g_stack = AbstractTensor.stack(g_list, dim=0)
+    return g_stack, C
+
 # ----------------------------- Boundary helpers ------------------------------
 
 def attach_dirichlet(
@@ -1571,29 +1592,31 @@ class Experiencer(threading.Thread):
                 bucket = residuals.get_bucket(space)
                 if not bucket:
                     continue
-                for (name, srcs, out, args, kwargs), g_list in reversed(
-                    list(zip(specs, grads))
+                for (name, srcs, out, args, kwargs), g_list, y in reversed(
+                    list(zip(specs, grads, ys))
                 ):
                     item = bucket.get(int(out))
                     if item is None or not g_list:
                         continue
-                    r = item.value
-                    g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                    g_stack, C = _stack_grads_per_source(g_list)
                     self._warn_broken_op(name, out, g_stack, g_list)
-                    r_tensor = AbstractTensor.get_tensor(r)
-                    prod = g_stack * r_tensor
-                    g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
-                    # Send impulses and update credits with locks
-                    for src, g_val in zip(srcs, g_scalars):
-                        try:
-                            g_float = float(getattr(g_val, "item", lambda: g_val)())
-                        except Exception:
-                            g_float = float(g_val)
-                        key = (int(src), int(out), name)
-                        with self.sys.edge_locks[key]:
-                            e = self.sys.ensure_edge(int(src), int(out), name)
-                            e.update_credit(g_float, self.dt)
-                            e.ingest_impulse(-g_float, self.dt)
+                    if len(srcs) != g_stack.shape[0]:
+                        raise ValueError(
+                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]}"
+                        )
+                    y_width = y.shape[-1] if getattr(y, "ndim", 0) > 0 else 1
+                    if y_width != C:
+                        raise ValueError(
+                            f"{name}: output width {y_width} mismatches grad width {C}"
+                        )
+                    if space is Space.F and item.width != C:
+                        raise ValueError(
+                            f"{name}: feature residual width {item.width} mismatches grad width {C}"
+                        )
+                    rF = AbstractTensor.get_tensor(item.value)
+                    prod = g_stack * rF
+                    g_scalars = prod.sum(dim=1)
+                    self.sys.impulse_batch(srcs, out, name, g_scalars)
 
                     # Parameter updates for source nodes
                     param_nodes = []
