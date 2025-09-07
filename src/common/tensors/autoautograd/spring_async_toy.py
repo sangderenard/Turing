@@ -1494,7 +1494,9 @@ class Experiencer(threading.Thread):
         g_stack: AbstractTensor,
         g_list: List[AbstractTensor],
     ) -> None:
+
         width = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 0
+
         if width != 0:
             return
         key = (name, int(out_id))

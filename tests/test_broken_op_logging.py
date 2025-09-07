@@ -15,6 +15,7 @@ def _stub_dependencies():
     sys.modules.setdefault(
         "src.common.tensors.autoautograd.integration.bridge_v2", stub_bridge
     )
+
     wbc = types.ModuleType("whiteboard_cache")
     class WhiteboardCache:
         pass
@@ -59,6 +60,7 @@ def _stub_dependencies():
     sys.modules.setdefault("matplotlib.pyplot", mpl.pyplot)
     sys.modules.setdefault("matplotlib.animation", mpl.animation)
     sys.modules.setdefault("matplotlib.colors", mpl.colors)
+
 
 
 def test_broken_op_log_emitted_once(capsys):
