@@ -155,6 +155,7 @@ def test_cache_hits_with_tensor_pool():
             scale=j.scale,
             residual=j.residual,
             backend_tag=j.backend_tag,
+            grad_mode="scalar",
         )
         # Direct dictionary probe (authoritative)
         assert key in runner.cache._store

@@ -665,8 +665,9 @@ class SpringRepulsorSystem:
 # - Autoscaled camera; non-blocking window
 
 
+import math
 import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT
+from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT, KEYDOWN, K_SPACE
 from OpenGL.GL import *
 from OpenGL.GL.shaders import compileProgram, compileShader
 from matplotlib import cm, colors as mcolors
@@ -729,6 +730,13 @@ class LiveVizGLPoints:
         tensor = AbstractTensor.get_tensor(0)
         dtype = tensor.get_dtype()
         self._mvp = AbstractTensor.eye(4, dtype=dtype)  # updated each frame
+
+        # optional wandering camera
+        self._auto_rotate = False
+        self._rot_theta = 0.0
+        self._rot_phi = 0.0
+        self._rot_dtheta = 0.002
+        self._rot_dphi = 0.0015
 
     # ---------- data snapshot ----------
     def _snapshot(self):
@@ -1087,7 +1095,14 @@ class LiveVizGLPoints:
             extent_t = AbstractTensor.get_tensor(1.0)
 
         rad = extent_t * 0.6 + 1e-3
-        eye = ctr + AbstractTensor.get_tensor([rad * 1.6, rad * 1.6, rad * 1.6], dtype=P.float_dtype)
+        r = float(rad) * 1.6
+        if self._auto_rotate:
+            x = r * math.sin(self._rot_phi) * math.cos(self._rot_theta)
+            y = r * math.cos(self._rot_phi)
+            z = r * math.sin(self._rot_phi) * math.sin(self._rot_theta)
+            eye = ctr + AbstractTensor.get_tensor([x, y, z], dtype=P.float_dtype)
+        else:
+            eye = ctr + AbstractTensor.get_tensor([r, r, r], dtype=P.float_dtype)
         up  = AbstractTensor.get_tensor([0.0, 1.0, 0.0], dtype=P.float_dtype)
 
         V  = self._look_at(eye, ctr, up)
@@ -1140,6 +1155,8 @@ class LiveVizGLPoints:
                 # NEW: context was recreated → rebuild program & buffers
                 self._rebuild_gl_objects()
                 self._update_buffers()
+            elif evt.type == KEYDOWN and evt.key == K_SPACE:
+                self._auto_rotate = not self._auto_rotate
 
     def _draw(self):
         r, g, b = self.bg_color
@@ -1162,12 +1179,26 @@ class LiveVizGLPoints:
         pygame.display.flip()
 
 
+    def _update_rotation(self):
+        if not self._auto_rotate:
+            return
+        self._rot_theta += self._rot_dtheta
+        self._rot_phi += self._rot_dphi
+        if self._rot_phi < 0.0 or self._rot_phi > math.pi:
+            self._rot_dphi = -self._rot_dphi
+            self._rot_phi = max(0.0, min(math.pi, self._rot_phi))
+        self._rot_dtheta += 0.00005 * math.sin(self._rot_phi * 1.7)
+        self._rot_dphi   += 0.00005 * math.cos(self._rot_theta * 1.3)
+        self._rot_dtheta *= 0.9995
+        self._rot_dphi   *= 0.9995
+
     def step(self, _dt: float = 0.0):
         """Call from your main loop (non-blocking)."""
         if self._program is None:
             # if user forgot to launch, do it lazily
             self.launch(self._w, self._h)
         self._handle_events()
+        self._update_rotation()
         self._update_buffers()
         self._draw()
 

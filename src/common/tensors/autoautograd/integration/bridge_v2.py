@@ -142,7 +142,7 @@ def push_impulses_from_op_v2(
         metas.append(meta)
 
     wb_cache = cache or WhiteboardCache()
-    y, grads = run_op_and_grads_cached(
+    y, g_param, _ = run_op_and_grads_cached(
         sys,
         op_name,
         tuple(int(i) for i in src_ids),
@@ -154,11 +154,32 @@ def push_impulses_from_op_v2(
         backend_tag=None,
         op_args=tuple(op_args) if op_args is not None else (),
         op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
+        grad_mode="param",
     )
     if residual is not None:
+        r_tensor = AbstractTensor.get_tensor(residual)
+        prod = g_param * r_tensor
+        extra_dims = tuple(range(1, getattr(prod, "ndim", 1)))
+        g_scalar = prod.sum(dim=extra_dims) if extra_dims else prod
         for idx, i in enumerate(src_ids):
-            g_val = grads[idx]
+            g_val = float(g_scalar[idx])
             sys.impulse(int(i), int(out_id), op_name, float(-scale * g_val))
+        param_nodes = []
+        param_idx = []
+        for idx, i in enumerate(src_ids):
+            node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+            if hasattr(node, "param"):
+                param_nodes.append(node)
+                param_idx.append(idx)
+        if param_nodes:
+            gk = g_param[param_idx]
+            prod = gk * r_tensor
+            extra_dims = tuple(range(2, getattr(prod, "ndim", 2)))
+            delta = prod.sum(dim=extra_dims) if extra_dims else prod
+            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+            params = params + delta
+            for node, new_param in zip(param_nodes, params):
+                node.param = new_param
     return y, tuple(metas)
 
 
@@ -200,7 +221,7 @@ def batched_forward_v2(
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         for idx, src_ids, out_id, op_args, op_kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            y, _ = run_op_and_grads_cached(
+            y, _, _ = run_op_and_grads_cached(
                 sys,
                 op_name,
                 src_ids,
@@ -212,6 +233,7 @@ def batched_forward_v2(
                 backend_tag=None,
                 op_args=op_args or (),
                 op_kwargs=op_kwargs,
+                grad_mode="scalar",
             )
             ys_buffer[idx] = y
     for i in range(len(specs)):
@@ -276,19 +298,20 @@ def push_impulses_from_ops_batched(
                 metas.append(meta)
             metas_out[idx] = tuple(metas)
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            y, grads = run_op_and_grads_cached(
+            y, g_param, _ = run_op_and_grads_cached(
                 sys,
                 op_name,
                 src_ids,
                 scale=sc,
-                residual=1.0,
+                residual=None,
                 weight=weight,
                 cache=wb_cache,
                 backend=None,
                 backend_tag=None,
                 op_args=op_args or (),
                 op_kwargs=op_kwargs,
+                grad_mode="param",
             )
             ys_out[idx] = y
-            grads_out[idx] = grads
+            grads_out[idx] = g_param
     return ys_out, grads_out, metas_out
