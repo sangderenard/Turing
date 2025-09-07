@@ -41,13 +41,25 @@ def _op_apply_factory(
     chain_local = chain  # closure binding
     args_local = args or ()
 
-    def _apply(x, _chain=chain_local, _args=args_local):
+    def _resolve(item: Any, params: Optional[Any]):
+        if isinstance(item, str) and item.startswith("@param[") and item.endswith("]"):
+            idx = int(item[7:-1])
+            if params is None:
+                raise ValueError("param placeholder used but no params provided")
+            return params[idx]
+        if isinstance(item, (list, tuple)):
+            return type(item)(_resolve(x, params) for x in item)
+        if isinstance(item, dict):
+            return {k: _resolve(v, params) for k, v in item.items()}
+        return item
+
+    def _apply(x, params=None, _chain=chain_local, _args=args_local):
         y = x
         for i, f in enumerate(_chain):
             pos = ()
             kw = {}
             if i < len(_args):
-                spec = _args[i]
+                spec = _resolve(_args[i], params)
                 if (
                     isinstance(spec, tuple)
                     and len(spec) == 2
@@ -60,6 +72,8 @@ def _op_apply_factory(
                     kw = spec
                 elif isinstance(spec, (list, tuple)):
                     pos = tuple(spec)
+                else:
+                    pos = (spec,)
             y = f(y, *pos, **kw)
         return y
 
@@ -144,6 +158,18 @@ def push_impulses_from_op_v2(
         metas.append(meta)
 
     wb_cache = cache or WhiteboardCache()
+    params: List[Any] = []
+    for i in src_ids:
+        node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+        if hasattr(node, "param"):
+            flat = AbstractTensor.get_tensor(node.param).flatten()
+            params.append(flat)
+    if params:
+        params_vec = AbstractTensor.concat(params, dim=0)
+    else:
+        params_vec = AbstractTensor.get_tensor([])
+    base_args = tuple(op_args) if op_args is not None else ()
+    full_args = base_args + (params_vec,)
     y, g_param, _ = run_op_and_grads_cached(
         sys,
         op_name,
@@ -154,7 +180,7 @@ def push_impulses_from_op_v2(
         cache=wb_cache,
         backend=None,
         backend_tag=None,
-        op_args=tuple(op_args) if op_args is not None else (),
+        op_args=full_args,
         op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
         grad_mode="param",
     )
