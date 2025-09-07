@@ -32,7 +32,7 @@ import time
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional, Callable
+from typing import Dict, Tuple, List, Optional, Callable, Set
 import matplotlib
 
 import matplotlib.pyplot as plt
@@ -1477,6 +1477,7 @@ class Experiencer(threading.Thread):
         self.outputs = outputs
         # If none provided, fall back to the tiny demo. (We’ll pass one in.)
         self.ops_program = ops_program
+        self._broken_ops_logged: Set[Tuple[str, int]] = set()
 
     def _residual_for_out(
         self, out_id: int, y_val: AbstractTensor, t: float
@@ -1485,6 +1486,23 @@ class Experiencer(threading.Thread):
             return None
         target_vec = self.outputs[out_id](t)
         return y_val - target_vec
+
+    def _warn_broken_op(
+        self,
+        name: str,
+        out_id: int,
+        g_stack: AbstractTensor,
+        g_list: List[AbstractTensor],
+    ) -> None:
+        width = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 0
+        if width != 0:
+            return
+        key = (name, int(out_id))
+        if key in self._broken_ops_logged:
+            return
+        shapes = [getattr(g, "shape", None) for g in g_list]
+        print(f"[BROKEN-OP] op={name} out={out_id} grad_shapes={shapes}")
+        self._broken_ops_logged.add(key)
 
     def run(self):
         t0 = now_s()
@@ -1525,8 +1543,16 @@ class Experiencer(threading.Thread):
                 tvec = port.target_fn(t)
                 if AbstractTensor.isfinite(tvec).all():
                     rb = node.p - tvec
-                    prev = residual_map.get(nid, AbstractTensor.zeros_like(rb))
-                    residual_map[nid] = prev + rb
+                    g_list = [rb]
+                    g_stack = AbstractTensor.stack(g_list, dim=0)
+                    if getattr(rb, "ndim", 0) > 0 and rb.shape[-1] == 0:
+                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
+                        continue
+                    prev = residual_map.get(nid)
+                    if prev is not None and getattr(prev, "shape", None) != getattr(rb, "shape", None):
+                        self._warn_broken_op("dirichlet-boundary", nid, g_stack, g_list)
+                        continue
+                    residual_map[nid] = rb if prev is None else prev + rb
 
             # --- Reverse sweep: propagate residuals upstream ---
             for (name, srcs, out, args, kwargs), g_list in reversed(
@@ -1536,6 +1562,7 @@ class Experiencer(threading.Thread):
                 if r is None or not g_list:
                     continue
                 g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                self._warn_broken_op(name, out, g_stack, g_list)
                 r_tensor = AbstractTensor.get_tensor(r)
                 prod = g_stack * r_tensor
                 g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
