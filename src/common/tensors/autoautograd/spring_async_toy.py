@@ -326,11 +326,11 @@ class Node:
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
 
     def commit(self, param_residuals=None):
-        print("Committing node", self.id)
-        print("p:", self.p)
-        print("param:", self.param)
-        print("sphere:", self.sphere)
-        print("param_residuals:", param_residuals)
+        #print("Committing node", self.id)
+        #print("p:", self.p)
+        #print("param:", self.param)
+        #print("sphere:", self.sphere)
+        #print("param_residuals:", param_residuals)
         self.sphere = AbstractTensor.concat([self.p, self.param], dim=0)
         if param_residuals is not None:
             self.param += param_residuals

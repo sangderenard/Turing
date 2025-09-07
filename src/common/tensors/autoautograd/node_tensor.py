@@ -49,6 +49,13 @@ class AbstractTensorPolicy(BackendPolicy):
 # ---- View with policy manager -------------------------------------------
 
 @dataclass
+class BatchView:
+    """Stacked tensor with per-job slices."""
+
+    tensor: Any
+    slice_for_job: Sequence[slice]
+
+@dataclass
 class NodeAttrView:
     """
     Vectorized view over nodes[i].<attr> with backend/override policy.
@@ -186,6 +193,42 @@ class NodeAttrView:
 
         H["post_build"](self)
         return self
+
+    def build_batches(self, job_batches: Sequence[Sequence[int]]) -> "BatchView":
+        """Stack nodes for ``job_batches`` and track slices per job.
+
+        ``job_batches`` supplies per-job node indices.  All referenced nodes are
+        gathered and stacked once; ``slice_for_job`` records the span within the
+        stacked tensor for each job.
+        """
+
+        flat: list[int] = []
+        slices: list[slice] = []
+        start = 0
+        for batch in job_batches:
+            ids = list(int(i) for i in batch)
+            flat.extend(ids)
+            end = start + len(ids)
+            slices.append(slice(start, end))
+            start = end
+
+        view = NodeAttrView(
+            self.nodes,
+            self.attr,
+            indices=flat,
+            select=self.select,
+            policy=self.policy,
+            policy_overrides=self.policy_overrides,
+            stack_fn=self.stack_fn,
+            asarray_fn=self.asarray_fn,
+            getter=self.getter,
+            setter=self.setter,
+            scatter_row=self.scatter_row,
+            hooks=self.resolve(),
+            check_shapes=self.check_shapes,
+        ).build()
+
+        return BatchView(view.tensor, tuple(slices))
 
     @property
     def tensor(self) -> Any:
