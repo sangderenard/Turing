@@ -1628,11 +1628,6 @@ class Experiencer(threading.Thread):
                         raise ValueError(
                             f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})"
                         )
-                    y_width = y.shape[-1] if getattr(y, "ndim", 0) > 0 else 1
-                    if y_width != C:
-                        raise ValueError(
-                            f"{name}: output width {y_width} mismatches grad width {C}"
-                        )
                     for item in list(items.values()):
                         if space is Space.F and item.width != C:
                             raise ValueError(
