@@ -1484,77 +1484,103 @@ class Experiencer(threading.Thread):
             for (name, srcs, out, args, kwargs) in self.ops_program:
                 if out in self.outputs:
                     out_specs.append((name, srcs, out, args, kwargs))
+            residual_map: Dict[int, AbstractTensor] = {}
             if out_specs:
                 ys, grads, _ = push_impulses_from_ops_batched(
                     self.sys, out_specs, weight=None, scale=1.0
                 )
-                residuals: List[AbstractTensor] = []
                 for spec, y, g_list in zip(out_specs, ys, grads):
                     name, srcs, out, args, kwargs = spec
-                    target_fn = self.outputs.get(out)
-                    r = (
-                        y - target_fn(t)
-                        if target_fn is not None and y is not None
-                        else AbstractTensor.get_tensor(0.0)
-                    )
-                    residuals.append(r)
-
-                # Apply any desired smoothing on the vector residuals before
-                # scalarization (e.g., operate on ||r|| or per-channel norms).
-                smoothed = residuals
-
-                for (name, srcs, out, args, kwargs), y, g_list, r in zip(
-                    out_specs, ys, grads, smoothed
-                ):
-                    if not g_list:
+                    r = self._residual_for_out(out, y, t)
+                    if r is None:
                         continue
-                    g_stack = AbstractTensor.stack(list(g_list), dim=0)
-                    r_tensor = AbstractTensor.get_tensor(r)
-                    prod = g_stack * r_tensor
-                    g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
-                    self.sys.impulse_batch(srcs, out, name, -g_scalars)
+                    residual_map[out] = r
 
-                    param_nodes = []
-                    param_idx = []
-                    for idx, i in enumerate(srcs):
-                        node = self.sys.nodes.get(int(i))
-                        if node is not None and hasattr(node, "param"):
-                            param_nodes.append(node)
-                            param_idx.append(idx)
-                    if param_nodes:
-                        params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
-                        upd_full = prod[param_idx]
-                        if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
-                            params = params + upd_full
-                        else:
-                            extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
-                            params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
-                        for node, new_param in zip(param_nodes, params):
-                            node.param = new_param
+            # Residuals for any other nodes with targets (e.g. standalone boundaries)
+            for nid, target_fn in self.outputs.items():
+                if nid in residual_map:
+                    continue
+                node = self.sys.nodes.get(nid)
+                if node is None:
+                    continue
+                cur = getattr(node, "param", None)
+                if cur is None:
+                    cur = getattr(node, "p", None)
+                if cur is None:
+                    continue
+                residual_map[nid] = AbstractTensor.get_tensor(cur) - target_fn(t)
 
-                    node = self.sys.nodes[out]
-                    y_t = (
-                        AbstractTensor.get_tensor(0.0)
-                        if y is None
-                        else AbstractTensor.get_tensor(y)
-                    )
-                    mean_val = y_t.mean() if getattr(y_t, "ndim", 0) > 0 else y_t
-                    # node.param could also be updated here if desired
-                if self.sys.feedback_edges and smoothed:
-                    # Aggregate vector residuals into a scalar loss before feedback.
-                    L = AbstractTensor.get_tensor(0.0)
-                    for r in smoothed:
-                        L += 0.5 * (r * r).sum()
-                    L_scalar = (
-                        float(getattr(L, "item_", lambda: L)())
-                        if hasattr(L, "item_")
-                        else float(L)
-                    )
-                    for i, j, op_id in self.sys.feedback_edges:
-                        try:
-                            self.sys.impulse(i, j, op_id, g_scalar=L_scalar)
-                        except Exception:
-                            pass
+            # Build adjacency among nodes with residuals
+            if residual_map:
+                nids = list(residual_map.keys())
+                idx = {nid: i for i, nid in enumerate(nids)}
+                N = len(nids)
+                adjacency = AbstractTensor.zeros((N, N), dtype=float)
+                for e in self.sys.edges.values():
+                    if e.i in idx and e.j in idx:
+                        ii, jj = idx[e.i], idx[e.j]
+                        adjacency[ii, jj] = adjacency[jj, ii] = 1.0
+
+                # Stack residuals and smooth per-parameter via filtered Poisson
+                R = AbstractTensor.stack([residual_map[n] for n in nids], dim=0)
+                if R.ndim == 1:
+                    R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
+                else:
+                    cols = []
+                    for k in range(R.shape[1]):
+                        col = filtered_poisson(R[:, k], iterations=20, adjacency=adjacency)
+                        cols.append(col)
+                    R_sm = AbstractTensor.stack(cols, dim=1)
+                for nid, r_sm in zip(nids, R_sm):
+                    residual_map[nid] = r_sm
+
+                # Impulses and param updates for ops whose outputs have residuals
+                if out_specs:
+                    for (name, srcs, out, args, kwargs), y, g_list in zip(
+                        out_specs, ys, grads
+                    ):
+                        r = residual_map.get(out)
+                        if r is None or not g_list:
+                            continue
+                        g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                        r_tensor = AbstractTensor.get_tensor(r)
+                        prod = g_stack * r_tensor
+                        g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
+                        self.sys.impulse_batch(srcs, out, name, -g_scalars)
+
+                        param_nodes = []
+                        param_idx = []
+                        for idx_i, i in enumerate(srcs):
+                            node = self.sys.nodes.get(int(i))
+                            if node is not None and hasattr(node, "param"):
+                                param_nodes.append(node)
+                                param_idx.append(idx_i)
+                        if param_nodes:
+                            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+                            upd_full = prod[param_idx]
+                            if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
+                                params = params + upd_full
+                            else:
+                                extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
+                                params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
+                            for node, new_param in zip(param_nodes, params):
+                                node.param = new_param
+
+            if self.sys.feedback_edges and residual_map:
+                L = AbstractTensor.get_tensor(0.0)
+                for r in residual_map.values():
+                    L += 0.5 * (r * r).sum()
+                L_scalar = (
+                    float(getattr(L, "item_", lambda: L)())
+                    if hasattr(L, "item_")
+                    else float(L)
+                )
+                for i, j, op_id in self.sys.feedback_edges:
+                    try:
+                        self.sys.impulse(i, j, op_id, g_scalar=L_scalar)
+                    except Exception:
+                        pass
+
             time.sleep(self.dt)
 
 
