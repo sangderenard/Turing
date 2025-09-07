@@ -1982,7 +1982,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
 def main(duration_s: float = 8.0):
     # Default to a large random batch driving the inputs
-    sys, outputs = build_toy_system(seed=42, batch_size=10000, batch_refresh_hz=15.0)
+    sys, outputs = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
 
     stop = threading.Event()
     refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=5.0)
