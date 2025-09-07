@@ -313,6 +313,8 @@ class Edge:
     hodge1: float = 1.0   # stub for DEC; can be set per-edge
     timestamp: float = field(default_factory=now_s)
     rings: int = 0        # number of microgradients accumulated
+    credit_ema: float = 0.0
+    credit_tau: float = 0.5
 
     # Spectral bands
     bands: List[EdgeBand] = field(default_factory=list)
@@ -322,6 +324,10 @@ class Edge:
 
     # Base rest length l0 (from DEC). Updated on construction.
     l0: float = 1.0
+
+    def update_credit(self, amount: float, dt: float) -> None:
+        a = abs(amount)
+        self.credit_ema += (a - self.credit_ema) * (dt / max(self.credit_tau, 1e-6))
 
     def ingest_impulse(self, g_scalar: float, dt: float):
         self.timestamp = now_s()
@@ -1546,6 +1552,13 @@ class Experiencer(threading.Thread):
                         r_tensor = AbstractTensor.get_tensor(r)
                         prod = g_stack * r_tensor
                         g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
+                        for src, g_val in zip(srcs, g_scalars):
+                            try:
+                                g_float = float(getattr(g_val, "item", lambda: g_val)())
+                            except Exception:
+                                g_float = float(g_val)
+                            e = self.sys.ensure_edge(int(src), int(out), name)
+                            e.update_credit(g_float, self.dt)
                         self.sys.impulse_batch(srcs, out, name, -g_scalars)
 
                         param_nodes = []
@@ -1577,6 +1590,8 @@ class Experiencer(threading.Thread):
                 )
                 for i, j, op_id in self.sys.feedback_edges:
                     try:
+                        e = self.sys.ensure_edge(i, j, op_id)
+                        e.update_credit(L_scalar, self.dt)
                         self.sys.impulse(i, j, op_id, g_scalar=L_scalar)
                     except Exception:
                         pass
