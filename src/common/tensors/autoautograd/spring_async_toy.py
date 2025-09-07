@@ -2109,7 +2109,7 @@ class LinearBlockFactory:
                 )
 
         # common agg fn for gather_and
-        agg_fn = _op_apply_factory(["__add__", "__mul__"], [(0,), (1,)])
+        agg_fn = _op_apply_factory(["__mul__", "__add__"], ["@param[1]", "@param[2]"])
 
         # --- connect: inputs -> first row (fully connected) ---
         if self.rows > 0:
@@ -2121,8 +2121,8 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
+                    (0, list(range(len(srcs))), agg_fn),
                     None,
-                    {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
                 ))
 
         # --- connect: row r -> row r+1 (fully connected between consecutive rows) ---
@@ -2137,8 +2137,8 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
+                    (0, list(range(len(srcs))), agg_fn),
                     None,
-                    {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
                 ))
 
         # --- connect: last row -> outputs (+ bias per output) ---
@@ -2151,8 +2151,8 @@ class LinearBlockFactory:
                 "gather_and",
                 srcs,
                 oj,
+                (0, list(range(len(srcs))), agg_fn),
                 None,
-                {"indices": list(range(len(srcs))), "dim": 0, "fn": agg_fn},
             ))
 
         return LinearBlock(
