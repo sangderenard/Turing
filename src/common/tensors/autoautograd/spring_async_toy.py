@@ -31,14 +31,20 @@ from .residual_store import ResidualStore, Space
 
 import time
 import threading
+import math
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Optional, Callable
-import matplotlib
 
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib import colors as mcolors
+# Optional heavy visualization deps (lazy-loaded via CLI flags)
+matplotlib = None  # type: ignore
+plt = None  # type: ignore
+FuncAnimation = None  # type: ignore
+mcolors = None  # type: ignore
+GL_DYNAMIC_DRAW = GL_ARRAY_BUFFER = GL_DEPTH_TEST = GL_LEQUAL = GL_CULL_FACE = None  # type: ignore
+GL_PROGRAM_POINT_SIZE = GL_COLOR_BUFFER_BIT = GL_DEPTH_BUFFER_BIT = GL_POINTS = GL_LINES = None  # type: ignore
+GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: ignore
+
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
 
@@ -900,16 +906,7 @@ class SpringRepulsorSystem:
 # - Autoscaled camera; non-blocking window
 
 
-import math
-import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT, KEYDOWN, K_SPACE
-from OpenGL.GL import *
-from OpenGL.GL.shaders import compileProgram, compileShader
-from matplotlib import cm, colors as mcolors
 from typing import Any, Tuple
-# spring_async_toy.py (top-level, before creating LiveVizGLPoints)
-from ..pyopengl_handler import install_pyopengl_handlers
-install_pyopengl_handlers()
 
 # Expecting SpringRepulsorSystem with:
 #   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.param is scalar
@@ -1472,8 +1469,8 @@ class LiveViz3D:
                  edge_cmap="viridis", node_cmap="coolwarm",
                  interval_ms: int = 60):
         self.sys = sys
-        self.edge_cmap = plt.colormaps.get_cmap(edge_cmap)
-        self.node_cmap = plt.colormaps.get_cmap(node_cmap)
+        self.edge_cmap = matplotlib.colormaps.get_cmap(edge_cmap)
+        self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
         self.norm_nodes = mcolors.TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
         self.norm_edges = mcolors.Normalize(vmin=0.0, vmax=0.5)  # auto-updated
         self.interval_ms = interval_ms
@@ -2276,7 +2273,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
 
 
-def main(duration_s: float = 8.0):
+def main(duration_s: float = 8.0, viz_mode: str = "none"):
     # Default to a large random batch driving the inputs
     sys, outputs = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
 
@@ -2287,11 +2284,40 @@ def main(duration_s: float = 8.0):
     print("[INFO] Starting threads…")
     refl.start(); expr.start()
     t0 = now_s()
-#    viz = LiveViz3D(sys)
-#    viz.launch()
-    viz = LiveVizGLPoints(sys, node_cmap="coolwarm", base_point_size=6.0)
-    viz.launch()              # once
-    from collections import deque
+
+    if viz_mode == "gl":
+        global matplotlib, mcolors, pygame, DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT, KEYDOWN, K_SPACE
+        global compileProgram, compileShader
+        import matplotlib  # type: ignore
+        from matplotlib import colors as mcolors  # type: ignore
+        import pygame  # type: ignore
+        from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, VIDEORESIZE, QUIT, KEYDOWN, K_SPACE  # type: ignore
+        import OpenGL.GL as _GL  # type: ignore
+        from OpenGL.GL import shaders as _shaders  # type: ignore
+        globals().update({k: getattr(_GL, k) for k in dir(_GL) if not k.startswith("_")})
+        compileProgram = _shaders.compileProgram
+        compileShader = _shaders.compileShader
+        from ..pyopengl_handler import install_pyopengl_handlers
+        install_pyopengl_handlers()
+        viz = LiveVizGLPoints(sys, node_cmap="coolwarm", base_point_size=6.0)
+        viz.launch()
+    elif viz_mode == "mpl":
+        global matplotlib, plt, FuncAnimation, mcolors
+        import matplotlib  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+        from matplotlib.animation import FuncAnimation  # type: ignore
+        from matplotlib import colors as mcolors  # type: ignore
+        viz = LiveViz3D(sys)
+        viz.launch()
+    else:
+        class _NullViz:
+            def launch(self, *args, **kwargs):
+                return None
+            def step(self, _dt: float = 0.0):
+                return None
+            def close(self):
+                return None
+        viz = _NullViz()
 
     BATCH = 16  # batch/window size for the running mean
     batch_actual_q = deque(maxlen=BATCH)
@@ -2354,4 +2380,14 @@ def main(duration_s: float = 8.0):
         viz.close()
 
 if __name__ == "__main__":
-    main(float('inf'))
+    import argparse
+    parser = argparse.ArgumentParser(description="Spring-Repulsor Async Toy")
+    parser.add_argument("--duration", type=float, default=float("inf"), help="run duration in seconds")
+    parser.add_argument(
+        "--viz",
+        choices=["none", "mpl", "gl"],
+        default="none",
+        help="optional visualization backend",
+    )
+    args = parser.parse_args()
+    main(duration_s=args.duration, viz_mode=args.viz)
