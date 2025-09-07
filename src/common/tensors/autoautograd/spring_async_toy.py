@@ -46,7 +46,7 @@ L_MAX = 3.0
 DL_CAP = 0.5
 MAGNITUDE_ONLY = False
 V_MAX = 2.0
-STEP_MAX = 0.2
+STEP_MAX = 10.2
 READOUT_SCALE = 1.0
 READOUT_BIAS  = 0.0
 W_EPS = 1e-3
@@ -54,8 +54,8 @@ W_MIN, W_MAX = 0.25, 4.0
 # --- threshold-pop optimizer knobs ---
 POP_FRUSTRATION_TH = 1e-6   # how 'annoyed' an edge must be: |L - L*|
 POP_AGG_TH         = 1e-6   # how large the transient aggregate must be: |sum(contribs)|
-POP_QUANTUM        = 1.0   # discrete ΔL moved per pop
-POP_MAX_PER_TICK   = 1000      # safety cap per integrator tick
+POP_QUANTUM        = 1e-2   # discrete ΔL moved per pop
+POP_MAX_PER_TICK   = 1e10      # safety cap per integrator tick
 
 # ----------------------------- Utilities ------------------------------------
 
@@ -126,12 +126,16 @@ def attach_dirichlet(
     alpha: float = 2.0,
     axis: int = 0,
 ) -> None:
-    """Clamp ``nid`` by a Dirichlet spring on ``axis`` toward ``value_fn(t)``."""
-
+    """Clamp only the chosen axis of ``nid`` toward value_fn(t); leave other axes untouched."""
     D = sys.D if D is None else int(D)
-    sys.add_boundary(
-        BoundaryPort(nid=nid, alpha=alpha, target_fn=as_axis_target(value_fn, axis, D))
-    )
+
+    def _target_vec(t, _sys=sys, _nid=nid, _axis=axis):
+        # copy current position so non-target axes see zero Dirichlet force
+        p_now = _sys.nodes[_nid].p.clone()
+        p_now[_axis] = float(value_fn(t))
+        return p_now
+
+    sys.add_boundary(BoundaryPort(nid=nid, alpha=alpha, target_fn=_target_vec))
 
 
 def attach_neumann_noop(
@@ -249,7 +253,7 @@ class Node:
     p: AbstractTensor  # shape (D,)
     v: AbstractTensor  # shape (D,)
     sphere: AbstractTensor
-    M0: float = 1.0
+    M0: float = 10.0
     last_commit: float = 0.0
     version: int = 0
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
@@ -360,25 +364,27 @@ class Edge:
         frustration = abs(L_current - L_star)
         agg_mag = abs(self._last_reduce)
         if frustration < POP_FRUSTRATION_TH or agg_mag < POP_AGG_TH:
-            return  # nothing to do
+            #return  # nothing to do
+            pass #diagnostic
 
         # how many quanta could we commit right now?
         want = min(int(agg_mag // POP_QUANTUM), POP_MAX_PER_TICK)
         if want <= 0:
-            return
+            #return
+            pass #diagnostic
 
         sgn = 1.0 if self._last_reduce >= 0.0 else -1.0
-        for _ in range(want):
-            if quantized:
+        for _ in range(1):#want):
+            if False and quantized:
                 # commit ΔL into the permanent base
                 self.l0 += sgn * POP_QUANTUM
                 # consume the same amount from the transient buffer immediately
                 self.spring.add(-sgn * POP_QUANTUM)
             else:
                 # fractional pop (for testing)
-                delta = sgn * min(POP_QUANTUM, agg_mag)
+                delta = sgn * agg_mag #min(POP_QUANTUM, agg_mag)
                 self.l0 += delta
-                self.spring.add(-delta)
+                #self.spring.add(-delta)
                 agg_mag -= delta
                 if agg_mag <= 0.0:
                     break
@@ -725,6 +731,8 @@ class LiveVizGLPoints:
         self._edge_vbo_col = None
         self._edge_vbo_size = None
         self._num_edge_vertices = 0
+        self._cap_pos = self._cap_col = self._cap_size = 0
+        self._edge_cap_pos = self._edge_cap_col = self._edge_cap_size = 0
 
         self._u_mvp = None  # uniform location
         tensor = AbstractTensor.get_tensor(0)
@@ -737,6 +745,24 @@ class LiveVizGLPoints:
         self._rot_phi = 0.0
         self._rot_dtheta = 0.002
         self._rot_dphi = 0.0015
+    def _upload(self, vbo, arr, cap_attr, usage=GL_DYNAMIC_DRAW):
+        import numpy as np
+        # bytes & pointer for numpy vs AbstractTensor
+        if isinstance(arr, np.ndarray):
+            nbytes = int(arr.nbytes); ptr = arr
+        else:
+            nbytes = int(arr.nbytes()); ptr = arr.data
+
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        cap = getattr(self, cap_attr, 0)
+
+        # grow (and orphan) only when needed
+        if nbytes > cap:
+            new_cap = max(int(nbytes * 1.5), 256)
+            glBufferData(GL_ARRAY_BUFFER, new_cap, None, usage)  # allocate/orphan
+            setattr(self, cap_attr, new_cap)
+
+        glBufferSubData(GL_ARRAY_BUFFER, 0, nbytes, ptr)         # upload bytes
 
     # ---------- data snapshot ----------
     def _snapshot(self):
@@ -872,8 +898,7 @@ class LiveVizGLPoints:
                     AbstractTensor.zeros((0,), ids.float_dtype),
                     AbstractTensor.zeros((0, 3), ids.float_dtype))
 
-        P = AbstractTensor.stack([nodes[i][0] for i in ids]).astype(ids.float_dtype)
-
+        P = AbstractTensor.stack([nodes[i][0] for i in ids])
         # NEW: pad to 3D if needed
         if P.shape[1] == 2:
             # Add one column (axis 1) of zeros to promote (N,2) -> (N,3)
@@ -981,43 +1006,24 @@ class LiveVizGLPoints:
     def _update_buffers(self):
         P, C, S, P_for_bounds = self._pack_points()
         self._num_points = P.shape[0]
+        # points
+        self._upload(self._vbo_pos,  P, "_cap_pos")
+        self._upload(self._vbo_col,  C, "_cap_col")
+        self._upload(self._vbo_size, S, "_cap_size")
 
-        glBindVertexArray(self._vao)
 
-        # positions
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_pos)
-        # ``AbstractTensor.nbytes`` is a method; we must call it to obtain the
-        # byte size.  Passing the bound method directly leads to ctypes type
-        # errors under PyOpenGL.
-        glBufferData(GL_ARRAY_BUFFER, P.nbytes(), P.data, GL_DYNAMIC_DRAW)
-
-        # colors
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_col)
-        glBufferData(GL_ARRAY_BUFFER, C.nbytes, C, GL_DYNAMIC_DRAW)
-
-        # sizes
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo_size)
-        # ``S`` is also an ``AbstractTensor``; ensure we pass the computed
-        # integer byte size rather than the bound method object.
-        glBufferData(GL_ARRAY_BUFFER, S.nbytes(), S.data, GL_DYNAMIC_DRAW)
 
         glBindVertexArray(0)
 
-        PE, CE, SE = self._pack_edges()
-        self._num_edge_vertices = PE.shape[0]
+        #PE, CE, SE = self._pack_edges()
+        #self._num_edge_vertices = PE.shape[0]
 
-        glBindVertexArray(self._edge_vao)
+        # edges
+        #self._upload(self._edge_vbo_pos, PE, "_edge_cap_pos")
+        #self._upload(self._edge_vbo_col, CE, "_edge_cap_col")
+        #self._upload(self._edge_vbo_size, SE, "_edge_cap_size")
 
-        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_pos)
-        glBufferData(GL_ARRAY_BUFFER, PE.nbytes(), PE.data, GL_DYNAMIC_DRAW)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_col)
-        glBufferData(GL_ARRAY_BUFFER, CE.nbytes, CE, GL_DYNAMIC_DRAW)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self._edge_vbo_size)
-        glBufferData(GL_ARRAY_BUFFER, SE.nbytes(), SE.data, GL_DYNAMIC_DRAW)
-
-        glBindVertexArray(0)
+        #glBindVertexArray(0)
 
         # update camera
         self._compute_mvp(P_for_bounds)
@@ -1523,28 +1529,74 @@ class Experiencer(threading.Thread):
 
                 # Stack residuals and smooth per-parameter via filtered Poisson
                 R = AbstractTensor.stack([residual_map[n] for n in nids], dim=0)
-                if R.ndim == 1:
+
+                if True or adjacency.sum() <= 0.0:
+                    R_sm = R
+                elif R.ndim == 1:
+                    # 1D case: smooth directly
                     R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
                 else:
-                    cols = []
-                    for k in range(R.shape[1]):
-                        col = filtered_poisson(R[:, k], iterations=20, adjacency=adjacency)
-                        cols.append(col)
-                    R_sm = AbstractTensor.stack(cols, dim=1)
-                for nid, r_sm in zip(nids, R_sm):
-                    residual_map[nid] = r_sm
+                    F = int(R.shape[1])
+                    if F == 0:
+                        # Nothing to smooth — keep originals; do not overwrite with empties
+                        R_sm = R
+                    else:
+                        cols = []
+                        for k in range(F):
+                            col = filtered_poisson(R[:, k], iterations=20, adjacency=adjacency)
+                            cols.append(col)
+                        # Ensure row-major (N, F)
+                        R_sm = AbstractTensor.stack(cols, dim=1)
+
+                # Only overwrite residual_map if shapes align and we actually have features
+                if getattr(R_sm, "ndim", 0) >= 1 and int(R_sm.shape[0]) == len(nids) and (R_sm.ndim == 1 or int(getattr(R_sm, "shape", (0, 0))[1]) > 0):
+                    for nid, r_sm in zip(nids, R_sm):
+                        residual_map[nid] = r_sm
+                # else: keep the pre-smoothing residuals
+
 
                 # Impulses and param updates for ops whose outputs have residuals
                 if out_specs:
                     for (name, srcs, out, args, kwargs), y, g_list in zip(
                         out_specs, ys, grads
                     ):
-                        r = residual_map.get(out)
-                        if r is None or not g_list:
+                        r = residual_map.get(out, None)
+                        if r is None:
+                            Ops._need_residual_warn(name)
                             continue
-                        g_stack = AbstractTensor.stack(list(g_list), dim=0)
+                        if y is None or g_list is None:
+                            Ops._need_residual_warn(name)
+                            continue
+                        g_stack = AbstractTensor.stack(list(g_list), dim=0)  # (S, C) e.g. (65, 3)
                         r_tensor = AbstractTensor.get_tensor(r)
-                        prod = g_stack * r_tensor
+
+                        # --- normalize r_tensor BEFORE any elementwise ops (avoid nan_to_num on empties) ---
+                        C = int(g_stack.shape[1]) if getattr(g_stack, "ndim", 0) >= 2 else 1
+
+                        if getattr(r_tensor, "ndim", 0) >= 1:
+                            # flatten; handle empty; dimension mismatch -> reduce to scalar
+                            try:
+                                r_tensor = r_tensor.reshape(-1)
+                            except Exception:
+                                r_tensor = AbstractTensor.get_tensor(r_tensor).reshape(-1)
+                            nfeat = int(getattr(r_tensor, "shape", (0,))[0])
+                            if nfeat == 0:
+                                r_tensor = AbstractTensor.get_tensor(0.0)     # neutral; no impulses this tick
+                            elif nfeat != C:
+                                r_tensor = r_tensor.mean()                    # broadcastable scalar
+
+                        # now safe to sanitize NaN/Inf
+                        try:
+                            r_tensor = AbstractTensor.nan_to_num(r_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+                        except Exception:
+                            # backend 'where' can be picky — fall back to scalar/mean path
+                            if getattr(r_tensor, "ndim", 0) == 0:
+                                r_tensor = AbstractTensor.get_tensor(float(r_tensor))
+                            else:
+                                r_tensor = r_tensor  # already shaped or zeroed above
+
+                        prod = g_stack * r_tensor  # r_tensor is scalar or (C,)
+
                         g_scalars = prod.reshape(len(srcs), -1).sum(dim=1)
                         self.sys.impulse_batch(srcs, out, name, -g_scalars)
 
@@ -1815,7 +1867,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
         n_in=len(TEXT),
         n_out=len(TEXT),
         spacing=0.28,
-        rows=1,
+        rows=3,
         gather_operators=["fused_add_mul"],
         seed=seed
     ).build(start_id=0, z_level=0.0)
@@ -1824,7 +1876,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
     nodes.extend(lb.nodes)
     edges.extend(lb.edges)
 
-    sys = SpringRepulsorSystem(nodes, edges, eta=0.08, gamma=0.93, dt=0.02)
+    sys = SpringRepulsorSystem(nodes, edges, eta=0.0, gamma=0.3, dt=0.02)
 
     # Tag roles for visualization
     sys.roles = {}
@@ -1895,10 +1947,10 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
 def main(duration_s: float = 8.0):
     # Default to a large random batch driving the inputs
-    sys, outputs = build_toy_system(seed=42, batch_size=1000, batch_refresh_hz=15.0)
+    sys, outputs = build_toy_system(seed=42, batch_size=10000, batch_refresh_hz=15.0)
 
     stop = threading.Event()
-    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=0.01)
+    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=5.0)
     expr = Experiencer(sys, stop, outputs, schedule_hz=60.0, ops_program=sys.ops_program)
 
     print("[INFO] Starting threads…")
@@ -1926,8 +1978,12 @@ def main(duration_s: float = 8.0):
 
     t0 = now_s()
     try:
+        LOG_EVERY = 2.0  # seconds
+        next_log = now_s()
+        t0 = now_s()
         while (now_s() - t0) < duration_s:
             t = now_s() - t0
+
 
             # (F,) feature rows for this tick
             actual_row = AbstractTensor.stack([
@@ -1945,21 +2001,18 @@ def main(duration_s: float = 8.0):
             actual_batch = AbstractTensor.get_tensor([row for row in batch_actual_q])
             target_batch = AbstractTensor.get_tensor([row for row in batch_target_q])
 
-            # mean across batch (dim=0) → (F,) per-feature means (what you print as a string)
-            mean_vals  = actual_batch.mean(dim=1)
-            mean_tgts  = target_batch.mean(dim=0)
+            if now_s() >= next_log:
+                mean_vals  = actual_batch.mean(dim=0)
+                mean_tgts  = target_batch.mean(dim=0)
+                output_str = ''.join(chr(_to_byte(v[2])) for v in mean_vals)
+                target_str = ''.join(chr(_to_byte(v))    for v in mean_tgts)
+                error = mse_batch(actual_batch[..., 2], target_batch)
+                print(f"[DBG] outputs→batch-mean Error: {error: .3f} | Out: {output_str} | Tgt: {target_str}")
+                next_log += LOG_EVERY
 
-            # adherence/loss over the whole batch (not a single scalar output vector)
-            error = mse_batch(actual_batch[..., 2], target_batch)
+            viz.step(0.0)           # render without forcing a big sleep
+            time.sleep(0.005)       # tiny yield so we don’t busy-wait
 
-            # visualize both the averaged output (z-axis) and averaged target
-            output_str = ''.join(chr(_to_byte(v[2])) for v in mean_vals)
-            target_str = ''.join(chr(_to_byte(v)) for v in mean_tgts)
-
-            print(f"[DBG] outputs→batch-mean Error: {error: .3f} | "
-                f"Out: {output_str} | Tgt: {target_str}")
-
-            viz.step(0.5)
 
 
     finally:

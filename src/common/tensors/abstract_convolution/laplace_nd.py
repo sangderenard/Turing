@@ -129,10 +129,13 @@ class BuildGraphLaplace:
             A = A * scale[:, None]
 
         deg = A.sum(-1)
-        nz = AbstractTensor.get_tensor(A.nonzero())
+        nz = AbstractTensor.get_tensor(A.nonzero(), dtype=A.long_dtype_)
+        print(nz)
         row = nz[:, 0]
         col = nz[:, 1]
+        print(row, col)
         off_mask = row != col
+        print(off_mask)
         row = row[off_mask]
         col = col[off_mask]
 
