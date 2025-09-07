@@ -33,7 +33,7 @@ import time
 import threading
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional, Callable, Set
+from typing import Dict, Tuple, List, Optional, Callable
 import matplotlib
 
 import matplotlib.pyplot as plt
@@ -117,25 +117,64 @@ def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
     return x + ((1.0 / max(ratio, 1e-6) - 1.0) * (x - th)) * a * (2 - a)
 
 
-def _stack_grads_per_source(g_list) -> Tuple[AbstractTensor, int]:
-    """Stack gradients per source ensuring equal width.
+def _stack_grads_per_source(
+    name: str, out: int, srcs, g_list
+) -> Tuple[AbstractTensor, int]:
+    """Stack gradients per source ensuring equal width and count.
 
-    Returns the stacked tensor and inferred width ``C``. Raises ``ValueError``
-    if any gradient has a mismatched width.
+    Parameters
+    ----------
+    name:
+        Operator name for error messages.
+    out:
+        Output node identifier for error messages.
+    srcs:
+        Sequence of source node identifiers.
+    g_list:
+        Gradients aligned to ``srcs``.
+
+    Returns
+    -------
+    Tuple[AbstractTensor, int]
+        Stacked gradients and inferred width ``C``.
+
+    Raises
+    ------
+    ValueError
+        If any gradient is missing or has a mismatched width. The error
+        message includes ``name``, ``out`` and the offending source index.
     """
 
-    g_list = [AbstractTensor.get_tensor(g) for g in g_list]
-    if not g_list:
-        return AbstractTensor.stack([], dim=0), 0
+    tensors: List[AbstractTensor] = []
+    C = None
+    for i, _ in enumerate(srcs):
+        try:
+            g = g_list[i]
+        except IndexError:
+            raise ValueError(
+                f"{name}: missing gradient for source index {i} (output {out})"
+            )
+        if g is None:
+            raise ValueError(
+                f"{name}: missing gradient for source index {i} (output {out})"
+            )
+        t = AbstractTensor.get_tensor(g)
+        width = t.shape[-1] if getattr(t, "ndim", 0) > 0 else 1
+        if C is None:
+            C = width
+        elif width != C:
+            raise ValueError(
+                f"{name}: grad width {width} for source index {i} mismatches {C} (output {out})"
+            )
+        tensors.append(t)
 
-    widths = [g.shape[-1] if getattr(g, "ndim", 0) > 0 else 1 for g in g_list]
-    C = widths[0]
-    for w in widths[1:]:
-        if w != C:
-            raise ValueError(f"gradient width mismatch: expected {C}, got {w}")
+    if len(g_list) != len(srcs):
+        raise ValueError(
+            f"{name}: expected {len(srcs)} gradients, got {len(g_list)} (output {out})"
+        )
 
-    g_stack = AbstractTensor.stack(g_list, dim=0)
-    return g_stack, C
+    g_stack = AbstractTensor.stack(tensors, dim=0)
+    return g_stack, C or 0
 
 # ----------------------------- Boundary helpers ------------------------------
 
@@ -1499,7 +1538,6 @@ class Experiencer(threading.Thread):
         self.outputs = outputs
         # If none provided, fall back to the tiny demo. (We’ll pass one in.)
         self.ops_program = ops_program
-        self._broken_ops_logged: Set[Tuple[str, int]] = set()
 
     def _residual_for_out(
         self, out_id: int, y_val: AbstractTensor, t: float
@@ -1508,25 +1546,6 @@ class Experiencer(threading.Thread):
             return None
         target_vec = self.outputs[out_id](t)
         return y_val - target_vec
-
-    def _warn_broken_op(
-        self,
-        name: str,
-        out_id: int,
-        g_stack: AbstractTensor,
-        g_list: List[AbstractTensor],
-    ) -> None:
-
-        width = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 0
-
-        if width != 0:
-            return
-        key = (name, int(out_id))
-        if key in self._broken_ops_logged:
-            return
-        shapes = [getattr(g, "shape", None) for g in g_list]
-        print(f"[BROKEN-OP] op={name} out={out_id} grad_shapes={shapes}")
-        self._broken_ops_logged.add(key)
 
     def run(self):
         t0 = now_s()
@@ -1602,11 +1621,10 @@ class Experiencer(threading.Thread):
                     items = bucket.get(int(out))
                     if not items or not g_list:
                         continue
-                    g_stack, C = _stack_grads_per_source(g_list)
-                    self._warn_broken_op(name, out, g_stack, g_list)
-                    if len(srcs) != g_stack.shape[0]:
+                    g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)
+                    if g_stack.shape[0] != len(srcs):
                         raise ValueError(
-                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]}"
+                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})"
                         )
                     y_width = y.shape[-1] if getattr(y, "ndim", 0) > 0 else 1
                     if y_width != C:
