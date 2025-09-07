@@ -249,6 +249,18 @@ def batched_forward_v2(
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
         for idx, src_ids, out_id, op_args, op_kwargs in items:
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
+            params: List[Any] = []
+            for i in src_ids:
+                node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+                if hasattr(node, "param"):
+                    flat = AbstractTensor.get_tensor(node.param).flatten()
+                    params.append(flat)
+            if params:
+                params_vec = AbstractTensor.concat(params, dim=0)
+            else:
+                params_vec = AbstractTensor.get_tensor([])
+            base_args = op_args or ()
+            full_args = base_args + (params_vec,)
             y, _, _ = run_op_and_grads_cached(
                 sys,
                 op_name,
@@ -259,7 +271,7 @@ def batched_forward_v2(
                 cache=wb_cache,
                 backend=None,
                 backend_tag=None,
-                op_args=op_args or (),
+                op_args=full_args,
                 op_kwargs=op_kwargs,
                 grad_mode="scalar",
             )
@@ -326,6 +338,18 @@ def push_impulses_from_ops_batched(
                 metas.append(meta)
             metas_out[idx] = tuple(metas)
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
+            params: List[Any] = []
+            for i in src_ids:
+                node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+                if hasattr(node, "param"):
+                    flat = AbstractTensor.get_tensor(node.param).flatten()
+                    params.append(flat)
+            if params:
+                params_vec = AbstractTensor.concat(params, dim=0)
+            else:
+                params_vec = AbstractTensor.get_tensor([])
+            base_args = op_args or ()
+            full_args = base_args + (params_vec,)
             y, g_param, _ = run_op_and_grads_cached(
                 sys,
                 op_name,
@@ -336,7 +360,7 @@ def push_impulses_from_ops_batched(
                 cache=wb_cache,
                 backend=None,
                 backend_tag=None,
-                op_args=op_args or (),
+                op_args=full_args,
                 op_kwargs=op_kwargs,
                 grad_mode="param",
             )

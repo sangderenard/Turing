@@ -316,7 +316,7 @@ def wire_output_chain(
 @dataclass
 class Node:
     id: int
-    param: AbstractTensor  # scalar parameter
+    param: AbstractTensor  # [eccentricity, weight, bias] tensor
     p: AbstractTensor  # shape (D,)
     v: AbstractTensor  # shape (D,)
     sphere: AbstractTensor
