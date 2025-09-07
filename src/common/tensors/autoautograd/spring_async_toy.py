@@ -176,10 +176,10 @@ def wire_input_chain(
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
     param_generator = empty_param_generator()
-    
+    param = param_generator.__next__()
     sys.nodes[d] = Node(
         id=d,
-        param=param_generator.__next__(),
+        param=param,
         p=p,
         v=AT.zeros(D, dtype=float),
         sphere=AbstractTensor.concat([p, param], dim=0),
@@ -187,10 +187,10 @@ def wire_input_chain(
     attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    
+    param = param_generator.__next__()
     sys.nodes[n] = Node(
         id=n,
-        param=param_generator.__next__(),
+        param=param,
         p=p,
         v=AT.zeros(D, dtype=float),
         sphere=AbstractTensor.concat([p, param], dim=0),
@@ -215,7 +215,8 @@ def wire_output_chain(
     D = sys.D if D is None else int(D)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = AT.zeros(1, dtype=float)
+    param_generator = empty_param_generator()
+    param = param_generator.__next__()
     sys.nodes[n] = Node(
         id=n,
         param=param,
@@ -227,7 +228,7 @@ def wire_output_chain(
     sys.ensure_edge(system_nid, n, "out_link")
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = AT.zeros(1, dtype=float)
+    param = param_generator.__next__()
     sys.nodes[d] = Node(
         id=d,
         param=param,
