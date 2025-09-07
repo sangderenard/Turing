@@ -1619,7 +1619,9 @@ class Experiencer(threading.Thread):
                     list(zip(specs, grads, ys))
                 ):
                     items = bucket.get(int(out))
-                    if not items or not g_list:
+                    if items is None or g_list is None:
+                        continue
+                    if isinstance(g_list, (list, tuple, AbstractTensor)) and len(g_list) == 0:
                         continue
                     g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)
                     if g_stack.shape[0] != len(srcs):
