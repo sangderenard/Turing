@@ -16,6 +16,8 @@ def _normalize_chain(ops: Sequence[str]) -> Tuple[Callable[[Any], Any], ...]:
     fns = [getattr(AbstractTensor, op, None) for op in ops]
     return tuple(f for f in fns if callable(f))
 
+
+
 def _op_apply_factory(
     ops: Sequence[str], args: Optional[Sequence[Any]] = None
 ) -> Callable[[Any], Any]:

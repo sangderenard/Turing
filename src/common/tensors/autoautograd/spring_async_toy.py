@@ -42,7 +42,7 @@ from matplotlib import colors as mcolors
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
 
-L_MIN = 0.05
+L_MIN = -3.0
 L_MAX = 3.0
 DL_CAP = 0.5
 MAGNITUDE_ONLY = False
@@ -144,7 +144,7 @@ def _stack_grads_per_source(
         If any gradient is missing or has a mismatched width. The error
         message includes ``name``, ``out`` and the offending source index.
     """
-
+    print("_stack_grads_per_source:", name, out, srcs, g_list)
     tensors: List[AbstractTensor] = []
     C = None
     for i, _ in enumerate(srcs):
@@ -320,6 +320,11 @@ class Node:
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
 
     def commit(self, param_residuals=None):
+        print("Committing node", self.id)
+        print("p:", self.p)
+        print("param:", self.param)
+        print("sphere:", self.sphere)
+        print("param_residuals:", param_residuals)
         self.sphere = AbstractTensor.concat([self.p, self.param], dim=0)
         if param_residuals is not None:
             self.param += param_residuals
@@ -468,6 +473,163 @@ class BoundaryPort:
     enabled: bool = True
 
 
+class ParamLogger:
+    """
+    Periodically prints a per-node table:
+      nid | role | P | param[0:K] | Δp1 | Δp2 | resF | resG | impulses | deg(in/out) | pops | credit | status
+
+    - Δp1/Δp2: L1/L2 delta since last log
+    - resF/resG: counts of residual items present this tick (Feature / Geometry)
+    - impulses: sum of edge ring deltas incident to node since last log
+    - pops/credit: summed pops and mean credit_ema across incident edges
+    - status: DEAD if no movement & no residuals & no impulses
+    """
+    def __init__(self, sys, *, interval_s=5.0, dead_tol=1e-8, preview_k=3, sort_by="Δp2"):
+        self.sys = sys
+        self.interval_s = float(interval_s)
+        self.dead_tol = float(dead_tol)
+        self.preview_k = int(preview_k)
+        self.sort_by = sort_by  # "Δp2" or "nid"
+
+        self._t_last = 0.0
+        self._prev_params = {}
+        self._prev_rings = {}
+        self._prime()
+
+    def _prime(self):
+        # cheap, lock-free snapshots
+        self._prev_params = {
+            i: n.param.clone() if hasattr(n.param, "clone") else AbstractTensor.get_tensor(n.param)
+            for i, n in self.sys.nodes.items()
+        }
+        self._prev_rings = {k: int(e.rings) for k, e in self.sys.edges.items()}
+        self._t_last = now_s()
+
+    def _fmt_vec(self, v):
+        # preview first K components, robust to any width/backend
+        t = AbstractTensor.get_tensor(v).reshape(-1)
+        k = min(self.preview_k, int(t.shape[0])) if getattr(t, "shape", None) else 1
+        vals = [float(getattr(t[i], "item", lambda: t[i])()) for i in range(k)]
+        tail = "" if int(getattr(t, "shape", [k])[0]) <= k else "…"
+        return "[" + ", ".join(f"{x:+.4f}" for x in vals) + tail + "]"
+
+    def _norms(self, v):
+        t = AbstractTensor.get_tensor(v).reshape(-1)
+        l1 = float(AbstractTensor.sum(AbstractTensor.abs(t)))
+        l2 = float(AbstractTensor.linalg.norm(t))
+        return l1, l2
+
+    def _rings_delta_per_node(self, prev_rings):
+        # sum incident edge ring deltas per node
+        delta_by_node = {i: 0 for i in self.sys.nodes}
+        for (i, j, _), e in self.sys.edges.items():
+            d = int(e.rings) - int(prev_rings.get((i, j, _), int(e.rings)))
+            if d != 0:
+                delta_by_node[i] = delta_by_node.get(i, 0) + d
+                delta_by_node[j] = delta_by_node.get(j, 0) + d
+        return delta_by_node
+
+    def _deg_in_out(self):
+        din = {i: 0 for i in self.sys.nodes}
+        dout = {i: 0 for i in self.sys.nodes}
+        for (i, j, _op) in self.sys.edges.keys():
+            dout[i] = dout.get(i, 0) + 1
+            din[j]  = din.get(j, 0) + 1
+        return din, dout
+
+    def tick(self, *, residuals=None, touched_srcs=None, force=False):
+        """Call once per Experiencer iteration."""
+        t = now_s()
+        if not force and (t - self._t_last) < self.interval_s:
+            return
+
+        # --- snapshots
+        roles = getattr(self.sys, "roles", {})
+        params_now = {
+            i: n.param.clone() if hasattr(n.param, "clone") else AbstractTensor.get_tensor(n.param)
+            for i, n in self.sys.nodes.items()
+        }
+        rings_delta = self._rings_delta_per_node(self._prev_rings)
+        din, dout = self._deg_in_out()
+
+        # residual presence maps (counts per node)
+        resF_ct = {i: 0 for i in self.sys.nodes}
+        resG_ct = {i: 0 for i in self.sys.nodes}
+        if residuals is not None:
+            try:
+                bucketF = residuals.get_bucket(Space.F) or {}
+                for nid, items in bucketF.items():
+                    resF_ct[int(nid)] = len(items)
+            except Exception:
+                pass
+            try:
+                bucketG = residuals.get_bucket(Space.G) or {}
+                for nid, items in bucketG.items():
+                    resG_ct[int(nid)] = len(items)
+            except Exception:
+                pass
+
+        # pops / credit summaries per node from incident edges
+        pops_sum = {i: 0 for i in self.sys.nodes}
+        credit_mean = {i: 0.0 for i in self.sys.nodes}
+        credit_cnt = {i: 0 for i in self.sys.nodes}
+        for (i, j, _), e in self.sys.edges.items():
+            for n in (i, j):
+                pops_sum[n] = pops_sum.get(n, 0) + int(getattr(e, "pops", 0))
+                credit_mean[n] = credit_mean.get(n, 0.0) + float(getattr(e, "credit_ema", 0.0))
+                credit_cnt[n] = credit_cnt.get(n, 0) + 1
+        for n in credit_mean:
+            c = credit_cnt.get(n, 0)
+            if c > 0:
+                credit_mean[n] = credit_mean[n] / c
+
+        # table rows
+        rows = []
+        for nid, p_now in params_now.items():
+            p_prev = self._prev_params.get(nid, AbstractTensor.zeros_like(p_now))
+            dp = p_now - p_prev
+            l1, l2 = self._norms(dp)
+            role = roles.get(int(nid), "")
+            P = int(getattr(p_now, "shape", (1,))[-1]) if hasattr(p_now, "shape") else 1
+            status = "DEAD" if (l2 <= self.dead_tol and resF_ct[nid] == 0 and resG_ct[nid] == 0 and rings_delta.get(nid, 0) == 0) else ""
+            rows.append({
+                "nid": int(nid),
+                "role": role,
+                "P": P,
+                "param": self._fmt_vec(p_now),
+                "Δp1": l1,
+                "Δp2": l2,
+                "resF": int(resF_ct[nid]),
+                "resG": int(resG_ct[nid]),
+                "imp": int(rings_delta.get(nid, 0)),
+                "deg": f"{din.get(nid,0)}/{dout.get(nid,0)}",
+                "pops": int(pops_sum.get(nid, 0)),
+                "credit": float(credit_mean.get(nid, 0.0)),
+                "status": status,
+            })
+
+        # sort (smallest movement first helps spot dead regions)
+        if self.sort_by == "Δp2":
+            rows.sort(key=lambda r: (r["Δp2"], r["nid"]))
+        elif self.sort_by == "nid":
+            rows.sort(key=lambda r: r["nid"])
+
+        # print
+        print("\n[PARAMS] t=%.2fs (Δ since last=%.2fs)" % (t, t - self._t_last))
+        print(" nid | role      |  P | param[0:K]             |   Δp1    |   Δp2    | rF | rG | imp | deg(in/out) | pops |  credit  | status")
+        print("-----+-----------+----+------------------------+----------+----------+----+----+-----+-------------+------+----------+--------")
+        for r in rows:
+            print(f"{r['nid']:>4d} | {r['role'][:9]:<9} | {r['P']:>2d} | {r['param']:<22} | "
+                  f"{r['Δp1']:>8.2e} | {r['Δp2']:>8.2e} | {r['resF']:>2d} | {r['resG']:>2d} | "
+                  f"{r['imp']:>3d} | {r['deg']:^11} | {r['pops']:>4d} | {r['credit']:>8.2e} | {r['status']}")
+        print(flush=True)
+
+        # rollover
+        self._prev_params = params_now
+        self._prev_rings = {k: int(e.rings) for k, e in self.sys.edges.items()}
+        self._t_last = t
+
+
 class SpringRepulsorSystem:
     def __init__(self, nodes: List[Node], edges: List[Edge], *,
                  eta: float = 0.1, gamma: float = 0.92, dt: float = 0.02,
@@ -597,7 +759,7 @@ class SpringRepulsorSystem:
             n.p = n.p + dp
             n.hist_p.append(n.p.copy())
 
-
+        print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
     def commit_some(self, every_s: float = 0.2):
         t = now_s()
         for n in self.nodes.values():
@@ -1538,7 +1700,7 @@ class Experiencer(threading.Thread):
         self.outputs = outputs
         # If none provided, fall back to the tiny demo. (We’ll pass one in.)
         self.ops_program = ops_program
-
+        self.logger = ParamLogger(sys, interval_s=5.0, dead_tol=1e-8, preview_k=3, sort_by="Δp2")
     def _residual_for_out(
         self, out_id: int, y_val: AbstractTensor, t: float
     ) -> Optional[AbstractTensor]:
@@ -1550,6 +1712,7 @@ class Experiencer(threading.Thread):
     def run(self):
         t0 = now_s()
         while not self.stop.is_set():
+            print("Experiencer step")
             t = now_s() - t0
             
             # --- Forward sweep: evaluate all ops once ---
@@ -1611,41 +1774,61 @@ class Experiencer(threading.Thread):
                                 )
 
             # --- Reverse sweep: propagate residuals upstream ---
+            # --- Reverse sweep: propagate residuals upstream ---
             for space in Space:
                 bucket = residuals.get_bucket(space)
                 if not bucket:
+                    print(f"[WARNING] No residuals in space {space}; skipping impulse pass.")
                     continue
-                for (name, srcs, out, args, kwargs), g_list, y in reversed(
-                    list(zip(specs, grads, ys))
-                ):
+
+                # specs, grads, ys are aligned
+                for (name, srcs, out, args, kwargs), g_list, y in reversed(list(zip(specs, grads, ys))):
                     items = bucket.get(int(out))
-                    if (
-                        items is None
-                        or not isinstance(g_list, (list, tuple, AbstractTensor))
-                        or len(g_list) == 0
-                    ):
+                    if items is None:
+                        print(f"[WARNING] No items found in bucket for output {out}; skipping.")
                         continue
-                    g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)
+                    if not isinstance(g_list, (list, tuple, AbstractTensor)) or len(g_list) == 0:
+                        print(f"[WARNING] No gradients for op {name} output {out}; skipping.")
+                        continue
+
+                    # Stack per-source grads, enforce consistent channel width C
+                    g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)  # (S, C)
                     if g_stack.shape[0] != len(srcs):
-                        raise ValueError(
-                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})"
-                        )
+                        raise ValueError(f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})")
+
                     for item in list(items.values()):
+                        # 1) Ensure residual width matches the operator channel width
+                        #    - If explicitly mismatched in Feature space, expand zero-width to C zeros
                         if space is Space.F and item.width != C:
-                            raise ValueError(
-                                f"{name}: feature residual width {item.width} mismatches grad width {C}"
-                            )
-                        rF = AbstractTensor.get_tensor(item.value)
+                            if item.width == 0:
+                                # promote empty residual to a zero vector of width C
+                                item.value = AbstractTensor.zeros(C, dtype=float)
+                                item.width = C
+                            else:
+                                raise ValueError(f"{name}: feature residual width {item.width} mismatches grad width {C}")
+
+                        rF = AbstractTensor.get_tensor(item.value)  # shape (C,) for F, or scalar for axis-G
+
+                        # 2) Local J^T * r_out product (never collapse feature width)
                         if item.axis is not None:
-                            prod = g_stack[:, item.axis] * rF
-                            g_scalars = prod
+                            # Axis-specific residual (Geometry space): map back into C channels by
+                            # selecting that channel. prod_axis has shape (S,)
+                            prod_axis = g_stack[:, item.axis] * rF
+                            # Expand into (S, C) by placing on the chosen axis (vector-valued update)
+                            prod = AbstractTensor.zeros_like(g_stack)
+                            prod[:, item.axis] = prod_axis
                         else:
+                            # Full feature residual: elementwise (S,C) * (C,) → (S,C)
                             prod = g_stack * rF
-                            g_scalars = prod.sum(dim=1)
+
+                        # 3) Emit impulses (still per-source, vector aware; batch API will scalarize per edge)
                         if space is Space.F:
+                            # Reduce per source to a scalar impulse if your edge scalar expects magnitude.
+                            # If you want pure vector impulses, adapt impulse_batch to accept (S,C).
+                            g_scalars = prod.sum(dim=1)  # (S,)
                             self.sys.impulse_batch(srcs, out, name, g_scalars)
 
-                        # Parameter updates for source nodes
+                        # 4) Parameter updates for source nodes — preserve param width P
                         param_nodes = []
                         param_idx = []
                         for idx_i, i in enumerate(srcs):
@@ -1653,35 +1836,66 @@ class Experiencer(threading.Thread):
                             if node is not None and hasattr(node, "param"):
                                 param_nodes.append(node)
                                 param_idx.append(idx_i)
+
                         if param_nodes:
+                            # params: (M, P)
                             params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+                            P = params.shape[-1]
+                            # upd_full: (M, C) pulled out of prod by source index
                             upd_full = prod[param_idx]
-                            if getattr(params, "shape", ()) == getattr(upd_full, "shape", () ):
-                                params = params + upd_full
+
+                            if upd_full.ndim == 1:
+                                # Shouldn't happen now (we expanded axis to C), but defend anyway
+                                # broadcast to (M, P)
+                                upd_param = upd_full[:, None].repeat(P, axis=1)
                             else:
-                                extra_dims = tuple(range(1, getattr(upd_full, "ndim", 1)))
-                                params = params + upd_full.sum(dim=extra_dims).reshape(params.shape)
+                                if C == P:
+                                    upd_param = upd_full  # shape matches
+                                else:
+                                    # If you want a learned projector, apply it here:
+                                    #   upd_param = (Proj @ upd_full.T).T  # Proj: (P, C)
+                                    # For now, fail loudly so we don’t silently scramble shapes.
+                                    raise ValueError(
+                                        f"{name}: update width C={C} does not match param width P={P} "
+                                        f"for sources {param_idx}; provide a projector or align widths."
+                                    )
+
+                            params = params + upd_param
                             for node, new_param in zip(param_nodes, params):
                                 node.param = new_param
 
-                        # Transport residuals upstream: J^T * r_out
+                        # 5) Transport residuals upstream (keep vector width)
                         for idx_i, src in enumerate(srcs):
-                            r_in_full = prod[idx_i]
+                            r_in_full = prod[idx_i]                # (C,)
                             node = self.sys.nodes.get(int(src))
-                            base = None
-                            if node is not None:
-                                base = getattr(node, "param", None)
-                                if base is None:
-                                    base = getattr(node, "p", None)
+                            # choose a base to shape against; prefer param (P) then p (D)
+                            base = getattr(node, "param", None) if node is not None else None
                             if base is None:
-                                base = r_in_full
-                            if getattr(base, "shape", ()) == getattr(r_in_full, "shape", () ):
-                                r_in = r_in_full
+                                base = getattr(node, "p", None) if node is not None else None
+
+                            if base is not None and getattr(base, "ndim", 0) > 0:
+                                target_w = base.shape[-1]
+                                if r_in_full.shape[-1] == target_w:
+                                    r_in = r_in_full
+                                elif r_in_full.shape[-1] == 1:
+                                    r_in = AbstractTensor.repeat(r_in_full, target_w, axis=-1)
+                                else:
+                                    # Last-chance projector spot if C != target_w
+                                    raise ValueError(
+                                        f"{name}: cannot map residual width {r_in_full.shape[-1]} "
+                                        f"to base width {target_w} at src {src}; add a projector."
+                                    )
                             else:
-                                extra_dims = tuple(range(getattr(r_in_full, "ndim", 0) - getattr(base, "ndim", 0)))
-                                r_in = r_in_full.sum(dim=extra_dims).reshape(getattr(base, "shape", ()))
+                                r_in = r_in_full  # fallback
+
                             width = r_in.shape[-1] if getattr(r_in, "ndim", 0) > 0 else 1
                             residuals.add(int(src), r_in, space=space, width=width)
+            print("Post-op residuals:", residuals)
+            print("Post-op residual buckets:", {space: len(residuals.get_bucket(space)) for space in Space})
+            print("----")
+            print("")
+            # --- Optional smoothing pass on residuals ---
+            print("Smoothing residuals...")
 
             # Optional Poisson redistribution across all residual nodes
             for space in Space:
@@ -1707,6 +1921,13 @@ class Experiencer(threading.Thread):
                                 adjacency[i, j] = adjacency[j, i] = 1.0
 
                     R = AbstractTensor.stack([item.value for _, item in pairs], dim=0)
+                    print(f"Smoothing {len(pairs)} residuals of shape {R.shape if R.ndim > 1 else 1} in space {space}...")
+                    print("R:")
+                    print(R)
+                    print("adjacency:")
+                    print(adjacency)
+                    if len(R) != N:
+                        raise ValueError(f"Residual smoothing: expected {N} residuals, got {len(R)}")
                     if R.ndim == 1:
                         R_sm = filtered_poisson(R, iterations=20, adjacency=adjacency)
                     else:
@@ -1717,7 +1938,11 @@ class Experiencer(threading.Thread):
                         R_sm = AbstractTensor.stack(cols, dim=1)
                     for (nid, item), r_sm in zip(pairs, R_sm):
                         item.value = r_sm
-
+            print("Residuals:", residuals)
+            print("Residual buckets:", {space: len(residuals.get_bucket(space)) for space in Space})
+            print("----")
+            print("")
+            print("Feedback edges:", self.sys.feedback_edges)
             # Global feedback edges seeded from aggregate residuals
             if self.sys.feedback_edges and residuals.any():
                 L = AbstractTensor.get_tensor(0.0)
@@ -1736,8 +1961,9 @@ class Experiencer(threading.Thread):
                             e.update_credit(L_scalar, self.dt)
                             e.ingest_impulse(L_scalar, self.dt)
                     except Exception:
+                        print(f"[ERROR] Failed to update feedback edge {key}: {e}")
                         pass
-
+            self.logger.tick(residuals=residuals)
             time.sleep(self.dt)
 
 
