@@ -1162,6 +1162,8 @@ class AbstractTensor:
 
         # --- gather
         y = base.gather(idx, dim)
+        axis = dim if dim >= 0 else len(bshape) + dim
+        axis_after = axis + len(ishape) - 1
 
         # --- apply function chain
         for spec in fn_specs or ():
@@ -1169,6 +1171,14 @@ class AbstractTensor:
                 raise TypeError("fn_specs must be (fn, slice_spec) pairs")
             fn, sl = spec[0], spec[1]
             p_slice = p_all[sl]  # autograd-friendly slicing
+            if getattr(p_slice, "ndim", 0) < getattr(y, "ndim", 0):
+                lead = axis_after - (p_slice.ndim - 1)
+                trail = y.ndim - lead - p_slice.ndim
+                p_slice = p_slice.reshape(
+                    *(1,) * max(0, lead),
+                    *p_slice.shape,
+                    *(1,) * max(0, trail),
+                )
             y = fn(y, p_slice)
         return y
 
