@@ -11,7 +11,7 @@ full discrete exterior calculus operators are available.
 """
 from __future__ import annotations
 
-from ...tensors.abstraction import AbstractTensor
+from ..tensors.abstraction import AbstractTensor
 
 
 def hex_face_curvature(p0: AbstractTensor, p1: AbstractTensor) -> AbstractTensor:
@@ -41,4 +41,18 @@ def hex_face_curvature(p0: AbstractTensor, p1: AbstractTensor) -> AbstractTensor
     normal = AbstractTensor.tensor([-edge[1], edge[0]])
     num = AbstractTensor.dot(edge, normal)
     denom = AbstractTensor.linalg.norm(edge) * AbstractTensor.linalg.norm(normal) + 1e-12
+    return num / denom
+
+
+def hex_face_curvature_batch(p0: AbstractTensor, p1: AbstractTensor) -> AbstractTensor:
+    """Vectorised ``hex_face_curvature`` for arrays of edge endpoints."""
+
+    v0 = AbstractTensor.get_tensor(p0)[..., :2]
+    v1 = AbstractTensor.get_tensor(p1)[..., :2]
+    edge = v1 - v0
+    normal = AbstractTensor.stack([-edge[..., 1], edge[..., 0]], dim=-1)
+    num = AbstractTensor.sum(edge * normal, dim=-1)
+    edge_norm = AbstractTensor.linalg.norm(edge, dim=-1)
+    norm_norm = AbstractTensor.linalg.norm(normal, dim=-1)
+    denom = edge_norm * norm_norm + 1e-12
     return num / denom
