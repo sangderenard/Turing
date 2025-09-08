@@ -83,6 +83,12 @@ def _op_apply_factory(
 
 def _freeze_for_key(obj: Any) -> Any:
     """Recursively convert lists/dicts to tuples for hashing."""
+    if isinstance(obj, slice):
+        return (
+            _freeze_for_key(obj.start),
+            _freeze_for_key(obj.stop),
+            _freeze_for_key(obj.step),
+        )
     if isinstance(obj, dict):
         return tuple(sorted((str(k), _freeze_for_key(v)) for k, v in obj.items()))
     if isinstance(obj, (list, tuple)):
