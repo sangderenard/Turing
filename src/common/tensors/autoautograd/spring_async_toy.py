@@ -63,6 +63,12 @@ from ...dt_system.spectral_dampener import spectral_inertia
 from ...dt_system.curvature import hex_face_curvature
 from ...dt_system.integrator.integrator import Integrator
 from ...dt_system.dt_scaler import Metrics
+from ...dt_system.dt_controller import STController, Targets
+from ...dt_system.dt_graph import GraphBuilder, MetaLoopRunner
+from ...dt_system.engine_api import EngineRegistration
+from ...dt_system.roundnode_engine import RoundNodeEngine
+from ...dt_system.state_table import StateTable
+from ...dt_system.threaded_system import ThreadedSystemEngine
 V_MAX = 2.0
 STEP_MAX = 10.2
 READOUT_SCALE = 1.0
@@ -114,6 +120,24 @@ def norm_weights(ws):
     if s <= 0.0:
         return [1.0 / max(1, len(ws))] * len(ws)
     return [w / s for w in ws]
+
+
+def capture_node_positions(sys: 'SpringRepulsorSystem'):
+    """Return a capture function yielding node positions.
+
+    The returned callable packs a mapping ``{"positions": [[x, y, z], ...]}``
+    suitable for ThreadedSystemEngine's ``capture`` hook, enabling optional
+    visualisation of the current node positions.
+    """
+
+    def _cap() -> Dict[str, List[List[float]]]:
+        pos = [
+            AbstractTensor.get_tensor(n.p).tolist()  # type: ignore[call-arg]
+            for n in sys.nodes.values()
+        ]
+        return {"positions": pos}
+
+    return _cap
 
 
 def _stack_grads_per_source(
@@ -1753,27 +1777,6 @@ class Ops:
             node.p[2] = float(mean_val)
         return y
 
-# ----------------------------- Threads --------------------------------------
-
-class Reflector(threading.Thread):
-    def __init__(self, sys: SpringRepulsorSystem, stop: threading.Event,
-                 tick_hz: float = 50.0):
-        super().__init__(daemon=True)
-        self.engine = SpringDtEngine(sys)
-        self.stop = stop
-        self.tick_dt = 1.0 / tick_hz
-
-    def run(self):
-        # THEORETIC.md frames integration as event-driven; this loop still relies
-        # on wall-clock ticks and thus drifts from the "timeless" goal.
-        while not self.stop.is_set():
-            t0 = now_s()
-            self.engine.step(self.tick_dt)
-            elapsed = now_s() - t0
-            to_sleep = max(0.0, self.tick_dt - elapsed)
-            time.sleep(to_sleep)
-
-
 class Experiencer(threading.Thread):
     def __init__(
         self,
@@ -2060,7 +2063,6 @@ class Experiencer(threading.Thread):
                         print(f"[ERROR] Failed to update feedback edge {key}: {e}")
                         pass
             self.logger.tick(residuals=residuals)
-            time.sleep(self.dt)
 
 
 
@@ -2383,11 +2385,28 @@ def main(duration_s: float = 8.0, viz_mode: str = "none"):
     sys, outputs = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
 
     stop = threading.Event()
-    refl = Reflector(sys, stop, tick_hz=30.0)
+    tick_hz = 30.0
+    tick_dt = 1.0 / tick_hz
+
+    table = StateTable()
+    spring_engine = SpringDtEngine(sys)
+    targets = Targets(cfl=1.0, div_max=1.0, mass_max=1.0)
+    ctrl = STController(dt_min=1e-6)
+    reg = EngineRegistration(name="spring", engine=spring_engine, targets=targets, dx=1.0)
+    gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=1.0)
+    round_node = gb.round(dt=tick_dt, engines=[reg], state_table=table)
+    round_engine = RoundNodeEngine(inner=round_node, runner=MetaLoopRunner(state_table=table))
+    worker = ThreadedSystemEngine(round_engine, capture=capture_node_positions(sys))
+
+    def _drive() -> None:
+        while not stop.is_set():
+            worker.step(tick_dt, state_table=table)
+
+    drive_thread = threading.Thread(target=_drive, daemon=True)
     expr = Experiencer(sys, stop, outputs, schedule_hz=60.0, ops_program=sys.ops_program)
 
     print("[INFO] Starting threads…")
-    refl.start(); expr.start()
+    drive_thread.start(); expr.start()
     t0 = now_s()
 
     if viz_mode == "gl":
@@ -2477,14 +2496,14 @@ def main(duration_s: float = 8.0, viz_mode: str = "none"):
                 next_log += LOG_EVERY
 
             viz.step(0.0)           # render without forcing a big sleep
-            time.sleep(0.005)       # tiny yield so we don’t busy-wait
 
 
 
     finally:
         stop.set()
         expr.join(timeout=2.0)
-        refl.join(timeout=2.0)
+        drive_thread.join(timeout=2.0)
+        worker.stop()
         print("[INFO] Stopped.")
         viz.close()
 
