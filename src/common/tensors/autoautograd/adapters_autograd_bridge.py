@@ -76,8 +76,8 @@ def push_impulses_from_op(
 
     residual: full-vector `(y - target)` if already computed; otherwise ``None``.
     """
-    # gather current scalar parameters from nodes
-    vals = [AbstractTensor.array(sys.nodes[i].param, dtype=float) for i in src_ids]
+    # gather current control parameters from nodes
+    vals = [AbstractTensor.array(sys.nodes[i].ctrl, dtype=float) for i in src_ids]
 
     y_at, grads_at = run_op_and_grads(op_name, *vals)  # grads in same order as src_ids
 

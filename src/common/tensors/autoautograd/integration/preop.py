@@ -35,9 +35,9 @@ def preactivate_src(sys: Any, nid: int) -> Tuple[AbstractTensor, dict]:
     n = sys.nodes[nid]
     x = n.p
     ecc_raw, w, b = (
-        AbstractTensor.get_tensor(n.param[0]),
-        AbstractTensor.get_tensor(n.param[1]),
-        AbstractTensor.get_tensor(n.param[2]),
+        AbstractTensor.get_tensor(n.ctrl[0]),
+        AbstractTensor.get_tensor(n.ctrl[1]),
+        AbstractTensor.get_tensor(n.ctrl[2]),
     )
     gate = _sigmoid(ecc_raw)  # 0-1 mix between identity and activation
     z = x * w + b
