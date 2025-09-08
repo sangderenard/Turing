@@ -2,6 +2,18 @@
 Spring-Repulsor Async Toy (AbstractTensor)
 ---------------------------------
 Minimal, threadful prototype of the "spring–repulsor, multiband gradient acoustics" learner.
+This toy sketches ideas from ``THEORETIC.md`` where nodes are geometry-indifferent
+and edges/faces carry the discrete exterior calculus (DEC) parameters.  It keeps the
+asynchronous ``Experiencer`` / ``Reflector`` split but still deviates from the plan in
+several ways:
+
+- Uses an explicit time-step integrator instead of the proposed timeless, impulse-only
+  update (see ``tick``).
+- Nodes expose all three geometric channels and are free by default; ``THEORETIC.md``
+  expects x/z to be clamped and only the y-channel to evolve.
+- Caching, batching and stress-based updates are stubs.
+
+Current features:
 
 - < 20 nodes
 - Two roles/threads: Experiencer (ops + impulses) and Reflector (relaxer/integrator)
@@ -170,7 +182,12 @@ def attach_dirichlet(
     alpha: float = 2.0,
     axis: int = 0,
 ) -> None:
-    """Clamp only the chosen axis of ``nid`` toward value_fn(t); leave other axes untouched."""
+    """Clamp only the chosen axis of ``nid`` toward value_fn(t); leave other axes untouched.
+
+    ``THEORETIC.md`` envisions x and z as fixed Dirichlet channels.  This helper
+    now installs an explicit per-axis mask so the integrator can respect that
+    convention.
+    """
     D = sys.D if D is None else int(D)
 
     def _target_vec(t, _sys=sys, _nid=nid, _axis=axis):
@@ -178,8 +195,11 @@ def attach_dirichlet(
         p_now = _sys.nodes[_nid].p.clone()
         p_now[_axis] = float(value_fn(t))
         return p_now
-
-    sys.add_boundary(BoundaryPort(nid=nid, alpha=alpha, target_fn=_target_vec))
+    mask = AbstractTensor.zeros(D, dtype=float)
+    mask[axis] = 1.0
+    sys.add_boundary(
+        BoundaryPort(nid=nid, alpha=alpha, target_fn=_target_vec, axis_mask=mask)
+    )
 
 
 def attach_neumann_noop(
@@ -190,11 +210,21 @@ def attach_neumann_noop(
     beta: float = 1.0,
     axis: int = 0,
 ) -> None:
-    """Attach a traction-capable boundary that exerts no force (pass-through)."""
+    """Attach a traction-capable boundary that exerts no force (pass-through).
+
+    The mask matches ``attach_dirichlet`` so axes can be toggled free vs. fixed.
+    """
 
     D = sys.D if D is None else int(D)
+    mask = AbstractTensor.zeros(D, dtype=float)
+    mask[axis] = 1.0
     sys.add_boundary(
-        BoundaryPort(nid=nid, beta=beta, force_fn=as_axis_force(lambda _t: 0.0, axis, D))
+        BoundaryPort(
+            nid=nid,
+            beta=beta,
+            force_fn=as_axis_force(lambda _t: 0.0, axis, D),
+            axis_mask=mask,
+        )
     )
 
 def _fresh_node_id(sys: 'SpringRepulsorSystem') -> int:
@@ -324,6 +354,12 @@ class Node:
     v: AbstractTensor = field(
         default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
     )  # shape (D,)
+    # Mask indicating which geometric axes are free to move.
+    # THEORETIC.md constrains x and z to Dirichlet roles and leaves only y free,
+    # but this toy still integrates all axes unless `geom_mask` is set accordingly.
+    geom_mask: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.ones(3, dtype=float)
+    )
     sphere: AbstractTensor = field(
         default_factory=lambda: AbstractTensor.zeros(0, dtype=float)
     )
@@ -493,6 +529,8 @@ class BoundaryPort:
     beta: float = 0.0                      # Neumann (traction) gain
     target_fn: Optional[Callable[[float], AbstractTensor]] = None  # t -> R^D
     force_fn: Optional[Callable[[float], AbstractTensor]]  = None  # t -> R^D
+    # Optional per-axis mask selecting which components the boundary acts on.
+    axis_mask: Optional[AbstractTensor] = None
     enabled: bool = True
 
 
@@ -773,7 +811,9 @@ class SpringRepulsorSystem:
 
     # ----------------- Physics tick -----------------
     def tick(self):
-        # Force accumulator
+        # NOTE: This is a time-stepped Euler integrator. THEORETIC.md describes
+        # a timeless, impulse-accumulating update; replacing this loop with the
+        # unrolled variational solver remains future work.
         F: Dict[int, AbstractTensor] = {i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes}
 
 
@@ -797,25 +837,35 @@ class SpringRepulsorSystem:
             if not b.enabled or b.nid not in self.nodes:
                 continue
             n = self.nodes[b.nid]
+            mask = (
+                b.axis_mask
+                if b.axis_mask is not None
+                else AbstractTensor.ones(self.D, dtype=float)
+            )
             # Dirichlet spring toward target
             if b.alpha > 0.0 and b.target_fn is not None:
                 tvec = b.target_fn(t_now)
                 if AbstractTensor.isfinite(tvec).all():
-                    F[n.id] += -b.alpha * (n.p - tvec)
+                    F[n.id] += mask * (-b.alpha * (n.p - tvec))
             # Neumann traction force
             if b.beta > 0.0 and b.force_fn is not None:
                 fvec = b.force_fn(t_now)
                 if AbstractTensor.isfinite(fvec).all():
-                    F[n.id] += b.beta * fvec
+                    F[n.id] += mask * (b.beta * fvec)
 
         # Integrate with heavy damping
         for n in self.nodes.values():
+            mask = getattr(n, "geom_mask", None)
+            if mask is None:
+                mask = AbstractTensor.ones_like(n.p)
+            F[n.id] *= mask
             # spectral response (ND) → smoothing force
             resp, _, _ = self._spectral_inertia(n)
             if not AbstractTensor.isfinite(resp).all():
                 resp = AbstractTensor.zeros_like(n.p)
             F[n.id] += -resp
             n.v = self.gamma * n.v + self.dt * F[n.id] / n.M0
+            n.v *= mask
 
             # cap velocity
             speed = AbstractTensor.linalg.norm(n.v)
@@ -827,7 +877,7 @@ class SpringRepulsorSystem:
             step = float(AbstractTensor.linalg.norm(dp))
             if step > STEP_MAX:
                 dp *= STEP_MAX / (step + 1e-12)
-            n.p = n.p + dp
+            n.p = n.p + dp * mask
             n.hist_p.append(n.p.copy())
 
         print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
@@ -1729,6 +1779,8 @@ class Reflector(threading.Thread):
         self.commit_every_s = commit_every_s
 
     def run(self):
+        # THEORETIC.md frames integration as event-driven; this loop still relies
+        # on wall-clock ticks and thus drifts from the "timeless" goal.
         t_last = now_s()
         t_commit = now_s()
         while not self.stop.is_set():
