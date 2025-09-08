@@ -30,6 +30,8 @@ class BatchVJPResult:
     grads_full: Tuple[Any, ...]
     grads_per_source: Tuple[Tuple[float, ...], ...]
     grads_per_source_tensor: Any | None = None
+    param_grads_full: Tuple[Any, ...] | None = None
+    param_grads_tensor: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ def run_op_and_grads_cached(
         return hit.y, hit.grads, hit.meta
 
     vals = [sys.nodes[i].sphere for i in src_ids]
+    param_grads_full = None
     if op_name == "add" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] + vals[1]
         ones0 = vals[0] * 0 + 1
@@ -200,6 +203,8 @@ def run_op_and_grads_cached(
         )
         y = batch.ys[0]
         grads_full = batch.grads_full[0]
+        if batch.param_grads_full:
+            param_grads_full = batch.param_grads_full[0]
 
     node0 = sys.nodes[src_ids[0]]
     sphere = node0.sphere
@@ -236,7 +241,9 @@ def run_op_and_grads_cached(
         else:
             grads = _reduce_per_source(grads_full)
     elif grad_mode == "param":
-        if grads_full is None:
+        if param_grads_full is not None:
+            grads = param_grads_full
+        elif grads_full is None:
             grads = AbstractTensor.zeros((len(src_ids), P), float)
         else:
             grads = grads_full[:, D:] if P > 0 else grads_full[:, 0:0]
@@ -269,6 +276,13 @@ def run_batched_vjp(
     """
     op_kwargs = op_kwargs or {}
     op_name = jobs[0].op if jobs else ""
+
+    param_tensor = None
+    if "param_tensor" in op_kwargs:
+        param_tensor = op_kwargs["param_tensor"]
+    elif op_name == "gather_and" and len(op_args) >= 3 and not isinstance(op_args[0], int):
+        param_tensor = op_args[2]
+
     if not jobs:
         return BatchVJPResult(
             slices=BatchSlices(index_of={}, job_ids=()),
@@ -276,6 +290,8 @@ def run_batched_vjp(
             grads_full=(),
             grads_per_source=(),
             grads_per_source_tensor=None,
+            param_grads_full=(),
+            param_grads_tensor=None,
         )
 
     idx_of: Dict[str, int] = {j.job_id: i for i, j in enumerate(jobs)}
@@ -299,6 +315,8 @@ def run_batched_vjp(
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
+        if param_tensor is not None and hasattr(param_tensor, "requires_grad_"):
+            param_tensor = param_tensor.requires_grad_()
 
         # Slice per-job tensors referencing the union view
         x_list = [x_all[idxs] for idxs in slices_for_job]
@@ -378,14 +396,29 @@ def run_batched_vjp(
 
         if L is None:
             g_all = x_all.zeros_like() if hasattr(x_all, "zeros_like") else (x_all * 0)
+            if param_tensor is not None:
+                if hasattr(param_tensor, "zeros_like"):
+                    g_param = param_tensor.zeros_like()
+                else:
+                    g_param = param_tensor * 0
+            else:
+                g_param = None
         else:
-            g_all = autograd.grad(L, (x_all,), retain_graph=False, allow_unused=True)[0]
+            targets = (x_all, param_tensor) if param_tensor is not None else (x_all,)
+            grads = autograd.grad(L, targets, retain_graph=False, allow_unused=True)
+            g_all = grads[0]
+            g_param = grads[1] if param_tensor is not None else None
 
     g_stack = g_all
     if g_stack is None:
         grads_list = [None for _ in jobs]
     else:
         grads_list = [g_stack[idxs] for idxs in slices_for_job]
+
+    if g_param is None:
+        param_grads_list = [None for _ in jobs]
+    else:
+        param_grads_list = [g_param[idxs] for idxs in slices_for_job]
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(
@@ -399,4 +432,6 @@ def run_batched_vjp(
         grads_full=grads_full,
         grads_per_source=grads_per_source,
         grads_per_source_tensor=g_stack,
+        param_grads_full=tuple(param_grads_list),
+        param_grads_tensor=g_param,
     )
