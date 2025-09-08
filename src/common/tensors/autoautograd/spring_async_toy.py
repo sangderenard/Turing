@@ -655,9 +655,17 @@ class ParamLogger:
 
 
 class SpringRepulsorSystem:
-    def __init__(self, nodes: List[Node], edges: List[Edge], *,
-                 eta: float = 0.1, gamma: float = 0.92, dt: float = 0.02,
-                 rep_eps: float = 1e-6):
+    def __init__(
+        self,
+        nodes: List[Node],
+        edges: List[Edge],
+        faces: Optional[List[Face]] = None,
+        *,
+        eta: float = 0.1,
+        gamma: float = 0.92,
+        dt: float = 0.02,
+        rep_eps: float = 1e-6,
+    ):
         self.nodes: Dict[int, Node] = {n.id: n for n in nodes}
         self.edges: Dict[Tuple[int, int, str], Edge] = {e.key: e for e in edges}
         self.eta = eta
@@ -670,6 +678,51 @@ class SpringRepulsorSystem:
         self.D = int(next(iter(self.nodes.values())).p.shape[0])
         # loop-back loss plumbing (optional) – support multiple edges
         self.feedback_edges: List[Tuple[int, int, str]] = []
+
+        # ----- Geometry assembly -----
+        self.node_ids = [n.id for n in nodes]
+        node_index = {nid: i for i, nid in enumerate(self.node_ids)}
+        self.edge_list = list(edges)
+        E = len(self.edge_list)
+        N = len(self.node_ids)
+        self.D0 = AbstractTensor.zeros((E, N), dtype=float)
+        l0_vals = []
+        k_vals = []
+        for e_idx, e in enumerate(self.edge_list):
+            i_idx = node_index[e.i]
+            j_idx = node_index[e.j]
+            self.D0[e_idx, i_idx] = -1.0
+            self.D0[e_idx, j_idx] = 1.0
+            l0_vals.append(AbstractTensor.get_tensor(e.l0).reshape(()))
+            k_vals.append(AbstractTensor.get_tensor(e.k).reshape(()))
+        self.l0 = (
+            AbstractTensor.stack(l0_vals, dim=0) if l0_vals else AbstractTensor.zeros(0, dtype=float)
+        )
+        self.k = (
+            AbstractTensor.stack(k_vals, dim=0) if k_vals else AbstractTensor.zeros(0, dtype=float)
+        )
+
+        self.faces: List[Face] = list(faces) if faces else []
+        F = len(self.faces)
+        self.D1 = AbstractTensor.zeros((F, E), dtype=float)
+        alpha_vals = []
+        c_vals = []
+        for f_idx, face in enumerate(self.faces):
+            alpha_vals.append(AbstractTensor.get_tensor(face.alpha).reshape(()))
+            c_vals.append(AbstractTensor.get_tensor(face.c).reshape(()))
+            for e_oriented in face.edges:
+                e_id = abs(int(e_oriented)) - 1
+                if 0 <= e_id < E:
+                    sign = 1.0 if e_oriented > 0 else -1.0
+                    self.D1[f_idx, e_id] = sign
+        self.alpha_face = (
+            AbstractTensor.stack(alpha_vals, dim=0)
+            if alpha_vals
+            else AbstractTensor.zeros(0, dtype=float)
+        )
+        self.c = (
+            AbstractTensor.stack(c_vals, dim=0) if c_vals else AbstractTensor.zeros(0, dtype=float)
+        )
 
     def add_boundary(self, port: BoundaryPort):
         self.boundaries[port.nid] = port
