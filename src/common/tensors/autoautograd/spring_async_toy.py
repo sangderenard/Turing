@@ -2475,7 +2475,6 @@ def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) ->
     ctrl = STController(dt_min=1e-6)
     state = StateNode(state=None)
     controller = ControllerNode(ctrl=ctrl, targets=targets, dx=1.0)
-    prev_pos: AbstractTensor | None = None
 
     def _curv(state_obj, dt, *, realtime: bool = False, state_table=None):
         pos_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
@@ -2498,37 +2497,14 @@ def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) ->
         return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
 
     def _spring(state_obj, dt, *, realtime: bool = False, state_table=None):
-        nonlocal prev_pos
-        pos_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
-        prev_pos = AbstractTensor.get_tensor(pos_view.tensor).clone()
         ok, m, new_state = spring_engine.step(dt, state_table=state_table)
         return ok, m, new_state
-
-    def _vertical(state_obj, dt, *, realtime: bool = False, state_table=None):
-        if prev_pos is None:
-            return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
-        p_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
-        v_view = NodeAttrView(sys.nodes, "v", indices=sys.node_ids).build()
-        with p_view.editing() as P:
-            if P.shape[1] > 0:
-                P[:, 0] = getattr(sys, "prev_in_mean", 0.0)
-            if P.shape[1] > 2:
-                P[:, 2] = getattr(sys, "prev_out_mean", 0.0)
-            P[:, 1] = prev_pos[:, 1] + v_view.tensor[:, 1] * dt
-        now = now_s()
-        if getattr(sys, "in_mean_fn", None):
-            sys.prev_in_mean = float(sys.in_mean_fn(now))
-        if getattr(sys, "out_mean_fn", None):
-            sys.prev_out_mean = float(sys.out_mean_fn(now))
-        sys.prev_mean_time = now
-        return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
 
     plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt))
     children = [
         AdvanceNode(advance=_curv, state=state, label="advance:curvature"),
         AdvanceNode(advance=_spectral, state=state, label="advance:spectral"),
         AdvanceNode(advance=_spring, state=state, label="advance:spring"),
-        AdvanceNode(advance=_vertical, state=state, label="advance:vertical"),
     ]
     return RoundNode(plan=plan, controller=controller, children=children, state_table=table)
 
