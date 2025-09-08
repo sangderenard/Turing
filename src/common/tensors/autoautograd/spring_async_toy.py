@@ -624,7 +624,8 @@ class ParamLogger:
         print("\n[PARAMS] t=%.2fs (Δ since last=%.2fs)" % (t, t - self._t_last))
         print(" nid | role      |  P | param[0:K]             |   Δp1    |   Δp2    | rF | rG | imp | deg(in/out) | pops |  credit  | status")
         print("-----+-----------+----+------------------------+----------+----------+----+----+-----+-------------+------+----------+--------")
-        for r in rows:
+        import random as rnd
+        for r in rnd.sample(rows, min(len(rows), 20)) if len(rows) > 20 else rows:
             print(f"{r['nid']:>4d} | {r['role'][:9]:<9} | {r['P']:>2d} | {r['param']:<22} | "
                   f"{r['Δp1']:>8.2e} | {r['Δp2']:>8.2e} | {r['resF']:>2d} | {r['resG']:>2d} | "
                   f"{r['imp']:>3d} | {r['deg']:^11} | {r['pops']:>4d} | {r['credit']:>8.2e} | {r['status']}")
@@ -1899,6 +1900,7 @@ class Experiencer(threading.Thread):
 
             # Optional Poisson redistribution across all residual nodes
             for space in Space:
+                continue
                 bucket = residuals.get_bucket(space)
                 if not bucket:
                     continue
