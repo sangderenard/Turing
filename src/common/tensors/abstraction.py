@@ -1093,30 +1093,144 @@ class AbstractTensor:
         result = tensor.__class__(track_time=tensor.track_time)
         result.data = values
         return AbstractTensor._TopKResult(result, idxs)
-    def gather_and(x, dim, indices, fn, *args, **kwargs):
-        """
-        Gather from `x` along `dim` using `indices`, then pass the gathered tensor
-        straight into `fn` and return whatever it returns.
 
-        x:       tensor (e.g., AbstractTensor)
-        dim:     int, axis in x to gather from
-        indices: integer tensor of indices
-        fn:      callable; will be invoked as fn(gathered, *args, **kwargs)
+    def _prefix_broadcastable(self, shapes, dim: int):
         """
-        g = x.gather(indices, dim)
-        return fn(g, *args, **kwargs)
-    def scatter_and(out, dim, index, src, fn, *args, **kwargs):
+        Raise ValueError if any pair of prefixes ([:dim]) in `shapes`
+        is not broadcastable (equal or 1).
         """
-        Scatter `src` into `out` along `dim` using `index`, then pass the result to `fn`.
+        if dim <= 0 or not shapes:
+            return
+        # Left-pad each prefix with 1s to the same length
+        maxlen = max(len(s) for s in shapes)
+        pads = []
+        for s in shapes:
+            pref = s[:dim] if len(s) >= dim else s
+            # left-pad to `dim` with 1s
+            pref = (1,) * max(0, dim - len(pref)) + tuple(pref[:dim])
+            pads.append(pref)
+        # pairwise check
+        ref = pads[0]
+        for cur in pads[1:]:
+            for a, b in zip(ref, cur):
+                if (a != b) and (a != 1) and (b != 1):
+                    raise ValueError(
+                        f"Prefix dims before axis {dim} are not broadcastable: {ref} vs {cur}"
+                    )
 
-        out:   destination tensor (preallocated)
-        dim:   int, axis in `out` to scatter along
-        index: integer tensor of destinations (same shape as `src` along `dim`)
-        src:   values to scatter
-        fn:    callable; invoked as fn(scattered, *args, **kwargs)
+    def gather_and(
+        self,
+        dim: int,
+        indices,
+        fn_specs,
+        param_tensor,
+        *,
+        other=None,
+    ):
         """
-        y = out.scatter(index, src, dim)
-        return fn(y, *args, **kwargs)
+        Gather from `base` (=other or self) along `dim` with `indices`,
+        then run a function chain with per-fn params sliced from `param_tensor`.
+
+        Parameters
+        ----------
+        dim : int
+            Axis to gather along.
+        indices : tensor-like (int)
+            Indices for gather.
+        fn_specs : Sequence[Tuple[Callable, Any]]
+            List of (fn, slice_spec). Each `fn` is called as `fn(y, p_slice)`.
+        param_tensor : tensor-like
+            Single tensor holding all parameters; slices are drawn from this.
+        other : tensor-like, optional
+            If provided, `other` is the gather source; otherwise `self`.
+
+        Returns
+        -------
+        Any
+            Output of the final function in the chain.
+        """
+        base  = self.ensure_tensor(other) if other is not None else self
+        idx   = base.ensure_tensor(indices)
+        p_all = base.ensure_tensor(param_tensor)
+
+        # --- prefix broadcastability: shapes before `dim` must be equal or 1
+        bshape   = tuple(getattr(base, "shape", ()))
+        ishape   = tuple(getattr(idx,  "shape", ()))
+        pshape   = tuple(getattr(p_all, "shape", ()))
+        # Note: indices participates in the forward shape too; include it here
+        self._prefix_broadcastable([bshape, ishape, pshape], dim)
+
+        # --- gather
+        y = base.gather(idx, dim)
+
+        # --- apply function chain
+        for spec in fn_specs or ():
+            if not isinstance(spec, (tuple, list)) or len(spec) < 2:
+                raise TypeError("fn_specs must be (fn, slice_spec) pairs")
+            fn, sl = spec[0], spec[1]
+            p_slice = p_all[sl]  # autograd-friendly slicing
+            y = fn(y, p_slice)
+        return y
+
+
+    def scatter_and(
+        self,
+        dim: int,
+        index,
+        src,
+        fn_specs,
+        param_tensor,
+        *,
+        other=None,
+    ):
+        """
+        Scatter `src` into `base` (=other or self) along `dim` with `index`,
+        then run a function chain with per-fn params sliced from `param_tensor`.
+
+        Parameters
+        ----------
+        dim : int
+            Axis to scatter along.
+        index : tensor-like (int)
+            Destinations for scatter (same shape as `src` along `dim`).
+        src : tensor-like
+            Values to scatter.
+        fn_specs : Sequence[Tuple[Callable, Any]]
+            List of (fn, slice_spec). Each `fn` is called as `fn(y, p_slice)`.
+        param_tensor : tensor-like
+            Single tensor holding all parameters; slices are drawn from this.
+        other : tensor-like, optional
+            If provided, `other` is the scatter destination; otherwise `self`.
+
+        Returns
+        -------
+        Any
+            Output of the final function in the chain.
+        """
+        base  = self.ensure_tensor(other) if other is not None else self
+        idx   = base.ensure_tensor(index)
+        val   = base.ensure_tensor(src)
+        p_all = base.ensure_tensor(param_tensor)
+
+        # --- prefix broadcastability
+        bshape = tuple(getattr(base, "shape", ()))
+        ishape = tuple(getattr(idx,  "shape", ()))
+        vshape = tuple(getattr(val,  "shape", ()))
+        pshape = tuple(getattr(p_all, "shape", ()))
+        self._prefix_broadcastable([bshape, ishape, vshape, pshape], dim)
+
+        # --- scatter
+        y = base.scatter(idx, val, dim)
+
+        # --- apply function chain
+        for spec in fn_specs or ():
+            if not isinstance(spec, (tuple, list)) or len(spec) < 2:
+                raise TypeError("fn_specs must be (fn, slice_spec) pairs")
+            fn, sl = spec[0], spec[1]
+            p_slice = p_all[sl]
+            y = fn(y, p_slice)
+        return y
+
 
     @staticmethod
     def stack(tensors: List[Any], dim: int = 0) -> "AbstractTensor":
