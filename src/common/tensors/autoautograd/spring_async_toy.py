@@ -2001,8 +2001,6 @@ class LinearBlockFactory:
         return Edge(key=(i, j, op), i=i, j=j, op_id=op, bands=bands, l0=1.0)
 
     def build(self, start_id: int = 0, *, z_level: float = 0.0) -> LinearBlock:
-        from .integration.bridge_v2 import _op_apply_factory
-
         nid = int(start_id)
         nodes: List[Node] = []
         edges: List[Edge] = []
@@ -2105,8 +2103,11 @@ class LinearBlockFactory:
                     )
                 )
 
-        # common agg fn for gather_and
-        agg_fn = _op_apply_factory(["__mul__", "__add__"], ["@param[1]", "@param[2]"])
+        # chain for gather_and: multiply then add using per-node params
+        fn_specs = [
+            (AbstractTensor.__mul__, slice(1, None, 3)),
+            (AbstractTensor.__add__, slice(2, None, 3)),
+        ]
 
         # --- connect: inputs -> first row (fully connected) ---
         if self.rows > 0:
@@ -2118,7 +2119,7 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
-                    (0, list(range(len(srcs))), agg_fn),
+                    (0, list(range(len(srcs))), fn_specs),
                     None,
                 ))
 
@@ -2134,7 +2135,7 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
-                    (0, list(range(len(srcs))), agg_fn),
+                    (0, list(range(len(srcs))), fn_specs),
                     None,
                 ))
 
@@ -2148,7 +2149,7 @@ class LinearBlockFactory:
                 "gather_and",
                 srcs,
                 oj,
-                (0, list(range(len(srcs))), agg_fn),
+                (0, list(range(len(srcs))), fn_specs),
                 None,
             ))
 

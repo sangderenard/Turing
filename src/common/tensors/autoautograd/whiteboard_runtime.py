@@ -35,13 +35,14 @@ class BatchVJPResult:
 class SubFnMeta:
     """Description of a post-op function in a composite kernel.
 
-    ``param_refs`` lists indices into the invoking node's ``param`` vector that
-    should be passed as positional operands.  Scalars broadcast according to the
-    backend's normal rules so no extra annotation is required for them.
+    ``param_refs`` lists indices or slices into the invoking node's ``param``
+    vector that should be passed as positional operands.  Scalars broadcast
+    according to the backend's normal rules so no extra annotation is required
+    for them.
     """
 
     name: str
-    param_refs: Tuple[int, ...] = ()
+    param_refs: Tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,12 +86,16 @@ BATCHABLE_OPS: Dict[str, OpBatchMeta] = {
     # ``matmul`` is included as an example of a non element-wise operator.
     "matmul": OpBatchMeta(shape="matmul"),
     # ``gather_and`` gathers then applies a tiny op chain such as
-    # ("__mul__", "__add__").  Parameter references mirror how the autoautograd
-    # demo wires weights then biases via ``param[1]`` and ``param[2]``.
+    # ("__mul__", "__add__").  Parameter slices mirror how the autoautograd
+    # demo wires weights then biases via ``slice(1, None, 3)`` and
+    # ``slice(2, None, 3)``.
     "gather_and": OpBatchMeta(
         shape="gather",
         dim_params=("dim",),
-        sub_fns=(SubFnMeta("__mul__", (1,)), SubFnMeta("__add__", (2,))),
+        sub_fns=(
+            SubFnMeta("__mul__", (slice(1, None, 3),)),
+            SubFnMeta("__add__", (slice(2, None, 3),)),
+        ),
     ),
 }
 
