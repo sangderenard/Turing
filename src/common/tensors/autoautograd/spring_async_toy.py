@@ -1784,14 +1784,17 @@ class Experiencer(threading.Thread):
                     if items is None:
                         print(f"[WARNING] No items found in bucket for output {out}; skipping.")
                         continue
-                    if not isinstance(g_list, (list, tuple, AbstractTensor)) or len(g_list) == 0:
+                    if g_list is None or (isinstance(g_list, (list, tuple, AbstractTensor)) and len(g_list) == 0):
                         print(f"[WARNING] No gradients for op {name} output {out}; skipping.")
                         continue
 
-                    # Stack per-source grads, enforce consistent channel width C
-                    g_stack, C = _stack_grads_per_source(name, out, srcs, g_list)  # (S, C)
+                    # Consume tensor of per-source grads directly
+                    g_stack = AbstractTensor.get_tensor(g_list)
                     if g_stack.shape[0] != len(srcs):
-                        raise ValueError(f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})")
+                        raise ValueError(
+                            f"{name}: expected {len(srcs)} gradients, got {g_stack.shape[0]} (output {out})"
+                        )
+                    C = g_stack.shape[-1] if getattr(g_stack, "ndim", 0) > 0 else 1
 
                     for item in list(items.values()):
                         # 1) Ensure residual width matches the operator channel width
