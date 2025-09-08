@@ -19,7 +19,7 @@ Notes:
 - Impulses require a residual (sign + magnitude). If no residual is available, the op
   emits **no** impulse and logs a WARNING (clear & explicit).
 - The Reflector integrates geometry at steady ticks and periodically "commits" node
-  positions back into parameter scalars.
+  positions back into control scalars.
 """
 from __future__ import annotations
 from .integration.bridge_v2 import (
@@ -228,9 +228,22 @@ def enliven_feature_edges(sys: SpringRepulsorSystem, in_ids: List[int], out_ids:
     for i in in_ids:
         for o in out_ids:
             sys.ensure_edge(i, o, "feat")  # op_id tag just to distinguish
-def empty_param_generator():
-    while True:
-        yield AbstractTensor.get_tensor([0.0, 1.0, 0.0])
+def _default_ctrl() -> AbstractTensor:
+    """Return the default control triple `(alpha, w, b)`."""
+    return AbstractTensor.get_tensor([0.0, 1.0, 0.0])
+
+
+def _phys_from_p(p: AbstractTensor) -> AbstractTensor:
+    """Extract `[x0, 0.0, z0]` from a position tensor ``p``."""
+    try:
+        x0 = float(AbstractTensor.get_tensor(p[0]))
+    except Exception:
+        x0 = 0.0
+    try:
+        z0 = float(AbstractTensor.get_tensor(p[2]))
+    except Exception:
+        z0 = 0.0
+    return AbstractTensor.get_tensor([x0, 0.0, z0])
 
 def wire_input_chain(
     sys: "SpringRepulsorSystem",
@@ -246,25 +259,28 @@ def wire_input_chain(
     D = sys.D if D is None else int(D)
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param_generator = empty_param_generator()
-    param = param_generator.__next__()
+    phys = _phys_from_p(p)
+    ctrl = _default_ctrl()
     sys.nodes[d] = Node(
         id=d,
-        param=param,
+        phys=phys,
+        ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
-        sphere=AbstractTensor.concat([p, param], dim=0),
+        sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
     attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = param_generator.__next__()
+    phys = _phys_from_p(p)
+    ctrl = _default_ctrl()
     sys.nodes[n] = Node(
         id=n,
-        param=param,
+        phys=phys,
+        ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
-        sphere=AbstractTensor.concat([p, param], dim=0),
+        sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(d, n, "in_link")
@@ -286,26 +302,29 @@ def wire_output_chain(
     D = sys.D if D is None else int(D)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param_generator = empty_param_generator()
-    param = param_generator.__next__()
+    phys = _phys_from_p(p)
+    ctrl = _default_ctrl()
     sys.nodes[n] = Node(
         id=n,
-        param=param,
+        phys=phys,
+        ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
-        sphere=AbstractTensor.concat([p, param], dim=0),
+        sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(system_nid, n, "out_link")
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
-    param = param_generator.__next__()
+    phys = _phys_from_p(p)
+    ctrl = _default_ctrl()
     sys.nodes[d] = Node(
         id=d,
-        param=param,
+        phys=phys,
+        ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
-        sphere=AbstractTensor.concat([p, param], dim=0),
+        sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
     attach_dirichlet(sys, d, target_fn, D=D, alpha=alpha)
     sys.ensure_edge(n, d, "readout")
@@ -316,7 +335,8 @@ def wire_output_chain(
 @dataclass
 class Node:
     id: int
-    param: AbstractTensor  # [eccentricity, weight, bias] tensor
+    phys: AbstractTensor  # [x, y, z] → clamps and slack
+    ctrl: AbstractTensor  # [alpha, w, b]
     p: AbstractTensor  # shape (D,)
     v: AbstractTensor  # shape (D,)
     sphere: AbstractTensor
@@ -325,15 +345,16 @@ class Node:
     version: int = 0
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
 
-    def commit(self, param_residuals=None):
+    def commit(self, ctrl_residuals=None):
         #print("Committing node", self.id)
         #print("p:", self.p)
-        #print("param:", self.param)
+        #print("phys:", self.phys)
+        #print("ctrl:", self.ctrl)
         #print("sphere:", self.sphere)
-        #print("param_residuals:", param_residuals)
-        self.sphere = AbstractTensor.concat([self.p, self.param], dim=0)
-        if param_residuals is not None:
-            self.param += param_residuals
+        #print("ctrl_residuals:", ctrl_residuals)
+        self.sphere = AbstractTensor.concat([self.p, self.phys, self.ctrl], dim=0)
+        if ctrl_residuals is not None:
+            self.ctrl += ctrl_residuals
         self.version += 1
 
 
@@ -482,7 +503,7 @@ class BoundaryPort:
 class ParamLogger:
     """
     Periodically prints a per-node table:
-      nid | role | P | param[0:K] | Δp1 | Δp2 | resF | resG | impulses | deg(in/out) | pops | credit | status
+      nid | role | P | ctrl[0:K] | Δp1 | Δp2 | resF | resG | impulses | deg(in/out) | pops | credit | status
 
     - Δp1/Δp2: L1/L2 delta since last log
     - resF/resG: counts of residual items present this tick (Feature / Geometry)
@@ -498,14 +519,14 @@ class ParamLogger:
         self.sort_by = sort_by  # "Δp2" or "nid"
 
         self._t_last = 0.0
-        self._prev_params = {}
+        self._prev_ctrl = {}
         self._prev_rings = {}
         self._prime()
 
     def _prime(self):
         # cheap, lock-free snapshots
-        self._prev_params = {
-            i: n.param.clone() if hasattr(n.param, "clone") else AbstractTensor.get_tensor(n.param)
+        self._prev_ctrl = {
+            i: n.ctrl.clone() if hasattr(n.ctrl, "clone") else AbstractTensor.get_tensor(n.ctrl)
             for i, n in self.sys.nodes.items()
         }
         self._prev_rings = {k: int(e.rings) for k, e in self.sys.edges.items()}
@@ -551,8 +572,8 @@ class ParamLogger:
 
         # --- snapshots
         roles = getattr(self.sys, "roles", {})
-        params_now = {
-            i: n.param.clone() if hasattr(n.param, "clone") else AbstractTensor.get_tensor(n.param)
+        ctrl_now = {
+            i: n.ctrl.clone() if hasattr(n.ctrl, "clone") else AbstractTensor.get_tensor(n.ctrl)
             for i, n in self.sys.nodes.items()
         }
         rings_delta = self._rings_delta_per_node(self._prev_rings)
@@ -591,8 +612,8 @@ class ParamLogger:
 
         # table rows
         rows = []
-        for nid, p_now in params_now.items():
-            p_prev = self._prev_params.get(nid, AbstractTensor.zeros_like(p_now))
+        for nid, p_now in ctrl_now.items():
+            p_prev = self._prev_ctrl.get(nid, AbstractTensor.zeros_like(p_now))
             dp = p_now - p_prev
             l1, l2 = self._norms(dp)
             role = roles.get(int(nid), "")
@@ -602,7 +623,7 @@ class ParamLogger:
                 "nid": int(nid),
                 "role": role,
                 "P": P,
-                "param": self._fmt_vec(p_now),
+                "ctrl": self._fmt_vec(p_now),
                 "Δp1": l1,
                 "Δp2": l2,
                 "resF": int(resF_ct[nid]),
@@ -622,17 +643,17 @@ class ParamLogger:
 
         # print
         print("\n[PARAMS] t=%.2fs (Δ since last=%.2fs)" % (t, t - self._t_last))
-        print(" nid | role      |  P | param[0:K]             |   Δp1    |   Δp2    | rF | rG | imp | deg(in/out) | pops |  credit  | status")
+        print(" nid | role      |  P | ctrl[0:K]              |   Δp1    |   Δp2    | rF | rG | imp | deg(in/out) | pops |  credit  | status")
         print("-----+-----------+----+------------------------+----------+----------+----+----+-----+-------------+------+----------+--------")
         import random as rnd
         for r in rnd.sample(rows, min(len(rows), 20)) if len(rows) > 20 else rows:
-            print(f"{r['nid']:>4d} | {r['role'][:9]:<9} | {r['P']:>2d} | {r['param']:<22} | "
+            print(f"{r['nid']:>4d} | {r['role'][:9]:<9} | {r['P']:>2d} | {r['ctrl']:<22} | "
                   f"{r['Δp1']:>8.2e} | {r['Δp2']:>8.2e} | {r['resF']:>2d} | {r['resG']:>2d} | "
                   f"{r['imp']:>3d} | {r['deg']:^11} | {r['pops']:>4d} | {r['credit']:>8.2e} | {r['status']}")
         print(flush=True)
 
         # rollover
-        self._prev_params = params_now
+        self._prev_ctrl = ctrl_now
         self._prev_rings = {k: int(e.rings) for k, e in self.sys.edges.items()}
         self._t_last = t
 
@@ -910,7 +931,7 @@ class SpringRepulsorSystem:
 from typing import Any, Tuple
 
 # Expecting SpringRepulsorSystem with:
-#   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.param is scalar
+#   self.nodes: Dict[int, Node] where Node.p is (3,) ndarray-like and Node.ctrl is scalar
 #   self.boundaries: Dict[int, Any] (keys are boundary node ids)
 #   self.edges: Dict[Tuple[int, int, str], Edge] spring edges rendered as GL_LINES
 
@@ -995,7 +1016,7 @@ class LiveVizGLPoints:
     def _snapshot(self):
         # lock-free minimal copy
         nodes = {
-            i: (n.p.clone(), n.param.clone())
+            i: (n.p.clone(), n.ctrl.clone())
             for i, n in self.sys.nodes.items()
         }
         edges = list(self.sys.edges.values())
@@ -1135,18 +1156,18 @@ class LiveVizGLPoints:
         # NEW: replace NaN/Inf early to avoid NaN bounds
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # --- existing params & base colormap (KEEP this: learning nodes stay coolwarm) ---
-        params = AbstractTensor.get_tensor([nodes[i][1][1] for i in ids])
-        
-        vmin = AbstractTensor.min(params)
-        vmax = AbstractTensor.max(params)
+        # --- existing ctrls & base colormap (KEEP this: learning nodes stay coolwarm) ---
+        ctrl_vals = AbstractTensor.get_tensor([nodes[i][1][1] for i in ids])
+
+        vmin = AbstractTensor.min(ctrl_vals)
+        vmax = AbstractTensor.max(ctrl_vals)
         if vmin > 0.0:
             vmin = 0.0 - 1e-6
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
         import numpy as np
-        C = self.node_cmap(norm(params))[:, :3].astype(np.float32)  # (N,3) RGB
+        C = self.node_cmap(norm(ctrl_vals))[:, :3].astype(np.float32)  # (N,3) RGB
 
         # --- sizes (base) ---
         sizes = AbstractTensor.full(
@@ -1486,7 +1507,7 @@ class LiveViz3D:
     def _snapshot(self):
         # cheap, lock-free snapshot
         nodes = {
-            i: (n.p.copy(), float(AbstractTensor.get_tensor(n.param)))
+            i: (n.p.copy(), float(AbstractTensor.get_tensor(n.ctrl[1])))
             for i, n in self.sys.nodes.items()
         }
         edges = list(self.sys.edges.values())
@@ -1514,18 +1535,18 @@ class LiveViz3D:
 
         # split boundary vs non-boundary
         Pn = P[~is_b]; Pb = P[is_b]
-        params = AbstractTensor.array([nodes[i][1] for i in ids])
-        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=AbstractTensor.min(params), vcenter=0.0, vmax=AbstractTensor.max(params))
+        ctrl_vals = AbstractTensor.array([nodes[i][1] for i in ids])
+        self.norm_nodes = mcolors.TwoSlopeNorm(vmin=AbstractTensor.min(ctrl_vals), vcenter=0.0, vmax=AbstractTensor.max(ctrl_vals))
 
         if Pn.size:
             self.scat_nodes = self.ax.scatter(Pn[:,0], Pn[:,1], Pn[:,2],
                                               s=40, marker="o",
-                                              c=self.node_cmap(self.norm_nodes(params[~is_b])),
+                                              c=self.node_cmap(self.norm_nodes(ctrl_vals[~is_b])),
                                               depthshade=False, linewidths=0.5, edgecolors="k")
         if Pb.size:
             self.scat_bounds = self.ax.scatter(Pb[:,0], Pb[:,1], Pb[:,2],
                                                s=90, marker="s",
-                                               c=self.node_cmap(self.norm_nodes(params[is_b])),
+                                               c=self.node_cmap(self.norm_nodes(ctrl_vals[is_b])),
                                                depthshade=False, linewidths=1.0, edgecolors="black")
 
         # edges (draw once; will be recreated each frame)
@@ -1562,13 +1583,13 @@ class LiveViz3D:
         nodes, edges, bset = self._snapshot()
         ids = AbstractTensor.array(sorted(nodes.keys()))
         P = AbstractTensor.stack([nodes[i][0] for i in ids])
-        params = AbstractTensor.array([nodes[i][1] for i in ids])
+        ctrl_vals = AbstractTensor.array([nodes[i][1] for i in ids])
         is_b = AbstractTensor.array([i in bset for i in ids])
 
         # update node colors/positions
-        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(AbstractTensor.min(params)))
-        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(AbstractTensor.max(params)))
-        C_all = self.node_cmap(self.norm_nodes(params))
+        self.norm_nodes.vmin = min(self.norm_nodes.vmin, float(AbstractTensor.min(ctrl_vals)))
+        self.norm_nodes.vmax = max(self.norm_nodes.vmax, float(AbstractTensor.max(ctrl_vals)))
+        C_all = self.node_cmap(self.norm_nodes(ctrl_vals))
 
         Pn = P[~is_b]; Cn = C_all[~is_b]
         Pb = P[is_b];  Cb = C_all[is_b]
@@ -1829,48 +1850,48 @@ class Experiencer(threading.Thread):
                             g_scalars = prod.sum(dim=1)  # (S,)
                             self.sys.impulse_batch(srcs, out, name, g_scalars)
 
-                        # 4) Parameter updates for source nodes — preserve param width P
-                        param_nodes = []
-                        param_idx = []
+                        # 4) Control updates for source nodes — preserve ctrl width P
+                        ctrl_nodes = []
+                        ctrl_idx = []
                         for idx_i, i in enumerate(srcs):
                             node = self.sys.nodes.get(int(i))
-                            if node is not None and hasattr(node, "param"):
-                                param_nodes.append(node)
-                                param_idx.append(idx_i)
+                            if node is not None and hasattr(node, "ctrl"):
+                                ctrl_nodes.append(node)
+                                ctrl_idx.append(idx_i)
 
-                        if param_nodes:
-                            # params: (M, P)
-                            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
-                            P = params.shape[-1]
+                        if ctrl_nodes:
+                            # ctrls: (M, P)
+                            ctrls = AbstractTensor.stack([n.ctrl for n in ctrl_nodes], dim=0)
+                            P = ctrls.shape[-1]
                             # upd_full: (M, C) pulled out of prod by source index
-                            upd_full = prod[param_idx]
+                            upd_full = prod[ctrl_idx]
 
                             if upd_full.ndim == 1:
                                 # Shouldn't happen now (we expanded axis to C), but defend anyway
                                 # broadcast to (M, P)
-                                upd_param = upd_full[:, None].repeat(P, axis=1)
+                                upd_ctrl = upd_full[:, None].repeat(P, axis=1)
                             else:
                                 if C == P:
-                                    upd_param = upd_full  # shape matches
+                                    upd_ctrl = upd_full  # shape matches
                                 else:
                                     # If you want a learned projector, apply it here:
-                                    #   upd_param = (Proj @ upd_full.T).T  # Proj: (P, C)
+                                    #   upd_ctrl = (Proj @ upd_full.T).T  # Proj: (P, C)
                                     # For now, fail loudly so we don’t silently scramble shapes.
                                     raise ValueError(
-                                        f"{name}: update width C={C} does not match param width P={P} "
-                                        f"for sources {param_idx}; provide a projector or align widths."
+                                        f"{name}: update width C={C} does not match ctrl width P={P} "
+                                        f"for sources {ctrl_idx}; provide a projector or align widths."
                                     )
 
-                            params = params + upd_param
-                            for node, new_param in zip(param_nodes, params):
-                                node.param = new_param
+                            ctrls = ctrls + upd_ctrl
+                            for node, new_ctrl in zip(ctrl_nodes, ctrls):
+                                node.ctrl = new_ctrl
 
                         # 5) Transport residuals upstream (keep vector width)
                         for idx_i, src in enumerate(srcs):
                             r_in_full = prod[idx_i]                # (C,)
                             node = self.sys.nodes.get(int(src))
-                            # choose a base to shape against; prefer param (P) then p (D)
-                            base = getattr(node, "param", None) if node is not None else None
+                            # choose a base to shape against; prefer ctrl (P) then p (D)
+                            base = getattr(node, "ctrl", None) if node is not None else None
                             if base is None:
                                 base = getattr(node, "p", None) if node is not None else None
 
@@ -2044,15 +2065,16 @@ class LinearBlockFactory:
         for k, i_id in enumerate(in_ids):
             x = -2.0; y = (k - 0.5*(self.n_in-1)) * self.spacing; z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param_generator = empty_param_generator()
-            param = param_generator.__next__()
+            phys = _phys_from_p(p)
+            ctrl = _default_ctrl()
             nodes.append(
                 Node(
                     id=i_id,
-                    param=param,
+                    phys=phys,
+                    ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
-                    sphere=AbstractTensor.concat([p, param], dim=0),
+                    sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
 
@@ -2060,14 +2082,16 @@ class LinearBlockFactory:
         for k, o_id in enumerate(out_ids):
             x = +2.0; y = (k - 0.5*(self.n_out-1)) * self.spacing; z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param = param_generator.__next__()
+            phys = _phys_from_p(p)
+            ctrl = _default_ctrl()
             nodes.append(
                 Node(
                     id=o_id,
-                    param=param,
+                    phys=phys,
+                    ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
-                    sphere=AbstractTensor.concat([p, param], dim=0),
+                    sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
 
@@ -2078,14 +2102,16 @@ class LinearBlockFactory:
             y = (j - 0.5*(self.n_out-1)) * self.spacing
             z = z_level
             p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-            param = param_generator.__next__()
+            phys = _phys_from_p(p)
+            ctrl = _default_ctrl()
             nodes.append(
                 Node(
                     id=b_id,
-                    param=param,
+                    phys=phys,
+                    ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
-                    sphere=AbstractTensor.concat([p, param], dim=0),
+                    sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
 
@@ -2097,18 +2123,20 @@ class LinearBlockFactory:
                 y = (r - 0.5*(self.rows-1)) * self.spacing
                 z = z_level + 0.05 * self.rng.standard_normal()
                 p = AbstractTensor.get_tensor([x, y, z]) + jitter()
-                param = param_generator.__next__()
+                phys = _phys_from_p(p)
+                ctrl = _default_ctrl()
                 nodes.append(
                     Node(
                         id=n_id,
-                        param=param,
+                        phys=phys,
+                        ctrl=ctrl,
                         p=p,
                         v=AbstractTensor.zeros(3),
-                        sphere=AbstractTensor.concat([p, param], dim=0),
+                        sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                     )
                 )
 
-        # chain for gather_and: multiply then add using per-node params
+        # chain for gather_and: multiply then add using per-node ctrls
         fn_specs = [
             (AbstractTensor.__mul__, slice(1, None, 3)),
             (AbstractTensor.__add__, slice(2, None, 3)),
@@ -2350,7 +2378,11 @@ def main(duration_s: float = 8.0, viz_mode: str = "none"):
 
             # (F,) feature rows for this tick
             actual_row = AbstractTensor.stack([
-                AbstractTensor.cat([sys.nodes[oid].p.clone(), sys.nodes[oid].param.clone()]) if sys.nodes.get(oid) is not None else AbstractTensor.get_tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                AbstractTensor.cat([
+                    sys.nodes[oid].p.clone(),
+                    sys.nodes[oid].phys.clone(),
+                    sys.nodes[oid].ctrl.clone(),
+                ]) if sys.nodes.get(oid) is not None else AbstractTensor.get_tensor([0.0] * 9)
                 for oid in sample
             ])
 

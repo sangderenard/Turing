@@ -118,7 +118,7 @@ def _preactivate_nodes(sys, node_ids: Sequence[int]) -> Dict[int, Tuple[Any, dic
     cache: Dict[int, Tuple[Any, Any, dict]] = {}
     for i in node_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-        if hasattr(node, "p") and hasattr(node, "param"):
+        if hasattr(node, "p") and hasattr(node, "ctrl"):
             y, meta = preactivate_src(sys, int(i))
             cache[int(i)] = (getattr(node, "version", None), y, meta)
     return cache
@@ -157,7 +157,7 @@ def push_impulses_from_op_v2(
     metas: List[dict] = []
     for i in src_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-        if hasattr(node, "p") and hasattr(node, "param"):
+        if hasattr(node, "p") and hasattr(node, "ctrl"):
             _y, meta = _get_preactivation(sys, int(i), pre_cache)
         else:
             meta = {}
@@ -168,8 +168,8 @@ def push_impulses_from_op_v2(
     param_lens: List[int] = []
     for i in src_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-        if hasattr(node, "param"):
-            flat = AbstractTensor.get_tensor(node.param).flatten()
+        if hasattr(node, "ctrl"):
+            flat = AbstractTensor.get_tensor(node.ctrl).flatten()
             params.append(flat)
             param_lens.append(len(flat))
         else:
@@ -207,7 +207,7 @@ def push_impulses_from_op_v2(
         param_idx = []
         for idx, i in enumerate(src_ids):
             node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-            if hasattr(node, "param"):
+            if hasattr(node, "ctrl"):
                 param_nodes.append(node)
                 param_idx.append(idx)
         if param_nodes:
@@ -215,10 +215,10 @@ def push_impulses_from_op_v2(
             prod = gk * r_tensor
             extra_dims = tuple(range(2, getattr(prod, "ndim", 2)))
             delta = prod.sum(dim=extra_dims) if extra_dims else prod
-            params = AbstractTensor.stack([n.param for n in param_nodes], dim=0)
+            params = AbstractTensor.stack([n.ctrl for n in param_nodes], dim=0)
             params = params + delta
             for node, new_param in zip(param_nodes, params):
-                node.param = new_param
+                node.ctrl = new_param
     return y, tuple(metas)
 
 
@@ -243,7 +243,7 @@ def batched_forward_v2(
         op_name, src_ids, out_id, op_args, op_kwargs = (*spec, None, None)[:5]
         for i in src_ids:
             node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-            if hasattr(node, "p") and hasattr(node, "param"):
+            if hasattr(node, "p") and hasattr(node, "ctrl"):
                 _get_preactivation(sys, int(i), pre_cache)
         op_args_tuple = tuple(op_args) if isinstance(op_args, (list, tuple)) else op_args
         op_kwargs_dict = dict(op_kwargs) if isinstance(op_kwargs, dict) else None
@@ -264,8 +264,8 @@ def batched_forward_v2(
         param_lens: List[int] = []
         for i in src_ids0:
             node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-            if hasattr(node, "param"):
-                flat = AbstractTensor.get_tensor(node.param).flatten()
+            if hasattr(node, "ctrl"):
+                flat = AbstractTensor.get_tensor(node.ctrl).flatten()
                 params.append(flat)
                 param_lens.append(len(flat))
             else:
@@ -348,7 +348,7 @@ def push_impulses_from_ops_batched(
             metas = []
             for i in src_ids:
                 node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-                if hasattr(node, "p") and hasattr(node, "param"):
+                if hasattr(node, "p") and hasattr(node, "ctrl"):
                     _y, meta = _get_preactivation(sys, int(i), pre_cache)
                 else:
                     meta = {}
@@ -359,8 +359,8 @@ def push_impulses_from_ops_batched(
             param_lens: List[int] = []
             for i in src_ids:
                 node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-                if hasattr(node, "param"):
-                    flat = AbstractTensor.get_tensor(node.param).flatten()
+                if hasattr(node, "ctrl"):
+                    flat = AbstractTensor.get_tensor(node.ctrl).flatten()
                     params.append(flat)
                     param_lens.append(len(flat))
                 else:
