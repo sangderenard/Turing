@@ -764,20 +764,25 @@ class SpringRepulsorSystem:
         self.edge_list = list(edges)
         E = len(self.edge_list)
         N = len(self.node_ids)
-        self.D0 = AbstractTensor.zeros((E, N), dtype=float)
         l0_vals = []
         k_vals = []
         self.edge_src_idx: List[int] = []
         self.edge_dst_idx: List[int] = []
-        for e_idx, e in enumerate(self.edge_list):
+        D0_rows: List[AbstractTensor] = []
+        for e in self.edge_list:
             i_idx = node_index[e.i]
             j_idx = node_index[e.j]
             self.edge_src_idx.append(i_idx)
             self.edge_dst_idx.append(j_idx)
-            self.D0[e_idx, i_idx] = -1.0
-            self.D0[e_idx, j_idx] = 1.0
+            row = AbstractTensor.zeros(N, dtype=float)
+            row[i_idx] = -1.0
+            row[j_idx] = 1.0
+            D0_rows.append(row)
             l0_vals.append(AbstractTensor.get_tensor(e.l0).reshape(()))
             k_vals.append(AbstractTensor.get_tensor(e.k).reshape(()))
+        self.D0 = (
+            AbstractTensor.stack(D0_rows, dim=0) if D0_rows else AbstractTensor.zeros((0, N), dtype=float)
+        )
         self.l0 = (
             AbstractTensor.stack(l0_vals, dim=0) if l0_vals else AbstractTensor.zeros(0, dtype=float)
         )
@@ -787,17 +792,22 @@ class SpringRepulsorSystem:
 
         self.faces: List[Face] = list(faces) if faces else []
         F = len(self.faces)
-        self.D1 = AbstractTensor.zeros((F, E), dtype=float)
         alpha_vals = []
         c_vals = []
-        for f_idx, face in enumerate(self.faces):
+        D1_rows: List[AbstractTensor] = []
+        for face in self.faces:
             alpha_vals.append(AbstractTensor.get_tensor(face.alpha).reshape(()))
             c_vals.append(AbstractTensor.get_tensor(face.c).reshape(()))
+            row = AbstractTensor.zeros(E, dtype=float)
             for e_oriented in face.edges:
                 e_id = abs(int(e_oriented)) - 1
                 if 0 <= e_id < E:
                     sign = 1.0 if e_oriented > 0 else -1.0
-                    self.D1[f_idx, e_id] = sign
+                    row[e_id] = sign
+            D1_rows.append(row)
+        self.D1 = (
+            AbstractTensor.stack(D1_rows, dim=0) if D1_rows else AbstractTensor.zeros((0, E), dtype=float)
+        )
         self.alpha_face = (
             AbstractTensor.stack(alpha_vals, dim=0)
             if alpha_vals
@@ -1114,12 +1124,10 @@ class LiveVizGLPoints:
         self._rot_dtheta = 0.002
         self._rot_dphi = 0.0015
     def _upload(self, vbo, arr, cap_attr, usage=GL_DYNAMIC_DRAW):
-        import numpy as np
-        # bytes & pointer for numpy vs AbstractTensor
-        if isinstance(arr, np.ndarray):
-            nbytes = int(arr.nbytes); ptr = arr
-        else:
-            nbytes = int(arr.nbytes()); ptr = arr.data
+        t = AbstractTensor.get_tensor(arr)
+        nbytes_attr = getattr(t, "nbytes", None)
+        nbytes = int(nbytes_attr() if callable(nbytes_attr) else nbytes_attr)
+        ptr = getattr(t, "data", t)
 
         glBindBuffer(GL_ARRAY_BUFFER, vbo)
         cap = getattr(self, cap_attr, 0)
@@ -1286,8 +1294,7 @@ class LiveVizGLPoints:
         if vmax <= vmin:
             vmax = vmin + 1e-6
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-        import numpy as np
-        C = self.node_cmap(norm(ctrl_vals))[:, :3].astype(np.float32)  # (N,3) RGB
+        C = AbstractTensor.get_tensor(self.node_cmap(norm(ctrl_vals)), dtype="float32")[:, :3]
 
         # --- sizes (base) ---
         sizes = AbstractTensor.full(
@@ -1318,7 +1325,7 @@ class LiveVizGLPoints:
             rid = int(nid)
             role = roles[idx] or btypes.get(rid, "")
             if role in self.role_palette:
-                C[idx] = np.array(self.role_palette[role], dtype=np.float32)
+                C[idx] = AbstractTensor.get_tensor(self.role_palette[role], dtype="float32")
             if role in self.role_size_gain:
                 sizes[idx] *= float(self.role_size_gain[role])
 
@@ -1364,9 +1371,8 @@ class LiveVizGLPoints:
         if hi <= lo:
             hi = lo + 1e-12
         norm = mcolors.Normalize(vmin=lo, vmax=hi)
-        import numpy as np
-        colors = self.edge_cmap(norm(U_vals))[:, :3].astype(np.float32)
-        C = np.repeat(colors, 2, axis=0)
+        colors = AbstractTensor.get_tensor(self.edge_cmap(norm(U_vals)), dtype="float32")[:, :3]
+        C = AbstractTensor.repeat(colors, 2, axis=0)
 
         S = AT.full((P.shape[0],), 1.0, dtype=float)
         return P, C, S
@@ -1539,8 +1545,8 @@ class LiveVizGLPoints:
 
         glUseProgram(self._program)
         # CHANGED: upload transpose so GLSL sees the right matrix
-        import numpy as np
-        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, np.array(self._mvp.T(), dtype=np.float32))
+        mvp = AbstractTensor.get_tensor(self._mvp.T(), dtype="float32")
+        glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, getattr(mvp, "data", mvp))
 
         glBindVertexArray(self._vao)
         glDrawArrays(GL_POINTS, 0, self._num_points)
