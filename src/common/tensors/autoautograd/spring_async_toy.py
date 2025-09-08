@@ -398,6 +398,94 @@ class Edge:
         l0 = AbstractTensor.get_tensor(self.l0)
         return float(l0)
 
+
+@dataclass
+class Face:
+    """Oriented 2-simplex with DEC-aligned bookkeeping.
+
+    Parameters
+    ----------
+    edges:
+        Tuple of oriented edge indices. A positive index follows the
+        stored orientation of the edge while a negative index flips it.
+    alpha:
+        Wet/dry mix coefficient for downstream operators.
+    c:
+        Non-negative face weight. Values < 0 raise ``ValueError``.
+
+    Notes
+    -----
+    Orientation must respect the discrete exterior calculus convention
+    such that ``∂∘∂ = 0``. ``_validate_orientation`` currently provides a
+    placeholder hook for this check.
+    """
+
+    edges: Tuple[int, ...]
+    alpha: float = 0.0
+    c: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.edges = tuple(int(e) for e in self.edges)
+        self.alpha = float(self.alpha)
+        self.c = float(self.c)
+        if self.c < 0.0:
+            raise ValueError("Face weight 'c' must be non-negative")
+        if not self._validate_orientation():
+            raise ValueError("Face orientation violates DEC boundary condition")
+
+    def _validate_orientation(self) -> bool:
+        """Placeholder for DEC orientation check ensuring ``∂∘∂=0``."""
+        if any(e == 0 for e in self.edges):
+            return False
+        # TODO: implement full orientation validation
+        return True
+
+    def scale_by_node_geometry(
+        self,
+        nodes: Dict[int, "Node"],
+        edge_index: Dict[int, Tuple[int, int]],
+    ) -> None:
+        """Scale weight ``c`` by mean edge span from node geometry.
+
+        Parameters
+        ----------
+        nodes:
+            Mapping from node id to :class:`Node` providing positions ``p``.
+        edge_index:
+            Mapping from edge index to ``(src, dst)`` node ids. Orientation
+            stored in :attr:`edges` is ignored when measuring span length.
+        """
+        lengths: List[float] = []
+        for e in self.edges:
+            key = edge_index.get(abs(e))
+            if not key:
+                continue
+            i, j = key
+            pi, pj = nodes[i].p, nodes[j].p
+            length = float(AbstractTensor.linalg.norm(pj - pi))
+            lengths.append(length)
+        if lengths:
+            self.c *= sum(lengths) / len(lengths)
+
+    @classmethod
+    def from_edges(
+        cls,
+        edges: Tuple[int, ...],
+        nodes: Dict[int, "Node"],
+        edge_index: Dict[int, Tuple[int, int]],
+        *,
+        alpha: float = 0.0,
+        base_weight: float = 1.0,
+    ) -> "Face":
+        """Construct a :class:`Face` scaled by edge distance.
+
+        ``base_weight`` is multiplied by the mean edge span derived from
+        ``nodes`` and ``edge_index`` to yield ``c``.
+        """
+        face = cls(edges=edges, alpha=alpha, c=base_weight)
+        face.scale_by_node_geometry(nodes, edge_index)
+        return face
+
 @dataclass
 class BoundaryPort:
     nid: int
