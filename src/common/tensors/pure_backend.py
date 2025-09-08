@@ -492,7 +492,8 @@ class PurePythonTensorOperations(AbstractTensor):
             return self.get_dtype_(tensor[0])
         return type(tensor)
 
-    def item_(self, tensor: Any) -> Any:
+    def item_(self) -> Any:
+        tensor = self.data
         if isinstance(tensor, list) and len(tensor) == 1:
             return tensor[0]
         return tensor
@@ -1194,10 +1195,10 @@ class PurePythonTensorOperations(AbstractTensor):
             return [self.pow_(item, exponent) for item in tensor]
         return tensor**exponent
 
-    def sqrt_(self, tensor: Any) -> Any:
-        tensor = self._AbstractTensor__unwrap(tensor)
+    def sqrt_(self) -> Any:
+        tensor = self.data
         if isinstance(tensor, list):
-            return [self.sqrt_(item) for item in tensor]
+            return [math.sqrt(item) for item in tensor]
         return math.sqrt(tensor)
 
     def tensor_from_list_(self, data: list, dtype: Any, device: Any) -> Any:
