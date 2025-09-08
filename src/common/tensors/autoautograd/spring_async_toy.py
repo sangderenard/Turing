@@ -299,31 +299,50 @@ def wire_input_chain(
     """Create Dirichlet→Neumann chain feeding into an existing system node."""
     AT = AbstractTensor
     D = sys.D if D is None else int(D)
+    mean_in = float(getattr(sys, "prev_in_mean", 0.0))
+    mean_out = float(getattr(sys, "prev_out_mean", 0.0))
+
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
+    if D > 0:
+        p[0] = mean_in
+    if D > 2:
+        p[2] = mean_out
     phys = _phys_from_p(p)
     ctrl = _default_ctrl()
-    sys.nodes[d] = Node(
+    node_d = Node(
         id=d,
         phys=phys,
         ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
+        geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
         sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
+    node_d.commit()
+    node_d.hist_p.append(node_d.p.clone())
+    sys.nodes[d] = node_d
     attach_dirichlet(sys, d, sample_fn, D=D, alpha=alpha)
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
+    if D > 0:
+        p[0] = mean_in
+    if D > 2:
+        p[2] = mean_out
     phys = _phys_from_p(p)
     ctrl = _default_ctrl()
-    sys.nodes[n] = Node(
+    node_n = Node(
         id=n,
         phys=phys,
         ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
+        geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
         sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
+    node_n.commit()
+    node_n.hist_p.append(node_n.p.clone())
+    sys.nodes[n] = node_n
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(d, n, "in_link")
     sys.ensure_edge(n, system_nid, "in_link")
@@ -342,32 +361,51 @@ def wire_output_chain(
     """Create system_output→Neumann→Dirichlet chain anchored to `target_fn`."""
     AT = AbstractTensor
     D = sys.D if D is None else int(D)
+    mean_in = float(getattr(sys, "prev_in_mean", 0.0))
+    mean_out = float(getattr(sys, "prev_out_mean", 0.0))
+
     n = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
+    if D > 0:
+        p[0] = mean_in
+    if D > 2:
+        p[2] = mean_out
     phys = _phys_from_p(p)
     ctrl = _default_ctrl()
-    sys.nodes[n] = Node(
+    node_n = Node(
         id=n,
         phys=phys,
         ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
+        geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
         sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
+    node_n.commit()
+    node_n.hist_p.append(node_n.p.clone())
+    sys.nodes[n] = node_n
     attach_neumann_noop(sys, n, D=D, beta=beta)
     sys.ensure_edge(system_nid, n, "out_link")
     d = _fresh_node_id(sys)
     p = AT.zeros(D, dtype=float)
+    if D > 0:
+        p[0] = mean_in
+    if D > 2:
+        p[2] = mean_out
     phys = _phys_from_p(p)
     ctrl = _default_ctrl()
-    sys.nodes[d] = Node(
+    node_d = Node(
         id=d,
         phys=phys,
         ctrl=ctrl,
         p=p,
         v=AT.zeros(D, dtype=float),
+        geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
         sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
     )
+    node_d.commit()
+    node_d.hist_p.append(node_d.p.clone())
+    sys.nodes[d] = node_d
     attach_dirichlet(sys, d, target_fn, D=D, alpha=alpha)
     sys.ensure_edge(n, d, "readout")
     return n
@@ -745,6 +783,9 @@ class SpringRepulsorSystem:
         rep_eps: float = 1e-6,
     ):
         self.nodes: Dict[int, Node] = {n.id: n for n in nodes}
+        for n in self.nodes.values():
+            n.commit()
+            n.hist_p.append(n.p.clone())
         self.edges: Dict[Tuple[int, int, str], Edge] = {e.key: e for e in edges}
         self.eta = eta
         self.gamma = gamma
@@ -756,6 +797,13 @@ class SpringRepulsorSystem:
         self.D = int(next(iter(self.nodes.values())).p.shape[0])
         # loop-back loss plumbing (optional) – support multiple edges
         self.feedback_edges: List[Tuple[int, int, str]] = []
+
+        # Running batch means for geometry embedding
+        self.prev_in_mean = 0.0
+        self.prev_out_mean = 0.0
+        self.in_mean_fn: Optional[Callable[[float], float]] = None
+        self.out_mean_fn: Optional[Callable[[float], float]] = None
+        self.prev_mean_time = now_s()
 
         # ----- Geometry assembly -----
         self.node_ids = [n.id for n in nodes]
@@ -2175,6 +2223,7 @@ class LinearBlockFactory:
                     ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
+                    geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
                     sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
@@ -2192,6 +2241,7 @@ class LinearBlockFactory:
                     ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
+                    geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
                     sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
@@ -2212,6 +2262,7 @@ class LinearBlockFactory:
                     ctrl=ctrl,
                     p=p,
                     v=AbstractTensor.zeros(3),
+                    geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
                     sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                 )
             )
@@ -2233,6 +2284,7 @@ class LinearBlockFactory:
                         ctrl=ctrl,
                         p=p,
                         v=AbstractTensor.zeros(3),
+                        geom_mask=AbstractTensor.tensor([0.0, 1.0, 0.0]),
                         sphere=AbstractTensor.concat([p, phys, ctrl], dim=0),
                     )
                 )
@@ -2385,6 +2437,14 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
         return _mean
 
     in_mean_fn = group_data_mean_fn(input_force_fns)
+    out_mean_fn = group_data_mean_fn(outputs)
+
+    sys.in_mean_fn = in_mean_fn
+    sys.out_mean_fn = out_mean_fn
+    now = now_s()
+    sys.prev_in_mean = float(in_mean_fn(now))
+    sys.prev_out_mean = float(out_mean_fn(now))
+    sys.prev_mean_time = now
 
     for idx, nid in enumerate(lb.in_ids):
         attach_dirichlet(sys, nid, in_mean_fn, axis=0)
@@ -2450,9 +2510,17 @@ def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) ->
         p_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
         v_view = NodeAttrView(sys.nodes, "v", indices=sys.node_ids).build()
         with p_view.editing() as P:
-            P[:, 0] = prev_pos[:, 0]
-            P[:, 2] = prev_pos[:, 2]
+            if P.shape[1] > 0:
+                P[:, 0] = getattr(sys, "prev_in_mean", 0.0)
+            if P.shape[1] > 2:
+                P[:, 2] = getattr(sys, "prev_out_mean", 0.0)
             P[:, 1] = prev_pos[:, 1] + v_view.tensor[:, 1] * dt
+        now = now_s()
+        if getattr(sys, "in_mean_fn", None):
+            sys.prev_in_mean = float(sys.in_mean_fn(now))
+        if getattr(sys, "out_mean_fn", None):
+            sys.prev_out_mean = float(sys.out_mean_fn(now))
+        sys.prev_mean_time = now
         return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
 
     plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt))
