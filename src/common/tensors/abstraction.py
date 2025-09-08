@@ -1131,6 +1131,14 @@ class AbstractTensor:
         Gather from `base` (=other or self) along `dim` with `indices`,
         then run a function chain with per-fn params sliced from `param_tensor`.
 
+        Call Signatures
+        ---------------
+        ``gather_and(dim, indices, fn_specs, param_tensor, *, other=None)``
+            Standard form with ``dim`` as the first positional argument.
+        ``gather_and(indices, fn_specs, param_tensor, *, dim, other=None)``
+            ``dim`` may also be supplied via keyword, in which case the other
+            arguments remain positional.
+
         Parameters
         ----------
         dim : int
