@@ -112,7 +112,13 @@ class CausalRegionView:
         lorentz = self.limits.get('lorentz', False)
         for t, spatial, st in self._index:
             dt = abs(query_t - t)
-            dx = np.linalg.norm(np.array(query_spatial) - np.array(spatial))
+            try:
+                qs = AbstractTensor.tensor(query_spatial)
+                sp = AbstractTensor.tensor(spatial)
+                diff = qs - sp
+                dx = (diff * diff).sum().sqrt().item()
+            except Exception:
+                dx = np.linalg.norm(np.array(query_spatial) - np.array(spatial))
             if c is not None:
                 if lorentz:
                     # Use Lorentz interval: s^2 = c^2 dt^2 - dx^2 >= 0
@@ -148,6 +154,7 @@ relativistic or nonstandard time models.
 
 from typing import Any, Dict, Tuple, List
 import numpy as np
+from ..tensors.abstraction import AbstractTensor
 
 class StateTableArchive:
     def __init__(self):
