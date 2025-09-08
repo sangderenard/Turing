@@ -20,6 +20,11 @@ from typing import Iterable, List, Tuple
 
 from ..tensors.abstraction import AbstractTensor
 
+# Minimum number of history samples required before performing any FFT based
+# analysis.  Below this threshold the routine returns a zero response so callers
+# can treat the result as a no-op and simply pass the state through unchanged.
+_MIN_FFT_WINDOW = 32
+
 
 def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[AbstractTensor, AbstractTensor, List[Tuple[float, float, float]]]:
     """Estimate a spectral inertia response from ``history``.
@@ -42,11 +47,8 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
     """
     hist = list(history)
     H = len(hist)
-    if H < 32:
-        if H == 0:
-            D = 0
-        else:
-            D = hist[0].shape[0]
+    if H < _MIN_FFT_WINDOW:
+        D = hist[-1].shape[0] if H else 0
         return (
             AbstractTensor.zeros(D, float),
             AbstractTensor.zeros((D, D), float),

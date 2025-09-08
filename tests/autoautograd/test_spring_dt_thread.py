@@ -99,6 +99,17 @@ def test_spectral_inertia_reduces_velocity_norm():
     assert energy_damped < energy_no
 
 
+def test_spectral_inertia_passthrough_with_short_history():
+    AT = AbstractTensor
+    dt = 0.1
+    # Fewer samples than the minimum FFT window should yield a zero response
+    hist = [AT.tensor([0.0, 0.0]) for _ in range(10)]
+    resp, J, bands = spectral_inertia(hist, dt)
+    assert AT.get_tensor(resp).abs().sum().item() == 0.0
+    assert AT.get_tensor(J).abs().sum().item() == 0.0
+    assert bands == []
+
+
 def test_threaded_engine_steps_independently():
     sys = _build_simple_system()
     table = StateTable()
