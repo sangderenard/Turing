@@ -335,15 +335,32 @@ def wire_output_chain(
 @dataclass
 class Node:
     id: int
-    phys: AbstractTensor  # [x, y, z] → clamps and slack
-    ctrl: AbstractTensor  # [alpha, w, b]
-    p: AbstractTensor  # shape (D,)
-    v: AbstractTensor  # shape (D,)
-    sphere: AbstractTensor
+    phys: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
+    )  # [x, y, z] → clamps and slack
+    ctrl: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
+    )  # [alpha, w, b]
+    p: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
+    )  # shape (D,)
+    v: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
+    )  # shape (D,)
+    sphere: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(0, dtype=float)
+    )
+    param: Optional[AbstractTensor] = None
     M0: float = 10.0
     last_commit: float = 0.0
     version: int = 0
     hist_p: deque = field(default_factory=lambda: deque(maxlen=128))
+
+    def __post_init__(self):
+        if self.param is not None:
+            self.phys = self.param
+        else:
+            self.param = self.phys
 
     def commit(self, ctrl_residuals=None):
         #print("Committing node", self.id)
@@ -419,8 +436,18 @@ class Edge:
     # Composite spring contributions
     spring: CompositeSpringAggregator = field(default_factory=CompositeSpringAggregator)
 
-    # Base rest length l0 (from DEC). Updated on construction.
-    l0: float = 1.0
+    # Data-path controls for the edge: [alpha, w, b]
+    ctrl: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
+    )
+
+    # Base geometry parameters
+    l0: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.tensor(1.0)
+    )  # rest length
+    k: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.tensor(1.0)
+    )  # stiffness
 
     def update_credit(self, amount: float, dt: float) -> None:
         a = abs(float(amount))
@@ -450,7 +477,8 @@ class Edge:
         # cache current transient aggregate, then clamp total target length
         agg = self.spring.reduce()
         self._last_reduce = float(agg)
-        return float(AbstractTensor.get_tensor(self.l0 + agg).clip(L_MIN, L_MAX))
+        l0 = AbstractTensor.get_tensor(self.l0)
+        return float((l0 + agg).clip(L_MIN, L_MAX))
 
     def maybe_pop(self, L_current: float, quantized=False):
         """
@@ -459,7 +487,7 @@ class Edge:
           spring.consume by adding an equal-and-opposite transient (-sgn * POP_QUANTUM)
         """
         # current target uses cached _last_reduce set by target_length() this tick
-        L_star = float(AbstractTensor.get_tensor(self.l0 + self._last_reduce).clip(L_MIN, L_MAX))
+        L_star = float((AbstractTensor.get_tensor(self.l0) + self._last_reduce).clip(L_MIN, L_MAX))
         frustration = abs(L_current - L_star)
         agg_mag = abs(self._last_reduce)
         if frustration < POP_FRUSTRATION_TH or agg_mag < POP_AGG_TH:
@@ -476,7 +504,7 @@ class Edge:
         for _ in range(1):#want):
             if False and quantized:
                 # commit ΔL into the permanent base
-                self.l0 += sgn * POP_QUANTUM
+                self.l0 = self.l0 + sgn * POP_QUANTUM
                 # consume the same amount from the transient buffer immediately
                 self.spring.add(-sgn * POP_QUANTUM)
             else:
@@ -697,7 +725,12 @@ class SpringRepulsorSystem:
                 EdgeBand(tau=0.25, K=2.0, kappa=0.10, th=0.10, ratio=2.0, knee=0.10, alpha=0.5),
                 EdgeBand(tau=1.00, K=1.0, kappa=0.05, th=0.20, ratio=1.2, knee=0.20, alpha=0.2),
             ]
-            e = Edge(key=key, i=i, j=j, op_id=op_id, bands=bands, l0=1.0)
+            ctrl = AbstractTensor.zeros(3, dtype=float)
+            l0 = AbstractTensor.tensor(1.0)
+            k_val = sum(b.K for b in bands)
+            k = AbstractTensor.tensor(k_val)
+            e = Edge(key=key, i=i, j=j, op_id=op_id, bands=bands,
+                     ctrl=ctrl, l0=l0, k=k)
             self.edges[key] = e
         return self.edges[key]
 
@@ -741,8 +774,8 @@ class SpringRepulsorSystem:
                 continue
             u = d / (L + 1e-12)
             Lstar = e.target_length()  # also caches _last_reduce
-            Ksum = AbstractTensor.get_tensor([b.K for b in e.bands]).sum()
-            Fel = Ksum * e.hodge1 * (L - Lstar) * u
+            k = AbstractTensor.get_tensor(e.k)
+            Fel = k * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
             F[e.i] += (Fel - Rep) * scale
             F[e.j] -= (Fel - Rep) * scale
@@ -1216,8 +1249,8 @@ class LiveVizGLPoints:
         d = pj - pi
         L = float(AbstractTensor.linalg.norm(d) + 1e-12)
         Lstar = e.target_length()
-        Ksum = sum(b.K for b in e.bands)
-        return 0.5 * Ksum * (L - Lstar) ** 2, (pi, pj)
+        k = float(AbstractTensor.get_tensor(e.k))
+        return 0.5 * k * (L - Lstar) ** 2, (pi, pj)
 
     def _pack_edges(self):
         nodes, edges, _ = self._snapshot()
@@ -1519,8 +1552,8 @@ class LiveViz3D:
         d = pj - pi
         L = float(AbstractTensor.linalg.norm(d) + 1e-12)
         Lstar = e.target_length()
-        Ksum = sum(b.K for b in e.bands)
-        return 0.5 * Ksum * (L - Lstar) ** 2, (pi, pj)
+        k = float(AbstractTensor.get_tensor(e.k))
+        return 0.5 * k * (L - Lstar) ** 2, (pi, pj)
 
     def _init_fig(self):
         self.fig = plt.figure("Spring-Repulsor • Live 3D", figsize=(7, 6))
@@ -2024,7 +2057,12 @@ class LinearBlockFactory:
             EdgeBand(tau=0.25, K=2.0, kappa=0.08, th=0.10, ratio=2.0, knee=0.10, alpha=0.5),
             EdgeBand(tau=1.00, K=1.0, kappa=0.04, th=0.20, ratio=1.2, knee=0.20, alpha=0.2),
         ]
-        return Edge(key=(i, j, op), i=i, j=j, op_id=op, bands=bands, l0=1.0)
+        ctrl = AbstractTensor.zeros(3, dtype=float)
+        l0 = AbstractTensor.tensor(1.0)
+        k_val = sum(b.K for b in bands)
+        k = AbstractTensor.tensor(k_val)
+        return Edge(key=(i, j, op), i=i, j=j, op_id=op, bands=bands,
+                    ctrl=ctrl, l0=l0, k=k)
 
     def build(self, start_id: int = 0, *, z_level: float = 0.0) -> LinearBlock:
         nid = int(start_id)
