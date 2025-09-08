@@ -320,11 +320,34 @@ def run_batched_vjp(
 
             def _fn(x, *, residual=None, **kw):
                 op = getattr(x, op_name)
-                return op(*op_args, **op_kwargs) if callable(op) else op
+                if not callable(op):
+                    return op
+                # Support gather_and with dim passed via kwargs (no positional dim)
+                if op_name == "gather_and" and len(op_args) >= 3 and not isinstance(op_args[0], int):
+                    # Interpret op_args as (indices, fn_specs, param_tensor)
+                    _kw = dict(op_kwargs)
+                    _kw.setdefault("indices", op_args[0])
+                    _kw.setdefault("fn_specs", op_args[1])
+                    _kw.setdefault("param_tensor", op_args[2])
+                    return op(**_kw)
+                return op(*op_args, **op_kwargs)
 
             def _vec_fn(x, *, residual=None, **kw):
                 op = getattr(x, op_name)
-                return op(*op_args, **vec_kwargs) if callable(op) else op
+                if not callable(op):
+                    return op
+                # Support gather_and with dim passed via kwargs (no positional dim)
+                if op_name == "gather_and" and len(op_args) >= 3 and not isinstance(op_args[0], int):
+                    _kw = dict(vec_kwargs)
+                    _kw.setdefault("indices", op_args[0])
+                    _kw.setdefault("fn_specs", op_args[1])
+                    _kw.setdefault("param_tensor", op_args[2])
+                    return op(**_kw)
+                # Otherwise, handle positional dim by offsetting when present
+                vec_args = op_args
+                if meta.dim_params and len(vec_args) > 0 and isinstance(vec_args[0], int):
+                    vec_args = (vec_args[0] + 1,) + vec_args[1:]
+                return op(*vec_args, **vec_kwargs)
 
             ys = JobBatcher.run_vectorized(jb_jobs, {"fn": _fn, "vectorized_fn": _vec_fn})
         else:

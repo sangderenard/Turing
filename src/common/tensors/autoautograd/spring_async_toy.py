@@ -2119,8 +2119,8 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
-                    (0, list(range(len(srcs))), fn_specs),
-                    None,
+                    (list(range(len(srcs))), fn_specs),   # drop positional dim
+                    {"dim": 0},                           # set as kwarg so batching can offset
                 ))
 
         # --- connect: row r -> row r+1 (fully connected between consecutive rows) ---
@@ -2135,8 +2135,8 @@ class LinearBlockFactory:
                     "gather_and",
                     srcs,
                     tgt,
-                    (0, list(range(len(srcs))), fn_specs),
-                    None,
+                    (list(range(len(srcs))), fn_specs),   # drop positional dim
+                    {"dim": 0},                           # set as kwarg so batching can offset
                 ))
 
         # --- connect: last row -> outputs (+ bias per output) ---
@@ -2149,8 +2149,8 @@ class LinearBlockFactory:
                 "gather_and",
                 srcs,
                 oj,
-                (0, list(range(len(srcs))), fn_specs),
-                None,
+                (list(range(len(srcs))), fn_specs),   # drop positional dim
+                {"dim": 0},                           # set as kwarg so batching can offset
             ))
 
         return LinearBlock(
