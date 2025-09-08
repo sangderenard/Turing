@@ -60,6 +60,9 @@ GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: igno
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
 from ...dt_system.spectral_dampener import spectral_inertia
+from ...dt_system.curvature import hex_face_curvature
+from ...dt_system.integrator.integrator import Integrator
+from ...dt_system.dt_scaler import Metrics
 V_MAX = 2.0
 STEP_MAX = 10.2
 READOUT_SCALE = 1.0
@@ -858,13 +861,18 @@ class SpringRepulsorSystem:
         """Reset feedback edges to a single connection."""
         self.feedback_edges = [(int(src), int(dst), str(op_id))]
 
-    # ----------------- Physics tick -----------------
-    def tick(self):
-        # NOTE: This is a time-stepped Euler integrator. THEORETIC.md describes
-        # a timeless, impulse-accumulating update; replacing this loop with the
-        # unrolled variational solver remains future work.
-        F: Dict[int, AbstractTensor] = {i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes}
+    # ----------------- Force assembly -----------------
+    def assemble_forces(self, dt: float) -> Dict[int, AbstractTensor]:
+        """Assemble spring, repulsor and boundary forces.
 
+        Parameters
+        ----------
+        dt:
+            Time step used for spectral inertia.
+        """
+        F: Dict[int, AbstractTensor] = {
+            i: AbstractTensor.zeros(self.D, dtype=float) for i in self.nodes
+        }
 
         t_now = now_s()
         scale = -1.0
@@ -879,8 +887,9 @@ class SpringRepulsorSystem:
             k = AbstractTensor.get_tensor(e.k)
             Fel = k * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
-            F[e.i] += (Fel - Rep) * scale
-            F[e.j] -= (Fel - Rep) * scale
+            curv = hex_face_curvature(ni.p, nj.p)
+            F[e.i] += (Fel - Rep + curv * u) * scale
+            F[e.j] -= (Fel - Rep + curv * u) * scale
 
         for b in self.boundaries.values():
             if not b.enabled or b.nid not in self.nodes:
@@ -891,53 +900,105 @@ class SpringRepulsorSystem:
                 if b.axis_mask is not None
                 else AbstractTensor.ones(self.D, dtype=float)
             )
-            # Dirichlet spring toward target
             if b.alpha > 0.0 and b.target_fn is not None:
                 tvec = b.target_fn(t_now)
                 if AbstractTensor.isfinite(tvec).all():
                     F[n.id] += mask * (-b.alpha * (n.p - tvec))
-            # Neumann traction force
             if b.beta > 0.0 and b.force_fn is not None:
                 fvec = b.force_fn(t_now)
                 if AbstractTensor.isfinite(fvec).all():
                     F[n.id] += mask * (b.beta * fvec)
 
-        # Integrate with heavy damping
         for n in self.nodes.values():
             mask = getattr(n, "geom_mask", None)
             if mask is None:
                 mask = AbstractTensor.ones_like(n.p)
             F[n.id] *= mask
-            # spectral response (ND) → smoothing force
-            resp, _, _ = spectral_inertia(n.hist_p, getattr(self, "dt", 1.0))
+            resp, _, _ = spectral_inertia(n.hist_p, dt)
             if not AbstractTensor.isfinite(resp).all():
                 resp = AbstractTensor.zeros_like(n.p)
             F[n.id] += -resp
-            n.v = self.gamma * n.v + self.dt * F[n.id] / n.M0
-            n.v *= mask
+        return F
 
-            # cap velocity
-            speed = AbstractTensor.linalg.norm(n.v)
-            if speed > V_MAX:
-                n.v *= V_MAX / (speed + 1e-12)
 
-            # cap per-step displacement
-            dp = -self.dt * n.v
-            step = float(AbstractTensor.linalg.norm(dp))
-            if step > STEP_MAX:
-                dp *= STEP_MAX / (step + 1e-12)
-            n.p = n.p + dp * mask
+class SpringDtEngine(Integrator):
+    """dt-system engine driving a :class:`SpringRepulsorSystem`."""
+
+    def __init__(self, sys: SpringRepulsorSystem, *, algorithm: str = "rk4"):
+        self.sys = sys
+        self.node_ids = list(sys.node_ids)
+        self.D = sys.D
+        self.current_dt = getattr(sys, "dt", 0.01)
+        self._last_forces: Dict[int, AbstractTensor] = {
+            nid: AbstractTensor.zeros(self.D, dtype=float) for nid in self.node_ids
+        }
+
+        def _dynamics(t, state_vec):
+            N = len(self.node_ids)
+            D = self.D
+            pos = state_vec[: N * D].reshape((N, D))
+            vel = state_vec[N * D :].reshape((N, D))
+            for idx, nid in enumerate(self.node_ids):
+                node = self.sys.nodes[nid]
+                node.p = AbstractTensor.get_tensor(pos[idx])
+                node.v = AbstractTensor.get_tensor(vel[idx])
+            F = self.sys.assemble_forces(self.current_dt)
+            self._last_forces = F
+            acc_list = []
+            for nid in self.node_ids:
+                n = self.sys.nodes[nid]
+                acc = F[nid] / n.M0 + ((self.sys.gamma - 1.0) / self.current_dt) * n.v
+                acc_list.append(acc)
+            vel_arr = AbstractTensor.stack([self.sys.nodes[nid].v for nid in self.node_ids], dim=0)
+            acc_arr = AbstractTensor.stack(acc_list, dim=0)
+            dpdt = -vel_arr.reshape(-1)
+            dvdt = acc_arr.reshape(-1)
+            return AbstractTensor.concat([dpdt, dvdt], dim=0)
+
+        super().__init__(dynamics=_dynamics, algorithm=algorithm)
+        self._state_vec = self._pack_state()
+        self._state = self._state_vec
+
+    def _pack_state(self) -> AbstractTensor:
+        pos = [self.sys.nodes[nid].p for nid in self.node_ids]
+        vel = [self.sys.nodes[nid].v for nid in self.node_ids]
+        pos_vec = AbstractTensor.stack(pos, dim=0).reshape(-1)
+        vel_vec = AbstractTensor.stack(vel, dim=0).reshape(-1)
+        return AbstractTensor.concat([pos_vec, vel_vec], dim=0)
+
+    def _unpack_state(self, state_vec: AbstractTensor) -> None:
+        N = len(self.node_ids)
+        D = self.D
+        pos = state_vec[: N * D].reshape((N, D))
+        vel = state_vec[N * D :].reshape((N, D))
+        for idx, nid in enumerate(self.node_ids):
+            n = self.sys.nodes[nid]
+            n.p = AbstractTensor.get_tensor(pos[idx])
+            n.v = AbstractTensor.get_tensor(vel[idx])
             n.hist_p.append(n.p.copy())
+            n.commit()
+        self._state_vec = state_vec
 
-#         print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
-        print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
+    def step(self, dt: float, state_table=None):  # type: ignore[override]
+        self.current_dt = dt
+        ok, _, new_state = super().step(dt, self._state_vec, state_table=state_table)
+        self._unpack_state(new_state)
+        max_vel = max(
+            float(AbstractTensor.linalg.norm(self.sys.nodes[nid].v)) for nid in self.node_ids
+        )
+        max_flux = max(
+            float(AbstractTensor.linalg.norm(f)) for f in self._last_forces.values()
+        )
+        metrics = Metrics(
+            max_vel=max_vel,
+            max_flux=max_flux,
+            div_inf=0.0,
+            mass_err=0.0,
+        )
+        return ok, metrics, new_state
 
-    def commit_some(self, every_s: float = 0.2):
-        t = now_s()
-        for n in self.nodes.values():
-            if (t - n.last_commit) >= every_s:
-                n.commit()
-                n.last_commit = t
+    def get_state(self, state=None) -> object:  # type: ignore[override]
+        return self._state_vec
 # liveviz_gl_points.py
 # Minimal OpenGL point-field renderer (pygame + PyOpenGL)
 # - Keeps node colors from a matplotlib colormap (TwoSlopeNorm around 0)
@@ -1696,28 +1757,20 @@ class Ops:
 
 class Reflector(threading.Thread):
     def __init__(self, sys: SpringRepulsorSystem, stop: threading.Event,
-                 tick_hz: float = 50.0, commit_every_s: float = 0.25):
+                 tick_hz: float = 50.0):
         super().__init__(daemon=True)
-        self.sys = sys
+        self.engine = SpringDtEngine(sys)
         self.stop = stop
         self.tick_dt = 1.0 / tick_hz
-        self.commit_every_s = commit_every_s
 
     def run(self):
         # THEORETIC.md frames integration as event-driven; this loop still relies
         # on wall-clock ticks and thus drifts from the "timeless" goal.
-        t_last = now_s()
-        t_commit = now_s()
         while not self.stop.is_set():
             t0 = now_s()
-            self.sys.tick()
-            if (t0 - t_commit) >= self.commit_every_s:
-                self.sys.commit_some(self.commit_every_s)
-                t_commit = t0
-            # Sleep to maintain approx tick rate
+            self.engine.step(self.tick_dt)
             elapsed = now_s() - t0
             to_sleep = max(0.0, self.tick_dt - elapsed)
-            #print("Reflector tick")
             time.sleep(to_sleep)
 
 
@@ -2330,7 +2383,7 @@ def main(duration_s: float = 8.0, viz_mode: str = "none"):
     sys, outputs = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
 
     stop = threading.Event()
-    refl = Reflector(sys, stop, tick_hz=30.0, commit_every_s=5.0)
+    refl = Reflector(sys, stop, tick_hz=30.0)
     expr = Experiencer(sys, stop, outputs, schedule_hz=60.0, ops_program=sys.ops_program)
 
     print("[INFO] Starting threads…")
