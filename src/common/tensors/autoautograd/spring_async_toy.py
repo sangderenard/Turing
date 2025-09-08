@@ -942,6 +942,12 @@ class SpringRepulsorSystem:
             F[e.i] += (Fel - Rep + curv * u) * scale
             F[e.j] -= (Fel - Rep + curv * u) * scale
 
+        for n in self.nodes.values():
+            mask = getattr(n, "geom_mask", None)
+            if mask is None:
+                mask = AbstractTensor.ones_like(n.p)
+            F[n.id] *= mask
+
         for b in self.boundaries.values():
             if not b.enabled or b.nid not in self.nodes:
                 continue
@@ -964,11 +970,10 @@ class SpringRepulsorSystem:
             mask = getattr(n, "geom_mask", None)
             if mask is None:
                 mask = AbstractTensor.ones_like(n.p)
-            F[n.id] *= mask
             resp, _, _ = spectral_inertia(n.hist_p, dt)
             if not AbstractTensor.isfinite(resp).all():
                 resp = AbstractTensor.zeros_like(n.p)
-            F[n.id] += -resp
+            F[n.id] += -resp * mask
         return F
 
 
