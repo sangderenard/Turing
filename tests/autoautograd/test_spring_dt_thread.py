@@ -74,11 +74,17 @@ def test_meta_loop_runner_moves_free_node():
     table = StateTable()
     round_node = _build_round(sys, table)
     runner = MetaLoopRunner(state_table=table)
+    x0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[0])
     y0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
+    z0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[2])
     for _ in range(5):
         runner.run_round(round_node, dt=0.01, state_table=table)
+    x1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[0])
     y1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
+    z1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[2])
     assert not math.isclose(y0, y1)
+    assert math.isclose(x0, x1, rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(z0, z1, rel_tol=1e-6, abs_tol=1e-6)
 
 
 def test_spectral_inertia_reduces_velocity_norm():
