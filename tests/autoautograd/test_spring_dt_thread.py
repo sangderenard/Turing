@@ -87,6 +87,55 @@ def test_meta_loop_runner_moves_free_node():
     assert math.isclose(z0, z1, rel_tol=1e-6, abs_tol=1e-6)
 
 
+def test_boundary_targets_clamp_x_and_z():
+    AT = AbstractTensor
+    n_in = toy.Node(
+        id=0,
+        p=AT.tensor([1.0, 2.0, 0.0]),
+        v=AT.zeros(3, float),
+        geom_mask=AT.ones(3, float),
+    )
+    n_out = toy.Node(
+        id=1,
+        p=AT.tensor([0.0, -1.0, 2.0]),
+        v=AT.zeros(3, float),
+        geom_mask=AT.ones(3, float),
+    )
+    for n in (n_in, n_out):
+        n.commit()
+        n.hist_p.append(n.p.copy())
+    sys = toy.SpringRepulsorSystem([n_in, n_out], [], eta=0.0, gamma=0.0, dt=0.01)
+    sys.add_boundary(
+        toy.BoundaryPort(
+            nid=0,
+            alpha=10.0,
+            target_fn=lambda t: AT.tensor([1.0, 0.0, 0.0]),
+            axis_mask=AT.tensor([1.0, 0.0, 0.0]),
+        )
+    )
+    sys.add_boundary(
+        toy.BoundaryPort(
+            nid=1,
+            alpha=10.0,
+            target_fn=lambda t: AT.tensor([0.0, 0.0, 2.0]),
+            axis_mask=AT.tensor([0.0, 0.0, 1.0]),
+        )
+    )
+    table = StateTable()
+    round_node = _build_round(sys, table)
+    runner = MetaLoopRunner(state_table=table)
+    y0_in = float(AbstractTensor.get_tensor(sys.nodes[0].p)[1])
+    y0_out = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
+    for _ in range(5):
+        runner.run_round(round_node, dt=0.01, state_table=table)
+    p_in = AbstractTensor.get_tensor(sys.nodes[0].p)
+    p_out = AbstractTensor.get_tensor(sys.nodes[1].p)
+    assert math.isclose(float(p_in[0]), 1.0, rel_tol=1e-6, abs_tol=1e-3)
+    assert math.isclose(float(p_out[2]), 2.0, rel_tol=1e-6, abs_tol=1e-3)
+    assert math.isclose(float(p_in[1]), y0_in, rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(float(p_out[1]), y0_out, rel_tol=1e-6, abs_tol=1e-6)
+
+
 def test_spectral_inertia_reduces_velocity_norm():
     AT = AbstractTensor
     dt = 0.1
