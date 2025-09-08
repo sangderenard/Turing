@@ -165,11 +165,15 @@ def push_impulses_from_op_v2(
 
     wb_cache = cache or WhiteboardCache()
     params: List[Any] = []
+    param_lens: List[int] = []
     for i in src_ids:
         node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
         if hasattr(node, "param"):
             flat = AbstractTensor.get_tensor(node.param).flatten()
             params.append(flat)
+            param_lens.append(len(flat))
+        else:
+            param_lens.append(0)
     if params:
         params_vec = AbstractTensor.concat(params, dim=0)
     else:
@@ -189,6 +193,7 @@ def push_impulses_from_op_v2(
         op_args=full_args,
         op_kwargs=dict(op_kwargs) if op_kwargs is not None else None,
         grad_mode="param",
+        param_lens=tuple(param_lens),
     )
     if residual is not None:
         r_tensor = AbstractTensor.get_tensor(residual)
@@ -253,34 +258,40 @@ def batched_forward_v2(
 
     ys_buffer: Dict[int, Any] = {}
     for (op_name, _key_args, _key_kwargs), items in by_op.items():
-        for idx, src_ids, out_id, op_args, op_kwargs in items:
-            sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
-            params: List[Any] = []
-            for i in src_ids:
-                node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
-                if hasattr(node, "param"):
-                    flat = AbstractTensor.get_tensor(node.param).flatten()
-                    params.append(flat)
-            if params:
-                params_vec = AbstractTensor.concat(params, dim=0)
+        idx0, src_ids0, out_id0, op_args0, op_kwargs0 = items[0]
+        sc = scale * (_inv_length_scale(sys, out_id0, src_ids0) if weight == "inv_length" else 1.0)
+        params: List[Any] = []
+        param_lens: List[int] = []
+        for i in src_ids0:
+            node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
+            if hasattr(node, "param"):
+                flat = AbstractTensor.get_tensor(node.param).flatten()
+                params.append(flat)
+                param_lens.append(len(flat))
             else:
-                params_vec = AbstractTensor.get_tensor([])
-            base_args = op_args or ()
-            full_args = base_args + (params_vec,)
-            y, _, _ = run_op_and_grads_cached(
-                sys,
-                op_name,
-                src_ids,
-                scale=sc,
-                residual=None,
-                weight=weight,
-                cache=wb_cache,
-                backend=None,
-                backend_tag=None,
-                op_args=full_args,
-                op_kwargs=op_kwargs,
-                grad_mode="scalar",
-            )
+                param_lens.append(0)
+        if params:
+            params_vec = AbstractTensor.concat(params, dim=0)
+        else:
+            params_vec = AbstractTensor.get_tensor([])
+        base_args = op_args0 or ()
+        full_args = base_args + (params_vec,)
+        y, _, _ = run_op_and_grads_cached(
+            sys,
+            op_name,
+            src_ids0,
+            scale=sc,
+            residual=None,
+            weight=weight,
+            cache=wb_cache,
+            backend=None,
+            backend_tag=None,
+            op_args=full_args,
+            op_kwargs=op_kwargs0,
+            grad_mode="scalar",
+            param_lens=tuple(param_lens),
+        )
+        for idx, *_ in items:
             ys_buffer[idx] = y
     for i in range(len(specs)):
         ys_out.append(ys_buffer[i])
@@ -345,11 +356,15 @@ def push_impulses_from_ops_batched(
             metas_out[idx] = tuple(metas)
             sc = scale * (_inv_length_scale(sys, out_id, src_ids) if weight == "inv_length" else 1.0)
             params: List[Any] = []
+            param_lens: List[int] = []
             for i in src_ids:
                 node = sys.nodes.get(int(i)) if isinstance(sys.nodes, dict) else sys.nodes[int(i)]
                 if hasattr(node, "param"):
                     flat = AbstractTensor.get_tensor(node.param).flatten()
                     params.append(flat)
+                    param_lens.append(len(flat))
+                else:
+                    param_lens.append(0)
             if params:
                 params_vec = AbstractTensor.concat(params, dim=0)
             else:
@@ -369,6 +384,7 @@ def push_impulses_from_ops_batched(
                 op_args=full_args,
                 op_kwargs=op_kwargs,
                 grad_mode="param",
+                param_lens=tuple(param_lens),
             )
             ys_out[idx] = y
             grads_out[idx] = g_param

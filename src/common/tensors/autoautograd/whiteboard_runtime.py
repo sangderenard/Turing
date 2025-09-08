@@ -115,6 +115,7 @@ class _WBJob:
     op: str
     src_ids: Tuple[int, ...]
     residual: Optional[float]
+    param_lens: Tuple[int, ...] = ()
 
 def _residual_like(y: Any, residual: Optional[Any], backend: Any | None) -> Optional[Any]:
     """Ensure residual is backend-typed/broadcastable to y."""
@@ -151,6 +152,7 @@ def run_op_and_grads_cached(
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
     grad_mode: str = "scalar",
+    param_lens: Sequence[int] | None = None,
 ) -> Tuple[Any, Any, Dict[str, Any]]:
     """Convenience wrapper: run single op with caching."""
     cache = cache or WhiteboardCache()
@@ -192,6 +194,7 @@ def run_op_and_grads_cached(
             op=op_name,
             src_ids=tuple(int(i) for i in src_ids),
             residual=1.0,
+            param_lens=tuple(int(l) for l in (param_lens or [])),
         )
 
         batch = run_batched_vjp(
@@ -307,6 +310,18 @@ def run_batched_vjp(
     pos_of = {sid: i for i, sid in enumerate(union_ids)}
     slices_for_job: List[List[int]] = [[pos_of[int(s)] for s in j.src_ids] for j in jobs]
 
+    param_len_map: Dict[int, int] = {}
+    for j in jobs:
+        for sid, plen in zip(j.src_ids, getattr(j, "param_lens", ())):
+            param_len_map[int(sid)] = int(plen)
+    param_ids: List[int] = [sid for sid in union_ids if param_len_map.get(sid, 0) > 0]
+    param_pos = {sid: i for i, sid in enumerate(param_ids)}
+    param_offsets: Dict[int, int] = {}
+    offset = 0
+    for sid in param_ids:
+        param_offsets[sid] = offset
+        offset += param_len_map[sid]
+
     scope_cm = getattr(backend, "scope", None)
     scope = scope_cm() if callable(scope_cm) else nullcontext()
 
@@ -418,7 +433,21 @@ def run_batched_vjp(
     if g_param is None:
         param_grads_list = [None for _ in jobs]
     else:
-        param_grads_list = [g_param[idxs] for idxs in slices_for_job]
+        union_slices = [
+            g_param[param_offsets[sid] : param_offsets[sid] + param_len_map[sid]]
+            for sid in param_ids
+        ]
+        union_stack = JobBatcher._stack(union_slices)
+        zero_vec = union_stack[0][:0] if union_slices else g_param[0:0]
+        param_grads_list = []
+        for j in jobs:
+            grads = []
+            for sid, plen in zip(j.src_ids, getattr(j, "param_lens", ())):
+                if plen > 0 and sid in param_pos:
+                    grads.append(union_stack[param_pos[sid]])
+                else:
+                    grads.append(zero_vec)
+            param_grads_list.append(JobBatcher._stack(grads))
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(
