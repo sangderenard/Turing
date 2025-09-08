@@ -280,11 +280,14 @@ def run_batched_vjp(
     op_kwargs = op_kwargs or {}
     op_name = jobs[0].op if jobs else ""
 
-    param_tensor = None
-    if "param_tensor" in op_kwargs:
-        param_tensor = op_kwargs["param_tensor"]
-    elif op_name == "gather_and" and len(op_args) >= 3 and not isinstance(op_args[0], int):
-        param_tensor = op_args[2]
+    param_tensor = op_kwargs.get("param_tensor")
+    if param_tensor is None and op_name == "gather_and":
+        if len(op_args) >= 4 and isinstance(op_args[0], int):
+            # dim is the first positional argument
+            param_tensor = op_args[3]
+        elif len(op_args) >= 3:
+            # dim is provided via keyword or omitted from position 0
+            param_tensor = op_args[2]
 
     if not jobs:
         return BatchVJPResult(

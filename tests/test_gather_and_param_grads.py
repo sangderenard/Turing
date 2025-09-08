@@ -42,3 +42,26 @@ def test_gather_and_param_grads():
     )
     g = AbstractTensor.get_tensor(g_param)
     assert getattr(g, "shape", None) == (2, 3)
+
+
+def test_gather_and_dim_first_param_grads():
+    sys = _Sys()
+    indices = list(range(2))
+    fn_specs = [
+        (AbstractTensor.__mul__, slice(1, None, 3)),
+        (AbstractTensor.__add__, slice(2, None, 3)),
+    ]
+    params_vec = AbstractTensor.concat(
+        [sys.nodes[0].param.flatten(), sys.nodes[1].param.flatten()], dim=0
+    ).flatten()
+    param_lens = [len(sys.nodes[0].param.flatten()), len(sys.nodes[1].param.flatten())]
+    _, g_param, _ = run_op_and_grads_cached(
+        sys,
+        "gather_and",
+        [0, 1],
+        op_args=(0, indices, fn_specs, params_vec),
+        grad_mode="param",
+        param_lens=param_lens,
+    )
+    g = AbstractTensor.get_tensor(g_param)
+    assert getattr(g, "shape", None) == (2, 3)
