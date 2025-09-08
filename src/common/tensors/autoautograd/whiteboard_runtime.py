@@ -29,6 +29,7 @@ class BatchVJPResult:
     ys: Tuple[Any, ...]
     grads_full: Tuple[Any, ...]
     grads_per_source: Tuple[Tuple[float, ...], ...]
+    grads_per_source_tensor: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +275,7 @@ def run_batched_vjp(
             ys=(),
             grads_full=(),
             grads_per_source=(),
+            grads_per_source_tensor=None,
         )
 
     idx_of: Dict[str, int] = {j.job_id: i for i, j in enumerate(jobs)}
@@ -379,10 +381,11 @@ def run_batched_vjp(
         else:
             g_all = autograd.grad(L, (x_all,), retain_graph=False, allow_unused=True)[0]
 
-    if g_all is None:
+    g_stack = g_all
+    if g_stack is None:
         grads_list = [None for _ in jobs]
     else:
-        grads_list = [g_all[idxs] for idxs in slices_for_job]
+        grads_list = [g_stack[idxs] for idxs in slices_for_job]
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(
@@ -395,4 +398,5 @@ def run_batched_vjp(
         ys=tuple(ys),
         grads_full=grads_full,
         grads_per_source=grads_per_source,
+        grads_per_source_tensor=g_stack,
     )
