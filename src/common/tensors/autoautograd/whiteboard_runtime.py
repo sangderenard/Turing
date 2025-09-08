@@ -7,6 +7,7 @@ from .whiteboard_cache import WhiteboardCache, CacheEntry
 from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
 from ..abstraction import AbstractTensor
+from .job_batcher import JobBatcher
 
 @contextmanager
 def _tape():
@@ -273,8 +274,6 @@ def run_batched_vjp(
     idx_of: Dict[str, int] = {j.job_id: i for i, j in enumerate(jobs)}
     inv_ids: Tuple[str, ...] = tuple(j.job_id for j in jobs)
 
-    ys: List[Any] = []
-    residuals: List[Optional[Any]] = []
     # Prepare a single stacked view over all unique source ids
     union_ids: List[int] = []
     for j in jobs:
@@ -283,41 +282,69 @@ def run_batched_vjp(
             if sid not in union_ids:
                 union_ids.append(sid)
     pos_of = {sid: i for i, sid in enumerate(union_ids)}
-    slices_for_job: List[List[int]] = []
+    slices_for_job: List[List[int]] = [[pos_of[int(s)] for s in j.src_ids] for j in jobs]
 
     scope_cm = getattr(backend, "scope", None)
     scope = scope_cm() if callable(scope_cm) else nullcontext()
-
-    hooks = NodeAttrView(sys.nodes, "sphere").resolve()
 
     with scope, _tape():
         view = NodeAttrView(sys.nodes, "sphere", indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
-        for j in jobs:
-            x_j = NodeAttrView(
-                sys.nodes,
-                "sphere",
-                indices=j.src_ids,
-                hooks=hooks,
-                check_shapes=False,
-            ).build().tensor
-            if hasattr(x_j, "requires_grad_"):
-                x_j = x_j.requires_grad_()
-            slices_for_job.append([pos_of[int(s)] for s in j.src_ids])
-            op = getattr(x_j, op_name)
-            y_j = op(*op_args, **op_kwargs) if callable(op) else op
-            ys.append(y_j)
-            residuals.append(_residual_like(y_j, j.residual, backend))
+
+        # Slice per-job tensors referencing the union view
+        x_list = [x_all[idxs] for idxs in slices_for_job]
+
+        if op_name in BATCHABLE_OPS:
+            meta = BATCHABLE_OPS[op_name]
+
+            # Offset dimension parameters for stacked call
+            vec_kwargs = dict(op_kwargs)
+            for dp in meta.dim_params:
+                if dp in vec_kwargs and isinstance(vec_kwargs[dp], int):
+                    vec_kwargs[dp] += 1
+
+            class _JBJob:
+                def __init__(self, x: Any) -> None:
+                    self.args = (x,)
+                    self.kwargs: Dict[str, Any] = {}
+                    self.residual = None
+
+            jb_jobs = [_JBJob(x) for x in x_list]
+
+            def _fn(x, *, residual=None, **kw):
+                op = getattr(x, op_name)
+                return op(*op_args, **op_kwargs) if callable(op) else op
+
+            def _vec_fn(x, *, residual=None, **kw):
+                op = getattr(x, op_name)
+                return op(*op_args, **vec_kwargs) if callable(op) else op
+
+            ys = JobBatcher.run_vectorized(jb_jobs, {"fn": _fn, "vectorized_fn": _vec_fn})
+        else:
+            ys = []
+            for x_j in x_list:
+                op = getattr(x_j, op_name)
+                y_j = op(*op_args, **op_kwargs) if callable(op) else op
+                ys.append(y_j)
+
+        # Convert residuals to backend-friendly tensors
+        residuals = [_residual_like(y_j, j.residual, backend) for y_j, j in zip(ys, jobs)]
 
         # L = sum_j <residual_j, y_j>
         L = None
-        for y_j, r_j in zip(ys, residuals):
-            if r_j is None:
-                continue
-            term = (y_j * r_j).sum() if getattr(y_j, "ndim", 0) > 0 else (y_j * r_j)
-            L = term if L is None else (L + term)
+        if any(r is not None for r in residuals):
+            try:
+                y_stack = JobBatcher._stack(ys)
+                res_stack = JobBatcher._stack([r if r is not None else (y_stack[0] * 0) for r in residuals])
+                L = (y_stack * res_stack).sum()
+            except Exception:
+                for y_j, r_j in zip(ys, residuals):
+                    if r_j is None:
+                        continue
+                    term = (y_j * r_j).sum() if getattr(y_j, "ndim", 0) > 0 else (y_j * r_j)
+                    L = term if L is None else (L + term)
 
         if L is None:
             g_all = x_all.zeros_like() if hasattr(x_all, "zeros_like") else (x_all * 0)
