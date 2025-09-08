@@ -59,6 +59,7 @@ GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: igno
 
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
+from ...dt_system.spectral_dampener import spectral_inertia
 V_MAX = 2.0
 STEP_MAX = 10.2
 READOUT_SCALE = 1.0
@@ -908,7 +909,7 @@ class SpringRepulsorSystem:
                 mask = AbstractTensor.ones_like(n.p)
             F[n.id] *= mask
             # spectral response (ND) → smoothing force
-            resp, _, _ = self._spectral_inertia(n)
+            resp, _, _ = spectral_inertia(n.hist_p, getattr(self, "dt", 1.0))
             if not AbstractTensor.isfinite(resp).all():
                 resp = AbstractTensor.zeros_like(n.p)
             F[n.id] += -resp
@@ -928,139 +929,15 @@ class SpringRepulsorSystem:
             n.p = n.p + dp * mask
             n.hist_p.append(n.p.copy())
 
+#         print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
         print(f"[tick] t={t_now:.3f}, |F|_inf={max(float(AbstractTensor.linalg.norm(f, ord=AbstractTensor.inf)) for f in F.values()):.3e}")
+
     def commit_some(self, every_s: float = 0.2):
         t = now_s()
         for n in self.nodes.values():
             if (t - n.last_commit) >= every_s:
                 n.commit()
                 n.last_commit = t
-
-    # ----------------- Inertial dampener (stub) -----------------
-    def _spectral_inertia(self, n: Node):
-        """
-        Exploratory FFT with adaptive zoom:
-        1) coarse FFT to find active bins (remove 'empty' bins)
-        2) high-res zero-padded FFT inside each active band
-        3) build high-resolution ND rotation response:
-            resp = J @ x_t, where J is the aggregated rotation bivector
-
-        Returns:
-            resp : (D,) immediate ND response for current state
-            J    : (D,D) skew-symmetric rotation generator aggregated over active bands
-            bands: list of (w_lo, w_hi, power) tuples for diagnostics
-        """
-        H = len(n.hist_p)
-        if H < 32:
-            D = n.p.shape[0]
-            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-
-        # --- gather window & detrend ---
-        W = min(H, 128)
-        xs = AbstractTensor.stack(list(n.hist_p)[-W:])           # (W, D)
-        if not AbstractTensor.isfinite(xs).all():
-            D = xs.shape[1]
-            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-        xs = xs - xs.mean(dim=0, keepdim=True)
-        # AFTER: xs = xs - xs.mean(...)
-
-        # normalize to avoid huge FFT magnitudes
-        scale = max(1.0, float(AbstractTensor.linalg.norm(xs, ord=AbstractTensor.inf)))
-        xs = xs / scale
-
-        D = xs.shape[1]
-        dt = float(getattr(self, "dt", 1.0))
-
-        # Optional Hann to reduce leakage (pure AbstractTensor)
-        w = AbstractTensor.hanning(W) if W > 1 else AbstractTensor.ones(W)
-        xw = (w[:, None] * xs)
-
-        # --- 1) coarse FFT ---
-        C0 = AbstractTensor.fft.rfft(xw, axis=0)                 # (F0, D)
-        # Frequency bins for real FFT with sample step dt, matched to xs backend
-        w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(int(W), d=dt, like=xs)  # (F0,)
-        P0 = AbstractTensor.sum(AbstractTensor.abs(C0)**2, dim=1)           # (F0,)
-        if P0.sum() <= 1e-12 or len(P0) <= 2:
-            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-
-        # prune empty bins: absolute & relative thresholds
-        rel = 0.01 * float(P0.max())
-        abs_th = max(rel, 1e-12)
-        active = P0 > abs_th
-
-        # merge contiguous active bins into bands; drop tiny bands
-        bands_idx = []
-        i = 0
-        while i < len(active):
-            if active[i]:
-                j = i + 1
-                while j < len(active) and active[j]:
-                    j += 1
-                if (j - i) >= 1:
-                    # expand by 1 bin on each side (guard) if in range
-                    lo = max(0, i - 1)
-                    hi = min(len(active), j + 1)
-                    bands_idx.append((lo, hi))
-                i = j
-            else:
-                i += 1
-        if not bands_idx:
-            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-
-        # --- 2) high-res zoom via zero-padding ---
-        Z = 8  # zero-pad factor
-        Wz = W * Z
-        # zero-pad the windowed signal in time
-        # Pad along time axis (axis 0) by Wz - W zeros at the end
-        # Note: numpy backend pad_ consumes flattened pads in reverse axis order
-        # so we pass (0,0, 0,Wz-W) to target axis0 only.
-        xpad = AbstractTensor.pad(xw, (0, 0, 0, Wz - W))
-        Cz = AbstractTensor.fft.rfft(xpad, axis=0)                 # (Fz, D)
-        wz = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(Wz, d=dt, like=xs)   # (Fz,)
-
-        # helper to map coarse indices to high-res frequency indices
-        def coarse_band_to_w(b_lo, b_hi):
-            return w0[b_lo], w0[min(b_hi, len(w0)-1)]
-
-        def w_to_hi_idx(wlo, whi):
-            i0 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, wlo, side="left")).clip(0, len(wz)-1)
-            i1 = AbstractTensor.get_tensor(AbstractTensor.searchsorted(wz, whi, side="right")).clip(0, len(wz))
-            return i0, max(i1, i0+1)
-
-        # --- 3) build high-res rotation bivector across active bands ---
-        J = AbstractTensor.zeros((D, D), float)
-        bands_meta = []
-        total_power = 0.0
-
-        for (blo, bhi) in bands_idx:
-            w_lo, w_hi = coarse_band_to_w(blo, bhi)
-            hi_lo, hi_hi = w_to_hi_idx(w_lo, w_hi)
-            Cz_band = Cz[hi_lo:hi_hi, :]               # (Fb, D)
-            if Cz_band.shape[0] < 1:
-                continue
-            Pw = AbstractTensor.sum(AbstractTensor.abs(Cz_band)**2, dim=1) + 1e-12  # (Fb,)
-            if not AbstractTensor.isfinite(Pw).all() or Pw.sum() <= 1e-12:
-                continue
-            Ww = Pw / Pw.sum()
-            wgrid = wz[hi_lo:hi_hi]                    # (Fb,)
-
-            # integrate rotation bivector over refined grid
-            for c, wght, omg in zip(Cz_band, Ww, wgrid):
-                a = AbstractTensor.real(c)                         # (D,)
-                b = AbstractTensor.imag(c)                         # (D,)
-                J += wght * omg * (AbstractTensor.outer(a, b) - AbstractTensor.outer(b, a))
-            band_power = float(Pw.sum())
-            total_power += band_power
-            bands_meta.append((w_lo, w_hi, band_power))
-
-        if total_power <= 1e-12:
-            return AbstractTensor.zeros(D, float), AbstractTensor.zeros((D, D), float), []
-
-        # immediate ND response on current state
-        x_t = xs[-1]                                   # (D,)
-        resp = J @ x_t                                 # (D,)
-
-        return resp, J, bands_meta
 # liveviz_gl_points.py
 # Minimal OpenGL point-field renderer (pygame + PyOpenGL)
 # - Keeps node colors from a matplotlib colormap (TwoSlopeNorm around 0)
