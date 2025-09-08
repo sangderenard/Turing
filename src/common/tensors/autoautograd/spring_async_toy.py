@@ -774,6 +774,54 @@ class SpringRepulsorSystem:
             for k, v in kw.items():
                 setattr(b, k, v)
 
+    # ----------------- Geometry helpers (Guiding Theory §4) -----------------
+    def edge_strain(self, y: AbstractTensor) -> AbstractTensor:
+        """Edge strain ``g = D0 @ y - l0``."""
+        return self.D0 @ AbstractTensor.get_tensor(y) - self.l0
+
+    def face_curvature(self, g: AbstractTensor) -> AbstractTensor:
+        """Discrete curvature ``z = D1 @ g``."""
+        return self.D1 @ AbstractTensor.get_tensor(g)
+
+    def curvature_activation(self, z: AbstractTensor) -> tuple[AbstractTensor, AbstractTensor]:
+        """Curvature activation ``Φα(z)`` and its derivative.
+
+        Parameters
+        ----------
+        z:
+            Curvature values ``z``.
+
+        Returns
+        -------
+        Tuple[AbstractTensor, AbstractTensor]
+            ``u = Φα(z)`` and derivative ``Φα'(z)``.
+        """
+        alpha = self.alpha_face
+        z_t = AbstractTensor.get_tensor(z)
+        t = AbstractTensor.tanh(z_t)
+        u = (1.0 - alpha) * z_t + alpha * t
+        dphi = (1.0 - alpha) + alpha * (1.0 - t * t)
+        return u, dphi
+
+    def energy(self, y: AbstractTensor) -> AbstractTensor:
+        """Total energy ``E(y)``."""
+        g = self.edge_strain(y)
+        z = self.face_curvature(g)
+        u, _ = self.curvature_activation(z)
+        E_edges = 0.5 * AbstractTensor.sum(self.k * g * g)
+        E_faces = 0.5 * AbstractTensor.sum(self.c * u * u)
+        return E_edges + E_faces
+
+    def energy_grad(self, y: AbstractTensor) -> AbstractTensor:
+        """Gradient ``∇E(y)``."""
+        g = self.edge_strain(y)
+        z = self.face_curvature(g)
+        u, dphi = self.curvature_activation(z)
+        Kg = self.k * g
+        r = u * dphi
+        inner = Kg + self.D1.T() @ (self.c * r)
+        return self.D0.T() @ inner
+
     # ----------------- Impulse ingestion -----------------
     def ensure_edge(self, i: int, j: int, op_id: str) -> Edge:
         key = (i, j, op_id)
