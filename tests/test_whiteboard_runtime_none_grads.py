@@ -25,6 +25,8 @@ def test_run_op_and_grads_cached_none_grads(monkeypatch):
             ys=(AbstractTensor.zeros(3, float),),
             grads_full=(None,),
             grads_per_source=((0.0,),),
+            param_grads_full=(None,),
+            param_grads_tensor=None,
         )
 
     import src.common.tensors.autoautograd.whiteboard_runtime as wr

@@ -49,7 +49,14 @@ def _stub_batched_vjp(*, sys, jobs, op_args=(), op_kwargs=None, backend=None) ->
     ys = tuple(f"y:{j.job_id}" for j in jobs)
     grads_per_source = tuple(tuple(float(i) for i in range(len(j.src_ids))) for j in jobs)
     slices = BatchSlices(index_of={j.job_id: i for i, j in enumerate(jobs)}, job_ids=tuple(j.job_id for j in jobs))
-    return BatchVJPResult(slices=slices, ys=ys, grads_full=tuple(None for _ in jobs), grads_per_source=grads_per_source)
+    return BatchVJPResult(
+        slices=slices,
+        ys=ys,
+        grads_full=tuple(None for _ in jobs),
+        grads_per_source=grads_per_source,
+        param_grads_full=tuple(None for _ in jobs),
+        param_grads_tensor=None,
+    )
 
 
 def test_runner_cache_probe_and_update(monkeypatch):
