@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Tuple
 
-from ...tensors.abstraction import AbstractTensor
+from ..tensors.abstraction import AbstractTensor
 
 
 def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[AbstractTensor, AbstractTensor, List[Tuple[float, float, float]]]:

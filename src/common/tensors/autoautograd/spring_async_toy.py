@@ -59,13 +59,20 @@ GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: igno
 
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
+from .node_tensor import NodeAttrView
 from ...dt_system.spectral_dampener import spectral_inertia
-from ...dt_system.curvature import hex_face_curvature
+from ...dt_system.curvature import hex_face_curvature_batch
 from ...dt_system.integrator.integrator import Integrator
 from ...dt_system.dt_scaler import Metrics
 from ...dt_system.dt_controller import STController, Targets
-from ...dt_system.dt_graph import GraphBuilder, MetaLoopRunner
-from ...dt_system.engine_api import EngineRegistration
+from ...dt_system.dt_graph import (
+    AdvanceNode,
+    ControllerNode,
+    MetaLoopRunner,
+    RoundNode,
+    StateNode,
+)
+from ...dt_system.dt import SuperstepPlan
 from ...dt_system.roundnode_engine import RoundNodeEngine
 from ...dt_system.state_table import StateTable
 from ...dt_system.threaded_system import ThreadedSystemEngine
@@ -443,6 +450,11 @@ class Edge:
     face_alpha: Optional[AbstractTensor] = None
     face_weight: Optional[AbstractTensor] = None
 
+    # Latest curvature estimate for this edge
+    curvature: AbstractTensor = field(
+        default_factory=lambda: AbstractTensor.tensor(0.0)
+    )
+
     pops: int = 0  # diagnostics
 
     def update_credit(self, amount: float, dt: float) -> None:
@@ -748,15 +760,20 @@ class SpringRepulsorSystem:
         # ----- Geometry assembly -----
         self.node_ids = [n.id for n in nodes]
         node_index = {nid: i for i, nid in enumerate(self.node_ids)}
+        self.node_index = node_index
         self.edge_list = list(edges)
         E = len(self.edge_list)
         N = len(self.node_ids)
         self.D0 = AbstractTensor.zeros((E, N), dtype=float)
         l0_vals = []
         k_vals = []
+        self.edge_src_idx: List[int] = []
+        self.edge_dst_idx: List[int] = []
         for e_idx, e in enumerate(self.edge_list):
             i_idx = node_index[e.i]
             j_idx = node_index[e.j]
+            self.edge_src_idx.append(i_idx)
+            self.edge_dst_idx.append(j_idx)
             self.D0[e_idx, i_idx] = -1.0
             self.D0[e_idx, j_idx] = 1.0
             l0_vals.append(AbstractTensor.get_tensor(e.l0).reshape(()))
@@ -911,7 +928,7 @@ class SpringRepulsorSystem:
             k = AbstractTensor.get_tensor(e.k)
             Fel = k * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
-            curv = hex_face_curvature(ni.p, nj.p)
+            curv = AbstractTensor.get_tensor(e.curvature)
             F[e.i] += (Fel - Rep + curv * u) * scale
             F[e.j] -= (Fel - Rep + curv * u) * scale
 
@@ -2379,6 +2396,64 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
     return sys, outputs
 
 
+def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) -> RoundNode:
+    """Construct a RoundNode tree with curvature and spectral dampening."""
+
+    spring_engine = SpringDtEngine(sys)
+    targets = Targets(cfl=1.0, div_max=1.0, mass_max=1.0)
+    ctrl = STController(dt_min=1e-6)
+    state = StateNode(state=None)
+    controller = ControllerNode(ctrl=ctrl, targets=targets, dx=1.0)
+    prev_pos: AbstractTensor | None = None
+
+    def _curv(state_obj, dt, *, realtime: bool = False, state_table=None):
+        pos_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
+        pos = pos_view.tensor
+        src = sys.edge_src_idx
+        dst = sys.edge_dst_idx
+        curv = hex_face_curvature_batch(pos[src], pos[dst])
+        edge_view = NodeAttrView(sys.edge_list, "curvature").build()
+        with edge_view.editing() as C:
+            C[:] = curv
+        return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
+
+    def _spectral(state_obj, dt, *, realtime: bool = False, state_table=None):
+        v_view = NodeAttrView(sys.nodes, "v", indices=sys.node_ids).build()
+        with v_view.editing() as V:
+            for i, nid in enumerate(sys.node_ids):
+                n = sys.nodes[nid]
+                resp, _, _ = spectral_inertia(n.hist_p, dt)
+                V[i] += -resp
+        return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
+
+    def _spring(state_obj, dt, *, realtime: bool = False, state_table=None):
+        nonlocal prev_pos
+        pos_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
+        prev_pos = AbstractTensor.get_tensor(pos_view.tensor).clone()
+        ok, m, new_state = spring_engine.step(dt, state_table=state_table)
+        return ok, m, new_state
+
+    def _vertical(state_obj, dt, *, realtime: bool = False, state_table=None):
+        if prev_pos is None:
+            return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
+        p_view = NodeAttrView(sys.nodes, "p", indices=sys.node_ids).build()
+        v_view = NodeAttrView(sys.nodes, "v", indices=sys.node_ids).build()
+        with p_view.editing() as P:
+            P[:, 0] = prev_pos[:, 0]
+            P[:, 2] = prev_pos[:, 2]
+            P[:, 1] = prev_pos[:, 1] + v_view.tensor[:, 1] * dt
+        return True, Metrics(0.0, 0.0, 0.0, 0.0), state_obj
+
+    plan = SuperstepPlan(round_max=float(dt), dt_init=float(dt))
+    children = [
+        AdvanceNode(advance=_curv, state=state, label="advance:curvature"),
+        AdvanceNode(advance=_spectral, state=state, label="advance:spectral"),
+        AdvanceNode(advance=_spring, state=state, label="advance:spring"),
+        AdvanceNode(advance=_vertical, state=state, label="advance:vertical"),
+    ]
+    return RoundNode(plan=plan, controller=controller, children=children, state_table=table)
+
+
 
 def main(duration_s: float = 8.0, viz_mode: str = "none"):
     # Default to a large random batch driving the inputs
@@ -2389,12 +2464,7 @@ def main(duration_s: float = 8.0, viz_mode: str = "none"):
     tick_dt = 1.0 / tick_hz
 
     table = StateTable()
-    spring_engine = SpringDtEngine(sys)
-    targets = Targets(cfl=1.0, div_max=1.0, mass_max=1.0)
-    ctrl = STController(dt_min=1e-6)
-    reg = EngineRegistration(name="spring", engine=spring_engine, targets=targets, dx=1.0)
-    gb = GraphBuilder(ctrl=ctrl, targets=targets, dx=1.0)
-    round_node = gb.round(dt=tick_dt, engines=[reg], state_table=table)
+    round_node = build_round_node(sys, tick_dt, table)
     round_engine = RoundNodeEngine(inner=round_node, runner=MetaLoopRunner(state_table=table))
     worker = ThreadedSystemEngine(round_engine, capture=capture_node_positions(sys))
 
