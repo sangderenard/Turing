@@ -5,7 +5,7 @@ Minimal, threadful prototype of the "spring–repulsor, multiband gradient acous
 
 - < 20 nodes
 - Two roles/threads: Experiencer (ops + impulses) and Reflector (relaxer/integrator)
-- Edges store: timestamp, rings (microgradient count), composite spring aggregation
+- Edges store: timestamp, rings (microgradient count), geometry and control scalars
 - 3 operators: plus, multiply, gather, and a simple scatter (bonus)
 - Local, in-place gradient impulses per edge (requires a residual; we warn if absent)
 - Simple DEC/Hodge star stub (*1 = 1.0) with hooks
@@ -47,22 +47,12 @@ GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: igno
 
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
-
-L_MIN = -3.0
-L_MAX = 3.0
-DL_CAP = 0.5
-MAGNITUDE_ONLY = False
 V_MAX = 2.0
 STEP_MAX = 10.2
 READOUT_SCALE = 1.0
 READOUT_BIAS  = 0.0
 W_EPS = 1e-3
-W_MIN, W_MAX = 0.25, 4.0 
-# --- threshold-pop optimizer knobs ---
-POP_FRUSTRATION_TH = 1e-6   # how 'annoyed' an edge must be: |L - L*|
-POP_AGG_TH         = 1e-6   # how large the transient aggregate must be: |sum(contribs)|
-POP_QUANTUM        = 1e-2   # discrete ΔL moved per pop
-POP_MAX_PER_TICK   = 1e10      # safety cap per integrator tick
+W_MIN, W_MAX = 0.25, 4.0
 
 # ----------------------------- Utilities ------------------------------------
 
@@ -108,19 +98,6 @@ def norm_weights(ws):
     if s <= 0.0:
         return [1.0 / max(1, len(ws))] * len(ws)
     return [w / s for w in ws]
-
-def soft_knee(x: float, th: float, ratio: float, knee: float) -> float:
-    """Soft-knee compressor/expander on positive x."""
-    if x < 0:
-        x = -x  # magnitude domain; sign handled elsewhere
-    lo, hi = th - knee / 2.0, th + knee / 2.0
-    if x < lo:
-        return x
-    if x > hi:
-        return th + (x - th) / max(ratio, 1e-6)
-    # Smooth transition within knee
-    a = (x - lo) / max(knee, 1e-6)
-    return x + ((1.0 / max(ratio, 1e-6) - 1.0) * (x - th)) * a * (2 - a)
 
 
 def _stack_grads_per_source(
@@ -377,48 +354,6 @@ class Node:
 
 
 @dataclass
-class EdgeBand:
-    tau: float  # EMA time constant (s)
-    K: float    # stiffness contribution
-    kappa: float  # length scaling from impulse magnitude
-    th: float   # threshold for knee
-    ratio: float  # compression ratio (>1 compresses)
-    knee: float
-    alpha: float  # spectral inertia scale
-    # EMAs
-    m: float = 0.0  # magnitude EMA
-    s: float = 0.0  # signed EMA (approx sign average)
-
-
-@dataclass
-class CompositeSpringAggregator:
-    """Aggregates multiple rest-length suggestions across a fixed edge.
-
-    Maintains a short queue of contributions which decay over time.
-    Resulting target rest length L* = l0 + sum(decayed contributions).
-    """
-    decay: float = 0.98
-    maxlen: int = 64
-    _contribs: deque = field(default_factory=lambda: deque(maxlen=64))
-
-    def add(self, value: float):
-        self._contribs.append(float(value))
-
-    def reduce(self) -> float:
-        # Exponentially decay historical contributions and return sum
-        total = 0.0
-        new = deque(maxlen=self.maxlen)
-        scale = 1.0
-        for c in self._contribs:
-            total += scale * c
-            new.append(scale * c)
-            scale *= self.decay
-        # keep decayed values
-        self._contribs = new
-        return total
-
-
-@dataclass
 class Edge:
     key: Tuple[int, int, str]  # (i, j, op_id)
     i: int
@@ -429,14 +364,7 @@ class Edge:
     rings: int = 0        # number of microgradients accumulated
     credit_ema: float = 0.0
     credit_tau: float = 0.5
-
-    # Spectral bands
-    bands: List[EdgeBand] = field(default_factory=list)
-
-    # Composite spring contributions
-    spring: CompositeSpringAggregator = field(default_factory=CompositeSpringAggregator)
-
-    # Data-path controls for the edge: [alpha, w, b]
+    # Data-path controls for the edge: (alpha, w, b)
     ctrl: AbstractTensor = field(
         default_factory=lambda: AbstractTensor.zeros(3, dtype=float)
     )
@@ -448,75 +376,27 @@ class Edge:
     k: AbstractTensor = field(
         default_factory=lambda: AbstractTensor.tensor(1.0)
     )  # stiffness
+    face_alpha: Optional[AbstractTensor] = None
+    face_weight: Optional[AbstractTensor] = None
+
+    pops: int = 0  # diagnostics
 
     def update_credit(self, amount: float, dt: float) -> None:
-        a = abs(float(amount))
+        a = float(AbstractTensor.abs(AbstractTensor.get_tensor(amount)))
         self.credit_ema += (a - self.credit_ema) * (dt / max(self.credit_tau, 1e-6))
 
     def ingest_impulse(self, g_scalar: float, dt: float):
         self.timestamp = now_s()
         self.rings += 1
-        # Update band EMAs
-        for b in self.bands:
-            b.m += (abs(g_scalar) - b.m) * (dt / max(b.tau, 1e-6))
-            b.s += (AbstractTensor.sign(AbstractTensor.get_tensor(g_scalar)) - b.s) * (dt / max(b.tau, 1e-6))
-            # Also push a composite contribution (post-knee)
-            # AFTER
-            y = soft_knee(b.m, b.th, b.ratio, b.knee)
-            sgn = 1.0 if MAGNITUDE_ONLY else AbstractTensor.sign(b.s)
-            dl = float(AbstractTensor.get_tensor(b.kappa * sgn * y).clip(-DL_CAP, DL_CAP))
-            self.spring.add(dl)
-
-
-
-    # --- runtime (internal) ---
-    _last_reduce: float = 0.0
-    pops: int = 0  # diagnostics
+        g = AbstractTensor.get_tensor(g_scalar)
+        dt_t = AbstractTensor.get_tensor(dt)
+        ctrl = AbstractTensor.get_tensor(self.ctrl)
+        alpha = ctrl[0] + g * dt_t
+        self.ctrl = AbstractTensor.stack([alpha, ctrl[1], ctrl[2]])
 
     def target_length(self) -> float:
-        # cache current transient aggregate, then clamp total target length
-        agg = self.spring.reduce()
-        self._last_reduce = float(agg)
         l0 = AbstractTensor.get_tensor(self.l0)
-        return float((l0 + agg).clip(L_MIN, L_MAX))
-
-    def maybe_pop(self, L_current: float, quantized=False):
-        """
-        If both frustration and aggregate exceed thresholds, do 'integer' pops:
-          l0 += sgn * POP_QUANTUM
-          spring.consume by adding an equal-and-opposite transient (-sgn * POP_QUANTUM)
-        """
-        # current target uses cached _last_reduce set by target_length() this tick
-        L_star = float((AbstractTensor.get_tensor(self.l0) + self._last_reduce).clip(L_MIN, L_MAX))
-        frustration = abs(L_current - L_star)
-        agg_mag = abs(self._last_reduce)
-        if frustration < POP_FRUSTRATION_TH or agg_mag < POP_AGG_TH:
-            #return  # nothing to do
-            pass #diagnostic
-
-        # how many quanta could we commit right now?
-        want = min(int(agg_mag // POP_QUANTUM), POP_MAX_PER_TICK)
-        if want <= 0:
-            #return
-            pass #diagnostic
-
-        sgn = 1.0 if self._last_reduce >= 0.0 else -1.0
-        for _ in range(1):#want):
-            if False and quantized:
-                # commit ΔL into the permanent base
-                self.l0 = self.l0 + sgn * POP_QUANTUM
-                # consume the same amount from the transient buffer immediately
-                self.spring.add(-sgn * POP_QUANTUM)
-            else:
-                # fractional pop (for testing)
-                delta = sgn * agg_mag #min(POP_QUANTUM, agg_mag)
-                self.l0 += delta
-                #self.spring.add(-delta)
-                agg_mag -= delta
-                if agg_mag <= 0.0:
-                    break
-            
-            self.pops += 1
+        return float(l0)
 
 @dataclass
 class BoundaryPort:
@@ -719,18 +599,10 @@ class SpringRepulsorSystem:
     def ensure_edge(self, i: int, j: int, op_id: str) -> Edge:
         key = (i, j, op_id)
         if key not in self.edges:
-            # Default three bands (fast/mid/slow)
-            bands = [
-                EdgeBand(tau=0.05, K=3.0, kappa=0.15, th=0.05, ratio=3.0, knee=0.05, alpha=1.0),
-                EdgeBand(tau=0.25, K=2.0, kappa=0.10, th=0.10, ratio=2.0, knee=0.10, alpha=0.5),
-                EdgeBand(tau=1.00, K=1.0, kappa=0.05, th=0.20, ratio=1.2, knee=0.20, alpha=0.2),
-            ]
             ctrl = AbstractTensor.zeros(3, dtype=float)
             l0 = AbstractTensor.tensor(1.0)
-            k_val = sum(b.K for b in bands)
-            k = AbstractTensor.tensor(k_val)
-            e = Edge(key=key, i=i, j=j, op_id=op_id, bands=bands,
-                     ctrl=ctrl, l0=l0, k=k)
+            k = AbstractTensor.tensor(1.0)
+            e = Edge(key=key, i=i, j=j, op_id=op_id, ctrl=ctrl, l0=l0, k=k)
             self.edges[key] = e
         return self.edges[key]
 
@@ -773,15 +645,12 @@ class SpringRepulsorSystem:
             if L < 1e-9:
                 continue
             u = d / (L + 1e-12)
-            Lstar = e.target_length()  # also caches _last_reduce
+            Lstar = e.target_length()
             k = AbstractTensor.get_tensor(e.k)
             Fel = k * e.hodge1 * (L - Lstar) * u
             Rep = (self.eta / (self.rep_eps + L * L)) * u
             F[e.i] += (Fel - Rep) * scale
             F[e.j] -= (Fel - Rep) * scale
-
-            # NEW: event-driven discrete commits from stress
-            e.maybe_pop(L)
 
         for b in self.boundaries.values():
             if not b.enabled or b.nid not in self.nodes:
@@ -2052,17 +1921,10 @@ class LinearBlockFactory:
         self.gather_operators = list(gather_operators)
 
     def _mk_edge(self, i, j, op):
-        bands = [
-            EdgeBand(tau=0.05, K=3.0, kappa=0.12, th=0.05, ratio=3.0, knee=0.05, alpha=1.0),
-            EdgeBand(tau=0.25, K=2.0, kappa=0.08, th=0.10, ratio=2.0, knee=0.10, alpha=0.5),
-            EdgeBand(tau=1.00, K=1.0, kappa=0.04, th=0.20, ratio=1.2, knee=0.20, alpha=0.2),
-        ]
         ctrl = AbstractTensor.zeros(3, dtype=float)
         l0 = AbstractTensor.tensor(1.0)
-        k_val = sum(b.K for b in bands)
-        k = AbstractTensor.tensor(k_val)
-        return Edge(key=(i, j, op), i=i, j=j, op_id=op, bands=bands,
-                    ctrl=ctrl, l0=l0, k=k)
+        k = AbstractTensor.tensor(1.0)
+        return Edge(key=(i, j, op), i=i, j=j, op_id=op, ctrl=ctrl, l0=l0, k=k)
 
     def build(self, start_id: int = 0, *, z_level: float = 0.0) -> LinearBlock:
         nid = int(start_id)
