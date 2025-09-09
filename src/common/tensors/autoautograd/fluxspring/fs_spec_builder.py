@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 from ...abstraction import AbstractTensor as AT
 
 # ----------------------------- Nodes -----------------------------------------
@@ -52,8 +52,10 @@ class EdgeSpec:
     h1: AT           # scalar tensor (Hodge-1 weight)
     ctrl: AT         # (Q,) edge data-path scalars (free width)
 
-    # the ONLY nonlinear param, owned by the edge
-    flux: AT         # scalar tensor
+    # learnable parameters and optional resonance state
+    theta: AT        # raw parameter for kappa
+    kappa: AT        # non-negative spring gain
+    x: Optional[AT] = None  # optional resonance state
 
     op: str = ""     # optional operator tag
 
@@ -114,21 +116,25 @@ def make_classifier_spec(
     edges: List[EdgeSpec] = []
     # M → H
     for r, (i, j) in enumerate((ii, jj) for jj in hid_ids for ii in in_ids):
+        theta = AT.get_tensor(0.0)
+        kappa = AT.softplus(theta) if hasattr(AT, 'softplus') else (theta.exp() + 1.0).log()
         edges.append(EdgeSpec(
             eid_1=r + 1, row_idx=r, src=i, dst=j,
             k=AT.get_tensor(1.0), l0=AT.get_tensor(1.0),
             h1=AT.get_tensor(1.0), ctrl=AT.get_tensor([0.0]),
-            flux=AT.get_tensor(0.0), op=""
+            theta=theta, kappa=kappa, x=None, op="",
         ))
     # H → C
     base = len(edges)
     for t, (j, k_) in enumerate((jj, kk) for kk in out_ids for jj in hid_ids):
         r = base + t
+        theta = AT.get_tensor(0.0)
+        kappa = AT.softplus(theta) if hasattr(AT, 'softplus') else (theta.exp() + 1.0).log()
         edges.append(EdgeSpec(
             eid_1=r + 1, row_idx=r, src=j, dst=k_,
             k=AT.get_tensor(1.0), l0=AT.get_tensor(1.0),
             h1=AT.get_tensor(1.0), ctrl=AT.get_tensor([0.0]),
-            flux=AT.get_tensor(0.0), op=""
+            theta=theta, kappa=kappa, x=None, op="",
         ))
 
     # DEC (exactly what was requested; faces not used here → F=0)
