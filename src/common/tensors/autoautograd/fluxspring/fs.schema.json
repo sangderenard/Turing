@@ -172,7 +172,12 @@
       "additionalProperties": false,
       "default": {}
     },
-    "rho": { "type": "number", "default": 0.0 },
+    "rho": {
+      "type": "number",
+      "exclusiveMinimum": -1.0,
+      "exclusiveMaximum": 1.0,
+      "default": 0.0
+    },
     "beta": { "type": "number", "default": 0.0 },
     "gamma": { "type": "number", "default": 0.0 }
   },
