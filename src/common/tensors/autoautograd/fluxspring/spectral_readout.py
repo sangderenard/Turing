@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 from ...abstraction import AbstractTensor as AT
-from .fs_types import SpectralCfg
+from .fs_types import FluxSpringSpec, SpectralCfg
 
 
 def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
@@ -26,8 +26,8 @@ def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
 
     N = int(x.shape[0])
     try:
-        C = AT.fft.rfft(x, axis=0)
-        freqs = AT.fft.rfftfreq(N, d=1.0 / tick_hz, like=x)
+        C = AT.rfft(x, axis=0)
+        freqs = AT.rfftfreq(N, d=1.0 / tick_hz, like=x)
         return AT.real(C), AT.imag(C), freqs
     except Exception:
         t = AT.arange(N, dtype=float)
@@ -35,8 +35,8 @@ def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
         ang = (2.0 * AT.pi() * t[:, None] * k[None, :]) / float(N)
         cos_b = ang.cos()
         sin_b = ang.sin()
-        c_real = cos_b.T @ x
-        c_imag = -sin_b.T @ x
+        c_real = cos_b.T() @ x
+        c_imag = -sin_b.T() @ x
         freqs = k * (tick_hz / float(N))
         return c_real, c_imag, freqs
 
@@ -104,3 +104,22 @@ def compute_metrics(buffer: AT, cfg: SpectralCfg) -> Dict[str, Any]:
         metrics["coherence"] = float(AT.get_tensor(mean_coh).data.item())
 
     return metrics
+
+
+def gather_ring_metrics(spec: FluxSpringSpec) -> Dict[int, Dict[str, Any]]:
+    """Compile spectral metrics for node ring buffers in ``spec``.
+
+    Returns a mapping from node id to the computed metrics.  Only nodes with
+    allocated ring buffers are analysed.
+    """
+
+    cfg = spec.spectral
+    if not cfg.enabled:
+        return {}
+    stats: Dict[int, Dict[str, Any]] = {}
+    for n in spec.nodes:
+        if n.ring is None:
+            continue
+        buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+        stats[n.id] = compute_metrics(buf, cfg)
+    return stats
