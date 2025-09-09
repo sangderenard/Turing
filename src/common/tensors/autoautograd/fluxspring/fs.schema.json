@@ -169,7 +169,9 @@
               },
               "default": []
             },
-            "centroid": { "type": "boolean", "default": false }
+            "centroid": { "type": "boolean", "default": false },
+            "flatness": { "type": "boolean", "default": false },
+            "coherence": { "type": "boolean", "default": false }
           },
           "additionalProperties": false,
           "default": {}

@@ -125,6 +125,8 @@ def _coerce_spectral(d: Optional[Dict]) -> SpectralCfg:
         metrics=SpectralMetrics(
             bands=[[float(lo), float(hi)] for lo, hi in m.get("bands", [])],
             centroid=bool(m.get("centroid", False)),
+            flatness=bool(m.get("flatness", False)),
+            coherence=bool(m.get("coherence", False)),
         ),
     )
 
@@ -259,7 +261,6 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
 
     # Optional numeric check with AbstractTensor if available
     try:
-        from ...abstraction import AbstractTensor as AT
         D0_t = AT.get_tensor(D0).astype(float)
         D1_t = AT.get_tensor(D1).astype(float)
         bdry = D1_t @ D0_t
