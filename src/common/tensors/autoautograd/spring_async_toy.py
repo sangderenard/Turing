@@ -1,16 +1,38 @@
 """
 Spring-Repulsor Async Toy (AbstractTensor)
 ---------------------------------
-Minimal, threadful prototype of the "spring–repulsor, multiband gradient acoustics" learner.
-This toy sketches ideas from ``THEORETIC.md`` where nodes are geometry-indifferent
-and edges/faces carry the discrete exterior calculus (DEC) parameters.  It keeps the
-asynchronous ``Experiencer`` / ``Reflector`` split but still deviates from the plan in
-several ways:
+Minimal, threadful prototype of the "spring–repulsor, multiband gradient acoustics"
+learner.  It sketches the dual data/geometry domains from ``../THEORETIC.md`` where
+nodes shuttle signals through x/z terminals while edges and faces carry the discrete
+exterior calculus (DEC) geometry.  Nodes and edges each expose two parameter sets:
+
+* ``phys`` – per-node Dirichlet targets ``[x, y, z]`` describing the geometric
+  clamps.  The **x channel is always read from upstream** while **z writes to
+  downstream**; both are refreshed every tick.  The y entry alone is left to evolve
+  under the physics worker.
+* ``ctrl`` – data‑path scalars ``[alpha, w, b]`` (alpha, weight and bias) committed
+  alongside geometry to drive the learning rule.
+
+Edges mirror this split with their own ``ctrl`` block and geometric parameters:
+
+* ``phys`` – ``[l0, k, face_weight, curl]`` where rest length ``l0`` and stiffness
+  ``k`` anchor the spring, ``face_weight`` scales relative to edge distance via a
+  provisional face stencil (its angle is assumed rather than solved), and ``curl``
+  captures the local face curvature.  Introducing the stencil adds temporary points
+  in space so faces can exist without fixing global geometry.
+
+All of these geometric terms are learnable by gradient descent much like the
+data‑path scalars, letting a purely message‑passing process coax a graph‑based
+geometry and spatial field into existence.  Operator outputs continue to live in
+the data domain.
+
+The toy keeps the asynchronous ``Experiencer`` / ``Reflector`` split but still deviates
+from the plan in several ways:
 
 - Uses an explicit time-step integrator instead of the proposed timeless, impulse-only
   update (see ``tick``).
-- Nodes expose all three geometric channels and are free by default; ``THEORETIC.md``
-  expects x/z to be clamped and only the y-channel to evolve.
+- Because x and z are Dirichlet inputs they must be refreshed on every update; the
+  y channel alone is free to integrate.
 - Caching, batching and stress-based updates are stubs.
 
 Current features:
@@ -444,7 +466,9 @@ class Node:
 
     def __post_init__(self):
         if self.param is not None:
-            self.phys = self.param
+            # Allow callers to specify a scalar or shorter vector for ``param``.
+            # ``concat`` in ``commit`` expects 1‑D tensors, so reshape here.
+            self.phys = AbstractTensor.get_tensor(self.param).reshape(-1)
         else:
             self.param = self.phys
 
