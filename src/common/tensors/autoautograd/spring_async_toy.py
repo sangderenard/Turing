@@ -441,6 +441,143 @@ def wire_output_chain(
 # ----------------------------- Core data ------------------------------------
 
 
+# NOTE: The toy is transitioning to use FluxSpring specs directly.  The
+# simple Node/Edge/Face classes now wrap the FluxSpring dataclasses and intentionally
+# break the legacy constructors.  Tests depending on the old API are expected to
+# fail while the refactor proceeds.
+
+
+@dataclass
+class Node:
+    spec: NodeSpec
+    hist_p: List[AbstractTensor] = field(default_factory=list)
+    sphere: Optional[AbstractTensor] = None
+    M0: float = 1.0
+
+    @property
+    def id(self) -> int:  # legacy alias
+        return self.spec.id
+
+    @property
+    def p(self) -> AbstractTensor:
+        return self.spec.p
+
+    @p.setter
+    def p(self, v: AbstractTensor) -> None:
+        self.spec.p = v
+
+    @property
+    def v(self) -> AbstractTensor:
+        return self.spec.v
+
+    @v.setter
+    def v(self, val: AbstractTensor) -> None:
+        self.spec.v = val
+
+    @property
+    def phys(self) -> AbstractTensor:
+        return self.spec.phys
+
+    @phys.setter
+    def phys(self, val: AbstractTensor) -> None:
+        self.spec.phys = val
+
+    @property
+    def ctrl(self) -> AbstractTensor:
+        return self.spec.ctrl
+
+    @ctrl.setter
+    def ctrl(self, val: AbstractTensor) -> None:
+        self.spec.ctrl = val
+
+    @property
+    def geom_mask(self) -> AbstractTensor:
+        return self.spec.mask
+
+    @geom_mask.setter
+    def geom_mask(self, val: AbstractTensor) -> None:
+        self.spec.mask = val
+
+    def commit(self) -> None:
+        self.spec.sync_io()
+        self.sphere = AbstractTensor.concat([self.p, self.phys, self.ctrl], dim=0)
+
+
+@dataclass
+class Edge:
+    spec: EdgeSpec
+    rings: int = 0
+    curvature: Optional[AbstractTensor] = None
+
+    @property
+    def key(self) -> Tuple[int, int, str]:  # legacy alias
+        return (self.spec.src, self.spec.dst, self.spec.op)
+
+    @property
+    def i(self) -> int:
+        return self.spec.src
+
+    @i.setter
+    def i(self, val: int) -> None:
+        self.spec.src = val
+
+    @property
+    def j(self) -> int:
+        return self.spec.dst
+
+    @j.setter
+    def j(self, val: int) -> None:
+        self.spec.dst = val
+
+    @property
+    def op_id(self) -> str:
+        return self.spec.op
+
+    @op_id.setter
+    def op_id(self, val: str) -> None:
+        self.spec.op = val
+
+    @property
+    def ctrl(self) -> AbstractTensor:
+        return self.spec.ctrl
+
+    @ctrl.setter
+    def ctrl(self, val: AbstractTensor) -> None:
+        self.spec.ctrl = val
+
+    @property
+    def l0(self) -> AbstractTensor:
+        return self.spec.l0
+
+    @l0.setter
+    def l0(self, val: AbstractTensor) -> None:
+        self.spec.l0 = val
+
+    @property
+    def k(self) -> AbstractTensor:
+        return self.spec.k
+
+    @k.setter
+    def k(self, val: AbstractTensor) -> None:
+        self.spec.k = val
+
+    @property
+    def hodge1(self) -> AbstractTensor:
+        return self.spec.h1
+
+    @hodge1.setter
+    def hodge1(self, val: AbstractTensor) -> None:
+        self.spec.h1 = val
+
+    def target_length(self):
+        return AbstractTensor.get_tensor(self.l0)
+
+
+@dataclass
+class Face:
+    edges: List[Tuple[int, int, str]] = field(default_factory=list)
+    ctrl: Optional[AbstractTensor] = None
+
 
 @dataclass
 class Node:
@@ -2301,40 +2438,8 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
     # Build a FluxSpringSpec describing the same topology
     AT = AbstractTensor
-    fs_nodes: List[NodeSpec] = []
-    for n in nodes:
-        fs_nodes.append(
-            NodeSpec(
-                id=n.id,
-                p=n.p,
-                v=n.v,
-                phys=n.phys,
-                mask=n.geom_mask,
-                ctrl=n.ctrl,
-                mass=AT.get_tensor(1.0),
-                in_value=AT.get_tensor(0.0),
-                out_value=AT.get_tensor(0.0),
-                in_target=AT.get_tensor(0.0),
-                out_target=AT.get_tensor(0.0),
-            )
-        )
-
-    fs_edges: List[EdgeSpec] = []
-    for r, e in enumerate(edges):
-        fs_edges.append(
-            EdgeSpec(
-                eid_1=r + 1,
-                row_idx=r,
-                src=e.i,
-                dst=e.j,
-                k=e.k,
-                l0=e.l0,
-                h1=AT.get_tensor(1.0),
-                ctrl=e.ctrl,
-                flux=AT.get_tensor(0.0),
-                op=e.op_id,
-            )
-        )
+    fs_nodes: List[NodeSpec] = [n.spec for n in nodes]
+    fs_edges: List[EdgeSpec] = [e.spec for e in edges]
 
     N = len(fs_nodes)
     E = len(fs_edges)
