@@ -31,10 +31,12 @@ def _node(idx: int, D: int, scripted_axes=(0, 2)) -> NodeSpec:
     return NodeSpec(
         id=idx,
         p0=p0,
-        v0=v0,
+       v0=v0,
         mass=AT.tensor(1.0),
         ctrl=ctrl,
         scripted_axes=list(scripted_axes),
+        temperature=AT.tensor(0.0),
+        exclusive=False,
     )
 
 def _edge(i: int, j: int) -> EdgeSpec:
@@ -48,7 +50,7 @@ def _edge(i: int, j: int) -> EdgeSpec:
         b=AT.tensor(0.0),
         learn=LearnCtrl(True, True, True),
     )
-    return EdgeSpec(src=i, dst=j, transport=transport, ctrl=ctrl)
+    return EdgeSpec(src=i, dst=j, transport=transport, ctrl=ctrl, temperature=AT.tensor(0.0), exclusive=False)
 
 def make_classifier_spec(
     name: str,

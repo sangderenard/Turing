@@ -98,11 +98,15 @@ from ...dt_system.dt import SuperstepPlan
 from ...dt_system.roundnode_engine import RoundNodeEngine
 from ...dt_system.state_table import StateTable
 from ...dt_system.threaded_system import ThreadedSystemEngine
-from .fluxspring.fs_spec_builder import (
+from .fluxspring.fs_types import (
     FluxSpringSpec,
     NodeSpec,
     EdgeSpec,
     DECSpec,
+    NodeCtrl,
+    EdgeCtrl,
+    EdgeTransport,
+    EdgeTransportLearn,
 )
 V_MAX = 2.0
 STEP_MAX = 10.2
@@ -2437,32 +2441,57 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.0, gamma=0.3, dt=0.02)
 
     # Build a FluxSpringSpec describing the same topology
-    AT = AbstractTensor
-    fs_nodes: List[NodeSpec] = [n.spec for n in nodes]
-    fs_edges: List[EdgeSpec] = [e.spec for e in edges]
+    fs_nodes: List[NodeSpec] = []
+    for n in nodes:
+        ctrl = NodeCtrl(alpha=n.ctrl[0], w=n.ctrl[1], b=n.ctrl[2])
+        fs_nodes.append(
+            NodeSpec(
+                id=n.id,
+                p0=n.p,
+                v0=n.v if n.v is not None else AbstractTensor.zeros_like(n.p),
+                mass=AbstractTensor.tensor(n.M0),
+                ctrl=ctrl,
+                scripted_axes=[0, 2],
+                temperature=AbstractTensor.tensor(0.0),
+                exclusive=False,
+            )
+        )
+    fs_edges: List[EdgeSpec] = []
+    for e in edges:
+        transport = EdgeTransport(
+            kappa=AbstractTensor.tensor(1.0),
+            k=e.k,
+            l0=e.l0,
+            learn=EdgeTransportLearn(kappa=True, k=False, l0=False, lambda_s=False, x=False),
+        )
+        ctrl = EdgeCtrl(alpha=e.ctrl[0], w=e.ctrl[1], b=e.ctrl[2])
+        fs_edges.append(
+            EdgeSpec(
+                src=e.i,
+                dst=e.j,
+                transport=transport,
+                ctrl=ctrl,
+                temperature=AbstractTensor.tensor(0.0),
+                exclusive=False,
+            )
+        )
 
     N = len(fs_nodes)
     E = len(fs_edges)
-    F = 0
-    D0 = AT.zeros((E, N))
+    D0 = [[0.0] * N for _ in range(E)]
     for r, e in enumerate(fs_edges):
-        D0[r, e.src] = -1.0
-        D0[r, e.dst] = +1.0
-    D1 = AT.zeros((F, E))
-    H0 = AT.ones((N,))
-    H1 = AT.ones((E,))
-    H2 = AT.ones((F,))
-    S_fe = AT.zeros((F, E))
-    dec = DECSpec(
-        D0=D0,
-        D1=D1,
-        H0=H0,
-        H1=H1,
-        H2=H2,
-        S_fe=S_fe,
-        node_rows=[n.id for n in fs_nodes],
+        D0[r][e.src] = -1.0
+        D0[r][e.dst] = +1.0
+    D1: List[List[float]] = []
+    dec = DECSpec(D0=D0, D1=D1)
+    spec = FluxSpringSpec(
+        version="spring-async-toy-1.0",
+        D=sys.D,
+        nodes=fs_nodes,
+        edges=fs_edges,
+        faces=[],
+        dec=dec,
     )
-    spec = FluxSpringSpec(D=sys.D, nodes=fs_nodes, edges=fs_edges, dec=dec)
 
     # Tag roles for visualization
     sys.roles = {}
