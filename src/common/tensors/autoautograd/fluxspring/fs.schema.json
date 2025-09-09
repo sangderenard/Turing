@@ -142,6 +142,36 @@
       },
       "additionalProperties": false
     },
+    "spectral": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "tick_hz": { "type": "number", "minimum": 0.0, "default": 44100.0 },
+        "win_len": { "type": "integer", "minimum": 1, "default": 1024 },
+        "hop_len": { "type": "integer", "minimum": 1, "default": 256 },
+        "window": { "type": "string", "default": "hann" },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "bands": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": { "type": "number" },
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "default": []
+            },
+            "centroid": { "type": "boolean", "default": false }
+          },
+          "additionalProperties": false,
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "default": {}
+    },
     "rho": { "type": "number", "default": 0.0 },
     "beta": { "type": "number", "default": 0.0 },
     "gamma": { "type": "number", "default": 0.0 }

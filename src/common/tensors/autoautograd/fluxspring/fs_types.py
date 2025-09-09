@@ -100,6 +100,22 @@ class RegCfg:
     lambda_c: float = 0.0
     lambda_w: float = 0.0
 
+# ----- spectral feature extraction -----
+@dataclass
+class SpectralMetrics:
+    bands: List[List[float]] = field(default_factory=list)  # [ [f_lo, f_hi], ... ]
+    centroid: bool = False
+
+
+@dataclass
+class SpectralCfg:
+    enabled: bool = False
+    tick_hz: float = 44100.0
+    win_len: int = 1024
+    hop_len: int = 256
+    window: str = "hann"
+    metrics: SpectralMetrics = field(default_factory=SpectralMetrics)
+
 # ----- top-level FluxSpring spec -----
 @dataclass
 class FluxSpringSpec:
@@ -111,6 +127,7 @@ class FluxSpringSpec:
     dec: DECSpec
     dirichlet: Optional[DirichletCfg] = None
     regularizers: Optional[RegCfg] = None
+    spectral: SpectralCfg = field(default_factory=SpectralCfg)
     rho: AT = field(default_factory=lambda: AT.tensor(0.0))
     beta: AT = field(default_factory=lambda: AT.tensor(0.0))
     gamma: AT = field(default_factory=lambda: AT.tensor(0.0))
