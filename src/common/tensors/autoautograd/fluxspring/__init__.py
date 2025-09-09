@@ -19,4 +19,6 @@ from .fs_dec import (
     transport_tick,
     pump_tick,
 )
+# Spectral utilities
+from .spectral_readout import compute_metrics
 # Torch bridge is optional import to keep AT-only usage clean.

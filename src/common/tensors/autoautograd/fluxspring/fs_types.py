@@ -150,6 +150,8 @@ class RegCfg:
 class SpectralMetrics:
     bands: List[List[float]] = field(default_factory=list)  # [ [f_lo, f_hi], ... ]
     centroid: bool = False
+    flatness: bool = False
+    coherence: bool = False
 
 
 @dataclass
