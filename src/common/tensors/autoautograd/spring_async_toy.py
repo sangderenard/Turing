@@ -98,19 +98,11 @@ from ...dt_system.dt import SuperstepPlan
 from ...dt_system.roundnode_engine import RoundNodeEngine
 from ...dt_system.state_table import StateTable
 from ...dt_system.threaded_system import ThreadedSystemEngine
-from .fluxspring.fs_types import (
+from .fluxspring.fs_spec_builder import (
     FluxSpringSpec,
     NodeSpec,
     EdgeSpec,
-    FaceSpec,
-    NodeCtrl,
-    EdgeCtrl,
-    EdgeHooke,
-    EdgeHookeLearn,
-    LearnCtrl,
     DECSpec,
-    DirichletCfg,
-    RegCfg,
 )
 V_MAX = 2.0
 STEP_MAX = 10.2
@@ -2429,6 +2421,66 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
 
     sys = SpringRepulsorSystem(nodes, edges, eta=0.0, gamma=0.3, dt=0.02)
 
+    # Build a FluxSpringSpec describing the same topology
+    AT = AbstractTensor
+    fs_nodes: List[NodeSpec] = []
+    for n in nodes:
+        fs_nodes.append(
+            NodeSpec(
+                id=n.id,
+                p=n.p,
+                v=n.v,
+                phys=n.phys,
+                mask=n.geom_mask,
+                ctrl=n.ctrl,
+                mass=AT.get_tensor(1.0),
+                in_value=AT.get_tensor(0.0),
+                out_value=AT.get_tensor(0.0),
+                in_target=AT.get_tensor(0.0),
+                out_target=AT.get_tensor(0.0),
+            )
+        )
+
+    fs_edges: List[EdgeSpec] = []
+    for r, e in enumerate(edges):
+        fs_edges.append(
+            EdgeSpec(
+                eid_1=r + 1,
+                row_idx=r,
+                src=e.i,
+                dst=e.j,
+                k=e.k,
+                l0=e.l0,
+                h1=AT.get_tensor(1.0),
+                ctrl=e.ctrl,
+                flux=AT.get_tensor(0.0),
+                op=e.op_id,
+            )
+        )
+
+    N = len(fs_nodes)
+    E = len(fs_edges)
+    F = 0
+    D0 = AT.zeros((E, N))
+    for r, e in enumerate(fs_edges):
+        D0[r, e.src] = -1.0
+        D0[r, e.dst] = +1.0
+    D1 = AT.zeros((F, E))
+    H0 = AT.ones((N,))
+    H1 = AT.ones((E,))
+    H2 = AT.ones((F,))
+    S_fe = AT.zeros((F, E))
+    dec = DECSpec(
+        D0=D0,
+        D1=D1,
+        H0=H0,
+        H1=H1,
+        H2=H2,
+        S_fe=S_fe,
+        node_rows=[n.id for n in fs_nodes],
+    )
+    spec = FluxSpringSpec(D=sys.D, nodes=fs_nodes, edges=fs_edges, dec=dec)
+
     # Tag roles for visualization
     sys.roles = {}
     for i in lb.in_ids:
@@ -2500,7 +2552,7 @@ def build_toy_system(seed=0, *, batch_size: int = 4096, batch_refresh_hz: float 
     # Wire the op program
     sys.ops_program = lb.ops
 
-    return sys, outputs
+    return sys, outputs, spec
 
 
 def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) -> RoundNode:
@@ -2548,7 +2600,7 @@ def build_round_node(sys: SpringRepulsorSystem, dt: float, table: StateTable) ->
 
 def main(duration_s: float = 8.0, viz_mode: str = "none"):
     # Default to a large random batch driving the inputs
-    sys, outputs = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
+    sys, outputs, _spec = build_toy_system(seed=42, batch_size=10, batch_refresh_hz=15.0)
 
     stop = threading.Event()
     tick_hz = 30.0

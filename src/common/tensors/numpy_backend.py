@@ -297,6 +297,14 @@ class NumPyTensorOperations(AbstractTensor):
         if np.isscalar(self.data) or (isinstance(self.data, np.ndarray) and self.data.ndim == 0):
             return tuple(int(x) for x in result)
         return result
+
+    def noop(self, *_, **__):
+        """Identity operator used for boundary stubs.
+
+        Returning ``self + 0`` preserves autograd tracking while leaving the
+        tensor value unchanged.
+        """
+        return self + 0
     def __init__(self, track_time: bool = False, tape=None, requires_grad: bool = False):
         super().__init__(track_time=track_time, tape=tape, requires_grad=requires_grad)
 
