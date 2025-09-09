@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-AbstractTensor-based DEC helpers & energies for FluxSpring.
-No torch usage here. Analytic ∂E/∂P provided.
+"""AbstractTensor-based DEC helpers and transport updates for FluxSpring.
+
+No torch usage here.
 """
 from __future__ import annotations
-from typing import Tuple, List, Dict
+from typing import Tuple, Dict
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
@@ -74,11 +74,15 @@ def edge_energy_AT(P: AT.Tensor, spec: FluxSpringSpec, k: AT.Tensor, l0: AT.Tens
     g = edge_strain_AT(P, spec, l0)
     return 0.5 * AT.sum(k * g * g)
 
-def face_energy_from_strain_AT(g: AT.Tensor, spec: FluxSpringSpec, alpha_face: AT.Tensor, c: AT.Tensor):
+
+def face_energy_from_strain_AT(
+    g: AT.Tensor, spec: FluxSpringSpec, alpha_face: AT.Tensor, c: AT.Tensor
+):
     z = face_flux_AT(g, spec)
     u, dphi = curvature_activation_AT(z, alpha_face)
     E_face = 0.5 * AT.sum(c * u * u)
     return E_face, z, u, dphi
+
 
 def total_energy_AT(P: AT.Tensor, spec: FluxSpringSpec, *, return_parts: bool = False):
     k, l0 = edge_params_AT(spec)
@@ -93,13 +97,10 @@ def total_energy_AT(P: AT.Tensor, spec: FluxSpringSpec, *, return_parts: bool = 
         return E, {"edge": E_edge, "face": E_face, "g": g, "z": z, "u": u}
     return E
 
+
 def dec_energy_and_gradP_AT(P: AT.Tensor, spec: FluxSpringSpec):
-    """
-    Analytic gradient of total energy wrt node positions P (N,D).
-    Matches the form used in your engine:
-      ∂E/∂p_i = -Σ_{e=(i->j)} r_e u_e + Σ_{e=(k->i)} r_e u_e
-      where r = k*g + D1^T ( c * u * dphi )
-    """
+    """Analytic gradient of total energy wrt node positions ``P``."""
+
     k, l0 = edge_params_AT(spec)
     alpha, c = face_params_AT(spec)
     idx_i, idx_j = _edge_indices(spec)
@@ -120,17 +121,118 @@ def dec_energy_and_gradP_AT(P: AT.Tensor, spec: FluxSpringSpec):
     # accumulate to node grads
     gradP = AT.zeros_like(P)
     for eidx in range(len(spec.edges)):
-        i = int(idx_i[eidx]); j = int(idx_j[eidx])
+        i = int(idx_i[eidx])
+        j = int(idx_j[eidx])
         gradP[i] += -r[eidx] * uhat[eidx]
         gradP[j] += +r[eidx] * uhat[eidx]
     E = 0.5 * AT.sum(k * g * g) + 0.5 * AT.sum(c * u * u)
     return E, gradP
 
-def path_edge_energy_AT(P: AT.Tensor, spec: FluxSpringSpec, edge_indices_1based: List[int]) -> AT.Tensor:
+
+def path_edge_energy_AT(
+    P: AT.Tensor, spec: FluxSpringSpec, edge_indices_1based: list[int]
+) -> AT.Tensor:
     k, l0 = edge_params_AT(spec)
     g_all = edge_strain_AT(P, spec, l0)
-    # convert to 0-based
-    idx = AT.get_tensor([i-1 for i in edge_indices_1based], dtype=int)
+    idx = AT.get_tensor([i - 1 for i in edge_indices_1based], dtype=int)
     g = g_all.index_select(0, idx)
     k_sel = k.index_select(0, idx)
     return 0.5 * AT.sum(k_sel * g * g)
+
+
+# --------- Transport ---------
+def transport_tick(
+    psi: AT.Tensor,
+    spec: FluxSpringSpec,
+    *,
+    eta: float,
+    P: AT.Tensor | None = None,
+    phi=AT.tanh,
+) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
+    """Advance node potentials with transport params and geometry coupling."""
+
+    D0, _ = incidence_tensors_AT(spec)
+    dpsi = D0 @ psi  # (E,)
+
+    kappa = AT.get_tensor([e.transport.kappa for e in spec.edges]).astype(float)  # (E,)
+
+    if P is not None:
+        k = AT.get_tensor([
+            e.transport.k if e.transport.k is not None else AT.tensor(0.0)
+            for e in spec.edges
+        ]).astype(float)
+        l0 = AT.get_tensor([
+            e.transport.l0 if e.transport.l0 is not None else AT.tensor(0.0)
+            for e in spec.edges
+        ]).astype(float)
+        lambda_s = AT.get_tensor([
+            e.transport.lambda_s if e.transport.lambda_s is not None else AT.tensor(0.0)
+            for e in spec.edges
+        ]).astype(float)
+        g = edge_strain_AT(P, spec, l0)
+        G = lambda_s * k * g
+    else:
+        G = AT.zeros_like(kappa)
+
+    x = AT.get_tensor([
+        e.transport.x if e.transport.x is not None else AT.tensor(0.0)
+        for e in spec.edges
+    ]).astype(float)
+    gamma = AT.get_tensor(spec.gamma).astype(float)
+    R = gamma * x
+
+    delta = dpsi + G + R
+    q = kappa * phi(delta)
+
+    s = D0.T() @ q  # node balances
+    psi_next = psi + eta * s
+
+    x_new = x + eta * q
+    for e, x_val in zip(spec.edges, x_new):
+        e.transport.x = AT.get_tensor(float(x_val))
+
+    stats = {"q": q, "dpsi": dpsi, "G": G, "R": R, "s": s}
+    return psi_next, stats
+
+
+# --------- Data pump ---------
+def pump_tick(
+    psi: AT.Tensor,
+    spec: FluxSpringSpec,
+    *,
+    eta: float,
+    phi=AT.tanh,
+) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
+    """Advance node potentials via data-path control parameters.
+
+    Edge updates are applied in parallel followed by node updates, each driven by
+    their respective ``(alpha, w, b)`` control triples.
+    """
+
+    D0, _ = incidence_tensors_AT(spec)
+    dpsi = D0 @ psi  # (E,)
+
+    alpha_e = AT.get_tensor([e.ctrl.alpha for e in spec.edges]).astype(float)
+    w_e = AT.get_tensor([e.ctrl.w for e in spec.edges]).astype(float)
+    b_e = AT.get_tensor([e.ctrl.b for e in spec.edges]).astype(float)
+    edge_in = alpha_e * dpsi + b_e
+    q = w_e * phi(edge_in)
+
+    s = D0.T() @ q  # (N,)
+
+    alpha_n = AT.get_tensor([n.ctrl.alpha for n in spec.nodes]).astype(float)
+    w_n = AT.get_tensor([n.ctrl.w for n in spec.nodes]).astype(float)
+    b_n = AT.get_tensor([n.ctrl.b for n in spec.nodes]).astype(float)
+    node_in = alpha_n * s + b_n
+    delta = w_n * phi(node_in)
+
+    psi_next = psi + eta * delta
+    stats = {
+        "dpsi": dpsi,
+        "q": q,
+        "s": s,
+        "delta": delta,
+        "edge_in": edge_in,
+        "node_in": node_in,
+    }
+    return psi_next, stats
