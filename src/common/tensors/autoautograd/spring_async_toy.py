@@ -98,6 +98,20 @@ from ...dt_system.dt import SuperstepPlan
 from ...dt_system.roundnode_engine import RoundNodeEngine
 from ...dt_system.state_table import StateTable
 from ...dt_system.threaded_system import ThreadedSystemEngine
+from .fluxspring.fs_types import (
+    FluxSpringSpec,
+    NodeSpec,
+    EdgeSpec,
+    FaceSpec,
+    NodeCtrl,
+    EdgeCtrl,
+    EdgeHooke,
+    EdgeHookeLearn,
+    LearnCtrl,
+    DECSpec,
+    DirichletCfg,
+    RegCfg,
+)
 V_MAX = 2.0
 STEP_MAX = 10.2
 READOUT_SCALE = 1.0
