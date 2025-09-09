@@ -11,7 +11,6 @@ FluxSpring spec builders for data-network experiments.
 """
 from __future__ import annotations
 from typing import List
-from dataclasses import replace
 
 from .fs_types import (
     FluxSpringSpec, NodeSpec, EdgeSpec, FaceSpec,
@@ -43,8 +42,6 @@ def _node(idx: int, D: int, scripted_axes=(0, 2)) -> NodeSpec:
 def _edge(i: int, j: int) -> EdgeSpec:
     transport = EdgeTransport(
         kappa=AT.tensor(1.0),
-        k=AT.tensor(1.0),
-        l0=AT.tensor(1.0),
         learn=EdgeTransportLearn(kappa=True, k=False, l0=False, lambda_s=False, x=False),
     )
     ctrl = EdgeCtrl(

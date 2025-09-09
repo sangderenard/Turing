@@ -23,11 +23,11 @@ def _coerce_node(d: Dict) -> NodeSpec:
         id=int(d["id"]),
         p0=AT.get_tensor(d["p0"]),
         v0=AT.get_tensor(d["v0"]),
-        mass=AT.tensor(float(d["mass"])),
+        mass=AT.get_tensor(d.get("mass", 1.0)),
         ctrl=NodeCtrl(
-            alpha=AT.tensor(float(ctrl.get("alpha", 0.0))),
-            w=AT.tensor(float(ctrl.get("w", 1.0))),
-            b=AT.tensor(float(ctrl.get("b", 0.0))),
+            alpha=AT.get_tensor(ctrl.get("alpha", 0.0)),
+            w=AT.get_tensor(ctrl.get("w", 1.0)),
+            b=AT.get_tensor(ctrl.get("b", 0.0)),
             learn=LearnCtrl(
                 alpha=bool(learn.get("alpha", True)),
                 w=bool(learn.get("w", True)),
@@ -48,23 +48,21 @@ def _coerce_edge(d: Dict) -> EdgeSpec:
         src=int(d["src"]),
         dst=int(d["dst"]),
         transport=EdgeTransport(
-            kappa=AT.tensor(float(tr.get("kappa", 1.0))),
-            k=AT.tensor(float(tr["k"])) if "k" in tr else None,
-            l0=AT.tensor(float(tr["l0"])) if "l0" in tr else None,
-            lambda_s=AT.tensor(float(tr["lambda_s"])) if "lambda_s" in tr else None,
-            x=AT.tensor(float(tr["x"])) if "x" in tr else None,
+            kappa=AT.get_tensor(tr.get("kappa", 1.0)),
+            lambda_s=AT.get_tensor(tr["lambda_s"]) if "lambda_s" in tr else None,
+            x=AT.get_tensor(tr["x"]) if "x" in tr else None,
             learn=EdgeTransportLearn(
                 kappa=bool(trL.get("kappa", True)),
-                k=bool(trL.get("k", True)),
-                l0=bool(trL.get("l0", True)),
+                k=False,
+                l0=False,
                 lambda_s=bool(trL.get("lambda_s", True)),
                 x=bool(trL.get("x", True)),
             ),
         ),
         ctrl=EdgeCtrl(
-            alpha=AT.tensor(float(ctrl.get("alpha", 0.0))),
-            w=AT.tensor(float(ctrl.get("w", 1.0))),
-            b=AT.tensor(float(ctrl.get("b", 0.0))),
+            alpha=AT.get_tensor(ctrl.get("alpha", 0.0)),
+            w=AT.get_tensor(ctrl.get("w", 1.0)),
+            b=AT.get_tensor(ctrl.get("b", 0.0)),
             learn=LearnCtrl(
                 alpha=bool(cL.get("alpha", True)),
                 w=bool(cL.get("w", True)),
@@ -79,8 +77,8 @@ def _coerce_face(d: Dict) -> FaceSpec:
     L = d.get("learn", {})
     return FaceSpec(
         edges=[int(x) for x in d["edges"]],
-        alpha=AT.tensor(float(d["alpha"])),
-        c=AT.tensor(float(d["c"])),
+        alpha=AT.get_tensor(d["alpha"]),
+        c=AT.get_tensor(d["c"]),
         learn=FaceLearn(alpha=bool(L.get("alpha", True)), c=bool(L.get("c", True))),
     )
 
@@ -146,9 +144,9 @@ def load_fluxspring(path: str) -> FluxSpringSpec:
         dirichlet=_coerce_dirichlet(raw.get("dirichlet")),
         regularizers=_coerce_regs(raw.get("regularizers")),
         spectral=_coerce_spectral(raw.get("spectral")),
-        rho=AT.tensor(float(raw.get("rho", 0.0))),
-        beta=AT.tensor(float(raw.get("beta", 0.0))),
-        gamma=AT.tensor(float(raw.get("gamma", 0.0))),
+        rho=AT.get_tensor(raw.get("rho", 0.0)),
+        beta=AT.get_tensor(raw.get("beta", 0.0)),
+        gamma=AT.get_tensor(raw.get("gamma", 0.0)),
     )
     validate_fluxspring(spec)
     return spec
@@ -156,11 +154,11 @@ def load_fluxspring(path: str) -> FluxSpringSpec:
 def save_fluxspring(spec: FluxSpringSpec, path: str, *, indent: int = 2) -> None:
     def _plain(x):
         if is_dataclass(x):
-            return {k: _plain(v) for k, v in asdict(x).items()}
+            return {k: _plain(v) for k, v in asdict(x).items() if v is not None}
         if isinstance(x, list):
             return [_plain(v) for v in x]
         if isinstance(x, dict):
-            return {k: _plain(v) for k, v in x.items()}
+            return {k: _plain(v) for k, v in x.items() if v is not None}
         try:
             t = AT.get_tensor(x)
             if getattr(t, "shape", ()) == ():
@@ -201,17 +199,21 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
     for k, e in enumerate(spec.edges, start=1):
         if e.src not in valid_nodes or e.dst not in valid_nodes:
             raise ValueError(f"edge {k}: src/dst not valid node ids")
+        if e.transport.kappa is None:
+            raise ValueError(f"edge {k}: missing kappa")
         if float(AT.get_tensor(e.transport.kappa)) < 0:
             raise ValueError(f"edge {k}: kappa must be ≥ 0")
-        if e.transport.k is not None and float(AT.get_tensor(e.transport.k)) < 0:
-            raise ValueError(f"edge {k}: k must be ≥ 0")
-        if e.transport.l0 is not None and float(AT.get_tensor(e.transport.l0)) < 0:
-            raise ValueError(f"edge {k}: l0 must be ≥ 0")
+        if (e.transport.lambda_s is None) != (e.transport.x is None):
+            raise ValueError(f"edge {k}: lambda_s and x must both be present or absent")
         if e.transport.lambda_s is not None and float(AT.get_tensor(e.transport.lambda_s)) < 0:
             raise ValueError(f"edge {k}: lambda_s must be ≥ 0")
         _ = float(AT.get_tensor(e.temperature))
         if not isinstance(e.exclusive, bool):
             raise ValueError(f"edge {k}: exclusive must be bool")
+        if e.transport.x is not None:
+            x_t = AT.get_tensor(e.transport.x)
+            if len(x_t) != spec.D:
+                raise ValueError(f"edge {k}: x must have length D")
 
     for fidx, fc in enumerate(spec.faces, start=1):
         for or_idx in fc.edges:
@@ -231,6 +233,10 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
         raise ValueError(f"D0 shape must be (E={E}, N={N})")
     if len(D1) != F or any(len(row) != E for row in D1):
         raise ValueError(f"D1 shape must be (F={F}, E={E})")
+
+    for name in ("rho", "beta", "gamma"):
+        if float(AT.get_tensor(getattr(spec, name))) < 0:
+            raise ValueError(f"{name} must be ≥ 0")
 
     sp = spec.spectral
     if sp.win_len < sp.hop_len:
