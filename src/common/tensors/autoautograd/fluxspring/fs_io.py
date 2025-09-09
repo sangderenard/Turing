@@ -12,7 +12,7 @@ from ...abstraction import AbstractTensor as AT
 from .fs_types import (
     FluxSpringSpec, NodeSpec, EdgeSpec, FaceSpec, DECSpec,
     DirichletCfg, RegCfg, NodeCtrl, LearnCtrl, EdgeTransport, EdgeTransportLearn,
-    EdgeCtrl, FaceLearn
+    EdgeCtrl, FaceLearn, SpectralCfg, SpectralMetrics
 )
 
 # ------------ coercion into dataclasses ------------
@@ -107,6 +107,23 @@ def _coerce_regs(d: Optional[Dict]) -> Optional[RegCfg]:
         lambda_w=float(d.get("lambda_w", 0.0)),
     )
 
+
+def _coerce_spectral(d: Optional[Dict]) -> SpectralCfg:
+    if d is None:
+        return SpectralCfg()
+    m = d.get("metrics", {})
+    return SpectralCfg(
+        enabled=bool(d.get("enabled", False)),
+        tick_hz=float(d.get("tick_hz", 44100.0)),
+        win_len=int(d.get("win_len", 1024)),
+        hop_len=int(d.get("hop_len", 256)),
+        window=str(d.get("window", "hann")),
+        metrics=SpectralMetrics(
+            bands=[[float(lo), float(hi)] for lo, hi in m.get("bands", [])],
+            centroid=bool(m.get("centroid", False)),
+        ),
+    )
+
 # ------------ I/O ------------
 def load_fluxspring(path: str) -> FluxSpringSpec:
     with open(path, "r", encoding="utf-8") as f:
@@ -124,6 +141,7 @@ def load_fluxspring(path: str) -> FluxSpringSpec:
         dec=_coerce_dec(raw["dec"]),
         dirichlet=_coerce_dirichlet(raw.get("dirichlet")),
         regularizers=_coerce_regs(raw.get("regularizers")),
+        spectral=_coerce_spectral(raw.get("spectral")),
         rho=AT.tensor(float(raw.get("rho", 0.0))),
         beta=AT.tensor(float(raw.get("beta", 0.0))),
         gamma=AT.tensor(float(raw.get("gamma", 0.0))),
@@ -203,6 +221,16 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
         raise ValueError(f"D0 shape must be (E={E}, N={N})")
     if len(D1) != F or any(len(row) != E for row in D1):
         raise ValueError(f"D1 shape must be (F={F}, E={E})")
+
+    sp = spec.spectral
+    if sp.win_len < sp.hop_len:
+        raise ValueError("spectral.win_len must be ≥ hop_len")
+    nyq = sp.tick_hz / 2.0
+    for i, (f_lo, f_hi) in enumerate(sp.metrics.bands):
+        if not (0.0 <= f_lo < f_hi <= nyq):
+            raise ValueError(
+                f"spectral.metrics.bands[{i}] must satisfy 0 ≤ f_lo < f_hi ≤ tick_hz/2"
+            )
 
     # Optional numeric check with AbstractTensor if available
     try:
