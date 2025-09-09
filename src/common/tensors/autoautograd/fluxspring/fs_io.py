@@ -35,6 +35,8 @@ def _coerce_node(d: Dict) -> NodeSpec:
             ),
         ),
         scripted_axes=[int(a) for a in d["scripted_axes"]],
+        temperature=AT.tensor(float(d.get("temperature", 0.0))),
+        exclusive=bool(d.get("exclusive", False)),
     )
 
 def _coerce_edge(d: Dict) -> EdgeSpec:
@@ -69,6 +71,8 @@ def _coerce_edge(d: Dict) -> EdgeSpec:
                 b=bool(cL.get("b", True)),
             ),
         ),
+        temperature=AT.tensor(float(d.get("temperature", 0.0))),
+        exclusive=bool(d.get("exclusive", False)),
     )
 
 def _coerce_face(d: Dict) -> FaceSpec:
@@ -185,6 +189,9 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
             raise ValueError(f"node {n.id}: p0/v0 must be length D")
         if float(AT.get_tensor(n.mass)) <= 0:
             raise ValueError(f"node {n.id}: mass must be > 0")
+        _ = float(AT.get_tensor(n.temperature))
+        if not isinstance(n.exclusive, bool):
+            raise ValueError(f"node {n.id}: exclusive must be bool")
         if len(n.scripted_axes) != 2:
             raise ValueError(f"node {n.id}: scripted_axes must list exactly 2 axes")
         for a in n.scripted_axes:
@@ -202,6 +209,9 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
             raise ValueError(f"edge {k}: l0 must be ≥ 0")
         if e.transport.lambda_s is not None and float(AT.get_tensor(e.transport.lambda_s)) < 0:
             raise ValueError(f"edge {k}: lambda_s must be ≥ 0")
+        _ = float(AT.get_tensor(e.temperature))
+        if not isinstance(e.exclusive, bool):
+            raise ValueError(f"edge {k}: exclusive must be bool")
 
     for fidx, fc in enumerate(spec.faces, start=1):
         for or_idx in fc.edges:

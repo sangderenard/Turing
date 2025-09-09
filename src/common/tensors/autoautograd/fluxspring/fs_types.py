@@ -59,6 +59,8 @@ class NodeSpec:
     mass: AT
     ctrl: NodeCtrl
     scripted_axes: List[int]   # exactly 2 axes (Dirichlet/scripted)
+    temperature: AT = field(default_factory=lambda: AT.tensor(0.0))  # placeholder for thermal models
+    exclusive: bool = False  # True if node occupies exclusive geometry
 
 @dataclass
 class EdgeSpec:
@@ -66,6 +68,8 @@ class EdgeSpec:
     dst: int
     transport: EdgeTransport
     ctrl: EdgeCtrl
+    temperature: AT = field(default_factory=lambda: AT.tensor(0.0))  # placeholder for thermal models
+    exclusive: bool = False  # True if edge occupies exclusive geometry
 
 @dataclass
 class FaceLearn:
