@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from ...abstraction import AbstractTensor as AT
+
 # ----- learning switches shared by node/edge controls -----
 @dataclass
 class LearnCtrl:
@@ -17,38 +19,44 @@ class LearnCtrl:
 # ----- node control (data path) -----
 @dataclass
 class NodeCtrl:
-    alpha: float = 0.0
-    w: float = 1.0
-    b: float = 0.0
+    alpha: AT = field(default_factory=lambda: AT.tensor(0.0))
+    w: AT = field(default_factory=lambda: AT.tensor(1.0))
+    b: AT = field(default_factory=lambda: AT.tensor(0.0))
     learn: LearnCtrl = field(default_factory=LearnCtrl)
 
-# ----- edge Hooke params + learnability -----
+# ----- edge transport params + learnability -----
 @dataclass
-class EdgeHookeLearn:
+class EdgeTransportLearn:
+    kappa: bool = True
     k: bool = True
     l0: bool = True
+    lambda_s: bool = True
+    x: bool = True
 
 @dataclass
-class EdgeHooke:
-    k: float = 1.0
-    l0: float = 1.0
-    learn: EdgeHookeLearn = field(default_factory=EdgeHookeLearn)
+class EdgeTransport:
+    kappa: AT = field(default_factory=lambda: AT.tensor(1.0))
+    k: Optional[AT] = None
+    l0: Optional[AT] = None
+    lambda_s: Optional[AT] = None
+    x: Optional[AT] = None
+    learn: EdgeTransportLearn = field(default_factory=EdgeTransportLearn)
 
 # ----- edge control (data path) -----
 @dataclass
 class EdgeCtrl:
-    alpha: float = 0.0
-    w: float = 1.0
-    b: float = 0.0
+    alpha: AT = field(default_factory=lambda: AT.tensor(0.0))
+    w: AT = field(default_factory=lambda: AT.tensor(1.0))
+    b: AT = field(default_factory=lambda: AT.tensor(0.0))
     learn: LearnCtrl = field(default_factory=LearnCtrl)
 
 # ----- node/edge/face specs -----
 @dataclass
 class NodeSpec:
     id: int
-    p0: List[float]            # length D
-    v0: List[float]            # length D
-    mass: float
+    p0: AT                    # length D
+    v0: AT                    # length D
+    mass: AT
     ctrl: NodeCtrl
     scripted_axes: List[int]   # exactly 2 axes (Dirichlet/scripted)
 
@@ -56,7 +64,7 @@ class NodeSpec:
 class EdgeSpec:
     src: int
     dst: int
-    hooke: EdgeHooke
+    transport: EdgeTransport
     ctrl: EdgeCtrl
 
 @dataclass
@@ -67,8 +75,8 @@ class FaceLearn:
 @dataclass
 class FaceSpec:
     edges: List[int]           # oriented: 1-based edge indices, negative flips orientation
-    alpha: float               # activation wet/dry (mix)
-    c: float                   # face weight
+    alpha: AT                  # activation wet/dry (mix)
+    c: AT                      # face weight
     learn: FaceLearn = field(default_factory=FaceLearn)
 
 # ----- DEC + BC + regularizers -----
@@ -103,3 +111,6 @@ class FluxSpringSpec:
     dec: DECSpec
     dirichlet: Optional[DirichletCfg] = None
     regularizers: Optional[RegCfg] = None
+    rho: AT = field(default_factory=lambda: AT.tensor(0.0))
+    beta: AT = field(default_factory=lambda: AT.tensor(0.0))
+    gamma: AT = field(default_factory=lambda: AT.tensor(0.0))

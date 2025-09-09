@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
 # --------- tiny helpers ---------
@@ -39,12 +40,12 @@ class GraphDataNet(nn.Module):
         self.src_idx = torch.tensor([e.src for e in spec.edges], dtype=torch.long, device=device)
         self.dst_idx = torch.tensor([e.dst for e in spec.edges], dtype=torch.long, device=device)
 
-        e_alpha = torch.tensor([e.ctrl.alpha for e in spec.edges], dtype=dtype, device=device)
-        e_w     = torch.tensor([e.ctrl.w     for e in spec.edges], dtype=dtype, device=device)
-        e_b     = torch.tensor([e.ctrl.b     for e in spec.edges], dtype=dtype, device=device)
-        n_alpha = torch.tensor([n.ctrl.alpha for n in spec.nodes], dtype=dtype, device=device)
-        n_w     = torch.tensor([n.ctrl.w     for n in spec.nodes], dtype=dtype, device=device)
-        n_b     = torch.tensor([n.ctrl.b     for n in spec.nodes], dtype=dtype, device=device)
+        e_alpha = torch.tensor([float(AT.get_tensor(e.ctrl.alpha)) for e in spec.edges], dtype=dtype, device=device)
+        e_w     = torch.tensor([float(AT.get_tensor(e.ctrl.w))     for e in spec.edges], dtype=dtype, device=device)
+        e_b     = torch.tensor([float(AT.get_tensor(e.ctrl.b))     for e in spec.edges], dtype=dtype, device=device)
+        n_alpha = torch.tensor([float(AT.get_tensor(n.ctrl.alpha)) for n in spec.nodes], dtype=dtype, device=device)
+        n_w     = torch.tensor([float(AT.get_tensor(n.ctrl.w))     for n in spec.nodes], dtype=dtype, device=device)
+        n_b     = torch.tensor([float(AT.get_tensor(n.ctrl.b))     for n in spec.nodes], dtype=dtype, device=device)
 
         self.edge_alpha = nn.Parameter(e_alpha)
         self.edge_w     = nn.Parameter(e_w)
@@ -102,12 +103,12 @@ def to_torch_model(spec: FluxSpringSpec, *, activation: str = "tanh",
 
 def copy_spec_to_module(spec: FluxSpringSpec, module: GraphDataNet) -> None:
     with torch.no_grad():
-        module.edge_alpha.copy_(torch.tensor([e.ctrl.alpha for e in spec.edges], dtype=module.edge_alpha.dtype, device=module.edge_alpha.device))
-        module.edge_w.copy_(    torch.tensor([e.ctrl.w     for e in spec.edges], dtype=module.edge_w.dtype,     device=module.edge_w.device))
-        module.edge_b.copy_(    torch.tensor([e.ctrl.b     for e in spec.edges], dtype=module.edge_b.dtype,     device=module.edge_b.device))
-        module.node_alpha.copy_(torch.tensor([n.ctrl.alpha for n in spec.nodes], dtype=module.node_alpha.dtype, device=module.node_alpha.device))
-        module.node_w.copy_(    torch.tensor([n.ctrl.w     for n in spec.nodes], dtype=module.node_w.dtype,     device=module.node_w.device))
-        module.node_b.copy_(    torch.tensor([n.ctrl.b     for n in spec.nodes], dtype=module.node_b.dtype,     device=module.node_b.device))
+        module.edge_alpha.copy_(torch.tensor([float(AT.get_tensor(e.ctrl.alpha)) for e in spec.edges], dtype=module.edge_alpha.dtype, device=module.edge_alpha.device))
+        module.edge_w.copy_(    torch.tensor([float(AT.get_tensor(e.ctrl.w))     for e in spec.edges], dtype=module.edge_w.dtype,     device=module.edge_w.device))
+        module.edge_b.copy_(    torch.tensor([float(AT.get_tensor(e.ctrl.b))     for e in spec.edges], dtype=module.edge_b.dtype,     device=module.edge_b.device))
+        module.node_alpha.copy_(torch.tensor([float(AT.get_tensor(n.ctrl.alpha)) for n in spec.nodes], dtype=module.node_alpha.dtype, device=module.node_alpha.device))
+        module.node_w.copy_(    torch.tensor([float(AT.get_tensor(n.ctrl.w))     for n in spec.nodes], dtype=module.node_w.dtype,     device=module.node_w.device))
+        module.node_b.copy_(    torch.tensor([float(AT.get_tensor(n.ctrl.b))     for n in spec.nodes], dtype=module.node_b.dtype,     device=module.node_b.device))
 
 def copy_module_to_spec(module: GraphDataNet, spec: FluxSpringSpec) -> None:
     ea = module.edge_alpha.detach().cpu().tolist()
@@ -117,18 +118,24 @@ def copy_module_to_spec(module: GraphDataNet, spec: FluxSpringSpec) -> None:
     nw = module.node_w.detach().cpu().tolist()
     nb = module.node_b.detach().cpu().tolist()
     for e, a, w, b in zip(spec.edges, ea, ew, eb):
-        e.ctrl.alpha = float(a); e.ctrl.w = float(w); e.ctrl.b = float(b)
+        e.ctrl.alpha = AT.tensor(float(a)); e.ctrl.w = AT.tensor(float(w)); e.ctrl.b = AT.tensor(float(b))
     for n, a, w, b in zip(spec.nodes, na, nw, nb):
-        n.ctrl.alpha = float(a); n.ctrl.w = float(w); n.ctrl.b = float(b)
+        n.ctrl.alpha = AT.tensor(float(a)); n.ctrl.w = AT.tensor(float(w)); n.ctrl.b = AT.tensor(float(b))
 
 # Optional geometry tensors for torch-side diagnostics or training
 def geometry_tensors_to_torch(spec: FluxSpringSpec, *, dtype=torch.float32, device=None):
     D0 = torch.tensor(spec.dec.D0, dtype=dtype, device=device)
     D1 = torch.tensor(spec.dec.D1, dtype=dtype, device=device)
-    k  = torch.tensor([e.hooke.k for e in spec.edges], dtype=dtype, device=device)
-    l0 = torch.tensor([e.hooke.l0 for e in spec.edges], dtype=dtype, device=device)
-    alpha_face = torch.tensor([f.alpha for f in spec.faces], dtype=dtype, device=device)
-    c_face     = torch.tensor([f.c     for f in spec.faces], dtype=dtype, device=device)
+    k = torch.tensor([
+        float(e.transport.k if e.transport.k is not None else 1.0)
+        for e in spec.edges
+    ], dtype=dtype, device=device)
+    l0 = torch.tensor([
+        float(e.transport.l0 if e.transport.l0 is not None else 1.0)
+        for e in spec.edges
+    ], dtype=dtype, device=device)
+    alpha_face = torch.tensor([float(AT.get_tensor(f.alpha)) for f in spec.faces], dtype=dtype, device=device)
+    c_face     = torch.tensor([float(AT.get_tensor(f.c))     for f in spec.faces], dtype=dtype, device=device)
     return D0, D1, k, l0, alpha_face, c_face
 
 def geometry_tensors_from_torch(spec: FluxSpringSpec, D0: torch.Tensor, D1: torch.Tensor,
@@ -138,6 +145,8 @@ def geometry_tensors_from_torch(spec: FluxSpringSpec, D0: torch.Tensor, D1: torc
     kv = k.detach().cpu().tolist(); l0v = l0.detach().cpu().tolist()
     av = alpha_face.detach().cpu().tolist(); cv = c_face.detach().cpu().tolist()
     for e, kv_i, l0_i in zip(spec.edges, kv, l0v):
-        e.hooke.k = float(kv_i); e.hooke.l0 = float(l0_i)
+        e.transport.k = AT.tensor(float(kv_i))
+        e.transport.l0 = AT.tensor(float(l0_i))
     for f, a_i, c_i in zip(spec.faces, av, cv):
-        f.alpha = float(a_i); f.c = float(c_i)
+        f.alpha = AT.tensor(float(a_i))
+        f.c = AT.tensor(float(c_i))

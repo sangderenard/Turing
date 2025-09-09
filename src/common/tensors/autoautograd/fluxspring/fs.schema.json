@@ -53,21 +53,27 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["src", "dst", "hooke", "ctrl"],
+        "required": ["src", "dst", "transport", "ctrl"],
         "properties": {
           "src": { "type": "integer" },
           "dst": { "type": "integer" },
-          "hooke": {
+          "transport": {
             "type": "object",
-            "required": ["k", "l0", "learn"],
+            "required": ["kappa", "learn"],
             "properties": {
+              "kappa": { "type": "number", "minimum": 0.0 },
               "k": { "type": "number", "minimum": 0.0 },
               "l0": { "type": "number", "minimum": 0.0 },
+              "lambda_s": { "type": "number", "minimum": 0.0 },
+              "x": { "type": "number" },
               "learn": {
                 "type": "object",
                 "properties": {
+                  "kappa": { "type": "boolean" },
                   "k": { "type": "boolean" },
-                  "l0": { "type": "boolean" }
+                  "l0": { "type": "boolean" },
+                  "lambda_s": { "type": "boolean" },
+                  "x": { "type": "boolean" }
                 },
                 "additionalProperties": false
               }
@@ -135,7 +141,10 @@
         "lambda_w": { "type": "number", "minimum": 0.0 }
       },
       "additionalProperties": false
-    }
+    },
+    "rho": { "type": "number", "default": 0.0 },
+    "beta": { "type": "number", "default": 0.0 },
+    "gamma": { "type": "number", "default": 0.0 }
   },
   "additionalProperties": false
 }

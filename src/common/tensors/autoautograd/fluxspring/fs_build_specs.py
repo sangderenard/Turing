@@ -15,21 +15,43 @@ from dataclasses import replace
 
 from .fs_types import (
     FluxSpringSpec, NodeSpec, EdgeSpec, FaceSpec,
-    NodeCtrl, EdgeCtrl, EdgeHooke, EdgeHookeLearn,
+    NodeCtrl, EdgeCtrl, EdgeTransport, EdgeTransportLearn,
     LearnCtrl, DECSpec, DirichletCfg, RegCfg
 )
+from ...abstraction import AbstractTensor as AT
 
 def _node(idx: int, D: int, scripted_axes=(0, 2)) -> NodeSpec:
-    p0 = [0.0] * D
-    v0 = [0.0] * D
-    ctrl = NodeCtrl(alpha=0.15, w=1.0, b=0.0, learn=LearnCtrl(True, True, True))
-    return NodeSpec(id=idx, p0=p0, v0=v0, mass=1.0, ctrl=ctrl,
-                    scripted_axes=list(scripted_axes))
+    p0 = AT.zeros(D)
+    v0 = AT.zeros(D)
+    ctrl = NodeCtrl(
+        alpha=AT.tensor(0.15),
+        w=AT.tensor(1.0),
+        b=AT.tensor(0.0),
+        learn=LearnCtrl(True, True, True),
+    )
+    return NodeSpec(
+        id=idx,
+        p0=p0,
+        v0=v0,
+        mass=AT.tensor(1.0),
+        ctrl=ctrl,
+        scripted_axes=list(scripted_axes),
+    )
 
 def _edge(i: int, j: int) -> EdgeSpec:
-    hooke = EdgeHooke(k=1.0, l0=1.0, learn=EdgeHookeLearn(k=False, l0=False))
-    ctrl  = EdgeCtrl(alpha=0.15, w=1.0, b=0.0, learn=LearnCtrl(True, True, True))
-    return EdgeSpec(src=i, dst=j, hooke=hooke, ctrl=ctrl)
+    transport = EdgeTransport(
+        kappa=AT.tensor(1.0),
+        k=AT.tensor(1.0),
+        l0=AT.tensor(1.0),
+        learn=EdgeTransportLearn(kappa=True, k=False, l0=False, lambda_s=False, x=False),
+    )
+    ctrl = EdgeCtrl(
+        alpha=AT.tensor(0.15),
+        w=AT.tensor(1.0),
+        b=AT.tensor(0.0),
+        learn=LearnCtrl(True, True, True),
+    )
+    return EdgeSpec(src=i, dst=j, transport=transport, ctrl=ctrl)
 
 def make_classifier_spec(
     name: str,

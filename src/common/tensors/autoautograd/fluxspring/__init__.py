@@ -1,5 +1,5 @@
 from .fs_types import (
-    LearnCtrl, NodeCtrl, EdgeHookeLearn, EdgeHooke, EdgeCtrl,
+    LearnCtrl, NodeCtrl, EdgeTransportLearn, EdgeTransport, EdgeCtrl,
     NodeSpec, EdgeSpec, FaceLearn, FaceSpec,
     DirichletCfg, DECSpec, RegCfg, FluxSpringSpec
 )
