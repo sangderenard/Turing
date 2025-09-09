@@ -39,8 +39,14 @@ def edge_vectors_AT(P: AT.Tensor, spec: FluxSpringSpec) -> AT.Tensor:
     return Pj - Pi
 
 def edge_params_AT(spec: FluxSpringSpec):
-    k  = AT.get_tensor([e.hooke.k for e in spec.edges]).astype(float)   # (E,)
-    l0 = AT.get_tensor([e.hooke.l0 for e in spec.edges]).astype(float)  # (E,)
+    k = AT.get_tensor([
+        e.transport.k if e.transport.k is not None else AT.tensor(1.0)
+        for e in spec.edges
+    ]).astype(float)  # (E,)
+    l0 = AT.get_tensor([
+        e.transport.l0 if e.transport.l0 is not None else AT.tensor(1.0)
+        for e in spec.edges
+    ]).astype(float)  # (E,)
     return k, l0
 
 def face_params_AT(spec: FluxSpringSpec):
