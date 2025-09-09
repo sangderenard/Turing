@@ -177,6 +177,9 @@ def validate_fluxspring(spec: FluxSpringSpec, *, tol: float = 1e-8) -> None:
     N = len(spec.nodes); E = len(spec.edges); F = len(spec.faces)
     if spec.D < 2:
         raise ValueError("D must be ≥ 2")
+    rho_val = float(AT.get_tensor(spec.rho))
+    if not (-1.0 < rho_val < 1.0):
+        raise ValueError("rho must satisfy |rho| < 1")
     ids = [n.id for n in spec.nodes]
     if len(set(ids)) != N:
         raise ValueError("duplicate node ids")
