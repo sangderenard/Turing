@@ -11,7 +11,8 @@ AbstractTensor operations to apply the edge weights encoded in the spec.
 from __future__ import annotations
 
 from ...abstraction import AbstractTensor as AT
-from .spectral_readout import compute_metrics
+from .spectral_readout import gather_ring_metrics
+from . import fs_dec
 from .fs_types import (
     DECSpec,
     EdgeCtrl,
@@ -123,36 +124,47 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
 
 def main() -> None:
     tick_hz = 400.0
-    N = 400
-    t = AT.arange(N, dtype=float) / tick_hz
-    freqs = [40.0, 80.0, 160.0]
-    sig = AT.stack([(2 * AT.pi() * f * t).sin() for f in freqs], dim=1)
+    win = 400
+    frames = 5
 
+    bands = [[30, 50], [70, 90], [150, 170]]
     spectral_cfg = SpectralCfg(
         enabled=True,
         tick_hz=tick_hz,
-        win_len=N,
-        hop_len=N,
+        win_len=win,
+        hop_len=win,
         window="hann",
-        metrics=SpectralMetrics(bands=[[30, 50], [70, 90], [150, 170]]),
+        metrics=SpectralMetrics(bands=bands),
     )
-    metrics = compute_metrics(sig, spectral_cfg)
-    feats = metrics["bandpower"]
 
     spec = build_spec(spectral_cfg)
+    psi = AT.zeros(len(spec.nodes), dtype=float)
+    routed = []
 
-    # Run a simple forward pass using the edge weights in the spec.
-    activ = AT.zeros(len(spec.nodes), dtype=float)
-    for i, val in enumerate(feats):
-        activ[i] = AT.tensor(val)
-    for e in spec.edges:
-        w = float(AT.get_tensor(e.ctrl.w).data.item())
-        b = float(AT.get_tensor(e.ctrl.b).data.item())
-        activ[e.dst] = activ[e.dst] + w * activ[e.src] + b
-    out = activ[15:18]
+    def band_noise(lo: float, hi: float) -> AT:
+        t = AT.arange(win, dtype=float) / tick_hz
+        freqs = AT.linspace(lo, hi, steps=3)
+        n = AT.zeros(win, dtype=float)
+        for f in freqs:
+            n += (2 * AT.pi() * f * t).sin()
+        return n + 0.1 * AT.randn(win)
 
-    print("Band powers:", feats)
-    print("Routed output:", [float(AT.get_tensor(o).data.item()) for o in out])
+    for _ in range(frames):
+        chunks = [band_noise(lo, hi) for lo, hi in bands]
+        for k in range(win):
+            for i in range(3):
+                psi[i] = chunks[i][k]
+            psi, _ = fs_dec.pump_tick(psi, spec, eta=0.1, phi=AT.tanh)
+
+        ring_stats = gather_ring_metrics(spec)
+        feats = [ring_stats[i]["bandpower"][i] for i in range(3)]
+        for i, val in enumerate(feats):
+            psi[i] = AT.tensor(val)
+        psi, _ = fs_dec.pump_tick(psi, spec, eta=0.1, phi=AT.tanh)
+        out = [psi[15], psi[16], psi[17]]
+        routed.append([float(AT.get_tensor(o).data.item()) for o in out])
+
+    print("Routed output:", routed)
 
 
 if __name__ == "__main__":
