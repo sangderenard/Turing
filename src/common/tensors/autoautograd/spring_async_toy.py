@@ -443,6 +443,70 @@ def wire_output_chain(
 
 
 @dataclass
+class Node:
+    id: int
+    p: AbstractTensor
+    v: Optional[AbstractTensor] = None
+    phys: Optional[AbstractTensor] = None
+    ctrl: Optional[AbstractTensor] = None
+    geom_mask: Optional[AbstractTensor] = None
+    sphere: Optional[AbstractTensor] = None
+    M0: float = 1.0
+    hist_p: List[AbstractTensor] = field(default_factory=list)
+
+    def __post_init__(self):
+        AT = AbstractTensor
+        if self.v is None:
+            self.v = AT.zeros_like(self.p)
+        if self.phys is None:
+            self.phys = AT.zeros_like(self.p)
+        if self.ctrl is None:
+            self.ctrl = AT.zeros(3, dtype=float)
+        if self.geom_mask is None:
+            self.geom_mask = AT.ones_like(self.p)
+        if self.sphere is None:
+            self.sphere = AT.concat([self.p, self.phys, self.ctrl], dim=0)
+
+    def commit(self):
+        self.sphere = AbstractTensor.concat([self.p, self.phys, self.ctrl], dim=0)
+
+
+@dataclass
+class Edge:
+    key: Tuple[int, int, str]
+    i: int
+    j: int
+    op_id: str
+    ctrl: Optional[AbstractTensor] = None
+    l0: Optional[AbstractTensor] = None
+    k: Optional[AbstractTensor] = None
+    hodge1: float = 1.0
+    curvature: Optional[AbstractTensor] = None
+    rings: int = 0
+
+    def __post_init__(self):
+        AT = AbstractTensor
+        if self.ctrl is None:
+            self.ctrl = AT.zeros(3, dtype=float)
+        if self.l0 is None:
+            self.l0 = AT.tensor(1.0)
+        if self.k is None:
+            self.k = AT.tensor(1.0)
+        if self.curvature is None:
+            self.curvature = AT.tensor(0.0)
+
+    def target_length(self):
+        return AbstractTensor.get_tensor(self.l0)
+
+
+@dataclass
+class Face:
+    id: int
+    edges: List[Tuple[int, int, str]] = field(default_factory=list)
+    ctrl: Optional[AbstractTensor] = None
+
+
+@dataclass
 class BoundaryPort:
     nid: int
     alpha: float = 0.0                     # Dirichlet spring strength
