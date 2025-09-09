@@ -2663,7 +2663,12 @@ from .abstraction_methods.trigonometry import (
     rad2deg as trig_rad2deg,
 )
 from .abstraction_methods.fourier import (
-    FFTNamespace,
+    fft as fourier_fft,
+    ifft as fourier_ifft,
+    rfft as fourier_rfft,
+    irfft as fourier_irfft,
+    rfftfreq as fourier_rfftfreq,
+    fftfreq as fourier_fftfreq,
 )
 from .abstraction_methods.fold import (
     fold2d as fold2d_ref,
@@ -3052,8 +3057,13 @@ AbstractTensor.inverse = staticmethod(linalg_inv)
 AbstractTensor.eigh  = staticmethod(linalg_eigh)
 AbstractTensor.cholesky = staticmethod(linalg_cholesky)
 
-# --- FFT namespace (numpy-like) --------------------------------------------
-AbstractTensor.fft = FFTNamespace(AbstractTensor)
+# --- FFT methods -----------------------------------------------------------
+AbstractTensor.fft = fourier_fft
+AbstractTensor.ifft = fourier_ifft
+AbstractTensor.rfft = fourier_rfft
+AbstractTensor.irfft = fourier_irfft
+AbstractTensor.rfftfreq = fourier_rfftfreq
+AbstractTensor.fftfreq = fourier_fftfreq
 
 def _cbrt(x):
     import numpy as np

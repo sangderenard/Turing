@@ -917,6 +917,70 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     },
 
     # ----------------------------------------------------------------------
+    # Fourier transforms
+    # ----------------------------------------------------------------------
+    "fft": {
+        "arity": "unary",
+        "signature": "y = fft(x, n=None, axis=-1, norm=None)",
+        "latex": r"y = \mathcal{F}(x),\quad \frac{\partial y}{\partial x} = \mathcal{F}^{-1}(g)",
+        "backward": {
+            "x": "gx = ifft(g, n=n, axis=axis, norm=norm)",
+        },
+        "python": {
+            "parameters": ["g", "x", "n=None", "axis=-1", "norm=None"],
+            "body": "return AbstractTensor.ifft(g, n=n, axis=axis, norm=norm)",
+        },
+        "domain": "x real or complex",
+        "notes": "Gradient is the inverse FFT of the upstream gradient.",
+        "tags": ["fourier", "linear"],
+    },
+    "ifft": {
+        "arity": "unary",
+        "signature": "y = ifft(x, n=None, axis=-1, norm=None)",
+        "latex": r"y = \mathcal{F}^{-1}(x),\quad \frac{\partial y}{\partial x} = \mathcal{F}(g)",
+        "backward": {
+            "x": "gx = fft(g, n=n, axis=axis, norm=norm)",
+        },
+        "python": {
+            "parameters": ["g", "x", "n=None", "axis=-1", "norm=None"],
+            "body": "return AbstractTensor.fft(g, n=n, axis=axis, norm=norm)",
+        },
+        "domain": "x real or complex",
+        "notes": "Gradient is the forward FFT of the upstream gradient.",
+        "tags": ["fourier", "linear"],
+    },
+    "rfft": {
+        "arity": "unary",
+        "signature": "y = rfft(x, n=None, axis=-1, norm=None)",
+        "latex": r"y = \mathcal{F}_r(x),\quad \frac{\partial y}{\partial x} = \mathcal{F}^{-1}_r(g)",
+        "backward": {
+            "x": "gx = irfft(g, n=n, axis=axis, norm=norm)",
+        },
+        "python": {
+            "parameters": ["g", "x", "n=None", "axis=-1", "norm=None"],
+            "body": "return AbstractTensor.irfft(g, n=n, axis=axis, norm=norm)",
+        },
+        "domain": "x real",
+        "notes": "Real-input FFT uses inverse real FFT for gradients.",
+        "tags": ["fourier", "linear"],
+    },
+    "irfft": {
+        "arity": "unary",
+        "signature": "y = irfft(x, n=None, axis=-1, norm=None)",
+        "latex": r"y = \mathcal{F}^{-1}_r(x),\quad \frac{\partial y}{\partial x} = \mathcal{F}_r(g)",
+        "backward": {
+            "x": "gx = rfft(g, n=n, axis=axis, norm=norm)",
+        },
+        "python": {
+            "parameters": ["g", "x", "n=None", "axis=-1", "norm=None"],
+            "body": "return AbstractTensor.rfft(g, n=n, axis=axis, norm=norm)",
+        },
+        "domain": "x spectrum with Hermitian symmetry",
+        "notes": "Inverse real FFT uses forward real FFT for gradients.",
+        "tags": ["fourier", "linear"],
+    },
+
+    # ----------------------------------------------------------------------
     # Softmax family
     # ----------------------------------------------------------------------
     "softmax": {

@@ -73,8 +73,8 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
     w = AbstractTensor.hanning(W) if W > 1 else AbstractTensor.ones(W)
     xw = w[:, None] * xs
 
-    C0 = AbstractTensor.fft.rfft(xw, axis=0)  # (F0, D)
-    w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(int(W), d=dt, like=xs)
+    C0 = xw.rfft(axis=0)  # (F0, D)
+    w0 = 2.0 * AbstractTensor.pi() * AbstractTensor.rfftfreq(int(W), d=dt, like=xs)
     P0 = AbstractTensor.sum(AbstractTensor.abs(C0) ** 2, dim=1)
     if P0.sum() <= 1e-12 or len(P0) <= 2:
         return (
@@ -111,8 +111,8 @@ def spectral_inertia(history: Iterable[AbstractTensor], dt: float) -> Tuple[Abst
     Z = 8
     Wz = W * Z
     xpad = AbstractTensor.pad(xw, (0, 0, 0, Wz - W))
-    Cz = AbstractTensor.fft.rfft(xpad, axis=0)
-    wz = 2.0 * AbstractTensor.pi() * AbstractTensor.fft.rfftfreq(Wz, d=dt, like=xs)
+    Cz = xpad.rfft(axis=0)
+    wz = 2.0 * AbstractTensor.pi() * AbstractTensor.rfftfreq(Wz, d=dt, like=xs)
 
     def coarse_band_to_w(b_lo, b_hi):
         return w0[b_lo], w0[min(b_hi, len(w0) - 1)]
