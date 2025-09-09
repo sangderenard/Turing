@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FluxSpringSpecV1",
+  "type": "object",
+  "required": ["version", "D", "nodes", "edges", "faces", "dec"],
+  "properties": {
+    "version": { "type": "string" },
+    "D": { "type": "integer", "minimum": 2 },
+    "dirichlet": {
+      "type": "object",
+      "properties": {
+        "window": { "type": "integer", "minimum": 1, "nullable": true },
+        "ema_beta": { "type": "number", "minimum": 0.0, "maximum": 1.0, "nullable": true },
+        "gain": { "type": "number", "minimum": 0.0 }
+      },
+      "additionalProperties": false
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "p0", "v0", "mass", "ctrl", "scripted_axes"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 0 },
+          "p0": { "type": "array", "items": { "type": "number" }, "minItems": 2 },
+          "v0": { "type": "array", "items": { "type": "number" }, "minItems": 2 },
+          "mass": { "type": "number", "exclusiveMinimum": 0 },
+          "ctrl": {
+            "type": "object",
+            "required": ["alpha", "w", "b", "learn"],
+            "properties": {
+              "alpha": { "type": "number" },
+              "w": { "type": "number" },
+              "b": { "type": "number" },
+              "learn": {
+                "type": "object",
+                "properties": {
+                  "alpha": { "type": "boolean" },
+                  "w": { "type": "boolean" },
+                  "b": { "type": "boolean" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "scripted_axes": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["src", "dst", "hooke", "ctrl"],
+        "properties": {
+          "src": { "type": "integer" },
+          "dst": { "type": "integer" },
+          "hooke": {
+            "type": "object",
+            "required": ["k", "l0", "learn"],
+            "properties": {
+              "k": { "type": "number", "minimum": 0.0 },
+              "l0": { "type": "number", "minimum": 0.0 },
+              "learn": {
+                "type": "object",
+                "properties": {
+                  "k": { "type": "boolean" },
+                  "l0": { "type": "boolean" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "ctrl": {
+            "type": "object",
+            "required": ["alpha", "w", "b", "learn"],
+            "properties": {
+              "alpha": { "type": "number" },
+              "w": { "type": "number" },
+              "b": { "type": "number" },
+              "learn": {
+                "type": "object",
+                "properties": {
+                  "alpha": { "type": "boolean" },
+                  "w": { "type": "boolean" },
+                  "b": { "type": "boolean" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "faces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["edges", "alpha", "c", "learn"],
+        "properties": {
+          "edges": { "type": "array", "items": { "type": "integer" }, "minItems": 3 },
+          "alpha": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "c": { "type": "number", "minimum": 0.0 },
+          "learn": {
+            "type": "object",
+            "properties": { "alpha": { "type": "boolean" }, "c": { "type": "boolean" } },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "dec": {
+      "type": "object",
+      "required": ["D0", "D1"],
+      "properties": {
+        "D0": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } },
+        "D1": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
+      },
+      "additionalProperties": false
+    },
+    "regularizers": {
+      "type": "object",
+      "properties": {
+        "lambda_phi": { "type": "number", "minimum": 0.0 },
+        "mu_smooth": { "type": "number", "minimum": 0.0 },
+        "lambda_l0": { "type": "number", "minimum": 0.0 },
+        "lambda_b": { "type": "number", "minimum": 0.0 },
+        "lambda_c": { "type": "number", "minimum": 0.0 },
+        "lambda_w": { "type": "number", "minimum": 0.0 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

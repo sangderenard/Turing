@@ -517,8 +517,6 @@ class Edge:
         default_factory=lambda: AbstractTensor.tensor(0.0)
     )
 
-    pops: int = 0  # diagnostics
-
     def update_credit(self, amount: float, dt: float) -> None:
         a = float(AbstractTensor.abs(AbstractTensor.get_tensor(amount)))
         self.credit_ema += (a - self.credit_ema) * (dt / max(self.credit_tau, 1e-6))
