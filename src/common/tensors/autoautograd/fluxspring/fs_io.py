@@ -37,6 +37,7 @@ def _coerce_node(d: Dict) -> NodeSpec:
         scripted_axes=[int(a) for a in d["scripted_axes"]],
         temperature=AT.tensor(float(d.get("temperature", 0.0))),
         exclusive=bool(d.get("exclusive", False)),
+        ring_size=int(d["ring_size"]) if d.get("ring_size") is not None else None,
     )
 
 def _coerce_edge(d: Dict) -> EdgeSpec:
@@ -71,6 +72,7 @@ def _coerce_edge(d: Dict) -> EdgeSpec:
         ),
         temperature=AT.tensor(float(d.get("temperature", 0.0))),
         exclusive=bool(d.get("exclusive", False)),
+        ring_size=int(d["ring_size"]) if d.get("ring_size") is not None else None,
     )
 
 def _coerce_face(d: Dict) -> FaceSpec:
@@ -154,7 +156,11 @@ def load_fluxspring(path: str) -> FluxSpringSpec:
 def save_fluxspring(spec: FluxSpringSpec, path: str, *, indent: int = 2) -> None:
     def _plain(x):
         if is_dataclass(x):
-            return {k: _plain(v) for k, v in asdict(x).items() if v is not None}
+            return {
+                k: _plain(v)
+                for k, v in asdict(x).items()
+                if v is not None and k not in {"ring", "ring_idx"}
+            }
         if isinstance(x, list):
             return [_plain(v) for v in x]
         if isinstance(x, dict):
