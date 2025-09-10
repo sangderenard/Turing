@@ -342,11 +342,13 @@ def pump_tick(
     }
 
     # Maintain ring buffers for spectral analysis.
-    if harness is not None and spec.spectral.enabled:
-        lin = (lineage_id,) if lineage_id is not None else None
-        for n, val in zip(spec.nodes, psi_next):
-            harness.push_node(n.id, val, lineage=lin)
-        for idx, q_val in enumerate(q):
-            harness.push_edge(idx, q_val, lineage=lin)
+    if harness is not None:
+        if spec.spectral.enabled:
+            lin = (lineage_id,) if lineage_id is not None else None
+            for n, val in zip(spec.nodes, psi_next):
+                harness.push_node(n.id, val, lineage=lin)
+            for idx, q_val in enumerate(q):
+                harness.push_edge(idx, q_val, lineage=lin)
+        harness.snapshot_learnables(spec)
 
     return psi_next, stats
