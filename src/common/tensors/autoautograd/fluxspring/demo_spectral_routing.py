@@ -11,7 +11,6 @@ AbstractTensor operations to apply the edge weights encoded in the spec.
 from __future__ import annotations
 
 from ...abstraction import AbstractTensor as AT
-from ...autograd import autograd
 from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
@@ -175,6 +174,9 @@ def train_routing(
         hist_targets[nid] = tvec
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
+        for p in params:
+            if hasattr(p, "zero_grad"):
+                p.zero_grad()
         state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
         loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
         mids = list(range(3 * B, 4 * B))
@@ -186,8 +188,8 @@ def train_routing(
         else:
             hist_loss = AT.tensor(0.0)
         loss = loss_out + hist_loss
-        _ = autograd.grad(loss, params, retain_graph=False, allow_unused=True)
-        return state.detach()
+        loss.backward()
+        return state
 
     win = sine_chunks[0].shape[0]
     B = len(sine_chunks)
