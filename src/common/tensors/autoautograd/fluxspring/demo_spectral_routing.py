@@ -40,6 +40,15 @@ import numpy as np
 from typing import Callable, Optional
 
 
+# Special node IDs for harness-managed gradient buffers.
+OUT_FEAT_ID = -1
+OUT_TARG_ID = -2
+OUT_IDS_ID = -3
+HIST_FEAT_ID = -4
+HIST_TARG_ID = -5
+HIST_IDS_ID = -6
+
+
 class TensorRingBuffer:
     """AbstractTensor-based ring buffer for per-tick logs."""
 
@@ -239,51 +248,49 @@ def train_routing(
 
     previous_grads = None
 
-    def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
+    def try_backward(lin: int) -> None:
         nonlocal previous_grads, patience, log_buf
-        lid = ledger.ingest()
-        tick_idx = ledger.tick_of_lid[lid]
-        pre_state = state.clone()
-        state, _ = fs_dec.pump_tick(
-            state,
-            spec,
-            eta=0.1,
-            phi=AT.tanh,
-            norm="all",
-            harness=harness,
-            lineage_id=lid,
-        )
-        mix_residual = state[out_start : out_start + B] - target_out
-
-        mids = list(range(3 * B, 4 * B))
-        win_map, kept_map = gather_recent_windows(spec, mids, spectral_cfg, harness, ledger)
-        if win_map:
-            bp_rows = []
-            targ_rows = []
-            for lin, W in win_map.items():
-                bp_rows.append(batched_bandpower_from_windows(W, spectral_cfg))
-                targ_rows.append(AT.stack([hist_targets[nid] for nid in kept_map[lin]]))
-            bp = AT.cat(bp_rows, dim=0)
-            targ_mat = AT.cat(targ_rows, dim=0)
-            hist_residual = bp - targ_mat
-            hist_residual_summary = hist_residual.mean(0)
-            hist_loss = (hist_residual ** 2).mean()
-        else:
-            hist_residual = None
-            hist_residual_summary = AT.zeros(B, dtype=float)
-            hist_loss = AT.tensor(0.0)
-
+        line = (lin,)
+        rb_out_feat = harness.get_node_ring(OUT_FEAT_ID, lineage=line)
+        rb_out_targ = harness.get_node_ring(OUT_TARG_ID, lineage=line)
+        rb_out_ids = harness.get_node_ring(OUT_IDS_ID, lineage=line)
+        rb_hist_feat = harness.get_node_ring(HIST_FEAT_ID, lineage=line)
+        rb_hist_targ = harness.get_node_ring(HIST_TARG_ID, lineage=line)
+        rb_hist_ids = harness.get_node_ring(HIST_IDS_ID, lineage=line)
+        if None in (
+            rb_out_feat,
+            rb_out_targ,
+            rb_out_ids,
+            rb_hist_feat,
+            rb_hist_targ,
+            rb_hist_ids,
+        ):
+            return
+        out_feat = rb_out_feat.buf[0]
+        out_targ = rb_out_targ.buf[0]
+        hist_ids = rb_hist_ids.buf[0]
+        B = int(out_feat.shape[0])
+        M = int(hist_ids.shape[0])
+        if (
+            int(rb_hist_feat.buf.shape[1]) != M * B
+            or int(rb_hist_targ.buf.shape[1]) != M * B
+        ):
+            return
+        hist_feat = rb_hist_feat.buf[0].reshape(M, B)
+        hist_targ = rb_hist_targ.buf[0].reshape(M, B)
+        mix_residual = out_feat - out_targ
+        hist_residual = hist_feat - hist_targ
+        hist_residual_summary = hist_residual.mean(0)
+        hist_loss = (hist_residual ** 2).mean()
         loss_out = (mix_residual ** 2).mean()
         loss = loss_out + hist_loss
         losses = {"loss_out": loss_out, "hist_loss": hist_loss, "combined": loss}
         probe_losses(losses, params)
         loss.backward()
-
         grads = []
         for p in params:
             if hasattr(p, "grad"):
                 grads.append(p.grad)
-
         if previous_grads is not None:
             changed = False
             for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
@@ -308,17 +315,83 @@ def train_routing(
             print(f"[Gradients] initial gradients: {grads}")
         previous_grads = grads
         print(f"loss: {loss_out.item():.6f}, hist_loss: {hist_loss.item():.6f}")
-
+        tick_idx = ledger.tick_of_lid[lin]
         log_entry = {
             "tick": AT.tensor([float(tick_idx)]),
-            "pre_state": pre_state.clone(),
-            "target": target_out.clone(),
-            "post_state": state.clone(),
+            "out_feat": out_feat.clone(),
+            "out_targ": out_targ.clone(),
             "mix_residual": mix_residual.clone(),
             "hist_residual": hist_residual_summary.clone(),
         }
         log_buf.append(log_entry)
+        for key_id in (
+            OUT_FEAT_ID,
+            OUT_TARG_ID,
+            OUT_IDS_ID,
+            HIST_FEAT_ID,
+            HIST_TARG_ID,
+            HIST_IDS_ID,
+        ):
+            k = harness._key(key_id, line)
+            harness.node_rings.pop(k, None)
+        for n in spec.nodes:
+            k = harness._key(n.id, line)
+            harness.node_rings.pop(k, None)
+        for idx in range(len(spec.edges)):
+            k = harness._key(idx, line)
+            harness.edge_rings.pop(k, None)
 
+    def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
+        lid = ledger.ingest()
+        state, _ = fs_dec.pump_tick(
+            state,
+            spec,
+            eta=0.1,
+            phi=AT.tanh,
+            norm="all",
+            harness=harness,
+            lineage_id=lid,
+        )
+        out_feat = state[out_start : out_start + B].clone()
+        harness.push_node(OUT_FEAT_ID, out_feat, lineage=(lid,), size=1)
+        harness.push_node(OUT_TARG_ID, target_out.clone(), lineage=(lid,), size=1)
+        out_ids = AT.arange(out_start, out_start + B, dtype=float)
+        harness.push_node(OUT_IDS_ID, out_ids, lineage=(lid,), size=1)
+
+        mids = list(range(3 * B, 4 * B))
+        win_map, kept_map = gather_recent_windows(spec, mids, spectral_cfg, harness, ledger)
+        for lin, W in win_map.items():
+            complete = True
+            for nid in kept_map[lin]:
+                rb = harness.get_node_ring(nid, lineage=(lin,))
+                if rb is None or rb.idx < spectral_cfg.win_len:
+                    complete = False
+                    break
+            if not complete:
+                continue
+            bp = batched_bandpower_from_windows(W, spectral_cfg)
+            targ_mat = AT.stack([hist_targets[nid] for nid in kept_map[lin]])
+            harness.push_node(
+                HIST_FEAT_ID,
+                bp.flatten(),
+                lineage=(lin,),
+                size=1,
+            )
+            harness.push_node(
+                HIST_TARG_ID,
+                targ_mat.flatten(),
+                lineage=(lin,),
+                size=1,
+            )
+            harness.push_node(
+                HIST_IDS_ID,
+                AT.tensor(kept_map[lin], dtype=float),
+                lineage=(lin,),
+                size=1,
+            )
+            try_backward(lin)
+
+        try_backward(lid)
         return state
 
     win = sine_chunks[0].shape[0]
@@ -341,6 +414,9 @@ def train_routing(
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
+
+    for lid in list(ledger.tick_of_lid.keys()):
+        try_backward(lid)
 
     # Report gradient status for all learnable parameters once outputs have been
     # produced.  This helps diagnose dead graphs where ``loss.backward`` fails
