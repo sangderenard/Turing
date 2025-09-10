@@ -228,6 +228,7 @@ def pump_tick(
     eta: float,
     phi=AT.tanh,
     external: Optional[Dict[int, AT.Tensor]] = None,
+    leak: float = 0.0,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
     """Advance node potentials via data-path control parameters.
 
@@ -245,6 +246,9 @@ def pump_tick(
         Mapping of ``node_id → value`` used to inject fresh inputs before the
         tick.  Values are written via :func:`AT.scatter_row` so they remain on
         the autograd tape.
+    leak : float, optional
+        Fraction of the current state that decays each tick. ``0`` preserves
+        the previous behaviour.
     """
 
     # Inject fresh external inputs before computing edge potentials. ``ids`` is
@@ -254,6 +258,7 @@ def pump_tick(
         vals = AT.stack([external[i] for i in ids]).reshape(-1)
         psi = AT.scatter_row(psi.clone(), ids, vals, dim=0)
 
+    psi = psi * (1.0 - leak)
     D0, _ = incidence_tensors_AT(spec)
     dpsi = D0 @ psi  # (E,) edge potential differences
 

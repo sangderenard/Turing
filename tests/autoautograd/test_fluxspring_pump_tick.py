@@ -55,9 +55,18 @@ def _make_spec() -> FluxSpringSpec:
     )
 
 
-def test_pump_tick_injection():
+def test_pump_tick_injection_leak0():
     spec = _make_spec()
     psi = AT.zeros(2)
-    psi_next, _ = pump_tick(psi, spec, eta=0.1, external={0: AT.tensor(1.0)})
+    psi_next, _ = pump_tick(psi, spec, eta=0.0, external={0: AT.tensor(1.0)}, leak=0.0)
     assert psi_next.shape[0] == 2
     assert float(AT.get_tensor(psi_next)[0]) == pytest.approx(1.0)
+
+
+def test_pump_tick_leak_decay():
+    spec = _make_spec()
+    psi = AT.get_tensor([1.0, -1.0])
+    psi_next, _ = pump_tick(psi, spec, eta=0.0, leak=0.2)
+    vals = AT.get_tensor(psi_next)
+    assert float(vals[0]) == pytest.approx(0.8)
+    assert float(vals[1]) == pytest.approx(-0.8)
