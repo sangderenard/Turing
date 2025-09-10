@@ -230,16 +230,22 @@ def train_routing(
         tvec[j] = 1.0
         hist_targets[nid] = tvec
 
-    tick_idx = 0
     previous_grads = None
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
-        nonlocal previous_grads, patience, tick_idx, log_buf
+        nonlocal previous_grads, patience, log_buf
+        lid = ledger.ingest()
+        tick_idx = ledger.tick_of_lid[lid]
         pre_state = state.clone()
         state, _ = fs_dec.pump_tick(
-            state, spec, eta=0.1, phi=AT.tanh, norm="all", harness=harness
+            state,
+            spec,
+            eta=0.1,
+            phi=AT.tanh,
+            norm="all",
+            harness=harness,
+            lineage_id=lid,
         )
-        ledger.record(tick_idx, 0)
         mix_residual = state[out_start : out_start + B] - target_out
 
         mids = list(range(3 * B, 4 * B))
@@ -303,7 +309,6 @@ def train_routing(
             "hist_residual": hist_residual_summary.clone(),
         }
         log_buf.append(log_entry)
-        tick_idx += 1
 
         return state
 
