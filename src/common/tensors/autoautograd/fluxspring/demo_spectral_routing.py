@@ -160,7 +160,7 @@ def train_routing(
     noise_frames: list[list[AT.Tensor]],
 ) -> list[AT.Tensor]:
     """Run the spectral routing training loop."""
-
+    patience = 10
     params = register_learnable_params(spec)
     B = len(spectral_cfg.metrics.bands)
     psi = AT.zeros(len(spec.nodes), dtype=float)
@@ -195,6 +195,7 @@ def train_routing(
             if hasattr(p, "grad"):
                 grads = grads + [p.grad]
         nonlocal previous_grads
+        nonlocal patience
         if previous_grads is not None:
             changed = False
             for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
@@ -211,6 +212,11 @@ def train_routing(
             if changed:
                 print(f"[Gradients] previous: {previous_grads}")
                 print(f"[Gradients] current:  {grads}")
+            else:
+                patience -= 1
+                if patience <= 0:
+                    print("[Gradients] no changes in gradients, stopping early")
+                    exit(0)
         else:
             print(f"[Gradients] initial gradients: {grads}")
         previous_grads = grads
