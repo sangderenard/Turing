@@ -87,7 +87,11 @@ def face_energy_from_strain_AT(
 
 def total_energy_AT(P: AT.Tensor, spec: FluxSpringSpec, *, return_parts: bool = False):
     k, l0 = edge_params_AT(spec)
+    k = k.reshape(-1)
+    l0 = l0.reshape(-1)
     alpha, c = face_params_AT(spec)
+    alpha = alpha.reshape(-1)
+    c = c.reshape(-1)
     g = edge_strain_AT(P, spec, l0)
     E_edge = 0.5 * AT.sum(k * g * g)
     z = face_flux_AT(g, spec)
@@ -103,7 +107,11 @@ def dec_energy_and_gradP_AT(P: AT.Tensor, spec: FluxSpringSpec):
     """Analytic gradient of total energy wrt node positions ``P``."""
 
     k, l0 = edge_params_AT(spec)
+    k = k.reshape(-1)
+    l0 = l0.reshape(-1)
     alpha, c = face_params_AT(spec)
+    alpha = alpha.reshape(-1)
+    c = c.reshape(-1)
     idx_i, idx_j = _edge_indices(spec)
     N = len(spec.nodes)
 
@@ -115,17 +123,22 @@ def dec_energy_and_gradP_AT(P: AT.Tensor, spec: FluxSpringSpec):
 
     # face flux & backpressure
     D0, D1 = incidence_tensors_AT(spec)
-    z = D1 @ g                                         # (F,)
-    u, dphi = curvature_activation_AT(z, alpha)        # (F,)
-    r = k * g + (D1.T() @ (c * u * dphi))              # (E,)
+    if D1.shape[0] == 0:
+        z = AT.zeros(0, dtype=float)
+        u = AT.zeros(0, dtype=float)
+        dphi = AT.zeros(0, dtype=float)
+        backpressure = AT.zeros_like(k)
+    else:
+        z = D1 @ g                                     # (F,)
+        u, dphi = curvature_activation_AT(z, alpha)    # (F,)
+        backpressure = (D1.T() @ (c * u * dphi)).reshape(-1)
+    r = k * g + backpressure                            # (E,)
 
-    # accumulate to node grads
+    # accumulate to node grads using abstract scatter operations
+    edge_force = r.reshape(-1, 1) * uhat  # (E,D)
     gradP = AT.zeros_like(P)
-    for eidx in range(len(spec.edges)):
-        i = int(idx_i[eidx])
-        j = int(idx_j[eidx])
-        gradP[i] += -r[eidx] * uhat[eidx]
-        gradP[j] += +r[eidx] * uhat[eidx]
+    gradP = AT.scatter(gradP, idx_i, -edge_force, dim=0)
+    gradP = AT.scatter(gradP, idx_j, edge_force, dim=0)
     E = 0.5 * AT.sum(k * g * g) + 0.5 * AT.sum(c * u * u)
     return E, gradP
 
