@@ -175,9 +175,9 @@ def train_routing(
 
     previous_grads = None
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
-        for p in params:
-            if hasattr(p, "zero_grad"):
-                p.zero_grad()
+        #for p in params:
+        #    if hasattr(p, "zero_grad"):
+        #        p.zero_grad()
         state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
         loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
         mids = list(range(3 * B, 4 * B))
