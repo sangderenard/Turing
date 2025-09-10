@@ -3117,7 +3117,10 @@ def _flatten(data):
 
 def default_to_backend(source_ops, tensor, target_ops):
     if type(source_ops) is type(target_ops):
-        return source_ops.clone()
+        # Preserve the original tensor when no backend conversion is needed.
+        # Cloning here detached parameters from the autograd tape, yielding
+        # ``None`` gradients for FluxSpring weights during training.
+        return tensor
 
     data = tensor.tolist()
     dtype = None
