@@ -27,19 +27,25 @@ from ...abstraction import AbstractTensor as AT
 
 
 def _rebind_param(param: AT | None, learn: bool, out: list[AT]) -> AT | None:
-    """Detach ``param`` and toggle ``requires_grad`` according to ``learn``.
+    """Toggle ``requires_grad`` on ``param`` and collect trainables.
 
-    Parameters marked for learning are appended to ``out`` so callers can
-    easily access the list of trainable tensors.
+    The previous implementation detached every parameter before enabling
+    gradients.  This broke the connection between the ``FluxSpring`` spec
+    and the autograd tape, leaving ``p.grad`` as ``None`` for all learnable
+    fields.  Simply toggling ``requires_grad`` in place preserves the
+    original tensor objects so gradients propagate correctly.
     """
 
     if param is None:
         return None
-    p = param.detach()
-    p.requires_grad_(learn)
+
+    # Ensure the tensor is registered on the current tape with the desired
+    # gradient flag.  ``requires_grad_(False)`` is a no-op for most backends
+    # but keeps intent explicit.
+    param.requires_grad_(learn)
     if learn:
-        out.append(p)
-    return p
+        out.append(param)
+    return param
 
 
 def register_learnable_params(spec: FluxSpringSpec) -> list[AT]:
