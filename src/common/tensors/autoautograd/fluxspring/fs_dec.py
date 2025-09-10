@@ -4,7 +4,7 @@
 No torch usage here.
 """
 from __future__ import annotations
-from typing import Tuple, Dict, Optional, Callable
+from typing import Tuple, Dict, Optional, Callable, Literal
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
@@ -229,6 +229,7 @@ def pump_tick(
     phi=AT.tanh,
     external: Optional[Dict[int, AT.Tensor]] = None,
     leak: float = 0.0,
+    norm: Literal["off", "edge", "node", "all"] = "off",
     saturate: Callable[[AT.Tensor], AT.Tensor] | None = None,
     lorentz_c: float | None = None,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
@@ -251,6 +252,11 @@ def pump_tick(
     leak : float, optional
         Fraction of the current state that decays each tick. ``0`` preserves
         the previous behaviour.
+    norm : {"off", "edge", "node", "all"}, optional
+        Normalization mode applied to the edge and node updates. ``"edge"``
+        divides by ``len(spec.edges)``, ``"node"`` by ``len(spec.nodes)``, and
+        ``"all"`` by the sum of both counts. ``"off"`` preserves the previous
+        behaviour.
     saturate : callable, optional
         Optional saturation function applied to the post-update state. If
         provided, takes precedence over ``lorentz_c``.
@@ -291,6 +297,19 @@ def pump_tick(
     node_raw = s + b_n
     node_u   = (1.0 - alpha_n) * node_raw + alpha_n * phi(node_raw)
     delta    = w_n * node_u
+
+    denom = None
+    if norm == "edge":
+        denom = len(spec.edges)
+    elif norm == "node":
+        denom = len(spec.nodes)
+    elif norm == "all":
+        denom = len(spec.edges) + len(spec.nodes)
+    if denom and denom > 0:
+        denom_t = AT.tensor(float(denom))
+        q = q / denom_t
+        s = s / denom_t
+        delta = delta / denom_t
 
     if saturate is not None:
         psi_next = saturate(psi + eta * delta)
