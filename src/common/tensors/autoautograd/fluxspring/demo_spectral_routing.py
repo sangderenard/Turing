@@ -173,6 +173,7 @@ def train_routing(
         tvec[j] = 1.0
         hist_targets[nid] = tvec
 
+    previous_grads = None
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         for p in params:
             if hasattr(p, "zero_grad"):
@@ -189,6 +190,31 @@ def train_routing(
             hist_loss = AT.tensor(0.0)
         loss = loss_out + hist_loss
         loss.backward()
+        grads = []
+        for p in params:
+            if hasattr(p, "grad"):
+                grads = grads + [p.grad]
+        nonlocal previous_grads
+        if previous_grads is not None:
+            changed = False
+            for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
+                if g is None and pg is not None:
+                    changed = True
+                    print(f"[Gradients] param {idx} lost gradient")
+                elif g is not None and pg is None:
+                    changed = True
+                    print(f"[Gradients] param {idx} gained gradient")
+
+                if g != pg:
+                    changed = True
+                    print(f"[Gradients] param {idx} gradient changed")
+            if changed:
+                print(f"[Gradients] previous: {previous_grads}")
+                print(f"[Gradients] current:  {grads}")
+        else:
+            print(f"[Gradients] initial gradients: {grads}")
+        previous_grads = grads
+        print(f"loss: {loss_out.item():.6f}, hist_loss: {hist_loss.item():.6f}")
         return state
 
     win = sine_chunks[0].shape[0]
