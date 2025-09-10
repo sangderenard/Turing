@@ -11,7 +11,8 @@ AbstractTensor operations to apply the edge weights encoded in the spec.
 from __future__ import annotations
 
 from ...abstraction import AbstractTensor as AT
-from .spectral_readout import gather_ring_metrics
+from ...autograd import autograd
+from .spectral_readout import gather_ring_metrics, _window
 from . import fs_dec
 from .fs_types import (
     DECSpec,
@@ -29,12 +30,42 @@ from .fs_types import (
 from .fs_io import validate_fluxspring
 
 
+def _ring_signal(n: NodeSpec) -> AT:
+    """Return node ``n``'s ring buffer ordered by insertion time."""
+
+    buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+    N = int(buf.shape[0])
+    idx = n.ring_idx % N
+    if idx == 0:
+        return buf
+    return AT.cat([buf[idx:], buf[:idx]], dim=0)
+
+
+def _bandpower_fft(buffer: AT, cfg: SpectralCfg) -> AT:
+    """Return band powers for ``buffer`` using the backend FFT."""
+
+    x = buffer if buffer.ndim == 1 else buffer[:, 0]
+    N = int(x.shape[0])
+    w = _window(cfg.window, N)
+    xw = w * x
+    C = AT.rfft(xw, axis=0)
+    real = AT.real(C)
+    imag = AT.imag(C)
+    power = real**2 + imag**2
+    freqs = AT.rfftfreq(N, d=1.0 / cfg.tick_hz, like=xw)
+    band_vals = []
+    for lo, hi in cfg.metrics.bands:
+        mask = ((freqs >= lo) & (freqs <= hi)).astype(float)
+        band_vals.append(AT.sum(power * mask))
+    return AT.stack(band_vals)
+
+
 def _node(idx: int) -> NodeSpec:
     """Create a frozen linear node."""
 
     ctrl = NodeCtrl(
         alpha=AT.tensor(0.0),
-        w=AT.tensor(1.0),
+        w=AT.tensor(1.0, requires_grad=True),
         b=AT.tensor(0.0),
         learn=LearnCtrl(False, False, False),
     )
@@ -55,7 +86,7 @@ def _edge(i: int, j: int, w: float) -> EdgeSpec:
 
     ctrl = EdgeCtrl(
         alpha=AT.tensor(0.0),
-        w=AT.tensor(w),
+        w=AT.tensor(w, requires_grad=True),
         b=AT.tensor(0.0),
         learn=LearnCtrl(False, False, False),
     )
@@ -70,36 +101,33 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
     """Construct the demo FluxSpringSpec.
 
     The graph has six layers (input, two pre-mix identity layers, a
-    mixing layer and two post-mix identity layers) with three nodes per
-    layer.  Only the central layer mixes features; all other edges carry
-    identity weights.
+    mixing layer and two post-mix identity layers).  Each layer contains
+    one node per configured spectral band.  Only the central layer mixes
+    features; all other edges carry identity weights.
     """
 
     layers = 6
-    nodes = [_node(i) for i in range(3 * layers)]
+    B = len(spectral.metrics.bands)
+    nodes = [_node(i) for i in range(B * layers)]
     edges: list[EdgeSpec] = []
 
     def add_identity(src_start: int, dst_start: int) -> None:
-        for k in range(3):
+        for k in range(B):
             edges.append(_edge(src_start + k, dst_start + k, 1.0))
 
     # Input → pre-mix stacks
-    add_identity(0, 3)
-    add_identity(3, 6)
+    add_identity(0, B)
+    add_identity(B, 2 * B)
 
     # Mixing layer
-    Wmid = [
-        [1.0, 0.5, 0.0],
-        [0.0, 1.0, 0.5],
-        [0.5, 0.0, 1.0],
-    ]
-    for i in range(3):
-        for j in range(3):
-            edges.append(_edge(6 + i, 9 + j, Wmid[i][j]))
+    Wmid = [[1.0 if i == j else 0.5 for j in range(B)] for i in range(B)]
+    for i in range(B):
+        for j in range(B):
+            edges.append(_edge(2 * B + i, 3 * B + j, Wmid[i][j]))
 
     # Post-mix stacks
-    add_identity(9, 12)
-    add_identity(12, 15)
+    add_identity(3 * B, 4 * B)
+    add_identity(4 * B, 5 * B)
 
     E = len(edges)
     N = len(nodes)
@@ -127,7 +155,7 @@ def main() -> None:
     win = 400
     frames = 5
 
-    bands = [[30, 50], [70, 90], [150, 170]]
+    bands = [[20, 40], [40, 60], [60, 80], [80, 100], [100, 120], [120, 140], [140, 160], [160, 180]]
     spectral_cfg = SpectralCfg(
         enabled=True,
         tick_hz=tick_hz,
@@ -138,8 +166,49 @@ def main() -> None:
     )
 
     spec = build_spec(spectral_cfg)
+    B = len(bands)
     psi = AT.zeros(len(spec.nodes), dtype=float)
     routed = []
+
+    # Track node and edge weights for gradient logging
+    edge_params = [e.ctrl.w for e in spec.edges]
+    node_params = [n.ctrl.w for n in spec.nodes]
+    params = edge_params + node_params
+    out_start = 5 * B
+    tick = 0
+
+    # Frequency targets for middle layer histogram loss
+    hist_targets: dict[int, AT] = {}
+    for j, nid in enumerate(range(3 * B, 4 * B)):
+        tvec = AT.zeros(B, dtype=float)
+        tvec[j] = 1.0
+        hist_targets[nid] = tvec
+
+    def log_grads() -> None:
+        e0 = float(AT.get_tensor(edge_params[0].grad).data.item())
+        n0 = float(AT.get_tensor(node_params[0].grad).data.item())
+        print(f"tick {tick}: edge0.w.grad={e0:.4f} node0.w.grad={n0:.4f}")
+
+    def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
+        nonlocal tick
+        state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh)
+        loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
+        hist_loss = AT.tensor(0.0)
+        for nid, targ in hist_targets.items():
+            node = spec.nodes[nid]
+            if node.ring is not None:
+                buf = _ring_signal(node)
+                bp = _bandpower_fft(buf, spectral_cfg)
+                bp = bp / (AT.sum(bp) + 1e-12)
+                hist_loss = hist_loss + ((bp - targ) ** 2).mean()
+        loss = loss_out + hist_loss
+        autograd.zero_grad()
+        autograd.grad(loss, params, retain_graph=False)
+        log_grads()
+        tick += 1
+        return state.detach()
+
+    centers = [(lo + hi) / 2.0 for lo, hi in bands]
 
     def band_noise(lo: float, hi: float) -> AT:
         t = AT.arange(win, dtype=float) / tick_hz
@@ -149,19 +218,25 @@ def main() -> None:
             n += (2 * AT.pi() * f * t).sin()
         return n + 0.1 * AT.randn(win)
 
+    sine_chunks = []
+    t = AT.arange(win, dtype=float) / tick_hz
+    for c in centers:
+        sine_chunks.append((2 * AT.pi() * c * t).sin())
+
     for _ in range(frames):
         chunks = [band_noise(lo, hi) for lo, hi in bands]
         for k in range(win):
-            for i in range(3):
+            for i in range(B):
                 psi[i] = chunks[i][k]
-            psi, _ = fs_dec.pump_tick(psi, spec, eta=0.1, phi=AT.tanh)
+            target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
+            psi = pump_with_loss(psi, target_out)
 
         ring_stats = gather_ring_metrics(spec)
-        feats = [ring_stats[i]["bandpower"][i] for i in range(3)]
+        feats = [ring_stats[i]["bandpower"][i] for i in range(B)]
         for i, val in enumerate(feats):
             psi[i] = AT.tensor(val)
-        psi, _ = fs_dec.pump_tick(psi, spec, eta=0.1, phi=AT.tanh)
-        out = [psi[15], psi[16], psi[17]]
+        psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
+        out = [psi[out_start + i] for i in range(B)]
         routed.append([float(AT.get_tensor(o).data.item()) for o in out])
 
     print("Routed output:", routed)
