@@ -713,9 +713,15 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement full_like_()")
 
     def clone(self) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd("clone", [self])
         result = AbstractTensor.get_tensor(like=self)
         result.data = self.clone_()
-        return result
+        if getattr(self, "requires_grad", False):
+            try:
+                result.requires_grad_(True)
+            except Exception:
+                result._requires_grad = True
+        return finalize(result)
 
     # copy is an alias of clone for API compatibility
     def copy(self) -> "AbstractTensor":
@@ -2601,12 +2607,15 @@ from .abstraction_methods.indexing import (
 def scatter_row(x: "AbstractTensor", index: Any, row_value: Any, dim: int = 0):
     """Replace row(s) of ``x`` at ``index`` with ``row_value``.
 
-    This is implemented purely in terms of existing ``gather`` and ``scatter``
-    primitives so no backend-specific code is required. The function gathers the
-    current values at ``index``, computes the delta to ``row_value`` and scatters
-    that delta back into ``x``.
+    The update is expressed in terms of :func:`gather` and :func:`scatter` so the
+    operation remains differentiable. When ``row_value`` is already an
+    ``AbstractTensor`` we use it directly to preserve autograd tape connections;
+    otherwise it is promoted to a tensor via :meth:`x.ensure_tensor`.
     """
-    row_value = x.ensure_tensor(row_value)
+    from .abstraction import AbstractTensor as AT  # local import to avoid cycles
+
+    if not isinstance(row_value, AT):
+        row_value = x.ensure_tensor(row_value)
     current = gather(x, index, dim=dim)
     delta = row_value - current
     return scatter(x, index, delta, dim=dim)
