@@ -216,7 +216,7 @@ def main() -> None:
         n = AT.zeros(win, dtype=float)
         for f in freqs:
             n += (2 * AT.pi() * f * t).sin()
-        return n + 0.1 * AT.randn(win)
+        return n + 0.1 * AT.randn((win,))
 
     sine_chunks = []
     t = AT.arange(win, dtype=float) / tick_hz

@@ -1543,12 +1543,12 @@ class AbstractTensor:
             if hasattr(self, "_pi"):
                 val = getattr(self, "_pi")
                 # If it's a property/value, return it; if it's a callable, call it
-                return float(val() if callable(val) else val)
+                return AbstractTensor.get_tensor(val() if callable(val) else val)
         except Exception:
             pass
         # Fallback: numeric constant
-        return 3.14159265358979323846264338327950288419716939937510
-        
+        return AbstractTensor.get_tensor(3.14159265358979323846264338327950288419716939937510)
+
     def long_pi(self=None):
         if self is None:
             base = AbstractTensor.get_tensor(0)
