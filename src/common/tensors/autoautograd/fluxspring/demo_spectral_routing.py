@@ -153,8 +153,8 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
 
 def main() -> None:
     tick_hz = 400.0
-    win = 400
-    frames = 5
+    win = 40
+    frames = 50
 
     bands = [[20, 40], [40, 60], [60, 80], [80, 100], [100, 120], [120, 140], [140, 160], [160, 180]]
     spectral_cfg = SpectralCfg(
@@ -207,22 +207,85 @@ def main() -> None:
                 f"tick {tick}: grad stats min={g_min} max={g_max} mean={g_mean} std={g_std}"
             )
 
+    # --- NEW: per-node aligned window gather -------------------------------------
+
+    def _gather_recent_windows(spec: FluxSpringSpec, node_ids: list[int], cfg: SpectralCfg) -> tuple[AT | None, list[int]]:
+        """
+        Returns (W, kept) where W has shape (M, Nw) with each row the most-recent,
+        time-contiguous window for that node (i.e., ended at that node's own ring_idx).
+        Uses _ring_signal(n) to eliminate the discontinuity at the ring wrap.
+        """
+        Nw = int(cfg.win_len)
+        wins: list[AT] = []
+        kept: list[int] = []
+
+        for nid in node_ids:
+            n = spec.nodes[nid]
+            if getattr(n, "ring", None) is None:
+                continue
+            # _ring_signal returns the buffer in chronological order (oldest→newest)
+            buf = _ring_signal(n)  # (R,)
+            R = int(buf.shape[0])
+            if R >= Nw:
+                win = buf[-Nw:]     # latest Nw samples for THIS node (no discontinuity)
+            else:
+                # ring smaller than window: left-pad to fixed length for stable FFT
+                pad = Nw - R
+                win = AT.cat([AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0)
+            wins.append(win)
+            kept.append(nid)
+
+        if not wins:
+            return None, []
+        return AT.stack(wins), kept  # (M, Nw), node ids
+
+
+    def _batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
+        """
+        window_matrix: (M, Nw) most-recent, per-node aligned windows
+        returns: (M, B) normalized band powers
+        """
+        Nw = int(window_matrix.shape[-1])
+        w = _window(cfg.window, Nw)                  # (Nw,)
+        xw = window_matrix * w                       # (M, Nw)
+
+        C = AT.rfft(xw, axis=-1)                     # (M, F), F = Nw//2 + 1
+        real, imag = AT.real(C), AT.imag(C)
+        power = real**2 + imag**2                    # (M, F)
+
+        freqs = AT.rfftfreq(Nw, d=1.0 / cfg.tick_hz, like=xw)  # (F,)
+        band_rows = [(((freqs >= lo) & (freqs <= hi)).astype(float)) for lo, hi in cfg.metrics.bands]
+        mask_FB = AT.stack(band_rows).transpose(0, 1)          # (F, B)
+
+        band_powers = AT.matmul(power, mask_FB)      # (M, B)
+        band_powers = band_powers / (AT.sum(band_powers, dim=1, keepdim=True) + 1e-12)
+        return band_powers
+
+
+    # --- MOD: pump_with_loss (replace your existing one) --------------------------
+
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         nonlocal tick
         state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh)
+
+        # output loss
         loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
-        hist_loss = AT.tensor(0.0)
-        for nid, targ in hist_targets.items():
-            node = spec.nodes[nid]
-            if node.ring is not None:
-                buf = _ring_signal(node)
-                bp = _bandpower_fft(buf, spectral_cfg)
-                bp = bp / (AT.sum(bp) + 1e-12)
-                hist_loss = hist_loss + ((bp - targ) ** 2).mean()
+
+        # histogram loss over middle layer, with per-node latest windows (no cross-node sync)
+        mids = list(range(3 * B, 4 * B))
+        window_matrix, kept_ids = _gather_recent_windows(spec, mids, spectral_cfg)  # (M, Nw)
+        if window_matrix is not None and len(kept_ids) > 0:
+            bp = _batched_bandpower_from_windows(window_matrix, spectral_cfg)       # (M, B)
+            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])            # (M, B)
+            hist_loss = ((bp - targ_mat) ** 2).mean()
+        else:
+            hist_loss = AT.tensor(0.0)
+
         loss = loss_out + hist_loss
-        
+
+        #loss.zero_grad()
         autograd.grad(loss, params, retain_graph=False, allow_unused=True)
-        loss.zero_grad()
+
         log_grads()
         tick += 1
         return state.detach()
@@ -256,7 +319,7 @@ def main() -> None:
             psi[i] = AT.tensor(val)
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
-        routed.append([AT.to_numpy(AT.get_tensor(o)) for o in out])
+        routed.append(AT.get_tensor(out))
 
     print("Routed output:", routed)
 
