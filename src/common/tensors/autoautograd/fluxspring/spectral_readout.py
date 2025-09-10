@@ -123,3 +123,89 @@ def gather_ring_metrics(spec: FluxSpringSpec) -> Dict[int, Dict[str, Any]]:
         buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
         stats[n.id] = compute_metrics(buf, cfg)
     return stats
+
+
+def gather_recent_windows(
+    spec: FluxSpringSpec, node_ids: List[int], cfg: SpectralCfg
+) -> Tuple[AT | None, List[int]]:
+    """Return the latest time‑contiguous window for each node.
+
+    Parameters
+    ----------
+    spec:
+        FluxSpring specification containing the nodes.
+    node_ids:
+        Node ids to sample.
+    cfg:
+        Spectral configuration providing the window length and tapers.
+
+    Returns
+    -------
+    window_matrix, kept_ids:
+        ``window_matrix`` has shape ``(M, Nw)`` with each row holding the most
+        recent ``Nw`` samples for a node.  ``kept_ids`` lists the node ids for
+        which a window was gathered.  Nodes lacking a ring buffer are skipped.
+    """
+
+    Nw = int(cfg.win_len)
+    wins: List[AT] = []
+    kept: List[int] = []
+
+    for nid in node_ids:
+        n = spec.nodes[nid]
+        if getattr(n, "ring", None) is None:
+            continue
+
+        buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+        R = int(buf.shape[0])
+        idx = n.ring_idx % R if R > 0 else 0
+        if R > 0 and idx != 0:
+            buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
+
+        if R >= Nw:
+            win = buf[-Nw:]
+        else:
+            pad = Nw - R
+            win = AT.cat([AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0)
+
+        wins.append(win)
+        kept.append(nid)
+
+    if not wins:
+        return None, []
+    return AT.stack(wins), kept
+
+
+def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
+    """Compute normalized band powers for a batch of windows.
+
+    Parameters
+    ----------
+    window_matrix:
+        Tensor of shape ``(M, Nw)`` containing aligned windows.
+    cfg:
+        Spectral configuration specifying analysis bands.
+
+    Returns
+    -------
+    AT
+        Tensor of shape ``(M, B)`` with each row the normalized band powers
+        for the corresponding window.
+    """
+
+    Nw = int(window_matrix.shape[-1])
+    w = _window(cfg.window, Nw)
+    xw = window_matrix * w
+
+    C = AT.rfft(xw, axis=-1)
+    real, imag = AT.real(C), AT.imag(C)
+    power = real**2 + imag**2
+
+    freqs = AT.rfftfreq(Nw, d=1.0 / cfg.tick_hz, like=xw)
+    mask_FB = AT.stack(
+        [(((freqs >= lo) & (freqs <= hi)).astype(float)) for lo, hi in cfg.metrics.bands]
+    ).transpose(0, 1)
+
+    band_powers = AT.matmul(power, mask_FB)
+    band_powers = band_powers / (AT.sum(band_powers, dim=1, keepdim=True) + 1e-12)
+    return band_powers

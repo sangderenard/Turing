@@ -12,7 +12,12 @@ from __future__ import annotations
 
 from ...abstraction import AbstractTensor as AT
 from ...autograd import autograd
-from .spectral_readout import gather_ring_metrics, _window
+from .spectral_readout import (
+    gather_ring_metrics,
+    gather_recent_windows,
+    batched_bandpower_from_windows,
+    _window,
+)
 from . import fs_dec, register_learnable_params
 from .fs_types import (
     DECSpec,
@@ -29,19 +34,6 @@ from .fs_types import (
 )
 from .fs_io import validate_fluxspring
 import numpy as np
-
-
-def _ring_signal(n: NodeSpec) -> AT:
-    """Return node ``n``'s ring buffer ordered by insertion time."""
-
-    buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
-    N = int(buf.shape[0])
-    idx = n.ring_idx % N
-    if idx == 0:
-        return buf
-    return AT.cat([buf[idx:], buf[:idx]], dim=0)
-
-
 def _bandpower_fft(buffer: AT, cfg: SpectralCfg) -> AT:
     """Return band powers for ``buffer`` using the backend FFT."""
 
@@ -210,59 +202,6 @@ def main() -> None:
                 f"tick {tick}: grad stats min={g_min} max={g_max} mean={g_mean} std={g_std}"
             )
 
-    # --- NEW: per-node aligned window gather -------------------------------------
-
-    def _gather_recent_windows(spec: FluxSpringSpec, node_ids: list[int], cfg: SpectralCfg) -> tuple[AT | None, list[int]]:
-        """
-        Returns (W, kept) where W has shape (M, Nw) with each row the most-recent,
-        time-contiguous window for that node (i.e., ended at that node's own ring_idx).
-        Uses _ring_signal(n) to eliminate the discontinuity at the ring wrap.
-        """
-        Nw = int(cfg.win_len)
-        wins: list[AT] = []
-        kept: list[int] = []
-
-        for nid in node_ids:
-            n = spec.nodes[nid]
-            if getattr(n, "ring", None) is None:
-                continue
-            # _ring_signal returns the buffer in chronological order (oldest→newest)
-            buf = _ring_signal(n)  # (R,)
-            R = int(buf.shape[0])
-            if R >= Nw:
-                win = buf[-Nw:]     # latest Nw samples for THIS node (no discontinuity)
-            else:
-                # ring smaller than window: left-pad to fixed length for stable FFT
-                pad = Nw - R
-                win = AT.cat([AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0)
-            wins.append(win)
-            kept.append(nid)
-
-        if not wins:
-            return None, []
-        return AT.stack(wins), kept  # (M, Nw), node ids
-
-
-    def _batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
-        """
-        window_matrix: (M, Nw) most-recent, per-node aligned windows
-        returns: (M, B) normalized band powers
-        """
-        Nw = int(window_matrix.shape[-1])
-        w = _window(cfg.window, Nw)                  # (Nw,)
-        xw = window_matrix * w                       # (M, Nw)
-
-        C = AT.rfft(xw, axis=-1)                     # (M, F), F = Nw//2 + 1
-        real, imag = AT.real(C), AT.imag(C)
-        power = real**2 + imag**2                    # (M, F)
-
-        freqs = AT.rfftfreq(Nw, d=1.0 / cfg.tick_hz, like=xw)  # (F,)
-        band_rows = [(((freqs >= lo) & (freqs <= hi)).astype(float)) for lo, hi in cfg.metrics.bands]
-        mask_FB = AT.stack(band_rows).transpose(0, 1)          # (F, B)
-
-        band_powers = AT.matmul(power, mask_FB)      # (M, B)
-        band_powers = band_powers / (AT.sum(band_powers, dim=1, keepdim=True) + 1e-12)
-        return band_powers
 
 
     # --- MOD: pump_with_loss (replace your existing one) --------------------------
@@ -276,9 +215,9 @@ def main() -> None:
 
         # histogram loss over middle layer, with per-node latest windows (no cross-node sync)
         mids = list(range(3 * B, 4 * B))
-        window_matrix, kept_ids = _gather_recent_windows(spec, mids, spectral_cfg)  # (M, Nw)
+        window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg)  # (M, Nw)
         if window_matrix is not None and len(kept_ids) > 0:
-            bp = _batched_bandpower_from_windows(window_matrix, spectral_cfg)       # (M, B)
+            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)       # (M, B)
             targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])            # (M, B)
             hist_loss = ((bp - targ_mat) ** 2).mean()
         else:
