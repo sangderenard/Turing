@@ -40,19 +40,19 @@ def edge_vectors_AT(P: AT.Tensor, spec: FluxSpringSpec) -> AT.Tensor:
     return Pj - Pi
 
 def edge_params_AT(spec: FluxSpringSpec):
-    k = AT.get_tensor([
+    k = AT.stack([
         e.transport.k if e.transport.k is not None else AT.tensor(1.0)
         for e in spec.edges
-    ]).astype(float)  # (E,)
-    l0 = AT.get_tensor([
+    ]).reshape(-1)  # (E,)
+    l0 = AT.stack([
         e.transport.l0 if e.transport.l0 is not None else AT.tensor(1.0)
         for e in spec.edges
-    ]).astype(float)  # (E,)
+    ]).reshape(-1)  # (E,)
     return k, l0
 
 def face_params_AT(spec: FluxSpringSpec):
-    alpha = AT.get_tensor([fc.alpha for fc in spec.faces]).astype(float)  # (F,)
-    c     = AT.get_tensor([fc.c     for fc in spec.faces]).astype(float)  # (F,)
+    alpha = AT.stack([fc.alpha for fc in spec.faces]).reshape(-1)  # (F,)
+    c     = AT.stack([fc.c     for fc in spec.faces]).reshape(-1)  # (F,)
     return alpha, c
 
 def edge_strain_AT(P: AT.Tensor, spec: FluxSpringSpec, l0: AT.Tensor) -> AT.Tensor:
@@ -156,9 +156,7 @@ def transport_tick(
     dpsi = D0 @ psi  # (E,)
 
     kappa = (
-        AT.stack([e.transport.kappa for e in spec.edges])
-        .astype(float)
-        .reshape(-1)
+        AT.stack([e.transport.kappa for e in spec.edges]).reshape(-1)
     )  # (E,)
 
     if P is not None:
@@ -166,17 +164,13 @@ def transport_tick(
             AT.stack([
                 e.transport.k if e.transport.k is not None else AT.tensor(0.0)
                 for e in spec.edges
-            ])
-            .astype(float)
-            .reshape(-1)
+            ]).reshape(-1)
         )
         l0 = (
             AT.stack([
                 e.transport.l0 if e.transport.l0 is not None else AT.tensor(0.0)
                 for e in spec.edges
-            ])
-            .astype(float)
-            .reshape(-1)
+            ]).reshape(-1)
         )
         lambda_s = (
             AT.stack([
@@ -184,9 +178,7 @@ def transport_tick(
                 if e.transport.lambda_s is not None
                 else AT.tensor(0.0)
                 for e in spec.edges
-            ])
-            .astype(float)
-            .reshape(-1)
+            ]).reshape(-1)
         )
 
         g = edge_strain_AT(P, spec, l0)
@@ -198,12 +190,10 @@ def transport_tick(
         AT.stack([
             e.transport.x if e.transport.x is not None else AT.tensor(0.0)
             for e in spec.edges
-        ])
-        .astype(float)
-        .reshape(-1)
+        ]).reshape(-1)
     )
 
-    gamma = AT.get_tensor(spec.gamma).astype(float).reshape(-1)
+    gamma = AT.get_tensor(spec.gamma).reshape(-1)
 
     R = gamma * x
 

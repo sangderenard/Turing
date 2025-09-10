@@ -220,7 +220,10 @@ def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
 
     freqs = AT.rfftfreq(Nw, d=1.0 / cfg.tick_hz, like=xw)
     mask_FB = AT.stack(
-        [(((freqs >= lo) & (freqs <= hi)).astype(float)) for lo, hi in cfg.metrics.bands]
+        [
+            AT.get_tensor((freqs >= lo) & (freqs <= hi), dtype=float)
+            for lo, hi in cfg.metrics.bands
+        ]
     ).transpose(0, 1)
 
     band_powers = AT.matmul(power, mask_FB)

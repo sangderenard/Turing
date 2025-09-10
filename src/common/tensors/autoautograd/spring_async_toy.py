@@ -1461,7 +1461,7 @@ class LiveVizGLPoints:
             U_vals.append(U)
 
         AT = AbstractTensor
-        P = AT.stack(P_segs).astype(float)
+        P = AT.stack(P_segs)
         if P.shape[1] == 2:
             P = AT.pad(P, (0, 1, 0, 0), value=0.0)
         P = AT.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
