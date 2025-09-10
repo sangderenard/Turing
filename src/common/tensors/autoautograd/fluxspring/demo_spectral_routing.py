@@ -126,12 +126,94 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
     validate_fluxspring(spec)
     return spec
 
+def generate_signals(
+    bands: list[list[float]],
+    win: int,
+    tick_hz: float,
+    frames: int,
+    seed: int = 0,
+) -> tuple[list[AT.Tensor], list[list[AT.Tensor]]]:
+    """Generate deterministic sine and noise signals for each band."""
+
+    rng = np.random.default_rng(seed)
+    centers = [(lo + hi) / 2.0 for lo, hi in bands]
+    t = AT.arange(win, dtype=float) / tick_hz
+    sine_chunks = [(2 * AT.pi() * c * t).sin() for c in centers]
+
+    noise_frames: list[list[AT.Tensor]] = []
+    for _ in range(frames):
+        frame_chunks: list[AT.Tensor] = []
+        for lo, hi in bands:
+            freqs = AT.linspace(lo, hi, steps=3)
+            n = AT.zeros(win, dtype=float)
+            for f in freqs:
+                n += (2 * AT.pi() * f * t).sin()
+            noise = AT.tensor(rng.standard_normal(win))
+            frame_chunks.append(n + 0.1 * noise)
+        noise_frames.append(frame_chunks)
+    return sine_chunks, noise_frames
+
+
+def train_routing(
+    spec: FluxSpringSpec,
+    spectral_cfg: SpectralCfg,
+    sine_chunks: list[AT.Tensor],
+    noise_frames: list[list[AT.Tensor]],
+) -> list[AT.Tensor]:
+    """Run the spectral routing training loop."""
+
+    params = register_learnable_params(spec)
+    B = len(spectral_cfg.metrics.bands)
+    psi = AT.zeros(len(spec.nodes), dtype=float)
+    routed: list[AT.Tensor] = []
+    out_start = 5 * B
+
+    hist_targets: dict[int, AT.Tensor] = {}
+    for j, nid in enumerate(range(3 * B, 4 * B)):
+        tvec = AT.zeros(B, dtype=float)
+        tvec[j] = 1.0
+        hist_targets[nid] = tvec
+
+    def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
+        state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
+        loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
+        mids = list(range(3 * B, 4 * B))
+        window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg)
+        if window_matrix is not None and len(kept_ids) > 0:
+            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)
+            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])
+            hist_loss = ((bp - targ_mat) ** 2).mean()
+        else:
+            hist_loss = AT.tensor(0.0)
+        loss = loss_out + hist_loss
+        _ = autograd.grad(loss, params, retain_graph=False, allow_unused=True)
+        return state.detach()
+
+    win = sine_chunks[0].shape[0]
+    B = len(sine_chunks)
+    for frame_chunks in noise_frames:
+        for k in range(win):
+            for i in range(B):
+                psi[i] = frame_chunks[i][k]
+            target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
+            psi = pump_with_loss(psi, target_out)
+
+        window_matrix, kept = gather_recent_windows(spec, list(range(B)), spectral_cfg)
+        if window_matrix is not None and kept:
+            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)
+            for row, nid in enumerate(kept):
+                psi[nid] = bp[row, nid]
+        psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
+        out = [psi[out_start + i] for i in range(B)]
+        routed.append(AT.get_tensor(out))
+
+    return routed
+
 
 def main() -> None:
     tick_hz = 400.0
     win = 40
     frames = 50
-
     bands = [[20, 40], [40, 60], [60, 80], [80, 100], [100, 120], [120, 140], [140, 160], [160, 180]]
     spectral_cfg = SpectralCfg(
         enabled=True,
@@ -141,111 +223,9 @@ def main() -> None:
         window="hann",
         metrics=SpectralMetrics(bands=bands),
     )
-
     spec = build_spec(spectral_cfg)
-    params = register_learnable_params(spec)
-    B = len(bands)
-    psi = AT.zeros(len(spec.nodes), dtype=float)
-    routed = []
-    out_start = 5 * B
-    tick = 0
-
-    # Frequency targets for middle layer histogram loss
-    hist_targets: dict[int, AT] = {}
-    for j, nid in enumerate(range(3 * B, 4 * B)):
-        tvec = AT.zeros(B, dtype=float)
-        tvec[j] = 1.0
-        hist_targets[nid] = tvec
-
-    def log_grads() -> None:
-        grads_np = []
-        for idx, p in enumerate(params):
-            for attr in ("alpha", "w", "b"):
-                if hasattr(p, attr):
-                    pa = getattr(p, attr)
-                    if pa.grad is None:
-                        print(f"tick {tick}: param{idx}.{attr} no grad")
-                        continue
-                    ga = AT.get_tensor(pa.grad)
-                    ga_np = AT.to_numpy(ga)
-                    grads_np.append(ga_np.reshape(-1))
-                    va_np = AT.to_numpy(AT.get_tensor(pa))
-                    print(
-                        f"tick {tick}: param{idx}.{attr} value shape={va_np.shape} value={va_np} grad shape={ga_np.shape} grad={ga_np}"
-                    )
-        if grads_np:
-            all_grads = np.concatenate(grads_np)
-            g_min = all_grads.min()
-            g_max = all_grads.max()
-            g_mean = all_grads.mean()
-            g_std = all_grads.std()
-            print(
-                f"tick {tick}: grad stats min={g_min} max={g_max} mean={g_mean} std={g_std}"
-            )
-
-
-
-    # --- MOD: pump_with_loss (replace your existing one) --------------------------
-
-    def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
-        nonlocal tick
-        state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
-
-        # output loss
-        loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
-
-        # histogram loss over middle layer, with per-node latest windows (no cross-node sync)
-        mids = list(range(3 * B, 4 * B))
-        window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg)  # (M, Nw)
-        if window_matrix is not None and len(kept_ids) > 0:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)       # (M, B)
-            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])            # (M, B)
-            hist_loss = ((bp - targ_mat) ** 2).mean()
-        else:
-            hist_loss = AT.tensor(0.0)
-
-        loss = loss_out + hist_loss
-
-        #loss.zero_grad()
-        grads = autograd.grad(loss, params, retain_graph=False, allow_unused=True)
-        print(grads)
-        log_grads()
-        tick += 1
-        return state.detach()
-
-    centers = [(lo + hi) / 2.0 for lo, hi in bands]
-
-    def band_noise(lo: float, hi: float) -> AT:
-        t = AT.arange(win, dtype=float) / tick_hz
-        freqs = AT.linspace(lo, hi, steps=3)
-        n = AT.zeros(win, dtype=float)
-        for f in freqs:
-            n += (2 * AT.pi() * f * t).sin()
-        return n + 0.1 * AT.randn((win,))
-
-    sine_chunks = []
-    t = AT.arange(win, dtype=float) / tick_hz
-    for c in centers:
-        sine_chunks.append((2 * AT.pi() * c * t).sin())
-
-    for _ in range(frames):
-        chunks = [band_noise(lo, hi) for lo, hi in bands]
-        for k in range(win):
-            for i in range(B):
-                psi[i] = chunks[i][k]
-            target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
-            psi = pump_with_loss(psi, target_out)
-
-        # Preserve tensor metrics so they can influence the subsequent loss
-        window_matrix, kept = gather_recent_windows(spec, list(range(B)), spectral_cfg)
-        if window_matrix is not None and kept:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)  # (M, B)
-            for row, nid in enumerate(kept):
-                psi[nid] = bp[row, nid]
-        psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
-        out = [psi[out_start + i] for i in range(B)]
-        routed.append(AT.get_tensor(out))
-
+    sine_chunks, noise_frames = generate_signals(bands, win, tick_hz, frames)
+    routed = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
     print("Routed output:", routed)
 
 
