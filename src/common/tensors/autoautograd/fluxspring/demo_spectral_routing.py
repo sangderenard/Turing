@@ -12,10 +12,7 @@ from __future__ import annotations
 
 from ...abstraction import AbstractTensor as AT
 from ...autograd import autograd
-from .spectral_readout import (
-    gather_recent_windows,
-    batched_bandpower_from_windows,
-)
+from .spectral_readout import compute_metrics
 from . import fs_dec, register_learnable_params
 from .fs_types import (
     DECSpec,
@@ -187,26 +184,43 @@ def main() -> None:
 
     # --- MOD: pump_with_loss (replace your existing one) --------------------------
 
+    def node_bandpower(nid: int) -> AT | None:
+        n = spec.nodes[nid]
+        if getattr(n, "ring", None) is None:
+            return None
+        buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+        R = int(buf.shape[0])
+        idx = n.ring_idx % R if R > 0 else 0
+        if R > 0 and idx != 0:
+            buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
+        m = compute_metrics(buf, spectral_cfg)
+        return m.get("bandpower")
+
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         nonlocal tick
         state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
 
         # output loss
-        loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
+        loss_out = ((state[out_start: out_start + B] - target_out) ** 2).mean()
 
         # histogram loss over middle layer, with per-node latest windows (no cross-node sync)
         mids = list(range(3 * B, 4 * B))
-        window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg)  # (M, Nw)
-        if window_matrix is not None and len(kept_ids) > 0:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)       # (M, B)
-            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])            # (M, B)
-            hist_loss = ((bp - targ_mat) ** 2).mean()
+        bp_rows: list[AT] = []
+        kept_ids: list[int] = []
+        for nid in mids:
+            bp = node_bandpower(nid)
+            if bp is not None:
+                bp_rows.append(bp)
+                kept_ids.append(nid)
+        if bp_rows:
+            bp_mat = AT.stack(bp_rows)
+            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])
+            hist_loss = ((bp_mat - targ_mat) ** 2).mean()
         else:
             hist_loss = AT.tensor(0.0)
 
         loss = loss_out + hist_loss
 
-        #loss.zero_grad()
         grads = autograd.grad(loss, params, retain_graph=False, allow_unused=True)
         print(grads)
         log_grads()
@@ -237,11 +251,10 @@ def main() -> None:
             psi = pump_with_loss(psi, target_out)
 
         # Preserve tensor metrics so they can influence the subsequent loss
-        window_matrix, kept = gather_recent_windows(spec, list(range(B)), spectral_cfg)
-        if window_matrix is not None and kept:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)  # (M, B)
-            for row, nid in enumerate(kept):
-                psi[nid] = bp[row, nid]
+        for nid in range(B):
+            bp = node_bandpower(nid)
+            if bp is not None:
+                psi[nid] = bp[nid]
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.get_tensor(out))
