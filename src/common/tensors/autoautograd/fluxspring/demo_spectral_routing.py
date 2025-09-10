@@ -13,10 +13,8 @@ from __future__ import annotations
 from ...abstraction import AbstractTensor as AT
 from ...autograd import autograd
 from .spectral_readout import (
-    gather_ring_metrics,
     gather_recent_windows,
     batched_bandpower_from_windows,
-    _window,
 )
 from . import fs_dec, register_learnable_params
 from .fs_types import (
@@ -34,23 +32,6 @@ from .fs_types import (
 )
 from .fs_io import validate_fluxspring
 import numpy as np
-def _bandpower_fft(buffer: AT, cfg: SpectralCfg) -> AT:
-    """Return band powers for ``buffer`` using the backend FFT."""
-
-    x = buffer if buffer.ndim == 1 else buffer[:, 0]
-    N = int(x.shape[0])
-    w = _window(cfg.window, N)
-    xw = w * x
-    C = AT.rfft(xw, axis=0)
-    real = AT.real(C)
-    imag = AT.imag(C)
-    power = real**2 + imag**2
-    freqs = AT.rfftfreq(N, d=1.0 / cfg.tick_hz, like=xw)
-    band_vals = []
-    for lo, hi in cfg.metrics.bands:
-        mask = ((freqs >= lo) & (freqs <= hi)).astype(float)
-        band_vals.append(AT.sum(power * mask))
-    return AT.stack(band_vals)
 
 
 def _node(idx: int) -> NodeSpec:
@@ -256,10 +237,11 @@ def main() -> None:
             psi = pump_with_loss(psi, target_out)
 
         # Preserve tensor metrics so they can influence the subsequent loss
-        ring_stats = gather_ring_metrics(spec)
-        feats = [ring_stats[i]["bandpower"][i] for i in range(B)]
-        for i, val in enumerate(feats):
-            psi[i] = val
+        window_matrix, kept = gather_recent_windows(spec, list(range(B)), spectral_cfg)
+        if window_matrix is not None and kept:
+            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)  # (M, B)
+            for row, nid in enumerate(kept):
+                psi[nid] = bp[row, nid]
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.get_tensor(out))
