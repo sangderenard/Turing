@@ -75,13 +75,20 @@ class NodeSpec:
             self.ring = AT.zeros((self.ring_size, D), dtype=float)
             self.ring_idx = 0
 
-    def push_ring(self, val: AT) -> None:
-        """Insert ``val`` into the ring buffer."""
+    def push_ring(self, val: AT) -> AT:
+        """Insert ``val`` into the ring buffer and return the updated buffer.
+
+        Uses :func:`AT.scatter_row` so the operation participates in the
+        autograd tape instead of an in-place Python assignment.  The returned
+        tensor remains connected to the computation graph.
+        """
         if self.ring is None:
             raise RuntimeError("ring buffer not allocated")
+
         i = self.ring_idx % int(len(self.ring))
-        self.ring[i] = val
+        self.ring = AT.scatter_row(self.ring.clone(), i, val, dim=0)
         self.ring_idx = i + 1
+        return self.ring
 
 @dataclass
 class EdgeSpec:
@@ -104,13 +111,20 @@ class EdgeSpec:
             self.ring = AT.zeros(self.ring_size, dtype=float)
             self.ring_idx = 0
 
-    def push_ring(self, val: AT) -> None:
-        """Insert ``val`` into the ring buffer."""
+    def push_ring(self, val: AT) -> AT:
+        """Insert ``val`` into the ring buffer and return the updated buffer.
+
+        ``AT.scatter_row`` performs the update using differentiable tensor
+        operations so gradients flow back to ``val`` when the ring is involved
+        in later computations.
+        """
         if self.ring is None:
             raise RuntimeError("ring buffer not allocated")
+
         i = self.ring_idx % int(len(self.ring))
-        self.ring[i] = val
+        self.ring = AT.scatter_row(self.ring.clone(), i, val, dim=0)
         self.ring_idx = i + 1
+        return self.ring
 
 @dataclass
 class FaceLearn:
