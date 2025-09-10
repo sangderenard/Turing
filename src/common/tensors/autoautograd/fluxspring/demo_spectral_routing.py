@@ -28,6 +28,7 @@ from .fs_types import (
     SpectralMetrics,
 )
 from .fs_io import validate_fluxspring
+import numpy as np
 
 
 def _ring_signal(n: NodeSpec) -> AT:
@@ -185,9 +186,26 @@ def main() -> None:
         hist_targets[nid] = tvec
 
     def log_grads() -> None:
-        e0 = float(AT.get_tensor(edge_params[0].grad).data.item())
-        n0 = float(AT.get_tensor(node_params[0].grad).data.item())
-        print(f"tick {tick}: edge0.w.grad={e0:.4f} node0.w.grad={n0:.4f}")
+        grads_np = []
+        for idx, p in enumerate(params):
+            if p.grad is None:
+                continue
+            g = AT.get_tensor(p.grad)
+            g_np = AT.to_numpy(g)
+            grads_np.append(g_np.reshape(-1))
+            val_np = AT.to_numpy(AT.get_tensor(p))
+            print(
+                f"tick {tick}: param{idx} value shape={val_np.shape} value={val_np} grad shape={g_np.shape} grad={g_np}"
+            )
+        if grads_np:
+            all_grads = np.concatenate(grads_np)
+            g_min = all_grads.min()
+            g_max = all_grads.max()
+            g_mean = all_grads.mean()
+            g_std = all_grads.std()
+            print(
+                f"tick {tick}: grad stats min={g_min} max={g_max} mean={g_mean} std={g_std}"
+            )
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         nonlocal tick
@@ -238,7 +256,7 @@ def main() -> None:
             psi[i] = AT.tensor(val)
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
-        routed.append([float(AT.get_tensor(o).data.item()) for o in out])
+        routed.append([AT.to_numpy(AT.get_tensor(o)) for o in out])
 
     print("Routed output:", routed)
 
