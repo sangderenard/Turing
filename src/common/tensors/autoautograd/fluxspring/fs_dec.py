@@ -4,7 +4,7 @@
 No torch usage here.
 """
 from __future__ import annotations
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
@@ -227,43 +227,54 @@ def pump_tick(
     *,
     eta: float,
     phi=AT.tanh,
+    external: Optional[Dict[int, AT.Tensor]] = None,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
     """Advance node potentials via data-path control parameters.
 
-    Edge updates are applied in parallel followed by node updates, each driven by
-    their respective ``(alpha, w, b)`` control triples.
+    Parameters
+    ----------
+    psi : (N,) ``AT``
+        Node potentials for the graph.  Gradients may flow back to ``psi``.
+    spec : ``FluxSpringSpec``
+        Graph specification providing control parameters.
+    eta : float
+        Step size for the Euler update.
+    phi : callable, optional
+        Elementwise activation used on both edges and nodes.
+    external : dict, optional
+        Mapping of ``node_id → value`` used to inject fresh inputs before the
+        tick.  Values are written via :func:`AT.scatter_row` so they remain on
+        the autograd tape.
     """
 
+    # Inject fresh external inputs before computing edge potentials. ``ids`` is
+    # (K,) and ``vals`` is (K,); scatter_row preserves autograd history.
+    if external:
+        ids = list(external.keys())
+        vals = AT.stack([external[i] for i in ids]).reshape(-1)
+        psi = AT.scatter_row(psi.clone(), ids, vals, dim=0)
+
     D0, _ = incidence_tensors_AT(spec)
-    dpsi = D0 @ psi  # (E,)
+    dpsi = D0 @ psi  # (E,) edge potential differences
 
-    alpha_e = (
-        AT.get_tensor([e.ctrl.alpha for e in spec.edges]).astype(float).reshape(-1)
-    )
-    w_e = (
-        AT.get_tensor([e.ctrl.w for e in spec.edges]).astype(float).reshape(-1)
-    )
-    b_e = (
-        AT.get_tensor([e.ctrl.b for e in spec.edges]).astype(float).reshape(-1)
-    )
-    edge_in = alpha_e * dpsi + b_e
-    q = w_e * phi(edge_in)
+    # Stack edge control parameters to keep them on the autograd tape.  Each
+    # tensor has shape (E,).
+    alpha_e = AT.stack([e.ctrl.alpha for e in spec.edges]).reshape(-1)
+    w_e = AT.stack([e.ctrl.w for e in spec.edges]).reshape(-1)
+    b_e = AT.stack([e.ctrl.b for e in spec.edges]).reshape(-1)
+    edge_in = alpha_e * dpsi + b_e  # (E,)
+    q = w_e * phi(edge_in)          # (E,) edge flux after activation
 
-    s = D0.T() @ q  # (N,)
+    s = D0.T() @ q  # (N,) accumulated edge contributions
 
-    alpha_n = (
-        AT.get_tensor([n.ctrl.alpha for n in spec.nodes]).astype(float).reshape(-1)
-    )
-    w_n = (
-        AT.get_tensor([n.ctrl.w for n in spec.nodes]).astype(float).reshape(-1)
-    )
-    b_n = (
-        AT.get_tensor([n.ctrl.b for n in spec.nodes]).astype(float).reshape(-1)
-    )
-    node_in = alpha_n * s + b_n
-    delta = w_n * phi(node_in)
+    # Stack node control parameters to retain gradients; each is (N,).
+    alpha_n = AT.stack([n.ctrl.alpha for n in spec.nodes]).reshape(-1)
+    w_n = AT.stack([n.ctrl.w for n in spec.nodes]).reshape(-1)
+    b_n = AT.stack([n.ctrl.b for n in spec.nodes]).reshape(-1)
+    node_in = alpha_n * s + b_n  # (N,)
+    delta = w_n * phi(node_in)   # (N,)
 
-    psi_next = psi + eta * delta
+    psi_next = psi + eta * delta  # (N,) updated node potentials
     stats = {
         "dpsi": dpsi,
         "q": q,
