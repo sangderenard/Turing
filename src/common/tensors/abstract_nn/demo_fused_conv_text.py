@@ -148,7 +148,7 @@ def run_eager_training_test(model, AT, args):
     last_loss = None
     best_loss = None
     inputs = AT.randn((args.input_len,), requires_grad=True)
-    targets = AT.ones(args.input_len) * 65.0  # ASCII 'A'
+    targets = AT.full((args.input_len,), 65.0)  # ASCII 'A'
 
     for i in range(max_steps):
         tape = autograd.tape
