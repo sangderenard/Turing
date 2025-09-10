@@ -38,7 +38,7 @@ def test_bandpower_centroid_flatness():
             flatness=True,
         ),
     )
-    m = compute_metrics(x, cfg)
+    m = compute_metrics(x, cfg, return_tensor=False)
     assert m["bandpower"][0] > 10 * m["bandpower"][1]
     assert abs(m["centroid"] - freq) < 2.0
     assert m["flatness"] < 0.2
@@ -57,7 +57,7 @@ def test_window_function_applied():
         window="zeros",
         metrics=SpectralMetrics(bands=[[10.0, 30.0]]),
     )
-    m = compute_metrics(x, cfg)
+    m = compute_metrics(x, cfg, return_tensor=False)
     assert m["bandpower"][0] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -75,7 +75,7 @@ def test_coherence_identical_signals():
         window="rect",
         metrics=SpectralMetrics(coherence=True),
     )
-    m = compute_metrics(buf, cfg)
+    m = compute_metrics(buf, cfg, return_tensor=False)
     assert abs(m["coherence"] - 1.0) < 1e-6
 
 

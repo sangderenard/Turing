@@ -255,10 +255,11 @@ def main() -> None:
             target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
             psi = pump_with_loss(psi, target_out)
 
+        # Preserve tensor metrics so they can influence the subsequent loss
         ring_stats = gather_ring_metrics(spec)
         feats = [ring_stats[i]["bandpower"][i] for i in range(B)]
         for i, val in enumerate(feats):
-            psi[i] = AT.tensor(val)
+            psi[i] = val
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.get_tensor(out))
