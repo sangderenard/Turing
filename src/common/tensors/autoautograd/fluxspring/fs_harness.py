@@ -10,6 +10,30 @@ from ...abstraction import AbstractTensor as AT
 
 
 @dataclass
+class LineageLedger:
+    """Ledger mapping tick numbers to lineage identifiers.
+
+    The ledger tracks which lineage was active at a given tick.  This allows
+    callers to later retrieve lineage‑aligned histories from the
+    :class:`RingHarness` rather than relying on the wall‑clock ordering of
+    pushes.  Lineage identifiers are kept abstract and are typically simple
+    integers.
+    """
+
+    tick_to_lineage: Dict[int, int] = field(default_factory=dict)
+
+    def record(self, tick: int, lineage_id: int) -> None:
+        """Associate ``tick`` with ``lineage_id``."""
+
+        self.tick_to_lineage[tick] = lineage_id
+
+    def lineages(self) -> Tuple[int, ...]:
+        """Return the unique lineage identifiers seen so far."""
+
+        return tuple(dict.fromkeys(self.tick_to_lineage.values()))
+
+
+@dataclass
 class RingBuffer:
     """Simple differentiable ring buffer."""
 

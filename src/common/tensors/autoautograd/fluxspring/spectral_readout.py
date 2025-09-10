@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Tuple
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
-from .fs_harness import RingHarness
+from .fs_harness import RingHarness, LineageLedger
 
 
 def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
@@ -149,55 +149,48 @@ def gather_recent_windows(
     node_ids: List[int],
     cfg: SpectralCfg,
     harness: RingHarness,
-) -> Tuple[AT | None, List[int]]:
-    """Return the latest time‑contiguous window for each node.
+    ledger: LineageLedger,
+) -> Tuple[Dict[int, AT], Dict[int, List[int]]]:
+    """Return the most recent window for each lineage across ``node_ids``.
 
-    Parameters
-    ----------
-    spec:
-        FluxSpring specification containing the nodes.
-    node_ids:
-        Node ids to sample.
-    cfg:
-        Spectral configuration providing the window length and tapers.
-    harness:
-        Ring buffer harness supplying recent samples for each node.
-
-    Returns
-    -------
-    window_matrix, kept_ids:
-        ``window_matrix`` has shape ``(M, Nw)`` with each row holding the most
-        recent ``Nw`` samples for a node.  ``kept_ids`` lists the node ids for
-        which a window was gathered.  Nodes lacking a ring buffer are skipped.
+    The returned dictionaries are keyed by lineage identifier so callers can
+    align windows with lineage‑specific targets.  Each window matrix has shape
+    ``(M, Nw)`` where ``M`` is the number of nodes contributing history for that
+    lineage.
     """
 
     Nw = int(cfg.win_len)
-    wins: List[AT] = []
-    kept: List[int] = []
+    win_map: Dict[int, AT] = {}
+    kept_map: Dict[int, List[int]] = {}
 
-    for nid in node_ids:
-        rb = harness.get_node_ring(nid)
-        if rb is None:
-            continue
+    for lin in ledger.lineages():
+        wins: List[AT] = []
+        kept: List[int] = []
+        for nid in node_ids:
+            rb = harness.get_node_ring(nid, lineage=(lin,))
+            if rb is None:
+                continue
+            buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
+            R = int(buf.shape[0])
+            idx = rb.idx % R if R > 0 else 0
+            if R > 0 and idx != 0:
+                buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
 
-        buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
-        R = int(buf.shape[0])
-        idx = rb.idx % R if R > 0 else 0
-        if R > 0 and idx != 0:
-            buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
+            if R >= Nw:
+                win = buf[-Nw:]
+            else:
+                pad = Nw - R
+                win = AT.cat(
+                    [AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0
+                )
 
-        if R >= Nw:
-            win = buf[-Nw:]
-        else:
-            pad = Nw - R
-            win = AT.cat([AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0)
+            wins.append(win)
+            kept.append(nid)
+        if wins:
+            win_map[lin] = AT.stack(wins)
+            kept_map[lin] = kept
 
-        wins.append(win)
-        kept.append(nid)
-
-    if not wins:
-        return None, []
-    return AT.stack(wins), kept
+    return win_map, kept_map
 
 
 def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:

@@ -16,7 +16,7 @@ from .spectral_readout import (
     batched_bandpower_from_windows,
 )
 from . import fs_dec, register_learnable_params
-from .fs_harness import RingHarness
+from .fs_harness import RingHarness, LineageLedger
 from .fs_types import (
     DECSpec,
     EdgeCtrl,
@@ -222,6 +222,7 @@ def train_routing(
     ring_capacity = log_capacity or max(1, layers - 1)
     log_buf = TensorRingBuffer(ring_capacity, flush_hook)
     harness = RingHarness(default_size=spectral_cfg.win_len if spectral_cfg.enabled else None)
+    ledger = LineageLedger()
 
     hist_targets: dict[int, AT.Tensor] = {}
     for j, nid in enumerate(range(3 * B, 4 * B)):
@@ -238,13 +239,19 @@ def train_routing(
         state, _ = fs_dec.pump_tick(
             state, spec, eta=0.1, phi=AT.tanh, norm="all", harness=harness
         )
+        ledger.record(tick_idx, 0)
         mix_residual = state[out_start : out_start + B] - target_out
 
         mids = list(range(3 * B, 4 * B))
-        window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg, harness)
-        if window_matrix is not None and len(kept_ids) > 0:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)
-            targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])
+        win_map, kept_map = gather_recent_windows(spec, mids, spectral_cfg, harness, ledger)
+        if win_map:
+            bp_rows = []
+            targ_rows = []
+            for lin, W in win_map.items():
+                bp_rows.append(batched_bandpower_from_windows(W, spectral_cfg))
+                targ_rows.append(AT.stack([hist_targets[nid] for nid in kept_map[lin]]))
+            bp = AT.cat(bp_rows, dim=0)
+            targ_mat = AT.cat(targ_rows, dim=0)
             hist_residual = bp - targ_mat
             hist_residual_summary = hist_residual.mean(0)
             hist_loss = (hist_residual ** 2).mean()
@@ -309,11 +316,14 @@ def train_routing(
             target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
             psi = pump_with_loss(psi, target_out)
 
-        window_matrix, kept = gather_recent_windows(spec, list(range(B)), spectral_cfg, harness)
-        if window_matrix is not None and kept:
-            bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)
-            for row, nid in enumerate(kept):
-                psi[nid] = bp[row, nid]
+        win_map, kept_map = gather_recent_windows(
+            spec, list(range(B)), spectral_cfg, harness, ledger
+        )
+        if win_map:
+            for lin, W in win_map.items():
+                bp = batched_bandpower_from_windows(W, spectral_cfg)
+                for row, nid in enumerate(kept_map[lin]):
+                    psi[nid] = bp[row, nid]
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))

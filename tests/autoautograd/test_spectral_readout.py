@@ -14,7 +14,10 @@ from src.common.tensors.autoautograd.fluxspring.fs_types import (
     FluxSpringSpec,
     DECSpec,
 )
-from src.common.tensors.autoautograd.fluxspring.fs_harness import RingHarness
+from src.common.tensors.autoautograd.fluxspring.fs_harness import (
+    RingHarness,
+    LineageLedger,
+)
 
 
 def _sine(freq: float, N: int, tick_hz: float) -> AT:
@@ -106,10 +109,14 @@ def test_gather_recent_windows_wrap_and_pad():
         scripted_axes=[0, 0],
     )
     harness = RingHarness()
+    ledger = LineageLedger()
     for i in range(7):
-        harness.push_node(node0.id, AT.tensor([float(i)]), size=5)
-    harness.push_node(node1.id, AT.tensor([10.0]), size=2)
-    harness.push_node(node1.id, AT.tensor([11.0]), size=2)
+        harness.push_node(node0.id, AT.tensor([float(i)]), size=5, lineage=(0,))
+        ledger.record(i, 0)
+    harness.push_node(node1.id, AT.tensor([10.0]), size=2, lineage=(1,))
+    ledger.record(7, 1)
+    harness.push_node(node1.id, AT.tensor([11.0]), size=2, lineage=(1,))
+    ledger.record(8, 1)
     spec = FluxSpringSpec(
         version="t",
         D=1,
@@ -119,10 +126,12 @@ def test_gather_recent_windows_wrap_and_pad():
         dec=DECSpec(D0=[], D1=[]),
         spectral=cfg,
     )
-    W, ids = gather_recent_windows(spec, [0, 1], cfg, harness)
-    assert ids == [0, 1]
-    assert AT.get_tensor(W[0]).tolist() == [4.0, 5.0, 6.0]
-    assert AT.get_tensor(W[1]).tolist() == [0.0, 10.0, 11.0]
+    win_map, kept_map = gather_recent_windows(spec, [0, 1], cfg, harness, ledger)
+    assert sorted(win_map.keys()) == [0, 1]
+    assert kept_map[0] == [0]
+    assert kept_map[1] == [1]
+    assert AT.get_tensor(win_map[0][0]).tolist() == [4.0, 5.0, 6.0]
+    assert AT.get_tensor(win_map[1][0]).tolist() == [0.0, 10.0, 11.0]
 
 
 def test_batched_bandpower_from_windows():
