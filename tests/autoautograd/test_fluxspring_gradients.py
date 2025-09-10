@@ -22,7 +22,7 @@ def _make_spec():
         p0=AT.get_tensor([0.0]),
         v0=AT.get_tensor([0.0]),
         mass=AT.tensor(1.0),
-        ctrl=NodeCtrl(learn=LearnCtrl(False, False, False)),
+        ctrl=NodeCtrl(learn=LearnCtrl(True, True, True)),
         scripted_axes=[0],
     )
     node1 = NodeSpec(
@@ -30,7 +30,7 @@ def _make_spec():
         p0=AT.get_tensor([0.0]),
         v0=AT.get_tensor([0.0]),
         mass=AT.tensor(1.0),
-        ctrl=NodeCtrl(learn=LearnCtrl(False, True, False)),
+        ctrl=NodeCtrl(learn=LearnCtrl(True, True, True)),
         scripted_axes=[0],
     )
     edge = EdgeSpec(
@@ -44,7 +44,7 @@ def _make_spec():
             x=AT.tensor(0.0),
             learn=EdgeTransportLearn(kappa=False, k=False, l0=False, lambda_s=False, x=False),
         ),
-        ctrl=EdgeCtrl(learn=LearnCtrl(False, True, False)),
+        ctrl=EdgeCtrl(learn=LearnCtrl(True, True, True)),
     )
     dec = DECSpec(D0=[[-1.0, 1.0]], D1=[])
     spec = FluxSpringSpec(
@@ -61,6 +61,7 @@ def _make_spec():
     node_w = spec.nodes[1].ctrl.w
     assert edge_w in params and node_w in params
     return spec, edge_w, node_w
+
 
 
 def _forward(spec):
