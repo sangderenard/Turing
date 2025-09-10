@@ -30,7 +30,37 @@ from .fs_types import (
     SpectralMetrics,
 )
 from .fs_io import validate_fluxspring
+from collections import deque
 import numpy as np
+from typing import Any, Callable, Optional
+
+
+class _TickRingBuffer:
+    """Ring buffer for per-tick logs with optional flushing."""
+
+    def __init__(
+        self,
+        capacity: int,
+        flush_hook: Callable[[list[dict[str, Any]]], None] | None = None,
+    ) -> None:
+        self.capacity = capacity
+        self.flush_hook = flush_hook
+        self._buf: deque[dict[str, Any]] = deque()
+
+    def append(self, entry: dict[str, Any]) -> None:
+        if len(self._buf) == self.capacity:
+            old = self._buf.popleft()
+            if self.flush_hook is not None:
+                self.flush_hook([old])
+        self._buf.append(entry)
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        return list(self._buf)
+
+    def flush_all(self) -> None:
+        if self.flush_hook is not None and self._buf:
+            self.flush_hook(list(self._buf))
+        self._buf.clear()
 
 
 def _node(idx: int) -> NodeSpec:
@@ -158,14 +188,26 @@ def train_routing(
     spectral_cfg: SpectralCfg,
     sine_chunks: list[AT.Tensor],
     noise_frames: list[list[AT.Tensor]],
-) -> list[AT.Tensor]:
-    """Run the spectral routing training loop."""
+    *,
+    job_id: int | str = 0,
+    flush_hook: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+    log_capacity: Optional[int] = None,
+) -> tuple[list[AT.Tensor], list[dict[str, Any]]]:
+    """Run the spectral routing training loop.
+
+    Logs are stored in a ring buffer so unresolved backward references stay
+    valid. When the buffer fills, the oldest entry is optionally flushed via
+    ``flush_hook``.
+    """
     patience = 10
     params = register_learnable_params(spec)
     B = len(spectral_cfg.metrics.bands)
     psi = AT.zeros(len(spec.nodes), dtype=float)
     routed: list[AT.Tensor] = []
     out_start = 5 * B
+    layers = max(1, len(spec.nodes) // B)
+    ring_capacity = log_capacity or max(1, layers - 1)
+    log_buf = _TickRingBuffer(ring_capacity, flush_hook)
 
     hist_targets: dict[int, AT.Tensor] = {}
     for j, nid in enumerate(range(3 * B, 4 * B)):
@@ -173,29 +215,35 @@ def train_routing(
         tvec[j] = 1.0
         hist_targets[nid] = tvec
 
+    tick_idx = 0
     previous_grads = None
+
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
-        #for p in params:
-        #    if hasattr(p, "zero_grad"):
-        #        p.zero_grad()
+        nonlocal previous_grads, patience, tick_idx, log_buf
+        pre_state = AT.get_tensor(state).tolist()
         state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
-        loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
+        mix_residual = state[out_start : out_start + B] - target_out
+
         mids = list(range(3 * B, 4 * B))
         window_matrix, kept_ids = gather_recent_windows(spec, mids, spectral_cfg)
         if window_matrix is not None and len(kept_ids) > 0:
             bp = batched_bandpower_from_windows(window_matrix, spectral_cfg)
             targ_mat = AT.stack([hist_targets[nid] for nid in kept_ids])
-            hist_loss = ((bp - targ_mat) ** 2).mean()
+            hist_residual = bp - targ_mat
+            hist_loss = (hist_residual ** 2).mean()
         else:
+            hist_residual = None
             hist_loss = AT.tensor(0.0)
+
+        loss_out = (mix_residual ** 2).mean()
         loss = loss_out + hist_loss
         loss.backward()
+
         grads = []
         for p in params:
             if hasattr(p, "grad"):
-                grads = grads + [p.grad]
-        nonlocal previous_grads
-        nonlocal patience
+                grads.append(p.grad)
+
         if previous_grads is not None:
             changed = False
             for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
@@ -205,7 +253,6 @@ def train_routing(
                 elif g is not None and pg is None:
                     changed = True
                     print(f"[Gradients] param {idx} gained gradient")
-
                 if g != pg:
                     changed = True
                     print(f"[Gradients] param {idx} gradient changed")
@@ -221,6 +268,21 @@ def train_routing(
             print(f"[Gradients] initial gradients: {grads}")
         previous_grads = grads
         print(f"loss: {loss_out.item():.6f}, hist_loss: {hist_loss.item():.6f}")
+
+        log_entry = {
+            "job": job_id,
+            "tick": tick_idx,
+            "pre_state": pre_state,
+            "target": AT.get_tensor(target_out).tolist(),
+            "post_state": AT.get_tensor(state).tolist(),
+            "residuals": {
+                "mixing": AT.get_tensor(mix_residual).tolist(),
+                "hist": AT.get_tensor(hist_residual).tolist() if hist_residual is not None else None,
+            },
+        }
+        log_buf.append(log_entry)
+        tick_idx += 1
+
         return state
 
     win = sine_chunks[0].shape[0]
@@ -255,7 +317,10 @@ def train_routing(
             else:
                 print(f"[Gradients] param {idx} grad: {g}")
 
-    return routed
+    remaining_logs = log_buf.snapshot()
+    log_buf.flush_all()
+
+    return routed, remaining_logs
 
 
 def main() -> None:
@@ -273,8 +338,9 @@ def main() -> None:
     )
     spec = build_spec(spectral_cfg)
     sine_chunks, noise_frames = generate_signals(bands, win, tick_hz, frames)
-    routed = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
+    routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
     print("Routed output:", routed)
+    print("Collected ticks:", len(logs))
 
 
 if __name__ == "__main__":
