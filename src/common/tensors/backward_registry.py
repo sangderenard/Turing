@@ -710,6 +710,21 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Scatter assignment; gradient flows from selected region to the value.",
         "tags": ["indexing"],
     },
+    "clone": {
+        "arity": "unary",
+        "signature": "y = x.clone()",
+        "latex": r"y = \mathrm{clone}(x),\quad \frac{\partial y}{\partial x} = 1",
+        "backward": {
+            "x": "gx = g.clone()"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": "return g.clone() if hasattr(g, 'clone') else g",
+        },
+        "domain": "Any real",
+        "notes": "Identity operation; gradient passes through unchanged.",
+        "tags": ["identity"],
+    },
     "gather": {
         "arity": "binary",
         "signature": "y = gather(x, index, dim)",
@@ -734,8 +749,8 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
             "src": "gsrc = g[index]"
         },
         "python": {
-            "parameters": ["g", "x", "src", "index"],
-            "body": "gx=g.clone(); gsrc=g[index]; return gx, gsrc"
+            "parameters": ["g", "x", "index", "src"],
+            "body": "gx=g.clone(); gsrc=g[index]; return gx, None, gsrc"
         },
         "domain": "Any real; index valid.",
         "notes": "Backward of scatter: pass gradient through x; gather gradient for src at index positions.",
