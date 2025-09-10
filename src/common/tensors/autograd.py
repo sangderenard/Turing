@@ -79,6 +79,15 @@ def grad_fn(self):
 
 def zero_grad(self, *, clear_cache: bool = False):  # pragma: no cover - simple helper
     self._grad = None
+    # Rebind to the active global tape so subsequent operations stay connected
+    from . import autograd as _autograd
+    current = _autograd.autograd.tape
+    try:
+        if getattr(self, "_tape", None) is not current:
+            self._tape = current
+            current.create_tensor_node(self)
+    except Exception:
+        pass
     if clear_cache:
         tape = getattr(self, "_tape", None)
         if tape is not None:

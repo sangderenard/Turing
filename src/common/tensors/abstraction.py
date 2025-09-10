@@ -367,10 +367,11 @@ class AbstractTensor:
 
     # --- Clamping ---
     def clamp(self, min: float | None = None, max: float | None = None) -> "AbstractTensor":
-        """Return ``self`` clamped between ``min`` and ``max``."""
+        """Return ``self`` clamped between ``min`` and ``max`` with autograd support."""
+        finalize = AbstractTensor._pre_autograd("clamp", [self], params={"min": min, "max": max})
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.clamp_(min_val=min, max_val=max)
-        return result
+        return finalize(result)
 
     def clamp_(self, min_val: float | None = None, max_val: float | None = None):
         raise NotImplementedError(f"{self.__class__.__name__} must implement clamp_()")
