@@ -202,8 +202,9 @@ def main() -> None:
                 bp = bp / (AT.sum(bp) + 1e-12)
                 hist_loss = hist_loss + ((bp - targ) ** 2).mean()
         loss = loss_out + hist_loss
-        autograd.zero_grad()
-        autograd.grad(loss, params, retain_graph=False)
+        
+        autograd.grad(loss, params, retain_graph=False, allow_unused=True)
+        loss.zero_grad()
         log_grads()
         tick += 1
         return state.detach()
