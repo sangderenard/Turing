@@ -13,7 +13,7 @@ from __future__ import annotations
 from ...abstraction import AbstractTensor as AT
 from ...autograd import autograd
 from .spectral_readout import gather_ring_metrics, _window
-from . import fs_dec
+from . import fs_dec, register_learnable_params
 from .fs_types import (
     DECSpec,
     EdgeCtrl,
@@ -66,9 +66,11 @@ def _node(idx: int) -> NodeSpec:
 
     ctrl = NodeCtrl(
         alpha=AT.tensor(0.0),
-        w=AT.tensor(1.0, requires_grad=True),
+        w=AT.tensor(1.0),
         b=AT.tensor(0.0),
-        learn=LearnCtrl(False, False, False),
+        # Enable learning for all ctrl parameters so gradients propagate to
+        # alpha, weight and bias alike.
+        learn=LearnCtrl(True, True, True),
     )
     return NodeSpec(
         id=idx,
@@ -87,9 +89,10 @@ def _edge(i: int, j: int, w: float) -> EdgeSpec:
 
     ctrl = EdgeCtrl(
         alpha=AT.tensor(0.0),
-        w=AT.tensor(w, requires_grad=True),
+        w=AT.tensor(w),
         b=AT.tensor(0.0),
-        learn=LearnCtrl(False, False, False),
+        # Train all ctrl parameters on edges as well.
+        learn=LearnCtrl(True, True, True),
     )
     transport = EdgeTransport(
         kappa=AT.tensor(1.0),
@@ -167,14 +170,10 @@ def main() -> None:
     )
 
     spec = build_spec(spectral_cfg)
+    params = register_learnable_params(spec)
     B = len(bands)
     psi = AT.zeros(len(spec.nodes), dtype=float)
     routed = []
-
-    # Track node and edge weights for gradient logging
-    edge_params = [e.ctrl.w for e in spec.edges]
-    node_params = [n.ctrl.w for n in spec.nodes]
-    params = edge_params + node_params
     out_start = 5 * B
     tick = 0
 
