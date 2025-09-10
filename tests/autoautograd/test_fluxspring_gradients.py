@@ -1,6 +1,7 @@
 import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autograd import autograd
+from src.common.tensors.autoautograd.fluxspring import register_learnable_params
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     FluxSpringSpec,
     NodeSpec,
@@ -9,6 +10,8 @@ from src.common.tensors.autoautograd.fluxspring.fs_types import (
     NodeCtrl,
     EdgeCtrl,
     EdgeTransport,
+    EdgeTransportLearn,
+    LearnCtrl,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_dec import pump_tick
 
@@ -19,21 +22,17 @@ def _make_spec():
         p0=AT.get_tensor([0.0]),
         v0=AT.get_tensor([0.0]),
         mass=AT.tensor(1.0),
-        ctrl=NodeCtrl(),
+        ctrl=NodeCtrl(learn=LearnCtrl(True, True, True)),
         scripted_axes=[0],
     )
-    node1_ctrl = NodeCtrl()
-    node1_ctrl.w.requires_grad_(True)
     node1 = NodeSpec(
         id=1,
         p0=AT.get_tensor([0.0]),
         v0=AT.get_tensor([0.0]),
         mass=AT.tensor(1.0),
-        ctrl=node1_ctrl,
+        ctrl=NodeCtrl(learn=LearnCtrl(True, True, True)),
         scripted_axes=[0],
     )
-    edge_ctrl = EdgeCtrl()
-    edge_ctrl.w.requires_grad_(True)
     edge = EdgeSpec(
         src=0,
         dst=1,
@@ -43,8 +42,9 @@ def _make_spec():
             l0=AT.tensor(1.0),
             lambda_s=AT.tensor(1.0),
             x=AT.tensor(0.0),
+            learn=EdgeTransportLearn(kappa=False, k=False, l0=False, lambda_s=False, x=False),
         ),
-        ctrl=edge_ctrl,
+        ctrl=EdgeCtrl(learn=LearnCtrl(True, True, True)),
     )
     dec = DECSpec(D0=[[-1.0, 1.0]], D1=[])
     spec = FluxSpringSpec(
@@ -56,7 +56,12 @@ def _make_spec():
         dec=dec,
         gamma=AT.tensor(0.0),
     )
-    return spec, edge_ctrl.w, node1_ctrl.w
+    params = register_learnable_params(spec)
+    edge_w = spec.edges[0].ctrl.w
+    node_w = spec.nodes[1].ctrl.w
+    assert edge_w in params and node_w in params
+    return spec, edge_w, node_w
+
 
 
 def _forward(spec):
