@@ -241,6 +241,7 @@ def pump_tick(
     saturate: Callable[[AT.Tensor], AT.Tensor] | None = None,
     lorentz_c: float | None = None,
     harness: RingHarness | None = None,
+    lineage_id: int | None = None,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
     """Advance node potentials via data-path control parameters.
 
@@ -276,6 +277,10 @@ def pump_tick(
     harness : :class:`RingHarness`, optional
         When provided and ``spec.spectral.enabled`` is ``True``, ring buffers
         for nodes and edges are updated via this harness.
+    lineage_id : int, optional
+        Lineage identifier passed through to the harness so node and edge
+        histories can be keyed by input lineage.  ``None`` preserves the
+        previous behaviour where all pushes share the same buffers.
     """
 
     # Inject fresh external inputs before computing edge potentials. ``ids`` is
@@ -338,9 +343,10 @@ def pump_tick(
 
     # Maintain ring buffers for spectral analysis.
     if harness is not None and spec.spectral.enabled:
+        lin = (lineage_id,) if lineage_id is not None else None
         for n, val in zip(spec.nodes, psi_next):
-            harness.push_node(n.id, val)
+            harness.push_node(n.id, val, lineage=lin)
         for idx, q_val in enumerate(q):
-            harness.push_edge(idx, q_val)
+            harness.push_edge(idx, q_val, lineage=lin)
 
     return psi_next, stats

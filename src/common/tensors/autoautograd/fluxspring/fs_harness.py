@@ -11,26 +11,56 @@ from ...abstraction import AbstractTensor as AT
 
 @dataclass
 class LineageLedger:
-    """Ledger mapping tick numbers to lineage identifiers.
+    """Track lineage identifiers and their arrival order.
 
-    The ledger tracks which lineage was active at a given tick.  This allows
-    callers to later retrieve lineage‑aligned histories from the
-    :class:`RingHarness` rather than relying on the wall‑clock ordering of
-    pushes.  Lineage identifiers are kept abstract and are typically simple
-    integers.
+    The ledger assigns monotonically increasing *lineage identifiers* (LIDs)
+    whenever an input sample is ingested.  Each ingestion is associated with
+    the current ``tick`` counter which increases in lock‑step.  Two look‑up
+    dictionaries allow callers to translate between ticks and LIDs so that
+    ring‑buffer histories can be aligned with the originating input.
     """
 
-    tick_to_lineage: Dict[int, int] = field(default_factory=dict)
+    tick: int = 0
+    next_lid: int = 0
+    tick_of_lid: Dict[int, int] = field(default_factory=dict)
+    lid_by_tick: Dict[int, int] = field(default_factory=dict)
+
+    def ingest(self) -> int:
+        """Register a fresh input arrival and return its lineage ID.
+
+        Each call assigns the next available lineage identifier and records the
+        bidirectional mappings between ``tick`` and ``lineage``.  The ``tick``
+        counter is then advanced so that subsequent ingestions map to later
+        ticks.
+        """
+
+        lid = self.next_lid
+        t = self.tick
+        self.next_lid += 1
+        self.tick += 1
+        self.tick_of_lid[lid] = t
+        self.lid_by_tick[t] = lid
+        return lid
 
     def record(self, tick: int, lineage_id: int) -> None:
-        """Associate ``tick`` with ``lineage_id``."""
+        """Associate ``tick`` with ``lineage_id``.
 
-        self.tick_to_lineage[tick] = lineage_id
+        This helper mirrors the previous public API so legacy callers and unit
+        tests remain valid.  The internal counters are updated to stay
+        consistent with any manually recorded events.
+        """
+
+        self.tick_of_lid[lineage_id] = tick
+        self.lid_by_tick[tick] = lineage_id
+        if tick >= self.tick:
+            self.tick = tick + 1
+        if lineage_id >= self.next_lid:
+            self.next_lid = lineage_id + 1
 
     def lineages(self) -> Tuple[int, ...]:
-        """Return the unique lineage identifiers seen so far."""
+        """Return the known lineage identifiers ordered by tick."""
 
-        return tuple(dict.fromkeys(self.tick_to_lineage.values()))
+        return tuple(self.lid_by_tick[t] for t in sorted(self.lid_by_tick))
 
 
 @dataclass
