@@ -159,3 +159,21 @@ def test_demo_spec_has_no_gradients():
     grads = autograd.grad(loss, params, allow_unused=True)
     assert all(g is None for g in grads)
 
+
+def test_register_learnable_params_preserves_gradients():
+    bands = [[20, 40], [40, 60]]
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=400.0,
+        win_len=4,
+        hop_len=4,
+        window="hann",
+        metrics=SpectralMetrics(bands=bands),
+    )
+    spec = build_spec(cfg)
+    params = register_learnable_params(spec)
+    w = params[0]
+    loss = (w * AT.tensor(2.0)) ** 2
+    g = autograd.grad(loss, [w])[0]
+    assert g is not None
+
