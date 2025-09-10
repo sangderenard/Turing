@@ -2415,7 +2415,6 @@ def build_toy_system(
     batch_size: int = 4096,
     batch_refresh_hz: float = 20.0,
     spectral: bool = False,
-    ring_size: Optional[int] = None,
 ):
     """Build a toy spring–repulsor system where inputs are drawn from a large
     random batch tensor.
@@ -2462,7 +2461,6 @@ def build_toy_system(
                 scripted_axes=[0, 2],
                 temperature=AbstractTensor.tensor(0.0),
                 exclusive=False,
-                ring_size=ring_size,
             )
         )
     fs_edges: List[EdgeSpec] = []
@@ -2482,7 +2480,6 @@ def build_toy_system(
                 ctrl=ctrl,
                 temperature=AbstractTensor.tensor(0.0),
                 exclusive=False,
-                ring_size=ring_size,
             )
         )
 

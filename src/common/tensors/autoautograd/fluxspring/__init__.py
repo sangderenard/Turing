@@ -21,6 +21,7 @@ from .fs_dec import (
 )
 # Spectral utilities
 from .spectral_readout import compute_metrics
+from .fs_harness import RingHarness
 # Torch bridge is optional import to keep AT-only usage clean.
 
 from ...abstraction import AbstractTensor as AT

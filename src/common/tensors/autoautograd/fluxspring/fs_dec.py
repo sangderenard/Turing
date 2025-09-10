@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Tuple, Dict, Optional, Callable, Literal
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
+from .fs_harness import RingHarness
 
 # --------- Incidence & validators ---------
 def incidence_tensors_AT(spec: FluxSpringSpec):
@@ -232,6 +233,7 @@ def pump_tick(
     norm: Literal["off", "edge", "node", "all"] = "off",
     saturate: Callable[[AT.Tensor], AT.Tensor] | None = None,
     lorentz_c: float | None = None,
+    harness: RingHarness | None = None,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
     """Advance node potentials via data-path control parameters.
 
@@ -264,6 +266,9 @@ def pump_tick(
         Characteristic speed for a relativistic-style constraint. If
         ``saturate`` is ``None``, ``delta`` is divided by
         ``sqrt(1 - (psi/lorentz_c)**2)`` before the Euler update.
+    harness : :class:`RingHarness`, optional
+        When provided and ``spec.spectral.enabled`` is ``True``, ring buffers
+        for nodes and edges are updated via this harness.
     """
 
     # Inject fresh external inputs before computing edge potentials. ``ids`` is
@@ -325,12 +330,10 @@ def pump_tick(
     }
 
     # Maintain ring buffers for spectral analysis.
-    if spec.spectral.enabled:
+    if harness is not None and spec.spectral.enabled:
         for n, val in zip(spec.nodes, psi_next):
-            if n.ring is not None:
-                n.push_ring(val)
-        for e, q_val in zip(spec.edges, q):
-            if e.ring is not None:
-                e.push_ring(q_val)
+            harness.push_node(n.id, val)
+        for idx, q_val in enumerate(q):
+            harness.push_edge(idx, q_val)
 
     return psi_next, stats
