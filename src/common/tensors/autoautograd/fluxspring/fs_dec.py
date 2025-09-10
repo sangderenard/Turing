@@ -328,9 +328,7 @@ def pump_tick(
     if spec.spectral.enabled:
         for n, val in zip(spec.nodes, psi_next):
             if n.ring is not None:
-                r = AT.get_tensor(n.ring)
-                D = int(r.shape[1]) if r.ndim == 2 else 1
-                n.push_ring(AT.ones(D, dtype=float) * val)
+                n.push_ring(val)
         for e, q_val in zip(spec.edges, q):
             if e.ring is not None:
                 e.push_ring(q_val)
