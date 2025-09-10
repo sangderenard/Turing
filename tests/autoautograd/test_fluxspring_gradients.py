@@ -2,6 +2,11 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autograd import autograd
 from src.common.tensors.autoautograd.fluxspring import register_learnable_params
+from src.common.tensors.autoautograd.fluxspring.demo_spectral_routing import (
+    build_spec,
+    SpectralCfg,
+    SpectralMetrics,
+)
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     FluxSpringSpec,
     NodeSpec,
@@ -23,6 +28,7 @@ def _make_spec():
         v0=AT.get_tensor([0.0]),
         mass=AT.tensor(1.0),
         ctrl=NodeCtrl(learn=LearnCtrl(True, True, True)),
+
         scripted_axes=[0],
     )
     node1 = NodeSpec(
@@ -44,6 +50,7 @@ def _make_spec():
             x=AT.tensor(0.0),
             learn=EdgeTransportLearn(kappa=False, k=False, l0=False, lambda_s=False, x=False),
         ),
+
         ctrl=EdgeCtrl(learn=LearnCtrl(True, True, True)),
     )
     dec = DECSpec(D0=[[-1.0, 1.0]], D1=[])
@@ -61,7 +68,6 @@ def _make_spec():
     node_w = spec.nodes[1].ctrl.w
     assert edge_w in params and node_w in params
     return spec, edge_w, node_w
-
 
 
 def _forward(spec):
@@ -131,3 +137,25 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
     g_node_new = float(AT.get_tensor(node_w.grad))
     assert g_edge_new == pytest.approx(g_edge_val, rel=1e-6, abs=1e-6)
     assert g_node_new == pytest.approx(g_node_val, rel=1e-6, abs=1e-6)
+
+
+def test_demo_spec_has_no_gradients():
+    bands = [[20, 40], [40, 60]]
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=400.0,
+        win_len=4,
+        hop_len=4,
+        window="hann",
+        metrics=SpectralMetrics(bands=bands),
+    )
+    spec = build_spec(cfg)
+    params = register_learnable_params(spec)
+    psi = AT.zeros(len(spec.nodes), dtype=float)
+    for _ in range(3):
+        psi, _ = pump_tick(psi, spec, eta=0.1, external={0: AT.tensor(1.0)})
+    out_start = 5 * len(bands)
+    loss = ((psi[out_start : out_start + len(bands)]) ** 2).mean()
+    grads = autograd.grad(loss, params, allow_unused=True)
+    assert all(g is None for g in grads)
+
