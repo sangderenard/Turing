@@ -65,19 +65,19 @@ def _node(idx: int) -> NodeSpec:
     """Create a frozen linear node."""
 
     ctrl = NodeCtrl(
-        alpha=AT.tensor(0.0),
-        w=AT.tensor(1.0, requires_grad=True),
-        b=AT.tensor(0.0),
-        learn=LearnCtrl(False, False, False),
+        alpha=AT.get_tensor(0.0, requires_grad=True),
+        w=AT.get_tensor(1.0, requires_grad=True),
+        b=AT.get_tensor(0.0, requires_grad=True),
+        learn=LearnCtrl(True, True, True),
     )
     return NodeSpec(
         id=idx,
         p0=AT.zeros(3),
         v0=AT.zeros(3),
-        mass=AT.tensor(1.0),
+        mass=AT.get_tensor(1.0),
         ctrl=ctrl,
         scripted_axes=[0, 2],
-        temperature=AT.tensor(0.0),
+        temperature=AT.get_tensor(0.0),
         exclusive=False,
     )
 
@@ -86,16 +86,16 @@ def _edge(i: int, j: int, w: float) -> EdgeSpec:
     """Create a frozen linear edge with weight ``w``."""
 
     ctrl = EdgeCtrl(
-        alpha=AT.tensor(0.0),
-        w=AT.tensor(w, requires_grad=True),
-        b=AT.tensor(0.0),
-        learn=LearnCtrl(False, False, False),
+        alpha=AT.get_tensor(0.0, requires_grad=True),
+        w=AT.get_tensor(w, requires_grad=True),
+        b=AT.get_tensor(0.0, requires_grad=True),
+        learn=LearnCtrl(True, True, True),
     )
     transport = EdgeTransport(
-        kappa=AT.tensor(1.0),
-        learn=EdgeTransportLearn(kappa=False, k=False, l0=False, lambda_s=False, x=False),
+        kappa=AT.get_tensor(1.0, requires_grad=True),
+        learn=EdgeTransportLearn(kappa=True, k=True, l0=True, lambda_s=True, x=True),
     )
-    return EdgeSpec(src=i, dst=j, transport=transport, ctrl=ctrl, temperature=AT.tensor(0.0), exclusive=False)
+    return EdgeSpec(src=i, dst=j, transport=transport, ctrl=ctrl, temperature=AT.get_tensor(0.0), exclusive=False)
 
 
 def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
@@ -172,8 +172,8 @@ def main() -> None:
     routed = []
 
     # Track node and edge weights for gradient logging
-    edge_params = [e.ctrl.w for e in spec.edges]
-    node_params = [n.ctrl.w for n in spec.nodes]
+    edge_params = [e.ctrl for e in spec.edges]
+    node_params = [n.ctrl for n in spec.nodes]
     params = edge_params + node_params
     out_start = 5 * B
     tick = 0
@@ -188,15 +188,19 @@ def main() -> None:
     def log_grads() -> None:
         grads_np = []
         for idx, p in enumerate(params):
-            if p.grad is None:
-                continue
-            g = AT.get_tensor(p.grad)
-            g_np = AT.to_numpy(g)
-            grads_np.append(g_np.reshape(-1))
-            val_np = AT.to_numpy(AT.get_tensor(p))
-            print(
-                f"tick {tick}: param{idx} value shape={val_np.shape} value={val_np} grad shape={g_np.shape} grad={g_np}"
-            )
+            for attr in ("alpha", "w", "b"):
+                if hasattr(p, attr):
+                    pa = getattr(p, attr)
+                    if pa.grad is None:
+                        print(f"tick {tick}: param{idx}.{attr} no grad")
+                        continue
+                    ga = AT.get_tensor(pa.grad)
+                    ga_np = AT.to_numpy(ga)
+                    grads_np.append(ga_np.reshape(-1))
+                    va_np = AT.to_numpy(AT.get_tensor(pa))
+                    print(
+                        f"tick {tick}: param{idx}.{attr} value shape={va_np.shape} value={va_np} grad shape={ga_np.shape} grad={ga_np}"
+                    )
         if grads_np:
             all_grads = np.concatenate(grads_np)
             g_min = all_grads.min()
@@ -266,7 +270,7 @@ def main() -> None:
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         nonlocal tick
-        state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh)
+        state, _ = fs_dec.pump_tick(state, spec, eta=0.1, phi=AT.tanh, norm="all")
 
         # output loss
         loss_out = ((state[out_start : out_start + B] - target_out) ** 2).mean()
@@ -284,8 +288,8 @@ def main() -> None:
         loss = loss_out + hist_loss
 
         #loss.zero_grad()
-        autograd.grad(loss, params, retain_graph=False, allow_unused=True)
-
+        grads = autograd.grad(loss, params, retain_graph=False, allow_unused=True)
+        print(grads)
         log_grads()
         tick += 1
         return state.detach()
