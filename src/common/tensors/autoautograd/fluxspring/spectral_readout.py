@@ -52,8 +52,20 @@ def _window(name: str, N: int) -> AT:
     return AT.ones(N, dtype=float)
 
 
-def compute_metrics(buffer: AT, cfg: SpectralCfg) -> Dict[str, Any]:
-    """Compute spectral metrics for ``buffer`` according to ``cfg``."""
+def compute_metrics(buffer: AT, cfg: SpectralCfg, *, return_tensor: bool = True) -> Dict[str, Any]:
+    """Compute spectral metrics for ``buffer`` according to ``cfg``.
+
+    Parameters
+    ----------
+    buffer:
+        Input signal to analyse.
+    cfg:
+        Spectral configuration describing the analysis window and metrics.
+    return_tensor:
+        When ``True`` (default), values in the returned dictionary remain as
+        backend tensors.  If ``False``, results are converted to Python
+        ``float`` objects for compatibility with callers expecting host types.
+    """
 
     if buffer.ndim == 1:
         x = buffer[:, None]
@@ -71,23 +83,27 @@ def compute_metrics(buffer: AT, cfg: SpectralCfg) -> Dict[str, Any]:
     m = cfg.metrics
 
     if m.bands:
-        band_vals: List[float] = []
+        band_vals: List[Any] = []
         for lo, hi in m.bands:
             mask = (freqs >= lo) & (freqs <= hi)
             bw = AT.sum(power * mask[:, None])
-            band_vals.append(float(AT.get_tensor(bw).data.item()))
-        metrics["bandpower"] = band_vals
+            if return_tensor:
+                band_vals.append(bw)
+            else:
+                band_vals.append(float(AT.get_tensor(bw).data.item()))
+        metrics["bandpower"] = AT.stack(band_vals) if return_tensor else band_vals
 
     if m.centroid:
         total = AT.sum(power) + 1e-12
         cent = AT.sum(freqs * AT.sum(power, dim=1)) / total
-        metrics["centroid"] = float(AT.get_tensor(cent).data.item())
+        metrics["centroid"] = cent if return_tensor else float(AT.get_tensor(cent).data.item())
 
     if m.flatness:
         logp = AT.log(power + 1e-12)
         gm = AT.exp(AT.mean(logp))
         am = AT.mean(power)
-        metrics["flatness"] = float(AT.get_tensor(gm / (am + 1e-12)).data.item())
+        flat = gm / (am + 1e-12)
+        metrics["flatness"] = flat if return_tensor else float(AT.get_tensor(flat).data.item())
 
     if m.coherence and xw.shape[1] >= 2:
         r0, i0 = real[:, 0], imag[:, 0]
@@ -101,12 +117,12 @@ def compute_metrics(buffer: AT, cfg: SpectralCfg) -> Dict[str, Any]:
         mask = den > 1e-12
         coh_masked = AT.where(mask, coh, AT.zeros_like(coh))
         mean_coh = AT.sum(coh_masked) / (AT.sum(mask) + 1e-12)
-        metrics["coherence"] = float(AT.get_tensor(mean_coh).data.item())
+        metrics["coherence"] = mean_coh if return_tensor else float(AT.get_tensor(mean_coh).data.item())
 
     return metrics
 
 
-def gather_ring_metrics(spec: FluxSpringSpec) -> Dict[int, Dict[str, Any]]:
+def gather_ring_metrics(spec: FluxSpringSpec, *, return_tensor: bool = True) -> Dict[int, Dict[str, Any]]:
     """Compile spectral metrics for node ring buffers in ``spec``.
 
     Returns a mapping from node id to the computed metrics.  Only nodes with
@@ -121,7 +137,7 @@ def gather_ring_metrics(spec: FluxSpringSpec) -> Dict[int, Dict[str, Any]]:
         if n.ring is None:
             continue
         buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
-        stats[n.id] = compute_metrics(buf, cfg)
+        stats[n.id] = compute_metrics(buf, cfg, return_tensor=return_tensor)
     return stats
 
 
