@@ -257,31 +257,33 @@ def pump_tick(
     D0, _ = incidence_tensors_AT(spec)
     dpsi = D0 @ psi  # (E,) edge potential differences
 
-    # Stack edge control parameters to keep them on the autograd tape.  Each
-    # tensor has shape (E,).
+    # Edge controls (E,)
     alpha_e = AT.stack([e.ctrl.alpha for e in spec.edges]).reshape(-1)
-    w_e = AT.stack([e.ctrl.w for e in spec.edges]).reshape(-1)
-    b_e = AT.stack([e.ctrl.b for e in spec.edges]).reshape(-1)
-    edge_in = alpha_e * dpsi + b_e  # (E,)
-    q = w_e * phi(edge_in)          # (E,) edge flux after activation
-
+    # hard-bound to [0,1]; if AT.clip is unavailable, replace with max(min(...))
+    alpha_e = AT.clip(alpha_e, 0.0, 1.0)
+    w_e     = AT.stack([e.ctrl.w     for e in spec.edges]).reshape(-1)
+    b_e     = AT.stack([e.ctrl.b     for e in spec.edges]).reshape(-1)
+    edge_raw = dpsi + b_e
+    # wet mix: (1-α)*raw + α*φ(raw)
+    edge_u   = (1.0 - alpha_e) * edge_raw + alpha_e * phi(edge_raw)
+    q        = w_e * edge_u
     s = D0.T() @ q  # (N,) accumulated edge contributions
 
-    # Stack node control parameters to retain gradients; each is (N,).
+    # Node controls (N,)
     alpha_n = AT.stack([n.ctrl.alpha for n in spec.nodes]).reshape(-1)
-    w_n = AT.stack([n.ctrl.w for n in spec.nodes]).reshape(-1)
-    b_n = AT.stack([n.ctrl.b for n in spec.nodes]).reshape(-1)
-    node_in = alpha_n * s + b_n  # (N,)
-    delta = w_n * phi(node_in)   # (N,)
+    alpha_n = AT.clip(alpha_n, 0.0, 1.0)
+    w_n     = AT.stack([n.ctrl.w     for n in spec.nodes]).reshape(-1)
+    b_n     = AT.stack([n.ctrl.b     for n in spec.nodes]).reshape(-1)
+    node_raw = s + b_n
+    node_u   = (1.0 - alpha_n) * node_raw + alpha_n * phi(node_raw)
+    delta    = w_n * node_u
 
     psi_next = psi + eta * delta  # (N,) updated node potentials
     stats = {
-        "dpsi": dpsi,
-        "q": q,
-        "s": s,
-        "delta": delta,
-        "edge_in": edge_in,
-        "node_in": node_in,
+        "dpsi": dpsi, "q": q, "s": s, "delta": delta,
+        "edge_raw": edge_raw, "edge_u": edge_u,
+        "node_raw": node_raw, "node_u": node_u,
+        "alpha_e": alpha_e, "alpha_n": alpha_n,
     }
 
     # Maintain ring buffers for spectral analysis.
