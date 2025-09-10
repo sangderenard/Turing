@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Tuple
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
+from .fs_harness import RingHarness
 
 
 def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
@@ -122,27 +123,32 @@ def compute_metrics(buffer: AT, cfg: SpectralCfg, *, return_tensor: bool = True)
     return metrics
 
 
-def gather_ring_metrics(spec: FluxSpringSpec, *, return_tensor: bool = True) -> Dict[int, Dict[str, Any]]:
-    """Compile spectral metrics for node ring buffers in ``spec``.
-
-    Returns a mapping from node id to the computed metrics.  Only nodes with
-    allocated ring buffers are analysed.
-    """
+def gather_ring_metrics(
+    spec: FluxSpringSpec,
+    harness: RingHarness,
+    *,
+    return_tensor: bool = True,
+) -> Dict[int, Dict[str, Any]]:
+    """Compile spectral metrics for node ring buffers managed by ``harness``."""
 
     cfg = spec.spectral
     if not cfg.enabled:
         return {}
     stats: Dict[int, Dict[str, Any]] = {}
     for n in spec.nodes:
-        if n.ring is None:
+        rb = harness.get_node_ring(n.id)
+        if rb is None:
             continue
-        buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+        buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
         stats[n.id] = compute_metrics(buf, cfg, return_tensor=return_tensor)
     return stats
 
 
 def gather_recent_windows(
-    spec: FluxSpringSpec, node_ids: List[int], cfg: SpectralCfg
+    spec: FluxSpringSpec,
+    node_ids: List[int],
+    cfg: SpectralCfg,
+    harness: RingHarness,
 ) -> Tuple[AT | None, List[int]]:
     """Return the latest time‑contiguous window for each node.
 
@@ -154,6 +160,8 @@ def gather_recent_windows(
         Node ids to sample.
     cfg:
         Spectral configuration providing the window length and tapers.
+    harness:
+        Ring buffer harness supplying recent samples for each node.
 
     Returns
     -------
@@ -168,13 +176,13 @@ def gather_recent_windows(
     kept: List[int] = []
 
     for nid in node_ids:
-        n = spec.nodes[nid]
-        if getattr(n, "ring", None) is None:
+        rb = harness.get_node_ring(nid)
+        if rb is None:
             continue
 
-        buf = n.ring[:, 0] if AT.get_tensor(n.ring).ndim == 2 else n.ring
+        buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
         R = int(buf.shape[0])
-        idx = n.ring_idx % R if R > 0 else 0
+        idx = rb.idx % R if R > 0 else 0
         if R > 0 and idx != 0:
             buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
 

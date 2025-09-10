@@ -46,8 +46,7 @@
           },
           "scripted_axes": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
           "temperature": { "type": "number", "default": 0.0 },
-          "exclusive": { "type": "boolean", "default": false },
-          "ring_size": { "type": ["integer", "null"], "minimum": 1 }
+          "exclusive": { "type": "boolean", "default": false }
         },
         "additionalProperties": false
       }
@@ -103,8 +102,7 @@
             "additionalProperties": false
           },
           "temperature": { "type": "number", "default": 0.0 },
-          "exclusive": { "type": "boolean", "default": false },
-          "ring_size": { "type": ["integer", "null"], "minimum": 1 }
+          "exclusive": { "type": "boolean", "default": false }
         },
         "additionalProperties": false
       }

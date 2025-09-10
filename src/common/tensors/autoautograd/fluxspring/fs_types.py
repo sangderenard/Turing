@@ -61,34 +61,6 @@ class NodeSpec:
     scripted_axes: List[int]   # exactly 2 axes (Dirichlet/scripted)
     temperature: AT = field(default_factory=lambda: AT.tensor(0.0))  # placeholder for thermal models
     exclusive: bool = False  # True if node occupies exclusive geometry
-    ring_size: Optional[int] = None
-    ring: Optional[AT] = None
-    ring_idx: int = 0
-
-    def __post_init__(self) -> None:
-        self.ensure_ring_buffer()
-
-    def ensure_ring_buffer(self) -> None:
-        """Allocate the ring buffer if a size is set."""
-        if self.ring_size and self.ring_size > 0 and self.ring is None:
-            D = int(AT.get_tensor(self.p0).shape[0])
-            self.ring = AT.zeros((self.ring_size, D), dtype=float)
-            self.ring_idx = 0
-
-    def push_ring(self, val: AT) -> AT:
-        """Insert ``val`` into the ring buffer and return the updated buffer.
-
-        Uses :func:`AT.scatter_row` so the operation participates in the
-        autograd tape instead of an in-place Python assignment.  The returned
-        tensor remains connected to the computation graph.
-        """
-        if self.ring is None:
-            raise RuntimeError("ring buffer not allocated")
-
-        i = self.ring_idx % int(len(self.ring))
-        self.ring = AT.scatter_row(self.ring.clone(), i, val, dim=0)
-        self.ring_idx = i + 1
-        return self.ring
 
 @dataclass
 class EdgeSpec:
@@ -98,33 +70,6 @@ class EdgeSpec:
     ctrl: EdgeCtrl
     temperature: AT = field(default_factory=lambda: AT.tensor(0.0))  # placeholder for thermal models
     exclusive: bool = False  # True if edge occupies exclusive geometry
-    ring_size: Optional[int] = None
-    ring: Optional[AT] = None
-    ring_idx: int = 0
-
-    def __post_init__(self) -> None:
-        self.ensure_ring_buffer()
-
-    def ensure_ring_buffer(self) -> None:
-        """Allocate the ring buffer if a size is set."""
-        if self.ring_size and self.ring_size > 0 and self.ring is None:
-            self.ring = AT.zeros(self.ring_size, dtype=float)
-            self.ring_idx = 0
-
-    def push_ring(self, val: AT) -> AT:
-        """Insert ``val`` into the ring buffer and return the updated buffer.
-
-        ``AT.scatter_row`` performs the update using differentiable tensor
-        operations so gradients flow back to ``val`` when the ring is involved
-        in later computations.
-        """
-        if self.ring is None:
-            raise RuntimeError("ring buffer not allocated")
-
-        i = self.ring_idx % int(len(self.ring))
-        self.ring = AT.scatter_row(self.ring.clone(), i, val, dim=0)
-        self.ring_idx = i + 1
-        return self.ring
 
 @dataclass
 class FaceLearn:
@@ -192,14 +137,3 @@ class FluxSpringSpec:
     rho: AT = field(default_factory=lambda: AT.tensor(0.0))
     beta: AT = field(default_factory=lambda: AT.tensor(0.0))
     gamma: AT = field(default_factory=lambda: AT.tensor(0.0))
-
-    def __post_init__(self) -> None:
-        default_size = self.spectral.win_len if self.spectral.enabled else None
-        for n in self.nodes:
-            if n.ring_size is None:
-                n.ring_size = default_size
-            n.ensure_ring_buffer()
-        for e in self.edges:
-            if e.ring_size is None:
-                e.ring_size = default_size
-            e.ensure_ring_buffer()
