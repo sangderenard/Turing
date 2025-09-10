@@ -94,3 +94,18 @@ def test_pump_tick_lorentz():
     exp_vals = AT.get_tensor(expected)
     assert float(vals[0]) == pytest.approx(float(exp_vals[0]))
     assert float(vals[1]) == pytest.approx(float(exp_vals[1]))
+
+
+def test_pump_tick_norm_node():
+    spec = _make_spec()
+    psi = AT.get_tensor([0.5, -0.5])
+    eta = 1.0
+    _, stats_off = pump_tick(psi, spec, eta=eta)
+    _, stats_norm = pump_tick(psi, spec, eta=eta, norm="node")
+    delta_off = AT.get_tensor(stats_off["delta"])
+    delta_norm = AT.get_tensor(stats_norm["delta"])
+    q_off = AT.get_tensor(stats_off["q"])
+    q_norm = AT.get_tensor(stats_norm["q"])
+    assert float(delta_norm[0]) == pytest.approx(float(delta_off[0]) / 2)
+    assert float(delta_norm[1]) == pytest.approx(float(delta_off[1]) / 2)
+    assert float(q_norm[0]) == pytest.approx(float(q_off[0]) / 2)
