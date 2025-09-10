@@ -3,10 +3,16 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autoautograd.fluxspring.spectral_readout import (
     compute_metrics,
+    gather_recent_windows,
+    batched_bandpower_from_windows,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     SpectralCfg,
     SpectralMetrics,
+    NodeSpec,
+    NodeCtrl,
+    FluxSpringSpec,
+    DECSpec,
 )
 
 
@@ -71,3 +77,70 @@ def test_coherence_identical_signals():
     )
     m = compute_metrics(buf, cfg)
     assert abs(m["coherence"] - 1.0) < 1e-6
+
+
+def test_gather_recent_windows_wrap_and_pad():
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=1.0,
+        win_len=3,
+        hop_len=3,
+        window="rect",
+        metrics=SpectralMetrics(),
+    )
+    node0 = NodeSpec(
+        id=0,
+        p0=AT.zeros(1),
+        v0=AT.zeros(1),
+        mass=AT.tensor(1.0),
+        ctrl=NodeCtrl(),
+        scripted_axes=[0, 0],
+        ring_size=5,
+    )
+    for i in range(7):
+        node0.push_ring(AT.tensor([float(i)]))
+    node1 = NodeSpec(
+        id=1,
+        p0=AT.zeros(1),
+        v0=AT.zeros(1),
+        mass=AT.tensor(1.0),
+        ctrl=NodeCtrl(),
+        scripted_axes=[0, 0],
+        ring_size=2,
+    )
+    node1.push_ring(AT.tensor([10.0]))
+    node1.push_ring(AT.tensor([11.0]))
+    spec = FluxSpringSpec(
+        version="t",
+        D=1,
+        nodes=[node0, node1],
+        edges=[],
+        faces=[],
+        dec=DECSpec(D0=[], D1=[]),
+        spectral=cfg,
+    )
+    W, ids = gather_recent_windows(spec, [0, 1], cfg)
+    assert ids == [0, 1]
+    assert AT.get_tensor(W[0]).tolist() == [4.0, 5.0, 6.0]
+    assert AT.get_tensor(W[1]).tolist() == [0.0, 10.0, 11.0]
+
+
+def test_batched_bandpower_from_windows():
+    tick_hz = 100.0
+    Nw = 50
+    t = AT.arange(Nw, dtype=float) / tick_hz
+    win1 = (2 * AT.pi() * 20.0 * t).sin()
+    win2 = (2 * AT.pi() * 40.0 * t).sin()
+    W = AT.stack([win1, win2])
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=tick_hz,
+        win_len=Nw,
+        hop_len=Nw,
+        window="rect",
+        metrics=SpectralMetrics(bands=[[15.0, 25.0], [35.0, 45.0]]),
+    )
+    bp = batched_bandpower_from_windows(W, cfg)
+    bp_np = AT.get_tensor(bp)
+    assert bp_np[0, 0] > 0.9 and bp_np[0, 1] < 0.1
+    assert bp_np[1, 1] > 0.9 and bp_np[1, 0] < 0.1
