@@ -187,6 +187,7 @@ def transport_tick(
             .astype(float)
             .reshape(-1)
         )
+
         g = edge_strain_AT(P, spec, l0)
         G = lambda_s * k * g
     else:
@@ -200,7 +201,9 @@ def transport_tick(
         .astype(float)
         .reshape(-1)
     )
-    gamma = AT.get_tensor(spec.gamma).astype(float)
+
+    gamma = AT.get_tensor(spec.gamma).astype(float).reshape(-1)
+
     R = gamma * x
 
     delta = dpsi + G + R
@@ -234,17 +237,29 @@ def pump_tick(
     D0, _ = incidence_tensors_AT(spec)
     dpsi = D0 @ psi  # (E,)
 
-    alpha_e = AT.get_tensor([e.ctrl.alpha for e in spec.edges]).astype(float)
-    w_e = AT.get_tensor([e.ctrl.w for e in spec.edges]).astype(float)
-    b_e = AT.get_tensor([e.ctrl.b for e in spec.edges]).astype(float)
+    alpha_e = (
+        AT.get_tensor([e.ctrl.alpha for e in spec.edges]).astype(float).reshape(-1)
+    )
+    w_e = (
+        AT.get_tensor([e.ctrl.w for e in spec.edges]).astype(float).reshape(-1)
+    )
+    b_e = (
+        AT.get_tensor([e.ctrl.b for e in spec.edges]).astype(float).reshape(-1)
+    )
     edge_in = alpha_e * dpsi + b_e
     q = w_e * phi(edge_in)
 
     s = D0.T() @ q  # (N,)
 
-    alpha_n = AT.get_tensor([n.ctrl.alpha for n in spec.nodes]).astype(float)
-    w_n = AT.get_tensor([n.ctrl.w for n in spec.nodes]).astype(float)
-    b_n = AT.get_tensor([n.ctrl.b for n in spec.nodes]).astype(float)
+    alpha_n = (
+        AT.get_tensor([n.ctrl.alpha for n in spec.nodes]).astype(float).reshape(-1)
+    )
+    w_n = (
+        AT.get_tensor([n.ctrl.w for n in spec.nodes]).astype(float).reshape(-1)
+    )
+    b_n = (
+        AT.get_tensor([n.ctrl.b for n in spec.nodes]).astype(float).reshape(-1)
+    )
     node_in = alpha_n * s + b_n
     delta = w_n * phi(node_in)
 
