@@ -209,6 +209,20 @@ def train_routing(
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.get_tensor(out))
 
+    # Report gradient status for all learnable parameters once outputs have been
+    # produced.  This helps diagnose dead graphs where ``loss.backward`` fails
+    # to populate ``grad`` fields.
+    for idx, p in enumerate(params):
+        grad = getattr(p, "grad", None)
+        if grad is None:
+            print(f"[Gradients] param {idx} missing gradient")
+        else:
+            g = AT.get_tensor(grad)
+            if np.allclose(g, 0.0):
+                print(f"[Gradients] param {idx} gradient is zero: {g}")
+            else:
+                print(f"[Gradients] param {idx} grad: {g}")
+
     return routed
 
 
