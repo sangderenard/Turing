@@ -39,9 +39,10 @@ def _rebind_param(param: AT | None, learn: bool, out: list[AT]) -> AT | None:
     if param is None:
         return None
 
-    # Ensure the tensor is registered on the current tape with the desired
-    # gradient flag.  ``requires_grad_(False)`` is a no-op for most backends
-    # but keeps intent explicit.
+    # Reattach the tensor to the current tape as a leaf so gradients populate
+    # ``param.grad``.  ``detach`` drops any prior history while preserving the
+    # object identity once reassigned to the spec.
+    param = param.detach()
     param.requires_grad_(learn)
     if learn:
         out.append(param)

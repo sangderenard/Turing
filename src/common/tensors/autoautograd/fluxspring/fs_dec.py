@@ -155,14 +155,14 @@ def transport_tick(
     dpsi = D0 @ psi  # (E,)
 
     kappa = (
-        AT.get_tensor([e.transport.kappa for e in spec.edges])
+        AT.stack([e.transport.kappa for e in spec.edges])
         .astype(float)
         .reshape(-1)
     )  # (E,)
 
     if P is not None:
         k = (
-            AT.get_tensor([
+            AT.stack([
                 e.transport.k if e.transport.k is not None else AT.tensor(0.0)
                 for e in spec.edges
             ])
@@ -170,7 +170,7 @@ def transport_tick(
             .reshape(-1)
         )
         l0 = (
-            AT.get_tensor([
+            AT.stack([
                 e.transport.l0 if e.transport.l0 is not None else AT.tensor(0.0)
                 for e in spec.edges
             ])
@@ -178,7 +178,7 @@ def transport_tick(
             .reshape(-1)
         )
         lambda_s = (
-            AT.get_tensor([
+            AT.stack([
                 e.transport.lambda_s
                 if e.transport.lambda_s is not None
                 else AT.tensor(0.0)
@@ -194,7 +194,7 @@ def transport_tick(
         G = AT.zeros_like(kappa)
 
     x = (
-        AT.get_tensor([
+        AT.stack([
             e.transport.x if e.transport.x is not None else AT.tensor(0.0)
             for e in spec.edges
         ])
