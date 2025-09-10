@@ -31,6 +31,11 @@ from .fs_types import (
     SpectralMetrics,
 )
 from .fs_io import validate_fluxspring
+from src.common.tensors.autograd_probes import (
+    set_strict_mode,
+    annotate_params,
+    probe_losses,
+)
 import numpy as np
 from typing import Callable, Optional
 
@@ -214,6 +219,8 @@ def train_routing(
     """
     patience = 10
     params = register_learnable_params(spec)
+    set_strict_mode(True)
+    annotate_params(params)
     B = len(spectral_cfg.metrics.bands)
     psi = AT.zeros(len(spec.nodes), dtype=float)
     routed: list[AT.Tensor] = []
@@ -262,6 +269,8 @@ def train_routing(
 
         loss_out = (mix_residual ** 2).mean()
         loss = loss_out + hist_loss
+        losses = {"loss_out": loss_out, "hist_loss": hist_loss, "combined": loss}
+        probe_losses(losses, params)
         loss.backward()
 
         grads = []

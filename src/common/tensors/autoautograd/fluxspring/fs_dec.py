@@ -51,8 +51,12 @@ def edge_params_AT(spec: FluxSpringSpec):
     return k, l0
 
 def face_params_AT(spec: FluxSpringSpec):
-    alpha = AT.stack([fc.alpha for fc in spec.faces]).reshape(-1)  # (F,)
-    c     = AT.stack([fc.c     for fc in spec.faces]).reshape(-1)  # (F,)
+    if not spec.faces:
+        alpha = AT.zeros(0, dtype=float)
+        c = AT.zeros(0, dtype=float)
+    else:
+        alpha = AT.stack([fc.alpha for fc in spec.faces]).reshape(-1)
+        c = AT.stack([fc.c for fc in spec.faces]).reshape(-1)
     return alpha, c
 
 def edge_strain_AT(P: AT.Tensor, spec: FluxSpringSpec, l0: AT.Tensor) -> AT.Tensor:
