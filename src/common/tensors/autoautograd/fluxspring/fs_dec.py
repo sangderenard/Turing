@@ -4,7 +4,7 @@
 No torch usage here.
 """
 from __future__ import annotations
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Callable
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
@@ -229,6 +229,8 @@ def pump_tick(
     phi=AT.tanh,
     external: Optional[Dict[int, AT.Tensor]] = None,
     leak: float = 0.0,
+    saturate: Callable[[AT.Tensor], AT.Tensor] | None = None,
+    lorentz_c: float | None = None,
 ) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
     """Advance node potentials via data-path control parameters.
 
@@ -249,6 +251,13 @@ def pump_tick(
     leak : float, optional
         Fraction of the current state that decays each tick. ``0`` preserves
         the previous behaviour.
+    saturate : callable, optional
+        Optional saturation function applied to the post-update state. If
+        provided, takes precedence over ``lorentz_c``.
+    lorentz_c : float, optional
+        Characteristic speed for a relativistic-style constraint. If
+        ``saturate`` is ``None``, ``delta`` is divided by
+        ``sqrt(1 - (psi/lorentz_c)**2)`` before the Euler update.
     """
 
     # Inject fresh external inputs before computing edge potentials. ``ids`` is
@@ -283,7 +292,12 @@ def pump_tick(
     node_u   = (1.0 - alpha_n) * node_raw + alpha_n * phi(node_raw)
     delta    = w_n * node_u
 
-    psi_next = psi + eta * delta  # (N,) updated node potentials
+    if saturate is not None:
+        psi_next = saturate(psi + eta * delta)
+    elif lorentz_c is not None:
+        psi_next = psi + eta * (delta / AT.sqrt(1.0 - (psi / lorentz_c) ** 2))
+    else:
+        psi_next = psi + eta * delta  # (N,) updated node potentials
     stats = {
         "dpsi": dpsi, "q": q, "s": s, "delta": delta,
         "edge_raw": edge_raw, "edge_u": edge_u,

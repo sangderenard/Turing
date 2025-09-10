@@ -70,3 +70,27 @@ def test_pump_tick_leak_decay():
     vals = AT.get_tensor(psi_next)
     assert float(vals[0]) == pytest.approx(0.8)
     assert float(vals[1]) == pytest.approx(-0.8)
+
+
+def test_pump_tick_saturate():
+    spec = _make_spec()
+    psi = AT.get_tensor([2.0, -2.0])
+    sat = lambda x: AT.clip(x, -1.0, 1.0)
+    psi_next, _ = pump_tick(psi, spec, eta=0.0, leak=0.0, saturate=sat)
+    vals = AT.get_tensor(psi_next)
+    assert float(vals[0]) == pytest.approx(1.0)
+    assert float(vals[1]) == pytest.approx(-1.0)
+
+
+def test_pump_tick_lorentz():
+    spec = _make_spec()
+    psi = AT.get_tensor([0.5, 0.0])
+    eta = 0.1
+    c = 2.0
+    psi_next, stats = pump_tick(psi, spec, eta=eta, lorentz_c=c)
+    delta = stats["delta"]
+    expected = psi + eta * (delta / AT.sqrt(1.0 - (psi / c) ** 2))
+    vals = AT.get_tensor(psi_next)
+    exp_vals = AT.get_tensor(expected)
+    assert float(vals[0]) == pytest.approx(float(exp_vals[0]))
+    assert float(vals[1]) == pytest.approx(float(exp_vals[1]))
