@@ -18,6 +18,7 @@ from src.common.tensors.autoautograd.fluxspring.fs_harness import (
     RingHarness,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_dec import pump_tick
+from src.common.tensors.autograd import autograd
 
 
 def test_param_version_ring_snapshots():
@@ -60,3 +61,58 @@ def test_param_version_ring_snapshots():
     mat = harness.get_params_for_lineages(lids, ledger)
     assert mat.shape == (3, 1)
     assert float(AT.get_tensor(mat[0, 0])) == pytest.approx(1.0)
+
+
+def test_param_version_ring_respects_stage_depth():
+    param = AT.tensor(1.0)
+    param.requires_grad_(True)
+
+    node0 = NodeSpec(
+        id=0,
+        p0=AT.get_tensor([0.0]),
+        v0=AT.get_tensor([0.0]),
+        mass=AT.tensor(1.0),
+        ctrl=NodeCtrl(),
+        scripted_axes=[0],
+    )
+    node1 = NodeSpec(
+        id=1,
+        p0=AT.get_tensor([0.0]),
+        v0=AT.get_tensor([0.0]),
+        mass=AT.tensor(1.0),
+        ctrl=NodeCtrl(w=param, learn=LearnCtrl(alpha=False, w=True, b=False)),
+        scripted_axes=[0],
+    )
+    edge = EdgeSpec(
+        src=0,
+        dst=1,
+        transport=EdgeTransport(learn=EdgeTransportLearn(False, False, False, False, False)),
+        ctrl=EdgeCtrl(learn=LearnCtrl(False, False, False)),
+    )
+    spec = FluxSpringSpec(
+        version="t",
+        D=1,
+        nodes=[node0, node1],
+        edges=[edge],
+        faces=[],
+        dec=DECSpec(D0=[[-1.0, 1.0]], D1=[]),
+    )
+    register_learnable_params(spec)
+    param = spec.nodes[1].ctrl.w
+
+    harness = RingHarness(default_size=10)
+    ledger = LineageLedger()
+    psi = AT.tensor([0.0, 0.0])
+    lids: list[int] = []
+    for i in range(4):
+        lid = ledger.ingest()
+        lids.append(lid)
+        with autograd.no_grad():
+            param.data[0] = float(i + 1)
+        psi, _ = pump_tick(psi, spec, eta=0.0, harness=harness, lineage_id=lid)
+
+    mat = harness.get_params_for_lineages(lids[:2], ledger)
+    idx = harness.param_labels.index("node[1].ctrl.w")
+    vals = AT.get_tensor(mat)[:, idx]
+    assert float(vals[0]) == pytest.approx(1.0)
+    assert float(vals[1]) == pytest.approx(2.0)

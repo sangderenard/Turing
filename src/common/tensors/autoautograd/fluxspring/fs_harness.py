@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 
@@ -20,6 +21,52 @@ def _tape():
 
 
 _LABEL_STAGE_DEPTH: Dict[str, int] = {}
+_STAGE_TICKS = 3
+
+
+def _infer_node_depths(spec: FluxSpringSpec) -> Dict[int, int]:
+    """Return node depths in tick units for ``spec``."""
+
+    edges_by_dst: Dict[int, List[int]] = {}
+    for e in spec.edges:
+        edges_by_dst.setdefault(e.dst, []).append(e.src)
+
+    memo: Dict[int, int] = {}
+
+    def depth(n: int, stack: set[int]) -> int:
+        if n in memo:
+            return memo[n]
+        if n in stack:
+            return 0
+        stack.add(n)
+        best = 0
+        for p in edges_by_dst.get(n, []):
+            best = max(best, depth(p, stack) + _STAGE_TICKS)
+        stack.remove(n)
+        memo[n] = best
+        return best
+
+    return {n.id: depth(n.id, set()) for n in spec.nodes}
+
+
+def populate_label_stage_depth(spec: FluxSpringSpec) -> None:
+    """Fill ``_LABEL_STAGE_DEPTH`` based on ``spec`` if empty."""
+
+    if _LABEL_STAGE_DEPTH:
+        return
+    node_depth = _infer_node_depths(spec)
+    for n in spec.nodes:
+        _LABEL_STAGE_DEPTH[f"node[{n.id}]"] = node_depth.get(n.id, 0)
+    for e in spec.edges:
+        _LABEL_STAGE_DEPTH[f"edge[{e.src}->{e.dst}]"] = node_depth.get(e.dst, 0)
+    for idx, f in enumerate(spec.faces):
+        depths: List[int] = []
+        for e_idx in getattr(f, "edges", []):
+            e = spec.edges[abs(e_idx) - 1]
+            depths.append(node_depth.get(e.dst, 0))
+        if depths:
+            face_id = getattr(f, "id", idx)
+            _LABEL_STAGE_DEPTH[f"face[{face_id}]"] = max(depths)
 
 
 def label_stage_depth(label: str) -> int:
@@ -217,6 +264,7 @@ class RingHarness:
     ) -> None:
         """Record current learnable parameters with tick index."""
 
+        populate_label_stage_depth(spec)
         tape = _tape()
 
         def _maybe(label: str | None, p: AT | None) -> Iterable[Tuple[str, AT]]:
@@ -238,7 +286,7 @@ class RingHarness:
                     D = int(val.shape[0])
                     ring = self._ensure_param_ring(label, D, size)
                     if ring is not None:
-                        ring.push(self.tick, val)
+                        ring.push(self.tick + label_stage_depth(label), val)
                         if label not in self.param_labels:
                             self.param_labels.append(label)
 
@@ -252,7 +300,7 @@ class RingHarness:
                     D = int(val.shape[0])
                     ring = self._ensure_param_ring(label, D, size)
                     if ring is not None:
-                        ring.push(self.tick, val)
+                        ring.push(self.tick + label_stage_depth(label), val)
                         if label not in self.param_labels:
                             self.param_labels.append(label)
             for attr in ("kappa", "k", "l0", "lambda_s", "x"):
@@ -263,7 +311,7 @@ class RingHarness:
                     D = int(val.shape[0])
                     ring = self._ensure_param_ring(label, D, size)
                     if ring is not None:
-                        ring.push(self.tick, val)
+                        ring.push(self.tick + label_stage_depth(label), val)
                         if label not in self.param_labels:
                             self.param_labels.append(label)
 
@@ -277,7 +325,7 @@ class RingHarness:
                     D = int(val.shape[0])
                     ring = self._ensure_param_ring(label, D, size)
                     if ring is not None:
-                        ring.push(self.tick, val)
+                        ring.push(self.tick + label_stage_depth(label), val)
                         if label not in self.param_labels:
                             self.param_labels.append(label)
 
