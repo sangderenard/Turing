@@ -363,6 +363,7 @@ def train_routing(
         for idx in range(len(spec.edges)):
             k = harness._key(idx, line)
             harness.edge_rings.pop(k, None)
+        ledger.purge_through_lid(lin)
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         lid = ledger.ingest()

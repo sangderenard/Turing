@@ -62,6 +62,11 @@ def test_param_version_ring_snapshots():
     assert mat.shape == (3, 1)
     assert float(AT.get_tensor(mat[0, 0])) == pytest.approx(1.0)
 
+    assert ledger.lineages() == tuple(lids)
+    ledger.purge_through_lid(lids[1])
+    assert ledger.lineages() == (lids[2],)
+
+
 
 def test_param_version_ring_respects_stage_depth():
     param = AT.tensor(1.0)
@@ -116,3 +121,4 @@ def test_param_version_ring_respects_stage_depth():
     vals = AT.get_tensor(mat)[:, idx]
     assert float(vals[0]) == pytest.approx(1.0)
     assert float(vals[1]) == pytest.approx(2.0)
+
