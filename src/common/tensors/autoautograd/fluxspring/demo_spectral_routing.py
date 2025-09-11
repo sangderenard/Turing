@@ -39,8 +39,13 @@ from src.common.tensors.autograd_probes import (
 from ..whiteboard_runtime import run_batched_vjp
 from ...abstract_nn.train import rebind
 from types import SimpleNamespace
+import logging
 import numpy as np
 from typing import Callable, Optional
+
+
+# Module logger setup (configured in main if not already configured)
+logger = logging.getLogger(__name__)
 
 
 # Special node IDs for harness-managed gradient buffers.
@@ -69,6 +74,10 @@ class TensorRingBuffer:
         if self._buf is None:
             self._buf = {k: v[None, ...] for k, v in entry.items()}
             self._len = 1
+            logger.debug(
+                "TensorRingBuffer: initialized with first entry keys=%s",
+                list(entry.keys()),
+            )
             return
         for k, v in entry.items():
             self._buf[k] = AT.cat([self._buf[k], v[None, ...]], dim=0)
@@ -77,6 +86,11 @@ class TensorRingBuffer:
             overflow = self._len - self.capacity
             if self.flush_hook is not None:
                 flushed = {k: v[:overflow] for k, v in self._buf.items()}
+                logger.debug(
+                    "TensorRingBuffer: capacity=%d overflow=%d — flushing",
+                    self.capacity,
+                    overflow,
+                )
                 self.flush_hook(flushed)
             for k in self._buf:
                 self._buf[k] = self._buf[k][overflow:]
@@ -85,10 +99,21 @@ class TensorRingBuffer:
     def snapshot(self) -> dict[str, AT.Tensor]:
         if self._buf is None:
             return {}
-        return {k: v.clone() for k, v in self._buf.items()}
+        snap = {k: v.clone() for k, v in self._buf.items()}
+        logger.debug(
+            "TensorRingBuffer: snapshot taken keys=%s length=%d",
+            list(snap.keys()),
+            next((len(v) for v in snap.values()), 0),
+        )
+        return snap
 
     def flush_all(self) -> None:
         if self.flush_hook is not None and self._buf is not None and self._len > 0:
+            logger.debug(
+                "TensorRingBuffer: flush_all called with len=%d keys=%s",
+                self._len,
+                list(self._buf.keys()),
+            )
             self.flush_hook({k: v.clone() for k, v in self._buf.items()})
         self._buf = None
         self._len = 0
@@ -184,6 +209,12 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
         spectral=spectral,
     )
     validate_fluxspring(spec)
+    logger.debug(
+        "Spec built: layers=6 bands=%d nodes=%d edges=%d",
+        B,
+        len(nodes),
+        len(edges),
+    )
     return spec
 
 def generate_signals(
@@ -242,12 +273,20 @@ def train_routing(
     log_buf = TensorRingBuffer(ring_capacity, flush_hook)
     harness = RingHarness(default_size=spectral_cfg.win_len if spectral_cfg.enabled else None)
     ledger = LineageLedger()
+    logger.debug(
+        "train_routing: start B=%d layers=%d out_start=%d ring_capacity=%d",
+        B,
+        layers,
+        out_start,
+        ring_capacity,
+    )
 
     hist_targets: dict[int, AT.Tensor] = {}
     for j, nid in enumerate(range(3 * B, 4 * B)):
         tvec = AT.zeros(B, dtype=float)
         tvec[j] = 1.0
         hist_targets[nid] = tvec
+        logger.debug("hist_target for node %d set as one-hot idx=%d", nid, j)
 
     previous_grads = None
     mix_buf: dict[int, AT.Tensor] = {}
@@ -270,6 +309,16 @@ def train_routing(
             rb_hist_targ,
             rb_hist_ids,
         ):
+            logger.debug(
+                "try_backward(lin=%d): missing rings — skipping (out_feat=%s out_targ=%s out_ids=%s hist_feat=%s hist_targ=%s hist_ids=%s)",
+                lin,
+                rb_out_feat is not None,
+                rb_out_targ is not None,
+                rb_out_ids is not None,
+                rb_hist_feat is not None,
+                rb_hist_targ is not None,
+                rb_hist_ids is not None,
+            )
             return
         out_feat = rb_out_feat.buf[0]
         out_targ = rb_out_targ.buf[0]
@@ -280,6 +329,14 @@ def train_routing(
             int(rb_hist_feat.buf.shape[1]) != M * B
             or int(rb_hist_targ.buf.shape[1]) != M * B
         ):
+            logger.debug(
+                "try_backward(lin=%d): histogram shape mismatch M=%d B=%d (feat=%s targ=%s) — skipping",
+                lin,
+                M,
+                B,
+                tuple(rb_hist_feat.buf.shape) if rb_hist_feat is not None else None,
+                tuple(rb_hist_targ.buf.shape) if rb_hist_targ is not None else None,
+            )
             return
         hist_feat = rb_hist_feat.buf[0].reshape(M, B)
         hist_targ = rb_hist_targ.buf[0].reshape(M, B)
@@ -290,6 +347,12 @@ def train_routing(
         loss_out = (mix_residual ** 2).mean()
         losses = {"loss_out": loss_out, "hist_loss": hist_loss}
         probe_losses(losses, params)
+        logger.debug(
+            "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
+            lin,
+            float(loss_out.item()),
+            float(hist_loss.item()),
+        )
         mix_buf[lin] = mix_residual
         hist_buf[lin] = hist_residual_summary
         if lin not in mix_buf or lin not in hist_buf:
@@ -297,6 +360,12 @@ def train_routing(
         mix_seed = mix_buf.pop(lin)
         hist_seed = hist_buf.pop(lin)
         seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
+        logger.debug(
+            "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d",
+            lin,
+            seed_val,
+            len(params),
+        )
         sys = SimpleNamespace(
             nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(params)}
         )
@@ -313,30 +382,39 @@ def train_routing(
                 grads.append(grad)
                 new_p = p - 0.01 * grad
                 params[idx] = rebind(f"param[{idx}]", new_p)
+        logger.debug(
+            "try_backward(lin=%d): computed grads for %d params",
+            lin,
+            len(grads),
+        )
         if previous_grads is not None:
             changed = False
             for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
                 if g is None and pg is not None:
                     changed = True
-                    print(f"[Gradients] param {idx} lost gradient")
+                    logger.debug("[Gradients] param %d lost gradient", idx)
                 elif g is not None and pg is None:
                     changed = True
-                    print(f"[Gradients] param {idx} gained gradient")
+                    logger.debug("[Gradients] param %d gained gradient", idx)
                 if g != pg:
                     changed = True
-                    print(f"[Gradients] param {idx} gradient changed")
+                    logger.debug("[Gradients] param %d gradient changed", idx)
             if changed:
-                print(f"[Gradients] previous: {previous_grads}")
-                print(f"[Gradients] current:  {grads}")
+                logger.debug("[Gradients] previous: %s", previous_grads)
+                logger.debug("[Gradients] current:  %s", grads)
             else:
                 patience -= 1
                 if patience <= 0:
-                    print("[Gradients] no changes in gradients, stopping early")
+                    logger.debug("[Gradients] no changes in gradients, stopping early")
                     exit(0)
         else:
-            print(f"[Gradients] initial gradients: {grads}")
+            logger.debug("[Gradients] initial gradients: %s", grads)
         previous_grads = grads
-        print(f"loss: {loss_out.item():.6f}, hist_loss: {hist_loss.item():.6f}")
+        logger.debug(
+            "loss: %.6f, hist_loss: %.6f",
+            float(loss_out.item()),
+            float(hist_loss.item()),
+        )
         tick_idx = ledger.tick_of_lid[lin]
         log_entry = {
             "tick": AT.tensor([float(tick_idx)]),
@@ -347,6 +425,12 @@ def train_routing(
             "param_grad": AT.stack(grads) if grads else AT.zeros(len(params)),
         }
         log_buf.append(log_entry)
+        logger.debug(
+            "try_backward(lin=%d): logged tick=%d keys=%s",
+            lin,
+            int(float(tick_idx)),
+            list(log_entry.keys()),
+        )
         for key_id in (
             OUT_FEAT_ID,
             OUT_TARG_ID,
@@ -357,6 +441,7 @@ def train_routing(
         ):
             k = harness._key(key_id, line)
             harness.node_rings.pop(k, None)
+        logger.debug("try_backward(lin=%d): cleared transient node rings", lin)
         for n in spec.nodes:
             k = harness._key(n.id, line)
             harness.node_rings.pop(k, None)
@@ -364,9 +449,11 @@ def train_routing(
             k = harness._key(idx, line)
             harness.edge_rings.pop(k, None)
         ledger.purge_through_lid(lin)
+        logger.debug("try_backward(lin=%d): purged lineage from ledger", lin)
 
     def pump_with_loss(state: AT.Tensor, target_out: AT.Tensor) -> AT.Tensor:
         lid = ledger.ingest()
+        logger.debug("pump_with_loss: ingest lid=%d", lid)
         state, _ = fs_dec.pump_tick(
             state,
             spec,
@@ -376,14 +463,26 @@ def train_routing(
             harness=harness,
             lineage_id=lid,
         )
+        logger.debug("pump_with_loss: post pump lid=%d state_len=%d", lid, int(state.shape[0]))
         out_feat = state[out_start : out_start + B].clone()
         harness.push_node(OUT_FEAT_ID, out_feat, lineage=(lid,), size=1)
         harness.push_node(OUT_TARG_ID, target_out.clone(), lineage=(lid,), size=1)
         out_ids = AT.arange(out_start, out_start + B, dtype=float)
         harness.push_node(OUT_IDS_ID, out_ids, lineage=(lid,), size=1)
+        logger.debug(
+            "pump_with_loss: pushed OUT_* rings lid=%d out_ids=[%d..%d)",
+            lid,
+            out_start,
+            out_start + B,
+        )
 
         mids = list(range(3 * B, 4 * B))
         win_map, kept_map = gather_recent_windows(spec, mids, spectral_cfg, harness, ledger)
+        logger.debug(
+            "pump_with_loss: gather_recent_windows mids=%d returned lineages=%d",
+            len(mids),
+            len(win_map),
+        )
         for lin, W in win_map.items():
             complete = True
             for nid in kept_map[lin]:
@@ -392,6 +491,10 @@ def train_routing(
                     complete = False
                     break
             if not complete:
+                logger.debug(
+                    "pump_with_loss: lineage %d windows incomplete — skipping hist compute",
+                    lin,
+                )
                 continue
             bp = batched_bandpower_from_windows(W, spectral_cfg)
             targ_mat = AT.stack([hist_targets[nid] for nid in kept_map[lin]])
@@ -413,6 +516,12 @@ def train_routing(
                 lineage=(lin,),
                 size=1,
             )
+            logger.debug(
+                "pump_with_loss: lineage %d pushed HIST_* (rows=%d B=%d)",
+                lin,
+                int(bp.shape[0]),
+                B,
+            )
             try_backward(lin)
 
         try_backward(lid)
@@ -420,7 +529,8 @@ def train_routing(
 
     win = sine_chunks[0].shape[0]
     B = len(sine_chunks)
-    for frame_chunks in noise_frames:
+    for frame_idx, frame_chunks in enumerate(noise_frames):
+        logger.debug("train_routing: processing frame %d/%d", frame_idx + 1, len(noise_frames))
         for k in range(win):
             for i in range(B):
                 psi[i] = frame_chunks[i][k]
@@ -431,6 +541,10 @@ def train_routing(
             spec, list(range(B)), spectral_cfg, harness, ledger
         )
         if win_map:
+            logger.debug(
+                "train_routing: post-frame gather_recent_windows at inputs returned %d lineages",
+                len(win_map),
+            )
             for lin, W in win_map.items():
                 bp = batched_bandpower_from_windows(W, spectral_cfg)
                 for row, nid in enumerate(kept_map[lin]):
@@ -438,6 +552,7 @@ def train_routing(
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
+        logger.debug("train_routing: appended routed output for frame %d", frame_idx + 1)
 
     for lid in list(ledger.tick_of_lid.keys()):
         try_backward(lid)
@@ -448,13 +563,13 @@ def train_routing(
     for idx, p in enumerate(params):
         grad = getattr(p, "grad", None)
         if grad is None:
-            print(f"[Gradients] param {idx} missing gradient")
+            logger.debug("[Gradients] param %d missing gradient", idx)
         else:
             g = AT.get_tensor(grad)
             if np.allclose(g, 0.0):
-                print(f"[Gradients] param {idx} gradient is zero: {g}")
+                logger.debug("[Gradients] param %d gradient is zero: %s", idx, g)
             else:
-                print(f"[Gradients] param {idx} grad: {g}")
+                logger.debug("[Gradients] param %d grad: %s", idx, g)
 
     remaining_logs = log_buf.snapshot()
     log_buf.flush_all()
@@ -463,6 +578,13 @@ def train_routing(
 
 
 def main() -> None:
+    # Configure logging if not configured by the application/test harness
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    logger.debug("demo_spectral_routing: starting main()")
     tick_hz = 400.0
     win = 40
     frames = 50
@@ -478,9 +600,12 @@ def main() -> None:
     spec = build_spec(spectral_cfg)
     sine_chunks, noise_frames = generate_signals(bands, win, tick_hz, frames)
     routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
-    print("Routed output:", routed)
+    logger.debug("Routed output: %s", routed)
     ticks = logs.get("tick")
-    print("Collected ticks:", int(ticks.shape[0]) if ticks is not None else 0)
+    logger.debug(
+        "Collected ticks: %d",
+        int(ticks.shape[0]) if ticks is not None else 0,
+    )
 
 
 if __name__ == "__main__":
