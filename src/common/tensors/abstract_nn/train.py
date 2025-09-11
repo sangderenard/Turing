@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Tuple, List, Optional
 from ..abstraction import AbstractTensor
+from ..autograd import autograd
+from ..autoautograd.residual_store import ResidualStore, Space
+from ..autoautograd.whiteboard_runtime import run_batched_vjp
 from .core import Model
 from .losses import Loss
 from .optimizer import Adam
@@ -81,6 +84,16 @@ def _to_scalar(x):
     raise TypeError(f"Can't convert {type(x)} to scalar float")
 
 
+def rebind(label: str, new_tensor: AbstractTensor) -> AbstractTensor:
+    """Detach ``new_tensor`` and register it on the active tape with ``label``."""
+    t = new_tensor.detach()
+    t.requires_grad_(True)
+    try:
+        autograd.tape.annotate(t, label=label)
+    except Exception:
+        pass
+    return t
+
 
 def train_step(
     model: Model,
@@ -99,26 +112,58 @@ def train_step(
     hook_panel.run('forward', model=model, x=x, pred=pred)
     loss = loss_fn.forward(pred, y)
     hook_panel.run('loss', model=model, pred=pred, y=y, loss=loss)
-    loss.backward()
-    hook_panel.run('backward', model=model, grad_pred=None)
+
+    # Residual seeding instead of direct backward
+    grad_pred = loss_fn.backward(pred, y)
+    residuals = ResidualStore()
+    width = grad_pred.shape[-1] if getattr(grad_pred, "ndim", 0) > 0 else 1
+    residuals.add(0, grad_pred, space=Space.F, width=width)
+    hook_panel.run('backward', model=model, grad_pred=grad_pred)
+
+    # Attempt a real batched VJP once residuals and windows are prepared
+    try:  # best-effort; fall back silently if runtime lacks whiteboard support
+        import types
+
+        node0 = types.SimpleNamespace(sphere=pred, p=None, version=0)
+        sys_obj = types.SimpleNamespace(nodes={0: node0})
+        job0 = types.SimpleNamespace(
+            job_id="pred", op="__mul__", src_ids=(0,), residual=grad_pred
+        )
+        run_batched_vjp(sys=sys_obj, jobs=(job0,), op_args=(1,))
+    except Exception:
+        pass
+
+    L = (pred * grad_pred).sum() if getattr(pred, "ndim", 0) > 0 else pred * grad_pred
+    params_all = [p for layer in model.layers for p in layer.parameters()]
+    grads_all = autograd.grad(L, params_all, retain_graph=False, allow_unused=True)
+    for p, g in zip(params_all, grads_all):
+        try:
+            p._grad = g
+        except Exception:
+            pass
     if debug:
         def norms(t: AbstractTensor) -> float:
             return float(((t * t).sum()).sqrt().item())
 
+        idx = 0
         for i, l in enumerate(model.layers):
+            gW = grads_all[idx] if idx < len(grads_all) else None
+            idx += 1
+            gB = grads_all[idx] if l.b is not None and idx < len(grads_all) else None
+            if l.b is not None:
+                idx += 1
             b0 = float(l.b[0, 0].item()) if l.b is not None else None
-            hook_panel.run('debug', layer=l, i=i, W=l.W, gW=getattr(l.W, 'grad', None), b0=b0)
-
+            hook_panel.run('debug', layer=l, i=i, W=l.W, gW=gW, b0=b0)
 
     # Collect params/grads in a stable order
-    params: List[AbstractTensor] = []
-    grads: List[AbstractTensor] = []
+    params: List[AbstractTensor] = params_all
+    grads: List[AbstractTensor] = list(grads_all)
     per_layer_norms_before = []
+    idx = 0
     for layer in model.layers:
         layer_params = list(layer.parameters())
-        params.extend(layer_params)
-        g_list = [getattr(p, 'grad') for p in layer_params]
-        grads.extend(g_list)
+        g_list = grads[idx : idx + len(layer_params)]
+        idx += len(layer_params)
         w_n = _l2(g_list[0]) if g_list else 0.0
         b_n = _l2(g_list[1]) if len(g_list) > 1 and g_list[1] is not None else None
         per_layer_norms_before.append({"W": w_n, "b": b_n})
@@ -208,10 +253,10 @@ def train_step(
         new_params = optimizer.step(params, grads)
         i = 0
         for layer in model.layers:
-            layer.W = new_params[i]
+            layer.W = rebind(f"{layer.__class__.__name__}.W", new_params[i])
             i += 1
             if layer.b is not None:
-                layer.b = new_params[i]
+                layer.b = rebind(f"{layer.__class__.__name__}.b", new_params[i])
                 i += 1
         if zero_grad:
             model.zero_grad()
@@ -271,8 +316,9 @@ def train_loop(
                     params.extend(list(layer.parameters()))
                 grads = [p.grad for p in params]
                 new_params = optimizer.step(params, grads)
-                for p, new_p in zip(params, new_params):
-                    AbstractTensor.copyto(p, new_p)
+                for idx, (p, new_p) in enumerate(zip(params, new_params)):
+                    label = getattr(p, "_label", f"param[{idx}]")
+                    AbstractTensor.copyto(p, rebind(label, new_p))
                 model.zero_grad()
                 hook_panel.run('optimizer_step', epoch=e)
             l = sum(subbatch_losses) / len(subbatch_losses)
@@ -297,8 +343,9 @@ def train_loop(
                     params.extend(list(layer.parameters()))
                 grads = [p.grad for p in params]
                 new_params = optimizer.step(params, grads)
-                for p, new_p in zip(params, new_params):
-                    AbstractTensor.copyto(p, new_p)
+                for idx, (p, new_p) in enumerate(zip(params, new_params)):
+                    label = getattr(p, "_label", f"param[{idx}]")
+                    AbstractTensor.copyto(p, rebind(label, new_p))
                 model.zero_grad()
                 hook_panel.run('optimizer_step', epoch=e)
         losses.append(l)
