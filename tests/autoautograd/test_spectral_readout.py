@@ -3,21 +3,16 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autoautograd.fluxspring.spectral_readout import (
     compute_metrics,
-    gather_recent_windows,
+    update_fft_window,
+    current_fft_window,
+    reset_fft_windows,
     batched_bandpower_from_windows,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     SpectralCfg,
     SpectralMetrics,
-    NodeSpec,
-    NodeCtrl,
-    FluxSpringSpec,
-    DECSpec,
 )
-from src.common.tensors.autoautograd.fluxspring.fs_harness import (
-    RingHarness,
-    LineageLedger,
-)
+from src.common.tensors.autoautograd.fluxspring.fs_harness import LineageLedger
 
 
 def _sine(freq: float, N: int, tick_hz: float) -> AT:
@@ -83,55 +78,33 @@ def test_coherence_identical_signals():
     assert abs(m["coherence"] - 1.0) < 1e-6
 
 
-def test_gather_recent_windows_wrap_and_pad():
+def test_fft_window_tracks_lineage_order():
     cfg = SpectralCfg(
         enabled=True,
         tick_hz=1.0,
-        win_len=3,
-        hop_len=3,
+        win_len=2,
+        hop_len=2,
         window="rect",
         metrics=SpectralMetrics(),
     )
-    node0 = NodeSpec(
-        id=0,
-        p0=AT.zeros(1),
-        v0=AT.zeros(1),
-        mass=AT.tensor(1.0),
-        ctrl=NodeCtrl(),
-        scripted_axes=[0, 0],
-    )
-    node1 = NodeSpec(
-        id=1,
-        p0=AT.zeros(1),
-        v0=AT.zeros(1),
-        mass=AT.tensor(1.0),
-        ctrl=NodeCtrl(),
-        scripted_axes=[0, 0],
-    )
-    harness = RingHarness()
+    reset_fft_windows()
     ledger = LineageLedger()
-    for i in range(7):
-        harness.push_node(node0.id, AT.tensor([float(i)]), size=5, lineage=(0,))
-        ledger.record(i, 0)
-    harness.push_node(node1.id, AT.tensor([10.0]), size=2, lineage=(1,))
-    ledger.record(7, 1)
-    harness.push_node(node1.id, AT.tensor([11.0]), size=2, lineage=(1,))
-    ledger.record(8, 1)
-    spec = FluxSpringSpec(
-        version="t",
-        D=1,
-        nodes=[node0, node1],
-        edges=[],
-        faces=[],
-        dec=DECSpec(D0=[], D1=[]),
-        spectral=cfg,
-    )
-    win_map, kept_map = gather_recent_windows(spec, [0, 1], cfg, harness, ledger)
-    assert sorted(win_map.keys()) == [0, 1]
-    assert kept_map[0] == [0]
-    assert kept_map[1] == [1]
-    assert AT.get_tensor(win_map[0][0]).tolist() == [4.0, 5.0, 6.0]
-    assert AT.get_tensor(win_map[1][0]).tolist() == [0.0, 10.0, 11.0]
+
+    lid0 = ledger.ingest()
+    update_fft_window(lid0, AT.tensor(0.0), cfg)
+    lid1 = ledger.ingest()
+    update_fft_window(lid1, AT.tensor(1.0), cfg)
+
+    bands, lids = current_fft_window()
+    assert AT.get_tensor(bands).flatten().tolist() == [0.0, 1.0]
+    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid0, lid1]
+
+    lid2 = ledger.ingest()
+    update_fft_window(lid2, AT.tensor(2.0), cfg)
+
+    bands, lids = current_fft_window()
+    assert AT.get_tensor(bands).flatten().tolist() == [1.0, 2.0]
+    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid1, lid2]
 
 
 def test_batched_bandpower_from_windows():
