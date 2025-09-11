@@ -1,0 +1,94 @@
+each parameter has a wheel:
+
+
+-- input --
+a b c d e f
+-- pre mix --
+g h i j k l
+-- data frequency sorting --
+1 2 3 4 5 6 <-- as a demonstration and for curiosity, this is a spectral binning layer
+-- post mix --
+m n o p q r
+
+--output features--
+s t u v w x
+@ # $ % ^ & <-- not fed by the last row, fed by the binning layer as the fft output of the history of phi values per node
+                not fully connected but parallel wired to 1 2 3 4 5 6, processed at any time, a second output layer
+
+fft window = history = wheel size
+
+wheels: 
+
+ring buffers used in many places:
+
+* parameters are on wheels, each place on the parameter wheel, or any wheel, is tick number + row number % fft window
+* phi values are on wheels for the spectral binning layer and the output layer
+spectral binning layer:
+
+normalize by frequencies present in the history of phi values over time of the nodes
+one wheel per node, recording phi values in a history 
+
+1 lowest band
+...
+6 highest band
+
+1 connects to @, 6 to &, in the above diagram, with single edges, this is an "extra" process, a fork
+it is still open to design ideas how to handle forking with pump tick, which performs all steps at once in every tick
+
+pump tick:
+
+all edges share a common operation sequence, as do all nodes. Because of this, each tick:
+* every single edge function is handled at once in a vectorized operation over the required operations
+* every node then performs the same operation sequence
+* this consequentially means that at any given time once the window is filled, there are window length live processes inside the network
+
+ONE TICK = ONE BATCH
+((alpha * activation(in) + (1-alpha) * in) * weight + bias)
+in[0:feats]   in[feats:feats2]   in[feats2:feats3]   in[feats3:feats4]   in[feats4:feats5]
+]
+in feat.      premix feat.       # of fft target bins feat.  postmix feat.     out feat.
+-params0.6-   -params1.5-        -params2.4-                 -params3.3-       -params4.2-
+
+[input psi]   [pre mix psi]      [spectral bin psi]           [post-mix psi]   [output psi]
+
+-lineage6-    -lineage5-         -lineage4-                    -lineage3-       -lineage2-
+
+begets...                        # feat = # of fft wheels/bins
+
+[pre mix psi] [spectral bin psi] [post-mix psi]               [output psi]     [loss 2] [JVP analysis]
+                                 [spectral window 4 fft out] ----------------> [fft loss 2]
+
+[residual6]   [residual5]        [residual4]                  [residual3]      [residual2]
+premix feat.  fft tgt bins feat. postmix feat.                out feat.        backprop leaves
+out[0:feats]   out[feats:feats2]   out[feats2:feats3]   out[feats3:feats4]   out[feats4:feats5]
+
+JVP analysis -> continuous param update of the oldest param lineage on all param wheels (params#.1->params#.7)
+
+in feat.      premix feat.       # of fft target bins feat.  postmix feat.     out feat.
+-params0.7-   -params1.6-        -params2.5-                 -params3.4-       -params4.3-
+(new)
+[input psi]   [pre mix psi]      [spectral bin psi]           [post-mix psi]   [output psi]
+
+-lineage7-    -lineage6-         -lineage5-                    -lineage4-       -lineage3-
+
+begets...                        # feat = # of fft wheels/bins
+
+[pre mix psi] [spectral bin psi] [post-mix psi]               [output psi]     [loss 3] [JVP analysis]
+                                 [spectral window 5 fft out] ----------------> [fft loss analysis 3]
+
+[residual7]   [residual6]        [residual5]                  [residual4]      [residual3]
+premix feat.  fft tgt bins feat. postmix feat.                out feat.        backprop leaves
+
+JVP analysis -> continuous param update of the oldest param lineage on all param wheels
+
+...
+...
+
+THE WINDOW SIZE IS LARGER THAN THE NETWORK, THEREFOR, BACKPROP AND OUTPUT LOSS WILL NOT BE SYNCHRONOUS
+THIS NECESSITATES A LOSS/JVP WHEEL BUFFERING TO JVP/BACKPROP
+
+*FREEZE PARAM VALUES ON WHEELS, IMPRESSION FINISHED*
+
+forward inference:
+
+param wheel turns as each input is taken as a row entry in a stream, using it's stored value, creating a forward pass that is as long as the fft window was before parameter patterns repeat

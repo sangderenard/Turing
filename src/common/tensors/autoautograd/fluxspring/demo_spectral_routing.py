@@ -632,6 +632,7 @@ def main() -> None:
     tick_hz = 400.0
     win = 40
     frames = 50
+    max_lineage_backlog = win * 2
     bands = [[20, 40], [40, 60], [60, 80], [80, 100], [100, 120], [120, 140], [140, 160], [160, 180]]
     spectral_cfg = SpectralCfg(
         enabled=True,
@@ -643,7 +644,7 @@ def main() -> None:
     )
     spec = build_spec(spectral_cfg)
     sine_chunks, noise_frames = generate_signals(bands, win, tick_hz, frames)
-    routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
+    routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames, max_lineage_backlog=max_lineage_backlog)
     logger.debug("Routed output: %s", routed)
     ticks = logs.get("tick")
     logger.debug(
