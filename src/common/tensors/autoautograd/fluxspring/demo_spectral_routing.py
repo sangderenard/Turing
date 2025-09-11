@@ -15,7 +15,7 @@ from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
 )
-from . import fs_dec, register_learnable_params
+from . import fs_dec, register_param_wheels
 from .fs_harness import RingHarness, LineageLedger
 from .fs_types import (
     DECSpec,
@@ -275,7 +275,10 @@ def train_routing(
     with any cached ring data to avoid unbounded memory use.
     """
     patience = 10
-    params = register_learnable_params(spec)
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
+    params = [w.versions()[0] for w in wheels]
     set_strict_mode(True)
     annotate_params(params)
     B = len(spectral_cfg.metrics.bands)

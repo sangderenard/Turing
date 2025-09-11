@@ -2,7 +2,7 @@ import math
 
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autograd import autograd
-from src.common.tensors.autoautograd.fluxspring import register_learnable_params
+from src.common.tensors.autoautograd.fluxspring import register_param_wheels
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     NodeSpec,
     EdgeSpec,
@@ -56,10 +56,12 @@ def _build_spec(cfg):
         spectral=cfg,
         gamma=AT.tensor(0.0),
     )
-    params = register_learnable_params(spec)
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
     edge_w = spec.edges[0].ctrl.w
     node_w = spec.nodes[1].ctrl.w
-    assert edge_w in params and node_w in params
+    assert all(p.requires_grad for p in (edge_w, node_w))
     return spec, edge_w, node_w
 
 
