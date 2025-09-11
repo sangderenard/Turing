@@ -60,3 +60,6 @@ def test_param_version_ring_snapshots():
     mat = harness.get_params_for_lineages(lids, ledger)
     assert mat.shape == (3, 1)
     assert float(AT.get_tensor(mat[0, 0])) == pytest.approx(1.0)
+    assert ledger.lineages() == tuple(lids)
+    ledger.purge_through_lid(lids[1])
+    assert ledger.lineages() == (lids[2],)

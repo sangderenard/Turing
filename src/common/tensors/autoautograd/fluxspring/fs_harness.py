@@ -79,6 +79,14 @@ class LineageLedger:
         if lineage_id >= self.next_lid:
             self.next_lid = lineage_id + 1
 
+    def purge_through_lid(self, lid: int) -> None:
+        """Remove mappings for all lineages up to and including ``lid``."""
+
+        to_drop = [l for l in self.tick_of_lid if l <= lid]
+        for l in to_drop:
+            t = self.tick_of_lid.pop(l)
+            self.lid_by_tick.pop(t, None)
+
     def lineages(self) -> Tuple[int, ...]:
         """Return the known lineage identifiers ordered by tick."""
 
