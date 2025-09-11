@@ -14,7 +14,10 @@ Typical workflow inside your training script (before loss.backward()):
 
     set_strict_mode(True)  # fail fast on missing backwards (relies on env var)
 
-    params = register_learnable_params(spec)
+    wheels = register_param_wheels(spec)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
+    params = [w.bind_slot() for w in wheels]
     annotate_params(params)  # nice labels in reports
 
     losses = {

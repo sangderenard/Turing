@@ -1,7 +1,7 @@
 import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autograd import autograd
-from src.common.tensors.autoautograd.fluxspring import register_learnable_params
+from src.common.tensors.autoautograd.fluxspring import register_param_wheels
 from src.common.tensors.autoautograd.fluxspring.demo_spectral_routing import (
     build_spec,
     SpectralCfg,
@@ -63,10 +63,12 @@ def _make_spec():
         dec=dec,
         gamma=AT.tensor(0.0),
     )
-    params = register_learnable_params(spec)
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
     edge_w = spec.edges[0].ctrl.w
     node_w = spec.nodes[1].ctrl.w
-    assert edge_w in params and node_w in params
+    assert all(p.requires_grad for p in (edge_w, node_w))
     return spec, edge_w, node_w
 
 
@@ -150,12 +152,15 @@ def test_demo_spec_has_no_gradients():
         metrics=SpectralMetrics(bands=bands),
     )
     spec = build_spec(cfg)
-    params = register_learnable_params(spec)
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
     psi = AT.zeros(len(spec.nodes), dtype=float)
     for _ in range(3):
         psi, _ = pump_tick(psi, spec, eta=0.1, external={0: AT.tensor(1.0)})
     out_start = 5 * len(bands)
     loss = ((psi[out_start : out_start + len(bands)]) ** 2).mean()
+    params = [spec.edges[0].ctrl.w, spec.nodes[0].ctrl.w, spec.nodes[1].ctrl.w]
     grads = autograd.grad(loss, params, allow_unused=True)
     assert all(g is None for g in grads)
 
@@ -171,8 +176,10 @@ def test_register_learnable_params_preserves_gradients():
         metrics=SpectralMetrics(bands=bands),
     )
     spec = build_spec(cfg)
-    params = register_learnable_params(spec)
-    w = params[0]
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
+    w = wheels[0].versions()[0]
     loss = (w * AT.tensor(2.0)) ** 2
     g = autograd.grad(loss, [w])[0]
     assert g is not None

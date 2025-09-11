@@ -18,7 +18,7 @@ from src.common.tensors.autoautograd.fluxspring.fs_dec import (
     edge_params_AT,
     face_params_AT,
 )
-from src.common.tensors.autoautograd.fluxspring import register_learnable_params
+from src.common.tensors.autoautograd.fluxspring import register_param_wheels
 
 
 def _make_spec():
@@ -72,8 +72,10 @@ def _make_spec():
 
 def test_edge_face_params_gradients_and_dtype():
     spec = _make_spec()
-    params = register_learnable_params(spec)
-    assert len(params) == 4
+    wheels = register_param_wheels(spec, slots=1)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
+    assert len(wheels) == 4
 
     k, l0 = edge_params_AT(spec)
     alpha, c = face_params_AT(spec)
@@ -84,6 +86,7 @@ def test_edge_face_params_gradients_and_dtype():
     assert alpha.dtype == spec.faces[0].alpha.dtype
     assert c.dtype == spec.faces[0].c.dtype
 
+    params = [spec.edges[0].transport.k, spec.edges[0].transport.l0, spec.faces[0].alpha, spec.faces[0].c]
     loss = (k.sum() + l0.sum() + alpha.sum() + c.sum()) * AT.tensor(2.0)
     grads = autograd.grad(loss, params)
     assert all(g is not None for g in grads)

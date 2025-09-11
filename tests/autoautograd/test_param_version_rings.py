@@ -11,7 +11,7 @@ from src.common.tensors.autoautograd.fluxspring import (
     EdgeTransport,
     EdgeTransportLearn,
     DECSpec,
-    register_learnable_params,
+    register_param_wheels,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_harness import (
     LineageLedger,
@@ -47,7 +47,9 @@ def test_param_version_ring_snapshots():
         faces=[],
         dec=DECSpec(D0=[[0.0]], D1=[]),
     )
-    register_learnable_params(spec)
+    wheels = register_param_wheels(spec)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
 
     harness = RingHarness(default_size=5)
     ledger = LineageLedger()
@@ -57,6 +59,10 @@ def test_param_version_ring_snapshots():
         lid = ledger.ingest()
         lids.append(lid)
         psi, _ = pump_tick(psi, spec, eta=0.0, harness=harness, lineage_id=lid)
+        for w in wheels:
+            ev = w.rotate()
+            w.apply_slot(ev, lambda p, g: p)
+            w.bind_slot()
 
     mat = harness.get_params_for_lineages(lids, ledger)
     assert mat.shape == (3, 1)
@@ -102,9 +108,9 @@ def test_param_version_ring_respects_stage_depth():
         faces=[],
         dec=DECSpec(D0=[[-1.0, 1.0]], D1=[]),
     )
-    register_learnable_params(spec)
-    param = spec.nodes[1].ctrl.w
-
+    wheels = register_param_wheels(spec)
+    for w in wheels:
+        w.rotate(); w.bind_slot()
     harness = RingHarness(default_size=10)
     ledger = LineageLedger()
     psi = AT.tensor([0.0, 0.0])
@@ -112,9 +118,14 @@ def test_param_version_ring_respects_stage_depth():
     for i in range(4):
         lid = ledger.ingest()
         lids.append(lid)
+        param = spec.nodes[1].ctrl.w
         with autograd.no_grad():
             param.data[0] = float(i + 1)
         psi, _ = pump_tick(psi, spec, eta=0.0, harness=harness, lineage_id=lid)
+        for w in wheels:
+            ev = w.rotate()
+            w.apply_slot(ev, lambda p, g: p)
+            w.bind_slot()
 
     mat = harness.get_params_for_lineages(lids[:2], ledger)
     idx = harness.param_labels.index("node[1].ctrl.w")
