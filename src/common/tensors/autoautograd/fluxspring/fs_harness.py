@@ -155,6 +155,20 @@ class RingBuffer:
 
 
 @dataclass
+class PhiRing:
+    """Ring buffer specifically for Φ activation histories."""
+
+    buf: AT
+    idx: int = 0
+
+    def push(self, val: AT) -> AT:
+        i = self.idx % int(len(self.buf))
+        self.buf = AT.scatter_row(self.buf.clone(), i, val, dim=0)
+        self.idx = i + 1
+        return self.buf
+
+
+@dataclass
 class ParamRing:
     """Ring buffer storing parameter snapshots and their ticks."""
 
@@ -183,6 +197,7 @@ class RingHarness:
     default_size: Optional[int] = None
     node_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
     edge_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
+    phi_rings: Dict[Tuple[int, ...], PhiRing] = field(default_factory=dict)
     param_rings: Dict[str, ParamRing] = field(default_factory=dict)
     param_labels: List[str] = field(default_factory=list)
     tick: int = 0
@@ -239,6 +254,38 @@ class RingHarness:
         if rb is None:
             return None
         return rb.push(val)
+
+    def _ensure_phi_ring(
+        self, key: Tuple[int, ...], D: int, size: Optional[int]
+    ) -> Optional[PhiRing]:
+        size = size or self.default_size
+        if size is None:
+            return None
+        if key not in self.phi_rings:
+            buf = AT.zeros((size, D), dtype=float)
+            self.phi_rings[key] = PhiRing(buf)
+        return self.phi_rings[key]
+
+    def push_phi(
+        self,
+        node_id: int,
+        val: AT,
+        *,
+        lineage: Tuple[int, ...] | None = None,
+        size: Optional[int] = None,
+    ) -> AT | None:
+        key = self._key(node_id, lineage)
+        t = AT.get_tensor(val)
+        D = int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
+        rb = self._ensure_phi_ring(key, D, size)
+        if rb is None:
+            return None
+        return rb.push(t.reshape(-1))
+
+    def get_phi_ring(
+        self, node_id: int, *, lineage: Tuple[int, ...] | None = None
+    ) -> Optional[PhiRing]:
+        return self.phi_rings.get(self._key(node_id, lineage))
 
     def push_edge(
         self,
