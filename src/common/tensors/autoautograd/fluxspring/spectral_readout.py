@@ -267,3 +267,39 @@ def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
     band_powers = AT.matmul(power, mask_FB)
     band_powers = band_powers / (AT.sum(band_powers, dim=1, keepdim=True) + 1e-12)
     return band_powers
+
+
+def phi_histogram_loss(
+    rb: RingBuffer, *, band_idx: int, total_bands: int, tick_hz: float
+) -> AT.Tensor:
+    """Return histogram loss for a Φ activation history.
+
+    The buffer stored in ``rb`` is windowed with a Hann window, transformed via
+    an ``rfft`` and its power integrated into ``total_bands`` equal-frequency
+    bands.  The resulting normalized histogram is compared against a one-hot
+    target with index ``band_idx`` using squared error.
+    """
+
+    buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
+    N = int(buf.shape[0])
+    w = _window("hann", N)
+    xw = w * buf
+
+    real, imag, freqs = _rfft_real_imag(xw, tick_hz)
+    power = real**2 + imag**2
+
+    nyq = tick_hz / 2.0
+    edges = AT.linspace(0.0, nyq, steps=total_bands + 1)
+    bands: List[AT] = []
+    for b in range(total_bands):
+        lo, hi = edges[b], edges[b + 1]
+        mask = (freqs >= lo) & (freqs <= hi if b == total_bands - 1 else freqs < hi)
+        bands.append(AT.sum(power * mask))
+    hist = AT.stack(bands)
+    hist = hist / (AT.sum(hist) + 1e-12)
+
+    target = AT.zeros(total_bands, dtype=float)
+    target_idx = int(band_idx)
+    if 0 <= target_idx < total_bands:
+        target[target_idx] = 1.0
+    return AT.sum((hist - target) ** 2)
