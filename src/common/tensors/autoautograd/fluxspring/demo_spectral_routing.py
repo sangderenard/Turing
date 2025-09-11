@@ -259,12 +259,16 @@ def train_routing(
     *,
     flush_hook: Optional[Callable[[dict[str, AT.Tensor]], None]] = None,
     log_capacity: Optional[int] = None,
+    max_lineage_backlog: int = 1024,
 ) -> tuple[list[AT.Tensor], dict[str, AT.Tensor]]:
     """Run the spectral routing training loop.
 
     Logs are stored in an :class:`AbstractTensor` ring buffer so unresolved
     backward references stay valid. When the buffer fills, the oldest entries
-    are optionally flushed via ``flush_hook``.
+    are optionally flushed via ``flush_hook``.  ``max_lineage_backlog`` provides
+    a safety net: if lineage cleanup fails and the number of outstanding
+    lineages grows beyond this threshold, the oldest entries are purged along
+    with any cached ring data to avoid unbounded memory use.
     """
     patience = 10
     params = register_learnable_params(spec)
@@ -298,6 +302,34 @@ def train_routing(
     previous_grads = None
     mix_buf: dict[int, AT.Tensor] = {}
     hist_buf: dict[int, AT.Tensor] = {}
+
+    def purge_lineage_backlog(max_pending: int) -> None:
+        """Drop the oldest lineages when backlog exceeds ``max_pending``."""
+        active = ledger.lineages()
+        if len(active) <= max_pending:
+            return
+        stale = active[:-max_pending]
+        logger.warning(
+            "purge_lineage_backlog: dropping %d stale lineages (keeping %d)",
+            len(stale),
+            max_pending,
+        )
+        for lid in stale:
+            line = (lid,)
+            for key_id in (
+                OUT_FEAT_ID,
+                OUT_TARG_ID,
+                OUT_IDS_ID,
+                HIST_FEAT_ID,
+                HIST_TARG_ID,
+                HIST_IDS_ID,
+            ):
+                harness.node_rings.pop(harness._key(key_id, line), None)
+            for n in spec.nodes:
+                harness.node_rings.pop(harness._key(n.id, line), None)
+            for idx in range(len(spec.edges)):
+                harness.edge_rings.pop(harness._key(idx, line), None)
+        ledger.purge_through_lid(stale[-1])
 
     def try_backward(lin: int) -> None:
         nonlocal previous_grads, patience, log_buf
@@ -535,6 +567,7 @@ def train_routing(
             try_backward(lin)
 
         try_backward(lid)
+        purge_lineage_backlog(max_lineage_backlog)
         return state
 
     win = sine_chunks[0].shape[0]
@@ -566,6 +599,7 @@ def train_routing(
 
     for lid in list(ledger.tick_of_lid.keys()):
         try_backward(lid)
+    purge_lineage_backlog(max_lineage_backlog)
 
     # Report gradient status for all learnable parameters once outputs have been
     # produced.  This helps diagnose dead graphs where ``loss.backward`` fails
