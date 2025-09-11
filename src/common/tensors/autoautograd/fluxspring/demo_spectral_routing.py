@@ -166,6 +166,12 @@ def build_spec(spectral: SpectralCfg) -> FluxSpringSpec:
     add_identity(3 * B, 4 * B)
     add_identity(4 * B, 5 * B)
 
+    # Band-power logging branch
+    band_start = B * layers
+    for i in range(B):
+        nodes.append(_node(band_start + i))
+        edges.append(_edge(3 * B + i, band_start + i, 1.0))
+
     E = len(edges)
     N = len(nodes)
     D0 = [[0.0] * N for _ in range(E)]
@@ -244,7 +250,8 @@ def train_routing(
     ledger = LineageLedger()
 
     hist_targets: dict[int, AT.Tensor] = {}
-    for j, nid in enumerate(range(3 * B, 4 * B)):
+    band_start = len(spec.nodes) - B
+    for j, nid in enumerate(range(band_start, band_start + B)):
         tvec = AT.zeros(B, dtype=float)
         tvec[j] = 1.0
         hist_targets[nid] = tvec
@@ -382,7 +389,7 @@ def train_routing(
         out_ids = AT.arange(out_start, out_start + B, dtype=float)
         harness.push_node(OUT_IDS_ID, out_ids, lineage=(lid,), size=1)
 
-        mids = list(range(3 * B, 4 * B))
+        mids = list(range(band_start, band_start + B))
         win_map, kept_map = gather_recent_windows(spec, mids, spectral_cfg, harness, ledger)
         for lin, W in win_map.items():
             complete = True
@@ -394,10 +401,13 @@ def train_routing(
             if not complete:
                 continue
             bp = batched_bandpower_from_windows(W, spectral_cfg)
-            targ_mat = AT.stack([hist_targets[nid] for nid in kept_map[lin]])
+            bp_map = {nid: bp[row] for row, nid in enumerate(kept_map[lin])}
+            targ_map = {nid: hist_targets[nid] for nid in kept_map[lin]}
+            feat_mat = AT.stack([bp_map[nid] for nid in kept_map[lin]])
+            targ_mat = AT.stack([targ_map[nid] for nid in kept_map[lin]])
             harness.push_node(
                 HIST_FEAT_ID,
-                bp.flatten(),
+                feat_mat.flatten(),
                 lineage=(lin,),
                 size=1,
             )
@@ -427,14 +437,6 @@ def train_routing(
             target_out = AT.stack([sine_chunks[i][k] for i in range(B)]).flatten()
             psi = pump_with_loss(psi, target_out)
 
-        win_map, kept_map = gather_recent_windows(
-            spec, list(range(B)), spectral_cfg, harness, ledger
-        )
-        if win_map:
-            for lin, W in win_map.items():
-                bp = batched_bandpower_from_windows(W, spectral_cfg)
-                for row, nid in enumerate(kept_map[lin]):
-                    psi[nid] = bp[row, nid]
         psi = pump_with_loss(psi, AT.zeros(B, dtype=float))
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
