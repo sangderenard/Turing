@@ -423,7 +423,7 @@ def train_routing(
         for k in range(win):
             for i in range(B):
                 psi[i] = frame_chunks[i][k]
-            target_out = AT.stack([sine_chunks[i][k] for i in range(B)])
+            target_out = AT.stack([sine_chunks[i][k] for i in range(B)]).flatten()
             psi = pump_with_loss(psi, target_out)
 
         win_map, kept_map = gather_recent_windows(
