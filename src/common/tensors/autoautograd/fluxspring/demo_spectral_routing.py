@@ -67,43 +67,46 @@ class TensorRingBuffer:
     ) -> None:
         self.capacity = capacity
         self.flush_hook = flush_hook
-        self._buf: dict[str, AT.Tensor] | None = None
+        self._buf: dict[str, list[AT.Tensor]] | None = None
+        self._idx = 0
         self._len = 0
 
     def append(self, entry: dict[str, AT.Tensor]) -> None:
         if self._buf is None:
-            self._buf = {k: v[None, ...] for k, v in entry.items()}
-            self._len = 1
+            self._buf = {k: [None] * self.capacity for k in entry}
             logger.debug(
                 "TensorRingBuffer: initialized with first entry keys=%s",
                 list(entry.keys()),
             )
-            return
+        if self._len == self.capacity and self.flush_hook is not None:
+            flushed = {k: self._buf[k][self._idx][None, ...] for k in self._buf}
+            logger.debug(
+                "TensorRingBuffer: capacity=%d flushing index=%d",
+                self.capacity,
+                self._idx,
+            )
+            self.flush_hook(flushed)
         for k, v in entry.items():
-            self._buf[k] = AT.cat([self._buf[k], v[None, ...]], dim=0)
-        self._len += 1
-        if self._len > self.capacity:
-            overflow = self._len - self.capacity
-            if self.flush_hook is not None:
-                flushed = {k: v[:overflow] for k, v in self._buf.items()}
-                logger.debug(
-                    "TensorRingBuffer: capacity=%d overflow=%d — flushing",
-                    self.capacity,
-                    overflow,
-                )
-                self.flush_hook(flushed)
-            for k in self._buf:
-                self._buf[k] = self._buf[k][overflow:]
-            self._len = self.capacity
+            assert self._buf is not None  # for type checkers
+            self._buf[k][self._idx] = v.clone()
+        self._idx = (self._idx + 1) % self.capacity
+        if self._len < self.capacity:
+            self._len += 1
 
     def snapshot(self) -> dict[str, AT.Tensor]:
-        if self._buf is None:
+        if self._buf is None or self._len == 0:
             return {}
-        snap = {k: v.clone() for k, v in self._buf.items()}
+        snap: dict[str, AT.Tensor] = {}
+        for k, lst in self._buf.items():
+            if self._len == self.capacity:
+                ordered = lst[self._idx :] + lst[: self._idx]
+            else:
+                ordered = lst[: self._len]
+            snap[k] = AT.stack([t.clone() for t in ordered], dim=0)
         logger.debug(
             "TensorRingBuffer: snapshot taken keys=%s length=%d",
             list(snap.keys()),
-            next((len(v) for v in snap.values()), 0),
+            self._len,
         )
         return snap
 
@@ -114,8 +117,9 @@ class TensorRingBuffer:
                 self._len,
                 list(self._buf.keys()),
             )
-            self.flush_hook({k: v.clone() for k, v in self._buf.items()})
+            self.flush_hook(self.snapshot())
         self._buf = None
+        self._idx = 0
         self._len = 0
 
 
