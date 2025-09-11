@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Tuple
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
-from .fs_harness import RingHarness, LineageLedger
+from .fs_harness import RingHarness, LineageLedger, RingBuffer
 
 
 def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
@@ -144,6 +144,65 @@ def gather_ring_metrics(
     return stats
 
 
+_fft_bands_rb: RingBuffer | None = None
+_fft_lids_rb: RingBuffer | None = None
+_fft_count: int = 0
+
+
+def update_fft_window(lineage: int, band: AT, cfg: SpectralCfg) -> None:
+    """Record ``band`` and its ``lineage`` in a global tensor ring.
+
+    The ring buffer stores the most recent ``cfg.win_len`` entries using
+    :class:`RingBuffer` so gradients remain connected without manual tensor
+    slicing.  ``band`` is promoted to a 1‑D row to fit the ring layout.
+    """
+
+    global _fft_bands_rb, _fft_lids_rb, _fft_count
+
+    row = band if getattr(AT.get_tensor(band), "ndim", 0) > 0 else band[None]
+
+    if _fft_bands_rb is None:
+        D = int(row.shape[0])
+        zeros = AT.zeros((int(cfg.win_len), D), dtype=AT.get_tensor(row).dtype)
+        _fft_bands_rb = RingBuffer(zeros)
+        _fft_lids_rb = RingBuffer(AT.zeros(int(cfg.win_len), dtype=float))
+
+    _fft_bands_rb.push(row)
+    _fft_lids_rb.push(AT.tensor(lineage, dtype=float))
+    _fft_count += 1
+
+
+def _ordered_ring(rb: RingBuffer, count: int) -> AT:
+    buf = rb.buf
+    R = int(buf.shape[0])
+    c = count if count < R else R
+    if count < R:
+        return buf[:c]
+    start = count % R
+    if start == 0:
+        return buf
+    return AT.cat([buf[start:], buf[:start]], dim=0)
+
+
+def current_fft_window() -> Tuple[AT, AT]:
+    """Return the stacked bands and their lineage identifiers."""
+
+    if _fft_bands_rb is None or _fft_lids_rb is None or _fft_count == 0:
+        return AT.zeros(0, dtype=float), AT.zeros(0, dtype=float)
+    bands = _ordered_ring(_fft_bands_rb, _fft_count)
+    lids = _ordered_ring(_fft_lids_rb, _fft_count)
+    return bands, lids
+
+
+def reset_fft_windows() -> None:
+    """Clear stored window history for all lineages."""
+
+    global _fft_bands_rb, _fft_lids_rb, _fft_count
+    _fft_bands_rb = None
+    _fft_lids_rb = None
+    _fft_count = 0
+
+
 def gather_recent_windows(
     spec: FluxSpringSpec,
     node_ids: List[int],
@@ -151,45 +210,24 @@ def gather_recent_windows(
     harness: RingHarness,
     ledger: LineageLedger,
 ) -> Tuple[Dict[int, AT], Dict[int, List[int]]]:
-    """Return the most recent window for each lineage across ``node_ids``.
+    """Compatibility shim returning the global FFT window keyed by lineage.
 
-    The returned dictionaries are keyed by lineage identifier so callers can
-    align windows with lineage‑specific targets.  Each window matrix has shape
-    ``(M, Nw)`` where ``M`` is the number of nodes contributing history for that
-    lineage.
+    Each lineage present in the window is mapped to its band tensor.  ``node_ids``
+    are echoed back in ``kept_map`` so legacy callers can associate results with
+    originating nodes even though per-lineage history is no longer stored.
     """
 
-    Nw = int(cfg.win_len)
     win_map: Dict[int, AT] = {}
     kept_map: Dict[int, List[int]] = {}
 
-    for lin in ledger.lineages():
-        wins: List[AT] = []
-        kept: List[int] = []
-        for nid in node_ids:
-            rb = harness.get_node_ring(nid, lineage=(lin,))
-            if rb is None:
-                continue
-            buf = rb.buf[:, 0] if AT.get_tensor(rb.buf).ndim == 2 else rb.buf
-            R = int(buf.shape[0])
-            idx = rb.idx % R if R > 0 else 0
-            if R > 0 and idx != 0:
-                buf = AT.cat([buf[idx:], buf[:idx]], dim=0)
+    bands, lids = current_fft_window()
+    if int(bands.shape[0]) == 0:
+        return win_map, kept_map
 
-            if R >= Nw:
-                win = buf[-Nw:]
-            else:
-                pad = Nw - R
-                win = AT.cat(
-                    [AT.zeros(pad, dtype=AT.get_tensor(buf).dtype), buf], dim=0
-                )
-
-            wins.append(win)
-            kept.append(nid)
-        if wins:
-            win_map[lin] = AT.stack(wins)
-            kept_map[lin] = kept
-
+    lid_list = [int(x) for x in AT.get_tensor(lids).flatten().tolist()]
+    for i, lin in enumerate(lid_list):
+        win_map[lin] = bands[i : i + 1]
+        kept_map[lin] = list(node_ids)
     return win_map, kept_map
 
 
