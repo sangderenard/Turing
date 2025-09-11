@@ -396,10 +396,15 @@ def train_routing(
             float(loss_out.item()),
             float(hist_loss.item()),
         )
+        # Guard against asynchronous updates by clearing any stale entries
+        # before inserting fresh residuals. This ensures subsequent pops are
+        # safe and always retrieve the values from the current tick.
+        if lin in mix_buf or lin in hist_buf:
+            logger.debug("try_backward(lin=%d): replacing stale residuals", lin)
+            mix_buf.pop(lin, None)
+            hist_buf.pop(lin, None)
         mix_buf[lin] = mix_residual
         hist_buf[lin] = hist_residual_summary
-        if lin not in mix_buf or lin not in hist_buf:
-            return
         mix_seed = mix_buf.pop(lin)
         hist_seed = hist_buf.pop(lin)
         seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
