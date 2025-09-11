@@ -36,6 +36,9 @@ from src.common.tensors.autograd_probes import (
     annotate_params,
     probe_losses,
 )
+from ..whiteboard_runtime import run_batched_vjp
+from ...abstract_nn.train import rebind
+from types import SimpleNamespace
 import numpy as np
 from typing import Callable, Optional
 
@@ -247,6 +250,8 @@ def train_routing(
         hist_targets[nid] = tvec
 
     previous_grads = None
+    mix_buf: dict[int, AT.Tensor] = {}
+    hist_buf: dict[int, AT.Tensor] = {}
 
     def try_backward(lin: int) -> None:
         nonlocal previous_grads, patience, log_buf
@@ -283,14 +288,31 @@ def train_routing(
         hist_residual_summary = hist_residual.mean(0)
         hist_loss = (hist_residual ** 2).mean()
         loss_out = (mix_residual ** 2).mean()
-        loss = loss_out + hist_loss
-        losses = {"loss_out": loss_out, "hist_loss": hist_loss, "combined": loss}
+        losses = {"loss_out": loss_out, "hist_loss": hist_loss}
         probe_losses(losses, params)
-        loss.backward()
+        mix_buf[lin] = mix_residual
+        hist_buf[lin] = hist_residual_summary
+        if lin not in mix_buf or lin not in hist_buf:
+            return
+        mix_seed = mix_buf.pop(lin)
+        hist_seed = hist_buf.pop(lin)
+        seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
+        sys = SimpleNamespace(
+            nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(params)}
+        )
+        jobs = [
+            SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=seed_val)
+            for i in range(len(params))
+        ]
+        batch = run_batched_vjp(sys=sys, jobs=jobs)
         grads = []
-        for p in params:
-            if hasattr(p, "grad"):
-                grads.append(p.grad)
+        if batch.grads_per_source_tensor is not None:
+            g_tensor = AT.get_tensor(batch.grads_per_source_tensor)
+            for idx, p in enumerate(params):
+                grad = -g_tensor[idx]
+                grads.append(grad)
+                new_p = p - 0.01 * grad
+                params[idx] = rebind(f"param[{idx}]", new_p)
         if previous_grads is not None:
             changed = False
             for idx, (g, pg) in enumerate(zip(grads, previous_grads)):
@@ -320,8 +342,9 @@ def train_routing(
             "tick": AT.tensor([float(tick_idx)]),
             "out_feat": out_feat.clone(),
             "out_targ": out_targ.clone(),
-            "mix_residual": mix_residual.clone(),
-            "hist_residual": hist_residual_summary.clone(),
+            "mix_residual": mix_seed.clone(),
+            "hist_residual": hist_seed.clone(),
+            "param_grad": AT.stack(grads) if grads else AT.zeros(len(params)),
         }
         log_buf.append(log_entry)
         for key_id in (
