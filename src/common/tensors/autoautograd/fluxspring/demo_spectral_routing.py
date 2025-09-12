@@ -591,57 +591,43 @@ def pump_with_loss(
     pending: list[int] = []
 
     mids = list(range(band_start, band_start + B))
-    win_map, kept_map = gather_recent_windows(
-        mids, spectral_cfg, ctx.harness, ctx.ledger
-    )
+    W, kept = gather_recent_windows(mids, spectral_cfg, ctx.harness)
     logger.debug(
-        "pump_with_loss: gather_recent_windows mids=%d returned lineages=%d",
+        "pump_with_loss: gather_recent_windows mids=%d returned windows=%d",
         len(mids),
-        len(win_map),
+        len(kept),
     )
-    for lin, W in win_map.items():
-        complete = True
-        for nid in kept_map[lin]:
-            rb = ctx.harness.get_node_ring(nid, lineage=(lin,))
-            if rb is None or rb.idx < spectral_cfg.win_len:
-                complete = False
-                break
-        if not complete:
-            logger.debug(
-                "pump_with_loss: lineage %d windows incomplete — skipping hist compute",
-                lin,
-            )
-            continue
+    if len(kept) == len(mids):
         bp = batched_bandpower_from_windows(W, spectral_cfg)
-        bp_map = {nid: bp[row] for row, nid in enumerate(kept_map[lin])}
-        targ_map = {nid: hist_targets[nid] for nid in kept_map[lin]}
-        feat_mat = AT.stack([bp_map[nid] for nid in kept_map[lin]])
-        targ_mat = AT.stack([targ_map[nid] for nid in kept_map[lin]])
+        bp_map = {nid: bp[row] for row, nid in enumerate(kept)}
+        targ_map = {nid: hist_targets[nid] for nid in kept}
+        feat_mat = AT.stack([bp_map[nid] for nid in kept])
+        targ_mat = AT.stack([targ_map[nid] for nid in kept])
         ctx.harness.push_node(
             HIST_FEAT_ID,
             feat_mat.flatten(),
-            lineage=(lin,),
+            lineage=(lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_TARG_ID,
             targ_mat.flatten(),
-            lineage=(lin,),
+            lineage=(lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_IDS_ID,
-            AT.tensor(kept_map[lin], dtype=float),
-            lineage=(lin,),
+            AT.tensor(kept, dtype=float),
+            lineage=(lid,),
             size=spectral_cfg.win_len,
         )
         logger.debug(
-            "pump_with_loss: lineage %d pushed HIST_* (rows=%d B=%d)",
-            lin,
+            "pump_with_loss: lid %d pushed HIST_* (rows=%d B=%d)",
+            lid,
             int(bp.shape[0]),
             B,
         )
-        pending.append(lin)
+        pending.append(lid)
     return state, pending
 
 
@@ -732,18 +718,15 @@ def train_routing(
                 try_backward(ctx, lin)
             purge_lineage_backlog(ctx, max_lineage_backlog)
 
-        win_map, kept_map = gather_recent_windows(
-            list(range(B)), spectral_cfg, harness, ledger
-        )
-        if win_map:
+        W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
+        if len(kept):
             logger.debug(
-                "train_routing: post-frame gather_recent_windows at inputs returned %d lineages",
-                len(win_map),
+                "train_routing: post-frame gather_recent_windows at inputs returned %d windows",
+                len(kept),
             )
-            for lin, W in win_map.items():
-                bp = batched_bandpower_from_windows(W, spectral_cfg)
-                for row, nid in enumerate(kept_map[lin]):
-                    psi[nid] = bp[row, nid]
+            bp = batched_bandpower_from_windows(W, spectral_cfg)
+            for row, nid in enumerate(kept):
+                psi[nid] = bp[row, nid]
         psi, pending = pump_with_loss(
             ctx,
             psi,
