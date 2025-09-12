@@ -312,8 +312,8 @@ def pump_tick(
     w_n     = AT.stack([n.ctrl.w     for n in spec.nodes]).reshape(-1)
     b_n     = AT.stack([n.ctrl.b     for n in spec.nodes]).reshape(-1)
     node_raw = s + b_n
-    node_phi = phi(node_raw)
-    node_u   = (1.0 - alpha_n) * node_raw + alpha_n * node_phi
+    phi_mid = phi(node_raw)
+    node_u   = (1.0 - alpha_n) * node_raw + alpha_n * phi_mid
     delta    = w_n * node_u
 
     denom = None
@@ -346,11 +346,18 @@ def pump_tick(
     if harness is not None:
         if spec.spectral.enabled:
             lin = (lineage_id,) if lineage_id is not None else None
-            for n, val, ph in zip(spec.nodes, psi_next, node_phi):
+            phi_out = phi(psi_next)
+            evicted: Dict[int, AT] = {}
+            for n, val, raw, ph_o in zip(spec.nodes, psi_next, node_raw, phi_out):
                 harness.push_node(n.id, val, lineage=lin)
-                harness.push_phi(n.id, ph, lineage=lin)
+                harness.push_premix(n.id, raw, lineage=lin)
+                ev = harness.push_out_phi(n.id, ph_o, lineage=lin)
+                if ev is not None:
+                    evicted[n.id] = ev
             for idx, q_val in enumerate(q):
                 harness.push_edge(idx, q_val, lineage=lin)
+            if evicted:
+                stats["evicted_phi"] = evicted
         harness.snapshot_learnables(spec)
 
     return psi_next, stats

@@ -26,12 +26,18 @@ def test_slot_backprop_queue_applies_gradients_per_slot():
     mgr.add_residual(0, spectral=AT.tensor(0.2))
 
     # Queue simple jobs for slot 0
-    jobs = [types.SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=1.0) for i in range(2)]
-    for j in jobs:
-        mgr.queue_job(0, j)
+    jobs = [
+        types.SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=None)
+        for i in range(2)
+    ]
+    mgr.queue_job(0, jobs[0])  # defaults to main residual
+    mgr.queue_job(0, jobs[1], kind="spectral")
 
     # Stub run_batched_vjp to return deterministic gradients
     def _stub_vjp(*, sys, jobs, **_kw):
+        # Ensure residuals were injected correctly
+        assert AT.get_tensor(jobs[0].residual).item() == pytest.approx(0.5)
+        assert AT.get_tensor(jobs[1].residual).item() == pytest.approx(0.2)
         g = AT.tensor([2.0, 3.0])
         return BatchVJPResult(
             slices=BatchSlices(index_of={j.job_id: i for i, j in enumerate(jobs)}, job_ids=tuple(j.job_id for j in jobs)),

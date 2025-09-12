@@ -269,10 +269,10 @@ def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
     return band_powers
 
 
-def phi_histogram_loss(
+def premix_histogram_loss(
     rb: RingBuffer, *, band_idx: int, total_bands: int, tick_hz: float
 ) -> AT.Tensor:
-    """Return histogram loss for a Φ activation history.
+    """Return histogram loss for a raw pre-mix node history.
 
     The buffer stored in ``rb`` is windowed with a Hann window, transformed via
     an ``rfft`` and its power integrated into ``total_bands`` equal-frequency
