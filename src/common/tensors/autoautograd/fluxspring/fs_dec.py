@@ -387,7 +387,7 @@ def _pump_tick(
         # Always record raw inputs so premix history is available even when
         # spectral analysis is disabled.
         for n, raw in zip(spec.nodes, node_raw):
-            harness.push_premix(n.id, raw, lineage=lin)
+            harness.push_premix(n.id, raw)
         harness.snapshot_learnables(spec)
 
     return psi_next, stats
