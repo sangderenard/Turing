@@ -16,7 +16,7 @@ from .spectral_readout import (
     batched_bandpower_from_windows,
 )
 from . import fs_dec, register_param_wheels, ParamWheel
-from .fs_harness import RingHarness, LineageLedger, RingBuffer
+from .fs_harness import RingHarness, RingBuffer
 from .fs_types import (
     DECSpec,
     EdgeCtrl,
@@ -34,9 +34,9 @@ from .fs_io import validate_fluxspring
 from src.common.tensors.autograd_probes import (
     set_strict_mode,
     annotate_params,
-    probe_losses,
 )
-from ..whiteboard_runtime import run_batched_vjp
+from ..slot_backprop import SlotBackpropQueue
+from ..whiteboard_runtime import _WBJob
 from types import SimpleNamespace
 import logging
 import numpy as np
@@ -46,15 +46,6 @@ from dataclasses import dataclass
 
 # Module logger setup (configured in main if not already configured)
 logger = logging.getLogger(__name__)
-
-
-# Special node IDs for harness-managed gradient buffers.
-OUT_FEAT_ID = -1
-OUT_TARG_ID = -2
-OUT_IDS_ID = -3
-HIST_FEAT_ID = -4
-HIST_TARG_ID = -5
-HIST_IDS_ID = -6
 
 
 class TensorRingBuffer:
@@ -262,14 +253,11 @@ def generate_signals(
 class RoutingState:
     spec: FluxSpringSpec
     harness: RingHarness
-    ledger: LineageLedger
     wheels: list[ParamWheel]
     log_buf: TensorRingBuffer
     mix_buf: RingBuffer
     hist_buf: RingBuffer
-    slot_map: dict[int, list[list[int]]]
-    previous_grads: list[AT.Tensor] | None = None
-    patience: int = 10
+    bp_queue: SlotBackpropQueue
 
 
 def initialize_signal_state(
@@ -300,219 +288,6 @@ def log_param_gradients(params: list[AT.Tensor]) -> None:
                 logger.debug("[Gradients] param %d gradient is zero: %s", idx, g)
             else:
                 logger.debug("[Gradients] param %d grad: %s", idx, g)
-
-
-def purge_lineage_backlog(ctx: RoutingState, max_pending: int) -> None:
-    """Drop the oldest lineages when backlog exceeds ``max_pending``."""
-    active = ctx.ledger.lineages()
-    if len(active) <= max_pending:
-        return
-    stale = active[:-max_pending]
-    logger.warning(
-        "purge_lineage_backlog: dropping %d stale lineages (keeping %d)",
-        len(stale),
-        max_pending,
-    )
-    for lin in stale:
-        ctx.slot_map.pop(lin, None)
-    ctx.ledger.purge_through_lid(stale[-1])
-
-
-def try_backward(ctx: RoutingState, lin: int) -> None:
-    """Execute the backward pass for a completed lineage."""
-    rb_out_feat = ctx.harness.get_node_ring(OUT_FEAT_ID)
-    rb_out_targ = ctx.harness.get_node_ring(OUT_TARG_ID)
-    rb_out_ids = ctx.harness.get_node_ring(OUT_IDS_ID)
-    rb_hist_feat = ctx.harness.get_node_ring(HIST_FEAT_ID)
-    rb_hist_targ = ctx.harness.get_node_ring(HIST_TARG_ID)
-    rb_hist_ids = ctx.harness.get_node_ring(HIST_IDS_ID)
-    if None in (
-        rb_out_feat,
-        rb_out_targ,
-        rb_out_ids,
-        rb_hist_feat,
-        rb_hist_targ,
-        rb_hist_ids,
-    ):
-        logger.debug(
-            "try_backward(lin=%d): missing rings — skipping (out_feat=%s out_targ=%s out_ids=%s hist_feat=%s hist_targ=%s hist_ids=%s)",
-            lin,
-            rb_out_feat is not None,
-            rb_out_targ is not None,
-            rb_out_ids is not None,
-            rb_hist_feat is not None,
-            rb_hist_targ is not None,
-            rb_hist_ids is not None,
-        )
-        return
-    win_len = ctx.spec.spectral.win_len
-    lin_at_row_zero = ((ctx.ledger.next_lid - 1) // win_len) * win_len
-    row_offset = lin_at_row_zero - lin
-    slot = (lin_at_row_zero - row_offset) % win_len
-    rings = (
-        rb_out_feat,
-        rb_out_targ,
-        rb_out_ids,
-        rb_hist_feat,
-        rb_hist_targ,
-        rb_hist_ids,
-    )
-    if any(rb.count <= slot for rb in rings):
-        logger.debug(
-            "try_backward(lin=%d): insufficient data at slot %d", lin, slot
-        )
-        return
-    out_feat = rb_out_feat.buf[slot]
-    out_targ = rb_out_targ.buf[slot]
-    hist_ids = rb_hist_ids.buf[slot]
-    B = int(out_feat.shape[0])
-    M = int(hist_ids.shape[0])
-    logger.debug(
-        "try_backward(lin=%d): out_feat_shape=%s out_targ_shape=%s M=%d B=%d",
-        lin,
-        tuple(getattr(out_feat, "shape", ())),
-        tuple(getattr(out_targ, "shape", ())),
-        M,
-        B,
-    )
-    if (
-        int(rb_hist_feat.buf.shape[1]) != M * B
-        or int(rb_hist_targ.buf.shape[1]) != M * B
-    ):
-        logger.debug(
-            "try_backward(lin=%d): histogram shape mismatch M=%d B=%d (feat=%s targ=%s) — skipping",
-            lin,
-            M,
-            B,
-            tuple(rb_hist_feat.buf.shape) if rb_hist_feat is not None else None,
-            tuple(rb_hist_targ.buf.shape) if rb_hist_targ is not None else None,
-        )
-        return
-    hist_feat = rb_hist_feat.buf[slot].reshape(M, B)
-    hist_targ = rb_hist_targ.buf[slot].reshape(M, B)
-    logger.debug(
-        "try_backward(lin=%d): hist_feat_shape=%s hist_targ_shape=%s",
-        lin,
-        tuple(getattr(hist_feat, "shape", ())),
-        tuple(getattr(hist_targ, "shape", ())),
-    )
-    mix_residual = out_feat - out_targ
-    hist_residual = hist_feat - hist_targ
-    hist_residual_summary = hist_residual.mean(0)
-    hist_loss = (hist_residual ** 2).mean()
-    loss_out = (mix_residual ** 2).mean()
-    losses = {"loss_out": loss_out, "hist_loss": hist_loss}
-    slot_rows = ctx.slot_map.pop(lin, None)
-    if slot_rows is None:
-        logger.debug("try_backward(lin=%d): missing slot map — skipping", lin)
-        return
-    params = [w.value_for_slots(slots) for w, slots in zip(ctx.wheels, slot_rows)]
-    logger.debug(
-        "try_backward(lin=%d): slot_rows lens=%s param_count=%d",
-        lin,
-        [len(s) if hasattr(s, "__len__") else 1 for s in slot_rows],
-        len(params),
-    )
-    probe_losses(losses, params)
-    logger.debug(
-        "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
-        lin,
-        float(loss_out.item()),
-        float(hist_loss.item()),
-    )
-    ctx.mix_buf.push(mix_residual)
-    ctx.hist_buf.push(hist_residual_summary)
-    mix_seed = ctx.mix_buf.buf[slot]
-    hist_seed = ctx.hist_buf.buf[slot]
-    seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
-    logger.debug(
-        "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d mix_seed_shape=%s hist_seed_shape=%s",
-        lin,
-        seed_val,
-        len(params),
-        tuple(getattr(mix_seed, "shape", ())),
-        tuple(getattr(hist_seed, "shape", ())),
-    )
-    sys = SimpleNamespace(
-        nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(params)}
-    )
-    jobs = [
-        SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=seed_val)
-        for i in range(len(params))
-    ]
-    batch = run_batched_vjp(sys=sys, jobs=jobs)
-    grads: list[AT.Tensor] = []
-    if batch.grads_per_source_tensor is not None:
-        g_tensor = AT.get_tensor(batch.grads_per_source_tensor)
-        for idx, (slots, w) in enumerate(zip(slot_rows, ctx.wheels)):
-            grad = -g_tensor[idx]
-            grads.append(grad)
-            if len(slots) == 1:
-                s = slots[0]
-                g_val = AT.get_tensor(grad)
-                w._versions[s].grad = g_val
-                prev = w._grads[s]
-                w._grads[s] = g_val if prev is None else prev + g_val
-            else:
-                g_val = AT.get_tensor(grad)
-                for r, s in enumerate(slots):
-                    g_slice = g_val[r]
-                    w._versions[s].grad = g_slice
-                    prev = w._grads[s]
-                    w._grads[s] = g_slice if prev is None else prev + g_slice
-    logger.debug(
-        "try_backward(lin=%d): computed grads for %d params",
-        lin,
-        len(grads),
-    )
-    if ctx.previous_grads is not None:
-        changed = False
-        for idx, (g, pg) in enumerate(zip(grads, ctx.previous_grads)):
-            if g is None and pg is not None:
-                changed = True
-                logger.debug("[Gradients] param %d lost gradient", idx)
-            elif g is not None and pg is None:
-                changed = True
-                logger.debug("[Gradients] param %d gained gradient", idx)
-            if g != pg:
-                changed = True
-                logger.debug("[Gradients] param %d gradient changed", idx)
-        if changed:
-            logger.debug("[Gradients] previous: %s", ctx.previous_grads)
-            logger.debug("[Gradients] current:  %s", grads)
-        else:
-            ctx.patience -= 1
-            if ctx.patience <= 0:
-                logger.debug("[Gradients] no changes in gradients, stopping early")
-                exit(0)
-    else:
-        logger.debug("[Gradients] initial gradients: %s", grads)
-    ctx.previous_grads = grads
-    logger.debug(
-        "loss: %.6f, hist_loss: %.6f",
-        float(loss_out.item()),
-        float(hist_loss.item()),
-    )
-    tick_idx = ctx.ledger.tick_of_lid[lin]
-    log_entry = {
-        "tick": AT.tensor([float(tick_idx)]),
-        "out_feat": out_feat.clone(),
-        "out_targ": out_targ.clone(),
-        "mix_residual": mix_seed.clone(),
-        "hist_residual": hist_seed.clone(),
-        "param_grad": AT.stack(grads) if grads else AT.zeros(len(params)),
-    }
-    ctx.log_buf.append(log_entry)
-    logger.debug(
-        "try_backward(lin=%d): logged tick=%d keys=%s",
-        lin,
-        int(float(tick_idx)),
-        list(log_entry.keys()),
-    )
-    ctx.ledger.purge_through_lid(lin)
-    logger.debug("try_backward(lin=%d): purged lineage from ledger", lin)
-
-
 def pump_with_loss(
     ctx: RoutingState,
     state: AT.Tensor,
@@ -522,20 +297,15 @@ def pump_with_loss(
     band_start: int,
     out_start: int,
     B: int,
-) -> tuple[AT.Tensor, list[int]]:
-    """Advance the system by one tick and stage data for gradients."""
-    lid = ctx.ledger.ingest()
-    logger.debug("pump_with_loss: ingest lid=%d", lid)
-    tick = ctx.ledger.tick_of_lid[lid]
-    ctx.slot_map[lid] = [w.slots_for_tick(tick) for w in ctx.wheels]
-    if ctx.wheels:
-        first_slots = ctx.slot_map[lid][0] if ctx.slot_map[lid] else []
-        logger.debug(
-            "pump_with_loss: tick=%d wheels=%d first_slots=%s",
-            tick,
-            len(ctx.wheels),
-            first_slots,
-        )
+    tick: int,
+) -> AT.Tensor:
+    """Advance the system by one tick and queue residuals and jobs."""
+    for i in range(len(ctx.wheels)):
+        job_m = _WBJob(job_id=f"p{i}:m", op="__neg__", src_ids=(i,), residual=None)
+        ctx.bp_queue.queue_job(None, job_m, tick=tick, kind="main")
+        job_s = _WBJob(job_id=f"p{i}:s", op="__neg__", src_ids=(i,), residual=None)
+        ctx.bp_queue.queue_job(None, job_s, tick=tick, kind="spectral")
+
     state, _ = fs_dec.pump_tick(
         state,
         ctx.spec,
@@ -543,76 +313,28 @@ def pump_with_loss(
         phi=AT.tanh,
         norm="all",
         harness=ctx.harness,
-        lineage_id=lid,
         wheels=ctx.wheels,
         tick=tick,
-        update_fn=lambda p, g: p - 0.01 * g,
+        update_fn=lambda p, g: p,
     )
-    logger.debug(
-        "pump_with_loss: post pump lid=%d state_len=%d",
-        lid,
-        int(state.shape[0]),
-    )
+
     out_feat = state[out_start : out_start + B].clone()
-    ctx.harness.push_node(
-        OUT_FEAT_ID,
-        out_feat,
-        size=spectral_cfg.win_len,
-    )
-    ctx.harness.push_node(
-        OUT_TARG_ID,
-        target_out.clone(),
-        size=spectral_cfg.win_len,
-    )
-    out_ids = AT.arange(out_start, out_start + B, dtype=float)
-    ctx.harness.push_node(
-        OUT_IDS_ID,
-        out_ids,
-        size=spectral_cfg.win_len,
-    )
-    logger.debug(
-        "pump_with_loss: pushed OUT_* rings lid=%d out_ids=[%d..%d)",
-        lid,
-        out_start,
-        out_start + B,
-    )
-    pending: list[int] = []
+    mix_residual = out_feat - target_out
+    ctx.mix_buf.push(mix_residual)
+    ctx.bp_queue.add_residual(tick=tick, main=mix_residual.mean())
 
     mids = list(range(band_start, band_start + B))
     W, kept = gather_recent_windows(mids, spectral_cfg, ctx.harness)
-    logger.debug(
-        "pump_with_loss: gather_recent_windows mids=%d returned windows=%d",
-        len(mids),
-        len(kept),
-    )
     if len(kept) == len(mids):
         bp = batched_bandpower_from_windows(W, spectral_cfg)
         targ_mat = AT.stack([hist_targets[nid] for nid in kept])
-        fft_lid = lid - (spectral_cfg.win_len - 1)
-        ctx.harness.push_node(
-            HIST_FEAT_ID,
-            bp.flatten(),
-            size=spectral_cfg.win_len,
-        )
-        ctx.harness.push_node(
-            HIST_TARG_ID,
-            targ_mat.flatten(),
-            size=spectral_cfg.win_len,
-        )
-        ctx.harness.push_node(
-            HIST_IDS_ID,
-            AT.tensor(kept, dtype=float),
-            size=spectral_cfg.win_len,
-        )
-        logger.debug(
-            "pump_with_loss: lid %d pushed HIST_* (rows=%d B=%d oldest=%d)",
-            lid,
-            int(bp.shape[0]),
-            B,
-            fft_lid,
-        )
-        pending.append(fft_lid)
-    return state, pending
+        hist_residual = bp - targ_mat
+        hist_residual_summary = hist_residual.mean(0)
+        ctx.hist_buf.push(hist_residual_summary)
+        fft_tick = tick - (spectral_cfg.win_len - 1)
+        ctx.bp_queue.add_residual(tick=fft_tick, spectral=hist_residual_summary.mean())
+
+    return state
 
 
 def train_routing(
@@ -623,16 +345,12 @@ def train_routing(
     *,
     flush_hook: Optional[Callable[[dict[str, AT.Tensor]], None]] = None,
     log_capacity: Optional[int] = None,
-    max_lineage_backlog: int = 1024,
 ) -> tuple[list[AT.Tensor], dict[str, AT.Tensor]]:
     """Run the spectral routing training loop.
 
     Logs are stored in an :class:`AbstractTensor` ring buffer so unresolved
     backward references stay valid. When the buffer fills, the oldest entries
-    are optionally flushed via ``flush_hook``.  ``max_lineage_backlog`` provides
-    a safety net: if lineage cleanup fails and the number of outstanding
-    lineages grows beyond this threshold, the oldest entries are purged along
-    with any cached ring data to avoid unbounded memory use.
+    are optionally flushed via ``flush_hook``.
     """
     wheels = register_param_wheels(spec)
     for w in wheels:
@@ -656,7 +374,6 @@ def train_routing(
     harness = RingHarness(
         default_size=spectral_cfg.win_len if spectral_cfg.enabled else None
     )
-    ledger = LineageLedger()
     logger.debug(
         "train_routing: start B=%d layers=%d out_start=%d ring_capacity=%d win_len=%d",
         B,
@@ -668,18 +385,19 @@ def train_routing(
 
     mix_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     hist_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
+    bp_queue = SlotBackpropQueue(wheels)
     ctx = RoutingState(
         spec=spec,
         harness=harness,
-        ledger=ledger,
         wheels=wheels,
         log_buf=log_buf,
         mix_buf=mix_buf,
         hist_buf=hist_buf,
-        slot_map={},
+        bp_queue=bp_queue,
     )
 
     win = sine_chunks[0].shape[0]
+    tick = 0
     for frame_idx, frame_chunks in enumerate(noise_frames):
         logger.debug(
             "train_routing: processing frame %d/%d",
@@ -690,7 +408,7 @@ def train_routing(
             for i in range(B):
                 psi[i] = frame_chunks[i][k]
             target_out = AT.stack([sine_chunks[i][k] for i in range(B)]).flatten()
-            psi, pending = pump_with_loss(
+            psi = pump_with_loss(
                 ctx,
                 psi,
                 target_out,
@@ -699,10 +417,15 @@ def train_routing(
                 band_start,
                 out_start,
                 B,
+                tick,
             )
-            for lin in pending:
-                try_backward(ctx, lin)
-            purge_lineage_backlog(ctx, max_lineage_backlog)
+            if tick >= spectral_cfg.win_len - 1:
+                slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
+                sys = SimpleNamespace(
+                    nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
+                )
+                ctx.bp_queue.process_slot(slot, sys=sys)
+            tick += 1
 
         W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
         if len(kept) == B:
@@ -714,7 +437,7 @@ def train_routing(
             rows = AT.arange(len(kept), dtype=int)
             cols = AT.tensor(kept, dtype=int)
             psi[cols] = bp[rows, cols]
-        psi, pending = pump_with_loss(
+        psi = pump_with_loss(
             ctx,
             psi,
             AT.zeros(B, dtype=float),
@@ -723,15 +446,26 @@ def train_routing(
             band_start,
             out_start,
             B,
+            tick,
         )
-        for lin in pending:
-            try_backward(ctx, lin)
-        purge_lineage_backlog(ctx, max_lineage_backlog)
+        if tick >= spectral_cfg.win_len - 1:
+            slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
+            sys = SimpleNamespace(
+                nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
+            )
+            ctx.bp_queue.process_slot(slot, sys=sys)
+        tick += 1
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
         logger.debug("train_routing: appended routed output for frame %d", frame_idx + 1)
 
-    purge_lineage_backlog(ctx, max_lineage_backlog)
+    for _ in range(spectral_cfg.win_len - 1):
+        slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
+        sys = SimpleNamespace(
+            nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
+        )
+        ctx.bp_queue.process_slot(slot, sys=sys)
+        tick += 1
 
     log_param_gradients([p for w in ctx.wheels for p in w.versions()])
     remaining_logs = log_buf.snapshot()
@@ -753,7 +487,6 @@ def main(log_file: str = "fluxspring_debug.log") -> None:
     tick_hz = 400.0
     win = 40
     frames = 50
-    max_lineage_backlog = win * 2
     bands = [[20, 40], [40, 60], [60, 80], [80, 100], [100, 120], [120, 140], [140, 160], [160, 180]]
     spectral_cfg = SpectralCfg(
         enabled=True,
@@ -765,7 +498,7 @@ def main(log_file: str = "fluxspring_debug.log") -> None:
     )
     spec = build_spec(spectral_cfg)
     sine_chunks, noise_frames = generate_signals(bands, win, tick_hz, frames)
-    routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames, max_lineage_backlog=max_lineage_backlog)
+    routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
     logger.debug("Routed output: %s", routed)
     ticks = logs.get("tick")
     logger.debug(
