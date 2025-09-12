@@ -17,7 +17,7 @@ import numpy as np
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
-from .fs_harness import RingHarness, LineageLedger, RingBuffer
+from .fs_harness import RingHarness, RingBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -159,21 +159,18 @@ def gather_recent_windows(
     node_ids: List[int],
     cfg: SpectralCfg,
     harness: RingHarness,
-    ledger: LineageLedger,
-) -> Tuple[Dict[int, AT], Dict[int, List[int]]]:
-    """Return recent raw windows for specified node IDs grouped by lineage.
+) -> Tuple[AT, List[int]]:
+    """Return recent raw windows for specified node IDs.
 
-    For each lineage tracked in ``ledger`` this function attempts to retrieve
-    the pre‑mix ring buffer for every node in ``node_ids``.  When a ring
-    contains at least ``cfg.win_len`` samples the most recent ``win_len`` values
-    are stacked into a window.  The returned ``win_map`` associates each
-    lineage identifier with a tensor of shape ``(M, win_len)`` where ``M`` is the
-    number of nodes that produced a valid window.  ``kept_map`` stores the node
-    identifiers corresponding to each row in the window tensor.
+    Each node's pre-mix ring buffer is inspected and the most recent
+    ``cfg.win_len`` samples are collected when available.  The returned tensor
+    stacks these windows in row-major order giving shape ``(M, win_len)`` where
+    ``M`` is the number of nodes with sufficient history.  ``kept`` records the
+    node IDs corresponding to each row in the tensor.
     """
 
-    win_map: Dict[int, AT] = {}
-    kept_map: Dict[int, List[int]] = {}
+    windows: List[AT] = []
+    kept: List[int] = []
 
     def _ordered(rb: RingBuffer) -> AT:
         buf = rb.buf
@@ -186,41 +183,27 @@ def gather_recent_windows(
             return buf
         return AT.cat([buf[start:], buf[:start]], dim=0)
 
-    for lin in ledger.lineages():
-        windows: List[AT] = []
-        kept: List[int] = []
-        for nid in node_ids:
-            rb = harness.get_premix_ring(nid, lineage=(lin,))
-            if rb is None:
-                logger.debug(
-                    "gather_recent_windows: lin=%d nid=%d premix ring missing",
-                    lin,
-                    nid,
-                )
-                continue
-            ordered = _ordered(rb)
-            if int(ordered.shape[0]) < cfg.win_len:
-                logger.debug(
-                    "gather_recent_windows: lin=%d nid=%d insufficient samples %d < win_len %d",
-                    lin,
-                    nid,
-                    int(ordered.shape[0]),
-                    cfg.win_len,
-                )
-                continue
-            windows.append(ordered[-cfg.win_len :].reshape(-1))
-            kept.append(nid)
-        if windows:
-            win_map[lin] = AT.stack(windows)
-            kept_map[lin] = kept
+    for nid in node_ids:
+        rb = harness.get_premix_ring(nid)
+        if rb is None:
             logger.debug(
-                "gather_recent_windows: lin=%d windows=%d kept=%s",
-                lin,
-                len(windows),
-                kept,
+                "gather_recent_windows: nid=%d premix ring missing",
+                nid,
             )
+            continue
+        ordered = _ordered(rb)
+        if int(ordered.shape[0]) < cfg.win_len:
+            logger.debug(
+                "gather_recent_windows: nid=%d insufficient samples %d < win_len %d",
+                nid,
+                int(ordered.shape[0]),
+                cfg.win_len,
+            )
+            continue
+        windows.append(ordered[-cfg.win_len :].reshape(-1))
+        kept.append(nid)
 
-    return win_map, kept_map
+    return (AT.stack(windows) if windows else AT.zeros((0, cfg.win_len), dtype=float), kept)
 
 
 def quantile_band_targets(
