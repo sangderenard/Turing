@@ -16,7 +16,7 @@ from .spectral_readout import (
     batched_bandpower_from_windows,
 )
 from . import fs_dec, register_param_wheels, ParamWheel
-from .fs_harness import RingHarness, LineageLedger
+from .fs_harness import RingHarness, LineageLedger, RingBuffer
 from .fs_types import (
     DECSpec,
     EdgeCtrl,
@@ -265,8 +265,8 @@ class RoutingState:
     ledger: LineageLedger
     wheels: list[ParamWheel]
     log_buf: TensorRingBuffer
-    mix_buf: dict[int, AT.Tensor]
-    hist_buf: dict[int, AT.Tensor]
+    mix_buf: RingBuffer
+    hist_buf: RingBuffer
     slot_map: dict[int, list[list[int]]]
     previous_grads: list[AT.Tensor] | None = None
     patience: int = 10
@@ -420,14 +420,10 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         float(loss_out.item()),
         float(hist_loss.item()),
     )
-    if lin in ctx.mix_buf or lin in ctx.hist_buf:
-        logger.debug("try_backward(lin=%d): replacing stale residuals", lin)
-        ctx.mix_buf.pop(lin, None)
-        ctx.hist_buf.pop(lin, None)
-    ctx.mix_buf[lin] = mix_residual
-    ctx.hist_buf[lin] = hist_residual_summary
-    mix_seed = ctx.mix_buf.pop(lin)
-    hist_seed = ctx.hist_buf.pop(lin)
+    ctx.mix_buf.push(mix_residual)
+    ctx.hist_buf.push(hist_residual_summary)
+    mix_seed = ctx.mix_buf.buf[slot]
+    hist_seed = ctx.hist_buf.buf[slot]
     seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
     logger.debug(
         "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d mix_seed_shape=%s hist_seed_shape=%s",
@@ -670,14 +666,16 @@ def train_routing(
         spectral_cfg.win_len,
     )
 
+    mix_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
+    hist_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     ctx = RoutingState(
         spec=spec,
         harness=harness,
         ledger=ledger,
         wheels=wheels,
         log_buf=log_buf,
-        mix_buf={},
-        hist_buf={},
+        mix_buf=mix_buf,
+        hist_buf=hist_buf,
         slot_map={},
     )
 
