@@ -307,9 +307,7 @@ def _pump_tick(
         When provided and ``spec.spectral.enabled`` is ``True``, ring buffers
         for nodes and edges are updated via this harness.
     lineage_id : int, optional
-        Lineage identifier passed through to the harness so node and edge
-        histories can be keyed by input lineage.  ``None`` preserves the
-        previous behaviour where all pushes share the same buffers.
+        Reserved for future lineage tracking; currently unused.
     """
 
     # Inject fresh external inputs before computing edge potentials. ``ids`` is
