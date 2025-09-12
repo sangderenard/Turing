@@ -4,7 +4,10 @@
 No torch usage here.
 """
 from __future__ import annotations
-from typing import Tuple, Dict, Optional, Callable, Literal
+from typing import Tuple, Dict, Optional, Callable, Literal, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - for type hints only
+    from . import ParamWheel
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 from .fs_harness import RingHarness
@@ -228,8 +231,34 @@ def transport_tick(
     return psi_next, stats
 
 
-# --------- Data pump ---------
 def pump_tick(
+    psi: AT.Tensor,
+    spec: FluxSpringSpec,
+    *,
+    wheels: Sequence["ParamWheel"] | None = None,
+    tick: int | None = None,
+    update_fn: Callable[[AT.Tensor, AT.Tensor], AT.Tensor] = lambda p, g: p,
+    **kw,
+) -> Tuple[AT.Tensor, Dict[str, AT.Tensor]]:
+    """Wrapper around :func:`_pump_tick` with optional param wheel support."""
+
+    if wheels:
+        if tick is None:
+            raise ValueError("tick must be provided when wheels are used")
+        used = [w.bind_for_tick(tick) for w in wheels]
+        psi, stats = _pump_tick(psi, spec, **kw)
+        for w, u in zip(wheels, used):
+            w.stash_grads(u)
+        for w in wheels:
+            ev = w.rotate()
+            w.apply_slot(ev, update_fn)
+        return psi, stats
+
+    return _pump_tick(psi, spec, **kw)
+
+
+# --------- Data pump ---------
+def _pump_tick(
     psi: AT.Tensor,
     spec: FluxSpringSpec,
     *,
