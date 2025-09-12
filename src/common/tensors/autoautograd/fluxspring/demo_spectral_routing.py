@@ -15,7 +15,7 @@ from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
 )
-from . import fs_dec, register_param_wheels
+from . import fs_dec, register_param_wheels, ParamWheel
 from .fs_harness import RingHarness, LineageLedger
 from .fs_types import (
     DECSpec,
@@ -37,7 +37,6 @@ from src.common.tensors.autograd_probes import (
     probe_losses,
 )
 from ..whiteboard_runtime import run_batched_vjp
-from ...abstract_nn.train import rebind
 from types import SimpleNamespace
 import logging
 import numpy as np
@@ -264,7 +263,7 @@ class RoutingState:
     spec: FluxSpringSpec
     harness: RingHarness
     ledger: LineageLedger
-    params: list[AT.Tensor]
+    wheels: list[ParamWheel]
     log_buf: TensorRingBuffer
     mix_buf: dict[int, AT.Tensor]
     hist_buf: dict[int, AT.Tensor]
@@ -385,7 +384,10 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     hist_loss = (hist_residual ** 2).mean()
     loss_out = (mix_residual ** 2).mean()
     losses = {"loss_out": loss_out, "hist_loss": hist_loss}
-    probe_losses(losses, ctx.params)
+    params = [
+        w.versions()[(w.idx - 1) % len(w.versions())] for w in ctx.wheels
+    ]
+    probe_losses(losses, params)
     logger.debug(
         "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
         lin,
@@ -405,24 +407,23 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d",
         lin,
         seed_val,
-        len(ctx.params),
+        len(params),
     )
     sys = SimpleNamespace(
-        nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(ctx.params)}
+        nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(params)}
     )
     jobs = [
         SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=seed_val)
-        for i in range(len(ctx.params))
+        for i in range(len(params))
     ]
     batch = run_batched_vjp(sys=sys, jobs=jobs)
     grads: list[AT.Tensor] = []
     if batch.grads_per_source_tensor is not None:
         g_tensor = AT.get_tensor(batch.grads_per_source_tensor)
-        for idx, p in enumerate(ctx.params):
+        for idx, (p, w) in enumerate(zip(params, ctx.wheels)):
             grad = -g_tensor[idx]
             grads.append(grad)
-            new_p = p - 0.01 * grad
-            ctx.params[idx] = rebind(f"param[{idx}]", new_p)
+            p.grad = AT.get_tensor(grad)
     logger.debug(
         "try_backward(lin=%d): computed grads for %d params",
         lin,
@@ -463,7 +464,7 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         "out_targ": out_targ.clone(),
         "mix_residual": mix_seed.clone(),
         "hist_residual": hist_seed.clone(),
-        "param_grad": AT.stack(grads) if grads else AT.zeros(len(ctx.params)),
+        "param_grad": AT.stack(grads) if grads else AT.zeros(len(params)),
     }
     ctx.log_buf.append(log_entry)
     logger.debug(
@@ -514,6 +515,9 @@ def pump_with_loss(
         norm="all",
         harness=ctx.harness,
         lineage_id=lid,
+        wheels=ctx.wheels,
+        tick=ctx.ledger.tick_of_lid[lid],
+        update_fn=lambda p, g: p - 0.01 * g,
     )
     logger.debug(
         "pump_with_loss: post pump lid=%d state_len=%d",
@@ -607,12 +611,11 @@ def train_routing(
     lineages grows beyond this threshold, the oldest entries are purged along
     with any cached ring data to avoid unbounded memory use.
     """
-    wheels = register_param_wheels(spec, slots=1)
+    wheels = register_param_wheels(spec, slots=spectral_cfg.win_len)
     for w in wheels:
         w.rotate(); w.bind_slot()
-    params = [w.versions()[0] for w in wheels]
     set_strict_mode(True)
-    annotate_params(params)
+    annotate_params([v for w in wheels for v in w.versions()])
 
     psi, hist_targets, band_start, B = initialize_signal_state(spec, spectral_cfg)
     routed: list[AT.Tensor] = []
@@ -636,7 +639,7 @@ def train_routing(
         spec=spec,
         harness=harness,
         ledger=ledger,
-        params=params,
+        wheels=wheels,
         log_buf=log_buf,
         mix_buf={},
         hist_buf={},
@@ -700,7 +703,7 @@ def train_routing(
         try_backward(ctx, lid)
     purge_lineage_backlog(ctx, max_lineage_backlog)
 
-    log_param_gradients(params)
+    log_param_gradients([p for w in ctx.wheels for p in w.versions()])
     remaining_logs = log_buf.snapshot()
     log_buf.flush_all()
 
