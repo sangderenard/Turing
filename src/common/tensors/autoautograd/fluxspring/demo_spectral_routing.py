@@ -599,35 +599,34 @@ def pump_with_loss(
     )
     if len(kept) == len(mids):
         bp = batched_bandpower_from_windows(W, spectral_cfg)
-        bp_map = {nid: bp[row] for row, nid in enumerate(kept)}
-        targ_map = {nid: hist_targets[nid] for nid in kept}
-        feat_mat = AT.stack([bp_map[nid] for nid in kept])
-        targ_mat = AT.stack([targ_map[nid] for nid in kept])
+        targ_mat = AT.stack([hist_targets[nid] for nid in kept])
+        fft_lid = lid - (spectral_cfg.win_len - 1)
         ctx.harness.push_node(
             HIST_FEAT_ID,
-            feat_mat.flatten(),
-            lineage=(lid,),
+            bp.flatten(),
+            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_TARG_ID,
             targ_mat.flatten(),
-            lineage=(lid,),
+            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_IDS_ID,
             AT.tensor(kept, dtype=float),
-            lineage=(lid,),
+            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         logger.debug(
-            "pump_with_loss: lid %d pushed HIST_* (rows=%d B=%d)",
+            "pump_with_loss: lid %d pushed HIST_* (rows=%d B=%d oldest=%d)",
             lid,
             int(bp.shape[0]),
             B,
+            fft_lid,
         )
-        pending.append(lid)
+        pending.append(fft_lid)
     return state, pending
 
 
@@ -719,14 +718,15 @@ def train_routing(
             purge_lineage_backlog(ctx, max_lineage_backlog)
 
         W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
-        if len(kept):
+        if len(kept) == B:
             logger.debug(
                 "train_routing: post-frame gather_recent_windows at inputs returned %d windows",
                 len(kept),
             )
             bp = batched_bandpower_from_windows(W, spectral_cfg)
-            for row, nid in enumerate(kept):
-                psi[nid] = bp[row, nid]
+            rows = AT.arange(len(kept), dtype=int)
+            cols = AT.tensor(kept, dtype=int)
+            psi[cols] = bp[rows, cols]
         psi, pending = pump_with_loss(
             ctx,
             psi,
