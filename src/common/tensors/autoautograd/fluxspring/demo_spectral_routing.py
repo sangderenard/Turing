@@ -313,8 +313,7 @@ def purge_lineage_backlog(ctx: RoutingState, max_pending: int) -> None:
         len(stale),
         max_pending,
     )
-    for lid in stale:
-        line = (lid,)
+    for _ in stale:
         for key_id in (
             OUT_FEAT_ID,
             OUT_TARG_ID,
@@ -323,23 +322,22 @@ def purge_lineage_backlog(ctx: RoutingState, max_pending: int) -> None:
             HIST_TARG_ID,
             HIST_IDS_ID,
         ):
-            ctx.harness.node_rings.pop(ctx.harness._key(key_id, line), None)
+            ctx.harness.node_rings.pop(ctx.harness._key(key_id), None)
         for n in ctx.spec.nodes:
-            ctx.harness.node_rings.pop(ctx.harness._key(n.id, line), None)
+            ctx.harness.node_rings.pop(ctx.harness._key(n.id), None)
         for idx in range(len(ctx.spec.edges)):
-            ctx.harness.edge_rings.pop(ctx.harness._key(idx, line), None)
+            ctx.harness.edge_rings.pop(ctx.harness._key(idx), None)
     ctx.ledger.purge_through_lid(stale[-1])
 
 
 def try_backward(ctx: RoutingState, lin: int) -> None:
     """Execute the backward pass for a completed lineage."""
-    line = (lin,)
-    rb_out_feat = ctx.harness.get_node_ring(OUT_FEAT_ID, lineage=line)
-    rb_out_targ = ctx.harness.get_node_ring(OUT_TARG_ID, lineage=line)
-    rb_out_ids = ctx.harness.get_node_ring(OUT_IDS_ID, lineage=line)
-    rb_hist_feat = ctx.harness.get_node_ring(HIST_FEAT_ID, lineage=line)
-    rb_hist_targ = ctx.harness.get_node_ring(HIST_TARG_ID, lineage=line)
-    rb_hist_ids = ctx.harness.get_node_ring(HIST_IDS_ID, lineage=line)
+    rb_out_feat = ctx.harness.get_node_ring(OUT_FEAT_ID)
+    rb_out_targ = ctx.harness.get_node_ring(OUT_TARG_ID)
+    rb_out_ids = ctx.harness.get_node_ring(OUT_IDS_ID)
+    rb_hist_feat = ctx.harness.get_node_ring(HIST_FEAT_ID)
+    rb_hist_targ = ctx.harness.get_node_ring(HIST_TARG_ID)
+    rb_hist_ids = ctx.harness.get_node_ring(HIST_IDS_ID)
     if None in (
         rb_out_feat,
         rb_out_targ,
@@ -509,14 +507,14 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         HIST_TARG_ID,
         HIST_IDS_ID,
     ):
-        k = ctx.harness._key(key_id, line)
+        k = ctx.harness._key(key_id)
         ctx.harness.node_rings.pop(k, None)
     logger.debug("try_backward(lin=%d): cleared transient node rings", lin)
     for n in ctx.spec.nodes:
-        k = ctx.harness._key(n.id, line)
+        k = ctx.harness._key(n.id)
         ctx.harness.node_rings.pop(k, None)
     for idx in range(len(ctx.spec.edges)):
-        k = ctx.harness._key(idx, line)
+        k = ctx.harness._key(idx)
         ctx.harness.edge_rings.pop(k, None)
     ctx.ledger.purge_through_lid(lin)
     logger.debug("try_backward(lin=%d): purged lineage from ledger", lin)
@@ -566,20 +564,17 @@ def pump_with_loss(
     ctx.harness.push_node(
         OUT_FEAT_ID,
         out_feat,
-        lineage=(lid,),
         size=spectral_cfg.win_len,
     )
     ctx.harness.push_node(
         OUT_TARG_ID,
         target_out.clone(),
-        lineage=(lid,),
         size=spectral_cfg.win_len,
     )
     out_ids = AT.arange(out_start, out_start + B, dtype=float)
     ctx.harness.push_node(
         OUT_IDS_ID,
         out_ids,
-        lineage=(lid,),
         size=spectral_cfg.win_len,
     )
     logger.debug(
@@ -604,19 +599,16 @@ def pump_with_loss(
         ctx.harness.push_node(
             HIST_FEAT_ID,
             bp.flatten(),
-            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_TARG_ID,
             targ_mat.flatten(),
-            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_IDS_ID,
             AT.tensor(kept, dtype=float),
-            lineage=(fft_lid,),
             size=spectral_cfg.win_len,
         )
         logger.debug(
