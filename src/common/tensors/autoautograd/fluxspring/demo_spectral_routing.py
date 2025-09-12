@@ -357,12 +357,26 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
             rb_hist_ids is not None,
         )
         return
-    if any(rb.idx < rb.buf.shape[0] for rb in (rb_out_feat, rb_out_targ, rb_out_ids)):
-        logger.debug("try_backward(lin=%d): output rings incomplete — skipping", lin)
+    win_len = ctx.spec.spectral.win_len
+    lin_at_row_zero = ((ctx.ledger.next_lid - 1) // win_len) * win_len
+    row_offset = lin_at_row_zero - lin
+    slot = (lin_at_row_zero - row_offset) % win_len
+    rings = (
+        rb_out_feat,
+        rb_out_targ,
+        rb_out_ids,
+        rb_hist_feat,
+        rb_hist_targ,
+        rb_hist_ids,
+    )
+    if any(rb.count <= slot for rb in rings):
+        logger.debug(
+            "try_backward(lin=%d): insufficient data at slot %d", lin, slot
+        )
         return
-    out_feat = rb_out_feat.buf[0]
-    out_targ = rb_out_targ.buf[0]
-    hist_ids = rb_hist_ids.buf[0]
+    out_feat = rb_out_feat.buf[slot]
+    out_targ = rb_out_targ.buf[slot]
+    hist_ids = rb_hist_ids.buf[slot]
     B = int(out_feat.shape[0])
     M = int(hist_ids.shape[0])
     logger.debug(
@@ -386,8 +400,8 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
             tuple(rb_hist_targ.buf.shape) if rb_hist_targ is not None else None,
         )
         return
-    hist_feat = rb_hist_feat.buf[0].reshape(M, B)
-    hist_targ = rb_hist_targ.buf[0].reshape(M, B)
+    hist_feat = rb_hist_feat.buf[slot].reshape(M, B)
+    hist_targ = rb_hist_targ.buf[slot].reshape(M, B)
     logger.debug(
         "try_backward(lin=%d): hist_feat_shape=%s hist_targ_shape=%s",
         lin,
@@ -446,10 +460,22 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     grads: list[AT.Tensor] = []
     if batch.grads_per_source_tensor is not None:
         g_tensor = AT.get_tensor(batch.grads_per_source_tensor)
-        for idx, (p, w) in enumerate(zip(params, ctx.wheels)):
+        for idx, (slots, w) in enumerate(zip(slot_rows, ctx.wheels)):
             grad = -g_tensor[idx]
             grads.append(grad)
-            p.grad = AT.get_tensor(grad)
+            if len(slots) == 1:
+                s = slots[0]
+                g_val = AT.get_tensor(grad)
+                w._versions[s].grad = g_val
+                prev = w._grads[s]
+                w._grads[s] = g_val if prev is None else prev + g_val
+            else:
+                g_val = AT.get_tensor(grad)
+                for r, s in enumerate(slots):
+                    g_slice = g_val[r]
+                    w._versions[s].grad = g_slice
+                    prev = w._grads[s]
+                    w._grads[s] = g_slice if prev is None else prev + g_slice
     logger.debug(
         "try_backward(lin=%d): computed grads for %d params",
         lin,
