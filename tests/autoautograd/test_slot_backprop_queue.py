@@ -66,3 +66,36 @@ def test_slot_backprop_queue_applies_gradients_per_slot():
     assert mgr.main_residuals[0] is None
     assert mgr.spectral_residuals[0] is None
     assert mgr.jobs[0] == []
+
+
+def test_slot_backprop_queue_slot_keying():
+    """Residuals and jobs map via (tick - row_idx) % W."""
+
+    p = AT.tensor(0.0)
+    p.requires_grad_(True)
+    w = ParamWheel(p, lambda t: None, slots=4)
+    w.rotate(); w.bind_slot()
+
+    mgr = SlotBackpropQueue([w])
+
+    tick = 5
+    row_main = 2
+    row_spec = 1
+    main_res = AT.tensor(1.0)
+    spec_res = AT.tensor(2.0)
+
+    job_main = types.SimpleNamespace(job_id="jm", op="__neg__", src_ids=(0,), residual=None)
+    job_spec = types.SimpleNamespace(job_id="js", op="__neg__", src_ids=(0,), residual=None)
+
+    mgr.add_residual(None, tick=tick, row_idx=row_main, main=main_res)
+    mgr.add_residual(None, tick=tick, row_idx=row_spec, spectral=spec_res)
+    mgr.queue_job(None, job_main, tick=tick, row_idx=row_main)
+    mgr.queue_job(None, job_spec, tick=tick, row_idx=row_spec, kind="spectral")
+
+    slot_main = (tick - row_main) % 4
+    slot_spec = (tick - row_spec) % 4
+
+    assert AT.get_tensor(mgr.main_residuals[slot_main]).item() == pytest.approx(1.0)
+    assert AT.get_tensor(mgr.spectral_residuals[slot_spec]).item() == pytest.approx(2.0)
+    assert mgr.jobs[slot_main][0].job is job_main
+    assert mgr.jobs[slot_spec][0].job is job_spec

@@ -31,20 +31,49 @@ class SlotBackpropQueue:
     main_residuals: Dict[int, AT | None] = field(init=False)
     spectral_residuals: Dict[int, AT | None] = field(init=False)
     jobs: Dict[int, List[_QueuedJob]] = field(init=False)
+    slots: int = field(init=False)
 
     def __post_init__(self) -> None:
-        slots = len(self.wheels[0].params) if self.wheels else 0
-        self.main_residuals = {i: None for i in range(slots)}
-        self.spectral_residuals = {i: None for i in range(slots)}
-        self.jobs = {i: [] for i in range(slots)}
+        self.slots = len(self.wheels[0].params) if self.wheels else 0
+        self.main_residuals = {i: None for i in range(self.slots)}
+        self.spectral_residuals = {i: None for i in range(self.slots)}
+        self.jobs = {i: [] for i in range(self.slots)}
 
     # ------------------------------------------------------------------
-    def add_residual(self, slot: int, *, main: AT | None = None, spectral: AT | None = None) -> None:
-        """Accumulate residuals for ``slot``.
+    def _slot_for(self, *, tick: int, row_idx: int) -> int:
+        """Return slot index for ``row_idx`` at ``tick``.
 
-        Residuals are summed if multiple contributions arrive before the slot is
-        processed.
+        Parameters
+        ----------
+        tick:
+            Global tick counter.
+        row_idx:
+            Row index within the parameter tensor.
         """
+
+        return (tick - row_idx) % self.slots if self.slots else 0
+
+    # ------------------------------------------------------------------
+    def add_residual(
+        self,
+        slot: int | None = None,
+        *,
+        tick: int | None = None,
+        row_idx: int = 0,
+        main: AT | None = None,
+        spectral: AT | None = None,
+    ) -> None:
+        """Accumulate residuals for a slot determined by ``tick``/``row_idx``.
+
+        Callers may supply ``slot`` directly or allow it to be computed via the
+        ``tick`` and ``row_idx`` pair.  Residuals are summed if multiple
+        contributions arrive before the slot is processed.
+        """
+
+        if slot is None:
+            if tick is None:
+                raise ValueError("add_residual requires either slot or tick")
+            slot = self._slot_for(tick=tick, row_idx=row_idx)
 
         if main is not None:
             t = AT.get_tensor(main)
@@ -56,13 +85,22 @@ class SlotBackpropQueue:
             self.spectral_residuals[slot] = t if prev is None else prev + t
 
     # ------------------------------------------------------------------
-    def queue_job(self, slot: int, job: Any, *, kind: str = "main") -> None:
-        """Queue a JVP/VJP job for ``slot``.
+    def queue_job(
+        self,
+        slot: int | None,
+        job: Any,
+        *,
+        tick: int | None = None,
+        row_idx: int = 0,
+        kind: str = "main",
+    ) -> None:
+        """Queue a JVP/VJP job for a computed slot.
 
         Parameters
         ----------
         slot:
-            Slot index that the ``job`` is associated with.
+            Explicit slot index.  If ``None``, the index is derived from
+            ``tick`` and ``row_idx``.
         job:
             Any object understood by :func:`run_batched_vjp`.
         kind:
@@ -70,6 +108,11 @@ class SlotBackpropQueue:
             ``"main"`` (default) uses :attr:`main_residuals`; ``"spectral"``
             uses :attr:`spectral_residuals`.
         """
+
+        if slot is None:
+            if tick is None:
+                raise ValueError("queue_job requires either slot or tick")
+            slot = self._slot_for(tick=tick, row_idx=row_idx)
 
         self.jobs.setdefault(slot, []).append(_QueuedJob(job, kind))
 
