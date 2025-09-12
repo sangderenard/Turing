@@ -201,21 +201,21 @@ class ParamRing:
 
 @dataclass
 class RingHarness:
-    """Own per-node and per-edge ring buffers keyed by lineage."""
+    """Own per-node and per-edge ring buffers keyed by object ID."""
 
     default_size: Optional[int] = None
-    node_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
-    edge_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
-    premix_rings: Dict[Tuple[int, ...], PremixRing] = field(default_factory=dict)
+    node_rings: Dict[Tuple[int], RingBuffer] = field(default_factory=dict)
+    edge_rings: Dict[Tuple[int], RingBuffer] = field(default_factory=dict)
+    premix_rings: Dict[Tuple[int], PremixRing] = field(default_factory=dict)
     param_rings: Dict[str, ParamRing] = field(default_factory=dict)
     param_labels: List[str] = field(default_factory=list)
     tick: int = 0
 
-    def _key(self, obj_id: int, lineage: Tuple[int, ...] | None) -> Tuple[int, ...]:
-        return (obj_id,) if lineage is None else (obj_id, *lineage)
+    def _key(self, obj_id: int) -> Tuple[int]:
+        return (obj_id,)
 
     def _ensure_node_ring(
-        self, key: Tuple[int, ...], D: int, size: Optional[int]
+        self, key: Tuple[int], D: int, size: Optional[int]
     ) -> Optional[RingBuffer]:
         size = size or self.default_size
         if size is None:
@@ -232,7 +232,7 @@ class RingHarness:
         return self.node_rings[key]
 
     def _ensure_edge_ring(
-        self, key: Tuple[int, ...], size: Optional[int]
+        self, key: Tuple[int], size: Optional[int]
     ) -> Optional[RingBuffer]:
         size = size or self.default_size
         if size is None:
@@ -270,10 +270,9 @@ class RingHarness:
         node_id: int,
         val: AT,
         *,
-        lineage: Tuple[int, ...] | None = None,
         size: Optional[int] = None,
     ) -> AT | None:
-        key = self._key(node_id, lineage)
+        key = self._key(node_id)
         t = AT.get_tensor(val)
         D = int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
         rb = self._ensure_node_ring(key, D, size)
@@ -282,7 +281,7 @@ class RingHarness:
         return rb.push(val)
 
     def _ensure_premix_ring(
-        self, key: Tuple[int, ...], D: int, size: Optional[int]
+        self, key: Tuple[int], D: int, size: Optional[int]
     ) -> Optional[PremixRing]:
         size = size or self.default_size
         if size is None:
@@ -297,10 +296,9 @@ class RingHarness:
         node_id: int,
         val: AT,
         *,
-        lineage: Tuple[int, ...] | None = None,
         size: Optional[int] = None,
     ) -> AT | None:
-        key = self._key(node_id, lineage)
+        key = self._key(node_id)
         t = AT.get_tensor(val)
         D = int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
         rb = self._ensure_premix_ring(key, D, size)
@@ -309,33 +307,32 @@ class RingHarness:
         return rb.push(val.reshape(-1))
 
     def get_premix_ring(
-        self, node_id: int, *, lineage: Tuple[int, ...] | None = None
+        self, node_id: int
     ) -> Optional[PremixRing]:
-        return self.premix_rings.get(self._key(node_id, lineage))
+        return self.premix_rings.get(self._key(node_id))
 
     def push_edge(
         self,
         edge_idx: int,
         val: AT,
         *,
-        lineage: Tuple[int, ...] | None = None,
         size: Optional[int] = None,
     ) -> AT | None:
-        key = self._key(edge_idx, lineage)
+        key = self._key(edge_idx)
         rb = self._ensure_edge_ring(key, size)
         if rb is None:
             return None
         return rb.push(val)
 
     def get_node_ring(
-        self, node_id: int, *, lineage: Tuple[int, ...] | None = None
+        self, node_id: int
     ) -> Optional[RingBuffer]:
-        return self.node_rings.get(self._key(node_id, lineage))
+        return self.node_rings.get(self._key(node_id))
 
     def get_edge_ring(
-        self, edge_idx: int, *, lineage: Tuple[int, ...] | None = None
+        self, edge_idx: int
     ) -> Optional[RingBuffer]:
-        return self.edge_rings.get(self._key(edge_idx, lineage))
+        return self.edge_rings.get(self._key(edge_idx))
 
     # ------------------------------------------------------------------
     # Parameter versioning
