@@ -11,12 +11,15 @@ training FluxSpring graphs with frequency‑selective objectives.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
+import logging
 
 import numpy as np
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
 from .fs_harness import RingHarness, LineageLedger, RingBuffer
+
+logger = logging.getLogger(__name__)
 
 
 def _rfft_real_imag(x: AT, tick_hz: float) -> Tuple[AT, AT, AT]:
@@ -81,6 +84,12 @@ def compute_metrics(buffer: AT, cfg: SpectralCfg, *, return_tensor: bool = True)
 
     real, imag, freqs = _rfft_real_imag(xw, cfg.tick_hz)
     power = real**2 + imag**2
+    logger.debug(
+        "compute_metrics: N=%d window=%s power_shape=%s",
+        int(xw.shape[0]),
+        cfg.window,
+        tuple(getattr(power, "shape", ())),
+    )
 
     metrics: Dict[str, Any] = {}
     m = cfg.metrics
@@ -183,15 +192,33 @@ def gather_recent_windows(
         for nid in node_ids:
             rb = harness.get_premix_ring(nid, lineage=(lin,))
             if rb is None:
+                logger.debug(
+                    "gather_recent_windows: lin=%d nid=%d premix ring missing",
+                    lin,
+                    nid,
+                )
                 continue
             ordered = _ordered(rb)
             if int(ordered.shape[0]) < cfg.win_len:
+                logger.debug(
+                    "gather_recent_windows: lin=%d nid=%d insufficient samples %d < win_len %d",
+                    lin,
+                    nid,
+                    int(ordered.shape[0]),
+                    cfg.win_len,
+                )
                 continue
             windows.append(ordered[-cfg.win_len :].reshape(-1))
             kept.append(nid)
         if windows:
             win_map[lin] = AT.stack(windows)
             kept_map[lin] = kept
+            logger.debug(
+                "gather_recent_windows: lin=%d windows=%d kept=%s",
+                lin,
+                len(windows),
+                kept,
+            )
 
     return win_map, kept_map
 

@@ -23,10 +23,12 @@ from .fs_dec import (
 from .spectral_readout import compute_metrics
 from .fs_harness import RingHarness
 from typing import Callable, Sequence
+import logging
 # Torch bridge is optional import to keep AT-only usage clean.
 
 from ...abstraction import AbstractTensor as AT
 
+logger = logging.getLogger(__name__)
 def _tape():
     # Autograd is monkey-patched onto AT in your stack.
     try:
@@ -225,6 +227,7 @@ def register_param_wheels(
     wheels: list[ParamWheel] = []
     tmp: list[AT] = []
 
+    cnt = 0
     # Nodes
     for n in spec.nodes:
         lc = n.ctrl.learn
@@ -271,7 +274,12 @@ def register_param_wheels(
                 wheels.append(
                     ParamWheel(p, lambda t, f=f, attr=attr: setattr(f, attr, t), slots=slots, label=f"face[{fid}].{attr}")
                 )
-
+    logger.debug(
+        "register_param_wheels: created %d wheels slots=%d spectral=%s", 
+        len(wheels),
+        int(slots),
+        bool(spec.spectral.enabled),
+    )
     return wheels
 
 

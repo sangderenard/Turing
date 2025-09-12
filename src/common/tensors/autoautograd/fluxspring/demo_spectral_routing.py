@@ -367,6 +367,14 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     hist_ids = rb_hist_ids.buf[0]
     B = int(out_feat.shape[0])
     M = int(hist_ids.shape[0])
+    logger.debug(
+        "try_backward(lin=%d): out_feat_shape=%s out_targ_shape=%s M=%d B=%d",
+        lin,
+        tuple(getattr(out_feat, "shape", ())),
+        tuple(getattr(out_targ, "shape", ())),
+        M,
+        B,
+    )
     if (
         int(rb_hist_feat.buf.shape[1]) != M * B
         or int(rb_hist_targ.buf.shape[1]) != M * B
@@ -382,6 +390,12 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         return
     hist_feat = rb_hist_feat.buf[0].reshape(M, B)
     hist_targ = rb_hist_targ.buf[0].reshape(M, B)
+    logger.debug(
+        "try_backward(lin=%d): hist_feat_shape=%s hist_targ_shape=%s",
+        lin,
+        tuple(getattr(hist_feat, "shape", ())),
+        tuple(getattr(hist_targ, "shape", ())),
+    )
     mix_residual = out_feat - out_targ
     hist_residual = hist_feat - hist_targ
     hist_residual_summary = hist_residual.mean(0)
@@ -393,6 +407,12 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         logger.debug("try_backward(lin=%d): missing slot map — skipping", lin)
         return
     params = [w.value_for_slots(slots) for w, slots in zip(ctx.wheels, slot_rows)]
+    logger.debug(
+        "try_backward(lin=%d): slot_rows lens=%s param_count=%d",
+        lin,
+        [len(s) if hasattr(s, "__len__") else 1 for s in slot_rows],
+        len(params),
+    )
     probe_losses(losses, params)
     logger.debug(
         "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
@@ -410,10 +430,12 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     hist_seed = ctx.hist_buf.pop(lin)
     seed_val = float((mix_seed.mean() + hist_seed.mean()).item())
     logger.debug(
-        "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d",
+        "try_backward(lin=%d): batching VJP with seed_val=%.6f params=%d mix_seed_shape=%s hist_seed_shape=%s",
         lin,
         seed_val,
         len(params),
+        tuple(getattr(mix_seed, "shape", ())),
+        tuple(getattr(hist_seed, "shape", ())),
     )
     sys = SimpleNamespace(
         nodes={i: SimpleNamespace(sphere=p) for i, p in enumerate(params)}
@@ -515,6 +537,14 @@ def pump_with_loss(
     logger.debug("pump_with_loss: ingest lid=%d", lid)
     tick = ctx.ledger.tick_of_lid[lid]
     ctx.slot_map[lid] = [w.slots_for_tick(tick) for w in ctx.wheels]
+    if ctx.wheels:
+        first_slots = ctx.slot_map[lid][0] if ctx.slot_map[lid] else []
+        logger.debug(
+            "pump_with_loss: tick=%d wheels=%d first_slots=%s",
+            tick,
+            len(ctx.wheels),
+            first_slots,
+        )
     state, _ = fs_dec.pump_tick(
         state,
         ctx.spec,
@@ -740,14 +770,16 @@ def train_routing(
     return routed, remaining_logs
 
 
-def main() -> None:
-    # Configure logging if not configured by the application/test harness
-    if not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
-    logger.debug("demo_spectral_routing: starting main()")
+def main(log_file: str = "fluxspring_debug.log") -> None:
+    # Configure logging to a file (force replaces any existing console handlers)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        filename=log_file,
+        filemode="w",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    logger.debug("demo_spectral_routing: starting main(), logging to %s", log_file)
     tick_hz = 400.0
     win = 40
     frames = 50

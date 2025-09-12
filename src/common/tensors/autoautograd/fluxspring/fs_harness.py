@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
+
+logger = logging.getLogger(__name__)
 
 
 def _tape():
@@ -220,6 +223,12 @@ class RingHarness:
         if key not in self.node_rings:
             buf = AT.zeros((size, D), dtype=float)
             self.node_rings[key] = RingBuffer(buf)
+            logger.debug(
+                "RingHarness: created node ring key=%s size=%d D=%d",
+                key,
+                size,
+                D,
+            )
         return self.node_rings[key]
 
     def _ensure_edge_ring(
@@ -231,6 +240,11 @@ class RingHarness:
         if key not in self.edge_rings:
             buf = AT.zeros(size, dtype=float)
             self.edge_rings[key] = RingBuffer(buf)
+            logger.debug(
+                "RingHarness: created edge ring key=%s size=%d",
+                key,
+                size,
+            )
         return self.edge_rings[key]
 
     def _ensure_param_ring(
@@ -243,6 +257,12 @@ class RingHarness:
             buf = AT.zeros((size, D), dtype=float)
             ticks = [0] * size
             self.param_rings[label] = ParamRing(buf, ticks)
+            logger.debug(
+                "RingHarness: created param ring label=%s size=%d D=%d",
+                label,
+                size,
+                D,
+            )
         return self.param_rings[label]
 
     def push_node(
@@ -390,7 +410,14 @@ class RingHarness:
                         if label not in self.param_labels:
                             self.param_labels.append(label)
 
+        prev_tick = self.tick
         self.tick += 1
+        logger.debug(
+            "RingHarness: snapshot_learnables advanced tick %d -> %d labels=%d",
+            prev_tick,
+            self.tick,
+            len(self.param_labels),
+        )
 
     def get_params_for_lineages(
         self, lineage_ids: Iterable[int], ledger: LineageLedger

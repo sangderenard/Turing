@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .whiteboard_cache import WhiteboardCache, CacheEntry
@@ -8,6 +9,8 @@ from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
 from ..abstraction import AbstractTensor
 from .job_batcher import JobBatcher
+
+logger = logging.getLogger(__name__)
 
 @contextmanager
 def _tape():
@@ -290,6 +293,7 @@ def run_batched_vjp(
             param_tensor = op_args[2]
 
     if not jobs:
+        logger.debug("run_batched_vjp: empty jobs; returning empty result")
         return BatchVJPResult(
             slices=BatchSlices(index_of={}, job_ids=()),
             ys=(),
@@ -312,6 +316,14 @@ def run_batched_vjp(
                 union_ids.append(sid)
     pos_of = {sid: i for i, sid in enumerate(union_ids)}
     slices_for_job: List[List[int]] = [[pos_of[int(s)] for s in j.src_ids] for j in jobs]
+
+    logger.debug(
+        "run_batched_vjp: op=%s jobs=%d union_ids=%d slices_first=%s",
+        op_name,
+        len(jobs),
+        len(union_ids),
+        slices_for_job[0] if slices_for_job else (),
+    )
 
     param_len_map: Dict[int, int] = {}
     for j in jobs:
@@ -388,15 +400,33 @@ def run_batched_vjp(
                 return op(*vec_args, **vec_kwargs)
 
             ys = JobBatcher.run_vectorized(jb_jobs, {"fn": _fn, "vectorized_fn": _vec_fn})
+            logger.debug(
+                "run_batched_vjp: vectorized op=%s outputs=%d y0_shape=%s",
+                op_name,
+                len(ys),
+                tuple(getattr(ys[0], "shape", ())) if ys else (),
+            )
         else:
             ys = []
             for x_j in x_list:
                 op = getattr(x_j, op_name)
                 y_j = op(*op_args, **op_kwargs) if callable(op) else op
                 ys.append(y_j)
+            logger.debug(
+                "run_batched_vjp: scalar loop op=%s outputs=%d y0_shape=%s",
+                op_name,
+                len(ys),
+                tuple(getattr(ys[0], "shape", ())) if ys else (),
+            )
 
         # Convert residuals to backend-friendly tensors
         residuals = [_residual_like(y_j, j.residual, backend) for y_j, j in zip(ys, jobs)]
+        any_res = any(r is not None for r in residuals)
+        logger.debug(
+            "run_batched_vjp: residuals provided=%s first_residual_type=%s",
+            any_res,
+            type(residuals[0]).__name__ if residuals and residuals[0] is not None else None,
+        )
 
         # L = sum_j <residual_j, y_j>
         L = None
@@ -421,11 +451,17 @@ def run_batched_vjp(
                     g_param = param_tensor * 0
             else:
                 g_param = None
+            logger.debug("run_batched_vjp: no residuals → zero grads")
         else:
             targets = (x_all, param_tensor) if param_tensor is not None else (x_all,)
             grads = autograd.grad(L, targets, retain_graph=False, allow_unused=True)
             g_all = grads[0]
             g_param = grads[1] if param_tensor is not None else None
+            logger.debug(
+                "run_batched_vjp: computed grads g_all_shape=%s g_param_shape=%s",
+                tuple(getattr(g_all, "shape", ())) if g_all is not None else None,
+                tuple(getattr(g_param, "shape", ())) if g_param is not None else None,
+            )
 
     g_stack = g_all
     if g_stack is None:
@@ -458,6 +494,11 @@ def run_batched_vjp(
         for g, idxs in zip(grads_full, slices_for_job)
     )
 
+    logger.debug(
+        "run_batched_vjp: done grads_full=%d per_source=%d",
+        len(grads_full),
+        len(grads_per_source),
+    )
     return BatchVJPResult(
         slices=BatchSlices(index_of=idx_of, job_ids=inv_ids),
         ys=tuple(ys),
