@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 from .whiteboard_cache import WhiteboardCache, CacheEntry
 
 from ..autograd import autograd, GradTape
@@ -115,10 +115,11 @@ def register_batchable_op(name: str, meta: OpBatchMeta) -> None:
 @dataclass(frozen=True)
 class _WBJob:
     job_id: str
-    op: str
+    op: str | None
     src_ids: Tuple[int, ...]
     residual: Optional[float]
     param_lens: Tuple[int, ...] = ()
+    fn: Callable[[Any], Any] | None = None
 
 def _residual_like(y: Any, residual: Optional[Any], backend: Any | None) -> Optional[Any]:
     """Ensure residual is backend-typed/broadcastable to y."""
@@ -281,7 +282,8 @@ def run_batched_vjp(
     back to each job's original node ordering.
     """
     op_kwargs = op_kwargs or {}
-    op_name = jobs[0].op if jobs else ""
+    fn_jobs = bool(jobs) and callable(getattr(jobs[0], "fn", None))
+    op_name = jobs[0].op if (jobs and not fn_jobs) else ""
 
     param_tensor = op_kwargs.get("param_tensor")
     if param_tensor is None and op_name == "gather_and":
@@ -351,7 +353,14 @@ def run_batched_vjp(
         # Slice per-job tensors referencing the union view
         x_list = [x_all[idxs] for idxs in slices_for_job]
 
-        if op_name in BATCHABLE_OPS:
+        if fn_jobs:
+            ys = [j.fn(x) if callable(j.fn) else x for j, x in zip(jobs, x_list)]
+            logger.debug(
+                "run_batched_vjp: callable jobs=%d y0_shape=%s",
+                len(ys),
+                tuple(getattr(ys[0], "shape", ())) if ys else (),
+            )
+        elif op_name in BATCHABLE_OPS:
             meta = BATCHABLE_OPS[op_name]
 
             # Offset dimension parameters for stacked call

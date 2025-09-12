@@ -255,7 +255,8 @@ class RoutingState:
     harness: RingHarness
     wheels: list[ParamWheel]
     log_buf: TensorRingBuffer
-    mix_buf: RingBuffer
+    out_buf: RingBuffer
+    tgt_buf: RingBuffer
     hist_buf: RingBuffer
     bp_queue: SlotBackpropQueue
 
@@ -314,8 +315,8 @@ def pump_with_loss(
     )
 
     out_feat = state[out_start : out_start + B].clone()
-    mix_residual = out_feat - target_out
-    ctx.mix_buf.push(mix_residual)
+    ctx.out_buf.push(out_feat)
+    ctx.tgt_buf.push(target_out.clone())
     hist_residual_summary = None
 
     mids = list(range(band_start, band_start + B))
@@ -328,16 +329,58 @@ def pump_with_loss(
         ctx.hist_buf.push(hist_residual_summary)
     fft_tick = tick - (spectral_cfg.win_len - 1)
     if fft_tick >= 0:
+        idx = (ctx.out_buf.idx - spectral_cfg.win_len) % spectral_cfg.win_len
+        delayed_out = ctx.out_buf.buf[idx]
+        delayed_tgt = ctx.tgt_buf.buf[idx]
+        main_residual = delayed_out - delayed_tgt
         ctx.bp_queue.add_residual(
             tick=fft_tick,
-            main=mix_residual.mean(),
+            main=main_residual.mean(),
             spectral=hist_residual_summary.mean() if hist_residual_summary is not None else None,
         )
-        for i in range(len(ctx.wheels)):
-            job_m = _WBJob(job_id=f"p{i}:m", op="__neg__", src_ids=(i,), residual=None)
-            ctx.bp_queue.queue_job(None, job_m, tick=fft_tick, kind="main")
-            job_s = _WBJob(job_id=f"p{i}:s", op="__neg__", src_ids=(i,), residual=None)
-            ctx.bp_queue.queue_job(None, job_s, tick=fft_tick, kind="spectral")
+        src_ids = tuple(range(len(ctx.wheels)))
+
+        def _route_fn(_p: AT.Tensor) -> AT.Tensor:
+            psi_tmp, _ = fs_dec.pump_tick(
+                state.clone(),
+                ctx.spec,
+                eta=0.1,
+                phi=AT.tanh,
+                norm="all",
+                harness=ctx.harness,
+                wheels=ctx.wheels,
+                tick=fft_tick,
+                update_fn=lambda p, g: p,
+            )
+            out_tmp = psi_tmp[out_start : out_start + B]
+            return out_tmp.mean()
+
+        job_route = _WBJob(
+            job_id=f"route:{fft_tick}",
+            op=None,
+            src_ids=src_ids,
+            residual=None,
+            fn=_route_fn,
+        )
+        ctx.bp_queue.queue_job(None, job_route, tick=fft_tick, kind="main")
+
+        def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
+            mids_local = list(range(band_start, band_start + B))
+            W_loc, kept_loc = gather_recent_windows(mids_local, spectral_cfg, ctx.harness)
+            if len(kept_loc) == len(mids_local):
+                bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
+                targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
+                return (bp_loc - targ_mat).mean()
+            return AT.tensor(0.0)
+
+        job_fft = _WBJob(
+            job_id=f"fft:{fft_tick}",
+            op=None,
+            src_ids=src_ids,
+            residual=None,
+            fn=_fft_fn,
+        )
+        ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
 
     return state
 
@@ -388,7 +431,8 @@ def train_routing(
         spectral_cfg.win_len,
     )
 
-    mix_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
+    out_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
+    tgt_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     hist_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     bp_queue = SlotBackpropQueue(wheels)
     if bp_queue.slots != spectral_cfg.win_len:
@@ -401,7 +445,8 @@ def train_routing(
         harness=harness,
         wheels=wheels,
         log_buf=log_buf,
-        mix_buf=mix_buf,
+        out_buf=out_buf,
+        tgt_buf=tgt_buf,
         hist_buf=hist_buf,
         bp_queue=bp_queue,
     )
