@@ -12,6 +12,7 @@ from src.common.tensors.autoautograd.fluxspring import (
     EdgeTransportLearn,
     DECSpec,
     register_param_wheels,
+    SpectralCfg,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_harness import (
     LineageLedger,
@@ -132,4 +133,37 @@ def test_param_version_ring_respects_stage_depth():
     vals = AT.get_tensor(mat)[:, idx]
     assert float(vals[0]) == pytest.approx(1.0)
     assert float(vals[1]) == pytest.approx(2.0)
+
+
+def test_param_wheels_sized_to_spectral_window():
+    param = AT.tensor(1.0)
+    param.requires_grad_(True)
+
+    node = NodeSpec(
+        id=0,
+        p0=AT.get_tensor([0.0]),
+        v0=AT.get_tensor([0.0]),
+        mass=AT.tensor(1.0),
+        ctrl=NodeCtrl(w=param, learn=LearnCtrl(alpha=False, w=True, b=False)),
+        scripted_axes=[0],
+    )
+    edge = EdgeSpec(
+        src=0,
+        dst=0,
+        transport=EdgeTransport(learn=EdgeTransportLearn(False, False, False, False, False)),
+        ctrl=EdgeCtrl(learn=LearnCtrl(False, False, False)),
+    )
+    spec = FluxSpringSpec(
+        version="t",
+        D=1,
+        nodes=[node],
+        edges=[edge],
+        faces=[],
+        dec=DECSpec(D0=[[0.0]], D1=[]),
+        spectral=SpectralCfg(enabled=True, win_len=7),
+    )
+
+    wheels = register_param_wheels(spec)
+    assert wheels
+    assert all(len(w.versions()) == spec.spectral.win_len for w in wheels)
 

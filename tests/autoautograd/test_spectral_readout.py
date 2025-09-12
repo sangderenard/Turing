@@ -5,12 +5,17 @@ from src.common.tensors.autoautograd.fluxspring.spectral_readout import (
     compute_metrics,
     batched_bandpower_from_windows,
     quantile_band_targets,
+    gather_recent_windows,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     SpectralCfg,
     SpectralMetrics,
 )
-from src.common.tensors.autoautograd.fluxspring.fs_harness import RingHarness
+from src.common.tensors.autoautograd.fluxspring.fs_harness import (
+    RingHarness,
+    LineageLedger,
+)
+import numpy as np
 
 def _sine(freq: float, N: int, tick_hz: float) -> AT:
     t = AT.arange(N, dtype=float) / tick_hz
@@ -118,3 +123,28 @@ def test_quantile_band_targets_even_split():
     for nid, f in zip(range(3), freqs):
         lo, hi = targets[nid]
         assert lo <= f <= hi + 1e-6
+
+
+def test_gather_recent_windows_by_lineage():
+    tick_hz = 50.0
+    N = 4
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=tick_hz,
+        win_len=N,
+        hop_len=N,
+        window="rect",
+    )
+    harness = RingHarness(default_size=N)
+    ledger = LineageLedger()
+    ledger.record(0, 0)
+    for i in range(N):
+        harness.push_premix(0, AT.tensor(float(i)), lineage=(0,))
+        harness.push_premix(1, AT.tensor(float(i + 10)), lineage=(0,))
+    win_map, kept = gather_recent_windows([0, 1], cfg, harness, ledger)
+    assert set(win_map.keys()) == {0}
+    assert kept[0] == [0, 1]
+    W = AT.get_tensor(win_map[0])
+    expected = np.array([[0.0, 1.0, 2.0, 3.0], [10.0, 11.0, 12.0, 13.0]])
+    assert W.shape == expected.shape
+    assert np.allclose(W, expected)

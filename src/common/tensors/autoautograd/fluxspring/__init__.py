@@ -1,7 +1,7 @@
 from .fs_types import (
     LearnCtrl, NodeCtrl, EdgeTransportLearn, EdgeTransport, EdgeCtrl,
     NodeSpec, EdgeSpec, FaceLearn, FaceSpec,
-    DirichletCfg, DECSpec, RegCfg, FluxSpringSpec
+    DirichletCfg, DECSpec, RegCfg, FluxSpringSpec, SpectralCfg
 )
 from .fs_io import load_fluxspring, save_fluxspring, validate_fluxspring
 from .fs_dec import (
@@ -208,8 +208,19 @@ class ParamWheel:
             p._grad = None
 
 
-def register_param_wheels(spec: FluxSpringSpec, *, slots: int = 2) -> list[ParamWheel]:
-    """Instantiate :class:`ParamWheel` objects for all learnable parameters."""
+def register_param_wheels(
+    spec: FluxSpringSpec, *, slots: int | None = None
+) -> list[ParamWheel]:
+    """Instantiate :class:`ParamWheel` objects for all learnable parameters.
+
+    When ``spec.spectral.enabled`` is ``True`` and ``slots`` is not provided,
+    the number of slots defaults to the FFT window length so that every
+    parameter wheel maintains a full window of versions.  Otherwise two slots
+    are used as a minimal ring.
+    """
+
+    if slots is None:
+        slots = spec.spectral.win_len if spec.spectral.enabled else 2
 
     wheels: list[ParamWheel] = []
     tmp: list[AT] = []
