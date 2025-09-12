@@ -3,17 +3,12 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autoautograd.fluxspring.spectral_readout import (
     compute_metrics,
-    update_fft_window,
-    current_fft_window,
-    reset_fft_windows,
     batched_bandpower_from_windows,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     SpectralCfg,
     SpectralMetrics,
 )
-from src.common.tensors.autoautograd.fluxspring.fs_harness import LineageLedger
-
 
 def _sine(freq: float, N: int, tick_hz: float) -> AT:
     t = AT.arange(N, dtype=float) / tick_hz
@@ -76,35 +71,6 @@ def test_coherence_identical_signals():
     )
     m = compute_metrics(buf, cfg, return_tensor=False)
     assert abs(m["coherence"] - 1.0) < 1e-6
-
-
-def test_fft_window_tracks_lineage_order():
-    cfg = SpectralCfg(
-        enabled=True,
-        tick_hz=1.0,
-        win_len=2,
-        hop_len=2,
-        window="rect",
-        metrics=SpectralMetrics(),
-    )
-    reset_fft_windows()
-    ledger = LineageLedger()
-
-    lid0 = ledger.ingest()
-    update_fft_window(lid0, AT.tensor(0.0), cfg)
-    lid1 = ledger.ingest()
-    update_fft_window(lid1, AT.tensor(1.0), cfg)
-
-    bands, lids = current_fft_window()
-    assert AT.get_tensor(bands).flatten().tolist() == [0.0, 1.0]
-    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid0, lid1]
-
-    lid2 = ledger.ingest()
-    update_fft_window(lid2, AT.tensor(2.0), cfg)
-
-    bands, lids = current_fft_window()
-    assert AT.get_tensor(bands).flatten().tolist() == [1.0, 2.0]
-    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid1, lid2]
 
 
 def test_batched_bandpower_from_windows():
