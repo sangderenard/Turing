@@ -530,10 +530,25 @@ def pump_with_loss(
         int(state.shape[0]),
     )
     out_feat = state[out_start : out_start + B].clone()
-    ctx.harness.push_node(OUT_FEAT_ID, out_feat, lineage=(lid,), size=1)
-    ctx.harness.push_node(OUT_TARG_ID, target_out.clone(), lineage=(lid,), size=1)
+    ctx.harness.push_node(
+        OUT_FEAT_ID,
+        out_feat,
+        lineage=(lid,),
+        size=spectral_cfg.win_len,
+    )
+    ctx.harness.push_node(
+        OUT_TARG_ID,
+        target_out.clone(),
+        lineage=(lid,),
+        size=spectral_cfg.win_len,
+    )
     out_ids = AT.arange(out_start, out_start + B, dtype=float)
-    ctx.harness.push_node(OUT_IDS_ID, out_ids, lineage=(lid,), size=1)
+    ctx.harness.push_node(
+        OUT_IDS_ID,
+        out_ids,
+        lineage=(lid,),
+        size=spectral_cfg.win_len,
+    )
     logger.debug(
         "pump_with_loss: pushed OUT_* rings lid=%d out_ids=[%d..%d)",
         lid,
@@ -544,7 +559,7 @@ def pump_with_loss(
 
     mids = list(range(band_start, band_start + B))
     win_map, kept_map = gather_recent_windows(
-        ctx.spec, mids, spectral_cfg, ctx.harness, ctx.ledger
+        mids, spectral_cfg, ctx.harness, ctx.ledger
     )
     logger.debug(
         "pump_with_loss: gather_recent_windows mids=%d returned lineages=%d",
@@ -573,19 +588,19 @@ def pump_with_loss(
             HIST_FEAT_ID,
             feat_mat.flatten(),
             lineage=(lin,),
-            size=1,
+            size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_TARG_ID,
             targ_mat.flatten(),
             lineage=(lin,),
-            size=1,
+            size=spectral_cfg.win_len,
         )
         ctx.harness.push_node(
             HIST_IDS_ID,
             AT.tensor(kept_map[lin], dtype=float),
             lineage=(lin,),
-            size=1,
+            size=spectral_cfg.win_len,
         )
         logger.debug(
             "pump_with_loss: lineage %d pushed HIST_* (rows=%d B=%d)",
@@ -616,28 +631,36 @@ def train_routing(
     lineages grows beyond this threshold, the oldest entries are purged along
     with any cached ring data to avoid unbounded memory use.
     """
-    wheels = register_param_wheels(spec, slots=spectral_cfg.win_len)
+    wheels = register_param_wheels(spec)
     for w in wheels:
         w.rotate(); w.bind_slot()
     set_strict_mode(True)
     annotate_params([v for w in wheels for v in w.versions()])
+    logger.debug(
+        "train_routing: parameter wheels sized to %d slots", len(wheels[0].versions()) if wheels else 0
+    )
 
     psi, hist_targets, band_start, B = initialize_signal_state(spec, spectral_cfg)
     routed: list[AT.Tensor] = []
     out_start = 5 * B
     layers = max(1, len(spec.nodes) // B)
-    ring_capacity = log_capacity or max(1, layers - 1)
+    ring_capacity = (
+        spectral_cfg.win_len
+        if spectral_cfg.enabled
+        else (log_capacity or max(1, layers - 1))
+    )
     log_buf = TensorRingBuffer(ring_capacity, flush_hook)
     harness = RingHarness(
         default_size=spectral_cfg.win_len if spectral_cfg.enabled else None
     )
     ledger = LineageLedger()
     logger.debug(
-        "train_routing: start B=%d layers=%d out_start=%d ring_capacity=%d",
+        "train_routing: start B=%d layers=%d out_start=%d ring_capacity=%d win_len=%d",
         B,
         layers,
         out_start,
         ring_capacity,
+        spectral_cfg.win_len,
     )
 
     ctx = RoutingState(
@@ -677,7 +700,7 @@ def train_routing(
             purge_lineage_backlog(ctx, max_lineage_backlog)
 
         win_map, kept_map = gather_recent_windows(
-            spec, list(range(B)), spectral_cfg, harness, ledger
+            list(range(B)), spectral_cfg, harness, ledger
         )
         if win_map:
             logger.debug(
