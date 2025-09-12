@@ -300,11 +300,6 @@ def pump_with_loss(
     tick: int,
 ) -> AT.Tensor:
     """Advance the system by one tick and queue residuals and jobs."""
-    for i in range(len(ctx.wheels)):
-        job_m = _WBJob(job_id=f"p{i}:m", op="__neg__", src_ids=(i,), residual=None)
-        ctx.bp_queue.queue_job(None, job_m, tick=tick, kind="main")
-        job_s = _WBJob(job_id=f"p{i}:s", op="__neg__", src_ids=(i,), residual=None)
-        ctx.bp_queue.queue_job(None, job_s, tick=tick, kind="spectral")
 
     state, _ = fs_dec.pump_tick(
         state,
@@ -321,7 +316,7 @@ def pump_with_loss(
     out_feat = state[out_start : out_start + B].clone()
     mix_residual = out_feat - target_out
     ctx.mix_buf.push(mix_residual)
-    ctx.bp_queue.add_residual(tick=tick, main=mix_residual.mean())
+    hist_residual_summary = None
 
     mids = list(range(band_start, band_start + B))
     W, kept = gather_recent_windows(mids, spectral_cfg, ctx.harness)
@@ -331,8 +326,18 @@ def pump_with_loss(
         hist_residual = bp - targ_mat
         hist_residual_summary = hist_residual.mean(0)
         ctx.hist_buf.push(hist_residual_summary)
-        fft_tick = tick - (spectral_cfg.win_len - 1)
-        ctx.bp_queue.add_residual(tick=fft_tick, spectral=hist_residual_summary.mean())
+    fft_tick = tick - (spectral_cfg.win_len - 1)
+    if fft_tick >= 0:
+        ctx.bp_queue.add_residual(
+            tick=fft_tick,
+            main=mix_residual.mean(),
+            spectral=hist_residual_summary.mean() if hist_residual_summary is not None else None,
+        )
+        for i in range(len(ctx.wheels)):
+            job_m = _WBJob(job_id=f"p{i}:m", op="__neg__", src_ids=(i,), residual=None)
+            ctx.bp_queue.queue_job(None, job_m, tick=fft_tick, kind="main")
+            job_s = _WBJob(job_id=f"p{i}:s", op="__neg__", src_ids=(i,), residual=None)
+            ctx.bp_queue.queue_job(None, job_s, tick=fft_tick, kind="spectral")
 
     return state
 
@@ -419,12 +424,13 @@ def train_routing(
                 B,
                 tick,
             )
-            if tick >= spectral_cfg.win_len - 1:
-                slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
+            mature_tick = tick - (spectral_cfg.win_len - 1)
+            if mature_tick >= 0:
+                mature_slot = mature_tick % ctx.bp_queue.slots
                 sys = SimpleNamespace(
-                    nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
+                    nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
                 )
-                ctx.bp_queue.process_slot(slot, sys=sys)
+                ctx.bp_queue.process_slot(mature_slot, sys=sys)
             tick += 1
 
         W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
@@ -448,23 +454,26 @@ def train_routing(
             B,
             tick,
         )
-        if tick >= spectral_cfg.win_len - 1:
-            slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
+        mature_tick = tick - (spectral_cfg.win_len - 1)
+        if mature_tick >= 0:
+            mature_slot = mature_tick % ctx.bp_queue.slots
             sys = SimpleNamespace(
-                nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
+                nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            ctx.bp_queue.process_slot(slot, sys=sys)
+            ctx.bp_queue.process_slot(mature_slot, sys=sys)
         tick += 1
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
         logger.debug("train_routing: appended routed output for frame %d", frame_idx + 1)
 
     for _ in range(spectral_cfg.win_len - 1):
-        slot = (tick - (spectral_cfg.win_len - 1)) % ctx.bp_queue.slots
-        sys = SimpleNamespace(
-            nodes={i: SimpleNamespace(sphere=w.params[slot]) for i, w in enumerate(ctx.wheels)}
-        )
-        ctx.bp_queue.process_slot(slot, sys=sys)
+        mature_tick = tick - (spectral_cfg.win_len - 1)
+        if mature_tick >= 0:
+            mature_slot = mature_tick % ctx.bp_queue.slots
+            sys = SimpleNamespace(
+                nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
+            )
+            ctx.bp_queue.process_slot(mature_slot, sys=sys)
         tick += 1
 
     log_param_gradients([p for w in ctx.wheels for p in w.versions()])
