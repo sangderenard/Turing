@@ -41,7 +41,7 @@ from types import SimpleNamespace
 import logging
 import numpy as np
 from typing import Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Module logger setup (configured in main if not already configured)
@@ -269,6 +269,7 @@ class RoutingState:
     hist_buf: dict[int, AT.Tensor]
     previous_grads: list[AT.Tensor] | None = None
     patience: int = 10
+    lineage_slots: dict[int, list[list[int]]] = field(default_factory=dict)
 
 
 def initialize_signal_state(
@@ -384,9 +385,11 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     hist_loss = (hist_residual ** 2).mean()
     loss_out = (mix_residual ** 2).mean()
     losses = {"loss_out": loss_out, "hist_loss": hist_loss}
-    params = [
-        w.versions()[(w.idx - 1) % len(w.versions())] for w in ctx.wheels
-    ]
+    slot_map = ctx.lineage_slots.get(lin)
+    if slot_map is None:
+        logger.debug("try_backward(lin=%d): missing slot map — skipping", lin)
+        return
+    params = [w.value_from_slots(slots) for w, slots in zip(ctx.wheels, slot_map)]
     probe_losses(losses, params)
     logger.debug(
         "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
@@ -491,6 +494,7 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         k = ctx.harness._key(idx, line)
         ctx.harness.edge_rings.pop(k, None)
     ctx.ledger.purge_through_lid(lin)
+    ctx.lineage_slots.pop(lin, None)
     logger.debug("try_backward(lin=%d): purged lineage from ledger", lin)
 
 
@@ -507,6 +511,8 @@ def pump_with_loss(
     """Advance the system by one tick and stage data for gradients."""
     lid = ctx.ledger.ingest()
     logger.debug("pump_with_loss: ingest lid=%d", lid)
+    tick = ctx.ledger.tick_of_lid[lid]
+    ctx.lineage_slots[lid] = [w.slots_for_tick(tick) for w in ctx.wheels]
     state, _ = fs_dec.pump_tick(
         state,
         ctx.spec,
@@ -516,7 +522,7 @@ def pump_with_loss(
         harness=ctx.harness,
         lineage_id=lid,
         wheels=ctx.wheels,
-        tick=ctx.ledger.tick_of_lid[lid],
+        tick=tick,
         update_fn=lambda p, g: p - 0.01 * g,
     )
     logger.debug(
