@@ -167,6 +167,35 @@ class ParamWheel:
         return used
 
     # ------------------------------------------------------------------
+    def slots_for_tick(self, tick: int) -> list[int]:
+        """Return per-row slot indices for ``tick`` without binding."""
+
+        versions = self._versions
+        W = len(versions)
+        base = versions[0]
+        shape = getattr(base, "shape", ())
+        rows = int(shape[0]) if len(shape) > 0 else 1
+
+        return [(tick - r) % W for r in range(rows)]
+
+    # ------------------------------------------------------------------
+    def value_from_slots(self, slots: Sequence[int]) -> AT:
+        """Assemble a parameter tensor from row-wise ``slots``."""
+
+        versions = self._versions
+        base = versions[0]
+        shape = getattr(base, "shape", ())
+        rows = int(shape[0]) if len(shape) > 0 else 1
+
+        if rows == 1:
+            return versions[slots[0]]
+
+        rows_out = []
+        for r, s in enumerate(slots):
+            rows_out.append(versions[s][r])
+        return AT.stack(rows_out, dim=0)
+
+    # ------------------------------------------------------------------
     def stash_grads(self, slots: set[int]) -> None:
         """Accumulate gradients from ``slots`` into the wheel buffers."""
 
