@@ -435,7 +435,9 @@ def train_routing(
                 sys = SimpleNamespace(
                     nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
                 )
-                ctx.bp_queue.process_slot(mature_slot, sys=sys)
+                res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+                if res is not None:
+                    ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
             tick += 1
 
         W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
@@ -465,7 +467,9 @@ def train_routing(
             sys = SimpleNamespace(
                 nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            if res is not None:
+                ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
         out = [psi[out_start + i] for i in range(B)]
         routed.append(AT.stack(out))
@@ -478,7 +482,9 @@ def train_routing(
             sys = SimpleNamespace(
                 nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            if res is not None:
+                ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
 
     log_param_gradients([p for w in ctx.wheels for p in w.versions()])
