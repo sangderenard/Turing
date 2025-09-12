@@ -359,6 +359,9 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
             rb_hist_ids is not None,
         )
         return
+    if any(rb.idx < rb.buf.shape[0] for rb in (rb_out_feat, rb_out_targ, rb_out_ids)):
+        logger.debug("try_backward(lin=%d): output rings incomplete — skipping", lin)
+        return
     out_feat = rb_out_feat.buf[0]
     out_targ = rb_out_targ.buf[0]
     hist_ids = rb_hist_ids.buf[0]
@@ -555,7 +558,7 @@ def pump_with_loss(
         out_start,
         out_start + B,
     )
-    pending = [lid]
+    pending: list[int] = []
 
     mids = list(range(band_start, band_start + B))
     win_map, kept_map = gather_recent_windows(
@@ -728,8 +731,6 @@ def train_routing(
         routed.append(AT.stack(out))
         logger.debug("train_routing: appended routed output for frame %d", frame_idx + 1)
 
-    for lid in list(ledger.tick_of_lid.keys()):
-        try_backward(ctx, lid)
     purge_lineage_backlog(ctx, max_lineage_backlog)
 
     log_param_gradients([p for w in ctx.wheels for p in w.versions()])
