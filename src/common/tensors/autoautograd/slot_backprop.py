@@ -4,16 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 
 from ..abstraction import AbstractTensor as AT
-from .whiteboard_runtime import run_batched_vjp, BatchVJPResult
+from .whiteboard_runtime import run_batched_vjp, BatchVJPResult, _WBJob
 from .fluxspring import ParamWheel
-
-
-@dataclass
-class _QueuedJob:
-    """Internal helper bundling a job with its residual kind."""
-
-    job: Any
-    kind: str = "main"  # either "main" or "spectral"
 
 
 @dataclass
@@ -30,7 +22,8 @@ class SlotBackpropQueue:
     wheels: Sequence[ParamWheel]
     main_residuals: Dict[int, AT | None] = field(init=False)
     spectral_residuals: Dict[int, AT | None] = field(init=False)
-    jobs: Dict[int, List[_QueuedJob]] = field(init=False)
+    jobs: Dict[int, List[_WBJob]] = field(init=False)
+    spectral_jobs: Dict[int, List[_WBJob]] = field(init=False)
     slots: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -38,6 +31,7 @@ class SlotBackpropQueue:
         self.main_residuals = {i: None for i in range(self.slots)}
         self.spectral_residuals = {i: None for i in range(self.slots)}
         self.jobs = {i: [] for i in range(self.slots)}
+        self.spectral_jobs = {i: [] for i in range(self.slots)}
 
     # ------------------------------------------------------------------
     def _slot_for(self, *, tick: int, row_idx: int) -> int:
@@ -88,33 +82,39 @@ class SlotBackpropQueue:
     def queue_job(
         self,
         slot: int | None,
-        job: Any,
+        job: _WBJob,
         *,
         tick: int | None = None,
         row_idx: int = 0,
         kind: str = "main",
     ) -> None:
-        """Queue a JVP/VJP job for a computed slot.
+        """Queue a VJP job for a computed slot.
 
         Parameters
         ----------
         slot:
-            Explicit slot index.  If ``None``, the index is derived from
+            Explicit slot index. If ``None``, the index is derived from
             ``tick`` and ``row_idx``.
         job:
-            Any object understood by :func:`run_batched_vjp`.
+            :class:`_WBJob` instance to run via :func:`run_batched_vjp`.
         kind:
             Which residual buffer to apply when the slot is processed.
             ``"main"`` (default) uses :attr:`main_residuals`; ``"spectral"``
             uses :attr:`spectral_residuals`.
         """
 
+        if not isinstance(job, _WBJob):
+            raise TypeError("queue_job expects a _WBJob instance")
+
         if slot is None:
             if tick is None:
                 raise ValueError("queue_job requires either slot or tick")
             slot = self._slot_for(tick=tick, row_idx=row_idx)
 
-        self.jobs.setdefault(slot, []).append(_QueuedJob(job, kind))
+        if kind == "spectral":
+            self.spectral_jobs.setdefault(slot, []).append(job)
+        else:
+            self.jobs.setdefault(slot, []).append(job)
 
     # ------------------------------------------------------------------
     def process_slot(
@@ -140,21 +140,20 @@ class SlotBackpropQueue:
             gradients.  Primarily for dependency injection in tests.
         """
 
-        qjobs = self.jobs.get(slot, [])
-        if not qjobs:
+        main_jobs = self.jobs.get(slot, [])
+        spec_jobs = self.spectral_jobs.get(slot, [])
+        if not main_jobs and not spec_jobs:
             self.main_residuals[slot] = None
             self.spectral_residuals[slot] = None
             return None
 
         main_res = self.main_residuals.get(slot)
         spec_res = self.spectral_residuals.get(slot)
-        jobs = []
-        for qj in qjobs:
-            if qj.kind == "spectral":
-                qj.job.residual = spec_res
-            else:
-                qj.job.residual = main_res
-            jobs.append(qj.job)
+        jobs: List[_WBJob] = []
+        for j in main_jobs:
+            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, main_res, j.param_lens, j.fn))
+        for j in spec_jobs:
+            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, spec_res, j.param_lens, j.fn))
 
         batch = run_vjp(sys=sys, jobs=jobs)
         g_tensor = batch.grads_per_source_tensor
@@ -169,6 +168,7 @@ class SlotBackpropQueue:
                 p._grad = AT.get_tensor(grad)  # type: ignore[attr-defined]
                 w.apply_slot(slot, lambda p_, g_=p._grad: p_ - lr * g_)
         self.jobs[slot] = []
+        self.spectral_jobs[slot] = []
         self.main_residuals[slot] = None
         self.spectral_residuals[slot] = None
         return batch

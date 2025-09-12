@@ -1,11 +1,13 @@
-import types
-
 import pytest
 
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autoautograd.fluxspring import ParamWheel
 from src.common.tensors.autoautograd.slot_backprop import SlotBackpropQueue
-from src.common.tensors.autoautograd.whiteboard_runtime import BatchSlices, BatchVJPResult
+from src.common.tensors.autoautograd.whiteboard_runtime import (
+    BatchSlices,
+    BatchVJPResult,
+    _WBJob,
+)
 
 
 def test_slot_backprop_queue_applies_gradients_per_slot():
@@ -27,7 +29,7 @@ def test_slot_backprop_queue_applies_gradients_per_slot():
 
     # Queue simple jobs for slot 0
     jobs = [
-        types.SimpleNamespace(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=None)
+        _WBJob(job_id=f"p{i}", op="__neg__", src_ids=(i,), residual=None)
         for i in range(2)
     ]
     mgr.queue_job(0, jobs[0])  # defaults to main residual
@@ -66,6 +68,7 @@ def test_slot_backprop_queue_applies_gradients_per_slot():
     assert mgr.main_residuals[0] is None
     assert mgr.spectral_residuals[0] is None
     assert mgr.jobs[0] == []
+    assert mgr.spectral_jobs[0] == []
 
 
 def test_slot_backprop_queue_slot_keying():
@@ -84,8 +87,8 @@ def test_slot_backprop_queue_slot_keying():
     main_res = AT.tensor(1.0)
     spec_res = AT.tensor(2.0)
 
-    job_main = types.SimpleNamespace(job_id="jm", op="__neg__", src_ids=(0,), residual=None)
-    job_spec = types.SimpleNamespace(job_id="js", op="__neg__", src_ids=(0,), residual=None)
+    job_main = _WBJob(job_id="jm", op="__neg__", src_ids=(0,), residual=None)
+    job_spec = _WBJob(job_id="js", op="__neg__", src_ids=(0,), residual=None)
 
     mgr.add_residual(None, tick=tick, row_idx=row_main, main=main_res)
     mgr.add_residual(None, tick=tick, row_idx=row_spec, spectral=spec_res)
@@ -97,5 +100,5 @@ def test_slot_backprop_queue_slot_keying():
 
     assert AT.get_tensor(mgr.main_residuals[slot_main]).item() == pytest.approx(1.0)
     assert AT.get_tensor(mgr.spectral_residuals[slot_spec]).item() == pytest.approx(2.0)
-    assert mgr.jobs[slot_main][0].job is job_main
-    assert mgr.jobs[slot_spec][0].job is job_spec
+    assert mgr.jobs[slot_main][0] is job_main
+    assert mgr.spectral_jobs[slot_spec][0] is job_spec
