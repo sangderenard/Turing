@@ -12,7 +12,7 @@ from src.common.tensors.autoautograd.fluxspring.fs_types import (
 )
 from src.common.tensors.autoautograd.fluxspring.fs_dec import pump_tick
 from src.common.tensors.autoautograd.fluxspring.fs_harness import RingHarness
-from src.common.tensors.autoautograd.fluxspring.spectral_readout import phi_histogram_loss
+from src.common.tensors.autoautograd.fluxspring.spectral_readout import premix_histogram_loss
 from src.common.tensors.abstraction import AbstractTensor as AT
 
 
@@ -26,7 +26,7 @@ def _build_spec():
     dec = DECSpec(D0=[[-1.0, 1.0]], D1=[])
     spectral = SpectralCfg(enabled=True, win_len=32, hop_len=32, window="hann")
     return FluxSpringSpec(
-        version="phi-test",
+        version="premix-test",
         D=3,
         nodes=[n0, n1],
         edges=[edge],
@@ -36,7 +36,7 @@ def _build_spec():
     )
 
 
-def test_phi_ring_updates_and_hist_loss():
+def test_premix_ring_updates_and_hist_loss():
     spec = _build_spec()
     psi = AT.zeros(len(spec.nodes), dtype=float)
     harness = RingHarness(default_size=32)
@@ -45,10 +45,10 @@ def test_phi_ring_updates_and_hist_loss():
     signal = (2 * AT.pi() * 8.0 * t).sin()
     for val in signal:
         psi, _ = pump_tick(psi, spec, eta=0.0, external={0: val}, harness=harness)
-    rb = harness.get_phi_ring(1)
+    rb = harness.get_premix_ring(1)
     assert rb is not None
-    loss_lo = phi_histogram_loss(rb, band_idx=0, total_bands=2, tick_hz=tick_hz)
-    loss_hi = phi_histogram_loss(rb, band_idx=1, total_bands=2, tick_hz=tick_hz)
+    loss_lo = premix_histogram_loss(rb, band_idx=0, total_bands=2, tick_hz=tick_hz)
+    loss_hi = premix_histogram_loss(rb, band_idx=1, total_bands=2, tick_hz=tick_hz)
     loss_lo_f = float(AT.get_tensor(loss_lo).item())
     loss_hi_f = float(AT.get_tensor(loss_hi).item())
     assert loss_lo_f < loss_hi_f

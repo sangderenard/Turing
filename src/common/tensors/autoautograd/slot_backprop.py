@@ -9,6 +9,14 @@ from .fluxspring import ParamWheel
 
 
 @dataclass
+class _QueuedJob:
+    """Internal helper bundling a job with its residual kind."""
+
+    job: Any
+    kind: str = "main"  # either "main" or "spectral"
+
+
+@dataclass
 class SlotBackpropQueue:
     """Track residuals and VJP jobs per parameter slot.
 
@@ -22,7 +30,7 @@ class SlotBackpropQueue:
     wheels: Sequence[ParamWheel]
     main_residuals: Dict[int, AT | None] = field(init=False)
     spectral_residuals: Dict[int, AT | None] = field(init=False)
-    jobs: Dict[int, List[Any]] = field(init=False)
+    jobs: Dict[int, List[_QueuedJob]] = field(init=False)
 
     def __post_init__(self) -> None:
         slots = len(self.wheels[0].params) if self.wheels else 0
@@ -48,10 +56,22 @@ class SlotBackpropQueue:
             self.spectral_residuals[slot] = t if prev is None else prev + t
 
     # ------------------------------------------------------------------
-    def queue_job(self, slot: int, job: Any) -> None:
-        """Queue a JVP/VJP job for ``slot``."""
+    def queue_job(self, slot: int, job: Any, *, kind: str = "main") -> None:
+        """Queue a JVP/VJP job for ``slot``.
 
-        self.jobs.setdefault(slot, []).append(job)
+        Parameters
+        ----------
+        slot:
+            Slot index that the ``job`` is associated with.
+        job:
+            Any object understood by :func:`run_batched_vjp`.
+        kind:
+            Which residual buffer to apply when the slot is processed.
+            ``"main"`` (default) uses :attr:`main_residuals`; ``"spectral"``
+            uses :attr:`spectral_residuals`.
+        """
+
+        self.jobs.setdefault(slot, []).append(_QueuedJob(job, kind))
 
     # ------------------------------------------------------------------
     def process_slot(
@@ -77,11 +97,21 @@ class SlotBackpropQueue:
             gradients.  Primarily for dependency injection in tests.
         """
 
-        jobs = self.jobs.get(slot, [])
-        if not jobs:
+        qjobs = self.jobs.get(slot, [])
+        if not qjobs:
             self.main_residuals[slot] = None
             self.spectral_residuals[slot] = None
             return None
+
+        main_res = self.main_residuals.get(slot)
+        spec_res = self.spectral_residuals.get(slot)
+        jobs = []
+        for qj in qjobs:
+            if qj.kind == "spectral":
+                qj.job.residual = spec_res
+            else:
+                qj.job.residual = main_res
+            jobs.append(qj.job)
 
         batch = run_vjp(sys=sys, jobs=jobs)
         g_tensor = batch.grads_per_source_tensor
