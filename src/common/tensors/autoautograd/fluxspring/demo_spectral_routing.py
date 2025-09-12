@@ -391,6 +391,11 @@ def train_routing(
     mix_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     hist_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     bp_queue = SlotBackpropQueue(wheels)
+    if bp_queue.slots != spectral_cfg.win_len:
+        raise ValueError(
+            "train_routing: bp_queue.slots %d does not match spectral_cfg.win_len %d"
+            % (bp_queue.slots, spectral_cfg.win_len)
+        )
     ctx = RoutingState(
         spec=spec,
         harness=harness,
