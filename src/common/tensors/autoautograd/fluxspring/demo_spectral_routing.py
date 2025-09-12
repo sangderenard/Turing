@@ -313,20 +313,8 @@ def purge_lineage_backlog(ctx: RoutingState, max_pending: int) -> None:
         len(stale),
         max_pending,
     )
-    for _ in stale:
-        for key_id in (
-            OUT_FEAT_ID,
-            OUT_TARG_ID,
-            OUT_IDS_ID,
-            HIST_FEAT_ID,
-            HIST_TARG_ID,
-            HIST_IDS_ID,
-        ):
-            ctx.harness.node_rings.pop(ctx.harness._key(key_id), None)
-        for n in ctx.spec.nodes:
-            ctx.harness.node_rings.pop(ctx.harness._key(n.id), None)
-        for idx in range(len(ctx.spec.edges)):
-            ctx.harness.edge_rings.pop(ctx.harness._key(idx), None)
+    for lin in stale:
+        ctx.slot_map.pop(lin, None)
     ctx.ledger.purge_through_lid(stale[-1])
 
 
@@ -525,23 +513,6 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
         int(float(tick_idx)),
         list(log_entry.keys()),
     )
-    for key_id in (
-        OUT_FEAT_ID,
-        OUT_TARG_ID,
-        OUT_IDS_ID,
-        HIST_FEAT_ID,
-        HIST_TARG_ID,
-        HIST_IDS_ID,
-    ):
-        k = ctx.harness._key(key_id)
-        ctx.harness.node_rings.pop(k, None)
-    logger.debug("try_backward(lin=%d): cleared transient node rings", lin)
-    for n in ctx.spec.nodes:
-        k = ctx.harness._key(n.id)
-        ctx.harness.node_rings.pop(k, None)
-    for idx in range(len(ctx.spec.edges)):
-        k = ctx.harness._key(idx)
-        ctx.harness.edge_rings.pop(k, None)
     ctx.ledger.purge_through_lid(lin)
     logger.debug("try_backward(lin=%d): purged lineage from ledger", lin)
 
