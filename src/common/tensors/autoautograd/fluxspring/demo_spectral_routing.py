@@ -237,21 +237,24 @@ def generate_signals(
     """Generate deterministic sine and noise signals for each band."""
 
     rng = np.random.default_rng(seed)
-    centers = [(lo + hi) / 2.0 for lo, hi in bands]
-    t = AT.arange(win, dtype=float) / tick_hz
-    sine_chunks = [(2 * AT.pi() * c * t).sin() for c in centers]
+    band_bounds = AT.tensor(bands, dtype=float)
+
+    t = AT.arange(win, dtype=float)[None, :] / tick_hz
+    centers = band_bounds.mean(dim=1, keepdim=True)
+    sine_matrix = (2 * AT.pi() * centers * t).sin()
+    sine_chunks = [sine_matrix[i] for i in range(len(bands))]
+
+    lo = band_bounds[:, 0:1]
+    hi = band_bounds[:, 1:2]
+    freq_grid = AT.linspace(lo, hi, steps=3)
+    phase = 2 * AT.pi() * freq_grid[..., None] * t
+    sinusoid_sum = phase.sin().sum(dim=1)
 
     noise_frames: list[list[AT.Tensor]] = []
     for _ in range(frames):
-        frame_chunks: list[AT.Tensor] = []
-        for lo, hi in bands:
-            freqs = AT.linspace(lo, hi, steps=3)
-            n = AT.zeros(win, dtype=float)
-            for f in freqs:
-                n += (2 * AT.pi() * f * t).sin()
-            noise = AT.tensor(rng.standard_normal(win))
-            frame_chunks.append(n + 0.1 * noise)
-        noise_frames.append(frame_chunks)
+        noise = AT.tensor(rng.standard_normal((len(bands), win)))
+        mix = sinusoid_sum + 0.1 * noise
+        noise_frames.append([mix[i] for i in range(len(bands))])
     return sine_chunks, noise_frames
 
 
