@@ -22,7 +22,7 @@ from .fs_dec import (
 # Spectral utilities
 from .spectral_readout import compute_metrics
 from .fs_harness import RingHarness
-from typing import Callable
+from typing import Callable, Sequence
 # Torch bridge is optional import to keep AT-only usage clean.
 
 from ...abstraction import AbstractTensor as AT
@@ -74,7 +74,12 @@ def _rebind_param(
 
 
 class ParamWheel:
-    """Manage multiple in-flight versions of a single parameter."""
+    """Manage multiple in-flight versions of a single parameter.
+
+    Each wheel stores ``W`` parameter versions alongside matching gradient
+    buffers.  Slots are rotated in a ring; gradients accumulate until the slot
+    is evicted, at which point an update function is applied.
+    """
 
     def __init__(
         self,
@@ -86,42 +91,109 @@ class ParamWheel:
     ):
         self.setter = setter
         self.label = label
-        self.params: list[AT] = [base]
+
+        self._versions: list[AT] = [base]
         for _ in range(slots - 1):
             t = base.detach().clone()
             t.requires_grad_(True)
-            self.params.append(t)
+            self._versions.append(t)
+
+        # Gradient ring buffers parallel to ``_versions``
+        self._grads: list[AT | None] = [None for _ in range(slots)]
+
         tape = _tape()
         if label is not None:
-            for p in self.params:
+            for p in self._versions:
                 tape.annotate(p, label=label)
-        self.idx = -1  # first rotate brings index to 0
 
+        # ``idx`` tracks the next slot to receive new data; the value returned
+        # from :meth:`rotate` is the slot to be evicted and updated.  Start at
+        # ``-1`` so that an initial ``rotate(); bind_slot()`` sequence activates
+        # slot ``0`` to remain compatible with legacy call patterns.
+        self.idx = -1
+
+    # ------------------------------------------------------------------
+    @property
+    def params(self) -> list[AT]:
+        """Alias for ``versions`` to preserve legacy callers."""
+        return self._versions
+
+    def versions(self) -> list[AT]:
+        return self._versions
+
+    def grads(self) -> list[AT | None]:
+        return self._grads
+
+    # ------------------------------------------------------------------
     def rotate(self) -> int:
         evicted = self.idx
-        self.idx = (self.idx + 1) % len(self.params)
+        self.idx = (self.idx + 1) % len(self._versions)
         return evicted
 
+    # ------------------------------------------------------------------
     def bind_slot(self) -> AT:
-        p = self.params[self.idx]
+        p = self._versions[self.idx]
         self.setter(p)
         return p
 
-    def versions(self) -> list[AT]:
-        return self.params
+    # ------------------------------------------------------------------
+    def bind_for_tick(self, tick: int) -> set[int]:
+        """Bind row-wise parameter versions based on ``tick``.
 
-    def grads(self) -> list[AT | None]:
-        return [getattr(p, "grad", None) for p in self.params]
+        Returns the set of slot indices touched during this binding so that
+        their gradients can later be stashed.
+        """
 
+        versions = self._versions
+        W = len(versions)
+        base = versions[0]
+        shape = getattr(base, "shape", ())
+        rows = int(shape[0]) if len(shape) > 0 else 1
+        used: set[int] = set()
+
+        if rows == 1:
+            slot = (tick - 0) % W
+            used.add(slot)
+            self.setter(versions[slot])
+            return used
+
+        rows_out = []
+        for r in range(rows):
+            slot = (tick - r) % W
+            used.add(slot)
+            rows_out.append(versions[slot][r])
+        stacked = AT.stack(rows_out, dim=0)
+        self.setter(stacked)
+        return used
+
+    # ------------------------------------------------------------------
+    def stash_grads(self, slots: set[int]) -> None:
+        """Accumulate gradients from ``slots`` into the wheel buffers."""
+
+        for s in slots:
+            p = self._versions[s]
+            g = getattr(p, "grad", None)
+            if g is None:
+                continue
+            g = AT.get_tensor(g)
+            prev = self._grads[s]
+            self._grads[s] = g if prev is None else prev + g
+            if hasattr(p, "_grad"):
+                p._grad = None
+
+    # ------------------------------------------------------------------
     def apply_slot(self, idx: int, update_fn: Callable[[AT, AT], AT]) -> None:
-        if idx < 0 or idx >= len(self.params):
+        if idx < 0 or idx >= len(self._versions):
             return
-        p = self.params[idx]
-        g = getattr(p, "grad", None)
+        p = self._versions[idx]
+        g = self._grads[idx]
+        if g is None:
+            g = getattr(p, "grad", None)
         if g is None:
             return
         new_p = update_fn(p, g)
         p.data = AT.get_tensor(new_p)
+        self._grads[idx] = None
         if hasattr(p, "_grad"):
             p._grad = None
 
@@ -180,6 +252,55 @@ def register_param_wheels(spec: FluxSpringSpec, *, slots: int = 2) -> list[Param
                 )
 
     return wheels
+
+
+def wheel_tick(
+    psi: AT,
+    spec: FluxSpringSpec,
+    *,
+    wheels: Sequence[ParamWheel],
+    tick: int,
+    update_fn: Callable[[AT, AT], AT] = lambda p, g: p,
+    **pump_kw,
+) -> tuple[AT, dict[str, AT]]:
+    """Run a single :func:`pump_tick` with parameters sourced from wheels.
+
+    Parameters
+    ----------
+    psi:
+        State vector passed directly to :func:`pump_tick`.
+    spec:
+        FluxSpring specification mutated in-place with the assembled parameters.
+    wheels:
+        Sequence of :class:`ParamWheel` objects controlling learnable tensors.
+    tick:
+        Global tick counter used when selecting slots for each row via
+        ``slot = (tick - row_idx) % W``.
+    update_fn:
+        Callable applied to the parameter in the evicted slot using the stored
+        gradient.  Defaults to a no-op.
+    **pump_kw:
+        Additional keyword arguments forwarded to :func:`pump_tick`.
+    """
+
+    # Bind rows to slot-specific leaves for this tick
+    used_per_wheel: list[set[int]] = []
+    for w in wheels:
+        used_per_wheel.append(w.bind_for_tick(tick))
+
+    # Single forward/backward pass
+    psi, stats = pump_tick(psi, spec, **pump_kw)
+
+    # Stash gradients from touched slots
+    for w, used in zip(wheels, used_per_wheel):
+        w.stash_grads(used)
+
+    # Rotate wheels and update only the evicted slot
+    for w in wheels:
+        ev = w.rotate()
+        w.apply_slot(ev, update_fn)
+
+    return psi, stats
 
 
 def register_learnable_params(spec: FluxSpringSpec) -> list[AT]:
