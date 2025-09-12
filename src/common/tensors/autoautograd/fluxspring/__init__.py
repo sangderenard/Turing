@@ -122,7 +122,8 @@ class ParamWheel:
             return
         new_p = update_fn(p, g)
         p.data = AT.get_tensor(new_p)
-        p.grad = None
+        if hasattr(p, "_grad"):
+            p._grad = None
 
 
 def register_param_wheels(spec: FluxSpringSpec, *, slots: int = 2) -> list[ParamWheel]:
