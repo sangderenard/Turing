@@ -142,35 +142,7 @@ class LineageLedger:
 
 @dataclass
 class RingBuffer:
-    """Simple differentiable ring buffer."""
-
-    buf: AT
-    idx: int = 0
-
-    def push(self, val: AT) -> AT:
-        i = self.idx % int(len(self.buf))
-        self.buf = AT.scatter_row(self.buf.clone(), i, val, dim=0)
-        self.idx = i + 1
-        return self.buf
-
-
-@dataclass
-class PremixRing:
-    """Ring buffer for raw pre-mix node values."""
-
-    buf: AT
-    idx: int = 0
-
-    def push(self, val: AT) -> AT:
-        i = self.idx % int(len(self.buf))
-        self.buf = AT.scatter_row(self.buf.clone(), i, val, dim=0)
-        self.idx = i + 1
-        return self.buf
-
-
-@dataclass
-class OutPhiRing:
-    """Ring buffer storing output Φ activations and returning evicted rows."""
+    """Simple differentiable ring buffer returning evicted rows."""
 
     buf: AT
     idx: int = 0
@@ -186,6 +158,20 @@ class OutPhiRing:
         self.idx += 1
         self.count += 1
         return evicted
+
+
+@dataclass
+class PremixRing:
+    """Ring buffer for raw pre-mix node values."""
+
+    buf: AT
+    idx: int = 0
+
+    def push(self, val: AT) -> AT:
+        i = self.idx % int(len(self.buf))
+        self.buf = AT.scatter_row(self.buf.clone(), i, val, dim=0)
+        self.idx = i + 1
+        return self.buf
 
 
 @dataclass
@@ -218,7 +204,6 @@ class RingHarness:
     node_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
     edge_rings: Dict[Tuple[int, ...], RingBuffer] = field(default_factory=dict)
     premix_rings: Dict[Tuple[int, ...], PremixRing] = field(default_factory=dict)
-    out_phi_rings: Dict[Tuple[int, ...], OutPhiRing] = field(default_factory=dict)
     param_rings: Dict[str, ParamRing] = field(default_factory=dict)
     param_labels: List[str] = field(default_factory=list)
     tick: int = 0
@@ -307,38 +292,6 @@ class RingHarness:
         self, node_id: int, *, lineage: Tuple[int, ...] | None = None
     ) -> Optional[PremixRing]:
         return self.premix_rings.get(self._key(node_id, lineage))
-
-    def _ensure_out_phi_ring(
-        self, key: Tuple[int, ...], D: int, size: Optional[int]
-    ) -> Optional[OutPhiRing]:
-        size = size or self.default_size
-        if size is None:
-            return None
-        if key not in self.out_phi_rings:
-            buf = AT.zeros((size, D), dtype=float)
-            self.out_phi_rings[key] = OutPhiRing(buf)
-        return self.out_phi_rings[key]
-
-    def push_out_phi(
-        self,
-        node_id: int,
-        val: AT,
-        *,
-        lineage: Tuple[int, ...] | None = None,
-        size: Optional[int] = None,
-    ) -> AT | None:
-        key = self._key(node_id, lineage)
-        t = AT.get_tensor(val)
-        D = int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
-        rb = self._ensure_out_phi_ring(key, D, size)
-        if rb is None:
-            return None
-        return rb.push(val.reshape(-1))
-
-    def get_out_phi_ring(
-        self, node_id: int, *, lineage: Tuple[int, ...] | None = None
-    ) -> Optional[OutPhiRing]:
-        return self.out_phi_rings.get(self._key(node_id, lineage))
 
     def push_edge(
         self,

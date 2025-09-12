@@ -31,7 +31,7 @@ def _build_spec(win_len: int) -> FluxSpringSpec:
     dec = DECSpec(D0=[[0.0]], D1=[])
     spectral = SpectralCfg(enabled=True, win_len=win_len, hop_len=win_len, window="hann")
     return FluxSpringSpec(
-        version="phi-out-test",
+        version="psi-out-test",
         D=1,
         nodes=[node],
         edges=[edge],
@@ -41,7 +41,7 @@ def _build_spec(win_len: int) -> FluxSpringSpec:
     )
 
 
-def test_out_phi_ring_eviction_and_grad():
+def test_out_psi_ring_eviction_and_grad():
     spec = _build_spec(3)
     param = AT.tensor(0.5)
     param.requires_grad_(True)
@@ -51,8 +51,8 @@ def test_out_phi_ring_eviction_and_grad():
     for _ in range(4):
         psi, stats = pump_tick(psi, spec, eta=0.0, external={0: param}, harness=harness)
 
-    evicted = stats.get("evicted_phi", {}).get(0)
+    evicted = stats.get("evicted_psi", {}).get(0)
     assert evicted is not None
-    expected = AT.tanh(param).reshape(-1)
+    expected = param.reshape(-1)
     assert AT.allclose(evicted, expected)
 
