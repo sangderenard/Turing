@@ -3,17 +3,14 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.autoautograd.fluxspring.spectral_readout import (
     compute_metrics,
-    update_fft_window,
-    current_fft_window,
-    reset_fft_windows,
     batched_bandpower_from_windows,
+    quantile_band_targets,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     SpectralCfg,
     SpectralMetrics,
 )
-from src.common.tensors.autoautograd.fluxspring.fs_harness import LineageLedger
-
+from src.common.tensors.autoautograd.fluxspring.fs_harness import RingHarness
 
 def _sine(freq: float, N: int, tick_hz: float) -> AT:
     t = AT.arange(N, dtype=float) / tick_hz
@@ -78,35 +75,6 @@ def test_coherence_identical_signals():
     assert abs(m["coherence"] - 1.0) < 1e-6
 
 
-def test_fft_window_tracks_lineage_order():
-    cfg = SpectralCfg(
-        enabled=True,
-        tick_hz=1.0,
-        win_len=2,
-        hop_len=2,
-        window="rect",
-        metrics=SpectralMetrics(),
-    )
-    reset_fft_windows()
-    ledger = LineageLedger()
-
-    lid0 = ledger.ingest()
-    update_fft_window(lid0, AT.tensor(0.0), cfg)
-    lid1 = ledger.ingest()
-    update_fft_window(lid1, AT.tensor(1.0), cfg)
-
-    bands, lids = current_fft_window()
-    assert AT.get_tensor(bands).flatten().tolist() == [0.0, 1.0]
-    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid0, lid1]
-
-    lid2 = ledger.ingest()
-    update_fft_window(lid2, AT.tensor(2.0), cfg)
-
-    bands, lids = current_fft_window()
-    assert AT.get_tensor(bands).flatten().tolist() == [1.0, 2.0]
-    assert [int(x) for x in AT.get_tensor(lids).flatten().tolist()] == [lid1, lid2]
-
-
 def test_batched_bandpower_from_windows():
     tick_hz = 100.0
     Nw = 50
@@ -126,3 +94,27 @@ def test_batched_bandpower_from_windows():
     bp_np = AT.get_tensor(bp)
     assert bp_np[0, 0] > 0.9 and bp_np[0, 1] < 0.1
     assert bp_np[1, 1] > 0.9 and bp_np[1, 0] < 0.1
+
+
+def test_quantile_band_targets_even_split():
+    tick_hz = 90.0
+    N = 90
+    cfg = SpectralCfg(
+        enabled=True,
+        tick_hz=tick_hz,
+        win_len=N,
+        hop_len=N,
+        window="rect",
+    )
+    harness = RingHarness(default_size=N)
+    freqs = [5.0, 15.0, 25.0]
+    t = AT.arange(N, dtype=float) / tick_hz
+    waves = [(2 * AT.pi() * f * t).sin() for f in freqs]
+    for i in range(N):
+        for nid, w in enumerate(waves):
+            harness.push_premix(nid, w[i])
+    targets = quantile_band_targets(list(range(3)), cfg, harness)
+    assert set(targets.keys()) == {0, 1, 2}
+    for nid, f in zip(range(3), freqs):
+        lo, hi = targets[nid]
+        assert lo <= f <= hi + 1e-6

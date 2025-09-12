@@ -373,13 +373,12 @@ def _pump_tick(
 
     # Maintain ring buffers for spectral analysis.
     if harness is not None:
+        lin = (lineage_id,) if lineage_id is not None else None
         if spec.spectral.enabled:
-            lin = (lineage_id,) if lineage_id is not None else None
             phi_out = phi(psi_next)
             evicted: Dict[int, AT] = {}
-            for n, val, raw, ph_o in zip(spec.nodes, psi_next, node_raw, phi_out):
+            for n, val, ph_o in zip(spec.nodes, psi_next, phi_out):
                 harness.push_node(n.id, val, lineage=lin)
-                harness.push_premix(n.id, raw, lineage=lin)
                 ev = harness.push_out_phi(n.id, ph_o, lineage=lin)
                 if ev is not None:
                     evicted[n.id] = ev
@@ -387,6 +386,10 @@ def _pump_tick(
                 harness.push_edge(idx, q_val, lineage=lin)
             if evicted:
                 stats["evicted_phi"] = evicted
+        # Always record raw inputs so premix history is available even when
+        # spectral analysis is disabled.
+        for n, raw in zip(spec.nodes, node_raw):
+            harness.push_premix(n.id, raw, lineage=lin)
         harness.snapshot_learnables(spec)
 
     return psi_next, stats

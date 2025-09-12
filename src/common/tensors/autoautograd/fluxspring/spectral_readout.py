@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
+
 from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec, SpectralCfg
 from .fs_harness import RingHarness, LineageLedger, RingBuffer
@@ -144,91 +146,116 @@ def gather_ring_metrics(
     return stats
 
 
-_fft_bands_rb: RingBuffer | None = None
-_fft_lids_rb: RingBuffer | None = None
-_fft_count: int = 0
-
-
-def update_fft_window(lineage: int, band: AT, cfg: SpectralCfg) -> None:
-    """Record ``band`` and its ``lineage`` in a global tensor ring.
-
-    The ring buffer stores the most recent ``cfg.win_len`` entries using
-    :class:`RingBuffer` so gradients remain connected without manual tensor
-    slicing.  ``band`` is promoted to a 1‑D row to fit the ring layout.
-    """
-
-    global _fft_bands_rb, _fft_lids_rb, _fft_count
-
-    row = band if getattr(AT.get_tensor(band), "ndim", 0) > 0 else band[None]
-
-    if _fft_bands_rb is None:
-        D = int(row.shape[0])
-        zeros = AT.zeros((int(cfg.win_len), D), dtype=AT.get_tensor(row).dtype)
-        _fft_bands_rb = RingBuffer(zeros)
-        _fft_lids_rb = RingBuffer(AT.zeros(int(cfg.win_len), dtype=float))
-
-    _fft_bands_rb.push(row)
-    _fft_lids_rb.push(AT.tensor(lineage, dtype=float))
-    _fft_count += 1
-
-
-def _ordered_ring(rb: RingBuffer, count: int) -> AT:
-    buf = rb.buf
-    R = int(buf.shape[0])
-    c = count if count < R else R
-    if count < R:
-        return buf[:c]
-    start = count % R
-    if start == 0:
-        return buf
-    return AT.cat([buf[start:], buf[:start]], dim=0)
-
-
-def current_fft_window() -> Tuple[AT, AT]:
-    """Return the stacked bands and their lineage identifiers."""
-
-    if _fft_bands_rb is None or _fft_lids_rb is None or _fft_count == 0:
-        return AT.zeros(0, dtype=float), AT.zeros(0, dtype=float)
-    bands = _ordered_ring(_fft_bands_rb, _fft_count)
-    lids = _ordered_ring(_fft_lids_rb, _fft_count)
-    return bands, lids
-
-
-def reset_fft_windows() -> None:
-    """Clear stored window history for all lineages."""
-
-    global _fft_bands_rb, _fft_lids_rb, _fft_count
-    _fft_bands_rb = None
-    _fft_lids_rb = None
-    _fft_count = 0
-
-
 def gather_recent_windows(
     spec: FluxSpringSpec,
     node_ids: List[int],
     cfg: SpectralCfg,
     harness: RingHarness,
     ledger: LineageLedger,
-) -> Tuple[Dict[int, AT], Dict[int, List[int]]]:
-    """Compatibility shim returning the global FFT window keyed by lineage.
+) -> Dict[int, AT]:
+    """Return band powers computed from each node's pre-mix ring.
 
-    Each lineage present in the window is mapped to its band tensor.  ``node_ids``
-    are echoed back in ``kept_map`` so legacy callers can associate results with
-    originating nodes even though per-lineage history is no longer stored.
+    ``node_ids`` identifies which nodes correspond to FFT binning wheels.  For
+    each node, the raw pre-mix history is retrieved from the harness and ordered
+    so that the most recent ``cfg.win_len`` samples form the analysis window.
+    The window is transformed into band powers according to ``cfg.metrics``.
+
+    The returned mapping associates ``node_id`` with its band‑power tensor.  The
+    caller is responsible for comparing these values against any target bands
+    and accounting losses to the appropriate lineage.  Lineage tagging is left
+    as a TODO once per-node targets are formalised.
     """
 
     win_map: Dict[int, AT] = {}
-    kept_map: Dict[int, List[int]] = {}
 
-    bands, lids = current_fft_window()
-    if int(bands.shape[0]) == 0:
-        return win_map, kept_map
+    def _ordered(rb: RingBuffer) -> AT:
+        buf = rb.buf
+        R = int(buf.shape[0])
+        idx = rb.idx
+        if idx < R:
+            return buf[:idx]
+        start = idx % R
+        if start == 0:
+            return buf
+        return AT.cat([buf[start:], buf[:start]], dim=0)
 
-    lid_list = [int(x) for x in AT.get_tensor(lids).flatten().tolist()]
-    for i, lin in enumerate(lid_list):
-        win_map[lin] = bands[i : i + 1]
-        kept_map[lin] = list(node_ids)
-    return win_map, kept_map
+    for nid in node_ids:
+        rb = harness.get_premix_ring(nid)
+        if rb is None:
+            continue
+        ordered = _ordered(rb)
+        if int(ordered.shape[0]) < cfg.win_len:
+            continue
+        win = ordered[-cfg.win_len :]
+        metrics = compute_metrics(win, cfg, return_tensor=True)
+        band = metrics.get("bandpower")
+        if band is not None:
+            win_map[nid] = band
+
+    return win_map
+
+
+def quantile_band_targets(
+    node_ids: List[int], cfg: SpectralCfg, harness: RingHarness
+) -> Dict[int, Tuple[float, float]]:
+    """Return quantile frequency bands from node pre-mix histories.
+
+    For the provided ``node_ids``, the most recent ``cfg.win_len`` samples are
+    gathered from each node's pre-mix ring buffer.  Their FFT power spectra are
+    summed to produce an aggregate frequency distribution.  The cumulative power
+    distribution is then divided into ``len(node_ids)`` quantile bins, assigning
+    each middle node a target frequency range with equal mass.
+    """
+
+    if not node_ids:
+        return {}
+
+    freqs_ref: AT | None = None
+    agg_power: AT | None = None
+
+    def _ordered(rb: RingBuffer) -> AT:
+        buf = rb.buf
+        R = int(buf.shape[0])
+        idx = rb.idx
+        if idx < R:
+            return buf[:idx]
+        start = idx % R
+        if start == 0:
+            return buf
+        return AT.cat([buf[start:], buf[:start]], dim=0)
+
+    for nid in node_ids:
+        rb = harness.get_premix_ring(nid)
+        if rb is None:
+            continue
+        ordered = _ordered(rb)
+        if int(ordered.shape[0]) < cfg.win_len:
+            continue
+        win = ordered[-cfg.win_len :]
+        real, imag, freqs = _rfft_real_imag(win, cfg.tick_hz)
+        power = real**2 + imag**2
+        if freqs_ref is None:
+            freqs_ref = freqs
+            agg_power = power
+        else:
+            agg_power = agg_power + power  # type: ignore[operator]
+
+    if freqs_ref is None or agg_power is None:
+        return {}
+
+    f_np = np.asarray(AT.get_tensor(freqs_ref), dtype=float).reshape(-1)
+    p_np = np.asarray(AT.get_tensor(agg_power), dtype=float).reshape(-1)
+    total = p_np.sum()
+    if total <= 0:
+        return {}
+    cdf = np.cumsum(p_np) / total
+    quant = np.linspace(0.0, 1.0, len(node_ids) + 1)
+    edges = np.interp(quant, np.concatenate(([0.0], cdf)), np.concatenate(([f_np[0]], f_np)))
+
+    targets: Dict[int, Tuple[float, float]] = {}
+    for i, nid in enumerate(sorted(node_ids)):
+        targets[nid] = (float(edges[i]), float(edges[i + 1]))
+    return targets
 
 
 def batched_bandpower_from_windows(window_matrix: AT, cfg: SpectralCfg) -> AT:
