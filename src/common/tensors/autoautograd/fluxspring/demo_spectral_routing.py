@@ -267,6 +267,7 @@ class RoutingState:
     log_buf: TensorRingBuffer
     mix_buf: dict[int, AT.Tensor]
     hist_buf: dict[int, AT.Tensor]
+    slot_map: dict[int, list[list[int]]]
     previous_grads: list[AT.Tensor] | None = None
     patience: int = 10
 
@@ -384,9 +385,11 @@ def try_backward(ctx: RoutingState, lin: int) -> None:
     hist_loss = (hist_residual ** 2).mean()
     loss_out = (mix_residual ** 2).mean()
     losses = {"loss_out": loss_out, "hist_loss": hist_loss}
-    params = [
-        w.versions()[(w.idx - 1) % len(w.versions())] for w in ctx.wheels
-    ]
+    slot_rows = ctx.slot_map.pop(lin, None)
+    if slot_rows is None:
+        logger.debug("try_backward(lin=%d): missing slot map — skipping", lin)
+        return
+    params = [w.value_for_slots(slots) for w, slots in zip(ctx.wheels, slot_rows)]
     probe_losses(losses, params)
     logger.debug(
         "try_backward(lin=%d): loss_out=%.6f hist_loss=%.6f",
@@ -507,6 +510,8 @@ def pump_with_loss(
     """Advance the system by one tick and stage data for gradients."""
     lid = ctx.ledger.ingest()
     logger.debug("pump_with_loss: ingest lid=%d", lid)
+    tick = ctx.ledger.tick_of_lid[lid]
+    ctx.slot_map[lid] = [w.slots_for_tick(tick) for w in ctx.wheels]
     state, _ = fs_dec.pump_tick(
         state,
         ctx.spec,
@@ -516,7 +521,7 @@ def pump_with_loss(
         harness=ctx.harness,
         lineage_id=lid,
         wheels=ctx.wheels,
-        tick=ctx.ledger.tick_of_lid[lid],
+        tick=tick,
         update_fn=lambda p, g: p - 0.01 * g,
     )
     logger.debug(
@@ -643,6 +648,7 @@ def train_routing(
         log_buf=log_buf,
         mix_buf={},
         hist_buf={},
+        slot_map={},
     )
 
     win = sine_chunks[0].shape[0]

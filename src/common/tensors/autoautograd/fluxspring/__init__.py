@@ -137,6 +137,16 @@ class ParamWheel:
         return p
 
     # ------------------------------------------------------------------
+    def slots_for_tick(self, tick: int) -> list[int]:
+        """Return slot indices for each row at ``tick``."""
+
+        W = len(self._versions)
+        base = self._versions[0]
+        shape = getattr(base, "shape", ())
+        rows = int(shape[0]) if len(shape) > 0 else 1
+        return [int((tick - r) % W) for r in range(rows)]
+
+    # ------------------------------------------------------------------
     def bind_for_tick(self, tick: int) -> set[int]:
         """Bind row-wise parameter versions based on ``tick``.
 
@@ -144,27 +154,27 @@ class ParamWheel:
         their gradients can later be stashed.
         """
 
-        versions = self._versions
-        W = len(versions)
-        base = versions[0]
-        shape = getattr(base, "shape", ())
-        rows = int(shape[0]) if len(shape) > 0 else 1
-        used: set[int] = set()
+        row_slots = self.slots_for_tick(tick)
+        used = set(row_slots)
 
-        if rows == 1:
-            slot = (tick - 0) % W
-            used.add(slot)
-            self.setter(versions[slot])
+        if len(row_slots) == 1:
+            self.setter(self._versions[row_slots[0]])
             return used
 
-        rows_out = []
-        for r in range(rows):
-            slot = (tick - r) % W
-            used.add(slot)
-            rows_out.append(versions[slot][r])
+        rows_out = [self._versions[s][r] for r, s in enumerate(row_slots)]
         stacked = AT.stack(rows_out, dim=0)
         self.setter(stacked)
         return used
+
+    # ------------------------------------------------------------------
+    def value_for_slots(self, row_slots: Sequence[int]) -> AT:
+        """Reconstruct the parameter tensor from ``row_slots``."""
+
+        if len(row_slots) == 1:
+            return self._versions[row_slots[0]]
+
+        rows_out = [self._versions[s][r] for r, s in enumerate(row_slots)]
+        return AT.stack(rows_out, dim=0)
 
     # ------------------------------------------------------------------
     def stash_grads(self, slots: set[int]) -> None:
