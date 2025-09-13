@@ -79,14 +79,14 @@ def test_meta_loop_runner_moves_free_node():
     table = StateTable()
     round_node = _build_round(sys, table)
     runner = MetaLoopRunner(state_table=table)
-    x0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[0])
-    y0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
-    z0 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[2])
+    x0 = float(sys.nodes[1].p[0])
+    y0 = float(sys.nodes[1].p[1])
+    z0 = float(sys.nodes[1].p[2])
     for _ in range(5):
         runner.run_round(round_node, dt=0.01, state_table=table)
-    x1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[0])
-    y1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
-    z1 = float(AbstractTensor.get_tensor(sys.nodes[1].p)[2])
+    x1 = float(sys.nodes[1].p[0])
+    y1 = float(sys.nodes[1].p[1])
+    z1 = float(sys.nodes[1].p[2])
     assert not math.isclose(y0, y1)
     assert math.isclose(x0, x1, rel_tol=1e-6, abs_tol=1e-6)
     assert math.isclose(z0, z1, rel_tol=1e-6, abs_tol=1e-6)
@@ -129,12 +129,12 @@ def test_boundary_targets_clamp_x_and_z():
     table = StateTable()
     round_node = _build_round(sys, table)
     runner = MetaLoopRunner(state_table=table)
-    y0_in = float(AbstractTensor.get_tensor(sys.nodes[0].p)[1])
-    y0_out = float(AbstractTensor.get_tensor(sys.nodes[1].p)[1])
+    y0_in = float(sys.nodes[0].p[1])
+    y0_out = float(sys.nodes[1].p[1])
     for _ in range(5):
         runner.run_round(round_node, dt=0.01, state_table=table)
-    p_in = AbstractTensor.get_tensor(sys.nodes[0].p)
-    p_out = AbstractTensor.get_tensor(sys.nodes[1].p)
+    p_in = sys.nodes[0].p
+    p_out = sys.nodes[1].p
     assert math.isclose(float(p_in[0]), 1.0, rel_tol=1e-6, abs_tol=1e-3)
     assert math.isclose(float(p_out[2]), 2.0, rel_tol=1e-6, abs_tol=1e-3)
     assert math.isclose(float(p_in[1]), y0_in, rel_tol=1e-6, abs_tol=1e-6)
@@ -147,9 +147,9 @@ def test_spectral_inertia_reduces_velocity_norm():
     hist = [AT.tensor([math.sin(dt * i), math.cos(dt * i)]) for i in range(128)]
     resp, _, _ = spectral_inertia(hist, dt)
     v_last = hist[-1] - hist[-2]
-    energy_no = float(AT.get_tensor((v_last * v_last).sum()).item())
+    energy_no = float((v_last * v_last).sum())
     diff = v_last - resp * 1e-4
-    energy_damped = float(AT.get_tensor((diff * diff).sum()).item())
+    energy_damped = float((diff * diff).sum())
     assert energy_damped < energy_no
 
 
@@ -159,8 +159,8 @@ def test_spectral_inertia_passthrough_with_short_history():
     # Fewer samples than the minimum FFT window should yield a zero response
     hist = [AT.tensor([0.0, 0.0]) for _ in range(10)]
     resp, J, bands = spectral_inertia(hist, dt)
-    assert AT.get_tensor(resp).abs().sum().item() == 0.0
-    assert AT.get_tensor(J).abs().sum().item() == 0.0
+    assert resp.abs().sum().item() == 0.0
+    assert J.abs().sum().item() == 0.0
     assert bands == []
 
 
@@ -173,7 +173,7 @@ def test_threaded_engine_steps_independently():
     def capture():
         return {
             "pos": [
-                AbstractTensor.get_tensor(n.p).tolist() for n in sys.nodes.values()
+                n.p.tolist() for n in sys.nodes.values()
             ]
         }
 

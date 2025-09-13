@@ -50,8 +50,8 @@ def test_slot_backprop_queue_applies_gradients_per_slot(tmp_path):
         # Stub run_batched_vjp to emulate composite ops and return gradients
         def _stub_vjp(*, sys, jobs, **_kw):
             assert callable(jobs[0].fn) and callable(jobs[1].fn)
-            assert AT.get_tensor(jobs[0].residual).item() == pytest.approx(0.5)
-            assert AT.get_tensor(jobs[1].residual).item() == pytest.approx(0.2)
+            assert jobs[0].residual.item() == pytest.approx(0.5)
+            assert jobs[1].residual.item() == pytest.approx(0.2)
             g = AT.tensor([2.0, 3.0])
             return BatchVJPResult(
                 slices=BatchSlices(index_of={j.job_id: i for i, j in enumerate(jobs)}, job_ids=tuple(j.job_id for j in jobs)),
@@ -71,10 +71,10 @@ def test_slot_backprop_queue_applies_gradients_per_slot(tmp_path):
         mgr.process_slot(ev0, sys=None, lr=1.0, run_vjp=_stub_vjp)
 
         # Slot 0 parameters should have been updated; slot 1 untouched
-        assert float(AT.get_tensor(w0.params[0])) == pytest.approx(-1.0)
-        assert float(AT.get_tensor(w1.params[0])) == pytest.approx(-1.0)
-        assert float(AT.get_tensor(w0.params[1])) == pytest.approx(1.0)
-        assert float(AT.get_tensor(w1.params[1])) == pytest.approx(2.0)
+        assert w0.params[0].item() == pytest.approx(-1.0)
+        assert w1.params[0].item() == pytest.approx(-1.0)
+        assert w0.params[1].item() == pytest.approx(1.0)
+        assert w1.params[1].item() == pytest.approx(2.0)
 
         # Residual buffers and job queue for slot 0 should be cleared
         assert mgr.main_residuals[0] is None

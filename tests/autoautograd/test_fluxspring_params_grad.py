@@ -91,4 +91,4 @@ def test_edge_face_params_gradients_and_dtype():
     grads = autograd.grad(loss, params)
     assert all(g is not None for g in grads)
     for g in grads:
-        assert float(AT.get_tensor(g)) == pytest.approx(2.0)
+        assert float(g) == pytest.approx(2.0)
