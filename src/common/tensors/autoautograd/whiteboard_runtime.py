@@ -362,6 +362,12 @@ def run_batched_vjp(
             # dim is provided via keyword or omitted from position 0
             param_tensor = op_args[2]
 
+    logger.debug(
+        "run_batched_vjp: param_tensor_exists=%s requires_grad=%s",
+        param_tensor is not None,
+        getattr(param_tensor, "requires_grad", None) if param_tensor is not None else None,
+    )
+
     if not jobs:
         logger.debug("run_batched_vjp: empty jobs; returning empty result")
         return BatchVJPResult(
@@ -539,6 +545,21 @@ def run_batched_vjp(
                 "run_batched_vjp: computed grads g_all_shape=%s g_param_shape=%s",
                 tuple(getattr(g_all, "shape", ())) if g_all is not None else None,
                 tuple(getattr(g_param, "shape", ())) if g_param is not None else None,
+            )
+        def _has_any(t: Any) -> bool:
+            try:
+                return AT.get_tensor(t).any()
+            except Exception:
+                return False
+
+        zero_all = g_all is None or not _has_any(g_all)
+        zero_param = param_tensor is not None and (g_param is None or not _has_any(g_param))
+        if zero_all or zero_param:
+            job_ids = tuple(j.job_id for j in jobs)
+            logger.debug(
+                "run_batched_vjp: WARNING zero grads job_ids=%s union_ids=%s",
+                job_ids,
+                union_ids,
             )
 
     g_stack = g_all
