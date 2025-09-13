@@ -356,10 +356,26 @@ def pump_with_loss(
         delayed_out = ctx.out_buf.buf[idx]
         delayed_tgt = ctx.tgt_buf.buf[idx]
         main_residual = delayed_out - delayed_tgt
+        main_val = main_residual.mean()
+        spec_val = (
+            hist_residual_summary.mean() if hist_residual_summary is not None else None
+        )
+        main_float = float(AT.get_tensor(main_val))
+        spec_float = (
+            float(AT.get_tensor(spec_val)) if spec_val is not None else None
+        )
+        slot = ctx.bp_queue._slot_for(tick=fft_tick, row_idx=0)
         ctx.bp_queue.add_residual(
             tick=fft_tick,
-            main=main_residual.mean(),
-            spectral=hist_residual_summary.mean() if hist_residual_summary is not None else None,
+            main=main_val,
+            spectral=spec_val,
+        )
+        logger.debug(
+            "bp_queue.add_residual: tick=%d slot=%d main=%s spectral=%s",
+            fft_tick,
+            slot,
+            main_float,
+            spec_float,
         )
         src_ids = tuple(range(len(ctx.wheels)))
 
@@ -386,6 +402,13 @@ def pump_with_loss(
             fn=_route_fn,
         )
         ctx.bp_queue.queue_job(None, job_route, tick=fft_tick, kind="main")
+        logger.debug(
+            "bp_queue.queue_job: tick=%d slot=%d kind=main job_id=%s residual=%s",
+            fft_tick,
+            slot,
+            job_route.job_id,
+            main_float,
+        )
 
         def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
             mids_local = list(range(band_start, band_start + B))
@@ -404,6 +427,13 @@ def pump_with_loss(
             fn=_fft_fn,
         )
         ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
+        logger.debug(
+            "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
+            fft_tick,
+            slot,
+            job_fft.job_id,
+            spec_float,
+        )
 
     return state
 
