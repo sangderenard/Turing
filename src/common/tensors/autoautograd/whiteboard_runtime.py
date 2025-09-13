@@ -555,16 +555,17 @@ def run_batched_vjp(
             for sid in param_ids
         ]
         union_stack = JobBatcher._stack(union_slices)
-        zero_vec = union_stack[0][:0] if union_slices else g_param[0:0]
+        zero_full = g_param * 0
         param_grads_list = []
         for j in jobs:
-            grads = []
+            rows = []
             for sid, plen in zip(j.src_ids, getattr(j, "param_lens", ())):
+                row = zero_full.clone() if hasattr(zero_full, "clone") else zero_full
                 if plen > 0 and sid in param_pos:
-                    grads.append(union_stack[param_pos[sid]])
-                else:
-                    grads.append(zero_vec)
-            param_grads_list.append(JobBatcher._stack(grads))
+                    off = param_offsets[sid]
+                    row[off : off + plen] = union_stack[param_pos[sid]]
+                rows.append(row)
+            param_grads_list.append(JobBatcher._stack(rows))
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(

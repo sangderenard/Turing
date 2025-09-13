@@ -730,14 +730,14 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = gather(x, index, dim)",
         "latex": r"y_i = x_{index_i}",
         "backward": {
-            "x": "gx = zeros_like(x); gx[index] = g"
+            "x": "gx = zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g"
         },
         "python": {
-            "parameters": ["g", "x", "index"],
-            "body": "gx=AbstractTensor.zeros_like(x); gx[index]=g; return gx"
+            "parameters": ["g", "x", "index", "dim"],
+            "body": "gx=AbstractTensor.zeros_like(x); idx=[slice(None)]*x.ndims(); axis=dim if dim>=0 else x.ndims()+dim; idx[axis]=index; gx[tuple(idx)] = g; return gx"
         },
         "domain": "Any real; index valid.",
-        "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index or dim.",
+        "notes": "Backward of gather: scatter gradient back to x; no gradient w.r.t index.",
         "tags": ["indexing"],
     },
     "scatter": {

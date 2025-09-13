@@ -39,6 +39,15 @@ class AbstractTensorPolicy(BackendPolicy):
     def to_tensor(self, x: Any) -> Any:
         return AbstractTensor.get_tensor(x)
 
+    def getter(self, node: Any, attr: str) -> Any:
+        return getattr(node, attr) if hasattr(node, attr) else node[attr]
+
+    def setter(self, node: Any, attr: str, value: Any) -> None:
+        if hasattr(node, attr):
+            setattr(node, attr, value)
+        else:
+            node[attr] = value
+
     def scatter_row(self, node: Any, attr: str, row_value: Any) -> None:
         tensor = self.getter(node, attr)
         idx = getattr(node, "row_index", None)
