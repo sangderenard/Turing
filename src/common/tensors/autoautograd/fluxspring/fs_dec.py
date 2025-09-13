@@ -252,15 +252,86 @@ def pump_tick(
     """Wrapper around :func:`_pump_tick` with optional param wheel support."""
 
     if wheels:
+        from . import logger
         if tick is None:
             raise ValueError("tick must be provided when wheels are used")
-        used = [w.bind_for_tick(tick) for w in wheels]
-        psi, stats = _pump_tick(psi, spec, **kw)
-        for w, u in zip(wheels, used):
-            w.stash_grads(u)
+
+        def _has_grad(w: "ParamWheel", s: int) -> bool:
+            gbuf = w.grads()[s]
+            if gbuf is not None:
+                return True
+            return getattr(w.versions()[s], "grad", None) is not None
+
+        used: list[set[int]] = []
         for w in wheels:
+            label = getattr(w, "label", None)
+            slots = w.slots_for_tick(tick)
+            logger.debug(
+                "bind_for_tick start: wheel=%s tick=%s slot_grads=%s",
+                label,
+                int(tick),
+                {s: _has_grad(w, s) for s in slots},
+            )
+            u = w.bind_for_tick(tick)
+            logger.debug(
+                "bind_for_tick done: wheel=%s tick=%s slot_grads=%s",
+                label,
+                int(tick),
+                {s: _has_grad(w, s) for s in u},
+            )
+            used.append(u)
+
+        psi, stats = _pump_tick(psi, spec, **kw)
+
+        for w, u in zip(wheels, used):
+            label = getattr(w, "label", None)
+            logger.debug(
+                "stash_grads start: wheel=%s tick=%s slot_grads=%s",
+                label,
+                int(tick),
+                {s: _has_grad(w, s) for s in u},
+            )
+            w.stash_grads(u)
+            logger.debug(
+                "stash_grads done: wheel=%s tick=%s slot_grads=%s",
+                label,
+                int(tick),
+                {s: _has_grad(w, s) for s in u},
+            )
+
+        for w in wheels:
+            label = getattr(w, "label", None)
+            pre = w.idx
+            logger.debug(
+                "rotate start: wheel=%s tick=%s idx=%s grad=%s",
+                label,
+                int(tick),
+                pre,
+                _has_grad(w, pre) if pre >= 0 else False,
+            )
             ev = w.rotate()
+            logger.debug(
+                "rotate done: wheel=%s tick=%s evicted=%s grad=%s",
+                label,
+                int(tick),
+                ev,
+                _has_grad(w, ev),
+            )
+            logger.debug(
+                "apply_slot start: wheel=%s tick=%s idx=%s grad=%s",
+                label,
+                int(tick),
+                ev,
+                _has_grad(w, ev),
+            )
             w.apply_slot(ev, update_fn)
+            logger.debug(
+                "apply_slot done: wheel=%s tick=%s idx=%s grad=%s",
+                label,
+                int(tick),
+                ev,
+                _has_grad(w, ev),
+            )
         return psi, stats
 
     return _pump_tick(psi, spec, **kw)
