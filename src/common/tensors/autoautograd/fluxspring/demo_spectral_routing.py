@@ -384,11 +384,17 @@ def pump_with_loss(
             float(AT.get_tensor(spec_val)) if spec_val is not None else None
         )
         slot = ctx.bp_queue._slot_for(tick=fft_tick, row_idx=0)
-        ctx.bp_queue.add_residual(
-            tick=fft_tick,
-            main=main_val,
-            spectral=spec_val,
-        )
+        if spec_val is not None:
+            ctx.bp_queue.add_residual(
+                tick=fft_tick,
+                main=main_val,
+                spectral=spec_val,
+            )
+        else:
+            ctx.bp_queue.add_residual(
+                tick=fft_tick,
+                main=main_val,
+            )
         logger.debug(
             "bp_queue.add_residual: tick=%d slot=%d main=%s spectral=%s",
             fft_tick,
@@ -440,41 +446,42 @@ def pump_with_loss(
             main_float,
         )
 
-        def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
-            for w in ctx.wheels:
-                val = AT.get_tensor(w.params[w.idx])
-                flat = np.array(val).ravel()
-                summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
-                logger.debug(
-                    "_fft_fn wheel label=%s idx=%d param_id=%d val=%s",
-                    w.label,
-                    w.idx,
-                    id(w.params[w.idx]),
-                    summary,
-                )
-            mids_local = list(range(band_start, band_start + B))
-            W_loc, kept_loc = gather_recent_windows(mids_local, spectral_cfg, ctx.harness)
-            if len(kept_loc) == len(mids_local):
-                bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
-                targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
-                return (bp_loc - targ_mat).mean()
-            return AT.tensor(0.0)
+        if spec_val is not None:
+            def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
+                for w in ctx.wheels:
+                    val = AT.get_tensor(w.params[w.idx])
+                    flat = np.array(val).ravel()
+                    summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
+                    logger.debug(
+                        "_fft_fn wheel label=%s idx=%d param_id=%d val=%s",
+                        w.label,
+                        w.idx,
+                        id(w.params[w.idx]),
+                        summary,
+                    )
+                mids_local = list(range(band_start, band_start + B))
+                W_loc, kept_loc = gather_recent_windows(mids_local, spectral_cfg, ctx.harness)
+                if len(kept_loc) == len(mids_local):
+                    bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
+                    targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
+                    return (bp_loc - targ_mat).mean()
+                return AT.tensor(0.0)
 
-        job_fft = _WBJob(
-            job_id=f"fft:{fft_tick}",
-            op=None,
-            src_ids=src_ids,
-            residual=None,
-            fn=_fft_fn,
-        )
-        ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
-        logger.debug(
-            "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
-            fft_tick,
-            slot,
-            job_fft.job_id,
-            spec_float,
-        )
+            job_fft = _WBJob(
+                job_id=f"fft:{fft_tick}",
+                op=None,
+                src_ids=src_ids,
+                residual=None,
+                fn=_fft_fn,
+            )
+            ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
+            logger.debug(
+                "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
+                fft_tick,
+                slot,
+                job_fft.job_id,
+                spec_float,
+            )
 
     return state
 
