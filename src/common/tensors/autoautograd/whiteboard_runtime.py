@@ -103,6 +103,9 @@ BATCHABLE_OPS: Dict[str, OpBatchMeta] = {
             SubFnMeta("__add__", (slice(2, None, 3),)),
         ),
     ),
+    # fluxspring routing step and FFT analysis are batchable via custom helpers
+    "route_batch": OpBatchMeta(shape="any"),
+    "fft_analysis": OpBatchMeta(shape="any"),
 }
 
 
@@ -192,6 +195,70 @@ def run_op_and_grads_cached(
         g0 = vals[1] * (vals[0] * 0 + 1)
         g1 = vals[0] * (vals[1] * 0 + 1)
         grads_full = AbstractTensor.stack([g0, g1], dim=0)
+    elif op_name == "route_batch":
+        from .fluxspring import fs_dec
+
+        kw = dict(op_kwargs or {})
+        state = kw.pop("state")
+        spec = kw.pop("spec")
+
+        def _route_fn(_p):
+            psi_next, _ = fs_dec.pump_tick(state, spec, **kw)
+            return psi_next
+
+        job = _WBJob(
+            job_id=f"{op_name}:{tuple(src_ids)}",
+            op=None,
+            src_ids=tuple(int(i) for i in src_ids),
+            residual=residual,
+            param_lens=tuple(int(l) for l in (param_lens or [])),
+            fn=_route_fn,
+        )
+
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=(job,),
+            backend=backend,
+        )
+        y = batch.ys[0]
+        grads_full = batch.grads_full[0]
+        if batch.param_grads_full:
+            param_grads_full = batch.param_grads_full[0]
+    elif op_name == "fft_analysis":
+        from .fluxspring.spectral_readout import (
+            gather_recent_windows,
+            batched_bandpower_from_windows,
+        )
+
+        kw = dict(op_kwargs or {})
+        cfg = kw.pop("cfg")
+        harness = kw.pop("harness")
+        node_ids = kw.pop("node_ids", list(src_ids))
+        W, _ = gather_recent_windows(node_ids, cfg, harness)
+
+        def _fft_fn(_p: Any) -> Any:
+            return batched_bandpower_from_windows(W, cfg)
+
+        win_len = int(getattr(W, "shape", (0, 0))[1]) if getattr(W, "shape", None) else 0
+        job = _WBJob(
+            job_id=f"{op_name}:{tuple(src_ids)}",
+            op=None,
+            src_ids=tuple(int(i) for i in src_ids),
+            residual=residual,
+            param_lens=tuple(win_len for _ in src_ids),
+            fn=_fft_fn,
+        )
+
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=(job,),
+            backend=backend,
+            op_kwargs={"param_tensor": W},
+        )
+        y = batch.ys[0]
+        grads_full = batch.grads_full[0]
+        if batch.param_grads_full:
+            param_grads_full = batch.param_grads_full[0]
     else:
         job = _WBJob(
             job_id=f"{op_name}:{tuple(src_ids)}",
