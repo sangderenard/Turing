@@ -218,6 +218,12 @@ class SlotBackpropQueue:
                     before,
                     after,
                 )
+        else:
+            logger.debug(
+                "process_slot: slot=%d no g_tensor queued_jobs=%d",
+                slot,
+                len(jobs),
+            )
         self.jobs[slot] = []
         self.spectral_jobs[slot] = []
         self.main_residuals[slot] = None
