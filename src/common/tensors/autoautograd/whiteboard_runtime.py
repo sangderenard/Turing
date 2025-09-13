@@ -235,13 +235,30 @@ def run_op_and_grads_cached(
         harness = kw.pop("harness")
         node_ids = kw.pop("node_ids", list(src_ids))
         W, _ = gather_recent_windows(node_ids, cfg, harness)
-        y = batched_bandpower_from_windows(W, cfg)
-        res_t = _residual_like(y, residual, backend)
-        if res_t is not None:
-            (g_W,) = autograd.grad((y * res_t).sum(), W, retain_graph=False, allow_unused=True)
-        else:
-            g_W = W * 0
-        grads_full = AbstractTensor.stack([g_W for _ in src_ids], dim=0)
+
+        def _fft_fn(_p: Any) -> Any:
+            return batched_bandpower_from_windows(W, cfg)
+
+        win_len = int(getattr(W, "shape", (0, 0))[1]) if getattr(W, "shape", None) else 0
+        job = _WBJob(
+            job_id=f"{op_name}:{tuple(src_ids)}",
+            op=None,
+            src_ids=tuple(int(i) for i in src_ids),
+            residual=residual,
+            param_lens=tuple(win_len for _ in src_ids),
+            fn=_fft_fn,
+        )
+
+        batch = run_batched_vjp(
+            sys=sys,
+            jobs=(job,),
+            backend=backend,
+            op_kwargs={"param_tensor": W},
+        )
+        y = batch.ys[0]
+        grads_full = batch.grads_full[0]
+        if batch.param_grads_full:
+            param_grads_full = batch.param_grads_full[0]
     else:
         job = _WBJob(
             job_id=f"{op_name}:{tuple(src_ids)}",
