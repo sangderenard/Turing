@@ -127,6 +127,7 @@ class SlotBackpropQueue:
         sys: Any,
         lr: float = 0.01,
         run_vjp=run_batched_vjp,
+        node_attrs: Sequence[str] | str = "sphere",
     ) -> BatchVJPResult | None:
         """Drain and process jobs for ``slot`` applying gradients.
 
@@ -175,7 +176,7 @@ class SlotBackpropQueue:
             )
             jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
 
-        batch = run_vjp(sys=sys, jobs=jobs)
+        batch = run_vjp(sys=sys, jobs=jobs, node_attrs=node_attrs)
         g_tensor = batch.grads_per_source_tensor
         if g_tensor is not None:
             g_tensor = AT.get_tensor(g_tensor)
