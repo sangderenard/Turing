@@ -14,10 +14,10 @@ IndexLike = Union[None, Sequence[int], Iterable[int]]
 
 class BackendPolicy(Protocol):
     # Required
-    def asarray(self, x: Any) -> Any: ...
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any: ...
     def getter(self, node: Any, attr: str) -> Any: ...
     def setter(self, node: Any, attr: str, value: Any) -> None: ...
+    def to_tensor(self, x: Any) -> Any: ...
     # Optional (No-ops by default if missing)
     def scatter_row(self, node: Any, attr: str, row_value: Any) -> None: ...
     def pre_build(self, view: "NodeAttrView") -> None: ...
@@ -28,15 +28,16 @@ class BackendPolicy(Protocol):
 # Example AbstractTensor-ish policy (adjust to your API as needed)
 class AbstractTensorPolicy(BackendPolicy):
     """
-    Falls back to AbstractTensor for stack/asarray if your AbstractTensor lacks them.
+    Falls back to AbstractTensor for stack if your AbstractTensor lacks them.
     Swap in your real constructors (e.g., AbstractTensor.stack / from_AbstractTensor).
     """
     def __init__(self, AT):
         self.AT = AT
-    def asarray(self, x: Any) -> Any:
-        return AbstractTensor.get_tensor(x)
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Any:
         return AbstractTensor.stack(xs, dim=axis)
+
+    def to_tensor(self, x: Any) -> Any:
+        return AbstractTensor.get_tensor(x)
 
     def scatter_row(self, node: Any, attr: str, row_value: Any) -> None:
         tensor = self.getter(node, attr)
@@ -84,7 +85,6 @@ class NodeAttrView:
 
     # Optional per-instance hooks (leave None to defer to policy/defaults)
     stack_fn: Optional[Callable[[Sequence[Any], int], Any]] = None
-    asarray_fn: Optional[Callable[[Any], Any]] = None
     getter: Optional[Callable[[Any, str], Any]] = None
     setter: Optional[Callable[[Any, str, Any], None]] = None
     scatter_row: Optional[Callable[[Any, str, Any], None]] = None  # extra hook
@@ -137,7 +137,7 @@ class NodeAttrView:
                     return local
                 if hasattr(pol, name):
                     return getattr(pol, name)
-            if name == "asarray":  return AbstractTensor.asarray
+            if name == "to_tensor": return AbstractTensor.get_tensor
             if name == "stack":    return lambda xs, axis=0: AbstractTensor.stack(xs, axis=axis)
             if name == "getter":   return lambda n, a: getattr(n, a) if hasattr(n, a) else n[a]
             if name == "setter":   return lambda n, a, v: setattr(n, a, v) if hasattr(n, a) else n.__setitem__(a, v)
@@ -147,7 +147,7 @@ class NodeAttrView:
                 return None
             raise RuntimeError(f"No default for hook '{name}'")
         self._hooks = {
-            "asarray":    choose("asarray", self.asarray_fn),
+            "to_tensor":  choose("to_tensor", None),
             "stack":      choose("stack", self.stack_fn),
             "getter":     choose("getter", self.getter),
             "setter":     choose("setter", self.setter),
@@ -187,12 +187,13 @@ class NodeAttrView:
                     v = H["getter"](self.nodes[i], a)
                     if self.select is not None:
                         v = self.select(v)
-                    arr = H["asarray"](v).reshape(-1)
+                    t = H["to_tensor"](v)
+                    arr = t.view(-1) if hasattr(t, "view") else t.flatten()
                     pieces.append(arr)
                     if i == ids[0]:
                         ln = int(getattr(arr, "shape", (1,))[0])
                         self._attr_slices[a] = slice(offset, offset + ln)
-                        self._attr_shapes[a] = tuple(getattr(H["asarray"](v), "shape", ()))
+                        self._attr_shapes[a] = tuple(getattr(t, "shape", ()))
                         offset += ln
                 row = AbstractTensor.cat(pieces, dim=-1) if len(pieces) > 1 else pieces[0]
                 cols.append(row)
@@ -200,7 +201,7 @@ class NodeAttrView:
                 v = H["getter"](self.nodes[i], self.attr)  # type: ignore[arg-type]
                 if self.select is not None:
                     v = self.select(v)
-                cols.append(H["asarray"](v))
+                cols.append(H["to_tensor"](v))
 
         if not cols:
             raise ValueError("No nodes selected.")
@@ -242,7 +243,6 @@ class NodeAttrView:
             policy=self.policy,
             policy_overrides=self.policy_overrides,
             stack_fn=self.stack_fn,
-            asarray_fn=self.asarray_fn,
             getter=self.getter,
             setter=self.setter,
             scatter_row=self.scatter_row,
