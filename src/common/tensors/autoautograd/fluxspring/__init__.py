@@ -158,6 +158,15 @@ class ParamWheel:
 
         row_slots = self.slots_for_tick(tick)
         used = set(row_slots)
+        for r, s in enumerate(row_slots):
+            v = self._versions[s]
+            logger.debug(
+                "bind_for_tick row=%d slot=%d id=%d requires_grad=%s",
+                r,
+                s,
+                id(v),
+                bool(getattr(v, "requires_grad", False)),
+            )
 
         if len(row_slots) == 1:
             self.setter(self._versions[row_slots[0]])
