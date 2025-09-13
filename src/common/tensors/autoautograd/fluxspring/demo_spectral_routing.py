@@ -399,6 +399,17 @@ def pump_with_loss(
         src_ids = tuple(range(len(ctx.wheels)))
 
         def _route_fn(_p: AT.Tensor) -> AT.Tensor:
+            for w in ctx.wheels:
+                val = AT.get_tensor(w.params[w.idx])
+                flat = np.array(val).ravel()
+                summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
+                logger.debug(
+                    "_route_fn wheel label=%s idx=%d param_id=%d val=%s",
+                    w.label,
+                    w.idx,
+                    id(w.params[w.idx]),
+                    summary,
+                )
             psi_tmp, _ = fs_dec.pump_tick(
                 state.clone(),
                 ctx.spec,
@@ -430,6 +441,17 @@ def pump_with_loss(
         )
 
         def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
+            for w in ctx.wheels:
+                val = AT.get_tensor(w.params[w.idx])
+                flat = np.array(val).ravel()
+                summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
+                logger.debug(
+                    "_fft_fn wheel label=%s idx=%d param_id=%d val=%s",
+                    w.label,
+                    w.idx,
+                    id(w.params[w.idx]),
+                    summary,
+                )
             mids_local = list(range(band_start, band_start + B))
             W_loc, kept_loc = gather_recent_windows(mids_local, spectral_cfg, ctx.harness)
             if len(kept_loc) == len(mids_local):
