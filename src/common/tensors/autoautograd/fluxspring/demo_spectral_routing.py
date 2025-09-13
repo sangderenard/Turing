@@ -47,6 +47,8 @@ from dataclasses import dataclass
 # Module logger setup (configured in main if not already configured)
 logger = logging.getLogger(__name__)
 
+FLUX_PARAM_SCHEMA = ("p",)
+
 
 class TensorRingBuffer:
     """AbstractTensor-based ring buffer for per-tick logs."""
@@ -478,9 +480,9 @@ def train_routing(
             if mature_tick >= 0:
                 mature_slot = mature_tick % ctx.bp_queue.slots
                 sys = SimpleNamespace(
-                    nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
+                    nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
                 )
-                res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+                res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
                 if res is not None:
                     ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
             tick += 1
@@ -510,9 +512,9 @@ def train_routing(
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
             sys = SimpleNamespace(
-                nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
+                nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
@@ -525,9 +527,9 @@ def train_routing(
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
             sys = SimpleNamespace(
-                nodes={i: SimpleNamespace(sphere=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
+                nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1

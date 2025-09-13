@@ -337,6 +337,7 @@ def run_batched_vjp(
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
     backend: Any | None = None,
+    node_attrs: Sequence[str] | str = "sphere",
 ) -> BatchVJPResult:
     """
     One tape, one VJP over the whole bin.
@@ -410,7 +411,7 @@ def run_batched_vjp(
     scope = scope_cm() if callable(scope_cm) else nullcontext()
 
     with scope, _tape():
-        view = NodeAttrView(sys.nodes, "sphere", indices=union_ids).build()
+        view = NodeAttrView(sys.nodes, node_attrs, indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()

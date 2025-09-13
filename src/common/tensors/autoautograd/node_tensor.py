@@ -74,7 +74,7 @@ class NodeAttrView:
     attributes share the same shape.
     """
     nodes: Any
-    attr: str
+    attr: Union[str, Sequence[str]]
     indices: IndexLike = None
     select: Optional[Callable[[Any], Any]] = None
 
@@ -95,6 +95,8 @@ class NodeAttrView:
     hooks: dict[str, Any] | None = None
     check_shapes: bool = True
     _hooks: dict[str, Any] | None = None
+    _attr_slices: dict[str, slice] | None = None
+    _attr_shapes: dict[str, tuple[int, ...]] | None = None
 
     def __post_init__(self):
         if self.hooks is not None:
@@ -117,7 +119,7 @@ class NodeAttrView:
                     first = next(iter(self.nodes.values()))
                 except Exception:
                     first = None
-            if first is not None:
+            if first is not None and isinstance(self.attr, str):
                 try:
                     sample = getattr(first, self.attr) if hasattr(first, self.attr) else first[self.attr]
                 except Exception:
@@ -171,24 +173,44 @@ class NodeAttrView:
         else:
             ids = list(self.indices)
 
-        # Gather + optional select + asarray
         cols = []
-        for i in ids:
-            v = H["getter"](self.nodes[i], self.attr)
-            if self.select is not None:
-                v = self.select(v)
-            cols.append(H["asarray"](v))
+        is_list = not isinstance(self.attr, str)
+        if is_list and self._attr_slices is None:
+            self._attr_slices = {}
+            self._attr_shapes = {}
 
-        # Homogeneity check
+        for i in ids:
+            if is_list:
+                pieces = []
+                offset = 0
+                for a in self.attr:  # type: ignore[not-an-iterable]
+                    v = H["getter"](self.nodes[i], a)
+                    if self.select is not None:
+                        v = self.select(v)
+                    arr = H["asarray"](v).reshape(-1)
+                    pieces.append(arr)
+                    if i == ids[0]:
+                        ln = int(getattr(arr, "shape", (1,))[0])
+                        self._attr_slices[a] = slice(offset, offset + ln)
+                        self._attr_shapes[a] = tuple(getattr(H["asarray"](v), "shape", ()))
+                        offset += ln
+                row = AbstractTensor.cat(pieces, dim=-1) if len(pieces) > 1 else pieces[0]
+                cols.append(row)
+            else:
+                v = H["getter"](self.nodes[i], self.attr)  # type: ignore[arg-type]
+                if self.select is not None:
+                    v = self.select(v)
+                cols.append(H["asarray"](v))
+
         if not cols:
             raise ValueError("No nodes selected.")
-        if self.check_shapes:
+        if self.check_shapes and not is_list:
             ref_shape = getattr(cols[0], "shape", None)
             for c in cols:
                 if getattr(c, "shape", None) != ref_shape:
                     raise ValueError("Node attributes are ragged; provide select() or normalize shapes.")
 
-        self._tensor = H["stack"](cols, axis=0)  # (len(ids), *attr_shape)
+        self._tensor = H["stack"](cols, axis=0)
         self._order = ids
 
         H["post_build"](self)
@@ -244,11 +266,26 @@ class NodeAttrView:
 
         T = self._tensor
         scatter_row = H["scatter_row"]
+        is_list = not isinstance(self.attr, str)
         for row_idx, node_id in enumerate(self._order):
-            if scatter_row is not None:
-                scatter_row(self.nodes[node_id], self.attr, T[row_idx])
+            row = T[row_idx]
+            if is_list:
+                assert self._attr_slices is not None and self._attr_shapes is not None
+                for a in self.attr:  # type: ignore[not-an-iterable]
+                    sl = self._attr_slices[a]
+                    seg = row[sl]
+                    shape = self._attr_shapes[a]
+                    if hasattr(seg, "reshape"):
+                        seg = seg.reshape(shape)
+                    if scatter_row is not None:
+                        scatter_row(self.nodes[node_id], a, seg)
+                    else:
+                        H["setter"](self.nodes[node_id], a, seg)
             else:
-                H["setter"](self.nodes[node_id], self.attr, T[row_idx])
+                if scatter_row is not None:
+                    scatter_row(self.nodes[node_id], self.attr, row)
+                else:
+                    H["setter"](self.nodes[node_id], self.attr, row)
 
         H["post_commit"](self)
 
