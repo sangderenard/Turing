@@ -538,7 +538,18 @@ def run_batched_vjp(
             logger.debug("run_batched_vjp: no residuals → zero grads")
         else:
             targets = (x_all, param_tensor) if param_tensor is not None else (x_all,)
+            logger.debug(
+                "run_batched_vjp: pre grad param_tensor_id=%s requires_grad=%s grad_fn=%s",
+                id(param_tensor) if param_tensor is not None else None,
+                getattr(param_tensor, "requires_grad", None) if param_tensor is not None else None,
+                getattr(param_tensor, "grad_fn", None) if param_tensor is not None else None,
+            )
             grads = autograd.grad(L, targets, retain_graph=False, allow_unused=True)
+            ops = getattr(autograd.tape, "operations", None)
+            logger.debug(
+                "run_batched_vjp: tape_ops=%s",
+                len(ops) if ops is not None else None,
+            )
             g_all = grads[0]
             g_param = grads[1] if param_tensor is not None else None
             logger.debug(
