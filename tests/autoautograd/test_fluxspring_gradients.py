@@ -6,6 +6,7 @@ from src.common.tensors.autoautograd.fluxspring.demo_spectral_routing import (
     build_spec,
     SpectralCfg,
     SpectralMetrics,
+    generate_signals,
 )
 from src.common.tensors.autoautograd.fluxspring.fs_types import (
     FluxSpringSpec,
@@ -183,4 +184,13 @@ def test_register_learnable_params_preserves_gradients():
     loss = (w * AT.tensor(2.0)) ** 2
     g = autograd.grad(loss, [w])[0]
     assert g is not None
+
+
+def test_generate_signals_returns_entries_per_frame():
+    bands = [[20, 40], [40, 60]]
+    win = 4
+    tick_hz = 400.0
+    frames = 3
+    _, noise_frames = generate_signals(bands, win, tick_hz, frames)
+    assert len(noise_frames) == frames
 

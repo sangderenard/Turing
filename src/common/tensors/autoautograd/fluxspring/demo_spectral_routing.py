@@ -268,7 +268,7 @@ def generate_signals(
     for _ in range(frames):
         noise = AT.tensor(rng.standard_normal((len(bands), win)))
         mix = sinusoid_sum + 0.1 * noise
-    noise_frames.append([mix[i] for i in range(len(bands))])
+        noise_frames.append([mix[i] for i in range(len(bands))])
     return sine_chunks, noise_frames
 
 
