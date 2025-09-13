@@ -72,14 +72,27 @@ class SlotBackpropQueue:
                 raise ValueError("add_residual requires either slot or tick")
             slot = self._slot_for(tick=tick, row_idx=row_idx)
 
+        main_shape = None
         if main is not None:
             t = AT.get_tensor(main)
+            main_shape = getattr(t, "shape", None)
             prev = self.main_residuals.get(slot)
             self.main_residuals[slot] = t if prev is None else prev + t
+        spectral_shape = None
         if spectral is not None:
             t = AT.get_tensor(spectral)
+            spectral_shape = getattr(t, "shape", None)
             prev = self.spectral_residuals.get(slot)
             self.spectral_residuals[slot] = t if prev is None else prev + t
+
+        logger.debug(
+            "add_residual: slot=%s tick=%s row_idx=%d main_shape=%s spectral_shape=%s",
+            slot,
+            tick,
+            row_idx,
+            main_shape,
+            spectral_shape,
+        )
 
     # ------------------------------------------------------------------
     def queue_job(
@@ -118,6 +131,13 @@ class SlotBackpropQueue:
             self.spectral_jobs.setdefault(slot, []).append(job)
         else:
             self.jobs.setdefault(slot, []).append(job)
+
+        logger.debug(
+            "queue_job: slot=%s job_id=%s kind=%s",
+            slot,
+            getattr(job, "job_id", None),
+            kind,
+        )
 
     # ------------------------------------------------------------------
     def process_slot(
