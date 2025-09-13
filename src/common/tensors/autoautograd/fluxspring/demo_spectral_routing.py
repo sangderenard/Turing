@@ -40,7 +40,7 @@ from ..whiteboard_runtime import _WBJob
 from types import SimpleNamespace
 import logging
 import numpy as np
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from dataclasses import dataclass
 
 
@@ -48,6 +48,14 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 FLUX_PARAM_SCHEMA = ("p",)
+
+
+def _vectorize_wheel_params_to_1d(wheels: Sequence[ParamWheel]) -> None:
+    """Ensure each parameter slot is at least 1-D for autograd."""
+    for w in wheels:
+        for i, p in enumerate(w.params):
+            pt = AT.get_tensor(p)
+            w.params[i] = pt.reshape(1) if getattr(pt, "ndim", 0) == 0 else pt.reshape(-1)
 
 
 class TensorRingBuffer:
@@ -403,6 +411,7 @@ def train_routing(
     are optionally flushed via ``flush_hook``.
     """
     wheels = register_param_wheels(spec)
+    _vectorize_wheel_params_to_1d(wheels)
     for w in wheels:
         w.rotate(); w.bind_slot()
     set_strict_mode(True)

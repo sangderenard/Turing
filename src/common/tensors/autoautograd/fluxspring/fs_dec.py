@@ -12,6 +12,14 @@ from ...abstraction import AbstractTensor as AT
 from .fs_types import FluxSpringSpec
 from .fs_harness import RingHarness
 
+
+def _assert_tensor_param(name: str, t) -> None:
+    """Ensure learnable parameters remain ``AT`` tensors."""
+    if isinstance(t, (float, int)):
+        raise TypeError(
+            f"Learnable '{name}' was cast to a Python scalar; keep it as an AT tensor."
+        )
+
 # --------- Incidence & validators ---------
 def incidence_tensors_AT(spec: FluxSpringSpec):
     D0 = AT.get_tensor(spec.dec.D0).astype(float)  # (E,N)
@@ -225,7 +233,8 @@ def transport_tick(
 
     x_new = x + eta * q
     for e, x_val in zip(spec.edges, x_new):
-        e.transport.x = AT.get_tensor(float(x_val))
+        # Preserve autograd by keeping ``x_val`` as a tensor.
+        e.transport.x = AT.get_tensor(x_val)
 
     stats = {"q": q, "dpsi": dpsi, "G": G, "R": R, "s": s}
     return psi_next, stats
@@ -316,6 +325,16 @@ def _pump_tick(
         ids = list(external.keys())
         vals = AT.stack([external[i] for i in ids]).reshape(-1)
         psi = AT.scatter_row(psi.clone(), ids, vals, dim=0)
+
+    for n in spec.nodes:
+        _assert_tensor_param("node.ctrl.alpha", n.ctrl.alpha)
+        _assert_tensor_param("node.ctrl.w", n.ctrl.w)
+        _assert_tensor_param("node.ctrl.b", n.ctrl.b)
+    for e in spec.edges:
+        _assert_tensor_param("edge.transport.kappa", e.transport.kappa)
+        _assert_tensor_param("edge.ctrl.alpha", e.ctrl.alpha)
+        _assert_tensor_param("edge.ctrl.w", e.ctrl.w)
+        _assert_tensor_param("edge.ctrl.b", e.ctrl.b)
 
     psi = psi * (1.0 - leak)
     D0, _ = incidence_tensors_AT(spec)

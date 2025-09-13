@@ -189,12 +189,12 @@ def run_op_and_grads_cached(
         y = vals[0] + vals[1]
         ones0 = vals[0] * 0 + 1
         ones1 = vals[1] * 0 + 1
-        grads_full = AbstractTensor.stack([ones0, ones1], dim=0)
+        grads_full = AT.stack([ones0, ones1], dim=0)
     elif op_name == "mul" and len(vals) == 2 and not op_args and not op_kwargs:
         y = vals[0] * vals[1]
         g0 = vals[1] * (vals[0] * 0 + 1)
         g1 = vals[0] * (vals[1] * 0 + 1)
-        grads_full = AbstractTensor.stack([g0, g1], dim=0)
+        grads_full = AT.stack([g0, g1], dim=0)
     elif op_name == "route_batch":
         from .fluxspring import fs_dec
 
@@ -318,11 +318,11 @@ def run_op_and_grads_cached(
         if param_grads_full is not None:
             grads = param_grads_full
         elif grads_full is None:
-            grads = AbstractTensor.zeros((len(src_ids), P), float)
+            grads = AT.zeros((len(src_ids), P), float)
         else:
             grads = grads_full[:, D:] if P > 0 else grads_full[:, 0:0]
     else:  # "full"
-        grads = grads_full if grads_full is not None else AbstractTensor.zeros(
+        grads = grads_full if grads_full is not None else AT.zeros(
             (len(src_ids), sphere_len), float
         )
 
@@ -555,16 +555,17 @@ def run_batched_vjp(
             for sid in param_ids
         ]
         union_stack = JobBatcher._stack(union_slices)
-        zero_vec = union_stack[0][:0] if union_slices else g_param[0:0]
+        zero_full = g_param * 0
         param_grads_list = []
         for j in jobs:
-            grads = []
+            rows = []
             for sid, plen in zip(j.src_ids, getattr(j, "param_lens", ())):
+                row = zero_full.clone() if hasattr(zero_full, "clone") else zero_full
                 if plen > 0 and sid in param_pos:
-                    grads.append(union_stack[param_pos[sid]])
-                else:
-                    grads.append(zero_vec)
-            param_grads_list.append(JobBatcher._stack(grads))
+                    off = param_offsets[sid]
+                    row[off : off + plen] = union_stack[param_pos[sid]]
+                rows.append(row)
+            param_grads_list.append(JobBatcher._stack(rows))
 
     grads_full = tuple(grads_list)
     grads_per_source = tuple(
