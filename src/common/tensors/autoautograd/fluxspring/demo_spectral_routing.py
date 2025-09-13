@@ -52,10 +52,23 @@ FLUX_PARAM_SCHEMA = ("p",)
 
 def _vectorize_wheel_params_to_1d(wheels: Sequence[ParamWheel]) -> None:
     """Ensure each parameter slot is at least 1-D for autograd."""
-    for w in wheels:
-        for i, p in enumerate(w.params):
+    for w_idx, w in enumerate(wheels):
+        for p_idx, p in enumerate(w.params):
             pt = AT.get_tensor(p)
-            w.params[i] = pt.reshape(1) if getattr(pt, "ndim", 0) == 0 else pt.reshape(-1)
+            logger.debug(
+                "vectorize_wheel: wheel=%d param=%d before shape=%s",
+                w_idx,
+                p_idx,
+                getattr(pt, "shape", None),
+            )
+            reshaped = pt.reshape(1) if getattr(pt, "ndim", 0) == 0 else pt.reshape(-1)
+            logger.debug(
+                "vectorize_wheel: wheel=%d param=%d after shape=%s",
+                w_idx,
+                p_idx,
+                getattr(reshaped, "shape", None),
+            )
+            w.params[p_idx] = reshaped
 
 
 class TensorRingBuffer:
