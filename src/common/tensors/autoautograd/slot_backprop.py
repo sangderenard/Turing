@@ -196,6 +196,21 @@ class SlotBackpropQueue:
             )
             jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
 
+        if sys is not None and getattr(sys, "nodes", None) is not None:
+            for nid, node in (
+                sys.nodes.items() if isinstance(sys.nodes, dict) else enumerate(sys.nodes)
+            ):
+                p = getattr(node, "p", None)
+                if p is None:
+                    continue
+                logger.debug(
+                    "process_slot: node_id=%s param_id=%s requires_grad=%s value=%s",
+                    nid,
+                    id(p),
+                    getattr(p, "requires_grad", False),
+                    p,
+                )
+
         batch = run_vjp(sys=sys, jobs=jobs, node_attrs=node_attrs)
         g_tensor = batch.grads_per_source_tensor
         if g_tensor is not None:
