@@ -67,7 +67,7 @@ def test_param_version_ring_snapshots():
 
     mat = harness.get_params_for_lineages(lids, ledger)
     assert mat.shape == (3, 1)
-    assert float(AT.get_tensor(mat[0, 0])) == pytest.approx(1.0)
+    assert float(mat[0, 0]) == pytest.approx(1.0)
 
     assert ledger.lineages() == tuple(lids)
     ledger.purge_through_lid(lids[1])
@@ -130,7 +130,7 @@ def test_param_version_ring_respects_stage_depth():
 
     mat = harness.get_params_for_lineages(lids[:2], ledger)
     idx = harness.param_labels.index("node[1].ctrl.w")
-    vals = AT.get_tensor(mat)[:, idx]
+    vals = mat[:, idx]
     assert float(vals[0]) == pytest.approx(1.0)
     assert float(vals[1]) == pytest.approx(2.0)
 

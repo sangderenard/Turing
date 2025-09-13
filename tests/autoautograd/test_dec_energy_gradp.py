@@ -94,5 +94,5 @@ def test_vectorized_grad_matches_loop():
     P = AT.get_tensor([[0.0], [1.5]])
     E_vec, grad_vec = dec_energy_and_gradP_AT(P, spec)
     E_loop, grad_loop = dec_energy_and_gradP_loop(P, spec)
-    assert float(AT.get_tensor(E_vec)) == pytest.approx(float(AT.get_tensor(E_loop)))
+    assert float(E_vec) == pytest.approx(float(E_loop))
     assert AT.allclose(grad_vec, grad_loop)

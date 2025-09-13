@@ -60,16 +60,15 @@ def test_pump_tick_injection_leak0():
     psi = AT.zeros(2)
     psi_next, _ = pump_tick(psi, spec, eta=0.0, external={0: AT.tensor(1.0)}, leak=0.0)
     assert psi_next.shape[0] == 2
-    assert float(AT.get_tensor(psi_next)[0]) == pytest.approx(1.0)
+    assert float(psi_next[0]) == pytest.approx(1.0)
 
 
 def test_pump_tick_leak_decay():
     spec = _make_spec()
     psi = AT.get_tensor([1.0, -1.0])
     psi_next, _ = pump_tick(psi, spec, eta=0.0, leak=0.2)
-    vals = AT.get_tensor(psi_next)
-    assert float(vals[0]) == pytest.approx(0.8)
-    assert float(vals[1]) == pytest.approx(-0.8)
+    assert float(psi_next[0]) == pytest.approx(0.8)
+    assert float(psi_next[1]) == pytest.approx(-0.8)
 
 
 def test_pump_tick_saturate():
@@ -77,9 +76,8 @@ def test_pump_tick_saturate():
     psi = AT.get_tensor([2.0, -2.0])
     sat = lambda x: AT.clip(x, -1.0, 1.0)
     psi_next, _ = pump_tick(psi, spec, eta=0.0, leak=0.0, saturate=sat)
-    vals = AT.get_tensor(psi_next)
-    assert float(vals[0]) == pytest.approx(1.0)
-    assert float(vals[1]) == pytest.approx(-1.0)
+    assert float(psi_next[0]) == pytest.approx(1.0)
+    assert float(psi_next[1]) == pytest.approx(-1.0)
 
 
 def test_pump_tick_lorentz():
@@ -90,10 +88,8 @@ def test_pump_tick_lorentz():
     psi_next, stats = pump_tick(psi, spec, eta=eta, lorentz_c=c)
     delta = stats["delta"]
     expected = psi + eta * (delta / AT.sqrt(1.0 - (psi / c) ** 2))
-    vals = AT.get_tensor(psi_next)
-    exp_vals = AT.get_tensor(expected)
-    assert float(vals[0]) == pytest.approx(float(exp_vals[0]))
-    assert float(vals[1]) == pytest.approx(float(exp_vals[1]))
+    assert float(psi_next[0]) == pytest.approx(float(expected[0]))
+    assert float(psi_next[1]) == pytest.approx(float(expected[1]))
 
 
 def test_pump_tick_norm_node():
@@ -102,10 +98,10 @@ def test_pump_tick_norm_node():
     eta = 1.0
     _, stats_off = pump_tick(psi, spec, eta=eta)
     _, stats_norm = pump_tick(psi, spec, eta=eta, norm="node")
-    delta_off = AT.get_tensor(stats_off["delta"])
-    delta_norm = AT.get_tensor(stats_norm["delta"])
-    q_off = AT.get_tensor(stats_off["q"])
-    q_norm = AT.get_tensor(stats_norm["q"])
+    delta_off = stats_off["delta"]
+    delta_norm = stats_norm["delta"]
+    q_off = stats_off["q"]
+    q_norm = stats_norm["q"]
     assert float(delta_norm[0]) == pytest.approx(float(delta_off[0]) / 2)
     assert float(delta_norm[1]) == pytest.approx(float(delta_off[1]) / 2)
     assert float(q_norm[0]) == pytest.approx(float(q_off[0]) / 2)

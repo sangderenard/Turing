@@ -48,4 +48,4 @@ def test_ring_buffer_propagates_gradients():
     loss = rb.buf.sum()
     grad = autograd.grad(loss, [param])[0]
     assert grad is not None
-    assert float(AT.get_tensor(grad)) != 0.0
+    assert float(grad) != 0.0

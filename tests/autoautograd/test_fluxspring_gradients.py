@@ -96,12 +96,12 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
 
     psi_tick, loss = _forward(spec)
     g_edge, g_node = autograd.grad(loss, [edge_w, node_w])
-    exp_psi1_val = -0.1 * float(AT.get_tensor(edge_w)) * float(AT.get_tensor(node_w))
-    assert float(AT.get_tensor(psi_tick)[1]) == pytest.approx(exp_psi1_val)
+    exp_psi1_val = -0.1 * float(edge_w) * float(node_w)
+    assert float(psi_tick[1]) == pytest.approx(exp_psi1_val)
     assert g_edge is not None
     assert g_node is not None
-    g_edge_val = float(AT.get_tensor(g_edge))
-    g_node_val = float(AT.get_tensor(g_node))
+    g_edge_val = float(g_edge)
+    g_node_val = float(g_node)
 
     eps = 1e-4
 
@@ -109,9 +109,9 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
         orig = float(param.data[0])
         with autograd.no_grad():
             param.data[0] = orig + eps
-            lp = float(AT.get_tensor(_compute_loss(spec)))
+            lp = float(_compute_loss(spec))
             param.data[0] = orig - eps
-            lm = float(AT.get_tensor(_compute_loss(spec)))
+            lm = float(_compute_loss(spec))
             param.data[0] = orig
         return (lp - lm) / (2 * eps)
 
@@ -122,8 +122,8 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
 
     loss2 = _compute_loss(spec)
     autograd.grad(loss2, [edge_w, node_w])
-    g_edge_acc = float(AT.get_tensor(edge_w.grad))
-    g_node_acc = float(AT.get_tensor(node_w.grad))
+    g_edge_acc = float(edge_w.grad)
+    g_node_acc = float(node_w.grad)
     assert g_edge_acc == pytest.approx(2 * g_edge_val, rel=1e-6, abs=1e-6)
     assert g_node_acc == pytest.approx(2 * g_node_val, rel=1e-6, abs=1e-6)
 
@@ -135,8 +135,8 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
     spec.nodes[1].ctrl.w = node_w
     loss3 = _compute_loss(spec)
     autograd.grad(loss3, [edge_w, node_w])
-    g_edge_new = float(AT.get_tensor(edge_w.grad))
-    g_node_new = float(AT.get_tensor(node_w.grad))
+    g_edge_new = float(edge_w.grad)
+    g_node_new = float(node_w.grad)
     assert g_edge_new == pytest.approx(g_edge_val, rel=1e-6, abs=1e-6)
     assert g_node_new == pytest.approx(g_node_val, rel=1e-6, abs=1e-6)
 

@@ -49,6 +49,6 @@ def test_premix_ring_updates_and_hist_loss():
     assert rb is not None
     loss_lo = premix_histogram_loss(rb, band_idx=0, total_bands=2, tick_hz=tick_hz)
     loss_hi = premix_histogram_loss(rb, band_idx=1, total_bands=2, tick_hz=tick_hz)
-    loss_lo_f = float(AT.get_tensor(loss_lo).item())
-    loss_hi_f = float(AT.get_tensor(loss_hi).item())
+    loss_lo_f = float(loss_lo)
+    loss_hi_f = float(loss_hi)
     assert loss_lo_f < loss_hi_f
