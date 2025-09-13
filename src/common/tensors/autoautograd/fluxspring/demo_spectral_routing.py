@@ -303,15 +303,34 @@ def initialize_signal_state(
 def log_param_gradients(params: list[AT.Tensor]) -> None:
     """Report gradient status for learnable parameters."""
     for idx, p in enumerate(params):
+        value = AT.get_tensor(p)
+        requires_grad = getattr(p, "requires_grad", False)
         grad = getattr(p, "grad", None)
         if grad is None:
-            logger.debug("[Gradients] param %d missing gradient", idx)
+            logger.debug(
+                "[Gradients] param %d value=%s requires_grad=%s missing gradient",
+                idx,
+                value,
+                requires_grad,
+            )
         else:
             g = AT.get_tensor(grad)
             if np.allclose(g, 0.0):
-                logger.debug("[Gradients] param %d gradient is zero: %s", idx, g)
+                logger.debug(
+                    "[Gradients] param %d value=%s requires_grad=%s gradient is zero: %s",
+                    idx,
+                    value,
+                    requires_grad,
+                    g,
+                )
             else:
-                logger.debug("[Gradients] param %d grad: %s", idx, g)
+                logger.debug(
+                    "[Gradients] param %d value=%s requires_grad=%s grad: %s",
+                    idx,
+                    value,
+                    requires_grad,
+                    g,
+                )
 def pump_with_loss(
     ctx: RoutingState,
     state: AT.Tensor,
