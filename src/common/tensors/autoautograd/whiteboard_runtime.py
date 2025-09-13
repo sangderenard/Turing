@@ -7,7 +7,7 @@ from .whiteboard_cache import WhiteboardCache, CacheEntry
 
 from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
-from ..abstraction import AbstractTensor
+from ..abstraction import AbstractTensor as AT
 from .job_batcher import JobBatcher
 
 logger = logging.getLogger(__name__)
@@ -414,6 +414,7 @@ def run_batched_vjp(
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
+        logger.debug("run_batched_vjp: x_all=%s", AT.get_tensor(x_all))
         if param_tensor is not None and hasattr(param_tensor, "requires_grad_"):
             param_tensor = param_tensor.requires_grad_()
 
@@ -575,6 +576,16 @@ def run_batched_vjp(
         len(grads_full),
         len(grads_per_source),
     )
+    for j, y_j, r_j, g_j, p_j in zip(jobs, ys, residuals, grads_full, param_grads_list):
+        logger.debug(
+            "run_batched_vjp: job=%s src=%s residual=%s y=%s grad=%s param_grad=%s",
+            j.job_id,
+            j.src_ids,
+            r_j,
+            AT.get_tensor(y_j),
+            AT.get_tensor(g_j) if g_j is not None else None,
+            AT.get_tensor(p_j) if p_j is not None else None,
+        )
     return BatchVJPResult(
         slices=BatchSlices(index_of=idx_of, job_ids=inv_ids),
         ys=tuple(ys),

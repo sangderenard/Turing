@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
+import logging
 
 from ..abstraction import AbstractTensor as AT
 from .whiteboard_runtime import run_batched_vjp, BatchVJPResult, _WBJob
 from .fluxspring import ParamWheel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -145,30 +148,58 @@ class SlotBackpropQueue:
         if not main_jobs and not spec_jobs:
             self.main_residuals[slot] = None
             self.spectral_residuals[slot] = None
+            logger.debug("process_slot: slot=%d empty", slot)
             return None
 
         main_res = self.main_residuals.get(slot)
         spec_res = self.spectral_residuals.get(slot)
+        logger.debug(
+            "process_slot: slot=%d main_jobs=%d spec_jobs=%d main_res=%s spec_res=%s",
+            slot,
+            len(main_jobs),
+            len(spec_jobs),
+            main_res,
+            spec_res,
+        )
         jobs: List[_WBJob] = []
         for j in main_jobs:
-            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, main_res, j.param_lens, j.fn))
+            res = main_res if main_res is not None else j.residual
+            logger.debug(
+                "process_slot: enqueue main job=%s residual=%s", j.job_id, res
+            )
+            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
         for j in spec_jobs:
-            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, spec_res, j.param_lens, j.fn))
+            res = spec_res if spec_res is not None else j.residual
+            logger.debug(
+                "process_slot: enqueue spectral job=%s residual=%s", j.job_id, res
+            )
+            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
 
         batch = run_vjp(sys=sys, jobs=jobs)
         g_tensor = batch.grads_per_source_tensor
         if g_tensor is not None:
             g_tensor = AT.get_tensor(g_tensor)
+            logger.debug("process_slot: slot=%d g_tensor=%s", slot, g_tensor)
             for idx, w in enumerate(self.wheels):
                 grad = g_tensor[idx]
                 p = w.params[slot]
+                before = AT.get_tensor(p)
                 # Store gradient on the internal attribute expected by the
                 # autograd helpers.  ``grad`` is a read-only property, so we set
                 # ``_grad`` directly.
                 p._grad = AT.get_tensor(grad)  # type: ignore[attr-defined]
                 w.apply_slot(slot, lambda p_, g_=p._grad: p_ - lr * g_)
+                after = AT.get_tensor(w.params[slot])
+                logger.debug(
+                    "process_slot: apply idx=%d grad=%s before=%s after=%s",
+                    idx,
+                    grad,
+                    before,
+                    after,
+                )
         self.jobs[slot] = []
         self.spectral_jobs[slot] = []
         self.main_residuals[slot] = None
         self.spectral_residuals[slot] = None
+        logger.debug("process_slot: slot=%d cleared", slot)
         return batch
