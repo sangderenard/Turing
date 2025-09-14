@@ -48,6 +48,26 @@ def spiral_slot(tick: int, row_idx: int, spiral_len: int) -> int:
     if spiral_len <= 0:
         return 0
     return int((tick - row_idx) % spiral_len)
+
+
+def required_spiral_len(spec: FluxSpringSpec, extra_delay: int = 0) -> int:
+    """Return the minimal spiral length for a spec.
+
+    Parameters
+    ----------
+    spec:
+        FluxSpring configuration providing the spectral window length.
+    extra_delay:
+        Additional delay slots beyond ``spec.spectral.win_len``.  Exposed so
+        future stages can reserve space for effects such as transport lag.
+
+    Notes
+    -----
+    The spiral length is the maximal delay supported by the system.  It is
+    computed as ``spec.spectral.win_len + extra_delay``.
+    """
+
+    return int(spec.spectral.win_len) + int(extra_delay)
 def _tape():
     # Autograd is monkey-patched onto AT in your stack.
     try:
@@ -121,6 +141,7 @@ class ParamWheel:
 
         # Gradient ring buffers parallel to ``_versions``
         self._grads: list[AT | None] = [None for _ in range(slots)]
+        self._frozen = False
 
         tape = _tape()
         if label is not None:
@@ -144,6 +165,34 @@ class ParamWheel:
 
     def grads(self) -> list[AT | None]:
         return self._grads
+
+    # ------------------------------------------------------------------
+    def grow(self, slots: int) -> None:
+        """Grow the wheel to at least ``slots`` entries.
+
+        Growth is disallowed after :meth:`freeze` has been called.
+        """
+
+        if self._frozen or slots <= len(self._versions):
+            if slots > len(self._versions) and self._frozen:
+                raise RuntimeError("ParamWheel is frozen")
+            return
+
+        base = self._versions[0]
+        tape = _tape()
+        for _ in range(len(self._versions), slots):
+            t = base.detach().clone()
+            t.requires_grad_(True)
+            self._versions.append(t)
+            self._grads.append(None)
+            if self.label is not None:
+                tape.annotate(t, label=self.label)
+
+    # ------------------------------------------------------------------
+    def freeze(self) -> None:
+        """Prevent further growth of the wheel."""
+
+        self._frozen = True
 
     # ------------------------------------------------------------------
     def rotate(self) -> int:
@@ -239,7 +288,7 @@ class ParamWheel:
 
 
 def register_param_wheels(
-    spec: FluxSpringSpec, *, slots: int | None = None
+    spec: FluxSpringSpec, *, slots: int | None = None, extra_delay: int = 0
 ) -> list[ParamWheel]:
     """Instantiate :class:`ParamWheel` objects for all learnable parameters.
 
@@ -250,7 +299,7 @@ def register_param_wheels(
     """
 
     if slots is None:
-        slots = spec.spectral.win_len if spec.spectral.enabled else 2
+        slots = required_spiral_len(spec, extra_delay) if spec.spectral.enabled else 2
 
     wheels: list[ParamWheel] = []
     tmp: list[AT] = []

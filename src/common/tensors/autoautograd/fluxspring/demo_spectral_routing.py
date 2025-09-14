@@ -15,7 +15,7 @@ from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
 )
-from . import fs_dec, register_param_wheels, ParamWheel, spiral_slot
+from . import fs_dec, register_param_wheels, ParamWheel, spiral_slot, required_spiral_len
 from .fs_harness import RingHarness, RingBuffer
 from .fs_types import (
     DECSpec,
@@ -554,12 +554,7 @@ def train_routing(
     out_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     tgt_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
     hist_buf = RingBuffer(AT.zeros((spec.spectral.win_len, B), dtype=float))
-    bp_queue = SlotBackpropQueue(wheels)
-    if bp_queue.slots != spectral_cfg.win_len:
-        raise ValueError(
-            "train_routing: bp_queue.slots %d does not match spectral_cfg.win_len %d"
-            % (bp_queue.slots, spectral_cfg.win_len)
-        )
+    bp_queue = SlotBackpropQueue(wheels, slots=required_spiral_len(spec))
     ctx = RoutingState(
         spec=spec,
         harness=harness,
