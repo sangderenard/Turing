@@ -344,6 +344,7 @@ def run_batched_vjp(
     op_kwargs: Optional[Dict[str, Any]] = None,
     backend: Any | None = None,
     node_attrs: Sequence[str] | str = "sphere",
+    force_probe: bool = True,
 ) -> BatchVJPResult:
     """
     One tape, one VJP over the whole bin.
@@ -374,7 +375,7 @@ def run_batched_vjp(
         getattr(param_tensor, "requires_grad", None) if param_tensor is not None else None,
     )
 
-    probe_enabled = bool(int(os.environ.get("WHITEBOARD_PROBES", "0")))
+    probe_enabled = bool(int(os.environ.get("WHITEBOARD_PROBES", "0"))) or force_probe
     if probe_enabled:
         set_strict_mode(True)
 
