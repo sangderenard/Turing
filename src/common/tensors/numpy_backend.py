@@ -133,11 +133,11 @@ class NumPyTensorOperations(AbstractTensor):
     def argmax_(self, dim=None, keepdim=False):
         arr = self.data
         if dim is None:
-            return int(np.argmax(arr))
+            return np.asarray(np.argmax(arr))
         idx = np.argmax(arr, axis=dim)
         if keepdim:
-            return np.expand_dims(idx, axis=dim)
-        return idx
+            idx = np.expand_dims(idx, axis=dim)
+        return np.asarray(idx)
     def where_(self, x, y):
         import numpy as np
         x = x.data if isinstance(x, AbstractTensor) else x
@@ -432,7 +432,7 @@ class NumPyTensorOperations(AbstractTensor):
 
     def max_(self, tensor=None, dim=None, keepdim=False):
         data = self._AbstractTensor__unwrap(tensor if tensor is not None else self.data)
-        return np.max(data, axis=dim, keepdims=keepdim)
+        return np.asarray(np.max(data, axis=dim, keepdims=keepdim))
 
     def long_cast_(self, tensor):
         return self._AbstractTensor__unwrap(tensor).astype(np.int64)
@@ -700,18 +700,18 @@ class NumPyTensorOperations(AbstractTensor):
         return self.data.size
 
     def mean_(self, dim=None, keepdim=False):
-        return np.mean(self.data, axis=dim, keepdims=keepdim)
+        return np.asarray(np.mean(self.data, axis=dim, keepdims=keepdim))
 
     def sum_(self, dim=None, keepdim=False):
-        return np.sum(self.data, axis=dim, keepdims=keepdim)
+        return np.asarray(np.sum(self.data, axis=dim, keepdims=keepdim))
 
     def prod_(self, dim=None, keepdim=False):
         """Return the product of tensor elements along a dimension."""
         import numpy as np
-        return np.prod(self.data, axis=dim, keepdims=keepdim)
+        return np.asarray(np.prod(self.data, axis=dim, keepdims=keepdim))
 
     def min_(self, dim=None, keepdim=False):
-        return np.min(self.data, axis=dim, keepdims=keepdim)
+        return np.asarray(np.min(self.data, axis=dim, keepdims=keepdim))
 
     def pow_(self, exponent: float):
         return np.power(self.data, exponent)
@@ -753,7 +753,13 @@ class NumPyTensorOperations(AbstractTensor):
         return np.take(tensor, idx, axis=dim)
 
     def argmin_(self, dim=None, keepdim=False):
-        return np.argmin(self.data, axis=dim, keepdims=keepdim)
+        arr = self.data
+        if dim is None:
+            return np.asarray(np.argmin(arr))
+        idx = np.argmin(arr, axis=dim)
+        if keepdim:
+            idx = np.expand_dims(idx, axis=dim)
+        return np.asarray(idx)
 
     def nbytes_(self) -> int:
         return int(self.data.nbytes)

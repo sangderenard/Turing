@@ -540,6 +540,64 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "notes": "Same broadcasting mechanics as `sum`, scaled by 1/N.",
         "tags": ["reduction", "linear"],
     },
+    "prod": {
+        "arity": "unary",
+        "signature": "y = prod(x)",
+        "latex": r"y = \prod_{i \in \mathcal{I}} x_i",
+        "backward": {
+            "x": "y = prod(x, keepdim=True); gx = expand_to(g * y / x, x.shape)"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "y = AbstractTensor.prod(x, keepdim=True); "
+                "return expand_to(g * y / x, x.shape)"
+            )
+        },
+        "domain": "x: any real",
+        "notes": "Gradient of product; undefined when x contains zeros.",
+        "tags": ["reduction", "multiplicative"],
+    },
+    "max": {
+        "arity": "unary",
+        "signature": "y = max(x)",
+        "latex": r"y = \max_{i \in \mathcal{I}} x_i",
+        "backward": {
+            "x": "y = max(x, keepdim=True); m = where(x==y, 1, 0); c = sum(m, keepdim=True); gx = expand_to(g, x.shape) * m / c"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "y = AbstractTensor.max(x, keepdim=True); "
+                "m = AbstractTensor.where(x==y, 1, 0); "
+                "c = AbstractTensor.sum(m, keepdim=True); "
+                "return expand_to(g, x.shape) * m / c"
+            )
+        },
+        "domain": "x: any real",
+        "notes": "Split gradients equally among maximal elements.",
+        "tags": ["reduction", "nonsmooth"],
+    },
+    "min": {
+        "arity": "unary",
+        "signature": "y = min(x)",
+        "latex": r"y = \min_{i \in \mathcal{I}} x_i",
+        "backward": {
+            "x": "y = min(x, keepdim=True); m = where(x==y, 1, 0); c = sum(m, keepdim=True); gx = expand_to(g, x.shape) * m / c"
+        },
+        "python": {
+            "parameters": ["g", "x"],
+            "body": (
+                "y = AbstractTensor.min(x, keepdim=True); "
+                "m = AbstractTensor.where(x==y, 1, 0); "
+                "c = AbstractTensor.sum(m, keepdim=True); "
+                "return expand_to(g, x.shape) * m / c"
+            )
+        },
+        "domain": "x: any real",
+        "notes": "Split gradients equally among minimal elements.",
+        "tags": ["reduction", "nonsmooth"],
+    },
     "matmul": {
         "arity": "binary",
         "signature": "Y = matmul(A, B)  # ... x m x k  @  ... x k x n",
