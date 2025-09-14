@@ -44,8 +44,8 @@ def test_slot_backprop_queue_applies_gradients_per_slot(tmp_path):
             _WBJob(job_id="route", op=None, src_ids=(0,), residual=AT.tensor(0.5), fn=_route_fn),
             _WBJob(job_id="fft", op=None, src_ids=(1,), residual=AT.tensor(0.2), fn=_fft_fn),
         ]
-        mgr.queue_job(0, jobs[0])  # defaults to main queue
-        mgr.queue_job(0, jobs[1], kind="spectral")
+        mgr.queue_job(0, jobs[0], param_schema=("p",))  # defaults to main queue
+        mgr.queue_job(0, jobs[1], kind="spectral", param_schema=("p",))
 
         # Stub run_batched_vjp to emulate composite ops and return gradients
         def _stub_vjp(*, sys, jobs, **_kw):
@@ -108,8 +108,8 @@ def test_slot_backprop_queue_slot_keying():
     job_main = _WBJob(job_id="jm", op=None, src_ids=(0,), residual=AT.tensor(1.0), fn=lambda _: AT.tensor(0.0))
     job_spec = _WBJob(job_id="js", op=None, src_ids=(0,), residual=AT.tensor(2.0), fn=lambda _: AT.tensor(0.0))
 
-    mgr.queue_job(None, job_main, tick=tick, row_idx=row_main)
-    mgr.queue_job(None, job_spec, tick=tick, row_idx=row_spec, kind="spectral")
+    mgr.queue_job(None, job_main, tick=tick, row_idx=row_main, param_schema=("p",))
+    mgr.queue_job(None, job_spec, tick=tick, row_idx=row_spec, kind="spectral", param_schema=("p",))
 
     slot_main = (tick - row_main) % 4
     slot_spec = (tick - row_spec) % 4

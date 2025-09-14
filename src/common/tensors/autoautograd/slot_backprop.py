@@ -118,6 +118,9 @@ class SlotBackpropQueue:
             Which residual buffer to apply when the slot is processed.
             ``"main"`` (default) uses :attr:`main_residuals`; ``"spectral"``
             uses :attr:`spectral_residuals`.
+        param_schema:
+            Optional tuple of attribute names describing the parameter layout
+            for this job. If provided, it overrides ``job.param_schema``.
         """
 
         if not isinstance(job, _WBJob):

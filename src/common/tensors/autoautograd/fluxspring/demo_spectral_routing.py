@@ -431,7 +431,9 @@ def pump_with_loss(
             fn=_route_fn,
             param_schema=FLUX_PARAM_SCHEMA,
         )
-        ctx.bp_queue.queue_job(None, job_route, tick=fft_tick, kind="main")
+        ctx.bp_queue.queue_job(
+            None, job_route, tick=fft_tick, kind="main", param_schema=FLUX_PARAM_SCHEMA
+        )
         logger.debug(
             "bp_queue.queue_job: tick=%d slot=%d kind=main job_id=%s residual=%s",
             fft_tick,
@@ -467,7 +469,9 @@ def pump_with_loss(
                 fn=_fft_fn,
                 param_schema=FLUX_PARAM_SCHEMA,
             )
-            ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
+            ctx.bp_queue.queue_job(
+                None, job_fft, tick=fft_tick, kind="spectral", param_schema=FLUX_PARAM_SCHEMA
+            )
             logger.debug(
                 "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
                 fft_tick,
