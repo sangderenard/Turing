@@ -22,6 +22,7 @@ def test_zero_grad_warning_truncates_union_ids(caplog):
         src_ids=tuple(range(10)),
         residual=None,
         fn=lambda x, residual=None, **kw: x,
+        param_schema=("sphere",),
     )
     with caplog.at_level(logging.DEBUG):
         wr.run_batched_vjp(sys=sys, jobs=(job,))

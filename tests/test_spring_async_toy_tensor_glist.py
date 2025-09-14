@@ -22,8 +22,8 @@ def test_run_batched_vjp_returns_tensor_per_source():
     from src.common.tensors.autoautograd.whiteboard_runtime import run_batched_vjp
 
     sys_obj = _Sys()
-    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None)
-    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None)
+    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None, param_schema=("sphere",))
+    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None, param_schema=("sphere",))
     res = run_batched_vjp(sys=sys_obj, jobs=(j0, j1))
     g = res.grads_per_source_tensor
     assert getattr(g, "shape", None)[0] == 2

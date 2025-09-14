@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from contextlib import contextmanager, nullcontext
@@ -129,6 +129,9 @@ class _WBJob:
     residual: Optional[float]
     param_lens: Tuple[int, ...] = ()
     fn: Callable[[Any], Any] | None = None
+    param_schema: Tuple[str, ...] = ("p",)
+    fn_args: Tuple[Any, ...] = ()
+    fn_kwargs: dict[str, Any] = field(default_factory=dict)
 
 def _residual_like(y: Any, residual: Optional[Any], backend: Any | None) -> Optional[Any]:
     """Ensure residual is backend-typed/broadcastable to y."""
@@ -272,6 +275,7 @@ def run_op_and_grads_cached(
             src_ids=tuple(int(i) for i in src_ids),
             residual=1.0,
             param_lens=tuple(int(l) for l in (param_lens or [])),
+            param_schema=("sphere",),
         )
 
         batch = run_batched_vjp(
@@ -343,7 +347,6 @@ def run_batched_vjp(
     op_args: Tuple[Any, ...] = (),
     op_kwargs: Optional[Dict[str, Any]] = None,
     backend: Any | None = None,
-    node_attrs: Sequence[str] | str = "sphere",
     force_probe: bool = True,
 ) -> BatchVJPResult:
     """
@@ -394,13 +397,17 @@ def run_batched_vjp(
     idx_of: Dict[str, int] = {j.job_id: i for i, j in enumerate(jobs)}
     inv_ids: Tuple[str, ...] = tuple(j.job_id for j in jobs)
 
-    # Prepare a single stacked view over all unique source ids
+    # Prepare a single stacked view over all unique source ids and attributes
     union_ids: List[int] = []
+    union_attrs: List[str] = []
     for j in jobs:
         for sid in j.src_ids:
             sid = int(sid)
             if sid not in union_ids:
                 union_ids.append(sid)
+        for a in getattr(j, "param_schema", ("p",)):
+            if a not in union_attrs:
+                union_attrs.append(a)
     pos_of = {sid: i for i, sid in enumerate(union_ids)}
     slices_for_job: List[List[int]] = [[pos_of[int(s)] for s in j.src_ids] for j in jobs]
 
@@ -428,7 +435,7 @@ def run_batched_vjp(
     scope = scope_cm() if callable(scope_cm) else nullcontext()
 
     with scope, _tape():
-        view = NodeAttrView(sys.nodes, node_attrs, indices=union_ids).build()
+        view = NodeAttrView(sys.nodes, union_attrs, indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
@@ -447,15 +454,30 @@ def run_batched_vjp(
 
         # Slice per-job tensors referencing the union view
         x_list = [x_all[idxs] for idxs in slices_for_job]
+        params_per_job: List[List[Any]] = []
+        for x_j, j in zip(x_list, jobs):
+            params: List[Any] = []
+            for a in getattr(j, "param_schema", ("p",)):
+                sl = view._attr_slices[a]  # type: ignore[index]
+                part = x_j[..., sl]
+                shape = view._attr_shapes[a]  # type: ignore[index]
+                if hasattr(part, "view") and shape is not None:
+                    part = part.view((part.shape[0],) + shape)
+                params.append(part)
+            params_per_job.append(params)
 
         if fn_jobs:
-            ys = [j.fn(x) if callable(j.fn) else x for j, x in zip(jobs, x_list)]
+            ys = [
+                j.fn(*params, *j.fn_args, **j.fn_kwargs) if callable(j.fn) else params[0]
+                for j, params in zip(jobs, params_per_job)
+            ]
             logger.debug(
                 "run_batched_vjp: callable jobs=%d y0_shape=%s",
                 len(ys),
                 tuple(getattr(ys[0], "shape", ())) if ys else (),
             )
         elif op_name in BATCHABLE_OPS:
+            x_list = [p[0] for p in params_per_job]
             meta = BATCHABLE_OPS[op_name]
 
             # Offset dimension parameters for stacked call
@@ -511,6 +533,7 @@ def run_batched_vjp(
                 tuple(getattr(ys[0], "shape", ())) if ys else (),
             )
         else:
+            x_list = [p[0] for p in params_per_job]
             ys = []
             for x_j in x_list:
                 op = getattr(x_j, op_name)

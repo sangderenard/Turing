@@ -582,7 +582,7 @@ def train_routing(
                 sys = SimpleNamespace(
                     nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
                 )
-                res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
+                res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
                 if res is not None:
                     g_src = getattr(res, "grads_per_source_tensor", None)
                     g_par = getattr(res, "param_grads_tensor", None)
@@ -620,7 +620,7 @@ def train_routing(
             sys = SimpleNamespace(
                 nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)
@@ -641,7 +641,7 @@ def train_routing(
             sys = SimpleNamespace(
                 nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
             )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)

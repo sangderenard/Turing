@@ -30,8 +30,8 @@ def test_grads_per_source_tensor_matches_reduction():
     import types
 
     sys = _Sys2()
-    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None)
-    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None)
+    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None, param_schema=("sphere",))
+    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None, param_schema=("sphere",))
     res = run_batched_vjp(sys=sys, jobs=(j0, j1))
     g = res.grads_per_source_tensor
     sums = tuple(float(x) for x in g.sum(dim=1))
@@ -43,9 +43,9 @@ def test_grads_full_consistent_with_stacked_tensor():
     import types
 
     sys = _Sys3()
-    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None)
-    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None)
-    j2 = types.SimpleNamespace(job_id="j2", op="__neg__", src_ids=(2,), residual=None)
+    j0 = types.SimpleNamespace(job_id="j0", op="__neg__", src_ids=(0,), residual=None, param_schema=("sphere",))
+    j1 = types.SimpleNamespace(job_id="j1", op="__neg__", src_ids=(1,), residual=None, param_schema=("sphere",))
+    j2 = types.SimpleNamespace(job_id="j2", op="__neg__", src_ids=(2,), residual=None, param_schema=("sphere",))
     res = run_batched_vjp(sys=sys, jobs=(j0, j1, j2))
     g = res.grads_per_source_tensor
     g0 = g[0]
