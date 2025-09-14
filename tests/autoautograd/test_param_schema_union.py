@@ -25,22 +25,25 @@ def test_param_schema_union_grads():
         op=None,
         src_ids=(0,),
         residual=AT.tensor(1.0),
-        fn=lambda a, w, b: a * w + b,
+        fn=lambda a, w, b, s, bias: s * (a * w + b) + bias,
         param_schema=("alpha", "w", "b"),
+        fn_args=(AT.tensor(2.0),),
+        fn_kwargs={"bias": AT.tensor(1.0)},
     )
     job2 = _WBJob(
         job_id="j2",
         op=None,
         src_ids=(1,),
         residual=AT.tensor(1.0),
-        fn=lambda k, l: k * l,
+        fn=lambda k, l, offset: k * l + offset,
         param_schema=("kappa", "l0"),
+        fn_kwargs={"offset": AT.tensor(1.0)},
     )
     res = run_batched_vjp(sys=sys, jobs=(job1, job2))
     g = AT.get_tensor(res.grads_per_source_tensor)
-    assert float(g[0][0].item()) == pytest.approx(4.0)
-    assert float(g[0][1].item()) == pytest.approx(2.0)
-    assert float(g[0][2].item()) == pytest.approx(2.0)
+    assert float(g[0][0].item()) == pytest.approx(8.0)
+    assert float(g[0][1].item()) == pytest.approx(4.0)
+    assert float(g[0][2].item()) == pytest.approx(4.0)
     assert float(g[0][3].item()) == pytest.approx(0.0)
     assert float(g[0][4].item()) == pytest.approx(0.0)
     assert float(g[1][0].item()) == pytest.approx(0.0)

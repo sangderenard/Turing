@@ -44,18 +44,22 @@ def test_slot_backprop_queue_applies_gradients_per_slot(tmp_path):
             _WBJob(job_id="route", op=None, src_ids=(0,), residual=AT.tensor(0.5), fn=_route_fn),
             _WBJob(job_id="fft", op=None, src_ids=(1,), residual=AT.tensor(0.2), fn=_fft_fn),
         ]
-        mgr.queue_job(0, jobs[0], param_schema=("p",))  # defaults to main queue
-        mgr.queue_job(0, jobs[1], kind="spectral", param_schema=("p",))
+        mgr.queue_job(0, jobs[0], param_schema=("p",), fn_args=(1,), fn_kwargs={"bias": 2})
+        mgr.queue_job(0, jobs[1], kind="spectral", param_schema=("p",), fn_args=(3,), fn_kwargs={"bias": 4})
 
         # Stub run_batched_vjp to emulate composite ops and return gradients
         def _stub_vjp(*, sys, jobs, **_kw):
             assert callable(jobs[0].fn) and callable(jobs[1].fn)
             assert jobs[0].residual.item() == pytest.approx(0.5)
             assert jobs[1].residual.item() == pytest.approx(0.2)
+            assert jobs[0].fn_args == (1,)
+            assert jobs[0].fn_kwargs == {"bias": 2}
+            assert jobs[1].fn_args == (3,)
+            assert jobs[1].fn_kwargs == {"bias": 4}
             g = AT.tensor([2.0, 3.0])
             return BatchVJPResult(
                 slices=BatchSlices(index_of={j.job_id: i for i, j in enumerate(jobs)}, job_ids=tuple(j.job_id for j in jobs)),
-                ys=tuple(j.fn(None) for j in jobs),
+                ys=tuple(AT.tensor(0.0) for _ in jobs),
                 grads_full=tuple(AT.tensor(0.0) for _ in jobs),
                 grads_per_source=tuple(() for _ in jobs),
                 grads_per_source_tensor=g,

@@ -104,6 +104,8 @@ class SlotBackpropQueue:
         row_idx: int = 0,
         kind: str = "main",
         param_schema: Tuple[str, ...] | None = None,
+        fn_args: Tuple[Any, ...] | None = None,
+        fn_kwargs: Dict[str, Any] | None = None,
     ) -> None:
         """Queue a VJP job for a computed slot.
 
@@ -121,11 +123,24 @@ class SlotBackpropQueue:
         param_schema:
             Optional tuple of attribute names describing the parameter layout
             for this job. If provided, it overrides ``job.param_schema``.
+        fn_args:
+            Optional positional arguments supplied to the job's callable.
+            When provided, they replace ``job.fn_args``.
+        fn_kwargs:
+            Optional keyword arguments supplied to the job's callable.  When
+            provided, they replace ``job.fn_kwargs``.
         """
 
         if not isinstance(job, _WBJob):
             raise TypeError("queue_job expects a _WBJob instance")
-        if param_schema is not None and param_schema != job.param_schema:
+        new_schema = param_schema if param_schema is not None else job.param_schema
+        new_args = fn_args if fn_args is not None else job.fn_args
+        new_kwargs = fn_kwargs if fn_kwargs is not None else job.fn_kwargs
+        if (
+            new_schema != job.param_schema
+            or new_args != job.fn_args
+            or new_kwargs != job.fn_kwargs
+        ):
             job = _WBJob(
                 job.job_id,
                 job.op,
@@ -133,9 +148,9 @@ class SlotBackpropQueue:
                 job.residual,
                 job.param_lens,
                 job.fn,
-                param_schema,
-                job.fn_args,
-                job.fn_kwargs,
+                new_schema,
+                new_args,
+                new_kwargs,
             )
 
         if slot is None:
