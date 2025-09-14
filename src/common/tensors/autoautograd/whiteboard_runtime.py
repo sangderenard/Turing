@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 from .whiteboard_cache import WhiteboardCache, CacheEntry
@@ -9,6 +10,11 @@ from ..autograd import autograd, GradTape
 from .node_tensor import NodeAttrView
 from ..abstraction import AbstractTensor as AT
 from .job_batcher import JobBatcher
+from ..autograd_probes import (
+    annotate_params,
+    probe_losses,
+    set_strict_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +374,10 @@ def run_batched_vjp(
         getattr(param_tensor, "requires_grad", None) if param_tensor is not None else None,
     )
 
+    probe_enabled = bool(int(os.environ.get("WHITEBOARD_PROBES", "0")))
+    if probe_enabled:
+        set_strict_mode(True)
+
     if not jobs:
         logger.debug("run_batched_vjp: empty jobs; returning empty result")
         return BatchVJPResult(
@@ -424,6 +434,15 @@ def run_batched_vjp(
         logger.debug("run_batched_vjp: x_all=%s", AT.get_tensor(x_all))
         if param_tensor is not None and hasattr(param_tensor, "requires_grad_"):
             param_tensor = param_tensor.requires_grad_()
+        probe_params: List[Any] = []
+        if probe_enabled:
+            probe_params = [x_all]
+            if param_tensor is not None:
+                probe_params.append(param_tensor)
+            try:
+                annotate_params(probe_params, ag=autograd)
+            except Exception as e:  # pragma: no cover - best effort
+                logger.debug("run_batched_vjp: annotate_params failed: %s", e)
 
         # Slice per-job tensors referencing the union view
         x_list = [x_all[idxs] for idxs in slices_for_job]
@@ -544,7 +563,9 @@ def run_batched_vjp(
                 getattr(param_tensor, "requires_grad", None) if param_tensor is not None else None,
                 getattr(param_tensor, "grad_fn", None) if param_tensor is not None else None,
             )
-            grads = autograd.grad(L, targets, retain_graph=False, allow_unused=True)
+            grads = autograd.grad(
+                L, targets, retain_graph=probe_enabled, allow_unused=True
+            )
             ops = getattr(autograd.tape, "operations", None)
             logger.debug(
                 "run_batched_vjp: tape_ops=%s",
@@ -557,6 +578,14 @@ def run_batched_vjp(
                 tuple(getattr(g_all, "shape", ())) if g_all is not None else None,
                 tuple(getattr(g_param, "shape", ())) if g_param is not None else None,
             )
+            if probe_enabled:
+                logger.info("run_batched_vjp: running autograd probes")
+                try:
+                    probe_losses({"L": L}, probe_params, ag=autograd)
+                except Exception as e:  # pragma: no cover - best effort
+                    logger.warning(
+                        "run_batched_vjp: autograd probes failed: %s", e
+                    )
         def _has_any(t: Any) -> bool:
             try:
                 return AT.get_tensor(t).any()
