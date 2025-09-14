@@ -584,6 +584,9 @@ def train_routing(
                 )
                 res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
                 if res is not None:
+                    g = getattr(res, "grads_per_source_tensor", None)
+                    if g is None or not bool(AT.get_tensor(g).any()):
+                        raise RuntimeError("whiteboard op produced no gradients")
                     ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
             tick += 1
 
@@ -616,6 +619,9 @@ def train_routing(
             )
             res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
+                g = getattr(res, "grads_per_source_tensor", None)
+                if g is None or not bool(AT.get_tensor(g).any()):
+                    raise RuntimeError("whiteboard op produced no gradients")
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
         out = [psi[out_start + i] for i in range(B)]
@@ -631,6 +637,9 @@ def train_routing(
             )
             res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
+                g = getattr(res, "grads_per_source_tensor", None)
+                if g is None or not bool(AT.get_tensor(g).any()):
+                    raise RuntimeError("whiteboard op produced no gradients")
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
 
@@ -668,10 +677,10 @@ def main(log_file: str = "fluxspring_debug.log") -> None:
     routed, logs = train_routing(spec, spectral_cfg, sine_chunks, noise_frames)
     logger.debug("Routed output: %s", routed)
     ticks = logs.get("tick")
-    logger.debug(
-        "Collected ticks: %d",
-        int(ticks.shape[0]) if ticks is not None else 0,
-    )
+    tick_count = int(ticks.shape[0]) if ticks is not None else 0
+    logger.debug("Collected ticks: %d", tick_count)
+    print("Routed output sample:", [AT.get_tensor(r).tolist() for r in routed[:2]])
+    print("Collected ticks:", tick_count)
 
 
 if __name__ == "__main__":
