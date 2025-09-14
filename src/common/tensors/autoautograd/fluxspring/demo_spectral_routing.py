@@ -15,7 +15,7 @@ from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
 )
-from . import fs_dec, register_param_wheels, ParamWheel
+from . import fs_dec, register_param_wheels, ParamWheel, spiral_slot
 from .fs_harness import RingHarness, RingBuffer
 from .fs_types import (
     DECSpec,
@@ -402,83 +402,101 @@ def pump_with_loss(
         spec_float = (
             float(AT.get_tensor(spec_val)) if spec_val is not None else None
         )
-        slot_idx = ctx.bp_queue._slot_for(tick=fft_tick, row_idx=0)
-        if spec_val is not None:
-            ctx.bp_queue.add_residual(
-                tick=fft_tick,
-                main=main_val,
-                spectral=spec_val,
+        row_slots = [
+            spiral_slot(fft_tick, r, ctx.bp_queue.slots)
+            for r in range(len(ctx.wheels))
+        ]
+        for row_idx, slot_idx in enumerate(row_slots):
+            if spec_val is not None:
+                ctx.bp_queue.add_residual(
+                    tick=fft_tick,
+                    row_idx=row_idx,
+                    main=main_val,
+                    spectral=spec_val,
+                )
+            else:
+                ctx.bp_queue.add_residual(
+                    tick=fft_tick,
+                    row_idx=row_idx,
+                    main=main_val,
+                )
+            logger.debug(
+                "bp_queue.add_residual: tick=%d slot=%d row=%d main=%s spectral=%s",
+                fft_tick,
+                slot_idx,
+                row_idx,
+                main_float,
+                spec_float,
             )
-        else:
-            ctx.bp_queue.add_residual(
-                tick=fft_tick,
-                main=main_val,
-            )
-        logger.debug(
-            "bp_queue.add_residual: tick=%d slot=%d main=%s spectral=%s",
-            fft_tick,
-            slot_idx,
-            main_float,
-            spec_float,
-        )
-        src_ids = tuple(range(len(ctx.wheels)))
-
-        job_route = _WBJob(
-            job_id=f"route:{fft_tick}",
-            op=None,
-            src_ids=src_ids,
-            residual=None,
-            fn=_route_fn,
-            param_schema=FLUX_PARAM_SCHEMA,
-        )
-        ctx.bp_queue.queue_job(
-            None, job_route, tick=fft_tick, kind="main", param_schema=FLUX_PARAM_SCHEMA
-        )
-        logger.debug(
-            "bp_queue.queue_job: tick=%d slot=%d kind=main job_id=%s residual=%s",
-            fft_tick,
-            slot_idx,
-            job_route.job_id,
-            main_float,
-        )
-
-        if spec_val is not None and hist_residual_summary is not None:
-            hist_summary = hist_residual_summary
-            fft_cached: AT.Tensor | None = None
-
-            def _fft_fn(*_params: AT.Tensor) -> AT.Tensor:
-                nonlocal fft_cached
-                if fft_cached is None:
-                    mids_local = list(range(band_start, band_start + B))
-                    W_loc, kept_loc = gather_recent_windows(
-                        mids_local, spectral_cfg, ctx.harness
-                    )
-                    if len(kept_loc) == len(mids_local):
-                        bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
-                        targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
-                        fft_cached = (bp_loc - targ_mat).mean()
-                    else:
-                        fft_cached = AT.tensor(0.0)
-                return fft_cached
-
-            job_fft = _WBJob(
-                job_id=f"fft:{fft_tick}",
+            src_ids = (row_idx,)
+            job_route = _WBJob(
+                job_id=f"route:{fft_tick}:{row_idx}",
                 op=None,
                 src_ids=src_ids,
                 residual=None,
-                fn=_fft_fn,
+                fn=_route_fn,
                 param_schema=FLUX_PARAM_SCHEMA,
             )
             ctx.bp_queue.queue_job(
-                None, job_fft, tick=fft_tick, kind="spectral", param_schema=FLUX_PARAM_SCHEMA
+                None,
+                job_route,
+                tick=fft_tick,
+                row_idx=row_idx,
+                kind="main",
+                param_schema=FLUX_PARAM_SCHEMA,
             )
             logger.debug(
-                "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
+                "bp_queue.queue_job: tick=%d slot=%d row=%d kind=main job_id=%s residual=%s",
                 fft_tick,
                 slot_idx,
-                job_fft.job_id,
-                spec_float,
+                row_idx,
+                job_route.job_id,
+                main_float,
             )
+
+            if spec_val is not None and hist_residual_summary is not None:
+                hist_summary = hist_residual_summary
+                fft_cached: AT.Tensor | None = None
+
+                def _fft_fn(*_params: AT.Tensor) -> AT.Tensor:
+                    nonlocal fft_cached
+                    if fft_cached is None:
+                        mids_local = list(range(band_start, band_start + B))
+                        W_loc, kept_loc = gather_recent_windows(
+                            mids_local, spectral_cfg, ctx.harness
+                        )
+                        if len(kept_loc) == len(mids_local):
+                            bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
+                            targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
+                            fft_cached = (bp_loc - targ_mat).mean()
+                        else:
+                            fft_cached = AT.tensor(0.0)
+                    return fft_cached
+
+                job_fft = _WBJob(
+                    job_id=f"fft:{fft_tick}:{row_idx}",
+                    op=None,
+                    src_ids=src_ids,
+                    residual=None,
+                    fn=_fft_fn,
+                    param_schema=FLUX_PARAM_SCHEMA,
+                )
+                ctx.bp_queue.queue_job(
+                    None,
+                    job_fft,
+                    tick=fft_tick,
+                    row_idx=row_idx,
+                    kind="spectral",
+                    param_schema=FLUX_PARAM_SCHEMA,
+                )
+                logger.debug(
+                    "bp_queue.queue_job: tick=%d slot=%d row=%d kind=spectral job_id=%s residual=%s",
+                    fft_tick,
+                    slot_idx,
+                    row_idx,
+                    job_fft.job_id,
+                    spec_float,
+                )
 
     return state
 
