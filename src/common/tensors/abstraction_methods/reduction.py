@@ -11,6 +11,7 @@ def _wrap_scalar(result):
     return result
 
 
+
 def max(self, dim=None, keepdim: bool = False):
     """Return the maximum of the tensor along the specified dimension(s)."""
     finalize = AbstractTensor._pre_autograd(

@@ -3,6 +3,7 @@ import pytest
 from src.common.tensors.numpy_backend import NumPyTensorOperations as T
 from src.common.tensors.abstraction import AbstractScalar
 
+
 @pytest.mark.parametrize(
     "op,expected",
     [
@@ -18,6 +19,7 @@ def test_reduction_gradients_no_scalar_leak(op, expected):
     x.requires_grad_(True)
     y = getattr(x, op)()
     assert isinstance(y, AbstractScalar)
+
     assert isinstance(y.data, np.ndarray)
     assert y.numel() == 1
     y.backward()

@@ -546,6 +546,7 @@ class AbstractTensor:
         if getattr(result.data, "shape", ()) == ():
             return AbstractScalar(result)
         return result
+
     # --- Backend hooks for reductions (must be implemented by backends) ---
     def mean_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement mean_() with keepdim.")
