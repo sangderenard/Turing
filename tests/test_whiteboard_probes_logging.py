@@ -22,6 +22,7 @@ def test_whiteboard_runs_probes(monkeypatch, caplog):
         src_ids=(0,),
         residual=AbstractTensor.ones(1),
         fn=lambda x, residual=None, **kw: x,
+        param_schema=("sphere",),
     )
     monkeypatch.setenv("WHITEBOARD_PROBES", "1")
     with caplog.at_level(logging.INFO):

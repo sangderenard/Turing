@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 import logging
 
 from ..abstraction import AbstractTensor as AT
@@ -103,6 +103,7 @@ class SlotBackpropQueue:
         tick: int | None = None,
         row_idx: int = 0,
         kind: str = "main",
+        param_schema: Tuple[str, ...] | None = None,
     ) -> None:
         """Queue a VJP job for a computed slot.
 
@@ -121,6 +122,18 @@ class SlotBackpropQueue:
 
         if not isinstance(job, _WBJob):
             raise TypeError("queue_job expects a _WBJob instance")
+        if param_schema is not None and param_schema != job.param_schema:
+            job = _WBJob(
+                job.job_id,
+                job.op,
+                job.src_ids,
+                job.residual,
+                job.param_lens,
+                job.fn,
+                param_schema,
+                job.fn_args,
+                job.fn_kwargs,
+            )
 
         if slot is None:
             if tick is None:
@@ -147,7 +160,6 @@ class SlotBackpropQueue:
         sys: Any,
         lr: float = 0.01,
         run_vjp=run_batched_vjp,
-        node_attrs: Sequence[str] | str = "sphere",
     ) -> BatchVJPResult | None:
         """Drain and process jobs for ``slot`` applying gradients.
 
@@ -188,13 +200,37 @@ class SlotBackpropQueue:
             logger.debug(
                 "process_slot: enqueue main job=%s residual=%s", j.job_id, res
             )
-            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
+            jobs.append(
+                _WBJob(
+                    j.job_id,
+                    j.op,
+                    j.src_ids,
+                    res,
+                    j.param_lens,
+                    j.fn,
+                    j.param_schema,
+                    j.fn_args,
+                    j.fn_kwargs,
+                )
+            )
         for j in spec_jobs:
             res = spec_res if spec_res is not None else j.residual
             logger.debug(
                 "process_slot: enqueue spectral job=%s residual=%s", j.job_id, res
             )
-            jobs.append(_WBJob(j.job_id, j.op, j.src_ids, res, j.param_lens, j.fn))
+            jobs.append(
+                _WBJob(
+                    j.job_id,
+                    j.op,
+                    j.src_ids,
+                    res,
+                    j.param_lens,
+                    j.fn,
+                    j.param_schema,
+                    j.fn_args,
+                    j.fn_kwargs,
+                )
+            )
 
         if sys is not None and getattr(sys, "nodes", None) is not None:
             for nid, node in (
@@ -211,7 +247,7 @@ class SlotBackpropQueue:
                     p,
                 )
 
-        batch = run_vjp(sys=sys, jobs=jobs, node_attrs=node_attrs)
+        batch = run_vjp(sys=sys, jobs=jobs)
         g_tensor = batch.grads_per_source_tensor
         if g_tensor is not None:
             g_tensor = AT.get_tensor(g_tensor)
