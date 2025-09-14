@@ -36,7 +36,7 @@ from src.common.tensors.autograd_probes import (
     annotate_params,
 )
 from ..slot_backprop import SlotBackpropQueue
-from ..whiteboard_runtime import _WBJob
+from ..whiteboard_runtime import _WBJob, run_batched_vjp
 from types import SimpleNamespace
 import logging
 import numpy as np
@@ -346,38 +346,50 @@ def pump_with_loss(
     tick: int,
 ) -> AT.Tensor:
     """Advance the system by one tick and queue residuals and jobs."""
-
     slot = tick % ctx.bp_queue.slots
-    ran_forward = False
-    out_feat_cached: AT.Tensor | None = None
+
+    out_feat: AT.Tensor | None = None
+
+    def _fwd_route_fn(_dummy: AT.Tensor) -> AT.Tensor:
+        nonlocal state, out_feat
+        state, _ = fs_dec.pump_tick(
+            state,
+            ctx.spec,
+            eta=0.1,
+            phi=AT.tanh,
+            norm="all",
+            harness=ctx.harness,
+            wheels=ctx.wheels,
+            tick=tick,
+            update_fn=lambda p, g: p,
+        )
+        out_feat = state[out_start : out_start + B].clone()
+        return out_feat.mean()
 
     def _route_fn(*_params: AT.Tensor) -> AT.Tensor:
-        nonlocal state, ran_forward, out_feat_cached
-        if not ran_forward:
-            for w, p in zip(ctx.wheels, _params):
-                w.params[slot] = p.clone()
-            state, _ = fs_dec.pump_tick(
-                state,
-                ctx.spec,
-                eta=0.1,
-                phi=AT.tanh,
-                norm="all",
-                harness=ctx.harness,
-                wheels=ctx.wheels,
-                tick=tick,
-                update_fn=lambda p, g: p,
+        for w, p in zip(ctx.wheels, _params):
+            ref_shape = getattr(AT.get_tensor(w.params[slot]), "shape", None)
+            w.params[slot] = (
+                AT.reshape(p.clone(), ref_shape) if ref_shape else p.clone()
             )
-            out_feat_cached = state[out_start : out_start + B].clone()
-            ran_forward = True
-        assert out_feat_cached is not None
-        return out_feat_cached.mean()
+        return _fwd_route_fn(AT.tensor(0.0))
 
-    # Run the forward once to populate buffers and residuals
-    params_now = [w.params[slot] for w in ctx.wheels]
-    _ = _route_fn(*params_now)
+    # Run the forward tick inside the whiteboard to populate buffers
+    fwd_job = _WBJob(
+        job_id=f"route:{tick}",
+        op=None,
+        src_ids=(0,),
+        residual=None,
+        fn=_fwd_route_fn,
+        param_schema=("alpha",),
+    )
+    run_batched_vjp(
+        sys=SimpleNamespace(nodes={0: SimpleNamespace(alpha=AT.tensor(0.0))}),
+        jobs=(fwd_job,),
+    )
 
-    assert out_feat_cached is not None
-    ctx.out_buf.push(out_feat_cached)
+    assert out_feat is not None
+    ctx.out_buf.push(out_feat)
     ctx.tgt_buf.push(target_out.clone())
     hist_residual_summary = None
 
