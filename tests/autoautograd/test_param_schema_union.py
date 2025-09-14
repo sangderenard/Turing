@@ -41,6 +41,10 @@ def test_param_schema_union_grads():
     )
     res = run_batched_vjp(sys=sys, jobs=(job1, job2))
     g = AT.get_tensor(res.grads_per_source_tensor)
+    assert g.shape == (2, 5)
+    # residuals are non-zero so each attribute in the schema receives a gradient
+    assert all(float(g[0][i].item()) != 0.0 for i in range(3))
+    assert all(float(g[1][i].item()) != 0.0 for i in range(3, 5))
     assert float(g[0][0].item()) == pytest.approx(8.0)
     assert float(g[0][1].item()) == pytest.approx(4.0)
     assert float(g[0][2].item()) == pytest.approx(4.0)
