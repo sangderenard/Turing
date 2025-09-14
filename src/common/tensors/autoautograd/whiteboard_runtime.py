@@ -399,15 +399,15 @@ def run_batched_vjp(
 
     # Prepare a single stacked view over all unique source ids and attributes
     union_ids: List[int] = []
-    union_attrs: List[str] = []
+    union_schema: List[str] = []
     for j in jobs:
         for sid in j.src_ids:
             sid = int(sid)
             if sid not in union_ids:
                 union_ids.append(sid)
         for a in getattr(j, "param_schema", ("p",)):
-            if a not in union_attrs:
-                union_attrs.append(a)
+            if a not in union_schema:
+                union_schema.append(a)
     pos_of = {sid: i for i, sid in enumerate(union_ids)}
     slices_for_job: List[List[int]] = [[pos_of[int(s)] for s in j.src_ids] for j in jobs]
 
@@ -435,7 +435,7 @@ def run_batched_vjp(
     scope = scope_cm() if callable(scope_cm) else nullcontext()
 
     with scope, _tape():
-        view = NodeAttrView(sys.nodes, union_attrs, indices=union_ids).build()
+        view = NodeAttrView(sys.nodes, union_schema, indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
             x_all = x_all.requires_grad_()
