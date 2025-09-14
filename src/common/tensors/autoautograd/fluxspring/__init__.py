@@ -29,6 +29,25 @@ import logging
 from ...abstraction import AbstractTensor as AT
 
 logger = logging.getLogger(__name__)
+
+
+def spiral_slot(tick: int, row_idx: int, spiral_len: int) -> int:
+    """Return the slot index for ``row_idx`` at ``tick`` following the
+    spiral pattern.
+
+    Parameters
+    ----------
+    tick:
+        Global tick counter.
+    row_idx:
+        Row index within the parameter tensor.
+    spiral_len:
+        Total number of slots in the spiral.
+    """
+
+    if spiral_len <= 0:
+        return 0
+    return int((tick - row_idx) % spiral_len)
 def _tape():
     # Autograd is monkey-patched onto AT in your stack.
     try:
@@ -146,7 +165,7 @@ class ParamWheel:
         base = self._versions[0]
         shape = getattr(base, "shape", ())
         rows = int(shape[0]) if len(shape) > 0 else 1
-        return [int((tick - r) % W) for r in range(rows)]
+        return [spiral_slot(tick, r, W) for r in range(rows)]
 
     # ------------------------------------------------------------------
     def bind_for_tick(self, tick: int) -> set[int]:
@@ -313,7 +332,7 @@ def wheel_tick(
         Sequence of :class:`ParamWheel` objects controlling learnable tensors.
     tick:
         Global tick counter used when selecting slots for each row via
-        ``slot = (tick - row_idx) % W``.
+        ``spiral_slot(tick, row_idx, W)``.
     update_fn:
         Callable applied to the parameter in the evicted slot using the stored
         gradient.  Defaults to a no-op.

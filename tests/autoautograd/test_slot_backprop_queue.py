@@ -3,7 +3,7 @@ import logging
 
 
 from src.common.tensors.abstraction import AbstractTensor as AT
-from src.common.tensors.autoautograd.fluxspring import ParamWheel
+from src.common.tensors.autoautograd.fluxspring import ParamWheel, spiral_slot
 from src.common.tensors.autoautograd.slot_backprop import SlotBackpropQueue
 from src.common.tensors.autoautograd.whiteboard_runtime import (
     BatchSlices,
@@ -95,8 +95,13 @@ def test_slot_backprop_queue_applies_gradients_per_slot(tmp_path):
     assert "apply idx=0" in log_text
 
 
+def test_spiral_slot_basic():
+    assert spiral_slot(5, 2, 4) == 3
+    assert spiral_slot(5, 2, 0) == 0
+
+
 def test_slot_backprop_queue_slot_keying():
-    """Jobs map via (tick - row_idx) % W."""
+    """Jobs map via spiral_slot."""
 
     p = AT.tensor(0.0)
     p.requires_grad_(True)
@@ -115,8 +120,8 @@ def test_slot_backprop_queue_slot_keying():
     mgr.queue_job(None, job_main, tick=tick, row_idx=row_main, param_schema=("p",))
     mgr.queue_job(None, job_spec, tick=tick, row_idx=row_spec, kind="spectral", param_schema=("p",))
 
-    slot_main = (tick - row_main) % 4
-    slot_spec = (tick - row_spec) % 4
+    slot_main = spiral_slot(tick, row_main, 4)
+    slot_spec = spiral_slot(tick, row_spec, 4)
 
     assert mgr.jobs[slot_main][0] is job_main
     assert mgr.spectral_jobs[slot_spec][0] is job_spec
