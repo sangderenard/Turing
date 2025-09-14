@@ -56,3 +56,50 @@ def test_gradients_apply_to_matching_rows():
 
     assert w0.params[row_slots[0]].item() == pytest.approx(0.0)
     assert w1.params[row_slots[1]].item() == pytest.approx(0.0)
+
+
+def test_gradients_follow_original_slot_after_rotation():
+    p = AT.tensor(1.0)
+    p.requires_grad_(True)
+    w = ParamWheel(p, lambda t: None, slots=3)
+    w.rotate(); w.bind_slot()
+
+    mgr = SlotBackpropQueue([w])
+    tick = 0
+    slot_idx = spiral_slot(tick, 0, mgr.slots)
+
+    job = _WBJob(
+        job_id="j0",
+        op=None,
+        src_ids=(0,),
+        residual=None,
+        fn=lambda *_: AT.tensor(0.0),
+        param_schema=("p",),
+    )
+    row_map = {0: slot_idx}
+    mgr.add_residual(tick=tick, row_idx=0, main=AT.tensor(1.0))
+    mgr.queue_job(None, job, tick=tick, row_idx=0, param_schema=("p",))
+
+    # Advance wheel to a different active slot before processing
+    w.rotate(); w.bind_slot()
+
+    orig_val = AT.get_tensor(w.params[slot_idx]).item()
+
+    def _stub_vjp(*, sys, jobs, **_kw):
+        assert sys.nodes[0].p.item() == pytest.approx(orig_val)
+        g = AT.tensor([1.0])
+        return BatchVJPResult(
+            slices=BatchSlices(index_of={j.job_id: i for i, j in enumerate(jobs)}, job_ids=tuple(j.job_id for j in jobs)),
+            ys=tuple(AT.tensor(0.0) for _ in jobs),
+            grads_full=tuple(AT.tensor(0.0) for _ in jobs),
+            grads_per_source=tuple(() for _ in jobs),
+            grads_per_source_tensor=g,
+            param_grads_full=tuple(),
+            param_grads_tensor=None,
+        )
+
+    sys = SimpleNamespace(nodes={0: SimpleNamespace(p=w.value_for_slots([row_map[0]]))})
+    mgr.process_slot(slot_idx, sys=sys, row_slots=row_map, lr=1.0, run_vjp=_stub_vjp)
+
+    assert w.params[slot_idx].item() == pytest.approx(0.0)
+    assert w.params[w.idx].item() == pytest.approx(1.0)

@@ -176,6 +176,7 @@ class SlotBackpropQueue:
         slot: int,
         *,
         sys: Any,
+        row_slots: Sequence[int] | Dict[int, int] | None = None,
         lr: float = 0.01,
         run_vjp=run_batched_vjp,
     ) -> BatchVJPResult | None:
@@ -187,6 +188,11 @@ class SlotBackpropQueue:
             Slot index being evicted this tick.
         sys:
             System passed through to :func:`run_batched_vjp`.
+        row_slots:
+            Optional mapping of wheel index to slot indices corresponding to
+            the parameter versions used when the slot was queued.  When
+            provided, gradients are applied to these slot indices instead of
+            ``slot``.
         lr:
             Learning rate used when applying gradients to parameters.
         run_vjp:
@@ -270,19 +276,24 @@ class SlotBackpropQueue:
         if g_tensor is not None:
             g_tensor = AT.get_tensor(g_tensor)
             logger.debug("process_slot: slot=%d g_tensor=%s", slot, g_tensor)
+            if isinstance(row_slots, dict):
+                slots_seq = [row_slots.get(i, slot) for i in range(len(self.wheels))]
+            elif row_slots is None:
+                slots_seq = [slot] * len(self.wheels)
+            else:
+                slots_seq = list(row_slots)
             for idx, w in enumerate(self.wheels):
                 grad = g_tensor[idx]
-                p = w.params[slot]
+                s_idx = slots_seq[idx]
+                p = w.params[s_idx]
                 before = AT.get_tensor(p)
-                # Store gradient on the internal attribute expected by the
-                # autograd helpers.  ``grad`` is a read-only property, so we set
-                # ``_grad`` directly.
                 p._grad = AT.get_tensor(grad)  # type: ignore[attr-defined]
-                w.apply_slot(slot, lambda p_, g_=p._grad: p_ - lr * g_)
-                after = AT.get_tensor(w.params[slot])
+                w.apply_slot(s_idx, lambda p_, g_=p._grad: p_ - lr * g_)
+                after = AT.get_tensor(w.params[s_idx])
                 logger.debug(
-                    "process_slot: apply idx=%d grad=%s before=%s after=%s",
+                    "process_slot: apply idx=%d slot=%d grad=%s before=%s after=%s",
                     idx,
+                    s_idx,
                     grad,
                     before,
                     after,
