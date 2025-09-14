@@ -41,7 +41,7 @@ from types import SimpleNamespace
 import logging
 import numpy as np
 from typing import Callable, Optional, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Module logger setup (configured in main if not already configured)
@@ -284,6 +284,7 @@ class RoutingState:
     tgt_buf: RingBuffer
     hist_buf: RingBuffer
     bp_queue: SlotBackpropQueue
+    row_slots: dict[int, dict[int, int]] = field(default_factory=dict)
 
 
 def initialize_signal_state(
@@ -406,7 +407,9 @@ def pump_with_loss(
             spiral_slot(fft_tick, r, ctx.bp_queue.slots)
             for r in range(len(ctx.wheels))
         ]
+        tick_map = ctx.row_slots.setdefault(fft_tick, {})
         for row_idx, slot_idx in enumerate(row_slots):
+            tick_map[row_idx] = slot_idx
             if spec_val is not None:
                 ctx.bp_queue.add_residual(
                     tick=fft_tick,
@@ -568,12 +571,14 @@ def train_routing(
         bp_queue=bp_queue,
     )
 
-    def _sys_for_slot(slot: int) -> SimpleNamespace:
+    def _sys_for_slot(slot: int, tick: int) -> SimpleNamespace:
+        row_map = ctx.row_slots.get(tick, {})
         nodes: dict[int, SimpleNamespace] = {}
         for i, w in enumerate(ctx.wheels):
             attrs = {name: AT.tensor(0.0) for name in FLUX_PARAM_SCHEMA}
             attr = w.label.rsplit(".", 1)[-1]
-            attrs[attr] = w.params[slot]
+            w_row_slots = [row_map.get(i, slot)]
+            attrs[attr] = w.value_for_slots(w_row_slots)
             nodes[i] = SimpleNamespace(**attrs)
         return SimpleNamespace(nodes=nodes)
 
@@ -603,7 +608,13 @@ def train_routing(
             mature_tick = tick - (spectral_cfg.win_len - 1)
             if mature_tick >= 0:
                 mature_slot = mature_tick % ctx.bp_queue.slots
-                res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
+                row_map = ctx.row_slots.get(mature_tick)
+                res = ctx.bp_queue.process_slot(
+                    mature_slot,
+                    sys=_sys_for_slot(mature_slot, mature_tick),
+                    row_slots=row_map,
+                )
+                ctx.row_slots.pop(mature_tick, None)
                 if res is not None:
                     g_src = getattr(res, "grads_per_source_tensor", None)
                     g_par = getattr(res, "param_grads_tensor", None)
@@ -638,7 +649,13 @@ def train_routing(
         mature_tick = tick - (spectral_cfg.win_len - 1)
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
-            res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
+            row_map = ctx.row_slots.get(mature_tick)
+            res = ctx.bp_queue.process_slot(
+                mature_slot,
+                sys=_sys_for_slot(mature_slot, mature_tick),
+                row_slots=row_map,
+            )
+            ctx.row_slots.pop(mature_tick, None)
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)
@@ -656,7 +673,13 @@ def train_routing(
         mature_tick = tick - (spectral_cfg.win_len - 1)
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
-            res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
+            row_map = ctx.row_slots.get(mature_tick)
+            res = ctx.bp_queue.process_slot(
+                mature_slot,
+                sys=_sys_for_slot(mature_slot, mature_tick),
+                row_slots=row_map,
+            )
+            ctx.row_slots.pop(mature_tick, None)
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)
