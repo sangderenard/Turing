@@ -531,9 +531,12 @@ class AbstractTensor:
 
     def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
+        finalize = AbstractTensor._pre_autograd(
+            "min", [self], params={"axis": dim, "keepdim": keepdim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.min_(dim=dim, keepdim=keepdim)
-        return result
+        return finalize(result)
 
     def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
         """Return the indices of the minimum values along an axis."""
