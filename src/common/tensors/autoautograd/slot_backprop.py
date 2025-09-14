@@ -6,7 +6,7 @@ import logging
 
 from ..abstraction import AbstractTensor as AT
 from .whiteboard_runtime import run_batched_vjp, BatchVJPResult, _WBJob
-from .fluxspring import ParamWheel
+from .fluxspring import ParamWheel, spiral_slot
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class SlotBackpropQueue:
             Row index within the parameter tensor.
         """
 
-        return (tick - row_idx) % self.slots if self.slots else 0
+        return spiral_slot(tick, row_idx, self.slots)
 
     # ------------------------------------------------------------------
     def add_residual(
