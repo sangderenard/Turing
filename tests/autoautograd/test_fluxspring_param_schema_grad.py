@@ -41,7 +41,7 @@ def test_multi_attribute_param_schema_grad():
         fn=_fn,
         param_schema=("alpha", "w", "b"),
     )
-    mgr.queue_job(0, job)
+    mgr.queue_job(0, job, param_schema=FLUX_PARAM_SCHEMA)
     res = mgr.process_slot(0, sys=_sys_for_slot(wheels, 0))
     assert res is not None
     g = AT.get_tensor(res.grads_per_source_tensor)
