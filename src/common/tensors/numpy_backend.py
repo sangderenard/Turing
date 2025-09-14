@@ -133,11 +133,11 @@ class NumPyTensorOperations(AbstractTensor):
     def argmax_(self, dim=None, keepdim=False):
         arr = self.data
         if dim is None:
-            return int(np.argmax(arr))
+            return np.asarray(np.argmax(arr))
         idx = np.argmax(arr, axis=dim)
         if keepdim:
-            return np.expand_dims(idx, axis=dim)
-        return idx
+            idx = np.expand_dims(idx, axis=dim)
+        return np.asarray(idx)
     def where_(self, x, y):
         import numpy as np
         x = x.data if isinstance(x, AbstractTensor) else x
@@ -753,7 +753,13 @@ class NumPyTensorOperations(AbstractTensor):
         return np.take(tensor, idx, axis=dim)
 
     def argmin_(self, dim=None, keepdim=False):
-        return np.argmin(self.data, axis=dim, keepdims=keepdim)
+        arr = self.data
+        if dim is None:
+            return np.asarray(np.argmin(arr))
+        idx = np.argmin(arr, axis=dim)
+        if keepdim:
+            idx = np.expand_dims(idx, axis=dim)
+        return np.asarray(idx)
 
     def nbytes_(self) -> int:
         return int(self.data.nbytes)

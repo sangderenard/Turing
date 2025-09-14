@@ -512,7 +512,10 @@ class AbstractTensor:
         )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.mean_(dim=dim, keepdim=keepdim)
-        return finalize(result)
+        result = finalize(result)
+        if getattr(result.data, "shape", ()) == ():
+            return AbstractScalar(result)
+        return result
 
     def sum(self, dim=None, keepdim: bool = False):
         """Return the sum of the tensor along the specified dimension(s)."""
@@ -521,7 +524,10 @@ class AbstractTensor:
         )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.sum_(dim=dim, keepdim=keepdim)
-        return finalize(result)
+        result = finalize(result)
+        if getattr(result.data, "shape", ()) == ():
+            return AbstractScalar(result)
+        return result
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
         """Return the cumulative sum of the tensor along a dimension."""
@@ -536,11 +542,11 @@ class AbstractTensor:
         )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.min_(dim=dim, keepdim=keepdim)
-        return finalize(result)
+        result = finalize(result)
+        if getattr(result.data, "shape", ()) == ():
+            return AbstractScalar(result)
+        return result
 
-    def argmin(self, dim: Optional[int] = None, keepdim: bool = False):
-        """Return the indices of the minimum values along an axis."""
-        return self.argmin_(dim, keepdim)
     # --- Backend hooks for reductions (must be implemented by backends) ---
     def mean_(self, dim=None, keepdim: bool = False):
         raise NotImplementedError(f"{self.__class__.__name__} must implement mean_() with keepdim.")
@@ -2396,6 +2402,22 @@ class AbstractTensor:
         raise NotImplementedError(f"{self.__class__.__name__} must implement nbytes_()")
 
 
+class AbstractScalar(AbstractTensor):
+    """Marker mixin for zero-dimensional tensors produced by reductions."""
+
+    def __new__(cls, tensor: "AbstractTensor"):
+        if getattr(getattr(tensor, "data", None), "shape", ()) != ():
+            raise ValueError("AbstractScalar requires a zero-dimensional tensor")
+        if not isinstance(tensor, AbstractScalar):
+            scalar_cls = type(
+                f"{tensor.__class__.__name__}Scalar",
+                (tensor.__class__, cls),
+                {},
+            )
+            tensor.__class__ = scalar_cls
+        return tensor
+
+
 class AbstractF:
     """
     Functional API for advanced tensor operations (e.g., interpolation).
@@ -2599,6 +2621,7 @@ from .abstraction_methods.creation import (
 from .abstraction_methods.reduction import (
     max as reduction_max,
     argmax as reduction_argmax,
+    argmin as reduction_argmin,
     prod as reduction_prod,
 )
 from .abstraction_methods.indexing import (
@@ -2929,6 +2952,7 @@ _bind_and_wrap({
     "randint_like": randint_like,
     "max": reduction_max,
     "argmax": reduction_argmax,
+    "argmin": reduction_argmin,
     "prod": reduction_prod,
     "to": type_to,
     "astype": type_astype,
