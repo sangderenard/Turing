@@ -349,14 +349,36 @@ def run_batched_vjp(
     backend: Any | None = None,
     force_probe: bool = True,
 ) -> BatchVJPResult:
-    """
-    One tape, one VJP over the whole bin.
+    """Vector-Jacobian product over a batch of whiteboard jobs.
 
-      x_all = NodeAttrView(sys.nodes, "sphere", indices=union(src_ids)).build().tensor
-      x_j = x_all[slice_for_job]
-      y_j = getattr(x_j, op_name)(*op_args, **op_kwargs)  # or property value if not callable
+    Each :class:`_WBJob` advertises a ``param_schema`` – the tuple of node
+    attribute names it expects.  The union of schemas from all jobs drives
+    :class:`NodeAttrView` to stack those attributes into a single tensor in
+    that order.  Individual jobs then index into the stacked view to retrieve
+    their own attribute slices.
 
-    Then L = sum_j <residual_j, y_j> and grads = dL/dx_all with slices mapped
+    ``residual`` supplies the :math:`dL/dy` weight for each job's output.  The
+    VJP is taken with respect to the stacked node attributes and any
+    ``param_tensor`` included in ``op_kwargs``.
+
+    Example
+    -------
+    >>> job = _WBJob(
+    ...     job_id="j1",
+    ...     op=None,
+    ...     src_ids=(0,),
+    ...     residual=AT.tensor(2.0),
+    ...     fn=lambda a, w, b: a * w + b,
+    ...     param_schema=("alpha", "w", "b"),
+    ... )
+    >>> run_batched_vjp(sys=sys, jobs=(job,))
+    # gradients for alpha, w and b are populated because residual is non-zero
+
+    ``x_all = NodeAttrView(sys.nodes, "sphere", indices=union(src_ids)).build().tensor``
+    ``x_j = x_all[slice_for_job]``
+    ``y_j = getattr(x_j, op_name)(*op_args, **op_kwargs)``  # or property value if not callable
+
+    ``L = sum_j <residual_j, y_j>`` and grads ``= dL/dx_all`` with slices mapped
     back to each job's original node ordering.
     """
     op_kwargs = op_kwargs or {}
