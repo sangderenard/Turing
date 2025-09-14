@@ -568,9 +568,10 @@ def run_batched_vjp(
         if zero_all or zero_param:
             job_ids = tuple(j.job_id for j in jobs)
             logger.debug(
-                "run_batched_vjp: WARNING zero grads job_ids=%s union_ids=%s",
+                "run_batched_vjp: WARNING zero grads job_ids=%s union_ids_first=%s union_ids_len=%d",
                 job_ids,
-                union_ids,
+                tuple(union_ids[:5]),
+                len(union_ids),
             )
 
     g_stack = g_all
