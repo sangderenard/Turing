@@ -10,6 +10,7 @@ backward rules.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import wraps
 from typing import Callable, Dict, Iterable, List, Any
 
 
@@ -84,7 +85,15 @@ class BackwardRegistry:
 
     def register(self, name: str, fn: Callable[..., Any]) -> None:
         """Register a backward implementation under ``name``."""
-        self._methods[name] = fn
+
+        from . import backward_registry as br
+
+        @wraps(fn)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            checked = [br.coerce_to_tensor(a) for a in args]
+            return fn(*checked, **kwargs)
+
+        self._methods[name] = wrapped
 
     def register_from_module(self, module: Any) -> "BackwardRegistry":
         """Discover and register all ``bw_*`` functions from ``module``.

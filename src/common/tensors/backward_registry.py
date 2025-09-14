@@ -107,6 +107,7 @@ The entire registry is exposed as `BACKWARD_RULES`.
 
 from __future__ import annotations
 from typing import Dict, Any, List
+import numbers
 from .abstraction import AbstractTensor
 
 helpers_spec: Dict[str, str] = {
@@ -154,6 +155,28 @@ def expand_to(G, shape):
 
 def indicator(cond):
     return AbstractTensor.where(cond, 1, 0)
+
+
+def coerce_to_tensor(value):
+    """Return ``value`` as an :class:`AbstractTensor`.
+
+    Backward functions are expected to operate on tensors.  If ``value`` is a
+    plain Python scalar, it is wrapped via :meth:`AbstractTensor.tensor` so the
+    downstream rule receives a proper tensor.  Any other non-tensor input
+    results in a :class:`TypeError` with a clear diagnostic.
+    """
+
+    if value is None or isinstance(value, AbstractTensor):
+        return value
+    if isinstance(value, numbers.Number):
+        tensor = AbstractTensor.tensor(value)
+        try:
+            return tensor.reshape(())
+        except Exception:
+            return tensor
+    raise TypeError(
+        f"Backward functions require AbstractTensor inputs, got {type(value).__name__}"
+    )
 
 def I_like(X):
     *batch, m, n = X.shape
