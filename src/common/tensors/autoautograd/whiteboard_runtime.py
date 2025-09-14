@@ -210,7 +210,7 @@ def run_op_and_grads_cached(
             job_id=f"{op_name}:{tuple(src_ids)}",
             op=None,
             src_ids=tuple(int(i) for i in src_ids),
-            residual=residual,
+            residual=(1.0 if residual is None else residual),
             param_lens=tuple(int(l) for l in (param_lens or [])),
             fn=_route_fn,
         )
@@ -244,7 +244,7 @@ def run_op_and_grads_cached(
             job_id=f"{op_name}:{tuple(src_ids)}",
             op=None,
             src_ids=tuple(int(i) for i in src_ids),
-            residual=residual,
+            residual=(1.0 if residual is None else residual),
             param_lens=tuple(win_len for _ in src_ids),
             fn=_fft_fn,
         )

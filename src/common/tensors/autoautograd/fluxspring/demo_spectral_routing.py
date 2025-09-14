@@ -584,8 +584,11 @@ def train_routing(
                 )
                 res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
                 if res is not None:
-                    g = getattr(res, "grads_per_source_tensor", None)
-                    if g is None or not bool(AT.get_tensor(g).any()):
+                    g_src = getattr(res, "grads_per_source_tensor", None)
+                    g_par = getattr(res, "param_grads_tensor", None)
+                    have_src = (g_src is not None and bool(AT.get_tensor(g_src).any()))
+                    have_par = (g_par is not None and bool(AT.get_tensor(g_par).any()))
+                    if not (have_src or have_par):
                         raise RuntimeError("whiteboard op produced no gradients")
                     ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
             tick += 1
@@ -619,8 +622,11 @@ def train_routing(
             )
             res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
-                g = getattr(res, "grads_per_source_tensor", None)
-                if g is None or not bool(AT.get_tensor(g).any()):
+                g_src = getattr(res, "grads_per_source_tensor", None)
+                g_par = getattr(res, "param_grads_tensor", None)
+                have_src = (g_src is not None and bool(AT.get_tensor(g_src).any()))
+                have_par = (g_par is not None and bool(AT.get_tensor(g_par).any()))
+                if not (have_src or have_par):
                     raise RuntimeError("whiteboard op produced no gradients")
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
@@ -637,8 +643,11 @@ def train_routing(
             )
             res = ctx.bp_queue.process_slot(mature_slot, sys=sys, node_attrs=FLUX_PARAM_SCHEMA)
             if res is not None:
-                g = getattr(res, "grads_per_source_tensor", None)
-                if g is None or not bool(AT.get_tensor(g).any()):
+                g_src = getattr(res, "grads_per_source_tensor", None)
+                g_par = getattr(res, "param_grads_tensor", None)
+                have_src = (g_src is not None and bool(AT.get_tensor(g_src).any()))
+                have_par = (g_par is not None and bool(AT.get_tensor(g_par).any()))
+                if not (have_src or have_par):
                     raise RuntimeError("whiteboard op produced no gradients")
                 ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
         tick += 1
