@@ -20,21 +20,48 @@ class SlotBackpropQueue:
     wheels:
         Sequence of :class:`ParamWheel` objects whose slots will be updated
         when gradients are applied.
+    slots:
+        Optional fixed size for the spiral. When ``0`` (default) the size is
+        inferred from ``wheels``. The queue may grow via :meth:`grow` until
+        :meth:`freeze` is called.
     """
 
     wheels: Sequence[ParamWheel]
+    slots: int = 0
     main_residuals: Dict[int, AT | None] = field(init=False)
     spectral_residuals: Dict[int, AT | None] = field(init=False)
     jobs: Dict[int, List[_WBJob]] = field(init=False)
     spectral_jobs: Dict[int, List[_WBJob]] = field(init=False)
-    slots: int = field(init=False)
+    _frozen: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        self.slots = len(self.wheels[0].params) if self.wheels else 0
+        if self.slots <= 0:
+            self.slots = len(self.wheels[0].params) if self.wheels else 0
         self.main_residuals = {i: None for i in range(self.slots)}
         self.spectral_residuals = {i: None for i in range(self.slots)}
         self.jobs = {i: [] for i in range(self.slots)}
         self.spectral_jobs = {i: [] for i in range(self.slots)}
+
+    # ------------------------------------------------------------------
+    def grow(self, slots: int) -> None:
+        """Expand internal buffers to at least ``slots`` entries."""
+
+        if slots <= self.slots or self._frozen:
+            if slots > self.slots and self._frozen:
+                raise RuntimeError("SlotBackpropQueue is frozen")
+            return
+        for i in range(self.slots, slots):
+            self.main_residuals[i] = None
+            self.spectral_residuals[i] = None
+            self.jobs[i] = []
+            self.spectral_jobs[i] = []
+        self.slots = slots
+
+    # ------------------------------------------------------------------
+    def freeze(self) -> None:
+        """Prevent further growth of the queue."""
+
+        self._frozen = True
 
     # ------------------------------------------------------------------
     def _slot_for(self, *, tick: int, row_idx: int) -> int:
