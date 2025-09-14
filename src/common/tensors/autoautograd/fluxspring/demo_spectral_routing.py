@@ -47,7 +47,9 @@ from dataclasses import dataclass
 # Module logger setup (configured in main if not already configured)
 logger = logging.getLogger(__name__)
 
-FLUX_PARAM_SCHEMA = ("p",)
+# Parameters we expose to the whiteboard jobs.  Each slice provided to the
+# job function corresponds to one of these attributes in this order.
+FLUX_PARAM_SCHEMA = ("alpha", "w", "b")
 
 
 def _vectorize_wheel_params_to_1d(wheels: Sequence[ParamWheel]) -> None:
@@ -344,20 +346,37 @@ def pump_with_loss(
 ) -> AT.Tensor:
     """Advance the system by one tick and queue residuals and jobs."""
 
-    state, _ = fs_dec.pump_tick(
-        state,
-        ctx.spec,
-        eta=0.1,
-        phi=AT.tanh,
-        norm="all",
-        harness=ctx.harness,
-        wheels=ctx.wheels,
-        tick=tick,
-        update_fn=lambda p, g: p,
-    )
+    slot = tick % ctx.bp_queue.slots
+    ran_forward = False
+    out_feat_cached: AT.Tensor | None = None
 
-    out_feat = state[out_start : out_start + B].clone()
-    ctx.out_buf.push(out_feat)
+    def _route_fn(*_params: AT.Tensor) -> AT.Tensor:
+        nonlocal state, ran_forward, out_feat_cached
+        if not ran_forward:
+            for w, p in zip(ctx.wheels, _params):
+                w.params[slot] = p.clone()
+            state, _ = fs_dec.pump_tick(
+                state,
+                ctx.spec,
+                eta=0.1,
+                phi=AT.tanh,
+                norm="all",
+                harness=ctx.harness,
+                wheels=ctx.wheels,
+                tick=tick,
+                update_fn=lambda p, g: p,
+            )
+            out_feat_cached = state[out_start : out_start + B].clone()
+            ran_forward = True
+        assert out_feat_cached is not None
+        return out_feat_cached.mean()
+
+    # Run the forward once to populate buffers and residuals
+    params_now = [w.params[slot] for w in ctx.wheels]
+    _ = _route_fn(*params_now)
+
+    assert out_feat_cached is not None
+    ctx.out_buf.push(out_feat_cached)
     ctx.tgt_buf.push(target_out.clone())
     hist_residual_summary = None
 
@@ -383,7 +402,7 @@ def pump_with_loss(
         spec_float = (
             float(AT.get_tensor(spec_val)) if spec_val is not None else None
         )
-        slot = ctx.bp_queue._slot_for(tick=fft_tick, row_idx=0)
+        slot_idx = ctx.bp_queue._slot_for(tick=fft_tick, row_idx=0)
         if spec_val is not None:
             ctx.bp_queue.add_residual(
                 tick=fft_tick,
@@ -398,37 +417,11 @@ def pump_with_loss(
         logger.debug(
             "bp_queue.add_residual: tick=%d slot=%d main=%s spectral=%s",
             fft_tick,
-            slot,
+            slot_idx,
             main_float,
             spec_float,
         )
         src_ids = tuple(range(len(ctx.wheels)))
-
-        def _route_fn(_p: AT.Tensor) -> AT.Tensor:
-            for w in ctx.wheels:
-                val = AT.get_tensor(w.params[w.idx])
-                flat = np.array(val).ravel()
-                summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
-                logger.debug(
-                    "_route_fn wheel label=%s idx=%d param_id=%d val=%s",
-                    w.label,
-                    w.idx,
-                    id(w.params[w.idx]),
-                    summary,
-                )
-            psi_tmp, _ = fs_dec.pump_tick(
-                state.clone(),
-                ctx.spec,
-                eta=0.1,
-                phi=AT.tanh,
-                norm="all",
-                harness=ctx.harness,
-                wheels=ctx.wheels,
-                tick=fft_tick,
-                update_fn=lambda p, g: p,
-            )
-            out_tmp = psi_tmp[out_start : out_start + B]
-            return out_tmp.mean()
 
         job_route = _WBJob(
             job_id=f"route:{fft_tick}",
@@ -436,36 +429,35 @@ def pump_with_loss(
             src_ids=src_ids,
             residual=None,
             fn=_route_fn,
+            param_schema=FLUX_PARAM_SCHEMA,
         )
         ctx.bp_queue.queue_job(None, job_route, tick=fft_tick, kind="main")
         logger.debug(
             "bp_queue.queue_job: tick=%d slot=%d kind=main job_id=%s residual=%s",
             fft_tick,
-            slot,
+            slot_idx,
             job_route.job_id,
             main_float,
         )
 
-        if spec_val is not None:
-            def _fft_fn(_p: AT.Tensor) -> AT.Tensor:
-                for w in ctx.wheels:
-                    val = AT.get_tensor(w.params[w.idx])
-                    flat = np.array(val).ravel()
-                    summary = flat[:3].tolist() if flat.size > 3 else flat.tolist()
-                    logger.debug(
-                        "_fft_fn wheel label=%s idx=%d param_id=%d val=%s",
-                        w.label,
-                        w.idx,
-                        id(w.params[w.idx]),
-                        summary,
+        if spec_val is not None and hist_residual_summary is not None:
+            hist_summary = hist_residual_summary
+            fft_cached: AT.Tensor | None = None
+
+            def _fft_fn(*_params: AT.Tensor) -> AT.Tensor:
+                nonlocal fft_cached
+                if fft_cached is None:
+                    mids_local = list(range(band_start, band_start + B))
+                    W_loc, kept_loc = gather_recent_windows(
+                        mids_local, spectral_cfg, ctx.harness
                     )
-                mids_local = list(range(band_start, band_start + B))
-                W_loc, kept_loc = gather_recent_windows(mids_local, spectral_cfg, ctx.harness)
-                if len(kept_loc) == len(mids_local):
-                    bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
-                    targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
-                    return (bp_loc - targ_mat).mean()
-                return AT.tensor(0.0)
+                    if len(kept_loc) == len(mids_local):
+                        bp_loc = batched_bandpower_from_windows(W_loc, spectral_cfg)
+                        targ_mat = AT.stack([hist_targets[nid] for nid in kept_loc])
+                        fft_cached = (bp_loc - targ_mat).mean()
+                    else:
+                        fft_cached = AT.tensor(0.0)
+                return fft_cached
 
             job_fft = _WBJob(
                 job_id=f"fft:{fft_tick}",
@@ -473,12 +465,13 @@ def pump_with_loss(
                 src_ids=src_ids,
                 residual=None,
                 fn=_fft_fn,
+                param_schema=FLUX_PARAM_SCHEMA,
             )
             ctx.bp_queue.queue_job(None, job_fft, tick=fft_tick, kind="spectral")
             logger.debug(
                 "bp_queue.queue_job: tick=%d slot=%d kind=spectral job_id=%s residual=%s",
                 fft_tick,
-                slot,
+                slot_idx,
                 job_fft.job_id,
                 spec_float,
             )
@@ -553,6 +546,15 @@ def train_routing(
         bp_queue=bp_queue,
     )
 
+    def _sys_for_slot(slot: int) -> SimpleNamespace:
+        nodes: dict[int, SimpleNamespace] = {}
+        for i, w in enumerate(ctx.wheels):
+            attrs = {name: AT.tensor(0.0) for name in FLUX_PARAM_SCHEMA}
+            attr = w.label.rsplit(".", 1)[-1]
+            attrs[attr] = w.params[slot]
+            nodes[i] = SimpleNamespace(**attrs)
+        return SimpleNamespace(nodes=nodes)
+
     win = sine_chunks[0].shape[0]
     tick = 0
     for frame_idx, frame_chunks in enumerate(noise_frames):
@@ -579,10 +581,7 @@ def train_routing(
             mature_tick = tick - (spectral_cfg.win_len - 1)
             if mature_tick >= 0:
                 mature_slot = mature_tick % ctx.bp_queue.slots
-                sys = SimpleNamespace(
-                    nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
-                )
-                res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+                res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
                 if res is not None:
                     g_src = getattr(res, "grads_per_source_tensor", None)
                     g_par = getattr(res, "param_grads_tensor", None)
@@ -617,10 +616,7 @@ def train_routing(
         mature_tick = tick - (spectral_cfg.win_len - 1)
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
-            sys = SimpleNamespace(
-                nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
-            )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)
@@ -638,10 +634,7 @@ def train_routing(
         mature_tick = tick - (spectral_cfg.win_len - 1)
         if mature_tick >= 0:
             mature_slot = mature_tick % ctx.bp_queue.slots
-            sys = SimpleNamespace(
-                nodes={i: SimpleNamespace(p=w.params[mature_slot]) for i, w in enumerate(ctx.wheels)}
-            )
-            res = ctx.bp_queue.process_slot(mature_slot, sys=sys)
+            res = ctx.bp_queue.process_slot(mature_slot, sys=_sys_for_slot(mature_slot))
             if res is not None:
                 g_src = getattr(res, "grads_per_source_tensor", None)
                 g_par = getattr(res, "param_grads_tensor", None)
