@@ -131,6 +131,7 @@ class FluxSpringSpec:
     edges: List[EdgeSpec]
     faces: List[FaceSpec]
     dec: DECSpec
+    stages: int = 1
     dirichlet: Optional[DirichletCfg] = None
     regularizers: Optional[RegCfg] = None
     spectral: SpectralCfg = field(default_factory=SpectralCfg)

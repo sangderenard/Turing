@@ -6,7 +6,7 @@ import logging
 
 from ..abstraction import AbstractTensor as AT
 from .whiteboard_runtime import run_batched_vjp, BatchVJPResult, _WBJob
-from .fluxspring import ParamWheel, spiral_slot
+from .fluxspring import ParamWheel
 
 logger = logging.getLogger(__name__)
 

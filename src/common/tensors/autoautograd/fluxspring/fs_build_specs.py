@@ -31,7 +31,7 @@ def _node(idx: int, D: int, scripted_axes=(0, 2)) -> NodeSpec:
     return NodeSpec(
         id=idx,
         p0=p0,
-       v0=v0,
+        v0=v0,
         mass=AT.tensor(1.0),
         ctrl=ctrl,
         scripted_axes=list(scripted_axes),
