@@ -2935,6 +2935,7 @@ def _bind_and_wrap(mapping: Dict[str, Callable]) -> None:
 
 _bind_and_wrap({
     "reshape": _reshape_methods.reshape,
+    "view": _reshape_methods.view,
     "flatten": _reshape_methods.flatten,
     "transpose": _reshape_methods.transpose,
     "permute": _reshape_methods.permute,
@@ -3020,6 +3021,7 @@ def T(self) -> "AbstractTensor":
     return self.transpose(-2, -1)
 
 AbstractTensor.reshape = _reshape_methods.reshape
+AbstractTensor.view = _reshape_methods.view
 AbstractTensor.flatten = _reshape_methods.flatten
 AbstractTensor.transpose = _reshape_methods.transpose
 AbstractTensor.permute = _reshape_methods.permute

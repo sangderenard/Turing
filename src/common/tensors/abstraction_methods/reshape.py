@@ -11,16 +11,14 @@ def _wrap_result(self, result):
     out.data = result
     return out
 
-def reshape(self, *shape) -> "AbstractTensor":
-    """Return a reshaped tensor as an AbstractTensor."""
-    from ..abstraction import AbstractTensor, BACKEND_REGISTRY
 
-    shape_tuple = AbstractTensor._normalize_shape_args(*shape)
+def _reshape_dispatch(self, shape_tuple, op_name: str, fallback_error: str) -> "AbstractTensor":
+    from ..abstraction import AbstractTensor, BACKEND_REGISTRY
 
     if hasattr(self, "reshape_"):
         out = _wrap_result(self, self.reshape_(shape_tuple))
         finalize = AbstractTensor._pre_autograd(
-            "reshape", [self], params={"new_shape": out.shape}
+            op_name, [self], params={"new_shape": getattr(out, "shape", shape_tuple)}
         )
         return finalize(out)
 
@@ -35,13 +33,40 @@ def reshape(self, *shape) -> "AbstractTensor":
                 reshaped_tensor = backend_cls(track_time=getattr(self, "track_time", False))
                 reshaped_tensor.data = reshaped_data
                 finalize = AbstractTensor._pre_autograd(
-                    "reshape", [self], params={"new_shape": reshaped_tensor.shape}
+                    op_name, [self], params={"new_shape": reshaped_tensor.shape}
                 )
-                return finalize(reshaped_tensor.to_backend(self))
+                converted = reshaped_tensor.to_backend(self)
+                return finalize(converted)
     except Exception:
         pass
 
-    raise NotImplementedError("Reshape fallback not implemented for pure python backend.")
+    raise NotImplementedError(fallback_error)
+
+
+def reshape(self, *shape) -> "AbstractTensor":
+    """Return a reshaped tensor as an AbstractTensor."""
+    from ..abstraction import AbstractTensor
+
+    shape_tuple = AbstractTensor._normalize_shape_args(*shape)
+    return _reshape_dispatch(
+        self,
+        shape_tuple,
+        op_name="reshape",
+        fallback_error="Reshape fallback not implemented for pure python backend.",
+    )
+
+
+def view(self, *shape) -> "AbstractTensor":
+    """Alias for :meth:`reshape` mirroring PyTorch's ``view`` semantics."""
+    from ..abstraction import AbstractTensor
+
+    shape_tuple = AbstractTensor._normalize_shape_args(*shape)
+    return _reshape_dispatch(
+        self,
+        shape_tuple,
+        op_name="view",
+        fallback_error="View fallback not implemented for pure python backend.",
+    )
 
 def transpose(self, dim0: int = 0, dim1: int = 1) -> "AbstractTensor":
     """Return a transposed tensor as an AbstractTensor."""
