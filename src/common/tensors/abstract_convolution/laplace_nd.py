@@ -1761,7 +1761,8 @@ class PeriodicLinspace:
 class GridDomain:
     def __init__(self, U, V, W, u_mode=None, u_p=1, v_mode=None, v_p=1, w_mode=None, w_p=1,
                  Lx=1, Ly=1, Lz=1, grid_boundaries=(True, True, True, True, True, True),
-                 transform=None, coordinate_system="rectangular"):
+                 transform=None, coordinate_system="rectangular",
+                 defer_resolution=False):
         """
         Initializes the GridDomain object for 3D grids.
 
@@ -1779,7 +1780,10 @@ class GridDomain:
         self.V = V
         self.W = W
         self.transform = transform
-        self.vertices = self.transform.transform(U, V, W)  # Pass W here
+        self.defer_resolution = bool(defer_resolution)
+        self.vertices = None
+        if not self.defer_resolution:
+            self.vertices = self.resolve_positions(full_geometry=True, cache=True)
 
         self.u_mode = u_mode
         self.v_mode = v_mode
@@ -1816,6 +1820,33 @@ class GridDomain:
         # Step 4: Create a combined normalized grid for interpolation
         self.normalized_grid = AbstractTensor.stack([self.normalized_U, self.normalized_V, self.normalized_W], dim=-1).unsqueeze(0)
 
+    def resolve_positions(self, U=None, V=None, W=None, *, full_geometry=False,
+                          cache=False):
+        """Resolve parametric coordinates only when their final positions matter.
+
+        ``transform_spatial`` is the inexpensive continuous map used by field
+        queries such as YoungMan edge evaluation.  ``full_geometry=True`` keeps
+        the historical path that also computes partials, normals, and metric
+        data.  Arbitrary query coordinates are never cached as domain vertices.
+        """
+        query_u = self.U if U is None else U
+        query_v = self.V if V is None else V
+        query_w = self.W if W is None else W
+        if full_geometry:
+            resolved = self.transform.transform(query_u, query_v, query_w)
+        else:
+            resolved = self.transform.transform_spatial(query_u, query_v, query_w)
+        is_domain_query = U is None and V is None and W is None
+        if cache and is_domain_query:
+            self.vertices = resolved
+        return resolved
+
+    def signed_difference(self, field, U=None, V=None, W=None, *,
+                          iso_value=0.0):
+        """Evaluate an implicit field at final transformed query positions."""
+        X, Y, Z = self.resolve_positions(U, V, W, full_geometry=False)
+        return field(X, Y, Z) - iso_value
+
     @staticmethod
     def generate_grid_domain(coordinate_system, N_u, N_v, N_w, u_mode=None, v_mode=None, w_mode=None,
                             device='cpu', precision=None, **kwargs):
@@ -1829,6 +1860,7 @@ class GridDomain:
         w_mode = w_mode or {'method': 'linear', 'p': 1}
 
         # Combine all the parameters that are common across different transforms
+        defer_resolution = bool(kwargs.pop("defer_resolution", False))
         transform_params = {
             'N_u': N_u,
             'N_v': N_v,
@@ -1876,13 +1908,19 @@ class GridDomain:
             U, V, W = AbstractTensor.meshgrid(u_grid, v_grid, w_grid, indexing='ij')
 
         # Create and return the GridDomain
-        return GridDomain(U, V, W, transform=transform, coordinate_system=coordinate_system)
+        return GridDomain(
+            U, V, W, transform=transform,
+            coordinate_system=coordinate_system,
+            defer_resolution=defer_resolution,
+        )
 
 
     def apply_transform(self):
         return self.transform(self.U, self.V)
     
     def get_vertices(self):
+        if self.vertices is None:
+            self.vertices = self.resolve_positions(full_geometry=True, cache=True)
         return self.vertices
     def return_dense_copy(self, scaling_factor=(2,2), normalize=True):
         """

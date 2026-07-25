@@ -2405,7 +2405,11 @@ class AbstractTensor:
 class AbstractScalar(AbstractTensor):
     """Marker mixin for zero-dimensional tensors produced by reductions."""
 
-    def __new__(cls, tensor: "AbstractTensor"):
+    def __new__(cls, tensor: "AbstractTensor" = None, *args, **kwargs):
+        # Scalar backend subclasses must remain constructible by the ordinary
+        # AbstractTensor result path (for example ``x.max() - x.min()``).
+        if tensor is None:
+            return object.__new__(cls)
         if getattr(getattr(tensor, "data", None), "shape", ()) != ():
             raise ValueError("AbstractScalar requires a zero-dimensional tensor")
         if not isinstance(tensor, AbstractScalar):

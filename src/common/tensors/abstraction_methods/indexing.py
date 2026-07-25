@@ -9,7 +9,11 @@ def unravel_index(indices: Any, shape: Tuple[int, ...]):
     Delegates to the backend-specific implementation ``unravel_index_`` after
     converting ``indices`` to an ``AbstractTensor`` instance.
     """
-    # assume indices is already an AbstractTensor
+    from ..abstraction import AbstractTensor
+    if not isinstance(indices, AbstractTensor):
+        indices = AbstractTensor.get_tensor(indices).to_dtype(
+            AbstractTensor.long_dtype_
+        )
     return indices.unravel_index_(shape)
     
     
