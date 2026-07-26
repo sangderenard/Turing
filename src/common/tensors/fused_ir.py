@@ -137,3 +137,58 @@ def primary_output_id(program: FusedProgram) -> int:
     if len(program.outputs) != 1:
         raise ValueError("elementwise fused backends require exactly one output")
     return next(iter(program.outputs.values()))
+
+
+def serialize_elementwise_fused_program(program: FusedProgram) -> str:
+    """Serialize an equal-shape region for cross-language calculator replay.
+
+    This is a textual transport for :class:`FusedProgram`, not another
+    semantic program representation.  Operation names remain canonical and
+    consumers perform their own value-id-to-storage lowering.
+    """
+
+    lines = [f"fused_program {program.version}"]
+    for feed_id in ordered_feed_ids(program):
+        lines.append(f"feed {feed_id}")
+
+    for step in program.steps:
+        try:
+            op, prefix_reverse = canonical_elementwise_op(step.op_name)
+        except KeyError as exc:
+            raise ValueError(
+                f"{step.op_name} is not in the elementwise FusedProgram region"
+            ) from exc
+        attrs = dict(step.attrs)
+        reverse = bool(attrs.pop("reverse", False)) ^ prefix_reverse
+        scalar = attrs.pop("right_scalar", None)
+        if attrs:
+            raise ValueError(
+                f"FusedProgram step {step.step_id} has unsupported attrs: "
+                f"{', '.join(sorted(attrs))}"
+            )
+        if op in ELEMENTWISE_UNARY:
+            if len(step.input_ids) != 1 or scalar is not None:
+                raise ValueError(f"unary op {op} has an invalid operand layout")
+        elif len(step.input_ids) == 2 and scalar is None:
+            pass
+        elif len(step.input_ids) == 1 and scalar is not None:
+            scalar = float(scalar)
+        else:
+            raise ValueError(f"binary op {op} has an invalid operand layout")
+
+        tokens = [
+            "step",
+            str(step.step_id),
+            op,
+            str(step.result_id),
+            str(len(step.input_ids)),
+            *(str(value_id) for value_id in step.input_ids),
+            "1" if scalar is not None else "0",
+            format(scalar if scalar is not None else 0.0, ".17g"),
+            "1" if reverse else "0",
+        ]
+        lines.append(" ".join(tokens))
+
+    lines.append(f"output {primary_output_id(program)}")
+    lines.append("end")
+    return "\n".join(lines) + "\n"

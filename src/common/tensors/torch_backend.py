@@ -227,6 +227,28 @@ class PyTorchTensorOperations(AbstractTensor):
             return -a
         if op == "abs":
             return torch.abs(a)
+        if op == "sqrt":
+            return torch.sqrt(a)
+        if op == "exp":
+            return torch.exp(a)
+        if op == "log":
+            return torch.log(a)
+        if op == "round":
+            return torch.round(a)
+        if op == "trunc":
+            return torch.trunc(a)
+        if op == "floor":
+            return torch.floor(a)
+        if op == "ceil":
+            return torch.ceil(a)
+        if op == "isfinite":
+            return torch.isfinite(a)
+        if op == "isnan":
+            return torch.isnan(a)
+        if op == "isinf":
+            return torch.isinf(a)
+        if op == "logical_not":
+            return torch.logical_not(a)
         if op == "invert":
             return torch.bitwise_not(a)
         if op == "sin":
@@ -281,6 +303,30 @@ class PyTorchTensorOperations(AbstractTensor):
             return a ** b
         if op == "rpow":
             return a ** b
+        if op == "less":
+            return a < b
+        if op == "less_equal":
+            return a <= b
+        if op == "greater":
+            return a > b
+        if op == "greater_equal":
+            return a >= b
+        if op == "equal":
+            return a == b
+        if op == "not_equal":
+            return a != b
+        if op == "maximum":
+            if not torch.is_tensor(a):
+                a = torch.as_tensor(a, dtype=b.dtype, device=b.device)
+            if not torch.is_tensor(b):
+                b = torch.as_tensor(b, dtype=a.dtype, device=a.device)
+            return torch.maximum(a, b)
+        if op == "minimum":
+            if not torch.is_tensor(a):
+                a = torch.as_tensor(a, dtype=b.dtype, device=b.device)
+            if not torch.is_tensor(b):
+                b = torch.as_tensor(b, dtype=a.dtype, device=a.device)
+            return torch.minimum(a, b)
         if op in ("matmul", "imatmul"):
             return a @ b
         if op == "rmatmul":

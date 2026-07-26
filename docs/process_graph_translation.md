@@ -60,6 +60,13 @@ ports, named roles, connections, tensor metadata, and BitBit accounting.
 Nodus validates canonical names against its generated operation catalog while
 retaining inputs, constants, returns, and other structural nodes explicitly.
 
+The execution benchmark uses the narrower sibling boundary: one captured
+equal-shape `FusedProgram` is serialized as canonical names and value ids,
+then lowered by Nodus to its TensorMath-backed calculator. Nodus does not
+restate the benchmark expression. This transport does not replace the
+ProcessGraph → GraphIR path; it is the prepared numeric-region handoff after
+the graph compiler has selected such a region.
+
 ## Focused verification
 
 ```powershell

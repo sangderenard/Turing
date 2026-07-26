@@ -317,6 +317,28 @@ class NumPyTensorOperations(AbstractTensor):
             return -a
         if op == "abs":
             return np.abs(a)
+        if op == "sqrt":
+            return np.sqrt(a)
+        if op == "exp":
+            return np.exp(a)
+        if op == "log":
+            return np.log(a)
+        if op == "round":
+            return np.round(a)
+        if op == "trunc":
+            return np.trunc(a)
+        if op == "floor":
+            return np.floor(a)
+        if op == "ceil":
+            return np.ceil(a)
+        if op == "isfinite":
+            return np.isfinite(a)
+        if op == "isnan":
+            return np.isnan(a)
+        if op == "isinf":
+            return np.isinf(a)
+        if op == "logical_not":
+            return np.logical_not(a)
         if op == "invert":
             return np.invert(a)
         if op == "sin":
@@ -369,6 +391,22 @@ class NumPyTensorOperations(AbstractTensor):
             return np.power(a, b)
         if op == "rpow":
             return np.power(a, b)
+        if op == "less":
+            return np.less(a, b)
+        if op == "less_equal":
+            return np.less_equal(a, b)
+        if op == "greater":
+            return np.greater(a, b)
+        if op == "greater_equal":
+            return np.greater_equal(a, b)
+        if op == "equal":
+            return np.equal(a, b)
+        if op == "not_equal":
+            return np.not_equal(a, b)
+        if op == "maximum":
+            return np.maximum(a, b)
+        if op == "minimum":
+            return np.minimum(a, b)
         if op in ("matmul", "imatmul"):
             return a @ b
         if op == "rmatmul":

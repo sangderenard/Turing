@@ -2,13 +2,19 @@ import numpy as np
 import pytest
 
 from src.common.tensors.accelerator_backends.c_backend import CTensor
+from src.common.tensors import AbstractTensor
+from src.common.tensors.abstract_nn import ProgramRunner
 from src.common.tensors.accelerator_backends.c_primitive_program import (
     compile_elementwise_tape,
     execute_fused_program,
     prepare_fused_program,
 )
 from src.common.tensors.autograd import GradTape, autograd
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from src.common.tensors.fused_ir import (
+    FusedProgram,
+    OpStep,
+    serialize_elementwise_fused_program,
+)
 from src.common.tensors.numpy_backend import NumPyTensorOperations
 
 
@@ -42,6 +48,17 @@ def test_primitive_program_fuses_sigmoid_chain_across_one_native_call():
     )
 
     np.testing.assert_allclose(result.tolist(), 1.0 / (1.0 + np.exp(-values)))
+
+    assert serialize_elementwise_fused_program(program) == (
+        "fused_program 1\n"
+        "feed 0\n"
+        "step 0 neg 1 1 0 0 0 0\n"
+        "step 1 exp 2 1 1 0 0 0\n"
+        "step 2 add 3 1 2 1 1 0\n"
+        "step 3 truediv 4 1 3 1 1 1\n"
+        "output 4\n"
+        "end\n"
+    )
 
 
 def test_primitive_program_accepts_multiple_feed_slots():
@@ -98,3 +115,24 @@ def test_real_autograd_trace_compiles_and_replays_in_c():
         "neg", "exp", "add", "truediv"
     ]
     np.testing.assert_allclose(replayed.tolist(), result.tolist())
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "c"])
+def test_program_runner_replays_canonical_unary_scalar_and_comparison(backend):
+    values = np.asarray([-1.0, 0.0, 1.0])
+    program = _program(
+        [0],
+        [
+            ("exp", 1, [0], {}),
+            ("add", 2, [1], {"right_scalar": 1.0}),
+            ("maximum", 3, [2], {"right_scalar": 3.0}),
+            ("less", 4, [3], {"right_scalar": 4.0}),
+        ],
+        4,
+    )
+    with AbstractTensor.use_backend(backend):
+        source = AbstractTensor.tensor(values)
+        result = ProgramRunner(program)({0: source})["result"]
+
+    expected = np.maximum(np.exp(values) + 1.0, 3.0) < 4.0
+    np.testing.assert_array_equal(result.tolist(), expected)

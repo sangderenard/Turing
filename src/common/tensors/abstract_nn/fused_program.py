@@ -268,6 +268,13 @@ class ProgramRunner:
 
             # Build call kwargs with optional training flag if accepted
             call_kwargs = dict(step.attrs or {})
+            canonical_scalar = None
+            has_canonical_scalar = False
+            if canonical_op in ELEMENTWISE_UNARY | ELEMENTWISE_BINARY:
+                if "right_scalar" in call_kwargs:
+                    canonical_scalar = call_kwargs.pop("right_scalar")
+                    has_canonical_scalar = True
+                reverse_operands ^= bool(call_kwargs.pop("reverse", False))
             if step.mode_sensitive:
                 try:
                     sig = inspect.signature(fn)
@@ -310,9 +317,20 @@ class ProgramRunner:
 
             try:
                 if canonical_op in ELEMENTWISE_UNARY:
+                    if len(args) != 1 or has_canonical_scalar:
+                        raise ValueError(
+                            f"unary op {canonical_op} has invalid operands"
+                        )
                     result = fn(canonical_op, args[0], None)
                 elif canonical_op in ELEMENTWISE_BINARY:
-                    left, right = args[:2]
+                    if len(args) == 2 and not has_canonical_scalar:
+                        left, right = args
+                    elif len(args) == 1 and has_canonical_scalar:
+                        left, right = args[0], canonical_scalar
+                    else:
+                        raise ValueError(
+                            f"binary op {canonical_op} has invalid operands"
+                        )
                     if reverse_operands:
                         left, right = right, left
                     result = fn(canonical_op, left, right)

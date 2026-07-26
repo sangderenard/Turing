@@ -141,9 +141,11 @@ they receive explicit typed instructions. FFT continues to lower through
    with explicit constants and broadcasting rather than implicit Python
    behavior.
 4. Add liveness allocation and direct output-buffer execution.
-5. Let Nodus consume the packet in-process, bypassing CFFI. Preserve the C
-   interpreter as the reference implementation and parity oracle. Keep the
-   Python-to-SPIR-V compiler as a distinct, higher-level effort.
+5. Move the now-validated Nodus packet ingestion from the benchmark process
+   boundary into the host/plugin boundary, bypassing both process launch and
+   CFFI. Preserve the C interpreter as the reference implementation and parity
+   oracle. Keep the Python-to-SPIR-V compiler as a distinct, higher-level
+   effort.
 6. Add cost-based fusion: tiny chains benefit from fewer crossings, while
    large kernels benefit most from eliminating intermediate memory traffic.
 7. Only then stabilize serialization and cache compiled KernelIR by program,
@@ -176,15 +178,25 @@ not a change in mathematical semantics.
 
 ## Five-way execution benchmark
 
-`benchmark_nodus_calculator.py` runs the same float64 sigmoid chain on:
+`benchmark_nodus_calculator.py` captures one ordinary float64 sigmoid forward
+trace as a `FusedProgram`, then runs that exact program on:
 
-- eager AbstractTensor with NumPy;
-- eager AbstractTensor with Torch, on a selectable device;
-- eager AbstractTensor with the C backend;
+- `ProgramRunner` with NumPy AbstractTensor;
+- `ProgramRunner` with Torch AbstractTensor, on a selectable device;
+- `ProgramRunner` with the C AbstractTensor backend;
 - the developing GLSL backend as one fused compute shader, with a resident
   GPU input; and
-- an already-prepared Tensor Calculator program bound directly to Nodus
-  `InMemoryBackend` buffers.
+- Nodus, where the received canonical program is bound once to
+  `InMemoryBackend` buffers and prepared as Tensor Calculator instructions.
+
+The Nodus executable contains no sigmoid or private operation sequence. Python
+serializes the equal-shape `FusedProgram` as a small versioned textual
+transport containing value ids, canonical operation names, scalar operands,
+and the selected output. Nodus resolves those names through its generated
+canonical catalog, lowers value ids to tensors, and executes exclusively
+through TensorMath. The transport is a wire view of `FusedProgram`, not a
+second semantic IR. The runner writes its complete float64 output after timing
+so Python certifies every element against the same independent reference.
 
 Build the native runner in Nodus, then run from the Turing repository:
 
@@ -214,14 +226,14 @@ line benchmark and requires a real OpenGL 4.3+ compute context; use
 `--without-glsl` on machines that intentionally lack one.
 
 The comparison intentionally measures different execution modes. The three
-Python rows include eager AbstractTensor dispatch and result allocation on
-every repetition. The Nodus row excludes process startup and setup, then
-replays a prebound, preallocated native program. Setup is reported separately,
-all rows evaluate the full output against the analytical result, and CUDA is
-synchronized around each timed sample. This makes the benchmark useful for
-measuring the dispatch cost that precomposition removes, but it is not a claim
-that the underlying Nodus arithmetic loops are intrinsically faster than
-NumPy or Torch.
+Python rows replay the captured steps eagerly through AbstractTensor and
+allocate results on every repetition. The Nodus row excludes process startup
+and setup, then replays a prebound, preallocated native program. Setup is
+reported separately, all rows evaluate the full output against the analytical
+result, and CUDA is synchronized around each timed sample. This makes the
+benchmark useful for measuring the dispatch cost that precomposition removes,
+but it is not a claim that the underlying Nodus arithmetic loops are
+intrinsically faster than NumPy or Torch.
 
 The GLSL row compiles all four primitives into one shader. Its input and output
 SSBOs stay resident, the shader cache is warm for measured samples, and

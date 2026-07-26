@@ -4,12 +4,11 @@ The workload is deliberately restricted to the shared primitive vocabulary:
 
     sigmoid(x) = 1 / (1 + exp(-x))
 
-Setup/allocation is reported separately. Timed samples include complete eager
-AbstractTensor dispatch for NumPy, Torch, and C. The Nodus executable reports
-only repeated execution of an already-bound, already-prepared native program;
-process startup is therefore not charged to its compute samples. The developing
-GLSL backend executes the chain as one fused shader and reports synchronized
-host time, device timer-query time, transfer costs, and compilation separately.
+One forward trace is captured as a ``FusedProgram``. Setup/allocation is
+reported separately. NumPy, Torch, and C replay its steps through
+``ProgramRunner``; Nodus receives its canonical textual transport and lowers
+the value ids to prepared calculator tensors; GLSL lowers the same object to
+one shader. Process startup is not charged to Nodus compute samples.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import ctypes
 import json
 import os
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from time import perf_counter
@@ -27,6 +27,10 @@ import numpy as np
 import pandas as pd
 
 from .abstraction import AbstractTensor as AT
+from .fused_ir import (
+    ordered_feed_ids,
+    serialize_elementwise_fused_program,
+)
 
 ProgressCallback = Callable[[str, str, dict | None], None]
 
@@ -96,14 +100,21 @@ def _find_nodus_executable(explicit: Path | None = None) -> Path:
 def _benchmark_abstracttensor_backend(
     backend: str,
     *,
+    captured,
     elements: int,
     warmup: int,
     repeats: int,
     torch_device: str,
 ) -> dict:
+    from .abstract_nn import ProgramRunner
+    from .autograd import autograd
+
     host = _input_values(elements)
     expected = 1.0 / (1.0 + np.exp(-host))
     device = torch_device if backend == "torch" else None
+    feed_ids = ordered_feed_ids(captured.program)
+    output_name = next(iter(captured.program.outputs))
+    runner = ProgramRunner(captured.program)
 
     started = perf_counter()
     with AT.use_backend(backend, device):
@@ -111,7 +122,9 @@ def _benchmark_abstracttensor_backend(
     setup_sec = perf_counter() - started
 
     def execute():
-        return _sigmoid(value)
+        feeds = {feed_id: value for feed_id in feed_ids}
+        with autograd.no_grad():
+            return runner(feeds, training=False)[output_name]
 
     result = None
     with AT.use_backend(backend, device):
@@ -134,8 +147,9 @@ def _benchmark_abstracttensor_backend(
     return {
         "backend": backend,
         "device": device or "cpu",
-        "execution": "abstracttensor_eager",
+        "execution": "captured_fused_program_eager",
         "dtype": "float64",
+        "program_steps": len(captured.program.steps),
         "elements": elements,
         "warmup": warmup,
         "repeats": repeats,
@@ -154,35 +168,65 @@ def _benchmark_abstracttensor_backend(
 def _benchmark_nodus(
     executable: Path,
     *,
+    captured,
     elements: int,
     warmup: int,
     repeats: int,
 ) -> dict:
-    completed = subprocess.run(
-        [
-            str(executable),
-            "--elements",
-            str(elements),
-            "--warmup",
-            str(warmup),
-            "--repeats",
-            str(repeats),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    expected = 1.0 / (1.0 + np.exp(-_input_values(elements)))
+    with tempfile.TemporaryDirectory(prefix="nodus-fused-program-") as temp:
+        temp_path = Path(temp)
+        program_path = temp_path / "program.fused"
+        output_path = temp_path / "output.f64"
+        program_path.write_text(
+            serialize_elementwise_fused_program(captured.program),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                str(executable),
+                "--program",
+                str(program_path),
+                "--output-bin",
+                str(output_path),
+                "--elements",
+                str(elements),
+                "--warmup",
+                str(warmup),
+                "--repeats",
+                str(repeats),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        values = np.fromfile(output_path, dtype=np.float64)
+    if values.shape != (elements,):
+        raise RuntimeError(
+            "Nodus benchmark returned "
+            f"{values.size} values for {elements} elements"
+        )
     lines = [line.strip() for line in completed.stdout.splitlines()]
     payloads = [line for line in lines if line.startswith("{")]
     if not payloads:
         raise RuntimeError(
             "Nodus benchmark produced no JSON result:\n" + completed.stdout
         )
-    return json.loads(payloads[-1])
+    row = json.loads(payloads[-1])
+    difference = np.abs(values - expected)
+    row.update(
+        checksum=float(values.sum(dtype=np.float64)),
+        first=float(values[0]),
+        middle=float(values[elements // 2]),
+        last=float(values[-1]),
+        max_abs_error=float(difference.max(initial=0.0)),
+    )
+    return row
 
 
 def _benchmark_glsl(
     *,
+    captured,
     elements: int,
     warmup: int,
     repeats: int,
@@ -206,7 +250,6 @@ def _benchmark_glsl(
 
     host = _input_values(elements).astype(np.float32)
     expected = 1.0 / (1.0 + np.exp(-host.astype(np.float64)))
-    captured = _capture_sigmoid_program()
     program = captured.program
     feed_id = next(iter(program.feeds))
 
@@ -268,6 +311,7 @@ def _benchmark_glsl(
         "device": renderer,
         "execution": "fused_shader_resident_io",
         "dtype": "float32",
+        "program_steps": len(captured.program.steps),
         "elements": elements,
         "warmup": warmup,
         "repeats": repeats,
@@ -322,12 +366,12 @@ def _annotate_result(
         elements / row["median_sec"] / 1_000_000.0
     )
     row["million_primitive_ops_per_sec"] = (
-        4.0 * elements / row["median_sec"] / 1_000_000.0
+        row["program_steps"] * elements / row["median_sec"] / 1_000_000.0
     )
     gpu_median_sec = row.get("gpu_median_sec")
     if gpu_median_sec is not None and gpu_median_sec > 0.0:
         row["gpu_million_primitive_ops_per_sec"] = (
-            4.0 * elements / gpu_median_sec / 1_000_000.0
+            row["program_steps"] * elements / gpu_median_sec / 1_000_000.0
         )
         row["host_overhead_sec"] = row["median_sec"] - gpu_median_sec
     else:
@@ -353,6 +397,7 @@ def run_comparison(
 
     expected = 1.0 / (1.0 + np.exp(-_input_values(elements)))
     reference_checksum = float(expected.sum(dtype=np.float64))
+    captured = _capture_sigmoid_program()
     rows: list[dict] = []
 
     def run_one(label: str, benchmark: Callable[[], dict]) -> None:
@@ -373,6 +418,7 @@ def run_comparison(
             backend,
             lambda backend=backend: _benchmark_abstracttensor_backend(
                 backend,
+                captured=captured,
                 elements=elements,
                 warmup=warmup,
                 repeats=repeats,
@@ -383,6 +429,7 @@ def run_comparison(
         run_one(
             "glsl",
             lambda: _benchmark_glsl(
+                captured=captured,
                 elements=elements,
                 warmup=warmup,
                 repeats=repeats,
@@ -394,6 +441,7 @@ def run_comparison(
             "nodus_calculator",
             lambda: _benchmark_nodus(
                 executable,
+                captured=captured,
                 elements=elements,
                 warmup=warmup,
                 repeats=repeats,
@@ -540,7 +588,7 @@ def plot_comparison(
     throughput.set_yscale("log")
     throughput.set_xticks(x, labels, rotation=18, ha="right")
     throughput.set_ylabel("million primitive operations / second")
-    throughput.set_title("Throughput from the same four-op chain")
+    throughput.set_title("Throughput from the same captured program")
     throughput.grid(axis="y", which="both", alpha=0.22)
     throughput.legend(fontsize=8)
 
@@ -679,7 +727,7 @@ def main() -> None:
         "checksum_delta",
         "parity_ok",
     ]
-    print(table[columns].to_string(index=False))
+    print(table.reindex(columns=columns).to_string(index=False))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.output, index=False)
