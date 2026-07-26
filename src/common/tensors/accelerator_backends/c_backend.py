@@ -36,7 +36,12 @@ from cffi import FFI
 
 # The tensor abstraction module was renamed to ``abstraction``. Update imports
 # accordingly so the C backend stays in sync with the other backends.
-from ..abstraction import AbstractTensor, _get_shape, _flatten
+from ..abstraction import (
+    AbstractTensor,
+    _get_shape,
+    _flatten,
+    register_backend,
+)
 
 
 ffi = FFI()
@@ -94,8 +99,8 @@ ffi.cdef("""
         void (*callback)(const double*, int, int, void*),
         void* user_data);
 
-    void cast_double_to_int(const double* a, int* out, int n);
-    void cast_double_to_float(const double* a, float* out, int n);
+    void cast_double_to_int_values(const double* a, double* out, int n);
+    void cast_double_to_float_values(const double* a, double* out, int n);
     void stack_double(const double** tensors, int num_tensors, const int* shape, int ndim, int dim, double* out);
     void cat_double(const double** tensors, const int* dim_sizes, int num_tensors, const int* shape, int ndim, int dim, double* out);
 """)
@@ -307,7 +312,9 @@ class CTensorOperations(AbstractTensor):
     def zeros_(self, size: Tuple[int, ...], dtype: Any, device: Any):
         return self.full(size, 0.0, dtype, device)
 
-    def clone_(self, tensor: CTensor) -> CTensor:
+    def clone_(self, tensor: CTensor = None) -> CTensor:
+        if tensor is None:
+            tensor = self.data
         t = CTensor(tensor.shape)
         ffi.memmove(t.buffer, tensor.buffer, tensor.size * ffi.sizeof("double"))
         return t
@@ -343,7 +350,9 @@ class CTensorOperations(AbstractTensor):
         C.pow_scalar(tensor.as_c_ptr(), float(exponent), out.as_c_ptr(), tensor.size)
         return out
 
-    def sqrt_(self, tensor: Any) -> CTensor:
+    def sqrt_(self, tensor: Any = None) -> CTensor:
+        if tensor is None:
+            tensor = self.data
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
         out = CTensor(tensor.shape)
@@ -369,10 +378,14 @@ class CTensorOperations(AbstractTensor):
         shape = _get_shape(data)
         return CTensor.from_list(data, shape)
 
-    def shape_(self, tensor: CTensor) -> Tuple[int, ...]:
+    def shape_(self, tensor: CTensor = None) -> Tuple[int, ...]:
+        if tensor is None:
+            tensor = self.data
         return tensor.shape
 
-    def numel_(self, tensor: CTensor) -> int:
+    def numel_(self, tensor: CTensor = None) -> int:
+        if tensor is None:
+            tensor = self.data
         return tensor.size
 
     def __trunc__(self):
@@ -382,12 +395,26 @@ class CTensorOperations(AbstractTensor):
             raise TypeError("Only scalar tensors can be converted to int")
         return int(math.trunc(tensor.buffer[0]))
 
-    def mean_(self, tensor: Any, dim: Optional[int] = None) -> Any:
+    def mean_(
+        self,
+        tensor: Any = None,
+        dim: Optional[int] = None,
+        keepdim: bool = False,
+    ) -> Any:
+        if tensor is None:
+            tensor = self.data
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
-        values = _flatten(tensor.tolist())
         if dim is None:
-            return sum(values) / len(values) if values else 0.0
+            value = (
+                C.sum_double(tensor.as_c_ptr(), tensor.size) / tensor.size
+                if tensor.size else 0.0
+            )
+            if not keepdim:
+                return value
+            out = CTensor((1,) * len(tensor.shape))
+            out.buffer[0] = value
+            return out
 
         shape = tensor.shape
         if dim < 0:
@@ -395,7 +422,11 @@ class CTensorOperations(AbstractTensor):
         if dim < 0 or dim >= len(shape):
             raise ValueError("dim out of range")
 
-        out_shape = shape[:dim] + shape[dim + 1 :]
+        out_shape = (
+            shape[:dim] + (1,) + shape[dim + 1 :]
+            if keepdim
+            else shape[:dim] + shape[dim + 1 :]
+        )
         out = CTensor(out_shape if out_shape else ())
         shape_arr = ffi.new("int[]", list(shape))
         C.mean_dim(tensor.as_c_ptr(), out.as_c_ptr(), shape_arr, len(shape), dim)
@@ -413,7 +444,9 @@ class CTensorOperations(AbstractTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
         return _flatten(tensor.tolist())
 
-    def tolist_(self, tensor: Any) -> list:
+    def tolist_(self, tensor: Any = None) -> list:
+        if tensor is None:
+            tensor = self.data
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
         return tensor.tolist()
@@ -664,6 +697,10 @@ class CTensorOperations(AbstractTensor):
     def stack_(self, tensors: list, dim: int = 0) -> Any:
         if not tensors:
             raise ValueError("tensors list cannot be empty")
+        tensors = [
+            tensor.data if isinstance(tensor, AbstractTensor) else tensor
+            for tensor in tensors
+        ]
         c_tensors = [
             t if isinstance(t, CTensor) else CTensor.from_list(t, _get_shape(t))
             for t in tensors
@@ -687,6 +724,10 @@ class CTensorOperations(AbstractTensor):
     def cat_(self, tensors: list, dim: int = 0) -> Any:
         if not tensors:
             raise ValueError("tensors list cannot be empty")
+        tensors = [
+            tensor.data if isinstance(tensor, AbstractTensor) else tensor
+            for tensor in tensors
+        ]
         c_tensors = [
             t if isinstance(t, CTensor) else CTensor.from_list(t, _get_shape(t))
             for t in tensors
@@ -720,13 +761,15 @@ class CTensorOperations(AbstractTensor):
             "unravel_index not implemented for C backend"
         )
 
-    def get_device_(self, tensor: CTensor) -> str:
+    def get_device_(self, tensor: CTensor = None) -> str:
         return "cpu_cffi"
 
-    def get_dtype_(self, tensor: CTensor) -> Any:
+    def get_dtype_(self, tensor: CTensor = None) -> Any:
         return float
 
-    def item_(self, tensor: CTensor) -> Any:
+    def item_(self, tensor: CTensor = None) -> Any:
+        if tensor is None:
+            tensor = self.data
         if tensor.size == 1:
             return tensor.buffer[0]
         raise ValueError("Tensor has more than one element")
@@ -768,9 +811,7 @@ class CTensorOperations(AbstractTensor):
     def float_dtype_(self) -> Any:
         return float
 
-    @property
-    def tensor_type_(self) -> type:
-        return CTensor
+    tensor_type_ = CTensor
 
     # Implementation hooks required by AbstractTensor
     def get_shape(self) -> tuple[int, ...]:
@@ -797,14 +838,16 @@ class CTensorOperations(AbstractTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
 
         dtype = dtype.lower()
-        if dtype == "int":
-            buf = ffi.new("int[]", tensor.size)
-            C.cast_double_to_int(tensor.as_c_ptr(), buf, tensor.size)
-        elif dtype == "float":
+        if dtype in {"int", "int32", "int64", "long"}:
             buf = ffi.new("double[]", tensor.size)
-            C.cast_double_to_float(tensor.as_c_ptr(), buf, tensor.size)
+            C.cast_double_to_int_values(tensor.as_c_ptr(), buf, tensor.size)
+        elif dtype in {"float", "float32", "float64", "double"}:
+            buf = ffi.new("double[]", tensor.size)
+            C.cast_double_to_float_values(
+                tensor.as_c_ptr(), buf, tensor.size
+            )
         else:
-            raise ValueError("dtype must be 'float' or 'int'")
+            raise ValueError("C backend supports numeric float/int casts only")
 
         return CTensor(tensor.shape, buf)
 
@@ -814,4 +857,7 @@ class CTensorOperations(AbstractTensor):
         ops = CTensorOperations()
         result = ops.sqrt([4.0, 9.0])
         assert [round(x, 1) for x in result.tolist()] == [2.0, 3.0]
+
+
+register_backend("c", CTensorOperations)
 

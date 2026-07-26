@@ -192,12 +192,12 @@
         for (int i = 0; i < n; ++i) out[i] = sqrt(a[i]);
     }
 
-    void cast_double_to_int(const double* a, int* out, int n) {
-        for (int i = 0; i < n; ++i) out[i] = (int)a[i];
+    void cast_double_to_int_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = (double)((long long)a[i]);
     }
 
-    void cast_double_to_float(const double* a, float* out, int n) {
-        for (int i = 0; i < n; ++i) out[i] = (float)a[i];
+    void cast_double_to_float_values(const double* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = (double)((float)a[i]);
     }
 
     void log_softmax_1d(const double* a, double* out, int n) {

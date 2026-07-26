@@ -774,6 +774,7 @@ class AbstractTensor:
                 "torch": "torch_backend",
                 "jax": "jax_backend",
                 "pure_python": "pure_backend",
+                "c": "accelerator_backends.c_backend",
             }.get(preferred)
             if module_name is None:
                 raise ValueError(f"unknown tensor backend: {preferred}")
