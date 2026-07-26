@@ -40,3 +40,16 @@ def kernel(x, y):
     source = process_graph_to_nodus_graph_ir(graph)
     assert '"bitbit.quanta", 8' in source
     assert '"bitbit.bitsforbits", 1' in source
+
+
+def test_nodus_export_uses_shared_canonical_comparison_names():
+    source = process_graph_to_nodus_graph_ir(
+        _graph(
+            """
+def kernel(x, y):
+    return x > y
+"""
+        )
+    )
+    assert 'tensor_node("greater")' in source
+    assert 'tensor_node("gt")' not in source

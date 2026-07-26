@@ -49,12 +49,12 @@ class FusedProgram:
 
 ELEMENTWISE_ALIASES = {
     "div": "truediv",
-    "less": "lt",
-    "less_equal": "le",
-    "greater": "gt",
-    "greater_equal": "ge",
-    "equal": "eq",
-    "not_equal": "ne",
+    "lt": "less",
+    "le": "less_equal",
+    "gt": "greater",
+    "ge": "greater_equal",
+    "eq": "equal",
+    "ne": "not_equal",
 }
 
 ELEMENTWISE_UNARY = frozenset(
@@ -84,12 +84,12 @@ ELEMENTWISE_BINARY = frozenset(
         "pow",
         "mod",
         "floordiv",
-        "lt",
-        "le",
-        "gt",
-        "ge",
-        "eq",
-        "ne",
+        "less",
+        "less_equal",
+        "greater",
+        "greater_equal",
+        "equal",
+        "not_equal",
         "maximum",
         "minimum",
     }

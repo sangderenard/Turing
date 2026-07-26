@@ -127,12 +127,12 @@ _BINARY: dict[str, str] = {
     "minimum": "min($a, $b)",
     # Predicates return 1.0/0.0 floats, matching the C backend's double storage
     # convention (neither backend has a bool dtype).
-    "lt": "float($a < $b)",
-    "le": "float($a <= $b)",
-    "gt": "float($a > $b)",
-    "ge": "float($a >= $b)",
-    "eq": "float($a == $b)",
-    "ne": "float($a != $b)",
+    "less": "float($a < $b)",
+    "less_equal": "float($a <= $b)",
+    "greater": "float($a > $b)",
+    "greater_equal": "float($a >= $b)",
+    "equal": "float($a == $b)",
+    "not_equal": "float($a != $b)",
 }
 
 _UNARY: dict[str, str] = {

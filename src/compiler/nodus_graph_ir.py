@@ -7,6 +7,8 @@ from typing import Any, Dict
 
 import networkx as nx
 
+from ..common.tensors.fused_ir import canonical_elementwise_op
+
 
 def _quote(value: str) -> str:
     # JSON string escaping is compatible with GraphIR's quoted-string subset
@@ -29,9 +31,10 @@ def _scalar(value: Any) -> str | None:
 def process_graph_to_nodus_graph_ir(graph) -> str:
     """Emit a Nodus graph of typed AbstractTensor operation tools.
 
-    Every ProcessGraph node becomes an ``abstract_tensor_tool`` node with one
-    output port and an ordered input port per dependency. Edges preserve roles.
-    Canonical operation validation occurs in Nodus when ``tensor_node`` runs.
+    Every canonical ProcessGraph operation becomes a concrete registered
+    ``abstract_tensor.<op>`` tool node in Nodus, with one output port and an
+    ordered input port per dependency. Structural nodes stay explicit. Edges
+    preserve roles.
     """
 
     lines = ["# Generated from Turing ProcessGraph schema 1."]
@@ -40,6 +43,10 @@ def process_graph_to_nodus_graph_ir(graph) -> str:
     for ordinal, nid in enumerate(nx.topological_sort(graph.G)):
         data = graph.G.nodes[nid]
         op = str(data.get("op") or data.get("label") or data.get("type") or "opaque")
+        try:
+            op, _ = canonical_elementwise_op(op)
+        except KeyError:
+            pass
         attributes = dict(data.get("attributes") or data.get("extra_args") or {})
         constant = data.get("constant")
         tensor = data.get("tensor") or {}

@@ -134,7 +134,7 @@ def test_canonical_op_resolves_aliases_and_reverse():
     assert canonical_op("iadd") == ("add", False)
     assert canonical_op("rsub") == ("sub", True)
     assert canonical_op("div") == ("truediv", False)
-    assert canonical_op("less_equal") == ("le", False)
+    assert canonical_op("less_equal") == ("less_equal", False)
 
 
 @pytest.mark.parametrize("op", ["isnan", "isinf", "isfinite", "round"])
@@ -241,12 +241,12 @@ BINARY_CASES = {
     "floordiv": lambda a, b: np.floor(a / b),
     "maximum": np.maximum,
     "minimum": np.minimum,
-    "lt": lambda a, b: (a < b).astype(np.float32),
-    "le": lambda a, b: (a <= b).astype(np.float32),
-    "gt": lambda a, b: (a > b).astype(np.float32),
-    "ge": lambda a, b: (a >= b).astype(np.float32),
-    "eq": lambda a, b: (a == b).astype(np.float32),
-    "ne": lambda a, b: (a != b).astype(np.float32),
+    "less": lambda a, b: (a < b).astype(np.float32),
+    "less_equal": lambda a, b: (a <= b).astype(np.float32),
+    "greater": lambda a, b: (a > b).astype(np.float32),
+    "greater_equal": lambda a, b: (a >= b).astype(np.float32),
+    "equal": lambda a, b: (a == b).astype(np.float32),
+    "not_equal": lambda a, b: (a != b).astype(np.float32),
 }
 
 
