@@ -9,6 +9,7 @@ from .fused_program import (
     OpStep,
     FusedProgram,
     build_fused_program,
+    capture_forward_program,
     ProgramRunner,
 )
 from .completion_training import (

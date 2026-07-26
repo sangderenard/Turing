@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from time import perf_counter
 
-import networkx as nx
 import numpy as np
 
 from ..abstraction import AbstractTensor as AT
@@ -17,7 +16,7 @@ from ..abstract_nn import (
     ProgramRunner,
     Sequential,
     Tanh,
-    build_fused_program,
+    capture_forward_program,
 )
 from ..abstract_nn.utils import set_seed
 from ..autograd import GradTape, autograd
@@ -132,29 +131,6 @@ class RefinementTrainingResult:
                 log_pressure.tolist(), dtype=np.float64
             )[:, 0]
         return np.maximum(np.expm1(prediction), 0.0)
-
-
-def _capture_refinement_program(model: Sequential, values: AT):
-    """Capture one AbstractNN forward into the established FusedProgram IR."""
-
-    tape = autograd.tape
-    tape._nodes.clear()
-    tape.graph.clear()
-    for parameter in model.parameters():
-        parameter._tape = tape
-        tape.create_tensor_node(parameter)
-    values._tape = tape
-    tape.create_tensor_node(values)
-    prediction = model.forward(values)
-    output_id = id(prediction)
-    reachable = nx.ancestors(tape.graph, output_id) | {output_id}
-    graph = tape.graph.subgraph(reachable).copy()
-    program = build_fused_program(
-        graph, outputs={"prediction": output_id}
-    )
-    if id(values) not in program.feeds:
-        raise RuntimeError("captured refinement program lost its input feed")
-    return program, id(values)
 
 
 def triangle_refinement_features(
@@ -328,8 +304,8 @@ def train_refinement_predictor(
             [Tanh(), Identity()],
         )
         params = tuple(model.parameters())
-        program, program_input_id = _capture_refinement_program(
-            model, x_train
+        program, program_input_id = capture_forward_program(
+            model, x_train, output_name="prediction"
         )
         parameter_feeds = {id(parameter): parameter for parameter in params}
         missing_feeds = (

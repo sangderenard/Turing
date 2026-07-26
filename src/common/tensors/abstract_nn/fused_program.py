@@ -154,6 +154,31 @@ def build_fused_program(
     )
 
 
+def capture_forward_program(model, inputs: AT, *, output_name: str = "prediction"):
+    """Capture one AbstractNN forward as a reusable :class:`FusedProgram`.
+
+    Parameters remain explicit feeds, so replay during optimization observes
+    their current values without recapturing Python. Returns the program and
+    its external input feed id.
+    """
+    tape = autograd.tape
+    tape._nodes.clear()
+    tape.graph.clear()
+    for parameter in model.parameters():
+        parameter._tape = tape
+        tape.create_tensor_node(parameter)
+    inputs._tape = tape
+    tape.create_tensor_node(inputs)
+    prediction = model.forward(inputs)
+    output_id = id(prediction)
+    reachable = nx.ancestors(tape.graph, output_id) | {output_id}
+    graph = tape.graph.subgraph(reachable).copy()
+    program = build_fused_program(graph, outputs={output_name: output_id})
+    if id(inputs) not in program.feeds:
+        raise RuntimeError("captured forward program lost its input feed")
+    return program, id(inputs)
+
+
 # ---------------------------------------------------------------------------
 # Program runner
 # ---------------------------------------------------------------------------
