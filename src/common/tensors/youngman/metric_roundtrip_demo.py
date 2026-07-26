@@ -11,7 +11,10 @@ import numpy as np
 import pandas as pd
 
 from ..abstraction import AbstractTensor
-from ..abstract_convolution.laplace_nd import GridDomain
+from ..abstract_convolution.laplace_nd import (
+    GridDomain,
+    continuous_laplace_beltrami,
+)
 from .algorithm import (
     DomainTetrahedra,
     compile_grid_domain,
@@ -97,18 +100,25 @@ def singular_metric_mask(
     )
 
 
-def probe_gradient(parameters: np.ndarray) -> np.ndarray:
+def probe_gradient(parameters):
     """Gradient of the scalar probe used for both Laplace evaluations."""
-    u, v, w = np.asarray(parameters, dtype=np.float64).T
-    tau = 2.0 * np.pi
-    return np.stack(
-        (
-            tau * np.cos(tau * u) * np.cos(tau * v) + 0.1 * v,
-            -tau * np.sin(tau * u) * np.sin(tau * v) + 0.1 * u,
-            0.75 * np.pi * np.cos(3.0 * np.pi * w),
-        ),
-        axis=1,
+    tensor_input = isinstance(parameters, AbstractTensor)
+    parameters = (
+        parameters
+        if tensor_input
+        else AbstractTensor.tensor(parameters, dtype="float64")
     )
+    u, v, w = parameters[:, 0], parameters[:, 1], parameters[:, 2]
+    tau = 2.0 * np.pi
+    result = AbstractTensor.stack(
+        (
+            tau * (tau * u).cos() * (tau * v).cos() + 0.1 * v,
+            -tau * (tau * u).sin() * (tau * v).sin() + 0.1 * u,
+            0.75 * np.pi * (3.0 * np.pi * w).cos(),
+        ),
+        dim=1,
+    )
+    return result if tensor_input else np.asarray(result.tolist())
 
 
 @dataclass(frozen=True)
@@ -145,14 +155,6 @@ class BoundaryResolution:
         return contacts
 
 
-def _metric_flux(parameters: np.ndarray, metric_function) -> tuple[np.ndarray, np.ndarray]:
-    metric = metric_function(parameters)
-    root_det = np.sqrt(np.linalg.det(metric))
-    inverse = np.linalg.inv(metric)
-    vector = np.einsum("nij,nj->ni", inverse, probe_gradient(parameters))
-    return root_det[:, None] * vector, root_det
-
-
 def laplace_beltrami(
     parameters: np.ndarray,
     metric_function,
@@ -161,59 +163,38 @@ def laplace_beltrami(
     boundary_resolution: BoundaryResolution | None = None,
     return_boundary_mask: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Evaluate div(sqrt(det(g)) g^-1 grad(phi))/sqrt(det(g))."""
+    """Compatibility adapter for the rank-N AbstractTensor implementation."""
     parameters = np.asarray(parameters, dtype=np.float64)
-    center_flux, center_root_det = _metric_flux(parameters, metric_function)
-    divergence = np.zeros(len(parameters), dtype=np.float64)
+
+    def tensor_metric(query):
+        host_query = np.asarray(query.tolist(), dtype=np.float64)
+        return AbstractTensor.tensor(
+            metric_function(host_query),
+            dtype=query.get_dtype(),
+            device=query.get_device(),
+        )
+
+    # The shared operator owns all metric arithmetic.  Boundary samples are
+    # moved one stencil step inward so its centered stencil never leaves the
+    # declared chart.
+    evaluation_points = parameters.copy()
     contacts = (
         np.zeros((len(parameters), 6), dtype=bool)
         if boundary_resolution is None
         else boundary_resolution.contact_mask(parameters, step * 1.1)
     )
-    for axis in range(parameters.shape[1]):
-        offset = np.zeros_like(parameters)
-        offset[:, axis] = step
-        plus = parameters + offset
-        minus = parameters - offset
-        if boundary_resolution is not None:
+    if boundary_resolution is not None:
+        for axis in range(parameters.shape[1]):
             low, high = boundary_resolution.bounds[axis]
-            low_periodic = boundary_resolution.boundary_conditions[2 * axis] == "periodic"
-            high_periodic = boundary_resolution.boundary_conditions[2 * axis + 1] == "periodic"
-            minus[contacts[:, 2 * axis] & low_periodic, axis] = high - step
-            plus[contacts[:, 2 * axis + 1] & high_periodic, axis] = low + step
-        plus_flux, _ = _metric_flux(plus, metric_function)
-        minus_flux, _ = _metric_flux(minus, metric_function)
-        derivative = (plus_flux[:, axis] - minus_flux[:, axis]) / (2.0 * step)
-
-        if boundary_resolution is not None:
-            second_plus_flux, _ = _metric_flux(
-                parameters + 2.0 * offset, metric_function
-            )
-            second_minus_flux, _ = _metric_flux(
-                parameters - 2.0 * offset, metric_function
-            )
-            for face, sign in ((2 * axis, -1), (2 * axis + 1, 1)):
-                mask = contacts[:, face]
-                condition = boundary_resolution.boundary_conditions[face]
-                if not np.any(mask) or condition == "periodic":
-                    continue
-                boundary_flux = center_flux[:, axis].copy()
-                if condition == "neumann":
-                    boundary_flux[mask] = 0.0
-                if sign < 0:
-                    derivative[mask] = (
-                        -3.0 * boundary_flux[mask]
-                        + 4.0 * plus_flux[mask, axis]
-                        - second_plus_flux[mask, axis]
-                    ) / (2.0 * step)
-                else:
-                    derivative[mask] = (
-                        3.0 * boundary_flux[mask]
-                        - 4.0 * minus_flux[mask, axis]
-                        + second_minus_flux[mask, axis]
-                    ) / (2.0 * step)
-        divergence += derivative
-    result = divergence / center_root_det
+            evaluation_points[contacts[:, 2 * axis], axis] = low + step
+            evaluation_points[contacts[:, 2 * axis + 1], axis] = high - step
+    result = continuous_laplace_beltrami(
+        AbstractTensor.tensor(evaluation_points, dtype="float64"),
+        tensor_metric,
+        probe_gradient,
+        step=step,
+    )
+    result = np.asarray(result.tolist(), dtype=np.float64)
     boundary_mask = np.any(contacts, axis=1)
     if return_boundary_mask:
         return result, boundary_mask

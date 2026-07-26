@@ -16,9 +16,12 @@ AbstractTensor signed field and edge interpolation
 ```
 
 Host arrays remain intentionally responsible for discrete connectivity,
-deduplicating control identities, convergence decisions, the independent
-analytic reference, pandas reports, and OpenGL upload. These are explicit
-realization boundaries rather than silent numeric backend changes.
+deduplicating control identities, convergence decisions, pandas reports, and
+OpenGL upload. The source and reconstructed continuum references now share
+the rank-N `AbstractTensor` Laplace--Beltrami operation in `laplace_nd`: the
+former queries the continuous source manifold and the latter queries only
+the published spline. These are explicit realization boundaries rather than
+silent numeric backend changes.
 
 The mesh operator now shares one immutable `CotangentTopology` assembly with
 the established host DEC implementation. The host chooses triangle, edge,
@@ -28,6 +31,12 @@ degeneracy masking, and the final division never leave `AbstractTensor`.
 Irregular edge/vertex accumulation is a stable sort plus prefix-sum segment
 reduction, so there is no numeric `.tolist()`/`np.add.at` break in the tensor
 graph.
+
+This cotangent operator is part of the Riemann/DEC suite, not a private demo
+kernel. It is composed from canonical tensor indexing, arithmetic,
+reductions, concatenation, cumulative sum, comparison, and selection. Each
+selected backend therefore executes its normal primitives; no
+mesh-Laplacian-specific NumPy or Torch implementation is hidden underneath.
 
 That path is differentiated on NumPy, C, and Torch backends. Supporting it
 also closed three general tape defects rather than adding demo exceptions:

@@ -11,7 +11,10 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 
-from ..abstract_convolution.laplace_nd import GridDomain
+from ..abstract_convolution.laplace_nd import (
+    GridDomain,
+    continuous_laplace_beltrami,
+)
 from ..abstraction import AbstractTensor
 from ..riemann import (
     AdaptiveSurfaceTriangulator,
@@ -63,28 +66,33 @@ class PublishedSurfaceSpline:
             return self.model(uv)
         return self.model(np.asarray(uv, dtype=np.float64))
 
-    def jacobian(self, uv: np.ndarray):
-        uv = np.asarray(uv, dtype=np.float64)
+    def jacobian(self, uv):
+        tensor_input = isinstance(uv, AbstractTensor)
+        uv = uv if tensor_input else AbstractTensor.tensor(uv, dtype="float64")
         columns = []
-        for axis in range(2):
-            offset = np.zeros_like(uv)
+        for axis in range(uv.get_shape()[-1]):
+            offset = AbstractTensor.zeros_like(uv)
             offset[:, axis] = 2e-5
-            plus = self.model(AbstractTensor.tensor(uv + offset))
-            minus = self.model(AbstractTensor.tensor(uv - offset))
+            plus = self.model(uv + offset)
+            minus = self.model(uv - offset)
             columns.append((plus - minus) / (4e-5))
-        return AbstractTensor.stack(columns, dim=2)
+        result = AbstractTensor.stack(columns, dim=2)
+        return result if tensor_input else result
 
 
 def source_surface_parameters(
-    uv: np.ndarray, time_value: float = 0.0
-) -> np.ndarray:
+    uv, time_value: float = 0.0
+):
     """Exact source chart, used only by YoungMan/reference measurements."""
-    u, v = np.asarray(uv, dtype=np.float64).T
+    tensor_input = isinstance(uv, AbstractTensor)
+    uv = uv if tensor_input else AbstractTensor.tensor(uv, dtype="float64")
+    u, v = uv[:, 0], uv[:, 1]
     tau = 2.0 * np.pi
     phase = tau * float(time_value)
-    target_z = 0.5 + 0.12 * np.sin(tau * u + phase) * np.cos(tau * v)
-    visible_warp = 0.075 * np.sin(tau * u + phase) * np.sin(tau * v)
-    return np.stack((u, v, target_z - visible_warp), axis=1)
+    target_z = 0.5 + 0.12 * (tau * u + phase).sin() * (tau * v).cos()
+    visible_warp = 0.075 * (tau * u + phase).sin() * (tau * v).sin()
+    result = AbstractTensor.stack((u, v, target_z - visible_warp), dim=1)
+    return result if tensor_input else _host(result)
 
 
 def manifold_embedding(
@@ -145,20 +153,35 @@ def manifold_embedding(
 
 
 def source_surface(
-    uv: np.ndarray,
+    uv,
     time_value: float = 0.0,
     manifold: str = "ripple",
-) -> np.ndarray:
-    return _host(manifold_embedding(
+):
+    tensor_input = isinstance(uv, AbstractTensor)
+    result = manifold_embedding(
         source_surface_parameters(uv, time_value), time_value, manifold
-    ))
+    )
+    return result if tensor_input else _host(result)
 
 
 def source_surface_jacobian(
-    uv: np.ndarray,
+    uv,
     time_value: float = 0.0,
     manifold: str = "ripple",
-) -> np.ndarray:
+) :
+    if isinstance(uv, AbstractTensor):
+        columns = []
+        for axis in range(uv.get_shape()[-1]):
+            offset = AbstractTensor.zeros_like(uv)
+            offset[:, axis] = 2e-5
+            columns.append(
+                (
+                    source_surface(uv + offset, time_value, manifold)
+                    - source_surface(uv - offset, time_value, manifold)
+                )
+                / 4e-5
+            )
+        return AbstractTensor.stack(columns, dim=2)
     if manifold != "ripple":
         return _finite_jacobian(
             lambda query: source_surface(query, time_value, manifold), uv
@@ -216,41 +239,31 @@ def probe_values(uv: np.ndarray) -> np.ndarray:
     return np.sin(tau * u) * np.cos(tau * v) + 0.1 * u * v
 
 
-def probe_gradient(uv: np.ndarray) -> np.ndarray:
-    u, v = np.asarray(uv, dtype=np.float64).T
+def probe_gradient(uv):
+    tensor_input = isinstance(uv, AbstractTensor)
+    uv = uv if tensor_input else AbstractTensor.tensor(uv, dtype="float64")
+    u, v = uv[:, 0], uv[:, 1]
     tau = 2.0 * np.pi
-    return np.stack(
+    result = AbstractTensor.stack(
         (
-            tau * np.cos(tau * u) * np.cos(tau * v) + 0.1 * v,
-            -tau * np.sin(tau * u) * np.sin(tau * v) + 0.1 * u,
+            tau * (tau * u).cos() * (tau * v).cos() + 0.1 * v,
+            -tau * (tau * u).sin() * (tau * v).sin() + 0.1 * u,
         ),
-        axis=1,
+        dim=1,
     )
+    return result if tensor_input else _host(result)
 
 
-def continuous_surface_laplace(
-    uv: np.ndarray, metric_function, step: float = 2e-5
-) -> np.ndarray:
-    """Numerically evaluate the two-dimensional Laplace--Beltrami operator."""
-    uv = np.asarray(uv, dtype=np.float64)
-
-    def flux(query):
-        metric = metric_function(query)
-        root_det = np.sqrt(np.linalg.det(metric))
-        vector = np.einsum(
-            "nij,nj->ni", np.linalg.inv(metric), probe_gradient(query)
-        )
-        return root_det[:, None] * vector, root_det
-
-    _, root_det = flux(uv)
-    divergence = np.zeros(len(uv), dtype=np.float64)
-    for axis in range(2):
-        offset = np.zeros_like(uv)
-        offset[:, axis] = step
-        plus, _ = flux(uv + offset)
-        minus, _ = flux(uv - offset)
-        divergence += (plus[:, axis] - minus[:, axis]) / (2.0 * step)
-    return divergence / root_det
+def continuous_surface_laplace(uv, metric_function, step: float = 2e-5):
+    """Compatibility name for the shared rank-N AbstractTensor operator."""
+    tensor_input = isinstance(uv, AbstractTensor)
+    coordinates = (
+        uv if tensor_input else AbstractTensor.tensor(uv, dtype="float64")
+    )
+    result = continuous_laplace_beltrami(
+        coordinates, metric_function, probe_gradient, step=step
+    )
+    return result if tensor_input else _host(result)
 
 
 def _mesh_laplace_objective(
@@ -279,9 +292,7 @@ def _mesh_laplace_objective(
             raise ValueError(f"{component} objective requires spline_surface")
         spline_reference = continuous_surface_laplace(
             uv,
-            lambda query: _host(
-                _metric(spline_surface.jacobian(query))
-            ),
+            lambda query: _metric(spline_surface.jacobian(query)),
         )
         if component == "discretization":
             error = transformed.laplacian - spline_reference
@@ -707,7 +718,7 @@ def build_blackbox_roundtrip(
         ),
     )
     spline_continuous_laplace = continuous_surface_laplace(
-        uv, lambda query: _host(_metric(spline_surface.jacobian(query)))
+        uv, lambda query: _metric(spline_surface.jacobian(query))
     )
     finish_stage("continuous_reference", started)
 

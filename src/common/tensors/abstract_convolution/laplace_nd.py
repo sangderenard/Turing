@@ -35,6 +35,64 @@ from .local_state_network import LocalStateNetwork, DEFAULT_CONFIGURATION, INT_L
 from src.common.index_composer.indexcomposer import GeneralIndexComposer
 
 
+def continuous_laplace_beltrami(
+    coordinates,
+    metric_function,
+    gradient_function,
+    *,
+    step: float = 2e-5,
+):
+    """Evaluate the metric Laplacian at arbitrary points using AbstractTensor.
+
+    This is the rank-N, late-evaluation form of the Laplace--Beltrami
+    operator::
+
+        det(g)^(-1/2) d_i(det(g)^(1/2) g^ij d_j f)
+
+    ``metric_function`` and ``gradient_function`` remain callables, so neither
+    the geometry nor the scalar field has to be sampled until the requested
+    coordinates are known.  The intrinsic dimension is read from the final
+    coordinate axis; a surface is therefore simply the N=2 case.
+    """
+    coordinates = AbstractTensor.get_tensor(coordinates)
+    shape = coordinates.get_shape()
+    if len(shape) != 2:
+        raise ValueError("coordinates must have shape (sample, intrinsic_dim)")
+    intrinsic_dim = shape[-1]
+    if intrinsic_dim < 1:
+        raise ValueError("intrinsic_dim must be positive")
+
+    def flux(query):
+        metric = AbstractTensor.get_tensor(metric_function(query))
+        expected = (shape[0], intrinsic_dim, intrinsic_dim)
+        if tuple(metric.get_shape()) != expected:
+            raise ValueError(
+                f"metric_function returned {metric.get_shape()}, expected {expected}"
+            )
+        root_det = AbstractTensor.linalg.det(metric).sqrt()
+        gradient = AbstractTensor.get_tensor(gradient_function(query))
+        if tuple(gradient.get_shape()) != tuple(shape):
+            raise ValueError(
+                f"gradient_function returned {gradient.get_shape()}, expected {shape}"
+            )
+        raised = (
+            AbstractTensor.linalg.inv(metric) @ gradient.unsqueeze(-1)
+        ).squeeze(-1)
+        return root_det.unsqueeze(-1) * raised, root_det
+
+    _, center_root_det = flux(coordinates)
+    divergence = AbstractTensor.zeros_like(center_root_det)
+    for axis in range(intrinsic_dim):
+        offset = AbstractTensor.zeros_like(coordinates)
+        offset[:, axis] = step
+        plus_flux, _ = flux(coordinates + offset)
+        minus_flux, _ = flux(coordinates - offset)
+        divergence = divergence + (
+            plus_flux[:, axis] - minus_flux[:, axis]
+        ) / (2.0 * step)
+    return divergence / center_root_det
+
+
 class BuildGraphLaplace:
     """Construct a graph Laplacian using ``AbstractTensor`` primitives.
 
