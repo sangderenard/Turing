@@ -120,3 +120,34 @@ Every family should use NumPy as the behavioral oracle and test zero-sized
 tensors, scalars, negative axes, non-square shapes, arbitrary rank, and
 invalid inputs. Python may coordinate shapes and allocation, but numerical
 loops belong in the compiled C source.
+
+## Specialization benchmark
+
+Run the comparable CPU workloads with:
+
+```powershell
+python -m src.common.tensors.benchmark_backend_specializations --size 32 --warmup 2 --repeats 7
+```
+
+The demo performs three end-to-end AbstractTensor tasks:
+
+- a broadcast neural projection, sigmoid, and MSE-style loss;
+- a pairwise five-dimensional metric/affinity field with normalization and
+  entropy;
+- the Riemannian cotangent mesh Laplacian.
+
+It reports tensor setup separately from warm execution and certifies every
+output against NumPy before presenting timings. On the initial Windows CPU
+run, all nine cases passed parity. Median warm times in milliseconds were:
+
+| Task | NumPy | Torch CPU | C |
+|---|---:|---:|---:|
+| Neural projection/loss | 0.461 | 0.705 | 0.441 |
+| Pairwise metric field | 0.607 | 0.907 | 0.684 |
+| Riemann mesh Laplace | 1.837 | 3.165 | 3.566 |
+
+These are small-problem dispatch measurements, not throughput claims. The C
+backend is already competitive on dense compositions but loses on the mesh
+task because many small gathers and realized intermediate tensors cross the
+CFFI boundary. Larger-size sweeps and allocation reuse are required before
+drawing performance conclusions.

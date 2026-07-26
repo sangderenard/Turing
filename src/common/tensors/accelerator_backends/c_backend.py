@@ -1297,7 +1297,13 @@ class CTensorOperations(AbstractTensor):
         if dtype in {"int", "int32", "int64", "long"}:
             buf = ffi.new("double[]", tensor.size)
             C.cast_double_to_int_values(tensor.as_c_ptr(), buf, tensor.size)
-        elif dtype in {"float", "float32", "float64", "double"}:
+        elif dtype in {"float64", "double"}:
+            buf = ffi.new("double[]", tensor.size)
+            ffi.memmove(
+                buf, tensor.as_c_ptr(),
+                tensor.size * ffi.sizeof("double"),
+            )
+        elif dtype in {"float", "float32"}:
             buf = ffi.new("double[]", tensor.size)
             C.cast_double_to_float_values(
                 tensor.as_c_ptr(), buf, tensor.size
