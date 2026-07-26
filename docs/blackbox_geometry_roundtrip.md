@@ -70,3 +70,30 @@ renderer displays current, arithmetic-mean, and 95th-percentile timings beside
 the surface. All runs, including the first warm-up, enter the rolling
 statistics. Image rendering and GIF encoding are deliberately outside the
 solver profile and CSV so display cost cannot be mistaken for numerical cost.
+
+`--live` opens Pluck's ordinary OpenGL viewer. A worker repeatedly performs
+the complete solve while the GL thread continuously renders the newest
+completed mesh. Publication is latest-result-wins: an unpublished stale frame
+may be dropped, but a partial solve is never displayed. The HUD reports
+whether each published mesh met its certificates.
+
+## Appropriate neural participation
+
+The safest useful neural component is a proposal model, not a replacement for
+the measured operator. Candidate inputs include the current parameter samples,
+metric tags, prior refinement history, and `t`; candidate outputs include
+initial spline coefficients, likely failing triangles, or an anisotropic edge
+priority. The deterministic spline, triangulator, topology checks, and
+Laplace comparison then certify or reject that proposal.
+
+This creates a fair experiment with three separately profiled paths:
+
+1. an unassisted baseline;
+2. neural proposal generation plus deterministic correction; and
+3. deterministic certification shared by both.
+
+Report proposal time, correction time, total time, rejection rate, and final
+error together. Never omit rejected proposals or move network warm-up outside
+one path only. A particularly natural first target is refinement prediction:
+it can reduce expensive black-box probes while leaving mesh values and all
+acceptance decisions under the existing geometric certificate.

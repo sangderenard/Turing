@@ -419,6 +419,10 @@ def main() -> None:
     parser.add_argument("--time-value", type=float, default=0.0)
     parser.add_argument("--animation", type=Path)
     parser.add_argument("--animation-frames", type=int, default=8)
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--live-solves", type=int)
+    parser.add_argument("--live-period", type=float, default=8.0)
+    parser.add_argument("--live-max-frames", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--render-image", type=Path)
     parser.add_argument(
         "--error-field",
@@ -522,6 +526,44 @@ def main() -> None:
         for image in images:
             image.close()
         print(f"\nPROFILED ANIMATION\n {args.animation.resolve()}")
+    if args.live:
+        viewer = _load_pluck_viewer()
+        history = []
+
+        def solve_live_frame(index, time_value):
+            solved = build_blackbox_roundtrip(
+                args.youngman_resolution,
+                args.position_tolerance,
+                args.tangent_tolerance,
+                max_rounds=args.max_rounds,
+                max_triangles=args.max_triangles,
+                time_value=time_value,
+            )
+            profile = _profile_mapping(solved)
+            history.append(profile)
+            panel = viewer.rolling_profile_lines(
+                profile, history, time_value=time_value
+            )
+            panel.extend((
+                "",
+                f"solve index        {index:8d}",
+                f"certified          {str(solved.mesh.converged):>8}",
+                f"vertices           {len(solved.mesh.parameters):8d}",
+                f"triangles          {solved.mesh.triangle_count:8d}",
+            ))
+            return viewer.LiveMeshFrame(
+                solved.mesh.triangle_soup,
+                _triangle_field(solved, args.error_field),
+                panel,
+                time_value,
+            )
+
+        viewer.view_profiled_triangle_mesh_stream(
+            solve_live_frame,
+            period_sec=args.live_period,
+            max_solves=args.live_solves,
+            max_frames=args.live_max_frames,
+        )
 
 
 if __name__ == "__main__":
