@@ -19,15 +19,23 @@ Shared edges have one canonical identity, and a split is propagated to both
 incident triangles; recursive local subdivision handles triangles receiving
 multiple splits without T-junctions.
 
-Position error is the distance between the true embedded edge midpoint and
-the linear chord midpoint. When a vectorized Jacobian is supplied, tangent
-error measures deviation of the midpoint Jacobian from endpoint
-interpolation. The latter provides the first-derivative control needed before
-using a mesh for metric or Laplace–Beltrami work.
+Position error compares the callable with its piecewise-affine triangle at
+every edge midpoint plus the centroid and three asymmetric interior
+barycentric probes. When a vectorized Jacobian is supplied, tangent error
+compares the true Jacobian at vertices, edge midpoints, and those interior
+probes with the triangle's constant affine Jacobian. This avoids the
+paraboloid and periodic-aliasing failures of midpoint interpolation alone.
+
+These are sampled certificates, not mathematical global error bounds for an
+arbitrary black-box function. More adversarial functions may require denser
+or randomized probes. Failure to meet either tolerance before
+`max_rounds`/`max_triangles` is returned explicitly; the triangle budget is a
+strict upper bound.
 
 The returned generation is immutable and includes parameter vertices,
-expanded-dimensional vertices, topology, per-triangle errors, evaluation
-count, convergence state, and the stopping reason. `batch_size` can bound
+expanded-dimensional vertices, topology, per-triangle errors, separate
+surface/Jacobian sample-row counts, convergence state, and the stopping
+reason. `batch_size` can bound
 memory; leaving it unset exposes the maximum data-parallel batch for each
 wave.
 
@@ -49,6 +57,11 @@ The existing DEC code builds incidence and approximate Hodge operators from a
 supplied topology. It does not perform adaptive triangulation, and its face
 discovery and higher-simplex support remain provisional. The triangulator
 therefore produces topology for DEC rather than duplicating a DEC operator.
+
+`TriangulatedSurfaceTransform` turns that topology into a reusable
+piecewise-affine transform, induced-metric evaluator, and cached cotangent
+Laplacian. Its detached `nodus_payload()` is the intended narrow adapter
+boundary rather than demo-specific mesh plumbing.
 
 Guardian Geometry remains the natural eventual native implementation: its
 design already names parametric domains, granular domains, meshes, DEC,

@@ -18,6 +18,32 @@ class CotangentMeshGeometry:
     degenerate_vertex_mask: np.ndarray
     singular_vertex_mask: np.ndarray
     nonmanifold_edge_mask: np.ndarray
+    nonmanifold_vertex_mask: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name in (
+            "edges",
+            "cotangent_weights",
+            "triangle_areas",
+            "lumped_vertex_areas",
+            "boundary_vertex_mask",
+            "degenerate_triangle_mask",
+            "degenerate_vertex_mask",
+            "singular_vertex_mask",
+            "nonmanifold_edge_mask",
+            "nonmanifold_vertex_mask",
+        ):
+            value = np.array(getattr(self, name), copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def invalid_vertex_mask(self) -> np.ndarray:
+        return (
+            self.singular_vertex_mask
+            | self.degenerate_vertex_mask
+            | self.nonmanifold_vertex_mask
+        )
 
     def apply(
         self, scalar_values: np.ndarray, *, invalid_value: float = np.nan
@@ -30,7 +56,7 @@ class CotangentMeshGeometry:
         delta = self.cotangent_weights * (values[right] - values[left])
         np.add.at(result, left, delta)
         np.add.at(result, right, -delta)
-        valid = ~self.singular_vertex_mask
+        valid = ~self.invalid_vertex_mask
         result[valid] /= self.lumped_vertex_areas[valid]
         result[~valid] = invalid_value
         return result
@@ -103,6 +129,9 @@ def build_cotangent_geometry(
     np.add.at(weights, inverse, raw_weights)
     boundary_edges = counts == 1
     nonmanifold_edges = counts > 2
+    nonmanifold_vertices = np.zeros(len(vertices), dtype=bool)
+    if np.any(nonmanifold_edges):
+        nonmanifold_vertices[edges[nonmanifold_edges].ravel()] = True
     boundary_vertices = np.zeros(len(vertices), dtype=bool)
     boundary_vertices[edges[boundary_edges].ravel()] = True
 
@@ -128,6 +157,7 @@ def build_cotangent_geometry(
         degenerate_vertex_mask=degenerate_vertices,
         singular_vertex_mask=singular_vertices,
         nonmanifold_edge_mask=nonmanifold_edges,
+        nonmanifold_vertex_mask=nonmanifold_vertices,
     )
 
 

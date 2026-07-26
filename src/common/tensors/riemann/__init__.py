@@ -30,6 +30,7 @@ from .mesh_laplace import (
     build_cotangent_geometry,
     mesh_laplace_beltrami,
 )
+from .mesh_transform import TriangulatedSurfaceTransform
 
 __all__ = [
     "AdaptiveSurfaceTriangulator",
@@ -43,6 +44,7 @@ __all__ = [
     "SpectralConv3D",
     "TriangulationGeneration",
     "TriangulationTolerance",
+    "TriangulatedSurfaceTransform",
     "build_cotangent_geometry",
     "mesh_laplace_beltrami",
     "smooth_bins",

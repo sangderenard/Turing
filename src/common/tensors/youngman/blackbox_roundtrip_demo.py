@@ -11,14 +11,18 @@ import numpy as np
 import pandas as pd
 
 from ..abstract_convolution.laplace_nd import GridDomain
-from ..riemann import AdaptiveSurfaceTriangulator, TriangulationTolerance
+from ..riemann import (
+    AdaptiveSurfaceTriangulator,
+    TriangulatedSurfaceTransform,
+    TriangulationTolerance,
+)
 from .algorithm import DomainTetrahedra, compile_grid_domain, extract_isosurface
 from .metric_roundtrip_demo import (
     _surface_field,
     detailed_embedding,
     detailed_jacobian,
 )
-from .spline import StreamingSplineSolver
+from .spline import StreamingSplineSolver, validate_single_valued_chart
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class BlackBoxRoundTrip:
     summary: pd.DataFrame
     triangles: pd.DataFrame
     mesh: object
+    geometry_transform: TriangulatedSurfaceTransform
 
 
 @dataclass(frozen=True)
@@ -158,13 +163,19 @@ def _domain_and_extraction(resolution: int):
         compiled.embedded,
         _surface_field,
         parametric_tetrahedra=compiled.parametric,
+        expanded_embedding=detailed_embedding,
     )
     return domain, extraction
 
 
 def publish_surface_spline(samples) -> tuple[PublishedSurfaceSpline, int]:
-    """Use source access once, then publish a callable containing no source."""
-    source_controls = detailed_embedding(samples.parametric_points)
+    """Publish solely from values carried across the YoungMan boundary."""
+    if samples.expanded_points is None:
+        raise ValueError("YoungMan samples do not contain expanded geometry")
+    validate_single_valued_chart(
+        samples.parametric_points, intrinsic_axes=(0, 1), tolerance=1e-8
+    )
+    source_controls = np.asarray(samples.expanded_points, dtype=np.float64)
     fifo = StreamingSplineSolver(
         intrinsic_axes=(0, 1),
         smoothing=2e-8,
@@ -181,7 +192,10 @@ def publish_surface_spline(samples) -> tuple[PublishedSurfaceSpline, int]:
 def build_blackbox_roundtrip(
     youngman_resolution: int = 7,
     position_tolerance: float = 2e-3,
-    tangent_tolerance: float = 3.5e-1,
+    tangent_tolerance: float = 6e-1,
+    *,
+    max_rounds: int = 9,
+    max_triangles: int = 80_000,
 ) -> BlackBoxRoundTrip:
     """Build every stage while enforcing the spline/triangulator black box."""
     _, extraction = _domain_and_extraction(youngman_resolution)
@@ -196,8 +210,8 @@ def build_blackbox_roundtrip(
         tolerance=TriangulationTolerance(
             position=position_tolerance,
             tangent=tangent_tolerance,
-            max_rounds=9,
-            max_triangles=80_000,
+            max_rounds=max_rounds,
+            max_triangles=max_triangles,
         ),
         initial_resolution=(4, 4),
     )
@@ -217,17 +231,15 @@ def build_blackbox_roundtrip(
         uv, lambda query: _metric(spline_surface.jacobian(query))
     )
 
-    from ..riemann.mesh_laplace import mesh_laplace_beltrami
-
-    mesh_result = mesh_laplace_beltrami(
-        mesh.embedded, mesh.triangles, probe_values(uv)
+    geometry_transform = TriangulatedSurfaceTransform.from_mesh(
+        mesh.parameters, mesh.embedded, mesh.triangles
     )
+    mesh_result = geometry_transform.laplace(probe_values(uv))
     mesh_laplace = mesh_result.laplacian
     boundary = mesh_result.geometry.boundary_vertex_mask
     interior = (
         ~boundary
-        & ~mesh_result.geometry.degenerate_vertex_mask
-        & ~mesh_result.geometry.singular_vertex_mask
+        & ~mesh_result.geometry.invalid_vertex_mask
     )
 
     youngman_error = np.linalg.norm(
@@ -246,6 +258,17 @@ def build_blackbox_roundtrip(
     def rms(values):
         return float(np.sqrt(np.mean(np.square(values)))) if len(values) else np.nan
 
+    vertex_weights = mesh_result.geometry.lumped_vertex_areas
+
+    def weighted_rms(values, mask=None):
+        values = np.asarray(values, dtype=np.float64)
+        selected = np.ones(len(values), dtype=bool) if mask is None else mask
+        selected &= np.isfinite(values)
+        weights = vertex_weights[selected]
+        if not len(weights) or weights.sum() <= 0.0:
+            return np.nan
+        return float(np.sqrt(np.sum(weights * values[selected] ** 2) / weights.sum()))
+
     summary = pd.DataFrame([{
         "youngman_resolution": youngman_resolution,
         "youngman_samples": samples.sample_count,
@@ -255,37 +278,48 @@ def build_blackbox_roundtrip(
         "mesh_vertices": len(mesh.parameters),
         "mesh_triangles": mesh.triangle_count,
         "mesh_converged": mesh.converged,
-        "mesh_function_evaluations": mesh.function_evaluations,
+        "mesh_surface_sample_rows": mesh.surface_sample_count,
+        "mesh_jacobian_sample_rows": mesh.jacobian_sample_count,
         "youngman_error_rms": rms(youngman_error),
-        "spline_position_error_rms": rms(spline_error),
-        "spline_metric_error_rms": rms(metric_error),
+        "spline_position_error_area_rms": weighted_rms(spline_error),
+        "spline_metric_error_area_rms": weighted_rms(metric_error),
         "triangulator_max_chord_error": float(mesh.position_error.max()),
         "triangulator_max_tangent_error": (
             float(mesh.tangent_error.max()) if mesh.tangent_error is not None else np.nan
         ),
-        "continuous_spline_laplace_error_rms_interior": rms(
-            continuous_laplace_error[interior]
+        "continuous_spline_laplace_error_area_rms_interior": weighted_rms(
+            continuous_laplace_error, interior
         ),
-        "mesh_discretization_error_rms_interior": rms(
-            mesh_discretization_error[interior]
+        "mesh_discretization_error_area_rms_interior": weighted_rms(
+            mesh_discretization_error, interior
         ),
-        "source_laplace_rms_interior": rms(
-            source_continuous_laplace[interior]
+        "source_laplace_area_rms_interior": weighted_rms(
+            source_continuous_laplace, interior
         ),
-        "mesh_laplace_error_rms_interior": rms(mesh_laplace_error[interior]),
+        "mesh_laplace_error_area_rms_interior": weighted_rms(
+            mesh_laplace_error, interior
+        ),
         "degenerate_mesh_vertices": int(
             mesh_result.geometry.degenerate_vertex_mask.sum()
+        ),
+        "nonmanifold_mesh_edges": int(
+            mesh_result.geometry.nonmanifold_edge_mask.sum()
         ),
     }])
     triangle_position = spline_error[mesh.triangles].mean(axis=1)
     triangle_chord = mesh.position_error
     triangle_metric = metric_error[mesh.triangles].mean(axis=1)
-    triangle_laplace = np.nanmean(
-        np.where(interior, mesh_laplace_error, np.nan)[mesh.triangles], axis=1
-    )
-    triangle_discretization = np.nanmean(
-        np.where(interior, mesh_discretization_error, np.nan)[mesh.triangles],
-        axis=1,
+    def triangle_interior_mean(values):
+        gathered = np.where(interior, values, np.nan)[mesh.triangles]
+        count = np.isfinite(gathered).sum(axis=1)
+        total = np.nansum(gathered, axis=1)
+        return np.divide(
+            total, count, out=np.full(len(count), np.nan), where=count > 0
+        )
+
+    triangle_laplace = triangle_interior_mean(mesh_laplace_error)
+    triangle_discretization = triangle_interior_mean(
+        mesh_discretization_error
     )
     triangle_report = pd.DataFrame({
         "triangle": np.arange(mesh.triangle_count),
@@ -296,7 +330,7 @@ def build_blackbox_roundtrip(
         "mesh_discretization_error": triangle_discretization,
         "touches_boundary": boundary[mesh.triangles].any(axis=1),
     })
-    return BlackBoxRoundTrip(summary, triangle_report, mesh)
+    return BlackBoxRoundTrip(summary, triangle_report, mesh, geometry_transform)
 
 
 def _load_pluck_viewer():
@@ -312,7 +346,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--youngman-resolution", type=int, default=7)
     parser.add_argument("--position-tolerance", type=float, default=2e-3)
-    parser.add_argument("--tangent-tolerance", type=float, default=3.5e-1)
+    parser.add_argument("--tangent-tolerance", type=float, default=6e-1)
+    parser.add_argument("--max-rounds", type=int, default=9)
+    parser.add_argument("--max-triangles", type=int, default=80_000)
     parser.add_argument("--render-image", type=Path)
     parser.add_argument(
         "--error-field",
@@ -320,14 +356,26 @@ def main() -> None:
         default="laplace",
     )
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--allow-unconverged",
+        action="store_true",
+        help="emit diagnostics even if a triangulation tolerance or budget fails",
+    )
     args = parser.parse_args()
     result = build_blackbox_roundtrip(
         args.youngman_resolution,
         args.position_tolerance,
         args.tangent_tolerance,
+        max_rounds=args.max_rounds,
+        max_triangles=args.max_triangles,
     )
     print("\nBLACK-BOX ROUND TRIP\n", result.summary.to_string(index=False))
     print("\nTRIANGLE CERTIFICATES\n", result.triangles.head(12).to_string(index=False))
+    if not result.mesh.converged and not args.allow_unconverged:
+        raise RuntimeError(
+            f"triangulation did not converge: {result.mesh.stopped_reason}; "
+            "use --allow-unconverged for failure diagnostics"
+        )
     if args.output_dir:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         result.summary.to_csv(args.output_dir / "summary.csv", index=False)

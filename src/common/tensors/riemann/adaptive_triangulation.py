@@ -39,13 +39,29 @@ class TriangulationGeneration:
     triangles: np.ndarray
     position_error: np.ndarray
     tangent_error: Optional[np.ndarray]
-    function_evaluations: int
+    surface_sample_count: int
+    jacobian_sample_count: int
     converged: bool
     stopped_reason: str
+
+    def __post_init__(self) -> None:
+        for name in ("parameters", "embedded", "triangles", "position_error"):
+            value = np.array(getattr(self, name), copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        if self.tangent_error is not None:
+            tangent = np.array(self.tangent_error, copy=True)
+            tangent.setflags(write=False)
+            object.__setattr__(self, "tangent_error", tangent)
 
     @property
     def triangle_count(self) -> int:
         return int(len(self.triangles))
+
+    @property
+    def function_evaluations(self) -> int:
+        """Backward-compatible count of requested surface/Jacobian sample rows."""
+        return self.surface_sample_count + self.jacobian_sample_count
 
     @property
     def embedding_dimension(self) -> int:
@@ -117,9 +133,12 @@ class AdaptiveSurfaceTriangulator:
             raise ValueError("initial_resolution values must be positive")
         if tolerance.tangent is not None and jacobian is None:
             raise ValueError("tangent tolerance requires a jacobian callable")
-        self._evaluation_count = 0
+        self._surface_sample_count = 0
+        self._jacobian_sample_count = 0
 
-    def _evaluate(self, function: ArrayFunction, parameters: np.ndarray) -> np.ndarray:
+    def _evaluate(
+        self, function: ArrayFunction, parameters: np.ndarray, *, kind: str
+    ) -> np.ndarray:
         parameters = np.asarray(parameters, dtype=np.float64)
         chunks = (
             (parameters,)
@@ -133,7 +152,20 @@ class AdaptiveSurfaceTriangulator:
         result = np.concatenate(values, axis=0)
         if len(result) != len(parameters) or not np.isfinite(result).all():
             raise ValueError("geometry callable returned invalid batched values")
-        self._evaluation_count += len(parameters)
+        if result.ndim < 2:
+            raise ValueError("geometry callables must preserve a batch axis")
+        if kind == "surface":
+            if result.ndim != 2:
+                raise ValueError("surface must return shape (N, embedding_dimension)")
+            self._surface_sample_count += len(parameters)
+        elif kind == "jacobian":
+            if result.ndim != 3 or result.shape[2] != 2:
+                raise ValueError(
+                    "jacobian must return shape (N, embedding_dimension, 2)"
+                )
+            self._jacobian_sample_count += len(parameters)
+        else:
+            raise ValueError("unknown evaluation kind")
         return result
 
     def _initial_mesh(self) -> tuple[np.ndarray, np.ndarray]:
@@ -170,7 +202,9 @@ class AdaptiveSurfaceTriangulator:
         midpoint_parameters = (
             parameters[edges[:, 0]] + parameters[edges[:, 1]]
         ) * 0.5
-        midpoint_values = self._evaluate(self.surface, midpoint_parameters)
+        midpoint_values = self._evaluate(
+            self.surface, midpoint_parameters, kind="surface"
+        )
         midpoint_lookup = {
             _edge_key(*edge): row for row, edge in enumerate(edges)
         }
@@ -188,17 +222,68 @@ class AdaptiveSurfaceTriangulator:
             ]
             position_error[row] = np.max(edge_errors[indices])
 
+        interior_barycentric = np.asarray(
+            (
+                (1 / 3, 1 / 3, 1 / 3),
+                (0.6, 0.2, 0.2),
+                (0.2, 0.6, 0.2),
+                (0.2, 0.2, 0.6),
+            ),
+            dtype=np.float64,
+        )
+        triangle_parameters = parameters[triangles]
+        interior_parameters = np.einsum(
+            "ka,nad->nkd", interior_barycentric, triangle_parameters
+        )
+        interior_values = self._evaluate(
+            self.surface,
+            interior_parameters.reshape(-1, 2),
+            kind="surface",
+        ).reshape(len(triangles), len(interior_barycentric), -1)
+        linear_interior = np.einsum(
+            "ka,nam->nkm", interior_barycentric, embedded[triangles]
+        )
+        interior_error = np.linalg.norm(
+            interior_values - linear_interior, axis=2
+        ).max(axis=1)
+        position_error = np.maximum(position_error, interior_error)
+
         tangent_error = None
         if self.jacobian is not None:
-            endpoint_jacobian = self._evaluate(self.jacobian, parameters)
-            midpoint_jacobian = self._evaluate(self.jacobian, midpoint_parameters)
-            edge_tangent_error = np.linalg.norm(
-                midpoint_jacobian
-                - (
-                    endpoint_jacobian[edges[:, 0]]
-                    + endpoint_jacobian[edges[:, 1]]
-                ) * 0.5,
-                axis=(1, 2),
+            endpoint_jacobian = self._evaluate(
+                self.jacobian, parameters, kind="jacobian"
+            )
+            midpoint_jacobian = self._evaluate(
+                self.jacobian, midpoint_parameters, kind="jacobian"
+            )
+            interior_jacobian = self._evaluate(
+                self.jacobian,
+                interior_parameters.reshape(-1, 2),
+                kind="jacobian",
+            ).reshape(
+                len(triangles),
+                len(interior_barycentric),
+                embedded.shape[1],
+                2,
+            )
+            parameter_edges = np.stack(
+                (
+                    triangle_parameters[:, 1] - triangle_parameters[:, 0],
+                    triangle_parameters[:, 2] - triangle_parameters[:, 0],
+                ),
+                axis=2,
+            )
+            embedded_edges = np.stack(
+                (
+                    embedded[triangles[:, 1]] - embedded[triangles[:, 0]],
+                    embedded[triangles[:, 2]] - embedded[triangles[:, 0]],
+                ),
+                axis=2,
+            )
+            affine_jacobian = np.einsum(
+                "nmi,nij->nmj",
+                embedded_edges,
+                np.linalg.inv(parameter_edges),
             )
             tangent_error = np.empty(len(triangles), dtype=np.float64)
             for row, triangle in enumerate(triangles):
@@ -207,7 +292,17 @@ class AdaptiveSurfaceTriangulator:
                     midpoint_lookup[_edge_key(triangle[1], triangle[2])],
                     midpoint_lookup[_edge_key(triangle[2], triangle[0])],
                 ]
-                tangent_error[row] = np.max(edge_tangent_error[indices])
+                samples = np.concatenate(
+                    (
+                        endpoint_jacobian[triangle],
+                        midpoint_jacobian[indices],
+                        interior_jacobian[row],
+                    ),
+                    axis=0,
+                )
+                tangent_error[row] = np.linalg.norm(
+                    samples - affine_jacobian[row], axis=(1, 2)
+                ).max()
         return position_error, tangent_error, edges, midpoint_values
 
     @staticmethod
@@ -240,9 +335,10 @@ class AdaptiveSurfaceTriangulator:
         return [triangle]
 
     def triangulate(self) -> TriangulationGeneration:
-        self._evaluation_count = 0
+        self._surface_sample_count = 0
+        self._jacobian_sample_count = 0
         parameters, triangles = self._initial_mesh()
-        embedded = self._evaluate(self.surface, parameters)
+        embedded = self._evaluate(self.surface, parameters, kind="surface")
         generation = 0
         stopped_reason = "tolerance"
         while True:
@@ -271,9 +367,24 @@ class AdaptiveSurfaceTriangulator:
                 score = np.maximum(
                     score, tangent_error[failing_rows] / self.tolerance.tangent
                 )
-            capacity = max(1, remaining // 2)
-            failing_rows = failing_rows[np.argsort(score)[::-1][:capacity]]
+            failing_rows = failing_rows[np.argsort(score)[::-1]]
             selected_edges: set[tuple[int, int]] = set()
+            raw_edges = np.concatenate(
+                (
+                    triangles[:, (0, 1)],
+                    triangles[:, (1, 2)],
+                    triangles[:, (2, 0)],
+                )
+            )
+            raw_edges.sort(axis=1)
+            unique_edges, edge_counts = np.unique(
+                raw_edges, axis=0, return_counts=True
+            )
+            incidence = {
+                _edge_key(*edge): int(count)
+                for edge, count in zip(unique_edges, edge_counts)
+            }
+            additions = 0
             for row in failing_rows:
                 triangle = triangles[row]
                 pairs = (
@@ -284,7 +395,15 @@ class AdaptiveSurfaceTriangulator:
                 lengths = [
                     np.linalg.norm(parameters[a] - parameters[b]) for a, b in pairs
                 ]
-                selected_edges.add(pairs[int(np.argmax(lengths))])
+                edge = pairs[int(np.argmax(lengths))]
+                cost = 0 if edge in selected_edges else incidence[edge]
+                if additions + cost <= remaining:
+                    selected_edges.add(edge)
+                    additions += cost
+            if not selected_edges:
+                converged = False
+                stopped_reason = "max_triangles"
+                break
 
             edge_rows = {_edge_key(*edge): row for row, edge in enumerate(edges)}
             new_parameters = []
@@ -320,7 +439,8 @@ class AdaptiveSurfaceTriangulator:
             triangles=triangles,
             position_error=position_error,
             tangent_error=tangent_error,
-            function_evaluations=self._evaluation_count,
+            surface_sample_count=self._surface_sample_count,
+            jacobian_sample_count=self._jacobian_sample_count,
             converged=converged,
             stopped_reason=stopped_reason,
         )

@@ -11,6 +11,35 @@ import numpy as np
 from scipy.interpolate import RBFInterpolator
 
 
+def validate_single_valued_chart(
+    parameters: np.ndarray,
+    *,
+    intrinsic_axes: Sequence[int],
+    tolerance: float = 1e-9,
+) -> None:
+    """Reject samples that project one chart location to conflicting parameters."""
+    parameters = np.asarray(parameters, dtype=np.float64)
+    axes = np.asarray(tuple(intrinsic_axes), dtype=np.int64)
+    if parameters.ndim != 2 or len(axes) == 0:
+        raise ValueError("parameters must be a matrix and axes non-empty")
+    if tolerance <= 0.0:
+        raise ValueError("tolerance must be positive")
+    dependent = np.asarray(
+        [axis for axis in range(parameters.shape[1]) if axis not in set(axes)]
+    )
+    if not len(dependent):
+        return
+    chart = parameters[:, axes]
+    quantized = np.rint(chart / tolerance).astype(np.int64)
+    _, inverse = np.unique(quantized, axis=0, return_inverse=True)
+    for group in range(int(inverse.max()) + 1 if len(inverse) else 0):
+        rows = parameters[inverse == group][:, dependent]
+        if len(rows) > 1 and np.max(np.ptp(rows, axis=0)) > tolerance:
+            raise ValueError(
+                "surface samples are not single-valued in the selected chart"
+            )
+
+
 @dataclass(frozen=True)
 class ParametricSpline:
     """A spline from an intrinsic parameter chart into an embedding space."""

@@ -7,6 +7,7 @@ from src.common.tensors.riemann import (
     TriangulationTolerance,
 )
 from src.common.tensors.youngman import blackbox_roundtrip_demo as demo
+from src.common.tensors.youngman import validate_single_valued_chart
 
 
 def test_published_spline_no_longer_needs_source(monkeypatch):
@@ -17,14 +18,16 @@ def test_published_spline_no_longer_needs_source(monkeypatch):
         (u.ravel(), v.ravel(), np.full(u.size, 0.5))
     )
     samples = SimpleNamespace(
-        parametric_points=parameters, sample_count=len(parameters)
+        parametric_points=parameters,
+        expanded_points=demo.detailed_embedding(parameters),
+        sample_count=len(parameters),
     )
-    published, count = demo.publish_surface_spline(samples)
     monkeypatch.setattr(
         demo,
         "detailed_embedding",
         lambda *_: (_ for _ in ()).throw(AssertionError("source leaked")),
     )
+    published, count = demo.publish_surface_spline(samples)
     query = np.asarray(((0.2, 0.3), (0.7, 0.8)))
     assert published(query).shape == (2, 5)
     assert published.jacobian(query).shape == (2, 5, 2)
@@ -34,3 +37,9 @@ def test_published_spline_no_longer_needs_source(monkeypatch):
         tolerance=TriangulationTolerance(position=0.1, max_rounds=2),
     ).triangulate()
     assert mesh.embedding_dimension == 5
+
+
+def test_multisheet_samples_are_rejected_before_spline_fit():
+    samples = np.asarray(((0.2, 0.3, 0.0), (0.2, 0.3, 1.0)))
+    with np.testing.assert_raises(ValueError):
+        validate_single_valued_chart(samples, intrinsic_axes=(0, 1))

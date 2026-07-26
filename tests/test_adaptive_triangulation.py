@@ -77,3 +77,56 @@ def test_flat_surface_needs_no_refinement():
     assert result.converged
     assert result.generation == 0
     assert result.triangle_count == 2
+
+
+def test_tangent_certificate_compares_against_piecewise_linear_tangent():
+    result = AdaptiveSurfaceTriangulator(
+        _paraboloid,
+        jacobian=_paraboloid_jacobian,
+        tolerance=TriangulationTolerance(
+            position=100.0, tangent=0.3, max_rounds=8
+        ),
+        initial_resolution=(1, 1),
+    ).triangulate()
+    assert result.generation > 0
+    assert result.tangent_error is not None
+    assert result.tangent_error.max() <= 0.3
+
+
+def test_interior_probes_break_edge_midpoint_aliasing():
+    def aliased(parameters):
+        u, v = parameters.T
+        return np.column_stack((u, v, np.sin(4 * np.pi * u) * np.sin(4 * np.pi * v)))
+
+    result = AdaptiveSurfaceTriangulator(
+        aliased,
+        tolerance=TriangulationTolerance(position=0.1, max_rounds=3),
+        initial_resolution=(1, 1),
+    ).triangulate()
+    assert result.generation > 0
+    assert result.position_error.max() > 0.1
+
+
+def test_triangle_budget_is_a_strict_upper_bound():
+    result = AdaptiveSurfaceTriangulator(
+        _paraboloid,
+        tolerance=TriangulationTolerance(
+            position=1e-12, max_rounds=8, max_triangles=5
+        ),
+        initial_resolution=(1, 1),
+    ).triangulate()
+    assert not result.converged
+    assert result.triangle_count <= 5
+
+
+def test_results_own_immutable_array_storage():
+    result = AdaptiveSurfaceTriangulator(_paraboloid).triangulate()
+    assert not result.parameters.flags.writeable
+    assert not result.embedded.flags.writeable
+    assert not result.triangles.flags.writeable
+
+
+def test_callable_output_shapes_are_checked():
+    bad = lambda uv: np.zeros((len(uv), 3, 1))
+    with np.testing.assert_raises(ValueError):
+        AdaptiveSurfaceTriangulator(bad).triangulate()

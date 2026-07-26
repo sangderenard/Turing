@@ -63,6 +63,7 @@ class SolverSampleBatch:
     interpolation_weights: np.ndarray
     embedded_points: np.ndarray
     parametric_points: Optional[np.ndarray] = None
+    expanded_points: Optional[np.ndarray] = None
     metric_tags: Optional["MetricSampleTagBatch"] = None
 
     @property
@@ -237,6 +238,7 @@ def extract_isosurface(
     *,
     iso_value: float = 0.0,
     parametric_tetrahedra: Optional[np.ndarray] = None,
+    expanded_embedding: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> ExtractionResult:
     """Extract a triangle surface using AbstractTensor field/interpolation work."""
     import time
@@ -279,6 +281,7 @@ def extract_isosurface(
     tetrahedron_ids, edge_ids = np.nonzero(active_edges)
     weights_np = np.asarray(weight.tolist(), dtype=np.float64)[..., 0]
     parametric_points = None
+    expanded_points = None
     parametric_triangles = None
     parametric_crossings = None
     if parametric_tetrahedra is not None:
@@ -289,6 +292,19 @@ def extract_isosurface(
             + weights_np[..., None] * (parametric_end - parametric_start)
         )
         parametric_points = parametric_crossings[active_edges]
+        if expanded_embedding is not None:
+            expanded_points = np.asarray(
+                expanded_embedding(parametric_points), dtype=np.float64
+            )
+            if (
+                expanded_points.ndim != 2
+                or len(expanded_points) != len(parametric_points)
+            ):
+                raise ValueError(
+                    "expanded_embedding must return shape (sample_count, m)"
+                )
+            if not np.isfinite(expanded_points).all():
+                raise ValueError("expanded_embedding returned non-finite values")
     topology_points = (
         crossing_np if parametric_crossings is None else parametric_crossings
     )
@@ -307,6 +323,7 @@ def extract_isosurface(
         interpolation_weights=weights_np[active_edges],
         embedded_points=crossing_np[active_edges],
         parametric_points=parametric_points,
+        expanded_points=expanded_points,
     )
 
     return ExtractionResult(

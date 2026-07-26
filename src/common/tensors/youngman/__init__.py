@@ -15,6 +15,7 @@ from .spline import (
     ParametricSpline,
     SplineFactory,
     StreamingSplineSolver,
+    validate_single_valued_chart,
 )
 from .piecewise import (
     PatchSampleBatch,
@@ -38,6 +39,7 @@ __all__ = [
     "SolverSampleBatch",
     "SplineFactory",
     "StreamingSplineSolver",
+    "validate_single_valued_chart",
     "StreamingPiecewiseSplineEngine",
     "compile_grid_domain",
     "extract_isosurface",

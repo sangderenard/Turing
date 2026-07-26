@@ -13,9 +13,10 @@ expanded source geometry
   -> discrete Laplace--Beltrami comparison against source reference
 ```
 
-The source is allowed to answer YoungMan queries and provide expanded
-five-dimensional values for the exported crossing controls. The published
-surface spline contains only its fitted interpolator. The adaptive
+The source is allowed to answer YoungMan queries. YoungMan itself carries the
+expanded five-dimensional values across the solver-export boundary alongside
+each crossing control. Spline publication consumes only that exported batch;
+a regression test disables the source before fitting. The adaptive
 triangulator receives that callable and a finite-difference Jacobian; it has no
 source transform, implicit field, YoungMan topology, or source triangles.
 
@@ -34,9 +35,10 @@ The report separates:
 - mesh-versus-continuous-spline discretization error; and
 - final mesh-versus-source Laplacian error.
 
-Boundary and degenerate vertices are flagged and excluded from headline
-interior RMS values. Triangle CSV rows retain the fields needed for separate
-OpenGL or headless error views.
+Boundary, degenerate, singular, and nonmanifold vertices are flagged and
+excluded from headline interior RMS values. RMS quantities are weighted by
+lumped surface area rather than mesh vertex density. Triangle CSV rows retain
+the fields needed for separate OpenGL or headless error views.
 
 Run and render the final error:
 
@@ -49,3 +51,7 @@ Select `--error-field spline`, `triangulation`, `metric`, or `laplace` to
 inspect a particular transition. The final mesh uses all five embedding
 channels for metric and cotangent calculations; only its first three channels
 are sent to the ordinary renderer.
+
+An uncertified run exits with an error by default. `--allow-unconverged`
+exists for deliberate failure diagnostics, while `--max-rounds` and
+`--max-triangles` make those stress cases reproducible.

@@ -37,3 +37,24 @@ def test_degenerate_triangle_is_reported_without_silent_division():
     assert result.geometry.degenerate_triangle_mask[0]
     assert result.geometry.singular_vertex_mask.all()
     assert np.isnan(result.laplacian).all()
+
+
+def test_nonmanifold_vertices_are_invalidated():
+    vertices = np.asarray((
+        (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+        (0.0, -1.0), (0.5, 0.5),
+    ))
+    triangles = np.asarray(((0, 1, 2), (1, 0, 3), (0, 1, 4)))
+    result = mesh_laplace_beltrami(
+        vertices, triangles, np.arange(len(vertices), dtype=float)
+    )
+    assert result.geometry.nonmanifold_edge_mask.any()
+    assert result.geometry.nonmanifold_vertex_mask[[0, 1]].all()
+    assert np.isnan(result.laplacian[[0, 1]]).all()
+
+
+def test_geometry_arrays_are_immutable():
+    vertices, triangles = _grid()
+    result = mesh_laplace_beltrami(vertices, triangles, vertices[:, 0])
+    assert not result.geometry.edges.flags.writeable
+    assert not result.geometry.lumped_vertex_areas.flags.writeable
