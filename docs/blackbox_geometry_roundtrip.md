@@ -52,9 +52,29 @@ inspect a particular transition. The final mesh uses all five embedding
 channels for metric and cotangent calculations; only its first three channels
 are sent to the ordinary renderer.
 
+`--error-field geometry` removes the diverging error palette and presents the
+reconstructed mesh with Pluck's ordinary lit material. `--manifold` selects
+`ripple`, `banana`, `saddle`, or `twisted_ribbon`. These presets change the
+five-dimensional values exported through YoungMan and reconstructed by the
+spline; they are not post-solve renderer deformations.
+
 An uncertified run exits with an error by default. `--allow-unconverged`
 exists for deliberate failure diagnostics, while `--max-rounds` and
 `--max-triangles` make those stress cases reproducible.
+
+The default `--target-epsilon` is `1e-6`. It is specifically the maximum
+sampled positional deviation between the spline callable and its
+piecewise-affine mesh, in embedding-coordinate units. The adaptive
+triangulator increases parallel refinement waves until that epsilon and the
+independent tangent tolerance are met. `epsilon_ratio` reports measured
+maximum divided by target; success requires a ratio no greater than one.
+Resource caps remain explicit, and exhausting one reports nonconvergence
+instead of weakening epsilon.
+
+This epsilon does not rename spline-versus-source or Laplace error as mesh
+error. Those distinct quantities remain in the report and may be much larger;
+improving them requires increasing YoungMan sampling or changing the spline
+and discrete operator, respectively.
 
 ## Time-varying profiling
 
@@ -76,6 +96,12 @@ the complete solve while the GL thread continuously renders the newest
 completed mesh. Publication is latest-result-wins: an unpublished stale frame
 may be dropped, but a partial solve is never displayed. The HUD reports
 whether each published mesh met its certificates.
+
+The live HUD also profiles the video path: CPU mesh preparation/upload, draw
+submission, HUD update, buffer swap, full frame wall time, solve-to-display
+latency, rendered-frame count, and total session wall time. It does not call
+`glFinish`, so draw submission is correctly labelled as CPU time rather than
+pretending to measure completed GPU work.
 
 ## Appropriate neural participation
 

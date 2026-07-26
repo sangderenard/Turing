@@ -57,13 +57,62 @@ def source_surface_parameters(
     return np.stack((u, v, target_z - visible_warp), axis=1)
 
 
-def source_surface(uv: np.ndarray, time_value: float = 0.0) -> np.ndarray:
-    return detailed_embedding(source_surface_parameters(uv, time_value))
+def manifold_embedding(
+    parameters: np.ndarray,
+    time_value: float = 0.0,
+    manifold: str = "ripple",
+) -> np.ndarray:
+    """Embed the common parameter volume into selectable visible manifolds."""
+    parameters = np.asarray(parameters, dtype=np.float64)
+    result = detailed_embedding(parameters)
+    if manifold == "ripple":
+        return result
+    u, v, _ = parameters.T
+    phase = 2.0 * np.pi * float(time_value)
+    height = result[:, 2] - 0.5
+    if manifold == "banana":
+        angle = 2.35 * (u - 0.5) + 0.2 * np.sin(2.0 * np.pi * v + phase)
+        radius = 1.25 + 0.42 * (v - 0.5)
+        result[:, 0] = radius * np.sin(angle)
+        result[:, 1] = 1.35 * (v - 0.5)
+        result[:, 2] = radius * np.cos(angle) - 1.25 + 0.7 * height
+    elif manifold == "saddle":
+        x = 1.45 * (u - 0.5)
+        y = 1.45 * (v - 0.5)
+        result[:, 0] = x
+        result[:, 1] = y
+        result[:, 2] = 0.52 * (x * x - y * y) + height
+    elif manifold == "twisted_ribbon":
+        x = 1.8 * (u - 0.5)
+        across = 1.1 * (v - 0.5)
+        angle = 2.0 * np.pi * (u + time_value)
+        result[:, 0] = x
+        result[:, 1] = across * np.cos(angle) - height * np.sin(angle)
+        result[:, 2] = across * np.sin(angle) + height * np.cos(angle)
+    else:
+        raise ValueError(f"unknown manifold preset: {manifold}")
+    return result
+
+
+def source_surface(
+    uv: np.ndarray,
+    time_value: float = 0.0,
+    manifold: str = "ripple",
+) -> np.ndarray:
+    return manifold_embedding(
+        source_surface_parameters(uv, time_value), time_value, manifold
+    )
 
 
 def source_surface_jacobian(
-    uv: np.ndarray, time_value: float = 0.0
+    uv: np.ndarray,
+    time_value: float = 0.0,
+    manifold: str = "ripple",
 ) -> np.ndarray:
+    if manifold != "ripple":
+        return _finite_jacobian(
+            lambda query: source_surface(query, time_value, manifold), uv
+        )
     uv = np.asarray(uv, dtype=np.float64)
     u, v = uv.T
     tau = 2.0 * np.pi
@@ -146,7 +195,11 @@ def continuous_surface_laplace(
     return divergence / root_det
 
 
-def _domain_and_extraction(resolution: int, time_value: float = 0.0):
+def _domain_and_extraction(
+    resolution: int,
+    time_value: float = 0.0,
+    manifold: str = "ripple",
+):
     domain = GridDomain.generate_grid_domain(
         "rectangular",
         N_u=resolution + 1,
@@ -177,7 +230,9 @@ def _domain_and_extraction(resolution: int, time_value: float = 0.0):
         compiled.embedded,
         time_surface_field,
         parametric_tetrahedra=compiled.parametric,
-        expanded_embedding=detailed_embedding,
+        expanded_embedding=lambda points: manifold_embedding(
+            points, time_value, manifold
+        ),
     )
     return domain, extraction
 
@@ -205,12 +260,13 @@ def publish_surface_spline(samples) -> tuple[PublishedSurfaceSpline, int]:
 
 def build_blackbox_roundtrip(
     youngman_resolution: int = 7,
-    position_tolerance: float = 2e-3,
+    position_tolerance: float = 1e-6,
     tangent_tolerance: float = 6e-1,
     *,
-    max_rounds: int = 9,
-    max_triangles: int = 80_000,
+    max_rounds: int = 14,
+    max_triangles: int = 250_000,
     time_value: float = 0.0,
+    manifold: str = "ripple",
 ) -> BlackBoxRoundTrip:
     """Build every stage while enforcing the spline/triangulator black box."""
     profile_rows = []
@@ -223,7 +279,9 @@ def build_blackbox_roundtrip(
 
     total_started = perf_counter()
     started = perf_counter()
-    _, extraction = _domain_and_extraction(youngman_resolution, time_value)
+    _, extraction = _domain_and_extraction(
+        youngman_resolution, time_value, manifold
+    )
     finish_stage("youngman_extract", started)
     samples = extraction.solver_samples
     assert samples is not None and samples.parametric_points is not None
@@ -249,14 +307,17 @@ def build_blackbox_roundtrip(
 
     started = perf_counter()
     uv = mesh.parameters
-    source_values = source_surface(uv, time_value)
+    source_values = source_surface(uv, time_value, manifold)
     spline_values = mesh.embedded
-    source_jacobian = source_surface_jacobian(uv, time_value)
+    source_jacobian = source_surface_jacobian(uv, time_value, manifold)
     spline_jacobian_values = spline_surface.jacobian(uv)
     source_metric = _metric(source_jacobian)
     spline_metric = _metric(spline_jacobian_values)
     source_continuous_laplace = continuous_surface_laplace(
-        uv, lambda query: _metric(source_surface_jacobian(query, time_value))
+        uv,
+        lambda query: _metric(
+            source_surface_jacobian(query, time_value, manifold)
+        ),
     )
     spline_continuous_laplace = continuous_surface_laplace(
         uv, lambda query: _metric(spline_surface.jacobian(query))
@@ -306,6 +367,8 @@ def build_blackbox_roundtrip(
 
     summary = pd.DataFrame([{
         "time_value": time_value,
+        "manifold": manifold,
+        "target_epsilon": position_tolerance,
         "youngman_resolution": youngman_resolution,
         "youngman_samples": samples.sample_count,
         "spline_controls": control_point_count,
@@ -320,6 +383,10 @@ def build_blackbox_roundtrip(
         "spline_position_error_area_rms": weighted_rms(spline_error),
         "spline_metric_error_area_rms": weighted_rms(metric_error),
         "triangulator_max_chord_error": float(mesh.position_error.max()),
+        "epsilon_ratio": float(mesh.position_error.max() / position_tolerance),
+        "epsilon_achieved": bool(
+            float(mesh.position_error.max()) <= position_tolerance
+        ),
         "triangulator_max_tangent_error": (
             float(mesh.tangent_error.max()) if mesh.tangent_error is not None else np.nan
         ),
@@ -389,7 +456,9 @@ def _load_pluck_viewer():
     return ordinary_gl_mesh_viewer
 
 
-def _triangle_field(result, name: str) -> np.ndarray:
+def _triangle_field(result, name: str) -> np.ndarray | None:
+    if name == "geometry":
+        return None
     fields = {
         "youngman": np.full(
             result.mesh.triangle_count,
@@ -412,11 +481,26 @@ def _profile_mapping(result: BlackBoxRoundTrip) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--youngman-resolution", type=int, default=7)
-    parser.add_argument("--position-tolerance", type=float, default=2e-3)
+    parser.add_argument(
+        "--target-epsilon",
+        type=float,
+        default=1e-6,
+        help="target maximum positional certificate (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--position-tolerance",
+        type=float,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--tangent-tolerance", type=float, default=6e-1)
-    parser.add_argument("--max-rounds", type=int, default=9)
-    parser.add_argument("--max-triangles", type=int, default=80_000)
+    parser.add_argument("--max-rounds", type=int, default=14)
+    parser.add_argument("--max-triangles", type=int, default=250_000)
     parser.add_argument("--time-value", type=float, default=0.0)
+    parser.add_argument(
+        "--manifold",
+        choices=("ripple", "banana", "saddle", "twisted_ribbon"),
+        default="banana",
+    )
     parser.add_argument("--animation", type=Path)
     parser.add_argument("--animation-frames", type=int, default=8)
     parser.add_argument("--live", action="store_true")
@@ -426,8 +510,11 @@ def main() -> None:
     parser.add_argument("--render-image", type=Path)
     parser.add_argument(
         "--error-field",
-        choices=("youngman", "spline", "triangulation", "metric", "laplace"),
-        default="laplace",
+        choices=(
+            "geometry", "youngman", "spline", "triangulation", "metric",
+            "laplace",
+        ),
+        default="geometry",
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
@@ -436,13 +523,19 @@ def main() -> None:
         help="emit diagnostics even if a triangulation tolerance or budget fails",
     )
     args = parser.parse_args()
+    target_epsilon = (
+        args.target_epsilon
+        if args.position_tolerance is None
+        else args.position_tolerance
+    )
     result = build_blackbox_roundtrip(
         args.youngman_resolution,
-        args.position_tolerance,
+        target_epsilon,
         args.tangent_tolerance,
         max_rounds=args.max_rounds,
         max_triangles=args.max_triangles,
         time_value=args.time_value,
+        manifold=args.manifold,
     )
     print("\nBLACK-BOX ROUND TRIP\n", result.summary.to_string(index=False))
     print("\nPROFILE\n", result.profile.to_string(index=False))
@@ -488,11 +581,12 @@ def main() -> None:
             animated = result if frame == 0 and args.time_value == 0.0 else (
                 build_blackbox_roundtrip(
                     args.youngman_resolution,
-                    args.position_tolerance,
+                    target_epsilon,
                     args.tangent_tolerance,
                     max_rounds=args.max_rounds,
                     max_triangles=args.max_triangles,
                     time_value=float(time_value),
+                    manifold=args.manifold,
                 )
             )
             if not animated.mesh.converged and not args.allow_unconverged:
@@ -533,11 +627,12 @@ def main() -> None:
         def solve_live_frame(index, time_value):
             solved = build_blackbox_roundtrip(
                 args.youngman_resolution,
-                args.position_tolerance,
+                target_epsilon,
                 args.tangent_tolerance,
                 max_rounds=args.max_rounds,
                 max_triangles=args.max_triangles,
                 time_value=time_value,
+                manifold=args.manifold,
             )
             profile = _profile_mapping(solved)
             history.append(profile)
@@ -547,7 +642,10 @@ def main() -> None:
             panel.extend((
                 "",
                 f"solve index        {index:8d}",
+                f"manifold           {args.manifold:>8}",
                 f"certified          {str(solved.mesh.converged):>8}",
+                f"target epsilon     {target_epsilon:8.2e}",
+                f"epsilon ratio      {solved.summary.loc[0, 'epsilon_ratio']:8.3f}",
                 f"vertices           {len(solved.mesh.parameters):8d}",
                 f"triangles          {solved.mesh.triangle_count:8d}",
             ))

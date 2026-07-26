@@ -53,3 +53,22 @@ def test_time_parameter_changes_geometry_periodically():
     assert np.allclose(
         demo.source_surface(uv, 0.0), demo.source_surface(uv, 1.0)
     )
+
+
+def test_manifold_presets_are_distinct_periodic_five_dimensional_maps():
+    uv = np.asarray(((0.17, 0.31), (0.63, 0.72)))
+    surfaces = {
+        name: demo.source_surface(uv, 0.0, name)
+        for name in ("ripple", "banana", "saddle", "twisted_ribbon")
+    }
+    assert all(values.shape == (2, 5) for values in surfaces.values())
+    assert not np.allclose(surfaces["banana"], surfaces["saddle"])
+    for name, values in surfaces.items():
+        assert np.allclose(values, demo.source_surface(uv, 1.0, name))
+
+
+def test_nontrivial_manifold_jacobian_is_finite():
+    uv = np.asarray(((0.17, 0.31), (0.63, 0.72)))
+    jacobian = demo.source_surface_jacobian(uv, 0.2, "banana")
+    assert jacobian.shape == (2, 5, 2)
+    assert np.isfinite(jacobian).all()
