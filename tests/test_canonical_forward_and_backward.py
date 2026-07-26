@@ -35,10 +35,17 @@ def test_smooth_canonical_unary_backward_is_connected(backend):
     with AbstractTensor.use_backend(backend):
         source = AbstractTensor.tensor(values)
         source.requires_grad_(True)
-        result = (source.exp() + source.log() + source.sqrt()).sum()
+        result = (
+            source.exp() + source.log() + source.sqrt() + source.tanh()
+        ).sum()
         gradient = autograd.grad(result, [source])[0]
 
-    expected = np.exp(values) + 1.0 / values + 0.5 / np.sqrt(values)
+    expected = (
+        np.exp(values)
+        + 1.0 / values
+        + 0.5 / np.sqrt(values)
+        + 1.0 - np.tanh(values) ** 2
+    )
     np.testing.assert_allclose(gradient.tolist(), expected, rtol=1e-6)
 
 
@@ -80,6 +87,24 @@ def test_repeated_advanced_index_backward_accumulates(backend):
         gradient = autograd.grad(selected.sum(), [source])[0]
 
     np.testing.assert_allclose(gradient.tolist(), [1.0, 1.0, 3.0])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "c"])
+def test_tuple_advanced_index_forward_and_backward_share_policy(backend):
+    autograd.tape = GradTape()
+    values = np.arange(24.0).reshape(3, 4, 2)
+    indices = np.asarray([3, 1, 3])
+    with AbstractTensor.use_backend(backend):
+        source = AbstractTensor.tensor(values)
+        source.requires_grad_(True)
+        selected = source[:, indices, :]
+        gradient = autograd.grad(selected.sum(), [source])[0]
+
+    np.testing.assert_allclose(selected.tolist(), values[:, indices, :])
+    expected = np.zeros_like(values)
+    expected[:, 1, :] = 1.0
+    expected[:, 3, :] = 2.0
+    np.testing.assert_allclose(gradient.tolist(), expected)
 
 
 @pytest.mark.parametrize("backend", ["numpy", "c", "torch"])

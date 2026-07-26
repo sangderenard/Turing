@@ -10,10 +10,12 @@ with AbstractTensor.use_backend("c"):
 
 It is a functional experimental CPU lowering target, not a replacement for
 NumPy's high-level API. Its compiled C primitives now cover creation,
-elementwise and scalar arithmetic, broadcasting, elementary functions,
+elementwise and scalar arithmetic, broadcasting, elementary and trigonometric
+functions,
 comparison and masks, arbitrary-rank layout transforms, reductions,
 cumulative sums, index selection, repetition, two-dimensional matrix
-multiplication, padding, top-k, log-softmax, stacking, and concatenation.
+multiplication, broadcasted batched matrix multiplication, padding, top-k,
+log-softmax, stacking, and concatenation.
 Focused parity tests exercise these through AbstractTensor rather than by
 calling C-backend methods as an alternate public API.
 
@@ -63,12 +65,13 @@ tests demonstrate that the C primitive set runs:
 - a broadcast linear expression, mask selection, softmax, reductions, and
 arbitrary-rank layout composition.
 
-Basic tuple indexing is likewise an AbstractTensor policy rather than a C
-policy. The shared indexing specialization normalizes integers, slices,
-negative indices, and ellipses once. Reads lower through `index_select` plus
-metadata reshape; writes lower through one native `index_assign_double` loop
-over the same normalized axis selections. The C backend only adds its shaped
-first-axis gather required by constructs such as `vertices[triangles]`.
+Tuple indexing is likewise an AbstractTensor policy rather than a C policy.
+The shared indexing specialization normalizes integers, slices, negative
+indices, ellipses, and one arbitrary-shaped integer-array axis once. Reads
+lower through `index_select` plus metadata reshape; writes lower through one
+native `index_assign_double` loop over the same normalized axis selections.
+Its adjoint uses canonical flat source offsets and stable segment reduction,
+so repeated tuple indices accumulate gradients rather than overwrite them.
 
 YoungMan's spline additionally requires the universal linear solve. Its
 existing sliced LU implementation now runs on C without a backend-specific
@@ -85,7 +88,8 @@ conversion conveniences or optional specialized kernels. Remaining
 capability gaps include:
 
 1. General scatter families, nonzero/argwhere, and diagonal construction.
-2. Batched matrix multiplication beyond the current two-dimensional kernel.
+2. Multiple simultaneously advanced indexing axes and the full NumPy
+   advanced-index placement rules.
 3. True bool/integer/float32/complex storage rather than numeric values held
    in double storage.
 4. Fold/unfold and interpolation primitives used by convolutional
@@ -112,8 +116,8 @@ algorithms remain AbstractTensor compositions.
 ## Recommended implementation order
 
 First give CTensor explicit dtype and ownership metadata plus contiguous
-strides. Then complete scatter and batched matmul so broader geometry can
-run. Complex storage and the `fftfree` bridge form the next separate
+strides. Then complete scatter so broader irregular algorithms can run.
+Complex storage and the `fftfree` bridge form the next separate
 milestone; fold/unfold follows according to the convolution specialization
 tests.
 

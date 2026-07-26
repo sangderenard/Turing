@@ -79,6 +79,20 @@ def test_c_backend_runs_composite_linalg_solve():
     assert np.allclose(matrix_values @ np.asarray(solved.tolist()), rhs_values)
 
 
+def test_c_backend_batched_matmul_broadcasts_in_one_native_call():
+    left_values = np.arange(24.0).reshape(2, 3, 4)
+    right_values = np.arange(20.0).reshape(1, 4, 5)
+    with AbstractTensor.use_backend("c"):
+        result = (
+            AbstractTensor.tensor(left_values)
+            @ AbstractTensor.tensor(right_values)
+        )
+
+    np.testing.assert_allclose(
+        result.tolist(), left_values @ right_values
+    )
+
+
 def test_c_backend_slice_backward_uses_native_index_assignment():
     with AbstractTensor.use_backend("c"):
         values = AbstractTensor.tensor(np.arange(12.0).reshape(3, 4))

@@ -165,7 +165,6 @@ class Linear:
         return (None, self.W.shape[0])
 
     def forward(self, x: AbstractTensor) -> AbstractTensor:
-        print("=== Linear.forward called ===")
         # Ensure parameters are registered on the current tape so loss.backward()
         # can discover them via the tape's parameter registry even after tape resets.
         try:

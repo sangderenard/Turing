@@ -1,5 +1,7 @@
 import numpy as np
+import pytest
 
+from src.common.tensors import AbstractTensor
 from src.common.tensors.youngman.refinement_network import (
     train_refinement_predictor,
     triangle_refinement_features,
@@ -34,6 +36,14 @@ def test_abstract_refinement_predictor_trains_and_exports_schedules():
     assert result.forward_nodes > 0
     assert result.backward_nodes > 0
     assert result.concurrent_forward_width > 1
+    assert [step.op_name for step in result.fused_program.steps] == [
+        "matmul", "add", "tanh", "matmul", "add"
+    ]
+    assert result.fused_input_id in result.fused_program.feeds
+    assert (
+        set(result.fused_feed_values) | {result.fused_input_id}
+        == result.fused_program.feeds
+    )
     assert np.corrcoef(result.predictions, np.log1p(errors / 1e-5))[0, 1] > 0.98
     assert result.validation_loss < result.baseline_validation_loss
     assert result.validation_correlation > 0.95
@@ -56,3 +66,23 @@ def test_predictor_backpropagates_with_full_geometry_feature_width():
         features, errors, epsilon=1.0, epochs=3
     )
     assert np.isfinite(result.final_loss)
+
+
+@pytest.mark.parametrize("backend", ["c", "torch"])
+def test_captured_refinement_program_trains_on_selected_backend(backend):
+    rng = np.random.default_rng(7)
+    features = rng.normal(size=(48, 8))
+    errors = np.exp(0.3 * features[:, 0] - 0.2 * features[:, 3])
+    with AbstractTensor.use_backend(backend):
+        result = train_refinement_predictor(
+            features,
+            errors,
+            epsilon=1.0,
+            epochs=3,
+            required_correlation=-1.0,
+        )
+        alpha = result.predict_alpha(features[:5])
+
+    assert result.tensor_backend == backend
+    assert np.isfinite(result.final_loss)
+    assert np.isfinite(alpha).all()

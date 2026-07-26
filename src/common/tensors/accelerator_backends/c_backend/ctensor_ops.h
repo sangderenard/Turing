@@ -35,6 +35,18 @@ typedef enum CTensorOp {
     CT_OP_NE,
     CT_OP_MAXIMUM,
     CT_OP_MINIMUM,
+    CT_OP_TANH,
+    CT_OP_SIN,
+    CT_OP_COS,
+    CT_OP_TAN,
+    CT_OP_ASIN,
+    CT_OP_ACOS,
+    CT_OP_ATAN,
+    CT_OP_SINH,
+    CT_OP_COSH,
+    CT_OP_ASINH,
+    CT_OP_ACOSH,
+    CT_OP_ATANH,
     CT_OP_COUNT
 } CTensorOp;
 
@@ -59,6 +71,17 @@ typedef struct CTensorPrimitiveInstruction {
     double right_scalar;
     int reverse;
 } CTensorPrimitiveInstruction;
+
+void batched_matmul_indexed_double(
+    const double* a,
+    const double* b,
+    double* out,
+    const int* a_offsets,
+    const int* b_offsets,
+    int batch_count,
+    int m,
+    int n,
+    int p);
 
 int ctensor_execute_primitive_program(
     const CTensorPrimitiveInstruction* instructions,

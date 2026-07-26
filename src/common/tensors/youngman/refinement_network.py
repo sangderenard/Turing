@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
+import networkx as nx
 import numpy as np
 
 from ..abstraction import AbstractTensor as AT
+from ..abstract_nn import (
+    FusedProgram,
+    Identity,
+    Linear,
+    MSELoss,
+    ProgramRunner,
+    Sequential,
+    Tanh,
+    build_fused_program,
+)
+from ..abstract_nn.utils import set_seed
 from ..autograd import GradTape, autograd
 from ..autograd_process import AutogradProcess
 
@@ -92,27 +104,57 @@ class RefinementTrainingResult:
     optimization_sec: float
     inference_sec: float
     seed: int
+    fused_program: FusedProgram = field(repr=False, compare=False)
+    fused_input_id: int
+    fused_feed_values: dict[int, np.ndarray] = field(
+        repr=False, compare=False
+    )
 
     def predict_alpha(self, features: np.ndarray) -> np.ndarray:
-        """Evaluate the learned normalized-error pressure through AbstractTensor."""
+        """Replay the captured AbstractNN program for normalized pressure."""
         values = (
             np.asarray(features, dtype=np.float64) - self.feature_mean
         ) / self.feature_scale
         backend = self.tensor_backend or AT._preferred_backend or "numpy"
         with AT.use_backend(backend, self.tensor_device):
-            x = AT.tensor(values, dtype=self.tensor_dtype)
-            hidden = (
-                x @ AT.tensor(self.weight_hidden, dtype=self.tensor_dtype)
-                + AT.tensor(self.bias_hidden, dtype=self.tensor_dtype)
-            ).tanh()
-            log_pressure = (
-                hidden @ AT.tensor(self.weight_output, dtype=self.tensor_dtype)
-                + AT.tensor(self.bias_output, dtype=self.tensor_dtype)
+            feeds = {
+                feed_id: AT.tensor(feed_value, dtype=self.tensor_dtype)
+                for feed_id, feed_value in self.fused_feed_values.items()
+            }
+            feeds[self.fused_input_id] = AT.tensor(
+                values, dtype=self.tensor_dtype
             )
+            with autograd.no_grad():
+                log_pressure = ProgramRunner(self.fused_program)(
+                    feeds, training=False
+                )["prediction"]
             prediction = np.asarray(
                 log_pressure.tolist(), dtype=np.float64
             )[:, 0]
         return np.maximum(np.expm1(prediction), 0.0)
+
+
+def _capture_refinement_program(model: Sequential, values: AT):
+    """Capture one AbstractNN forward into the established FusedProgram IR."""
+
+    tape = autograd.tape
+    tape._nodes.clear()
+    tape.graph.clear()
+    for parameter in model.parameters():
+        parameter._tape = tape
+        tape.create_tensor_node(parameter)
+    values._tape = tape
+    tape.create_tensor_node(values)
+    prediction = model.forward(values)
+    output_id = id(prediction)
+    reachable = nx.ancestors(tape.graph, output_id) | {output_id}
+    graph = tape.graph.subgraph(reachable).copy()
+    program = build_fused_program(
+        graph, outputs={"prediction": output_id}
+    )
+    if id(values) not in program.feeds:
+        raise RuntimeError("captured refinement program lost its input feed")
+    return program, id(values)
 
 
 def triangle_refinement_features(
@@ -198,11 +240,12 @@ def train_refinement_predictor(
     tensor_dtype: str = "float64",
     seed: int = 1729,
 ) -> RefinementTrainingResult:
-    """Train an AbstractTensor linear neuron to predict log error pressure.
+    """Train an AbstractNN program to predict log error pressure.
 
-    The training uses Turing's tape reverse mode and ``AutogradProcess``. Its
-    graph/schedule export is part of the acceptance result, not a silent
-    best-effort side path.
+    The model is built from ``abstract_nn`` layers, captured once as the shared
+    ``FusedProgram`` IR, and replayed for every optimization and inference
+    pass. Tape reverse mode and ``AutogradProcess`` supply the backward graph
+    and schedule.
     """
     features = np.asarray(features, dtype=np.float64)
     errors = np.asarray(certificate_error, dtype=np.float64)
@@ -261,40 +304,56 @@ def train_refinement_predictor(
     autograd.tape = GradTape()
     try:
         setup_started = perf_counter()
-        x = AT.tensor(normalized, dtype=tensor_dtype)
         x_train = AT.tensor(normalized[training_mask], dtype=tensor_dtype)
         y_train = AT.tensor(fit_target[training_mask], dtype=tensor_dtype)
-        rng = np.random.default_rng(seed)
-        weight_hidden = AT.tensor(
-            rng.normal(
-                0.0, 0.15, size=(features.shape[1], hidden_dimension)
-            ),
-            dtype=tensor_dtype,
+        set_seed(seed)
+        hidden_layer = Linear(
+            features.shape[1],
+            hidden_dimension,
+            like=x_train,
+            bias=True,
+            init="xavier",
+            _label_prefix="refinement",
         )
-        bias_hidden = AT.tensor(
-            np.zeros((hidden_dimension,), dtype=np.float64),
-            dtype=tensor_dtype,
+        output_layer = Linear(
+            hidden_dimension,
+            1,
+            like=x_train,
+            bias=True,
+            init="xavier",
+            _label_prefix="refinement",
         )
-        weight_output = AT.tensor(
-            rng.normal(0.0, 0.1, size=(hidden_dimension, 1)),
-            dtype=tensor_dtype,
+        model = Sequential(
+            [hidden_layer, output_layer],
+            [Tanh(), Identity()],
         )
-        bias_output = AT.tensor(
-            np.zeros((1,), dtype=np.float64), dtype=tensor_dtype
+        params = tuple(model.parameters())
+        program, program_input_id = _capture_refinement_program(
+            model, x_train
         )
-        params = (weight_hidden, bias_hidden, weight_output, bias_output)
-        for parameter in params:
-            parameter.requires_grad_(True)
+        parameter_feeds = {id(parameter): parameter for parameter in params}
+        missing_feeds = (
+            set(program.feeds)
+            - {program_input_id}
+            - set(parameter_feeds)
+        )
+        if missing_feeds:
+            raise RuntimeError(
+                "refinement FusedProgram has unexplained feeds: "
+                f"{sorted(missing_feeds)}"
+            )
+        runner = ProgramRunner(program)
+        loss_module = MSELoss()
         tensor_setup_sec = perf_counter() - setup_started
 
         def predict(values):
-            hidden = (values @ weight_hidden + bias_hidden).tanh()
-            return hidden @ weight_output + bias_output
+            feeds = dict(parameter_feeds)
+            feeds[program_input_id] = values
+            return runner(feeds, training=False)["prediction"]
 
         def loss_fn():
             prediction = predict(x_train)
-            difference = prediction - y_train
-            loss = (difference * difference).mean()
+            loss = loss_module.forward(prediction, y_train)
             return loss, float(loss.item())
 
         process = AutogradProcess(autograd.tape)
@@ -304,7 +363,11 @@ def train_refinement_predictor(
         )
         optimization_sec = perf_counter() - optimization_started
         inference_started = perf_counter()
-        prediction = np.asarray(predict(x).tolist(), dtype=np.float64)
+        x_all = AT.tensor(normalized, dtype=tensor_dtype)
+        with autograd.no_grad():
+            prediction = np.asarray(
+                predict(x_all).tolist(), dtype=np.float64
+            )
         inference_sec = perf_counter() - inference_started
         validation_target = target[validation_mask, 0]
         validation_prediction = prediction[validation_mask, 0]
@@ -341,10 +404,10 @@ def train_refinement_predictor(
             accepted=accepted,
             feature_mean=feature_mean,
             feature_scale=feature_scale,
-            weight_hidden=np.asarray(weight_hidden.tolist()),
-            bias_hidden=np.asarray(bias_hidden.tolist()),
-            weight_output=np.asarray(weight_output.tolist()),
-            bias_output=np.asarray(bias_output.tolist()),
+            weight_hidden=np.asarray(hidden_layer.W.tolist()),
+            bias_hidden=np.asarray(hidden_layer.b.tolist()).reshape(-1),
+            weight_output=np.asarray(output_layer.W.tolist()),
+            bias_output=np.asarray(output_layer.b.tolist()).reshape(-1),
             tensor_dtype=tensor_dtype,
             tensor_backend=AT._preferred_backend,
             tensor_device=(
@@ -356,6 +419,12 @@ def train_refinement_predictor(
             optimization_sec=optimization_sec,
             inference_sec=inference_sec,
             seed=seed,
+            fused_program=program,
+            fused_input_id=program_input_id,
+            fused_feed_values={
+                feed_id: np.asarray(parameter.tolist())
+                for feed_id, parameter in parameter_feeds.items()
+            },
         )
     finally:
         autograd.tape = previous_tape

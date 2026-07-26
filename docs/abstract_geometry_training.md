@@ -60,11 +60,15 @@ Turing contains two related gradient layers:
 - AutoAutograd's whiteboard/batched-VJP scheduler, which packages residual
   jobs and asynchronous graph execution around tensor operations.
 
-The refinement predictor deliberately selects the first path and identifies
-it as `tape_reverse_mode+AutogradProcess`. `AutogradProcess` rebuilds the tape
-per epoch, performs the parameter update, and exports forward/backward graphs
-and schedules. Training is accepted only when loss decreases and those graphs
-are populated; there is no swallowed best-effort gradient call.
+The refinement predictor deliberately selects the first path. Its model is an
+`abstract_nn.Sequential` of the established `Linear`, `Tanh`, and `Identity`
+modules with `MSELoss`. One eager forward is captured into the shared
+`FusedProgram`; every optimization epoch and every later alpha inference
+replays that program through `ProgramRunner`. `AutogradProcess` rebuilds the
+reverse-mode tape around each replay, performs the parameter update, and
+exports forward/backward graphs and schedules. Training is accepted only when
+loss decreases and those graphs are populated; there is no hand-written MLP
+execution path or swallowed best-effort gradient call.
 
 The AutoAutograd FluxSpring path is not claimed by this demo. During this work
 its separate in-progress module could not collect because another concurrent
@@ -94,7 +98,7 @@ source-relative Laplace error. Targets use:
 log(1 + local_Laplace_error / robust_error_scale)
 ```
 
-An AbstractTensor MLP learns this refinement-pressure field. Its held-out
+The captured `abstract_nn` program learns this refinement-pressure field. Its held-out
 validation must beat a constant baseline and meet the configured correlation
 threshold before the prediction is allowed to affect geometry. An accepted
 model becomes an alpha map: the configured highest-pressure quantile requests
@@ -145,6 +149,13 @@ The CLI separates geometry and training placement:
 --tensor-backend numpy
 --training-backend torch --training-device cuda --training-dtype float32
 ```
+
+`c` is also a valid geometry and training backend. The complete headless
+YoungMan → spline → triangulation → cotangent-Laplace → captured-neural
+training round trip is exercised under C, not just the isolated dense layer.
+The work required no demo-specific C branches: shared tuple indexing,
+broadcasted batched matmul, persistent `copyto`, and the canonical elementary
+function set were completed in the backend and its Nodus operation catalog.
 
 The validated mixed-precision contract keeps source, spline, metric, and
 Laplace validation in NumPy FP64 while placing only dense neural training on

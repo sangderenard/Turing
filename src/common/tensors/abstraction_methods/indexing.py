@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Tuple
 
+import numpy as np
 
-def normalize_basic_index(index: Any, shape: Tuple[int, ...]):
-    """Normalize basic indexing into per-axis indices and output shape.
 
-    Integer axes are retained as one-element selections but omitted from the
-    logical output shape. This gives read and write lowerings one shared
-    interpretation of integers, slices, negative indices, and ellipses.
-    """
+@dataclass(frozen=True)
+class NormalizedIndexAxis:
+    indices: tuple[int, ...]
+    drop_axis: bool
+    index_shape: tuple[int, ...] | None = None
+
+    @property
+    def advanced(self) -> bool:
+        return self.index_shape is not None
+
+
+def normalize_index(index: Any, shape: Tuple[int, ...]):
+    """Normalize basic indexing plus one shaped integer-array index."""
+
     items = list(index) if isinstance(index, tuple) else [index]
     ellipses = sum(item is Ellipsis for item in items)
     if ellipses > 1:
@@ -27,22 +37,93 @@ def normalize_basic_index(index: Any, shape: Tuple[int, ...]):
         raise IndexError("too many indices for tensor")
     items.extend([slice(None)] * (len(shape) - len(items)))
 
-    axes = []
-    output_shape = []
+    axes: list[NormalizedIndexAxis] = []
+    output_shape: list[int] = []
+    advanced_count = 0
     for axis_size, item in zip(shape, items):
-        if isinstance(item, int):
-            if item < -axis_size or item >= axis_size:
+        if isinstance(item, (int, np.integer)):
+            value = int(item)
+            if value < -axis_size or value >= axis_size:
                 raise IndexError("tensor index out of range")
-            axes.append(([item % axis_size], True))
+            axes.append(NormalizedIndexAxis((value % axis_size,), True))
         elif isinstance(item, slice):
-            indices = list(range(*item.indices(axis_size)))
-            axes.append((indices, False))
+            indices = tuple(range(*item.indices(axis_size)))
+            axes.append(NormalizedIndexAxis(indices, False))
             output_shape.append(len(indices))
         else:
+            raw = item.tolist() if hasattr(item, "tolist") else item
+            array = np.asarray(raw)
+            if array.dtype.kind not in "iu":
+                raise TypeError("advanced tensor indices must be integers")
+            advanced_count += 1
+            if advanced_count > 1:
+                raise NotImplementedError(
+                    "at most one integer-array index is currently supported"
+                )
+            normalized = array.astype(np.int64, copy=False)
+            normalized = np.where(
+                normalized < 0, normalized + axis_size, normalized
+            )
+            if np.any((normalized < 0) | (normalized >= axis_size)):
+                raise IndexError("tensor index out of range")
+            index_shape = tuple(int(size) for size in normalized.shape)
+            axes.append(
+                NormalizedIndexAxis(
+                    tuple(int(value) for value in normalized.reshape(-1)),
+                    False,
+                    index_shape,
+                )
+            )
+            output_shape.extend(index_shape)
+    return tuple(axes), tuple(output_shape)
+
+
+def normalize_basic_index(index: Any, shape: Tuple[int, ...]):
+    """Normalize basic indexing into per-axis indices and output shape.
+
+    Integer axes are retained as one-element selections but omitted from the
+    logical output shape. This gives read and write lowerings one shared
+    interpretation of integers, slices, negative indices, and ellipses.
+    """
+    normalized, output_shape = normalize_index(index, shape)
+    axes = []
+    for axis in normalized:
+        if axis.advanced:
             raise NotImplementedError(
                 "basic indexing supports integers, slices, and ellipses"
             )
-    return axes, tuple(output_shape)
+        axes.append((list(axis.indices), axis.drop_axis))
+    return axes, output_shape
+
+
+def flat_index_ids(index: Any, shape: Tuple[int, ...]) -> np.ndarray:
+    """Return row-major source offsets selected by a normalized index."""
+
+    axes, output_shape = normalize_index(index, shape)
+    strides = []
+    running = 1
+    for size in reversed(shape):
+        strides.append(running)
+        running *= size
+    strides.reverse()
+    offsets = np.zeros(output_shape, dtype=np.int64)
+    output_axis = 0
+    for axis, stride in zip(axes, strides):
+        if axis.drop_axis:
+            offsets += axis.indices[0] * stride
+            continue
+        local_shape = axis.index_shape or (len(axis.indices),)
+        coordinate = np.asarray(axis.indices, dtype=np.int64).reshape(
+            local_shape
+        )
+        broadcast_shape = (
+            (1,) * output_axis
+            + local_shape
+            + (1,) * (len(output_shape) - output_axis - len(local_shape))
+        )
+        offsets += coordinate.reshape(broadcast_shape) * stride
+        output_axis += len(local_shape)
+    return offsets
 
 
 def lower_basic_index(
@@ -60,11 +141,12 @@ def lower_basic_index(
     share one AbstractTensor-level policy while numerical gathering remains a
     backend primitive.
     """
-    axes, _ = normalize_basic_index(index, tuple(shape_of(data)))
+    axes, _ = normalize_index(index, tuple(shape_of(data)))
     current = data
     output_axis = 0
-    for indices, drop_axis in axes:
-        if drop_axis:
+    for axis in axes:
+        indices = list(axis.indices)
+        if axis.drop_axis:
             selected = index_select(current, output_axis, indices)
             selected_shape = shape_of(selected)
             current = reshape(
@@ -72,6 +154,16 @@ def lower_basic_index(
                 selected_shape[:output_axis]
                 + selected_shape[output_axis + 1:],
             )
+        elif axis.advanced:
+            selected = index_select(current, output_axis, indices)
+            selected_shape = shape_of(selected)
+            current = reshape(
+                selected,
+                selected_shape[:output_axis]
+                + axis.index_shape
+                + selected_shape[output_axis + 1:],
+            )
+            output_axis += len(axis.index_shape)
         else:
             current = index_select(current, output_axis, indices)
             output_axis += 1

@@ -190,13 +190,49 @@
                     out[i] = isinf(value) ? 1.0 : 0.0; break;
                 case CT_OP_LOGICAL_NOT:
                     out[i] = value == 0.0 ? 1.0 : 0.0; break;
+                case CT_OP_TANH: out[i] = tanh(value); break;
+                case CT_OP_SIN: out[i] = sin(value); break;
+                case CT_OP_COS: out[i] = cos(value); break;
+                case CT_OP_TAN: out[i] = tan(value); break;
+                case CT_OP_ASIN: out[i] = asin(value); break;
+                case CT_OP_ACOS: out[i] = acos(value); break;
+                case CT_OP_ATAN: out[i] = atan(value); break;
+                case CT_OP_SINH: out[i] = sinh(value); break;
+                case CT_OP_COSH: out[i] = cosh(value); break;
+                case CT_OP_ASINH: out[i] = asinh(value); break;
+                case CT_OP_ACOSH: out[i] = acosh(value); break;
+                case CT_OP_ATANH: out[i] = atanh(value); break;
                 default: out[i] = value; break;
             }
         }
     }
+    void batched_matmul_indexed_double(
+        const double* a,
+        const double* b,
+        double* out,
+        const int* a_offsets,
+        const int* b_offsets,
+        int batch_count,
+        int m,
+        int n,
+        int p) {
+        const int output_stride = m * p;
+        for (int batch = 0; batch < batch_count; ++batch) {
+            matmul_double(
+                a + a_offsets[batch],
+                b + b_offsets[batch],
+                out + batch * output_stride,
+                m,
+                n,
+                p);
+        }
+    }
 
     static int is_unary_op(int op) {
-        return op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT;
+        return (
+            (op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT)
+            || (op >= CT_OP_TANH && op <= CT_OP_ATANH)
+        );
     }
 
     int ctensor_execute_primitive_program_slots(

@@ -131,8 +131,10 @@ one path only. A particularly natural first target is refinement prediction:
 it can reduce expensive black-box probes while leaving mesh values and all
 acceptance decisions under the existing geometric certificate.
 
-The first geometry-linked learner is now active by default. It trains an
-AbstractTensor refinement-pressure network on a cross-manifold corpus and
+The first geometry-linked learner is now active by default. It builds the
+network from `abstract_nn` modules, captures its forward path once as the
+shared `FusedProgram`, and replays that same program for training and
+inference on the selected backend. It trains on a cross-manifold corpus and
 reports held-out validation, its exported autograd schedule, and independent
 pilot/guided mesh certification. `--no-train` provides the unassisted timing
 baseline; `--training-epochs` controls the assisted run. A learned mesh is

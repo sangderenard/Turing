@@ -44,7 +44,14 @@ def from_list_like(
     Supports requires_grad and tape propagation without creating intermediate numpy arrays.
     """
     cls = type(like)
-    t = AbstractTensor.get_tensor(data, cls=cls, requires_grad=requires_grad, tape=tape)
+    t = AbstractTensor.get_tensor(
+        data,
+        cls=cls,
+        dtype=like.get_dtype(),
+        device=like.get_device(),
+        requires_grad=requires_grad,
+        tape=tape,
+    )
     if requires_grad:
         try:
             t.requires_grad_(True)

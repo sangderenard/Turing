@@ -25,7 +25,14 @@ import sys
 import ast
 import random
 
-from ..fused_ir import FusedProgram, Meta, OpStep
+from ..fused_ir import (
+    ELEMENTWISE_BINARY,
+    ELEMENTWISE_UNARY,
+    FusedProgram,
+    Meta,
+    OpStep,
+    canonical_elementwise_op,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +241,20 @@ class ProgramRunner:
                 ) from ke
 
             cls = args[0].__class__ if args else (default_cls or AT)
-            fn = getattr(cls, step.op_name, None)
+            canonical_op = None
+            reverse_operands = False
+            try:
+                canonical_op, reverse_operands = canonical_elementwise_op(
+                    step.op_name
+                )
+            except KeyError:
+                pass
+            if canonical_op in ELEMENTWISE_UNARY | ELEMENTWISE_BINARY:
+                fn = getattr(args[0], "_apply_operator", None) if args else None
+            elif step.op_name == "matmul" and args:
+                fn = getattr(args[0], "_apply_operator", None)
+            else:
+                fn = getattr(cls, step.op_name, None)
             if fn is None:
                 # Suggest close method names
                 candidates = [n for n in dir(cls) if not n.startswith("_")]
@@ -289,7 +309,17 @@ class ProgramRunner:
                 pass
 
             try:
-                result = fn(*args, **call_kwargs)
+                if canonical_op in ELEMENTWISE_UNARY:
+                    result = fn(canonical_op, args[0], None)
+                elif canonical_op in ELEMENTWISE_BINARY:
+                    left, right = args[:2]
+                    if reverse_operands:
+                        left, right = right, left
+                    result = fn(canonical_op, left, right)
+                elif step.op_name == "matmul":
+                    result = fn("matmul", args[0], args[1])
+                else:
+                    result = fn(*args, **call_kwargs)
             except Exception as e:
                 # Gather neighbor context for diagnostics
                 prev_producers = [producers.get(i).step_id for i in step.input_ids if producers.get(i)]

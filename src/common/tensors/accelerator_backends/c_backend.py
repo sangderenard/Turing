@@ -53,7 +53,10 @@ ffi.cdef("""
         CT_OP_NEG, CT_OP_ABS, CT_OP_ROUND, CT_OP_TRUNC, CT_OP_FLOOR,
         CT_OP_CEIL, CT_OP_ISFINITE, CT_OP_ISNAN, CT_OP_ISINF,
         CT_OP_LOGICAL_NOT, CT_OP_LT, CT_OP_LE, CT_OP_GT, CT_OP_GE,
-        CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, ...
+        CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, CT_OP_TANH,
+        CT_OP_SIN, CT_OP_COS, CT_OP_TAN, CT_OP_ASIN, CT_OP_ACOS,
+        CT_OP_ATAN, CT_OP_SINH, CT_OP_COSH, CT_OP_ASINH, CT_OP_ACOSH,
+        CT_OP_ATANH, ...
     } CTensorOp;
     typedef enum CTensorOperandKind {
         CT_OPERAND_NONE, CT_OPERAND_SLOT, CT_OPERAND_SCALAR
@@ -73,6 +76,10 @@ ffi.cdef("""
     void binary_scalar_double(
         const double* a, double b, double* out, int n, int op, int reverse);
     void matmul_double(const double* a, const double* b, double* out, int m, int n, int p);
+    void batched_matmul_indexed_double(
+        const double* a, const double* b, double* out,
+        const int* a_offsets, const int* b_offsets,
+        int batch_count, int m, int n, int p);
     void unary_double(const double* a, double* out, int n, int op);
     int ctensor_execute_primitive_program(
         const CTensorPrimitiveInstruction* instructions,
@@ -288,6 +295,81 @@ class CTensor:
         buf = ffi.new("double[]", [float(x) for x in flat])
         return cls(shape, buf)
 
+
+def _broadcast_batch_shapes(left: Tuple[int, ...], right: Tuple[int, ...]):
+    output = []
+    for offset in range(1, max(len(left), len(right)) + 1):
+        left_size = left[-offset] if offset <= len(left) else 1
+        right_size = right[-offset] if offset <= len(right) else 1
+        if left_size == 1:
+            output.append(right_size)
+        elif right_size == 1 or left_size == right_size:
+            output.append(left_size)
+        else:
+            raise ValueError(
+                f"cannot broadcast matmul batches {left} and {right}"
+            )
+    return tuple(reversed(output))
+
+
+def _contiguous_strides(shape: Tuple[int, ...]):
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * shape[axis + 1]
+    return tuple(strides)
+
+
+def _matmul_ctensor(left: CTensor, right: CTensor) -> CTensor:
+    """One-call C matmul with NumPy-style broadcasted batch dimensions."""
+
+    if len(left.shape) < 2 or len(right.shape) < 2:
+        raise ValueError("matmul expects tensors with at least two dimensions")
+    m, n = left.shape[-2:]
+    n2, p = right.shape[-2:]
+    if n != n2:
+        raise ValueError("Shape mismatch for matmul")
+    left_batch = left.shape[:-2]
+    right_batch = right.shape[:-2]
+    batch_shape = _broadcast_batch_shapes(left_batch, right_batch)
+    rank = len(batch_shape)
+    padded_left = (1,) * (rank - len(left_batch)) + left_batch
+    padded_right = (1,) * (rank - len(right_batch)) + right_batch
+    left_strides = _contiguous_strides(padded_left + (m, n))[:rank]
+    right_strides = _contiguous_strides(padded_right + (n, p))[:rank]
+    batch_count = 1
+    for size in batch_shape:
+        batch_count *= size
+    batch_strides = _contiguous_strides(batch_shape)
+    left_offsets = []
+    right_offsets = []
+    for linear in range(batch_count):
+        remainder = linear
+        left_offset = 0
+        right_offset = 0
+        for axis, stride in enumerate(batch_strides):
+            coordinate = 0 if stride == 0 else remainder // stride
+            remainder = remainder if stride == 0 else remainder % stride
+            if padded_left[axis] != 1:
+                left_offset += coordinate * left_strides[axis]
+            if padded_right[axis] != 1:
+                right_offset += coordinate * right_strides[axis]
+        left_offsets.append(left_offset)
+        right_offsets.append(right_offset)
+    out = CTensor(batch_shape + (m, p))
+    C.batched_matmul_indexed_double(
+        left.as_c_ptr(),
+        right.as_c_ptr(),
+        out.as_c_ptr(),
+        ffi.new("int[]", left_offsets),
+        ffi.new("int[]", right_offsets),
+        batch_count,
+        m,
+        n,
+        p,
+    )
+    return out
+
+
 class CTensorOperations(AbstractTensor):
     """C backend using cffi for all arithmetic ops."""
 
@@ -314,6 +396,18 @@ class CTensorOperations(AbstractTensor):
             "sqrt": C.CT_OP_SQRT,
             "exp": C.CT_OP_EXP,
             "log": C.CT_OP_LOG,
+            "tanh": C.CT_OP_TANH,
+            "sin": C.CT_OP_SIN,
+            "cos": C.CT_OP_COS,
+            "tan": C.CT_OP_TAN,
+            "asin": C.CT_OP_ASIN,
+            "acos": C.CT_OP_ACOS,
+            "atan": C.CT_OP_ATAN,
+            "sinh": C.CT_OP_SINH,
+            "cosh": C.CT_OP_COSH,
+            "asinh": C.CT_OP_ASINH,
+            "acosh": C.CT_OP_ACOSH,
+            "atanh": C.CT_OP_ATANH,
             "neg": C.CT_OP_NEG,
             "abs": C.CT_OP_ABS,
             "round": C.CT_OP_ROUND,
@@ -339,14 +433,7 @@ class CTensorOperations(AbstractTensor):
         if isinstance(right, CTensor) and isinstance(left, CTensor):
             if op in ('matmul', 'rmatmul', 'imatmul'):
                 a, b = (left, right) if op != 'rmatmul' else (right, left)
-                if len(a.shape) != 2 or len(b.shape) != 2:
-                    raise ValueError("matmul expects 2D tensors")
-                m, n = a.shape
-                n2, p = b.shape
-                if n != n2:
-                    raise ValueError("Shape mismatch for matmul")
-                out = CTensor((m, p))
-                C.matmul_double(a.as_c_ptr(), b.as_c_ptr(), out.as_c_ptr(), m, n, p)
+                out = _matmul_ctensor(a, b)
                 if op == 'imatmul':
                     left.buffer = out.buffer
                     left.shape = out.shape
@@ -385,7 +472,22 @@ class CTensorOperations(AbstractTensor):
             )
             return out
         elif isinstance(left, (int, float)) and isinstance(right, CTensor):
-            return self._apply_operator__(op, right, left)
+            canonical = op[1:] if op.startswith(("i", "r")) else op
+            code = binary_codes.get(canonical)
+            if code is None:
+                raise NotImplementedError(
+                    f"Operator {op} not implemented for C backend."
+                )
+            out = CTensor(right.shape)
+            C.binary_scalar_double(
+                right.as_c_ptr(),
+                float(left),
+                out.as_c_ptr(),
+                right.size,
+                code,
+                1,
+            )
+            return out
         elif isinstance(left, CTensor) and isinstance(right, (int, float)):
             out = CTensor(left.shape)
             n = left.size
@@ -417,6 +519,39 @@ class CTensorOperations(AbstractTensor):
         t = CTensor(tensor.shape)
         ffi.memmove(t.buffer, tensor.buffer, tensor.size * ffi.sizeof("double"))
         return t
+
+    def copyto_(self, src, *, where=None, casting="same_kind"):
+        """Copy into persistent C storage, optionally under a tensor mask."""
+
+        source = src.data if isinstance(src, AbstractTensor) else src
+        if not isinstance(source, CTensor):
+            source = CTensor.from_list(source, _get_shape(source))
+        if source.shape != self.data.shape:
+            temporary = type(self)()
+            temporary.data = source
+            source = temporary.expand_(self.data.shape)
+        if where is None:
+            ffi.memmove(
+                self.data.buffer,
+                source.buffer,
+                self.data.size * ffi.sizeof("double"),
+            )
+            return self.data
+        mask = where.data if isinstance(where, AbstractTensor) else where
+        if not isinstance(mask, CTensor):
+            mask = CTensor.from_list(mask, _get_shape(mask))
+        if mask.shape != self.data.shape:
+            temporary = type(self)()
+            temporary.data = mask
+            mask = temporary.expand_(self.data.shape)
+        C.where_double(
+            mask.as_c_ptr(),
+            source.as_c_ptr(),
+            self.data.as_c_ptr(),
+            self.data.as_c_ptr(),
+            self.data.size,
+        )
+        return self.data
 
     def to_device_(self, tensor: CTensor, device: Any) -> CTensor:
         return tensor  # No-op for now
@@ -716,15 +851,7 @@ class CTensorOperations(AbstractTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
         if not isinstance(other, CTensor):
             other = CTensor.from_list(other, _get_shape(other))
-        if len(tensor.shape) != 2 or len(other.shape) != 2:
-            raise ValueError("matmul expects 2D tensors")
-        m, n = tensor.shape
-        n2, p = other.shape
-        if n != n2:
-            raise ValueError("Shape mismatch for matmul")
-        out = CTensor((m, p))
-        C.matmul_double(tensor.as_c_ptr(), other.as_c_ptr(), out.as_c_ptr(), m, n, p)
-        return out
+        return _matmul_ctensor(tensor, other)
 
     def tensor_from_list_(self, data: List[Any], dtype: Any, device: Any) -> CTensor:
         shape = _get_shape(data)

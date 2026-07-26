@@ -792,7 +792,10 @@ def build_blackbox_roundtrip(
         finish_stage("abstract_nn_training", started)
     if train_network:
         training_rows.append({
-            "engine": "tape_reverse_mode+AutogradProcess",
+            "engine": (
+                "abstract_nn.Sequential+FusedProgram+"
+                "tape_reverse_mode+AutogradProcess"
+            ),
             "backend": trained.tensor_backend or "auto",
             "device": trained.tensor_device or "default",
             "dtype": trained.tensor_dtype,
@@ -996,7 +999,7 @@ def main() -> None:
     parser.add_argument("--live-max-frames", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--no-train", action="store_true")
     parser.add_argument(
-        "--tensor-backend", choices=("numpy", "torch"), default="numpy"
+        "--tensor-backend", choices=("numpy", "torch", "c"), default="numpy"
     )
     parser.add_argument(
         "--tensor-device",
@@ -1010,7 +1013,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--training-backend",
-        choices=("numpy", "torch"),
+        choices=("numpy", "torch", "c"),
         default=None,
         help="override the geometry backend for neural training only",
     )

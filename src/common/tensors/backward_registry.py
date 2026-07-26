@@ -110,6 +110,7 @@ from typing import Dict, Any, List
 import numbers
 import numpy as np
 from .abstraction import AbstractTensor
+from .abstraction_methods.indexing import flat_index_ids
 
 helpers_spec: Dict[str, str] = {
     "unbroadcast":
@@ -216,31 +217,28 @@ def index_adjoint(G, source, index):
     input_shape = tuple(source.shape)
     if isinstance(index, AbstractTensor):
         index = index.tolist()
-    is_advanced_first_axis = (
-        not isinstance(index, tuple)
-        and not isinstance(index, (int, slice))
-        and index is not Ellipsis
+    def _advanced(item):
+        return (
+            not isinstance(item, (int, np.integer, slice))
+            and item is not Ellipsis
+        )
+
+    has_advanced_index = (
+        any(_advanced(item) for item in index)
+        if isinstance(index, tuple)
+        else _advanced(index)
     )
-    if not is_advanced_first_axis:
+    if not has_advanced_index:
         result = AbstractTensor.zeros_like(source)
         result[index] = G
         return result
 
-    ids = np.asarray(index)
-    if ids.dtype.kind not in "iu":
-        raise TypeError("index backward requires integer indices")
-    if not input_shape:
-        raise IndexError("cannot index a scalar tensor")
-    vertex_count = input_shape[0]
-    ids = ids.astype(np.int64, copy=False).reshape(-1)
-    ids = np.where(ids < 0, ids + vertex_count, ids)
-    if np.any((ids < 0) | (ids >= vertex_count)):
-        raise IndexError("tensor index out of range")
-
-    tail_shape = input_shape[1:]
-    values = G.reshape((len(ids),) + tail_shape)
+    ids = flat_index_ids(index, input_shape).reshape(-1)
+    value_count = int(np.prod(input_shape))
+    values = G.reshape((len(ids),))
     zeros = AbstractTensor.zeros_like(source)
-    all_ids = np.concatenate((ids, np.arange(vertex_count, dtype=np.int64)))
+    zeros = zeros.reshape((value_count,))
+    all_ids = np.concatenate((ids, np.arange(value_count, dtype=np.int64)))
     order = np.argsort(all_ids, kind="stable")
     ordered_ids = all_ids[order]
     end_positions = np.flatnonzero(
@@ -251,7 +249,7 @@ def index_adjoint(G, source, index):
     previous = AbstractTensor.cat(
         (ends[:1] * 0.0, cumulative[end_positions[:-1]]), dim=0
     )
-    return ends - previous
+    return (ends - previous).reshape(input_shape)
 
 
 def coerce_to_tensor(value):
