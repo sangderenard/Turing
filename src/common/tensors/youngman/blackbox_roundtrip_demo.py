@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -17,11 +18,7 @@ from ..riemann import (
     TriangulationTolerance,
 )
 from .algorithm import DomainTetrahedra, compile_grid_domain, extract_isosurface
-from .metric_roundtrip_demo import (
-    _surface_field,
-    detailed_embedding,
-    detailed_jacobian,
-)
+from .metric_roundtrip_demo import detailed_embedding, detailed_jacobian
 from .spline import StreamingSplineSolver, validate_single_valued_chart
 
 
@@ -31,6 +28,7 @@ class BlackBoxRoundTrip:
     triangles: pd.DataFrame
     mesh: object
     geometry_transform: TriangulatedSurfaceTransform
+    profile: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -47,37 +45,43 @@ class PublishedSurfaceSpline:
         return _finite_jacobian(self, uv)
 
 
-def source_surface_parameters(uv: np.ndarray) -> np.ndarray:
+def source_surface_parameters(
+    uv: np.ndarray, time_value: float = 0.0
+) -> np.ndarray:
     """Exact source chart, used only by YoungMan/reference measurements."""
     u, v = np.asarray(uv, dtype=np.float64).T
     tau = 2.0 * np.pi
-    target_z = 0.5 + 0.12 * np.sin(tau * u) * np.cos(tau * v)
-    visible_warp = 0.075 * np.sin(tau * u) * np.sin(tau * v)
+    phase = tau * float(time_value)
+    target_z = 0.5 + 0.12 * np.sin(tau * u + phase) * np.cos(tau * v)
+    visible_warp = 0.075 * np.sin(tau * u + phase) * np.sin(tau * v)
     return np.stack((u, v, target_z - visible_warp), axis=1)
 
 
-def source_surface(uv: np.ndarray) -> np.ndarray:
-    return detailed_embedding(source_surface_parameters(uv))
+def source_surface(uv: np.ndarray, time_value: float = 0.0) -> np.ndarray:
+    return detailed_embedding(source_surface_parameters(uv, time_value))
 
 
-def source_surface_jacobian(uv: np.ndarray) -> np.ndarray:
+def source_surface_jacobian(
+    uv: np.ndarray, time_value: float = 0.0
+) -> np.ndarray:
     uv = np.asarray(uv, dtype=np.float64)
     u, v = uv.T
     tau = 2.0 * np.pi
+    phase = tau * float(time_value)
     parameter_jacobian = np.zeros((len(uv), 3, 2), dtype=np.float64)
     parameter_jacobian[:, 0, 0] = 1.0
     parameter_jacobian[:, 1, 1] = 1.0
     parameter_jacobian[:, 2, 0] = (
-        0.12 * tau * np.cos(tau * u) * np.cos(tau * v)
-        - 0.075 * tau * np.cos(tau * u) * np.sin(tau * v)
+        0.12 * tau * np.cos(tau * u + phase) * np.cos(tau * v)
+        - 0.075 * tau * np.cos(tau * u + phase) * np.sin(tau * v)
     )
     parameter_jacobian[:, 2, 1] = (
-        -0.12 * tau * np.sin(tau * u) * np.sin(tau * v)
-        - 0.075 * tau * np.sin(tau * u) * np.cos(tau * v)
+        -0.12 * tau * np.sin(tau * u + phase) * np.sin(tau * v)
+        - 0.075 * tau * np.sin(tau * u + phase) * np.cos(tau * v)
     )
     return np.einsum(
         "nmi,nij->nmj",
-        detailed_jacobian(source_surface_parameters(uv)),
+        detailed_jacobian(source_surface_parameters(uv, time_value)),
         parameter_jacobian,
     )
 
@@ -142,7 +146,7 @@ def continuous_surface_laplace(
     return divergence / root_det
 
 
-def _domain_and_extraction(resolution: int):
+def _domain_and_extraction(resolution: int, time_value: float = 0.0):
     domain = GridDomain.generate_grid_domain(
         "rectangular",
         N_u=resolution + 1,
@@ -159,9 +163,19 @@ def _domain_and_extraction(resolution: int):
         identity.parametric,
         expanded[:, :3].reshape(identity.parametric.shape),
     )
+    phase = 2.0 * np.pi * float(time_value)
+
+    def time_surface_field(points):
+        xyz = np.asarray(points.tolist(), dtype=np.float64)
+        x, y, z = xyz.transpose(2, 0, 1)
+        target = 0.5 + 0.12 * np.sin(2.0 * np.pi * x + phase) * np.cos(
+            2.0 * np.pi * y
+        )
+        return type(points).get_tensor(z - target)
+
     extraction = extract_isosurface(
         compiled.embedded,
-        _surface_field,
+        time_surface_field,
         parametric_tetrahedra=compiled.parametric,
         expanded_embedding=detailed_embedding,
     )
@@ -196,13 +210,27 @@ def build_blackbox_roundtrip(
     *,
     max_rounds: int = 9,
     max_triangles: int = 80_000,
+    time_value: float = 0.0,
 ) -> BlackBoxRoundTrip:
     """Build every stage while enforcing the spline/triangulator black box."""
-    _, extraction = _domain_and_extraction(youngman_resolution)
+    profile_rows = []
+
+    def finish_stage(name, started):
+        profile_rows.append({
+            "stage": name,
+            "elapsed_sec": perf_counter() - started,
+        })
+
+    total_started = perf_counter()
+    started = perf_counter()
+    _, extraction = _domain_and_extraction(youngman_resolution, time_value)
+    finish_stage("youngman_extract", started)
     samples = extraction.solver_samples
     assert samples is not None and samples.parametric_points is not None
 
+    started = perf_counter()
     spline_surface, control_point_count = publish_surface_spline(samples)
+    finish_stage("fifo_spline_fit", started)
 
     triangulator = AdaptiveSurfaceTriangulator(
         spline_surface,
@@ -215,33 +243,40 @@ def build_blackbox_roundtrip(
         ),
         initial_resolution=(4, 4),
     )
+    started = perf_counter()
     mesh = triangulator.triangulate()
+    finish_stage("adaptive_triangulation", started)
 
+    started = perf_counter()
     uv = mesh.parameters
-    source_values = source_surface(uv)
+    source_values = source_surface(uv, time_value)
     spline_values = mesh.embedded
-    source_jacobian = source_surface_jacobian(uv)
+    source_jacobian = source_surface_jacobian(uv, time_value)
     spline_jacobian_values = spline_surface.jacobian(uv)
     source_metric = _metric(source_jacobian)
     spline_metric = _metric(spline_jacobian_values)
     source_continuous_laplace = continuous_surface_laplace(
-        uv, lambda query: _metric(source_surface_jacobian(query))
+        uv, lambda query: _metric(source_surface_jacobian(query, time_value))
     )
     spline_continuous_laplace = continuous_surface_laplace(
         uv, lambda query: _metric(spline_surface.jacobian(query))
     )
+    finish_stage("continuous_reference", started)
 
+    started = perf_counter()
     geometry_transform = TriangulatedSurfaceTransform.from_mesh(
         mesh.parameters, mesh.embedded, mesh.triangles
     )
     mesh_result = geometry_transform.laplace(probe_values(uv))
     mesh_laplace = mesh_result.laplacian
+    finish_stage("mesh_transform_laplace", started)
     boundary = mesh_result.geometry.boundary_vertex_mask
     interior = (
         ~boundary
         & ~mesh_result.geometry.invalid_vertex_mask
     )
 
+    started = perf_counter()
     youngman_error = np.linalg.norm(
         samples.embedded_points
         - detailed_embedding(samples.parametric_points)[:, :3],
@@ -270,6 +305,7 @@ def build_blackbox_roundtrip(
         return float(np.sqrt(np.sum(weights * values[selected] ** 2) / weights.sum()))
 
     summary = pd.DataFrame([{
+        "time_value": time_value,
         "youngman_resolution": youngman_resolution,
         "youngman_samples": samples.sample_count,
         "spline_controls": control_point_count,
@@ -330,7 +366,18 @@ def build_blackbox_roundtrip(
         "mesh_discretization_error": triangle_discretization,
         "touches_boundary": boundary[mesh.triangles].any(axis=1),
     })
-    return BlackBoxRoundTrip(summary, triangle_report, mesh, geometry_transform)
+    finish_stage("error_reporting", started)
+    profile_rows.append({
+        "stage": "total",
+        "elapsed_sec": perf_counter() - total_started,
+    })
+    return BlackBoxRoundTrip(
+        summary,
+        triangle_report,
+        mesh,
+        geometry_transform,
+        pd.DataFrame(profile_rows),
+    )
 
 
 def _load_pluck_viewer():
@@ -342,6 +389,26 @@ def _load_pluck_viewer():
     return ordinary_gl_mesh_viewer
 
 
+def _triangle_field(result, name: str) -> np.ndarray:
+    fields = {
+        "youngman": np.full(
+            result.mesh.triangle_count,
+            result.summary.loc[0, "youngman_error_rms"],
+        ),
+        "spline": result.triangles["spline_position_error"].to_numpy(),
+        "triangulation": result.triangles[
+            "triangulation_chord_error"
+        ].to_numpy(),
+        "metric": result.triangles["spline_metric_error"].to_numpy(),
+        "laplace": result.triangles["mesh_laplace_error"].to_numpy(),
+    }
+    return fields[name]
+
+
+def _profile_mapping(result: BlackBoxRoundTrip) -> dict[str, float]:
+    return dict(zip(result.profile["stage"], result.profile["elapsed_sec"]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--youngman-resolution", type=int, default=7)
@@ -349,6 +416,9 @@ def main() -> None:
     parser.add_argument("--tangent-tolerance", type=float, default=6e-1)
     parser.add_argument("--max-rounds", type=int, default=9)
     parser.add_argument("--max-triangles", type=int, default=80_000)
+    parser.add_argument("--time-value", type=float, default=0.0)
+    parser.add_argument("--animation", type=Path)
+    parser.add_argument("--animation-frames", type=int, default=8)
     parser.add_argument("--render-image", type=Path)
     parser.add_argument(
         "--error-field",
@@ -368,8 +438,10 @@ def main() -> None:
         args.tangent_tolerance,
         max_rounds=args.max_rounds,
         max_triangles=args.max_triangles,
+        time_value=args.time_value,
     )
     print("\nBLACK-BOX ROUND TRIP\n", result.summary.to_string(index=False))
+    print("\nPROFILE\n", result.profile.to_string(index=False))
     print("\nTRIANGLE CERTIFICATES\n", result.triangles.head(12).to_string(index=False))
     if not result.mesh.converged and not args.allow_unconverged:
         raise RuntimeError(
@@ -380,25 +452,76 @@ def main() -> None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         result.summary.to_csv(args.output_dir / "summary.csv", index=False)
         result.triangles.to_csv(args.output_dir / "triangles.csv", index=False)
+        result.profile.to_csv(args.output_dir / "profile.csv", index=False)
     if args.render_image:
-        fields = {
-            "youngman": np.full(result.mesh.triangle_count,
-                                result.summary.loc[0, "youngman_error_rms"]),
-            "spline": result.triangles["spline_position_error"].to_numpy(),
-            "triangulation": result.triangles[
-                "triangulation_chord_error"
-            ].to_numpy(),
-            "metric": result.triangles["spline_metric_error"].to_numpy(),
-            "laplace": result.triangles["mesh_laplace_error"].to_numpy(),
-        }
-        output = _load_pluck_viewer().render_triangle_mesh_image(
+        viewer = _load_pluck_viewer()
+        profile = _profile_mapping(result)
+        panel = viewer.rolling_profile_lines(
+            profile, (profile,), time_value=args.time_value
+        )
+        output = viewer.render_triangle_mesh_image(
             result.mesh.triangle_soup,
             args.render_image,
-            triangle_values=fields[args.error_field],
+            triangle_values=_triangle_field(result, args.error_field),
             value_label=f"{args.error_field} stage error",
             title="Black-box geometry round trip",
+            side_panel_lines=panel,
         )
         print(f"\nHEADLESS IMAGE\n {output}")
+    if args.animation:
+        if args.animation_frames < 2:
+            raise ValueError("--animation-frames must be at least 2")
+        from PIL import Image
+
+        viewer = _load_pluck_viewer()
+        frame_root = args.animation.with_suffix("")
+        frame_root.mkdir(parents=True, exist_ok=True)
+        history = []
+        images = []
+        for frame, time_value in enumerate(
+            np.linspace(0.0, 1.0, args.animation_frames, endpoint=False)
+        ):
+            animated = result if frame == 0 and args.time_value == 0.0 else (
+                build_blackbox_roundtrip(
+                    args.youngman_resolution,
+                    args.position_tolerance,
+                    args.tangent_tolerance,
+                    max_rounds=args.max_rounds,
+                    max_triangles=args.max_triangles,
+                    time_value=float(time_value),
+                )
+            )
+            if not animated.mesh.converged and not args.allow_unconverged:
+                raise RuntimeError(
+                    f"animation frame {frame} at t={time_value:.4f} did not "
+                    f"converge: {animated.mesh.stopped_reason}"
+                )
+            profile = _profile_mapping(animated)
+            history.append(profile)
+            panel = viewer.rolling_profile_lines(
+                profile, history, time_value=float(time_value)
+            )
+            frame_path = frame_root / f"frame_{frame:03d}.png"
+            viewer.render_triangle_mesh_image(
+                animated.mesh.triangle_soup,
+                frame_path,
+                triangle_values=_triangle_field(animated, args.error_field),
+                value_label=f"{args.error_field} stage error",
+                title="Time-varying black-box solve",
+                side_panel_lines=panel,
+            )
+            images.append(Image.open(frame_path).convert("RGB"))
+        args.animation.parent.mkdir(parents=True, exist_ok=True)
+        images[0].save(
+            args.animation,
+            save_all=True,
+            append_images=images[1:],
+            duration=900,
+            loop=0,
+        )
+        for image in images:
+            image.close()
+        print(f"\nPROFILED ANIMATION\n {args.animation.resolve()}")
 
 
 if __name__ == "__main__":

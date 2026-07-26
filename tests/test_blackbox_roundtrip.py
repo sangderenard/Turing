@@ -43,3 +43,13 @@ def test_multisheet_samples_are_rejected_before_spline_fit():
     samples = np.asarray(((0.2, 0.3, 0.0), (0.2, 0.3, 1.0)))
     with np.testing.assert_raises(ValueError):
         validate_single_valued_chart(samples, intrinsic_axes=(0, 1))
+
+
+def test_time_parameter_changes_geometry_periodically():
+    uv = np.asarray(((0.17, 0.31), (0.63, 0.72)))
+    assert not np.allclose(
+        demo.source_surface(uv, 0.0), demo.source_surface(uv, 0.25)
+    )
+    assert np.allclose(
+        demo.source_surface(uv, 0.0), demo.source_surface(uv, 1.0)
+    )

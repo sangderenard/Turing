@@ -55,3 +55,18 @@ are sent to the ordinary renderer.
 An uncertified run exits with an error by default. `--allow-unconverged`
 exists for deliberate failure diagnostics, while `--max-rounds` and
 `--max-triangles` make those stress cases reproducible.
+
+## Time-varying profiling
+
+`--time-value` phase-shifts the source geometry while preserving a periodic
+round trip (`t=0` and `t=1` agree). `--animation output.gif` repeats the
+complete YoungMan → spline → triangulation → reference → mesh-Laplacian solve
+for every frame. It does not deform or recolor a cached solution.
+
+Each run records wall-clock time for YoungMan extraction, FIFO fitting,
+adaptive triangulation, continuous reference evaluation, mesh
+transform/Laplacian construction, and error reporting. Pluck's ordinary mesh
+renderer displays current, arithmetic-mean, and 95th-percentile timings beside
+the surface. All runs, including the first warm-up, enter the rolling
+statistics. Image rendering and GIF encoding are deliberately outside the
+solver profile and CSV so display cost cannot be mistaken for numerical cost.
