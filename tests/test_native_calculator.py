@@ -2,12 +2,12 @@ import numpy as np
 
 from src.common.tensors.accelerator_backends.c_backend import CTensor
 from src.common.tensors.accelerator_backends.c_primitive_program import (
-    PrimitiveInstruction,
-    PrimitiveProgram,
+    prepare_fused_program,
 )
 from src.common.tensors.accelerator_backends.native_calculator import (
     get_native_calculator,
 )
+from src.common.tensors.fused_ir import FusedProgram, OpStep
 
 
 def test_c_tensors_bind_persistently_without_copying():
@@ -29,19 +29,24 @@ def test_prepared_program_can_submit_async_and_reuse_slots(monkeypatch):
     calculator = get_native_calculator(required=True)
     values = np.linspace(-4.0, 4.0, 8192)
     source = CTensor.from_list(values.tolist(), values.shape)
-    prepared = PrimitiveProgram(
-        feed_count=1,
-        slot_count=5,
-        output_slot=4,
-        instructions=(
-            PrimitiveInstruction("neg", 1, 0),
-            PrimitiveInstruction("exp", 2, 1),
-            PrimitiveInstruction("add", 3, 2, right_scalar=1.0),
-            PrimitiveInstruction(
-                "truediv", 4, 3, right_scalar=1.0, reverse=True
+    program = FusedProgram(
+        1,
+        {0},
+        [
+            OpStep(0, "neg", [0], result_id=1),
+            OpStep(1, "exp", [1], result_id=2),
+            OpStep(2, "add", [2], {"right_scalar": 1.0}, 3),
+            OpStep(
+                3,
+                "truediv",
+                [3],
+                {"right_scalar": 1.0, "reverse": True},
+                4,
             ),
-        ),
-    ).prepare([source])
+        ],
+        {"result": 4},
+    )
+    prepared = prepare_fused_program(program, [source])
 
     before = calculator.stats()
     job = prepared.submit()

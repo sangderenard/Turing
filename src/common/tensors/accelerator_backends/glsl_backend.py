@@ -1,19 +1,18 @@
-"""GLSL compute-shader execution target for elementwise primitive programs.
+"""GLSL compute-shader execution target for FusedProgram elementwise regions.
 
 This is the GPU sibling of the C backend. It deliberately mirrors that design
 rather than inventing a second one:
 
     c_backend/ctensor_ops.c      one flat CTensorOp vocabulary + a switch dispatcher
-    c_primitive_program.py       PrimitiveProgram: slots, feeds, instructions
-    glsl_backend.py  (this)      the same vocabulary + the same program shape,
-                                 executed as a fused GLSL compute shader
+    fused_ir.py                  one backend-neutral semantic program
+    c_primitive_program.py       private lowering to the native C slot ABI
+    glsl_backend.py  (this)      direct lowering to a fused compute shader
 
 The one structural difference is where the win comes from. The C interpreter walks
 instructions and writes every intermediate slot to memory. A GPU does not want
 that: an elementwise program of N instructions compiles to **one shader with N
-lines and a single dispatch**, where every intermediate slot is a register-resident
-local. Only feeds and the final output ever touch a buffer. So a PrimitiveProgram
-is not merely runnable here, it is the natural input format.
+lines and a single dispatch**, where every intermediate is a register-resident
+local. Only feeds and the final output ever touch a buffer.
 
 Memory model
 ------------
@@ -48,11 +47,19 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
-from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from ..fused_ir import (
+    ELEMENTWISE_BINARY,
+    ELEMENTWISE_UNARY,
+    FusedProgram,
+    OpStep,
+    canonical_elementwise_op,
+    ordered_feed_ids,
+    primary_output_id,
+)
 from .gl_context import (  # re-exported: the backend's public context surface
     GLContextUnavailable,
     gl_context_info,
@@ -70,8 +77,8 @@ __all__ = [
     "register_context_provider",
     "release_gl_context",
     "GLChunk",
-    "GlslInstruction",
-    "GlslProgram",
+    "FusedProgram",
+    "OpStep",
     "emit_program_source",
     "emit_op_source",
     "run_op",
@@ -147,17 +154,6 @@ _UNARY: dict[str, str] = {
     "logical_not": "float($a == 0.0)",
 }
 
-# Aliases accepted on the way in, matching c_primitive_program.compile_elementwise_tape.
-_ALIASES: dict[str, str] = {
-    "div": "truediv",
-    "less": "lt",
-    "less_equal": "le",
-    "greater": "gt",
-    "greater_equal": "ge",
-    "equal": "eq",
-    "not_equal": "ne",
-}
-
 GLSL_OPS: frozenset[str] = frozenset(_BINARY) | frozenset(_UNARY)
 
 _LOCAL_SIZE = 256
@@ -171,17 +167,16 @@ def canonical_op(op: str) -> tuple[str, bool]:
     ``isfinite``, ``invert`` and ``round`` survive intact instead of becoming
     ``snan``, ``sinf``, ``sfinite``, ``nvert`` and ``ound``.
     """
-    name = _ALIASES.get(op, op)
-    if name in GLSL_OPS:
-        return name, False
-    if name[:1] in ("i", "r"):
-        base = _ALIASES.get(name[1:], name[1:])
-        if base in GLSL_OPS:
-            return base, name[0] == "r"
-    raise GLSLUnsupportedOp(
-        f"no GLSL lowering for op {op!r}; "
-        f"known ops: {', '.join(sorted(GLSL_OPS))}"
-    )
+    try:
+        name, reverse = canonical_elementwise_op(op)
+    except KeyError as exc:
+        raise GLSLUnsupportedOp(
+            f"no GLSL lowering for op {op!r}; "
+            f"known ops: {', '.join(sorted(GLSL_OPS))}"
+        ) from exc
+    if name not in GLSL_OPS:
+        raise GLSLUnsupportedOp(f"no GLSL expression for canonical op {name!r}")
+    return name, reverse
 
 
 def _expr(op: str, a: str, b: str | None, reverse: bool) -> str:
@@ -350,107 +345,65 @@ class GLChunk:
 
 
 # ---------------------------------------------------------------------------
-# program IR
-#
-# Structurally identical to c_primitive_program.PrimitiveInstruction/Program. It
-# is redefined rather than imported because importing that module pulls in the
-# CFFI C library build, and the GPU path must not require a working C toolchain.
-# ``from_c_program`` adapts one without importing it.
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class GlslInstruction:
-    """One equally-shaped elementwise primitive operation."""
-
-    op: str
-    out_slot: int
-    left_slot: int
-    right_slot: int | None = None
-    right_scalar: float | None = None
-    reverse: bool = False
-
-
-@dataclass(frozen=True)
-class GlslProgram:
-    """A validated elementwise program lowered to a single fused shader."""
-
-    instructions: Sequence[GlslInstruction]
-    feed_count: int
-    slot_count: int
-    output_slot: int
-
-    @classmethod
-    def from_c_program(cls, program: Any) -> "GlslProgram":
-        """Adapt a ``c_primitive_program.PrimitiveProgram`` (duck-typed)."""
-        return cls(
-            instructions=tuple(
-                GlslInstruction(
-                    op=i.op,
-                    out_slot=i.out_slot,
-                    left_slot=i.left_slot,
-                    right_slot=getattr(i, "right_slot", None),
-                    right_scalar=getattr(i, "right_scalar", None),
-                    reverse=bool(getattr(i, "reverse", False)),
-                )
-                for i in program.instructions
-            ),
-            feed_count=int(program.feed_count),
-            slot_count=int(program.slot_count),
-            output_slot=int(program.output_slot),
-        )
-
-    def validate(self) -> None:
-        if self.slot_count < self.feed_count:
-            raise ValueError("slot_count must be at least feed_count")
-        if not 0 <= self.output_slot < self.slot_count:
-            raise ValueError("output_slot out of range")
-        defined = set(range(self.feed_count))
-        for n, ins in enumerate(self.instructions):
-            canonical_op(ins.op)  # raises GLSLUnsupportedOp on an unknown op
-            if ins.right_slot is not None and ins.right_scalar is not None:
-                raise ValueError(
-                    f"instruction {n}: cannot have both slot and scalar right operands"
-                )
-            for slot in (ins.left_slot, ins.right_slot):
-                if slot is None:
-                    continue
-                if slot not in defined:
-                    raise ValueError(
-                        f"instruction {n} reads slot {slot} before it is written"
-                    )
-            if not 0 <= ins.out_slot < self.slot_count:
-                raise ValueError(f"instruction {n}: out_slot out of range")
-            defined.add(ins.out_slot)
-        if self.output_slot not in defined:
-            raise ValueError("output_slot is never written")
-
-
-# ---------------------------------------------------------------------------
 # shader emission
 # ---------------------------------------------------------------------------
 
 _SHADER_HEADER = """#version 430
 // GENERATED by turing glsl_backend.emit_program_source -- do not edit by hand.
 //
-// Fused elementwise program: every intermediate slot is a local (a register),
+// Fused elementwise program: every intermediate value is a local (a register),
 // so only feeds and the single output ever touch memory. This is the whole
-// reason a PrimitiveProgram is worth running on a GPU rather than instruction
+// reason a FusedProgram is worth running on a GPU rather than operation
 // by instruction.
 layout(local_size_x = {local_size}) in;
 """
 
 
-def emit_program_source(program: GlslProgram, local_size: int = _LOCAL_SIZE) -> str:
-    """Lower a whole elementwise program to one compute shader."""
-    program.validate()
+def _validate_program(program: FusedProgram) -> tuple[tuple[int, ...], int]:
+    feed_ids = ordered_feed_ids(program)
+    if not feed_ids:
+        raise ValueError("a fused program needs at least one feed")
+    defined = set(feed_ids)
+    for step in program.steps:
+        op, _ = canonical_op(step.op_name)
+        scalar = step.attrs.get("right_scalar")
+        unknown = set(step.attrs) - {"right_scalar", "reverse"}
+        if unknown:
+            raise ValueError(
+                f"step {step.step_id} has unsupported attrs: {sorted(unknown)}"
+            )
+        if any(value_id not in defined for value_id in step.input_ids):
+            raise ValueError(
+                f"step {step.step_id} reads a value before it is written"
+            )
+        if op in ELEMENTWISE_UNARY:
+            valid = len(step.input_ids) == 1 and scalar is None
+        else:
+            valid = (
+                len(step.input_ids) == 2 and scalar is None
+            ) or (
+                len(step.input_ids) == 1 and scalar is not None
+            )
+        if not valid:
+            raise ValueError(f"step {step.step_id} has an invalid operand layout")
+        defined.add(step.result_id)
+    output_id = primary_output_id(program)
+    if output_id not in defined:
+        raise ValueError("FusedProgram output is not produced")
+    return feed_ids, output_id
+
+
+def emit_program_source(program: FusedProgram, local_size: int = _LOCAL_SIZE) -> str:
+    """Lower a whole FusedProgram elementwise region to one compute shader."""
+    feed_ids, output_id = _validate_program(program)
     lines: list[str] = [_SHADER_HEADER.format(local_size=local_size)]
 
-    for i in range(program.feed_count):
+    for i, _ in enumerate(feed_ids):
         lines.append(
             f"layout(std430, binding = {i}) readonly buffer Feed{i} "
             f"{{ float feed{i}[]; }};"
         )
-    out_binding = program.feed_count
+    out_binding = len(feed_ids)
     lines.append(
         f"layout(std430, binding = {out_binding}) writeonly buffer OutBuf "
         f"{{ float outbuf[]; }};"
@@ -462,24 +415,27 @@ def emit_program_source(program: GlslProgram, local_size: int = _LOCAL_SIZE) -> 
     lines.append("    uint gid = gl_GlobalInvocationID.x;")
     lines.append("    if (gid >= u_count) { return; }")
 
-    for i in range(program.feed_count):
+    value_names: dict[int, str] = {}
+    for i, feed_id in enumerate(feed_ids):
         lines.append(f"    float s{i} = feed{i}[gid];")
+        value_names[feed_id] = f"s{i}"
 
-    for ins in program.instructions:
-        op, reverse = canonical_op(ins.op)
-        reverse = reverse or ins.reverse
-        a = f"s{ins.left_slot}"
+    for index, step in enumerate(program.steps, len(feed_ids)):
+        op, reverse = canonical_op(step.op_name)
+        reverse = reverse ^ bool(step.attrs.get("reverse", False))
+        a = value_names[step.input_ids[0]]
         if op in _UNARY:
             b = None
-        elif ins.right_slot is not None:
-            b = f"s{ins.right_slot}"
-        elif ins.right_scalar is not None:
-            b = _glsl_float(ins.right_scalar)
+        elif len(step.input_ids) == 2:
+            b = value_names[step.input_ids[1]]
+        elif "right_scalar" in step.attrs:
+            b = _glsl_float(step.attrs["right_scalar"])
         else:
-            raise ValueError(f"binary op {ins.op!r} has no right operand")
-        lines.append(f"    float s{ins.out_slot} = {_expr(op, a, b, reverse)};")
+            raise ValueError(f"binary op {step.op_name!r} has no right operand")
+        value_names[step.result_id] = f"s{index}"
+        lines.append(f"    float s{index} = {_expr(op, a, b, reverse)};")
 
-    lines.append(f"    outbuf[gid] = s{program.output_slot};")
+    lines.append(f"    outbuf[gid] = {value_names[output_id]};")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -501,15 +457,16 @@ def emit_op_source(op: str, *, scalar: float | None = None,
     """Lower a single op to a shader -- the ``_apply_operator__`` fast path."""
     name, reverse = canonical_op(op)
     if name in _UNARY:
-        program = GlslProgram((GlslInstruction(name, 1, 0),), 1, 2, 1)
+        step = OpStep(0, name, [0], result_id=1)
+        program = FusedProgram(1, {0}, [step], {"result": 1})
     elif scalar is not None:
-        program = GlslProgram(
-            (GlslInstruction(name, 1, 0, right_scalar=scalar, reverse=reverse),), 1, 2, 1
+        step = OpStep(
+            0, name, [0], {"right_scalar": scalar, "reverse": reverse}, 1
         )
+        program = FusedProgram(1, {0}, [step], {"result": 1})
     else:
-        program = GlslProgram(
-            (GlslInstruction(name, 2, 0, right_slot=1, reverse=reverse),), 2, 3, 2
-        )
+        step = OpStep(0, name, [0, 1], {"reverse": reverse}, 2)
+        program = FusedProgram(1, {0, 1}, [step], {"result": 2})
     return emit_program_source(program, local_size=local_size)
 
 
@@ -600,8 +557,8 @@ def _dispatch(program_id: int, chunks: Sequence[GLChunk], out: GLChunk,
 
 
 def execute_program(
-    program: GlslProgram,
-    feeds: Sequence[Any],
+    program: FusedProgram,
+    feeds: Mapping[int, Any] | Sequence[Any],
     *,
     out: GLChunk | None = None,
 ) -> GLChunk:
@@ -614,13 +571,18 @@ def execute_program(
     invocation writes all ``count`` elements before the chunk is observable.
     """
     require_gl_context()
-    program.validate()
-    if len(feeds) != program.feed_count:
+    feed_ids, _ = _validate_program(program)
+    if isinstance(feeds, Mapping):
+        missing = set(feed_ids) - set(feeds)
+        if missing:
+            raise ValueError(f"missing FusedProgram feeds: {sorted(missing)}")
+        feeds = [feeds[value_id] for value_id in feed_ids]
+    if len(feeds) != len(feed_ids):
         raise ValueError(
-            f"expected {program.feed_count} feeds, received {len(feeds)}"
+            f"expected {len(feed_ids)} feeds, received {len(feeds)}"
         )
     if not feeds:
-        raise ValueError("a primitive program needs at least one feed")
+        raise ValueError("a fused program needs at least one feed")
 
     chunks = [f if isinstance(f, GLChunk) else GLChunk.from_numpy(f) for f in feeds]
     shape = chunks[0].shape

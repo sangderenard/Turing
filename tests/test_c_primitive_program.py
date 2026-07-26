@@ -3,31 +3,43 @@ import pytest
 
 from src.common.tensors.accelerator_backends.c_backend import CTensor
 from src.common.tensors.accelerator_backends.c_primitive_program import (
-    PrimitiveInstruction,
-    PrimitiveProgram,
     compile_elementwise_tape,
+    execute_fused_program,
+    prepare_fused_program,
 )
 from src.common.tensors.autograd import GradTape, autograd
+from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.common.tensors.numpy_backend import NumPyTensorOperations
+
+
+def _program(feeds, specs, output):
+    return FusedProgram(
+        1,
+        set(feeds),
+        [
+            OpStep(index, op, inputs, attrs, result_id)
+            for index, (op, result_id, inputs, attrs) in enumerate(specs)
+        ],
+        {"result": output},
+    )
 
 
 def test_primitive_program_fuses_sigmoid_chain_across_one_native_call():
     values = np.linspace(-4.0, 4.0, 33)
-    program = PrimitiveProgram(
-        feed_count=1,
-        slot_count=5,
-        output_slot=4,
-        instructions=(
-            PrimitiveInstruction("neg", 1, 0),
-            PrimitiveInstruction("exp", 2, 1),
-            PrimitiveInstruction("add", 3, 2, right_scalar=1.0),
-            PrimitiveInstruction(
-                "truediv", 4, 3, right_scalar=1.0, reverse=True
-            ),
-        ),
+    program = _program(
+        [0],
+        [
+            ("neg", 1, [0], {}),
+            ("exp", 2, [1], {}),
+            ("add", 3, [2], {"right_scalar": 1.0}),
+            ("truediv", 4, [3], {"right_scalar": 1.0, "reverse": True}),
+        ],
+        4,
     )
 
-    result = program.execute([CTensor.from_list(values.tolist(), values.shape)])
+    result = execute_fused_program(
+        program, [CTensor.from_list(values.tolist(), values.shape)]
+    )
 
     np.testing.assert_allclose(result.tolist(), 1.0 / (1.0 + np.exp(-values)))
 
@@ -35,30 +47,27 @@ def test_primitive_program_fuses_sigmoid_chain_across_one_native_call():
 def test_primitive_program_accepts_multiple_feed_slots():
     left = CTensor.from_list([1.0, 2.0, 3.0], (3,))
     right = CTensor.from_list([4.0, 5.0, 6.0], (3,))
-    program = PrimitiveProgram(
-        feed_count=2,
-        slot_count=4,
-        output_slot=3,
-        instructions=(
-            PrimitiveInstruction("mul", 2, 0, right_slot=1),
-            PrimitiveInstruction("sqrt", 3, 2),
-        ),
+    program = _program(
+        [0, 1],
+        [
+            ("mul", 2, [0, 1], {}),
+            ("sqrt", 3, [2], {}),
+        ],
+        3,
     )
 
     np.testing.assert_allclose(
-        program.execute([left, right]).tolist(),
+        execute_fused_program(program, [left, right]).tolist(),
         np.sqrt(np.asarray([4.0, 10.0, 18.0])),
     )
 
 
 def test_prepared_primitive_program_reuses_native_slots():
     feed = CTensor.from_list([-1.0, 0.0, 1.0], (3,))
-    prepared = PrimitiveProgram(
-        feed_count=1,
-        slot_count=2,
-        output_slot=1,
-        instructions=(PrimitiveInstruction("mul", 1, 0, right_scalar=2.0),),
-    ).prepare([feed])
+    program = _program(
+        [0], [("mul", 1, [0], {"right_scalar": 2.0})], 1
+    )
+    prepared = prepare_fused_program(program, [feed])
 
     first = prepared.execute()
     feed.buffer[0] = 3.0
@@ -69,15 +78,12 @@ def test_prepared_primitive_program_reuses_native_slots():
 
 
 def test_primitive_program_rejects_invalid_slot_program():
-    program = PrimitiveProgram(
-        feed_count=1,
-        slot_count=2,
-        output_slot=1,
-        instructions=(PrimitiveInstruction("add", 1, 8, right_scalar=1.0),),
+    program = _program(
+        [0], [("add", 1, [8], {"right_scalar": 1.0})], 1
     )
 
-    with pytest.raises(ValueError, match="native primitive-program validation"):
-        program.execute([CTensor.from_list([1.0], (1,))])
+    with pytest.raises(ValueError, match="reads an unavailable input"):
+        execute_fused_program(program, [CTensor.from_list([1.0], (1,))])
 
 
 def test_real_autograd_trace_compiles_and_replays_in_c():
@@ -88,7 +94,7 @@ def test_real_autograd_trace_compiles_and_replays_in_c():
     captured = compile_elementwise_tape(tape, result)
     replayed = captured.execute_c()
 
-    assert [step.op for step in captured.program.instructions] == [
+    assert [step.op_name for step in captured.program.steps] == [
         "neg", "exp", "add", "truediv"
     ]
     np.testing.assert_allclose(replayed.tolist(), result.tolist())

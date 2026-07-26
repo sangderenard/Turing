@@ -7,7 +7,8 @@ Python AST
   -> ProcessGraph.build_from_ast(semantic=True)
   -> optional Turing-provenance BitOps primitive expansion
   -> metadata-rich SSA
-  -> C PrimitiveProgram or fused GLSL program
+  -> FusedProgram
+       -> private C slot plan or fused GLSL shader
   -> Nodus AbstractTensor GraphIR tools
 ```
 
@@ -40,9 +41,12 @@ Unexpanded operations remain present with `bitops_status=unexpanded`.
 
 ## Backend boundary
 
-`lower_ssa_to_primitive_program` targets the equal-shape program shared by the
-one-call C executor and fused GLSL backend. It supports canonical elementwise
-unary/binary operations, scalar operands, `nand`, and `select`.
+`lower_ssa_to_fused_program` targets the established backend-neutral
+`FusedProgram`. The C backend compiles that IR to a private native slot plan;
+GLSL lowers the same IR directly to shader locals. There is no public,
+competing `PrimitiveProgram` or `GlslProgram` schema.
+The equal-shape region supports canonical elementwise unary/binary operations,
+scalar operands, `nand`, and `select`.
 
 Structural primitives such as `concat`, `slice`, shifts, and shape-changing
 `mu` cannot fit that packet. They return structured `LoweringIssue` records and

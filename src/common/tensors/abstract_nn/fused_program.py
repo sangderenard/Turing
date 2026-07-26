@@ -9,7 +9,6 @@ flag to alter mode sensitive operators.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Set, Optional, Tuple
 import inspect
 import difflib
@@ -26,46 +25,7 @@ import sys
 import ast
 import random
 
-
-# ---------------------------------------------------------------------------
-# Dataclasses mirroring the design document
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Meta:
-    """Per-id snapshot of tensor metadata."""
-
-    shape: Iterable[int] | None = None
-    dtype: str | None = None
-    device: str | None = None
-
-
-@dataclass
-class OpStep:
-    """Single linearised tensor operation."""
-
-    step_id: int
-    op_name: str
-    input_ids: List[int]
-    attrs: Dict[str, Any] = field(default_factory=dict)
-    result_id: int = -1
-    mode_sensitive: bool = False
-    level: Optional[int] = None
-
-
-@dataclass
-class FusedProgram:
-    """Unified program representation for AbstractTensor graphs."""
-
-    version: int
-    feeds: Set[int]
-    steps: List[OpStep]
-    outputs: Dict[str, int]
-    state_in: Set[int] | None = None
-    meta: Dict[int, Meta] | None = None
-    # Optional map of additional outputs (e.g., updated params for training)
-    extras: Dict[str, int] | None = None
+from ..fused_ir import FusedProgram, Meta, OpStep
 
 
 # ---------------------------------------------------------------------------

@@ -166,7 +166,8 @@ drawing performance conclusions.
 ## Nodus interop and fused submission
 
 The canonical `CTensorOp` dispatch now has a narrow fused execution prototype:
-an equal-shape primitive program crosses CFFI once and executes a chain of
+an equal-shape `FusedProgram` lowers to a private slot plan, crosses CFFI once,
+and executes a chain of
 unary, binary, comparison, and scalar operations in C. See
 `docs/C_NODUS_INTEROP_AND_FUSION.md` for the representation boundaries,
 autograd-trace compiler, stateful slot reuse, KernelIR relationship, and native

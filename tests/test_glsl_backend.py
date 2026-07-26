@@ -18,8 +18,6 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     GLChunk,
     GLContextUnavailable,
     GLSLUnsupportedOp,
-    GlslInstruction,
-    GlslProgram,
     canonical_op,
     emit_op_source,
     emit_program_source,
@@ -29,10 +27,23 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     run_op,
     shader_cache_stats,
 )
+from src.common.tensors.fused_ir import FusedProgram, OpStep
 
 from src.common.tensors.accelerator_backends import gl_context as glctx
 
 RTOL, ATOL = 1e-5, 1e-5
+
+
+def _program(feeds, specs, output):
+    return FusedProgram(
+        1,
+        set(feeds),
+        [
+            OpStep(index, op, inputs, attrs, result_id)
+            for index, (op, result_id, inputs, attrs) in enumerate(specs)
+        ],
+        {"result": output},
+    )
 
 
 @pytest.fixture(scope="session")
@@ -139,12 +150,10 @@ def test_unknown_op_raises_rather_than_defaulting():
 
 def test_emitted_program_fuses_intermediates_into_locals():
     # (a + b) then exp(): two instructions, one dispatch, zero intermediate buffers.
-    program = GlslProgram(
-        instructions=(
-            GlslInstruction("add", 2, 0, right_slot=1),
-            GlslInstruction("exp", 3, 2),
-        ),
-        feed_count=2, slot_count=4, output_slot=3,
+    program = _program(
+        [0, 1],
+        [("add", 2, [0, 1], {}), ("exp", 3, [2], {})],
+        3,
     )
     src = emit_program_source(program)
     assert src.count("buffer") == 3          # 2 feeds + 1 output, no temporaries
@@ -154,16 +163,16 @@ def test_emitted_program_fuses_intermediates_into_locals():
 
 
 def test_emitter_rejects_reading_an_unwritten_slot():
-    bad = GlslProgram((GlslInstruction("add", 1, 0, right_slot=5),), 1, 2, 1)
+    bad = _program([0], [("add", 1, [0, 5], {})], 1)
     with pytest.raises(ValueError, match="before it is written"):
         emit_program_source(bad)
 
 
 def test_emitter_rejects_both_operand_kinds():
-    bad = GlslProgram(
-        (GlslInstruction("add", 1, 0, right_slot=0, right_scalar=1.0),), 1, 2, 1
+    bad = _program(
+        [0], [("add", 1, [0, 0], {"right_scalar": 1.0})], 1
     )
-    with pytest.raises(ValueError, match="both slot and scalar"):
+    with pytest.raises(ValueError, match="invalid operand layout"):
         emit_program_source(bad)
 
 
@@ -298,14 +307,15 @@ def test_fused_program_matches_numpy(gl):
     y = rng.uniform(0.5, 3.0, size=1024).astype(np.float32)
 
     # t = sqrt((x * y) + 2.0);  out = t - x
-    program = GlslProgram(
-        instructions=(
-            GlslInstruction("mul", 2, 0, right_slot=1),
-            GlslInstruction("add", 3, 2, right_scalar=2.0),
-            GlslInstruction("sqrt", 4, 3),
-            GlslInstruction("sub", 5, 4, right_slot=0),
-        ),
-        feed_count=2, slot_count=6, output_slot=5,
+    program = _program(
+        [0, 1],
+        [
+            ("mul", 2, [0, 1], {}),
+            ("add", 3, [2], {"right_scalar": 2.0}),
+            ("sqrt", 4, [3], {}),
+            ("sub", 5, [4, 0], {}),
+        ],
+        5,
     )
     got = execute_program(program, [x, y]).numpy()
     np.testing.assert_allclose(got, np.sqrt((x * y) + 2.0) - x, rtol=1e-4, atol=1e-5)
@@ -315,7 +325,7 @@ def test_program_runs_on_gpu_resident_feeds_without_readback(gl):
     """Feeds already on the GPU are used in place -- the interop path."""
     a = GLChunk.from_numpy(np.full(64, 3.0, dtype=np.float32)).to_gpu()
     b = GLChunk.from_numpy(np.full(64, 4.0, dtype=np.float32)).to_gpu()
-    program = GlslProgram((GlslInstruction("add", 2, 0, right_slot=1),), 2, 3, 2)
+    program = _program([0, 1], [("add", 2, [0, 1], {})], 2)
     out = execute_program(program, [a, b])
     assert out.on_gpu
     np.testing.assert_allclose(out.numpy(), np.full(64, 7.0), rtol=RTOL, atol=ATOL)
@@ -326,8 +336,7 @@ def test_program_reuses_caller_owned_output_buffer(gl):
     a = GLChunk.from_numpy(np.full(64, 3.0, dtype=np.float32)).to_gpu()
     out = GLChunk((64,)).to_gpu()
     buffer_id = out.buffer_id
-    program = GlslProgram((GlslInstruction("mul", 1, 0, right_scalar=2.0),),
-                          1, 2, 1)
+    program = _program([0], [("mul", 1, [0], {"right_scalar": 2.0})], 1)
 
     assert execute_program(program, [a], out=out) is out
     assert execute_program(program, [a], out=out) is out
@@ -341,7 +350,7 @@ def test_program_reuses_caller_owned_output_buffer(gl):
 def test_program_rejects_mismatched_output_shape(gl):
     a = GLChunk.from_numpy(np.ones(8, dtype=np.float32)).to_gpu()
     out = GLChunk((4,)).to_gpu()
-    program = GlslProgram((GlslInstruction("neg", 1, 0),), 1, 2, 1)
+    program = _program([0], [("neg", 1, [0], {})], 1)
     with pytest.raises(ValueError, match="output must share"):
         execute_program(program, [a], out=out)
     out.release()
@@ -365,7 +374,7 @@ def test_shape_mismatch_is_an_error_not_a_broadcast(gl):
 
 
 def test_feed_count_mismatch_is_an_error(gl):
-    program = GlslProgram((GlslInstruction("add", 2, 0, right_slot=1),), 2, 3, 2)
+    program = _program([0, 1], [("add", 2, [0, 1], {})], 2)
     with pytest.raises(ValueError, match="expected 2 feeds"):
         execute_program(program, [np.ones(4, dtype=np.float32)])
 

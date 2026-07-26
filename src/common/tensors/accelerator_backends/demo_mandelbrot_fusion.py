@@ -1,6 +1,6 @@
-"""One fused elementwise program, two backends, one picture.
+"""One ordinary AbstractTensor program, three backends, one picture.
 
-Escape-time Mandelbrot as a straight-line primitive program. The iteration is
+Escape-time Mandelbrot as an ordinary AbstractTensor function. The iteration is
 *unrolled*, so ``iterations`` steps become ~10x that many instructions in a
 single program with no control flow at all -- which is the point: it is the
 deepest fused program either backend has been asked to run, and it renders
@@ -23,13 +23,14 @@ What it exercises
 -----------------
 * the GLSL emitter at depth -- hundreds of instructions in one shader, every
   intermediate a register-resident local, one dispatch;
-* the C primitive-program interpreter over the same instruction stream;
+* the C backend's private slot lowering over the same FusedProgram steps;
 * the shared canonical op vocabulary, from two directions at once;
 * numpy as the behavioural oracle for both.
 
-The two backends consume the *same* program object. That is the interesting
-part: a `GlslProgram` and a `PrimitiveProgram` differ only in which struct they
-are poured into.
+Python executes the ordinary AbstractTensor function once under GradTape
+capture. The resulting established ``FusedProgram`` is then the single input
+to NumPy verification, the C one-call backend, and GLSL shader lowering. There
+is no demo-only instruction class or separately maintained NumPy algorithm.
 
 Run it::
 
@@ -41,9 +42,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -51,17 +50,6 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # the program
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Step:
-    """Backend-neutral instruction. Poured into whichever struct is needed."""
-
-    op: str
-    out: int
-    left: int
-    right_slot: int | None = None
-    right_scalar: float | None = None
-
 
 # Escaped orbits diverge without bound. In float32 they reach inf within a few
 # more iterations, then inf-inf produces NaN, and the two backends round that
@@ -76,49 +64,48 @@ class Step:
 ORBIT_CLAMP = 1e18
 
 
-def build_mandelbrot_program(iterations: int, clamp: float = ORBIT_CLAMP
-                             ) -> tuple[list[Step], int, int]:
-    """Return ``(steps, slot_count, output_slot)`` for an unrolled escape loop.
+def mandelbrot_escape(cx, cy, iterations: int, clamp: float = ORBIT_CLAMP):
+    """Ordinary backend-agnostic AbstractTensor Mandelbrot computation."""
 
-    Feeds are slot 0 = cx, slot 1 = cy. Everything else is derived, including
-    the zero constants -- ``mul(cx, 0.0)`` seeds a zero without needing a
-    constant-feed array or a creation op the primitive vocabulary lacks.
-    """
-    steps: list[Step] = []
-    n = 2  # next free slot; 0 and 1 are the feeds
-
-    def emit(op: str, left: int, right_slot: int | None = None,
-             right_scalar: float | None = None) -> int:
-        nonlocal n
-        out = n
-        n += 1
-        steps.append(Step(op, out, left, right_slot, right_scalar))
-        return out
-
-    def pin(slot: int) -> int:
-        """Keep an orbit finite without branching: clamp to +/- ``clamp``."""
-        slot = emit("minimum", slot, right_scalar=clamp)
-        return emit("maximum", slot, right_scalar=-clamp)
-
-    zx = emit("mul", 0, right_scalar=0.0)     # zx = 0
-    zy = emit("mul", 0, right_scalar=0.0)     # zy = 0
-    count = emit("mul", 0, right_scalar=0.0)  # count = 0
-
+    zx = cx * 0.0
+    zy = cx * 0.0
+    count = cx * 0.0
     for _ in range(iterations):
-        zx2 = emit("mul", zx, right_slot=zx)
-        zy2 = emit("mul", zy, right_slot=zy)
-        r2 = emit("add", zx2, right_slot=zy2)
-        inside = emit("le", r2, right_scalar=4.0)     # 1.0 while |z|^2 <= 4
-        count = emit("add", count, right_slot=inside)
+        zx2, zy2 = zx * zx, zy * zy
+        count = count + (zx2 + zy2 <= 4.0)
+        zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
+        zx = zx.minimum(clamp).maximum(-clamp)
+        zy = zy.minimum(clamp).maximum(-clamp)
+    return count
 
-        cross = emit("mul", zx, right_slot=zy)
-        cross2 = emit("mul", cross, right_scalar=2.0)
-        zy_next = emit("add", cross2, right_slot=1)   # 2*zx*zy + cy
-        diff = emit("sub", zx2, right_slot=zy2)
-        zx_next = emit("add", diff, right_slot=0)     # zx^2 - zy^2 + cx
-        zx, zy = pin(zx_next), pin(zy_next)
 
-    return steps, n, count
+def capture_mandelbrot(cx: np.ndarray, cy: np.ndarray, iterations: int):
+    """Execute and capture the ordinary function as one FusedProgram."""
+
+    from ..autograd import autograd
+    from ..numpy_backend import NumPyTensorOperations
+    from .c_primitive_program import compile_elementwise_tape
+
+    with autograd.forward_capture() as tape:
+        x = NumPyTensorOperations.tensor(cx)
+        y = NumPyTensorOperations.tensor(cy)
+        output = mandelbrot_escape(x, y, iterations)
+    captured = compile_elementwise_tape(tape, output)
+    captured = type(captured)(captured.program, {id(x): x, id(y): y})
+    return captured, np.asarray(output.tolist(), dtype=cx.dtype)
+
+
+def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
+    """Run the exact same AbstractTensor function on the NumPy backend."""
+
+    from ..numpy_backend import NumPyTensorOperations
+
+    result = mandelbrot_escape(
+        NumPyTensorOperations.tensor(cx),
+        NumPyTensorOperations.tensor(cy),
+        iterations,
+    )
+    return np.asarray(result.tolist(), dtype=cx.dtype)
 
 
 def complex_plane(width: int, height: int, center: complex, span: float
@@ -135,65 +122,42 @@ def complex_plane(width: int, height: int, center: complex, span: float
 
 
 # ---------------------------------------------------------------------------
-# oracle
-# ---------------------------------------------------------------------------
-
-def run_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int,
-              clamp: float = ORBIT_CLAMP) -> np.ndarray:
-    """The same arithmetic in numpy, step for step, as the behavioural oracle.
-
-    Including the same orbit clamp -- an oracle that computes something subtly
-    different is not an oracle.
-    """
-    zx = np.zeros_like(cx)
-    zy = np.zeros_like(cy)
-    count = np.zeros_like(cx)
-    lo, hi = np.float32(-clamp), np.float32(clamp)
-    for _ in range(iterations):
-        zx2, zy2 = zx * zx, zy * zy
-        count = count + (zx2 + zy2 <= 4.0).astype(np.float32)
-        zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
-        zx = np.maximum(np.minimum(zx, hi), lo)
-        zy = np.maximum(np.minimum(zy, hi), lo)
-    return count
-
-
-# ---------------------------------------------------------------------------
 # backends
 # ---------------------------------------------------------------------------
 
-def run_glsl(steps, slot_count, output_slot, cx, cy):
-    from .glsl_backend import GlslInstruction, GlslProgram, execute_program
+def _replacement_feeds(captured, cx, cy):
+    """Bind replacement arrays by matching the two captured root identities."""
 
-    program = GlslProgram(
-        instructions=tuple(
-            GlslInstruction(s.op, s.out, s.left, s.right_slot, s.right_scalar)
-            for s in steps
-        ),
-        feed_count=2, slot_count=slot_count, output_slot=output_slot,
-    )
-    return execute_program(program, [cx, cy]).numpy()
+    feed_ids = list(captured.feeds)
+    if len(feed_ids) != 2:
+        raise ValueError(f"expected cx/cy capture roots, found {len(feed_ids)}")
+    return {feed_ids[0]: cx, feed_ids[1]: cy}
 
 
-def run_c(steps, slot_count, output_slot, cx, cy):
+def run_glsl(captured, cx, cy):
+    from .glsl_backend import execute_program
+
+    return execute_program(
+        captured.program, _replacement_feeds(captured, cx, cy)
+    ).numpy()
+
+
+def run_c(captured, cx, cy):
     from .c_backend import CTensor
-    from .c_primitive_program import PrimitiveInstruction, PrimitiveProgram
+    from .c_primitive_program import execute_fused_program
 
-    program = PrimitiveProgram(
-        instructions=tuple(
-            PrimitiveInstruction(s.op, s.out, s.left, s.right_slot, s.right_scalar)
-            for s in steps
-        ),
-        feed_count=2, slot_count=slot_count, output_slot=output_slot,
+    feeds = {
+        feed_id: CTensor.from_list(array.tolist(), array.shape)
+        for feed_id, array in _replacement_feeds(captured, cx, cy).items()
+    }
+    return np.asarray(
+        execute_fused_program(captured.program, feeds).tolist(), dtype=np.float32
     )
-    feeds = [CTensor.from_list(cx.tolist(), cx.shape),
-             CTensor.from_list(cy.tolist(), cy.shape)]
-    return np.asarray(program.execute(feeds).tolist(), dtype=np.float32)
 
 
-def c_workspace_bytes(slot_count: int, elements: int) -> int:
+def c_workspace_bytes(program, elements: int) -> int:
     """The C interpreter allocates one full slot array per instruction result."""
-    return slot_count * elements * 8
+    return (len(program.feeds) + len(program.steps)) * elements * 8
 
 
 # ---------------------------------------------------------------------------
@@ -250,13 +214,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    steps, slot_count, output_slot = build_mandelbrot_program(args.iterations)
     elements = args.width * args.height
-    print(f"program : {len(steps)} instructions, {slot_count} slots, "
-          f"{args.iterations} unrolled iterations")
     print(f"image   : {args.width}x{args.height} = {elements:,} pixels")
 
     cx, cy = complex_plane(args.width, args.height, args.center, args.span)
+    captured, _ = capture_mandelbrot(cx[:2], cy[:2], args.iterations)
+    print(f"program : {len(captured.program.steps)} FusedProgram steps, "
+          f"{args.iterations} Python-loop iterations captured")
 
     # -- GPU ---------------------------------------------------------------
     from .gl_context import require_gl_context
@@ -264,16 +228,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"gpu     : {info['renderer']} (context: {info['source']})")
 
     t0 = time.perf_counter()
-    gpu = run_glsl(steps, slot_count, output_slot, cx, cy)
+    gpu = run_glsl(captured, cx, cy)
     gpu_ms = (time.perf_counter() - t0) * 1e3
-    print(f"glsl    : {gpu_ms:8.1f} ms  ({len(steps)} instrs x {elements:,} px, one dispatch)")
+    print(f"glsl    : {gpu_ms:8.1f} ms  "
+          f"({len(captured.program.steps)} steps x {elements:,} px, one dispatch)")
 
     if not args.only_glsl:
         # -- oracle --------------------------------------------------------
         t0 = time.perf_counter()
-        ref = run_numpy(cx, cy, args.iterations)
+        ref = run_abstract_numpy(cx, cy, args.iterations)
         np_ms = (time.perf_counter() - t0) * 1e3
-        print(f"numpy   : {np_ms:8.1f} ms  (oracle)")
+        print(f"numpy   : {np_ms:8.1f} ms  (same AbstractTensor function)")
 
         max_err = float(np.max(np.abs(gpu - ref)))
         agree = float(np.mean(gpu == ref)) * 100.0
@@ -282,7 +247,9 @@ def main(argv: list[str] | None = None) -> int:
         # Escape-time is chaotic: a 1-ULP boundary difference can change the
         # escape iteration. Compare both float32 paths with float64 so precision
         # sensitivity is not mistaken for a lowering defect.
-        ref64 = run_numpy(cx.astype(np.float64), cy.astype(np.float64), args.iterations)
+        ref64 = run_abstract_numpy(
+            cx.astype(np.float64), cy.astype(np.float64), args.iterations
+        )
         gpu_vs64 = float(np.mean(gpu == ref64)) * 100.0
         np_vs64 = float(np.mean(ref == ref64)) * 100.0
         print(f"vs f64  : glsl-f32 {gpu_vs64:.4f}%, numpy-f32 {np_vs64:.4f}% "
@@ -307,15 +274,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_c and not args.only_glsl:
         n = args.c_probe
         pcx, pcy = complex_plane(n, n, args.center, args.span)
-        big = c_workspace_bytes(slot_count, elements)
-        small = c_workspace_bytes(slot_count, n * n)
+        big = c_workspace_bytes(captured.program, elements)
+        small = c_workspace_bytes(captured.program, n * n)
         print(f"c probe : {n}x{n}; workspace {small / 1e6:.1f} MB "
               f"(the full image would need {big / 1e9:.1f} GB -- see note)")
         t0 = time.perf_counter()
-        cpu = run_c(steps, slot_count, output_slot, pcx, pcy)
+        cpu = run_c(captured, pcx, pcy)
         c_ms = (time.perf_counter() - t0) * 1e3
-        pref = run_numpy(pcx, pcy, args.iterations)
-        pgpu = run_glsl(steps, slot_count, output_slot, pcx, pcy)
+        pref = run_abstract_numpy(pcx, pcy, args.iterations)
+        pgpu = run_glsl(captured, pcx, pcy)
         print(f"c       : {c_ms:8.1f} ms  "
               f"(vs numpy: {float(np.max(np.abs(cpu - pref))):g} max diff)")
         print(f"c vs glsl: same program, both backends agree "

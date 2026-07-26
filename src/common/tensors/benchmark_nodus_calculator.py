@@ -31,6 +31,23 @@ from .abstraction import AbstractTensor as AT
 ProgressCallback = Callable[[str, str, dict | None], None]
 
 
+def _sigmoid(value):
+    """The one ordinary AbstractTensor workload captured and run everywhere."""
+
+    return 1.0 / (1.0 + (-value).exp())
+
+
+def _capture_sigmoid_program():
+    from .accelerator_backends.c_primitive_program import compile_elementwise_tape
+    from .autograd import autograd
+    from .numpy_backend import NumPyTensorOperations
+
+    with autograd.forward_capture() as tape:
+        source = NumPyTensorOperations.tensor(np.asarray([-1.0, 1.0]))
+        output = _sigmoid(source)
+    return compile_elementwise_tape(tape, output)
+
+
 def _input_values(elements: int) -> np.ndarray:
     indices = np.arange(elements, dtype=np.int64)
     return ((indices % 1024) - 512).astype(np.float64) / 128.0
@@ -94,7 +111,7 @@ def _benchmark_abstracttensor_backend(
     setup_sec = perf_counter() - started
 
     def execute():
-        return 1.0 / (1.0 + (-value).exp())
+        return _sigmoid(value)
 
     result = None
     with AT.use_backend(backend, device):
@@ -189,19 +206,9 @@ def _benchmark_glsl(
 
     host = _input_values(elements).astype(np.float32)
     expected = 1.0 / (1.0 + np.exp(-host.astype(np.float64)))
-    program = glsl.GlslProgram(
-        instructions=(
-            glsl.GlslInstruction("neg", 1, 0),
-            glsl.GlslInstruction("exp", 2, 1),
-            glsl.GlslInstruction("add", 3, 2, right_scalar=1.0),
-            glsl.GlslInstruction(
-                "truediv", 4, 3, right_scalar=1.0, reverse=True
-            ),
-        ),
-        feed_count=1,
-        slot_count=5,
-        output_slot=4,
-    )
+    captured = _capture_sigmoid_program()
+    program = captured.program
+    feed_id = next(iter(program.feeds))
 
     feed = glsl.GLChunk.from_numpy(host)
     upload_started = perf_counter()
@@ -217,14 +224,14 @@ def _benchmark_glsl(
 
     cache_before = glsl.shader_cache_stats()
     compile_started = perf_counter()
-    glsl.execute_program(program, [feed], out=output)
+    glsl.execute_program(program, {feed_id: feed}, out=output)
     GL.glFinish()
     compile_first_dispatch_sec = perf_counter() - compile_started
     cache_after_compile = glsl.shader_cache_stats()
     setup_sec = perf_counter() - overall_started
 
     for _ in range(warmup):
-        glsl.execute_program(program, [feed], out=output)
+        glsl.execute_program(program, {feed_id: feed}, out=output)
         GL.glFinish()
 
     generated_queries = np.asarray(GL.glGenQueries(1)).reshape(-1)
@@ -235,7 +242,7 @@ def _benchmark_glsl(
         for _ in range(repeats):
             GL.glBeginQuery(GL.GL_TIME_ELAPSED, query)
             started = perf_counter()
-            glsl.execute_program(program, [feed], out=output)
+            glsl.execute_program(program, {feed_id: feed}, out=output)
             GL.glEndQuery(GL.GL_TIME_ELAPSED)
             GL.glFinish()
             timings.append(perf_counter() - started)

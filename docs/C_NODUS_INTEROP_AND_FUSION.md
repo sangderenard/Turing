@@ -33,7 +33,7 @@ version the serialized format.
 | `FusedProgram` | Replayable AbstractTensor graph with feeds, state, metadata, and mode | Model-level capture and optimization input |
 | Transmogrifier SSA/rewrite forms | Compiler and graph-transformation research | Normalization and lowering experiments |
 | `CTensorOp` | Primitive native operation vocabulary | Shared semantic names and backend lowering |
-| `CTensorPrimitiveProgram` | Equal-shape elementwise execution packet | Amortizing Python/CFFI calls; native prototype |
+| `FusedProgram` → private C slot plan | Equal-shape elementwise execution packet | Amortizing Python/CFFI calls without introducing a second semantic IR |
 | Nodus `KernelIR` | Typed, low-level SSA compute kernel | CPU/GPU code generation and dispatch |
 | Nodus path/Kpath tapes | Spatial/tool trajectories and provenance | Geometry, motion, and media scheduling |
 | CTensor/Nodus tensor ABI | Buffer shape, dtype, strides, ownership, device | Zero-copy data exchange |
@@ -100,7 +100,7 @@ for i:
 That removes both repeated CFFI transitions and repeated full-array memory
 traffic. Existing Nodus microkernels such as fused add/multiply are useful
 specialized targets; they should be selected from the same normalized
-primitive program rather than exposed as unrelated AbstractTensor operators.
+private C execution plan rather than exposed as unrelated AbstractTensor operators.
 
 ## Two related routes
 
@@ -110,7 +110,7 @@ The immediate native submission route is:
 AbstractTensor algorithm executed once on any backend
   -> forward autograd trace
   -> validated elementwise normalization
-  -> CTensor primitive program (portable interpreter/debug target)
+  -> FusedProgram -> private CTensor slot plan (portable interpreter/debug target)
   -> one CFFI call, or the same native packet hosted directly by Nodus
 ```
 
@@ -125,10 +125,10 @@ AbstractTensor/FusedProgram semantics
 
 Nodus KernelIR is a compatibility and hosting target for that typed work, not
 a reason to move Turing's lowering compiler into Nodus. Only elementwise
-regions lower to the present primitive program. Reductions, matmul, indexing,
+regions lower through the established FusedProgram. Reductions, matmul, indexing,
 FFT, geometry kernels, and stateful operations remain region boundaries until
 they receive explicit typed instructions. FFT continues to lower through
-`fftfree`; it should not be reimplemented as a primitive program.
+`fftfree`; it should not be reimplemented as an elementwise fused region.
 
 ## Native handoff milestones
 
@@ -137,7 +137,7 @@ they receive explicit typed instructions. FFT continues to lower through
 2. Specify a shared tensor descriptor: dtype, rank, shape, strides, device,
    ownership, lifetime, and error reporting. The current C backend is
    double-only and contiguous; Nodus is primarily float32.
-3. Lower eligible forward autograd-trace regions to typed primitive programs,
+3. Capture eligible forward autograd-trace regions as typed FusedPrograms,
    with explicit constants and broadcasting rather than implicit Python
    behavior.
 4. Add liveness allocation and direct output-buffer execution.
@@ -163,7 +163,7 @@ format between, Turing and Nodus.
 - Turing's ordinary eager C calls remain on the existing direct C functions:
   benchmarks showed that routing every tiny operation through a second Python
   binding added 15–40% dispatch overhead.
-- Prepared Turing primitive programs can bind their CTensor buffers once to
+- Prepared Turing FusedPrograms can bind their CTensor buffers once to
   Tensor Calculator, compile handle resolution once, replay synchronously, or
   submit asynchronously. Set `TENSOR_CALCULATOR_PROGRAMS=1`; `auto` selects it
   when `TENSOR_CALCULATOR_WORKERS` is nonzero.
