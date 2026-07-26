@@ -7,8 +7,6 @@ from typing import Any, Dict
 
 import networkx as nx
 
-from ..transmogrifier.process_op import ProcessOp
-
 
 def _quote(value: str) -> str:
     # JSON string escaping is compatible with GraphIR's quoted-string subset
@@ -41,54 +39,58 @@ def process_graph_to_nodus_graph_ir(graph) -> str:
 
     for ordinal, nid in enumerate(nx.topological_sort(graph.G)):
         data = graph.G.nodes[nid]
-        payload = data.get("process_op")
-        if not isinstance(payload, ProcessOp):
-            payload = ProcessOp(str(data.get("label") or data.get("type") or "opaque"))
+        op = str(data.get("op") or data.get("label") or data.get("type") or "opaque")
+        attributes = dict(data.get("attributes") or data.get("extra_args") or {})
+        constant = data.get("constant")
+        tensor = data.get("tensor") or {}
+        bit_quanta = data.get("bit_quanta") or {}
+        output_roles = tuple(data.get("output_roles") or ("result",))
+        schema_version = int(data.get("schema_version", 1))
 
         node_var = f"n{ordinal}"
         output_var = f"o{ordinal}"
-        lines.append(f"{node_var} = tensor_node({_quote(payload.op)});")
+        lines.append(f"{node_var} = tensor_node({_quote(op)});")
         lines.append(
-            f"attr({node_var}, \"process.schema_version\", {payload.schema_version});"
+            f"attr({node_var}, \"process.schema_version\", {schema_version});"
         )
-        for key, value in sorted(payload.attributes.items()):
+        for key, value in sorted(attributes.items()):
             encoded = _scalar(value)
             if encoded is not None:
                 lines.append(
                     f"attr({node_var}, {_quote('process.' + key)}, {encoded});"
                 )
-        if payload.constant is not None:
-            encoded = _scalar(payload.constant)
+        if constant is not None:
+            encoded = _scalar(constant)
             if encoded is not None:
                 lines.append(f"attr({node_var}, \"process.constant\", {encoded});")
-        if payload.tensor is not None:
-            if payload.tensor.dtype:
+        if tensor:
+            if tensor.get("dtype"):
                 lines.append(
-                    f"attr({node_var}, \"tensor.dtype\", {_quote(payload.tensor.dtype)});"
+                    f"attr({node_var}, \"tensor.dtype\", {_quote(tensor['dtype'])});"
                 )
-            if payload.tensor.shape:
+            if tensor.get("shape"):
                 lines.append(
                     f"attr({node_var}, \"tensor.shape\", "
-                    f"{_quote(json.dumps(payload.tensor.shape))});"
+                    f"{_quote(json.dumps(tensor['shape']))});"
                 )
-            if payload.tensor.device:
+            if tensor.get("device"):
                 lines.append(
-                    f"attr({node_var}, \"tensor.device\", {_quote(payload.tensor.device)});"
+                    f"attr({node_var}, \"tensor.device\", {_quote(tensor['device'])});"
                 )
-        if payload.bit_quanta is not None:
+        if bit_quanta:
             lines.append(
-                f"attr({node_var}, \"bitbit.quanta\", {payload.bit_quanta.quanta});"
+                f"attr({node_var}, \"bitbit.quanta\", {bit_quanta['quanta']});"
             )
             lines.append(
                 f"attr({node_var}, \"bitbit.bitsforbits\", "
-                f"{payload.bit_quanta.bits_per_quantum});"
+                f"{bit_quanta.get('bits_per_quantum', 1)});"
             )
-            if payload.bit_quanta.pid_domains:
+            if bit_quanta.get("pid_domains"):
                 lines.append(
                     f"attr({node_var}, \"bitbit.pid_domains\", "
-                    f"{_quote(json.dumps(payload.bit_quanta.pid_domains))});"
+                    f"{_quote(json.dumps(bit_quanta['pid_domains']))});"
                 )
-        output_role = payload.output_roles[0] if payload.output_roles else "control"
+        output_role = output_roles[0] if output_roles else "control"
         lines.append(f"{output_var} = tensor_output({node_var}, {_quote(output_role)});")
         output_vars[nid] = output_var
 

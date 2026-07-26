@@ -4,31 +4,32 @@ The compiler path is:
 
 ```text
 Python AST
-  -> semantic ProcessGraph / ProcessOp
-  -> optional BitOps primitive expansion
+  -> ProcessGraph.build_from_ast(semantic=True)
+  -> optional Turing-provenance BitOps primitive expansion
   -> metadata-rich SSA
   -> C PrimitiveProgram or fused GLSL program
   -> Nodus AbstractTensor GraphIR tools
 ```
 
-## Stable semantic payload
+## ProcessGraph node contract
 
-`ProcessOp` separates compilation data from visualization labels and live
-Python objects. It records the canonical operation name, ordered input/output
-roles, scalar attributes and constants, tensor dtype/shape/device, control
-metadata, and source span.
+Compiler metadata lives on ordinary ProcessGraph nodes. The canonical
+operation name, ordered input/output roles, scalar attributes and constants,
+tensor dtype/shape/device, control metadata, source span, and BitBit accounting
+are graph attributes. There is no parallel `ProcessOp` object to keep in sync.
 
-`BitQuantaSpec` preserves the accounting contract of `BitBitBuffer`: mask
-quanta, `bitsforbits`, PID-domain labels, and source-node provenance. It
-describes a live buffer without copying either storage plane or its UUID
-tables.
+`BitBitBuffer.quanta_metadata()` preserves mask quanta, `bitsforbits`,
+PID-domain labels, and source-node provenance without copying either storage
+plane or its UUID tables.
 
 ## BitOps
 
-`expand_bitops_process_graph` invokes the existing `Turing` algebra with a
-symbolic ProcessGraph carrier. The NAND, mux, ripple-add, and structural
-recipes therefore remain in `turing_machine/turing.py`; the compiler does not
-maintain a second arithmetic implementation.
+`expand_bitops_process_graph` invokes `BitOpsTranslator.apply_bits`, whose
+hooks are instrumented by `Turing`'s existing `ProvenanceGraph`. Recorded
+primitive subgraphs are imported through the ordinary
+`provenance_to_process_graph` bridge and spliced into the source graph. NAND,
+mux, ripple-add, multiplication, and structural recipes therefore remain in
+`Turing`/`BitOpsTranslator`; the graph pass contains no arithmetic recipes.
 
 Currently expanded operations:
 
@@ -60,4 +61,3 @@ retaining inputs, constants, returns, and other structural nodes explicitly.
 ```powershell
 python -m pytest tests/test_ast_process_graph.py tests/test_bitops_process_graph.py tests/test_ssa_primitive_lowering.py tests/test_nodus_graph_ir.py -q
 ```
-

@@ -466,29 +466,324 @@ class ProcessGraph:
         return nid
 
 
-    def build_from_ast(self, node_or_path, *args, **kwargs):
+    def build_from_ast(
+        self,
+        node_or_path,
+        *args,
+        semantic=True,
+        filename=None,
+        **kwargs,
+    ):
+        """Import Python source into this ProcessGraph.
+
+        Semantic import is the normal compiler path: Python definitions and
+        uses become ProcessGraph dataflow nodes with canonical operation names.
+        ``semantic=False`` retains the older structural AST reflection used by
+        visualization/debugging callers.  Neither route enters the independent
+        SymPy expression/recombinatorics path.
+        """
         import ast
         import os
-        # Case 1: If already an AST node, just pass it to build_graph
+
         if isinstance(node_or_path, ast.AST):
-            return self.build_graph(node_or_path, *args, **kwargs)
-        
-        # Case 2: If a filename, open and parse
-        if isinstance(node_or_path, str) and os.path.exists(node_or_path):
-            with open(node_or_path, "r") as f:
-                src = f.read()
-            tree = ast.parse(src, filename=node_or_path)
-            return self.build_graph(tree, *args, **kwargs)
-        
-        # Case 3: If it's a source string (not a path), try parsing
-        if isinstance(node_or_path, str):
+            tree = node_or_path
+        elif isinstance(node_or_path, str) and os.path.exists(node_or_path):
+            filename = filename or node_or_path
+            with open(node_or_path, "r", encoding="utf-8") as stream:
+                tree = ast.parse(stream.read(), filename=filename)
+        elif isinstance(node_or_path, str):
             try:
-                tree = ast.parse(node_or_path)
-                return self.build_graph(tree, *args, **kwargs)
-            except Exception as e:
-                raise ValueError(f"Could not parse string as source code: {e}")
-        
-        raise TypeError("build_from_ast expects an AST node, a filename, or a source string")
+                tree = ast.parse(node_or_path, filename=filename or "<string>")
+            except Exception as exc:
+                raise ValueError(f"Could not parse string as source code: {exc}") from exc
+        else:
+            raise TypeError(
+                "build_from_ast expects an AST node, a filename, or a source string"
+            )
+
+        if not semantic:
+            return self.build_graph(tree, *args, **kwargs)
+        return self._build_semantic_ast(tree, filename=filename)
+
+    def _build_semantic_ast(self, tree, *, filename=None):
+        """Build canonical Python dataflow directly in this ProcessGraph."""
+        import ast
+
+        binary_ops = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.Div: "truediv",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+            ast.BitAnd: "bitand",
+            ast.BitOr: "bitor",
+            ast.BitXor: "bitxor",
+            ast.LShift: "shl",
+            ast.RShift: "shr",
+        }
+        compare_ops = {
+            ast.Eq: "eq",
+            ast.NotEq: "ne",
+            ast.Lt: "lt",
+            ast.LtE: "le",
+            ast.Gt: "gt",
+            ast.GtE: "ge",
+        }
+        env = {}
+        next_id = 0
+        while next_id in self.G:
+            next_id += 1
+
+        def span(node):
+            return {
+                "filename": filename,
+                "line": getattr(node, "lineno", None),
+                "column": getattr(node, "col_offset", None),
+                "end_line": getattr(node, "end_lineno", None),
+                "end_column": getattr(node, "end_col_offset", None),
+            }
+
+        def add_node(
+            op,
+            inputs=(),
+            *,
+            label=None,
+            attributes=None,
+            constant=None,
+            tensor=None,
+            control=None,
+            source=None,
+            output_roles=("result",),
+        ):
+            nonlocal next_id
+            while next_id in self.G:
+                next_id += 1
+            nid = next_id
+            next_id += 1
+            parents = list(inputs)
+            domain_node = DomainNode(shape=(1, 1, 1), unit_size=1)
+            domain_node.id = id(domain_node)
+            attrs = dict(attributes or {})
+            self.G.add_node(
+                nid,
+                label=label or op,
+                type=op,
+                op=op,
+                expr_obj=None,
+                extra_args=attrs,
+                attributes=attrs,
+                constant=constant,
+                tensor=dict(tensor or {}),
+                bit_quanta=None,
+                control=dict(control or {}),
+                source_span=source,
+                input_roles=tuple(role for _, role in parents),
+                output_roles=tuple(output_roles),
+                schema_version=1,
+                domain_node=domain_node,
+                store_id=None,
+                parents=parents,
+                children=[],
+            )
+            for parent, role in parents:
+                self.G.add_edge(parent, nid, role=role)
+                self.G.nodes[parent]["children"].append((nid, role))
+            return nid
+
+        def opaque(node):
+            return add_node(
+                "opaque_python",
+                attributes={
+                    "ast_type": type(node).__name__,
+                    "dump": ast.dump(node),
+                },
+                source=span(node),
+            )
+
+        def expression(node):
+            if isinstance(node, ast.Name):
+                if node.id not in env:
+                    env[node.id] = add_node(
+                        "input",
+                        label=node.id,
+                        attributes={"name": node.id},
+                        tensor={},
+                        source=span(node),
+                        output_roles=("value",),
+                    )
+                return env[node.id]
+            if isinstance(node, ast.Constant):
+                return add_node(
+                    "const",
+                    label=repr(node.value),
+                    constant=node.value,
+                    source=span(node),
+                    output_roles=("value",),
+                )
+            if isinstance(node, ast.BinOp):
+                lhs = expression(node.left)
+                rhs = expression(node.right)
+                op = binary_ops.get(type(node.op))
+                return (
+                    add_node(
+                        op,
+                        ((lhs, "lhs"), (rhs, "rhs")),
+                        source=span(node),
+                    )
+                    if op is not None
+                    else opaque(node)
+                )
+            if isinstance(node, ast.UnaryOp):
+                operand = expression(node.operand)
+                op = {
+                    ast.USub: "neg",
+                    ast.Not: "logical_not",
+                    ast.Invert: "invert",
+                }.get(type(node.op))
+                return (
+                    add_node(
+                        op,
+                        ((operand, "operand"),),
+                        source=span(node),
+                    )
+                    if op is not None
+                    else opaque(node)
+                )
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == len(node.comparators) == 1
+            ):
+                lhs = expression(node.left)
+                rhs = expression(node.comparators[0])
+                op = compare_ops.get(type(node.ops[0]))
+                return (
+                    add_node(
+                        op,
+                        ((lhs, "lhs"), (rhs, "rhs")),
+                        source=span(node),
+                    )
+                    if op is not None
+                    else opaque(node)
+                )
+            if isinstance(node, ast.Call):
+                arguments = [expression(arg) for arg in node.args]
+                function = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else ast.unparse(node.func)
+                )
+                roles = tuple(f"arg{index}" for index in range(len(arguments)))
+                return add_node(
+                    "call",
+                    zip(arguments, roles),
+                    label=function,
+                    attributes={
+                        "function": function,
+                        "keywords": {
+                            keyword.arg or "**": ast.unparse(keyword.value)
+                            for keyword in node.keywords
+                        },
+                    },
+                    source=span(node),
+                )
+            return opaque(node)
+
+        def statement(node):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                value = expression(node.value)
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    env[target.id] = value
+                    return value
+                return opaque(node)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is None:
+                    return None
+                value = expression(node.value)
+                env[node.target.id] = value
+                return value
+            if isinstance(node, ast.Expr):
+                return expression(node.value)
+            if isinstance(node, ast.Return):
+                value = expression(node.value) if node.value is not None else None
+                inputs = () if value is None else ((value, "value"),)
+                result = add_node(
+                    "return",
+                    inputs,
+                    source=span(node),
+                    output_roles=(),
+                )
+                self.roots.append(result)
+                return result
+            if isinstance(node, ast.If):
+                condition = expression(node.test)
+                before = dict(env)
+                env.clear()
+                env.update(before)
+                for child in node.body:
+                    statement(child)
+                then_env = dict(env)
+                env.clear()
+                env.update(before)
+                for child in node.orelse:
+                    statement(child)
+                else_env = dict(env)
+                merged = dict(before)
+                for name in sorted(set(then_env) | set(else_env)):
+                    then_value = then_env.get(name, before.get(name))
+                    else_value = else_env.get(name, before.get(name))
+                    if then_value is None or else_value is None:
+                        continue
+                    if then_value == else_value:
+                        merged[name] = then_value
+                    else:
+                        merged[name] = add_node(
+                            "select",
+                            (
+                                (condition, "condition"),
+                                (then_value, "if_true"),
+                                (else_value, "if_false"),
+                            ),
+                            attributes={"variable": name},
+                            source=span(node),
+                        )
+                env.clear()
+                env.update(merged)
+                return condition
+            return opaque(node)
+
+        if isinstance(tree, ast.Module):
+            body = tree.body
+        elif isinstance(tree, ast.FunctionDef):
+            for argument in tree.args.args:
+                env[argument.arg] = add_node(
+                    "input",
+                    label=argument.arg,
+                    attributes={"name": argument.arg},
+                    tensor={},
+                    source=span(argument),
+                    output_roles=("value",),
+                )
+            body = tree.body
+        else:
+            body = [ast.Expr(value=tree)]
+
+        for child in body:
+            if isinstance(child, ast.FunctionDef):
+                if self.G.number_of_nodes():
+                    raise ValueError(
+                        "semantic AST import accepts one top-level function"
+                    )
+                return self._build_semantic_ast(child, filename=filename)
+            statement(child)
+        if not self.roots:
+            self.roots = [
+                nid for nid in self.G.nodes if self.G.out_degree(nid) == 0
+            ]
+        self.domain_shape = (1,)
+        return self
     
     def finalize_graph_with_outputs(self):
         """
@@ -709,20 +1004,51 @@ class ProcessGraph:
             for idx, node in by_idx.items():
                 domain_node = DomainNode(shape=(1, 1, 1), unit_size=1)
                 domain_node.id = id(domain_node)
+                parents = sorted(
+                    incoming[idx], key=lambda item: int(item[1][3:])
+                )
+                children = sorted(
+                    outgoing[idx], key=lambda item: int(item[1][3:])
+                )
+                result_length = node.metadata.get("result_length")
+                tensor = (
+                    {"dtype": "bit", "shape": (int(result_length),)}
+                    if result_length is not None
+                    else {}
+                )
                 self.G.add_node(
                     idx,
                     label=node.op,
                     type=node.op,
+                    op=node.op,
                     expr_obj=node,
                     extra_args={
                         "kwargs": dict(node.kwargs),
                         "arg_ids": tuple(node.args),
                         "out_obj_id": node.out_obj_id,
                     },
+                    attributes=dict(node.kwargs),
+                    constant=None,
+                    tensor=tensor,
+                    bit_quanta=(
+                        {
+                            "quanta": int(result_length),
+                            "bits_per_quantum": 1,
+                            "pid_domains": (),
+                            "source_nodes": tuple(parent for parent, _ in parents),
+                        }
+                        if result_length is not None
+                        else None
+                    ),
+                    control={"recorded_by": "turing_provenance"},
+                    source_span=None,
+                    input_roles=tuple(role for _, role in parents),
+                    output_roles=("result",),
+                    schema_version=1,
                     domain_node=domain_node,
                     store_id=None,
-                    parents=sorted(incoming[idx], key=lambda item: int(item[1][3:])),
-                    children=sorted(outgoing[idx], key=lambda item: int(item[1][3:])),
+                    parents=parents,
+                    children=children,
                 )
                 self.node_map[idx] = node
 

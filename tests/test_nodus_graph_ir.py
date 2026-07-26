@@ -1,10 +1,16 @@
-from src.compiler.ast_process_graph import ast_to_process_graph
 from src.compiler.bitops_process_graph import expand_bitops_process_graph
 from src.compiler.nodus_graph_ir import process_graph_to_nodus_graph_ir
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def _graph(source):
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(source)
+    return graph
 
 
 def test_process_graph_serializes_as_nodus_tensor_tools():
-    graph = ast_to_process_graph(
+    graph = _graph(
         """
 def kernel(x, y):
     return (x + y) * 3
@@ -23,7 +29,7 @@ def kernel(x, y):
 
 def test_nodus_export_keeps_bitbit_quanta_accounting():
     graph = expand_bitops_process_graph(
-        ast_to_process_graph(
+        _graph(
             """
 def kernel(x, y):
     return x ^ y

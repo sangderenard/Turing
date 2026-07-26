@@ -1,4 +1,3 @@
-from src.compiler.ast_process_graph import ast_to_process_graph
 from src.compiler.bitops_process_graph import expand_bitops_process_graph
 from src.compiler.ssa_builder import process_graph_to_ssa_instrs
 from src.compiler.ssa_primitive_lowering import lower_ssa_to_primitive_program
@@ -7,10 +6,12 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     GlslProgram,
     emit_program_source,
 )
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
 def _ssa(source, *, bitops=False):
-    graph = ast_to_process_graph(source)
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(source)
     if bitops:
         graph = expand_bitops_process_graph(graph, bit_width=8)
     return process_graph_to_ssa_instrs(graph, schedule="asap")

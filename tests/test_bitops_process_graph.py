@@ -1,14 +1,22 @@
-from src.compiler.ast_process_graph import ast_to_process_graph
 from src.compiler.bitops_process_graph import expand_bitops_process_graph
 from src.compiler.ssa_builder import process_graph_to_ssa_instrs
+from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+
+def _graph(source):
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(source)
+    return graph
 
 
 def _ops(graph):
-    return [data["process_op"].op for _, data in graph.G.nodes(data=True)]
+    import networkx as nx
+
+    return [graph.G.nodes[node]["op"] for node in nx.topological_sort(graph.G)]
 
 
 def test_bitxor_expands_to_the_real_turing_nand_algebra():
-    source = ast_to_process_graph(
+    source = _graph(
         """
 def kernel(x, y):
     return x ^ y
@@ -19,24 +27,24 @@ def kernel(x, y):
 
     assert "bitxor" not in ops
     assert "nand" in ops
-    assert ops[-1] == "return"
+    assert "return" in ops
     assert all(
-        data["process_op"].control.get("lowered_by") == "bitops"
+        data["control"].get("lowered_by") == "bitops"
         for _, data in lowered.G.nodes(data=True)
-        if data["process_op"].op == "nand"
+        if data["op"] == "nand"
     )
     nand_payload = next(
-        data["process_op"]
+        data
         for _, data in lowered.G.nodes(data=True)
-        if data["process_op"].op == "nand"
+        if data["op"] == "nand"
     )
-    assert nand_payload.bit_quanta.quanta == 4
-    assert nand_payload.bit_quanta.bits_per_quantum == 1
-    assert len(nand_payload.bit_quanta.source_nodes) == 2
+    assert nand_payload["bit_quanta"]["quanta"] == 4
+    assert nand_payload["bit_quanta"]["bits_per_quantum"] == 1
+    assert len(nand_payload["bit_quanta"]["source_nodes"]) == 2
 
 
 def test_partial_expansion_is_explicit_and_ssa_consumable():
-    source = ast_to_process_graph(
+    source = _graph(
         """
 def kernel(x, y, n):
     z = (x + y) * 3
@@ -53,11 +61,11 @@ def kernel(x, y, n):
     assert "bitxor" not in ops
     assert "gt" in ops
     gt = next(
-        data["process_op"]
+        data
         for _, data in lowered.G.nodes(data=True)
-        if data["process_op"].op == "gt"
+        if data["op"] == "gt"
     )
-    assert gt.attributes["bitops_status"] == "unexpanded"
+    assert gt["attributes"]["bitops_status"] == "unexpanded"
 
     instrs = process_graph_to_ssa_instrs(lowered, schedule="asap")
     assert any(instr.op == "nand" for instr in instrs)

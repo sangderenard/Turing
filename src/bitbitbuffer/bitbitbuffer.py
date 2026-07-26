@@ -135,6 +135,17 @@ class BitBitBuffer:
         """
         return self.mask_size
 
+    def quanta_metadata(self, *, source_nodes=()):
+        """Return the graph-safe accounting description of both bit planes."""
+
+        return {
+            "quanta": int(self.mask_size),
+            "bits_per_quantum": int(self.bitsforbits),
+            "data_bits": int(self.mask_size) * int(self.bitsforbits),
+            "pid_domains": tuple(sorted(self.pid_buffers)),
+            "source_nodes": tuple(int(node) for node in source_nodes),
+        }
+
     def __repr__(self):
         spec = BitBitIndex(self, slice(0, self.mask_size), mode='repr')
         return_val = self.indexer.access(spec)

@@ -75,25 +75,75 @@ class BitOpsTranslator:
             acc = self.tm.OR(acc, self.tm.slc(bits, i, i + 1))
         return self.int_from_bits(acc) == 0
 
+    def apply_bits(self, op: str, *operands: BitStr) -> BitStr:
+        """Apply one derived integer operation to existing bit carriers.
+
+        This is the authoritative derived-operation entry point for both
+        concrete integer translation and ProcessGraph expansion. Primitive
+        provenance is recorded by the instrumented Turing hooks.
+        """
+        if op == "bitand":
+            return self.tm.AND(*operands)
+        if op == "bitor":
+            return self.tm.OR(*operands)
+        if op == "bitxor":
+            return self.tm.XOR(*operands)
+        if op == "invert":
+            return self.tm.NOT(operands[0])
+        if op == "add":
+            return self.tm.slc(
+                self.tm.ripple_add(*operands), 1, self.bit_width + 1
+            )
+        if op == "sub":
+            y_inv = self.tm.NOT(operands[1])
+            y_neg = self.tm.slc(
+                self.tm.succ(y_inv), 1, self.bit_width + 1
+            )
+            return self.tm.slc(
+                self.tm.ripple_add(operands[0], y_neg),
+                1,
+                self.bit_width + 1,
+            )
+        if op == "mul":
+            width = self.bit_width
+            product = self.tm.zeros(width * 2)
+            for index in range(width):
+                selector_bit = self.tm.slc(
+                    operands[1], width - 1 - index, width - index
+                )
+                shifted = self.tm.sigma_L(operands[0], index)
+                padded = self.tm.concat(self.tm.zeros(width - index), shifted)
+                selector = self._expand_bit(selector_bit, width * 2)
+                addend = self.tm.mu(
+                    self.tm.zeros(width * 2), padded, selector
+                )
+                product = self.tm.slc(
+                    self.tm.ripple_add(product, addend),
+                    1,
+                    width * 2 + 1,
+                )
+            return self.tm.slc(product, width, width * 2)
+        raise NotImplementedError(f"no Turing derived expansion for {op!r}")
+
     # pointwise logic
     def bit_and(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        out = self.tm.AND(X, Y)
+        out = self.apply_bits("bitand", X, Y)
         return self.int_from_bits(out)
 
     def bit_or(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        out = self.tm.OR(X, Y)
+        out = self.apply_bits("bitor", X, Y)
         return self.int_from_bits(out)
 
     def bit_xor(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        out = self.tm.XOR(X, Y)
+        out = self.apply_bits("bitxor", X, Y)
         return self.int_from_bits(out)
 
     def bit_not(self, x: int) -> int:
         X = self.bits_from_int(x)
-        out = self.tm.NOT(X)
+        out = self.apply_bits("invert", X)
         return self.int_from_bits(out)
 
     # shifts
@@ -114,18 +164,11 @@ class BitOpsTranslator:
     # arithmetic
     def bit_add(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        summed = self.tm.ripple_add(X, Y)
-        truncated = self.tm.slc(summed, 1, self.bit_width + 1)
-        return self.int_from_bits(truncated)
+        return self.int_from_bits(self.apply_bits("add", X, Y))
 
     def bit_sub(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        y_inv = self.tm.NOT(Y)
-        y_neg = self.tm.succ(y_inv)
-        y_neg_trunc = self.tm.slc(y_neg, 1, self.bit_width + 1)
-        diff = self.tm.ripple_add(X, y_neg_trunc)
-        truncated = self.tm.slc(diff, 1, self.bit_width + 1)
-        return self.int_from_bits(truncated)
+        return self.int_from_bits(self.apply_bits("sub", X, Y))
 
     def _expand_bit(self, bit1: BitStr, n: int) -> BitStr:
         out = self.tm.zeros(n)
@@ -135,18 +178,7 @@ class BitOpsTranslator:
 
     def bit_mul(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)
-        width = self.bit_width
-        product = self.tm.zeros(width * 2)
-        for i in range(width):
-            sel_bit = self.tm.slc(Y, width - 1 - i, width - i)
-            x_shift = self.tm.sigma_L(X, i)
-            x_pad = self.tm.concat(self.tm.zeros(width - i), x_shift)
-            sel = self._expand_bit(sel_bit, width * 2)
-            addend = self.tm.mu(self.tm.zeros(width * 2), x_pad, sel)
-            product = self.tm.ripple_add(product, addend)
-            product = self.tm.slc(product, 1, width * 2 + 1)
-        final = self.tm.slc(product, width, width * 2)
-        return self.int_from_bits(final)
+        return self.int_from_bits(self.apply_bits("mul", X, Y))
 
     def bit_div(self, x: int, y: int) -> int:
         X, Y = self.bits_from_int(x), self.bits_from_int(y)

@@ -48,6 +48,7 @@ class ProvNode:
     args:       Tuple[int, ...]         # id(arg) per positional arg
     kwargs:     Dict[str, Any]
     out_obj_id: int                     # id(result)
+    metadata:   Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 @dataclasses.dataclass
 class ProvEdge:
@@ -76,14 +77,58 @@ class ProvenanceGraph:
     def edges(self) -> List[ProvEdge]:
         return self._edges
 
+    def bind_input(
+        self,
+        value: Any,
+        *,
+        name: str | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> int:
+        """Register an externally-produced value as an explicit graph leaf."""
+
+        idx = self._next_idx()
+        details = dict(metadata or {})
+        if name is not None:
+            details["name"] = name
+        node = ProvNode(idx, "input", (), {}, id(value), details)
+        self._nodes.append(node)
+        self._producer[id(value)] = idx
+        if self.nx is not None:
+            self.nx.add_node(
+                idx,
+                op="input",
+                args=(),
+                kwargs={},
+                out_obj_id=id(value),
+                metadata=details,
+            )
+        return idx
+
+    def producer_index(self, value: Any) -> int | None:
+        """Return the node that most recently produced ``value``."""
+
+        return self._producer.get(id(value))
+
     def add_call(self, op: str, args: Tuple[Any, ...], kwargs: Dict[str, Any], result: Any):
         idx = self._next_idx()
         arg_ids = tuple(id(a) for a in args)
         out_id  = id(result)
-        node    = ProvNode(idx, op, arg_ids, kwargs, out_id)
+        metadata = {}
+        try:
+            metadata["result_length"] = len(result)
+        except (TypeError, AttributeError):
+            pass
+        node    = ProvNode(idx, op, arg_ids, kwargs, out_id, metadata)
         self._nodes.append(node)
         if self.nx is not None:
-            self.nx.add_node(idx, op=op, args=arg_ids, kwargs=kwargs, out_obj_id=out_id)
+            self.nx.add_node(
+                idx,
+                op=op,
+                args=arg_ids,
+                kwargs=kwargs,
+                out_obj_id=out_id,
+                metadata=metadata,
+            )
 
         # build edges arg -> this node
         for pos, a in enumerate(args):

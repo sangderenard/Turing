@@ -1,176 +1,50 @@
-"""Rewrite canonical integer ProcessGraph operations into Turing primitives."""
+"""Expand ProcessGraph integer operations through Turing provenance.
+
+Derived arithmetic remains defined by :class:`BitOpsTranslator` and
+:class:`Turing`.  This module only splices the recorded primitive provenance
+subgraph into the caller's ProcessGraph.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Dict, Iterable, Tuple
+import copy
+from typing import Dict
 
 import networkx as nx
 
+from .bitops_translator import BitOpsTranslator
+from .process_graph_helper import provenance_to_process_graph
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
-from ..transmogrifier.process_op import BitQuantaSpec, ProcessOp, TensorSpec
-from ..transmogrifier.solver_types import DomainNode
-from ..turing_machine.turing import Hooks, Turing
 
 
-@dataclass(frozen=True)
-class GraphBits:
-    """Symbolic bitstring carrier used by the ordinary :class:`Turing` algebra."""
-
-    node_id: int
-    accounting: BitQuantaSpec
-
-    @property
-    def width(self) -> int:
-        return self.accounting.quanta
-
-    def copy(self) -> "GraphBits":
-        """Satisfy the generic bitstring carrier protocol without mutation."""
-
-        return self
+_EXPANDABLE = frozenset(
+    {"bitand", "bitor", "bitxor", "invert", "add", "sub", "mul"}
+)
 
 
-class _PrimitiveEmitter:
-    def __init__(self, graph: ProcessGraph, start_id: int = 0):
-        self.graph = graph
-        self.next_id = start_id
-
-    def emit(
-        self,
-        op: str,
-        inputs: Iterable[Tuple[GraphBits, str]] = (),
-        *,
-        width: int,
-        attributes=None,
-    ) -> GraphBits:
-        nid = self.next_id
-        self.next_id += 1
-        parents = [(value.node_id, role) for value, role in inputs]
-        payload = ProcessOp(
-            op,
-            tuple(role for _, role in parents),
-            attributes=attributes or {},
-            tensor=TensorSpec(dtype="bit", shape=(width,)),
-            bit_quanta=BitQuantaSpec(
-                quanta=width,
-                bits_per_quantum=1,
-                source_nodes=tuple(parent for parent, _ in parents),
-            ),
-            control={"lowered_by": "bitops"},
-        )
-        domain_node = DomainNode(shape=(1, 1, 1), unit_size=1)
-        domain_node.id = id(domain_node)
-        self.graph.G.add_node(
-            nid,
-            label=op,
-            type=op,
-            expr_obj=None,
-            process_op=payload,
-            extra_args=dict(payload.attributes),
-            domain_node=domain_node,
-            store_id=None,
-            parents=parents,
-            children=[],
-        )
-        for src, role in parents:
-            self.graph.G.add_edge(src, nid, role=role)
-            self.graph.G.nodes[src]["children"].append((nid, role))
-        return GraphBits(nid, payload.bit_quanta)
-
-    def hooks(self) -> Hooks:
-        def nand(a, b):
-            if a.width != b.width:
-                raise ValueError("nand operands must have equal bit width")
-            return self.emit("nand", ((a, "lhs"), (b, "rhs")), width=a.width)
-
-        def sigma_l(a, amount):
-            return self.emit(
-                "sigma_L",
-                ((a, "value"),),
-                width=a.width + int(amount),
-                attributes={"amount": int(amount)},
-            )
-
-        def sigma_r(a, amount):
-            return self.emit(
-                "sigma_R",
-                ((a, "value"),),
-                width=max(a.width - int(amount), 0),
-                attributes={"amount": int(amount)},
-            )
-
-        def concat(a, b):
-            return self.emit(
-                "concat",
-                ((a, "lhs"), (b, "rhs")),
-                width=a.width + b.width,
-            )
-
-        def slice_(a, start, stop):
-            start, stop = int(start), int(stop)
-            return self.emit(
-                "slice",
-                ((a, "value"),),
-                width=max(stop - start, 0),
-                attributes={"start": start, "stop": stop},
-            )
-
-        def mu(a, b, selector):
-            if not (a.width == b.width == selector.width):
-                raise ValueError("mu operands must have equal bit width")
-            return self.emit(
-                "mu",
-                ((a, "if_false"), (b, "if_true"), (selector, "selector")),
-                width=a.width,
-            )
-
-        def length(a):
-            return a.width
-
-        def zeros(width):
-            width = int(width)
-            return self.emit("zeros", width=width, attributes={"length": width})
-
-        return Hooks(
-            nand=nand,
-            sigma_L=sigma_l,
-            sigma_R=sigma_r,
-            concat=concat,
-            slice=slice_,
-            mu=mu,
-            length=length,
-            zeros=zeros,
-        )
+def _next_free_id(graph: nx.DiGraph, start: int) -> int:
+    while start in graph:
+        start += 1
+    return start
 
 
-def _expand(tm: Turing, op: str, args, width: int) -> GraphBits | None:
-    if op == "bitand":
-        return tm.AND(*args)
-    if op == "bitor":
-        return tm.OR(*args)
-    if op == "bitxor":
-        return tm.XOR(*args)
-    if op == "invert":
-        return tm.NOT(*args)
-    if op == "add":
-        return tm.slc(tm.ripple_add(*args), 1, width + 1)
-    if op == "sub":
-        inverted = tm.NOT(args[1])
-        negated = tm.slc(tm.succ(inverted), 1, width + 1)
-        return tm.slc(tm.ripple_add(args[0], negated), 1, width + 1)
-    if op == "mul":
-        product = tm.zeros(width * 2)
-        for i in range(width):
-            selector_bit = tm.slc(args[1], width - 1 - i, width - i)
-            shifted = tm.sigma_L(args[0], i)
-            padded = tm.concat(tm.zeros(width - i), shifted)
-            selector = tm.zeros(width * 2)
-            for j in range(width * 2):
-                selector = tm.write_bit(selector, j, selector_bit)
-            addend = tm.mu(tm.zeros(width * 2), padded, selector)
-            product = tm.slc(tm.ripple_add(product, addend), 1, width * 2 + 1)
-        return tm.slc(product, width, width * 2)
-    return None
+def _bits_for_node(data: dict, translator: BitOpsTranslator) -> list[int]:
+    if data.get("op") == "const" and isinstance(data.get("constant"), int):
+        mask = (1 << translator.bit_width) - 1
+        return translator.bits_from_int(int(data["constant"]) & mask)
+    return [0] * translator.bit_width
+
+
+def _remove_child_reference(data: dict, child: int) -> None:
+    data["children"] = [
+        item for item in data.get("children", ()) if item[0] != child
+    ]
+
+
+def _append_child_reference(data: dict, child: int, role: str) -> None:
+    children = data.setdefault("children", [])
+    if (child, role) not in children:
+        children.append((child, role))
 
 
 def expand_bitops_process_graph(
@@ -178,65 +52,138 @@ def expand_bitops_process_graph(
     *,
     bit_width: int,
 ) -> ProcessGraph:
-    """Return a graph with supported integer operations expanded to primitives.
+    """Replace supported integer nodes with recorded Turing primitives.
 
-    Unsupported operations remain in the graph with an explicit
-    ``bitops_status=unexpanded`` attribute. This makes partial lowering
-    inspectable and prevents accidental claims of backend completeness.
+    Every replacement is obtained by executing the existing instrumented
+    Turing implementation. Unsupported operations stay in place and are marked
+    explicitly. No derived arithmetic is implemented in this pass.
     """
 
     if bit_width <= 0:
         raise ValueError("bit_width must be positive")
 
     target = ProcessGraph(materialize_memory=False)
-    emitter = _PrimitiveEmitter(target)
-    tm = Turing(emitter.hooks())
-    values: Dict[int, GraphBits] = {}
+    target.G = copy.deepcopy(source.G)
+    target.scheduler = type(target.scheduler)(target)
+    target.roots = list(source.roots)
+    target.domain_shape = source.domain_shape
+    target.node_map = dict(source.node_map)
+    original_order = list(nx.topological_sort(source.G))
+    next_id = _next_free_id(
+        target.G,
+        max((node for node in target.G if isinstance(node, int)), default=-1) + 1,
+    )
 
-    for old_id in nx.topological_sort(source.G):
-        data = source.G.nodes[old_id]
-        payload = data.get("process_op")
-        if not isinstance(payload, ProcessOp):
-            payload = ProcessOp(str(data.get("label") or data.get("type") or "opaque"))
-        parent_items = list(data.get("parents", ()))
-        args = [values[parent] for parent, _ in parent_items]
-        expanded = _expand(tm, payload.op, args, bit_width)
-        if expanded is not None:
-            values[old_id] = expanded
+    for old_id in original_order:
+        if old_id not in target.G:
+            continue
+        old_data = target.G.nodes[old_id]
+        op = old_data.get("op") or old_data.get("label")
+        if op not in _EXPANDABLE:
+            if op not in {"input", "const", "return", "select"}:
+                attributes = old_data.setdefault("attributes", {})
+                attributes["bitops_status"] = "unexpanded"
+                old_data["extra_args"] = dict(attributes)
             continue
 
-        attrs = dict(payload.attributes)
-        if payload.op not in {"input", "const", "return", "select"}:
-            attrs["bitops_status"] = "unexpanded"
-        cloned = replace(payload, attributes=attrs)
-        width = (
-            cloned.tensor.shape[0]
-            if cloned.tensor and cloned.tensor.shape and cloned.tensor.shape[0] is not None
-            else bit_width
-        )
-        values[old_id] = emitter.emit(
-            cloned.op,
-            ((values[parent], role) for parent, role in parent_items),
-            width=int(width),
-            attributes={
-                **dict(cloned.attributes),
-                **({"value": cloned.constant} if cloned.constant is not None else {}),
-            },
-        )
-        new_data = target.G.nodes[values[old_id].node_id]
-        if cloned.bit_quanta is None:
-            cloned = replace(
-                cloned,
-                bit_quanta=BitQuantaSpec(
-                    quanta=int(width),
-                    bits_per_quantum=1,
-                    source_nodes=tuple(values[parent].node_id for parent, _ in parent_items),
-                ),
+        parents = list(old_data.get("parents", ()))
+        translator = BitOpsTranslator(bit_width)
+        operands = []
+        provenance_inputs: Dict[int, int] = {}
+        for parent, _role in parents:
+            bits = _bits_for_node(target.G.nodes[parent], translator)
+            provenance_id = translator.graph.bind_input(
+                bits,
+                name=f"process_node_{parent}",
+                metadata={
+                    "source_node": parent,
+                    "result_length": bit_width,
+                },
             )
-        new_data["process_op"] = cloned
-        new_data["label"] = data.get("label", cloned.op)
-        new_data["type"] = data.get("type", cloned.op)
+            provenance_inputs[provenance_id] = parent
+            operands.append(bits)
 
-    target.roots = [values[root].node_id for root in source.roots]
-    target.domain_shape = source.domain_shape
+        result = translator.apply_bits(op, *operands)
+        result_provenance_id = translator.graph.producer_index(result)
+        if result_provenance_id is None:
+            raise RuntimeError(f"Turing provenance did not record the result of {op}")
+        recorded = provenance_to_process_graph(translator.graph)
+        live_nodes = nx.ancestors(recorded.G, result_provenance_id)
+        live_nodes.add(result_provenance_id)
+        recorded_order = [
+            node
+            for node in nx.topological_sort(recorded.G)
+            if node in live_nodes
+        ]
+        mapping: Dict[int, int] = {
+            node: parent
+            for node, parent in provenance_inputs.items()
+            if node in live_nodes
+        }
+
+        for provenance_id in recorded_order:
+            if provenance_id in mapping:
+                continue
+            next_id = _next_free_id(target.G, next_id)
+            mapping[provenance_id] = next_id
+            node_data = copy.deepcopy(recorded.G.nodes[provenance_id])
+            node_data["control"] = {
+                **dict(node_data.get("control") or {}),
+                "lowered_by": "bitops",
+                "source_operation": op,
+            }
+            target.G.add_node(next_id, **node_data)
+            next_id += 1
+
+        for provenance_id in recorded_order:
+            mapped = mapping[provenance_id]
+            if provenance_id in provenance_inputs:
+                continue
+            data = target.G.nodes[mapped]
+            mapped_parents = [
+                (mapping[parent], role)
+                for parent, role in recorded.G.nodes[provenance_id].get(
+                    "parents", ()
+                )
+            ]
+            data["parents"] = mapped_parents
+            data["children"] = []
+            data["input_roles"] = tuple(role for _, role in mapped_parents)
+            quanta = int(
+                (data.get("tensor") or {}).get("shape", (bit_width,))[0]
+            )
+            data["bit_quanta"] = {
+                "quanta": quanta,
+                "bits_per_quantum": 1,
+                "pid_domains": (),
+                "source_nodes": tuple(parent for parent, _ in mapped_parents),
+            }
+            for parent, role in mapped_parents:
+                target.G.add_edge(parent, mapped, role=role)
+                _append_child_reference(target.G.nodes[parent], mapped, role)
+
+        replacement = mapping[result_provenance_id]
+        children = list(old_data.get("children", ()))
+        for parent, _role in parents:
+            if parent in target.G:
+                _remove_child_reference(target.G.nodes[parent], old_id)
+            if target.G.has_edge(parent, old_id):
+                target.G.remove_edge(parent, old_id)
+        for child, role in children:
+            if child not in target.G:
+                continue
+            child_data = target.G.nodes[child]
+            child_data["parents"] = [
+                (replacement if parent == old_id else parent, parent_role)
+                for parent, parent_role in child_data.get("parents", ())
+            ]
+            if target.G.has_edge(old_id, child):
+                target.G.remove_edge(old_id, child)
+            target.G.add_edge(replacement, child, role=role)
+            _append_child_reference(target.G.nodes[replacement], child, role)
+        target.roots = [
+            replacement if root == old_id else root for root in target.roots
+        ]
+        target.G.remove_node(old_id)
+
     return target
