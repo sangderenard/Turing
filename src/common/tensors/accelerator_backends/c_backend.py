@@ -42,7 +42,7 @@ from ..abstraction import (
     _flatten,
     register_backend,
 )
-from ..abstraction_methods.indexing import lower_basic_index
+from ..abstraction_methods.indexing import lower_basic_index, normalize_basic_index
 
 
 ffi = FFI()
@@ -117,6 +117,10 @@ ffi.cdef("""
     void index_select_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, const int* indices, int index_count);
+    void index_assign_double(
+        double* target, const int* shape, int ndim,
+        const int* axis_offsets, const int* axis_indices,
+        const double* values, int value_count);
     int count_true_double(const double* mask, int n);
     void mask_select_double(
         const double* input, const double* mask, double* output, int n);
@@ -768,6 +772,44 @@ class CTensorOperations(AbstractTensor):
             return CTensor(self.data.shape[1:], selected.buffer)
         return CTensor(index_shape + self.data.shape[1:], selected.buffer)
 
+    def set_item_(self, data, index, value):
+        """Assign through the shared basic-index policy and one native loop."""
+        axes, selection_shape = normalize_basic_index(index, data.shape)
+        selection_count = 1
+        for size in selection_shape:
+            selection_count *= size
+        if selection_count == 0:
+            return
+
+        raw_value = value.data if isinstance(value, AbstractTensor) else value
+        if isinstance(raw_value, CTensor):
+            values = raw_value
+        elif isinstance(raw_value, (int, float, bool)):
+            values = CTensor.from_list([raw_value], (1,))
+        else:
+            values = CTensor.from_list(raw_value, _get_shape(raw_value))
+
+        if values.size not in (1, selection_count):
+            raise ValueError(
+                f"assignment value has {values.size} elements; "
+                f"selection requires 1 or {selection_count}"
+            )
+
+        offsets = [0]
+        flattened_indices = []
+        for indices, _ in axes:
+            flattened_indices.extend(indices)
+            offsets.append(len(flattened_indices))
+        C.index_assign_double(
+            data.as_c_ptr(),
+            ffi.new("int[]", data.shape),
+            len(data.shape),
+            ffi.new("int[]", offsets),
+            ffi.new("int[]", flattened_indices),
+            values.as_c_ptr(),
+            values.size,
+        )
+
     def shape_(self, tensor: CTensor = None) -> Tuple[int, ...]:
         if tensor is None:
             tensor = self.data
@@ -1084,8 +1126,8 @@ class CTensorOperations(AbstractTensor):
             factors = list(repeats)
             if len(factors) < len(input_shape):
                 factors = [1] * (len(input_shape) - len(factors)) + factors
-            if len(factors) != len(input_shape):
-                raise ValueError("repeat rank must match tensor rank")
+            elif len(factors) > len(input_shape):
+                input_shape = (1,) * (len(factors) - len(input_shape)) + input_shape
         if any(factor < 0 for factor in factors):
             raise ValueError("repeat factors must be non-negative")
         output_shape = tuple(

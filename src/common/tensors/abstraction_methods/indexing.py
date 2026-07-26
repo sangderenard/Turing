@@ -3,6 +3,48 @@ from __future__ import annotations
 from typing import Any, Tuple
 
 
+def normalize_basic_index(index: Any, shape: Tuple[int, ...]):
+    """Normalize basic indexing into per-axis indices and output shape.
+
+    Integer axes are retained as one-element selections but omitted from the
+    logical output shape. This gives read and write lowerings one shared
+    interpretation of integers, slices, negative indices, and ellipses.
+    """
+    items = list(index) if isinstance(index, tuple) else [index]
+    ellipses = sum(item is Ellipsis for item in items)
+    if ellipses > 1:
+        raise IndexError("an index can only have a single ellipsis")
+    if ellipses:
+        location = next(
+            position for position, item in enumerate(items)
+            if item is Ellipsis
+        )
+        missing = len(shape) - (len(items) - 1)
+        if missing < 0:
+            raise IndexError("too many indices for tensor")
+        items[location:location + 1] = [slice(None)] * missing
+    if len(items) > len(shape):
+        raise IndexError("too many indices for tensor")
+    items.extend([slice(None)] * (len(shape) - len(items)))
+
+    axes = []
+    output_shape = []
+    for axis_size, item in zip(shape, items):
+        if isinstance(item, int):
+            if item < -axis_size or item >= axis_size:
+                raise IndexError("tensor index out of range")
+            axes.append(([item % axis_size], True))
+        elif isinstance(item, slice):
+            indices = list(range(*item.indices(axis_size)))
+            axes.append((indices, False))
+            output_shape.append(len(indices))
+        else:
+            raise NotImplementedError(
+                "basic indexing supports integers, slices, and ellipses"
+            )
+    return axes, tuple(output_shape)
+
+
 def lower_basic_index(
     data: Any,
     index: Any,
@@ -18,38 +60,21 @@ def lower_basic_index(
     share one AbstractTensor-level policy while numerical gathering remains a
     backend primitive.
     """
-    items = list(index) if isinstance(index, tuple) else [index]
-    if any(item is Ellipsis for item in items):
-        location = next(
-            position for position, item in enumerate(items)
-            if item is Ellipsis
-        )
-        missing = len(shape_of(data)) - (len(items) - 1)
-        items[location:location + 1] = [slice(None)] * missing
-    items.extend([slice(None)] * (len(shape_of(data)) - len(items)))
+    axes, _ = normalize_basic_index(index, tuple(shape_of(data)))
     current = data
     output_axis = 0
-    for item in items:
-        current_shape = shape_of(current)
-        axis_size = current_shape[output_axis]
-        if isinstance(item, int):
-            selected = index_select(
-                current, output_axis, [item % axis_size]
-            )
+    for indices, drop_axis in axes:
+        if drop_axis:
+            selected = index_select(current, output_axis, indices)
             selected_shape = shape_of(selected)
             current = reshape(
                 selected,
                 selected_shape[:output_axis]
                 + selected_shape[output_axis + 1:],
             )
-        elif isinstance(item, slice):
-            indices = list(range(*item.indices(axis_size)))
+        else:
             current = index_select(current, output_axis, indices)
             output_axis += 1
-        else:
-            raise NotImplementedError(
-                "basic indexing supports integers, slices, and ellipses"
-            )
     return current
 
 

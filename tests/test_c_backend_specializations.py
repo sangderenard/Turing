@@ -50,3 +50,44 @@ def test_c_backend_runs_riemannian_mesh_laplace_composition():
         )
 
     assert np.isclose(result.tolist()[4], 4.0)
+
+
+def test_c_backend_basic_slice_assignment_uses_shared_index_policy():
+    with AbstractTensor.use_backend("c"):
+        values = AbstractTensor.tensor(np.arange(24.0).reshape(2, 3, 4))
+        values[..., 1, 1:4:2] = AbstractTensor.tensor(
+            [[101.0, 102.0], [201.0, 202.0]]
+        )
+        values[0, -1, :] = -3.0
+
+    expected = np.arange(24.0).reshape(2, 3, 4)
+    expected[..., 1, 1:4:2] = [[101.0, 102.0], [201.0, 202.0]]
+    expected[0, -1, :] = -3.0
+    assert values.tolist() == expected.tolist()
+
+
+def test_c_backend_runs_composite_linalg_solve():
+    matrix_values = np.asarray(
+        [[4.0, 2.0, 0.0], [2.0, 5.0, 1.0], [0.0, 1.0, 3.0]]
+    )
+    rhs_values = np.asarray([[2.0], [4.0], [5.0]])
+    with AbstractTensor.use_backend("c"):
+        matrix = AbstractTensor.tensor(matrix_values)
+        rhs = AbstractTensor.tensor(rhs_values)
+        solved = AbstractTensor.linalg.solve(matrix, rhs)
+
+    assert np.allclose(matrix_values @ np.asarray(solved.tolist()), rhs_values)
+
+
+def test_c_backend_slice_backward_uses_native_index_assignment():
+    with AbstractTensor.use_backend("c"):
+        values = AbstractTensor.tensor(np.arange(12.0).reshape(3, 4))
+        values.requires_grad_(True)
+        loss = values[1:, 1:3].sum()
+        gradient = AbstractTensor.autograd.grad(loss, [values])[0]
+
+    assert gradient.tolist() == [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0, 0.0],
+    ]

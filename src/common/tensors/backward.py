@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import wraps
+import inspect
 from typing import Callable, Dict, Iterable, List, Any
 
 
@@ -87,10 +88,22 @@ class BackwardRegistry:
         """Register a backward implementation under ``name``."""
 
         from . import backward_registry as br
+        parameter_names = tuple(inspect.signature(fn).parameters)
+        metadata_parameters = {
+            "axis", "axes", "dim", "dims", "idx", "index", "indices",
+            "keepdim", "order", "padding", "perm", "repeats", "shape",
+            "slices", "stride",
+        }
 
         @wraps(fn)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            checked = [br.coerce_to_tensor(a) for a in args]
+            checked = [
+                value
+                if position < len(parameter_names)
+                and parameter_names[position] in metadata_parameters
+                else br.coerce_to_tensor(value)
+                for position, value in enumerate(args)
+            ]
             return fn(*checked, **kwargs)
 
         self._methods[name] = wrapped

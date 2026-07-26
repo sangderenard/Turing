@@ -2375,8 +2375,6 @@ class AbstractTensor:
         data = self.data
         if data is None:
             raise ValueError("__setitem__ called on empty tensor")
-        if CTensor is not None and isinstance(data, CTensor):
-            raise NotImplementedError("__setitem__ not implemented for CTensor backend")
         if isinstance(idx, tuple):
             index = tuple(
                 item._AbstractTensor__unwrap() if isinstance(item, AbstractTensor) else item
@@ -2389,14 +2387,20 @@ class AbstractTensor:
 
         if getattr(AbstractTensor.autograd, "_no_grad_depth", 0) > 0:
             raw_value = value.data if isinstance(value, AbstractTensor) else value
-            data[index] = raw_value
+            if hasattr(self, "set_item_"):
+                self.set_item_(data, index, raw_value)
+            else:
+                data[index] = raw_value
             logger.debug("setitem idx=%s tensor_id=%s", index, id(self))
             return
 
         finalize = AbstractTensor._pre_autograd("index_set", [self, value], params={"idx": index})
 
         raw_value = value.data if isinstance(value, AbstractTensor) else value
-        data[index] = raw_value
+        if hasattr(self, "set_item_"):
+            self.set_item_(data, index, raw_value)
+        else:
+            data[index] = raw_value
         finalize(self)
         logger.debug("setitem idx=%s tensor_id=%s", index, id(self))
 

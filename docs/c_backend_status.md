@@ -64,27 +64,28 @@ tests demonstrate that the C primitive set runs:
 arbitrary-rank layout composition.
 
 Basic tuple indexing is likewise an AbstractTensor policy rather than a C
-policy. The shared indexing specialization lowers integers, slices, negative
-indices, and ellipses into backend `index_select` plus metadata reshape.
-The C backend implements those primitives and only adds its shaped first-axis
-gather required by constructs such as `vertices[triangles]`.
+policy. The shared indexing specialization normalizes integers, slices,
+negative indices, and ellipses once. Reads lower through `index_select` plus
+metadata reshape; writes lower through one native `index_assign_double` loop
+over the same normalized axis selections. The C backend only adds its shaped
+first-axis gather required by constructs such as `vertices[triangles]`.
 
-YoungMan's spline additionally requires the universal linear solve. Riemannian
-and convolution specializations require stronger slicing/assignment and,
-where applicable, fold/unfold primitives. Those are more meaningful next
-targets than mechanically mirroring every convenience method on NumPy.
+YoungMan's spline additionally requires the universal linear solve. Its
+existing sliced LU implementation now runs on C without a backend-specific
+solver: completing indexed assignment also completed this composition.
+Slice backward uses the same native assignment path. Riemannian and
+convolution specializations still require scatter families and, where
+applicable, fold/unfold primitives.
 
 ## Gap to a broad mathematical base
 
-A mechanical comparison with the canonical NumPy backend now finds 94 hooks
-on the C class and 34 NumPy hooks absent from it. Several of those 34 are
+A mechanical comparison with the canonical NumPy backend now finds 100 hooks
+on the C class and 12 NumPy hooks absent from it. Several of those 12 are
 conversion conveniences or optional specialized kernels. Remaining
 capability gaps include:
 
-1. General slicing and mutation, scatter assignment, nonzero/argwhere, and
-   diagonal construction.
-2. Batched matrix multiplication and the primitive support required by the
-   universal LU/solve path.
+1. General scatter families, nonzero/argwhere, and diagonal construction.
+2. Batched matrix multiplication beyond the current two-dimensional kernel.
 3. True bool/integer/float32/complex storage rather than numeric values held
    in double storage.
 4. Fold/unfold and interpolation primitives used by convolutional
@@ -111,10 +112,20 @@ algorithms remain AbstractTensor compositions.
 ## Recommended implementation order
 
 First give CTensor explicit dtype and ownership metadata plus contiguous
-strides. Then complete slicing/mutation and batched matmul so universal
-linear algebra and geometry can run. Complex storage and the `fftfree` bridge
-form the next separate milestone; fold/unfold follows according to the
-convolution specialization tests.
+strides. Then complete scatter and batched matmul so broader geometry can
+run. Complex storage and the `fftfree` bridge form the next separate
+milestone; fold/unfold follows according to the convolution specialization
+tests.
+
+Run the cross-target catalog audit with:
+
+```powershell
+python -m src.common.tensors.backend_capability_audit
+```
+
+It joins Nodus's versioned operation table to the live C and GLSL lowering
+surfaces and prints every missing target explicitly. `--require-complete`
+turns any remaining hole into a failing exit status.
 
 Every family should use NumPy as the behavioral oracle and test zero-sized
 tensors, scalars, negative axes, non-square shapes, arbitrary rank, and

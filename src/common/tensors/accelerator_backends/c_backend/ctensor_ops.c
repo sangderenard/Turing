@@ -481,6 +481,44 @@
                     after * sizeof(double));
     }
 
+    void index_assign_double(
+        double* target, const int* shape, int ndim,
+        const int* axis_offsets, const int* axis_indices,
+        const double* values, int value_count) {
+        if (ndim == 0) {
+            target[0] = values[0];
+            return;
+        }
+        int selected_count = 1;
+        int target_stride = 1;
+        int* selection_stride = (int*)malloc(ndim * sizeof(int));
+        int* target_strides = (int*)malloc(ndim * sizeof(int));
+        if (!selection_stride || !target_strides) {
+            free(selection_stride);
+            free(target_strides);
+            return;
+        }
+        for (int axis = ndim - 1; axis >= 0; --axis) {
+            int axis_count = axis_offsets[axis + 1] - axis_offsets[axis];
+            selection_stride[axis] = selected_count;
+            selected_count *= axis_count;
+            target_strides[axis] = target_stride;
+            target_stride *= shape[axis];
+        }
+        for (int flat = 0; flat < selected_count; ++flat) {
+            int target_flat = 0;
+            for (int axis = 0; axis < ndim; ++axis) {
+                int axis_count = axis_offsets[axis + 1] - axis_offsets[axis];
+                int coordinate = (flat / selection_stride[axis]) % axis_count;
+                int selected = axis_indices[axis_offsets[axis] + coordinate];
+                target_flat += selected * target_strides[axis];
+            }
+            target[target_flat] = values[value_count == 1 ? 0 : flat];
+        }
+        free(selection_stride);
+        free(target_strides);
+    }
+
     int count_true_double(const double* mask, int n) {
         int count = 0;
         for (int i = 0; i < n; ++i)
