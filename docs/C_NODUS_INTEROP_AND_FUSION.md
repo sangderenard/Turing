@@ -184,3 +184,77 @@ single operation should call the calculator's raw synchronous ABI. A repeated
 dependent chain should use an opaque prepared program. Independent large
 chains may enter the worker queue. Selection is a measured submission policy,
 not a change in mathematical semantics.
+
+## Five-way execution benchmark
+
+`benchmark_nodus_calculator.py` runs the same float64 sigmoid chain on:
+
+- eager AbstractTensor with NumPy;
+- eager AbstractTensor with Torch, on a selectable device;
+- eager AbstractTensor with the C backend;
+- the developing GLSL backend as one fused compute shader, with a resident
+  GPU input; and
+- an already-prepared Tensor Calculator program bound directly to Nodus
+  `InMemoryBackend` buffers.
+
+Build the native runner in Nodus, then run from the Turing repository:
+
+```powershell
+cmake --build ..\nodus\build --config Release --target nodus_precomposed_calculator_benchmark
+python -m src.common.tensors.benchmark_nodus_calculator --elements 262144 --warmup 10 --repeats 30
+```
+
+The command runs one backend at a time and prints that backend's median and
+parity result before starting the next. No backend samples overlap. After the
+final result it writes `benchmark_timing.png`, a four-panel comparison of:
+
+- synchronized steady-state min, median, and max execution time;
+- GLSL device-query time beside its host-visible completion time;
+- setup, context, compilation, upload, output allocation, and readback costs;
+  and
+- host-visible and device-only throughput, plus an exact millisecond table.
+
+Use `--plot <path>` to choose the PNG destination, `--show-plot` to open it
+after saving, `--no-plot` for tabular-only operation, and `--quiet` to suppress
+per-backend progress.
+
+Use `--torch-device cuda` for a CUDA comparison, or
+`--nodus-executable <path>` when the Nodus build is elsewhere. `--output`
+writes the full result table as CSV. GLSL is included by default in the command
+line benchmark and requires a real OpenGL 4.3+ compute context; use
+`--without-glsl` on machines that intentionally lack one.
+
+The comparison intentionally measures different execution modes. The three
+Python rows include eager AbstractTensor dispatch and result allocation on
+every repetition. The Nodus row excludes process startup and setup, then
+replays a prebound, preallocated native program. Setup is reported separately,
+all rows evaluate the full output against the analytical result, and CUDA is
+synchronized around each timed sample. This makes the benchmark useful for
+measuring the dispatch cost that precomposition removes, but it is not a claim
+that the underlying Nodus arithmetic loops are intrinsically faster than
+NumPy or Torch.
+
+The GLSL row compiles all four primitives into one shader. Its input and output
+SSBOs stay resident, the shader cache is warm for measured samples, and
+`glFinish()` makes
+the host-side `median_sec` a completed-operation measurement rather than a
+command-submission measurement. Initial buffer creation/upload and final
+readback are excluded from `median_sec` and reported separately.
+`GL_TIME_ELAPSED` queries independently report actual device work as
+`gpu_median_sec`. Context acquisition, initial upload, and shader compilation
+plus first dispatch are also separate fields. This split makes both the fused
+shader's strength and the current Python/OpenGL resource-management overhead
+visible.
+
+GLSL storage is float32, whereas these NumPy, C, Nodus, and default Torch rows
+use float64. The benchmark therefore uses a documented float32 parity tolerance
+for GLSL and records the dtype in every row. It does not silently present
+reduced precision as exact float64 parity.
+
+Small arrays should expose the precomposed path's low dispatch overhead. Large
+arrays expose its present limitation: `neg`, `exp`, `add`, and `div` are still
+four separate loops with full intermediate buffers. Loop fusion and liveness-
+based buffer reuse are the relevant next optimizations there. GLSL already
+performs that mathematical fusion and now accepts a caller-owned output chunk;
+host-provided wrapped SSBOs extend the same persistent-buffer path to Pluck and
+Nodus.
