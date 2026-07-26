@@ -8,7 +8,10 @@ from src.common.tensors.youngman.algorithm import (
     sphere_field,
 )
 from src.common.tensors.youngman.metric_roundtrip_demo import (
+    BoundaryResolution,
     build_metric_roundtrip,
+    laplace_beltrami,
+    singular_metric_mask,
 )
 
 
@@ -47,3 +50,26 @@ def test_roundtrip_compares_laplace_on_the_same_surface():
     assert summary.loc[0, "fifo_batches_pending"] == 0
     assert np.isfinite(triangles["laplace_difference"]).all()
     assert len(triangles) == display.triangle_count
+
+
+def test_boundary_option_marks_faces_and_uses_one_sided_stencil():
+    points = np.asarray(((0.0, 0.4, 0.5), (0.5, 0.4, 0.5)))
+    identity_metric = lambda rows: np.repeat(np.eye(3)[None], len(rows), axis=0)
+    policy = BoundaryResolution(
+        np.asarray(((0.0, 1.0),) * 3),
+        ("dirichlet",) * 6,
+        (True,) * 6,
+    )
+    values, mask = laplace_beltrami(
+        points,
+        identity_metric,
+        boundary_resolution=policy,
+        return_boundary_mask=True,
+    )
+    assert np.array_equal(mask, (True, False))
+    assert np.isfinite(values).all()
+
+
+def test_singularity_detector_uses_numerical_health_not_exact_zero_only():
+    metrics = np.asarray((np.eye(3), np.diag((1.0, 1.0, 1e-12))))
+    assert np.array_equal(singular_metric_mask(metrics), (False, True))

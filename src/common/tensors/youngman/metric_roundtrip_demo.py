@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
 
@@ -74,6 +74,29 @@ def induced_metric(parameters: np.ndarray) -> np.ndarray:
     return np.einsum("nmi,nmj->nij", jacobian, jacobian)
 
 
+def singular_metric_mask(
+    metric: np.ndarray,
+    *,
+    determinant_floor: float = 1e-10,
+    eigenvalue_floor: float = 1e-9,
+    condition_limit: float = 1e10,
+) -> np.ndarray:
+    """Detect degenerate or numerically unsafe metric matrices."""
+    metric = np.asarray(metric, dtype=np.float64)
+    eigenvalues = np.linalg.eigvalsh(metric)
+    determinant = np.linalg.det(metric)
+    smallest = eigenvalues[:, 0]
+    largest = eigenvalues[:, -1]
+    condition = largest / np.maximum(smallest, np.finfo(np.float64).tiny)
+    return (
+        ~np.isfinite(metric).all(axis=(1, 2))
+        | ~np.isfinite(determinant)
+        | (determinant <= determinant_floor)
+        | (smallest <= eigenvalue_floor)
+        | (condition >= condition_limit)
+    )
+
+
 def probe_gradient(parameters: np.ndarray) -> np.ndarray:
     """Gradient of the scalar probe used for both Laplace evaluations."""
     u, v, w = np.asarray(parameters, dtype=np.float64).T
@@ -88,29 +111,113 @@ def probe_gradient(parameters: np.ndarray) -> np.ndarray:
     )
 
 
+@dataclass(frozen=True)
+class BoundaryResolution:
+    """Experimental adapter for ``laplace_nd``'s six-face convention."""
+
+    bounds: np.ndarray
+    boundary_conditions: tuple[str, str, str, str, str, str]
+    grid_boundaries: tuple[bool, bool, bool, bool, bool, bool]
+
+    def __post_init__(self) -> None:
+        bounds = np.asarray(self.bounds, dtype=np.float64)
+        if bounds.shape != (3, 2):
+            raise ValueError("bounds must have shape (3, 2)")
+        if len(self.boundary_conditions) != 6 or len(self.grid_boundaries) != 6:
+            raise ValueError("boundary tuples follow (u-, u+, v-, v+, w-, w+)")
+        supported = {"dirichlet", "neumann", "periodic"}
+        unknown = set(self.boundary_conditions) - supported
+        if unknown:
+            raise ValueError(f"unsupported boundary conditions: {sorted(unknown)}")
+        object.__setattr__(self, "bounds", bounds)
+
+    def contact_mask(self, parameters: np.ndarray, tolerance: float) -> np.ndarray:
+        contacts = np.zeros((len(parameters), 6), dtype=bool)
+        for axis in range(3):
+            contacts[:, 2 * axis] = (
+                self.grid_boundaries[2 * axis]
+                & (parameters[:, axis] <= self.bounds[axis, 0] + tolerance)
+            )
+            contacts[:, 2 * axis + 1] = (
+                self.grid_boundaries[2 * axis + 1]
+                & (parameters[:, axis] >= self.bounds[axis, 1] - tolerance)
+            )
+        return contacts
+
+
+def _metric_flux(parameters: np.ndarray, metric_function) -> tuple[np.ndarray, np.ndarray]:
+    metric = metric_function(parameters)
+    root_det = np.sqrt(np.linalg.det(metric))
+    inverse = np.linalg.inv(metric)
+    vector = np.einsum("nij,nj->ni", inverse, probe_gradient(parameters))
+    return root_det[:, None] * vector, root_det
+
+
 def laplace_beltrami(
     parameters: np.ndarray,
     metric_function,
     *,
     step: float = 2e-5,
-) -> np.ndarray:
+    boundary_resolution: BoundaryResolution | None = None,
+    return_boundary_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Evaluate div(sqrt(det(g)) g^-1 grad(phi))/sqrt(det(g))."""
     parameters = np.asarray(parameters, dtype=np.float64)
-    center_metric = metric_function(parameters)
-    center_root_det = np.sqrt(np.linalg.det(center_metric))
+    center_flux, center_root_det = _metric_flux(parameters, metric_function)
     divergence = np.zeros(len(parameters), dtype=np.float64)
+    contacts = (
+        np.zeros((len(parameters), 6), dtype=bool)
+        if boundary_resolution is None
+        else boundary_resolution.contact_mask(parameters, step * 1.1)
+    )
     for axis in range(parameters.shape[1]):
         offset = np.zeros_like(parameters)
         offset[:, axis] = step
-        flux = []
-        for query in (parameters + offset, parameters - offset):
-            metric = metric_function(query)
-            root_det = np.sqrt(np.linalg.det(metric))
-            inverse = np.linalg.inv(metric)
-            vector = np.einsum("nij,nj->ni", inverse, probe_gradient(query))
-            flux.append(root_det[:, None] * vector)
-        divergence += (flux[0][:, axis] - flux[1][:, axis]) / (2.0 * step)
-    return divergence / center_root_det
+        plus = parameters + offset
+        minus = parameters - offset
+        if boundary_resolution is not None:
+            low, high = boundary_resolution.bounds[axis]
+            low_periodic = boundary_resolution.boundary_conditions[2 * axis] == "periodic"
+            high_periodic = boundary_resolution.boundary_conditions[2 * axis + 1] == "periodic"
+            minus[contacts[:, 2 * axis] & low_periodic, axis] = high - step
+            plus[contacts[:, 2 * axis + 1] & high_periodic, axis] = low + step
+        plus_flux, _ = _metric_flux(plus, metric_function)
+        minus_flux, _ = _metric_flux(minus, metric_function)
+        derivative = (plus_flux[:, axis] - minus_flux[:, axis]) / (2.0 * step)
+
+        if boundary_resolution is not None:
+            second_plus_flux, _ = _metric_flux(
+                parameters + 2.0 * offset, metric_function
+            )
+            second_minus_flux, _ = _metric_flux(
+                parameters - 2.0 * offset, metric_function
+            )
+            for face, sign in ((2 * axis, -1), (2 * axis + 1, 1)):
+                mask = contacts[:, face]
+                condition = boundary_resolution.boundary_conditions[face]
+                if not np.any(mask) or condition == "periodic":
+                    continue
+                boundary_flux = center_flux[:, axis].copy()
+                if condition == "neumann":
+                    boundary_flux[mask] = 0.0
+                if sign < 0:
+                    derivative[mask] = (
+                        -3.0 * boundary_flux[mask]
+                        + 4.0 * plus_flux[mask, axis]
+                        - second_plus_flux[mask, axis]
+                    ) / (2.0 * step)
+                else:
+                    derivative[mask] = (
+                        3.0 * boundary_flux[mask]
+                        - 4.0 * minus_flux[mask, axis]
+                        + second_minus_flux[mask, axis]
+                    ) / (2.0 * step)
+        divergence += derivative
+    result = divergence / center_root_det
+    boundary_mask = np.any(contacts, axis=1)
+    if return_boundary_mask:
+        return result, boundary_mask
+    return result
 
 
 def _sample_simplex(
@@ -130,6 +237,9 @@ def build_metric_roundtrip(
     resolution: int = 4,
     samples_per_patch: int = 10,
     fifo_batches: int = 16,
+    *,
+    resolve_boundaries: bool = False,
+    boundary_condition: str = "dirichlet",
 ) -> tuple[pd.DataFrame, pd.DataFrame, object]:
     """Run the complete extraction/reconstruction/geometric comparison."""
     domain = GridDomain.generate_grid_domain(
@@ -207,17 +317,34 @@ def build_metric_roundtrip(
     spline_metric = np.empty((len(query), 3, 3), dtype=np.float64)
     source_laplace = np.empty(len(query), dtype=np.float64)
     spline_laplace = np.empty(len(query), dtype=np.float64)
+    boundary_vertices = np.zeros(len(query), dtype=bool)
+    boundary_resolution = None
+    if resolve_boundaries:
+        parametric = compiled.parametric.reshape(-1, 3)
+        boundary_resolution = BoundaryResolution(
+            bounds=np.stack((parametric.min(axis=0), parametric.max(axis=0)), axis=1),
+            boundary_conditions=(boundary_condition,) * 6,
+            grid_boundaries=tuple(bool(value) for value in domain.grid_boundaries),
+        )
     for patch_id in np.unique(query_patch_ids):
         mask = query_patch_ids == patch_id
         patch = generation.patches[int(patch_id)]
         spline_values[mask] = patch.evaluate(query[mask])
         spline_metric[mask] = patch.metric_tensor(query[mask])
-        source_laplace[mask] = laplace_beltrami(
-            query[mask], induced_metric
+        source_result = laplace_beltrami(
+            query[mask],
+            induced_metric,
+            boundary_resolution=boundary_resolution,
+            return_boundary_mask=True,
         )
-        spline_laplace[mask] = laplace_beltrami(
-            query[mask], patch.metric_tensor
+        spline_result = laplace_beltrami(
+            query[mask],
+            patch.metric_tensor,
+            boundary_resolution=boundary_resolution,
+            return_boundary_mask=True,
         )
+        source_laplace[mask], boundary_vertices[mask] = source_result
+        spline_laplace[mask], _ = spline_result
     spline_tags = metric_sample_tags(
         query,
         query_patch_ids,
@@ -228,6 +355,8 @@ def build_metric_roundtrip(
     metric_error = np.linalg.norm(
         spline_tags.metric - induced_metric(query), axis=(1, 2)
     )
+    source_singular = singular_metric_mask(induced_metric(query))
+    spline_singular = singular_metric_mask(spline_tags.metric)
     embedding_error = np.linalg.norm(spline_values - source_values, axis=1)
     laplace_difference = spline_laplace - source_laplace
     triangle_difference = laplace_difference.reshape(-1, 3).mean(axis=1)
@@ -243,6 +372,12 @@ def build_metric_roundtrip(
         "control_points": generation.control_point_count,
         "embedding_dimension": source_values.shape[1],
         "metric_matrix_shape": "3x3",
+        "boundary_resolution": (
+            f"experimental-{boundary_condition}" if resolve_boundaries else "off"
+        ),
+        "boundary_vertices": int(boundary_vertices.sum()),
+        "source_singular_vertices": int(source_singular.sum()),
+        "spline_singular_vertices": int(spline_singular.sum()),
         "mean_embedding_error": float(embedding_error.mean()),
         "max_embedding_error": float(embedding_error.max()),
         "mean_metric_error": float(metric_error.mean()),
@@ -256,6 +391,10 @@ def build_metric_roundtrip(
         "source_laplace": source_laplace.reshape(-1, 3).mean(axis=1),
         "spline_laplace": spline_laplace.reshape(-1, 3).mean(axis=1),
         "laplace_difference": triangle_difference,
+        "touches_domain_boundary": boundary_vertices.reshape(-1, 3).any(axis=1),
+        "contains_singularity": (
+            source_singular | spline_singular
+        ).reshape(-1, 3).any(axis=1),
     })
     display = replace(
         extraction,
@@ -279,10 +418,24 @@ def main() -> None:
     parser.add_argument("--samples-per-patch", type=int, default=10)
     parser.add_argument("--fifo-batches", type=int, default=16)
     parser.add_argument("--view", action="store_true")
+    parser.add_argument(
+        "--resolve-boundaries",
+        action="store_true",
+        help="use experimental laplace_nd-compatible face handling",
+    )
+    parser.add_argument(
+        "--boundary-condition",
+        choices=("dirichlet", "neumann"),
+        default="dirichlet",
+    )
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     summary, triangles, display = build_metric_roundtrip(
-        args.resolution, args.samples_per_patch, args.fifo_batches
+        args.resolution,
+        args.samples_per_patch,
+        args.fifo_batches,
+        resolve_boundaries=args.resolve_boundaries,
+        boundary_condition=args.boundary_condition,
     )
     print("\nMETRIC ROUND-TRIP\n", summary.to_string(index=False))
     print("\nLAPLACE SAMPLE\n", triangles.head(12).to_string(index=False))
