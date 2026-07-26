@@ -32,6 +32,27 @@ def test_extraction_preserves_parametric_triangle_provenance():
     assert len(result.triangle_tetrahedron_ids) == result.triangle_count
 
 
+def test_four_crossing_tetrahedron_is_split_as_an_ordered_quad():
+    tetrahedron = np.asarray([[
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    ]])
+    result = extract_isosurface(
+        tetrahedron,
+        lambda points: points[..., 0] + points[..., 1] - 0.5,
+    )
+    assert result.triangle_count == 2
+    areas = np.asarray([
+        np.linalg.norm(np.cross(triangle[1] - triangle[0],
+                                triangle[2] - triangle[0])) * 0.5
+        for triangle in result.triangles
+    ])
+    assert np.all(areas > 0.0)
+    assert np.isclose(areas.sum(), np.sqrt(1.0 / 8.0))
+
+
 def test_metric_tags_retain_full_matrix_and_derived_state():
     parameters = np.asarray(((0.2, 0.3, 0.4), (0.5, 0.6, 0.7)))
     metric = np.asarray((np.eye(3), np.diag((2.0, 3.0, 4.0))))

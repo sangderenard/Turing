@@ -184,11 +184,27 @@ def sphere_field(
     return (relative * relative).sum(dim=-1) - radius * radius
 
 
-def _triangle_selections(crossings: np.ndarray) -> list[tuple[int, np.ndarray]]:
-    """Return cell and edge selections shared by every coordinate system."""
+def _ordered_polygon_edges(points: np.ndarray, edge_ids: np.ndarray) -> np.ndarray:
+    """Order one tetrahedral crossing polygon around its centroid."""
+    polygon = points[edge_ids]
+    centered = polygon - polygon.mean(axis=0)
+    _, _, axes = np.linalg.svd(centered, full_matrices=False)
+    coordinates = np.stack(
+        (centered @ axes[0], centered @ axes[1]), axis=1
+    )
+    angles = np.arctan2(coordinates[:, 1], coordinates[:, 0])
+    return edge_ids[np.argsort(angles)]
+
+
+def _triangle_selections(
+    crossings: np.ndarray, topology_points: np.ndarray
+) -> list[tuple[int, np.ndarray]]:
+    """Return geometrically ordered selections shared by every coordinate system."""
     selections: list[tuple[int, np.ndarray]] = []
     for cell_id, mask in enumerate(crossings):
         active = np.flatnonzero(mask)
+        if active.size >= 3:
+            active = _ordered_polygon_edges(topology_points[cell_id], active)
         if active.size == 3:
             selections.append((cell_id, active))
         elif active.size == 4:
@@ -260,15 +276,11 @@ def extract_isosurface(
     weight = (value_start / safe_denominator).reshape(tetrahedra.shape[0], 6, 1)
     crossing_points = edge_start + weight * (edge_end - edge_start)
     crossing_np = np.asarray(crossing_points.tolist(), dtype=np.float64)
-    triangle_selections = _triangle_selections(active_edges)
-    triangles = _assemble_triangles(triangle_selections, crossing_np)
-    triangle_tetrahedron_ids = np.asarray(
-        [cell_id for cell_id, _ in triangle_selections], dtype=np.int64
-    )
     tetrahedron_ids, edge_ids = np.nonzero(active_edges)
     weights_np = np.asarray(weight.tolist(), dtype=np.float64)[..., 0]
     parametric_points = None
     parametric_triangles = None
+    parametric_crossings = None
     if parametric_tetrahedra is not None:
         parametric_start = parametric_tetrahedra[:, _TETRA_EDGES[:, 0], :]
         parametric_end = parametric_tetrahedra[:, _TETRA_EDGES[:, 1], :]
@@ -277,6 +289,15 @@ def extract_isosurface(
             + weights_np[..., None] * (parametric_end - parametric_start)
         )
         parametric_points = parametric_crossings[active_edges]
+    topology_points = (
+        crossing_np if parametric_crossings is None else parametric_crossings
+    )
+    triangle_selections = _triangle_selections(active_edges, topology_points)
+    triangles = _assemble_triangles(triangle_selections, crossing_np)
+    triangle_tetrahedron_ids = np.asarray(
+        [cell_id for cell_id, _ in triangle_selections], dtype=np.int64
+    )
+    if parametric_crossings is not None:
         parametric_triangles = _assemble_triangles(
             triangle_selections, parametric_crossings
         )

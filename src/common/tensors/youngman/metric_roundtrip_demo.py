@@ -240,6 +240,7 @@ def build_metric_roundtrip(
     *,
     resolve_boundaries: bool = False,
     boundary_condition: str = "dirichlet",
+    display_geometry: str = "source",
 ) -> tuple[pd.DataFrame, pd.DataFrame, object]:
     """Run the complete extraction/reconstruction/geometric comparison."""
     domain = GridDomain.generate_grid_domain(
@@ -360,6 +361,11 @@ def build_metric_roundtrip(
     embedding_error = np.linalg.norm(spline_values - source_values, axis=1)
     laplace_difference = spline_laplace - source_laplace
     triangle_difference = laplace_difference.reshape(-1, 3).mean(axis=1)
+    interior = ~boundary_vertices
+    boundary = boundary_vertices
+
+    def _rms(values: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(values**2))) if len(values) else float("nan")
 
     summary = pd.DataFrame([{
         "grid_resolution": resolution,
@@ -384,6 +390,9 @@ def build_metric_roundtrip(
         "max_metric_error": float(metric_error.max()),
         "laplace_difference_rms": float(np.sqrt(np.mean(laplace_difference**2))),
         "laplace_difference_max_abs": float(np.max(np.abs(laplace_difference))),
+        "source_laplace_rms": _rms(source_laplace),
+        "interior_laplace_difference_rms": _rms(laplace_difference[interior]),
+        "boundary_laplace_difference_rms": _rms(laplace_difference[boundary]),
     }])
     triangle_report = pd.DataFrame({
         "triangle": np.arange(extraction.triangle_count),
@@ -396,9 +405,15 @@ def build_metric_roundtrip(
             source_singular | spline_singular
         ).reshape(-1, 3).any(axis=1),
     })
-    display = replace(
-        extraction,
-        triangles=spline_values[:, :3].reshape(-1, 3, 3),
+    if display_geometry not in {"source", "spline"}:
+        raise ValueError("display_geometry must be 'source' or 'spline'")
+    display = (
+        extraction
+        if display_geometry == "source"
+        else replace(
+            extraction,
+            triangles=spline_values[:, :3].reshape(-1, 3, 3),
+        )
     )
     return summary, triangle_report, display
 
@@ -419,6 +434,17 @@ def main() -> None:
     parser.add_argument("--fifo-batches", type=int, default=16)
     parser.add_argument("--view", action="store_true")
     parser.add_argument(
+        "--render-image",
+        type=Path,
+        help="write a deterministic headless PNG through Pluck's mesh adapter",
+    )
+    parser.add_argument(
+        "--display-geometry",
+        choices=("source", "spline"),
+        default="source",
+        help="carrier surface for the error colors; spline exposes patch seams",
+    )
+    parser.add_argument(
         "--resolve-boundaries",
         action="store_true",
         help="use experimental laplace_nd-compatible face handling",
@@ -436,6 +462,7 @@ def main() -> None:
         args.fifo_batches,
         resolve_boundaries=args.resolve_boundaries,
         boundary_condition=args.boundary_condition,
+        display_geometry=args.display_geometry,
     )
     print("\nMETRIC ROUND-TRIP\n", summary.to_string(index=False))
     print("\nLAPLACE SAMPLE\n", triangles.head(12).to_string(index=False))
@@ -450,6 +477,15 @@ def main() -> None:
             value_label="spline minus source Laplace-Beltrami",
             title="YoungMan metric round-trip: Laplace-Beltrami difference",
         )
+    if args.render_image:
+        output = _load_pluck_viewer().render_triangle_mesh_image(
+            display.triangles,
+            args.render_image,
+            triangle_values=triangles["laplace_difference"].to_numpy(),
+            value_label="spline minus source Laplace-Beltrami",
+            title="YoungMan metric round-trip",
+        )
+        print(f"\nHEADLESS IMAGE\n {output}")
 
 
 if __name__ == "__main__":

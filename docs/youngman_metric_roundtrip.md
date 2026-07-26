@@ -36,6 +36,21 @@ Open the Pluck view:
 python -m src.common.tensors.youngman.metric_roundtrip_demo --view
 ```
 
+Resolve the experimental boundary stencil and write a headless image:
+
+```powershell
+python -m src.common.tensors.youngman.metric_roundtrip_demo `
+    --resolve-boundaries --boundary-condition dirichlet `
+    --render-image metric_roundtrip.png
+```
+
+The snapshot is software-rasterized through Pluck's public mesh adapter, so it
+does not require a window or GPU context. Its palette and robust symmetric
+clipping are shared with the interactive OpenGL view. By default the coherent
+YoungMan source surface carries the error colors. Add
+`--display-geometry spline` to expose positional discontinuities between
+independently fitted patches; this diagnostic view may contain visible seams.
+
 The heat map is a useful error instrument, not just presentation. Blue means
 the reconstructed Laplacian is lower than the source value, red means it is
 higher, and the window caption reports the symmetric clipping range. A finer
