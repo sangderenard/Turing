@@ -7,8 +7,11 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from ..abstraction import AbstractTensor
+
 
 ArrayFunction = Callable[[np.ndarray], np.ndarray]
+AlphaFunction = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,7 @@ class TriangulationTolerance:
 
     position: float
     tangent: Optional[float] = None
+    hinge_angle: Optional[float] = None
     max_rounds: int = 12
     max_triangles: int = 250_000
 
@@ -25,8 +29,22 @@ class TriangulationTolerance:
             raise ValueError("position tolerance must be positive")
         if self.tangent is not None and self.tangent <= 0.0:
             raise ValueError("tangent tolerance must be positive")
+        if self.hinge_angle is not None and not 0.0 < self.hinge_angle < np.pi:
+            raise ValueError("hinge angle must be between zero and pi")
         if self.max_rounds < 0 or self.max_triangles < 2:
             raise ValueError("invalid refinement limits")
+
+
+@dataclass(frozen=True)
+class RefinementCertificate:
+    """Triangle-local evidence captured before one refinement wave."""
+
+    generation: int
+    parameters: np.ndarray
+    triangles: np.ndarray
+    position_error: np.ndarray
+    tangent_error: Optional[np.ndarray]
+    hinge_angle: Optional[np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -39,10 +57,12 @@ class TriangulationGeneration:
     triangles: np.ndarray
     position_error: np.ndarray
     tangent_error: Optional[np.ndarray]
+    hinge_angle: Optional[np.ndarray]
     surface_sample_count: int
     jacobian_sample_count: int
     converged: bool
     stopped_reason: str
+    certificate_history: tuple[RefinementCertificate, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("parameters", "embedded", "triangles", "position_error"):
@@ -53,6 +73,10 @@ class TriangulationGeneration:
             tangent = np.array(self.tangent_error, copy=True)
             tangent.setflags(write=False)
             object.__setattr__(self, "tangent_error", tangent)
+        if self.hinge_angle is not None:
+            hinge = np.array(self.hinge_angle, copy=True)
+            hinge.setflags(write=False)
+            object.__setattr__(self, "hinge_angle", hinge)
 
     @property
     def triangle_count(self) -> int:
@@ -120,6 +144,8 @@ class AdaptiveSurfaceTriangulator:
         tolerance: TriangulationTolerance = TriangulationTolerance(1e-3),
         initial_resolution: tuple[int, int] = (1, 1),
         batch_size: Optional[int] = None,
+        alpha_map: Optional[AlphaFunction] = None,
+        history_limit_per_generation: int = 4096,
     ) -> None:
         self.surface = surface
         self.jacobian = jacobian
@@ -127,12 +153,16 @@ class AdaptiveSurfaceTriangulator:
         self.tolerance = tolerance
         self.initial_resolution = tuple(int(value) for value in initial_resolution)
         self.batch_size = batch_size
+        self.alpha_map = alpha_map
+        self.history_limit_per_generation = int(history_limit_per_generation)
         if self.bounds.shape != (2, 2) or np.any(self.bounds[:, 1] <= self.bounds[:, 0]):
             raise ValueError("bounds must contain two increasing intervals")
         if min(self.initial_resolution) < 1:
             raise ValueError("initial_resolution values must be positive")
         if tolerance.tangent is not None and jacobian is None:
             raise ValueError("tangent tolerance requires a jacobian callable")
+        if self.history_limit_per_generation < 0:
+            raise ValueError("history_limit_per_generation cannot be negative")
         self._surface_sample_count = 0
         self._jacobian_sample_count = 0
 
@@ -148,7 +178,12 @@ class AdaptiveSurfaceTriangulator:
                 max(1, int(np.ceil(len(parameters) / self.batch_size))),
             )
         )
-        values = [np.asarray(function(chunk), dtype=np.float64) for chunk in chunks]
+        values = []
+        for chunk in chunks:
+            value = function(chunk)
+            if isinstance(value, AbstractTensor):
+                value = value.tolist()
+            values.append(np.asarray(value, dtype=np.float64))
         result = np.concatenate(values, axis=0)
         if len(result) != len(parameters) or not np.isfinite(result).all():
             raise ValueError("geometry callable returned invalid batched values")
@@ -197,7 +232,9 @@ class AdaptiveSurfaceTriangulator:
         parameters: np.ndarray,
         embedded: np.ndarray,
         triangles: np.ndarray,
-    ) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray
+    ]:
         edges = self._unique_edges(triangles)
         midpoint_parameters = (
             parameters[edges[:, 0]] + parameters[edges[:, 1]]
@@ -208,10 +245,12 @@ class AdaptiveSurfaceTriangulator:
         midpoint_lookup = {
             _edge_key(*edge): row for row, edge in enumerate(edges)
         }
-        edge_errors = np.linalg.norm(
-            midpoint_values
-            - (embedded[edges[:, 0]] + embedded[edges[:, 1]]) * 0.5,
-            axis=1,
+        edge_difference = AbstractTensor.tensor(midpoint_values) - (
+            AbstractTensor.tensor(embedded[edges[:, 0]])
+            + AbstractTensor.tensor(embedded[edges[:, 1]])
+        ) * 0.5
+        edge_errors = np.asarray(
+            AbstractTensor.linalg.norm(edge_difference, dim=1).tolist()
         )
         position_error = np.empty(len(triangles), dtype=np.float64)
         for row, triangle in enumerate(triangles):
@@ -243,8 +282,12 @@ class AdaptiveSurfaceTriangulator:
         linear_interior = np.einsum(
             "ka,nam->nkm", interior_barycentric, embedded[triangles]
         )
-        interior_error = np.linalg.norm(
-            interior_values - linear_interior, axis=2
+        interior_difference = (
+            AbstractTensor.tensor(interior_values)
+            - AbstractTensor.tensor(linear_interior)
+        )
+        interior_error = np.asarray(
+            AbstractTensor.linalg.norm(interior_difference, dim=2).tolist()
         ).max(axis=1)
         position_error = np.maximum(position_error, interior_error)
 
@@ -300,10 +343,42 @@ class AdaptiveSurfaceTriangulator:
                     ),
                     axis=0,
                 )
-                tangent_error[row] = np.linalg.norm(
-                    samples - affine_jacobian[row], axis=(1, 2)
-                ).max()
-        return position_error, tangent_error, edges, midpoint_values
+                difference = (
+                    AbstractTensor.tensor(samples)
+                    - AbstractTensor.tensor(affine_jacobian[row])
+                )
+                squared = (difference * difference).sum(dim=2).sum(dim=1)
+                tangent_error[row] = max(
+                    float(value) for value in (squared ** 0.5).tolist()
+                )
+        hinge_angle = np.zeros(len(triangles), dtype=np.float64)
+        edge_owners: dict[tuple[int, int], list[int]] = {}
+        for row, triangle in enumerate(triangles):
+            for a, b in (
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ):
+                edge_owners.setdefault(_edge_key(a, b), []).append(row)
+        tangent_bases = []
+        for triangle in triangles:
+            local_edges = np.stack((
+                embedded[triangle[1]] - embedded[triangle[0]],
+                embedded[triangle[2]] - embedded[triangle[0]],
+            ), axis=1)
+            tangent_bases.append(np.linalg.qr(local_edges)[0][:, :2])
+        for owners in edge_owners.values():
+            if len(owners) != 2:
+                continue
+            left, right = owners
+            singular = np.linalg.svd(
+                tangent_bases[left].T @ tangent_bases[right],
+                compute_uv=False,
+            )
+            angle = float(np.arccos(np.clip(singular.min(), -1.0, 1.0)))
+            hinge_angle[left] = max(hinge_angle[left], angle)
+            hinge_angle[right] = max(hinge_angle[right], angle)
+        return position_error, tangent_error, hinge_angle, edges, midpoint_values
 
     @staticmethod
     def _split_triangle(
@@ -340,14 +415,48 @@ class AdaptiveSurfaceTriangulator:
         parameters, triangles = self._initial_mesh()
         embedded = self._evaluate(self.surface, parameters, kind="surface")
         generation = 0
+        history = []
         stopped_reason = "tolerance"
         while True:
-            position_error, tangent_error, edges, midpoint_values = self._measure(
+            (
+                position_error,
+                tangent_error,
+                hinge_angle,
+                edges,
+                midpoint_values,
+            ) = self._measure(
                 parameters, embedded, triangles
             )
             failing = position_error > self.tolerance.position
             if tangent_error is not None and self.tolerance.tangent is not None:
                 failing |= tangent_error > self.tolerance.tangent
+            if self.tolerance.hinge_angle is not None:
+                failing |= hinge_angle > self.tolerance.hinge_angle
+            alpha = np.ones(len(triangles), dtype=np.float64)
+            if self.alpha_map is not None:
+                alpha = np.asarray(
+                    self.alpha_map(parameters, triangles), dtype=np.float64
+                )
+                if alpha.shape != (len(triangles),) or not np.isfinite(alpha).all():
+                    raise ValueError("alpha_map must return one finite value per triangle")
+                alpha = np.maximum(alpha, 0.0)
+                failing |= alpha > 1.0
+            if self.history_limit_per_generation:
+                count = min(len(triangles), self.history_limit_per_generation)
+                rows = np.linspace(
+                    0, len(triangles) - 1, count, dtype=np.int64
+                )
+                history.append(RefinementCertificate(
+                    generation=generation,
+                    parameters=np.array(parameters, copy=True),
+                    triangles=np.array(triangles[rows], copy=True),
+                    position_error=np.array(position_error[rows], copy=True),
+                    tangent_error=(
+                        None if tangent_error is None
+                        else np.array(tangent_error[rows], copy=True)
+                    ),
+                    hinge_angle=np.array(hinge_angle[rows], copy=True),
+                ))
             if not np.any(failing):
                 converged = True
                 break
@@ -367,6 +476,12 @@ class AdaptiveSurfaceTriangulator:
                 score = np.maximum(
                     score, tangent_error[failing_rows] / self.tolerance.tangent
                 )
+            if self.tolerance.hinge_angle is not None:
+                score = np.maximum(
+                    score,
+                    hinge_angle[failing_rows] / self.tolerance.hinge_angle,
+                )
+            score = np.maximum(score, alpha[failing_rows])
             failing_rows = failing_rows[np.argsort(score)[::-1]]
             selected_edges: set[tuple[int, int]] = set()
             raw_edges = np.concatenate(
@@ -439,8 +554,10 @@ class AdaptiveSurfaceTriangulator:
             triangles=triangles,
             position_error=position_error,
             tangent_error=tangent_error,
+            hinge_angle=hinge_angle,
             surface_sample_count=self._surface_sample_count,
             jacobian_sample_count=self._jacobian_sample_count,
             converged=converged,
             stopped_reason=stopped_reason,
+            certificate_history=tuple(history),
         )

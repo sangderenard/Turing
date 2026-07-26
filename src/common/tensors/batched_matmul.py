@@ -71,3 +71,49 @@ def matmul_chunked(A, B, *, Mt=512, Kt=2048, Nt=512):
         out[..., i0:i1, :] = y
 
     return out
+
+
+def matmul_chunked_data(A, B, *, Mt=512, Kt=2048, Nt=512):
+    """Compute a 2-D tiled product as backend data, without tape-side tiles.
+
+    The caller records one ordinary ``matmul`` node around this kernel. This
+    keeps the public gradient rule exact while avoiding in-place tensor
+    assembly inside the autograd graph.
+    """
+    if len(A.shape) != 2 or len(B.shape) != 2:
+        # Batched products currently use the backend's native implementation;
+        # their broadcast semantics should not be approximated here.
+        return A._apply_operator__(
+            "matmul",
+            A._AbstractTensor__unwrap(),
+            B._AbstractTensor__unwrap(),
+        )
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2:
+        raise ValueError(f"matmul_chunked_data: inner dims mismatch {K} != {K2}")
+    raw_a = A._AbstractTensor__unwrap()
+    raw_b = B._AbstractTensor__unwrap()
+    output = A.full(
+        (M, N),
+        0.0,
+        device=A.get_device(),
+        dtype=A.get_dtype(),
+        cls=type(A),
+    )
+    raw_output = output._AbstractTensor__unwrap()
+    for i0 in range(0, M, Mt):
+        i1 = min(i0 + Mt, M)
+        for j0 in range(0, N, Nt):
+            j1 = min(j0 + Nt, N)
+            tile = None
+            for k0 in range(0, K, Kt):
+                k1 = min(k0 + Kt, K)
+                product = A._apply_operator__(
+                    "matmul",
+                    raw_a[i0:i1, k0:k1],
+                    raw_b[k0:k1, j0:j1],
+                )
+                tile = product if tile is None else tile + product
+            raw_output[i0:i1, j0:j1] = tile
+    return raw_output

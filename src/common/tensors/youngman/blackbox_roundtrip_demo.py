@@ -12,14 +12,21 @@ import numpy as np
 import pandas as pd
 
 from ..abstract_convolution.laplace_nd import GridDomain
+from ..abstraction import AbstractTensor
 from ..riemann import (
     AdaptiveSurfaceTriangulator,
     TriangulatedSurfaceTransform,
     TriangulationTolerance,
+    abstract_mesh_laplace,
 )
 from .algorithm import DomainTetrahedra, compile_grid_domain, extract_isosurface
 from .metric_roundtrip_demo import detailed_embedding, detailed_jacobian
-from .spline import StreamingSplineSolver, validate_single_valued_chart
+from .refinement_network import (
+    train_refinement_predictor,
+    triangle_refinement_features,
+    triangle_spring_edges,
+)
+from .spline import AbstractKernelInterpolator, validate_single_valued_chart
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,20 @@ class BlackBoxRoundTrip:
     mesh: object
     geometry_transform: TriangulatedSurfaceTransform
     profile: pd.DataFrame
+    training: pd.DataFrame
+
+
+def deployment_decision(
+    *, model_accepted: bool, guided_converged: bool, objective_improved: bool
+) -> tuple[bool, str]:
+    """Apply all independent gates required to promote a learned mesh."""
+    if not model_accepted:
+        return False, "model_not_accepted"
+    if not guided_converged:
+        return False, "guided_mesh_unconverged"
+    if not objective_improved:
+        return False, "laplace_not_improved"
+    return True, "accepted"
 
 
 @dataclass(frozen=True)
@@ -37,12 +58,21 @@ class PublishedSurfaceSpline:
 
     model: object
 
-    def __call__(self, uv: np.ndarray) -> np.ndarray:
-        uv = np.asarray(uv, dtype=np.float64)
-        return self.model(np.column_stack((uv, np.zeros(len(uv)))))
+    def __call__(self, uv):
+        if isinstance(uv, AbstractTensor):
+            return self.model(uv)
+        return self.model(np.asarray(uv, dtype=np.float64))
 
-    def jacobian(self, uv: np.ndarray) -> np.ndarray:
-        return _finite_jacobian(self, uv)
+    def jacobian(self, uv: np.ndarray):
+        uv = np.asarray(uv, dtype=np.float64)
+        columns = []
+        for axis in range(2):
+            offset = np.zeros_like(uv)
+            offset[:, axis] = 2e-5
+            plus = self.model(AbstractTensor.tensor(uv + offset))
+            minus = self.model(AbstractTensor.tensor(uv - offset))
+            columns.append((plus - minus) / (4e-5))
+        return AbstractTensor.stack(columns, dim=2)
 
 
 def source_surface_parameters(
@@ -58,40 +88,60 @@ def source_surface_parameters(
 
 
 def manifold_embedding(
-    parameters: np.ndarray,
+    parameters,
     time_value: float = 0.0,
     manifold: str = "ripple",
-) -> np.ndarray:
+) :
     """Embed the common parameter volume into selectable visible manifolds."""
-    parameters = np.asarray(parameters, dtype=np.float64)
-    result = detailed_embedding(parameters)
+    tensor_input = isinstance(parameters, AbstractTensor)
+    parameters = (
+        parameters
+        if tensor_input
+        else AbstractTensor.tensor(parameters, dtype="float64")
+    )
+    u, v, w = parameters[:, 0], parameters[:, 1], parameters[:, 2]
+    tau = 2.0 * np.pi
+    base = (
+        u,
+        v,
+        w + 0.075 * (tau * u).sin() * (tau * v).sin(),
+        0.11
+        * (2.0 * tau * u).sin()
+        * (1.5 * tau * v).cos()
+        * (1.0 + 0.2 * w),
+        0.09 * (1.5 * tau * u).cos() * (2.0 * tau * w).sin()
+        + 0.035 * (2.5 * tau * v).sin(),
+    )
     if manifold == "ripple":
-        return result
-    u, v, _ = parameters.T
+        result = AbstractTensor.stack(base, dim=1)
+        return result if tensor_input else _host(result)
     phase = 2.0 * np.pi * float(time_value)
-    height = result[:, 2] - 0.5
+    height = base[2] - 0.5
     if manifold == "banana":
-        angle = 2.35 * (u - 0.5) + 0.2 * np.sin(2.0 * np.pi * v + phase)
+        angle = 2.35 * (u - 0.5) + 0.2 * (2.0 * np.pi * v + phase).sin()
         radius = 1.25 + 0.42 * (v - 0.5)
-        result[:, 0] = radius * np.sin(angle)
-        result[:, 1] = 1.35 * (v - 0.5)
-        result[:, 2] = radius * np.cos(angle) - 1.25 + 0.7 * height
+        visible = (
+            radius * angle.sin(),
+            1.35 * (v - 0.5),
+            radius * angle.cos() - 1.25 + 0.7 * height,
+        )
     elif manifold == "saddle":
         x = 1.45 * (u - 0.5)
         y = 1.45 * (v - 0.5)
-        result[:, 0] = x
-        result[:, 1] = y
-        result[:, 2] = 0.52 * (x * x - y * y) + height
+        visible = (x, y, 0.52 * (x * x - y * y) + height)
     elif manifold == "twisted_ribbon":
         x = 1.8 * (u - 0.5)
         across = 1.1 * (v - 0.5)
         angle = 2.0 * np.pi * (u + time_value)
-        result[:, 0] = x
-        result[:, 1] = across * np.cos(angle) - height * np.sin(angle)
-        result[:, 2] = across * np.sin(angle) + height * np.cos(angle)
+        visible = (
+            x,
+            across * angle.cos() - height * angle.sin(),
+            across * angle.sin() + height * angle.cos(),
+        )
     else:
         raise ValueError(f"unknown manifold preset: {manifold}")
-    return result
+    result = AbstractTensor.stack((*visible, base[3], base[4]), dim=1)
+    return result if tensor_input else _host(result)
 
 
 def source_surface(
@@ -99,9 +149,9 @@ def source_surface(
     time_value: float = 0.0,
     manifold: str = "ripple",
 ) -> np.ndarray:
-    return manifold_embedding(
+    return _host(manifold_embedding(
         source_surface_parameters(uv, time_value), time_value, manifold
-    )
+    ))
 
 
 def source_surface_jacobian(
@@ -148,7 +198,15 @@ def _finite_jacobian(function, uv: np.ndarray, step: float = 2e-5) -> np.ndarray
     return jacobian
 
 
-def _metric(jacobian: np.ndarray) -> np.ndarray:
+def _host(value) -> np.ndarray:
+    if isinstance(value, AbstractTensor):
+        value = value.tolist()
+    return np.asarray(value, dtype=np.float64)
+
+
+def _metric(jacobian):
+    if isinstance(jacobian, AbstractTensor):
+        return jacobian.swapaxes(1, 2) @ jacobian
     return np.einsum("nmi,nmj->nij", jacobian, jacobian)
 
 
@@ -195,11 +253,72 @@ def continuous_surface_laplace(
     return divergence / root_det
 
 
+def _mesh_laplace_objective(
+    mesh,
+    time_value: float,
+    manifold: str,
+    *,
+    spline_surface=None,
+    component: str = "total",
+):
+    """Measure one independently defined Laplace-error component."""
+    uv = mesh.parameters
+    transformed = TriangulatedSurfaceTransform.from_mesh(
+        uv, mesh.embedded, mesh.triangles
+    ).laplace(probe_values(uv))
+    reference = continuous_surface_laplace(
+        uv,
+        lambda query: _metric(
+            source_surface_jacobian(query, time_value, manifold)
+        ),
+    )
+    if component == "total":
+        error = transformed.laplacian - reference
+    else:
+        if spline_surface is None:
+            raise ValueError(f"{component} objective requires spline_surface")
+        spline_reference = continuous_surface_laplace(
+            uv,
+            lambda query: _host(
+                _metric(spline_surface.jacobian(query))
+            ),
+        )
+        if component == "discretization":
+            error = transformed.laplacian - spline_reference
+        elif component == "reconstruction":
+            error = spline_reference - reference
+        else:
+            raise ValueError(f"unknown Laplace component: {component}")
+    valid = (
+        ~transformed.geometry.boundary_vertex_mask
+        & ~transformed.geometry.invalid_vertex_mask
+        & np.isfinite(error)
+    )
+    weights = transformed.geometry.lumped_vertex_areas[valid]
+    loss = (
+        float(np.sqrt(np.sum(weights * error[valid] ** 2) / weights.sum()))
+        if len(weights) and weights.sum() > 0.0
+        else np.inf
+    )
+    finite = np.isfinite(error)[mesh.triangles]
+    values = np.where(finite, np.abs(error)[mesh.triangles], 0.0)
+    counts = finite.sum(axis=1)
+    triangle_error = np.zeros(mesh.triangle_count, dtype=np.float64)
+    np.divide(
+        values.sum(axis=1), counts, out=triangle_error, where=counts > 0
+    )
+    return loss, triangle_error
+
+
 def _domain_and_extraction(
     resolution: int,
     time_value: float = 0.0,
     manifold: str = "ripple",
 ):
+    geometry_device = AbstractTensor._preferred_device or "cpu"
+    geometry_precision = AbstractTensor.tensor(
+        [0.0], dtype="float64", device=geometry_device
+    ).get_dtype()
     domain = GridDomain.generate_grid_domain(
         "rectangular",
         N_u=resolution + 1,
@@ -208,10 +327,16 @@ def _domain_and_extraction(
         Lx=1.0,
         Ly=1.0,
         Lz=1.0,
+        device=geometry_device,
+        precision=geometry_precision,
         defer_resolution=True,
     )
     identity = compile_grid_domain(domain)
-    expanded = detailed_embedding(identity.parametric.reshape(-1, 3))
+    expanded = _host(manifold_embedding(
+        AbstractTensor.tensor(identity.parametric.reshape(-1, 3)),
+        time_value,
+        "ripple",
+    ))
     compiled = DomainTetrahedra(
         identity.parametric,
         expanded[:, :3].reshape(identity.parametric.shape),
@@ -219,19 +344,18 @@ def _domain_and_extraction(
     phase = 2.0 * np.pi * float(time_value)
 
     def time_surface_field(points):
-        xyz = np.asarray(points.tolist(), dtype=np.float64)
-        x, y, z = xyz.transpose(2, 0, 1)
-        target = 0.5 + 0.12 * np.sin(2.0 * np.pi * x + phase) * np.cos(
+        x, y, z = points[..., 0], points[..., 1], points[..., 2]
+        target = 0.5 + 0.12 * (2.0 * np.pi * x + phase).sin() * (
             2.0 * np.pi * y
-        )
-        return type(points).get_tensor(z - target)
+        ).cos()
+        return z - target
 
     extraction = extract_isosurface(
         compiled.embedded,
         time_surface_field,
         parametric_tetrahedra=compiled.parametric,
         expanded_embedding=lambda points: manifold_embedding(
-            points, time_value, manifold
+            AbstractTensor.tensor(points), time_value, manifold
         ),
     )
     return domain, extraction
@@ -242,20 +366,20 @@ def publish_surface_spline(samples) -> tuple[PublishedSurfaceSpline, int]:
     if samples.expanded_points is None:
         raise ValueError("YoungMan samples do not contain expanded geometry")
     validate_single_valued_chart(
-        samples.parametric_points, intrinsic_axes=(0, 1), tolerance=1e-8
+        samples.parametric_points, intrinsic_axes=(0, 1), tolerance=1e-7
     )
     source_controls = np.asarray(samples.expanded_points, dtype=np.float64)
-    fifo = StreamingSplineSolver(
-        intrinsic_axes=(0, 1),
-        smoothing=2e-8,
-        kernel="thin_plate_spline",
-        neighbors=None,
-    )
+    parameter_batches = []
+    value_batches = []
     for rows in np.array_split(np.arange(samples.sample_count), 12):
-        fifo.submit(samples.parametric_points[rows], source_controls[rows])
-    model = fifo.update()
-    assert model is not None
-    return PublishedSurfaceSpline(model), fifo.control_point_count
+        parameter_batches.append(samples.parametric_points[rows])
+        value_batches.append(source_controls[rows])
+    parameters = np.concatenate(parameter_batches)
+    values = np.concatenate(value_batches)
+    model = AbstractKernelInterpolator.fit(
+        parameters, values, intrinsic_axes=(0, 1)
+    )
+    return PublishedSurfaceSpline(model), len(parameters)
 
 
 def build_blackbox_roundtrip(
@@ -267,9 +391,25 @@ def build_blackbox_roundtrip(
     max_triangles: int = 250_000,
     time_value: float = 0.0,
     manifold: str = "ripple",
+    train_network: bool = True,
+    training_epochs: int = 80,
+    training_target: str = "laplace",
+    training_scope: str = "all",
+    alpha_quantile: float = 0.85,
+    training_examples: int = 9,
+    spring_strength: float = 0.02,
+    max_hinge_angle: float = 0.35,
+    training_dtype: str = "float64",
+    training_backend: str | None = None,
+    training_device: str | None = None,
+    training_seed: int = 1729,
 ) -> BlackBoxRoundTrip:
     """Build every stage while enforcing the spline/triangulator black box."""
     profile_rows = []
+    if not 0.5 <= alpha_quantile < 1.0:
+        raise ValueError("alpha_quantile must be in [0.5, 1.0)")
+    if training_examples < 1 or spring_strength < 0.0:
+        raise ValueError("invalid training corpus parameters")
 
     def finish_stage(name, started):
         profile_rows.append({
@@ -296,6 +436,7 @@ def build_blackbox_roundtrip(
         tolerance=TriangulationTolerance(
             position=position_tolerance,
             tangent=tangent_tolerance,
+            hinge_angle=max_hinge_angle,
             max_rounds=max_rounds,
             max_triangles=max_triangles,
         ),
@@ -305,12 +446,258 @@ def build_blackbox_roundtrip(
     mesh = triangulator.triangulate()
     finish_stage("adaptive_triangulation", started)
 
+    trained = None
+    training_features = None
+    training_errors = None
+    training_scale = position_tolerance
+    pilot_mesh = mesh
+    pilot_triangle_count = mesh.triangle_count
+    pilot_laplace_loss = np.nan
+    guided_laplace_loss = np.nan
+    guided_triangle_count = pilot_triangle_count
+    alpha_improved_objective = False
+    guided_converged = False
+    alpha_deployed = False
+    alpha_inference_sec = 0.0
+    deployment_reason = "model_not_accepted"
+    laplace_targets = {"laplace", "discretization", "reconstruction"}
+    if train_network and training_target in {"position", *laplace_targets}:
+        started = perf_counter()
+        if training_target == "position":
+            feature_parts = []
+            error_parts = []
+            for certificate in mesh.certificate_history:
+                features = triangle_refinement_features(
+                    certificate.parameters, certificate.triangles
+                )
+                feature_parts.append(features)
+                error_parts.append(certificate.position_error)
+            training_features = np.concatenate(feature_parts)
+            training_errors = np.concatenate(error_parts)
+        else:
+            corpus_features = []
+            corpus_errors = []
+            corpus_groups = []
+            corpus_springs = []
+            row_offset = 0
+            candidates = [
+                (name, phase)
+                for phase in np.linspace(0.0, 1.0, 4, endpoint=False)
+                for name in ("ripple", "banana", "saddle", "twisted_ribbon")
+                if (name, float(phase)) != (manifold, float(time_value))
+            ][:max(0, training_examples - 1)]
+            cases = []
+            for name, phase in candidates:
+                _, case_extraction = _domain_and_extraction(
+                    min(youngman_resolution, 3), float(phase), name
+                )
+                case_surface, _ = publish_surface_spline(
+                    case_extraction.solver_samples
+                )
+                case_mesh = AdaptiveSurfaceTriangulator(
+                    case_surface,
+                    jacobian=case_surface.jacobian,
+                    tolerance=TriangulationTolerance(
+                        position=max(position_tolerance, 2e-2),
+                        tangent=tangent_tolerance,
+                        hinge_angle=max_hinge_angle,
+                        max_rounds=min(max_rounds, 8),
+                        max_triangles=min(max_triangles, 12_000),
+                    ),
+                    initial_resolution=(4, 4),
+                ).triangulate()
+                cases.append((
+                    case_mesh, case_surface, float(phase), name
+                ))
+            # The requested target is the final group: labels are used only
+            # for held-out validation and final deployment acceptance.
+            cases.append((mesh, spline_surface, time_value, manifold))
+            for group, (
+                case_mesh, case_surface, phase, name
+            ) in enumerate(cases):
+                loss, errors = _mesh_laplace_objective(
+                    case_mesh,
+                    phase,
+                    name,
+                    spline_surface=case_surface,
+                    component=(
+                        "total"
+                        if training_target == "laplace"
+                        else training_target
+                    ),
+                )
+                if group == len(cases) - 1:
+                    pilot_laplace_loss, _ = _mesh_laplace_objective(
+                        case_mesh,
+                        phase,
+                        name,
+                        spline_surface=case_surface,
+                        component="total",
+                    )
+                features = triangle_refinement_features(
+                    case_mesh.parameters,
+                    case_mesh.triangles,
+                    case_mesh.embedded,
+                )
+                springs = triangle_spring_edges(case_mesh.triangles)
+                if training_scope == "interior":
+                    triangle_uv = case_mesh.parameters[
+                        case_mesh.triangles
+                    ]
+                    keep = ~(
+                        np.isclose(triangle_uv, 0.0)
+                        | np.isclose(triangle_uv, 1.0)
+                    ).any(axis=(1, 2))
+                    remap = np.full(len(features), -1, dtype=np.int64)
+                    remap[keep] = np.arange(int(keep.sum()))
+                    spring_keep = (
+                        (remap[springs[:, 0]] >= 0)
+                        & (remap[springs[:, 1]] >= 0)
+                    )
+                    springs = remap[springs[spring_keep]]
+                    features = features[keep]
+                    errors = errors[keep]
+                corpus_features.append(features)
+                corpus_errors.append(errors)
+                corpus_groups.append(
+                    np.full(len(features), group, dtype=np.int64)
+                )
+                corpus_springs.append(springs + row_offset)
+                row_offset += len(features)
+            training_features = np.concatenate(corpus_features)
+            training_errors = np.concatenate(corpus_errors)
+            training_groups = np.concatenate(corpus_groups)
+            training_springs = np.concatenate(corpus_springs)
+            training_scale = max(float(np.median(training_errors)), 1e-12)
+        if training_scope not in {"all", "interior"}:
+            raise ValueError(f"unknown training scope: {training_scope}")
+        if len(training_features) > 8192:
+            selected = np.linspace(
+                0, len(training_features) - 1, 8192, dtype=np.int64
+            )
+            if training_target in laplace_targets:
+                remap = np.full(len(training_features), -1, dtype=np.int64)
+                remap[selected] = np.arange(len(selected))
+                spring_keep = (
+                    (remap[training_springs[:, 0]] >= 0)
+                    & (remap[training_springs[:, 1]] >= 0)
+                )
+                training_springs = remap[training_springs[spring_keep]]
+                training_groups = training_groups[selected]
+            training_features = training_features[selected]
+            training_errors = training_errors[selected]
+        selected_training_backend = (
+            training_backend
+            or AbstractTensor._preferred_backend
+            or "numpy"
+        )
+        selected_training_device = (
+            training_device
+            if training_device is not None
+            else AbstractTensor._preferred_device
+        )
+        finish_stage("training_corpus", started)
+        with AbstractTensor.use_backend(
+            selected_training_backend, selected_training_device
+        ):
+            trained = train_refinement_predictor(
+                training_features,
+                training_errors,
+                epsilon=training_scale,
+                epochs=training_epochs,
+                group_ids=(
+                training_groups if training_target in laplace_targets else None
+                ),
+                spring_edges=(
+                training_springs if training_target in laplace_targets else None
+                ),
+                spring_strength=(
+                    spring_strength if training_target in laplace_targets else 0.0
+                ),
+                tensor_dtype=training_dtype,
+                seed=training_seed,
+            )
+        profile_rows.extend((
+            {
+                "stage": "training_tensor_setup",
+                "elapsed_sec": trained.tensor_setup_sec,
+            },
+            {
+                "stage": "abstract_nn_optimization",
+                "elapsed_sec": trained.optimization_sec,
+            },
+            {
+                "stage": "training_validation_inference",
+                "elapsed_sec": trained.inference_sec,
+            },
+        ))
+
+        if trained.accepted:
+            def learned_alpha(parameters, triangles):
+                nonlocal alpha_inference_sec
+                inference_started = perf_counter()
+                embedded = _host(spline_surface(parameters))
+                pressure = trained.predict_alpha(
+                    triangle_refinement_features(
+                        parameters, triangles, embedded
+                    )
+                )
+                threshold = max(
+                    float(np.quantile(pressure, alpha_quantile)), 1e-12
+                )
+                result = pressure / threshold
+                alpha_inference_sec += perf_counter() - inference_started
+                return result
+
+            guided = AdaptiveSurfaceTriangulator(
+                spline_surface,
+                jacobian=spline_surface.jacobian,
+                tolerance=triangulator.tolerance,
+                initial_resolution=triangulator.initial_resolution,
+                batch_size=triangulator.batch_size,
+                alpha_map=learned_alpha,
+            )
+            started = perf_counter()
+            mesh = guided.triangulate()
+            guided_converged = mesh.converged
+            guided_triangle_count = mesh.triangle_count
+            finish_stage("alpha_guided_triangulation", started)
+            profile_rows.append({
+                "stage": "alpha_inference_in_guided",
+                "elapsed_sec": alpha_inference_sec,
+            })
+            if training_target in laplace_targets:
+                started = perf_counter()
+                guided_laplace_loss, _ = _mesh_laplace_objective(
+                    mesh, time_value, manifold
+                )
+                finish_stage("guided_laplace_certification", started)
+                alpha_improved_objective = (
+                    guided_laplace_loss < pilot_laplace_loss
+                )
+                alpha_deployed, deployment_reason = deployment_decision(
+                    model_accepted=trained.accepted,
+                    guided_converged=guided_converged,
+                    objective_improved=alpha_improved_objective,
+                )
+                if not alpha_deployed:
+                    mesh = pilot_mesh
+            else:
+                alpha_deployed, deployment_reason = deployment_decision(
+                    model_accepted=trained.accepted,
+                    guided_converged=guided_converged,
+                    objective_improved=True,
+                )
+                if not alpha_deployed:
+                    mesh = pilot_mesh
+
     started = perf_counter()
     uv = mesh.parameters
     source_values = source_surface(uv, time_value, manifold)
     spline_values = mesh.embedded
     source_jacobian = source_surface_jacobian(uv, time_value, manifold)
-    spline_jacobian_values = spline_surface.jacobian(uv)
+    spline_jacobian_tensor = spline_surface.jacobian(uv)
+    spline_jacobian_values = _host(spline_jacobian_tensor)
     source_metric = _metric(source_jacobian)
     spline_metric = _metric(spline_jacobian_values)
     source_continuous_laplace = continuous_surface_laplace(
@@ -320,7 +707,7 @@ def build_blackbox_roundtrip(
         ),
     )
     spline_continuous_laplace = continuous_surface_laplace(
-        uv, lambda query: _metric(spline_surface.jacobian(query))
+        uv, lambda query: _host(_metric(spline_surface.jacobian(query)))
     )
     finish_stage("continuous_reference", started)
 
@@ -328,8 +715,17 @@ def build_blackbox_roundtrip(
     geometry_transform = TriangulatedSurfaceTransform.from_mesh(
         mesh.parameters, mesh.embedded, mesh.triangles
     )
-    mesh_result = geometry_transform.laplace(probe_values(uv))
-    mesh_laplace = mesh_result.laplacian
+    probe = probe_values(uv)
+    mesh_result = geometry_transform.laplace(probe)
+    abstract_laplace_tensor = abstract_mesh_laplace(
+        AbstractTensor.tensor(mesh.embedded, dtype="float64"),
+        mesh.triangles,
+        AbstractTensor.tensor(probe, dtype="float64"),
+    )
+    mesh_laplace = _host(abstract_laplace_tensor)
+    abstract_laplace_parity = np.nanmax(
+        np.abs(mesh_laplace - mesh_result.laplacian)
+    )
     finish_stage("mesh_transform_laplace", started)
     boundary = mesh_result.geometry.boundary_vertex_mask
     interior = (
@@ -351,6 +747,83 @@ def build_blackbox_roundtrip(
     mesh_discretization_error = mesh_laplace - spline_continuous_laplace
     mesh_laplace_error = mesh_laplace - source_continuous_laplace
 
+    training_rows = []
+    if train_network and trained is None:
+        started = perf_counter()
+        all_training_features = triangle_refinement_features(
+            mesh.parameters, mesh.triangles
+        )
+        target_fields = {
+            "position": mesh.position_error,
+            "spline_position": spline_error[mesh.triangles].mean(axis=1),
+            "metric": metric_error[mesh.triangles].mean(axis=1),
+            "laplace": np.nanmean(
+                np.abs(mesh_laplace_error)[mesh.triangles], axis=1
+            ),
+        }
+        if training_target not in target_fields:
+            raise ValueError(f"unknown training target: {training_target}")
+        training_errors = target_fields[training_target]
+        training_mask = np.isfinite(training_errors)
+        if training_scope == "interior":
+            training_mask &= ~boundary[mesh.triangles].any(axis=1)
+        elif training_scope != "all":
+            raise ValueError(f"unknown training scope: {training_scope}")
+        training_features = all_training_features[training_mask]
+        training_errors = training_errors[training_mask]
+        if len(training_features) > 2048:
+            selected = np.linspace(
+                0, len(training_features) - 1, 2048, dtype=np.int64
+            )
+            training_features = training_features[selected]
+            training_errors = training_errors[selected]
+        training_scale = (
+            position_tolerance
+            if training_target == "position"
+            else max(float(np.median(training_errors)), 1e-12)
+        )
+        trained = train_refinement_predictor(
+            training_features,
+            training_errors,
+            epsilon=training_scale,
+            epochs=training_epochs,
+            seed=training_seed,
+        )
+        finish_stage("abstract_nn_training", started)
+    if train_network:
+        training_rows.append({
+            "engine": "tape_reverse_mode+AutogradProcess",
+            "backend": trained.tensor_backend or "auto",
+            "device": trained.tensor_device or "default",
+            "dtype": trained.tensor_dtype,
+            "target": training_target,
+            "scope": training_scope,
+            "target_scale": training_scale,
+            "epochs": trained.epochs,
+            "seed": trained.seed,
+            "samples": len(training_features),
+            "initial_loss": trained.initial_loss,
+            "final_loss": trained.final_loss,
+            "loss_ratio": trained.final_loss / max(
+                trained.initial_loss, np.finfo(float).tiny
+            ),
+            "forward_nodes": trained.forward_nodes,
+            "backward_nodes": trained.backward_nodes,
+            "concurrent_forward_width": trained.concurrent_forward_width,
+            "validation_loss": trained.validation_loss,
+            "baseline_validation_loss": trained.baseline_validation_loss,
+            "validation_correlation": trained.validation_correlation,
+            "accepted": trained.accepted,
+            "guided_converged": guided_converged,
+            "pilot_triangles": pilot_triangle_count,
+            "guided_triangles": guided_triangle_count,
+            "alpha_applied": alpha_deployed,
+            "deployment_reason": deployment_reason,
+            "pilot_laplace_loss": pilot_laplace_loss,
+            "guided_laplace_loss": guided_laplace_loss,
+            "alpha_improved_objective": alpha_improved_objective,
+        })
+
     def rms(values):
         return float(np.sqrt(np.mean(np.square(values)))) if len(values) else np.nan
 
@@ -366,6 +839,8 @@ def build_blackbox_roundtrip(
         return float(np.sqrt(np.sum(weights * values[selected] ** 2) / weights.sum()))
 
     summary = pd.DataFrame([{
+        "tensor_backend": AbstractTensor._preferred_backend or "auto",
+        "tensor_device": AbstractTensor._preferred_device or "default",
         "time_value": time_value,
         "manifold": manifold,
         "target_epsilon": position_tolerance,
@@ -408,6 +883,17 @@ def build_blackbox_roundtrip(
         "nonmanifold_mesh_edges": int(
             mesh_result.geometry.nonmanifold_edge_mask.sum()
         ),
+        "abstract_laplace_parity_max": abstract_laplace_parity,
+        "abstract_nn_trained": bool(training_rows),
+        "abstract_nn_loss_ratio": (
+            training_rows[0]["loss_ratio"] if training_rows else np.nan
+        ),
+        "abstract_nn_accepted": (
+            training_rows[0]["accepted"] if training_rows else False
+        ),
+        "abstract_nn_deployed": (
+            training_rows[0]["alpha_applied"] if training_rows else False
+        ),
     }])
     triangle_position = spline_error[mesh.triangles].mean(axis=1)
     triangle_chord = mesh.position_error
@@ -444,6 +930,7 @@ def build_blackbox_roundtrip(
         mesh,
         geometry_transform,
         pd.DataFrame(profile_rows),
+        pd.DataFrame(training_rows),
     )
 
 
@@ -507,6 +994,57 @@ def main() -> None:
     parser.add_argument("--live-solves", type=int)
     parser.add_argument("--live-period", type=float, default=8.0)
     parser.add_argument("--live-max-frames", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--no-train", action="store_true")
+    parser.add_argument(
+        "--tensor-backend", choices=("numpy", "torch"), default="numpy"
+    )
+    parser.add_argument(
+        "--tensor-device",
+        default=None,
+        help="backend device such as cpu, cuda, or cuda:1",
+    )
+    parser.add_argument(
+        "--training-dtype",
+        choices=("float32", "float64"),
+        default=None,
+    )
+    parser.add_argument(
+        "--training-backend",
+        choices=("numpy", "torch"),
+        default=None,
+        help="override the geometry backend for neural training only",
+    )
+    parser.add_argument(
+        "--training-device",
+        default=None,
+        help="training-only device such as cuda or cuda:1",
+    )
+    parser.add_argument("--training-epochs", type=int, default=80)
+    parser.add_argument("--training-seed", type=int, default=1729)
+    parser.add_argument(
+        "--training-target",
+        choices=(
+            "position",
+            "spline_position",
+            "metric",
+            "laplace",
+            "discretization",
+            "reconstruction",
+        ),
+        default="laplace",
+    )
+    parser.add_argument(
+        "--training-scope", choices=("all", "interior"), default="all"
+    )
+    parser.add_argument("--alpha-quantile", type=float, default=0.85)
+    parser.add_argument("--training-examples", type=int, default=9)
+    parser.add_argument("--spring-strength", type=float, default=0.02)
+    parser.add_argument(
+        "--max-hinge-angle",
+        type=float,
+        default=0.35,
+        help="maximum principal angle in radians across connected faces",
+    )
     parser.add_argument("--render-image", type=Path)
     parser.add_argument(
         "--error-field",
@@ -523,6 +1061,24 @@ def main() -> None:
         help="emit diagnostics even if a triangulation tolerance or budget fails",
     )
     args = parser.parse_args()
+    AbstractTensor.set_default_backend(
+        args.tensor_backend, args.tensor_device
+    )
+    effective_training_backend = (
+        args.training_backend or args.tensor_backend
+    )
+    effective_training_device = (
+        args.training_device
+        if args.training_device is not None
+        else args.tensor_device
+    )
+    training_dtype = args.training_dtype or (
+        "float32"
+        if effective_training_backend == "torch"
+        and effective_training_device
+        and effective_training_device.startswith("cuda")
+        else "float64"
+    )
     target_epsilon = (
         args.target_epsilon
         if args.position_tolerance is None
@@ -536,9 +1092,23 @@ def main() -> None:
         max_triangles=args.max_triangles,
         time_value=args.time_value,
         manifold=args.manifold,
+        train_network=not args.no_train,
+        training_epochs=args.training_epochs,
+        training_target=args.training_target,
+        training_scope=args.training_scope,
+        alpha_quantile=args.alpha_quantile,
+        training_examples=args.training_examples,
+        spring_strength=args.spring_strength,
+        max_hinge_angle=args.max_hinge_angle,
+        training_dtype=training_dtype,
+        training_backend=args.training_backend,
+        training_device=args.training_device,
+        training_seed=args.training_seed,
     )
     print("\nBLACK-BOX ROUND TRIP\n", result.summary.to_string(index=False))
     print("\nPROFILE\n", result.profile.to_string(index=False))
+    if len(result.training):
+        print("\nABSTRACT NN TRAINING\n", result.training.to_string(index=False))
     print("\nTRIANGLE CERTIFICATES\n", result.triangles.head(12).to_string(index=False))
     if not result.mesh.converged and not args.allow_unconverged:
         raise RuntimeError(
@@ -550,6 +1120,7 @@ def main() -> None:
         result.summary.to_csv(args.output_dir / "summary.csv", index=False)
         result.triangles.to_csv(args.output_dir / "triangles.csv", index=False)
         result.profile.to_csv(args.output_dir / "profile.csv", index=False)
+        result.training.to_csv(args.output_dir / "training.csv", index=False)
     if args.render_image:
         viewer = _load_pluck_viewer()
         profile = _profile_mapping(result)
@@ -587,6 +1158,18 @@ def main() -> None:
                     max_triangles=args.max_triangles,
                     time_value=float(time_value),
                     manifold=args.manifold,
+                    train_network=not args.no_train,
+                    training_epochs=args.training_epochs,
+                    training_target=args.training_target,
+                    training_scope=args.training_scope,
+                    alpha_quantile=args.alpha_quantile,
+                    training_examples=args.training_examples,
+                    spring_strength=args.spring_strength,
+                    max_hinge_angle=args.max_hinge_angle,
+                    training_dtype=training_dtype,
+                    training_backend=args.training_backend,
+                    training_device=args.training_device,
+                    training_seed=args.training_seed,
                 )
             )
             if not animated.mesh.converged and not args.allow_unconverged:
@@ -633,21 +1216,56 @@ def main() -> None:
                 max_triangles=args.max_triangles,
                 time_value=time_value,
                 manifold=args.manifold,
+                train_network=not args.no_train,
+                training_epochs=args.training_epochs,
+                training_target=args.training_target,
+                training_scope=args.training_scope,
+                alpha_quantile=args.alpha_quantile,
+                training_examples=args.training_examples,
+                spring_strength=args.spring_strength,
+                max_hinge_angle=args.max_hinge_angle,
+                training_dtype=training_dtype,
+                training_backend=args.training_backend,
+                training_device=args.training_device,
+                training_seed=args.training_seed,
             )
             profile = _profile_mapping(solved)
             history.append(profile)
             panel = viewer.rolling_profile_lines(
                 profile, history, time_value=time_value
             )
+            training = (
+                solved.training.iloc[0] if len(solved.training) else None
+            )
             panel.extend((
                 "",
+                "benchmark          TRAIN -> HELDOUT EVAL",
                 f"solve index        {index:8d}",
                 f"manifold           {args.manifold:>8}",
+                f"corpus examples    {args.training_examples:8d}",
+                f"held-out phase     {time_value:8.4f}",
                 f"certified          {str(solved.mesh.converged):>8}",
                 f"target epsilon     {target_epsilon:8.2e}",
                 f"epsilon ratio      {solved.summary.loc[0, 'epsilon_ratio']:8.3f}",
                 f"vertices           {len(solved.mesh.parameters):8d}",
                 f"triangles          {solved.mesh.triangle_count:8d}",
+                f"NN loss ratio      "
+                f"{solved.summary.loc[0, 'abstract_nn_loss_ratio']:8.3g}",
+                f"NN accepted        "
+                f"{str(solved.summary.loc[0, 'abstract_nn_accepted']):>8}",
+                (
+                    f"pilot LB RMS       {training['pilot_laplace_loss']:8.3g}"
+                    if training is not None else "pilot LB RMS            n/a"
+                ),
+                (
+                    f"guided LB RMS      {training['guided_laplace_loss']:8.3g}"
+                    if training is not None else "guided LB RMS           n/a"
+                ),
+                (
+                    f"deployed           "
+                    f"{str(training['alpha_applied']):>8}"
+                    if training is not None else "deployed                 n/a"
+                ),
             ))
             return viewer.LiveMeshFrame(
                 solved.mesh.triangle_soup,

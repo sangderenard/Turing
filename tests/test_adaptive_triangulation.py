@@ -48,6 +48,23 @@ def test_curved_surface_refines_in_parallel_generations():
     assert result.position_error.max() <= 0.02
     assert result.tangent_error is not None
     assert result.tangent_error.max() <= 0.2
+    assert len(result.certificate_history) == result.generation + 1
+    assert result.certificate_history[0].generation == 0
+
+
+def test_alpha_map_can_request_density_beyond_position_certificate():
+    ordinary = AdaptiveSurfaceTriangulator(
+        _paraboloid,
+        tolerance=TriangulationTolerance(position=1.0, max_rounds=2),
+    ).triangulate()
+    guided = AdaptiveSurfaceTriangulator(
+        _paraboloid,
+        tolerance=TriangulationTolerance(position=1.0, max_rounds=2),
+        alpha_map=lambda parameters, triangles: np.full(len(triangles), 2.0),
+    ).triangulate()
+    assert ordinary.generation == 0
+    assert guided.generation == 2
+    assert guided.triangle_count > ordinary.triangle_count
 
 
 def test_refinement_has_no_hanging_full_edges():

@@ -8,6 +8,7 @@ from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, Nam
 import math
 import time
 from collections import deque
+from contextlib import contextmanager
 
 # Wire in new abstraction_methods/properties
 from .abstraction_methods import properties as _properties
@@ -205,6 +206,8 @@ def _register_all_conversions():
     JAXTensorOperations = BACKEND_REGISTRY.get("jax")
     PurePythonTensorOperations = BACKEND_REGISTRY.get("pure_python")
 class AbstractTensor:
+    _preferred_backend: str | None = None
+    _preferred_device: Any = None
     inf: float = float('inf')
     ninf: float = float('-inf')  
     nan: float = float('nan')
@@ -514,7 +517,7 @@ class AbstractTensor:
         result.data = self.mean_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
-            return AbstractScalar(result)
+            return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
     def sum(self, dim=None, keepdim: bool = False):
@@ -526,7 +529,7 @@ class AbstractTensor:
         result.data = self.sum_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
-            return AbstractScalar(result)
+            return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
@@ -544,7 +547,7 @@ class AbstractTensor:
         result.data = self.min_(dim=dim, keepdim=keepdim)
         result = finalize(result)
         if getattr(result.data, "shape", ()) == ():
-            return AbstractScalar(result)
+            return AbstractScalar.__new__(AbstractScalar, result)
         return result
 
     # --- Backend hooks for reductions (must be implemented by backends) ---
@@ -764,6 +767,24 @@ class AbstractTensor:
 
     @staticmethod
     def check_or_build_registry():
+        preferred = AbstractTensor._preferred_backend
+        if preferred is not None and preferred not in BACKEND_REGISTRY:
+            module_name = {
+                "numpy": "numpy_backend",
+                "torch": "torch_backend",
+                "jax": "jax_backend",
+                "pure_python": "pure_backend",
+            }.get(preferred)
+            if module_name is None:
+                raise ValueError(f"unknown tensor backend: {preferred}")
+            __import__(f"{__package__}.{module_name}", fromlist=[module_name])
+        if preferred is not None:
+            backend_cls = BACKEND_REGISTRY.get(preferred)
+            if backend_cls is None:
+                raise RuntimeError(
+                    f"tensor backend {preferred!r} could not be loaded"
+                )
+            return backend_cls
         cls = None
         if not BACKEND_REGISTRY:
             try:
@@ -789,6 +810,36 @@ class AbstractTensor:
         return cls
 
     @classmethod
+    @contextmanager
+    def use_backend(cls, backend: str, device=None):
+        """Scope implicit ``AbstractTensor`` creation to one backend/device."""
+        previous_backend = cls._preferred_backend
+        previous_device = cls._preferred_device
+        cls._preferred_backend = backend
+        cls._preferred_device = device
+        try:
+            cls.check_or_build_registry()
+            yield
+        finally:
+            cls._preferred_backend = previous_backend
+            cls._preferred_device = previous_device
+
+    @classmethod
+    def set_default_backend(cls, backend: str | None, device=None) -> None:
+        """Set the process-wide backend used by implicit tensor creation."""
+        previous_backend = cls._preferred_backend
+        previous_device = cls._preferred_device
+        cls._preferred_backend = backend
+        cls._preferred_device = device
+        try:
+            if backend is not None:
+                cls.check_or_build_registry()
+        except Exception:
+            cls._preferred_backend = previous_backend
+            cls._preferred_device = previous_device
+            raise
+
+    @classmethod
     def tensor(
         cls,
         data=None,
@@ -809,6 +860,8 @@ class AbstractTensor:
         """
         if faculty is not None:
             print("Faculty is depreciated and unused")
+        if device is None and cls is AbstractTensor:
+            device = cls._preferred_device
         if cls is AbstractTensor:
             cls = cls.check_or_build_registry()
 
@@ -873,6 +926,8 @@ class AbstractTensor:
         Get the tensor data from this AbstractTensor or create a new one if data is provided.
         If data is None, return self.
         """
+        if device is None:
+            device = AbstractTensor._preferred_device
         if cls is None:
             if like is not None:
                 cls = like.__class__
@@ -895,7 +950,14 @@ class AbstractTensor:
                 tape = _autograd.autograd.tape
             except Exception:
                 tape = None
-        pool = _get_tensor_pool(cls)
+        # The legacy pool is not keyed by explicit backend/device identity and
+        # can return a NumPy payload inside a Torch wrapper. Keep it out of an
+        # explicitly selected backend scope until the pool contract is fixed.
+        pool = (
+            None
+            if AbstractTensor._preferred_backend is not None
+            else _get_tensor_pool(cls)
+        )
         if data is not None and pool is not None and np is not None:
             if not isinstance(data, AbstractTensor):
                 try:
@@ -1361,6 +1423,11 @@ class AbstractTensor:
 
 
     # --- Broadcasting helpers (abstract, backend-agnostic) ---
+    @staticmethod
+    def broadcast_to(tensor, shape) -> "AbstractTensor":
+        """Broadcast ``tensor`` to ``shape`` through the selected backend."""
+        return AbstractTensor.get_tensor(tensor).expand(tuple(shape))
+
     def expand(self, *shape) -> "AbstractTensor":
         """Backend-agnostic expand/broadcast_to (view when possible).
 
@@ -2102,8 +2169,14 @@ class AbstractTensor:
                     right = right.to_dtype("float")
 
         if op == "matmul" and max(list(left.shape) + list(right.shape)) > 4096:
-            from .batched_matmul import matmul_chunked
-            return matmul_chunked(left, right, Kt=1024, Nt=512)
+            from .batched_matmul import matmul_chunked_data
+            result = type(self)(
+                track_time=self.track_time, tape=getattr(self, "_tape", None)
+            )
+            result.data = matmul_chunked_data(
+                left, right, Kt=1024, Nt=512
+            )
+            return finalize(result)
 
         # unwrap AFTER promotion
         l = left._AbstractTensor__unwrap() if isinstance(left, AbstractTensor) else left

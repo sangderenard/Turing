@@ -72,3 +72,21 @@ def test_nontrivial_manifold_jacobian_is_finite():
     jacobian = demo.source_surface_jacobian(uv, 0.2, "banana")
     assert jacobian.shape == (2, 5, 2)
     assert np.isfinite(jacobian).all()
+
+
+def test_learned_mesh_deployment_requires_every_gate():
+    assert demo.deployment_decision(
+        model_accepted=True,
+        guided_converged=True,
+        objective_improved=True,
+    ) == (True, "accepted")
+    assert demo.deployment_decision(
+        model_accepted=True,
+        guided_converged=False,
+        objective_improved=True,
+    ) == (False, "guided_mesh_unconverged")
+    assert demo.deployment_decision(
+        model_accepted=True,
+        guided_converged=True,
+        objective_improved=False,
+    ) == (False, "laplace_not_improved")

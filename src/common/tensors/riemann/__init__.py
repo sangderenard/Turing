@@ -21,6 +21,7 @@ from .grid_block import RiemannGridBlock
 from .regularization import smooth_bins, weight_decay
 from .adaptive_triangulation import (
     AdaptiveSurfaceTriangulator,
+    RefinementCertificate,
     TriangulationGeneration,
     TriangulationTolerance,
 )
@@ -31,6 +32,7 @@ from .mesh_laplace import (
     mesh_laplace_beltrami,
 )
 from .mesh_transform import TriangulatedSurfaceTransform
+from .abstract_mesh_laplace import abstract_mesh_laplace
 
 __all__ = [
     "AdaptiveSurfaceTriangulator",
@@ -40,12 +42,14 @@ __all__ = [
     "ManifoldPackage",
     "MeshLaplaceResult",
     "ParallelTransport",
+    "RefinementCertificate",
     "RiemannGridBlock",
     "SpectralConv3D",
     "TriangulationGeneration",
     "TriangulationTolerance",
     "TriangulatedSurfaceTransform",
     "build_cotangent_geometry",
+    "abstract_mesh_laplace",
     "mesh_laplace_beltrami",
     "smooth_bins",
     "weight_decay",

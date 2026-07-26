@@ -123,3 +123,13 @@ error together. Never omit rejected proposals or move network warm-up outside
 one path only. A particularly natural first target is refinement prediction:
 it can reduce expensive black-box probes while leaving mesh values and all
 acceptance decisions under the existing geometric certificate.
+
+The first geometry-linked learner is now active by default. It trains an
+AbstractTensor refinement-pressure network on a cross-manifold corpus and
+reports held-out validation, its exported autograd schedule, and independent
+pilot/guided mesh certification. `--no-train` provides the unassisted timing
+baseline; `--training-epochs` controls the assisted run. A learned mesh is
+deployed only when the model passes held-out validation, the guided
+triangulation converges, and a fresh source-relative Laplace certificate
+improves. See `docs/abstract_geometry_training.md` for the numeric backend
+boundaries, objective separation, and selected autograd contract.

@@ -10,6 +10,8 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy.interpolate import RBFInterpolator
 
+from ..abstraction import AbstractTensor
+
 
 def validate_single_valued_chart(
     parameters: np.ndarray,
@@ -264,3 +266,130 @@ class StreamingSplineSolver:
         with self._model_lock:
             self._model = model
         return model
+
+
+@dataclass(frozen=True)
+class AbstractKernelInterpolator:
+    """Thin-plate vector spline expressed entirely through AbstractTensor ops."""
+
+    chart_controls: AbstractTensor
+    radial_coefficients: AbstractTensor
+    polynomial_coefficients: AbstractTensor
+    regularization: float = 1e-10
+
+    @staticmethod
+    def _kernel(left: AbstractTensor, right: AbstractTensor) -> AbstractTensor:
+        differences = (
+            left.reshape(left.shape[0], 1, left.shape[1])
+            - right.reshape(1, right.shape[0], right.shape[1])
+        )
+        squared_distance = (differences * differences).sum(dim=2)
+        return squared_distance * (squared_distance + 1e-30).log() * 0.5
+
+    @classmethod
+    def fit(
+        cls,
+        parameters: np.ndarray,
+        embedded_values: np.ndarray,
+        *,
+        intrinsic_axes: Sequence[int] = (0, 1),
+        bandwidth: float | None = None,
+    ) -> "AbstractKernelInterpolator":
+        parameters = np.asarray(parameters, dtype=np.float64)
+        values = np.asarray(embedded_values, dtype=np.float64)
+        chart = parameters[:, tuple(intrinsic_axes)]
+        unique_chart, inverse = np.unique(chart, axis=0, return_inverse=True)
+        unique_values = np.zeros((len(unique_chart), values.shape[1]))
+        counts = np.bincount(inverse)
+        np.add.at(unique_values, inverse, values)
+        unique_values /= counts[:, None]
+        chart = unique_chart
+        values = unique_values
+        chart_tensor = AbstractTensor.tensor(chart, dtype="float64")
+        value_tensor = AbstractTensor.tensor(values, dtype="float64")
+        dtype = chart_tensor.get_dtype()
+        device = chart_tensor.get_device()
+        backend = type(chart_tensor)
+        radial = cls._kernel(chart_tensor, chart_tensor)
+        polynomial = AbstractTensor.cat(
+            (
+                AbstractTensor.ones(
+                    (len(chart), 1), dtype=dtype, device=device, cls=backend
+                ),
+                chart_tensor,
+            ),
+            dim=1,
+        )
+        zero = AbstractTensor.zeros(
+            (polynomial.shape[1], polynomial.shape[1]),
+            dtype=dtype,
+            device=device,
+            cls=backend,
+        )
+        system = AbstractTensor.cat(
+            (
+                AbstractTensor.cat(
+                    (
+                        radial + 1e-10 * AbstractTensor.eye(
+                            len(chart), dtype=dtype, device=device
+                        ),
+                        polynomial,
+                    ),
+                    dim=1,
+                ),
+                AbstractTensor.cat((polynomial.swapaxes(0, 1), zero), dim=1),
+            ),
+            dim=0,
+        )
+        rhs = AbstractTensor.cat(
+            (
+                value_tensor,
+                AbstractTensor.zeros(
+                    (polynomial.shape[1], value_tensor.shape[1]),
+                    dtype=dtype,
+                    device=device,
+                    cls=backend,
+                ),
+            ),
+            dim=0,
+        )
+        coefficients = AbstractTensor.linalg.solve(system, rhs)
+        return cls(
+            chart_tensor,
+            coefficients[: len(chart)],
+            coefficients[len(chart) :],
+        )
+
+    @property
+    def embedding_dimension(self) -> int:
+        return int(self.radial_coefficients.shape[-1])
+
+    def __call__(self, chart_parameters) -> AbstractTensor:
+        query = (
+            chart_parameters.to_backend(self.chart_controls).to_dtype(
+                self.chart_controls.get_dtype()
+            )
+            if isinstance(chart_parameters, AbstractTensor)
+            else AbstractTensor.tensor(
+                chart_parameters,
+                dtype=self.chart_controls.get_dtype(),
+                device=self.chart_controls.get_device(),
+            )
+        )
+        radial = self._kernel(query, self.chart_controls)
+        polynomial = AbstractTensor.cat(
+            (
+                AbstractTensor.ones(
+                    (query.shape[0], 1),
+                    dtype=query.get_dtype(),
+                    device=query.get_device(),
+                    cls=type(query),
+                ),
+                query,
+            ),
+            dim=1,
+        )
+        return (
+            radial @ self.radial_coefficients
+            + polynomial @ self.polynomial_coefficients
+        )

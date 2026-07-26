@@ -293,9 +293,10 @@ def extract_isosurface(
         )
         parametric_points = parametric_crossings[active_edges]
         if expanded_embedding is not None:
-            expanded_points = np.asarray(
-                expanded_embedding(parametric_points), dtype=np.float64
-            )
+            expanded_value = expanded_embedding(parametric_points)
+            if isinstance(expanded_value, AbstractTensor):
+                expanded_value = expanded_value.tolist()
+            expanded_points = np.asarray(expanded_value, dtype=np.float64)
             if (
                 expanded_points.ndim != 2
                 or len(expanded_points) != len(parametric_points)

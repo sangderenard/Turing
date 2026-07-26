@@ -7,7 +7,7 @@ from ..abstraction import AbstractTensor, AbstractScalar
 
 def _wrap_scalar(result):
     if getattr(result.data, "shape", ()) == ():
-        return AbstractScalar(result)
+        return AbstractScalar.__new__(AbstractScalar, result)
     return result
 
 

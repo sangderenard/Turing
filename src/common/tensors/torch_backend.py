@@ -207,12 +207,14 @@ class PyTorchTensorOperations(AbstractTensor):
         if self.data.dim() == 0:
             return tuple(int(x) for x in result)
         return result
-    def __init__(self, default_device="cpu", track_time: bool = False, requires_grad: bool = False, tape=None):
+    def __init__(self, default_device=None, track_time: bool = False, requires_grad: bool = False, tape=None):
         super().__init__(track_time=track_time, requires_grad=requires_grad, tape=tape)
         try:
             import torch
         except ImportError:
             raise RuntimeError("PyTorch is required for this backend")
+        if default_device is None:
+            default_device = AbstractTensor._preferred_device or "cpu"
         self.default_device = torch.device(default_device)
 
     def _apply_operator__(self, op, left, right):

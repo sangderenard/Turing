@@ -254,6 +254,9 @@ def _resolve_cls(cls):
     """
     if cls is not None:
         return cls
+    from ..abstraction import AbstractTensor
+    if AbstractTensor._preferred_backend is not None:
+        return AbstractTensor.check_or_build_registry()
     from ..abstraction import BACKEND_REGISTRY  # Local import to avoid circular dependency
 
     for backend_name in ("numpy", "torch", "pure_python"):
