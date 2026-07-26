@@ -538,9 +538,12 @@ class AbstractTensor:
 
     def cumsum(self, dim: int = 0) -> "AbstractTensor":
         """Return the cumulative sum of the tensor along a dimension."""
+        finalize = AbstractTensor._pre_autograd(
+            "cumsum", [self], params={"dim": dim}
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.cumsum_(dim)
-        return result
+        return finalize(result)
 
     def min(self, dim=None, keepdim: bool = False):
         """Return the minimum of the tensor along the specified dimension(s)."""
@@ -1114,14 +1117,22 @@ class AbstractTensor:
 
         Accepts raw backend tensors or ``AbstractTensor`` instances and
         dispatches to the underlying backend implementation via ``cat_``.
+        The canonical ``concat`` tape node keeps the operation differentiable
+        on every backend.
         """
         if not tensors:
             raise ValueError("cat requires at least one tensor")
         first = AbstractTensor.get_tensor(tensors[0])
         tensors = [first.ensure_tensor(t) for t in tensors]
-        result = first.__class__(track_time=first.track_time)
+        result = first.__class__(
+            track_time=first.track_time,
+            tape=getattr(first, "_tape", None),
+        )
         result.data = first.cat_(tensors, dim)
-        return result
+        finalize = AbstractTensor._pre_autograd(
+            "concat", tensors, params={"dim": dim}
+        )
+        return finalize(result)
 
     @staticmethod
     def pad_cat(
@@ -2260,28 +2271,28 @@ class AbstractTensor:
 
     # Reverse operators
     def __radd__(self, other):
-        return self._apply_operator("radd", other, self)
+        return self._apply_operator("add", self, other)
 
     def __rsub__(self, other):
-        return self._apply_operator("rsub", other, self)
+        return self._apply_operator("sub", other, self)
 
     def __rmul__(self, other):
-        return self._apply_operator("rmul", other, self)
+        return self._apply_operator("mul", self, other)
 
     def __rtruediv__(self, other):
-        return self._apply_operator("rtruediv", other, self)
+        return self._apply_operator("truediv", other, self)
 
     def __rfloordiv__(self, other):
-        return self._apply_operator("rfloordiv", other, self)
+        return self._apply_operator("floordiv", other, self)
 
     def __rmod__(self, other):
-        return self._apply_operator("rmod", other, self)
+        return self._apply_operator("mod", other, self)
 
     def __rpow__(self, other):
-        return self._apply_operator("rpow", other, self)
+        return self._apply_operator("pow", other, self)
 
     def __rmatmul__(self, other):
-        return self._apply_operator("rmatmul", other, self)
+        return self._apply_operator("matmul", other, self)
 
     # In-place operators
     def __iadd__(self, other):

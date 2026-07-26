@@ -34,3 +34,15 @@ def test_arg_reductions_wrap_scalar():
         assert isinstance(y, AbstractScalar)
         assert isinstance(y.data, np.ndarray)
         assert y.numel() == 1
+
+
+def test_cumsum_backward_is_suffix_sum():
+    x = T.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    x.requires_grad_(True)
+    weights = T.tensor([[1.0, 2.0, 4.0], [8.0, 16.0, 32.0]])
+    loss = (x.cumsum(dim=1) * weights).sum()
+    loss.backward()
+    np.testing.assert_allclose(
+        x.grad.data,
+        np.asarray([[7.0, 6.0, 4.0], [56.0, 48.0, 32.0]]),
+    )

@@ -40,6 +40,13 @@ excluded from headline interior RMS values. RMS quantities are weighted by
 lumped surface area rather than mesh vertex density. Triangle CSV rows retain
 the fields needed for separate OpenGL or headless error views.
 
+The mesh-backed stage is not a second Laplace implementation. It reuses the
+same cotangent topology builder as the established mesh/DEC operator, then
+executes its numeric geometry and reductions through `AbstractTensor`.
+Only integer connectivity is realized on the host; geometry, weights, mass,
+flux, masks, and Laplace values remain on the selected backend and on the
+gradient tape.
+
 Run and render the final error:
 
 ```powershell

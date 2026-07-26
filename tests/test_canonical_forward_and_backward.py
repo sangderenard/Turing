@@ -57,6 +57,47 @@ def test_maximum_and_minimum_backward_are_connected():
 
 
 @pytest.mark.parametrize("backend", ["numpy", "c"])
+def test_reverse_arithmetic_uses_canonical_ops_and_backward(backend):
+    autograd.tape = GradTape()
+    values = np.asarray([1.0, 2.0, 4.0])
+    with AbstractTensor.use_backend(backend):
+        source = AbstractTensor.tensor(values)
+        source.requires_grad_(True)
+        result = (2.0 * source + (5.0 - source) + 8.0 / source).sum()
+        gradient = autograd.grad(result, [source])[0]
+
+    expected = 1.0 - 8.0 / values**2
+    np.testing.assert_allclose(gradient.tolist(), expected)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "c"])
+def test_repeated_advanced_index_backward_accumulates(backend):
+    autograd.tape = GradTape()
+    with AbstractTensor.use_backend(backend):
+        source = AbstractTensor.tensor([1.0, 2.0, 3.0])
+        source.requires_grad_(True)
+        selected = source[np.asarray([2, 0, 2, 1, 2])]
+        gradient = autograd.grad(selected.sum(), [source])[0]
+
+    np.testing.assert_allclose(gradient.tolist(), [1.0, 1.0, 3.0])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "c", "torch"])
+def test_axis_reduction_backward_restores_the_reduced_dimension(backend):
+    autograd.tape = GradTape()
+    weights = np.arange(8.0).reshape(2, 4) + 1.0
+    with AbstractTensor.use_backend(backend):
+        source = AbstractTensor.tensor(np.arange(24.0).reshape(2, 3, 4))
+        source.requires_grad_(True)
+        reduced = source.sum(dim=1)
+        loss = (reduced * AbstractTensor.tensor(weights)).sum()
+        gradient = autograd.grad(loss, [source])[0]
+
+    expected = np.broadcast_to(weights[:, None, :], (2, 3, 4))
+    np.testing.assert_allclose(gradient.tolist(), expected)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "c"])
 def test_mod_backward_matches_floor_quotient_semantics(backend):
     autograd.tape = GradTape()
     with AbstractTensor.use_backend(backend):

@@ -20,6 +20,23 @@ deduplicating control identities, convergence decisions, the independent
 analytic reference, pandas reports, and OpenGL upload. These are explicit
 realization boundaries rather than silent numeric backend changes.
 
+The mesh operator now shares one immutable `CotangentTopology` assembly with
+the established host DEC implementation. The host chooses triangle, edge,
+boundary, and nonmanifold identities once; both numeric paths consume those
+same identities. Cotangents, edge weights, lumped mass, flux divergence,
+degeneracy masking, and the final division never leave `AbstractTensor`.
+Irregular edge/vertex accumulation is a stable sort plus prefix-sum segment
+reduction, so there is no numeric `.tolist()`/`np.add.at` break in the tensor
+graph.
+
+That path is differentiated on NumPy, C, and Torch backends. Supporting it
+also closed three general tape defects rather than adding demo exceptions:
+`cat` and `cumsum` now record their canonical backward operations, reduction
+backward restores the actual reduced axes before broadcasting, and repeated
+integer-array indices accumulate in the indexing adjoint. Reverse scalar
+arithmetic is recorded under the ordinary canonical operations (`add`,
+`sub`, `mul`, and so on), not a second set of reverse-only tape names.
+
 ## Interpolator lineage
 
 The spline follows the early JavaScript interpolation system's central

@@ -26,8 +26,10 @@ from .adaptive_triangulation import (
     TriangulationTolerance,
 )
 from .mesh_laplace import (
+    CotangentTopology,
     CotangentMeshGeometry,
     MeshLaplaceResult,
+    build_cotangent_topology,
     build_cotangent_geometry,
     mesh_laplace_beltrami,
 )
@@ -37,6 +39,7 @@ from .abstract_mesh_laplace import abstract_mesh_laplace
 __all__ = [
     "AdaptiveSurfaceTriangulator",
     "CotangentMeshGeometry",
+    "CotangentTopology",
     "GeodesicConv3D",
     "HeatKernel3D",
     "ManifoldPackage",
@@ -49,6 +52,7 @@ __all__ = [
     "TriangulationTolerance",
     "TriangulatedSurfaceTransform",
     "build_cotangent_geometry",
+    "build_cotangent_topology",
     "abstract_mesh_laplace",
     "mesh_laplace_beltrami",
     "smooth_bins",

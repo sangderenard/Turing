@@ -8,6 +8,34 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class CotangentTopology:
+    """Host-only immutable connectivity shared by numeric implementations."""
+
+    vertex_count: int
+    triangles: np.ndarray
+    raw_edges: np.ndarray
+    edges: np.ndarray
+    edge_inverse: np.ndarray
+    edge_counts: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name in (
+            "triangles", "raw_edges", "edges", "edge_inverse", "edge_counts"
+        ):
+            value = np.array(getattr(self, name), copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def boundary_edge_mask(self) -> np.ndarray:
+        return self.edge_counts == 1
+
+    @property
+    def nonmanifold_edge_mask(self) -> np.ndarray:
+        return self.edge_counts > 2
+
+
+@dataclass(frozen=True)
 class CotangentMeshGeometry:
     edges: np.ndarray
     cotangent_weights: np.ndarray
@@ -68,6 +96,43 @@ class MeshLaplaceResult:
     geometry: CotangentMeshGeometry
 
 
+def build_cotangent_topology(
+    triangles: np.ndarray, vertex_count: int
+) -> CotangentTopology:
+    """Assemble only the discrete connectivity of a triangle mesh."""
+
+    triangles = np.asarray(triangles, dtype=np.int64)
+    vertex_count = int(vertex_count)
+    if vertex_count < 0:
+        raise ValueError("vertex_count cannot be negative")
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise ValueError("triangles must have shape (T, 3)")
+    if len(triangles) and (
+        triangles.min() < 0 or triangles.max() >= vertex_count
+    ):
+        raise ValueError("triangle index outside vertex array")
+    raw_edges = np.concatenate(
+        (
+            triangles[:, (1, 2)],
+            triangles[:, (2, 0)],
+            triangles[:, (0, 1)],
+        ),
+        axis=0,
+    )
+    raw_edges.sort(axis=1)
+    edges, inverse, counts = np.unique(
+        raw_edges, axis=0, return_inverse=True, return_counts=True
+    )
+    return CotangentTopology(
+        vertex_count,
+        triangles,
+        raw_edges,
+        edges,
+        inverse,
+        counts,
+    )
+
+
 def build_cotangent_geometry(
     vertices: np.ndarray,
     triangles: np.ndarray,
@@ -76,15 +141,10 @@ def build_cotangent_geometry(
 ) -> CotangentMeshGeometry:
     """Build lumped mass and cotangent weights using full ambient geometry."""
     vertices = np.asarray(vertices, dtype=np.float64)
-    triangles = np.asarray(triangles, dtype=np.int64)
     if vertices.ndim != 2 or vertices.shape[1] < 2:
         raise ValueError("vertices must have shape (N, embedding_dimension>=2)")
-    if triangles.ndim != 2 or triangles.shape[1] != 3:
-        raise ValueError("triangles must have shape (T, 3)")
-    if len(triangles) and (
-        triangles.min() < 0 or triangles.max() >= len(vertices)
-    ):
-        raise ValueError("triangle index outside vertex array")
+    topology = build_cotangent_topology(triangles, len(vertices))
+    triangles = topology.triangles
 
     points = vertices[triangles]
     edge_01 = points[:, 1] - points[:, 0]
@@ -110,30 +170,18 @@ def build_cotangent_geometry(
         )
     cotangent[degenerate_triangles] = 0.0
 
-    raw_edges = np.concatenate(
-        (
-            triangles[:, (1, 2)],
-            triangles[:, (2, 0)],
-            triangles[:, (0, 1)],
-        ),
-        axis=0,
-    )
     raw_weights = 0.5 * np.concatenate(
         (cotangent[:, 0], cotangent[:, 1], cotangent[:, 2])
     )
-    raw_edges.sort(axis=1)
-    edges, inverse, counts = np.unique(
-        raw_edges, axis=0, return_inverse=True, return_counts=True
-    )
-    weights = np.zeros(len(edges), dtype=np.float64)
-    np.add.at(weights, inverse, raw_weights)
-    boundary_edges = counts == 1
-    nonmanifold_edges = counts > 2
+    weights = np.zeros(len(topology.edges), dtype=np.float64)
+    np.add.at(weights, topology.edge_inverse, raw_weights)
+    boundary_edges = topology.boundary_edge_mask
+    nonmanifold_edges = topology.nonmanifold_edge_mask
     nonmanifold_vertices = np.zeros(len(vertices), dtype=bool)
     if np.any(nonmanifold_edges):
-        nonmanifold_vertices[edges[nonmanifold_edges].ravel()] = True
+        nonmanifold_vertices[topology.edges[nonmanifold_edges].ravel()] = True
     boundary_vertices = np.zeros(len(vertices), dtype=bool)
-    boundary_vertices[edges[boundary_edges].ravel()] = True
+    boundary_vertices[topology.edges[boundary_edges].ravel()] = True
 
     lumped_area = np.zeros(len(vertices), dtype=np.float64)
     valid_area = np.where(degenerate_triangles, 0.0, triangle_areas) / 3.0
@@ -148,7 +196,7 @@ def build_cotangent_geometry(
         ~np.isfinite(lumped_area) | (lumped_area <= degeneracy_tolerance)
     )
     return CotangentMeshGeometry(
-        edges=edges,
+        edges=topology.edges,
         cotangent_weights=weights,
         triangle_areas=triangle_areas,
         lumped_vertex_areas=lumped_area,

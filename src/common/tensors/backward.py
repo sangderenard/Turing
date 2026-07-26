@@ -52,7 +52,10 @@ class BackwardRegistry:
             # registry helpers
             "unbroadcast": br.unbroadcast,
             "expand_to": br.expand_to,
+            "expand_reduction": br.expand_reduction,
             "indicator": br.indicator,
+            "reverse_cumsum": br.reverse_cumsum,
+            "index_adjoint": br.index_adjoint,
             "eps": br.eps,
             "T": br.T,
 

@@ -108,6 +108,7 @@ The entire registry is exposed as `BACKWARD_RULES`.
 from __future__ import annotations
 from typing import Dict, Any, List
 import numbers
+import numpy as np
 from .abstraction import AbstractTensor
 
 helpers_spec: Dict[str, str] = {
@@ -115,6 +116,8 @@ helpers_spec: Dict[str, str] = {
         "unbroadcast(G, shape): reduce-sum G over axes that were broadcast to match shape; reshape to shape.",
     "expand_to":
         "expand_to(G, shape): broadcast G to target shape by (re)inserting singleton dims.",
+    "expand_reduction":
+        "expand_reduction(G, shape, axis, keepdim): restore reduced axes, then broadcast G to shape.",
     "indicator":
         "indicator(cond): 1 where cond, else 0 (cast to appropriate dtype).",
     "eps":
@@ -153,8 +156,102 @@ def expand_to(G, shape):
         ones = AbstractTensor.ones(shape, dtype=getattr(G, "dtype", None), device=getattr(G, "device", None))
         return ones * G
 
+
+def expand_reduction(G, shape, axis=None, keepdim=False):
+    """Broadcast a reduction gradient with the reduced axes restored.
+
+    General broadcasting cannot infer whether a shape ``(N,)`` reduced from
+    ``(N, M)`` came from axis 0 or axis 1. The forward reduction metadata can,
+    so preserve and use it rather than relying on a backend-specific guess.
+    """
+
+    target_shape = tuple(shape)
+    if axis is None:
+        axes = tuple(range(len(target_shape)))
+    elif isinstance(axis, (tuple, list)):
+        axes = tuple(
+            sorted(
+                (item if item >= 0 else len(target_shape) + item)
+                for item in axis
+            )
+        )
+    else:
+        normalized = axis if axis >= 0 else len(target_shape) + axis
+        axes = (normalized,)
+    if axis is None and not keepdim:
+        # Scalar wrappers may store their one value as shape ``(1,)``. The
+        # logical reduction output is still rank zero, so normalize it before
+        # restoring all reduced dimensions.
+        G = G.reshape((1,) * len(target_shape))
+    elif not keepdim and axes:
+        restored_shape = list(getattr(G, "shape", ()))
+        for reduced_axis in axes:
+            restored_shape.insert(reduced_axis, 1)
+        G = G.reshape(tuple(restored_shape))
+    return expand_to(G, target_shape)
+
+
 def indicator(cond):
     return AbstractTensor.where(cond, 1, 0)
+
+
+def reverse_cumsum(G, dim=0):
+    """Adjoint of cumsum: suffix sums along the same dimension."""
+    axis = dim if dim >= 0 else len(G.shape) + dim
+    index = [slice(None)] * len(G.shape)
+    index[axis] = slice(None, None, -1)
+    reversed_gradient = G[tuple(index)]
+    return reversed_gradient.cumsum(dim=axis)[tuple(index)]
+
+
+def index_adjoint(G, source, index):
+    """Transpose indexing, accumulating repeated first-axis gathers.
+
+    Integer-array indexing is topology, not numeric tensor data. Sort and
+    prefix-sum the numeric gradient through AbstractTensor so repeated indices
+    accumulate correctly without a backend-specific scatter-add primitive.
+    Basic indexing retains the direct assignment path.
+    """
+
+    input_shape = tuple(source.shape)
+    if isinstance(index, AbstractTensor):
+        index = index.tolist()
+    is_advanced_first_axis = (
+        not isinstance(index, tuple)
+        and not isinstance(index, (int, slice))
+        and index is not Ellipsis
+    )
+    if not is_advanced_first_axis:
+        result = AbstractTensor.zeros_like(source)
+        result[index] = G
+        return result
+
+    ids = np.asarray(index)
+    if ids.dtype.kind not in "iu":
+        raise TypeError("index backward requires integer indices")
+    if not input_shape:
+        raise IndexError("cannot index a scalar tensor")
+    vertex_count = input_shape[0]
+    ids = ids.astype(np.int64, copy=False).reshape(-1)
+    ids = np.where(ids < 0, ids + vertex_count, ids)
+    if np.any((ids < 0) | (ids >= vertex_count)):
+        raise IndexError("tensor index out of range")
+
+    tail_shape = input_shape[1:]
+    values = G.reshape((len(ids),) + tail_shape)
+    zeros = AbstractTensor.zeros_like(source)
+    all_ids = np.concatenate((ids, np.arange(vertex_count, dtype=np.int64)))
+    order = np.argsort(all_ids, kind="stable")
+    ordered_ids = all_ids[order]
+    end_positions = np.flatnonzero(
+        np.r_[ordered_ids[1:] != ordered_ids[:-1], True]
+    )
+    cumulative = AbstractTensor.cat((values, zeros), dim=0)[order].cumsum(dim=0)
+    ends = cumulative[end_positions]
+    previous = AbstractTensor.cat(
+        (ends[:1] * 0.0, cumulative[end_positions[:-1]]), dim=0
+    )
+    return ends - previous
 
 
 def coerce_to_tensor(value):
@@ -552,16 +649,31 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
     # Reductions
     # ----------------------------------------------------------------------
+    "cumsum": {
+        "arity": "unary",
+        "signature": "y = cumsum(x, dim)",
+        "latex": r"y_i = \sum_{j \le i} x_j",
+        "backward": {
+            "x": "gx is the reverse cumulative sum of g"
+        },
+        "python": {
+            "parameters": ["g", "x", "dim=0"],
+            "body": "return reverse_cumsum(g, dim)"
+        },
+        "domain": "x: any real",
+        "notes": "The transpose of a prefix-sum matrix is a suffix sum.",
+        "tags": ["reduction", "linear"],
+    },
     "sum": {
         "arity": "unary",
         "signature": "y = sum(x, axis=None, keepdim=False)",
         "latex": r"y = \sum_{i \in \mathcal{I}} x_i",
         "backward": {
-            "x": "gx = expand_to(g, x.shape)"
+            "x": "gx = expand_reduction(g, x.shape, axis, keepdim)"
         },
         "python": {
-            "parameters": ["g", "x"],
-            "body": "return expand_to(g, x.shape)"
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
+            "body": "return expand_reduction(g, x.shape, axis, keepdim)"
         },
         "domain": "x: any real",
         "notes": "If axis is specified and keepdim=False, conceptually unsqueeze `g` on the reduced axes before expand.",
@@ -572,13 +684,13 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = mean(x, axis=None, keepdim=False)",
         "latex": r"y = \frac{1}{N}\sum_{i \in \mathcal{I}} x_i",
         "backward": {
-            "x": "N = number_of_elements_reduced; gx = expand_to(g, x.shape) / N"
+            "x": "N = number_of_elements_reduced; gx = expand_reduction(g, x.shape, axis, keepdim) / N"
         },
         "python": {
             "parameters": ["g", "x", "axis=None", "keepdim=False"],
             "body": (
                 "N = max(1, x.numel() // max(1, g.numel())); "
-                "return expand_to(g, x.shape) / N"
+                "return expand_reduction(g, x.shape, axis, keepdim) / N"
             )
         },
         "domain": "x: any real",
@@ -590,13 +702,13 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = prod(x)",
         "latex": r"y = \prod_{i \in \mathcal{I}} x_i",
         "backward": {
-            "x": "y = prod(x, keepdim=True); gx = expand_to(g * y / x, x.shape)"
+            "x": "y = prod(x, axis, keepdim=True); gx = expand_reduction(g, x.shape, axis, keepdim) * y / x"
         },
         "python": {
-            "parameters": ["g", "x"],
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
             "body": (
-                "y = AbstractTensor.prod(x, keepdim=True); "
-                "return expand_to(g * y / x, x.shape)"
+                "y = x.prod(dim=axis, keepdim=True); "
+                "return expand_reduction(g, x.shape, axis, keepdim) * y / x"
             )
         },
         "domain": "x: any real",
@@ -608,15 +720,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = max(x)",
         "latex": r"y = \max_{i \in \mathcal{I}} x_i",
         "backward": {
-            "x": "y = max(x, keepdim=True); m = where(x==y, 1, 0); c = sum(m, keepdim=True); gx = expand_to(g, x.shape) * m / c"
+            "x": "y = max(x, axis, keepdim=True); m = where(x==y, 1, 0); c = sum(m, axis, keepdim=True); gx = expand_reduction(g, x.shape, axis, keepdim) * m / c"
         },
         "python": {
-            "parameters": ["g", "x"],
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
             "body": (
-                "y = AbstractTensor.max(x, keepdim=True); "
+                "y = x.max(dim=axis, keepdim=True); "
                 "m = AbstractTensor.where(x==y, 1, 0); "
-                "c = AbstractTensor.sum(m, keepdim=True); "
-                "return expand_to(g, x.shape) * m / c"
+                "c = m.sum(dim=axis, keepdim=True); "
+                "return expand_reduction(g, x.shape, axis, keepdim) * m / c"
             )
         },
         "domain": "x: any real",
@@ -628,15 +740,15 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = min(x)",
         "latex": r"y = \min_{i \in \mathcal{I}} x_i",
         "backward": {
-            "x": "y = min(x, keepdim=True); m = where(x==y, 1, 0); c = sum(m, keepdim=True); gx = expand_to(g, x.shape) * m / c"
+            "x": "y = min(x, axis, keepdim=True); m = where(x==y, 1, 0); c = sum(m, axis, keepdim=True); gx = expand_reduction(g, x.shape, axis, keepdim) * m / c"
         },
         "python": {
-            "parameters": ["g", "x"],
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
             "body": (
-                "y = AbstractTensor.min(x, keepdim=True); "
+                "y = x.min(dim=axis, keepdim=True); "
                 "m = AbstractTensor.where(x==y, 1, 0); "
-                "c = AbstractTensor.sum(m, keepdim=True); "
-                "return expand_to(g, x.shape) * m / c"
+                "c = m.sum(dim=axis, keepdim=True); "
+                "return expand_reduction(g, x.shape, axis, keepdim) * m / c"
             )
         },
         "domain": "x: any real",
@@ -668,14 +780,16 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = var(x, axis=None, keepdim=False, unbiased=False)",
         "latex": r"y = \frac{1}{N}\sum_i (x_i - \bar{x})^2 \text{ (population)}",
         "backward": {
-            "x": "mu = mean(x, axis, keepdim=True); gx = expand_to(g, x.shape) * 2*(x - mu)/N"
+            "x": "mu = mean(x, axis, keepdim=True); gx = expand_reduction(g, x.shape, axis, keepdim) * 2*(x - mu)/N"
         },
         "python": {
-            "parameters": ["g", "x", "axis", "keepdim", "unbiased"],
+            "parameters": [
+                "g", "x", "axis=None", "keepdim=False", "unbiased=False"
+            ],
             "body": (
-                "mu = AbstractTensor.mean(x, axis=axis, keepdim=True); "
+                "mu = x.mean(dim=axis, keepdim=True); "
                 "N  = max(1, x.numel() // max(1, g.numel())); "
-                "return expand_to(g, x.shape) * 2*(x - mu) / N"
+                "return expand_reduction(g, x.shape, axis, keepdim) * 2*(x - mu) / N"
             )
         },
         "domain": "x: any real",
@@ -687,15 +801,17 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = std(x, axis=None, keepdim=False, unbiased=False) = sqrt(var(x))",
         "latex": r"y = \sqrt{\mathrm{var}(x)}",
         "backward": {
-            "x": "mu = mean(x, axis, keepdim=True); v = mean((x - mu)**2, axis, keepdim=True); gx = expand_to(g, x.shape) * (x - mu) / (sqrt(v) * N + eps)"
+            "x": "mu = mean(x, axis, keepdim=True); v = mean((x - mu)**2, axis, keepdim=True); gx = expand_reduction(g, x.shape, axis, keepdim) * (x - mu) / (sqrt(v) * N + eps)"
         },
         "python": {
-            "parameters": ["g", "x", "axis", "keepdim", "unbiased"],
+            "parameters": [
+                "g", "x", "axis=None", "keepdim=False", "unbiased=False"
+            ],
             "body": (
-                "mu = AbstractTensor.mean(x, axis=axis, keepdim=True); "
-                "v  = AbstractTensor.mean((x - mu)**2, axis=axis, keepdim=True); "
+                "mu = x.mean(dim=axis, keepdim=True); "
+                "v  = ((x - mu)**2).mean(dim=axis, keepdim=True); "
                 "N  = max(1, x.numel() // max(1, g.numel())); "
-                "return expand_to(g, x.shape) * (x - mu) / (AbstractTensor.sqrt(v) * N + eps())"
+                "return expand_reduction(g, x.shape, axis, keepdim) * (x - mu) / (AbstractTensor.sqrt(v) * N + eps())"
             )
         },
         "domain": "x: any real",
@@ -787,14 +903,14 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = x[slices]",
         "latex": r"y = S(x) \text{ (slicing operator)}",
         "backward": {
-            "x": "gx = zeros_like(x); gx[slices] = g"
+            "x": "gx = index_adjoint(g, x, slices)"
         },
         "python": {
             "parameters": ["g", "x", "slices"],
-            "body": "gx=AbstractTensor.zeros_like(x); gx[slices]=g; return gx"
+            "body": "return index_adjoint(g, x, slices)"
         },
         "domain": "Any real; slices valid.",
-        "notes": "Implements a simple scatter into the sliced region.",
+        "notes": "Repeated integer-array indices are accumulated, not overwritten.",
         "tags": ["shape", "indexing"],
     },
     "index_set": {
@@ -978,11 +1094,11 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "signature": "y = ||x||_2 = sqrt(sum(x^2, axis, keepdim=False))",
         "latex": r"y = \sqrt{\sum_i x_i^2},\quad \frac{\partial y}{\partial x} = \frac{x}{\|x\|_2}",
         "backward": {
-            "x": "gx = expand_to(g, x.shape) * x / (norm2(x, axis, keepdim=True) + eps)"
+            "x": "gx = expand_reduction(g, x.shape, axis, keepdim) * x / (norm2(x, axis, keepdim=True) + eps)"
         },
         "python": {
-            "parameters": ["g", "x", "axis"],
-            "body": "n = AbstractTensor.sqrt(AbstractTensor.sum(x*x, axis=axis, keepdim=True)) + eps(); return expand_to(g, x.shape) * x / n"
+            "parameters": ["g", "x", "axis=None", "keepdim=False"],
+            "body": "n = AbstractTensor.sqrt((x*x).sum(dim=axis, keepdim=True)) + eps(); return expand_reduction(g, x.shape, axis, keepdim) * x / n"
         },
         "domain": "x real; handle zero norm via eps.",
         "notes": "For axis=None treat as scalar norm; else vectorized by axis.",
