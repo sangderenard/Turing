@@ -1,6 +1,7 @@
 from src.compiler.ast_process_graph import ast_to_process_graph
 from src.compiler.ssa_builder import process_graph_to_ssa_instrs
-from src.transmogrifier.process_op import ProcessOp
+from src.bitbitbuffer import BitBitBuffer
+from src.transmogrifier.process_op import BitQuantaSpec, ProcessOp
 
 
 SOURCE = """
@@ -50,6 +51,18 @@ def test_process_op_roundtrips_without_live_python_objects():
     restored = ProcessOp.from_dict(payload.to_dict())
     assert restored == payload
     assert restored.constant == 3
+
+
+def test_bitbit_quanta_accounting_is_serializable_without_copying_storage():
+    buffer = BitBitBuffer(mask_size=4, bitsforbits=8)
+    buffer.register_pid_buffer(left=0, right=4, stride=1, label="value")
+    accounting = BitQuantaSpec.from_bitbit_buffer(buffer)
+    payload = ProcessOp("input", bit_quanta=accounting)
+    restored = ProcessOp.from_dict(payload.to_dict())
+
+    assert restored.bit_quanta.quanta == 4
+    assert restored.bit_quanta.data_bits == 32
+    assert restored.bit_quanta.pid_domains == ("value",)
 
 
 def test_ssa_preserves_roles_constants_attributes_and_source():

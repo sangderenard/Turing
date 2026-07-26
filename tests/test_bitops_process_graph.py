@@ -25,6 +25,14 @@ def kernel(x, y):
         for _, data in lowered.G.nodes(data=True)
         if data["process_op"].op == "nand"
     )
+    nand_payload = next(
+        data["process_op"]
+        for _, data in lowered.G.nodes(data=True)
+        if data["process_op"].op == "nand"
+    )
+    assert nand_payload.bit_quanta.quanta == 4
+    assert nand_payload.bit_quanta.bits_per_quantum == 1
+    assert len(nand_payload.bit_quanta.source_nodes) == 2
 
 
 def test_partial_expansion_is_explicit_and_ssa_consumable():

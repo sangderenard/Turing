@@ -49,6 +49,7 @@ class SSAValue:
     dtype: Optional[str] = None
     shape: tuple = ()
     device: Optional[str] = None
+    accounting: Dict[str, Any] = field(default_factory=dict)
 
     def name(self) -> str:
         """Return the textual SSA name in `%t<ID>` form."""

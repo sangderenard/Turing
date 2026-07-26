@@ -8,7 +8,7 @@ from typing import Dict, Iterable, Tuple
 import networkx as nx
 
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
-from ..transmogrifier.process_op import ProcessOp, TensorSpec
+from ..transmogrifier.process_op import BitQuantaSpec, ProcessOp, TensorSpec
 from ..transmogrifier.solver_types import DomainNode
 from ..turing_machine.turing import Hooks, Turing
 
@@ -18,7 +18,11 @@ class GraphBits:
     """Symbolic bitstring carrier used by the ordinary :class:`Turing` algebra."""
 
     node_id: int
-    width: int
+    accounting: BitQuantaSpec
+
+    @property
+    def width(self) -> int:
+        return self.accounting.quanta
 
     def copy(self) -> "GraphBits":
         """Satisfy the generic bitstring carrier protocol without mutation."""
@@ -47,6 +51,11 @@ class _PrimitiveEmitter:
             tuple(role for _, role in parents),
             attributes=attributes or {},
             tensor=TensorSpec(dtype="bit", shape=(width,)),
+            bit_quanta=BitQuantaSpec(
+                quanta=width,
+                bits_per_quantum=1,
+                source_nodes=tuple(parent for parent, _ in parents),
+            ),
             control={"lowered_by": "bitops"},
         )
         domain_node = DomainNode(shape=(1, 1, 1), unit_size=1)
@@ -66,7 +75,7 @@ class _PrimitiveEmitter:
         for src, role in parents:
             self.graph.G.add_edge(src, nid, role=role)
             self.graph.G.nodes[src]["children"].append((nid, role))
-        return GraphBits(nid, width)
+        return GraphBits(nid, payload.bit_quanta)
 
     def hooks(self) -> Hooks:
         def nand(a, b):
@@ -215,6 +224,15 @@ def expand_bitops_process_graph(
             },
         )
         new_data = target.G.nodes[values[old_id].node_id]
+        if cloned.bit_quanta is None:
+            cloned = replace(
+                cloned,
+                bit_quanta=BitQuantaSpec(
+                    quanta=int(width),
+                    bits_per_quantum=1,
+                    source_nodes=tuple(values[parent].node_id for parent, _ in parent_items),
+                ),
+            )
         new_data["process_op"] = cloned
         new_data["label"] = data.get("label", cloned.op)
         new_data["type"] = data.get("type", cloned.op)

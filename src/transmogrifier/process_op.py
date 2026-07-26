@@ -35,6 +35,35 @@ class TensorSpec:
 
 
 @dataclass(frozen=True)
+class BitQuantaSpec:
+    """Accounting metadata compatible with BitBitBuffer's two-plane model.
+
+    One mask bit accounts for one quantum; ``bits_per_quantum`` is
+    BitBitBuffer's ``bitsforbits`` payload width. PID domain labels identify
+    provenance namespaces without serializing live UUID tables into the graph.
+    """
+
+    quanta: int
+    bits_per_quantum: int = 1
+    pid_domains: Tuple[str, ...] = ()
+    source_nodes: Tuple[int, ...] = ()
+
+    @property
+    def data_bits(self) -> int:
+        return self.quanta * self.bits_per_quantum
+
+    @classmethod
+    def from_bitbit_buffer(cls, buffer: Any) -> "BitQuantaSpec":
+        """Describe a BitBitBuffer without copying either storage plane."""
+
+        return cls(
+            quanta=int(buffer.mask_size),
+            bits_per_quantum=int(buffer.bitsforbits),
+            pid_domains=tuple(sorted(getattr(buffer, "pid_buffers", {}).keys())),
+        )
+
+
+@dataclass(frozen=True)
 class ProcessOp:
     """Serializable semantic payload for one ProcessGraph operation.
 
@@ -49,6 +78,7 @@ class ProcessOp:
     output_roles: Tuple[str, ...] = ("result",)
     attributes: Mapping[str, Any] = field(default_factory=dict)
     tensor: Optional[TensorSpec] = None
+    bit_quanta: Optional[BitQuantaSpec] = None
     constant: Any = None
     control: Mapping[str, Any] = field(default_factory=dict)
     source: Optional[SourceSpan] = None
@@ -65,14 +95,22 @@ class ProcessOp:
 
         data = dict(payload)
         tensor = data.get("tensor")
+        bit_quanta = data.get("bit_quanta")
         source = data.get("source")
         if tensor is not None and not isinstance(tensor, TensorSpec):
             tensor = TensorSpec(**tensor)
         if source is not None and not isinstance(source, SourceSpan):
             source = SourceSpan(**source)
+        if bit_quanta is not None and not isinstance(bit_quanta, BitQuantaSpec):
+            bit_quanta = BitQuantaSpec(
+                quanta=bit_quanta["quanta"],
+                bits_per_quantum=bit_quanta.get("bits_per_quantum", 1),
+                pid_domains=tuple(bit_quanta.get("pid_domains", ())),
+                source_nodes=tuple(bit_quanta.get("source_nodes", ())),
+            )
         data["tensor"] = tensor
+        data["bit_quanta"] = bit_quanta
         data["source"] = source
         data["input_roles"] = tuple(data.get("input_roles", ()))
         data["output_roles"] = tuple(data.get("output_roles", ("result",)))
         return cls(**data)
-

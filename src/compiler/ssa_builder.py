@@ -52,6 +52,12 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
                 dtype=tensor.dtype if tensor else None,
                 shape=tensor.shape if tensor else (),
                 device=tensor.device if tensor else None,
+                accounting=(
+                    process_op.bit_quanta.__dict__
+                    if isinstance(process_op, ProcessOp)
+                    and process_op.bit_quanta is not None
+                    else {}
+                ),
             ),
         )
 
