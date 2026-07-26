@@ -68,3 +68,21 @@ the recovered Laplace geometry:
 The existing `VolumeMapGenerator` remains incomplete for arbitrary edge/face
 graphs. This demo supplies a structured-grid tetrahedral decomposition rather
 than claiming to solve generic volume detection.
+
+## Planned metric-aware YoungMan handoff
+
+The three-dimensional search topology should eventually accept local metric
+tags produced by a domain transform or piecewise expanded-dimensional spline.
+The first integration should annotate tetrahedra, active-edge solves, crossing
+points, and emitted vertices without changing the existing case table.
+
+Such a tag records a local symmetric metric, its parameter position, and the
+patch/generation that produced it. A shuttle or later worker can then interpret
+distance as `dx^T g dx`, select anisotropic refinement, retain the geometry for
+later Laplace–Beltrami work, or compare the metric-aware result with the
+Euclidean baseline.
+
+After that observational stage is validated, the metric may guide YoungMan's
+own traversal and refinement. The complete expanded-dimensional spline remains
+authoritative; the metric is a compact local geometric instruction, not a
+lossless encoding of hidden coordinates.
