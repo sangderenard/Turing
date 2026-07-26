@@ -3,6 +3,56 @@ from __future__ import annotations
 from typing import Any, Tuple
 
 
+def lower_basic_index(
+    data: Any,
+    index: Any,
+    *,
+    shape_of,
+    index_select,
+    reshape,
+):
+    """Compose basic tuple indexing from index-select and metadata reshape.
+
+    Backends with rich native indexing may bypass this helper. Lowering
+    targets can reuse it so integers, slices, negative indices, and ellipses
+    share one AbstractTensor-level policy while numerical gathering remains a
+    backend primitive.
+    """
+    items = list(index) if isinstance(index, tuple) else [index]
+    if any(item is Ellipsis for item in items):
+        location = next(
+            position for position, item in enumerate(items)
+            if item is Ellipsis
+        )
+        missing = len(shape_of(data)) - (len(items) - 1)
+        items[location:location + 1] = [slice(None)] * missing
+    items.extend([slice(None)] * (len(shape_of(data)) - len(items)))
+    current = data
+    output_axis = 0
+    for item in items:
+        current_shape = shape_of(current)
+        axis_size = current_shape[output_axis]
+        if isinstance(item, int):
+            selected = index_select(
+                current, output_axis, [item % axis_size]
+            )
+            selected_shape = shape_of(selected)
+            current = reshape(
+                selected,
+                selected_shape[:output_axis]
+                + selected_shape[output_axis + 1:],
+            )
+        elif isinstance(item, slice):
+            indices = list(range(*item.indices(axis_size)))
+            current = index_select(current, output_axis, indices)
+            output_axis += 1
+        else:
+            raise NotImplementedError(
+                "basic indexing supports integers, slices, and ellipses"
+            )
+    return current
+
+
 def unravel_index(indices: Any, shape: Tuple[int, ...]):
     """Map flat ``indices`` into coordinates for a tensor of ``shape``.
 

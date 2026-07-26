@@ -42,32 +42,57 @@ from ..abstraction import (
     _flatten,
     register_backend,
 )
+from ..abstraction_methods.indexing import lower_basic_index
 
 
 ffi = FFI()
 ffi.cdef("""
-    void add_double(const double* a, const double* b, double* out, int n);
-    void sub_double(const double* a, const double* b, double* out, int n);
-    void mul_double(const double* a, const double* b, double* out, int n);
-    void div_double(const double* a, const double* b, double* out, int n);
-    void pow_double(const double* a, const double* b, double* out, int n);
-    void mod_double(const double* a, const double* b, double* out, int n);
-    void floordiv_double(const double* a, const double* b, double* out, int n);
+    typedef enum CTensorOp {
+        CT_OP_ADD, CT_OP_SUB, CT_OP_MUL, CT_OP_DIV, CT_OP_POW,
+        CT_OP_MOD, CT_OP_FLOORDIV, CT_OP_SQRT, CT_OP_EXP, CT_OP_LOG,
+        CT_OP_NEG, CT_OP_ABS, CT_OP_ROUND, CT_OP_TRUNC, CT_OP_FLOOR,
+        CT_OP_CEIL, CT_OP_ISFINITE, CT_OP_ISNAN, CT_OP_ISINF,
+        CT_OP_LOGICAL_NOT, CT_OP_LT, CT_OP_LE, CT_OP_GT, CT_OP_GE,
+        CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, ...
+    } CTensorOp;
+    void fill_double(double* out, double value, int n);
+    void binary_double(
+        const double* a, const double* b, double* out, int n, int op);
+    void binary_scalar_double(
+        const double* a, double b, double* out, int n, int op, int reverse);
     void matmul_double(const double* a, const double* b, double* out, int m, int n, int p);
-    // Scalar ops
-    void add_scalar(const double* a, double b, double* out, int n);
-    void subtract_const(const double* a, double b, double* out, int n);
-    void rsubtract_const(const double* a, double b, double* out, int n);
-    void mul_scalar(const double* a, double b, double* out, int n);
-    void divide_const(const double* a, double b, double* out, int n);
-    void rdivide_const(const double* a, double b, double* out, int n);
-    void pow_scalar(const double* a, double b, double* out, int n);
-    void rpow_scalar(const double* a, double b, double* out, int n);
-    void mod_scalar(const double* a, double b, double* out, int n);
-    void rmod_scalar(const double* a, double b, double* out, int n);
-    void floor_div_const(const double* a, double b, double* out, int n);
-    void rfloor_div_const(const double* a, double b, double* out, int n);
-    void sqrt_double(const double* a, double* out, int n);
+    void unary_double(const double* a, double* out, int n, int op);
+    void reduce_dim_double(
+        const double* a, double* out, const int* shape, int ndim,
+        int dim, int op);
+    void transpose_double(
+        const double* a, double* out, const int* shape,
+        const int* axes, int ndim);
+    void where_double(
+        const double* condition, const double* x, const double* y,
+        double* out, int n);
+    void broadcast_double(
+        const double* input, double* output, const int* input_shape,
+        int input_ndim, const int* output_shape, int output_ndim);
+    void cumsum_dim_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim);
+    void argreduce_dim_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, int find_max);
+    void repeat_interleave_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, int repeats);
+    void tile_double(
+        const double* input, double* output, const int* input_shape,
+        const int* output_shape, int ndim);
+    void index_select_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int* indices, int index_count);
+    int count_true_double(const double* mask, int n);
+    void mask_select_double(
+        const double* input, const double* mask, double* output, int n);
+    void increment_mask_double(double* input, const double* mask, int n);
     void log_softmax_1d(const double* a, double* out, int n);
     void log_softmax_dim(
         const double* a,
@@ -121,7 +146,9 @@ _prebuilt = os.environ.get("TENSOR_CTENSOR_LIB")
 if _prebuilt and os.path.exists(_prebuilt):
     C = ffi.dlopen(_prebuilt)
 else:
-    C = ffi.verify(C_SOURCE)
+    C = ffi.verify(
+        C_SOURCE, include_dirs=[str(SOURCE_PATH.parent)]
+    )
 
 # ########## STUB: build_ctensor_with_zig ##########
 # PURPOSE: Compile ``ctensor_ops.c`` into a shared library using the Zig
@@ -225,7 +252,50 @@ class CTensorOperations(AbstractTensor):
     """C backend using cffi for all arithmetic ops."""
 
     def _apply_operator__(self, op: str, left: CTensor, right: Any):
-        """Operate on ``CTensor`` objects or scalars."""
+        """Lower the canonical AbstractTensor operation vocabulary to C."""
+        binary_codes = {
+            "add": C.CT_OP_ADD,
+            "sub": C.CT_OP_SUB,
+            "mul": C.CT_OP_MUL,
+            "truediv": C.CT_OP_DIV,
+            "pow": C.CT_OP_POW,
+            "mod": C.CT_OP_MOD,
+            "floordiv": C.CT_OP_FLOORDIV,
+            "less": C.CT_OP_LT,
+            "less_equal": C.CT_OP_LE,
+            "greater": C.CT_OP_GT,
+            "greater_equal": C.CT_OP_GE,
+            "equal": C.CT_OP_EQ,
+            "not_equal": C.CT_OP_NE,
+            "maximum": C.CT_OP_MAXIMUM,
+            "minimum": C.CT_OP_MINIMUM,
+        }
+        unary_codes = {
+            "sqrt": C.CT_OP_SQRT,
+            "exp": C.CT_OP_EXP,
+            "log": C.CT_OP_LOG,
+            "neg": C.CT_OP_NEG,
+            "abs": C.CT_OP_ABS,
+            "round": C.CT_OP_ROUND,
+            "trunc": C.CT_OP_TRUNC,
+            "floor": C.CT_OP_FLOOR,
+            "ceil": C.CT_OP_CEIL,
+            "isfinite": C.CT_OP_ISFINITE,
+            "isnan": C.CT_OP_ISNAN,
+            "isinf": C.CT_OP_ISINF,
+            "logical_not": C.CT_OP_LOGICAL_NOT,
+        }
+        if isinstance(left, CTensor) and right is None:
+            code = unary_codes.get(op)
+            if code is None:
+                raise NotImplementedError(
+                    f"Unary operator {op} not implemented for C backend"
+                )
+            out = CTensor(left.shape)
+            C.unary_double(
+                left.as_c_ptr(), out.as_c_ptr(), left.size, code
+            )
+            return out
         if isinstance(right, CTensor) and isinstance(left, CTensor):
             if op in ('matmul', 'rmatmul', 'imatmul'):
                 a, b = (left, right) if op != 'rmatmul' else (right, left)
@@ -244,60 +314,50 @@ class CTensorOperations(AbstractTensor):
                     return left
                 return out
             if left.shape != right.shape:
-                raise ValueError("Shape mismatch")
+                rank = max(len(left.shape), len(right.shape))
+                left_shape = (1,) * (rank - len(left.shape)) + left.shape
+                right_shape = (1,) * (rank - len(right.shape)) + right.shape
+                shape = []
+                for left_size, right_size in zip(left_shape, right_shape):
+                    if left_size == right_size or left_size == 1:
+                        shape.append(right_size)
+                    elif right_size == 1:
+                        shape.append(left_size)
+                    else:
+                        raise ValueError("C operands are not broadcastable")
+                target = tuple(shape)
+                if left.shape != target:
+                    temporary = type(self)()
+                    temporary.data = left
+                    left = temporary.expand_(target)
+                if right.shape != target:
+                    temporary = type(self)()
+                    temporary.data = right
+                    right = temporary.expand_(target)
             out = CTensor(left.shape)
             n = left.size
-            if op in ('add', 'iadd'):
-                C.add_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('sub', 'isub'):
-                C.sub_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('mul', 'imul'):
-                C.mul_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('truediv', 'itruediv'):
-                C.div_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('pow', 'ipow'):
-                C.pow_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('mod', 'imod'):
-                C.mod_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            elif op in ('floordiv', 'ifloordiv'):
-                C.floordiv_double(left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n)
-            else:
+            canonical = op[1:] if op.startswith(("i", "r")) else op
+            code = binary_codes.get(canonical)
+            if code is None:
                 raise NotImplementedError(f"Operator {op} not implemented for C backend.")
+            C.binary_double(
+                left.as_c_ptr(), right.as_c_ptr(), out.as_c_ptr(), n, code
+            )
             return out
+        elif isinstance(left, (int, float)) and isinstance(right, CTensor):
+            return self._apply_operator__(op, right, left)
         elif isinstance(left, CTensor) and isinstance(right, (int, float)):
             out = CTensor(left.shape)
             n = left.size
             val = float(right)
-            if op in ('add', 'iadd'):
-                C.add_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'radd':
-                C.add_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('sub', 'isub'):
-                C.subtract_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rsub':
-                C.rsubtract_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('mul', 'imul'):
-                C.mul_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rmul':
-                C.mul_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('truediv', 'itruediv'):
-                C.divide_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rtruediv':
-                C.rdivide_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('pow', 'ipow'):
-                C.pow_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rpow':
-                C.rpow_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('mod', 'imod'):
-                C.mod_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rmod':
-                C.rmod_scalar(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op in ('floordiv', 'ifloordiv'):
-                C.floor_div_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            elif op == 'rfloordiv':
-                C.rfloor_div_const(left.as_c_ptr(), val, out.as_c_ptr(), n)
-            else:
+            reverse = op.startswith("r")
+            canonical = op[1:] if op.startswith(("i", "r")) else op
+            code = binary_codes.get(canonical)
+            if code is None:
                 raise NotImplementedError(f"Operator {op} not implemented for C backend.")
+            C.binary_scalar_double(
+                left.as_c_ptr(), val, out.as_c_ptr(), n, code, int(reverse)
+            )
             return out
         else:
             raise TypeError("CTensorOperations only supports CTensor or scalar operands.")
@@ -305,12 +365,11 @@ class CTensorOperations(AbstractTensor):
     # Creation ops
     def full_(self, size: Tuple[int, ...], fill_value: Any, dtype: Any, device: Any):
         t = CTensor(size)
-        for i in range(t.size):
-            t.buffer[i] = float(fill_value)
+        C.fill_double(t.as_c_ptr(), float(fill_value), t.size)
         return t
 
     def zeros_(self, size: Tuple[int, ...], dtype: Any, device: Any):
-        return self.full(size, 0.0, dtype, device)
+        return self.full_(size, 0.0, dtype, device)
 
     def clone_(self, tensor: CTensor = None) -> CTensor:
         if tensor is None:
@@ -346,18 +405,271 @@ class CTensorOperations(AbstractTensor):
     def pow_(self, tensor: Any, exponent: float) -> CTensor:
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
-        out = CTensor(tensor.shape)
-        C.pow_scalar(tensor.as_c_ptr(), float(exponent), out.as_c_ptr(), tensor.size)
-        return out
+        return self._apply_operator__("pow", tensor, float(exponent))
 
     def sqrt_(self, tensor: Any = None) -> CTensor:
         if tensor is None:
             tensor = self.data
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
-        out = CTensor(tensor.shape)
-        C.sqrt_double(tensor.as_c_ptr(), out.as_c_ptr(), tensor.size)
+        return self._apply_operator__("sqrt", tensor, None)
+
+    def exp_(self):
+        return self._apply_operator__("exp", self.data, None)
+
+    def log_(self):
+        return self._apply_operator__("log", self.data, None)
+
+    def neg_(self):
+        return self._apply_operator__("neg", self.data, None)
+
+    def abs_(self):
+        return self._apply_operator__("abs", self.data, None)
+
+    def round_(self, n=None):
+        if n not in (None, 0):
+            scale = 10.0 ** int(n)
+            scaled = self._apply_operator__(
+                "mul", self.data, scale
+            )
+            temporary = type(self)()
+            temporary.data = scaled
+            rounded = temporary._apply_operator__(
+                "round", temporary.data, None
+            )
+            return self._apply_operator__("truediv", rounded, scale)
+        return self._apply_operator__("round", self.data, None)
+
+    def trunc_(self):
+        return self._apply_operator__("trunc", self.data, None)
+
+    def floor_(self):
+        return self._apply_operator__("floor", self.data, None)
+
+    def ceil_(self):
+        return self._apply_operator__("ceil", self.data, None)
+
+    def isfinite_(self):
+        return self._apply_operator__("isfinite", self.data, None)
+
+    def isnan_(self):
+        return self._apply_operator__("isnan", self.data, None)
+
+    def isinf_(self):
+        return self._apply_operator__("isinf", self.data, None)
+
+    def logical_not_(self):
+        return self._apply_operator__("logical_not", self.data, None)
+
+    def real_(self):
+        return self.clone_()
+
+    def imag_(self):
+        return self.zeros_(self.data.shape, None, None)
+
+    def less_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self._apply_operator__("less", self.data, value)
+
+    def less_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self._apply_operator__("less_equal", self.data, value)
+
+    def greater_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self._apply_operator__("greater", self.data, value)
+
+    def greater_equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self._apply_operator__("greater_equal", self.data, value)
+
+    def equal_(self, value):
+        value = value.data if isinstance(value, AbstractTensor) else value
+        return self._apply_operator__("equal", self.data, value)
+
+    def not_equal_(self, tensor1, tensor2=None):
+        if tensor2 is None:
+            tensor1 = (
+                tensor1.data
+                if isinstance(tensor1, AbstractTensor) else tensor1
+            )
+            return self._apply_operator__("not_equal", self.data, tensor1)
+        previous = self.data
+        try:
+            self.data = tensor1
+            tensor2 = (
+                tensor2.data
+                if isinstance(tensor2, AbstractTensor) else tensor2
+            )
+            return self._apply_operator__("not_equal", self.data, tensor2)
+        finally:
+            self.data = previous
+
+    def maximum_(self, other):
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return self._apply_operator__("maximum", self.data, other)
+
+    def minimum_(self, other):
+        other = other.data if isinstance(other, AbstractTensor) else other
+        return self._apply_operator__("minimum", self.data, other)
+
+    def empty_(self, size, dtype=None, device=None):
+        return CTensor(tuple(size))
+
+    def reshape_(self, shape):
+        shape = list(shape)
+        unknown = [index for index, size in enumerate(shape) if size == -1]
+        if len(unknown) > 1:
+            raise ValueError("only one inferred dimension is permitted")
+        known = 1
+        for size in shape:
+            if size != -1:
+                known *= size
+        if unknown:
+            if known == 0 or self.data.size % known:
+                raise ValueError("shape is incompatible with tensor size")
+            shape[unknown[0]] = self.data.size // known
+        size = 1
+        for dimension in shape:
+            size *= dimension
+        if size != self.data.size:
+            raise ValueError("shape is incompatible with tensor size")
+        return CTensor(tuple(shape), self.data.buffer)
+
+    def flatten_(self, start_dim=0, end_dim=-1):
+        ndim = len(self.data.shape)
+        start_dim %= ndim
+        end_dim %= ndim
+        if start_dim > end_dim:
+            raise ValueError("start_dim must not follow end_dim")
+        merged = 1
+        for size in self.data.shape[start_dim:end_dim + 1]:
+            merged *= size
+        shape = (
+            self.data.shape[:start_dim]
+            + (merged,)
+            + self.data.shape[end_dim + 1:]
+        )
+        return CTensor(shape, self.data.buffer)
+
+    def unsqueeze_(self, dim):
+        ndim = len(self.data.shape) + 1
+        dim %= ndim
+        shape = self.data.shape[:dim] + (1,) + self.data.shape[dim:]
+        return CTensor(shape, self.data.buffer)
+
+    def squeeze_(self, dim=None):
+        shape = self.data.shape
+        if dim is None:
+            result = tuple(size for size in shape if size != 1)
+        else:
+            dim %= len(shape)
+            result = (
+                shape[:dim] + shape[dim + 1:]
+                if shape[dim] == 1 else shape
+            )
+        return CTensor(result, self.data.buffer)
+
+    def permute_(self, dims):
+        dims = tuple(axis % len(self.data.shape) for axis in dims)
+        if sorted(dims) != list(range(len(self.data.shape))):
+            raise ValueError("dims must be a permutation of tensor axes")
+        shape = tuple(self.data.shape[axis] for axis in dims)
+        out = CTensor(shape)
+        C.transpose_double(
+            self.data.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", self.data.shape),
+            ffi.new("int[]", dims), len(dims),
+        )
         return out
+
+    def transpose_(self, dim0, dim1):
+        axes = list(range(len(self.data.shape)))
+        dim0 %= len(axes)
+        dim1 %= len(axes)
+        axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+        return self.permute_(axes)
+
+    def swapaxes_(self, axis1, axis2):
+        return self.transpose_(axis1, axis2)
+
+    def expand_(self, shape):
+        target = list(shape)
+        if len(target) < len(self.data.shape):
+            raise ValueError("cannot expand to fewer dimensions")
+        source_shape = (
+            (1,) * (len(target) - len(self.data.shape)) + self.data.shape
+        )
+        for axis, (current, desired) in enumerate(
+            zip(source_shape, target)
+        ):
+            if desired == -1:
+                target[axis] = current
+            elif desired < 0 or (current != desired and current != 1):
+                raise ValueError(
+                    f"cannot expand dimension {axis} "
+                    f"from {current} to {desired}"
+                )
+        target_shape = tuple(target)
+        out = CTensor(target_shape)
+        C.broadcast_double(
+            self.data.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", source_shape), len(source_shape),
+            ffi.new("int[]", target_shape), len(target_shape),
+        )
+        return out
+
+    def cumsum_(self, dim=0):
+        dim %= len(self.data.shape)
+        out = CTensor(self.data.shape)
+        C.cumsum_dim_double(
+            self.data.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", self.data.shape), len(self.data.shape), dim,
+        )
+        return out
+
+    def _argreduce_c(self, dim, keepdim, find_max):
+        if dim is None:
+            source = CTensor((self.data.size,), self.data.buffer)
+            shape = source.shape
+            dim = 0
+            reduce_all = True
+        else:
+            source = self.data
+            shape = source.shape
+            dim %= len(shape)
+            reduce_all = False
+        out_shape = shape[:dim] + shape[dim + 1:]
+        out = CTensor(out_shape if out_shape else ())
+        C.argreduce_dim_double(
+            source.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", shape), len(shape), dim, int(find_max),
+        )
+        if keepdim:
+            target = (
+                (1,) * len(self.data.shape)
+                if reduce_all
+                else self.data.shape[:dim]
+                + (1,)
+                + self.data.shape[dim + 1:]
+            )
+            return CTensor(target, out.buffer)
+        return out
+
+    def argmin_(self, dim=None, keepdim=False):
+        return self._argreduce_c(dim, keepdim, False)
+
+    def argmax_(self, dim=None, keepdim=False):
+        return self._argreduce_c(dim, keepdim, True)
+
+    def softmax_(self, dim):
+        logged = self.log_softmax_(dim)
+        temporary = type(self)()
+        temporary.data = logged
+        return temporary.exp_()
+
+    def log_softmax_tensor_(self, dim):
+        return self.log_softmax_(dim)
 
     def matmul_(self, tensor: Any, other: Any) -> CTensor:
         if not isinstance(tensor, CTensor):
@@ -377,6 +689,48 @@ class CTensorOperations(AbstractTensor):
     def tensor_from_list_(self, data: List[Any], dtype: Any, device: Any) -> CTensor:
         shape = _get_shape(data)
         return CTensor.from_list(data, shape)
+
+    def get_item_(self, data, index):
+        """Lower scalar/slice or shaped first-axis gather into index_select."""
+        previous = self.data
+        self.data = data
+        try:
+            return self._get_item_from_data(index)
+        finally:
+            self.data = previous
+
+    def _get_item_from_data(self, index):
+        if isinstance(index, tuple):
+            def select(data, axis, indices):
+                temporary = type(self)()
+                temporary.data = data
+                return temporary.index_select_(axis, indices)
+
+            return lower_basic_index(
+                self.data,
+                index,
+                shape_of=lambda data: data.shape,
+                index_select=select,
+                reshape=lambda data, shape: CTensor(shape, data.buffer),
+            )
+        if isinstance(index, slice):
+            indices = list(range(*index.indices(self.data.shape[0])))
+            index_shape = (len(indices),)
+            drop_axis = False
+        elif isinstance(index, int):
+            normalized = index % self.data.shape[0]
+            indices = [normalized]
+            index_shape = ()
+            drop_axis = True
+        else:
+            raw = index.tolist() if hasattr(index, "tolist") else index
+            index_shape = _get_shape(raw)
+            indices = [int(value) for value in _flatten(raw)]
+            drop_axis = False
+        selected = self.index_select_(0, indices)
+        if drop_axis:
+            return CTensor(self.data.shape[1:], selected.buffer)
+        return CTensor(index_shape + self.data.shape[1:], selected.buffer)
 
     def shape_(self, tensor: CTensor = None) -> Tuple[int, ...]:
         if tensor is None:
@@ -410,9 +764,7 @@ class CTensorOperations(AbstractTensor):
                 C.sum_double(tensor.as_c_ptr(), tensor.size) / tensor.size
                 if tensor.size else 0.0
             )
-            if not keepdim:
-                return value
-            out = CTensor((1,) * len(tensor.shape))
+            out = CTensor((1,) * len(tensor.shape) if keepdim else ())
             out.buffer[0] = value
             return out
 
@@ -434,10 +786,54 @@ class CTensorOperations(AbstractTensor):
             return out.buffer[0]
         return out
 
-    def less_(self, tensor: Any, value: Any) -> list:
-        if not isinstance(tensor, CTensor):
-            tensor = CTensor.from_list(tensor, _get_shape(tensor))
-        return [tensor.buffer[i] < value for i in range(tensor.size)]
+    def _reduce_c(self, dim, keepdim, op):
+        tensor = self.data
+        reduce_all = dim is None
+        if reduce_all:
+            source = CTensor((tensor.size,), tensor.buffer)
+            shape = source.shape
+            dim = 0
+        else:
+            shape = tensor.shape
+            dim %= len(shape)
+            source = tensor
+        reduced_shape = shape[:dim] + shape[dim + 1:]
+        out = CTensor(reduced_shape if reduced_shape else ())
+        C.reduce_dim_double(
+            source.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", shape), len(shape), dim, op,
+        )
+        if keepdim:
+            if tensor.shape:
+                target = (
+                    (1,) * len(tensor.shape)
+                    if reduce_all
+                    else tensor.shape[:dim]
+                    + (1,)
+                    + tensor.shape[dim + 1:]
+                )
+            else:
+                target = ()
+            return CTensor(target, out.buffer)
+        return out
+
+    def sum_(self, dim=None, keepdim=False):
+        return self._reduce_c(dim, keepdim, 0)
+
+    def prod_(self, dim=None, keepdim=False):
+        return self._reduce_c(dim, keepdim, 1)
+
+    def min_(self, dim=None, keepdim=False):
+        return self._reduce_c(dim, keepdim, 2)
+
+    def max_(self, dim=None, keepdim=False):
+        return self._reduce_c(dim, keepdim, 3)
+
+    def any_(self, dim=None):
+        return self._reduce_c(dim, False, 4)
+
+    def all_(self, dim=None):
+        return self._reduce_c(dim, False, 5)
 
     def view_flat_(self, tensor: Any) -> list:
         if not isinstance(tensor, CTensor):
@@ -453,20 +849,50 @@ class CTensorOperations(AbstractTensor):
 
     def clamp_(
         self,
-        tensor: Any,
         min_val: Optional[float] = None,
         max_val: Optional[float] = None,
     ) -> CTensor:
-        if not isinstance(tensor, CTensor):
-            tensor = CTensor.from_list(tensor, _get_shape(tensor))
-        out = CTensor(tensor.shape)
-        for i in range(tensor.size):
-            val = tensor.buffer[i]
-            if min_val is not None and val < min_val:
-                val = min_val
-            if max_val is not None and val > max_val:
-                val = max_val
-            out.buffer[i] = val
+        out = self.data
+        if min_val is not None:
+            out = self._apply_operator__(
+                "maximum", self.data, min_val
+            )
+        if max_val is not None:
+            temporary = type(self)()
+            temporary.data = out
+            out = temporary._apply_operator__(
+                "minimum", temporary.data, max_val
+            )
+        return out
+
+    def clamp_min_(self, min_val):
+        return self._apply_operator__("maximum", self.data, min_val)
+
+    def clamp_max_(self, max_val):
+        return self._apply_operator__("minimum", self.data, max_val)
+
+    def where_(self, x, y):
+        def operand(value):
+            value = value.data if isinstance(value, AbstractTensor) else value
+            if isinstance(value, CTensor):
+                if value.shape != self.data.shape:
+                    raise ValueError("C where operand shapes must match")
+                return value
+            zeros = CTensor(self.data.shape)
+            filled = CTensor(self.data.shape)
+            C.binary_scalar_double(
+                zeros.as_c_ptr(), float(value), filled.as_c_ptr(),
+                filled.size, C.CT_OP_ADD, 0,
+            )
+            return filled
+
+        left = operand(x)
+        right = operand(y)
+        out = CTensor(self.data.shape)
+        C.where_double(
+            self.data.as_c_ptr(), left.as_c_ptr(), right.as_c_ptr(),
+            out.as_c_ptr(), out.size,
+        )
         return out
 
     def select_by_indices_(self, tensor: CTensor, indices_dim0: Any, indices_dim1: Any) -> Any:
@@ -507,10 +933,9 @@ class CTensorOperations(AbstractTensor):
 
         return CTensor(out_shape, out_buf)
 
-    def log_softmax_(self, tensor: CTensor, dim: int) -> Any:
+    def log_softmax_(self, dim: int) -> Any:
         """Compute log softmax along ``dim`` using C routines."""
-        if not isinstance(tensor, CTensor):
-            tensor = CTensor.from_list(tensor, _get_shape(tensor))
+        tensor = self.data
         ndim = len(tensor.shape)
         if dim < 0:
             dim += ndim
@@ -524,10 +949,9 @@ class CTensorOperations(AbstractTensor):
             C.log_softmax_dim(tensor.as_c_ptr(), c_shape, ndim, dim, out.as_c_ptr())
         return out
 
-    def pad_(self, tensor: CTensor, pad: Tuple[int, ...], value: float = 0) -> Any:
+    def pad_(self, pad: Tuple[int, ...], value: float = 0) -> Any:
         """Pad ``tensor`` with ``value`` according to ``pad`` specification."""
-        if not isinstance(tensor, CTensor):
-            tensor = CTensor.from_list(tensor, _get_shape(tensor))
+        tensor = self.data
 
         if len(pad) % 2 != 0:
             raise ValueError("Padding length must be even.")
@@ -564,7 +988,8 @@ class CTensorOperations(AbstractTensor):
         )
         return out
 
-    def topk_(self, tensor: CTensor, k: int, dim: int) -> Tuple[Any, Any]:
+    def topk_(self, k: int, dim: int) -> Tuple[Any, Any]:
+        tensor = self.data
         shape = tensor.shape
         ndim = len(shape)
         if dim < 0:
@@ -591,22 +1016,52 @@ class CTensorOperations(AbstractTensor):
         )
         return values, indices
 
-    def repeat_interleave_(self, tensor: CTensor, repeats: int, dim: Optional[int] = None) -> Any:
-        # ########## STUB: CTensorOperations.repeat_interleave ##########
-        # PURPOSE: Repeat each element in ``tensor`` ``repeats`` times along ``dim``.
-        # EXPECTED BEHAVIOR: New CTensor with expanded dimension.
-        # INPUTS: CTensor, repeats int, optional dimension.
-        # OUTPUTS: CTensor with repeated values.
-        # KEY ASSUMPTIONS/DEPENDENCIES: Requires advanced slicing helpers.
-        # TODO:
-        #   - Implement axis-aware repetition.
-        # NOTES: Only full flattening supported currently.
-        # ############################################################
-        raise NotImplementedError("repeat_interleave not implemented for C backend")
+    def repeat_interleave_(
+        self, repeats: int = 1, dim: Optional[int] = None
+    ) -> Any:
+        tensor = self.data
+        if repeats < 0:
+            raise ValueError("repeats must be non-negative")
+        if dim is None:
+            tensor = CTensor((tensor.size,), tensor.buffer)
+            dim = 0
+        else:
+            dim %= len(tensor.shape)
+        shape = list(tensor.shape)
+        shape[dim] *= repeats
+        out = CTensor(tuple(shape))
+        C.repeat_interleave_double(
+            tensor.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", tensor.shape), len(tensor.shape),
+            dim, repeats,
+        )
+        return out
 
     def repeat_(self, repeats: Any = None, dim: int = 0) -> Any:
-        """Repeat tensor along ``dim`` ``repeats`` times (stub)."""
-        raise NotImplementedError("repeat not implemented for C backend")
+        if repeats is None:
+            raise ValueError("repeats must be specified")
+        input_shape = self.data.shape
+        if isinstance(repeats, int):
+            factors = [1] * len(input_shape)
+            factors[dim % len(input_shape)] = repeats
+        else:
+            factors = list(repeats)
+            if len(factors) < len(input_shape):
+                factors = [1] * (len(input_shape) - len(factors)) + factors
+            if len(factors) != len(input_shape):
+                raise ValueError("repeat rank must match tensor rank")
+        if any(factor < 0 for factor in factors):
+            raise ValueError("repeat factors must be non-negative")
+        output_shape = tuple(
+            size * factor for size, factor in zip(input_shape, factors)
+        )
+        out = CTensor(output_shape)
+        C.tile_double(
+            self.data.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", input_shape),
+            ffi.new("int[]", output_shape), len(input_shape),
+        )
+        return out
 
     def assign_at_indices_(
         self,
@@ -627,57 +1082,55 @@ class CTensorOperations(AbstractTensor):
         # ############################################################
         raise NotImplementedError("assign_at_indices not implemented for C backend")
 
-    def increment_at_indices_(self, tensor_to_modify: CTensor, mask: Any) -> None:
-        # ########## STUB: CTensorOperations.increment_at_indices ##########
-        # PURPOSE: Increment elements of ``tensor_to_modify`` where ``mask`` is True.
-        # EXPECTED BEHAVIOR: Element-wise increment using a boolean mask.
-        # INPUTS: target CTensor, boolean mask list.
-        # OUTPUTS: None (in-place update).
-        # KEY ASSUMPTIONS/DEPENDENCIES: Requires broadcasting rules.
-        # TODO:
-        #   - Implement efficient masked increment.
-        # NOTES: Stub to signal incomplete feature.
-        # ############################################################
-        raise NotImplementedError("increment_at_indices not implemented for C backend")
+    def increment_at_indices_(self, mask: Any):
+        mask = mask.data if isinstance(mask, AbstractTensor) else mask
+        if not isinstance(mask, CTensor):
+            mask = CTensor.from_list(mask, _get_shape(mask))
+        if mask.shape != self.data.shape:
+            raise ValueError("mask shape must match tensor shape")
+        C.increment_mask_double(
+            self.data.as_c_ptr(), mask.as_c_ptr(), self.data.size
+        )
+        return self.data
 
-    def boolean_mask_select_(self, tensor: CTensor, mask: Any) -> Any:
-        # ########## STUB: CTensorOperations.boolean_mask_select ##########
-        # PURPOSE: Select values from ``tensor`` where ``mask`` is True.
-        # EXPECTED BEHAVIOR: Return CTensor or list of filtered values.
-        # INPUTS: CTensor, mask list.
-        # OUTPUTS: CTensor containing selected elements.
-        # KEY ASSUMPTIONS/DEPENDENCIES: Requires shape-aware masking.
-        # TODO:
-        #   - Implement boolean masking for CTensors.
-        # NOTES: Not yet supported in C backend.
-        # ############################################################
-        raise NotImplementedError("boolean_mask_select not implemented for C backend")
+    def boolean_mask_select_(self, mask: Any) -> Any:
+        mask = mask.data if isinstance(mask, AbstractTensor) else mask
+        if not isinstance(mask, CTensor):
+            mask = CTensor.from_list(mask, _get_shape(mask))
+        if mask.shape != self.data.shape:
+            raise ValueError("mask shape must match tensor shape")
+        count = C.count_true_double(mask.as_c_ptr(), mask.size)
+        out = CTensor((count,))
+        C.mask_select_double(
+            self.data.as_c_ptr(), mask.as_c_ptr(), out.as_c_ptr(),
+            self.data.size,
+        )
+        return out
 
-    def index_select_(self, tensor: CTensor, dim: int, indices: Any) -> Any:
-        # ########## STUB: CTensorOperations.index_select ##########
-        # PURPOSE: Select entries along ``dim`` using ``indices``.
-        # EXPECTED BEHAVIOR: Mirror numpy.take along the specified dimension.
-        # INPUTS: CTensor, dimension index, index list.
-        # OUTPUTS: CTensor with gathered values.
-        # KEY ASSUMPTIONS/DEPENDENCIES: Requires advanced indexing support.
-        # TODO:
-        #   - Implement general index selection.
-        # NOTES: Current design does not provide necessary helpers.
-        # ############################################################
-        raise NotImplementedError("index_select not implemented for C backend")
-
-    def argmin_(self, tensor: CTensor, dim: Optional[int] = None) -> Any:
-        # ########## STUB: CTensorOperations.argmin ##########
-        # PURPOSE: Placeholder for argmin across dimensions in the C backend.
-        # EXPECTED BEHAVIOR: Should mirror numpy.argmin with optional axis.
-        # INPUTS: CTensor to examine and optional dimension ``dim``.
-        # OUTPUTS: Integer index or CTensor of indices.
-        # KEY ASSUMPTIONS/DEPENDENCIES: Requires C helpers for reduction.
-        # TODO:
-        #   - Implement dimension-aware minimum search.
-        # NOTES: Current backend lacks the functionality to compute argmin.
-        # ############################################################
-        raise NotImplementedError("argmin not implemented for C backend")
+    def index_select_(self, dim: int, indices: Any) -> Any:
+        indices = (
+            indices.tolist()
+            if isinstance(indices, AbstractTensor)
+            else indices.tolist()
+            if isinstance(indices, CTensor)
+            else list(indices)
+        )
+        indices = [int(index) for index in indices]
+        dim %= len(self.data.shape)
+        if any(
+            index < 0 or index >= self.data.shape[dim]
+            for index in indices
+        ):
+            raise IndexError("index_select index out of range")
+        shape = list(self.data.shape)
+        shape[dim] = len(indices)
+        out = CTensor(tuple(shape))
+        C.index_select_double(
+            self.data.as_c_ptr(), out.as_c_ptr(),
+            ffi.new("int[]", self.data.shape), len(self.data.shape), dim,
+            ffi.new("int[]", indices), len(indices),
+        )
+        return out
 
     def interpolate_(self, tensor: CTensor, size: Tuple[int, ...]) -> Any:
         # ########## STUB: CTensorOperations.interpolate ##########
@@ -774,17 +1227,14 @@ class CTensorOperations(AbstractTensor):
             return tensor.buffer[0]
         raise ValueError("Tensor has more than one element")
 
-    def max_(self, tensor: CTensor) -> float:
-        return max(tensor.tolist())
+    def nbytes_(self) -> int:
+        return self.data.size * ffi.sizeof("double")
 
     def long_cast_(self, tensor: CTensor) -> CTensor:
         t = CTensor(tensor.shape)
         for i in range(t.size):
             t.buffer[i] = int(tensor.buffer[i])
         return t
-
-    def not_equal_(self, tensor1: CTensor, tensor2: CTensor) -> list:
-        return [tensor1.buffer[i] != tensor2.buffer[i] for i in range(tensor1.size)]
 
     def save_(self, tensor: CTensor, filepath: str) -> None:
         with open(filepath, "wb") as f:
@@ -823,7 +1273,7 @@ class CTensorOperations(AbstractTensor):
     def get_ndims(self) -> int:
         return len(self.get_shape())
 
-    def to_dtype_(self, tensor, dtype: str = "float"):
+    def to_dtype_(self, dtype: str = "float", tensor=None):
         """Convert ``tensor`` data type using C helpers."""
         # ########## STUB: CTensorOperations.to_dtype_ ##########
         # PURPOSE: Convert CTensor data to specified dtype.
@@ -834,10 +1284,16 @@ class CTensorOperations(AbstractTensor):
         # TODO:
         #   - Extend to additional dtypes and integrate with other operations.
         # ############################################################
+        if isinstance(dtype, CTensor):
+            dtype, tensor = tensor, dtype
+        if tensor is None:
+            tensor = self.data
         if not isinstance(tensor, CTensor):
             tensor = CTensor.from_list(tensor, _get_shape(tensor))
 
-        dtype = dtype.lower()
+        if isinstance(dtype, type):
+            dtype = dtype.__name__
+        dtype = str(dtype).lower()
         if dtype in {"int", "int32", "int64", "long"}:
             buf = ffi.new("double[]", tensor.size)
             C.cast_double_to_int_values(tensor.as_c_ptr(), buf, tensor.size)
