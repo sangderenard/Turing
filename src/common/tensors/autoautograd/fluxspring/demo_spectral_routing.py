@@ -52,27 +52,6 @@ logger = logging.getLogger(__name__)
 FLUX_PARAM_SCHEMA = ("alpha", "w", "b")
 
 
-def _vectorize_wheel_params_to_1d(wheels: Sequence[ParamWheel]) -> None:
-    """Ensure each parameter slot is at least 1-D for autograd."""
-    for w_idx, w in enumerate(wheels):
-        for p_idx, p in enumerate(w.params):
-            pt = AT.get_tensor(p)
-            logger.debug(
-                "vectorize_wheel: wheel=%d param=%d before shape=%s",
-                w_idx,
-                p_idx,
-                getattr(pt, "shape", None),
-            )
-            reshaped = pt.reshape(1) if getattr(pt, "ndim", 0) == 0 else pt.reshape(-1)
-            logger.debug(
-                "vectorize_wheel: wheel=%d param=%d after shape=%s",
-                w_idx,
-                p_idx,
-                getattr(reshaped, "shape", None),
-            )
-            w.params[p_idx] = reshaped
-
-
 class TensorRingBuffer:
     """AbstractTensor-based ring buffer for per-tick logs."""
 
@@ -395,14 +374,15 @@ def pump_with_loss(
     hist_residual_summary = None
 
     mids = list(range(band_start, band_start + B))
+    fft_tick = tick - (spectral_cfg.win_len - 1)
     W, kept = gather_recent_windows(mids, spectral_cfg, ctx.harness)
     if len(kept) == len(mids):
-        bp = batched_bandpower_from_windows(W, spectral_cfg)
+        
         targ_mat = AT.stack([hist_targets[nid] for nid in kept])
         hist_residual = bp - targ_mat
-        hist_residual_summary = hist_residual.mean(0)
-        ctx.hist_buf.push(hist_residual_summary)
-    fft_tick = tick - (spectral_cfg.win_len - 1)
+        
+        ctx.hist_buf.push(hist_residual)
+
     if fft_tick >= 0:
         idx = (ctx.out_buf.idx - spectral_cfg.win_len) % spectral_cfg.win_len
         delayed_out = ctx.out_buf.buf[idx]
@@ -416,10 +396,7 @@ def pump_with_loss(
         spec_float = (
             float(AT.get_tensor(spec_val)) if spec_val is not None else None
         )
-        row_slots = [
-            spiral_slot(fft_tick, r, ctx.bp_queue.slots)
-            for r in range(len(ctx.wheels))
-        ]
+        active_slots = 
         tick_map = ctx.row_slots.setdefault(fft_tick, {})
         for row_idx, slot_idx in enumerate(row_slots):
             tick_map[row_idx] = slot_idx

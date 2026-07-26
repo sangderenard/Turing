@@ -244,6 +244,14 @@ class CTensor:
     def as_c_ptr(self):
         return self.buffer
 
+    def __del__(self):
+        owner = getattr(self, "_calculator_owner", None)
+        if owner is not None:
+            try:
+                owner.release(self)
+            except Exception:
+                pass
+
     def tolist(self):
         def build(offset: int, shp: Tuple[int, ...]):
             if not shp:

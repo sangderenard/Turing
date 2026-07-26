@@ -18,6 +18,13 @@ from .dt_system.registry import (
     list_engines,
     get_engine,
 )
+from .dt_system.time_runtime import (
+    ManagedAdvance,
+    ManagedCommitGate,
+    TimeWindowRequest,
+    TimeAdvanceReport,
+    ManagedTimeRuntime,
+)
 
 __all__ = [
     # Planning/result types
@@ -33,4 +40,10 @@ __all__ = [
     "register_engine",
     "list_engines",
     "get_engine",
+    # Stable external managed-time process boundary
+    "ManagedAdvance",
+    "ManagedCommitGate",
+    "TimeWindowRequest",
+    "TimeAdvanceReport",
+    "ManagedTimeRuntime",
 ]

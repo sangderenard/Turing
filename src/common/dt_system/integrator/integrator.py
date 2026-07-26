@@ -6,9 +6,11 @@ This module introduces the Integrator class, which provides advanced integration
 methods and a poetic API for summing over infinitesimals.
 """
 
+import copy
 from typing import Callable, Any, Optional, Sequence
 import math
 from ..engine_api import DtCompatibleEngine
+from ..dt_scaler import Metrics
 from ..state_table_archive import StateTableArchive
 from ...tensors.abstraction import AbstractTensor
 
@@ -115,6 +117,27 @@ class Integrator(DtCompatibleEngine):
         self.axis_mask = list(axis_mask) if axis_mask is not None else None
         self.quantize = quantize
         self._prev_delta = None
+
+    def snapshot(self):
+        return {
+            "state": copy.deepcopy(self._state),
+            "world_time": float(getattr(self, "world_time", 0.0)),
+            "observer_time": float(getattr(self, "observer_time", 0.0)),
+            "velocity": copy.deepcopy(getattr(self, "_v", None)),
+            "previous_delta": copy.deepcopy(self._prev_delta),
+            "archive": copy.deepcopy(self.archive),
+        }
+
+    def restore(self, snapshot) -> None:
+        self._state = copy.deepcopy(snapshot["state"])
+        self.world_time = float(snapshot["world_time"])
+        self.observer_time = float(snapshot["observer_time"])
+        if snapshot["velocity"] is None and hasattr(self, "_v"):
+            delattr(self, "_v")
+        elif snapshot["velocity"] is not None:
+            self._v = copy.deepcopy(snapshot["velocity"])
+        self._prev_delta = copy.deepcopy(snapshot["previous_delta"])
+        self.archive = copy.deepcopy(snapshot["archive"])
 
     def register_dt_graph(self, dt_graph: object):
         """
@@ -248,7 +271,12 @@ class Integrator(DtCompatibleEngine):
         x = self._apply_post(prev_state, x)
         self._state = x
         self.world_time = t + dt
-        metrics = None  # Could be extended to return integration error, etc.
+        metrics = Metrics(
+            max_vel=0.0,
+            max_flux=0.0,
+            div_inf=0.0,
+            mass_err=0.0,
+        )
         if state_table is not None:
             # Attach archive to state_table for external access
             if getattr(state_table, "archive", None) is None:

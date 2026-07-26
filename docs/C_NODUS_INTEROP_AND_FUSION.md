@@ -153,3 +153,34 @@ This route makes the C backend useful immediately while preserving clean
 ownership: Turing captures mathematical intent, the primitive schema gives
 the projects a shared language, and Nodus owns native scheduling and code
 generation.
+
+## Persistent Tensor Calculator
+
+The workspace now contains a standalone `tensor-calculator` native library.
+It is the shared execution substrate beneath, rather than another translation
+format between, Turing and Nodus.
+
+- Turing's ordinary eager C calls remain on the existing direct C functions:
+  benchmarks showed that routing every tiny operation through a second Python
+  binding added 15–40% dispatch overhead.
+- Prepared Turing primitive programs can bind their CTensor buffers once to
+  Tensor Calculator, compile handle resolution once, replay synchronously, or
+  submit asynchronously. Set `TENSOR_CALCULATOR_PROGRAMS=1`; `auto` selects it
+  when `TENSOR_CALCULATOR_WORKERS` is nonzero.
+- Nodus maps its existing in-memory tensors and binds those exact pointers as
+  external calculator tensors. No payload is copied.
+- The calculator supplies both F32 and F64 versions of the canonical 28
+  primitives, while Turing's historical CTensor storage remains F64-only.
+
+The calculator follows AbstractTensor's singular-access trust model.
+Allocation, binding, release, and preparation are externally sequenced and
+have no registry mutex. Prepared synchronous execution takes no mutex.
+Synchronization exists only for the explicitly optional asynchronous queue
+and job completion. Submissions resolve and pin tensors before queueing, so
+workers never access the mutable registry.
+
+This is also why the direct and persistent forms coexist. A known-pointer
+single operation should call the calculator's raw synchronous ABI. A repeated
+dependent chain should use an opaque prepared program. Independent large
+chains may enter the worker queue. Selection is a measured submission policy,
+not a change in mathematical semantics.

@@ -2,7 +2,7 @@
 """Relocated: dt controller under common/dt_system."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import time
 
@@ -13,7 +13,7 @@ try:  # NumPy is the canonical lightweight backend
 except Exception:  # pragma: no cover - optional dependency
     np = None
 
-from .dt_scaler import Metrics
+from .dt_scaler import Metrics, coerce_metrics
 from .dt import SuperstepPlan, SuperstepResult
 from .debug import dbg, is_enabled, pretty_metrics
 
@@ -37,6 +37,7 @@ class Targets:
     cfl: float
     div_max: float
     mass_max: float
+    error_limits: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -106,7 +107,8 @@ def step_with_dt_control_used(state,
                              advance,
                              retries: int = 0,
                              failures: list[tuple[float, Metrics]] | None = None,
-                             ref=None):
+                             ref=None,
+                             attempt_log: list[dict] | None = None):
     if failures is None:
         failures = []
     if ref is None:
@@ -121,7 +123,25 @@ def step_with_dt_control_used(state,
             f"advance try: dt={float(dt_for_advance):.6g} dx={float(dx.item() if isinstance(dx, AbstractTensor) else dx):.6g} retries={retries}"
         )
     ok, metrics = advance(state, dt_for_advance)
-    if (not ok) or (metrics.mass_err > targets.mass_max) or (metrics.div_inf > targets.div_max * 10.0):
+    metrics = coerce_metrics(metrics)
+    channel_failure = any(
+        float(metrics.error_channels.get(name, 0.0)) > float(limit)
+        for name, limit in targets.error_limits.items()
+    )
+    rejected = (
+        (not ok)
+        or bool(metrics.hard_failure)
+        or (metrics.mass_err > targets.mass_max)
+        or (metrics.div_inf > targets.div_max * 10.0)
+        or channel_failure
+    )
+    if attempt_log is not None:
+        attempt_log.append({
+            "dt": float(dt_for_advance),
+            "accepted": not rejected,
+            "metrics": metrics,
+        })
+    if rejected:
         state.restore(saved)
         failures.append((float(dt_for_advance), metrics))
         if is_enabled():
@@ -138,18 +158,42 @@ def step_with_dt_control_used(state,
             print("\n".join(lines))
             raise RuntimeError("adaptive timestep controller failed")
         dt_half = dt_tensor * 0.5
-        if ctrl.dt_min is not None:
+        if (
+            ctrl.dt_min is not None
+            and float(dt_tensor.item()) >= float(ctrl.dt_min)
+        ):
             dt_half = AbstractTensor.maximum(dt_half, ctrl.dt_min)
+        if (
+            metrics.dt_limit is not None
+            and math.isfinite(float(metrics.dt_limit))
+            and float(metrics.dt_limit) > 0.0
+        ):
+            dt_half = AbstractTensor.minimum(dt_half, metrics.dt_limit)
         if is_enabled():
             dbg("ctrl").debug(
                 f"retry with dt_half={float(dt_half.item() if isinstance(dt_half, AbstractTensor) else dt_half):.6g}"
             )
-        return step_with_dt_control_used(state, dt_half, dx, targets, ctrl, advance, retries + 1, failures, ref=ref)
+        return step_with_dt_control_used(
+            state,
+            dt_half,
+            dx,
+            targets,
+            ctrl,
+            advance,
+            retries + 1,
+            failures,
+            ref=ref,
+            attempt_log=attempt_log,
+        )
 
     dt_cfl = targets.cfl * dx / max(metrics.max_vel, 1e-30)
     penalty = max(
         metrics.div_inf / targets.div_max,
         metrics.mass_err / targets.mass_max,
+        *(
+            float(metrics.error_channels.get(name, 0.0)) / max(float(limit), 1e-30)
+            for name, limit in targets.error_limits.items()
+        ),
         1.0,
     )
     dt_pen = dt_cfl / penalty
@@ -186,7 +230,9 @@ def run_superstep(state,
                   *,
                   allow_increase_mid_round: bool = False,
                   max_iters: int = 10000,
-                  eps: float = 1e-15):
+                  eps: float = 1e-15,
+                  event_boundaries: tuple[float, ...] = (),
+                  attempt_log: list[dict] | None = None):
     ref_dt = dt_init
     round_max_t = round_max if isinstance(round_max, AbstractTensor) else AbstractTensor.tensor(round_max)
     total = AbstractTensor.tensor(0.0)
@@ -197,6 +243,11 @@ def run_superstep(state,
         dt_cap = AbstractTensor.minimum(dt_cap, ctrl.dt_max)
     last_dt_next = dt_cap
     last_metrics = None
+    boundary_values = tuple(sorted({
+        float(value)
+        for value in event_boundaries
+        if eps < float(value) < float(round_max_t.item()) - eps
+    }))
 
     iters = 0
     if is_enabled():
@@ -207,7 +258,24 @@ def run_superstep(state,
         iters += 1
         remainder = round_max_t - total
         dt_try = AbstractTensor.minimum(dt_cap, remainder)
-        metrics, dt_next, dt_used = step_with_dt_control_used(state, dt_try, dx, targets, ctrl, advance, ref=ref_dt)
+        total_value = float(total.item())
+        for boundary in boundary_values:
+            if boundary > total_value + eps:
+                dt_try = AbstractTensor.minimum(
+                    dt_try,
+                    AbstractTensor.tensor(boundary - total_value),
+                )
+                break
+        metrics, dt_next, dt_used = step_with_dt_control_used(
+            state,
+            dt_try,
+            dx,
+            targets,
+            ctrl,
+            advance,
+            ref=ref_dt,
+            attempt_log=attempt_log,
+        )
         last_metrics = metrics
         if dt_used <= 0.0:
             break
@@ -226,6 +294,15 @@ def run_superstep(state,
                 f"  iter={iters} used={float(dt_used.item() if isinstance(dt_used, AbstractTensor) else dt_used):.6g} total={float(total.item()):.6g}/{round_max:.6g} next_cap={float(dt_cap.item()):.6g}"
             )
 
+    remaining = float((round_max_t - total).item())
+    if remaining > eps:
+        raise RuntimeError(
+            "adaptive superstep did not land on its requested window: "
+            f"advanced={float(total.item()):.17g} "
+            f"round_max={float(round_max_t.item()):.17g} "
+            f"remaining={remaining:.17g} iterations={iters}/{max_iters}"
+        )
+
     total_out = _restore_type(total, ref_dt)
     dt_next_out = _restore_type(last_dt_next, ref_dt)
     return total_out, dt_next_out, last_metrics
@@ -237,6 +314,7 @@ def run_superstep_plan(state,
                        targets: Targets,
                        ctrl: STController,
                        advance) -> SuperstepResult:
+    attempt_log: list[dict] = []
     total, dt_next, metrics = run_superstep(
         state,
         plan.round_max,
@@ -247,6 +325,8 @@ def run_superstep_plan(state,
         advance,
         allow_increase_mid_round=plan.allow_increase_mid_round,
         eps=plan.eps,
+        event_boundaries=plan.event_boundaries,
+        attempt_log=attempt_log,
     )
     total_val = float(total.item() if isinstance(total, AbstractTensor) else total)
     dt_next_val = float(dt_next.item() if isinstance(dt_next, AbstractTensor) else dt_next)
@@ -255,8 +335,29 @@ def run_superstep_plan(state,
     if ctrl.dt_min is not None:
         ref = max(ref, float(ctrl.dt_min.item() if isinstance(ctrl.dt_min, AbstractTensor) else ctrl.dt_min))
     clamped = bool(dt_next_val < ref)
-    steps = max(1, int(round(total_val / max(plan_dt_init_val, 1e-30)))) if total_val > 0 else 0
-    return SuperstepResult(advanced=total, dt_next=dt_next, steps=steps, clamped=clamped, metrics=metrics)
+    accepted = tuple(
+        float(item["dt"]) for item in attempt_log if item["accepted"]
+    )
+    rejected = sum(1 for item in attempt_log if not item["accepted"])
+    steps = len(accepted)
+    clamped = clamped or rejected > 0
+    cumulative = 0.0
+    landed = []
+    for dt_used in accepted:
+        cumulative += dt_used
+        if any(abs(cumulative - boundary) <= plan.eps for boundary in plan.event_boundaries):
+            landed.append(cumulative)
+    return SuperstepResult(
+        advanced=total,
+        dt_next=dt_next,
+        steps=steps,
+        clamped=clamped,
+        metrics=metrics,
+        attempted_dts=tuple(float(item["dt"]) for item in attempt_log),
+        accepted_dts=accepted,
+        rejected_attempts=rejected,
+        landed_boundaries=tuple(landed),
+    )
 
 
 # ------------------------- Realtime mode (single-step) -----------------------

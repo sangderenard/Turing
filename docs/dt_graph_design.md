@@ -1,5 +1,23 @@
 # DT Graph Design and Migration Plan
 
+## 2026 managed-time status
+
+The controller/superstep hierarchy and scientific graph path are now joined:
+
+- scientific `MetaLoopRunner` execution delegates to nested adaptive
+  supersteps instead of advancing a flattened schedule once;
+- shared `StateTable` and engine checkpoints roll back rejected parent steps;
+- bisection uses explicit state-table transactions;
+- plans support exact authored event boundaries;
+- results retain attempted, accepted, rejected, and boundary-landing telemetry;
+- named error channels support non-fluid scientific engines;
+- `ManagedTimeRuntime` exposes a revisioned absolute-time process boundary.
+
+The flattened scheduler remains an explicit realtime/process-deployment path.
+It must not replace managed scientific advancement.
+
+See `docs/managed_time_runtime.md`.
+
 This document evaluates the current managed-dt system and proposes a graph-based organization that enables arbitrary access to details from any subset in nested loops, with a standardized meta-loop runner.
 
 ## Current State (Managed dt)

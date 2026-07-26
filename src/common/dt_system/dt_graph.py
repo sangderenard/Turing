@@ -22,11 +22,13 @@ to a declarative graph.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .dt import SuperstepPlan, SuperstepResult
 from .dt_controller import STController, Targets, Metrics, run_superstep
+from .dt_scaler import coerce_metrics
 from .engine_api import EngineRegistration
 from .debug import dbg, is_enabled, pretty_metrics
 from .dt_solver import solve_window_bisect
@@ -66,6 +68,7 @@ class AdvanceNode:
     advance: AdvanceFn
     state: StateNode
     label: str = "advance"
+    transaction_owner: Any = None
 
 
 @dataclass
@@ -120,7 +123,12 @@ class EngineNode:
                 )
             return bool(ok), metrics, state_new
 
-        return AdvanceNode(advance=advance, state=state, label=f"advance:{self.registration.name}")
+        return AdvanceNode(
+            advance=advance,
+            state=state,
+            label=f"advance:{self.registration.name}",
+            transaction_owner=self.registration.engine,
+        )
 
 
 @dataclass
@@ -155,6 +163,141 @@ class NodeStats:
     attempted: List[float] = field(default_factory=list)
     advanced_total: float = 0.0
 
+
+def _combine_metrics(values: List[Metrics]) -> Metrics:
+    """Conservatively aggregate diagnostics from coupled child advances."""
+
+    if not values:
+        return Metrics(0.0, 0.0, 0.0, 0.0)
+    limits = [
+        float(value.dt_limit)
+        for value in values
+        if value.dt_limit is not None
+    ]
+    error_names = {
+        name for value in values for name in value.error_channels
+    }
+    return Metrics(
+        max_vel=max(float(value.max_vel) for value in values),
+        max_flux=max(float(value.max_flux) for value in values),
+        div_inf=max(float(value.div_inf) for value in values),
+        mass_err=max(float(value.mass_err) for value in values),
+        osc_flag=any(bool(value.osc_flag) for value in values),
+        stiff_flag=any(bool(value.stiff_flag) for value in values),
+        sim_frame=max(int(value.sim_frame) for value in values),
+        proc_ms=sum(float(value.proc_ms) for value in values),
+        dt_limit=min(limits) if limits else None,
+        error_channels={
+            name: max(
+                float(value.error_channels.get(name, 0.0))
+                for value in values
+            )
+            for name in error_names
+        },
+        hard_failure=any(bool(value.hard_failure) for value in values),
+        advanced_dt=min(
+            (
+                float(value.advanced_dt)
+                for value in values
+                if value.advanced_dt is not None
+            ),
+            default=None,
+        ),
+    )
+
+
+class _RoundTransaction:
+    """Rollback adapter consumed by ``run_superstep``.
+
+    It preserves StateNode identities, engine-owned snapshot state, controller
+    memory, and the shared StateTable across a rejected parent micro-step.
+    """
+
+    def __init__(self, root: RoundNode, state_table: Any) -> None:
+        self.root = root
+        self.state_table = state_table
+
+    def _collect(self):
+        state_nodes: dict[int, StateNode] = {}
+        owners: dict[int, Any] = {}
+        controllers: dict[int, STController] = {}
+
+        def visit(node):
+            if isinstance(node, AdvanceNode):
+                state_nodes[id(node.state)] = node.state
+                owner = node.transaction_owner
+                if owner is not None:
+                    owners[id(owner)] = owner
+            elif isinstance(node, RoundNode):
+                controllers[id(node.controller.ctrl)] = node.controller.ctrl
+                for child in node.children:
+                    visit(child)
+
+        visit(self.root)
+        return state_nodes, owners, controllers
+
+    def copy_shallow(self):
+        state_nodes, owners, controllers = self._collect()
+        state_snapshots = {}
+        for key, node in state_nodes.items():
+            value = node.state
+            if hasattr(value, "copy_shallow") and hasattr(value, "restore"):
+                state_snapshots[key] = ("restore", value.copy_shallow())
+            else:
+                state_snapshots[key] = ("replace", copy.deepcopy(value))
+        owner_snapshots = {}
+        for key, owner in owners.items():
+            if hasattr(owner, "snapshot") and hasattr(owner, "restore"):
+                owner_snapshots[key] = ("restore", owner.snapshot())
+            else:
+                owner_snapshots[key] = ("clocks", {
+                    name: copy.deepcopy(getattr(owner, name))
+                    for name in ("world_time", "observer_time")
+                    if hasattr(owner, name)
+                })
+        controller_snapshots = {
+            key: copy.deepcopy(vars(controller))
+            for key, controller in controllers.items()
+        }
+        table_snapshot = (
+            self.state_table.snapshot()
+            if self.state_table is not None
+            and hasattr(self.state_table, "snapshot")
+            else copy.deepcopy(self.state_table)
+        )
+        return (
+            state_snapshots,
+            owner_snapshots,
+            controller_snapshots,
+            table_snapshot,
+        )
+
+    def restore(self, snapshot) -> None:
+        state_snapshots, owner_snapshots, controller_snapshots, table_snapshot = snapshot
+        state_nodes, owners, controllers = self._collect()
+        for key, (strategy, saved) in state_snapshots.items():
+            node = state_nodes[key]
+            if strategy == "restore":
+                node.state.restore(saved)
+            else:
+                node.state = copy.deepcopy(saved)
+        for key, (strategy, saved) in owner_snapshots.items():
+            owner = owners[key]
+            if strategy == "restore":
+                owner.restore(saved)
+            else:
+                for name, value in saved.items():
+                    setattr(owner, name, copy.deepcopy(value))
+        for key, saved in controller_snapshots.items():
+            controller = controllers[key]
+            vars(controller).clear()
+            vars(controller).update(copy.deepcopy(saved))
+        if self.state_table is not None:
+            if hasattr(self.state_table, "restore"):
+                self.state_table.restore(table_snapshot)
+            else:
+                self.state_table = copy.deepcopy(table_snapshot)
+
 from .realtime import RealtimeConfig, RealtimeState
 class MetaLoopRunner:
     """Standardized meta-loop runner that executes a RoundNode tree.
@@ -167,7 +310,7 @@ class MetaLoopRunner:
     """
 
     def __init__(self, realtime_config: RealtimeConfig = None, realtime_state: RealtimeState = None, realtime: bool = False, state_table=None) -> None:
-        self._stats: Dict[int, NodeStats] = {}
+        self._stats: Dict[str, NodeStats] = {}
         self._process_graph = None
         self._adapter = None
         self._root_round = None
@@ -235,44 +378,153 @@ class MetaLoopRunner:
         # Use the instance default if not explicitly provided
         if realtime is None:
             realtime = self._realtime
+        self._last_timings = []
         if realtime:
             self._renew_allocations()
-        else:
-            self._realtime_allocations = [None] * len(self._schedule)  # reset for non-realtime
-        for adv, alloc in zip(self._schedule, self._realtime_allocations):
-            if realtime:
+            if not self._schedule:
+                return SuperstepResult(
+                    advanced=0.0,
+                    dt_next=0.0,
+                    steps=0,
+                    clamped=False,
+                    metrics=None,
+                )
+            for adv, alloc in zip(self._schedule, self._realtime_allocations):
                 step_dt_ms = alloc if alloc is not None else dt*1000.0 if dt is not None else 1.0
                 step_dt = step_dt_ms / 1000.0  # convert ms to seconds
                 t0 = time.perf_counter()
                 ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=True, state_table=table)
+                metrics = coerce_metrics(metrics)
                 t1 = time.perf_counter()
                 elapsed = t1 - t0
                 self._last_timings.append(elapsed)
-            else:
-                step_dt = dt if dt is not None else 1.0
-                ok, metrics, new_state = adv.advance(adv.state.state, step_dt, realtime=False, state_table=table)
-                self._last_timings.append(0.0)
-            adv.state.state = new_state
-            last_metrics = metrics
-            # --- DT TAPE LOGGING ---
-            if table is not None:
-                node_id = adv.label
-                # Log latest metrics
-                table.set('dt_tape', node_id, 'metrics', metrics)
-                # Log actual dt used for this node
-                table.set('dt_tape', node_id, 'dt', step_dt)
-                # Log attempted dts (if available)
-                st = self._stats.get(adv.label)
-                if st is not None:
-                    table.set('dt_tape', node_id, 'attempted', list(st.attempted))
-        from .dt import SuperstepResult
-        return SuperstepResult(
-            advanced=step_dt,
-            dt_next=step_dt,
-            steps=len(self._schedule),
-            clamped=False,
-            metrics=last_metrics if last_metrics is not None else None,
+                adv.state.state = new_state
+                if table is not None:
+                    table.set("dt_tape", adv.label, "metrics", metrics)
+                    table.set("dt_tape", adv.label, "dt", step_dt)
+            return SuperstepResult(
+                advanced=step_dt,
+                dt_next=step_dt,
+                steps=len(self._schedule),
+                clamped=False,
+                metrics=metrics if self._schedule else None,
+            )
+
+        self._realtime_allocations = [None] * len(self._schedule)
+        window = (
+            float(dt)
+            if dt is not None
+            else float(self._root_round.plan.round_max)
         )
+        return self._run_scientific_round(self._root_round, window, table)
+
+    def _run_scientific_round(
+        self,
+        round_node: RoundNode,
+        window: float,
+        state_table: Any,
+    ) -> SuperstepResult:
+        transaction = _RoundTransaction(round_node, state_table)
+        window_checkpoint = transaction.copy_shallow()
+        round_stats = self._stats.setdefault(round_node.label, NodeStats())
+        attempted_before = len(round_stats.attempted)
+        advanced_before = round_stats.advanced_total
+        metrics_before = round_stats.last_metrics
+        timings_before = len(self._last_timings)
+        attempt_log: list[dict] = []
+
+        def advance(_transaction, dt_step):
+            round_stats.attempted.append(float(dt_step))
+            ok, metrics = self._advance_children(
+                round_node, float(dt_step), state_table
+            )
+            return ok, metrics
+
+        try:
+            total, dt_next, metrics = run_superstep(
+                transaction,
+                round_max=float(window),
+                dt_init=min(
+                    max(float(round_node.plan.dt_init), 1e-30),
+                    float(window),
+                ),
+                dx=round_node.controller.dx,
+                targets=round_node.controller.targets,
+                ctrl=round_node.controller.ctrl,
+                advance=advance,
+                allow_increase_mid_round=(
+                    round_node.allow_increase_mid_round
+                    or round_node.plan.allow_increase_mid_round
+                ),
+                eps=round_node.plan.eps,
+                event_boundaries=round_node.plan.event_boundaries,
+                attempt_log=attempt_log,
+            )
+        except Exception:
+            transaction.restore(window_checkpoint)
+            del round_stats.attempted[attempted_before:]
+            round_stats.advanced_total = advanced_before
+            round_stats.last_metrics = metrics_before
+            del self._last_timings[timings_before:]
+            raise
+        attempts = len(round_stats.attempted) - attempted_before
+        round_stats.advanced_total += float(total)
+        round_stats.last_metrics = metrics
+        if state_table is not None:
+            state_table.set("dt_tape", round_node.label, "metrics", metrics)
+            state_table.set("dt_tape", round_node.label, "attempted", list(
+                round_stats.attempted
+            ))
+            state_table.set("dt_tape", round_node.label, "advanced", float(total))
+        return SuperstepResult(
+            advanced=float(total),
+            dt_next=float(dt_next),
+            steps=attempts,
+            clamped=any(
+                attempted < float(round_node.plan.dt_init)
+                for attempted in round_stats.attempted[attempted_before:]
+            ),
+            metrics=metrics,
+            attempted_dts=tuple(
+                float(item["dt"]) for item in attempt_log
+            ),
+            accepted_dts=tuple(
+                float(item["dt"])
+                for item in attempt_log
+                if item["accepted"]
+            ),
+            rejected_attempts=sum(
+                1 for item in attempt_log if not item["accepted"]
+            ),
+            landed_boundaries=self._landed_boundaries(
+                attempt_log,
+                round_node.plan.event_boundaries,
+                round_node.plan.eps,
+            ),
+        )
+
+    @staticmethod
+    def _landed_boundaries(
+        attempt_log: list[dict],
+        boundaries: tuple[float, ...],
+        eps: float,
+    ) -> tuple[float, ...]:
+        cumulative = 0.0
+        landed: list[float] = []
+        for item in attempt_log:
+            if not item["accepted"]:
+                continue
+            cumulative += float(item["dt"])
+            for boundary in boundaries:
+                if (
+                    abs(cumulative - float(boundary)) <= eps
+                    and not any(
+                        abs(existing - float(boundary)) <= eps
+                        for existing in landed
+                    )
+                ):
+                    landed.append(float(boundary))
+        return tuple(landed)
 
     def get_last_schedule_timings(self) -> list[float]:
         """Return the list of per-node timings (in seconds) for the last frame, in schedule order."""
@@ -288,7 +540,9 @@ class MetaLoopRunner:
         return list(st.attempted) if st else []
 
     # ------------------------------ helpers
-    def _advance_children(self, parent_round: RoundNode, dt: float) -> Metrics:
+    def _advance_children(
+        self, parent_round: RoundNode, dt: float, state_table: Any
+    ) -> tuple[bool, Metrics]:
         """Advance all children to cover dt; returns a composite Metrics.
 
         Policy: iterate children in order, delegating dt entirely to each child
@@ -298,7 +552,7 @@ class MetaLoopRunner:
         the controller). If no children exist, returns a zeroed Metrics.
         """
 
-        last_metrics: Optional[Metrics] = None
+        observed: List[Metrics] = []
 
         def run_one(child, slice_dt: float) -> Metrics:
             if isinstance(child, AdvanceNode):
@@ -306,15 +560,36 @@ class MetaLoopRunner:
                 st.attempted.append(float(slice_dt))
                 if is_enabled():
                     dbg("graph").debug(f"  leaf advance: label={child.label} dt={float(slice_dt):.6g}")
-                res = child.advance(child.state.state, slice_dt)
+                t0 = time.perf_counter()
+                res = child.advance(
+                    child.state.state,
+                    slice_dt,
+                    realtime=False,
+                    state_table=state_table,
+                )
+                self._last_timings.append(time.perf_counter() - t0)
                 # Strict contract: must return (ok, Metrics, state)
                 if not (isinstance(res, tuple) and len(res) == 3):
                     raise ValueError(
                         f"AdvanceNode advance() must return a three-tuple (ok, Metrics, state); got {type(res)} with len={len(res) if isinstance(res, tuple) else 'n/a'}"
                     )
                 ok, m, new_state = res  # type: ignore[misc]
+                m = coerce_metrics(m)
                 if not ok:
-                    return Metrics(max_vel=m.max_vel, max_flux=m.max_flux, div_inf=1e9, mass_err=1e9)
+                    return Metrics(
+                        max_vel=m.max_vel,
+                        max_flux=m.max_flux,
+                        div_inf=m.div_inf,
+                        mass_err=m.mass_err,
+                        osc_flag=m.osc_flag,
+                        stiff_flag=m.stiff_flag,
+                        sim_frame=m.sim_frame,
+                        proc_ms=m.proc_ms,
+                        dt_limit=m.dt_limit,
+                        error_channels=dict(m.error_channels),
+                        hard_failure=True,
+                        advanced_dt=m.advanced_dt,
+                    )
                 st.last_metrics = m
                 st.advanced_total += float(slice_dt)
                 # Update the StateNode with the returned state
@@ -324,62 +599,58 @@ class MetaLoopRunner:
                 return m
             elif isinstance(child, RoundNode):
                 inner = child
-                inner_plan = SuperstepPlan(round_max=float(slice_dt), dt_init=max(inner.plan.dt_init, 1e-30))
-                saved = inner.plan
-                inner.plan = inner_plan
-                try:
-                    if is_enabled():
-                        dbg("graph").debug(f"  inner round: label={inner.label} dt={float(slice_dt):.6g}")
-                    res = self.run_round(inner)
-                    return res.metrics
-                finally:
-                    inner.plan = saved
+                if is_enabled():
+                    dbg("graph").debug(
+                        f"  inner round: label={inner.label} "
+                        f"dt={float(slice_dt):.6g}"
+                    )
+                res = self._run_scientific_round(
+                    inner, float(slice_dt), state_table
+                )
+                return res.metrics or Metrics(0.0, 0.0, 0.0, 0.0)
             else:
                 raise TypeError(f"Unsupported child node type: {type(child)}")
 
         sched = parent_round.schedule or "sequential"
         children = list(parent_round.children)
         if not children:
-            last_metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
+            observed.append(Metrics(0.0, 0.0, 0.0, 0.0))
         elif sched == "sequential":
             for child in children:
-                last_metrics = run_one(child, dt)
+                metrics = run_one(child, dt)
+                observed.append(metrics)
+                if metrics.hard_failure:
+                    break
         elif sched == "interleave":
             # Break dt into equal slices across children, preserving order.
             slice_dt = dt / max(len(children), 1)
             for child in children:
-                last_metrics = run_one(child, slice_dt)
+                metrics = run_one(child, slice_dt)
+                observed.append(metrics)
+                if metrics.hard_failure:
+                    break
         elif sched == "parallel":
             # Cooperative parallel stub: run each child for full dt and combine metrics conservatively.
             # True threading is engine-dependent; this aggregates maxima.
-            agg = None
             for child in children:
-                m = run_one(child, dt)
-                if agg is None:
-                    agg = m
-                else:
-                    agg = Metrics(
-                        max_vel=max(agg.max_vel, m.max_vel),
-                        max_flux=max(agg.max_flux, m.max_flux),
-                        div_inf=max(agg.div_inf, m.div_inf),
-                        mass_err=max(agg.mass_err, m.mass_err),
-                    )
-            last_metrics = agg
+                observed.append(run_one(child, dt))
         else:
             # Fallback to sequential
             for child in children:
-                last_metrics = run_one(child, dt)
+                metrics = run_one(child, dt)
+                observed.append(metrics)
+                if metrics.hard_failure:
+                    break
 
-        if last_metrics is None:
-            # empty sequence: return inert metrics
-            last_metrics = Metrics(max_vel=0.0, max_flux=0.0, div_inf=0.0, mass_err=0.0)
+        combined = _combine_metrics(observed)
         # Also track on the parent round for introspection
-        self._stats.setdefault(parent_round.label, NodeStats()).last_metrics = last_metrics
+        self._stats.setdefault(parent_round.label, NodeStats()).last_metrics = combined
         if is_enabled():
             dbg("graph").debug(
-                f"_advance_children: sched={sched} children={len(children)} -> {pretty_metrics(last_metrics)}"
+                f"_advance_children: sched={sched} children={len(children)} "
+                f"-> {pretty_metrics(combined)}"
             )
-        return last_metrics
+        return not combined.hard_failure, combined
 
 
 @dataclass
@@ -426,12 +697,28 @@ class GraphBuilder:
                 localize = False
             if reg.solver_config is not None and realtime_config is None:
                 def make_adv_with_bisect(reg_local: EngineRegistration, label: str) -> AdvanceNode:
-                    def advance(_state_obj: Any, dt: float, *, realtime: bool = False):
+                    def advance(
+                        _state_obj: Any,
+                        dt: float,
+                        *,
+                        realtime: bool = False,
+                        state_table=None,
+                    ):
                         if is_enabled():
                             dbg("graph").debug(
                                 f"bisect solve: name={reg_local.name} dt={float(dt):.6g} realtime={realtime}"
                             )
-                        m = solve_window_bisect(reg_local.engine, float(dt), reg_local.solver_config)  # type: ignore[arg-type]
+                        if state_table is None:
+                            raise ValueError(
+                                "bisect engine advance requires StateTable"
+                            )
+                        m = solve_window_bisect(
+                            reg_local.engine,
+                            float(dt),
+                            reg_local.solver_config,
+                            state_table=state_table,
+                            registration_name=reg_local.name,
+                        )
                         penalty = 0.0
                         targets = getattr(reg_local, "targets", None)
                         if targets is not None:
@@ -442,7 +729,12 @@ class GraphBuilder:
                         if realtime and realtime_state is not None:
                             realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                         return True, m, _state_obj
-                    return AdvanceNode(advance=advance, state=state_stub, label=f"bisect:{label}")
+                    return AdvanceNode(
+                        advance=advance,
+                        state=state_stub,
+                        label=f"bisect:{label}",
+                        transaction_owner=reg_local.engine,
+                    )
 
                 e_round = RoundNode(
                     plan=SuperstepPlan(round_max=float(dt), dt_init=float(dt)),
@@ -464,7 +756,12 @@ class GraphBuilder:
                     if realtime and realtime_state is not None:
                         realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                     return ok, m, state_new
-                children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
+                children.append(AdvanceNode(
+                    advance=adv_with_timing,
+                    state=state_stub,
+                    label=f"advance:{unique_label}",
+                    transaction_owner=reg.engine,
+                ))
             elif localize:
                 e_ctrl = reg.ctrl if reg.ctrl is not None else STController(
                     Kp=self.ctrl.Kp,
@@ -495,14 +792,24 @@ class GraphBuilder:
                         if realtime and realtime_state is not None:
                             realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                         return ok, m, state_new
-                    children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
+                    children.append(AdvanceNode(
+                        advance=adv_with_timing,
+                        state=state_stub,
+                        label=f"advance:{unique_label}",
+                        transaction_owner=reg.engine,
+                    ))
             else:
                 def adv_with_timing(state_obj, dt, *, realtime=False, adv=adv, label=unique_label, state_table=None):
                     ok, m, state_new = adv.advance(state_obj, dt, realtime=realtime, state_table=state_table)
                     if realtime and realtime_state is not None:
                         realtime_state.update_proc_ms(label, getattr(m, 'proc_ms', 0.0), getattr(realtime_config, 'ema_alpha', 0.2))
                     return ok, m, state_new
-                children.append(AdvanceNode(advance=adv_with_timing, state=state_stub, label=f"advance:{unique_label}"))
+                children.append(AdvanceNode(
+                    advance=adv_with_timing,
+                    state=state_stub,
+                    label=f"advance:{unique_label}",
+                    transaction_owner=reg.engine,
+                ))
         # Ensure an integrator finalizes the round by default
         if not any(isinstance(reg.engine, Integrator) for reg in engines):
             integ = Integrator()
@@ -514,7 +821,12 @@ class GraphBuilder:
             int_reg = EngineRegistration(name="integrator", engine=integ, targets=self.targets, dx=self.dx, localize=False)
             adv_int = EngineNode(int_reg).to_advance_node(state_stub)
             int_label = f"{label_prefix}integrator_{len(children)}"
-            children.append(AdvanceNode(advance=adv_int.advance, state=state_stub, label=f"advance:{int_label}"))
+            children.append(AdvanceNode(
+                advance=adv_int.advance,
+                state=state_stub,
+                label=f"advance:{int_label}",
+                transaction_owner=adv_int.transaction_owner,
+            ))
 
         return RoundNode(
             plan=plan,

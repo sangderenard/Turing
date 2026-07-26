@@ -22,17 +22,12 @@ from .fs_dec import (
 # Spectral utilities
 from .spectral_readout import compute_metrics
 from .fs_harness import RingHarness
-from typing import Callable, Sequence
+from typing import Callable, Sequence, Iterable
 import logging
-# Torch bridge is optional import to keep AT-only usage clean.
 
 from ...abstraction import AbstractTensor as AT
 
 logger = logging.getLogger(__name__)
-
-
-
-
 
 
 def _tape():
@@ -44,6 +39,7 @@ def _tape():
         from ...autograd import autograd as _ag
         return _ag.tape
 
+
 def _rebind_param(
     param: AT | None,
     learn: bool,
@@ -52,11 +48,15 @@ def _rebind_param(
     label: str | None = None,
     mark_structural_if_frozen: bool = True,
 ) -> AT | None:
-    """Toggle requires_grad, attach to tape, label, and collect trainables."""
+    """Toggle requires_grad, attach to tape, label, and collect trainables.
+
+    Keeps the same Python object identity but detaches so it becomes a fresh
+    leaf on the current tape. Parameters intended to ride a ParamWheel should
+    be rebound once here, after which wheel slices are assigned directly.
+    """
     if param is None:
         return None
 
-    # Re-leaf on the active tape, preserving object identity in the spec.
     t = param.detach()
     t.requires_grad_(learn)
 
@@ -65,28 +65,20 @@ def _rebind_param(
         tape.annotate(t, label=label)
 
     if learn:
-        # Drop any stale gradients/caches to make 'first tick' checks clean.
-        # we can't zero gradients until we have gradients to zero
-        # so for diagnostic reasons and because it takes many ticks
-        # to accumulate gradients, we will only zero them when we are sure
-        # they exist.
-        #if hasattr(t, "zero_grad"):
-        #    t.zero_grad(clear_cache=True)
         out.append(t)
     elif False and mark_structural_if_frozen:
-        # Make frozen fields explicit so they don't pollute param lists.
-        # this is disabled for reasons explained above
         tape.mark_structural(t, label=label)
 
     return t
 
 
 class ParamWheel:
-    """Manage multiple in-flight versions of a single parameter.
+    """Simple slice-based parameter wheel.
 
-    Each wheel stores ``W`` parameter versions alongside matching gradient
-    buffers.  Slots are rotated in a ring; gradients accumulate until the slot
-    is evicted, at which point an update function is applied.
+    Stores independent parameter versions in a fixed list. Callers bind the
+    appropriate slice for a tick via :meth:`bind_for_tick`, which simply assigns
+    the chosen slot tensor to the owning spec attribute through the provided
+    ``setter``. No copying, stashing or rotation side-effects are performed.
     """
 
     def __init__(
@@ -97,99 +89,111 @@ class ParamWheel:
         slots: int = 2,
         rings: int = 1,
         label: str | None = None,
-    ):
+        initialization: AT | str = "ones",
+    ) -> None:
         self.setter = setter
         self.label = label
+        self.slots: int = int(max(1, slots))
+        self.rings: int = int(max(1, rings))
+        self.idx: int = -1  # next slot to bind with bind_slot()
 
-        new_shape = (rings, slots) + base.shape
-        self.parameters = AT.ones(new_shape)
-        self.parameters.requires_grad_(True)
-        # Gradient ring buffers parallel to ``_versions``
-        self._grads = AT.zeros_like(self.parameters)
-        self._frozen = False
+        # Initialize per-slot tensors
+        self._params: list[AT] = []
+        base_t = AT.get_tensor(base)
+        if isinstance(initialization, str):
+            if initialization == "ones":
+                init_val = base_t * 0 + 1
+            elif initialization == "zeros":
+                init_val = base_t * 0
+            else:
+                init_val = base_t * 0
+        else:
+            init_val = AT.get_tensor(initialization)
+            # If provided scalar/shape doesn't match, try a reshape/broadcast
+            try:
+                init_val = AT.reshape(init_val, base_t.shape)
+            except Exception:
+                pass
+        for s in range(self.slots):
+            p = init_val.clone() if hasattr(init_val, "clone") else AT.get_tensor(init_val)
+            p.requires_grad_(True)
+            # Annotate each leaf so whiteboard/debuggers can locate them
+            lbl = f"{label or 'ParamWheel'}[slot={s}]"
+            try:
+                _tape().annotate(p, label=lbl)
+            except Exception:
+                pass
+            self._params.append(p)
 
-        tape = _tape()
-        for r in range(rings):
-            for s in range(slots):
-                flat_shape = 1
-                for i in range(len(base.shape)):
-                    flat_shape *= base.shape[i]
+        # Optional external grad stash used by some callers
+        self._grads: list[AT | None] = [None] * self.slots
 
-                for i in range(flat_shape):
-                    p = base.detach().clone().view(-1)[i]
-                    p.requires_grad_(True)
-                    self._versions.append(p)
-                    self._grads.append(None)
-                    if label is None:
-                        lbl = f"ParamWheel r{r} s{s} i{i} id{id(p)}"
-                    else:
-                        lbl = f"{label} r{r} s{s} i{i} id{id(p)}"
-                    tape.annotate(p, label=lbl)
-
-        # ``idx`` tracks the next slot to receive new data; the value returned
-        # from :meth:`rotate` is the slot to be evicted and updated.  Start at
-        # ``-1`` so that an initial ``rotate(); bind_slot()`` sequence activates
-        # slot ``0`` to remain compatible with legacy call patterns.
-        self.idx = -1
-
-    # ------------------------------------------------------------------
+    # Back-compat property used throughout the repo
     @property
     def params(self) -> list[AT]:
-        """Alias for ``versions`` to preserve legacy callers."""
-        return self._versions
+        return self._params
 
     def versions(self) -> list[AT]:
-        return self._versions
+        return list(self._params)
 
     def grads(self) -> list[AT | None]:
-        return self._grads
+        return list(self._grads)
 
-    # ------------------------------------------------------------------
-    def grow(self, slots: int) -> None:
-        """Grow the wheel to at least ``slots`` entries.
-
-        Growth is disallowed after :meth:`freeze` has been called.
-        """
-
-        if self._frozen or slots <= len(self.parameters):
-            if slots > len(self._versions) and self._frozen:
-                raise RuntimeError("ParamWheel is frozen")
-            return
-
-        self.parameters.resize((self.rings, slots, self.parameters.shape[2:]))
-
-    # ------------------------------------------------------------------
-    def freeze(self) -> None:
-        """Prevent further growth of the wheel."""
-
-        self._frozen = True
-
-    # ------------------------------------------------------------------
+    # Lightweight helpers -------------------------------------------------
     def rotate(self) -> int:
         evicted = self.idx
-        self.idx = (self.idx + 1) % (self.rings * len(self.slots))
+        self.idx = (self.idx + 1) % self.slots if self.slots > 0 else -1
         return evicted
 
-    # ------------------------------------------------------------------
-    def slots_for_tick(self, tick: int = 0) -> list[int]:
-        """Return slot indices for each row at ``tick``."""
-        return tick % self.slots
+    def bind_slot(self, slot: int | None = None) -> int:
+        if self.slots <= 0:
+            raise RuntimeError("ParamWheel has no slots")
+        if slot is None:
+            if self.idx < 0:
+                self.idx = 0
+            slot = self.idx
+        self.setter(self._params[int(slot)])
+        return int(slot)
 
-    def ring_for_tick(self, tick: int = 0) -> int:
-        subindex = tick % (self.slots * self.rings)
-        return subindex // self.slots
+    def bind_for_tick(self, tick: int, row_idx: int = 0) -> set[int]:
+        slot = int((tick + row_idx) % self.slots)
+        self.setter(self._params[slot])
+        return {slot}
 
-    def indices_for_tick(self, tick: int = 0) -> int:
-        slots = self.slots_for_tick(tick)
-        rings = [self.ring_for_tick(tick - r) for r in range(self.rows)]
-        return (rings, slots)
+    def stash_grads(self, used: Iterable[int]) -> None:
+        for s in used:
+            p = self._params[int(s)]
+            g = getattr(p, "grad", None)
+            # Allow whiteboard to write `_grad` as a side channel
+            if g is None:
+                g = getattr(p, "_grad", None)
+            self._grads[int(s)] = AT.get_tensor(g) if g is not None else None
 
-    def mask_for_tick(self, tick: int = 0) -> AT:
-        rings, slots = self.indices_for_tick(tick)
-        mask = AT.zeros((self.rings, self.slots), dtype=bool)
-        for r, s in zip(rings, slots):
-            mask[r, s] = True
-        return mask
+    def apply_slot(self, slot: int, update_fn: Callable[[AT, AT], AT]) -> None:
+        p = self._params[int(slot)]
+        g = getattr(p, "_grad", None) or self._grads[int(slot)] or getattr(p, "grad", None)
+        if g is None:
+            return
+        new_p = update_fn(p, g)
+        # Re-leaf to keep future grads clean
+        new_leaf = AT.get_tensor(new_p).detach() if hasattr(new_p, "detach") else AT.get_tensor(new_p)
+        try:
+            new_leaf.requires_grad_(True)
+        except Exception:
+            pass
+        self._params[int(slot)] = new_leaf
+        # If the most recent bind targeted this slot, refresh the binding
+        if self.idx >= 0 and (self.idx % self.slots) == int(slot):
+            self.setter(self._params[int(slot)])
+
+    # Convenience used by whiteboard demo to expose per-slot scalars/vectors
+    def value_for_slots(self, slots: Iterable[int], attr: str | None = None) -> AT:
+        vals = []
+        for s in slots:
+            v = AT.get_tensor(self._params[int(s)])
+            v = v.reshape(-1) if hasattr(v, "reshape") else v
+            vals.append(v)
+        return AT.stack(vals)
 
 
 
@@ -205,14 +209,11 @@ def register_param_wheels(
     """
 
     if slots is None:
-        slots = spec.spectral.win_len if spec.spectral.enabled else spec.stages
-    rings = 1 + (extra_delay + slots - 1) // slots
-
+        slots = spec.spectral.win_len if getattr(spec, "spectral", None) and getattr(spec.spectral, "enabled", False) else max(2, getattr(spec, "stages", 2))
+    rings = 1 + (int(extra_delay) + int(slots) - 1) // int(slots)
 
     wheels: list[ParamWheel] = []
     tmp: list[AT] = []
-
-    cnt = 0
     # Nodes
     for n in spec.nodes:
         lc = n.ctrl.learn
@@ -222,7 +223,13 @@ def register_param_wheels(
             setattr(n.ctrl, attr, p)
             if learn and p is not None:
                 wheels.append(
-                    ParamWheel(p, lambda t, n=n, attr=attr: setattr(n.ctrl, attr, t), slots=slots, label=f"node[{n.id}].ctrl.{attr}")
+                    ParamWheel(
+                        p,
+                        lambda t, n=n, attr=attr: setattr(n.ctrl, attr, t),
+                        slots=int(slots),
+                        rings=int(rings),
+                        label=f"node[{n.id}].ctrl.{attr}",
+                    )
                 )
 
     # Edges
@@ -234,7 +241,13 @@ def register_param_wheels(
             setattr(e.ctrl, attr, p)
             if learn and p is not None:
                 wheels.append(
-                    ParamWheel(p, lambda t, e=e, attr=attr: setattr(e.ctrl, attr, t), slots=slots, label=f"edge[{e.src}->{e.dst}].ctrl.{attr}")
+                    ParamWheel(
+                        p,
+                        lambda t, e=e, attr=attr: setattr(e.ctrl, attr, t),
+                        slots=int(slots),
+                        rings=int(rings),
+                        label=f"edge[{e.src}->{e.dst}].ctrl.{attr}",
+                    )
                 )
 
         lt = e.transport.learn
@@ -246,7 +259,13 @@ def register_param_wheels(
             setattr(e.transport, attr, p)
             if learn and p is not None:
                 wheels.append(
-                    ParamWheel(p, lambda t, e=e, attr=attr: setattr(e.transport, attr, t), slots=slots, label=f"edge[{e.src}->{e.dst}].tr.{attr}")
+                    ParamWheel(
+                        p,
+                        lambda t, e=e, attr=attr: setattr(e.transport, attr, t),
+                        slots=int(slots),
+                        rings=int(rings),
+                        label=f"edge[{e.src}->{e.dst}].tr.{attr}",
+                    )
                 )
 
     # Faces
@@ -259,7 +278,13 @@ def register_param_wheels(
             setattr(f, attr, p)
             if learn and p is not None:
                 wheels.append(
-                    ParamWheel(p, lambda t, f=f, attr=attr: setattr(f, attr, t), slots=slots, label=f"face[{fid}].{attr}")
+                    ParamWheel(
+                        p,
+                        lambda t, f=f, attr=attr: setattr(f, attr, t),
+                        slots=int(slots),
+                        rings=int(rings),
+                        label=f"face[{fid}].{attr}",
+                    )
                 )
     logger.debug(
         "register_param_wheels: created %d wheels slots=%d spectral=%s", 
@@ -299,23 +324,12 @@ def wheel_tick(
         Additional keyword arguments forwarded to :func:`pump_tick`.
     """
 
-    # Bind rows to slot-specific leaves for this tick
-    used_per_wheel: list[set[int]] = []
+    # Bind params to the correct slot slices for this tick
     for w in wheels:
-        used_per_wheel.append(w.bind_for_tick(tick))
+        w.bind_for_tick(tick)
 
-    # Single forward/backward pass
+    # Single forward pass (any gradient handling is external)
     psi, stats = pump_tick(psi, spec, **pump_kw)
-
-    # Stash gradients from touched slots
-    for w, used in zip(wheels, used_per_wheel):
-        w.stash_grads(used)
-
-    # Rotate wheels and update only the evicted slot
-    for w in wheels:
-        ev = w.rotate()
-        w.apply_slot(ev, update_fn)
-
     return psi, stats
 
 

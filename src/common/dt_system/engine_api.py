@@ -12,13 +12,14 @@ nonlinearize dt proposals relative to metric ranges.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable, Optional, Iterable, Mapping, Any, Sequence
 
 
 from .state_table import StateTable
 
 
-from .dt_scaler import Metrics
+from .dt_scaler import Metrics, coerce_metrics
 from .dt_controller import Targets, STController
 from .dt_solver import BisectSolverConfig
 
@@ -170,19 +171,6 @@ class DtCompatibleEngine:
         self, state: object, dt: float, *, realtime: bool = False, state_table = None
     ) -> tuple[bool, Metrics, object]:  # pragma: no cover - default bridge
 
-        self.world_time += dt
-
-        if isinstance(self.causal_ceiling_dt, float) and self.causal_ceiling_dt < dt or isinstance(self.causal_ceiling_dt, Callable) and self.causal_ceiling_dt() < dt:
-            ceiling = self.causal_ceiling_dt if isinstance(self.causal_ceiling_dt, float) else self.causal_ceiling_dt()
-            if realtime:
-                ceiling *= 1e1
-            
-            slip = dt - ceiling
-            dt = ceiling
-
-        #shift observer
-        self.observer_time += dt
-
         if state_table is None:
             state_table = getattr(self, '_state_table', None)
         if state_table is None:
@@ -191,7 +179,68 @@ class DtCompatibleEngine:
             raise RuntimeError(
                 f"{self.__class__.__name__} has no registered identities; call register() first"
             )
-        ok, m, state = self.step(float(dt), state, state_table=state_table)
+
+        requested_dt = float(dt)
+        if not math.isfinite(requested_dt) or requested_dt <= 0.0:
+            raise ValueError("engine dt must be finite and positive")
+        ceiling_source = self.causal_ceiling_dt
+        ceiling = (
+            float(ceiling_source())
+            if callable(ceiling_source)
+            else float(ceiling_source)
+        )
+        if not math.isfinite(ceiling):
+            ceiling = float("inf")
+        if ceiling <= 0.0:
+            raise ValueError("causal_ceiling_dt must be positive")
+        actual_dt = min(requested_dt, ceiling)
+        slip = requested_dt - actual_dt
+        if slip > 0.0 and not realtime:
+            return (
+                False,
+                Metrics(
+                    max_vel=0.0,
+                    max_flux=0.0,
+                    div_inf=0.0,
+                    mass_err=0.0,
+                    dt_limit=ceiling,
+                    error_channels={"causal_dt_excess": slip},
+                    advanced_dt=0.0,
+                ),
+                state,
+            )
+
+        world_before = float(getattr(self, "world_time", 0.0))
+        observer_before = float(getattr(self, "observer_time", 0.0))
+        ok, m, state = self.step(
+            actual_dt, state, state_table=state_table
+        )
+        m = coerce_metrics(m)
+        if ok:
+            if math.isclose(
+                float(getattr(self, "world_time", world_before)),
+                world_before,
+                rel_tol=0.0,
+                abs_tol=1.0e-15,
+            ):
+                self.world_time = world_before + actual_dt
+            if math.isclose(
+                float(getattr(self, "observer_time", observer_before)),
+                observer_before,
+                rel_tol=0.0,
+                abs_tol=1.0e-15,
+            ):
+                self.observer_time = observer_before + actual_dt
+            m.advanced_dt = actual_dt
+            if math.isfinite(ceiling):
+                m.dt_limit = (
+                    ceiling
+                    if m.dt_limit is None
+                    else min(float(m.dt_limit), ceiling)
+                )
+            if slip > 0.0:
+                m.error_channels = dict(m.error_channels)
+                m.error_channels["time_slip"] = slip
         state = self.get_state() if state is None else state
         return ok, m, state
 

@@ -1,3 +1,12 @@
+# Turing
+
+Turing is a Python compiler and runtime research repository. Its major threads include managed scientific time, abstract tensors and backend dispatch, graph and SSA compilation, analog tape-machine execution, cellular/soft-body simulation, Riemannian neural blocks, and the integrated Transmogrifier graph toolchain.
+
+The old standalone workspace at [`../transmogrifier/`](../transmogrifier/) is a legacy snapshot. Active Transmogrifier development belongs in [`src/transmogrifier/`](src/transmogrifier/).
+
+This repository has strict local guidance in [`AGENTS.md`](AGENTS.md). The analog-tape contract in that file governs changes to tape-machine surfaces; it is not a complete description of every Turing subsystem.
+
+## Historical project idea
 # Novel Idea:
 
 Title idea:
@@ -7,13 +16,14 @@ Abstract (sketch):
 We introduce a new class of convolutional neural networks where the Riemannian metric tensor of the feature space is learned directly from the data manifold. Unlike prior manifold CNNs that fix geometry a priori, our approach dynamically adapts the Laplace–Beltrami operator to the latent structure. We demonstrate stable convergence to below 1e-6 training error within 235 epochs on an 8-class dataset and strong generalization on 100-class classification. This shows that data-driven metric learning can serve as both a geometric prior and a numerical preconditioner, unifying geometric deep learning with learned differential geometry.
 
 
-# Turing
+## Tape-machine overview
 
 This project simulates a cassette-driven "survival computer" using a compile and run flow.
 
 ## Table of contents
 
 - [Compiling a program](#compiling-a-program)
+- [Managed scientific time](#managed-scientific-time)
 - [Priming a tape and executing with TapeMachine](#priming-a-tape-and-executing-with-tapemachine)
 - [Reel animation demo](#reel-animation-demo)
 - [Live cassette demo](#live-cassette-demo)
@@ -21,6 +31,17 @@ This project simulates a cassette-driven "survival computer" using a compile and
 - [Modules & capabilities](#modules--capabilities)
 - [Tests](#tests)
 - [Full module index](MODULES.md)
+
+## Managed scientific time
+
+Turing includes a transactional, multirate timestep runtime for scientific
+engines. It supports adaptive reruns, exact authored event boundaries,
+revisioned absolute-time requests, named error channels, and complete rollback
+of failed windows. The stable external boundary is exported from `src.common`
+as `ManagedTimeRuntime`, `TimeWindowRequest`, and `TimeAdvanceReport`.
+
+See [docs/managed_time_runtime.md](docs/managed_time_runtime.md) for the
+architecture and camera/optical integration contract.
 
 ## Compiling a program
 

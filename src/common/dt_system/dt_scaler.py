@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Common metrics and scaling utilities for adaptive dt control."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple, Optional
 import math
 
@@ -32,6 +32,34 @@ class Metrics:
     # value (min()), centralizing stability control instead of engines
     # self-capping internally.
     dt_limit: float | None = None
+    # Named scientific error channels. Controllers compare these against
+    # Targets.error_limits without forcing every engine into fluid terminology.
+    error_channels: dict[str, float] = field(default_factory=dict)
+    hard_failure: bool = False
+    advanced_dt: float | None = None
+
+
+def coerce_metrics(value) -> Metrics:
+    """Normalize legacy metric-shaped records into the canonical contract."""
+
+    if isinstance(value, Metrics):
+        return value
+    if value is None:
+        raise TypeError("simulation advance returned no metrics")
+    return Metrics(
+        max_vel=float(getattr(value, "max_vel", 0.0)),
+        max_flux=float(getattr(value, "max_flux", 0.0)),
+        div_inf=float(getattr(value, "div_inf", 0.0)),
+        mass_err=float(getattr(value, "mass_err", 0.0)),
+        osc_flag=bool(getattr(value, "osc_flag", False)),
+        stiff_flag=bool(getattr(value, "stiff_flag", False)),
+        sim_frame=int(getattr(value, "sim_frame", 0)),
+        proc_ms=float(getattr(value, "proc_ms", 0.0)),
+        dt_limit=getattr(value, "dt_limit", None),
+        error_channels=dict(getattr(value, "error_channels", {}) or {}),
+        hard_failure=bool(getattr(value, "hard_failure", False)),
+        advanced_dt=getattr(value, "advanced_dt", None),
+    )
 
 
 class ScalerControl:
@@ -101,6 +129,7 @@ def scale_metric(
 
 __all__ = [
     "Metrics",
+    "coerce_metrics",
     "ScalerControl",
     "scale_metric",
 ]

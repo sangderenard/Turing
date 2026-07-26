@@ -59,6 +59,7 @@ class SuperstepPlan:
     dt_init: float | AbstractTensor
     allow_increase_mid_round: bool = False
     eps: float = 1e-15
+    event_boundaries: tuple[float, ...] = ()
 
 
 @dataclass
@@ -85,6 +86,10 @@ class SuperstepResult:
     steps: int
     clamped: bool
     metrics: Optional[Metrics] = None
+    attempted_dts: tuple[float, ...] = ()
+    accepted_dts: tuple[float, ...] = ()
+    rejected_attempts: int = 0
+    landed_boundaries: tuple[float, ...] = ()
 
 
 __all__ = [

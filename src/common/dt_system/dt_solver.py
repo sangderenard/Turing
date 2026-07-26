@@ -13,8 +13,9 @@ parent-required duration is met.
 Assumptions
 -----------
 - The objective is monotonic in ``dt`` over the bracket [dt_lo, dt_hi].
-- The engine implements optional ``snapshot()``/``restore(snap)``. If absent
-  and ``require_snapshot`` is True, a ValueError is raised.
+- The engine implements ``snapshot()``/``restore(snap)`` either directly or on
+  a conventional inner ``s``, ``sim``, or ``state`` object. Non-transactional
+  candidate evaluation is rejected.
 
 Usage
 -----
@@ -24,11 +25,13 @@ Usage
 """
 
 from dataclasses import dataclass
+import inspect
 from typing import Callable, Optional, Any
 
-from .dt_scaler import Metrics
+from .dt_scaler import Metrics, coerce_metrics
 from .debug import dbg, is_enabled, pretty_metrics
 from .state_table import sync_engine_from_table, publish_engine_to_table
+from .state_table import StateTable
 
 
 ObjectiveFn = Callable[[Metrics], float]
@@ -41,12 +44,14 @@ class BisectSolverConfig:
     dt_min: float = 1e-9
     dt_max: Optional[float] = None  # per micro-step cap; default to remainder
     max_iters: int = 30
+    max_steps: int = 100_000
     # Choose objective either by field name or callable. If both provided, callable wins.
     field: Optional[str] = None  # e.g., "div_inf", "mass_err", "max_vel", "max_flux"
     objective: Optional[ObjectiveFn] = None
     # Monotonic direction of objective as dt increases: "increase" or "decrease"
     monotonic: str = "increase"
-    # Require snapshot/restore; when False, evaluations mutate state and cannot rollback.
+    # Retained for constructor compatibility. Scientific bisection rejects
+    # False because candidate evaluations must never leak into committed state.
     require_snapshot: bool = True
 
 
@@ -66,57 +71,161 @@ def _has_snapshot_api(obj: Any) -> bool:
     return hasattr(obj, "snapshot") and hasattr(obj, "restore")
 
 
-def _eval_on_snapshot(engine: Any, dt: float, cfg: BisectSolverConfig) -> tuple[bool, Metrics, Any]:
-    snap = None
-    # Prefer engine-level snapshot/restore; otherwise try common state attrs
-    state_holder = None
+def _engine_checkpoint(engine: Any, *, required: bool) -> tuple[Any, Any, dict[str, Any]]:
+    """Capture the engine or its conventional inner state plus clock fields."""
+
+    holder = None
+    snapshot = None
     if _has_snapshot_api(engine):
-        snap = engine.snapshot()
+        holder = engine
+        snapshot = engine.snapshot()
     else:
         for attr in ("s", "sim", "state"):
-            if hasattr(engine, attr):
-                candidate = getattr(engine, attr)
-                if _has_snapshot_api(candidate):
-                    state_holder = candidate
-                    try:
-                        snap = candidate.snapshot()
-                    except Exception:
-                        snap = None
-                    break
-        if snap is None and cfg.require_snapshot:
-            raise ValueError("No snapshot/restore available for bisect solver (engine or inner state)")
+            candidate = getattr(engine, attr, None)
+            if _has_snapshot_api(candidate):
+                holder = candidate
+                snapshot = candidate.snapshot()
+                break
+    if snapshot is None and required:
+        raise ValueError(
+            "No snapshot/restore available for bisect solver "
+            "(engine or conventional inner state)"
+        )
+    clocks = {
+        name: getattr(engine, name)
+        for name in ("world_time", "observer_time")
+        if hasattr(engine, name)
+    }
+    return holder, snapshot, clocks
 
-    # Sync from shared table before evaluation
-    # Explicit state table required; must be passed in by caller
-    raise NotImplementedError("sync_engine_from_table now requires explicit state_table; update call site to pass it.")
-    # ok, m = engine.step(dt)
-    # Roll back if we can; ignore errors
+
+def _restore_engine(
+    engine: Any,
+    checkpoint: tuple[Any, Any, dict[str, Any]],
+) -> None:
+    holder, snapshot, clocks = checkpoint
+    if holder is not None and snapshot is not None:
+        holder.restore(snapshot)
+    for name, value in clocks.items():
+        setattr(engine, name, value)
+
+
+def _call_engine_step(
+    engine: Any,
+    dt: float,
+    state_table: StateTable,
+) -> tuple[bool, Metrics]:
+    """Call the engine's declared step signature without masking body errors."""
+
+    step = getattr(engine, "step", None)
+    if not callable(step):
+        raise TypeError("bisect solver engine must provide step()")
+    parameters = inspect.signature(step).parameters
+    kwargs: dict[str, Any] = {}
+    if "state" in parameters:
+        kwargs["state"] = None
+    if "state_table" in parameters:
+        kwargs["state_table"] = state_table
+    result = step(float(dt), **kwargs)
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise TypeError("engine step must return at least (ok, Metrics)")
+    ok, metrics = result[0], result[1]
+    return bool(ok), coerce_metrics(metrics)
+
+
+def _advance_once(
+    engine: Any,
+    dt: float,
+    state_table: StateTable,
+    registration_name: str,
+) -> tuple[bool, Metrics]:
+    sync_engine_from_table(engine, registration_name, state_table)
+    ok, metrics = _call_engine_step(engine, dt, state_table)
+    if ok:
+        publish_engine_to_table(engine, registration_name, state_table)
+    return ok, metrics
+
+
+def _eval_on_snapshot(
+    engine: Any,
+    dt: float,
+    cfg: BisectSolverConfig,
+    *,
+    state_table: StateTable,
+    registration_name: str,
+) -> tuple[bool, Metrics]:
+    engine_checkpoint = _engine_checkpoint(
+        engine, required=cfg.require_snapshot
+    )
+    table_checkpoint = state_table.snapshot()
     try:
-        if snap is not None:
-            if state_holder is not None:
-                state_holder.restore(snap)
-            else:
-                engine.restore(snap)
-    except Exception:
-        pass
-    return bool(ok), m, snap
+        return _advance_once(
+            engine, dt, state_table, registration_name
+        )
+    finally:
+        _restore_engine(engine, engine_checkpoint)
+        state_table.restore(table_checkpoint)
 
 
-def solve_window_bisect(engine: Any, total_dt: float, cfg: BisectSolverConfig) -> Metrics:
+def solve_window_bisect(
+    engine: Any,
+    total_dt: float,
+    cfg: BisectSolverConfig,
+    *,
+    state_table: StateTable,
+    registration_name: str = "engine",
+) -> Metrics:
     """Advance ``engine`` by ``total_dt`` using bisection micro-steps.
 
     Returns the Metrics of the final micro-step.
     """
+    if state_table is None:
+        raise ValueError("bisect solver requires an explicit StateTable")
+    if not str(registration_name).strip():
+        raise ValueError("bisect solver requires a registration name")
+    if not total_dt >= 0.0:
+        raise ValueError("bisect solver total_dt must be non-negative")
+    if cfg.dt_min <= 0.0:
+        raise ValueError("bisect solver dt_min must be positive")
+    if cfg.dt_max is not None and cfg.dt_max <= 0.0:
+        raise ValueError("bisect solver dt_max must be positive")
+    if int(cfg.max_iters) < 1 or int(cfg.max_steps) < 1:
+        raise ValueError("bisect solver iteration budgets must be positive")
+    if cfg.monotonic not in ("increase", "decrease"):
+        raise ValueError("bisect solver monotonic must be increase or decrease")
+    if not cfg.require_snapshot:
+        raise ValueError(
+            "bisect solver requires transactional candidate evaluation"
+        )
+
     advanced = 0.0
+    steps = 0
     last_metrics = Metrics(0.0, 0.0, 0.0, 0.0)
     while (total_dt - advanced) > 1e-15:
+        steps += 1
+        if steps > int(cfg.max_steps):
+            raise RuntimeError(
+                "bisect solver exceeded its committed microstep budget"
+            )
         remainder = total_dt - advanced
         dt_lo = max(min(cfg.dt_min, remainder), 1e-30)
         dt_hi = min(cfg.dt_max if cfg.dt_max is not None else remainder, remainder)
 
         # Evaluate endpoints
-        ok_lo, m_lo, _ = _eval_on_snapshot(engine, dt_lo, cfg)
-        ok_hi, m_hi, _ = _eval_on_snapshot(engine, dt_hi, cfg)
+        ok_lo, m_lo = _eval_on_snapshot(
+            engine,
+            dt_lo,
+            cfg,
+            state_table=state_table,
+            registration_name=registration_name,
+        )
+        ok_hi, m_hi = _eval_on_snapshot(
+            engine,
+            dt_hi,
+            cfg,
+            state_table=state_table,
+            registration_name=registration_name,
+        )
         f_lo = _get_objective_value(m_lo, cfg) if ok_lo else float("inf")
         f_hi = _get_objective_value(m_hi, cfg) if ok_hi else float("inf")
 
@@ -158,7 +267,13 @@ def solve_window_bisect(engine: Any, total_dt: float, cfg: BisectSolverConfig) -
                 m_mid = m_hi
                 for _ in range(int(cfg.max_iters)):
                     mid = 0.5 * (lo + hi)
-                    ok_mid, m_mid, _ = _eval_on_snapshot(engine, mid, cfg)
+                    ok_mid, m_mid = _eval_on_snapshot(
+                        engine,
+                        mid,
+                        cfg,
+                        state_table=state_table,
+                        registration_name=registration_name,
+                    )
                     f_mid = _get_objective_value(m_mid, cfg) if ok_mid else float("inf")
                     if is_enabled():
                         dbg("solver").debug(
@@ -177,10 +292,20 @@ def solve_window_bisect(engine: Any, total_dt: float, cfg: BisectSolverConfig) -
                     # Max iters reached: pick midpoint
                     pick_dt, pick_m = 0.5 * (lo + hi), m_mid
 
-        # Commit chosen dt
-        # Sync from state table before commit, publish after commit
-    # Explicit state table required; must be passed in by caller
-    raise NotImplementedError("sync_engine_from_table/publish_engine_to_table now require explicit state_table; update call site to pass it.")
+        if pick_dt is None:
+            raise RuntimeError("bisect solver failed to select a timestep")
+        ok_commit, committed_metrics = _advance_once(
+            engine,
+            float(pick_dt),
+            state_table,
+            registration_name,
+        )
+        if not ok_commit:
+            raise RuntimeError(
+                f"bisect solver selected dt={pick_dt:.6g} but commit failed"
+            )
+        advanced += float(pick_dt)
+        last_metrics = committed_metrics
 
     return last_metrics
 

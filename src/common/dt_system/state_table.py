@@ -10,10 +10,15 @@ It uses duck-typed adapters to avoid tight coupling with specific engines.
 from __future__ import annotations
 
 
+import copy
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Optional
 
+import numpy as np
+
+from ..tensors.abstraction import AbstractTensor
+from .state_table_archive import StateTableArchive
 
 Key = Tuple[str, str, str]
 
@@ -36,6 +41,30 @@ class StateTable:
     # --- Identity registry ---
     # Each identity is a UUID mapping to a dict with at least 'pos' and 'mass'
     identity_registry: Dict[str, dict] = field(default_factory=dict)
+
+    def snapshot(self) -> "StateTable":
+        """Return an isolated checkpoint suitable for scientific rollback."""
+
+        return copy.deepcopy(self)
+
+    def restore(self, snapshot: "StateTable") -> None:
+        """Restore this table in place so existing references remain valid."""
+
+        if not isinstance(snapshot, StateTable):
+            raise TypeError("StateTable.restore requires a StateTable snapshot")
+        restored = copy.deepcopy(snapshot)
+        self.store = restored.store
+        self.group_to_vertices = restored.group_to_vertices
+        self.group_to_edges = restored.group_to_edges
+        self.group_to_faces = restored.group_to_faces
+        self.vertex_to_groups = restored.vertex_to_groups
+        self.edge_to_groups = restored.edge_to_groups
+        self.face_to_groups = restored.face_to_groups
+        self.identity_registry = restored.identity_registry
+        if hasattr(restored, "archive"):
+            self.archive = restored.archive
+        elif hasattr(self, "archive"):
+            delattr(self, "archive")
 
 
     def register_identity(self, pos: Any, mass: Any = 0.0, uuid_str: str = None, dedup: bool = False) -> str:
