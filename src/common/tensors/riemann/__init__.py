@@ -24,17 +24,27 @@ from .adaptive_triangulation import (
     TriangulationGeneration,
     TriangulationTolerance,
 )
+from .mesh_laplace import (
+    CotangentMeshGeometry,
+    MeshLaplaceResult,
+    build_cotangent_geometry,
+    mesh_laplace_beltrami,
+)
 
 __all__ = [
     "AdaptiveSurfaceTriangulator",
+    "CotangentMeshGeometry",
     "GeodesicConv3D",
     "HeatKernel3D",
     "ManifoldPackage",
+    "MeshLaplaceResult",
     "ParallelTransport",
     "RiemannGridBlock",
     "SpectralConv3D",
     "TriangulationGeneration",
     "TriangulationTolerance",
+    "build_cotangent_geometry",
+    "mesh_laplace_beltrami",
     "smooth_bins",
     "weight_decay",
 ]
