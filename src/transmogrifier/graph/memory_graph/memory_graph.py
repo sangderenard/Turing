@@ -10,7 +10,7 @@ import threading
 from uuid import uuid4
 
 from src.cells.simulator import Simulator
-from src.cells.cellsim.api.saline import SalinePressureAPI as SalineHydraulicSystem
+from src.cells.cellsim.api.saline import run_saline_sim
 from src.cells.cell_consts import Cell
 from .helpers.meta_graph_edge import META_GRAPH_TRANSFER_BUFFER_SIZE
 
@@ -310,7 +310,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         edge_size = ctypes.sizeof(EdgeEntry)
         self.hard_memory.region_manager.cells[3].salinity += edge_size  # 3 = 'edge'
-        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+        run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("edge", edge_size)
 
         if free_space is not None:
@@ -331,7 +331,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         parent_size = ctypes.sizeof(MetaGraphEdge)
         self.hard_memory.region_manager.cells[4].salinity += parent_size  # 4 = 'parent'
-        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+        run_saline_sim(self.hard_memory.region_manager)
         space = self.hard_memory.find_free_space("parent", parent_size)
         if space is None:
             self.emergency_reference = self.hard_memory.allocate_block(parent_size, (self.LINE_P, self.LINE_C))
@@ -470,7 +470,7 @@ class BitTensorMemoryGraph:
                 # System adaptation: set salinity and balance before allocation
                 header_size = self.header_size
                 self.hard_memory.region_manager.cells[0].salinity += header_size  # 0 = 'header'
-                SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+                run_saline_sim(self.hard_memory.region_manager)
                 free_space = self.hard_memory.find_free_space("header", header_size)
                 print(f"Debugging: Free space for header serialization: {free_space}")
                 if free_space is None:
@@ -540,7 +540,7 @@ class BitTensorMemoryGraph:
             # System adaptation: set salinity and balance before allocation
             child_size = ctypes.sizeof(MetaGraphEdge)
             self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-            SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+            run_saline_sim(self.hard_memory.region_manager)
             free_space = self.hard_memory.find_free_space("child", child_size)
         if not byref:
             new_child_entry = MetaGraphEdge()
@@ -728,7 +728,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         child_size = ctypes.sizeof(MetaGraphEdge)
         self.hard_memory.region_manager.cells[5].salinity += child_size  # 5 = 'child'
-        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+        run_saline_sim(self.hard_memory.region_manager)
         free_space = self.hard_memory.find_free_space("child", child_size)
         new_child = None
         if free_space == BitTensorMemory.ALLOCATION_FAILURE or free_space is None:
@@ -1308,7 +1308,7 @@ class BitTensorMemoryGraph:
         # System adaptation: set salinity and balance before allocation
         node_size = ctypes.sizeof(NodeEntry)
         self.hard_memory.region_manager.cells[2].salinity += node_size  # 2 = 'node'
-        SalineHydraulicSystem.run_saline_sim(self.hard_memory.region_manager)
+        run_saline_sim(self.hard_memory.region_manager)
         new_node_slot = self.hard_memory.find_free_space("node", node_size)
         if new_node_slot == BitTensorMemory.ALLOCATION_FAILURE:
             raise MemoryError("Failed to add node: no free space available after balancing")
