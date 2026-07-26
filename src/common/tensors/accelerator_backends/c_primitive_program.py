@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import prod
-import os
 from typing import Any, Mapping, Sequence
 
 from ..fused_ir import (
@@ -110,21 +109,6 @@ class _SlotPlan:
         slots = list(feeds) + [
             CTensor(shape) for _ in range(self.slot_count - self.feed_count)
         ]
-        calculator = None
-        calculator_mode = os.environ.get("TENSOR_CALCULATOR_PROGRAMS", "auto").lower()
-        use_calculator = calculator_mode in ("1", "true", "yes") or (
-            calculator_mode == "auto"
-            and int(os.environ.get("TENSOR_CALCULATOR_WORKERS", "0")) > 0
-        )
-        if use_calculator:
-            try:
-                from .native_calculator import get_native_calculator
-
-                calculator = get_native_calculator()
-            except Exception:
-                calculator = None
-        if calculator is not None:
-            return calculator.prepare_program(self, slots)
         return PreparedFusedProgram(
             self, slots, self.native_instructions(), prod(shape)
         )
