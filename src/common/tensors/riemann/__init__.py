@@ -19,4 +19,23 @@ from .transport import ParallelTransport
 from .heat import HeatKernel3D
 from .grid_block import RiemannGridBlock
 from .regularization import smooth_bins, weight_decay
+from .adaptive_triangulation import (
+    AdaptiveSurfaceTriangulator,
+    TriangulationGeneration,
+    TriangulationTolerance,
+)
+
+__all__ = [
+    "AdaptiveSurfaceTriangulator",
+    "GeodesicConv3D",
+    "HeatKernel3D",
+    "ManifoldPackage",
+    "ParallelTransport",
+    "RiemannGridBlock",
+    "SpectralConv3D",
+    "TriangulationGeneration",
+    "TriangulationTolerance",
+    "smooth_bins",
+    "weight_decay",
+]
 
