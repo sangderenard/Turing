@@ -247,7 +247,11 @@ class Turing:
         Write a single bit at index idx using mu.
         `bit1` is a length-1 bitstring.
         """
-        bit1 = bit1.copy() if isinstance(bit1, list) else [bit1]
+        # Preserve the backend's carrier type.  Wrapping every non-list
+        # carrier in a Python list breaks symbolic, tensor, and foreign
+        # backends even though the primitive contract deliberately treats the
+        # carrier as opaque.
+        bit1 = bit1.copy() if hasattr(bit1, "copy") else bit1
         n = self._len(tape)
         if not (0 <= idx < n):
             raise AlgebraViolation("write_bit: index out of bounds")

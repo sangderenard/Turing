@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, TYPE_CHECKING
 
 from ..transmogrifier.ssa import SSAValue, Instr
+from ..transmogrifier.process_op import ProcessOp
 
 if TYPE_CHECKING:  # pragma: no cover - optional heavy deps
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
@@ -35,12 +36,24 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
 
     for nid in order:
         data = pg.G.nodes[nid]
-        op = data.get("label")
+        process_op = data.get("process_op")
+        op = process_op.op if isinstance(process_op, ProcessOp) else data.get("label")
         expr_obj = data.get("expr_obj")
         if op is None and expr_obj is not None:
             op = type(expr_obj).__name__
-        parents = [p for p, _ in data.get("parents", [])]
-        res = values.setdefault(nid, SSAValue(nid))
+        parent_items = list(data.get("parents", []))
+        parents = [p for p, _ in parent_items]
+        roles = [role for _, role in parent_items]
+        tensor = process_op.tensor if isinstance(process_op, ProcessOp) else None
+        res = values.setdefault(
+            nid,
+            SSAValue(
+                nid,
+                dtype=tensor.dtype if tensor else None,
+                shape=tensor.shape if tensor else (),
+                device=tensor.device if tensor else None,
+            ),
+        )
 
         # Detect back-edges (loop-carried dependencies).  Any parent scheduled
         # at the same or a later level feeds a previous iteration and must be
@@ -49,9 +62,28 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
         if back_parents:
             phi_args = [values.setdefault(p, SSAValue(p)) for p in back_parents]
             instrs.append(Instr("phi", phi_args, res))
-            parents = [p for p in parents if p not in back_parents]
+            keep = [(p, role) for p, role in zip(parents, roles) if p not in back_parents]
+            parents = [p for p, _ in keep]
+            roles = [role for _, role in keep]
 
         args = [values.setdefault(p, SSAValue(p)) for p in parents]
-        instrs.append(Instr(op, args, res))
+        attributes = dict(process_op.attributes) if isinstance(process_op, ProcessOp) else {}
+        if isinstance(process_op, ProcessOp) and process_op.constant is not None:
+            attributes["value"] = process_op.constant
+        source = (
+            process_op.source.__dict__
+            if isinstance(process_op, ProcessOp) and process_op.source is not None
+            else None
+        )
+        instrs.append(
+            Instr(
+                op,
+                args,
+                res,
+                arg_roles=roles,
+                attributes=attributes,
+                source_span=source,
+            )
+        )
 
     return instrs

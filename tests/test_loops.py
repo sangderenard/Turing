@@ -6,7 +6,6 @@ from src.compiler.tape_compiler import TapeCompiler
 from src.compiler.process_graph_helper import provenance_to_process_graph, reduce_cycles_to_mu
 
 
-@pytest.mark.xfail(reason="ProcessGraph build_from_expression requires full memory context")
 def test_process_graph_ssa_and_compile():
     """End-to-end check from provenance -> ProcessGraph -> SSA -> tape instructions."""
     pg = ProvenanceGraph()
@@ -30,7 +29,6 @@ def test_process_graph_ssa_and_compile():
     assert any(ins.opcode == Opcode.NAND for ins in instructions)
 
 
-@pytest.mark.xfail(reason="ProcessGraph build_from_expression requires full memory context")
 def test_compile_pipeline_from_provenance():
     """``TapeCompiler.compile`` should route through SSA automatically."""
     pg = ProvenanceGraph()
@@ -48,7 +46,6 @@ def test_compile_pipeline_from_provenance():
     assert any(ins.opcode == Opcode.NAND for ins in instructions)
 
 
-@pytest.mark.xfail(reason="ProcessGraph build_from_expression requires full memory context")
 def test_provenance_to_process_graph_roundtrip():
     """Helper should expose ProcessGraph utilities for provenance data."""
     pg = ProvenanceGraph()

@@ -1,5 +1,6 @@
 from turtle import width
 import sympy
+import networkx as nx
 import numpy as np
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
@@ -172,10 +173,13 @@ class ExpressionTensor:
 
 
 class ProcessGraph:
-    def __init__(self, recombinatorics_level=0, expand_complex=False):
-        # replace networkx DiGraph with BitTensorMemoryGraph
-        self.MG = BitTensorMemoryGraph(size=0)
-        self.G = self.MG.G
+    def __init__(self, recombinatorics_level=0, expand_complex=False, materialize_memory=True):
+        # Translation and scheduling do not require a physical memory graph.
+        # Keep materialization opt-in at the call site so compiler front-ends
+        # can operate even when the experimental allocator is unavailable.
+        self.materialize_memory = materialize_memory
+        self.MG = BitTensorMemoryGraph(size=0) if materialize_memory else None
+        self.G = self.MG.G if self.MG is not None else nx.DiGraph()
         self.levels = {}
         self.node_map = {}
         # integer level for recombinatorics aggressiveness: 0=no, higher unlock more transforms
@@ -643,6 +647,8 @@ class ProcessGraph:
         """
         self.finalize_graph_with_outputs()  # ensure min_outputs satisfied
         self.levels = self.scheduler.compute_levels(method, order)
+        if not self.materialize_memory:
+            return self.levels
         
         
         self.proc_interference_graph, self.proc_lifespans = self.compute_asap_maxslack_interference(interference_mode)
@@ -686,9 +692,53 @@ class ProcessGraph:
         # bypass SymPy path for a recorded ProvenanceGraph
         from src.turing_machine.turing_provenance import ProvenanceGraph
         if isinstance(expr_or_tensor, ProvenanceGraph):
-            # wrap each ProvNode into an adapter exposing .args and .op for build_graph
-            self.build_graph(expr_or_tensor)
-            
+            # Provenance is already a graph.  Import it directly instead of
+            # asking the symbolic/AST introspector to interpret the recorder
+            # object itself.  Keep the provenance node ids stable so edges,
+            # schedules, and downstream SSA values all share one identity.
+            self.domain_shape = (1,)
+            self.roots = []
+            by_idx = {node.idx: node for node in expr_or_tensor.nodes}
+            incoming = {idx: [] for idx in by_idx}
+            outgoing = {idx: [] for idx in by_idx}
+            for edge in expr_or_tensor.edges:
+                role = f"arg{edge.arg_pos}"
+                incoming[edge.dst_idx].append((edge.src_idx, role))
+                outgoing[edge.src_idx].append((edge.dst_idx, role))
+
+            for idx, node in by_idx.items():
+                domain_node = DomainNode(shape=(1, 1, 1), unit_size=1)
+                domain_node.id = id(domain_node)
+                self.G.add_node(
+                    idx,
+                    label=node.op,
+                    type=node.op,
+                    expr_obj=node,
+                    extra_args={
+                        "kwargs": dict(node.kwargs),
+                        "arg_ids": tuple(node.args),
+                        "out_obj_id": node.out_obj_id,
+                    },
+                    domain_node=domain_node,
+                    store_id=None,
+                    parents=sorted(incoming[idx], key=lambda item: int(item[1][3:])),
+                    children=sorted(outgoing[idx], key=lambda item: int(item[1][3:])),
+                )
+                self.node_map[idx] = node
+
+            for edge in expr_or_tensor.edges:
+                role = f"arg{edge.arg_pos}"
+                graph_edge = Edge(
+                    id=(edge.src_idx, edge.dst_idx, "result", role),
+                    operation=None,
+                    source=edge.src_idx,
+                    target=edge.dst_idx,
+                    store_id=None,
+                )
+                self.G.add_edge(edge.src_idx, edge.dst_idx, extra=[graph_edge])
+
+            self.roots = [idx for idx in by_idx if not outgoing[idx]]
+            return self
 
         if isinstance(expr_or_tensor, tuple) and isinstance(expr_or_tensor[1], ExpressionTensor):
             registry, et = expr_or_tensor

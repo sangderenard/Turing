@@ -28,7 +28,7 @@
 # Imports
 # -----------------------------------------------------------------------------
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Callable, Union
+from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
 
 # -----------------------------------------------------------------------------
@@ -47,6 +47,8 @@ class SSAValue:
     """
     id: int
     dtype: Optional[str] = None
+    shape: tuple = ()
+    device: Optional[str] = None
 
     def name(self) -> str:
         """Return the textual SSA name in `%t<ID>` form."""
@@ -69,6 +71,9 @@ class Instr:
     op: str
     args: List[SSAValue]
     res: SSAValue
+    arg_roles: List[str] = field(default_factory=list)
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    source_span: Optional[Dict[str, Any]] = None
 
 from enum import Enum
 

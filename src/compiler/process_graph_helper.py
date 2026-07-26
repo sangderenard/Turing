@@ -91,7 +91,7 @@ def provenance_to_process_graph(pg: "ProvenanceGraph"):
     ProcessGraph internals.
     """
 
-    proc = ProcessGraph()
+    proc = ProcessGraph(materialize_memory=False)
     # ProcessGraph knows how to interpret a ProvenanceGraph and will translate
     # each node/edge into its own graph form.  We funnel all conversions through
     # this single entry point to avoid duplicate logic elsewhere.
