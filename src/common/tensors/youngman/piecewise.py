@@ -113,8 +113,8 @@ class SimplexBezierPatch:
         return np.all(barycentric >= -tolerance, axis=1)
 
     def _basis_bundle(
-        self, parameters: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self, parameters: np.ndarray, *, include_hessian: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         _, barycentric, inverse_edges = self._local_coordinates(parameters)
         sample_count = len(barycentric)
         control_count = len(self.multi_indices)
@@ -133,9 +133,12 @@ class SimplexBezierPatch:
         derivative_local = np.zeros(
             (sample_count, control_count, dimension), dtype=np.float64
         )
-        hessian_local = np.zeros(
-            (sample_count, control_count, dimension, dimension),
-            dtype=np.float64,
+        hessian_local = (
+            np.zeros(
+                (sample_count, control_count, dimension, dimension),
+                dtype=np.float64,
+            )
+            if include_hessian else None
         )
 
         for control, alpha in enumerate(self.multi_indices):
@@ -150,37 +153,40 @@ class SimplexBezierPatch:
                 derivative_local[:, control, :] += (
                     term[:, None] * lambda_gradient[source_axis]
                 )
-                for second_axis, second_exponent in enumerate(alpha):
-                    remaining = second_exponent - (
-                        1 if second_axis == source_axis else 0
-                    )
-                    if remaining <= 0:
-                        continue
-                    reduced_twice = reduced.copy()
-                    reduced_twice[second_axis] -= 1
-                    second_term = (
-                        coefficient
-                        * exponent
-                        * remaining
-                        * _monomial(barycentric, reduced_twice)
-                    )
-                    hessian_local[:, control, :, :] += (
-                        second_term[:, None, None]
-                        * np.outer(
-                            lambda_gradient[source_axis],
-                            lambda_gradient[second_axis],
+                if hessian_local is not None:
+                    for second_axis, second_exponent in enumerate(alpha):
+                        remaining = second_exponent - (
+                            1 if second_axis == source_axis else 0
                         )
-                    )
+                        if remaining <= 0:
+                            continue
+                        reduced_twice = reduced.copy()
+                        reduced_twice[second_axis] -= 1
+                        second_term = (
+                            coefficient
+                            * exponent
+                            * remaining
+                            * _monomial(barycentric, reduced_twice)
+                        )
+                        hessian_local[:, control, :, :] += (
+                            second_term[:, None, None]
+                            * np.outer(
+                                lambda_gradient[source_axis],
+                                lambda_gradient[second_axis],
+                            )
+                        )
 
         derivative_global = np.einsum(
             "nck,ak->nca", derivative_local, inverse_edges
         )
-        hessian_global = np.einsum(
-            "nckl,ak,bl->ncab",
-            hessian_local,
-            inverse_edges,
-            inverse_edges,
-        )
+        hessian_global = None
+        if hessian_local is not None:
+            hessian_global = np.einsum(
+                "nckl,ak,bl->ncab",
+                hessian_local,
+                inverse_edges,
+                inverse_edges,
+            )
         return basis, derivative_global, hessian_global
 
     def evaluate(self, parameters: np.ndarray) -> np.ndarray:
@@ -192,7 +198,8 @@ class SimplexBezierPatch:
         return np.einsum("ncd,cm->nmd", derivative, self.coefficients)
 
     def hessian(self, parameters: np.ndarray) -> np.ndarray:
-        _, _, hessian = self._basis_bundle(parameters)
+        _, _, hessian = self._basis_bundle(parameters, include_hessian=True)
+        assert hessian is not None
         return np.einsum("ncab,cm->nmab", hessian, self.coefficients)
 
     def spatial_position(

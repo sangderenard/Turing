@@ -3,9 +3,11 @@
 from .algorithm import (
     DomainTetrahedra,
     ExtractionResult,
+    MetricSampleTagBatch,
     SolverSampleBatch,
     compile_grid_domain,
     extract_isosurface,
+    metric_sample_tags,
     tetrahedra_from_grid_domain,
 )
 from .spline import (
@@ -27,6 +29,7 @@ __all__ = [
     "ControlPointBatch",
     "DomainTetrahedra",
     "ExtractionResult",
+    "MetricSampleTagBatch",
     "ParametricSpline",
     "PatchSampleBatch",
     "PiecewiseSplineGeneration",
@@ -38,6 +41,7 @@ __all__ = [
     "StreamingPiecewiseSplineEngine",
     "compile_grid_domain",
     "extract_isosurface",
+    "metric_sample_tags",
     "simplex_multi_indices",
     "tetrahedra_from_grid_domain",
 ]

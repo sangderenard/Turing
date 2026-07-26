@@ -38,6 +38,8 @@ class ExtractionResult:
     case_ids: np.ndarray
     elapsed_seconds: float
     solver_samples: Optional["SolverSampleBatch"] = None
+    parametric_triangles: Optional[np.ndarray] = None
+    triangle_tetrahedron_ids: Optional[np.ndarray] = None
 
     @property
     def triangle_count(self) -> int:
@@ -61,10 +63,68 @@ class SolverSampleBatch:
     interpolation_weights: np.ndarray
     embedded_points: np.ndarray
     parametric_points: Optional[np.ndarray] = None
+    metric_tags: Optional["MetricSampleTagBatch"] = None
 
     @property
     def sample_count(self) -> int:
         return int(self.embedded_points.shape[0])
+
+
+@dataclass(frozen=True)
+class MetricSampleTagBatch:
+    """Matrix-valued local geometry copied alongside solver movements."""
+
+    metric: np.ndarray
+    inverse_metric: np.ndarray
+    determinant: np.ndarray
+    parameter_positions: np.ndarray
+    patch_ids: np.ndarray
+    generation: Optional[int] = None
+    source: str = "source"
+
+    def __post_init__(self) -> None:
+        metric = np.asarray(self.metric, dtype=np.float64)
+        inverse = np.asarray(self.inverse_metric, dtype=np.float64)
+        determinant = np.asarray(self.determinant, dtype=np.float64)
+        parameters = np.asarray(self.parameter_positions, dtype=np.float64)
+        patch_ids = np.asarray(self.patch_ids, dtype=np.int64)
+        if metric.ndim != 3 or metric.shape[1] != metric.shape[2]:
+            raise ValueError("metric must have shape (N, d, d)")
+        if inverse.shape != metric.shape:
+            raise ValueError("inverse_metric must match metric")
+        if not (
+            len(metric) == len(determinant) == len(parameters) == len(patch_ids)
+        ):
+            raise ValueError("metric tag arrays need equal row counts")
+        object.__setattr__(self, "metric", metric)
+        object.__setattr__(self, "inverse_metric", inverse)
+        object.__setattr__(self, "determinant", determinant)
+        object.__setattr__(self, "parameter_positions", parameters)
+        object.__setattr__(self, "patch_ids", patch_ids)
+
+
+def metric_sample_tags(
+    parameters: np.ndarray,
+    patch_ids: np.ndarray,
+    metric: np.ndarray,
+    *,
+    generation: Optional[int] = None,
+    source: str = "source",
+) -> MetricSampleTagBatch:
+    """Build a validated metric-matrix sidecar without collapsing its axes."""
+    metric = np.asarray(metric, dtype=np.float64)
+    determinant = np.linalg.det(metric)
+    if np.any(determinant <= 0.0):
+        raise ValueError("metric matrices must be positive definite")
+    return MetricSampleTagBatch(
+        metric=metric,
+        inverse_metric=np.linalg.inv(metric),
+        determinant=determinant,
+        parameter_positions=np.asarray(parameters, dtype=np.float64),
+        patch_ids=np.asarray(patch_ids, dtype=np.int64),
+        generation=generation,
+        source=source,
+    )
 
 
 def compile_grid_domain(domain) -> DomainTetrahedra:
@@ -124,20 +184,34 @@ def sphere_field(
     return (relative * relative).sum(dim=-1) - radius * radius
 
 
-def _assemble_triangles(
-    crossings: np.ndarray, crossing_points: np.ndarray
-) -> np.ndarray:
-    """Turn tetrahedral edge crossings into consistently shaped triangles."""
-    triangles: list[np.ndarray] = []
-    for mask, points in zip(crossings, crossing_points):
+def _triangle_selections(crossings: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    """Return cell and edge selections shared by every coordinate system."""
+    selections: list[tuple[int, np.ndarray]] = []
+    for cell_id, mask in enumerate(crossings):
         active = np.flatnonzero(mask)
         if active.size == 3:
-            triangles.append(points[active])
+            selections.append((cell_id, active))
         elif active.size == 4:
-            quad = points[active]
-            triangles.extend((quad[[0, 1, 2]], quad[[0, 2, 3]]))
+            selections.extend(
+                (
+                    (cell_id, active[[0, 1, 2]]),
+                    (cell_id, active[[0, 2, 3]]),
+                )
+            )
+    return selections
+
+
+def _assemble_triangles(
+    selections: list[tuple[int, np.ndarray]], crossing_points: np.ndarray
+) -> np.ndarray:
+    """Apply one topology selection to points in any coordinate system."""
+    triangles: list[np.ndarray] = []
+    for cell_id, edge_ids in selections:
+        triangles.append(crossing_points[cell_id, edge_ids])
     if not triangles:
-        return np.empty((0, 3, 3), dtype=np.float64)
+        return np.empty(
+            (0, 3, crossing_points.shape[-1]), dtype=np.float64
+        )
     return np.asarray(triangles, dtype=np.float64)
 
 
@@ -186,10 +260,15 @@ def extract_isosurface(
     weight = (value_start / safe_denominator).reshape(tetrahedra.shape[0], 6, 1)
     crossing_points = edge_start + weight * (edge_end - edge_start)
     crossing_np = np.asarray(crossing_points.tolist(), dtype=np.float64)
-    triangles = _assemble_triangles(active_edges, crossing_np)
+    triangle_selections = _triangle_selections(active_edges)
+    triangles = _assemble_triangles(triangle_selections, crossing_np)
+    triangle_tetrahedron_ids = np.asarray(
+        [cell_id for cell_id, _ in triangle_selections], dtype=np.int64
+    )
     tetrahedron_ids, edge_ids = np.nonzero(active_edges)
     weights_np = np.asarray(weight.tolist(), dtype=np.float64)[..., 0]
     parametric_points = None
+    parametric_triangles = None
     if parametric_tetrahedra is not None:
         parametric_start = parametric_tetrahedra[:, _TETRA_EDGES[:, 0], :]
         parametric_end = parametric_tetrahedra[:, _TETRA_EDGES[:, 1], :]
@@ -198,6 +277,9 @@ def extract_isosurface(
             + weights_np[..., None] * (parametric_end - parametric_start)
         )
         parametric_points = parametric_crossings[active_edges]
+        parametric_triangles = _assemble_triangles(
+            triangle_selections, parametric_crossings
+        )
     solver_samples = SolverSampleBatch(
         tetrahedron_ids=tetrahedron_ids.astype(np.int64, copy=False),
         edge_ids=edge_ids.astype(np.int8, copy=False),
@@ -213,6 +295,8 @@ def extract_isosurface(
         case_ids=case_ids,
         elapsed_seconds=time.perf_counter() - started,
         solver_samples=solver_samples,
+        parametric_triangles=parametric_triangles,
+        triangle_tetrahedron_ids=triangle_tetrahedron_ids,
     )
 
 
