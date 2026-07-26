@@ -247,7 +247,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(g * y, x.shape)"
         },
-        "python":  {"parameters": ["g", "x", "y"], "body": "return unbroadcast(g * y, x.shape)"},
+        "python":  {"parameters": ["g", "x"], "body": "y=x.detach().exp(); return unbroadcast(g * y, x.shape)"},
         "domain": "x: any real",
         "notes": "Use forward output `y` if available for efficiency.",
         "tags": ["elementwise", "unary", "smooth"],
@@ -271,7 +271,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "backward": {
             "x": "gx = unbroadcast(0.5 * g / (y + eps), x.shape)"
         },
-        "python": {"parameters": ["g", "x", "y"], "body": "return unbroadcast(0.5 * g / (y + eps()), x.shape)"},
+        "python": {"parameters": ["g", "x"], "body": "y=x.detach().sqrt(); return unbroadcast(0.5 * g / (y + eps()), x.shape)"},
         "domain": "x >= 0; practical: x >= 0 with eps guard",
         "notes": "Prefer using forward output `y` for stability.",
         "tags": ["elementwise", "unary", "smooth", "domain"],
@@ -485,6 +485,28 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         "domain": "x>0 if p varies; if p is integer constant, extend by continuity.",
         "notes": "When p is constant, only x-branch is needed.",
         "tags": ["elementwise", "binary", "domain"],
+    },
+    "mod": {
+        "arity": "binary",
+        "signature": "z = x mod y",
+        "latex": [
+            r"\frac{\partial z}{\partial x}=1",
+            r"\frac{\partial z}{\partial y}=-\operatorname{floor}(x/y)",
+        ],
+        "backward": {
+            "x": "gx = unbroadcast(g, x.shape)",
+            "y": "gy = unbroadcast(-g * floor(x/y), y.shape)",
+        },
+        "python": {
+            "parameters": ["g", "x", "y"],
+            "body": (
+                "xd=x.detach(); yd=y.detach(); r=xd%yd; q=(xd-r)/yd; "
+                "return unbroadcast(g, x.shape), unbroadcast(-g*q, y.shape)"
+            ),
+        },
+        "domain": "y != 0; derivative is piecewise and undefined at jumps",
+        "notes": "Matches Python, NumPy, and Torch floor-remainder semantics.",
+        "tags": ["elementwise", "binary", "piecewise"],
     },
     "maximum": {
         "arity": "binary",

@@ -151,3 +151,18 @@ backend is already competitive on dense compositions but loses on the mesh
 task because many small gathers and realized intermediate tensors cross the
 CFFI boundary. Larger-size sweeps and allocation reuse are required before
 drawing performance conclusions.
+
+## Nodus interop and fused submission
+
+The canonical `CTensorOp` dispatch now has a narrow fused execution prototype:
+an equal-shape primitive program crosses CFFI once and executes a chain of
+unary, binary, comparison, and scalar operations in C. See
+`docs/C_NODUS_INTEROP_AND_FUSION.md` for the representation boundaries,
+autograd-trace compiler, stateful slot reuse, KernelIR relationship, and native
+handoff milestones. This is an interpreter and reference ABI prototype, not
+yet a register-fused generated kernel.
+
+Forward compiler capture is now independent of differentiation support. Tape
+nodes report whether backward is available, intentionally nondifferentiable,
+or genuinely missing, so captured workloads double as a backend/autograd
+development audit.

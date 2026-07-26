@@ -131,7 +131,7 @@
             case CT_OP_MUL: return a * b;
             case CT_OP_DIV: return a / b;
             case CT_OP_POW: return pow(a, b);
-            case CT_OP_MOD: return fmod(a, b);
+            case CT_OP_MOD: return a - floor(a / b) * b;
             case CT_OP_FLOORDIV: return floor(a / b);
             case CT_OP_LT: return a < b;
             case CT_OP_LE: return a <= b;
@@ -193,6 +193,89 @@
                 default: out[i] = value; break;
             }
         }
+    }
+
+    static int is_unary_op(int op) {
+        return op >= CT_OP_SQRT && op <= CT_OP_LOGICAL_NOT;
+    }
+
+    int ctensor_execute_primitive_program_slots(
+        const CTensorPrimitiveInstruction* instructions,
+        int instruction_count,
+        double* const* slots,
+        int slot_count,
+        int element_count) {
+        if (!instructions || !slots || instruction_count < 0 ||
+            slot_count < 1 || element_count < 0) {
+            return 0;
+        }
+        for (int step = 0; step < instruction_count; ++step) {
+            const CTensorPrimitiveInstruction* ins = &instructions[step];
+            if (ins->op < 0 || ins->op >= CT_OP_COUNT ||
+                ins->out_slot < 0 || ins->out_slot >= slot_count ||
+                ins->left_slot < 0 || ins->left_slot >= slot_count ||
+                !slots[ins->out_slot] || !slots[ins->left_slot]) {
+                return 0;
+            }
+            const double* left = slots[ins->left_slot];
+            double* dest = slots[ins->out_slot];
+            if (is_unary_op(ins->op)) {
+                if (ins->right_kind != CT_OPERAND_NONE) return 0;
+                unary_double(left, dest, element_count, ins->op);
+            } else if (ins->right_kind == CT_OPERAND_SLOT) {
+                if (ins->right_slot < 0 || ins->right_slot >= slot_count ||
+                    !slots[ins->right_slot]) {
+                    return 0;
+                }
+                binary_double(
+                    left, slots[ins->right_slot], dest, element_count, ins->op);
+            } else if (ins->right_kind == CT_OPERAND_SCALAR) {
+                binary_scalar_double(
+                    left, ins->right_scalar, dest, element_count, ins->op,
+                    ins->reverse);
+            } else {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    int ctensor_execute_primitive_program(
+        const CTensorPrimitiveInstruction* instructions,
+        int instruction_count,
+        const double* const* feeds,
+        int feed_count,
+        double* workspace,
+        int slot_count,
+        int element_count,
+        int output_slot,
+        double* output) {
+        if (!instructions || !workspace || !output || instruction_count < 0 ||
+            feed_count < 0 || feed_count > slot_count || element_count < 0 ||
+            output_slot < 0 || output_slot >= slot_count) {
+            return 0;
+        }
+        for (int slot = 0; slot < feed_count; ++slot) {
+            if (!feeds || !feeds[slot]) return 0;
+            memcpy(
+                workspace + (size_t)slot * element_count,
+                feeds[slot],
+                (size_t)element_count * sizeof(double));
+        }
+        double** slots = (double**)malloc((size_t)slot_count * sizeof(double*));
+        if (!slots) return 0;
+        for (int slot = 0; slot < slot_count; ++slot) {
+            slots[slot] = workspace + (size_t)slot * element_count;
+        }
+        int ok = ctensor_execute_primitive_program_slots(
+            instructions, instruction_count, slots, slot_count, element_count);
+        free(slots);
+        if (!ok) return 0;
+        memcpy(
+            output,
+            workspace + (size_t)output_slot * element_count,
+            (size_t)element_count * sizeof(double));
+        return 1;
     }
 
     void reduce_dim_double(

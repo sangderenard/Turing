@@ -38,4 +38,44 @@ typedef enum CTensorOp {
     CT_OP_COUNT
 } CTensorOp;
 
+/*
+ * A compact, elementwise execution packet.  This is deliberately named a
+ * primitive program rather than a tape: it is not an autograd tape, a path
+ * tape, or a general SSA graph.  Feed values occupy slots [0, feed_count);
+ * each instruction writes one complete, equally-shaped slot.
+ */
+typedef enum CTensorOperandKind {
+    CT_OPERAND_NONE = 0,
+    CT_OPERAND_SLOT,
+    CT_OPERAND_SCALAR
+} CTensorOperandKind;
+
+typedef struct CTensorPrimitiveInstruction {
+    CTensorOp op;
+    int out_slot;
+    int left_slot;
+    CTensorOperandKind right_kind;
+    int right_slot;
+    double right_scalar;
+    int reverse;
+} CTensorPrimitiveInstruction;
+
+int ctensor_execute_primitive_program(
+    const CTensorPrimitiveInstruction* instructions,
+    int instruction_count,
+    const double* const* feeds,
+    int feed_count,
+    double* workspace,
+    int slot_count,
+    int element_count,
+    int output_slot,
+    double* output);
+
+int ctensor_execute_primitive_program_slots(
+    const CTensorPrimitiveInstruction* instructions,
+    int instruction_count,
+    double* const* slots,
+    int slot_count,
+    int element_count);
+
 #endif

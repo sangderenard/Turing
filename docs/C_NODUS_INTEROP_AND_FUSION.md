@@ -1,0 +1,155 @@
+# C backend, Nodus interop, and fusion boundaries
+
+The C backend is the most direct native bridge from AbstractTensor to Nodus,
+but “native bridge” must not collapse the repository's several program-like
+representations into one. They encode different things at different levels.
+
+## The canonical primitive vocabulary
+
+`CTensorOp` in `ctensor_ops.h` is the canonical vocabulary of scalar and
+elementwise primitives lowered by the C backend. Its values are read from the
+compiled library by CFFI; Python does not maintain a second numeric table.
+Every binary, unary, and comparison operator reaches the C backend through
+AbstractTensor's one `_apply_operator__` method. Backend convenience hooks are
+thin adapters to that same path.
+
+This resolves the former structural defect in which binary operators used
+`_apply_operator__`, while unary and comparison operators used separate
+integer-dispatch side doors. It also gives Nodus's `KernelIR` a natural answer
+to its current missing detail: `UNARY`, `BINARY`, and `CMP` are useful coarse
+instruction classes, while a shared or mechanically translated `CTensorOp`
+identifies the operation within each class.
+
+The two projects should generate their enums from one schema before treating
+numeric values as a stable ABI. Until then, translate by symbolic name and
+version the serialized format.
+
+## Keep the representations distinct
+
+| Representation | Meaning | Appropriate use |
+|---|---|---|
+| AbstractTensor operator call | Backend-neutral mathematical intent | User algorithms and universal compositions |
+| Autograd tape/process graph | Differentiation provenance and scheduling | Gradient construction and training |
+| `FusedProgram` | Replayable AbstractTensor graph with feeds, state, metadata, and mode | Model-level capture and optimization input |
+| Transmogrifier SSA/rewrite forms | Compiler and graph-transformation research | Normalization and lowering experiments |
+| `CTensorOp` | Primitive native operation vocabulary | Shared semantic names and backend lowering |
+| `CTensorPrimitiveProgram` | Equal-shape elementwise execution packet | Amortizing Python/CFFI calls; native prototype |
+| Nodus `KernelIR` | Typed, low-level SSA compute kernel | CPU/GPU code generation and dispatch |
+| Nodus path/Kpath tapes | Spatial/tool trajectories and provenance | Geometry, motion, and media scheduling |
+| CTensor/Nodus tensor ABI | Buffer shape, dtype, strides, ownership, device | Zero-copy data exchange |
+
+In particular, an autograd tape is not a wire format, a path tape is not a
+compute instruction stream, and `FusedProgram` is not yet a KernelIR binary
+encoding.
+
+## First fused execution boundary
+
+`c_primitive_program.py` and `ctensor_execute_primitive_program` implement a
+deliberately narrow proof:
+
+1. Python submits an instruction array and its feeds once.
+2. C copies feeds into a contiguous slot workspace.
+3. C executes any chain of the canonical equal-shape unary, binary, comparison,
+   scalar, min, and max primitives.
+4. C copies the selected output slot back once.
+
+A four-operation sigmoid therefore crosses CFFI once rather than once for
+negation, exponentiation, addition, and division. The current interpreter
+still materializes one full slot per result. Its purpose is to prove the
+program boundary and opcode fluency, not to claim finished kernel fusion.
+
+The prepared form binds feeds and result slots once and reuses them. An
+initial Windows CPU measurement of a four-operation chain showed approximately
+2.2x lower dispatch time at 32 elements, 1.08x at 4,096 elements, and parity at
+262,144 elements. These are dispatch diagnostics, not general performance
+claims. At large sizes both paths still execute four C loops and incur the
+same intermediate-memory traffic.
+
+`autograd.forward_capture()` now records forward operations independently of
+backward-rule eligibility. Every operation node carries `backward_available`
+and a three-way `backward_status`: `available`, intentionally
+`nondifferentiable`, or `missing`. `missing_backward_ops()` is consequently a
+live development audit rather than a noisy list of predicates that should
+never receive gradients.
+
+Callers may supply temporary backward implementations either on capture with
+`autograd.forward_capture(backward_overrides={...})` or for one gradient run
+with `autograd.grad(..., backward_overrides={...})`. Call-time overrides take
+precedence over tape defaults and the global registry. Captured nodes label a
+tape-carried implementation as `override`; the registry is never mutated.
+This makes finite-difference or experimental numerical derivatives easy to
+inject without presenting them as canonical mathematics.
+
+`compile_elementwise_tape` proves that a real forward trace can be normalized
+into this program and replayed in C. A captured sigmoid arithmetic chain
+lowers to `neg`, `exp`, scalar `add`, and reverse scalar `truediv`, then crosses
+CFFI once. Smooth canonical unary paths (`exp`, `log`, `sqrt`) now preserve
+ordinary autograd connectivity; their backward rules run on both NumPy and C.
+Modulo also has a piecewise backward rule, and the C implementation was aligned
+with NumPy/Torch floor-remainder semantics for negative inputs.
+
+The next optimization is liveness-based slot reuse. After that, recognized
+straight-line subgraphs can be emitted as C loops so intermediates remain in
+registers:
+
+```text
+for i:
+    output[i] = 1 / (1 + exp(-input[i]))
+```
+
+That removes both repeated CFFI transitions and repeated full-array memory
+traffic. Existing Nodus microkernels such as fused add/multiply are useful
+specialized targets; they should be selected from the same normalized
+primitive program rather than exposed as unrelated AbstractTensor operators.
+
+## Two related routes
+
+The immediate native submission route is:
+
+```text
+AbstractTensor algorithm executed once on any backend
+  -> forward autograd trace
+  -> validated elementwise normalization
+  -> CTensor primitive program (portable interpreter/debug target)
+  -> one CFFI call, or the same native packet hosted directly by Nodus
+```
+
+The broader compiler route remains a separate Python responsibility:
+
+```text
+AbstractTensor/FusedProgram semantics
+  -> typed SSA with shapes, dtype, constants, and regions
+  -> SPIR-V-compatible operations
+  -> SPIR-V module
+```
+
+Nodus KernelIR is a compatibility and hosting target for that typed work, not
+a reason to move Turing's lowering compiler into Nodus. Only elementwise
+regions lower to the present primitive program. Reductions, matmul, indexing,
+FFT, geometry kernels, and stateful operations remain region boundaries until
+they receive explicit typed instructions. FFT continues to lower through
+`fftfree`; it should not be reimplemented as a primitive program.
+
+## Native handoff milestones
+
+1. Define a versioned schema that generates `CTensorOp` names for Python, C,
+   and Nodus, plus Nodus `UNARY/BINARY/CMP` sub-operations.
+2. Specify a shared tensor descriptor: dtype, rank, shape, strides, device,
+   ownership, lifetime, and error reporting. The current C backend is
+   double-only and contiguous; Nodus is primarily float32.
+3. Lower eligible forward autograd-trace regions to typed primitive programs,
+   with explicit constants and broadcasting rather than implicit Python
+   behavior.
+4. Add liveness allocation and direct output-buffer execution.
+5. Let Nodus consume the packet in-process, bypassing CFFI. Preserve the C
+   interpreter as the reference implementation and parity oracle. Keep the
+   Python-to-SPIR-V compiler as a distinct, higher-level effort.
+6. Add cost-based fusion: tiny chains benefit from fewer crossings, while
+   large kernels benefit most from eliminating intermediate memory traffic.
+7. Only then stabilize serialization and cache compiled KernelIR by program,
+   dtype, shape signature, and target capabilities.
+
+This route makes the C backend useful immediately while preserving clean
+ownership: Turing captures mathematical intent, the primitive schema gives
+the projects a shared language, and Nodus owns native scheduling and code
+generation.

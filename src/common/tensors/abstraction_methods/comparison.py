@@ -42,7 +42,7 @@ def isnan(self) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.isnan_()
     return result
 
@@ -50,7 +50,7 @@ def isfinite(self) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.isfinite_()
     return result
 
@@ -58,7 +58,7 @@ def isinf(self) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.isinf_()
     return result
 

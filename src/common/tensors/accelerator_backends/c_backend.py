@@ -55,6 +55,18 @@ ffi.cdef("""
         CT_OP_LOGICAL_NOT, CT_OP_LT, CT_OP_LE, CT_OP_GT, CT_OP_GE,
         CT_OP_EQ, CT_OP_NE, CT_OP_MAXIMUM, CT_OP_MINIMUM, ...
     } CTensorOp;
+    typedef enum CTensorOperandKind {
+        CT_OPERAND_NONE, CT_OPERAND_SLOT, CT_OPERAND_SCALAR
+    } CTensorOperandKind;
+    typedef struct CTensorPrimitiveInstruction {
+        CTensorOp op;
+        int out_slot;
+        int left_slot;
+        CTensorOperandKind right_kind;
+        int right_slot;
+        double right_scalar;
+        int reverse;
+    } CTensorPrimitiveInstruction;
     void fill_double(double* out, double value, int n);
     void binary_double(
         const double* a, const double* b, double* out, int n, int op);
@@ -62,6 +74,22 @@ ffi.cdef("""
         const double* a, double b, double* out, int n, int op, int reverse);
     void matmul_double(const double* a, const double* b, double* out, int m, int n, int p);
     void unary_double(const double* a, double* out, int n, int op);
+    int ctensor_execute_primitive_program(
+        const CTensorPrimitiveInstruction* instructions,
+        int instruction_count,
+        const double* const* feeds,
+        int feed_count,
+        double* workspace,
+        int slot_count,
+        int element_count,
+        int output_slot,
+        double* output);
+    int ctensor_execute_primitive_program_slots(
+        const CTensorPrimitiveInstruction* instructions,
+        int instruction_count,
+        double* const* slots,
+        int slot_count,
+        int element_count);
     void reduce_dim_double(
         const double* a, double* out, const int* shape, int ndim,
         int dim, int op);

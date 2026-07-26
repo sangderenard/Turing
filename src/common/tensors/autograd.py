@@ -31,6 +31,7 @@ def backward(
     grad_output=None,
     *,
     retain_graph: bool = False,
+    backward_overrides: Dict[str, Callable[..., Any]] | None = None,
 ):
     """Compute gradients for parameters with respect to this scalar tensor."""
     tape = getattr(self, "_tape", None) or autograd.tape
@@ -47,6 +48,7 @@ def backward(
         grad_outputs=grad_output,
         retain_graph=retain_graph,
         allow_unused=True,
+        backward_overrides=backward_overrides,
     )
     return None
 
@@ -141,6 +143,14 @@ import math
 import statistics
 import re
 
+_INTENTIONALLY_NONDIFFERENTIABLE = {
+    "round", "trunc", "floor", "ceil", "floordiv",
+    "isfinite", "isnan", "isinf", "logical_not", "invert",
+    "lt", "le", "gt", "ge", "eq", "ne",
+    "less", "less_equal", "greater", "greater_equal", "equal", "not_equal",
+    "logical_and", "logical_or", "logical_xor",
+}
+
 try:  # NumPy is an optional dependency for the repository
     import numpy as np
 except Exception:  # pragma: no cover - tested in environments without numpy
@@ -165,7 +175,9 @@ class GradTape:
     yields nodes in reverse topological order suitable for backprop.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, backward_overrides: Dict[str, Callable[..., Any]] | None = None
+    ) -> None:
         self._nodes: Dict[int, GradNode] = {}
         self.graph = nx.DiGraph()
         self._op_index = 0
@@ -174,6 +186,9 @@ class GradTape:
         self._param_index = 0
         self._loss_tensor: Any | None = None
         self._loss_id: int | None = None
+        self.backward_overrides: Dict[str, Callable[..., Any]] = dict(
+            backward_overrides or {}
+        )
         # Structural tensors are allowed to require_grad but are not treated
         # as trainable parameters and are excluded from parameter lists and
         # strict connectivity diagnostics.
@@ -438,6 +453,16 @@ class GradTape:
             inputs_payload = None
             result_payload = None
 
+        backward_status = (
+            "override"
+            if op in self.backward_overrides
+            else
+            "available"
+            if op in BACKWARD_REGISTRY._methods
+            else "nondifferentiable"
+            if op in _INTENTIONALLY_NONDIFFERENTIABLE
+            else "missing"
+        )
         ctx = {
             "inputs": list(inputs),
             "result": result,
@@ -457,6 +482,10 @@ class GradTape:
             "end": end,
             "elapsed": elapsed,
             "params": params or {},
+            "backward_available": (
+                op in self.backward_overrides or op in BACKWARD_REGISTRY._methods
+            ),
+            "backward_status": backward_status,
         }
         node = GradNode(op=op, parents=parent_ids, ctx=ctx)
         self._nodes[id(result)] = node
@@ -471,6 +500,10 @@ class GradTape:
             start=start,
             end=end,
             elapsed=elapsed,
+            backward_available=(
+                op in self.backward_overrides or op in BACKWARD_REGISTRY._methods
+            ),
+            backward_status=backward_status,
             ctx=ctx,
         )
         for t in inputs:
@@ -494,6 +527,24 @@ class GradTape:
         if "label" not in anns:
             self.annotate(result, label=op)
         return result
+
+    def missing_backward_ops(self) -> List[str]:
+        """Return captured operation names that have no registered backward."""
+        return sorted({
+            str(data.get("op"))
+            for _, data in self.graph.nodes(data=True)
+            if data.get("kind") == "op"
+            and data.get("backward_status") == "missing"
+        })
+
+    def nondifferentiable_ops(self) -> List[str]:
+        """Return captured operations explicitly classified as nondifferentiable."""
+        return sorted({
+            str(data.get("op"))
+            for _, data in self.graph.nodes(data=True)
+            if data.get("kind") == "op"
+            and data.get("backward_status") == "nondifferentiable"
+        })
 
     # ------------------------------------------------------------------
     # metadata utilities
@@ -863,6 +914,32 @@ class Autograd:
         finally:
             self._no_grad_depth -= 1
 
+    @contextmanager
+    def forward_capture(
+        self,
+        tape: GradTape | None = None,
+        *,
+        backward_overrides: Dict[str, Callable[..., Any]] | None = None,
+    ) -> Generator[GradTape, None, None]:
+        """Capture forward operations without requiring backward rules.
+
+        A fresh tape is used by default and the previous global tape/capture
+        state is restored on exit.  This is the compiler-tracing path; it does
+        not promise that the captured operations are differentiable.
+        """
+        previous_tape = self.tape
+        previous_capture_all = self.capture_all
+        capture_tape = tape or GradTape(backward_overrides)
+        if tape is not None and backward_overrides:
+            capture_tape.backward_overrides.update(backward_overrides)
+        self.tape = capture_tape
+        self.capture_all = True
+        try:
+            yield capture_tape
+        finally:
+            self.capture_all = previous_capture_all
+            self.tape = previous_tape
+
     # ------------------------------------------------------------------
     # Strict-mode allowlist helpers
     # ------------------------------------------------------------------
@@ -920,7 +997,9 @@ class Autograd:
         """Record an operation on the appropriate tape if supported."""
 
         op = {"truediv": "div"}.get(op, op)
-        if op not in BACKWARD_REGISTRY._methods or self._no_grad_depth > 0:
+        if self._no_grad_depth > 0:
+            return result
+        if op not in BACKWARD_REGISTRY._methods and not self.capture_all:
             return result
         tape = getattr(result, "_tape", None)
         if tape is None:
@@ -952,13 +1031,22 @@ class Autograd:
         grad_outputs: Any | None = None,
         retain_graph: bool = False,
         allow_unused: bool = False,
+        backward_overrides: Dict[str, Callable[..., Any]] | None = None,
     ) -> List[Any]:
+        tape_for_output = getattr(output, "_tape", self.tape)
+        effective_overrides = dict(
+            getattr(tape_for_output, "backward_overrides", {})
+        )
+        effective_overrides.update(backward_overrides or {})
         # Strict-mode preflight: fail fast on missing backward ops
         if self.strict:
             # Always validate on the tape that produced the output, not the engine tape.
             tape_v = getattr(output, "_tape", self.tape)
             try:
-                missing = tape_v.validate_backward_ops(output)
+                missing = [
+                    item for item in tape_v.validate_backward_ops(output)
+                    if item.get("op") not in effective_overrides
+                ]
             except Exception:
                 missing = []
             if missing:
@@ -1095,7 +1183,7 @@ class Autograd:
         if out_grad is None:
             out_grad = output.ones_like()
 
-        tape = getattr(output, "_tape", self.tape)
+        tape = tape_for_output
         grad_map: Dict[int, Any] = {id(output): out_grad}
 
         with self.no_grad():
@@ -1103,7 +1191,9 @@ class Autograd:
                 grad_out = grad_map.get(tid)
                 if grad_out is None:
                     continue
-                bw = BACKWARD_REGISTRY._methods.get(node.op)
+                bw = effective_overrides.get(node.op)
+                if bw is None:
+                    bw = BACKWARD_REGISTRY._methods.get(node.op)
                 if bw is None:
                     continue
                 go = grad_out

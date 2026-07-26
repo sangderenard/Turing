@@ -215,10 +215,11 @@ def maximum(self, other):
         self = AbstractTensor.tensor(self)
     if not isinstance(other, AbstractTensor):
         other = AbstractTensor.tensor(other)
+    finalize = AbstractTensor._pre_autograd("maximum", [self, other])
     other_arg = other.data
     result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.maximum_(other_arg)
-    return result
+    return finalize(result)
 
 
 def minimum(self, other):
@@ -228,10 +229,11 @@ def minimum(self, other):
         self = AbstractTensor.tensor(self)
     if not isinstance(other, AbstractTensor):
         other = AbstractTensor.tensor(other)
+    finalize = AbstractTensor._pre_autograd("minimum", [self, other])
     other_arg = other.data
     result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
     result.data = self.minimum_(other_arg)
-    return result
+    return finalize(result)
 
 # ----------------- Tiny user-facing shims (preserve real op names) ----------
 def __eq__(self, other):         return self._v2_valuewise("equal", other, annotate={"op":"equal"})

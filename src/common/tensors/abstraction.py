@@ -431,37 +431,41 @@ class AbstractTensor:
 
     # --- Logical ---
     def logical_not(self) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd("logical_not", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.logical_not_()
-        return result
+        return finalize(result)
 
     def logical_not_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement logical_not_()")
 
     # --- Unary math ---
     def sqrt(self) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd("sqrt", [self])
         if isinstance(self, AbstractTensor):
             result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         else:
             result = AbstractTensor.get_tensor(self.data, track_time=False)
         result.data = self.sqrt_()
-        return result
+        return finalize(result)
 
     def sqrt_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement sqrt_()")
 
     def exp(self) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd("exp", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.exp_()
-        return result
+        return finalize(result)
 
     def exp_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement exp_()")
 
     def log(self) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd("log", [self])
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.log_()
-        return result
+        return finalize(result)
 
     def log_(self):
         raise NotImplementedError(f"{self.__class__.__name__} must implement log_()")
