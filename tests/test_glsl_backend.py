@@ -335,8 +335,15 @@ def test_emitter_rejects_both_operand_kinds():
 
 def test_mod_is_floored_not_glsl_mod():
     """C and numpy use floored modulo; GLSL's mod() is not guaranteed to match."""
-    src = emit_op_source("mod")
-    assert "floor(" in src and "mod(" not in src.split("void main")[1]
+    float_src = emit_op_source("mod")
+    int_src = emit_op_source(
+        "mod",
+        left_dtype=np.int32,
+        right_dtype=np.int32,
+        output_dtype=np.int32,
+    )
+    assert "floor(" in float_src and "mod(" not in float_src.split("void main")[1]
+    assert "floor_div_i(" in int_src
 
 
 def test_round_is_half_away_from_zero():
@@ -429,6 +436,24 @@ def test_binary_ops_match_numpy(gl, op):
     b = rng.uniform(0.5, 4.0, size=257).astype(np.float32)
     got = run_op(op, a, b).numpy()
     np.testing.assert_allclose(got, BINARY_CASES[op](a, b), rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("op", ["floordiv", "mod"])
+def test_signed_integer_division_matches_numpy_for_negative_values(gl, op):
+    """PCM byte extraction depends on Python/NumPy floor semantics for negatives."""
+    a = np.array(
+        [-65535, -32768, -16384, -300, -257, -256, -255, -44, -1,
+         0, 1, 255, 256, 257],
+        dtype=np.int32,
+    )
+    for divisor in (256, 65536):
+        got = run_op(op, a, divisor).numpy()
+        expected = (
+            np.floor_divide(a, divisor)
+            if op == "floordiv"
+            else np.mod(a, divisor)
+        )
+        np.testing.assert_array_equal(got, expected)
 
 
 UNARY_CASES = {

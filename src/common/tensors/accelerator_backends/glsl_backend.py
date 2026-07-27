@@ -1170,7 +1170,10 @@ def _typed_expr(
             "int floor_div_i(int x, int y) {\n"
             "    int q = x / y;\n"
             "    int r = x % y;\n"
-            "    return q - int((r != 0) && ((r < 0) != (y < 0)));\n"
+            "    if ((r != 0) && ((x < 0) != (y < 0))) {\n"
+            "        q -= 1;\n"
+            "    }\n"
+            "    return q;\n"
             "}\n"
         )
         if op == "floordiv":

@@ -10,7 +10,7 @@ from src.common.tensors.compression.pcm import (
 )
 
 
-@pytest.mark.parametrize("backend", ["numpy", "torch", "c"])
+@pytest.mark.parametrize("backend", ["numpy", "torch", "c", "glsl"])
 def test_s16_pcm_quantization_is_backend_independent(backend):
     pcm_format = PCMFormat(sample_rate=48_000, channels=1)
     with AT.use_backend(backend):
