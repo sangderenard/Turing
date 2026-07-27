@@ -468,6 +468,7 @@ class ProcessGraph:
         semantic=True,
         filename=None,
         entrypoint=None,
+        profile="complete",
         **kwargs,
     ):
         """Import Python source into this ProcessGraph.
@@ -486,6 +487,7 @@ class ProcessGraph:
                 node_or_path,
                 filename=filename,
                 entrypoint=entrypoint,
+                profile=profile,
             )
 
         import ast

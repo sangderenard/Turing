@@ -10,24 +10,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .demo_mandelbrot_fusion import (
-    mandelbrot_jpeg_planes,
-    parametric_mandelbrot_escape,
-)
-from ..compression.jpeg.frame import encode_ycbcr_jfif
+from ..abstraction import AbstractTensor
 
 
 def mandelbrot_jpeg_master(
-    unit_x,
-    unit_y,
-    center_x,
-    center_y,
-    span,
-    family_mix,
-    julia_x,
-    julia_y,
-    palette_phase,
-    color_drive,
+    unit_x: AbstractTensor,
+    unit_y: AbstractTensor,
+    center_x: AbstractTensor,
+    center_y: AbstractTensor,
+    span: AbstractTensor,
+    family_mix: AbstractTensor,
+    julia_x: AbstractTensor,
+    julia_y: AbstractTensor,
+    palette_phase: AbstractTensor,
+    color_drive: AbstractTensor,
     *,
     width: int,
     height: int,
@@ -35,6 +31,15 @@ def mandelbrot_jpeg_master(
     resources,
 ):
     """Compose the original solve and complete 4:4:4 JFIF encoder."""
+
+    # Avoid eagerly importing the demo/UI module from this source-compiler
+    # entrypoint. The AST resolves these original definitions from the supplied
+    # source bundle; ordinary execution imports them when the master is called.
+    from .demo_mandelbrot_fusion import (
+        mandelbrot_jpeg_planes,
+        parametric_mandelbrot_escape,
+    )
+    from ..compression.jpeg.frame import encode_ycbcr_jfif
 
     counts = parametric_mandelbrot_escape(
         unit_x,
@@ -79,8 +84,15 @@ def mandelbrot_encoder_source_files() -> tuple[Path, ...]:
     return tuple(sources)
 
 
-def build_mandelbrot_encoder_process_graph():
-    """Ingest the complete source bundle without executing the program."""
+def build_mandelbrot_encoder_process_graph(
+    *,
+    profile: str = "tensor_control",
+):
+    """Ingest the source bundle without executing the program.
+
+    The default graph is the compiler-facing tensor/control projection.
+    Request ``profile="complete"`` for syntax-coverage and archaeology audits.
+    """
 
     from ....transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -88,6 +100,7 @@ def build_mandelbrot_encoder_process_graph():
     graph.build_from_ast(
         mandelbrot_encoder_source_files(),
         entrypoint="mandelbrot_jpeg_master",
+        profile=profile,
     )
     return graph
 

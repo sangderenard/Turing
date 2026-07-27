@@ -4,8 +4,9 @@ The compiler path is:
 
 ```text
 Python AST
-  -> ProcessGraph.build_from_ast(semantic=True)
-       (one or several files; functions, control, and canonical tensor calls)
+  -> ProcessGraph.build_from_ast(
+       semantic=True, profile="tensor_control")
+       (Python control + AbstractTensor operations + host boundaries)
   -> optional Turing-provenance BitOps primitive expansion
        (Python-list or AbstractTensor carrier)
   -> metadata-rich SSA
@@ -50,7 +51,20 @@ provenance can be spliced into the source ProcessGraph through
 
 ## Natural tensor source
 
-The semantic AST importer recognizes canonical tensor operation spellings in
+The semantic AST importer is not intended to compile all of Python. It uses
+Python syntax to recover process flow around a smaller executable language:
+AbstractTensor operations. The compiler-facing `tensor_control` profile keeps
+tensor-valued dataflow, the loops/branches/contexts that govern it, required
+shape and scalar dependencies, and explicit host materialization boundaries.
+Imports, formatting, UI code, unused helpers, and validation-only branches do
+not enter backend partitioning.
+
+The optional `complete` profile preserves every recognized syntax node for
+coverage audits and source archaeology. It is deliberately not the graph sent
+to GLSL. On the current Mandelbrot/compression source bundle, the complete
+graph has 11,928 nodes while the compiler projection has 1,916 nodes.
+
+The importer recognizes canonical tensor operation spellings in
 both method and function form. For example,
 `tanh((x + y).sin())` enters the graph as `add -> sin -> tanh`, rather than as
 opaque Python calls. The recognized names come from the established fused
@@ -60,18 +74,21 @@ only resolves syntax and never supplies alternate numerical implementations.
 Multi-file ingestion registers definitions before visiting bodies. Calls then
 link to their original function/class regions, and an entrypoint identifies one
 master program without copying those functions into a generated source file.
-Loops, indexing, slices, contexts, generators, containers, comprehensions,
-exceptions, attributes, mutation, functions, and classes remain explicit
-ProcessGraph nodes. The generic structural fallback reads the established
-`operator_defs.role_schemas`; it is not a second AST schema.
+In the complete audit graph, loops, indexing, slices, contexts, generators,
+containers, comprehensions, exceptions, attributes, mutation, functions, and
+classes remain explicit ProcessGraph nodes. The generic structural fallback
+reads the established `operator_defs.role_schemas`; it is not a second AST
+schema. The tensor/control projection then removes nodes that do not
+participate in the selected entrypoint's tensor process.
 
 The reduction boundaries remain unchanged:
 
 - canonical tensor arithmetic uses the established AbstractTensor/FusedProgram
   vocabulary and SSA correlation;
-- integer-capable arithmetic and bitwise nodes are only marked as candidates
-  for `expand_bitops_process_graph`, which continues to obtain implementations
-  exclusively from `BitOpsTranslator` and Turing provenance;
+- operations advertise whether BitOps can implement them, but are selected as
+  BitOps candidates only after dtype inference proves an integer/bit domain;
+  expansion continues to obtain implementations exclusively from
+  `BitOpsTranslator` and Turing provenance;
 - symbolic SymPy expressions continue through
   `ProcessGraph.build_from_expression` and the SymPy/SSA registry.
 

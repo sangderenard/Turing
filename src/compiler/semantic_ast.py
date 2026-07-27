@@ -94,6 +94,64 @@ _TENSOR_CALL_ALIASES = {
     "zeros": "zeros",
 }
 
+_CONTROL_OPS = {
+    "async_for",
+    "async_with",
+    "await",
+    "break",
+    "continue",
+    "for",
+    "if",
+    "iteration_item",
+    "loop_result",
+    "return",
+    "select",
+    "try",
+    "while",
+    "with",
+    "yield",
+    "yield_from",
+}
+
+_TENSOR_VALUE_OPS = {
+    *_TENSOR_CALL_ALIASES.values(),
+    *_BINARY_OPS.values(),
+    *_COMPARE_OPS.values(),
+    "index",
+    "index_set",
+    "logical_and",
+    "logical_not",
+    "logical_or",
+    "neg",
+    "positive",
+    "select",
+    "tuple_get",
+}
+
+_TENSOR_CONTAINER_OPS = {
+    "dict",
+    "list",
+    "list_comp",
+    "set",
+    "set_comp",
+    "tuple",
+}
+
+_TENSOR_METADATA_ATTRIBUTES = {
+    "device",
+    "dtype",
+    "ndim",
+    "ndims",
+    "shape",
+}
+
+_HOST_BOUNDARY_METHODS = {
+    "item",
+    "numpy",
+    "to_bytes",
+    "tolist",
+}
+
 
 def _snake(name: str) -> str:
     out: list[str] = []
@@ -200,7 +258,9 @@ class SemanticAstBuilder:
         # actual integer expansion remains exclusively in
         # expand_bitops_process_graph/BitOpsTranslator.
         if op in BITOPS_EXPANDABLE_OPS:
-            attrs.setdefault("bitops_candidate", True)
+            # Capability metadata only. Selection is deferred until dtype
+            # inference proves this value belongs to an integer/bit domain.
+            attrs.setdefault("bitops_capable", True)
         handler = SSARegistry.name_map.get(op.lower())
         if handler is not None:
             attrs.setdefault("ssa_handler", str(handler))
@@ -552,6 +612,7 @@ class SemanticAstBuilder:
                 "function": function_text,
                 "resolved": callee is not None,
                 "callee": callee,
+                "constructed_type": constructed_type,
             },
             source=node,
         )
@@ -915,7 +976,15 @@ class SemanticAstBuilder:
             value = self.add(
                 "input",
                 label=argument.arg,
-                attributes={"name": argument.arg, "function": node.name},
+                attributes={
+                    "name": argument.arg,
+                    "function": node.name,
+                    "annotation": (
+                        ast.unparse(argument.annotation)
+                        if argument.annotation is not None
+                        else None
+                    ),
+                },
                 source=argument,
                 output_roles=("value",),
             )
@@ -1015,6 +1084,182 @@ class SemanticAstBuilder:
                         self.definitions.setdefault(node.name, definition)
                     self.definition_asts.append((node, filename, node.name))
 
+    def _annotate_semantic_domains(self) -> None:
+        """Mark the small compiler surface hidden inside the Python AST.
+
+        Python is the control language here, not the numerical IR.  This pass
+        identifies tensor-valued dataflow, control nodes, and explicit host
+        boundaries without attempting to assign executable semantics to every
+        Python object in the source bundle.
+        """
+
+        tensor_values: set[int] = set()
+        tensor_containers: set[int] = set()
+        tensor_metadata: set[int] = set()
+
+        for node_id, data in self.graph.G.nodes(data=True):
+            attrs = data.get("attributes") or {}
+            annotation = str(attrs.get("annotation") or "")
+            spelling = str(attrs.get("spelling") or "")
+            function = str(attrs.get("function") or "")
+            if data.get("op") == "input" and "AbstractTensor" in annotation:
+                tensor_values.add(node_id)
+            if spelling.startswith("AbstractTensor.") or function.startswith(
+                "AbstractTensor."
+            ):
+                tensor_values.add(node_id)
+
+        changed = True
+        while changed:
+            changed = False
+
+            # A resolved Python call carries tensor arguments into the
+            # corresponding function parameters. This is type flow, not call
+            # execution or function inlining.
+            for call_id, call_data in self.graph.G.nodes(data=True):
+                if call_data.get("op") != "call":
+                    continue
+                attrs = call_data.get("attributes") or {}
+                callee = attrs.get("callee")
+                if callee not in self.graph.G:
+                    continue
+                parameters = [
+                    child
+                    for child in self.graph.G.successors(callee)
+                    if self.graph.G.edges[callee, child].get("role")
+                    == "parameter"
+                ]
+                positional = [
+                    parent
+                    for parent, role in call_data.get("parents") or ()
+                    if role.startswith("arg") or role == "self"
+                ]
+                keywords = {
+                    role[3:]: parent
+                    for parent, role in call_data.get("parents") or ()
+                    if role.startswith("kw:") and role != "kw:**"
+                }
+                for index, parameter in enumerate(parameters):
+                    parameter_name = str(
+                        (self.graph.G.nodes[parameter].get("attributes") or {})
+                        .get("name", "")
+                    )
+                    argument = (
+                        positional[index]
+                        if index < len(positional)
+                        else keywords.get(parameter_name)
+                    )
+                    if argument in tensor_values | tensor_containers:
+                        target = (
+                            tensor_containers
+                            if argument in tensor_containers
+                            else tensor_values
+                        )
+                        if parameter not in target:
+                            target.add(parameter)
+                            changed = True
+
+            for node_id, data in self.graph.G.nodes(data=True):
+                op = str(data.get("op") or "")
+                attrs = data.get("attributes") or {}
+                parents = [
+                    parent for parent, _ in data.get("parents") or ()
+                ]
+                parent_is_tensor = any(
+                    parent in tensor_values or parent in tensor_containers
+                    for parent in parents
+                )
+
+                if op == "attribute" and parents:
+                    attribute = str(attrs.get("attribute") or "")
+                    if (
+                        parents[0] in tensor_values | tensor_containers
+                        and attribute in _TENSOR_METADATA_ATTRIBUTES
+                        and node_id not in tensor_metadata
+                    ):
+                        tensor_metadata.add(node_id)
+                        changed = True
+                    continue
+
+                if op in _TENSOR_CONTAINER_OPS and parent_is_tensor:
+                    if node_id not in tensor_containers:
+                        tensor_containers.add(node_id)
+                        changed = True
+                    continue
+
+                if op == "call":
+                    function = str(attrs.get("function") or "")
+                    method = function.rsplit(".", 1)[-1]
+                    if method in _HOST_BOUNDARY_METHODS:
+                        continue
+                    callee = attrs.get("callee")
+                    if callee in self.graph.G:
+                        returns_tensor = any(
+                            self.graph.G.nodes[return_id].get("op") == "return"
+                            and any(
+                                parent in tensor_values
+                                or parent in tensor_containers
+                                for parent, _ in self.graph.G.nodes[
+                                    return_id
+                                ].get("parents", ())
+                            )
+                            for return_id in self.graph.G.successors(callee)
+                        )
+                        if returns_tensor and node_id not in tensor_values:
+                            tensor_values.add(node_id)
+                            changed = True
+                    elif attrs.get("constructed_type") and parent_is_tensor:
+                        if node_id not in tensor_containers:
+                            tensor_containers.add(node_id)
+                            changed = True
+                    continue
+
+                if op in _TENSOR_VALUE_OPS and parent_is_tensor:
+                    if node_id not in tensor_values:
+                        tensor_values.add(node_id)
+                        changed = True
+
+        for node_id, data in self.graph.G.nodes(data=True):
+            op = str(data.get("op") or "")
+            attrs = data.get("attributes") or {}
+            function = str(attrs.get("function") or "")
+            method = function.rsplit(".", 1)[-1]
+            if node_id in tensor_values:
+                attrs["semantic_kind"] = (
+                    "tensor_input"
+                    if op in {"input", "lambda_input", "vararg", "kwarg"}
+                    else "tensor_operation"
+                )
+                attrs["execution_domain"] = "abstract_tensor"
+                attrs["tensor_value"] = True
+            elif node_id in tensor_containers:
+                attrs["semantic_kind"] = "tensor_container"
+                attrs["execution_domain"] = "abstract_tensor"
+                attrs["tensor_value"] = True
+            elif node_id in tensor_metadata:
+                attrs["semantic_kind"] = "tensor_metadata"
+                attrs["execution_domain"] = "scalar"
+            elif op in _CONTROL_OPS:
+                attrs["semantic_kind"] = "control"
+                attrs["execution_domain"] = "python_control"
+            elif op == "call" and method in _HOST_BOUNDARY_METHODS:
+                attrs["semantic_kind"] = "host_boundary"
+                attrs["execution_domain"] = "host"
+            elif op == "call" and attrs.get("resolved"):
+                attrs["semantic_kind"] = "process_call"
+                attrs["execution_domain"] = "python_control"
+            else:
+                attrs.setdefault("semantic_kind", "python_support")
+                attrs.setdefault("execution_domain", "python")
+
+            # BitOps eligibility is a separate, deliberately conservative
+            # decision. AbstractTensor arithmetic is not bit arithmetic merely
+            # because the operator has a BitOps implementation.
+            if attrs.get("bitops_capable"):
+                attrs["bitops_candidate"] = bool(
+                    attrs.get("dtype_domain") in {"bit", "integer"}
+                )
+
     def build(
         self,
         trees: list[tuple[ast.AST, str]],
@@ -1105,6 +1350,7 @@ class SemanticAstBuilder:
                 ]
             else:
                 self.graph.G.add_edge(source, target, role="invokes")
+        self._annotate_semantic_domains()
         self.graph.domain_shape = (1,)
         return self.graph
 
@@ -1115,11 +1361,158 @@ def build_semantic_process_graph(
     *,
     filename: str | None = None,
     entrypoint: str | None = None,
+    profile: str = "complete",
 ):
-    """Ingest one or several Python sources into ``graph``."""
+    """Ingest Python control and tensor operations into ``graph``.
+
+    ``complete`` preserves every recognized Python syntax node for auditing.
+    ``tensor_control`` projects that audit graph to the AbstractTensor
+    operations, governing Python control flow, dependencies, and explicit host
+    boundaries that a backend compiler actually needs.
+    """
 
     trees = _read_sources(sources, filename=filename)
-    return SemanticAstBuilder(graph).build(trees, entrypoint=entrypoint)
+    SemanticAstBuilder(graph).build(trees, entrypoint=entrypoint)
+    if profile == "complete":
+        graph.G.graph["semantic_profile"] = profile
+        return graph
+    if profile != "tensor_control":
+        raise ValueError(
+            "semantic AST profile must be 'complete' or 'tensor_control'"
+        )
+    if entrypoint is None:
+        raise ValueError("tensor_control profile requires an entrypoint")
+    return project_tensor_control_graph(graph)
 
 
-__all__ = ["SemanticAstBuilder", "build_semantic_process_graph"]
+def project_tensor_control_graph(graph):
+    """Discard Python noise while retaining tensor-governing process flow.
+
+    This is a source projection, not a Python compiler.  It intentionally
+    keeps only reachable function regions, tensor dataflow, control constructs,
+    required scalar/shape dependencies, and host materialization boundaries.
+    """
+
+    if len(graph.roots) != 1:
+        raise ValueError("tensor/control projection requires one graph root")
+    complete_nodes = graph.G.number_of_nodes()
+    root = graph.roots[0]
+    calls_by_scope: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for node_id, data in graph.G.nodes(data=True):
+        if data.get("op") != "call":
+            continue
+        calls_by_scope[
+            (
+                str((data.get("source_span") or {}).get("filename") or ""),
+                str((data.get("attributes") or {}).get("scope") or ""),
+            )
+        ].append(node_id)
+    reachable_definitions = {root}
+    pending = [root]
+    while pending:
+        definition = pending.pop()
+        definition_data = graph.G.nodes[definition]
+        scope = str(definition_data.get("label") or "")
+        filename = str(
+            (definition_data.get("source_span") or {}).get("filename") or ""
+        )
+        for node_id in calls_by_scope.get((filename, scope), ()):
+            data = graph.G.nodes[node_id]
+            attrs = data.get("attributes") or {}
+            callee = attrs.get("callee")
+            if callee in graph.G and callee not in reachable_definitions:
+                reachable_definitions.add(callee)
+                pending.append(callee)
+
+    reachable_scopes = {
+        (
+            str((graph.G.nodes[node].get("source_span") or {}).get("filename") or ""),
+            str(graph.G.nodes[node].get("label") or ""),
+        )
+        for node in reachable_definitions
+    }
+
+    def in_reachable_scope(node_id: int) -> bool:
+        data = graph.G.nodes[node_id]
+        return (
+            str((data.get("source_span") or {}).get("filename") or ""),
+            str((data.get("attributes") or {}).get("scope") or ""),
+        ) in reachable_scopes
+
+    def validation_only(node_id: int) -> bool:
+        if graph.G.nodes[node_id].get("op") != "if":
+            return False
+        branches = [
+            child
+            for child in graph.G.successors(node_id)
+            if graph.G.edges[node_id, child].get("role") in {"then", "else"}
+        ]
+        return bool(branches) and all(
+            graph.G.nodes[child].get("op") in {"assert", "raise"}
+            for child in branches
+        )
+
+    seeds: set[int] = set(reachable_definitions)
+    for node_id, data in graph.G.nodes(data=True):
+        if not in_reachable_scope(node_id):
+            continue
+        attrs = data.get("attributes") or {}
+        kind = attrs.get("semantic_kind")
+        if kind in {
+            "tensor_input",
+            "tensor_operation",
+            "tensor_container",
+            "tensor_metadata",
+            "host_boundary",
+        }:
+            seeds.add(node_id)
+        elif kind == "control" and not validation_only(node_id):
+            seeds.add(node_id)
+        elif (
+            kind == "process_call"
+            and attrs.get("callee") in reachable_definitions
+        ):
+            seeds.add(node_id)
+
+    keep = set(seeds)
+    pending = list(seeds)
+    while pending:
+        node_id = pending.pop()
+        for parent in graph.G.predecessors(node_id):
+            if parent in keep:
+                continue
+            if in_reachable_scope(parent) or parent in reachable_definitions:
+                keep.add(parent)
+                pending.append(parent)
+
+    removed = set(graph.G) - keep
+    graph.G.remove_nodes_from(removed)
+    for node_id, data in graph.G.nodes(data=True):
+        data["parents"] = [
+            (parent, role)
+            for parent, role in data.get("parents", ())
+            if parent in graph.G
+        ]
+        data["children"] = [
+            (child, role)
+            for child, role in data.get("children", ())
+            if child in graph.G
+        ]
+        data["input_roles"] = tuple(
+            role for _, role in data.get("parents", ())
+        )
+    graph.roots = [root]
+    graph.G.graph.update(
+        semantic_profile="tensor_control",
+        complete_node_count=complete_nodes,
+        filtered_node_count=len(removed),
+        reachable_function_count=len(reachable_definitions),
+    )
+    return graph
+
+
+__all__ = [
+    "SemanticAstBuilder",
+    "build_semantic_process_graph",
+    "project_tensor_control_graph",
+]

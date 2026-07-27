@@ -96,8 +96,36 @@ def test_ast_math_is_routed_to_existing_reduction_systems(encoder_graph):
         data for _, data in graph.G.nodes(data=True) if data["op"] == "bitand"
     )
     assert add["attributes"]["canonical_operation"] == "add"
-    assert add["attributes"]["bitops_candidate"] is True
-    assert bitand["attributes"]["bitops_candidate"] is True
+    assert add["attributes"]["bitops_capable"] is True
+    assert add["attributes"]["bitops_candidate"] is False
+    assert bitand["attributes"]["bitops_capable"] is True
+
+
+def test_compiler_profile_filters_python_noise_and_types_tensor_nodes():
+    complete = build_mandelbrot_encoder_process_graph(profile="complete")
+    compiler_graph = build_mandelbrot_encoder_process_graph()
+
+    assert compiler_graph.G.graph["semantic_profile"] == "tensor_control"
+    assert compiler_graph.G.graph["complete_node_count"] == len(complete.G)
+    assert len(compiler_graph.G) < len(complete.G) // 4
+    assert not any(
+        data["op"] == "import"
+        for _, data in compiler_graph.G.nodes(data=True)
+    )
+
+    matmul = next(
+        data
+        for _, data in compiler_graph.G.nodes(data=True)
+        if data["op"] == "matmul"
+    )
+    assert matmul["attributes"]["semantic_kind"] == "tensor_operation"
+    assert matmul["attributes"]["execution_domain"] == "abstract_tensor"
+
+    kinds = {
+        data["attributes"]["semantic_kind"]
+        for _, data in compiler_graph.G.nodes(data=True)
+    }
+    assert {"tensor_operation", "control", "host_boundary"} <= kinds
 
 
 def test_master_function_executes_the_original_numpy_tensor_encoder():
