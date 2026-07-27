@@ -1122,7 +1122,11 @@ class AbstractTensor:
         """
         if not tensors:
             raise ValueError("cat requires at least one tensor")
-        first = AbstractTensor.get_tensor(tensors[0])
+        first = (
+            tensors[0]
+            if isinstance(tensors[0], AbstractTensor)
+            else AbstractTensor.get_tensor(tensors[0])
+        )
         tensors = [first.ensure_tensor(t) for t in tensors]
         result = first.__class__(
             track_time=first.track_time,

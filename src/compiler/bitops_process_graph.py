@@ -8,7 +8,7 @@ subgraph into the caller's ProcessGraph.
 from __future__ import annotations
 
 import copy
-from typing import Dict
+from typing import Any, Callable, Dict
 
 import networkx as nx
 
@@ -28,11 +28,11 @@ def _next_free_id(graph: nx.DiGraph, start: int) -> int:
     return start
 
 
-def _bits_for_node(data: dict, translator: BitOpsTranslator) -> list[int]:
+def _bits_for_node(data: dict, translator: BitOpsTranslator) -> Any:
     if data.get("op") == "const" and isinstance(data.get("constant"), int):
         mask = (1 << translator.bit_width) - 1
         return translator.bits_from_int(int(data["constant"]) & mask)
-    return [0] * translator.bit_width
+    return translator.bits_from_int(0)
 
 
 def _remove_child_reference(data: dict, child: int) -> None:
@@ -51,6 +51,7 @@ def expand_bitops_process_graph(
     source: ProcessGraph,
     *,
     bit_width: int,
+    translator_factory: Callable[[int], BitOpsTranslator] = BitOpsTranslator,
 ) -> ProcessGraph:
     """Replace supported integer nodes with recorded Turing primitives.
 
@@ -87,7 +88,7 @@ def expand_bitops_process_graph(
             continue
 
         parents = list(old_data.get("parents", ()))
-        translator = BitOpsTranslator(bit_width)
+        translator = translator_factory(bit_width)
         operands = []
         provenance_inputs: Dict[int, int] = {}
         for parent, _role in parents:

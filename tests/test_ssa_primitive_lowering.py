@@ -45,6 +45,24 @@ def kernel(x, y):
     assert "float s3 = s2 * float(3.0);" in shader
 
 
+def test_natural_tensor_calls_lower_to_one_glsl_program():
+    result = lower_ssa_to_fused_program(
+        _ssa(
+            """
+def kernel(x, y):
+    return tanh((x + y).sin())
+"""
+        )
+    )
+    program = result.require_complete()
+    assert [step.op_name for step in program.steps] == ["add", "sin", "tanh"]
+
+    shader = emit_program_source(program)
+    assert "float s2 = s0 + s1;" in shader
+    assert "float s3 = sin(s2);" in shader
+    assert "float s4 = tanh(s3);" in shader
+
+
 def test_bitops_nand_graph_lowers_without_bypassing_provenance():
     result = lower_ssa_to_fused_program(
         _ssa(

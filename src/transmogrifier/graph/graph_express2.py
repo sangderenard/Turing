@@ -508,6 +508,10 @@ class ProcessGraph:
     def _build_semantic_ast(self, tree, *, filename=None):
         """Build canonical Python dataflow directly in this ProcessGraph."""
         import ast
+        from ...common.tensors.fused_ir import (
+            ELEMENTWISE_BINARY,
+            ELEMENTWISE_UNARY,
+        )
 
         binary_ops = {
             ast.Add: "add",
@@ -530,6 +534,26 @@ class ProcessGraph:
             ast.LtE: "le",
             ast.Gt: "gt",
             ast.GtE: "ge",
+        }
+        tensor_call_aliases = {
+            **{name: name for name in ELEMENTWISE_UNARY | ELEMENTWISE_BINARY},
+            "absolute": "abs",
+            "divide": "truediv",
+            "subtract": "sub",
+            "multiply": "mul",
+            "power": "pow",
+            "concat": "cat",
+            "concatenate": "cat",
+            "arange": "arange",
+            "cat": "cat",
+            "gather": "gather",
+            "log_softmax": "log_softmax",
+            "matmul": "matmul",
+            "mean": "mean",
+            "pad": "pad",
+            "stack": "stack",
+            "sum": "sum",
+            "topk": "topk",
         }
         env = {}
         next_id = 0
@@ -668,12 +692,53 @@ class ProcessGraph:
                     else opaque(node)
                 )
             if isinstance(node, ast.Call):
-                arguments = [expression(arg) for arg in node.args]
                 function = (
                     node.func.id
                     if isinstance(node.func, ast.Name)
                     else ast.unparse(node.func)
                 )
+                spelling = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                canonical = tensor_call_aliases.get(spelling)
+                arguments = []
+                if (
+                    canonical is not None
+                    and isinstance(node.func, ast.Attribute)
+                ):
+                    arguments.append(expression(node.func.value))
+                arguments.extend(expression(arg) for arg in node.args)
+                if canonical is not None:
+                    if canonical in ELEMENTWISE_UNARY:
+                        roles = ("operand",)
+                    elif canonical in ELEMENTWISE_BINARY:
+                        roles = ("lhs", "rhs")
+                    else:
+                        roles = tuple(
+                            f"arg{index}" for index in range(len(arguments))
+                        )
+                    if len(roles) != len(arguments):
+                        return opaque(node)
+
+                    attributes = {}
+                    for keyword in node.keywords:
+                        key = keyword.arg or "**"
+                        try:
+                            attributes[key] = ast.literal_eval(keyword.value)
+                        except (ValueError, TypeError):
+                            attributes[key] = ast.unparse(keyword.value)
+                    return add_node(
+                        canonical,
+                        zip(arguments, roles),
+                        label=canonical,
+                        attributes=attributes,
+                        source=span(node),
+                    )
+
                 roles = tuple(f"arg{index}" for index in range(len(arguments)))
                 return add_node(
                     "call",

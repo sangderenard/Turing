@@ -77,3 +77,23 @@ def test_ssa_preserves_roles_constants_attributes_and_source():
     assert const.source_span["filename"] == "fixture.py"
     assert select.arg_roles == ["condition", "if_true", "if_false"]
     assert select.attributes["variable"] == "z"
+
+
+def test_tensor_method_and_function_calls_keep_canonical_operations():
+    graph = _graph(
+        """
+def kernel(x, y):
+    return tanh((x + y).sin())
+"""
+    )
+
+    ops = [data["op"] for _, data in graph.G.nodes(data=True)]
+    assert ops == ["input", "input", "add", "sin", "tanh", "return"]
+    sin_node = next(
+        data for _, data in graph.G.nodes(data=True) if data["op"] == "sin"
+    )
+    tanh_node = next(
+        data for _, data in graph.G.nodes(data=True) if data["op"] == "tanh"
+    )
+    assert sin_node["input_roles"] == ("operand",)
+    assert tanh_node["input_roles"] == ("operand",)

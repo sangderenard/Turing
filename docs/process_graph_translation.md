@@ -5,7 +5,9 @@ The compiler path is:
 ```text
 Python AST
   -> ProcessGraph.build_from_ast(semantic=True)
+       (operators and canonical tensor method/function calls)
   -> optional Turing-provenance BitOps primitive expansion
+       (Python-list or AbstractTensor carrier)
   -> metadata-rich SSA
   -> FusedProgram
        -> private C slot plan or fused GLSL shader
@@ -39,6 +41,22 @@ Currently expanded operations:
 
 Unexpanded operations remain present with `bitops_status=unexpanded`.
 
+`AbstractTensorBitOpsTranslator` supplies the existing Turing calculus with an
+AbstractTensor carrier. Its eight hooks are compositions of ordinary tensor
+arithmetic, concatenation, slicing, shape inspection, and same-backend
+construction. The derived BitOps recipes are unchanged, and their primitive
+provenance can be spliced into the source ProcessGraph through
+`abstract_tensor_bitops_factory(like)`.
+
+## Natural tensor source
+
+The semantic AST importer recognizes canonical tensor operation spellings in
+both method and function form. For example,
+`tanh((x + y).sin())` enters the graph as `add -> sin -> tanh`, rather than as
+opaque Python calls. The recognized names come from the established fused
+operation vocabulary plus the structural canonical operations; this mapping
+only resolves syntax and never supplies alternate numerical implementations.
+
 ## Backend boundary
 
 `lower_ssa_to_fused_program` targets the established backend-neutral
@@ -52,6 +70,13 @@ Structural primitives such as `concat`, `slice`, shifts, and shape-changing
 `mu` cannot fit that packet. They return structured `LoweringIssue` records and
 no executable program. A future region/view packet should represent their
 shapes and storage ranges explicitly.
+
+The current complete slice is substantial but deliberately bounded: the
+canonical cross-language catalog contains 66 operations, GLSL implements 56
+canonical primitives, and the equal-shape whole-program fusion region accepts
+40. Existing standalone GLSL matmul, reduction, and layout kernels should
+become neighboring regions in a ProcessGraph partitioner rather than being
+restated inside the elementwise emitter.
 
 ## Nodus
 
