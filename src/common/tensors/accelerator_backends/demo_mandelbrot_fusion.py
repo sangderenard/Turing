@@ -155,6 +155,48 @@ def capture_parametric_mandelbrot_encoder(iterations: int):
     )
 
 
+def compile_parametric_mandelbrot_glsl(iterations: int):
+    """Compile the AST/ProcessGraph display program to one structured shader."""
+
+    from ....compiler.glsl_process_graph import compile_process_graph_glsl
+    from ..fused_ir import Meta
+    from .mandelbrot_encoder_program import (
+        build_mandelbrot_encoder_process_graph,
+    )
+
+    tensor_inputs = (
+        "unit_x",
+        "unit_y",
+        "center_x",
+        "center_y",
+        "span",
+        "family_mix",
+        "julia_x",
+        "julia_y",
+        "palette_phase",
+        "color_drive",
+    )
+    graph = build_mandelbrot_encoder_process_graph(
+        entrypoint="mandelbrot_display_master"
+    )
+    compiled = compile_process_graph_glsl(
+        graph,
+        specializations={"iterations": int(iterations)},
+        input_meta={
+            name: Meta(dtype="float32", device="glsl")
+            for name in tensor_inputs
+        },
+        scalar_tensor_inputs=tensor_inputs[2:],
+        output_names=(
+            "counts",
+            "luminance",
+            "blue_difference",
+            "red_difference",
+        ),
+    )
+    return compiled, graph
+
+
 def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
     """Run the exact same AbstractTensor function on the NumPy backend."""
 
@@ -494,6 +536,7 @@ def animate_glsl(
     record_fps: float = 30.0,
     record_pcm_dtype: str = "s16le",
     record_segment_bytes: int = 1 << 30,
+    profile: bool = False,
 ) -> None:
     """Run the parameterized solve continuously with resident GPU buffers."""
     import pygame
@@ -504,18 +547,12 @@ def animate_glsl(
     from .glsl_backend import (
         GLChunk,
         dispatch_stats,
-        execute_multi_output_program,
-        execute_program,
         shader_cache_stats,
     )
 
-    dispatch_plan = None
-    if record_avi is None:
-        program, roles = capture_parametric_mandelbrot(iterations)
-    else:
-        program, roles, dispatch_plan = (
-            capture_parametric_mandelbrot_encoder(iterations)
-        )
+    compile_started = time.perf_counter()
+    program, _ = compile_parametric_mandelbrot_glsl(iterations)
+    compile_ms = (time.perf_counter() - compile_started) * 1e3
     unit_x, unit_y = normalized_plane(width, height)
 
     pygame.init()
@@ -533,14 +570,10 @@ def animate_glsl(
     info = require_gl_context()
     print(
         f"gpu     : {info['renderer']} (context: {info['source']})\n"
-        f"program : {len(program.steps)} steps; "
-        + (
-            "ProcessGraph chose one solve+palette+YCbCr dispatch "
-            f"(score {dispatch_plan.regions[0].score:.1f}, "
-            f"{dispatch_plan.regions[0].binding_count} bindings)"
-            if dispatch_plan is not None
-            else "camera/family are six scalar feeds"
-        ),
+        f"program : {program.source_node_count} selected ProcessGraph nodes -> "
+        f"{program.primitive_count} GLSL primitives + "
+        f"{program.loop_count} structured loop; one dispatch\n"
+        f"compile : {compile_ms:.1f} ms AST/ProcessGraph/source",
         flush=True,
     )
 
@@ -644,44 +677,30 @@ def animate_glsl(
         )
 
     feeds = {
-        roles["unit_x"]: GLChunk.from_numpy(unit_x).to_gpu(),
-        roles["unit_y"]: GLChunk.from_numpy(unit_y).to_gpu(),
-        roles["center_x"]: GLChunk.from_numpy(
-            np.asarray([center.real], np.float32)
-        ).to_gpu(),
-        roles["center_y"]: GLChunk.from_numpy(
-            np.asarray([center.imag], np.float32)
-        ).to_gpu(),
-        roles["span"]: GLChunk.from_numpy(
-            np.asarray([span], np.float32)
-        ).to_gpu(),
-        roles["family_mix"]: GLChunk.from_numpy(
-            np.asarray([0.0], np.float32)
-        ).to_gpu(),
-        roles["julia_x"]: GLChunk.from_numpy(
-            np.asarray([-0.72], np.float32)
-        ).to_gpu(),
-        roles["julia_y"]: GLChunk.from_numpy(
-            np.asarray([0.24], np.float32)
+        "unit_x": GLChunk.from_numpy(unit_x).to_gpu(),
+        "unit_y": GLChunk.from_numpy(unit_y).to_gpu(),
+        program.scalar_buffer_name: GLChunk.from_numpy(
+            np.asarray(
+                [
+                    center.real,
+                    center.imag,
+                    span,
+                    0.0,
+                    -0.72,
+                    0.24,
+                    0.0,
+                    0.52,
+                ],
+                np.float32,
+            )
         ).to_gpu(),
     }
-    if dispatch_plan is not None:
-        feeds[roles["palette_phase"]] = GLChunk.from_numpy(
-            np.asarray([0.0], np.float32)
-        ).to_gpu()
-        feeds[roles["color_drive"]] = GLChunk.from_numpy(
-            np.asarray([0.52], np.float32)
-        ).to_gpu()
-        fused_outputs = {
-            name: GLChunk((height * width,)).to_gpu()
-            for name in program.outputs
-        }
-        output = fused_outputs["counts"]
-    else:
-        fused_outputs = None
-        output = GLChunk((height * width,)).to_gpu()
+    fused_outputs = {
+        name: GLChunk((height * width,), dtype=dtype).to_gpu()
+        for name, dtype in zip(program.output_names, program.output_dtypes)
+    }
     jpeg_resources = None
-    if recorder is not None and fused_outputs is not None:
+    if recorder is not None:
         from ..compression.jpeg.frame import (
             prepare_jpeg_encoding_resources,
         )
@@ -704,26 +723,26 @@ def animate_glsl(
         ),
         compileShader(
             """#version 430 core
-            layout(std430, binding=0) readonly buffer Counts { float count[]; };
+            layout(std430, binding=0) readonly buffer YPlane { float y_plane[]; };
+            layout(std430, binding=1) readonly buffer CbPlane { float cb_plane[]; };
+            layout(std430, binding=2) readonly buffer CrPlane { float cr_plane[]; };
             uniform uint image_width;
             uniform uint image_height;
-            uniform float iteration_scale;
             out vec4 color;
-            uniform float palette_phase;
-            uniform float color_drive;
-            vec3 palette(float x) {
-                float t=sqrt(clamp(x,0.0,1.0))+palette_phase;
-                vec3 wave=0.5+0.5*cos(
-                    6.2831853*(t+vec3(0.00,0.21,0.43)));
-                float exponent=mix(1.65,0.62,clamp(color_drive,0.0,1.0));
-                return pow(wave,vec3(exponent));
-            }
             void main(){
                 uint x=uint(gl_FragCoord.x);
                 uint y=uint(gl_FragCoord.y);
                 if(x>=image_width || y>=image_height){ color=vec4(0); return; }
-                float value=count[y*image_width+x]/iteration_scale;
-                color=vec4(palette(value),1.0);
+                uint index=y*image_width+x;
+                float yy=y_plane[index];
+                float cb=cb_plane[index]-128.0;
+                float cr=cr_plane[index]-128.0;
+                vec3 rgb=vec3(
+                    yy+1.402*cr,
+                    yy-0.344136*cb-0.714136*cr,
+                    yy+1.772*cb
+                )/255.0;
+                color=vec4(clamp(rgb,0.0,1.0),1.0);
             }""",
             GL.GL_FRAGMENT_SHADER,
         ),
@@ -731,9 +750,6 @@ def animate_glsl(
     vao = int(GL.glGenVertexArrays(1))
     width_location = GL.glGetUniformLocation(display_program, "image_width")
     height_location = GL.glGetUniformLocation(display_program, "image_height")
-    scale_location = GL.glGetUniformLocation(display_program, "iteration_scale")
-    palette_location = GL.glGetUniformLocation(display_program, "palette_phase")
-    drive_location = GL.glGetUniformLocation(display_program, "color_drive")
 
     if audio_playback_ready:
         pygame.mixer.music.play(loops=-1)
@@ -747,9 +763,11 @@ def animate_glsl(
     cache_baseline = shader_cache_stats()
     frame_dispatches = 0
     predicted_detail = 1.0
+    profile_rows: list[dict[str, float]] = []
     running = True
     try:
         while running and (max_frames is None or frame < max_frames):
+            frame_started = time.perf_counter()
             dispatch_before_frame = dispatch_stats()["calls"]
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -819,45 +837,57 @@ def animate_glsl(
                 zoom_rate=zoom_rate,
             )
             julia_x, julia_y = julia_constant.real, julia_constant.imag
-            feeds[roles["center_x"]].update_numpy(
-                np.asarray([animated_center.real], np.float32)
-            ).to_gpu()
-            feeds[roles["center_y"]].update_numpy(
-                np.asarray([animated_center.imag], np.float32)
-            ).to_gpu()
-            feeds[roles["span"]].update_numpy(
-                np.asarray([animated_span], np.float32)
-            ).to_gpu()
-            feeds[roles["family_mix"]].update_numpy(
-                np.asarray([family_mix], np.float32)
-            ).to_gpu()
-            feeds[roles["julia_x"]].update_numpy(
-                np.asarray([julia_x], np.float32)
-            ).to_gpu()
-            feeds[roles["julia_y"]].update_numpy(
-                np.asarray([julia_y], np.float32)
-            ).to_gpu()
             palette_phase = float(
                 0.028 * travel + reaction * 0.09 * (treble - 0.5)
             )
             color_drive = float(
                 0.52 + reaction * 0.24 * (high_mid - 0.5)
             )
-            if fused_outputs is None:
-                execute_program(program, feeds, out=output)
-            else:
-                feeds[roles["palette_phase"]].update_numpy(
-                    np.asarray([palette_phase], np.float32)
-                ).to_gpu()
-                feeds[roles["color_drive"]].update_numpy(
-                    np.asarray([color_drive], np.float32)
-                ).to_gpu()
-                execute_multi_output_program(
-                    program,
-                    feeds,
-                    outs=fused_outputs,
+            controls_finished = time.perf_counter()
+            scalar_values = {
+                "center_x": animated_center.real,
+                "center_y": animated_center.imag,
+                "span": animated_span,
+                "family_mix": family_mix,
+                "julia_x": julia_x,
+                "julia_y": julia_y,
+                "palette_phase": palette_phase,
+                "color_drive": color_drive,
+            }
+            feeds[program.scalar_buffer_name].update_numpy(
+                np.asarray(
+                    [
+                        scalar_values[name]
+                        for name in program.scalar_input_order
+                    ],
+                    np.float32,
                 )
+            ).to_gpu()
+            uploads_finished = time.perf_counter()
+            query = None
+            if profile:
+                generated = GL.glGenQueries(1)
+                query = int(np.asarray(generated).reshape(-1)[0])
+                GL.glBeginQuery(GL.GL_TIME_ELAPSED, query)
+            submit_started = time.perf_counter()
+            program.execute(feeds, outs=fused_outputs)
+            submit_finished = time.perf_counter()
+            gpu_ms = 0.0
+            if query is not None:
+                import ctypes
 
+                GL.glEndQuery(GL.GL_TIME_ELAPSED)
+                elapsed_ns = ctypes.c_uint64()
+                GL.glGetQueryObjectui64v(
+                    query,
+                    GL.GL_QUERY_RESULT,
+                    ctypes.byref(elapsed_ns),
+                )
+                gpu_ms = elapsed_ns.value / 1e6
+                GL.glDeleteQueries(1, (query,))
+            compute_finished = time.perf_counter()
+
+            present_started = time.perf_counter()
             surface = pygame.display.get_surface()
             draw_width, draw_height = surface.get_size()
             GL.glViewport(0, 0, draw_width, draw_height)
@@ -867,16 +897,27 @@ def animate_glsl(
             GL.glUseProgram(display_program)
             GL.glUniform1ui(width_location, width)
             GL.glUniform1ui(height_location, height)
-            GL.glUniform1f(scale_location, float(iterations))
-            GL.glUniform1f(palette_location, palette_phase)
-            GL.glUniform1f(drive_location, color_drive)
             GL.glBindBufferBase(
-                GL.GL_SHADER_STORAGE_BUFFER, 0, output.buffer_id
+                GL.GL_SHADER_STORAGE_BUFFER,
+                0,
+                fused_outputs["luminance"].buffer_id,
+            )
+            GL.glBindBufferBase(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                1,
+                fused_outputs["blue_difference"].buffer_id,
+            )
+            GL.glBindBufferBase(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                2,
+                fused_outputs["red_difference"].buffer_id,
             )
             GL.glBindVertexArray(vao)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
             GL.glBindVertexArray(0)
             pygame.display.flip()
+            present_finished = time.perf_counter()
+            encode_started = present_finished
             if recorder is not None:
                 recorder.append_frame(
                     tensor_ycbcr_jpeg_bytes(
@@ -901,11 +942,39 @@ def animate_glsl(
                             AbstractTensor.tensor(audio.samples[indices])
                         )
                     recorded_audio_position += count
+            encode_finished = time.perf_counter()
             frame += 1
             frame_dispatches = (
                 dispatch_stats()["calls"] - dispatch_before_frame
             )
             report_frames += 1
+            if profile:
+                profile_rows.append(
+                    {
+                        "control": (
+                            controls_finished - frame_started
+                        ) * 1e3,
+                        "uploads": (
+                            uploads_finished - controls_finished
+                        ) * 1e3,
+                        "submit": (
+                            submit_finished - submit_started
+                        ) * 1e3,
+                        "compute_wait": (
+                            compute_finished - submit_started
+                        ) * 1e3,
+                        "gpu": gpu_ms,
+                        "present": (
+                            present_finished - present_started
+                        ) * 1e3,
+                        "encode": (
+                            encode_finished - encode_started
+                        ) * 1e3,
+                        "total": (
+                            encode_finished - frame_started
+                        ) * 1e3,
+                    }
+                )
             if now - report_started >= 0.5:
                 fps = report_frames / (now - report_started)
                 pygame.display.set_caption(
@@ -925,7 +994,7 @@ def animate_glsl(
         cache_final = shader_cache_stats()
         dispatch_count = dispatch_final["calls"] - dispatch_baseline["calls"]
         print(
-            "encoder : "
+            "dispatch: "
             f"{dispatch_count} physical GLSL launches "
             f"({dispatch_count / max(frame, 1):.1f}/frame) | "
             f"shader cache "
@@ -933,14 +1002,35 @@ def animate_glsl(
             f"{cache_final['misses'] - cache_baseline['misses']} misses",
             flush=True,
         )
+        if profile_rows:
+            warmup = min(5, max(0, len(profile_rows) - 1))
+            steady = profile_rows[warmup:] or profile_rows
+            print(
+                f"profile : steady frames ({warmup} warmup frames excluded)"
+            )
+            for name in (
+                "control",
+                "uploads",
+                "submit",
+                "compute_wait",
+                "gpu",
+                "present",
+                "encode",
+                "total",
+            ):
+                values = np.asarray(
+                    [row[name] for row in steady], dtype=np.float64
+                )
+                print(
+                    f"  {name:12s} mean {values.mean():8.3f} ms | "
+                    f"p95 {np.quantile(values, 0.95):8.3f} ms",
+                    flush=True,
+                )
     finally:
         for chunk in feeds.values():
             chunk.release()
-        if fused_outputs is None:
-            output.release()
-        else:
-            for chunk in fused_outputs.values():
-                chunk.release()
+        for chunk in fused_outputs.values():
+            chunk.release()
         if audio is not None:
             audio.close()
         if audio_playback_ready:
@@ -993,7 +1083,12 @@ def tensor_jpeg_bytes(
 ) -> bytes:
     """Encode the displayed GLSL palette through AbstractTensor JPEG."""
     from ..abstraction import AbstractTensor as AT
-    from .glsl_backend import GLChunk, fuse_elementwise, reshape_chunk
+    from .glsl_backend import (
+        GLChunk,
+        dispatch_batch,
+        fuse_elementwise,
+        reshape_chunk,
+    )
     from .glsl_tensor_backend import GLSLTensorOperations
 
     if width % 8 or height % 8:
@@ -1004,7 +1099,7 @@ def tensor_jpeg_bytes(
             field.data = reshape_chunk(counts, (height, width))
         else:
             field = AT.tensor(counts.reshape(height, width))
-        with fuse_elementwise():
+        with dispatch_batch(), fuse_elementwise():
             phase = (
                 (field / max(iterations, 1)).clamp(0.0, 1.0).sqrt()
                 + float(palette_phase)
@@ -1059,7 +1154,12 @@ def tensor_ycbcr_jpeg_bytes(
 
     from ..abstraction import AbstractTensor as AT
     from ..compression.jpeg.frame import encode_ycbcr_jfif
-    from .glsl_backend import GLChunk, fuse_elementwise, reshape_chunk
+    from .glsl_backend import (
+        GLChunk,
+        dispatch_batch,
+        fuse_elementwise,
+        reshape_chunk,
+    )
     from .glsl_tensor_backend import GLSLTensorOperations
 
     if width % 8 or height % 8:
@@ -1080,7 +1180,7 @@ def tensor_ycbcr_jpeg_bytes(
         # or reduction boundary, just as the older RGB entry point already
         # does. Without this scope the graph-optimized front end accidentally
         # fell back to one GLSL launch per primitive throughout JPEG.
-        with fuse_elementwise():
+        with dispatch_batch(), fuse_elementwise():
             return encode_ycbcr_jfif(
                 tuple(wrapped),
                 mcu_rows_per_batch=min(32, max(1, (height + 7) // 8)),
@@ -1205,6 +1305,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=1 << 30,
     )
+    ap.add_argument(
+        "--profile",
+        action="store_true",
+        help="synchronize GPU timer queries and print per-stage timings",
+    )
     args = ap.parse_args(argv)
 
     if args.animate:
@@ -1228,6 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
             record_fps=args.record_fps,
             record_pcm_dtype=args.record_pcm_dtype,
             record_segment_bytes=args.record_segment_bytes,
+            profile=args.profile,
         )
         return 0
 
@@ -1235,20 +1341,54 @@ def main(argv: list[str] | None = None) -> int:
     print(f"image   : {args.width}x{args.height} = {elements:,} pixels")
 
     cx, cy = complex_plane(args.width, args.height, args.center, args.span)
-    captured, _ = capture_mandelbrot(cx[:2], cy[:2], args.iterations)
-    print(f"program : {len(captured.program.steps)} FusedProgram steps, "
-          f"{args.iterations} Python-loop iterations captured")
+    compiled, _ = compile_parametric_mandelbrot_glsl(args.iterations)
+    print(
+        f"program : {compiled.source_node_count} ProcessGraph nodes -> "
+        f"{compiled.primitive_count} primitives + "
+        f"{compiled.loop_count} structured loop"
+    )
 
     # -- GPU ---------------------------------------------------------------
     from .gl_context import require_gl_context
+    from .glsl_backend import GLChunk
+
     info = require_gl_context()
     print(f"gpu     : {info['renderer']} (context: {info['source']})")
 
+    unit_x, unit_y = normalized_plane(args.width, args.height)
+    static_scalars = {
+        "center_x": args.center.real,
+        "center_y": args.center.imag,
+        "span": args.span,
+        "family_mix": 0.0,
+        "julia_x": -0.72,
+        "julia_y": 0.24,
+        "palette_phase": 0.0,
+        "color_drive": 0.52,
+    }
+    feeds = {
+        "unit_x": GLChunk.from_numpy(unit_x).to_gpu(),
+        "unit_y": GLChunk.from_numpy(unit_y).to_gpu(),
+        compiled.scalar_buffer_name: GLChunk.from_numpy(
+            np.asarray(
+                [
+                    static_scalars[name]
+                    for name in compiled.scalar_input_order
+                ],
+                dtype=np.float32,
+            )
+        ).to_gpu(),
+    }
     t0 = time.perf_counter()
-    gpu = run_glsl(captured, cx, cy)
+    gpu_outputs = compiled.execute(feeds)
+    gpu = gpu_outputs["counts"].numpy().copy()
     gpu_ms = (time.perf_counter() - t0) * 1e3
-    print(f"glsl    : {gpu_ms:8.1f} ms  "
-          f"({len(captured.program.steps)} steps x {elements:,} px, one dispatch)")
+    print(
+        f"glsl    : {gpu_ms:8.1f} ms  "
+        f"({args.iterations} loop iterations x {elements:,} px, one dispatch)"
+    )
+    for chunk in (*feeds.values(), *gpu_outputs.values()):
+        chunk.release()
 
     if not args.only_glsl:
         # -- oracle --------------------------------------------------------
@@ -1289,21 +1429,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- C backend, on a small grid ----------------------------------------
     if not args.skip_c and not args.only_glsl:
-        n = args.c_probe
-        pcx, pcy = complex_plane(n, n, args.center, args.span)
-        big = c_workspace_bytes(captured.program, elements)
-        small = c_workspace_bytes(captured.program, n * n)
-        print(f"c probe : {n}x{n}; workspace {small / 1e6:.1f} MB "
-              f"(the full image would need {big / 1e9:.1f} GB -- see note)")
-        t0 = time.perf_counter()
-        cpu = run_c(captured, pcx, pcy)
-        c_ms = (time.perf_counter() - t0) * 1e3
-        pref = run_abstract_numpy(pcx, pcy, args.iterations)
-        pgpu = run_glsl(captured, pcx, pcy)
-        print(f"c       : {c_ms:8.1f} ms  "
-              f"(vs numpy: {float(np.max(np.abs(cpu - pref))):g} max diff)")
-        print(f"c vs glsl: same program, both backends agree "
-              f"= {bool(np.array_equal(cpu, pgpu))}")
+        print(
+            "c probe : skipped; the C backend does not yet lower structured "
+            "ProcessGraph loops (no tape fallback)"
+        )
 
     if args.out.suffix.lower() in {".jpg", ".jpeg"}:
         out = save_tensor_jpeg(

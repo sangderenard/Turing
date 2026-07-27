@@ -26,6 +26,8 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     canonical_op,
     cat_chunks,
     cumsum_chunk,
+    dispatch_batch,
+    dispatch_stats,
     emit_cat_source,
     emit_arange_source,
     emit_cumsum_source,
@@ -51,6 +53,7 @@ from src.common.tensors.accelerator_backends.glsl_backend import (
     reshape_chunk,
     run_op,
     shader_cache_stats,
+    slice_axis_chunk,
     stack_chunks,
     topk_chunks,
 )
@@ -1203,6 +1206,130 @@ def test_reshape_view_keeps_shared_storage_alive_after_source_release(gl):
     assert view.buffer_id == buffer_id and view.on_gpu
     np.testing.assert_array_equal(view.numpy(), values.reshape(2, 6))
     view.release()
+
+
+def test_first_axis_prefix_slice_is_a_zero_dispatch_shared_view(gl):
+    values = np.arange(30, dtype=np.float32).reshape(5, 6)
+    source = GLChunk.from_numpy(values).to_gpu()
+    source.discard_host()
+    dispatch_stats(reset=True)
+
+    prefix = slice_axis_chunk(source, 0, 0, 1, 3)
+    try:
+        assert prefix.shape == (3, 6)
+        assert prefix.buffer_id == source.buffer_id
+        assert dispatch_stats()["calls"] == 0
+        np.testing.assert_array_equal(prefix.numpy(), values[:3])
+        # A partial readback must not replace the parent storage's full cache.
+        np.testing.assert_array_equal(source.numpy(), values)
+    finally:
+        prefix.release()
+        source.release()
+
+
+def test_partial_glsl_view_cannot_replace_shared_storage(gl):
+    source = GLChunk.from_numpy(np.arange(12, dtype=np.float32)).to_gpu()
+    prefix = source.prefix_view((6,))
+    try:
+        with pytest.raises(RuntimeError, match="partial GLChunk view"):
+            prefix.update_numpy(np.zeros(6, dtype=np.float32))
+    finally:
+        prefix.release()
+        source.release()
+
+
+def test_aligned_first_axis_range_slice_is_zero_dispatch(gl):
+    from src.common.tensors.accelerator_backends import glsl_backend
+
+    elements_per_alignment = (
+        glsl_backend._compute_limits().ssbo_offset_alignment // 4
+    )
+    values = np.arange(
+        4 * elements_per_alignment,
+        dtype=np.float32,
+    ).reshape(4, elements_per_alignment)
+    source = GLChunk.from_numpy(values).to_gpu()
+    source.discard_host()
+    dispatch_stats(reset=True)
+
+    middle = slice_axis_chunk(source, 0, 1, 1, 2)
+    try:
+        assert middle.shape == (2, elements_per_alignment)
+        assert middle.buffer_id == source.buffer_id
+        assert dispatch_stats()["calls"] == 0
+        np.testing.assert_array_equal(middle.numpy(), values[1:3])
+        np.testing.assert_array_equal(source.numpy(), values)
+    finally:
+        middle.release()
+        source.release()
+
+
+def test_dispatch_batch_preserves_dependent_kernel_results(gl):
+    source = GLChunk.from_numpy(np.arange(64, dtype=np.float32)).to_gpu()
+    dispatch_stats(reset=True)
+    with dispatch_batch():
+        doubled = run_op("mul", source, 2.0)
+        shifted = run_op("add", doubled, 3.0)
+        shifted.to_gpu()
+    try:
+        assert dispatch_stats()["calls"] == 2
+        np.testing.assert_allclose(
+            shifted.numpy(),
+            np.arange(64, dtype=np.float32) * 2.0 + 3.0,
+        )
+    finally:
+        shifted.release()
+        doubled.release()
+        source.release()
+
+
+def test_stack_coalesces_deferred_fanout_into_one_producer_dispatch(gl):
+    source = GLChunk.from_numpy(np.arange(64, dtype=np.float32)).to_gpu()
+    dispatch_stats(reset=True)
+    with fuse_elementwise():
+        first = run_op("add", source, 1.0)
+        second = run_op("mul", source, 2.0)
+        third = run_op("sub", source, 3.0)
+        stacked = stack_chunks((first, second, third), dim=0)
+    try:
+        assert dispatch_stats()["calls"] == 2
+        np.testing.assert_allclose(
+            stacked.numpy(),
+            np.stack(
+                (
+                    np.arange(64, dtype=np.float32) + 1.0,
+                    np.arange(64, dtype=np.float32) * 2.0,
+                    np.arange(64, dtype=np.float32) - 3.0,
+                ),
+                axis=0,
+            ),
+        )
+    finally:
+        stacked.release()
+        third.release()
+        second.release()
+        first.release()
+        source.release()
+
+
+def test_same_dtype_glsl_cast_is_a_zero_dispatch_view(gl):
+    from src.common.tensors.accelerator_backends.glsl_tensor_backend import (
+        GLSLTensorOperations,
+    )
+
+    source = GLChunk.from_numpy(np.arange(32, dtype=np.int32)).to_gpu()
+    operations = GLSLTensorOperations()
+    operations.data = source
+    dispatch_stats(reset=True)
+    cast = operations.to_dtype_("int64")
+    try:
+        assert cast.dtype == np.dtype(np.int32)
+        assert cast.buffer_id == source.buffer_id
+        assert dispatch_stats()["calls"] == 0
+        np.testing.assert_array_equal(cast.numpy(), np.arange(32, dtype=np.int32))
+    finally:
+        cast.release()
+        source.release()
 
 
 @pytest.mark.parametrize(

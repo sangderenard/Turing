@@ -966,7 +966,13 @@ class SemanticAstBuilder:
             self.scope,
             self.filename,
         )
-        self.env = dict(self.globals)
+        # Nested functions close over the values already built in their
+        # enclosing ProcessGraph region. Top-level functions begin from module
+        # globals. This preserves lexical tensor dependencies such as a local
+        # palette function reading ``phase`` from its parent.
+        self.env = dict(
+            previous_env if owner_scope != "<module>" else self.globals
+        )
         self.scope = node.name
         for argument in (
             *node.args.posonlyargs,
@@ -1169,6 +1175,15 @@ class SemanticAstBuilder:
                     parent in tensor_values or parent in tensor_containers
                     for parent in parents
                 )
+                if op == "loop_result" and parents:
+                    loop = parents[0]
+                    parent_is_tensor = parent_is_tensor or any(
+                        source in tensor_values
+                        or source in tensor_containers
+                        for source, _ in self.graph.G.nodes[loop].get(
+                            "parents", ()
+                        )
+                    )
 
                 if op == "attribute" and parents:
                     attribute = str(attrs.get("attribute") or "")
@@ -1214,7 +1229,10 @@ class SemanticAstBuilder:
                             changed = True
                     continue
 
-                if op in _TENSOR_VALUE_OPS and parent_is_tensor:
+                if (
+                    op in _TENSOR_VALUE_OPS
+                    or op in {"iteration_item", "loop_result"}
+                ) and parent_is_tensor:
                     if node_id not in tensor_values:
                         tensor_values.add(node_id)
                         changed = True

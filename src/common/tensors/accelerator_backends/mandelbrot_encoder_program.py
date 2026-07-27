@@ -13,6 +13,48 @@ from pathlib import Path
 from ..abstraction import AbstractTensor
 
 
+def mandelbrot_display_master(
+    unit_x: AbstractTensor,
+    unit_y: AbstractTensor,
+    center_x: AbstractTensor,
+    center_y: AbstractTensor,
+    span: AbstractTensor,
+    family_mix: AbstractTensor,
+    julia_x: AbstractTensor,
+    julia_y: AbstractTensor,
+    palette_phase: AbstractTensor,
+    color_drive: AbstractTensor,
+    *,
+    iterations: int,
+):
+    """Return the resident solve and display/encoder color planes."""
+
+    from .demo_mandelbrot_fusion import (
+        mandelbrot_jpeg_planes,
+        parametric_mandelbrot_escape,
+    )
+
+    counts = parametric_mandelbrot_escape(
+        unit_x,
+        unit_y,
+        center_x,
+        center_y,
+        span,
+        family_mix,
+        julia_x,
+        julia_y,
+        iterations,
+        clamp=1e18,
+    )
+    luminance, blue_difference, red_difference = mandelbrot_jpeg_planes(
+        counts,
+        iterations,
+        palette_phase,
+        color_drive,
+    )
+    return counts, luminance, blue_difference, red_difference
+
+
 def mandelbrot_jpeg_master(
     unit_x: AbstractTensor,
     unit_y: AbstractTensor,
@@ -87,6 +129,7 @@ def mandelbrot_encoder_source_files() -> tuple[Path, ...]:
 def build_mandelbrot_encoder_process_graph(
     *,
     profile: str = "tensor_control",
+    entrypoint: str = "mandelbrot_jpeg_master",
 ):
     """Ingest the source bundle without executing the program.
 
@@ -99,7 +142,7 @@ def build_mandelbrot_encoder_process_graph(
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(
         mandelbrot_encoder_source_files(),
-        entrypoint="mandelbrot_jpeg_master",
+        entrypoint=entrypoint,
         profile=profile,
     )
     return graph
@@ -107,6 +150,7 @@ def build_mandelbrot_encoder_process_graph(
 
 __all__ = [
     "build_mandelbrot_encoder_process_graph",
+    "mandelbrot_display_master",
     "mandelbrot_encoder_source_files",
     "mandelbrot_jpeg_master",
 ]

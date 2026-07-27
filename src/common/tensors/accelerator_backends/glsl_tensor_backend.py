@@ -154,7 +154,10 @@ class GLSLTensorOperations(AbstractTensor):
         value = _raw(self.data if tensor is None else tensor)
         target = _normalize_dtype(dtype)
         if value.dtype == target:
-            return self.clone_(value)
+            # A no-op cast has the same aliasing contract as Torch's native
+            # ``Tensor.to(dtype)`` fast path. Preserve resident storage instead
+            # of launching an identity arithmetic kernel.
+            return value.view(value.shape)
         source_kind = value.dtype.kind
         target_kind = target.kind
         if target_kind == "b":

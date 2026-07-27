@@ -120,6 +120,7 @@ __all__ = [
     "topk_chunks",
     "execute_program",
     "execute_multi_output_program",
+    "dispatch_batch",
     "fuse_elementwise",
     "GLSL_OPS",
     "shader_cache_stats",
@@ -322,11 +323,20 @@ def _glsl_type(dtype: Any) -> str:
 class _GLStorage:
     """Shared physical storage for one or more differently shaped GL views."""
 
-    __slots__ = ("dtype", "host", "buffer", "owns_buffer", "gpu_valid", "refs")
+    __slots__ = (
+        "dtype",
+        "capacity",
+        "host",
+        "buffer",
+        "owns_buffer",
+        "gpu_valid",
+        "refs",
+    )
 
     def __init__(
         self,
         dtype: Any,
+        capacity: int,
         host: np.ndarray | None = None,
         *,
         buffer: int | None = None,
@@ -334,6 +344,7 @@ class _GLStorage:
         gpu_valid: bool = False,
     ) -> None:
         self.dtype = _normalize_dtype(dtype)
+        self.capacity = int(capacity)
         self.host = (
             None
             if host is None
@@ -357,6 +368,7 @@ class GLChunk:
     __slots__ = (
         "_shape",
         "_count",
+        "_offset",
         "_storage",
         "_deferred",
         "_released",
@@ -371,6 +383,7 @@ class GLChunk:
     ) -> None:
         self._shape = tuple(int(d) for d in shape)
         self._count = int(np.prod(self._shape)) if self._shape else 1
+        self._offset = 0
         logical_dtype = _normalize_dtype(
             host.dtype if host is not None and dtype is None else dtype
         )
@@ -382,7 +395,7 @@ class GLChunk:
                     f"host contains {host_array.size} elements for shape "
                     f"{self._shape} ({self._count} required)"
                 )
-        self._storage = _GLStorage(logical_dtype, host_array)
+        self._storage = _GLStorage(logical_dtype, self._count, host_array)
         self._deferred = None
         self._released = False
 
@@ -501,6 +514,73 @@ class GLChunk:
         chunk = object.__new__(type(self))
         chunk._shape = shape
         chunk._count = count
+        chunk._offset = self._offset
+        chunk._storage = self._storage
+        chunk._storage.refs += 1
+        chunk._deferred = None
+        chunk._released = False
+        return chunk
+
+    def prefix_view(self, shape: Sequence[int]) -> "GLChunk":
+        """Return a zero-copy contiguous prefix with a smaller logical count.
+
+        This is valid only for a row-major prefix beginning at element zero.
+        It exists primarily for first-axis slicing, where dispatching a copy
+        shader would add synchronization without changing a single address.
+        """
+
+        if self._released:
+            raise RuntimeError("cannot view a released GLChunk")
+        shape = tuple(int(d) for d in shape)
+        count = int(np.prod(shape)) if shape else 1
+        if count < 0 or count > self._count:
+            raise ValueError(
+                f"prefix shape {shape} has {count} elements, but source has "
+                f"{self._count}"
+            )
+        # A deferred expression must first produce the complete source buffer;
+        # the prefix then aliases that resident storage.
+        self._to_gpu_current()
+        chunk = object.__new__(type(self))
+        chunk._shape = shape
+        chunk._count = count
+        chunk._offset = self._offset
+        chunk._storage = self._storage
+        chunk._storage.refs += 1
+        chunk._deferred = None
+        chunk._released = False
+        return chunk
+
+    def range_view(
+        self,
+        shape: Sequence[int],
+        *,
+        offset: int,
+    ) -> "GLChunk":
+        """Return an aligned zero-copy contiguous subrange of this chunk."""
+
+        if self._released:
+            raise RuntimeError("cannot view a released GLChunk")
+        shape = tuple(int(d) for d in shape)
+        count = int(np.prod(shape)) if shape else 1
+        offset = int(offset)
+        if offset < 0 or count < 0 or offset + count > self._count:
+            raise ValueError(
+                f"range [{offset}, {offset + count}) is outside "
+                f"{self._count} source elements"
+            )
+        byte_offset = (self._offset + offset) * 4
+        alignment = _compute_limits().ssbo_offset_alignment
+        if byte_offset % alignment:
+            raise ValueError(
+                f"range byte offset {byte_offset} is not aligned to "
+                f"the device SSBO requirement {alignment}"
+            )
+        self._to_gpu_current()
+        chunk = object.__new__(type(self))
+        chunk._shape = shape
+        chunk._count = count
+        chunk._offset = self._offset + offset
         chunk._storage = self._storage
         chunk._storage.refs += 1
         chunk._deferred = None
@@ -607,6 +687,10 @@ class GLChunk:
         """
         if self._released:
             raise RuntimeError("cannot update a released GLChunk")
+        if self._offset != 0 or self._count != self._storage.capacity:
+            raise RuntimeError(
+                "cannot replace storage through a partial GLChunk view"
+            )
         self._deferred = None
         data = np.ascontiguousarray(np.asarray(array, dtype=self.dtype))
         if data.shape != self._shape:
@@ -644,7 +728,10 @@ class GLChunk:
         if self._deferred is not None:
             self.to_gpu()
         if self._storage.host is not None:
-            return self._storage.host.reshape(self._shape)
+            start = self._offset
+            return self._storage.host[start:start + self._count].reshape(
+                self._shape
+            )
         if not self.on_gpu:
             raise RuntimeError("chunk has no CPU data and no live GPU buffer")
         require_gl_context()
@@ -653,12 +740,14 @@ class GLChunk:
         out = np.empty(self._count, dtype=_storage_dtype(self.dtype))
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self._storage.buffer)
         GL.glGetBufferSubData(
-            GL.GL_SHADER_STORAGE_BUFFER, 0, self.nbytes,
+            GL.GL_SHADER_STORAGE_BUFFER, self._offset * 4, self.nbytes,
             out.ctypes.data_as(ctypes.c_void_p),
         )
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
-        self._storage.host = out.astype(self.dtype, copy=False).reshape(-1)
-        return self._storage.host.reshape(self._shape)
+        result = out.astype(self.dtype, copy=False).reshape(self._shape)
+        if self._offset == 0 and self._count == self._storage.capacity:
+            self._storage.host = result.reshape(-1)
+        return result
 
     def numpy(self) -> np.ndarray:
         """Host view, reading back from the GPU when that is the live copy."""
@@ -2460,6 +2549,70 @@ _fusion_depth: ContextVar[int] = ContextVar("glsl_fusion_depth", default=0)
 _deferred_value_ids = itertools.count(start=-1, step=-1)
 
 
+@dataclass
+class _DispatchBatchState:
+    """Mutable state for one lock-free sequence of dependent GL launches."""
+
+    max_bindings: int = 0
+    depth: int = 1
+
+
+_dispatch_batch_state: ContextVar[_DispatchBatchState | None] = ContextVar(
+    "glsl_dispatch_batch_state",
+    default=None,
+)
+
+
+@contextmanager
+def dispatch_batch():
+    """Submit a staged compute graph with one GL state/error boundary.
+
+    Individual launches retain their memory barriers, so dependent kernels see
+    prior writes exactly as they do outside this scope. The scope only removes
+    redundant program resets, SSBO unbinding, and driver error polling between
+    known stages. Nested callers share the outer batch.
+    """
+
+    existing = _dispatch_batch_state.get()
+    if existing is not None:
+        existing.depth += 1
+        try:
+            yield
+        finally:
+            existing.depth -= 1
+        return
+
+    require_gl_context()
+    from OpenGL import GL
+
+    state = _DispatchBatchState()
+    token = _dispatch_batch_state.set(state)
+    checker = getattr(GL.glUseProgram, "error_checker", None)
+    previous_checker = None
+    if checker is not None and hasattr(checker, "_currentChecker"):
+        previous_checker = checker._currentChecker
+        checker._currentChecker = checker.nullGetError
+    succeeded = False
+    try:
+        yield
+        succeeded = True
+    finally:
+        try:
+            for binding in range(state.max_bindings):
+                GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, binding, 0)
+            GL.glUseProgram(0)
+        finally:
+            if previous_checker is not None:
+                checker._currentChecker = previous_checker
+            _dispatch_batch_state.reset(token)
+    if succeeded:
+        error = int(GL.glGetError())
+        if error != int(GL.GL_NO_ERROR):
+            raise RuntimeError(
+                f"OpenGL error 0x{error:04X} during compute dispatch batch"
+            )
+
+
 @contextmanager
 def fuse_elementwise():
     """Defer compatible GLSL primitives and emit each region as one shader.
@@ -2561,6 +2714,7 @@ class GLComputeLimits:
     max_invocations: int
     max_ssbo_bindings: int
     max_compute_ssbo_blocks: int
+    ssbo_offset_alignment: int = 1
 
     @property
     def max_dispatch_ssbo_blocks(self) -> int:
@@ -2626,6 +2780,9 @@ def _compute_limits() -> GLComputeLimits:
         ),
         max_compute_ssbo_blocks=_first_gl_integer(
             GL.glGetIntegerv(GL.GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS)
+        ),
+        ssbo_offset_alignment=_first_gl_integer(
+            GL.glGetIntegerv(GL.GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT)
         ),
     )
     _compute_limits_cache[key] = limits
@@ -2721,6 +2878,27 @@ def _dispatch(
     _dispatch_many(program_id, chunks, (out,), plan)
 
 
+def _bind_chunk(binding: int, chunk: GLChunk) -> None:
+    """Bind a whole buffer or an aligned logical subrange."""
+
+    from OpenGL import GL
+
+    if chunk._offset:
+        GL.glBindBufferRange(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            binding,
+            chunk.buffer_id,
+            chunk._offset * 4,
+            chunk.nbytes,
+        )
+    else:
+        GL.glBindBufferBase(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            binding,
+            chunk.buffer_id,
+        )
+
+
 def _dispatch_many(
     program_id: int,
     chunks: Sequence[GLChunk],
@@ -2752,6 +2930,30 @@ def _dispatch_many(
     for output in outputs:
         output._to_gpu_current()
 
+    batch = _dispatch_batch_state.get()
+    if batch is not None:
+        batch.max_bindings = max(batch.max_bindings, binding_count)
+        GL.glUseProgram(program_id)
+        uniform_key = (program_id, "u_count")
+        loc = _uniform_location_cache.get(uniform_key)
+        if loc is None:
+            loc = int(GL.glGetUniformLocation(program_id, "u_count"))
+            _uniform_location_cache[uniform_key] = loc
+        if loc != -1:
+            GL.glUniform1ui(loc, plan.count)
+        for binding, chunk in enumerate(chunks):
+            _bind_chunk(binding, chunk)
+        for output_index, output in enumerate(outputs, len(chunks)):
+            _bind_chunk(output_index, output)
+        GL.glDispatchCompute(*plan.groups)
+        GL.glMemoryBarrier(
+            GL.GL_SHADER_STORAGE_BARRIER_BIT
+            | GL.GL_BUFFER_UPDATE_BARRIER_BIT
+        )
+        for output in outputs:
+            output._mark_gpu_written()
+        return
+
     # PyOpenGL normally calls glGetError after every individual state change.
     # A dispatch performs a dozen tightly related calls, so that policy can do
     # more driver round-trips than the shader itself. Preserve error detection
@@ -2773,15 +2975,9 @@ def _dispatch_many(
             GL.glUniform1ui(loc, plan.count)
 
         for binding, chunk in enumerate(chunks):
-            GL.glBindBufferBase(
-                GL.GL_SHADER_STORAGE_BUFFER, binding, chunk.buffer_id
-            )
+            _bind_chunk(binding, chunk)
         for output_index, output in enumerate(outputs, len(chunks)):
-            GL.glBindBufferBase(
-                GL.GL_SHADER_STORAGE_BUFFER,
-                output_index,
-                output.buffer_id,
-            )
+            _bind_chunk(output_index, output)
 
         GL.glDispatchCompute(*plan.groups)
         # Without this the readback may observe stale memory. It is the GPU
@@ -2815,7 +3011,101 @@ def _structural_chunks(values: Sequence[Any]) -> list[GLChunk]:
         value if isinstance(value, GLChunk) else GLChunk.from_numpy(value)
         for value in values
     ]
+    _materialize_structural_fanout(chunks)
     return chunks
+
+
+def _materialize_structural_fanout(chunks: Sequence[GLChunk]) -> None:
+    """Coalesce compatible deferred branches before stack/cat boundaries."""
+
+    candidates: list[GLChunk] = []
+    seen_chunks: set[int] = set()
+    for chunk in chunks:
+        if chunk._deferred is None or id(chunk) in seen_chunks:
+            continue
+        candidates.append(chunk)
+        seen_chunks.add(id(chunk))
+    if len(candidates) < 2:
+        return
+
+    groups: list[list[GLChunk]] = []
+    for chunk in candidates:
+        placed = False
+        for group in groups:
+            if group[0].shape != chunk.shape:
+                continue
+            tentative = group + [chunk]
+            feed_ids = {
+                feed_id
+                for value in tentative
+                for feed_id in value._deferred.feeds
+            }
+            step_ids = {
+                step.result_id
+                for value in tentative
+                for step in value._deferred.program.steps
+            }
+            binding_count = len(feed_ids) + len(tentative)
+            if (
+                binding_count
+                <= _compute_limits().max_dispatch_ssbo_blocks
+                and len(step_ids) <= 512
+            ):
+                group.append(chunk)
+                placed = True
+                break
+        if not placed:
+            groups.append([chunk])
+
+    for group in groups:
+        if len(group) < 2:
+            continue
+        snapshots = [chunk._deferred for chunk in group]
+        feeds: dict[int, GLChunk] = {}
+        metadata: dict[int, Meta] = {}
+        steps: list[OpStep] = []
+        seen_results: set[int] = set()
+        outputs: dict[str, int] = {}
+        feed_order: list[int] = []
+        for output_index, deferred in enumerate(snapshots):
+            assert deferred is not None
+            for feed_id, feed in deferred.feeds.items():
+                if feed_id not in feeds:
+                    feed_order.append(feed_id)
+                feeds[feed_id] = feed
+            if deferred.program.meta:
+                metadata.update(deferred.program.meta)
+            for step in deferred.program.steps:
+                if step.result_id not in seen_results:
+                    steps.append(step)
+                    seen_results.add(step.result_id)
+            outputs[f"result_{output_index}"] = primary_output_id(
+                deferred.program
+            )
+        program = FusedProgram(
+            version=1,
+            feeds=set(feeds),
+            steps=steps,
+            outputs=outputs,
+            meta=metadata,
+        )
+        program.feed_order = tuple(feed_order)
+        program.glsl_linear_output_shape = group[0].shape
+        for chunk in group:
+            chunk._deferred = None
+        try:
+            execute_multi_output_program(
+                program,
+                feeds,
+                outs={
+                    f"result_{index}": chunk
+                    for index, chunk in enumerate(group)
+                },
+            )
+        except Exception:
+            for chunk, deferred in zip(group, snapshots):
+                chunk._deferred = deferred
+            raise
 
 
 def _structural_dtype(chunks: Sequence[GLChunk]) -> np.dtype:
@@ -3086,6 +3376,19 @@ def slice_axis_chunk(
         )
     if start == 0 and step == 1 and count == chunk.shape[dim]:
         return chunk.view(output_shape)
+    if dim == 0 and step == 1:
+        if start == 0:
+            return chunk.prefix_view(output_shape)
+        source_row_size = _shape_product(chunk.shape[1:])
+        try:
+            return chunk.range_view(
+                output_shape,
+                offset=start * source_row_size,
+            )
+        except ValueError:
+            # SSBO range offsets are device-aligned. Small/misaligned slices
+            # retain the ordinary one-dispatch copy path below.
+            pass
     out = GLChunk(output_shape, dtype=chunk.dtype)
     plan = plan_launch(out.count, binding_count=2)
     _dispatch(

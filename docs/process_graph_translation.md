@@ -62,7 +62,7 @@ not enter backend partitioning.
 The optional `complete` profile preserves every recognized syntax node for
 coverage audits and source archaeology. It is deliberately not the graph sent
 to GLSL. On the current Mandelbrot/compression source bundle, the complete
-graph has 11,928 nodes while the compiler projection has 1,916 nodes.
+graph has 11,973 nodes while the compiler projection has 1,911 nodes.
 
 The importer recognizes canonical tensor operation spellings in
 both method and function form. For example,
@@ -119,8 +119,14 @@ restated inside the elementwise emitter.
 The [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md) no
 longer uses execution-tape capture. Its source-bundle builder ingests the
 original solve, palette, compression, JPEG, and container functions as one
-entrypoint-rooted ProcessGraph. Region optimization and executable backend
-lowering remain the next compiler stage.
+entrypoint-rooted ProcessGraph. The display entrypoint now has an executable
+structured GLSL lowering: resolved function regions are inlined, the canonical
+Python control loop becomes one GLSL loop without source unrolling, scalar
+controls are packed into one resident feed, and count/Y/Cb/Cr are produced by
+one multi-output dispatch. The complete encoder still runs as ordinary
+AbstractTensor composition across explicit DCT, reduction, scan, scatter, and
+host-byte boundaries. Partitioning that full graph into a small ordered set of
+legal regions is the next compiler stage.
 
 ## Nodus
 
