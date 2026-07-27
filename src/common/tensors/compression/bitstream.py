@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from ..abstraction import AbstractTensor
 from ..autograd import autograd
@@ -48,7 +49,25 @@ def tensor_octets_to_bytes(
     if limit < 0 or limit > octets.shape[0]:
         raise ValueError("octet count is outside the tensor payload")
     values = octets[:limit].tolist()
-    return bytes(int(value) for value in values)
+    serialized: list[int] = []
+    for index, value in enumerate(values):
+        try:
+            numeric = float(value)
+            integer = int(value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"octet {index} is not a finite integer byte value: {value!r}"
+            ) from error
+        if not math.isfinite(numeric) or numeric != integer:
+            raise ValueError(
+                f"octet {index} is not an integer byte value: {value!r}"
+            )
+        if integer < 0 or integer > 255:
+            raise ValueError(
+                f"octet {index} is outside [0, 255]: {value!r}"
+            )
+        serialized.append(integer)
+    return bytes(serialized)
 
 
 @dataclass(frozen=True)
@@ -130,7 +149,7 @@ def compact_codewords(codewords: HuffmanCodewords) -> PackedBitstream:
     )
     octets = (
         stream.reshape(-1, 8) * byte_weights.unsqueeze(0)
-    ).sum(dim=1)
+    ).sum(dim=1).to_dtype("int64")
     return PackedBitstream(
         octets=octets,
         valid_bits=lengths.sum(),

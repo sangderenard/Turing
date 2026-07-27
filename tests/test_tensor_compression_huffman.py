@@ -11,6 +11,7 @@ from src.common.tensors.compression.bitstream import (
     compact_codewords,
     decode_huffman_octets,
     decode_with_provenance,
+    tensor_octets_to_bytes,
     unpack_octets,
 )
 from src.common.tensors.compression.jpeg.huffman import (
@@ -68,6 +69,33 @@ def test_codewords_compact_to_real_msb_first_octets(backend):
     assert packed.valid_bits.item() == 18
     assert packed.symbol_offsets.tolist() == [0, 2, 5, 9]
     assert packed.to_bytes() == bytes((0x17, 0x7F, 0x80))
+
+
+def test_octet_boundary_accepts_integral_storage_and_rejects_corruption():
+    with AT.use_backend("numpy"):
+        assert tensor_octets_to_bytes(
+            AT.tensor([0.0, 127.0, 255.0])
+        ) == b"\x00\x7f\xff"
+
+        for values, message in (
+            ([1.5], "not an integer"),
+            ([-1.0], "outside"),
+            ([256.0], "outside"),
+            ([float("nan")], "not a finite"),
+            ([float("inf")], "not a finite"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                tensor_octets_to_bytes(AT.tensor(values))
+
+
+def test_compacted_octets_request_integer_dtype():
+    with AT.use_backend("numpy"):
+        table = jpeg_standard_dc_luminance(AT.tensor([0]))
+        packed = compact_codewords(
+            table.encode_codewords(AT.tensor([0, 1, 6, 11]))
+        )
+
+    assert "int" in str(packed.octets.dtype)
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "c"])

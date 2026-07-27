@@ -75,7 +75,9 @@ def _stuff_entropy_octets(octets: AbstractTensor) -> AbstractTensor:
         + preceding_markers
     ).to_dtype("int64")
     stuffed = AbstractTensor.zeros(
-        (count + marker_count,), cls=type(octets)
+        (count + marker_count,),
+        dtype=octets.dtype,
+        cls=type(octets),
     )
     with autograd.no_grad():
         stuffed = AbstractTensor.scatter(
@@ -114,7 +116,7 @@ class _EntropyTensorAccumulator:
         octets = (
             combined[:complete_bit_count].reshape(-1, 8)
             * byte_weights.unsqueeze(0)
-        ).sum(dim=1)
+        ).sum(dim=1).to_dtype("int64")
         return tensor_octets_to_bytes(_stuff_entropy_octets(octets))
 
     def finish(self) -> bytes:
@@ -135,7 +137,7 @@ class _EntropyTensorAccumulator:
         )
         octets = (
             padded.reshape(1, 8) * byte_weights.unsqueeze(0)
-        ).sum(dim=1)
+        ).sum(dim=1).to_dtype("int64")
         self._pending = None
         return tensor_octets_to_bytes(
             _stuff_entropy_octets(octets)
