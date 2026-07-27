@@ -21,6 +21,7 @@ from . import (
     ProgramRunner,
     Sequential,
     Tanh,
+    capture_backward_program,
     capture_forward_program,
 )
 from .utils import set_seed
@@ -118,6 +119,7 @@ def run_demo(
     live: bool = False,
     render_every: int = 20,
     output: str | Path | None = "abstract_nn_fused_field.png",
+    capture_backward: bool = False,
 ):
     previous_tape = autograd.tape
     autograd.tape = GradTape()
@@ -145,6 +147,7 @@ def run_demo(
                 raise RuntimeError(f"unexplained FusedProgram feeds: {unexplained}")
             runner = ProgramRunner(program)
             loss_module = MSELoss()
+            backward_capture = None
 
             def predict(values):
                 return runner(
@@ -155,6 +158,11 @@ def run_demo(
                 loss = loss_module(predict(x_train), y_train)
                 return loss, float(loss.item())
 
+            if capture_backward:
+                capture_loss = loss_module(predict(x_train), y_train)
+                backward_capture = capture_backward_program(
+                    capture_loss, params
+                )
             process = AutogradProcess(autograd.tape)
             axis = np.linspace(-1.0, 1.0, display_resolution)
             xx, yy = np.meshgrid(axis, axis, indexing="xy")
@@ -203,6 +211,16 @@ def run_demo(
                 "initial_loss": losses[0],
                 "final_loss": losses[-1],
                 "program_steps": len(program.steps),
+                "backward_program_steps": (
+                    len(backward_capture.program.steps)
+                    if backward_capture is not None
+                    else 0
+                ),
+                "missing_backward": (
+                    backward_capture.missing_backward
+                    if backward_capture is not None
+                    else ()
+                ),
                 "forward_nodes": len(process.forward_graph),
                 "backward_nodes": len(process.backward_graph),
                 "output": output_path,
@@ -223,6 +241,7 @@ def main():
     parser.add_argument("--render-every", type=int, default=20)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--output", default="abstract_nn_fused_field.png")
+    parser.add_argument("--capture-backward", action="store_true")
     args = parser.parse_args()
     result = run_demo(
         epochs=args.epochs,

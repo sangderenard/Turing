@@ -9,7 +9,8 @@ flag to alter mode sensitive operators.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Set, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Set, Optional, Tuple
+from dataclasses import dataclass
 import inspect
 import difflib
 
@@ -19,6 +20,7 @@ from ..abstraction import AbstractTensor as AT
 from ..graph_translator import GraphTranslator
 from ....transmogrifier.ilpscheduler import ILPScheduler
 from ..autograd import autograd
+from ..backward import BACKWARD_REGISTRY
 from .optimizer import Adam, adam_step
 from collections import deque
 import sys
@@ -179,6 +181,108 @@ def capture_forward_program(model, inputs: AT, *, output_name: str = "prediction
     return program, id(inputs)
 
 
+@dataclass(frozen=True)
+class BackwardProgramCapture:
+    """A captured backward program and the live values for its feed boundary."""
+
+    program: FusedProgram
+    feed_values: Dict[int, AT]
+    missing_backward: tuple[str, ...]
+
+
+def capture_backward_program(
+    loss: AT,
+    wrt: Iterable[AT],
+    *,
+    grad_output: AT | None = None,
+    backward_overrides: Dict[str, Callable[..., Any]] | None = None,
+    allow_missing: bool = False,
+    output_prefix: str = "grad",
+) -> BackwardProgramCapture:
+    """Obtain a FusedProgram for reverse mode, symmetric with forward capture.
+
+    Backward rules come from the canonical ``BACKWARD_REGISTRY`` or from
+    ``backward_overrides``. Saved forward values become explicit feeds; the
+    forward operations themselves are not duplicated into the backward
+    program.
+    """
+    wrt = tuple(wrt)
+    forward_tape = getattr(loss, "_tape", None) or autograd.tape
+    if id(loss) not in forward_tape.graph:
+        raise ValueError("loss is not present on the active forward GradTape")
+    override_names = set(backward_overrides or {})
+    missing = tuple(sorted({
+        str(node.op)
+        for _, node in forward_tape.traverse(loss)
+        if node.op not in override_names
+        and node.op not in BACKWARD_REGISTRY._methods
+    }))
+    if missing and not allow_missing:
+        raise RuntimeError(
+            "cannot capture backward program; missing backward operators: "
+            + ", ".join(missing)
+        )
+
+    if grad_output is None:
+        with autograd.no_grad():
+            grad_output = loss.ones_like()
+    grad_output._tape = forward_tape
+    forward_tape.create_tensor_node(grad_output)
+    before_nodes = set(forward_tape.graph.nodes)
+    previous_tape = autograd.tape
+    autograd.tape = forward_tape
+    try:
+        gradients = autograd.grad(
+            loss,
+            wrt,
+            grad_outputs=grad_output,
+            retain_graph=True,
+            allow_unused=allow_missing,
+            backward_overrides=backward_overrides,
+            record_backward=True,
+        )
+    finally:
+        autograd.tape = previous_tape
+
+    graph = forward_tape.graph
+    new_nodes = set(graph.nodes) - before_nodes
+    selected = set(new_nodes)
+    for node_id in tuple(new_nodes):
+        selected.update(graph.predecessors(node_id))
+    backward_graph = graph.subgraph(selected).copy()
+    outputs = {
+        f"{output_prefix}_{index}": id(gradient)
+        for index, gradient in enumerate(gradients)
+        if gradient is not None
+    }
+    if not outputs:
+        raise RuntimeError("backward capture produced no gradients")
+    program = build_fused_program(
+        backward_graph,
+        outputs=outputs,
+    )
+    refs = getattr(forward_tape, "_tensor_refs", {})
+    live_values: Dict[int, AT] = dict(refs)
+    for node in getattr(forward_tape, "_nodes", {}).values():
+        for value in node.ctx.get("inputs", ()):
+            if isinstance(value, AT):
+                live_values[id(value)] = value
+        value = node.ctx.get("result")
+        if isinstance(value, AT):
+            live_values[id(value)] = value
+    for value in (*wrt, loss, grad_output, *gradients):
+        if isinstance(value, AT):
+            live_values[id(value)] = value
+    feed_values = {
+        feed_id: live_values[feed_id]
+        for feed_id in program.feeds
+        if feed_id in live_values
+    }
+    if id(grad_output) in program.feeds:
+        feed_values[id(grad_output)] = grad_output
+    return BackwardProgramCapture(program, feed_values, missing)
+
+
 # ---------------------------------------------------------------------------
 # Program runner
 # ---------------------------------------------------------------------------
@@ -293,6 +397,22 @@ class ProgramRunner:
 
             # Build call kwargs with optional training flag if accepted
             call_kwargs = dict(step.attrs or {})
+            positional_tail: tuple[Any, ...] = ()
+            if step.op_name == "reshape":
+                reshape_shape = call_kwargs.pop(
+                    "new_shape", call_kwargs.pop("shape", None)
+                )
+                if reshape_shape is not None:
+                    positional_tail = tuple(reshape_shape)
+            elif step.op_name == "permute":
+                permutation = call_kwargs.pop(
+                    "perm", call_kwargs.pop("dims", None)
+                )
+                if permutation is not None:
+                    positional_tail = tuple(permutation)
+            elif step.op_name in {"sum", "mean", "max", "min"}:
+                if "axis" in call_kwargs and "dim" not in call_kwargs:
+                    call_kwargs["dim"] = call_kwargs.pop("axis")
             canonical_scalar = None
             has_canonical_scalar = False
             if canonical_op in ELEMENTWISE_UNARY | ELEMENTWISE_BINARY:
@@ -362,7 +482,7 @@ class ProgramRunner:
                 elif step.op_name == "matmul":
                     result = fn("matmul", args[0], args[1])
                 else:
-                    result = fn(*args, **call_kwargs)
+                    result = fn(*args, *positional_tail, **call_kwargs)
             except Exception as e:
                 # Gather neighbor context for diagnostics
                 prev_producers = [producers.get(i).step_id for i in step.input_ids if producers.get(i)]
@@ -409,6 +529,9 @@ __all__ = [
     "OpStep",
     "FusedProgram",
     "build_fused_program",
+    "capture_forward_program",
+    "capture_backward_program",
+    "BackwardProgramCapture",
     "ProgramRunner",
     "IRGraphedModel",
 ]

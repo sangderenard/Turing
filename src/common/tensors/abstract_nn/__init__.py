@@ -10,6 +10,8 @@ from .fused_program import (
     FusedProgram,
     build_fused_program,
     capture_forward_program,
+    capture_backward_program,
+    BackwardProgramCapture,
     ProgramRunner,
 )
 from .completion_training import (

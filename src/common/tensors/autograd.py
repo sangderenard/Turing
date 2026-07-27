@@ -128,7 +128,7 @@ accumulate gradients for requested inputs.
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import networkx as nx
 import hashlib
@@ -1032,6 +1032,7 @@ class Autograd:
         retain_graph: bool = False,
         allow_unused: bool = False,
         backward_overrides: Dict[str, Callable[..., Any]] | None = None,
+        record_backward: bool = False,
     ) -> List[Any]:
         tape_for_output = getattr(output, "_tape", self.tape)
         effective_overrides = dict(
@@ -1186,7 +1187,8 @@ class Autograd:
         tape = tape_for_output
         grad_map: Dict[int, Any] = {id(output): out_grad}
 
-        with self.no_grad():
+        backward_context = nullcontext() if record_backward else self.no_grad()
+        with backward_context:
             for tid, node in tape.traverse(output):
                 grad_out = grad_map.get(tid)
                 if grad_out is None:

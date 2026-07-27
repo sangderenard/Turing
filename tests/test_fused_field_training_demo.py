@@ -10,8 +10,11 @@ def test_fused_field_program_visibly_learns():
         training_phases=4,
         display_resolution=16,
         output=None,
+        capture_backward=True,
     )
     assert result["program_steps"] > 1
     assert result["forward_nodes"] > 0
     assert result["backward_nodes"] > 0
+    assert result["backward_program_steps"] > 1
+    assert result["missing_backward"] == ()
     assert result["final_loss"] < 0.15 * result["initial_loss"]
