@@ -57,10 +57,12 @@ class ManifoldPackage:
             if self.num_eigenpairs and isinstance(laplace_dense, AbstractTensor):
                 # Compute full symmetric eigendecomposition (ascending eigenvalues)
                 w, V = AbstractTensor.linalg.eigh(laplace_dense)
-                # Keep the first num_eigenpairs (smallest magnitude modes)
+                # ``BuildLaplace3D`` uses the negative-semidefinite convention
+                # and eigh sorts ascending.  The low-frequency modes are
+                # therefore at the end (closest to zero), not the beginning.
                 k = max(1, int(self.num_eigenpairs))
-                self.evals = w[:k]
-                self.evecs = V[:, :k]
+                self.evals = w[-k:]
+                self.evecs = V[:, -k:]
 
     def laplace_package(self) -> dict:
         if self.package is None:
