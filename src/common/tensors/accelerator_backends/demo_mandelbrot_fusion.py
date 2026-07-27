@@ -1,41 +1,10 @@
-"""One ordinary AbstractTensor program, three backends, one picture.
+"""Mandelbrot/JPEG compiler demo awaiting complete AST-to-ProcessGraph input.
 
-Escape-time Mandelbrot as an ordinary AbstractTensor function. The iteration is
-*unrolled*, so ``iterations`` steps become ~10x that many instructions in a
-single program with no control flow at all -- which is the point: it is the
-deepest fused program either backend has been asked to run, and it renders
-something you can look at.
-
-Why it needs no ``select``/``where``
-------------------------------------
-Escape counting is usually written with a branch. It does not need one: the
-comparison primitives already return 1.0/0.0, so
-
-    still_inside = le(|z|^2, 4.0)
-    count        = count + still_inside
-
-accumulates the escape iteration branchlessly. So this demo runs entirely on
-ops both backends already have -- nothing was invented to make it work. (The
-missing ternary ``select`` still matters for *general* control flow; it just
-isn't needed here.)
-
-What it exercises
------------------
-* the GLSL emitter at depth -- hundreds of instructions in one shader, every
-  intermediate a register-resident local, one dispatch;
-* the C backend's private slot lowering over the same FusedProgram steps;
-* the shared canonical op vocabulary, from two directions at once;
-* numpy as the behavioural oracle for both.
-
-Python executes the ordinary AbstractTensor function once under GradTape
-capture. The resulting established ``FusedProgram`` is then the single input
-to NumPy verification, the C one-call backend, and GLSL shader lowering. There
-is no demo-only instruction class or separately maintained NumPy algorithm.
-
-Run it::
-
-    python -m src.common.tensors.accelerator_backends.demo_mandelbrot_fusion
-    python -m ...demo_mandelbrot_fusion --width 1600 --height 1200 --iterations 96
+The former GradTape-to-FusedProgram shortcut is deliberately disabled. It
+captured only an executed elementwise prefix and therefore did not represent
+the encoder or its control flow. The mathematical and rendering helpers remain
+here, but the capture entry points fail until the complete program is compiled
+through AST -> ProcessGraph before backend optimization and lowering.
 """
 
 from __future__ import annotations
@@ -115,86 +84,21 @@ def parametric_mandelbrot_escape(
 
 
 def capture_mandelbrot(cx: np.ndarray, cy: np.ndarray, iterations: int):
-    """Execute and capture the ordinary function as one FusedProgram."""
+    """Reject the retired execution-tape compiler shortcut."""
 
-    from ..autograd import autograd
-    from ..numpy_backend import NumPyTensorOperations
-    from .c_primitive_program import compile_elementwise_tape
-
-    with autograd.forward_capture() as tape:
-        x = NumPyTensorOperations.tensor(cx)
-        y = NumPyTensorOperations.tensor(cy)
-        output = mandelbrot_escape(x, y, iterations)
-    captured = compile_elementwise_tape(tape, output)
-    captured = type(captured)(captured.program, {id(x): x, id(y): y})
-    return captured, np.asarray(output.tolist(), dtype=cx.dtype)
+    raise RuntimeError(
+        "Mandelbrot GradTape capture is disabled; compile the complete "
+        "program through AST -> ProcessGraph instead"
+    )
 
 
 def capture_parametric_mandelbrot(iterations: int):
-    """Capture one reusable solve with scalar center/span feed parameters."""
-    from ..autograd import autograd
-    from ..numpy_backend import NumPyTensorOperations
-    from .c_primitive_program import compile_elementwise_tape
+    """Reject the retired execution-tape compiler shortcut."""
 
-    with autograd.forward_capture() as tape:
-        unit_x = NumPyTensorOperations.tensor(
-            np.asarray([-0.5, 0.5], dtype=np.float32)
-        )
-        unit_y = NumPyTensorOperations.tensor(
-            np.asarray([-0.5, 0.5], dtype=np.float32)
-        )
-        center_x = NumPyTensorOperations.tensor(
-            np.asarray([0.0], dtype=np.float32)
-        )
-        center_y = NumPyTensorOperations.tensor(
-            np.asarray([0.0], dtype=np.float32)
-        )
-        span = NumPyTensorOperations.tensor(
-            np.asarray([1.0], dtype=np.float32)
-        )
-        family_mix = NumPyTensorOperations.tensor(
-            np.asarray([0.0], dtype=np.float32)
-        )
-        julia_x = NumPyTensorOperations.tensor(
-            np.asarray([-0.72], dtype=np.float32)
-        )
-        julia_y = NumPyTensorOperations.tensor(
-            np.asarray([0.24], dtype=np.float32)
-        )
-        output = parametric_mandelbrot_escape(
-            unit_x,
-            unit_y,
-            center_x,
-            center_y,
-            span,
-            family_mix,
-            julia_x,
-            julia_y,
-            iterations,
-        )
-    roles = {
-        "unit_x": id(unit_x),
-        "unit_y": id(unit_y),
-        "center_x": id(center_x),
-        "center_y": id(center_y),
-        "span": id(span),
-        "family_mix": id(family_mix),
-        "julia_x": id(julia_x),
-        "julia_y": id(julia_y),
-    }
-    captured = compile_elementwise_tape(
-        tape,
-        output,
-        dynamic_scalar_ids=(
-            roles["center_x"],
-            roles["center_y"],
-            roles["span"],
-            roles["family_mix"],
-            roles["julia_x"],
-            roles["julia_y"],
-        ),
+    raise RuntimeError(
+        "Parametric Mandelbrot GradTape capture is disabled; compile the "
+        "complete program through AST -> ProcessGraph instead"
     )
-    return captured.program, roles
 
 
 def mandelbrot_jpeg_planes(
@@ -243,101 +147,12 @@ def mandelbrot_jpeg_planes(
 
 
 def capture_parametric_mandelbrot_encoder(iterations: int):
-    """Capture, ProcessGraph-plan, and lower the solve plus JPEG planes."""
+    """Reject the partial tape capture previously presented as compilation."""
 
-    from ....compiler.process_graph_fusion import (
-        BackendFusionProfile,
-        dispatch_region_to_fused_program,
-        fused_program_to_process_graph,
-        plan_process_graph_dispatches,
+    raise RuntimeError(
+        "Partial Mandelbrot/JPEG GradTape capture is disabled; the complete "
+        "encoder must enter through AST -> ProcessGraph before lowering"
     )
-    from ..autograd import autograd
-    from ..numpy_backend import NumPyTensorOperations
-    from .c_primitive_program import compile_elementwise_tape
-    from .glsl_backend import GLSL_OPS
-
-    with autograd.forward_capture() as tape:
-        unit_x = NumPyTensorOperations.tensor(
-            np.asarray([-0.5, 0.5], dtype=np.float32)
-        )
-        unit_y = NumPyTensorOperations.tensor(
-            np.asarray([-0.5, 0.5], dtype=np.float32)
-        )
-        scalar = lambda value: NumPyTensorOperations.tensor(
-            np.asarray([value], dtype=np.float32)
-        )
-        center_x = scalar(0.0)
-        center_y = scalar(0.0)
-        span = scalar(1.0)
-        family_mix = scalar(0.0)
-        julia_x = scalar(-0.72)
-        julia_y = scalar(0.24)
-        palette_phase = scalar(0.0)
-        color_drive = scalar(0.52)
-        counts = parametric_mandelbrot_escape(
-            unit_x,
-            unit_y,
-            center_x,
-            center_y,
-            span,
-            family_mix,
-            julia_x,
-            julia_y,
-            iterations,
-        )
-        luminance, blue_difference, red_difference = mandelbrot_jpeg_planes(
-            counts,
-            iterations,
-            palette_phase,
-            color_drive,
-        )
-
-    role_values = {
-        "unit_x": unit_x,
-        "unit_y": unit_y,
-        "center_x": center_x,
-        "center_y": center_y,
-        "span": span,
-        "family_mix": family_mix,
-        "julia_x": julia_x,
-        "julia_y": julia_y,
-        "palette_phase": palette_phase,
-        "color_drive": color_drive,
-    }
-    roles = {name: id(value) for name, value in role_values.items()}
-    captured = compile_elementwise_tape(
-        tape,
-        {
-            "counts": counts,
-            "luminance": luminance,
-            "blue_difference": blue_difference,
-            "red_difference": red_difference,
-        },
-        dynamic_scalar_ids=tuple(
-            roles[name]
-            for name in roles
-            if name not in {"unit_x", "unit_y"}
-        ),
-    )
-    process_graph = fused_program_to_process_graph(captured.program)
-    plan = plan_process_graph_dispatches(
-        process_graph,
-        BackendFusionProfile(
-            "glsl",
-            frozenset(GLSL_OPS),
-            # OpenGL guarantees at least 16 compute-stage SSBO bindings.
-            max_bindings=16,
-        ),
-    )
-    if len(plan.regions) != 1:
-        raise RuntimeError(
-            "Mandelbrot solve/palette did not form one GLSL dispatch region: "
-            f"{len(plan.regions)} regions"
-        )
-    region = plan.regions[0]
-    if set(dict(region.outputs)) != set(captured.program.outputs):
-        raise RuntimeError("ProcessGraph fusion lost a Mandelbrot output")
-    return dispatch_region_to_fused_program(process_graph, region), roles, plan
 
 
 def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):

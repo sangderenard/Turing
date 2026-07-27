@@ -1,12 +1,14 @@
 import numpy as np
+import pytest
 
 from src.common.tensors.accelerator_backends.demo_mandelbrot_fusion import (
     animated_camera,
+    capture_mandelbrot,
     capture_parametric_mandelbrot,
+    capture_parametric_mandelbrot_encoder,
     dream_parameters,
     normalized_plane,
     parametric_mandelbrot_escape,
-    run_glsl_frame_batch,
 )
 from src.common.tensors.accelerator_backends.demo_mandelbrot_fusion import (
     mandelbrot_escape,
@@ -26,66 +28,21 @@ def test_animated_camera_produces_visible_nonrepeating_variety():
     assert spans.max() / spans.min() > 8.0
 
 
-def test_camera_parameters_survive_capture_as_runtime_feeds():
-    program, roles = capture_parametric_mandelbrot(4)
-    assert set(roles.values()) == set(program.feeds)
-
-
-def test_captured_glsl_program_broadcasts_an_outer_frame_batch():
-    from src.common.tensors.accelerator_backends.glsl_backend import (
-        GLContextUnavailable,
-        require_gl_context,
-    )
-
-    try:
-        require_gl_context()
-    except GLContextUnavailable as exc:
-        import pytest
-        pytest.skip(f"no OpenGL compute context: {exc}")
-
-    iterations = 6
-    program, roles = capture_parametric_mandelbrot(iterations)
-    unit_x, unit_y = normalized_plane(12, 8)
-    centers = np.asarray(
-        [-0.72 + 0.0j, -0.66 + 0.08j, -0.58 + 0.16j],
-        dtype=np.complex64,
-    )
-    spans = np.asarray([2.5, 2.0, 1.5], dtype=np.float32)
-    family = np.asarray([0.0, 0.1, 0.2], dtype=np.float32)
-    julia = np.asarray([-0.72 + 0.24j] * 3, dtype=np.complex64)
-
-    result = run_glsl_frame_batch(
-        program,
-        roles,
-        unit_x,
-        unit_y,
-        centers=centers,
-        spans=spans,
-        family_mixes=family,
-        julia_constants=julia,
-    )
-    column = lambda values: NT.tensor(
-        np.asarray(values, dtype=np.float32).reshape(-1, 1)
-    )
-    reference = parametric_mandelbrot_escape(
-        NT.tensor(unit_x.reshape(1, -1)),
-        NT.tensor(unit_y.reshape(1, -1)),
-        column(centers.real),
-        column(centers.imag),
-        column(spans),
-        column(family),
-        column(julia.real),
-        column(julia.imag),
-        iterations,
-    )
-    try:
-        assert result.shape == (3, 12 * 8)
-        np.testing.assert_array_equal(
-            result.numpy(),
-            np.asarray(reference.tolist(), dtype=np.float32),
-        )
-    finally:
-        result.release()
+@pytest.mark.parametrize(
+    "capture",
+    (
+        lambda: capture_mandelbrot(
+            np.zeros(2, dtype=np.float32),
+            np.zeros(2, dtype=np.float32),
+            4,
+        ),
+        lambda: capture_parametric_mandelbrot(4),
+        lambda: capture_parametric_mandelbrot_encoder(4),
+    ),
+)
+def test_execution_tape_capture_is_disabled(capture):
+    with pytest.raises(RuntimeError, match="AST -> ProcessGraph"):
+        capture()
 
 
 def test_zero_family_mix_is_exactly_the_mandelbrot_recurrence():
