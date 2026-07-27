@@ -3,6 +3,7 @@ import pytest
 from src.common.tensors.abstraction import AbstractTensor as AT
 from src.common.tensors.compression.coefficient_events import (
     collect_block_coefficient_events,
+    collect_component_block_coefficient_events,
     decode_signed_magnitudes,
     encode_signed_magnitudes,
     reconstruct_block_coefficients,
@@ -91,3 +92,23 @@ def test_block_dc_predictor_can_continue_across_streaming_batches():
 
     assert decode_signed_magnitudes(first.dc).tolist() == [3, 3]
     assert decode_signed_magnitudes(second.dc).tolist() == [2]
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "c"])
+def test_component_event_collection_resets_each_dc_predictor(backend):
+    coefficients = [
+        [[3, 0, 2, 0], [6, 1, 0, 0]],
+        [[20, 0, 0, 4], [23, 0, -1, 0]],
+        [[-1, 5, 0, 0], [1, 0, 0, 6]],
+    ]
+    with AT.use_backend(backend):
+        events = collect_component_block_coefficient_events(
+            AT.tensor(coefficients),
+            max_magnitude_bits=8,
+            previous_dc=(1, 10, -2),
+        )
+
+    assert decode_signed_magnitudes(events.dc).tolist() == [
+        2, 3, 10, 3, 1, 2
+    ]
+    assert events.event_counts.tolist() == [1, 1, 1, 1, 1, 1]

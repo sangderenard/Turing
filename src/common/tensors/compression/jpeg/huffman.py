@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...abstraction import AbstractTensor
+from ...autograd import autograd
 from ..huffman import CanonicalHuffmanTable
 
 
@@ -98,11 +99,36 @@ def jpeg_huffman_table(
         if count
     ]
     ordered_lengths = AbstractTensor.cat(parts, dim=0)
-    return CanonicalHuffmanTable.from_code_lengths(
+    ordered = CanonicalHuffmanTable.from_code_lengths(
         ordered_lengths,
         max_bits=16,
-        symbols=ordered_symbols,
         validate=False,
+    )
+    # JPEG transmits symbols in canonical-code order, but its symbol space is
+    # dense and bounded.  Materialize that order once into dense lookup tensors
+    # so encoding a frame can gather by symbol value.  Keeping
+    # ``ordered_symbols`` on every table would turn each lookup into an
+    # O(samples * alphabet) comparison matrix, which is especially punishing
+    # for accelerator backends and obscures the direct-index operation already
+    # present in the general CanonicalHuffmanTable.
+    dense_codes = AbstractTensor.zeros(
+        (alphabet_size,), cls=type(ordered_symbols)
+    )
+    dense_lengths = AbstractTensor.zeros(
+        (alphabet_size,), cls=type(ordered_symbols)
+    )
+    indices = ordered_symbols.to_dtype("int64")
+    with autograd.no_grad():
+        dense_codes = AbstractTensor.scatter(
+            dense_codes, indices, ordered.codes, dim=0
+        )
+        dense_lengths = AbstractTensor.scatter(
+            dense_lengths, indices, ordered.lengths, dim=0
+        )
+    return CanonicalHuffmanTable(
+        codes=dense_codes,
+        lengths=dense_lengths,
+        max_bits=16,
     )
 
 

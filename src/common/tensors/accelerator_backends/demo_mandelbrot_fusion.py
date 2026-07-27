@@ -688,8 +688,10 @@ def animate_glsl(
     from .gl_context import require_gl_context
     from .glsl_backend import (
         GLChunk,
+        dispatch_stats,
         execute_multi_output_program,
         execute_program,
+        shader_cache_stats,
     )
 
     dispatch_plan = None
@@ -863,6 +865,20 @@ def animate_glsl(
     else:
         fused_outputs = None
         output = GLChunk((height * width,)).to_gpu()
+    jpeg_resources = None
+    if recorder is not None and fused_outputs is not None:
+        from ..compression.jpeg.frame import (
+            prepare_jpeg_encoding_resources,
+        )
+        from .glsl_backend import fuse_elementwise, reshape_chunk
+        from .glsl_tensor_backend import GLSLTensorOperations
+
+        exemplar = GLSLTensorOperations()
+        exemplar.data = reshape_chunk(
+            fused_outputs["luminance"], (height, width)
+        )
+        with AbstractTensor.use_backend("glsl"), fuse_elementwise():
+            jpeg_resources = prepare_jpeg_encoding_resources(exemplar)
     display_program = compileProgram(
         compileShader(
             """#version 430 core
@@ -912,10 +928,14 @@ def animate_glsl(
     report_started = started
     report_frames = 0
     frame = 0
+    dispatch_baseline = dispatch_stats()
+    cache_baseline = shader_cache_stats()
+    frame_dispatches = 0
     predicted_detail = 1.0
     running = True
     try:
         while running and (max_frames is None or frame < max_frames):
+            dispatch_before_frame = dispatch_stats()["calls"]
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -1052,6 +1072,7 @@ def animate_glsl(
                         ),
                         width,
                         height,
+                        resources=jpeg_resources,
                     )
                 )
                 if audio_scheduler is not None:
@@ -1066,6 +1087,9 @@ def animate_glsl(
                         )
                     recorded_audio_position += count
             frame += 1
+            frame_dispatches = (
+                dispatch_stats()["calls"] - dispatch_before_frame
+            )
             report_frames += 1
             if now - report_started >= 0.5:
                 fps = report_frames / (now - report_started)
@@ -1073,13 +1097,25 @@ def animate_glsl(
                     "Parametric AbstractTensor Mandelbrot — GLSL | "
                     f"{fps:.1f} solve+render fps | span {animated_span:.5g} | "
                     f"family {family_mix:.2f} | detail {predicted_detail:.2f} | "
-                    f"loud {loudness:.2f}"
+                    f"loud {loudness:.2f} | GL launches {frame_dispatches}"
                 )
                 report_started, report_frames = now, 0
         elapsed = time.perf_counter() - started
         print(
             f"animated: {frame} solve+render frames in {elapsed:.3f}s "
             f"({frame / max(elapsed, 1e-9):.1f} fps)",
+            flush=True,
+        )
+        dispatch_final = dispatch_stats()
+        cache_final = shader_cache_stats()
+        dispatch_count = dispatch_final["calls"] - dispatch_baseline["calls"]
+        print(
+            "encoder : "
+            f"{dispatch_count} physical GLSL launches "
+            f"({dispatch_count / max(frame, 1):.1f}/frame) | "
+            f"shader cache "
+            f"{cache_final['hits'] - cache_baseline['hits']} hits / "
+            f"{cache_final['misses'] - cache_baseline['misses']} misses",
             flush=True,
         )
     finally:
@@ -1096,6 +1132,8 @@ def animate_glsl(
             pygame.mixer.music.stop()
         if recorder is not None:
             recorder.close()
+        if jpeg_resources is not None:
+            jpeg_resources.release()
         GL.glDeleteVertexArrays(1, (vao,))
         GL.glDeleteProgram(display_program)
         pygame.quit()
@@ -1199,12 +1237,14 @@ def tensor_ycbcr_jpeg_bytes(
     planes,
     width: int,
     height: int,
+    *,
+    resources=None,
 ) -> bytes:
     """Encode resident Y/Cb/Cr outputs without rebuilding RGB."""
 
     from ..abstraction import AbstractTensor as AT
     from ..compression.jpeg.frame import encode_ycbcr_jfif
-    from .glsl_backend import GLChunk, reshape_chunk
+    from .glsl_backend import GLChunk, fuse_elementwise, reshape_chunk
     from .glsl_tensor_backend import GLSLTensorOperations
 
     if width % 8 or height % 8:
@@ -1220,10 +1260,17 @@ def tensor_ycbcr_jpeg_bytes(
             else:
                 tensor = AT.tensor(plane.reshape(height, width))
             wrapped.append(tensor)
-        return encode_ycbcr_jfif(
-            tuple(wrapped),
-            mcu_rows_per_batch=min(32, max(1, (height + 7) // 8)),
-        )
+        # The ProcessGraph front end hands us resident Y/Cb/Cr planes. Keep
+        # every eligible encoder expression deferred until a true structural
+        # or reduction boundary, just as the older RGB entry point already
+        # does. Without this scope the graph-optimized front end accidentally
+        # fell back to one GLSL launch per primitive throughout JPEG.
+        with fuse_elementwise():
+            return encode_ycbcr_jfif(
+                tuple(wrapped),
+                mcu_rows_per_batch=min(32, max(1, (height + 7) // 8)),
+                resources=resources,
+            )
 
 
 def save_tensor_jpeg(

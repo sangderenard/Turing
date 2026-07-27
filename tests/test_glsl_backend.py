@@ -678,6 +678,40 @@ def test_opt_in_fusion_carries_linear_reshape_inside_region(gl, monkeypatch):
     source.release()
 
 
+def test_opt_in_fusion_keeps_broadcast_branches_in_one_dispatch(gl, monkeypatch):
+    from src.common.tensors.accelerator_backends import glsl_backend
+
+    left_values = np.arange(8, dtype=np.float32).reshape(8, 1)
+    right_values = np.arange(8, dtype=np.float32).reshape(1, 8)
+    left = GLChunk.from_numpy(left_values).to_gpu()
+    right = GLChunk.from_numpy(right_values).to_gpu()
+    dispatch_count = 0
+    original_dispatch = glsl_backend._dispatch
+
+    def counted_dispatch(*args, **kwargs):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        return original_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(glsl_backend, "_dispatch", counted_dispatch)
+    with fuse_elementwise():
+        left_branch = run_op("mul", left, 2.0)
+        right_branch = run_op("add", right, 3.0)
+        result = run_op("sub", left_branch, right_branch)
+        assert dispatch_count == 0
+
+    np.testing.assert_allclose(
+        result.numpy(),
+        left_values * 2.0 - (right_values + 3.0),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    assert dispatch_count == 1
+    result.release()
+    left.release()
+    right.release()
+
+
 def test_program_runs_on_gpu_resident_feeds_without_readback(gl):
     """Feeds already on the GPU are used in place -- the interop path."""
     a = GLChunk.from_numpy(np.full(64, 3.0, dtype=np.float32)).to_gpu()

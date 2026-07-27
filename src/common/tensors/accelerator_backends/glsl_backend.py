@@ -123,6 +123,7 @@ __all__ = [
     "fuse_elementwise",
     "GLSL_OPS",
     "shader_cache_stats",
+    "dispatch_stats",
 ]
 
 
@@ -436,10 +437,38 @@ class GLChunk:
             raise ValueError(
                 f"view shape {shape} has {count} elements, expected {self._count}"
             )
+        if self._deferred is not None and any(
+            feed.count not in (1, self._count)
+            for feed in self._deferred.feeds.values()
+        ):
+            # A row-major reshape is transparent only when every non-scalar
+            # feed already spans the complete logical output. If the deferred
+            # expression broadcasts (for example, (..., 8, 8) / (8, 8)),
+            # changing the final coordinates before emission would reinterpret
+            # that broadcast against the reshaped axes. Materialize the valid
+            # broadcast region first, then keep the reshape itself zero-copy.
+            self._to_gpu_current()
         if self._deferred is not None:
             deferred = self._deferred
             output_id = primary_output_id(deferred.program)
             metadata = dict(deferred.program.meta or {})
+            for feed_id, feed in deferred.feeds.items():
+                if feed.count != self._count:
+                    continue
+                feed_meta = metadata.get(feed_id)
+                metadata[feed_id] = Meta(
+                    shape=shape,
+                    dtype=(
+                        getattr(feed_meta, "dtype", None)
+                        if feed_meta is not None
+                        else feed.dtype.name
+                    ),
+                    device=(
+                        getattr(feed_meta, "device", None)
+                        if feed_meta is not None
+                        else "glsl"
+                    ),
+                )
             output_meta = metadata.get(output_id)
             metadata[output_id] = Meta(
                 shape=shape,
@@ -2416,6 +2445,7 @@ def emit_stack_source(
 _program_cache: dict[str, int] = {}
 _uniform_location_cache: dict[tuple[int, str], int] = {}
 _cache_stats = {"hits": 0, "misses": 0}
+_dispatch_stats = {"calls": 0, "work_items": 0}
 
 
 @dataclass(frozen=True)
@@ -2450,6 +2480,15 @@ def fuse_elementwise():
 
 def shader_cache_stats() -> dict[str, int]:
     return dict(_cache_stats, size=len(_program_cache))
+
+
+def dispatch_stats(*, reset: bool = False) -> dict[str, int]:
+    """Return physical compute-launch totals for transparent live profiling."""
+
+    snapshot = dict(_dispatch_stats)
+    if reset:
+        _dispatch_stats.update(calls=0, work_items=0)
+    return snapshot
 
 
 def _compile(source: str) -> int:
@@ -2701,6 +2740,8 @@ def _dispatch_many(
             "compute stage supports "
             f"{plan.limits.max_dispatch_ssbo_blocks}"
         )
+    _dispatch_stats["calls"] += 1
+    _dispatch_stats["work_items"] += int(plan.count)
 
     # Deferred inputs can themselves execute a fused program. Materialize every
     # nested region before binding this dispatch's program; otherwise the inner
@@ -3394,12 +3435,27 @@ def execute_multi_output_program(
         output_count = _shape_product(shape)
         runtime_feed_shapes = {}
         for feed_id, chunk in zip(feed_ids, chunks):
+            meta = metadata.get(feed_id)
+            declared_shape = tuple(
+                int(size)
+                for size in (
+                    getattr(meta, "shape", None) or chunk.shape
+                )
+            )
+            if _shape_product(declared_shape) != chunk.count:
+                declared_shape = chunk.shape
             if chunk.count == 1 and output_count != 1:
-                runtime_feed_shapes[feed_id] = chunk.shape
+                runtime_feed_shapes[feed_id] = declared_shape
             elif chunk.count == output_count:
                 # A deferred reshape changes logical coordinates but not the
                 # elementwise program's row-major lane correspondence.
-                runtime_feed_shapes[feed_id] = shape
+                runtime_feed_shapes[feed_id] = declared_shape
+            elif _broadcast_shape(declared_shape, shape) == shape:
+                # A smaller non-scalar feed may be broadcast directly by
+                # the fused shader. This keeps branches such as (N, 1) and
+                # (1, M) register-resident instead of materializing each
+                # side before their common (N, M) consumer.
+                runtime_feed_shapes[feed_id] = declared_shape
             else:
                 raise ValueError(
                     f"linear fused feed {feed_id} has {chunk.count} elements; "
@@ -3651,7 +3707,7 @@ def run_op(op: str, left: Any, right: Any = None) -> GLChunk:
             and not owned
             and name in GLSL_OPS
             and all(
-                chunk.shape == out_shape or chunk.count == 1
+                _broadcast_shape(chunk.shape, out_shape) == out_shape
                 for chunk in feeds
             )
         )

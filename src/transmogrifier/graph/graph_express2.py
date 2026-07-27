@@ -1,4 +1,3 @@
-from turtle import width
 import sympy
 import networkx as nx
 import numpy as np
@@ -9,15 +8,9 @@ from colorama import Fore, Style, init
 from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
 from ..operator_defs import default_funcs, operator_signatures, role_schemas
 from ..ilpscheduler import ILPScheduler
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import colorsys
 import random
 from collections import deque
-import random
-from collections import deque
-from .graph_express2_tests import test_suite
-from .graph_express2printing import GraphExpresss2Printer
 
 class _RandomFloatQueue(deque):
     """
@@ -37,8 +30,6 @@ class _RandomFloatQueue(deque):
 # initialise one global instance once; re-use it everywhere
 _DUMMY_QUEUE = _RandomFloatQueue()
 SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
-import numpy as np
-import random
 from collections.abc import Callable
 
 
@@ -62,13 +53,7 @@ def _resolve(val):
         return np.asarray(val, dtype=float)
     return val
 
-import sympy
-import numpy as np
-from sympy import Sum, IndexedBase, Idx, symbols, Function
-
-
 init(autoreset=True)
-import colorsys
 
 MAX_HUES = 12  # maximum distinct hues before wrapping
 def multi_sort(collection, key_funcs):
@@ -80,12 +65,22 @@ def multi_sort(collection, key_funcs):
     items_with_keys.sort(key=lambda x: x[1])
     return [item for item, _ in items_with_keys]
 
-# `torch` is an optional heavy dependency. Import lazily so that tests and
-# environments without PyTorch can still import this module.
-try:  # optional heavy dependency
-    import torch  # type: ignore
-except Exception:  # pragma: no cover - optional dep
-    torch = None  # type: ignore
+_torch_module = None
+_torch_checked = False
+
+
+def _optional_torch():
+    """Import Torch only for ProcessGraph paths that explicitly request it."""
+
+    global _torch_module, _torch_checked
+    if not _torch_checked:
+        try:
+            import torch as module  # type: ignore
+        except Exception:  # pragma: no cover - optional dependency
+            module = None
+        _torch_module = module
+        _torch_checked = True
+    return _torch_module
 
 class ExpressionTensor:
     def __init__(self, data, contexts=None, sequence_length=1, domain_shape=None, function_index=None):
@@ -1259,6 +1254,7 @@ class ProcessGraph:
         nested_list_indices = rebuild_nested_list(self.domain_shape, flat_indices.copy())
 
         # --- Convert indices to tensor/array ---
+        torch = _optional_torch()
         if torch is not None:
             indices_tensor = torch.tensor(nested_list_indices, dtype=torch.long)
             expr_tensor_data = indices_tensor.unsqueeze(0).unsqueeze(0)  # add context and sequence dims
@@ -1927,11 +1923,16 @@ class ProcessGraph:
 # ----------------------------
 # ----------------------------
 def main():
+    # Demonstration fixtures are deliberately lazy: importing ProcessGraph is
+    # a compiler/library operation and must not execute the expensive symbolic
+    # chalkboard construction owned by its demo suite.
+    from .graph_express2_tests import test_suite
 
     # ----------------------------
     # Unified runner
     # ----------------------------
     def run(process_graph, data_sources, expected_fn):
+        torch = _optional_torch()
         try:
             result = process_graph.run(data_sources, default_funcs)
             expected = expected_fn(data_sources)

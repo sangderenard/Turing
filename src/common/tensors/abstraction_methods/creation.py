@@ -297,11 +297,14 @@ def one(cls, dtype: Any = None, device: Any = None):
     return inst
 
 def zeros(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, requires_grad: bool = False, tape=None):
-    """Create a tensor filled with zeros using the requested backend."""
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
-
+    """Create zeros through the backend creation hook, with a pure fallback."""
+    cls = _resolve_cls(cls)
     with _CreationTapeCtx(requires_grad=requires_grad, tape=tape):
-        out = zero(cls, dtype=dtype, device=device).repeat(size)
+        out = cls(track_time=False, tape=tape)
+        try:
+            out.data = out.zeros_(size, dtype=dtype, device=device)
+        except NotImplementedError:
+            out = zero(cls, dtype=dtype, device=device).repeat(size)
     return _finalize_requires(out, requires_grad)
 
 
@@ -311,11 +314,14 @@ def randoms(size: Tuple[int, ...], device: Any = None, *, cls=None, **kwargs):
 
 
 def ones(size: Tuple[int, ...], dtype: Any = None, device: Any = None, *, cls=None, requires_grad: bool = False, tape=None):
-    """Create a tensor filled with ones using the requested backend."""
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
-
+    """Create ones through the backend creation hook, with a pure fallback."""
+    cls = _resolve_cls(cls)
     with _CreationTapeCtx(requires_grad=requires_grad, tape=tape):
-        out = one(cls, dtype=dtype, device=device).repeat(size)
+        out = cls(track_time=False, tape=tape)
+        try:
+            out.data = out.ones_(size, dtype=dtype, device=device)
+        except NotImplementedError:
+            out = one(cls, dtype=dtype, device=device).repeat(size)
     return _finalize_requires(out, requires_grad)
 
 
@@ -330,12 +336,20 @@ def full(
     tape=None,
 ):
     """Create a tensor of ``size`` filled with ``fill_value`` using the backend."""
-    from ..abstraction import AbstractTensor  # Local import to avoid circular dependency
-
     cls = _resolve_cls(cls)
     with _CreationTapeCtx(requires_grad=requires_grad, tape=tape):
-        inst = AbstractTensor.get_tensor([fill_value], dtype=dtype, device=device, cls=cls)
-        out = inst.repeat(size)
+        out = cls(track_time=False, tape=tape)
+        try:
+            out.data = out.full_(
+                size, fill_value, dtype=dtype, device=device
+            )
+        except NotImplementedError:
+            from ..abstraction import AbstractTensor
+
+            inst = AbstractTensor.get_tensor(
+                [fill_value], dtype=dtype, device=device, cls=cls
+            )
+            out = inst.repeat(size)
     return _finalize_requires(out, requires_grad)
 
 def likeness(tensor):

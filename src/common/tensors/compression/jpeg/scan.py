@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from ...abstraction import AbstractTensor
 from ...autograd import autograd
 from ..bitstream import PackedBitstream, compact_codewords
-from ..coefficient_events import BlockCoefficientEvents
+from ..coefficient_events import (
+    BlockCoefficientEvents,
+    concatenate_block_coefficient_events,
+)
 from ..entropy_scan import interleave_codewords_and_payloads
 from ..entropy_symbols import EntropySymbolSequence
 from ..huffman import HuffmanCodewords
@@ -245,30 +248,68 @@ def encode_baseline_color_scan(
         or cr_events.dc.categories.shape[0] != block_count
     ):
         raise ValueError("4:4:4 JPEG components must have equal block counts")
+    return encode_baseline_color_component_scan(
+        y_events,
+        concatenate_block_coefficient_events((cb_events, cr_events)),
+        luma_dc_table=luma_dc_table,
+        luma_ac_table=luma_ac_table,
+        chroma_dc_table=chroma_dc_table,
+        chroma_ac_table=chroma_ac_table,
+    )
+
+
+def encode_baseline_color_component_scan(
+    y_events: BlockCoefficientEvents,
+    chroma_events: BlockCoefficientEvents,
+    *,
+    luma_dc_table=None,
+    luma_ac_table=None,
+    chroma_dc_table=None,
+    chroma_ac_table=None,
+) -> PackedBitstream:
+    """Encode luma blocks followed by contiguous Cb and Cr event blocks."""
+
+    block_count = y_events.dc.categories.shape[0]
+    if chroma_events.dc.categories.shape[0] != block_count * 2:
+        raise ValueError("4:4:4 chroma events must contain Cb then Cr blocks")
     if luma_dc_table is None:
         luma_dc_table = jpeg_standard_dc_luminance(y_events.dc.categories)
     if luma_ac_table is None:
         luma_ac_table = jpeg_standard_ac_luminance(y_events.ac.categories)
     if chroma_dc_table is None:
-        chroma_dc_table = jpeg_standard_dc_chrominance(cb_events.dc.categories)
+        chroma_dc_table = jpeg_standard_dc_chrominance(
+            chroma_events.dc.categories
+        )
     if chroma_ac_table is None:
-        chroma_ac_table = jpeg_standard_ac_chrominance(cb_events.ac.categories)
+        chroma_ac_table = jpeg_standard_ac_chrominance(
+            chroma_events.ac.categories
+        )
 
     y_words = _encode_block_codewords(
         y_events,
         dc_table=luma_dc_table,
         ac_table=luma_ac_table,
     )
-    cb_words = _encode_block_codewords(
-        cb_events,
+    chroma_words = _encode_block_codewords(
+        chroma_events,
         dc_table=chroma_dc_table,
         ac_table=chroma_ac_table,
     )
-    cr_words = _encode_block_codewords(
-        cr_events,
-        dc_table=chroma_dc_table,
-        ac_table=chroma_ac_table,
-    )
+    chroma_symbol_count = block_count * (JPEG_AC_CAPACITY + 1)
+    cb_slice = slice(0, chroma_symbol_count)
+    cr_slice = slice(chroma_symbol_count, chroma_symbol_count * 2)
+
+    def chroma_component_words(symbol_slice) -> HuffmanCodewords:
+        return HuffmanCodewords(
+            codes=chroma_words.codes[symbol_slice],
+            lengths=chroma_words.lengths[symbol_slice],
+            bits=chroma_words.bits[symbol_slice],
+            valid=chroma_words.valid[symbol_slice],
+            max_bits=chroma_words.max_bits,
+        )
+
+    cb_words = chroma_component_words(cb_slice)
+    cr_words = chroma_component_words(cr_slice)
     if not (
         y_words.max_bits == cb_words.max_bits == cr_words.max_bits
     ):
@@ -320,6 +361,7 @@ def encode_baseline_color_scan(
 __all__ = [
     "JPEG_AC_CAPACITY",
     "JPEG_ZRL",
+    "encode_baseline_color_component_scan",
     "encode_baseline_color_scan",
     "encode_baseline_luma_scan",
     "jpeg_ac_entropy_symbols",

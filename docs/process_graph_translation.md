@@ -78,6 +78,11 @@ canonical primitives, and the equal-shape whole-program fusion region accepts
 become neighboring regions in a ProcessGraph partitioner rather than being
 restated inside the elementwise emitter.
 
+The live [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md)
+exercises that exact frontier: ProcessGraph chooses the solve, palette, and
+YCbCr region, while the structural JPEG program remains visible as ordinary
+AbstractTensor boundaries for the next partitioning work.
+
 ## Nodus
 
 `process_graph_to_nodus_graph_ir` emits operation-tool nodes, directional

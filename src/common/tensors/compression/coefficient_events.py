@@ -105,31 +105,96 @@ class BlockCoefficientEvents:
         return self.ac_valid.to_dtype("int64").sum(dim=1)
 
 
-def collect_block_coefficient_events(
-    coefficients: AbstractTensor,
-    *,
-    max_magnitude_bits: int = 31,
-    previous_dc=0,
+def concatenate_block_coefficient_events(
+    events,
 ) -> BlockCoefficientEvents:
-    """Collect DC differences and compact nonzero AC events in parallel."""
-    if not isinstance(coefficients, AbstractTensor):
-        raise TypeError("coefficients must be an AbstractTensor")
-    if coefficients.ndims() < 2 or coefficients.shape[-1] < 2:
-        raise ValueError(
-            "coefficients must contain blocks with DC and at least one AC value"
+    """Concatenate compatible block-event batches without decoding them."""
+
+    events = tuple(events)
+    if not events:
+        raise ValueError("at least one block-event batch is required")
+    first = events[0]
+    if any(event.coefficient_count != first.coefficient_count for event in events):
+        raise ValueError("block-event coefficient counts must match")
+    if any(event.dc.max_bits != first.dc.max_bits for event in events):
+        raise ValueError("DC magnitude widths must match")
+    if any(event.ac.max_bits != first.ac.max_bits for event in events):
+        raise ValueError("AC magnitude widths must match")
+
+    def join_signed(name: str) -> SignedMagnitudeFields:
+        fields = tuple(getattr(event, name) for event in events)
+        return SignedMagnitudeFields(
+            categories=AbstractTensor.cat(
+                tuple(field.categories for field in fields), dim=0
+            ),
+            payloads=AbstractTensor.cat(
+                tuple(field.payloads for field in fields), dim=0
+            ),
+            valid=AbstractTensor.cat(
+                tuple(field.valid for field in fields), dim=0
+            ),
+            max_bits=fields[0].max_bits,
         )
-    original_shape = tuple(coefficients.shape)
-    coefficient_count = original_shape[-1]
-    flat = coefficients.reshape(-1, coefficient_count)
-    dc_values = flat[:, 0]
-    prior_dc = flat.ensure_tensor(previous_dc).reshape(-1)[:1]
-    dc_differences = AbstractTensor.cat(
-        (
-            dc_values[:1] - prior_dc,
-            dc_values[1:] - dc_values[:-1],
+
+    block_count = sum(event.dc.categories.shape[0] for event in events)
+    return BlockCoefficientEvents(
+        dc=join_signed("dc"),
+        ac=join_signed("ac"),
+        ac_zero_runs=AbstractTensor.cat(
+            tuple(event.ac_zero_runs for event in events), dim=0
         ),
-        dim=0,
+        ac_valid=AbstractTensor.cat(
+            tuple(event.ac_valid for event in events), dim=0
+        ),
+        trailing_zeros=AbstractTensor.cat(
+            tuple(event.trailing_zeros for event in events), dim=0
+        ),
+        original_shape=(block_count, first.coefficient_count),
+        coefficient_count=first.coefficient_count,
     )
+
+
+def slice_block_coefficient_events(
+    events: BlockCoefficientEvents,
+    start: int,
+    stop: int,
+) -> BlockCoefficientEvents:
+    """Take a contiguous block range while retaining event field alignment."""
+
+    start, stop = int(start), int(stop)
+    block_count = events.dc.categories.shape[0]
+    if start < 0 or stop < start or stop > block_count:
+        raise ValueError("block-event slice is outside the available range")
+
+    def slice_signed(fields: SignedMagnitudeFields) -> SignedMagnitudeFields:
+        return SignedMagnitudeFields(
+            categories=fields.categories[start:stop],
+            payloads=fields.payloads[start:stop],
+            valid=fields.valid[start:stop],
+            max_bits=fields.max_bits,
+        )
+
+    return BlockCoefficientEvents(
+        dc=slice_signed(events.dc),
+        ac=slice_signed(events.ac),
+        ac_zero_runs=events.ac_zero_runs[start:stop],
+        ac_valid=events.ac_valid[start:stop],
+        trailing_zeros=events.trailing_zeros[start:stop],
+        original_shape=(stop - start, events.coefficient_count),
+        coefficient_count=events.coefficient_count,
+    )
+
+
+def _collect_flat_block_coefficient_events(
+    flat: AbstractTensor,
+    dc_differences: AbstractTensor,
+    *,
+    original_shape: tuple[int, ...],
+    max_magnitude_bits: int,
+) -> BlockCoefficientEvents:
+    """Shared parallel event extraction once DC boundaries are established."""
+
+    coefficient_count = original_shape[-1]
     dc_fields = encode_signed_magnitudes(
         dc_differences,
         max_bits=max_magnitude_bits,
@@ -207,6 +272,91 @@ def collect_block_coefficient_events(
     )
 
 
+def collect_block_coefficient_events(
+    coefficients: AbstractTensor,
+    *,
+    max_magnitude_bits: int = 31,
+    previous_dc=0,
+) -> BlockCoefficientEvents:
+    """Collect DC differences and compact nonzero AC events in parallel."""
+    if not isinstance(coefficients, AbstractTensor):
+        raise TypeError("coefficients must be an AbstractTensor")
+    if coefficients.ndims() < 2 or coefficients.shape[-1] < 2:
+        raise ValueError(
+            "coefficients must contain blocks with DC and at least one AC value"
+        )
+    original_shape = tuple(coefficients.shape)
+    coefficient_count = original_shape[-1]
+    flat = coefficients.reshape(-1, coefficient_count)
+    dc_values = flat[:, 0]
+    prior_dc = flat.ensure_tensor(previous_dc).reshape(-1)[:1]
+    dc_differences = AbstractTensor.cat(
+        (
+            dc_values[:1] - prior_dc,
+            dc_values[1:] - dc_values[:-1],
+        ),
+        dim=0,
+    )
+    return _collect_flat_block_coefficient_events(
+        flat,
+        dc_differences,
+        original_shape=original_shape,
+        max_magnitude_bits=max_magnitude_bits,
+    )
+
+
+def collect_component_block_coefficient_events(
+    coefficients: AbstractTensor,
+    *,
+    max_magnitude_bits: int = 31,
+    previous_dc=(0,),
+) -> BlockCoefficientEvents:
+    """Collect several independent component streams in one tensor program.
+
+    ``coefficients`` has shape ``(components, ..., coefficients_per_block)``.
+    DC prediction resets for each leading component, while all remaining
+    event extraction is one wider parallel operation.
+    """
+
+    if not isinstance(coefficients, AbstractTensor):
+        raise TypeError("coefficients must be an AbstractTensor")
+    if coefficients.ndims() < 3 or coefficients.shape[-1] < 2:
+        raise ValueError(
+            "component coefficients need a component axis and block axis"
+        )
+    component_count = coefficients.shape[0]
+    previous_dc = tuple(previous_dc)
+    if len(previous_dc) != component_count:
+        raise ValueError("previous_dc must contain one value per component")
+
+    coefficient_count = coefficients.shape[-1]
+    component_flat = coefficients.reshape(
+        component_count, -1, coefficient_count
+    )
+    dc_values = component_flat[:, :, 0]
+    prior_dc = AbstractTensor.stack(
+        tuple(
+            component_flat.ensure_tensor(value).reshape(1)
+            for value in previous_dc
+        ),
+        dim=0,
+    )
+    dc_differences = AbstractTensor.cat(
+        (
+            dc_values[:, :1] - prior_dc,
+            dc_values[:, 1:] - dc_values[:, :-1],
+        ),
+        dim=1,
+    ).reshape(-1)
+    flat = component_flat.reshape(-1, coefficient_count)
+    return _collect_flat_block_coefficient_events(
+        flat,
+        dc_differences,
+        original_shape=tuple(coefficients.shape),
+        max_magnitude_bits=max_magnitude_bits,
+    )
+
+
 def reconstruct_block_coefficients(
     events: BlockCoefficientEvents,
 ) -> AbstractTensor:
@@ -246,8 +396,11 @@ def reconstruct_block_coefficients(
 __all__ = [
     "BlockCoefficientEvents",
     "SignedMagnitudeFields",
+    "collect_component_block_coefficient_events",
+    "concatenate_block_coefficient_events",
     "collect_block_coefficient_events",
     "decode_signed_magnitudes",
     "encode_signed_magnitudes",
     "reconstruct_block_coefficients",
+    "slice_block_coefficient_events",
 ]

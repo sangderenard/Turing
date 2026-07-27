@@ -43,6 +43,9 @@ JPEG_CHROMA_QUANTIZATION = (
 def jpeg_component_coefficients(
     samples: AbstractTensor,
     quantization,
+    *,
+    basis: AbstractTensor | None = None,
+    zigzag: AbstractTensor | None = None,
 ) -> AbstractTensor:
     """Return zigzag-ordered coefficients for one JPEG sample component."""
     if not isinstance(samples, AbstractTensor):
@@ -50,26 +53,94 @@ def jpeg_component_coefficients(
     blocks = block_view_2d(
         samples - 128.0, block_height=8, block_width=8
     )
-    transformed = dct_2d_blocks(blocks)
-    quantization_tensor = samples.ensure_tensor(quantization)
+    transformed = dct_2d_blocks(blocks, basis=basis)
+    quantization_tensor = (
+        quantization
+        if isinstance(quantization, AbstractTensor)
+        else samples.ensure_tensor(quantization)
+    )
     scaled = transformed / quantization_tensor
     # The orthonormal cosine basis is evaluated in backend precision. A tiny
     # format-level tie tolerance keeps mathematical half-integers stable across
     # float32, float64, and the C backend's double storage.
     rounded = scaled.sign() * ((scaled.abs() + 0.500001) // 1)
     flattened = rounded.reshape(*(rounded.shape[:-2] + (64,)))
-    zigzag = samples.ensure_tensor(JPEG_ZIGZAG).to_dtype("int64")
-    return flattened[..., zigzag]
+    zigzag_tensor = (
+        samples.ensure_tensor(JPEG_ZIGZAG).to_dtype("int64")
+        if zigzag is None
+        else zigzag
+    )
+    return flattened[..., zigzag_tensor]
 
 
-def jpeg_luma_coefficients(samples: AbstractTensor) -> AbstractTensor:
+def jpeg_luma_coefficients(
+    samples: AbstractTensor,
+    *,
+    basis: AbstractTensor | None = None,
+    quantization: AbstractTensor | None = None,
+    zigzag: AbstractTensor | None = None,
+) -> AbstractTensor:
     """Return zigzag-ordered quantized coefficients for a luma plane."""
-    return jpeg_component_coefficients(samples, JPEG_LUMA_QUANTIZATION)
+    return jpeg_component_coefficients(
+        samples,
+        JPEG_LUMA_QUANTIZATION if quantization is None else quantization,
+        basis=basis,
+        zigzag=zigzag,
+    )
 
 
-def jpeg_chroma_coefficients(samples: AbstractTensor) -> AbstractTensor:
+def jpeg_chroma_coefficients(
+    samples: AbstractTensor,
+    *,
+    basis: AbstractTensor | None = None,
+    quantization: AbstractTensor | None = None,
+    zigzag: AbstractTensor | None = None,
+) -> AbstractTensor:
     """Return zigzag-ordered quantized coefficients for a chroma plane."""
-    return jpeg_component_coefficients(samples, JPEG_CHROMA_QUANTIZATION)
+    return jpeg_component_coefficients(
+        samples,
+        JPEG_CHROMA_QUANTIZATION if quantization is None else quantization,
+        basis=basis,
+        zigzag=zigzag,
+    )
+
+
+def jpeg_ycbcr_coefficients(
+    planes,
+    *,
+    basis: AbstractTensor,
+    quantization: AbstractTensor,
+    zigzag: AbstractTensor,
+) -> AbstractTensor:
+    """Transform Y, Cb, and Cr together as one batched tensor program.
+
+    The leading component dimension is an ordinary batch dimension to
+    ``block_view_2d`` and the backend matmul primitive.  This preserves the
+    exact per-component JPEG mathematics while allowing an accelerator to
+    launch one wider DCT instead of three small, serial DCTs.
+    """
+
+    planes = tuple(planes)
+    if len(planes) != 3:
+        raise ValueError("YCbCr coefficient preparation needs three planes")
+    if any(not isinstance(plane, AbstractTensor) for plane in planes):
+        raise TypeError("every YCbCr plane must be an AbstractTensor")
+    if any(plane.shape != planes[0].shape for plane in planes[1:]):
+        raise ValueError("YCbCr planes must share one shape")
+    if quantization.shape != (3, 1, 1, 8, 8):
+        raise ValueError(
+            "YCbCr quantization must have shape (3, 1, 1, 8, 8)"
+        )
+
+    samples = AbstractTensor.stack(planes, dim=0)
+    blocks = block_view_2d(
+        samples - 128.0, block_height=8, block_width=8
+    )
+    transformed = dct_2d_blocks(blocks, basis=basis)
+    scaled = transformed / quantization
+    rounded = scaled.sign() * ((scaled.abs() + 0.500001) // 1)
+    flattened = rounded.reshape(*(rounded.shape[:-2] + (64,)))
+    return flattened[..., zigzag]
 
 
 def rgb_to_ycbcr(samples: AbstractTensor) -> tuple[
@@ -106,5 +177,6 @@ __all__ = [
     "jpeg_chroma_coefficients",
     "jpeg_component_coefficients",
     "jpeg_luma_coefficients",
+    "jpeg_ycbcr_coefficients",
     "rgb_to_ycbcr",
 ]

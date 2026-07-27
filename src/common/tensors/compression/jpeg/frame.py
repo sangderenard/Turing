@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from ...abstraction import AbstractTensor
 from ...autograd import autograd
+from ..block_transform import orthonormal_dct_basis
 from ..bitstream import tensor_octets_to_bytes, unpack_octets
-from ..coefficient_events import collect_block_coefficient_events
+from ..coefficient_events import (
+    collect_block_coefficient_events,
+    collect_component_block_coefficient_events,
+    slice_block_coefficient_events,
+)
 from .huffman import (
     JPEG_AC_CHROMINANCE_COUNTS,
     JPEG_AC_CHROMINANCE_SYMBOLS,
@@ -22,15 +28,91 @@ from .huffman import (
     jpeg_standard_dc_chrominance,
     jpeg_standard_dc_luminance,
 )
-from .scan import encode_baseline_color_scan, encode_baseline_luma_scan
+from .scan import (
+    encode_baseline_color_component_scan,
+    encode_baseline_color_scan,
+    encode_baseline_luma_scan,
+)
 from .transform import (
     JPEG_CHROMA_QUANTIZATION,
     JPEG_LUMA_QUANTIZATION,
     JPEG_ZIGZAG,
-    jpeg_chroma_coefficients,
     jpeg_luma_coefficients,
+    jpeg_ycbcr_coefficients,
     rgb_to_ycbcr,
 )
+
+
+@dataclass(frozen=True)
+class JPEGEncodingResources:
+    """Backend-resident constants shared by every frame of an encoder."""
+
+    dct_basis: AbstractTensor
+    luma_quantization: AbstractTensor
+    chroma_quantization: AbstractTensor
+    ycbcr_quantization: AbstractTensor
+    zigzag: AbstractTensor
+    luma_dc_table: object
+    luma_ac_table: object
+    chroma_dc_table: object
+    chroma_ac_table: object
+
+    def release(self) -> None:
+        """Release owned accelerator storage while its context remains live."""
+
+        tensors = [
+            self.dct_basis,
+            self.luma_quantization,
+            self.chroma_quantization,
+            self.ycbcr_quantization,
+            self.zigzag,
+        ]
+        for table in (
+            self.luma_dc_table,
+            self.luma_ac_table,
+            self.chroma_dc_table,
+            self.chroma_ac_table,
+        ):
+            tensors.extend((table.codes, table.lengths))
+            if table.symbols is not None:
+                tensors.append(table.symbols)
+        released: set[int] = set()
+        for tensor in tensors:
+            data = getattr(tensor, "data", None)
+            release = getattr(data, "release", None)
+            if callable(release) and id(data) not in released:
+                release()
+                released.add(id(data))
+
+
+def prepare_jpeg_encoding_resources(
+    like: AbstractTensor,
+) -> JPEGEncodingResources:
+    """Create invariant JPEG tensors once on ``like``'s active backend."""
+
+    if not isinstance(like, AbstractTensor):
+        raise TypeError("JPEG resources require an AbstractTensor exemplar")
+    with autograd.no_grad():
+        luma_quantization = like.ensure_tensor(JPEG_LUMA_QUANTIZATION)
+        chroma_quantization = like.ensure_tensor(JPEG_CHROMA_QUANTIZATION)
+        return JPEGEncodingResources(
+            dct_basis=orthonormal_dct_basis(8, like=like),
+            luma_quantization=luma_quantization,
+            chroma_quantization=chroma_quantization,
+            ycbcr_quantization=AbstractTensor.stack(
+                (
+                    luma_quantization,
+                    chroma_quantization,
+                    chroma_quantization,
+                ),
+                dim=0,
+            ).reshape(3, 1, 1, 8, 8),
+            zigzag=like.ensure_tensor(JPEG_ZIGZAG).to_dtype("int64"),
+            luma_dc_table=jpeg_standard_dc_luminance(like),
+            luma_ac_table=jpeg_standard_ac_luminance(like),
+            chroma_dc_table=jpeg_standard_dc_chrominance(like),
+            chroma_ac_table=jpeg_standard_ac_chrominance(like),
+        )
 
 
 def _u16(value: int) -> bytes:
@@ -95,8 +177,27 @@ class _EntropyTensorAccumulator:
     def __init__(self) -> None:
         self._pending: AbstractTensor | None = None
 
-    def append(self, scan) -> bytes:
+    def append(self, scan, *, final: bool = False) -> bytes:
         bit_count = int(scan.valid_bits.item())
+        if final and self._pending is None:
+            # ``compact_codewords`` has already formed the exact leading
+            # octets.  A one-batch scan only needs JPEG's all-ones fill in the
+            # unused tail of its last byte, then marker stuffing.  Expanding
+            # every octet back to eight bits and reducing it to the same octet
+            # was pure work introduced by the multi-batch carry path.
+            byte_count = (bit_count + 7) // 8
+            octets = scan.octets[:byte_count]
+            remainder = bit_count % 8
+            if remainder:
+                fill = (1 << (8 - remainder)) - 1
+                octets = AbstractTensor.cat(
+                    (octets[:-1], octets[-1:] + fill),
+                    dim=0,
+                )
+            return tensor_octets_to_bytes(
+                _stuff_entropy_octets(octets)
+            )
+
         source_bits = unpack_octets(scan).bits[:bit_count]
         combined = source_bits
         if self._pending is not None and self._pending.shape[0]:
@@ -290,6 +391,7 @@ def iter_jfif_chunks(
     samples: AbstractTensor,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ):
     """Yield a complete baseline JFIF while bounding tensor work by MCU rows."""
     if not isinstance(samples, AbstractTensor):
@@ -311,15 +413,11 @@ def iter_jfif_chunks(
     rows_per_batch = mcu_rows_per_batch * 8
     entropy = _EntropyTensorAccumulator()
     previous_dc = [0, 0, 0]
-    with autograd.no_grad():
-        if color:
-            luma_dc_table = jpeg_standard_dc_luminance(samples)
-            luma_ac_table = jpeg_standard_ac_luminance(samples)
-            chroma_dc_table = jpeg_standard_dc_chrominance(samples)
-            chroma_ac_table = jpeg_standard_ac_chrominance(samples)
-        else:
-            luma_dc_table = jpeg_standard_dc_luminance(samples)
-            luma_ac_table = jpeg_standard_ac_luminance(samples)
+    resources = resources or prepare_jpeg_encoding_resources(samples)
+    luma_dc_table = resources.luma_dc_table
+    luma_ac_table = resources.luma_ac_table
+    chroma_dc_table = resources.chroma_dc_table
+    chroma_ac_table = resources.chroma_ac_table
     for row_start in range(0, height, rows_per_batch):
         row_stop = min(height, row_start + rows_per_batch)
         # JPEG serialization is a terminal, quantized byte boundary. Recording
@@ -329,31 +427,43 @@ def iter_jfif_chunks(
             batch = samples[row_start:row_stop]
             if color:
                 planes = rgb_to_ycbcr(batch)
-                coefficients = (
-                    jpeg_luma_coefficients(planes[0]),
-                    jpeg_chroma_coefficients(planes[1]),
-                    jpeg_chroma_coefficients(planes[2]),
+                component_coefficients = jpeg_ycbcr_coefficients(
+                    planes,
+                    basis=resources.dct_basis,
+                    quantization=resources.ycbcr_quantization,
+                    zigzag=resources.zigzag,
                 )
-                events = []
-                for component, component_coefficients in enumerate(coefficients):
-                    component_events = collect_block_coefficient_events(
-                        component_coefficients,
-                        max_magnitude_bits=11,
-                        previous_dc=previous_dc[component],
-                    )
-                    events.append(component_events)
-                    previous_dc[component] = component_coefficients.reshape(
-                        -1, 64
-                    )[-1, 0]
-                scan = encode_baseline_color_scan(
-                    *events,
+                combined_events = collect_component_block_coefficient_events(
+                    component_coefficients,
+                    max_magnitude_bits=11,
+                    previous_dc=previous_dc,
+                )
+                block_count = component_coefficients[0].reshape(-1, 64).shape[0]
+                y_events = slice_block_coefficient_events(
+                    combined_events, 0, block_count
+                )
+                chroma_events = slice_block_coefficient_events(
+                    combined_events, block_count, block_count * 3
+                )
+                previous_dc = [
+                    component_coefficients[component].reshape(-1, 64)[-1, 0]
+                    for component in range(3)
+                ]
+                scan = encode_baseline_color_component_scan(
+                    y_events,
+                    chroma_events,
                     luma_dc_table=luma_dc_table,
                     luma_ac_table=luma_ac_table,
                     chroma_dc_table=chroma_dc_table,
                     chroma_ac_table=chroma_ac_table,
                 )
             else:
-                coefficients = jpeg_luma_coefficients(batch)
+                coefficients = jpeg_luma_coefficients(
+                    batch,
+                    basis=resources.dct_basis,
+                    quantization=resources.luma_quantization,
+                    zigzag=resources.zigzag,
+                )
                 events = collect_block_coefficient_events(
                     coefficients,
                     max_magnitude_bits=11,
@@ -365,7 +475,10 @@ def iter_jfif_chunks(
                     dc_table=luma_dc_table,
                     ac_table=luma_ac_table,
                 )
-            encoded = entropy.append(scan)
+            encoded = entropy.append(
+                scan,
+                final=row_start == 0 and row_stop == height,
+            )
         if encoded:
             yield encoded
     tail = entropy.finish()
@@ -378,6 +491,7 @@ def iter_ycbcr_jfif_chunks(
     planes,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ):
     """Yield baseline 4:4:4 JFIF from resident Y, Cb, and Cr planes.
 
@@ -403,39 +517,49 @@ def iter_ycbcr_jfif_chunks(
     rows_per_batch = mcu_rows_per_batch * 8
     entropy = _EntropyTensorAccumulator()
     previous_dc = [0, 0, 0]
-    with autograd.no_grad():
-        luma_dc_table = jpeg_standard_dc_luminance(planes[0])
-        luma_ac_table = jpeg_standard_ac_luminance(planes[0])
-        chroma_dc_table = jpeg_standard_dc_chrominance(planes[0])
-        chroma_ac_table = jpeg_standard_ac_chrominance(planes[0])
+    resources = resources or prepare_jpeg_encoding_resources(planes[0])
+    luma_dc_table = resources.luma_dc_table
+    luma_ac_table = resources.luma_ac_table
+    chroma_dc_table = resources.chroma_dc_table
+    chroma_ac_table = resources.chroma_ac_table
     for row_start in range(0, height, rows_per_batch):
         row_stop = min(height, row_start + rows_per_batch)
         with autograd.no_grad():
             batches = tuple(plane[row_start:row_stop] for plane in planes)
-            coefficients = (
-                jpeg_luma_coefficients(batches[0]),
-                jpeg_chroma_coefficients(batches[1]),
-                jpeg_chroma_coefficients(batches[2]),
+            component_coefficients = jpeg_ycbcr_coefficients(
+                batches,
+                basis=resources.dct_basis,
+                quantization=resources.ycbcr_quantization,
+                zigzag=resources.zigzag,
             )
-            events = []
-            for component, component_coefficients in enumerate(coefficients):
-                component_events = collect_block_coefficient_events(
-                    component_coefficients,
-                    max_magnitude_bits=11,
-                    previous_dc=previous_dc[component],
-                )
-                events.append(component_events)
-                previous_dc[component] = component_coefficients.reshape(
-                    -1, 64
-                )[-1, 0]
-            scan = encode_baseline_color_scan(
-                *events,
+            combined_events = collect_component_block_coefficient_events(
+                component_coefficients,
+                max_magnitude_bits=11,
+                previous_dc=previous_dc,
+            )
+            block_count = component_coefficients[0].reshape(-1, 64).shape[0]
+            y_events = slice_block_coefficient_events(
+                combined_events, 0, block_count
+            )
+            chroma_events = slice_block_coefficient_events(
+                combined_events, block_count, block_count * 3
+            )
+            previous_dc = [
+                component_coefficients[component].reshape(-1, 64)[-1, 0]
+                for component in range(3)
+            ]
+            scan = encode_baseline_color_component_scan(
+                y_events,
+                chroma_events,
                 luma_dc_table=luma_dc_table,
                 luma_ac_table=luma_ac_table,
                 chroma_dc_table=chroma_dc_table,
                 chroma_ac_table=chroma_ac_table,
             )
-            encoded = entropy.append(scan)
+            encoded = entropy.append(
+                scan,
+                final=row_start == 0 and row_stop == height,
+            )
         if encoded:
             yield encoded
     tail = entropy.finish()
@@ -448,6 +572,7 @@ def encode_ycbcr_jfif(
     planes,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ) -> bytes:
     """Encode three full-resolution AbstractTensor planes as 4:4:4 JFIF."""
 
@@ -455,6 +580,7 @@ def encode_ycbcr_jfif(
         iter_ycbcr_jfif_chunks(
             planes,
             mcu_rows_per_batch=mcu_rows_per_batch,
+            resources=resources,
         )
     )
 
@@ -463,6 +589,7 @@ def encode_grayscale_jfif(
     samples: AbstractTensor,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ) -> bytes:
     """Encode a two-dimensional sample tensor as a streaming baseline JFIF."""
     if not isinstance(samples, AbstractTensor) or samples.ndims() != 2:
@@ -471,6 +598,7 @@ def encode_grayscale_jfif(
         iter_jfif_chunks(
             samples,
             mcu_rows_per_batch=mcu_rows_per_batch,
+            resources=resources,
         )
     )
 
@@ -479,6 +607,7 @@ def encode_color_jfif(
     samples: AbstractTensor,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ) -> bytes:
     """Encode an RGB tensor as a streaming 4:4:4 baseline JFIF."""
     if (
@@ -491,6 +620,7 @@ def encode_color_jfif(
         iter_jfif_chunks(
             samples,
             mcu_rows_per_batch=mcu_rows_per_batch,
+            resources=resources,
         )
     )
 
@@ -499,12 +629,14 @@ def encode_jfif(
     samples: AbstractTensor,
     *,
     mcu_rows_per_batch: int = 8,
+    resources: JPEGEncodingResources | None = None,
 ) -> bytes:
     """Dispatch a grayscale or RGB tensor to the baseline JFIF encoder."""
     return b"".join(
         iter_jfif_chunks(
             samples,
             mcu_rows_per_batch=mcu_rows_per_batch,
+            resources=resources,
         )
     )
 
@@ -538,12 +670,14 @@ def write_jfif(
 
 
 __all__ = [
+    "JPEGEncodingResources",
     "encode_color_jfif",
     "encode_grayscale_jfif",
     "encode_jfif",
     "encode_ycbcr_jfif",
     "iter_jfif_chunks",
     "iter_ycbcr_jfif_chunks",
+    "prepare_jpeg_encoding_resources",
     "write_grayscale_jfif",
     "write_jfif",
 ]
