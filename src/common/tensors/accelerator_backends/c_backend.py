@@ -42,7 +42,10 @@ from ..abstraction import (
     _flatten,
     register_backend,
 )
-from ..abstraction_methods.indexing import lower_basic_index, normalize_basic_index
+from ..abstraction_methods.indexing import (
+    lower_basic_index,
+    normalize_index,
+)
 
 
 ffi = FFI()
@@ -370,8 +373,30 @@ def _matmul_ctensor(left: CTensor, right: CTensor) -> CTensor:
     return out
 
 
+def _normalize_ctensor_index(index):
+    """Expose integral-valued C tensors as shaped integer index metadata.
+
+    CTensor stores every numeric dtype in a double buffer. In particular,
+    ``to_dtype("int64")`` guarantees integral values but cannot change that
+    storage representation. Convert only at the explicit indexing boundary so
+    the shared indexing policy does not mistake those values for float indices.
+    """
+    def integral_tree(value):
+        if isinstance(value, list):
+            return [integral_tree(item) for item in value]
+        return int(value)
+
+    if isinstance(index, tuple):
+        return tuple(_normalize_ctensor_index(item) for item in index)
+    if isinstance(index, CTensor):
+        return integral_tree(index.tolist())
+    return index
+
+
 class CTensorOperations(AbstractTensor):
     """C backend using cffi for all arithmetic ops."""
+
+    supports_native_batched_matmul = True
 
     def _apply_operator__(self, op: str, left: CTensor, right: Any):
         """Lower the canonical AbstractTensor operation vocabulary to C."""
@@ -691,6 +716,22 @@ class CTensorOperations(AbstractTensor):
     def empty_(self, size, dtype=None, device=None):
         return CTensor(tuple(size))
 
+    # Backend-required structural surface.
+    #
+    # The cat/stack work exposed a broader contract than the canonical
+    # arithmetic operator vocabulary alone.  AbstractTensor supplies the public
+    # reshape/view/flatten composition and autograd recording, but its
+    # ``reshape_`` method is deliberately only a backend hook that raises until
+    # storage supplies the operation.  NumPy, Torch, JAX, Pure, and C all
+    # implement that hook independently because only the backend knows whether
+    # a new shape can alias storage, needs a contiguous copy, or needs a device
+    # transfer.  In C, contiguous CTensor storage makes reshape metadata-only:
+    # the new CTensor retains the same cffi buffer.
+    #
+    # This task is therefore also serving as an indirect inventory of the
+    # expanded backend requirements: primitive dispatch is the mathematical
+    # core, while storage metadata, accessors, and structural layout hooks are
+    # the additional surface a fully usable backend must provide.
     def reshape_(self, shape):
         shape = list(shape)
         unknown = [index for index, size in enumerate(shape) if size == -1]
@@ -859,6 +900,7 @@ class CTensorOperations(AbstractTensor):
 
     def get_item_(self, data, index):
         """Lower scalar/slice or shaped first-axis gather into index_select."""
+        index = _normalize_ctensor_index(index)
         previous = self.data
         self.data = data
         try:
@@ -900,8 +942,10 @@ class CTensorOperations(AbstractTensor):
         return CTensor(index_shape + self.data.shape[1:], selected.buffer)
 
     def set_item_(self, data, index, value):
-        """Assign through the shared basic-index policy and one native loop."""
-        axes, selection_shape = normalize_basic_index(index, data.shape)
+        """Assign basic or one-axis advanced indices in one native loop."""
+        index = _normalize_ctensor_index(index)
+        normalized, selection_shape = normalize_index(index, data.shape)
+        axes = [(axis.indices, axis.drop_axis) for axis in normalized]
         selection_count = 1
         for size in selection_shape:
             selection_count *= size
@@ -1352,6 +1396,21 @@ class CTensorOperations(AbstractTensor):
         # ############################################################
         raise NotImplementedError("interpolate not implemented for C backend")
 
+    # Structural layout operations deliberately live at the backend boundary.
+    # The tensor audit found that ``cat`` and ``stack`` have always dispatched
+    # through ``cat_``/``stack_`` in AbstractTensor rather than belonging to the
+    # dynamically grafted reshape or indexing method families.  NumPy and Torch
+    # expose these operations through different native APIs, which is one reason
+    # the common layer kept a semantic hook instead of prescribing one host-side
+    # implementation.  There is also a performance reason to preserve the hook:
+    # although ``stack`` can be described as unsqueeze-plus-cat, this C backend
+    # can validate once and perform the complete arbitrary-rank layout transform
+    # in one native call, without materializing intermediate tensors in Python.
+    #
+    # Keep these methods beside one another.  Together with reshape/unsqueeze
+    # they form part of the expanded backend-required structural surface being
+    # mapped by this work, but unlike metadata-only C reshapes both operations
+    # must copy values into a newly arranged buffer.
     def stack_(self, tensors: list, dim: int = 0) -> Any:
         if not tensors:
             raise ValueError("tensors list cannot be empty")

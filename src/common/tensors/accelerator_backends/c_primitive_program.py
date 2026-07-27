@@ -287,14 +287,22 @@ class CapturedFusedProgram:
         return execute_fused_program(self.program, self.c_feeds())
 
 
-def compile_elementwise_tape(tape, output: Any) -> CapturedFusedProgram:
+def compile_elementwise_tape(
+    tape,
+    output: Any,
+    *,
+    dynamic_scalar_ids: Sequence[int] = (),
+) -> CapturedFusedProgram:
     """Capture an eligible forward GradTape region as a FusedProgram.
 
     Reductions, broadcasting, indexing, and shape-changing operations are
     explicit boundaries.  No C-specific program representation escapes this
-    lowering function.
+    lowering function. Tensor scalars normally become instruction literals;
+    identities named by ``dynamic_scalar_ids`` instead remain runtime feeds.
     """
 
+    dynamic_scalar_ids = {int(value) for value in dynamic_scalar_ids}
+    dynamic_scalar_visiting: set[int] = set()
     feeds: dict[int, Any] = {}
     steps: list[OpStep] = []
     lowered: set[int] = set()
@@ -303,13 +311,61 @@ def compile_elementwise_tape(tape, output: Any) -> CapturedFusedProgram:
     def is_tensor(value):
         return hasattr(value, "data") and hasattr(value, "shape")
 
+    def is_dynamic_scalar(value):
+        if not is_tensor(value) or tuple(value.shape) not in ((), (1,)):
+            return False
+        identity = id(value)
+        if identity in dynamic_scalar_ids:
+            return True
+        if identity in dynamic_scalar_visiting:
+            return False
+        node = tape._nodes.get(identity)
+        if node is None:
+            return False
+        dynamic_scalar_visiting.add(identity)
+        try:
+            dynamic = any(
+                is_dynamic_scalar(item)
+                for item in node.ctx.get("inputs", ())
+                if is_tensor(item)
+            )
+        finally:
+            dynamic_scalar_visiting.remove(identity)
+        if dynamic:
+            dynamic_scalar_ids.add(identity)
+        return dynamic
+
     def is_scalar(value):
         return isinstance(value, (int, float, bool)) or (
             is_tensor(value) and tuple(value.shape) in ((), (1,))
+            and not is_dynamic_scalar(value)
         )
 
     def scalar_value(value):
-        return float(value.item() if is_tensor(value) else value)
+        # Preserve scalar kind in the backend-neutral IR. C still consumes the
+        # value through its double slot, while typed lowerers such as GLSL need
+        # to distinguish ``3`` from ``3.0`` when selecting integer operations.
+        return value.item() if is_tensor(value) else value
+
+    def tensor_meta(value, *, node=None):
+        dtype = None
+        device = None
+        if node is not None:
+            dtype = node.ctx.get("result_dtype")
+            device = node.ctx.get("result_device")
+        graph_node = tape.graph.nodes.get(id(value), {})
+        if dtype is None:
+            dtype = graph_node.get("dtype", getattr(value, "dtype", None))
+        if device is None:
+            device = graph_node.get("device", getattr(value, "device", None))
+        dtype_name = getattr(dtype, "name", None) or str(dtype)
+        if "." in dtype_name:
+            dtype_name = dtype_name.rsplit(".", 1)[-1]
+        return Meta(
+            shape=tuple(value.shape),
+            dtype=None if dtype is None else dtype_name,
+            device=None if device is None else str(device),
+        )
 
     def lower(value):
         identity = id(value)
@@ -320,7 +376,7 @@ def compile_elementwise_tape(tape, output: Any) -> CapturedFusedProgram:
             if not is_tensor(value) or is_scalar(value):
                 raise ValueError("non-tensor trace root cannot become a feed")
             feeds[identity] = value
-            metadata[identity] = Meta(shape=tuple(value.shape))
+            metadata[identity] = tensor_meta(value)
             lowered.add(identity)
             return identity
 
@@ -333,13 +389,19 @@ def compile_elementwise_tape(tape, output: Any) -> CapturedFusedProgram:
             ) from exc
         inputs = node.ctx["inputs"]
         tensor_inputs = [
-            item for item in inputs if is_tensor(item) and not is_scalar(item)
+            item
+            for item in inputs
+            if is_tensor(item)
+            and not is_scalar(item)
         ]
         if not tensor_inputs:
             raise ValueError(f"{op} has no tensor input")
-        expected_shape = tuple(tensor_inputs[0].shape)
+        shape_inputs = [
+            item for item in tensor_inputs if not is_dynamic_scalar(item)
+        ] or tensor_inputs
+        expected_shape = tuple(shape_inputs[0].shape)
         if tuple(value.shape) != expected_shape or any(
-            tuple(item.shape) != expected_shape for item in tensor_inputs
+            tuple(item.shape) != expected_shape for item in shape_inputs
         ):
             raise ValueError(f"{op} crosses an elementwise shape boundary")
 
@@ -371,16 +433,23 @@ def compile_elementwise_tape(tape, output: Any) -> CapturedFusedProgram:
                 result_id=identity,
             )
         )
-        metadata[identity] = Meta(shape=tuple(value.shape))
+        metadata[identity] = tensor_meta(value, node=node)
         lowered.add(identity)
         return identity
 
-    output_id = lower(output)
+    if isinstance(output, Mapping):
+        if not output:
+            raise ValueError("a captured program needs at least one output")
+        output_ids = {
+            str(name): lower(value) for name, value in output.items()
+        }
+    else:
+        output_ids = {"result": lower(output)}
     program = FusedProgram(
         version=1,
         feeds=set(feeds),
         steps=steps,
-        outputs={"result": output_id},
+        outputs=output_ids,
         meta=metadata,
     )
     return CapturedFusedProgram(program, feeds)

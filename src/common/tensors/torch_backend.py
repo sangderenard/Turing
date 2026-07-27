@@ -43,6 +43,7 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class PyTorchTensorOperations(AbstractTensor):
+    supports_native_batched_matmul = True
     def argwhere_(self):
         import torch
         return torch.nonzero(self.data, as_tuple=False)

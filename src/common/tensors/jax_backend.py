@@ -49,6 +49,7 @@ except Exception:
 from .abstraction import AbstractTensor
 
 class JAXTensorOperations(AbstractTensor):
+    supports_native_batched_matmul = True
     def argwhere_(self):
         import jax.numpy as jnp
         return jnp.argwhere(self.data)

@@ -38,6 +38,13 @@ def test_add_records_metadata():
     assert ctx["input_strides"] == [a.data.strides, b.data.strides]
     assert ctx["result_strides"] == c.data.strides
     assert ctx["params"] == {}
+    for tensor in (a, b, c):
+        graph_node = autograd.tape.graph.nodes[id(tensor)]
+        assert graph_node["shape"] == tensor.shape
+        assert graph_node["dtype"] == tensor.dtype
+        assert graph_node["device"] == tensor.device
+        assert graph_node["backend"] == type(tensor).__name__
+        assert graph_node["strides"] == tensor.data.strides
 
 
 @pytest.mark.skipif(Tensor is None, reason="NumPy backend not available")

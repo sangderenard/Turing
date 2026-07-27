@@ -209,10 +209,37 @@ class GradTape:
     # ------------------------------------------------------------------
     # node utilities
     # ------------------------------------------------------------------
+    @staticmethod
+    def _tensor_metadata(tensor: Any) -> Dict[str, Any]:
+        """Snapshot execution metadata on every tensor graph node."""
+        try:
+            dtype = tensor.get_dtype()
+        except Exception:
+            data = getattr(tensor, "data", tensor)
+            dtype = getattr(data, "dtype", getattr(tensor, "dtype", None))
+        try:
+            device = tensor.get_device()
+        except Exception:
+            data = getattr(tensor, "data", tensor)
+            device = getattr(data, "device", getattr(tensor, "device", None))
+        data = getattr(tensor, "data", tensor)
+        shape = getattr(tensor, "shape", getattr(data, "shape", None))
+        return {
+            "shape": tuple(shape) if shape is not None else None,
+            "dtype": dtype,
+            "device": device,
+            "backend": type(tensor).__name__,
+            "strides": getattr(data, "strides", None),
+        }
+
     def create_tensor_node(self, tensor: Any) -> None:
         """Register ``tensor`` as a root node in the graph."""
         tid = id(tensor)
-        self.graph.add_node(tid, kind="tensor")
+        self.graph.add_node(
+            tid,
+            kind="tensor",
+            **self._tensor_metadata(tensor),
+        )
         self._tensor_refs[tid] = tensor
         try:
             tensor._tape = self  # type: ignore[attr-defined]
@@ -254,7 +281,11 @@ class GradTape:
         tid = id(tensor)
         self._loss_tensor = tensor
         self._loss_id = tid
-        self.graph.add_node(tid, kind="tensor")
+        self.graph.add_node(
+            tid,
+            kind="tensor",
+            **self._tensor_metadata(tensor),
+        )
         self.graph.nodes[tid]["loss"] = True
         self._tensor_refs[tid] = tensor
 
@@ -264,7 +295,11 @@ class GradTape:
         """Mark ``tensor`` as structural (non-trainable, excluded from params)."""
         tid = id(tensor)
         self._structural.add(tid)
-        self.graph.add_node(tid, kind="tensor")
+        self.graph.add_node(
+            tid,
+            kind="tensor",
+            **self._tensor_metadata(tensor),
+        )
         anns = self.graph.nodes[tid].setdefault("annotations", {})
         anns["structural"] = True
         if label is not None:
@@ -508,10 +543,18 @@ class GradTape:
         )
         for t in inputs:
             tid = id(t)
-            self.graph.add_node(tid, kind="tensor")
+            self.graph.add_node(
+                tid,
+                kind="tensor",
+                **self._tensor_metadata(t),
+            )
             self.graph.add_edge(tid, op_name)
         rid = id(result)
-        self.graph.add_node(rid, kind="tensor")
+        self.graph.add_node(
+            rid,
+            kind="tensor",
+            **self._tensor_metadata(result),
+        )
         self.graph.add_edge(op_name, rid)
 
         # Attach graph references so tensors know their generating node and tape.
@@ -714,6 +757,11 @@ class GradTape:
             g.add_node(
                 tid,
                 op=op_name,
+                shape=data.get("shape"),
+                dtype=data.get("dtype"),
+                device=data.get("device"),
+                backend=data.get("backend"),
+                strides=data.get("strides"),
                 cached=bool(anns.get("cache")),
                 metadata=anns,
                 param_id=pid,

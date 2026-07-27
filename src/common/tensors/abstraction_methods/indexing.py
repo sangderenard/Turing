@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 import numpy as np
 
 
 @dataclass(frozen=True)
 class NormalizedIndexAxis:
-    indices: tuple[int, ...]
+    indices: Sequence[int] | np.ndarray
     drop_axis: bool
     index_shape: tuple[int, ...] | None = None
 
@@ -47,7 +47,10 @@ def normalize_index(index: Any, shape: Tuple[int, ...]):
                 raise IndexError("tensor index out of range")
             axes.append(NormalizedIndexAxis((value % axis_size,), True))
         elif isinstance(item, slice):
-            indices = tuple(range(*item.indices(axis_size)))
+            # Keep a slice symbolic and constant-size. Expanding a full image
+            # axis into a Python tuple made GPU indexing spend more time
+            # manufacturing host integers than dispatching its gather.
+            indices = range(*item.indices(axis_size))
             axes.append(NormalizedIndexAxis(indices, False))
             output_shape.append(len(indices))
         else:
@@ -69,7 +72,7 @@ def normalize_index(index: Any, shape: Tuple[int, ...]):
             index_shape = tuple(int(size) for size in normalized.shape)
             axes.append(
                 NormalizedIndexAxis(
-                    tuple(int(value) for value in normalized.reshape(-1)),
+                    normalized.reshape(-1),
                     False,
                     index_shape,
                 )

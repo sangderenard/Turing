@@ -134,7 +134,22 @@ def unsqueeze(self, dim: int) -> "AbstractTensor":
         )
         return finalize(result)
 
-    raise NotImplementedError("Unsqueeze fallback not implemented for this backend.")
+    # ``unsqueeze_`` is an optional specialization, not a required primitive.
+    # Unlike ``reshape_``, AbstractTensor does not define a raising base hook for
+    # it.  Backends such as Torch/C/Pure may retain native implementations, but
+    # inserting a unit axis is universally and exactly expressible as reshape.
+    # This fallback is also important for newly completed backends: once their
+    # storage implements reshape, they should not need another implementation
+    # merely to participate in common shape composition.
+    rank = len(getattr(self, "shape", ()))
+    if dim < 0:
+        dim += rank + 1
+    if dim < 0 or dim > rank:
+        raise ValueError(
+            f"unsqueeze dimension {dim} out of range for tensor rank {rank}"
+        )
+    shape = tuple(getattr(self, "shape", ()))
+    return self.reshape(shape[:dim] + (1,) + shape[dim:])
 
 def swapaxes(self, axis1: int, axis2: int) -> "AbstractTensor":
     from ..abstraction import AbstractTensor

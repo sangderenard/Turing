@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import numpy as np
 
@@ -62,49 +63,14 @@ def make_training_set(resolution: int, phases: int):
     return np.concatenate(inputs), np.concatenate(targets)
 
 
-def _render(path, target, prediction, losses, resolution, *, live=False):
-    import matplotlib.pyplot as plt
+def _load_pluck_viewer():
+    root = Path(__file__).resolve().parents[5]
+    pluck = root / "spectral-analyzer"
+    if str(pluck) not in sys.path:
+        sys.path.insert(0, str(pluck))
+    import ordinary_gl_mesh_viewer
 
-    error = np.abs(prediction - target)
-    fig = plt.figure("AbstractNN FusedProgram learns a living field", figsize=(13, 7))
-    fig.clear()
-    axes = fig.subplots(2, 2)
-    panels = (
-        (axes[0, 0], target, "continuous target"),
-        (axes[0, 1], prediction, "FusedProgram network"),
-        (axes[1, 0], error, f"absolute error · max {error.max():.3g}"),
-    )
-    for axis, values, title in panels:
-        image = axis.imshow(
-            values.reshape(resolution, resolution),
-            origin="lower",
-            cmap="turbo",
-            vmin=-1.0 if "error" not in title else 0.0,
-            vmax=1.0 if "error" not in title else max(0.25, float(error.max())),
-        )
-        axis.set_title(title)
-        axis.set_xticks([])
-        axis.set_yticks([])
-        fig.colorbar(image, ax=axis, fraction=0.046)
-    axes[1, 1].plot(np.arange(len(losses)), losses, color="#f05a28")
-    axes[1, 1].set_yscale("log")
-    axes[1, 1].set_title(
-        f"replayed-program training · {losses[0]:.3g} → {losses[-1]:.3g}"
-    )
-    axes[1, 1].set_xlabel("epoch")
-    axes[1, 1].set_ylabel("MSE")
-    axes[1, 1].grid(alpha=0.25)
-    fig.suptitle(
-        "AbstractTensor → AbstractNN → captured FusedProgram → autograd",
-        fontsize=15,
-    )
-    fig.tight_layout()
-    if path is not None:
-        fig.savefig(path, dpi=150)
-    if live:
-        plt.pause(0.001)
-    else:
-        plt.close(fig)
+    return ordinary_gl_mesh_viewer
 
 
 def run_demo(
@@ -121,10 +87,18 @@ def run_demo(
     output: str | Path | None = "abstract_nn_fused_field.png",
     capture_backward: bool = False,
 ):
+    selected_backend = "torch" if backend == "torch-cuda" else backend
+    selected_device = "cuda" if backend == "torch-cuda" else None
     previous_tape = autograd.tape
     autograd.tape = GradTape()
+    output_path = None if output is None else Path(output)
+    dashboard = None
     try:
-        with AT.use_backend(backend):
+        if live or output_path is not None:
+            dashboard = _load_pluck_viewer().HeatmapDashboard(
+                title="AbstractTensor / AbstractNN / FusedProgram — Pluck OpenGL"
+            )
+        with AT.use_backend(selected_backend, selected_device):
             x_values, y_values = make_training_set(
                 training_resolution, training_phases
             )
@@ -167,8 +141,8 @@ def run_demo(
             axis = np.linspace(-1.0, 1.0, display_resolution)
             xx, yy = np.meshgrid(axis, axis, indexing="xy")
             display_xy = np.column_stack((xx.ravel(), yy.ravel()))
-            output_path = None if output is None else Path(output)
             completed = 0
+            display_open = True
             while completed < epochs:
                 chunk = min(render_every if live else epochs, epochs - completed)
                 process.training_loop(
@@ -185,15 +159,21 @@ def run_demo(
                     )[:, 0]
                 target = target_field(display_xy, phase)[:, 0]
                 losses = [row["loss"] for row in process.training_log]
-                if output_path is not None or live:
-                    _render(
-                        output_path,
-                        target,
-                        prediction,
+                error = np.abs(prediction - target)
+                if dashboard is not None:
+                    dashboard.update(
+                        target.reshape(display_resolution, display_resolution),
+                        prediction.reshape(
+                            display_resolution, display_resolution
+                        ),
+                        error.reshape(display_resolution, display_resolution),
                         losses,
-                        display_resolution,
-                        live=live,
+                        status_lines=(
+                            f"epoch {completed}/{epochs}  backend {backend}",
+                            f"max error {error.max():.4g}",
+                        ),
                     )
+                    display_open = dashboard.pump()
                 print(
                     f"\repoch {completed:5d}/{epochs}  "
                     f"loss {losses[-1]:.6g}  "
@@ -202,11 +182,13 @@ def run_demo(
                     end="",
                     flush=True,
                 )
+                if not display_open:
+                    break
             print()
-            if live:
-                import matplotlib.pyplot as plt
-
-                plt.show()
+            if dashboard is not None and output_path is not None and display_open:
+                dashboard.save(output_path)
+            if live and dashboard is not None and display_open:
+                dashboard.wait()
             return {
                 "initial_loss": losses[0],
                 "final_loss": losses[-1],
@@ -226,6 +208,8 @@ def run_demo(
                 "output": output_path,
             }
     finally:
+        if dashboard is not None:
+            dashboard.close()
         autograd.tape = previous_tape
 
 
@@ -237,7 +221,11 @@ def main():
     parser.add_argument("--training-resolution", type=int, default=18)
     parser.add_argument("--training-phases", type=int, default=8)
     parser.add_argument("--display-resolution", type=int, default=96)
-    parser.add_argument("--backend", choices=("numpy", "c", "torch"), default="numpy")
+    parser.add_argument(
+        "--backend",
+        choices=("numpy", "c", "torch", "torch-cuda", "glsl", "nodus"),
+        default="numpy",
+    )
     parser.add_argument("--render-every", type=int, default=20)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--output", default="abstract_nn_fused_field.png")
@@ -254,6 +242,7 @@ def main():
         live=args.live,
         render_every=args.render_every,
         output=args.output,
+        capture_backward=args.capture_backward,
     )
     print(result)
 

@@ -114,7 +114,28 @@ def test_real_autograd_trace_compiles_and_replays_in_c():
     assert [step.op_name for step in captured.program.steps] == [
         "neg", "exp", "add", "truediv"
     ]
+    feed_id = next(iter(captured.program.feeds))
+    output_id = captured.program.outputs["result"]
+    assert captured.program.meta[feed_id].dtype == "float64"
+    assert captured.program.meta[output_id].dtype == "float64"
     np.testing.assert_allclose(replayed.tolist(), result.tolist())
+
+
+def test_integer_trace_preserves_tape_dtype_in_fused_metadata():
+    with autograd.forward_capture() as tape:
+        source = NumPyTensorOperations.tensor(
+            np.asarray([2, 1, 0, 3], dtype=np.int32)
+        )
+        result = source * 9 + 1
+
+    captured = compile_elementwise_tape(tape, result)
+    feed_id = next(iter(captured.program.feeds))
+    output_id = captured.program.outputs["result"]
+
+    assert tape.graph.nodes[feed_id]["dtype"] == source.dtype
+    assert tape.node(result).ctx["result_dtype"] == result.dtype
+    assert captured.program.meta[feed_id].dtype == "int32"
+    assert captured.program.meta[output_id].dtype == "int32"
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "c"])

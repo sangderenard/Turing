@@ -74,20 +74,30 @@ def matmul_chunked(A, B, *, Mt=512, Kt=2048, Nt=512):
 
 
 def matmul_chunked_data(A, B, *, Mt=512, Kt=2048, Nt=512):
-    """Compute a 2-D tiled product as backend data, without tape-side tiles.
+    """Compute a tiled product as backend data, without tape-side tiles.
 
     The caller records one ordinary ``matmul`` node around this kernel. This
     keeps the public gradient rule exact while avoiding in-place tensor
     assembly inside the autograd graph.
     """
-    if len(A.shape) != 2 or len(B.shape) != 2:
-        # Batched products currently use the backend's native implementation;
-        # their broadcast semantics should not be approximated here.
-        return A._apply_operator__(
-            "matmul",
-            A._AbstractTensor__unwrap(),
-            B._AbstractTensor__unwrap(),
-        )
+    if len(A.shape) < 2 or len(B.shape) < 2:
+        raise ValueError("matmul_chunked_data expects rank-two or batched matrices")
+    if len(A.shape) > 2 or len(B.shape) > 2:
+        # The public composite already implements broadcasted N-D matmul using
+        # only expand, slicing, elementwise multiplication, and reduction.
+        # Suppress its internal tape nodes because the caller records the one
+        # semantic matmul operation with the standard backward rule.
+        from .autograd import autograd
+
+        with autograd.no_grad():
+            return matmul_chunked(
+                A,
+                B,
+                Mt=Mt,
+                Kt=Kt,
+                Nt=Nt,
+            ).data
+
     M, K = A.shape
     K2, N = B.shape
     if K != K2:

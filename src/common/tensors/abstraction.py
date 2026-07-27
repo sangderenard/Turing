@@ -370,10 +370,34 @@ class AbstractTensor:
 
     # --- Clamping ---
     def clamp(self, min: float | None = None, max: float | None = None) -> "AbstractTensor":
-        """Return ``self`` clamped between ``min`` and ``max`` with autograd support."""
-        finalize = AbstractTensor._pre_autograd("clamp", [self], params={"min": min, "max": max})
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.clamp_(min_val=min, max_val=max)
+        """Return ``self`` clamped between ``min`` and ``max``.
+
+        A backend may provide a specialized ``clamp_`` hook.  Backends that
+        only implement the canonical primitive dispatcher inherit the same
+        behavior compositionally through ``maximum`` and ``minimum``.
+        """
+        try:
+            data = self.clamp_(min_val=min, max_val=max)
+        except NotImplementedError:
+            result = self
+            if min is not None:
+                result = result._apply_operator("maximum", result, min)
+            if max is not None:
+                result = result._apply_operator("minimum", result, max)
+            if result is self:
+                return self._apply_operator("add", self, 0)
+            return result
+
+        finalize = AbstractTensor._pre_autograd(
+            "clamp",
+            [self],
+            params={"min": min, "max": max},
+        )
+        result = type(self)(
+            track_time=self.track_time,
+            tape=getattr(self, "_tape", None),
+        )
+        result.data = data
         return finalize(result)
 
     def clamp_(self, min_val: float | None = None, max_val: float | None = None):
@@ -782,6 +806,7 @@ class AbstractTensor:
                 "jax": "jax_backend",
                 "pure_python": "pure_backend",
                 "c": "accelerator_backends.c_backend",
+                "glsl": "accelerator_backends.glsl_tensor_backend",
             }.get(preferred)
             if module_name is None:
                 raise ValueError(f"unknown tensor backend: {preferred}")
@@ -1680,6 +1705,26 @@ class AbstractTensor:
     def save(self, filepath: str = None) -> None:
         self.save_(filepath)
 
+    def jpg(self, path: str | None = None, **kwargs):
+        """Encode this grayscale or RGB tensor as a baseline JPEG.
+
+        With no ``path``, return the complete JFIF byte stream.  When ``path``
+        is supplied, write the stream and return its destination.  Codec work
+        lives in :mod:`common.tensors.compression`; this method is only the
+        convenient AbstractTensor entry point.
+        """
+        from .compression.jpeg.frame import encode_jfif, write_jfif
+
+        if path is None:
+            return encode_jfif(self, **kwargs)
+        return write_jfif(path, self, **kwargs)
+
+    def avi(self, path: str, **kwargs):
+        """Write this grayscale/RGB frame or frame stack as an MJPEG AVI."""
+        from .compression.containers.avi import write_tensor_mjpeg_avi
+
+        return write_tensor_mjpeg_avi(path, self, **kwargs)
+
     def load(
         self, filepath: str, dtype: Any = None, device: Any = None
     ) -> "AbstractTensor":
@@ -1947,6 +1992,19 @@ class AbstractTensor:
 
 
     def to_backend(self, target_ops):
+        target_tensor_type = getattr(target_ops, "tensor_type", None)
+        if (
+            isinstance(target_tensor_type, type)
+            and isinstance(getattr(self, "data", None), target_tensor_type)
+        ):
+            if type(self) is type(target_ops):
+                return self
+            converted = type(target_ops)(
+                track_time=self.track_time,
+                tape=getattr(target_ops, "_tape", None),
+            )
+            converted.data = self.data
+            return converted
         conv_func = CONVERSION_REGISTRY.get((type(self), type(target_ops)))
         if conv_func is None:
             converted = default_to_backend(self, self, target_ops)
@@ -1974,6 +2032,8 @@ class AbstractTensor:
         if tensor is None:
             raise ValueError("ensure_tensor called with tensor=None")
         backend_cls = self.__class__
+        if isinstance(tensor, backend_cls):
+            return tensor
         if isinstance(tensor, AbstractTensor):
             return tensor.to_backend(self)
         if isinstance(tensor, self.tensor_type):
@@ -2188,7 +2248,15 @@ class AbstractTensor:
                 if isinstance(right, AbstractTensor) and rk == "int":
                     right = right.to_dtype("float")
 
-        if op == "matmul" and max(list(left.shape) + list(right.shape)) > 4096:
+        if (
+            op == "matmul"
+            and not getattr(self, "supports_native_batched_matmul", False)
+            and (
+                left.ndims() > 2
+                or right.ndims() > 2
+                or max(list(left.shape) + list(right.shape)) > 4096
+            )
+        ):
             from .batched_matmul import matmul_chunked_data
             result = type(self)(
                 track_time=self.track_time, tape=getattr(self, "_tape", None)
