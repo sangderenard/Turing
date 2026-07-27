@@ -467,6 +467,7 @@ class ProcessGraph:
         *args,
         semantic=True,
         filename=None,
+        entrypoint=None,
         **kwargs,
     ):
         """Import Python source into this ProcessGraph.
@@ -477,6 +478,16 @@ class ProcessGraph:
         visualization/debugging callers.  Neither route enters the independent
         SymPy expression/recombinatorics path.
         """
+        if semantic:
+            from ...compiler.semantic_ast import build_semantic_process_graph
+
+            return build_semantic_process_graph(
+                self,
+                node_or_path,
+                filename=filename,
+                entrypoint=entrypoint,
+            )
+
         import ast
         import os
 
@@ -496,9 +507,7 @@ class ProcessGraph:
                 "build_from_ast expects an AST node, a filename, or a source string"
             )
 
-        if not semantic:
-            return self.build_graph(tree, *args, **kwargs)
-        return self._build_semantic_ast(tree, filename=filename)
+        return self.build_graph(tree, *args, **kwargs)
 
     def _build_semantic_ast(self, tree, *, filename=None):
         """Build canonical Python dataflow directly in this ProcessGraph."""

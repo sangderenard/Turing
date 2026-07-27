@@ -15,11 +15,7 @@ import networkx as nx
 from .bitops_translator import BitOpsTranslator
 from .process_graph_helper import provenance_to_process_graph
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
-
-
-_EXPANDABLE = frozenset(
-    {"bitand", "bitor", "bitxor", "invert", "add", "sub", "mul"}
-)
+from ..transmogrifier.ssa_registry import BITOPS_EXPANDABLE_OPS
 
 
 def _next_free_id(graph: nx.DiGraph, start: int) -> int:
@@ -80,7 +76,7 @@ def expand_bitops_process_graph(
             continue
         old_data = target.G.nodes[old_id]
         op = old_data.get("op") or old_data.get("label")
-        if op not in _EXPANDABLE:
+        if op not in BITOPS_EXPANDABLE_OPS:
             if op not in {"input", "const", "return", "select"}:
                 attributes = old_data.setdefault("attributes", {})
                 attributes["bitops_status"] = "unexpanded"
@@ -188,3 +184,6 @@ def expand_bitops_process_graph(
         target.G.remove_node(old_id)
 
     return target
+
+
+__all__ = ["BITOPS_EXPANDABLE_OPS", "expand_bitops_process_graph"]

@@ -445,10 +445,32 @@ role_schemas.update({
     'BitXor':      {'up': {}, 'down': {}},
     'BitAnd':      {'up': {}, 'down': {}},
     'FloorDiv':    {'up': {}, 'down': {}},
+    'MatMult':     {'up': {}, 'down': {}},
     'Invert':      {'up': {}, 'down': {}},
     'Not':         {'up': {}, 'down': {}},
     'UAdd':        {'up': {}, 'down': {}},
     'USub':        {'up': {}, 'down': {}},
+
+    # Boolean/comparison/context leaves and structural helpers used by the
+    # semantic Python front end. Arithmetic leaves reduce to the established
+    # canonical operation names; these schemas only describe AST shape.
+    'And':         {'up': {}, 'down': {}},
+    'Or':          {'up': {}, 'down': {}},
+    'Eq':          {'up': {}, 'down': {}},
+    'NotEq':       {'up': {}, 'down': {}},
+    'Lt':          {'up': {}, 'down': {}},
+    'LtE':         {'up': {}, 'down': {}},
+    'Gt':          {'up': {}, 'down': {}},
+    'GtE':         {'up': {}, 'down': {}},
+    'Is':          {'up': {}, 'down': {}},
+    'IsNot':       {'up': {}, 'down': {}},
+    'In':          {'up': {}, 'down': {}},
+    'NotIn':       {'up': {}, 'down': {}},
+    'Load':        {'up': {}, 'down': {}},
+    'Store':       {'up': {}, 'down': {}},
+    'Slice':       {'up': {'lower': 1, 'upper': 1, 'step': 1}, 'down': {}},
+    'alias':       {'up': {}, 'down': {}},
+    'withitem':    {'up': {'context_expr': 1, 'optional_vars': 1}, 'down': {}},
 
     # Optionally: cover all ast.AST leaf nodes as {}
 })

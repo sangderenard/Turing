@@ -5,7 +5,7 @@ The compiler path is:
 ```text
 Python AST
   -> ProcessGraph.build_from_ast(semantic=True)
-       (operators and canonical tensor method/function calls)
+       (one or several files; functions, control, and canonical tensor calls)
   -> optional Turing-provenance BitOps primitive expansion
        (Python-list or AbstractTensor carrier)
   -> metadata-rich SSA
@@ -57,6 +57,27 @@ opaque Python calls. The recognized names come from the established fused
 operation vocabulary plus the structural canonical operations; this mapping
 only resolves syntax and never supplies alternate numerical implementations.
 
+Multi-file ingestion registers definitions before visiting bodies. Calls then
+link to their original function/class regions, and an entrypoint identifies one
+master program without copying those functions into a generated source file.
+Loops, indexing, slices, contexts, generators, containers, comprehensions,
+exceptions, attributes, mutation, functions, and classes remain explicit
+ProcessGraph nodes. The generic structural fallback reads the established
+`operator_defs.role_schemas`; it is not a second AST schema.
+
+The reduction boundaries remain unchanged:
+
+- canonical tensor arithmetic uses the established AbstractTensor/FusedProgram
+  vocabulary and SSA correlation;
+- integer-capable arithmetic and bitwise nodes are only marked as candidates
+  for `expand_bitops_process_graph`, which continues to obtain implementations
+  exclusively from `BitOpsTranslator` and Turing provenance;
+- symbolic SymPy expressions continue through
+  `ProcessGraph.build_from_expression` and the SymPy/SSA registry.
+
+The AST importer contains no numerical implementation for any of those three
+paths.
+
 ## Backend boundary
 
 `lower_ssa_to_fused_program` targets the established backend-neutral
@@ -78,10 +99,11 @@ canonical primitives, and the equal-shape whole-program fusion region accepts
 become neighboring regions in a ProcessGraph partitioner rather than being
 restated inside the elementwise emitter.
 
-The live [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md)
-exercises that exact frontier: ProcessGraph chooses the solve, palette, and
-YCbCr region, while the structural JPEG program remains visible as ordinary
-AbstractTensor boundaries for the next partitioning work.
+The [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md) no
+longer uses execution-tape capture. Its source-bundle builder ingests the
+original solve, palette, compression, JPEG, and container functions as one
+entrypoint-rooted ProcessGraph. Region optimization and executable backend
+lowering remain the next compiler stage.
 
 ## Nodus
 

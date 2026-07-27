@@ -3,6 +3,11 @@ from typing import Dict, Callable, List, Any
 from collections import defaultdict
 
 
+BITOPS_EXPANDABLE_OPS = frozenset(
+    {"bitand", "bitor", "bitxor", "invert", "add", "sub", "mul"}
+)
+
+
 class Handler(Enum):
     """
     Enumeration of all SSA operations used.
