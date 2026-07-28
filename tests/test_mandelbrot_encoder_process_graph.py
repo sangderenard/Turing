@@ -9,6 +9,7 @@ from src.common.tensors.accelerator_backends.mandelbrot_encoder_program import (
     build_mandelbrot_recording_process_graph,
     mandelbrot_encoder_source_files,
     mandelbrot_jpeg_master,
+    mandelbrot_recording_function_ast,
 )
 from src.common.tensors.accelerator_backends.demo_mandelbrot_fusion import (
     normalized_plane,
@@ -43,6 +44,31 @@ def encoder_graph():
 @pytest.fixture(scope="module")
 def recording_graph():
     return build_mandelbrot_recording_process_graph()
+
+
+def test_recording_source_is_extracted_as_exactly_one_outer_function():
+    module = mandelbrot_recording_function_ast()
+
+    compile(module, "<mandelbrot_recording_program>", "exec")
+    assert len(module.body) == 1
+    master = module.body[0]
+    assert isinstance(master, ast.FunctionDef)
+    assert master.name == "mandelbrot_recording_program"
+    nested = {
+        statement.name
+        for statement in master.body
+        if isinstance(
+            statement,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+    }
+    assert {
+        "mandelbrot_display_master",
+        "parametric_mandelbrot_escape",
+        "tensor_ycbcr_jpeg_bytes",
+        "encode_ycbcr_jfif",
+        "MJPEGAVIWriter",
+    } <= nested
 
 
 def test_every_ast_object_in_the_original_source_bundle_has_a_role_schema():
@@ -173,12 +199,16 @@ def test_recording_program_is_one_forward_reachable_start_to_finish_graph(
 
     assert graph.G.graph["semantic_profile"] == "program"
     assert graph.G.graph["entrypoint_expanded"] is True
-    assert graph.G.graph["program_entrypoint"] == "animate_glsl"
+    assert graph.G.graph["program_entrypoint"] == (
+        "mandelbrot_recording_program"
+    )
+    assert graph.G.graph["source_entrypoint"] == "animate_glsl"
+    assert graph.G.graph["single_function_ast"] is True
     assert reachable == set(graph.G)
     assert nx.is_directed_acyclic_graph(graph.G)
 
     required_functions = {
-        "animate_glsl",
+        "mandelbrot_recording_program",
         "mandelbrot_display_master",
         "parametric_mandelbrot_escape",
         "mandelbrot_jpeg_planes",

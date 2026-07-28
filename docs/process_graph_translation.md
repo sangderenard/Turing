@@ -66,13 +66,18 @@ unreachable definitions from every supplied source file for coverage audits
 and source archaeology. Neither profile is sent wholesale to GLSL; backend
 partitioning selects legal numerical regions from it.
 
-On the current Mandelbrot/compression source bundle:
+For the recording demo, the source-level dependency walk first constructs one
+AST module containing exactly one top-level function,
+`mandelbrot_recording_program`. Its body contains the original transitive
+helper/class definitions followed by the original `animate_glsl` body.
+ProcessGraph ingests that one function AST; it does not receive the source-file
+bundle and does not discover the program from an execution tape.
 
-- the complete audit graph has 12,035 nodes;
-- the complete `animate_glsl` recording program has 5,258 nodes across 83
-  transitively reached definitions;
-- all 5,258 recording nodes are forward-reachable from the one entrypoint root;
-- the recording tensor/control projection has 3,312 nodes;
+- the complete single-function audit graph has 7,739 nodes;
+- the recording program projection has 6,161 nodes across 84 reached
+  definitions;
+- all 6,161 recording nodes are forward-reachable from the one function root;
+- the recording tensor/control projection has 4,003 nodes;
 - the narrower encoder-only tensor/control projection has 1,899 nodes.
 
 The importer recognizes canonical tensor operation spellings in
@@ -139,9 +144,9 @@ become neighboring regions in a ProcessGraph partitioner rather than being
 restated inside the elementwise emitter.
 
 The [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md) no
-longer uses execution-tape capture. Its source-bundle builder can now select
-the actual `animate_glsl` entrypoint and expand the complete start-to-finish
-recording program into one ProcessGraph:
+longer uses execution-tape capture. Its source extractor places the complete
+start-to-finish recording program inside one function AST and that single
+function becomes one ProcessGraph:
 
 ```text
 frame/control loop

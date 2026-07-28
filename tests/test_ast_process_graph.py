@@ -165,3 +165,31 @@ def program(value):
         structural_roles.isdisjoint(instruction.arg_roles)
         for instruction in instructions
     )
+
+
+def test_single_outer_function_registers_nested_helpers_before_bodies():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(
+        """
+def program(value):
+    def first(item):
+        return second(item)
+
+    def second(item):
+        return item.sin()
+
+    return first(value)
+""",
+        filename="single_function_fixture.py",
+        entrypoint="program",
+        profile="program",
+    )
+
+    calls = {
+        (data.get("attributes") or {}).get("function"):
+        data.get("attributes") or {}
+        for _, data in graph.G.nodes(data=True)
+        if data.get("op") == "call"
+    }
+    assert calls["second"]["resolved"] is True
+    assert calls["first"]["resolved"] is True

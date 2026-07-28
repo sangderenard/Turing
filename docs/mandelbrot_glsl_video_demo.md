@@ -19,12 +19,14 @@ their misleading use as this demo's compiler has been disabled.
 
 ## Complete start-to-finish source ingestion
 
-`build_mandelbrot_recording_process_graph()` scans the actual demo,
-Mandelbrot master source, and every compression source together, with the real
-`animate_glsl` recording loop as its one root. Semantic AST ingestion follows
-resolved project calls, class methods, and the compiler call's literal source
-entrypoint. No generated replacement loop and no AbstractTensor execution tape
-is involved.
+`mandelbrot_recording_function_ast()` performs a source-level dependency walk,
+then returns an AST module with exactly one top-level function:
+`mandelbrot_recording_program`. That function contains the original reachable
+helper and class definitions followed by the original `animate_glsl` body.
+`build_mandelbrot_recording_process_graph()` gives only that one function AST
+to semantic ingestion. No replacement rendering loop, source-file bundle
+input, preliminary ProcessGraph discovery, or AbstractTensor execution tape is
+involved.
 
 The default recording result uses `profile="program"` and retains the complete
 transitive program: Python control and UI, AbstractTensor calculation, JPEG
@@ -35,10 +37,11 @@ to inspect even the unused definitions in the source bundle.
 
 Current source-front-end measurements on the complete bundle are:
 
-- complete audit graph: 12,035 nodes;
-- complete recording program: 5,258 nodes and 83 reached definitions;
-- forward reachability from `animate_glsl`: 5,258 / 5,258 nodes;
-- recording tensor/control projection: 3,312 nodes;
+- complete single-function audit graph: 7,739 nodes;
+- recording program projection: 6,161 nodes and 84 reached definitions;
+- forward reachability from `mandelbrot_recording_program`: 6,161 / 6,161
+  nodes;
+- recording tensor/control projection: 4,003 nodes;
 - encoder-only tensor/control projection: 1,899 nodes.
 
 Those are compiler-front-end timings, not render or shader timings.

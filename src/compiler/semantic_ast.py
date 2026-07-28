@@ -206,6 +206,7 @@ class SemanticAstBuilder:
             self.next_id += 1
         self.filename = "<unknown>"
         self.scope = "<module>"
+        self.lexical_parent_scope = "<module>"
         self.env: dict[str, int] = {}
         self.globals_by_file: dict[str, dict[str, int]] = defaultdict(dict)
         self.definitions: dict[str, int] = {}
@@ -594,6 +595,14 @@ class SemanticAstBuilder:
                 callee = self.definitions_by_scope.get(
                     (self.filename, self.scope, spelling)
                 )
+                if callee is None:
+                    callee = self.definitions_by_scope.get(
+                        (
+                            self.filename,
+                            self.lexical_parent_scope,
+                            spelling,
+                        )
+                    )
                 if callee is None:
                     callee = self.definitions_by_scope.get(
                         (self.filename, "<module>", spelling)
@@ -1018,9 +1027,15 @@ class SemanticAstBuilder:
             else:
                 self.definitions.setdefault(node.name, definition)
         region_start = self.next_id
-        previous_env, previous_scope, previous_filename = (
+        (
+            previous_env,
+            previous_scope,
+            previous_lexical_parent_scope,
+            previous_filename,
+        ) = (
             self.env,
             self.scope,
+            self.lexical_parent_scope,
             self.filename,
         )
         # Nested functions close over the values already built in their
@@ -1033,6 +1048,70 @@ class SemanticAstBuilder:
             else self.globals_by_file[self.filename]
         )
         self.scope = node.name
+        self.lexical_parent_scope = owner_scope
+        # A single extracted program function may contain all of its helper
+        # definitions as nested source. Register that complete local surface
+        # before visiting any helper body so forward references resolve in the
+        # same way as multi-file module ingestion.
+        for child in node.body:
+            if not isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                continue
+            key = (self.filename, node.name, child.name)
+            if key in self.definitions_by_scope:
+                continue
+            nested = self.add(
+                (
+                    "class_def"
+                    if isinstance(child, ast.ClassDef)
+                    else "function_def"
+                ),
+                label=child.name,
+                attributes={
+                    "name": child.name,
+                    "async": isinstance(child, ast.AsyncFunctionDef),
+                    "nested_in": node.name,
+                },
+                source=child,
+            )
+            self.definitions_by_scope[key] = nested
+            self.definition_candidates[child.name].append(nested)
+            if isinstance(child, ast.ClassDef):
+                self.class_definitions[child.name] = nested
+                for method_node in child.body:
+                    if not isinstance(
+                        method_node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    ):
+                        continue
+                    method_key = (
+                        self.filename,
+                        child.name,
+                        method_node.name,
+                    )
+                    if method_key in self.definitions_by_scope:
+                        continue
+                    method = self.add(
+                        "function_def",
+                        label=method_node.name,
+                        attributes={
+                            "name": method_node.name,
+                            "async": isinstance(
+                                method_node, ast.AsyncFunctionDef
+                            ),
+                            "nested_in": child.name,
+                        },
+                        source=method_node,
+                    )
+                    self.definitions_by_scope[method_key] = method
+                    self.definition_candidates[
+                        method_node.name
+                    ].append(method)
+                    self.class_methods[
+                        (child.name, method_node.name)
+                    ] = method
         for argument in (
             *node.args.posonlyargs,
             *node.args.args,
@@ -1079,9 +1158,15 @@ class SemanticAstBuilder:
             child_id = self.statement(child)
             if definition is not None and child_id is not None:
                 self._control_edge(definition, child_id, "body")
-        self.env, self.scope, self.filename = (
+        (
+            self.env,
+            self.scope,
+            self.lexical_parent_scope,
+            self.filename,
+        ) = (
             previous_env,
             previous_scope,
+            previous_lexical_parent_scope,
             previous_filename,
         )
         if definition is not None:
