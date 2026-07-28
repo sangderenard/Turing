@@ -17,27 +17,29 @@ Calling any of the demo's `capture_*` entry points now fails explicitly. The
 general GradTape and FusedProgram facilities remain available elsewhere; only
 their misleading use as this demo's compiler has been disabled.
 
-## Source ingestion now present
+## Complete start-to-finish source ingestion
 
-`build_mandelbrot_encoder_process_graph()` now scans the master program, the
-original Mandelbrot demo source, and the original compression sources together.
-The entrypoint composes the original parametric solve, palette, and
-`encode_ycbcr_jfif`; it does not copy their implementations and does not execute
-an AbstractTensor tape.
+`build_mandelbrot_recording_process_graph()` scans the actual demo,
+Mandelbrot master source, and every compression source together, with the real
+`animate_glsl` recording loop as its one root. Semantic AST ingestion follows
+resolved project calls, class methods, and the compiler call's literal source
+entrypoint. No generated replacement loop and no AbstractTensor execution tape
+is involved.
 
-The default result is a tensor/control projection, not an attempted compiler
-for all of Python. AbstractTensor values and operations are typed explicitly;
-Python supplies loops, branches, contexts, calls, and shape/scalar
-dependencies. Host byte materialization remains an explicit boundary. Use
-`profile="complete"` only to inspect every source syntax node.
+The default recording result uses `profile="program"` and retains the complete
+transitive program: Python control and UI, AbstractTensor calculation, JPEG
+entropy work, tensor-to-byte materialization, AVI/audio writes, segment and
+superindex updates, header patching, and final close. Use
+`profile="tensor_control"` for compiler partitioning and `profile="complete"`
+to inspect even the unused definitions in the source bundle.
 
 Current source-front-end measurements on the complete bundle are:
 
-- complete audit graph: 11,973 nodes;
-- tensor/control compiler graph: 1,911 nodes (84% removed);
-- warm complete builds: roughly 1.0–1.1 seconds;
-- warm tensor/control builds: roughly 1.0–1.1 seconds, including construction
-  of the audit graph and projection.
+- complete audit graph: 12,035 nodes;
+- complete recording program: 5,258 nodes and 83 reached definitions;
+- forward reachability from `animate_glsl`: 5,258 / 5,258 nodes;
+- recording tensor/control projection: 3,312 nodes;
+- encoder-only tensor/control projection: 1,899 nodes.
 
 Those are compiler-front-end timings, not render or shader timings.
 
@@ -45,7 +47,8 @@ The resulting graph is acyclic and contains no opaque AST placeholders. Its
 resolved entrypoint path reaches:
 
 ```text
-parametric solve
+frame/control loop
+  -> compiler-selected parametric solve
   -> palette / YCbCr planes
   -> 8x8 DCT and quantization
   -> coefficient-event collection
@@ -53,13 +56,20 @@ parametric solve
   -> prefix placement and packed octets
   -> marker stuffing
   -> tensor-octet byte boundary
+  -> AVI video chunks and synchronized PCM chunks
+  -> RIFF/OpenDML segment indexes and superindexes
+  -> size/header patching and final close
 ```
 
 All Python syntax used by the source bundle is registered in the existing
-ProcessGraph role-schema table for audit coverage. Tensor arithmetic retains
-canonical operation names and `execution_domain="abstract_tensor"`.
-Bitwise/integer nodes advertise BitOps capability but are not selected without
-integer dtype evidence. The ingestion layer implements no alternate arithmetic.
+ProcessGraph role-schema table for audit coverage. Definitions explicitly own
+their complete regions, and the one root owns required environment nodes, so
+the whole retained program is forward-traversable. A shared compiler contract
+prevents those ownership edges from becoming SSA or fused-program operands.
+Tensor arithmetic retains canonical operation names and
+`execution_domain="abstract_tensor"`. Bitwise/integer nodes advertise BitOps
+capability but are not selected without integer dtype evidence. The ingestion
+layer implements no alternate arithmetic.
 
 ## Executable structured GLSL path
 
@@ -117,10 +127,10 @@ encoding, and total frame time. For example:
 python -m src.common.tensors.accelerator_backends.demo_mandelbrot_fusion --animate --only-glsl --width 512 --height 256 --iterations 4000 --animation-frames 100 --no-detail-network --profile
 ```
 
-## JPEG/AVI synchronization frontier
+## JPEG/AVI compilation frontier
 
-The recording path consumes the same resident Y/Cb/Cr outputs, but it is not
-honestly describable as one shader yet. Baseline JPEG contains global
+The whole recording path is now honestly one entrypoint-expanded ProcessGraph,
+but it is not one shader yet. Baseline JPEG contains global
 boundaries—two-sided block transforms, reductions, prefix scans, scatter and
 compaction, entropy bit packing, a final byte-count readback, and host
 JFIF/OpenDML framing. A compute shader has no whole-dispatch global barrier, so

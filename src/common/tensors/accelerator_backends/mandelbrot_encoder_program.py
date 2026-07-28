@@ -133,8 +133,9 @@ def build_mandelbrot_encoder_process_graph(
 ):
     """Ingest the source bundle without executing the program.
 
-    The default graph is the compiler-facing tensor/control projection.
-    Request ``profile="complete"`` for syntax-coverage and archaeology audits.
+    ``tensor_control`` is the numerical compiler projection, ``program`` keeps
+    every node in the transitive entrypoint program, and ``complete`` retains
+    the entire source bundle for syntax-coverage and archaeology audits.
     """
 
     from ....transmogrifier.graph.graph_express2 import ProcessGraph
@@ -148,8 +149,30 @@ def build_mandelbrot_encoder_process_graph(
     return graph
 
 
+def build_mandelbrot_recording_process_graph(*, profile: str = "program"):
+    """Ingest the actual recording loop as one start-to-finish ProcessGraph.
+
+    This is not a second rendering loop. It selects the existing ``animate_glsl``
+    implementation as the root; semantic AST ingestion follows its statically
+    declared compiled entrypoint into the original solve and follows the live
+    encoder/writer calls through JPEG bytes, audio, AVI indexes, final header
+    patching, and close.
+    """
+
+    graph = build_mandelbrot_encoder_process_graph(
+        profile=profile,
+        entrypoint="animate_glsl",
+    )
+    graph.G.graph.update(
+        program_name="mandelbrot_recording",
+        program_entrypoint="animate_glsl",
+    )
+    return graph
+
+
 __all__ = [
     "build_mandelbrot_encoder_process_graph",
+    "build_mandelbrot_recording_process_graph",
     "mandelbrot_display_master",
     "mandelbrot_encoder_source_files",
     "mandelbrot_jpeg_master",

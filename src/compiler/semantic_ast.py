@@ -207,7 +207,7 @@ class SemanticAstBuilder:
         self.filename = "<unknown>"
         self.scope = "<module>"
         self.env: dict[str, int] = {}
-        self.globals: dict[str, int] = {}
+        self.globals_by_file: dict[str, dict[str, int]] = defaultdict(dict)
         self.definitions: dict[str, int] = {}
         self.definition_candidates: dict[str, list[int]] = defaultdict(list)
         self.definitions_by_scope: dict[tuple[str, str, str], int] = {}
@@ -353,8 +353,11 @@ class SemanticAstBuilder:
         if isinstance(node, ast.Name):
             if node.id in self.env:
                 return self.env[node.id]
-            if node.id in self.globals:
-                return self.globals[node.id]
+            module_globals = self.globals_by_file[self.filename]
+            if node.id in module_globals:
+                return module_globals[node.id]
+            previous_scope = self.scope
+            self.scope = "<module>"
             value = self.add(
                 "global_ref",
                 label=node.id,
@@ -362,7 +365,8 @@ class SemanticAstBuilder:
                 source=node,
                 output_roles=("value",),
             )
-            self.globals[node.id] = value
+            self.scope = previous_scope
+            module_globals[node.id] = value
             return value
         if isinstance(node, ast.Constant):
             return self.constant(node.value, node)
@@ -616,6 +620,33 @@ class SemanticAstBuilder:
             },
             source=node,
         )
+        declared_entrypoint = None
+        for value_id, role in inputs:
+            if role != "kw:entrypoint":
+                continue
+            value = self.graph.G.nodes[value_id].get("constant")
+            if not isinstance(value, str):
+                continue
+            candidates = self.definition_candidates.get(value, ())
+            if len(candidates) == 1:
+                declared_entrypoint = candidates[0]
+                break
+        if declared_entrypoint is not None:
+            # A source compiler invocation is itself part of the program.
+            # Keep the statically named program it compiles inside the same
+            # entrypoint graph instead of hiding numerical work behind the
+            # compiler wrapper.
+            self.graph.G.nodes[call_id]["attributes"][
+                "compiled_entrypoint"
+            ] = declared_entrypoint
+            self.graph.G.nodes[call_id]["extra_args"][
+                "compiled_entrypoint"
+            ] = declared_entrypoint
+            self._control_edge(
+                call_id,
+                declared_entrypoint,
+                "compiles",
+            )
         if callee is not None:
             # Calls own their result value.  The control edge points into the
             # registered function region so an entrypoint traversal reaches
@@ -821,6 +852,21 @@ class SemanticAstBuilder:
         self.graph.G.nodes[source]["children"].append((target, role))
         self.graph.G.nodes[target]["parents"].append((source, role))
 
+    def _propagate_common_value_type(
+        self,
+        target: int,
+        *sources: int | None,
+    ) -> None:
+        """Retain one unambiguous runtime class across control-flow joins."""
+
+        possible = {
+            self.value_types[source]
+            for source in sources
+            if source is not None and source in self.value_types
+        }
+        if len(possible) == 1:
+            self.value_types[target] = possible.pop()
+
     def if_statement(self, node: ast.If) -> int:
         condition = self.expression(node.test)
         before = dict(self.env)
@@ -850,10 +896,10 @@ class SemanticAstBuilder:
             else_value = else_env.get(name, before.get(name))
             if then_value is None or else_value is None:
                 continue
-            merged[name] = (
-                then_value
-                if then_value == else_value
-                else self.add(
+            if then_value == else_value:
+                merged[name] = then_value
+            else:
+                merged[name] = self.add(
                     "select",
                     (
                         (condition, "condition"),
@@ -863,7 +909,11 @@ class SemanticAstBuilder:
                     attributes={"variable": name},
                     source=node,
                 )
-            )
+                self._propagate_common_value_type(
+                    merged[name],
+                    then_value,
+                    else_value,
+                )
         self.env = merged
         return marker
 
@@ -906,11 +956,17 @@ class SemanticAstBuilder:
         )
         self.env = dict(before)
         for name in changed:
-            self.env[name] = self.add(
+            result = self.add(
                 "loop_result",
                 ((marker, "loop"),),
                 attributes={"variable": name},
                 source=node,
+            )
+            self.env[name] = result
+            self._propagate_common_value_type(
+                result,
+                before.get(name),
+                body_env.get(name),
             )
         for child in orelse:
             child_id = self.statement(child)
@@ -961,6 +1017,7 @@ class SemanticAstBuilder:
                 self.class_methods[(owner_scope, node.name)] = definition
             else:
                 self.definitions.setdefault(node.name, definition)
+        region_start = self.next_id
         previous_env, previous_scope, previous_filename = (
             self.env,
             self.scope,
@@ -971,7 +1028,9 @@ class SemanticAstBuilder:
         # globals. This preserves lexical tensor dependencies such as a local
         # palette function reading ``phase`` from its parent.
         self.env = dict(
-            previous_env if owner_scope != "<module>" else self.globals
+            previous_env
+            if owner_scope != "<module>"
+            else self.globals_by_file[self.filename]
         )
         self.scope = node.name
         for argument in (
@@ -1026,6 +1085,30 @@ class SemanticAstBuilder:
             previous_filename,
         )
         if definition is not None:
+            # Data dependencies point from expressions toward statements, so
+            # a definition linked only to its final statement does not make
+            # the complete implementation forward-reachable. Record explicit
+            # region ownership for every node created while parsing this
+            # function. These are control/containment edges, never operands.
+            for node_id in range(region_start, self.next_id):
+                if node_id not in self.graph.G or node_id == definition:
+                    continue
+                data = self.graph.G.nodes[node_id]
+                attrs = data.get("attributes") or {}
+                if (
+                    attrs.get("scope") != node.name
+                    or str(
+                        (data.get("source_span") or {}).get("filename") or ""
+                    )
+                    != str(previous_filename)
+                ):
+                    continue
+                if not self.graph.G.has_edge(definition, node_id):
+                    self._control_edge(
+                        definition,
+                        node_id,
+                        "contains",
+                    )
             return definition
         returns = self.return_nodes.get(node.name, ())
         return returns[-1] if returns else next(iter(self.env.values()), -1)
@@ -1034,6 +1117,7 @@ class SemanticAstBuilder:
         definition = self.class_definitions[node.name]
         previous_scope = self.scope
         self.scope = node.name
+        region_start = self.next_id
         for child in node.body:
             if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -1057,6 +1141,14 @@ class SemanticAstBuilder:
             child_id = self.statement(child)
             if child_id is not None:
                 self._control_edge(definition, child_id, "body")
+        for node_id in range(region_start, self.next_id):
+            if node_id not in self.graph.G or node_id == definition:
+                continue
+            data = self.graph.G.nodes[node_id]
+            if (data.get("attributes") or {}).get("scope") != node.name:
+                continue
+            if not self.graph.G.has_edge(definition, node_id):
+                self._control_edge(definition, node_id, "contains")
         self.scope = previous_scope
         return definition
 
@@ -1086,6 +1178,41 @@ class SemanticAstBuilder:
                     self.definition_candidates[node.name].append(definition)
                     if isinstance(node, ast.ClassDef):
                         self.class_definitions[node.name] = definition
+                        # Register the complete method surface before parsing
+                        # any function body. A runner may construct a class
+                        # whose source file appears later in a multi-file
+                        # bundle; method resolution must not depend on source
+                        # ordering.
+                        for child in node.body:
+                            if not isinstance(
+                                child,
+                                (ast.FunctionDef, ast.AsyncFunctionDef),
+                            ):
+                                continue
+                            previous_filename = self.filename
+                            self.filename = filename
+                            method = self.add(
+                                "function_def",
+                                label=child.name,
+                                attributes={
+                                    "name": child.name,
+                                    "async": isinstance(
+                                        child, ast.AsyncFunctionDef
+                                    ),
+                                    "nested_in": node.name,
+                                },
+                                source=child,
+                            )
+                            self.filename = previous_filename
+                            self.definitions_by_scope[
+                                (filename, node.name, child.name)
+                            ] = method
+                            self.definition_candidates[child.name].append(
+                                method
+                            )
+                            self.class_methods[
+                                (node.name, child.name)
+                            ] = method
                     else:
                         self.definitions.setdefault(node.name, definition)
                     self.definition_asts.append((node, filename, node.name))
@@ -1384,9 +1511,10 @@ def build_semantic_process_graph(
     """Ingest Python control and tensor operations into ``graph``.
 
     ``complete`` preserves every recognized Python syntax node for auditing.
-    ``tensor_control`` projects that audit graph to the AbstractTensor
-    operations, governing Python control flow, dependencies, and explicit host
-    boundaries that a backend compiler actually needs.
+    ``program`` retains every node in the transitively resolved entrypoint,
+    including host I/O and finalization. ``tensor_control`` projects that
+    entrypoint to AbstractTensor operations, governing Python control flow,
+    dependencies, and explicit host boundaries that a backend compiler needs.
     """
 
     trees = _read_sources(sources, filename=filename)
@@ -1394,26 +1522,21 @@ def build_semantic_process_graph(
     if profile == "complete":
         graph.G.graph["semantic_profile"] = profile
         return graph
-    if profile != "tensor_control":
+    if profile not in {"tensor_control", "program"}:
         raise ValueError(
-            "semantic AST profile must be 'complete' or 'tensor_control'"
+            "semantic AST profile must be 'complete', 'program', or "
+            "'tensor_control'"
         )
     if entrypoint is None:
-        raise ValueError("tensor_control profile requires an entrypoint")
+        raise ValueError(f"{profile} profile requires an entrypoint")
+    if profile == "program":
+        return project_entrypoint_program_graph(graph)
     return project_tensor_control_graph(graph)
 
 
-def project_tensor_control_graph(graph):
-    """Discard Python noise while retaining tensor-governing process flow.
-
-    This is a source projection, not a Python compiler.  It intentionally
-    keeps only reachable function regions, tensor dataflow, control constructs,
-    required scalar/shape dependencies, and host materialization boundaries.
-    """
-
+def _reachable_entrypoint_regions(graph):
     if len(graph.roots) != 1:
-        raise ValueError("tensor/control projection requires one graph root")
-    complete_nodes = graph.G.number_of_nodes()
+        raise ValueError("entrypoint projection requires one graph root")
     root = graph.roots[0]
     calls_by_scope: dict[tuple[str, str], list[int]] = defaultdict(list)
     for node_id, data in graph.G.nodes(data=True):
@@ -1437,10 +1560,13 @@ def project_tensor_control_graph(graph):
         for node_id in calls_by_scope.get((filename, scope), ()):
             data = graph.G.nodes[node_id]
             attrs = data.get("attributes") or {}
-            callee = attrs.get("callee")
-            if callee in graph.G and callee not in reachable_definitions:
-                reachable_definitions.add(callee)
-                pending.append(callee)
+            for callee in (
+                attrs.get("callee"),
+                attrs.get("compiled_entrypoint"),
+            ):
+                if callee in graph.G and callee not in reachable_definitions:
+                    reachable_definitions.add(callee)
+                    pending.append(callee)
 
     reachable_scopes = {
         (
@@ -1456,6 +1582,122 @@ def project_tensor_control_graph(graph):
             str((data.get("source_span") or {}).get("filename") or ""),
             str((data.get("attributes") or {}).get("scope") or ""),
         ) in reachable_scopes
+
+    return root, reachable_definitions, in_reachable_scope
+
+
+def _finish_entrypoint_projection(
+    graph,
+    *,
+    root: int,
+    keep: set[int],
+    profile: str,
+    complete_nodes: int,
+    reachable_function_count: int,
+):
+    removed = set(graph.G) - keep
+    graph.G.remove_nodes_from(removed)
+    for node_id, data in graph.G.nodes(data=True):
+        data["parents"] = [
+            (parent, role)
+            for parent, role in data.get("parents", ())
+            if parent in graph.G
+        ]
+        data["children"] = [
+            (child, role)
+            for child, role in data.get("children", ())
+            if child in graph.G
+        ]
+        data["input_roles"] = tuple(
+            role for _, role in data.get("parents", ())
+        )
+    graph.roots = [root]
+
+    # Module globals and other explicit environmental inputs are data
+    # predecessors, not function-body statements. Attach them to the one
+    # program root so the complete retained program is forward-traversable
+    # from start to finish without changing their operand relationships.
+    forward = nx.descendants(graph.G, root) | {root}
+    for node_id in sorted(set(graph.G) - forward):
+        if nx.has_path(graph.G, node_id, root):
+            raise ValueError(
+                "entrypoint ownership would create a ProcessGraph cycle"
+            )
+        graph.G.add_edge(root, node_id, role="environment")
+        graph.G.nodes[root]["children"].append((node_id, "environment"))
+        graph.G.nodes[node_id]["parents"].append((root, "environment"))
+    forward = nx.descendants(graph.G, root) | {root}
+    if len(forward) != graph.G.number_of_nodes():
+        raise RuntimeError("entrypoint projection left unreachable nodes")
+
+    graph.G.graph.update(
+        semantic_profile=profile,
+        complete_node_count=complete_nodes,
+        filtered_node_count=len(removed),
+        reachable_function_count=reachable_function_count,
+        entrypoint_expanded=True,
+        forward_reachable_node_count=len(forward),
+    )
+    return graph
+
+
+def project_entrypoint_program_graph(graph):
+    """Retain the complete start-to-finish program under one entrypoint.
+
+    Unlike ``tensor_control``, this profile does not discard Python support,
+    validation, UI, container, or I/O nodes inside reachable project
+    functions. Resolved calls, statically declared compiled entrypoints, and
+    class methods are all part of the same forward-traversable ProcessGraph.
+    """
+
+    complete_nodes = graph.G.number_of_nodes()
+    root, reachable_definitions, in_reachable_scope = (
+        _reachable_entrypoint_regions(graph)
+    )
+    keep = set(reachable_definitions)
+    keep.update(
+        node_id for node_id in graph.G if in_reachable_scope(node_id)
+    )
+    pending = list(keep)
+    while pending:
+        node_id = pending.pop()
+        for parent in graph.G.predecessors(node_id):
+            role = graph.G.edges[parent, node_id].get("role")
+            if role in {
+                "body",
+                "compiles",
+                "contains",
+                "environment",
+                "invokes",
+                "parameter",
+            }:
+                continue
+            if parent in keep:
+                continue
+            keep.add(parent)
+            pending.append(parent)
+    return _finish_entrypoint_projection(
+        graph,
+        root=root,
+        keep=keep,
+        profile="program",
+        complete_nodes=complete_nodes,
+        reachable_function_count=len(reachable_definitions),
+    )
+
+
+def project_tensor_control_graph(graph):
+    """Discard Python noise while retaining tensor-governing process flow.
+
+    This is a source projection, not a Python compiler.  It intentionally
+    keeps only reachable function regions, tensor dataflow, control constructs,
+    required scalar/shape dependencies, and host materialization boundaries.
+    """
+
+    complete_nodes = graph.G.number_of_nodes()
+    root, reachable_definitions, in_reachable_scope = (
+        _reachable_entrypoint_regions(graph)
+    )
 
     def validation_only(node_id: int) -> bool:
         if graph.G.nodes[node_id].get("op") != "if":
@@ -1488,7 +1730,11 @@ def project_tensor_control_graph(graph):
             seeds.add(node_id)
         elif (
             kind == "process_call"
-            and attrs.get("callee") in reachable_definitions
+            and (
+                attrs.get("callee") in reachable_definitions
+                or attrs.get("compiled_entrypoint")
+                in reachable_definitions
+            )
         ):
             seeds.add(node_id)
 
@@ -1503,34 +1749,19 @@ def project_tensor_control_graph(graph):
                 keep.add(parent)
                 pending.append(parent)
 
-    removed = set(graph.G) - keep
-    graph.G.remove_nodes_from(removed)
-    for node_id, data in graph.G.nodes(data=True):
-        data["parents"] = [
-            (parent, role)
-            for parent, role in data.get("parents", ())
-            if parent in graph.G
-        ]
-        data["children"] = [
-            (child, role)
-            for child, role in data.get("children", ())
-            if child in graph.G
-        ]
-        data["input_roles"] = tuple(
-            role for _, role in data.get("parents", ())
-        )
-    graph.roots = [root]
-    graph.G.graph.update(
-        semantic_profile="tensor_control",
-        complete_node_count=complete_nodes,
-        filtered_node_count=len(removed),
+    return _finish_entrypoint_projection(
+        graph,
+        root=root,
+        keep=keep,
+        profile="tensor_control",
+        complete_nodes=complete_nodes,
         reachable_function_count=len(reachable_definitions),
     )
-    return graph
 
 
 __all__ = [
     "SemanticAstBuilder",
     "build_semantic_process_graph",
+    "project_entrypoint_program_graph",
     "project_tensor_control_graph",
 ]

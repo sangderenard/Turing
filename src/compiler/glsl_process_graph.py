@@ -28,6 +28,7 @@ from ..common.tensors.accelerator_backends.glsl_backend import (
     canonical_op,
     plan_launch,
 )
+from .process_graph_contract import NON_VALUE_EDGE_ROLES
 
 
 @dataclass(frozen=True)
@@ -141,20 +142,6 @@ _SCALAR_UNARY = {
     "positive": operator.pos,
 }
 
-_NON_VALUE_ROLES = frozenset(
-    {
-        "body",
-        "else",
-        "finally",
-        "handler",
-        "invokes",
-        "orelse",
-        "parameter",
-        "then",
-    }
-)
-
-
 class _Compiler:
     def __init__(
         self,
@@ -228,7 +215,7 @@ class _Compiler:
         return [
             (parent, role)
             for parent, role in self.graph.G.nodes[node_id].get("parents", ())
-            if role not in _NON_VALUE_ROLES
+            if role not in NON_VALUE_EDGE_ROLES
         ]
 
     def append(self, line: str) -> None:

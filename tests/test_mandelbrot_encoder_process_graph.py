@@ -6,6 +6,7 @@ import pytest
 
 from src.common.tensors.accelerator_backends.mandelbrot_encoder_program import (
     build_mandelbrot_encoder_process_graph,
+    build_mandelbrot_recording_process_graph,
     mandelbrot_encoder_source_files,
     mandelbrot_jpeg_master,
 )
@@ -37,6 +38,11 @@ ENCODER_CHAIN = (
 @pytest.fixture(scope="module")
 def encoder_graph():
     return build_mandelbrot_encoder_process_graph()
+
+
+@pytest.fixture(scope="module")
+def recording_graph():
+    return build_mandelbrot_recording_process_graph()
 
 
 def test_every_ast_object_in_the_original_source_bundle_has_a_role_schema():
@@ -156,3 +162,117 @@ def test_master_function_executes_the_original_numpy_tensor_encoder():
     assert counts.shape == (64,)
     assert encoded.startswith(b"\xFF\xD8")
     assert encoded.endswith(b"\xFF\xD9")
+
+
+def test_recording_program_is_one_forward_reachable_start_to_finish_graph(
+    recording_graph,
+):
+    graph = recording_graph
+    root = graph.roots[0]
+    reachable = nx.descendants(graph.G, root) | {root}
+
+    assert graph.G.graph["semantic_profile"] == "program"
+    assert graph.G.graph["entrypoint_expanded"] is True
+    assert graph.G.graph["program_entrypoint"] == "animate_glsl"
+    assert reachable == set(graph.G)
+    assert nx.is_directed_acyclic_graph(graph.G)
+
+    required_functions = {
+        "animate_glsl",
+        "mandelbrot_display_master",
+        "parametric_mandelbrot_escape",
+        "mandelbrot_jpeg_planes",
+        "tensor_ycbcr_jpeg_bytes",
+        "encode_ycbcr_jfif",
+        "iter_ycbcr_jfif_chunks",
+        "jpeg_ycbcr_coefficients",
+        "collect_component_block_coefficient_events",
+        "encode_baseline_color_component_scan",
+        "compact_codewords",
+        "tensor_octets_to_bytes",
+        "append_frame",
+        "append_audio_tensor",
+        "append_audio",
+        "_finish_segment",
+        "_patch_superindex",
+        "_patch_u32",
+        "close",
+    }
+    present = {
+        data["label"]
+        for _, data in graph.G.nodes(data=True)
+        if data["op"] == "function_def"
+    }
+    assert required_functions <= present
+
+    operations = {data["op"] for _, data in graph.G.nodes(data=True)}
+    assert {
+        "while",
+        "for",
+        "matmul",
+        "scatter",
+        "cumsum",
+        "yield",
+        "with",
+        "try",
+        "call",
+    } <= operations
+
+
+def test_recording_program_links_compiled_source_and_writer_methods(
+    recording_graph,
+):
+    graph = recording_graph
+    compiled_links = [
+        (node_id, (data.get("attributes") or {}).get("compiled_entrypoint"))
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("compiled_entrypoint") is not None
+    ]
+    assert len(compiled_links) == 1
+    compiler_call, source_root = compiled_links[0]
+    assert graph.G.has_edge(compiler_call, source_root)
+    assert graph.G.edges[compiler_call, source_root]["role"] == "compiles"
+    assert graph.G.nodes[source_root]["label"] == "mandelbrot_display_master"
+
+    for spelling, target_name in (
+        ("recorder.append_frame", "append_frame"),
+        ("recorder.append_audio_tensor", "append_audio_tensor"),
+        ("recorder.close", "close"),
+    ):
+        call = next(
+            data
+            for _, data in graph.G.nodes(data=True)
+            if data["op"] == "call"
+            and (data.get("attributes") or {}).get("function") == spelling
+        )
+        target = call["attributes"]["callee"]
+        assert call["attributes"]["resolved"] is True
+        assert graph.G.nodes[target]["label"] == target_name
+
+    retained_definitions = {
+        data["label"]
+        for _, data in graph.G.nodes(data=True)
+        if data["op"] in {"class_def", "function_def"}
+    }
+    unresolved_direct_project_calls = [
+        (data.get("attributes") or {}).get("function")
+        for _, data in graph.G.nodes(data=True)
+        if data["op"] == "call"
+        and not (data.get("attributes") or {}).get("resolved")
+        and "." not in str((data.get("attributes") or {}).get("function"))
+        and (data.get("attributes") or {}).get("function")
+        in retained_definitions
+    ]
+    assert unresolved_direct_project_calls == []
+
+    root = graph.roots[0]
+    environment_targets = [
+        target
+        for source, target, edge in graph.G.edges(data=True)
+        if source == root and edge.get("role") == "environment"
+    ]
+    assert environment_targets
+    assert {
+        (graph.G.nodes[target].get("attributes") or {}).get("scope")
+        for target in environment_targets
+    } == {"<module>"}

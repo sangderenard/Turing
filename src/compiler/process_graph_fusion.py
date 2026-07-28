@@ -25,6 +25,7 @@ from ..common.tensors.fused_ir import (
     ordered_feed_ids,
 )
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
+from .process_graph_contract import NON_VALUE_EDGE_ROLES
 
 
 @dataclass(frozen=True)
@@ -232,7 +233,15 @@ def plan_process_graph_dispatches(
         for node_id in graph.G
         if _operation(graph, node_id) in profile.fusible_ops
     }
-    induced = graph.G.subgraph(fusible)
+    induced = nx.DiGraph()
+    induced.add_nodes_from(fusible)
+    induced.add_edges_from(
+        (left, right)
+        for left, right, data in graph.G.edges(data=True)
+        if left in fusible
+        and right in fusible
+        and data.get("role") not in NON_VALUE_EDGE_ROLES
+    )
     components = list(nx.weakly_connected_components(induced))
     topological = list(nx.topological_sort(graph.G))
     order_index = {node_id: index for index, node_id in enumerate(topological)}
@@ -248,13 +257,19 @@ def plan_process_graph_dispatches(
             node_id
             for node_id in topological
             if node_id not in node_set
-            and any(child in node_set for child in graph.G.successors(node_id))
+            and any(
+                child in node_set
+                and graph.G.edges[node_id, child].get("role")
+                not in NON_VALUE_EDGE_ROLES
+                for child in graph.G.successors(node_id)
+            )
             and _operation(graph, node_id) != "const"
         )
         output_names: dict[int, str] = {}
         for node_id in nodes:
             for child in graph.G.successors(node_id):
-                if child in node_set:
+                role = graph.G.edges[node_id, child].get("role")
+                if child in node_set or role in NON_VALUE_EDGE_ROLES:
                     continue
                 child_data = graph.G.nodes[child]
                 if _operation(graph, child) == "return":
@@ -278,6 +293,8 @@ def plan_process_graph_dispatches(
             1
             for left, right in graph.G.edges
             if left in node_set and right in node_set
+            and graph.G.edges[left, right].get("role")
+            not in NON_VALUE_EDGE_ROLES
         )
         score = (
             max(0, len(nodes) - 1) * profile.launch_cost
@@ -317,7 +334,11 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         op, _ = canonical_elementwise_op(_operation(graph, node_id))
-        parents = list(data.get("parents") or ())
+        parents = [
+            (parent, role)
+            for parent, role in (data.get("parents") or ())
+            if role not in NON_VALUE_EDGE_ROLES
+        ]
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
         for parent_id, _role in parents:

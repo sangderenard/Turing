@@ -5,8 +5,8 @@ The compiler path is:
 ```text
 Python AST
   -> ProcessGraph.build_from_ast(
-       semantic=True, profile="tensor_control")
-       (Python control + AbstractTensor operations + host boundaries)
+       semantic=True, profile="program" | "tensor_control")
+       (one expanded entrypoint, or its compiler projection)
   -> optional Turing-provenance BitOps primitive expansion
        (Python-list or AbstractTensor carrier)
   -> metadata-rich SSA
@@ -59,10 +59,21 @@ shape and scalar dependencies, and explicit host materialization boundaries.
 Imports, formatting, UI code, unused helpers, and validation-only branches do
 not enter backend partitioning.
 
-The optional `complete` profile preserves every recognized syntax node for
-coverage audits and source archaeology. It is deliberately not the graph sent
-to GLSL. On the current Mandelbrot/compression source bundle, the complete
-graph has 11,973 nodes while the compiler projection has 1,911 nodes.
+The `program` profile keeps every node belonging to the transitive entrypoint:
+tensor work, Python control, validation, UI, containers, byte materialization,
+file I/O, and finalization. The optional `complete` profile additionally keeps
+unreachable definitions from every supplied source file for coverage audits
+and source archaeology. Neither profile is sent wholesale to GLSL; backend
+partitioning selects legal numerical regions from it.
+
+On the current Mandelbrot/compression source bundle:
+
+- the complete audit graph has 12,035 nodes;
+- the complete `animate_glsl` recording program has 5,258 nodes across 83
+  transitively reached definitions;
+- all 5,258 recording nodes are forward-reachable from the one entrypoint root;
+- the recording tensor/control projection has 3,312 nodes;
+- the narrower encoder-only tensor/control projection has 1,899 nodes.
 
 The importer recognizes canonical tensor operation spellings in
 both method and function form. For example,
@@ -71,9 +82,20 @@ opaque Python calls. The recognized names come from the established fused
 operation vocabulary plus the structural canonical operations; this mapping
 only resolves syntax and never supplies alternate numerical implementations.
 
-Multi-file ingestion registers definitions before visiting bodies. Calls then
-link to their original function/class regions, and an entrypoint identifies one
-master program without copying those functions into a generated source file.
+Multi-file ingestion registers definitions and class methods before visiting
+bodies. Calls then link to their original function/class regions, and an
+entrypoint identifies one master program without copying those functions into
+a generated source file. Constructed types survive branch and loop merges, so
+methods on an optional writer still resolve after the writer is conditionally
+created. A compiler call with a literal `entrypoint=` also has a `compiles`
+edge to that source definition; numerical source is therefore not hidden
+behind a Python compiler wrapper.
+
+Function definitions own every node in their source region through explicit
+`contains` edges. The one program root also owns required module/environment
+dependencies. These structural edges make the complete program
+forward-traversable but are excluded by one shared edge-role contract from
+SSA operands and backend fusion inputs.
 In the complete audit graph, loops, indexing, slices, contexts, generators,
 containers, comprehensions, exceptions, attributes, mutation, functions, and
 classes remain explicit ProcessGraph nodes. The generic structural fallback
@@ -117,16 +139,29 @@ become neighboring regions in a ProcessGraph partitioner rather than being
 restated inside the elementwise emitter.
 
 The [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md) no
-longer uses execution-tape capture. Its source-bundle builder ingests the
-original solve, palette, compression, JPEG, and container functions as one
-entrypoint-rooted ProcessGraph. The display entrypoint now has an executable
-structured GLSL lowering: resolved function regions are inlined, the canonical
-Python control loop becomes one GLSL loop without source unrolling, scalar
-controls are packed into one resident feed, and count/Y/Cb/Cr are produced by
-one multi-output dispatch. The complete encoder still runs as ordinary
-AbstractTensor composition across explicit DCT, reduction, scan, scatter, and
-host-byte boundaries. Partitioning that full graph into a small ordered set of
-legal regions is the next compiler stage.
+longer uses execution-tape capture. Its source-bundle builder can now select
+the actual `animate_glsl` entrypoint and expand the complete start-to-finish
+recording program into one ProcessGraph:
+
+```text
+frame/control loop
+  -> compiled AbstractTensor Mandelbrot source
+  -> count/Y/Cb/Cr
+  -> JPEG DCT, quantization, events, Huffman scan, packed octets
+  -> tensor octets to bytes
+  -> AVI video/audio chunks
+  -> segment and superindex finalization
+  -> header patching and close
+```
+
+The display numerical region has an executable structured GLSL lowering:
+resolved function regions are inlined, the canonical Python control loop
+becomes one GLSL loop without source unrolling, scalar controls are packed into
+one resident feed, and count/Y/Cb/Cr are produced by one multi-output dispatch.
+The newly complete recording graph is an ingestion/completeness result, not a
+claim that host file operations have become shader instructions. Its next
+compiler stage is to partition this one program into legal GLSL numerical
+regions and explicit host-I/O regions.
 
 ## Nodus
 
