@@ -18,6 +18,7 @@ class Handler(Enum):
     Sub           = "Sub"
     Mul           = "Mul"
     Div           = "Div"
+    FloorDiv      = "FloorDiv"
     Mod           = "Mod"
     Pow           = "Pow"
     Neg           = "Neg"
@@ -256,16 +257,18 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
     ),
     Handler.Div: (
         'div',
-        'floordiv',
         'binop:div',
-        'binop:floordiv',
         'augassign:div',
-        'augassign:floordiv',
         'operator:truediv',
-        'operator:floordiv',
         '__truediv__',
         '__rtruediv__',
         '__itruediv__',
+    ),
+    Handler.FloorDiv: (
+        'floordiv',
+        'binop:floordiv',
+        'augassign:floordiv',
+        'operator:floordiv',
         '__floordiv__',
         '__rfloordiv__',
         '__ifloordiv__',

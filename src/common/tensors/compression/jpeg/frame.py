@@ -171,6 +171,22 @@ def _stuff_entropy_octets(octets: AbstractTensor) -> AbstractTensor:
     return stuffed
 
 
+def finalize_entropy_scan(scan) -> bytes:
+    """Finish one complete packed scan without a byte-aligned carry state."""
+
+    bit_count = int(scan.valid_bits.item())
+    byte_count = (bit_count + 7) // 8
+    octets = scan.octets[:byte_count]
+    remainder = bit_count % 8
+    if remainder:
+        fill = (1 << (8 - remainder)) - 1
+        octets = AbstractTensor.cat(
+            (octets[:-1], octets[-1:] + fill),
+            dim=0,
+        )
+    return tensor_octets_to_bytes(_stuff_entropy_octets(octets))
+
+
 class _EntropyTensorAccumulator:
     """Join independently packed tensor scans without byte-aligning batches."""
 
@@ -185,18 +201,7 @@ class _EntropyTensorAccumulator:
             # unused tail of its last byte, then marker stuffing.  Expanding
             # every octet back to eight bits and reducing it to the same octet
             # was pure work introduced by the multi-batch carry path.
-            byte_count = (bit_count + 7) // 8
-            octets = scan.octets[:byte_count]
-            remainder = bit_count % 8
-            if remainder:
-                fill = (1 << (8 - remainder)) - 1
-                octets = AbstractTensor.cat(
-                    (octets[:-1], octets[-1:] + fill),
-                    dim=0,
-                )
-            return tensor_octets_to_bytes(
-                _stuff_entropy_octets(octets)
-            )
+            return finalize_entropy_scan(scan)
 
         source_bits = unpack_octets(scan).bits[:bit_count]
         combined = source_bits

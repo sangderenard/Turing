@@ -227,6 +227,7 @@ class GraphDeepCompiler:
 
             ntype = node["type"]
             sig = self.signatures.get(ntype, {})
+            role_parents = list(node["parents"])
 
             lhs   = f"v{nid}"           # unique local name
 
@@ -275,7 +276,6 @@ class GraphDeepCompiler:
                 lines.append(f"{indent}{lhs} = {rhs}")
                 continue
             elif ntype == "Call":
-                role_parents = list(node["parents"])
                 attributes = dict(node.get("attributes") or {})
                 callee_ref = attributes.get("callee_ref")
                 target = None
@@ -343,7 +343,25 @@ class GraphDeepCompiler:
                 env[fn_name] = fn
 
                 # parents come in topo order already
-                if sig.get("min_inputs",None) is None and sig.get("max_inputs",None) is None and sig.get("min_outputs",None) is None and sig.get("max_outputs",None) is None:
+                keyword_parents = [
+                    (parent, str(role)[3:])
+                    for parent, role in role_parents
+                    if str(role).startswith("kw:")
+                ]
+                positional_parents = [
+                    parent
+                    for parent, role in role_parents
+                    if not str(role).startswith("kw:")
+                ]
+                if keyword_parents:
+                    args = ", ".join((
+                        *(f"v{parent}" for parent in positional_parents),
+                        *(
+                            f"{name}=v{parent}"
+                            for parent, name in keyword_parents
+                        ),
+                    ))
+                elif sig.get("min_inputs",None) is None and sig.get("max_inputs",None) is None and sig.get("min_outputs",None) is None and sig.get("max_outputs",None) is None:
                     args = f"[{', '.join(f'v{pid}' for pid,_ in node['parents'])}]"
                 else:
                     args = ", ".join(f"v{pid}" for pid, _ in node["parents"])

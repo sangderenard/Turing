@@ -22,6 +22,7 @@ from .glsl_backend import (
     cat_chunks,
     cumsum_chunk,
     expand_chunk,
+    full_chunk,
     gather_offsets_chunk,
     index_assign_index_chunk,
     index_assign_offsets_chunk,
@@ -64,13 +65,10 @@ class GLSLTensorOperations(AbstractTensor):
         return GLChunk(tuple(size), dtype=_normalize_dtype(dtype))
 
     def full_(self, size, fill_value, dtype=None, device=None):
-        dtype = _normalize_dtype(dtype)
-        return GLChunk.from_numpy(
-            np.full(tuple(size), fill_value, dtype=dtype), dtype=dtype
-        )
+        return full_chunk(size, fill_value, dtype=dtype)
 
     def zeros_(self, size, dtype=None, device=None):
-        return GLChunk.zeros(tuple(size), dtype=_normalize_dtype(dtype))
+        return full_chunk(size, 0, dtype=dtype)
 
     def ones_(self, size, dtype=None, device=None):
         return self.full_(size, 1, dtype=dtype, device=device)

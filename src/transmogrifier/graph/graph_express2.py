@@ -1,6 +1,10 @@
 import sympy
 import networkx as nx
 import numpy as np
+import ast
+import importlib
+import inspect
+import textwrap
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 from ...compiler.bitops import BitTensorMemoryGraph
@@ -8,7 +12,7 @@ from colorama import Fore, Style, init
 from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
 from ..operator_defs import default_funcs, operator_signatures, role_schemas
 from ..ilpscheduler import ILPScheduler
-from ..function_table import FunctionTable
+from ..function_table import ExternalFunctionTable, FunctionTable
 import colorsys
 import random
 from collections import deque
@@ -32,6 +36,326 @@ class _RandomFloatQueue(deque):
 _DUMMY_QUEUE = _RandomFloatQueue()
 SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
 from collections.abc import Callable
+
+
+def _resolve_ast_parent_reference(expression, bindings):
+    """Resolve only enough Python context to obtain a callee's source AST."""
+
+    if isinstance(expression, ast.Name):
+        return bindings.get(expression.id)
+    if not isinstance(expression, ast.Attribute):
+        return None
+    owner = _resolve_ast_parent_reference(expression.value, bindings)
+    if owner is None:
+        return None
+    try:
+        return getattr(owner, expression.attr)
+    except AttributeError:
+        return None
+
+
+def _source_ast_definition(value):
+    """Return a fresh AST definition without retaining the Python callable."""
+
+    if inspect.ismethod(value):
+        value = value.__func__
+    if not (inspect.isfunction(value) or inspect.isclass(value)):
+        return None
+    try:
+        source = textwrap.dedent(inspect.getsource(value))
+    except (OSError, TypeError):
+        return None
+    parsed = ast.parse(
+        source,
+        filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
+    )
+    return next(
+        (
+            statement
+            for statement in parsed.body
+            if isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            )
+        ),
+        None,
+    )
+
+
+def _ast_definition_bindings(value):
+    """Obtain names needed only while recursively discovering source AST."""
+
+    if inspect.ismethod(value):
+        value = value.__func__
+    module = inspect.getmodule(value)
+    bindings = dict(vars(module)) if module is not None else {}
+    if inspect.isfunction(value):
+        closure = inspect.getclosurevars(value)
+        bindings.update(closure.builtins)
+        bindings.update(closure.globals)
+        bindings.update(closure.nonlocals)
+        owner = module
+        for component in str(value.__qualname__).split(".")[:-1]:
+            if component == "<locals>":
+                owner = None
+                break
+            owner = getattr(owner, component, None)
+            if owner is None:
+                break
+        if inspect.isclass(owner):
+            definition = _source_ast_definition(value)
+            if isinstance(
+                definition,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            ):
+                parameters = [
+                    *definition.args.posonlyargs,
+                    *definition.args.args,
+                ]
+                if parameters:
+                    bindings[parameters[0].arg] = owner
+    return bindings
+
+
+def _import_ast_bindings(tree, bindings, package=None):
+    """Make imports visible to source discovery without adding runtime calls."""
+
+    resolved = dict(bindings)
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            for imported in statement.names:
+                try:
+                    value = importlib.import_module(imported.name)
+                except ImportError:
+                    continue
+                resolved[imported.asname or imported.name.split(".")[0]] = value
+        elif isinstance(statement, ast.ImportFrom):
+            module_name = (
+                "." * int(statement.level)
+                + str(statement.module or "")
+            )
+            try:
+                module = importlib.import_module(module_name, package=package)
+            except (ImportError, TypeError, ValueError):
+                continue
+            for imported in statement.names:
+                try:
+                    resolved[imported.asname or imported.name] = getattr(
+                        module,
+                        imported.name,
+                    )
+                except AttributeError:
+                    continue
+    return resolved
+
+
+def _expand_unresolved_ast_parents(
+    tree,
+    bindings,
+    *,
+    package=None,
+    include=None,
+):
+    """Discover missing source definitions and return AST parent links.
+
+    The returned definitions are ordinary AST objects.  They are subsequently
+    ingested by ``ProcessGraph.build_graph``; no callable is installed in a
+    function table or deferred to runtime.
+    """
+
+    if isinstance(tree, ast.Module):
+        module = tree
+    else:
+        module = ast.Module(body=[tree], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+    bindings = _import_ast_bindings(module, bindings, package=package)
+    definitions = [
+        node
+        for node in ast.walk(module)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+    ]
+    definitions_by_name = {}
+    for definition in definitions:
+        definitions_by_name.setdefault(definition.name, []).append(definition)
+
+    unavailable_identities = set()
+    target_definitions = {}
+    while True:
+        added_definition = False
+        for node in tuple(ast.walk(module)):
+            if not isinstance(node, ast.Call):
+                continue
+            target = _resolve_ast_parent_reference(node.func, bindings)
+            identity_target = (
+                target.__func__ if inspect.ismethod(target) else target
+            )
+            if not callable(identity_target) or (
+                include is not None and not include(identity_target)
+            ):
+                continue
+            identity = (
+                str(getattr(identity_target, "__module__", "")),
+                str(
+                    getattr(
+                        identity_target,
+                        "__qualname__",
+                        getattr(identity_target, "__name__", ""),
+                    )
+                ),
+            )
+            if (
+                identity in target_definitions
+                or identity in unavailable_identities
+            ):
+                continue
+
+            if isinstance(node.func, ast.Name):
+                call_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                call_name = node.func.attr
+            else:
+                call_name = None
+            existing = definitions_by_name.get(call_name, ())
+            if len(existing) == 1:
+                target_definitions[identity] = existing[0]
+                bindings.update(_ast_definition_bindings(identity_target))
+                continue
+
+            source_target = identity_target
+            owner = None
+            if isinstance(node.func, ast.Attribute):
+                owner = _resolve_ast_parent_reference(
+                    node.func.value,
+                    bindings,
+                )
+                if inspect.isclass(owner):
+                    source_target = owner
+            source_definition = _source_ast_definition(source_target)
+            if source_definition is None:
+                unavailable_identities.add(identity)
+                continue
+
+            module.body.append(source_definition)
+            new_definitions = [
+                member
+                for member in ast.walk(source_definition)
+                if isinstance(
+                    member,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                    ),
+                )
+            ]
+            definitions.extend(new_definitions)
+            for new_definition in new_definitions:
+                definitions_by_name.setdefault(
+                    new_definition.name,
+                    [],
+                ).append(new_definition)
+            if inspect.isclass(owner):
+                method_candidates = [
+                    member
+                    for member in source_definition.body
+                    if isinstance(
+                        member,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    and member.name == node.func.attr
+                ]
+                definition = (
+                    method_candidates[0]
+                    if len(method_candidates) == 1
+                    else source_definition
+                )
+            else:
+                definition = source_definition
+            target_definitions[identity] = definition
+            bindings.update(_ast_definition_bindings(source_target))
+            bindings = _import_ast_bindings(
+                source_definition,
+                bindings,
+                package=str(
+                    getattr(
+                        inspect.getmodule(source_target),
+                        "__package__",
+                        package,
+                    )
+                    or ""
+                ),
+            )
+            added_definition = True
+        if not added_definition:
+            break
+
+    parent_links = []
+    unresolved_calls = []
+    for call in (
+        node for node in ast.walk(module) if isinstance(node, ast.Call)
+    ):
+        target = _resolve_ast_parent_reference(call.func, bindings)
+        if inspect.ismethod(target):
+            target = target.__func__
+        definition = None
+        if callable(target):
+            identity = (
+                str(getattr(target, "__module__", "")),
+                str(
+                    getattr(
+                        target,
+                        "__qualname__",
+                        getattr(target, "__name__", ""),
+                    )
+                ),
+            )
+            definition = target_definitions.get(identity)
+        if definition is None:
+            if isinstance(call.func, ast.Name):
+                name = call.func.id
+            elif isinstance(call.func, ast.Attribute):
+                name = call.func.attr
+            else:
+                name = None
+            candidates = definitions_by_name.get(name, ())
+            if len(candidates) == 1:
+                definition = candidates[0]
+        if definition is not None and definition is not call:
+            parent_links.append((definition, call))
+            continue
+        if isinstance(call.func, ast.Name):
+            unresolved_name = call.func.id
+        elif isinstance(call.func, ast.Attribute):
+            unresolved_name = call.func.attr
+        else:
+            unresolved_name = type(call.func).__name__
+        target = _resolve_ast_parent_reference(call.func, bindings)
+        identity_target = (
+            target.__func__ if inspect.ismethod(target) else target
+        )
+        if not callable(identity_target):
+            reason = "dynamic_or_primitive"
+        elif include is not None and not include(identity_target):
+            reason = "declared_boundary"
+        elif _source_ast_definition(identity_target) is None:
+            reason = "source_unavailable"
+        else:
+            reason = "missing_source_parent"
+        unresolved_calls.append(
+            {
+                "name": unresolved_name,
+                "line": getattr(call, "lineno", None),
+                "column": getattr(call, "col_offset", None),
+                "reason": reason,
+            }
+        )
+
+    ast.fix_missing_locations(module)
+    return module, tuple(parent_links), tuple(unresolved_calls)
 
 
 def _resolve(val):
@@ -175,6 +499,7 @@ class ProcessGraph:
         expand_complex=False,
         materialize_memory=True,
         function_table=None,
+        external_function_table=None,
     ):
         # Translation and scheduling do not require a physical memory graph.
         # Keep materialization opt-in at the call site so compiler front-ends
@@ -195,6 +520,11 @@ class ProcessGraph:
         self.consumer_queues = {}
         self.function_table = (
             FunctionTable() if function_table is None else function_table
+        )
+        self.external_function_table = (
+            ExternalFunctionTable()
+            if external_function_table is None
+            else external_function_table
         )
 
     def full_recombinatorics(self, expr, level=1):
@@ -476,10 +806,12 @@ class ProcessGraph:
         node_or_path,
         *args,
         filename=None,
+        resolve_unresolved_parents=False,
+        parent_bindings=None,
+        parent_include=None,
         **kwargs,
     ):
         """Import Python source as a structural AST ProcessGraph."""
-        import ast
         import os
 
         if isinstance(node_or_path, ast.AST):
@@ -498,7 +830,53 @@ class ProcessGraph:
                 "build_from_ast expects an AST node, a filename, or a source string"
             )
 
-        return self.build_graph(tree, *args, **kwargs)
+        parent_links = ()
+        unresolved_calls = ()
+        if resolve_unresolved_parents:
+            bindings = dict(getattr(self, "python_bindings", {}) or {})
+            bindings.update(parent_bindings or {})
+            tree, parent_links, unresolved_calls = (
+                _expand_unresolved_ast_parents(
+                tree,
+                bindings,
+                package=getattr(self, "python_package", None),
+                include=parent_include,
+                )
+            )
+
+        root = self.build_graph(tree, *args, **kwargs)
+        for definition, call in parent_links:
+            definition_id = id(definition)
+            call_id = id(call)
+            if definition_id not in self.G or call_id not in self.G:
+                continue
+            self.connect(
+                definition_id,
+                call_id,
+                "definition",
+                "callee",
+            )
+            self.G.nodes[call_id].setdefault("attributes", {})[
+                "resolved_ast_parent"
+            ] = definition_id
+        if resolve_unresolved_parents:
+            self.G.graph["resolved_ast_parent_count"] = len(parent_links)
+            self.G.graph["unresolved_ast_calls"] = unresolved_calls
+            missing_parent_calls = tuple(
+                call
+                for call in unresolved_calls
+                if call["reason"] == "missing_source_parent"
+            )
+            self.G.graph["missing_ast_parent_calls"] = missing_parent_calls
+            self.G.graph["ast_parent_closure_complete"] = (
+                not missing_parent_calls
+            )
+            if missing_parent_calls:
+                raise RuntimeError(
+                    "AST parent ingestion did not reach a source-definition "
+                    f"fixed point: {missing_parent_calls!r}"
+                )
+        return root
     
     def finalize_graph_with_outputs(self):
         """

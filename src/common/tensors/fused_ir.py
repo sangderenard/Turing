@@ -76,6 +76,7 @@ ELEMENTWISE_UNARY = frozenset(
         "atanh",
         "neg",
         "abs",
+        "sign",
         "round",
         "trunc",
         "floor",
@@ -84,6 +85,14 @@ ELEMENTWISE_UNARY = frozenset(
         "isnan",
         "isinf",
         "logical_not",
+        "invert",
+        "int_trunc",
+        "zext",
+        "sext",
+        "fptosi",
+        "fptoui",
+        "sitofp",
+        "uitofp",
     }
 )
 
@@ -104,6 +113,13 @@ ELEMENTWISE_BINARY = frozenset(
         "not_equal",
         "maximum",
         "minimum",
+        "bitand",
+        "bitor",
+        "bitxor",
+        "shl",
+        "shr",
+        "logical_and",
+        "logical_or",
     }
 )
 

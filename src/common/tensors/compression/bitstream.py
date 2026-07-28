@@ -70,6 +70,9 @@ def tensor_octets_to_bytes(
     return bytes(serialized)
 
 
+tensor_octets_to_bytes.__process_graph_boundary__ = "host_materialization"
+
+
 @dataclass(frozen=True)
 class UnpackedBitstream:
     """Parallel MSB-first bits recovered exactly from packed octets."""

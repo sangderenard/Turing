@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from src.compiler.process_graph_fusion import (
+    extract_clean_process_subgraph,
     serialize_scheduled_operator_dispatches,
 )
+from src.compiler.glsl_deployment_strategy import _dispatch_subgraph
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
@@ -89,3 +91,36 @@ def test_same_operator_level_is_split_only_at_the_dispatch_cap():
     ]
     assert [pattern.batch_index for pattern in plan.patterns] == [0, 1, 2]
     assert [pattern.batch_count for pattern in plan.patterns] == [3, 3, 3]
+
+
+def test_clean_subgraph_drops_obligations_to_excluded_parents():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    _add(graph, 2, "add", (1,))
+    _add(graph, 3, "sin", (2,))
+    graph.levels = {1: 0, 2: 1, 3: 2}
+    graph.roots = [3]
+
+    extracted = extract_clean_process_subgraph(graph, (2, 3))
+
+    assert set(extracted.G) == {2, 3}
+    assert extracted.G.nodes[2]["parents"] == []
+    assert extracted.G.nodes[2]["children"] == [(3, "arg0")]
+    assert extracted.G.nodes[3]["parents"] == [(2, "arg0")]
+    assert extracted.levels == {2: 1, 3: 2}
+    assert extracted.roots == [3]
+    assert graph.G.nodes[2]["parents"] == [(1, "arg0")]
+
+
+def test_dispatch_exports_an_internal_value_used_outside_the_region():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Mul", (1,))
+    _add(graph, 3, "external", (1,))
+    graph.compute_levels(method="asap", order="dependency")
+
+    dispatch = _dispatch_subgraph(graph, (1, 2))
+
+    assert dispatch.G.graph["deployment_outputs"] == (1, 2)
+    assert len(dispatch.G.graph["deployment_store_nodes"]) == 2

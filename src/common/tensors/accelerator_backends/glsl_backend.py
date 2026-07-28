@@ -85,6 +85,7 @@ __all__ = [
     "OpStep",
     "emit_program_source",
     "emit_multi_output_program_source",
+    "emit_native_for_loop",
     "emit_op_source",
     "emit_cat_source",
     "emit_arange_source",
@@ -104,6 +105,7 @@ __all__ = [
     "run_op",
     "cat_chunks",
     "arange_chunk",
+    "full_chunk",
     "cumsum_chunk",
     "expand_chunk",
     "gather_offsets_chunk",
@@ -121,6 +123,8 @@ __all__ = [
     "topk_chunks",
     "execute_program",
     "execute_multi_output_program",
+    "execute_captured_fused_program",
+    "compile_captured_fused_program",
     "dispatch_batch",
     "fuse_elementwise",
     "GLSL_OPS",
@@ -862,6 +866,44 @@ uint turing_linear_gid() {{
 """
 
 
+def emit_native_for_loop(
+    body: Iterable[str],
+    *,
+    induction: str,
+    start: str | int,
+    stop: str | int,
+    step: str | int = 1,
+    indent: int = 4,
+) -> tuple[str, ...]:
+    """Wrap an already-lowered GLSL region in one device-native loop."""
+
+    name = str(induction)
+    if not name.isidentifier():
+        raise ValueError(f"invalid GLSL loop induction name {name!r}")
+    step_text = str(step)
+    try:
+        numeric_step = int(step_text)
+    except ValueError:
+        comparison = "<"
+    else:
+        if numeric_step == 0:
+            raise ValueError("GLSL loop step cannot be zero")
+        comparison = "<" if numeric_step > 0 else ">"
+    prefix = " " * int(indent)
+    nested = prefix + "    "
+    return (
+        prefix
+        + f"for (int {name} = int({start}); "
+        + f"{name} {comparison} int({stop}); "
+        + f"{name} += int({step_text})) {{",
+        *(
+            nested + line if line else line
+            for line in body
+        ),
+        prefix + "}",
+    )
+
+
 def _validate_program_outputs(
     program: FusedProgram,
 ) -> tuple[tuple[int, ...], tuple[tuple[str, int], ...]]:
@@ -1568,6 +1610,35 @@ def emit_arange_source(
             "    if (gid >= u_count) { return; }",
             f"    outbuf[gid] = {start_literal} + "
             f"{gid_value} * {step_literal};",
+            "}",
+            "",
+        ]
+    )
+
+
+def emit_fill_source(
+    value: Any,
+    *,
+    dtype: Any = np.float32,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Emit a typed constant-fill shader."""
+
+    dtype = _normalize_dtype(dtype)
+    scalar_type = _glsl_type(dtype)
+    literal = _glsl_literal(value, dtype)
+    return "\n".join(
+        [
+            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
+            "layout(std430, binding = 0) writeonly buffer OutBuf "
+            f"{{ {scalar_type} outbuf[]; }};",
+            "",
+            "uniform uint u_count;",
+            "",
+            "void main() {",
+            "    uint gid = turing_linear_gid();",
+            "    if (gid >= u_count) { return; }",
+            f"    outbuf[gid] = {literal};",
             "}",
             "",
         ]
@@ -3177,6 +3248,30 @@ def arange_chunk(
     return out
 
 
+def full_chunk(
+    shape: Sequence[int],
+    fill_value: Any,
+    *,
+    dtype: Any = None,
+) -> GLChunk:
+    """Create a constant tensor in one resident GPU dispatch."""
+
+    if isinstance(shape, int):
+        shape = (shape,)
+    shape = tuple(int(size) for size in shape)
+    out = GLChunk(shape, dtype=_normalize_dtype(dtype))
+    if out.count == 0:
+        return out
+    plan = plan_launch(out.count, binding_count=1)
+    source = emit_fill_source(
+        fill_value,
+        dtype=out.dtype,
+        local_size=plan.local_size,
+    )
+    _dispatch(_compile(source), [], out, plan)
+    return out
+
+
 def expand_chunk(chunk: GLChunk, shape: Sequence[int]) -> GLChunk:
     """Materialize a broadcasted shape in one planned resident dispatch."""
     if not isinstance(chunk, GLChunk):
@@ -3788,7 +3883,7 @@ def execute_multi_output_program(
             elif chunk.count == output_count:
                 # A deferred reshape changes logical coordinates but not the
                 # elementwise program's row-major lane correspondence.
-                runtime_feed_shapes[feed_id] = declared_shape
+                runtime_feed_shapes[feed_id] = shape
             elif _broadcast_shape(declared_shape, shape) == shape:
                 # A smaller non-scalar feed may be broadcast directly by
                 # the fused shader. This keeps branches such as (N, 1) and
@@ -3876,6 +3971,280 @@ def execute_program(
     output_name = next(iter(program.outputs))
     outs = None if out is None else {output_name: out}
     return execute_multi_output_program(program, feeds, outs=outs)[output_name]
+
+
+def execute_captured_fused_program(
+    captured,
+    runtime_feeds: Mapping[int, Any],
+) -> dict[str, GLChunk]:
+    """Execute one captured ProcessGraph region as one GLSL dispatch."""
+
+    program = captured.program
+    merged = dict(captured.feeds)
+    merged.update(runtime_feeds)
+    chunks = {
+        value_id: (
+            value.data
+            if hasattr(value, "data") and isinstance(value.data, GLChunk)
+            else value
+        )
+        for value_id, value in merged.items()
+    }
+    kind = (program.extras or {}).get("kernel_kind")
+    if kind in {None, "linear_reshape_copy"}:
+        return execute_multi_output_program(program, chunks)
+
+    if len(program.steps) != 1 or len(program.outputs) != 1:
+        raise ValueError(
+            f"GLSL {kind!r} captured regions require one operation/output"
+        )
+    step = program.steps[0]
+    output_name = next(iter(program.outputs))
+    input_chunks = [chunks[value_id] for value_id in step.input_ids]
+    if kind == "fill":
+        result = full_chunk(
+            step.attrs["shape"],
+            step.attrs["fill_value"],
+            dtype=(program.meta or {})[
+                next(iter(program.outputs.values()))
+            ].dtype,
+        )
+    elif kind == "arange":
+        result = arange_chunk(
+            step.attrs["start"],
+            step.attrs["end"],
+            step.attrs.get("step", 1),
+            dtype=(program.meta or {})[
+                next(iter(program.outputs.values()))
+            ].dtype,
+        )
+    elif kind == "stack":
+        result = stack_chunks(
+            input_chunks,
+            int(step.attrs.get("dim", 0)),
+        )
+    elif kind == "cat":
+        result = cat_chunks(
+            input_chunks,
+            int(step.attrs.get("dim", 0)),
+        )
+    elif kind == "expand":
+        result = expand_chunk(input_chunks[0], step.attrs["shape"])
+    elif kind == "permute":
+        result = permute_chunk(input_chunks[0], step.attrs["dims"])
+    elif kind == "repeat":
+        result = repeat_chunk(
+            input_chunks[0],
+            step.attrs.get("repeats"),
+            int(step.attrs.get("dim", 0)),
+        )
+    elif kind == "matmul":
+        result = matmul_chunks(input_chunks[0], input_chunks[1])
+    elif kind == "index_select":
+        result = index_select_chunk(
+            input_chunks[0],
+            int(step.attrs.get("dim", 0)),
+            input_chunks[1],
+        )
+    elif kind == "reduce":
+        result = reduce_chunk(
+            input_chunks[0],
+            step.attrs["reduce_op"],
+            step.attrs.get("axis"),
+            bool(step.attrs.get("keepdim", False)),
+        )
+    elif kind == "cumsum":
+        result = cumsum_chunk(
+            input_chunks[0],
+            int(step.attrs.get("dim", 0)),
+        )
+    elif kind == "slice":
+        output_id = next(iter(program.outputs.values()))
+        output_meta = (program.meta or {})[output_id]
+        result = GLChunk(
+            tuple(int(size) for size in output_meta.shape),
+            dtype=output_meta.dtype,
+        )
+        plan = plan_launch(result.count, binding_count=len(step.input_ids) + 1)
+        source = _emit_captured_fused_program_source(
+            captured,
+            local_size=plan.local_size,
+        )
+        _dispatch(
+            _compile(source),
+            input_chunks,
+            result,
+            plan,
+        )
+    else:
+        raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
+    return {output_name: result}
+
+
+def _emit_captured_fused_program_source(
+    captured,
+    *,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Emit one complete shader for one captured numerical region."""
+
+    program = captured.program
+    kind = (program.extras or {}).get("kernel_kind")
+    if kind in {None, "linear_reshape_copy"}:
+        output_id = next(iter(program.outputs.values()))
+        output_shape = tuple(
+            int(size)
+            for size in ((program.meta or {})[output_id].shape or ())
+        )
+        feed_shapes = {
+            value_id: (
+                output_shape
+                if kind == "linear_reshape_copy"
+                else tuple(
+                    int(size)
+                    for size in (
+                        (program.meta or {})[value_id].shape or ()
+                    )
+                )
+            )
+            for value_id in program.feeds
+        }
+        return emit_multi_output_program_source(
+            program,
+            local_size=local_size,
+            feed_shapes=feed_shapes,
+            output_shape=output_shape,
+        )
+
+    step = program.steps[0]
+    metadata = program.meta or {}
+    output_id = next(iter(program.outputs.values()))
+    output_meta = metadata[output_id]
+    if kind == "fill":
+        return emit_fill_source(
+            step.attrs["fill_value"],
+            dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "arange":
+        return emit_arange_source(
+            step.attrs["start"],
+            step.attrs.get("step", 1),
+            dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    source_meta = metadata[step.input_ids[0]]
+    if kind == "stack":
+        return emit_stack_source(
+            tuple(source_meta.shape or ()),
+            len(step.input_ids),
+            int(step.attrs.get("dim", 0)),
+            input_dtypes=[
+                metadata[value_id].dtype for value_id in step.input_ids
+            ],
+            output_dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "cat":
+        return emit_cat_source(
+            [tuple(metadata[value_id].shape or ()) for value_id in step.input_ids],
+            int(step.attrs.get("dim", 0)),
+            input_dtypes=[
+                metadata[value_id].dtype for value_id in step.input_ids
+            ],
+            output_dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "expand":
+        return emit_expand_source(
+            tuple(source_meta.shape or ()),
+            tuple(step.attrs["shape"]),
+            dtype=source_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "permute":
+        return emit_permute_source(
+            tuple(source_meta.shape or ()),
+            tuple(step.attrs["dims"]),
+            dtype=source_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "repeat":
+        return emit_repeat_source(
+            tuple(source_meta.shape or ()),
+            step.attrs.get("repeats"),
+            int(step.attrs.get("dim", 0)),
+            dtype=source_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "matmul":
+        right_meta = metadata[step.input_ids[1]]
+        return emit_matmul_source(
+            tuple(source_meta.shape or ()),
+            tuple(right_meta.shape or ()),
+            left_dtype=source_meta.dtype,
+            right_dtype=right_meta.dtype,
+            output_dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "index_select":
+        index_meta = metadata[step.input_ids[1]]
+        return emit_index_select_source(
+            tuple(source_meta.shape or ()),
+            int(step.attrs.get("dim", 0)),
+            _shape_product(tuple(index_meta.shape or ())),
+            dtype=source_meta.dtype,
+            index_dtype=index_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "reduce":
+        return emit_reduce_source(
+            step.attrs["reduce_op"],
+            tuple(source_meta.shape or ()),
+            step.attrs.get("axis"),
+            bool(step.attrs.get("keepdim", False)),
+            dtype=source_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "cumsum":
+        return emit_cumsum_source(
+            tuple(source_meta.shape or ()),
+            int(step.attrs.get("dim", 0)),
+            dtype=source_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "slice":
+        slice_kind = step.attrs.get("slice_kind")
+        if slice_kind == "axis":
+            return emit_slice_axis_source(
+                tuple(source_meta.shape or ()),
+                int(step.attrs["dim"]),
+                int(step.attrs["start"]),
+                int(step.attrs["step"]),
+                int(step.attrs["count"]),
+                dtype=source_meta.dtype,
+                local_size=local_size,
+            )
+        if slice_kind == "index_select":
+            index_meta = metadata[step.input_ids[1]]
+            index_count = _shape_product(tuple(index_meta.shape or ()))
+            return emit_index_select_source(
+                tuple(source_meta.shape or ()),
+                int(step.attrs["dim"]),
+                index_count,
+                dtype=source_meta.dtype,
+                index_dtype=index_meta.dtype,
+                local_size=local_size,
+            )
+    raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
+
+
+def compile_captured_fused_program(captured) -> str:
+    """Compile and cache the shader for one captured numerical region."""
+
+    source = _emit_captured_fused_program_source(captured)
+    _compile(source)
+    return source
 
 
 def _defer_elementwise(

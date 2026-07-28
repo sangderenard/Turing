@@ -13,7 +13,9 @@ branches.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+import io
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ..common.tensors.autograd import autograd
@@ -34,21 +36,44 @@ class EphemeralProcessGraphCallable:
     """A transient Python callable projected from one ``ProcessGraph``."""
 
     graph: Any
+    compiler: GraphDeepCompiler | None = None
+    device: Any = None
+    eager: bool = True
 
     def __post_init__(self) -> None:
         # GraphDeepCompiler installs its Store adapter into the supplied table,
         # so give each callable its own shallow copy of the canonical mapping.
-        compiler = GraphDeepCompiler(
-            self.graph,
-            dict(abstract_tensor_funcs),
-            abstract_tensor_sigs,
-        )
-        self._callable = compiler.build_function()
-        self.generated_source = compiler._code
+        if self.compiler is None:
+            self.compiler = GraphDeepCompiler(
+                self.graph,
+                dict(abstract_tensor_funcs),
+                abstract_tensor_sigs,
+            )
+        self._callable = None
+        self.generated_source = None
+        self.output_names = ()
+        if self.eager:
+            self.prepare(device=self.device)
+
+    def prepare(self, *, device: Any = None) -> "EphemeralProcessGraphCallable":
+        """Materialize the transient Python/AbstractTensor projection."""
+
+        if self._callable is not None:
+            return self
+        self.device = device
+        # Source printing is a GraphDeepCompiler diagnostic. The ephemeral
+        # projection retains that source explicitly without leaking it into a
+        # deployment's live output stream.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._callable = self.compiler.build_function(device=device)
+        self.generated_source = self.compiler._code
+        self.output_names = tuple(self.compiler._outs)
+        return self
 
     def __call__(self, **inputs: Any) -> tuple[Any, ...]:
         """Execute the graph through ordinary AbstractTensor operations."""
 
+        self.prepare(device=self.device)
         return self._callable(**inputs)
 
     def capture_forward(

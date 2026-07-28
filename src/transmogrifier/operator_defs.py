@@ -607,11 +607,11 @@ def _abstract_tensor_reduce(binary):
 
 
 def _abstract_tensor_method(name):
-    def apply(*values):
+    def apply(*values, **kwargs):
         operands = _abstract_tensor_values(*values)
         if not operands:
             raise ValueError(f"AbstractTensor.{name} requires an operand")
-        return getattr(operands[0], name)(*operands[1:])
+        return getattr(operands[0], name)(*operands[1:], **kwargs)
     return apply
 
 
@@ -639,9 +639,12 @@ def _abstract_tensor_primitive(name):
 
 
 def _abstract_tensor_static(name):
-    def apply(*values):
+    def apply(*values, **kwargs):
         from ..common.tensors.abstraction import AbstractTensor
-        return getattr(AbstractTensor, name)(*_abstract_tensor_values(*values))
+        return getattr(AbstractTensor, name)(
+            *_abstract_tensor_values(*values),
+            **kwargs,
+        )
     return apply
 
 
@@ -702,14 +705,24 @@ def _abstract_tensor_minimum(*values):
     return result
 
 
-def _abstract_tensor_stack(*values):
+def _abstract_tensor_stack(*values, dim=0):
     from ..common.tensors.abstraction import AbstractTensor
-    return AbstractTensor.stack(_abstract_tensor_values(*values), dim=0)
+    operands = _abstract_tensor_values(*values)
+    if operands and isinstance(operands[-1], int):
+        dim = operands.pop()
+    if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+        operands = list(operands[0])
+    return AbstractTensor.stack(operands, dim=dim)
 
 
-def _abstract_tensor_cat(*values):
+def _abstract_tensor_cat(*values, dim=0):
     from ..common.tensors.abstraction import AbstractTensor
-    return AbstractTensor.cat(_abstract_tensor_values(*values), dim=0)
+    operands = _abstract_tensor_values(*values)
+    if operands and isinstance(operands[-1], int):
+        dim = operands.pop()
+    if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+        operands = list(operands[0])
+    return AbstractTensor.cat(operands, dim=dim)
 
 
 def _abstract_tensor_where(*values):
@@ -769,6 +782,9 @@ abstract_tensor_funcs = {
     "Sub": _at_sub,
     "Mul": _at_mul,
     "Div": _at_div,
+    "FloorDiv": _abstract_tensor_reduce(
+        lambda left, right: left // right
+    ),
     "Mod": _at_mod,
     "Pow": _at_pow,
     "Rational": _at_div,
@@ -991,6 +1007,7 @@ _abstract_tensor_unary_names = {
 }
 _abstract_tensor_binary_names = {
     "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Rational", "MatMult",
+    "FloorDiv",
     "And", "Or", "Equality", "Unequality", "StrictLessThan",
     "LessThanOrEqual", "StrictGreaterThan", "GreaterThanOrEqual",
     "add", "sub", "mul", "div", "truediv", "mod", "pow", "matmul",

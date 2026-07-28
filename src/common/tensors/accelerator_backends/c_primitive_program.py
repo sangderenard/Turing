@@ -222,6 +222,10 @@ def compile_fused_program(program: FusedProgram) -> _SlotPlan:
                 raise ValueError(f"binary op {op} has an invalid operand layout")
             scalar = None if scalar is None else float(scalar)
         out_slot = len(feed_ids) + len(instructions)
+        if op not in _OP_NAMES:
+            raise ValueError(
+                f"C fused-program execution does not yet implement {op!r}"
+            )
         slots[step.result_id] = out_slot
         instructions.append(
             _SlotInstruction(
@@ -399,11 +403,26 @@ def compile_elementwise_tape(
         shape_inputs = [
             item for item in tensor_inputs if not is_dynamic_scalar(item)
         ] or tensor_inputs
-        expected_shape = tuple(shape_inputs[0].shape)
-        if tuple(value.shape) != expected_shape or any(
-            tuple(item.shape) != expected_shape for item in shape_inputs
+        output_shape = tuple(value.shape)
+
+        def broadcasts_to(input_shape, target_shape):
+            if len(input_shape) > len(target_shape):
+                return False
+            padded = (1,) * (len(target_shape) - len(input_shape)) + tuple(
+                input_shape
+            )
+            return all(
+                source in (1, target)
+                for source, target in zip(padded, target_shape)
+            )
+
+        if any(
+            not broadcasts_to(tuple(item.shape), output_shape)
+            for item in shape_inputs
         ):
-            raise ValueError(f"{op} crosses an elementwise shape boundary")
+            raise ValueError(
+                f"{op} inputs do not broadcast to {output_shape}"
+            )
 
         attrs: dict[str, Any] = {}
         input_ids: list[int]
@@ -483,5 +502,252 @@ def compile_recorded_elementwise_tape(
     return compile_elementwise_tape(
         tape,
         terminals,
+        dynamic_scalar_ids=dynamic_scalar_ids,
+    )
+
+
+_CAPTURED_NATIVE_KERNELS = {
+    "arange": "arange",
+    "broadcast_to": "expand",
+    "cat": "cat",
+    "concat": "cat",
+    "cumsum": "cumsum",
+    "expand": "expand",
+    "matmul": "matmul",
+    "imatmul": "matmul",
+    "rmatmul": "matmul",
+    "max": "reduce",
+    "mean": "reduce",
+    "min": "reduce",
+    "any": "reduce",
+    "all": "reduce",
+    "empty": "fill",
+    "full": "fill",
+    "gather": "index_select",
+    "permute": "permute",
+    "repeat": "repeat",
+    "stack": "stack",
+    "sum": "reduce",
+    "ones": "fill",
+    "zeros": "fill",
+}
+
+
+def _captured_meta(value: Any) -> Meta:
+    device = getattr(value, "device", None)
+    if device is None:
+        try:
+            device = value.get_device()
+        except (AttributeError, NotImplementedError):
+            device = "glsl" if type(value).__name__ == "GLChunk" else None
+    return Meta(
+        shape=tuple(value.shape),
+        dtype=str(value.dtype),
+        device=None if device is None else str(device),
+    )
+
+
+def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
+    """Preserve one backend-native operation in the shared fused IR."""
+
+    result = node.ctx["result"]
+    feeds: dict[int, Any] = {}
+    metadata: dict[int, Meta] = {}
+    input_ids: list[int] = []
+    for value in node.ctx.get("inputs", ()):
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            continue
+        value_id = id(value)
+        input_ids.append(value_id)
+        feeds[value_id] = value
+        metadata[value_id] = _captured_meta(value)
+
+    result_id = id(result)
+    metadata[result_id] = _captured_meta(result)
+    attrs = dict(node.ctx.get("params") or {})
+    kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
+
+    if operation == "rmatmul":
+        input_ids.reverse()
+    if kernel_kind == "reduce":
+        attrs["reduce_op"] = operation
+        if "axis" not in attrs and "dim" in attrs:
+            attrs["axis"] = attrs.pop("dim")
+    if kernel_kind == "permute":
+        attrs["dims"] = attrs.pop("perm", attrs.get("dims"))
+    if kernel_kind == "expand":
+        attrs["shape"] = tuple(
+            attrs.get("shape", tuple(result.shape))
+        )
+    if kernel_kind == "fill":
+        attrs["shape"] = tuple(result.shape)
+        attrs["fill_value"] = {
+            "empty": 0,
+            "zeros": 0,
+            "ones": 1,
+        }.get(operation, attrs.get("fill_value"))
+    if kernel_kind == "arange" and attrs.get("end") is None:
+        attrs["start"], attrs["end"] = 0, attrs.get("start")
+
+    program = FusedProgram(
+        version=1,
+        feeds=set(feeds),
+        steps=[
+            OpStep(
+                step_id=0,
+                op_name=operation,
+                input_ids=input_ids,
+                attrs=attrs,
+                result_id=result_id,
+            )
+        ],
+        outputs={"result_0": result_id},
+        meta=metadata,
+        extras={"kernel_kind": kernel_kind},
+    )
+    return CapturedFusedProgram(program, feeds)
+
+
+def compile_recorded_fused_tape(
+    tape,
+    *,
+    dynamic_scalar_ids: Sequence[int] = (),
+) -> CapturedFusedProgram:
+    """Lower one recorded numerical region to the shared FusedProgram IR.
+
+    Equal-shape arithmetic uses the established elementwise lowering. Layout
+    regions retain their canonical operation and captured parameters so a
+    backend can compile the entire region as one native dispatch.
+    """
+
+    nodes = list(tape._nodes.values())
+    if not nodes:
+        raise ValueError("recorded tape has no numerical operations")
+    operations = tuple(str(node.op) for node in nodes)
+    if all(
+        operation in {"clone", "reshape", "view"}
+        for operation in operations
+    ):
+        feeds: dict[int, Any] = {}
+        metadata: dict[int, Meta] = {}
+        steps: list[OpStep] = []
+        outputs: dict[str, int] = {}
+        for index, node in enumerate(nodes):
+            source = node.ctx["inputs"][0]
+            result = node.ctx["result"]
+            source_id = id(source)
+            result_id = id(result)
+            feeds[source_id] = source
+            metadata[source_id] = Meta(
+                shape=tuple(source.shape),
+                dtype=str(source.dtype),
+                device=str(source.device),
+            )
+            metadata[result_id] = Meta(
+                shape=tuple(result.shape),
+                dtype=str(result.dtype),
+                device=str(result.device),
+            )
+            # A reshape is a view. At a fused-program boundary, represent it
+            # as one linear identity shader so the region still owns exactly
+            # one backend dispatch and its output storage has the new shape.
+            steps.append(
+                OpStep(
+                    step_id=index,
+                    op_name="add",
+                    input_ids=[source_id],
+                    attrs={"right_scalar": 0},
+                    result_id=result_id,
+                )
+            )
+            outputs[f"result_{index}"] = result_id
+        program = FusedProgram(
+            version=1,
+            feeds=set(feeds),
+            steps=steps,
+            outputs=outputs,
+            meta=metadata,
+            extras={"kernel_kind": "linear_reshape_copy"},
+        )
+        output_shapes = {
+            tuple(metadata[value_id].shape or ())
+            for value_id in outputs.values()
+        }
+        if len(output_shapes) != 1:
+            raise ValueError(
+                "one reshape region requires one common output shape"
+            )
+        program.glsl_linear_output_shape = next(iter(output_shapes))
+        return CapturedFusedProgram(program, feeds)
+
+    if len(nodes) == 1 and (
+        operations[0] in _CAPTURED_NATIVE_KERNELS
+        or operations[0] == "slice"
+    ):
+        node = nodes[0]
+        if operations[0] != "slice":
+            return _compile_single_native_node(node, operations[0])
+
+        captured = _compile_single_native_node(node, operations[0])
+        program = captured.program
+        step = program.steps[0]
+        attributes = dict(step.attrs)
+        index = attributes.get("slices")
+        if operations[0] == "slice":
+            items = list(index) if isinstance(index, tuple) else [index]
+            if Ellipsis in items:
+                location = items.index(Ellipsis)
+                missing = len(node.ctx["inputs"][0].shape) - (len(items) - 1)
+                items[location:location + 1] = [slice(None)] * missing
+            items.extend(
+                [slice(None)]
+                * (len(node.ctx["inputs"][0].shape) - len(items))
+            )
+            active = [
+                (axis, item)
+                for axis, item in enumerate(items)
+                if not (
+                    isinstance(item, slice)
+                    and item.start is None
+                    and item.stop is None
+                    and item.step is None
+                )
+            ]
+            if len(active) != 1:
+                raise ValueError(
+                    "one captured slice shader currently requires one "
+                    "active index axis"
+                )
+            axis, item = active[0]
+            if isinstance(item, int):
+                axis_size = int(node.ctx["inputs"][0].shape[axis])
+                start = item % axis_size
+                attributes = {
+                    "slice_kind": "axis",
+                    "dim": axis,
+                    "start": start,
+                    "step": 1,
+                    "count": 1,
+                }
+            elif hasattr(item, "shape") and hasattr(item, "dtype"):
+                index_id = id(item)
+                step.input_ids.append(index_id)
+                captured.feeds[index_id] = item
+                program.feeds.add(index_id)
+                program.meta[index_id] = _captured_meta(item)
+                attributes = {
+                    "slice_kind": "index_select",
+                    "dim": axis,
+                }
+            else:
+                raise ValueError(
+                    "captured slice index is not an integer or tensor"
+                )
+
+        step.attrs = attributes
+        return captured
+
+    return compile_recorded_elementwise_tape(
+        tape,
         dynamic_scalar_ids=dynamic_scalar_ids,
     )

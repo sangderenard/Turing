@@ -12,6 +12,7 @@ today, and lets one selected region reuse the established backend lowerers.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -102,6 +103,40 @@ class ScheduledProcessGraphDispatchPlan:
     dependency_columns: tuple[tuple[int, ...], ...]
     levels: tuple[tuple[int, tuple[int, ...]], ...]
     node_locations: Mapping[int, tuple[int, int]]
+
+
+def extract_clean_process_subgraph(
+    graph: ProcessGraph,
+    node_ids: Iterable[int],
+) -> ProcessGraph:
+    """Copy an induced subgraph without obligations to excluded nodes."""
+
+    included = set(node_ids)
+    extracted = copy.copy(graph)
+    extracted.G = graph.G.subgraph(included).copy()
+    for node_id in extracted.G:
+        data = extracted.G.nodes[node_id]
+        data["parents"] = [
+            (parent, role)
+            for parent, role in data.get("parents", ())
+            if parent in included
+        ]
+        data["children"] = [
+            (child, role)
+            for child, role in data.get("children", ())
+            if child in included
+        ]
+    extracted.levels = {
+        node_id: level
+        for node_id, level in graph.levels.items()
+        if node_id in included
+    }
+    extracted.roots = [
+        node_id for node_id in graph.roots if node_id in included
+    ]
+    extracted.scheduler = copy.copy(graph.scheduler)
+    extracted.scheduler.G = extracted.G
+    return extracted
 
 
 def _isolated_dependency_columns(

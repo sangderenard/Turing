@@ -6,6 +6,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
+import inspect
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -3004,6 +3005,12 @@ def _wrap_creation_fn(op_name: str, raw_fn):
 
         params = {}
         try:
+            bound = inspect.signature(raw_fn).bind(*args, **kwargs)
+            bound.apply_defaults()
+            params.update(bound.arguments)
+        except (TypeError, ValueError):
+            pass
+        try:
             params["shape"] = tuple(getattr(result, "shape", ()))
         except Exception:
             pass
@@ -3089,10 +3096,53 @@ except Exception:
     pass
 def _wrap_with_autograd(name: str, func: Callable) -> Callable:
     def wrapped(self, *args, **kwargs):
+        from . import autograd as _autograd
+
         tensor_args = [a for a in args if isinstance(a, AbstractTensor)]
         tensor_args += [v for v in kwargs.values() if isinstance(v, AbstractTensor)]
-        finalize = AbstractTensor._pre_autograd(name, [self] + tensor_args)
+        candidate_tapes = {
+            id(tape): tape
+            for tape in (
+                getattr(self, "_tape", None),
+                _autograd.autograd.tape,
+            )
+            if tape is not None
+        }
+        previous_nodes = {
+            tape_id: dict(getattr(tape, "_nodes", {}))
+            for tape_id, tape in candidate_tapes.items()
+        }
         result = func(self, *args, **kwargs)
+
+        # Several grafted methods (notably reshape/permute) already record a
+        # canonical node with normalized parameters. Do not overwrite that
+        # node with the parameterless compatibility wrapper record.
+        tape = getattr(result, "_tape", None)
+        existing = getattr(tape, "_nodes", {}).get(id(result))
+        previous = previous_nodes.get(id(tape), {}).get(id(result))
+        if (
+            existing is not None
+            and existing is not previous
+            and existing.ctx.get("result") is result
+        ):
+            return result
+
+        params = {}
+        try:
+            bound = inspect.signature(func).bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            params = {
+                key: value
+                for key, value in bound.arguments.items()
+                if key != "self" and not isinstance(value, AbstractTensor)
+            }
+        except (TypeError, ValueError):
+            pass
+        finalize = AbstractTensor._pre_autograd(
+            name,
+            [self] + tensor_args,
+            params=params,
+        )
         return finalize(result)
     return wrapped
 

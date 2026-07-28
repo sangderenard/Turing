@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import importlib
 from typing import Any, Callable, Mapping
 
 
@@ -214,7 +215,49 @@ class FunctionTable:
         return len(self._entries)
 
 
+class ExternalFunctionTable(FunctionTable):
+    """Python-call handoffs kept separate from graph-backed functions."""
+
+    def resolve_imports(self, *, package: str | None = None) -> None:
+        """Resolve declared import references to their Python callables."""
+
+        for entry in self:
+            requirement = entry.metadata.get("contextual_requirement")
+            imported_name = entry.metadata.get("imported_name", entry.name)
+            if not isinstance(requirement, Mapping):
+                continue
+            kind = requirement.get("kind")
+            if kind == "import_from":
+                module_name = (
+                    "." * int(requirement.get("level", 0))
+                    + str(requirement.get("module") or "")
+                )
+                module = importlib.import_module(module_name, package)
+                target = getattr(module, str(imported_name))
+            elif kind == "import":
+                module = importlib.import_module(str(imported_name), package)
+                target = module
+            else:
+                continue
+            self.resolve_callable(entry.reference, target)
+
+    def invoke(self, reference_or_name, *args, **kwargs):
+        """Invoke one resolved external Python target."""
+
+        entry = self.entry(reference_or_name)
+        target = entry.python_callable
+        if target is None:
+            target = entry.implementations.get("python")
+        if target is None:
+            raise RuntimeError(
+                f"external function {entry.qualified_name!r} has no "
+                "resolved Python callable"
+            )
+        return target(*args, **kwargs)
+
+
 __all__ = [
+    "ExternalFunctionTable",
     "FunctionEntry",
     "FunctionReference",
     "FunctionResolutionState",

@@ -54,25 +54,40 @@ provenance can be spliced into the source ProcessGraph through
 `FusedProgram`. The C backend compiles that IR to a private native slot plan;
 GLSL lowers the same IR directly to shader locals. There is no public,
 competing `PrimitiveProgram` or `GlslProgram` schema.
-The equal-shape region supports canonical elementwise unary/binary operations,
-scalar operands, `nand`, and `select`.
-
-Structural primitives such as `concat`, `slice`, shifts, and shape-changing
-`mu` cannot fit that packet. They return structured `LoweringIssue` records and
-no executable program. A future region/view packet should represent their
-shapes and storage ranges explicitly.
-
-The current complete slice is substantial but deliberately bounded: the
-canonical cross-language catalog contains 66 operations, GLSL implements 56
-canonical primitives, and the equal-shape whole-program fusion region accepts
-40. Existing standalone GLSL matmul, reduction, and layout kernels should
-become neighboring regions in a ProcessGraph partitioner rather than being
-restated inside the elementwise emitter.
+The elementwise region supports the complete canonical set of 56 lowerable
+unary, binary, comparison, logical, bitwise, shift, and cast primitives,
+including scalar operands and broadcasting. Shape-changing operations remain
+explicit FusedProgram kernel kinds rather than being misrepresented as
+elementwise instructions. GLSL compiles captured creation/fill, reshape,
+stack, concatenate, expand, permute, repeat, slice/index-select, matmul,
+reduction, and cumulative-sum regions through the backend's established
+native shader emitters.
 
 The live [AbstractTensor Mandelbrot video demo](mandelbrot_glsl_video_demo.md)
-exercises that exact frontier: ProcessGraph chooses the solve, palette, and
-YCbCr region, while the structural JPEG program remains visible as ordinary
-AbstractTensor boundaries for the next partitioning work.
+now exposes that frontier through a stateful deployment shell. The complete
+recording function enters ProcessGraph, the scheduler produces dispatch
+subgraphs, and the shell owns their function-table registry, named feeds and
+outputs, FIFO interface, and profiling state. The general coordinator now
+resolves structural host values and explicit external-call boundaries while
+executing every scheduled numerical region through the AbstractTensor operator
+table on GLSL. Semantic AST nodes are excluded rather than emitted as no-op
+dispatches.
+
+The first scheduled invocation is the ephemeral specialization boundary: each
+tensor-producing callable records a forward tape, lowers to the shared
+FusedProgram IR, and compiles to exactly one GLSL shader. In the current
+Mandelbrot-to-JPEG graph this yields thirteen shaders and two scalar/shape
+coordinator regions. Imported Python functions, entropy coding, container
+framing, and I/O remain explicit host boundaries; they are not disguised as
+empty shaders or numerical fallbacks.
+
+The deployment shell tree also shares a root-owned hierarchical profiler.
+Region dispatches, graph-backed child-shell calls, and explicit external
+boundaries retain their shell path while contributing CPU, GPU, call-count,
+and launch-count measurements to one report. This makes dispatch partitioning
+and optimization evidence-driven: a caller can rank actual expensive graph
+sections instead of treating the complete translated program as one opaque
+duration.
 
 ## Nodus
 

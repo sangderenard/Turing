@@ -135,6 +135,41 @@ def kernel(x):
     assert "retaining ProcessGraph import" in caplog.text
 
 
+def test_imported_calls_use_distinct_external_python_table():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(
+            ast.parse(
+                """
+from operator import add
+
+def combine(left, right):
+    return add(left, right)
+"""
+            )
+        )
+    reduce_abstract_tensor_topology(graph)
+
+    assert graph.function_table.reference("combine") is not None
+    assert graph.function_table.reference("add") is None
+    external_reference = graph.external_function_table.reference("add")
+    assert external_reference is not None
+    call = next(
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("external_callee_ref")
+        == external_reference.address
+    )
+    assert "callee_ref" not in call["attributes"]
+
+    graph.external_function_table.resolve_imports()
+    assert graph.external_function_table.invoke(
+        external_reference,
+        4,
+        7,
+    ) == 11
+
+
 def test_calls_reference_separate_local_function_subgraphs():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
@@ -191,13 +226,14 @@ def kernel(x):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    reference = graph.function_table.reference("operation")
+    assert graph.function_table.reference("operation") is None
+    reference = graph.external_function_table.reference("operation")
     assert reference is not None
     assert (
-        graph.G.nodes[id(call)]["attributes"]["callee_ref"]
+        graph.G.nodes[id(call)]["attributes"]["external_callee_ref"]
         == reference.address
     )
-    assert graph.function_table.entry(reference).qualified_name == (
+    assert graph.external_function_table.entry(reference).qualified_name == (
         "package.math.helper"
     )
 
@@ -220,3 +256,140 @@ def recur(x):
     assert reference is not None
     assert graph.function_table.entry(reference).recursive
     assert graph.G.nodes[id(call)]["attributes"]["recursive_backedge"] is True
+
+
+def test_lexical_occurrences_are_unique_then_reduce_to_monotonic_fanout():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def kernel(x):
+    first = x + 1
+    second = first * first
+    return second
+"""
+    )
+    first_loads = [
+        node
+        for node in ast.walk(module)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == "first"
+        )
+    ]
+    assert len(first_loads) == 2
+    assert id(first_loads[0]) != id(first_loads[1])
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    assert all(id(node) in graph.G for node in first_loads)
+
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("kernel").graph
+
+    assert list(function_graph.G) == list(range(len(function_graph.G)))
+    assert all(
+        data["value_id"] == node_id
+        for node_id, data in function_graph.G.nodes(data=True)
+    )
+    assert not any(
+        data.get("type") in {"Load", "Store"}
+        for _node_id, data in function_graph.G.nodes(data=True)
+    )
+    inputs = [
+        node_id
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+    ]
+    assert len(inputs) == 1
+    add = next(
+        node_id
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Add"
+    )
+    multiply = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Mul"
+    )
+    assert multiply["parents"] == [(add, "lhs"), (add, "rhs")]
+
+
+def test_static_python_reference_chain_collapses_without_becoming_input():
+    class StaticTensorAPI:
+        @staticmethod
+        def stack(values, dim=0):
+            raise AssertionError("static collapse must not execute the method")
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"StaticTensorAPI": StaticTensorAPI}
+    module = ast.parse(
+        """
+def kernel(values):
+    return StaticTensorAPI.stack(values, dim=0)
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("kernel").graph
+
+    assert not any(
+        data.get("label") == "StaticTensorAPI"
+        for _node_id, data in function_graph.G.nodes(data=True)
+    )
+    operation = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "stack"
+    )
+    assert operation["attributes"]["static_python_reference"] == (
+        "StaticTensorAPI.stack"
+    )
+    assert [
+        data["label"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+    ] == ["values"]
+
+
+def test_reducer_preserves_every_python_constant_literal():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def constants():
+    return (8, 0.5, None, ..., b"jpeg")
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("constants").graph
+
+    literals = [
+        data["constant"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Constant"
+    ]
+    assert literals == [8, 0.5, None, Ellipsis, b"jpeg"]
+
+
+def test_floor_division_remains_distinct_from_true_division():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def divide(x):
+    return (x / 2, x // 2)
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("divide").graph
+
+    operations = [
+        data["type"]
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") in {"Div", "FloorDiv"}
+    ]
+    assert operations == ["Div", "FloorDiv"]

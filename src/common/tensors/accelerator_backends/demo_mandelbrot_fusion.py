@@ -154,8 +154,12 @@ def capture_parametric_mandelbrot_encoder(iterations: int):
     )
 
 
-def compile_parametric_mandelbrot_glsl(iterations: int):
-    """Submit the whole recording ProcessGraph through GLSL deployment."""
+def build_parametric_mandelbrot_glsl_deployment(
+    iterations: int,
+    *,
+    profiling: bool = False,
+):
+    """Plan and select the recording function's stateful GLSL shell."""
 
     from ....compiler.glsl_deployment_strategy import (
         strategize_glsl_deployment,
@@ -165,9 +169,31 @@ def compile_parametric_mandelbrot_glsl(iterations: int):
     )
 
     graph = build_mandelbrot_recording_process_graph()
-    deployment_class = strategize_glsl_deployment(graph)
-    deployment = deployment_class(iterations=int(iterations))
+    module_shell_type = strategize_glsl_deployment(graph)
+    module_shell = module_shell_type(
+        iterations=int(iterations),
+        profiling=profiling,
+    )
+    reference = graph.function_table.reference(
+        graph.G.graph["program_entrypoint"]
+    )
+    if reference is None:
+        raise RuntimeError("Mandelbrot ProcessGraph entrypoint is undeclared")
+    try:
+        deployment = module_shell.function_shells[reference.address]
+    except KeyError as exc:
+        raise RuntimeError(
+            "Mandelbrot ProcessGraph entrypoint has no deployment shell"
+        ) from exc
+    deployment.module_shell = module_shell
+    deployment.entry_reference = reference
     return deployment, graph
+
+
+def compile_parametric_mandelbrot_glsl(iterations: int):
+    """Compatibility spelling for the deployment-shell construction stage."""
+
+    return build_parametric_mandelbrot_glsl_deployment(iterations)
 
 
 def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
@@ -512,19 +538,43 @@ def animate_glsl(
     profile: bool = False,
 ) -> None:
     """Run the parameterized solve continuously with resident GPU buffers."""
+    # AST-ROOT INTEGRITY WARNING:
+    #
+    # The recording branch in this older live-animation coordinator still
+    # constructs and drives MJPEGAVIWriter outside the ingested recording
+    # function.  That is a known architectural violation, not an approved
+    # execution boundary and not a pattern to preserve or extend.  It must be
+    # replaced by a stateful/multi-frame AST-root recording program whose
+    # ProcessGraph owns writer creation, every video/audio packet, indexing,
+    # and final closure.  Until then, this path must not be cited as evidence
+    # that the complete animated source-to-AVI program has been compiled.
+    #
+    # Never solve this by introducing another collector, callback, post-pass,
+    # or caller-owned writer.  If the full root cannot compile, expose and fix
+    # that compiler frontier.
     import pygame
     from OpenGL import GL
     from OpenGL.GL.shaders import compileProgram, compileShader
 
     from .gl_context import require_gl_context
     from .glsl_backend import (
-        GLChunk,
         dispatch_stats,
         shader_cache_stats,
     )
 
-    program, _ = compile_parametric_mandelbrot_glsl(iterations)
+    deployment, _ = build_parametric_mandelbrot_glsl_deployment(
+        iterations,
+        profiling=profile,
+    )
     unit_x, unit_y = normalized_plane(width, height)
+
+    print(
+        f"program : {deployment.source_node_count} ProcessGraph nodes -> "
+        f"{deployment.primitive_count} scheduled nodes in "
+        f"{deployment.dispatch_count} deployment regions",
+        flush=True,
+    )
+    deployment.require_ready()
 
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
@@ -541,9 +591,8 @@ def animate_glsl(
     info = require_gl_context()
     print(
         f"gpu     : {info['renderer']} (context: {info['source']})\n"
-        f"program : {program.source_node_count} selected ProcessGraph nodes -> "
-        f"{program.primitive_count} GLSL primitives + "
-        f"{program.loop_count} structured loop; one dispatch",
+        f"deploy  : {len(deployment.programs)} resident fused programs; "
+        "ProcessGraph-scheduled GLSL execution",
         flush=True,
     )
 
@@ -608,6 +657,10 @@ def animate_glsl(
     audio_scheduler = None
     recorded_audio_position = 0
     if record_avi is not None:
+        # KNOWN TEMPORARY VIOLATION OF AST-ROOT INTEGRITY.
+        # See the contract above.  This block is retained only so its remaining
+        # migration work is visible; it must move into the ingested multi-frame
+        # recording root rather than becoming a permanent host-side feature.
         from ..abstraction import AbstractTensor
         from ..compression.containers.avi import MJPEGAVIWriter
         from ..compression.pcm import PCMFormat, RationalAudioScheduler
@@ -646,34 +699,9 @@ def animate_glsl(
             flush=True,
         )
 
-    initial_scalar_values = np.asarray(
-        [
-            center.real,
-            center.imag,
-            span,
-            0.0,
-            -0.72,
-            0.24,
-            0.0,
-            0.52,
-        ],
-        np.float32,
-    )
-    # Scalar controls are rewritten every frame.  A small resident ring keeps
-    # that 32-byte upload from waiting on the preceding dispatch's read of the
-    # same SSBO.
-    scalar_feed_ring = tuple(
-        GLChunk.from_numpy(initial_scalar_values).to_gpu()
-        for _ in range(4)
-    )
-    feeds = {
-        "unit_x": GLChunk.from_numpy(unit_x).to_gpu(),
-        "unit_y": GLChunk.from_numpy(unit_y).to_gpu(),
-        program.scalar_buffer_name: scalar_feed_ring[0],
-    }
-    fused_outputs = {
-        name: GLChunk((height * width,), dtype=dtype).to_gpu()
-        for name, dtype in zip(program.output_names, program.output_dtypes)
+    static_feeds = {
+        "unit_x": unit_x,
+        "unit_y": unit_y,
     }
     jpeg_resources = None
     if recorder is not None:
@@ -685,7 +713,18 @@ def animate_glsl(
 
         exemplar = GLSLTensorOperations()
         exemplar.data = reshape_chunk(
-            fused_outputs["luminance"], (height, width)
+            deployment.execute_named({
+                **static_feeds,
+                "center_x": np.float32(center.real),
+                "center_y": np.float32(center.imag),
+                "span": np.float32(span),
+                "family_mix": np.float32(0.0),
+                "julia_x": np.float32(-0.72),
+                "julia_y": np.float32(0.24),
+                "palette_phase": np.float32(0.0),
+                "color_drive": np.float32(0.52),
+            })["luminance"],
+            (height, width),
         )
         with AbstractTensor.use_backend("glsl"), fuse_elementwise():
             jpeg_resources = prepare_jpeg_encoding_resources(exemplar)
@@ -830,39 +869,22 @@ def animate_glsl(
                 "palette_phase": palette_phase,
                 "color_drive": color_drive,
             }
-            scalar_feed = scalar_feed_ring[frame % len(scalar_feed_ring)]
-            scalar_feed.update_numpy(
-                np.asarray(
-                    [
-                        scalar_values[name]
-                        for name in program.scalar_input_order
-                    ],
-                    np.float32,
-                )
-            ).to_gpu()
-            feeds[program.scalar_buffer_name] = scalar_feed
             uploads_finished = time.perf_counter()
-            query = None
-            if profile:
-                generated = GL.glGenQueries(1)
-                query = int(np.asarray(generated).reshape(-1)[0])
-                GL.glBeginQuery(GL.GL_TIME_ELAPSED, query)
             submit_started = time.perf_counter()
-            program.execute(feeds, outs=fused_outputs)
+            fused_outputs = deployment.execute_named({
+                **static_feeds,
+                **{
+                    name: np.float32(value)
+                    for name, value in scalar_values.items()
+                },
+            })
             submit_finished = time.perf_counter()
-            gpu_ms = 0.0
-            if query is not None:
-                import ctypes
-
-                GL.glEndQuery(GL.GL_TIME_ELAPSED)
-                elapsed_ns = ctypes.c_uint64()
-                GL.glGetQueryObjectui64v(
-                    query,
-                    GL.GL_QUERY_RESULT,
-                    ctypes.byref(elapsed_ns),
-                )
-                gpu_ms = elapsed_ns.value / 1e6
-                GL.glDeleteQueries(1, (query,))
+            shell_report = deployment.profile_report()
+            gpu_ms = sum(
+                row["gpu_ms"]
+                for row in shell_report["rows"]
+                if row["section"] in {"dispatch", "external"}
+            )
             compute_finished = time.perf_counter()
 
             present_started = time.perf_counter()
@@ -955,11 +977,31 @@ def animate_glsl(
                 )
             if now - report_started >= 0.5:
                 fps = report_frames / (now - report_started)
+                hot_rows = [
+                    row
+                    for row in shell_report["rows"]
+                    if row["section"] in {"dispatch", "external"}
+                ]
+                hot = max(
+                    hot_rows,
+                    key=lambda row: (
+                        row["gpu_ms"],
+                        row["cpu_ms"],
+                    ),
+                    default=None,
+                )
+                hot_caption = (
+                    f" | hot {hot['label']} "
+                    f"{max(hot['gpu_ms'], hot['cpu_ms']):.2f} ms"
+                    if hot is not None
+                    else ""
+                )
                 pygame.display.set_caption(
                     "Parametric AbstractTensor Mandelbrot — GLSL | "
                     f"{fps:.1f} solve+render fps | span {animated_span:.5g} | "
                     f"family {family_mix:.2f} | detail {predicted_detail:.2f} | "
                     f"loud {loudness:.2f} | GL launches {frame_dispatches}"
+                    + hot_caption
                 )
                 report_started, report_frames = now, 0
         elapsed = time.perf_counter() - started
@@ -1004,11 +1046,10 @@ def animate_glsl(
                     f"p95 {np.quantile(values, 0.95):8.3f} ms",
                     flush=True,
                 )
+            for line in deployment.profile_lines(window=60):
+                print(line, flush=True)
     finally:
-        for chunk in (feeds["unit_x"], feeds["unit_y"], *scalar_feed_ring):
-            chunk.release()
-        for chunk in fused_outputs.values():
-            chunk.release()
+        deployment.release()
         if audio is not None:
             audio.close()
         if audio_playback_ready:
@@ -1318,18 +1359,17 @@ def main(argv: list[str] | None = None) -> int:
     elements = args.width * args.height
     print(f"image   : {args.width}x{args.height} = {elements:,} pixels")
 
-    cx, cy = complex_plane(args.width, args.height, args.center, args.span)
-    compiled, _ = compile_parametric_mandelbrot_glsl(args.iterations)
-    print(
-        f"program : {compiled.source_node_count} ProcessGraph nodes -> "
-        f"{compiled.primitive_count} primitives + "
-        f"{compiled.loop_count} structured loop"
+    deployment, _ = build_parametric_mandelbrot_glsl_deployment(
+        args.iterations,
+        profiling=args.profile,
     )
-
+    print(
+        f"program : {deployment.source_node_count} ProcessGraph nodes -> "
+        f"{deployment.primitive_count} scheduled nodes in "
+        f"{deployment.dispatch_count} deployment regions"
+    )
     # -- GPU ---------------------------------------------------------------
     from .gl_context import require_gl_context
-    from .glsl_backend import GLChunk
-
     info = require_gl_context()
     print(f"gpu     : {info['renderer']} (context: {info['source']})")
 
@@ -1344,31 +1384,56 @@ def main(argv: list[str] | None = None) -> int:
         "palette_phase": 0.0,
         "color_drive": 0.52,
     }
+    # This non-animated path intentionally supplies only data/configuration.
+    # It must never supply a writer, frame collector, encoder callback, or
+    # partially completed container.  The ingested root owns those operations.
     feeds = {
-        "unit_x": GLChunk.from_numpy(unit_x).to_gpu(),
-        "unit_y": GLChunk.from_numpy(unit_y).to_gpu(),
-        compiled.scalar_buffer_name: GLChunk.from_numpy(
-            np.asarray(
-                [
-                    static_scalars[name]
-                    for name in compiled.scalar_input_order
-                ],
-                dtype=np.float32,
-            )
-        ).to_gpu(),
+        "unit_x": unit_x,
+        "unit_y": unit_y,
+        **{
+            name: np.float32(value)
+            for name, value in static_scalars.items()
+        },
+        "width": args.width,
+        "height": args.height,
+        "iterations": args.iterations,
+        "avi_path": args.record_avi,
+        "avi_fps": args.record_fps,
+        "avi_opendml": True,
+        "avi_segment_bytes": args.record_segment_bytes,
+        "audio_samples": None,
+        "resources": None,
     }
+    deployment.compile_process_graph()
+    deployment.capture_fused_programs(feeds)
     t0 = time.perf_counter()
-    gpu_outputs = compiled.execute(feeds)
-    gpu = gpu_outputs["counts"].numpy().copy()
+    recording_outputs = deployment.execute_named(feeds)
+    gpu = recording_outputs["counts"].numpy().copy()
+    jpeg_frame = recording_outputs["jpeg_frame"]
     gpu_ms = (time.perf_counter() - t0) * 1e3
     print(
         f"glsl    : {gpu_ms:8.1f} ms  "
-        f"({args.iterations} loop iterations x {elements:,} px, one dispatch)"
+        f"({args.iterations} loop iterations x {elements:,} px, "
+        f"{deployment.dispatch_count} planned regions)"
     )
-    for chunk in (*feeds.values(), *gpu_outputs.values()):
-        chunk.release()
+    print(
+        f"compile : {len(deployment.captured_region_programs)} "
+        "CapturedFusedProgram shaders; "
+        f"{len(deployment.coordinator_region_indices)} scalar/shape "
+        "coordinator regions"
+    )
+    if args.profile:
+        for line in deployment.profile_lines():
+            print(line)
+    deployment.release()
 
     if not args.only_glsl:
+        cx, cy = complex_plane(
+            args.width,
+            args.height,
+            args.center,
+            args.span,
+        )
         # -- oracle --------------------------------------------------------
         t0 = time.perf_counter()
         ref = run_abstract_numpy(cx, cy, args.iterations)
@@ -1413,13 +1478,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.out.suffix.lower() in {".jpg", ".jpeg"}:
-        out = save_tensor_jpeg(
-            gpu,
-            args.width,
-            args.height,
-            args.iterations,
-            args.out,
-        )
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_bytes(jpeg_frame)
+        out = args.out
     else:
         out = save_image(
             gpu,
