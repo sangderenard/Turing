@@ -453,3 +453,35 @@ def compile_elementwise_tape(
         meta=metadata,
     )
     return CapturedFusedProgram(program, feeds)
+
+
+def compile_recorded_elementwise_tape(
+    tape,
+    *,
+    dynamic_scalar_ids: Sequence[int] = (),
+) -> CapturedFusedProgram:
+    """Compile every recorded operation without requiring result arguments."""
+
+    produced_ids = set(tape._nodes)
+    consumed_ids = {
+        id(value)
+        for node in tape._nodes.values()
+        for value in node.ctx.get("inputs", ())
+        if id(value) in produced_ids
+    }
+    terminal_ids = [
+        result_id
+        for result_id in tape._nodes
+        if result_id not in consumed_ids
+    ]
+    if not terminal_ids:
+        raise ValueError("recorded tape has no terminal operation")
+    terminals = {
+        f"result_{index}": tape._nodes[result_id].ctx["result"]
+        for index, result_id in enumerate(terminal_ids)
+    }
+    return compile_elementwise_tape(
+        tape,
+        terminals,
+        dynamic_scalar_ids=dynamic_scalar_ids,
+    )

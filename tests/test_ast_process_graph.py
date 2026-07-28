@@ -11,6 +11,7 @@ def kernel(x, y, n):
     return z
 """
 
+
 def _graph(source=SOURCE, *, filename=None):
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(source, filename=filename)
@@ -97,99 +98,3 @@ def kernel(x, y):
     )
     assert sin_node["input_roles"] == ("operand",)
     assert tanh_node["input_roles"] == ("operand",)
-
-
-def test_optional_constructed_type_resolves_methods_after_control_merge():
-    graph = ProcessGraph(materialize_memory=False)
-    graph.build_from_ast(
-        """
-class Writer:
-    def append(self, value):
-        return value
-
-def program(enabled, value):
-    writer = None
-    if enabled:
-        writer = Writer()
-    if writer is not None:
-        writer.append(value)
-    return value
-""",
-        filename="writer_fixture.py",
-        entrypoint="program",
-        profile="tensor_control",
-    )
-
-    append_call = next(
-        data
-        for _, data in graph.G.nodes(data=True)
-        if data.get("op") == "call"
-        and (data.get("attributes") or {}).get("function")
-        == "writer.append"
-    )
-    assert append_call["attributes"]["resolved"] is True
-    callee = append_call["attributes"]["callee"]
-    assert graph.G.nodes[callee]["op"] == "function_def"
-    assert graph.G.nodes[callee]["label"] == "append"
-
-
-def test_entrypoint_ownership_edges_never_become_ssa_operands():
-    graph = ProcessGraph(materialize_memory=False)
-    graph.build_from_ast(
-        """
-def helper(value):
-    return value.sin()
-
-def program(value):
-    return helper(value)
-""",
-        filename="ownership_fixture.py",
-        entrypoint="program",
-        profile="program",
-    )
-
-    structural_roles = {
-        "body",
-        "compiles",
-        "contains",
-        "environment",
-        "invokes",
-        "parameter",
-    }
-    assert any(
-        data.get("role") in structural_roles
-        for _, _, data in graph.G.edges(data=True)
-    )
-    instructions = process_graph_to_ssa_instrs(graph, schedule="asap")
-    assert all(
-        structural_roles.isdisjoint(instruction.arg_roles)
-        for instruction in instructions
-    )
-
-
-def test_single_outer_function_registers_nested_helpers_before_bodies():
-    graph = ProcessGraph(materialize_memory=False)
-    graph.build_from_ast(
-        """
-def program(value):
-    def first(item):
-        return second(item)
-
-    def second(item):
-        return item.sin()
-
-    return first(value)
-""",
-        filename="single_function_fixture.py",
-        entrypoint="program",
-        profile="program",
-    )
-
-    calls = {
-        (data.get("attributes") or {}).get("function"):
-        data.get("attributes") or {}
-        for _, data in graph.G.nodes(data=True)
-        if data.get("op") == "call"
-    }
-    assert calls["second"]["resolved"] is True
-    assert calls["first"]["resolved"] is True

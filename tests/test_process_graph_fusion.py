@@ -54,37 +54,6 @@ def test_process_graph_planner_keeps_shared_multi_output_producer_in_one_region(
     assert lowered.outputs == {"sine": 4, "cosine": 5}
 
 
-def test_process_graph_planner_ignores_entrypoint_ownership_edges():
-    graph = fused_program_to_process_graph(_branched_program())
-    owner = max(graph.G) + 1
-    graph.G.add_node(
-        owner,
-        op="function_def",
-        parents=[],
-        children=[],
-        attributes={"name": "program"},
-    )
-    for node_id in tuple(graph.G):
-        if node_id == owner:
-            continue
-        graph.G.add_edge(owner, node_id, role="contains")
-        graph.G.nodes[owner]["children"].append((node_id, "contains"))
-        graph.G.nodes[node_id]["parents"].append((owner, "contains"))
-
-    plan = plan_process_graph_dispatches(
-        graph,
-        BackendFusionProfile("glsl", frozenset(GLSL_OPS)),
-    )
-
-    assert len(plan.regions) == 1
-    region = plan.regions[0]
-    assert region.node_ids == (3, 4, 5)
-    assert region.input_ids == (1, 2)
-    assert region.binding_count == 4
-    lowered = dispatch_region_to_fused_program(graph, region)
-    assert all(owner not in step.input_ids for step in lowered.steps)
-
-
 def test_multi_output_glsl_emitter_writes_all_results_in_one_shader():
     source = emit_multi_output_program_source(
         _branched_program(),

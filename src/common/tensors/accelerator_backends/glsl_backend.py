@@ -100,6 +100,7 @@ __all__ = [
     "emit_reduce_source",
     "emit_stack_source",
     "emit_topk_offsets_source",
+    "compile_glsl_source",
     "run_op",
     "cat_chunks",
     "arange_chunk",
@@ -699,6 +700,35 @@ class GLChunk:
             )
         self._storage.host = data.reshape(-1)
         self._storage.gpu_valid = False
+        return self
+
+    def upload_numpy(self, array: Any) -> "GLChunk":
+        """Upload exactly this logical view into its resident buffer range."""
+
+        if self._released:
+            raise RuntimeError("cannot upload into a released GLChunk")
+        require_gl_context()
+        from OpenGL import GL
+
+        data = np.ascontiguousarray(
+            np.asarray(array, dtype=_storage_dtype(self.dtype))
+        )
+        if data.shape != self._shape:
+            raise ValueError(
+                f"uploaded data must keep shape {self._shape}, got {data.shape}"
+            )
+        self._to_gpu_current()
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self._storage.buffer)
+        GL.glBufferSubData(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            self._offset * 4,
+            self.nbytes,
+            data,
+        )
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        # A partial write invalidates any cached full-storage host image.
+        self._storage.host = None
+        self._storage.gpu_valid = True
         return self
 
     def discard_host(self) -> "GLChunk":
@@ -2675,6 +2705,12 @@ def _compile(source: str) -> int:
 
     _program_cache[key] = program
     return program
+
+
+def compile_glsl_source(source: str) -> int:
+    """Compile one fully composed GLSL compute-shader source."""
+
+    return _compile(source)
 
 
 def _annotate(source: str, log: Any) -> str:

@@ -25,7 +25,6 @@ from ..common.tensors.fused_ir import (
     ordered_feed_ids,
 )
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
-from .process_graph_contract import NON_VALUE_EDGE_ROLES
 
 
 @dataclass(frozen=True)
@@ -66,6 +65,234 @@ class ProcessGraphDispatchPlan:
     backend: str
     regions: tuple[DispatchRegion, ...]
     uncovered_nodes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ScheduledOperatorPattern:
+    """One same-operator batch at one existing ProcessGraph schedule level."""
+
+    level: int
+    operator: str
+    node_ids: tuple[int, ...]
+    batch_index: int
+    batch_count: int
+
+
+@dataclass(frozen=True)
+class FlatComputeDispatch:
+    """One ordered backend dispatch described directly by scheduled nodes."""
+
+    kind: str
+    node_ids: tuple[int, ...]
+    levels: tuple[int, ...]
+    operator_pattern: tuple[str, ...]
+    dependency_columns: tuple[tuple[int, ...], ...] = ()
+
+    @property
+    def operation_count(self) -> int:
+        return len(self.node_ids)
+
+
+@dataclass(frozen=True)
+class ScheduledProcessGraphDispatchPlan:
+    """Flat serialization of the ProcessGraph's existing execution schedule."""
+
+    patterns: tuple[ScheduledOperatorPattern, ...]
+    dispatches: tuple[FlatComputeDispatch, ...]
+    dependency_columns: tuple[tuple[int, ...], ...]
+    levels: tuple[tuple[int, tuple[int, ...]], ...]
+    node_locations: Mapping[int, tuple[int, int]]
+
+
+def _isolated_dependency_columns(
+    graph: ProcessGraph,
+    levels: Mapping[int, int],
+    topological: tuple[int, ...],
+    cap: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Find maximal scheduled chains with no internal fan-in or fan-out."""
+
+    visited: set[int] = set()
+    columns: list[tuple[int, ...]] = []
+    for start in topological:
+        if start in visited:
+            continue
+        predecessors = tuple(graph.G.predecessors(start))
+        is_continuation = (
+            len(predecessors) == 1
+            and graph.G.out_degree(predecessors[0]) == 1
+            and int(levels[start]) == int(levels[predecessors[0]]) + 1
+        )
+        if is_continuation:
+            continue
+
+        chain = [start]
+        current = start
+        while True:
+            successors = tuple(graph.G.successors(current))
+            if len(successors) != 1:
+                break
+            successor = successors[0]
+            if (
+                graph.G.in_degree(successor) != 1
+                or int(levels[successor]) != int(levels[current]) + 1
+            ):
+                break
+            chain.append(successor)
+            current = successor
+
+        if len(chain) < 2:
+            continue
+        visited.update(chain)
+        for offset in range(0, len(chain), cap):
+            part = tuple(chain[offset:offset + cap])
+            if len(part) > 1:
+                columns.append(part)
+            elif part:
+                visited.discard(part[0])
+    return tuple(columns)
+
+
+def serialize_scheduled_operator_dispatches(
+    graph: ProcessGraph,
+    *,
+    max_nodes_per_dispatch: int = 256,
+    schedule: str = "asap",
+) -> ScheduledProcessGraphDispatchPlan:
+    """Serialize scheduled operator batches and linear forward-record runs.
+
+    The ProcessGraph scheduler remains authoritative.  Within each level,
+    nodes with the same operation form one pattern and are split only at the
+    explicit dispatch cap.  Consecutive levels containing exactly one node are
+    emitted as a single ``forward_record`` dispatch; all other patterns become
+    ordinary same-operator batches.
+    """
+
+    cap = int(max_nodes_per_dispatch)
+    if cap < 1:
+        raise ValueError("max_nodes_per_dispatch must be positive")
+    if not nx.is_directed_acyclic_graph(graph.G):
+        raise ValueError(
+            "scheduled dispatch serialization requires an acyclic graph"
+        )
+
+    computed = graph.compute_levels(method=schedule, order="dependency")
+    levels = computed if computed is not None else graph.levels
+    topological = tuple(nx.topological_sort(graph.G))
+    order_index = {
+        node_id: index for index, node_id in enumerate(topological)
+    }
+
+    level_nodes: dict[int, list[int]] = {}
+    for node_id in topological:
+        level_nodes.setdefault(int(levels[node_id]), []).append(node_id)
+
+    patterns: list[ScheduledOperatorPattern] = []
+    for level in sorted(level_nodes):
+        by_operator: dict[str, list[int]] = {}
+        for node_id in sorted(
+            level_nodes[level],
+            key=order_index.__getitem__,
+        ):
+            by_operator.setdefault(_operation(graph, node_id), []).append(
+                node_id
+            )
+        for operator, node_ids in by_operator.items():
+            batch_count = (len(node_ids) + cap - 1) // cap
+            for batch_index, start in enumerate(range(0, len(node_ids), cap)):
+                patterns.append(
+                    ScheduledOperatorPattern(
+                        level=level,
+                        operator=operator,
+                        node_ids=tuple(node_ids[start:start + cap]),
+                        batch_index=batch_index,
+                        batch_count=batch_count,
+                    )
+                )
+
+    dependency_columns = _isolated_dependency_columns(
+        graph,
+        levels,
+        topological,
+        cap,
+    )
+    column_nodes = {
+        node_id
+        for column in dependency_columns
+        for node_id in column
+    }
+
+    # Columns with the same level span and operation sequence are independent
+    # instances of one forward record.  Group them into the outer batch
+    # dimension without exceeding the same explicit node cap.
+    column_groups: dict[
+        tuple[tuple[int, ...], tuple[str, ...]],
+        list[tuple[int, ...]],
+    ] = {}
+    for column in dependency_columns:
+        key = (
+            tuple(int(levels[node_id]) for node_id in column),
+            tuple(_operation(graph, node_id) for node_id in column),
+        )
+        column_groups.setdefault(key, []).append(column)
+
+    dispatches: list[FlatComputeDispatch] = []
+    for (column_levels, operator_pattern), columns in column_groups.items():
+        columns_per_dispatch = max(1, cap // len(operator_pattern))
+        for start in range(0, len(columns), columns_per_dispatch):
+            batch = tuple(columns[start:start + columns_per_dispatch])
+            dispatches.append(
+                FlatComputeDispatch(
+                    kind="forward_record",
+                    node_ids=tuple(
+                        node_id for column in batch for node_id in column
+                    ),
+                    levels=column_levels,
+                    operator_pattern=operator_pattern,
+                    dependency_columns=batch,
+                )
+            )
+
+    for pattern in patterns:
+        remaining = tuple(
+            node_id
+            for node_id in pattern.node_ids
+            if node_id not in column_nodes
+        )
+        if not remaining:
+            continue
+        dispatches.append(
+            FlatComputeDispatch(
+                kind="operator_batch",
+                node_ids=remaining,
+                levels=(pattern.level,),
+                operator_pattern=(pattern.operator,),
+            )
+        )
+
+    dispatches.sort(
+        key=lambda dispatch: (
+            min(dispatch.levels),
+            min(order_index[node_id] for node_id in dispatch.node_ids),
+        )
+    )
+
+    node_locations = {
+        node_id: (dispatch_index, lane_index)
+        for dispatch_index, dispatch in enumerate(dispatches)
+        for lane_index, node_id in enumerate(dispatch.node_ids)
+    }
+    serialized_levels = tuple(
+        (level, tuple(level_nodes[level]))
+        for level in sorted(level_nodes)
+    )
+    return ScheduledProcessGraphDispatchPlan(
+        patterns=tuple(patterns),
+        dispatches=tuple(dispatches),
+        dependency_columns=dependency_columns,
+        levels=serialized_levels,
+        node_locations=node_locations,
+    )
 
 
 def _node_payload(
@@ -208,7 +435,7 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
 
 def _operation(graph: ProcessGraph, node_id: int) -> str:
     data = graph.G.nodes[node_id]
-    return str(data.get("op") or data.get("label"))
+    return str(data.get("op") or data.get("type") or data.get("label"))
 
 
 def plan_process_graph_dispatches(
@@ -233,15 +460,7 @@ def plan_process_graph_dispatches(
         for node_id in graph.G
         if _operation(graph, node_id) in profile.fusible_ops
     }
-    induced = nx.DiGraph()
-    induced.add_nodes_from(fusible)
-    induced.add_edges_from(
-        (left, right)
-        for left, right, data in graph.G.edges(data=True)
-        if left in fusible
-        and right in fusible
-        and data.get("role") not in NON_VALUE_EDGE_ROLES
-    )
+    induced = graph.G.subgraph(fusible)
     components = list(nx.weakly_connected_components(induced))
     topological = list(nx.topological_sort(graph.G))
     order_index = {node_id: index for index, node_id in enumerate(topological)}
@@ -257,19 +476,13 @@ def plan_process_graph_dispatches(
             node_id
             for node_id in topological
             if node_id not in node_set
-            and any(
-                child in node_set
-                and graph.G.edges[node_id, child].get("role")
-                not in NON_VALUE_EDGE_ROLES
-                for child in graph.G.successors(node_id)
-            )
+            and any(child in node_set for child in graph.G.successors(node_id))
             and _operation(graph, node_id) != "const"
         )
         output_names: dict[int, str] = {}
         for node_id in nodes:
             for child in graph.G.successors(node_id):
-                role = graph.G.edges[node_id, child].get("role")
-                if child in node_set or role in NON_VALUE_EDGE_ROLES:
+                if child in node_set:
                     continue
                 child_data = graph.G.nodes[child]
                 if _operation(graph, child) == "return":
@@ -293,8 +506,6 @@ def plan_process_graph_dispatches(
             1
             for left, right in graph.G.edges
             if left in node_set and right in node_set
-            and graph.G.edges[left, right].get("role")
-            not in NON_VALUE_EDGE_ROLES
         )
         score = (
             max(0, len(nodes) - 1) * profile.launch_cost
@@ -334,11 +545,7 @@ def dispatch_region_to_fused_program(
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         op, _ = canonical_elementwise_op(_operation(graph, node_id))
-        parents = [
-            (parent, role)
-            for parent, role in (data.get("parents") or ())
-            if role not in NON_VALUE_EDGE_ROLES
-        ]
+        parents = list(data.get("parents") or ())
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
         for parent_id, _role in parents:
@@ -376,8 +583,12 @@ def dispatch_region_to_fused_program(
 __all__ = [
     "BackendFusionProfile",
     "DispatchRegion",
+    "FlatComputeDispatch",
     "ProcessGraphDispatchPlan",
+    "ScheduledOperatorPattern",
+    "ScheduledProcessGraphDispatchPlan",
     "dispatch_region_to_fused_program",
     "fused_program_to_process_graph",
     "plan_process_graph_dispatches",
+    "serialize_scheduled_operator_dispatches",
 ]

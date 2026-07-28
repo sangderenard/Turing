@@ -1,6 +1,17 @@
 import numpy as np
 import sympy
 
+from ..common.tensors.fused_ir import (
+    ELEMENTWISE_BINARY,
+    ELEMENTWISE_UNARY,
+)
+from ..common.tensors.operator_catalog import (
+    ACCESSOR_OPERATORS,
+    CANONICAL_ABSTRACT_TENSOR_OPERATORS,
+    CREATION_OPERATORS,
+    OPERATOR_ALIASES,
+)
+
 try:  # optional heavy dependency
     import torch  # type: ignore
 except Exception:  # pragma: no cover - optional dep
@@ -8,6 +19,7 @@ except Exception:  # pragma: no cover - optional dep
 
 SIMD_DEFAULT_CONCURRENCY = 4
 numpy_funcs, torch_funcs, numpy_sigs, torch_sigs = {}, {}, {}, {}
+abstract_tensor_funcs, abstract_tensor_sigs = {}, {}
 # -------------------------------------------------
 #  Anonymous signature definitions (shared objects)
 # -------------------------------------------------
@@ -567,6 +579,467 @@ torch_funcs.update({
 })
 
 
+# -------------------------------------------------
+# AbstractTensor ProcessGraph execution table
+# -------------------------------------------------
+#
+# This is the same ProcessGraph backend-table contract used by ``numpy_funcs``
+# and ``torch_funcs`` above.  The functions deliberately operate through the
+# public AbstractTensor surface instead of selecting a concrete implementation:
+# the tensor operands retain their NumPy, Torch/CUDA, C, GLSL, or other
+# registered backend all the way through graph execution.
+def _abstract_tensor_values(*values):
+    if len(values) == 1 and isinstance(values[0], (list, tuple)):
+        return list(values[0])
+    return list(values)
+
+
+def _abstract_tensor_reduce(binary):
+    def apply(*values):
+        operands = _abstract_tensor_values(*values)
+        if not operands:
+            raise ValueError("AbstractTensor operation requires an operand")
+        result = operands[0]
+        for operand in operands[1:]:
+            result = binary(result, operand)
+        return result
+    return apply
+
+
+def _abstract_tensor_method(name):
+    def apply(*values):
+        operands = _abstract_tensor_values(*values)
+        if not operands:
+            raise ValueError(f"AbstractTensor.{name} requires an operand")
+        return getattr(operands[0], name)(*operands[1:])
+    return apply
+
+
+def _abstract_tensor_attribute(name):
+    def apply(*values):
+        operands = _abstract_tensor_values(*values)
+        if len(operands) != 1:
+            raise ValueError(
+                f"AbstractTensor attribute {name} expects one operand"
+            )
+        return getattr(operands[0], name)
+    return apply
+
+
+def _abstract_tensor_primitive(name):
+    def apply(*values):
+        operands = _abstract_tensor_values(*values)
+        if len(operands) != 1:
+            raise ValueError(
+                f"AbstractTensor primitive {name} expects one operand"
+            )
+        tensor = operands[0]
+        return tensor._apply_operator(name, tensor, None)
+    return apply
+
+
+def _abstract_tensor_static(name):
+    def apply(*values):
+        from ..common.tensors.abstraction import AbstractTensor
+        return getattr(AbstractTensor, name)(*_abstract_tensor_values(*values))
+    return apply
+
+
+def _abstract_tensor_constant(value):
+    def build(*_values):
+        from ..common.tensors.abstraction import AbstractTensor
+        return AbstractTensor.get_tensor(value)
+    return build
+
+
+def _abstract_tensor_tuple(*values):
+    return tuple(_abstract_tensor_values(*values))
+
+
+def _abstract_tensor_identity(*values):
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor identity operation requires an operand")
+    return operands[0]
+
+
+def _abstract_tensor_index(*values):
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor indexing requires a tensor operand")
+    if len(operands) < 2:
+        return operands[0]
+    index = tuple(operands[1:])
+    if len(index) == 1:
+        index = index[0]
+    return operands[0][index]
+
+
+def _abstract_tensor_sum(*values):
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor sum requires an operand")
+    return operands[0].sum(*operands[1:])
+
+
+def _abstract_tensor_maximum(*values):
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor maximum requires an operand")
+    result = operands[0]
+    for operand in operands[1:]:
+        result = result.maximum(operand)
+    return result
+
+
+def _abstract_tensor_minimum(*values):
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor minimum requires an operand")
+    result = operands[0]
+    for operand in operands[1:]:
+        result = result.minimum(operand)
+    return result
+
+
+def _abstract_tensor_stack(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+    return AbstractTensor.stack(_abstract_tensor_values(*values), dim=0)
+
+
+def _abstract_tensor_cat(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+    return AbstractTensor.cat(_abstract_tensor_values(*values), dim=0)
+
+
+def _abstract_tensor_where(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+    operands = _abstract_tensor_values(*values)
+    if len(operands) != 3:
+        raise ValueError("AbstractTensor where expects condition, true, false")
+    return AbstractTensor.where(operands[0], operands[1], operands[2])
+
+
+def _abstract_tensor_topk(*values):
+    from ..common.tensors.abstraction import AbstractTensor
+    operands = _abstract_tensor_values(*values)
+    if not operands:
+        raise ValueError("AbstractTensor topk requires a tensor operand")
+    return AbstractTensor.topk(*operands)
+
+
+def _abstract_tensor_erf(*values):
+    """Backend-neutral erf approximation composed from AbstractTensor ops."""
+    operands = _abstract_tensor_values(*values)
+    if len(operands) != 1:
+        raise ValueError("AbstractTensor erf expects one operand")
+    value = operands[0]
+    magnitude = value.abs()
+    t = 1.0 / (1.0 + 0.3275911 * magnitude)
+    polynomial = (
+        (
+            (
+                (
+                    1.061405429 * t
+                    - 1.453152027
+                ) * t
+                + 1.421413741
+            ) * t
+            - 0.284496736
+        ) * t
+        + 0.254829592
+    ) * t
+    return value.sign() * (1.0 - polynomial * (-(magnitude * magnitude)).exp())
+
+
+_at_add = _abstract_tensor_reduce(lambda left, right: left + right)
+_at_sub = _abstract_tensor_reduce(lambda left, right: left - right)
+_at_mul = _abstract_tensor_reduce(lambda left, right: left * right)
+_at_div = _abstract_tensor_reduce(lambda left, right: left / right)
+_at_mod = _abstract_tensor_reduce(lambda left, right: left % right)
+_at_pow = _abstract_tensor_reduce(lambda left, right: left ** right)
+_at_matmul = _abstract_tensor_reduce(lambda left, right: left @ right)
+_at_and = _abstract_tensor_reduce(lambda left, right: left & right)
+_at_or = _abstract_tensor_reduce(lambda left, right: left | right)
+_at_xor = _abstract_tensor_reduce(lambda left, right: left ^ right)
+
+abstract_tensor_funcs = {
+    # SymPy/ProcessGraph spellings.
+    "Add": _at_add,
+    "Sub": _at_sub,
+    "Mul": _at_mul,
+    "Div": _at_div,
+    "Mod": _at_mod,
+    "Pow": _at_pow,
+    "Rational": _at_div,
+    "MatMult": _at_matmul,
+    "And": _at_and,
+    "Or": _at_or,
+    "Not": _abstract_tensor_method("logical_not"),
+    "Equality": _abstract_tensor_reduce(lambda left, right: left == right),
+    "Unequality": _abstract_tensor_reduce(lambda left, right: left != right),
+    "StrictLessThan": _abstract_tensor_reduce(lambda left, right: left < right),
+    "LessThanOrEqual": _abstract_tensor_reduce(lambda left, right: left <= right),
+    "StrictGreaterThan": _abstract_tensor_reduce(lambda left, right: left > right),
+    "GreaterThanOrEqual": _abstract_tensor_reduce(lambda left, right: left >= right),
+    "Sin": _abstract_tensor_method("sin"),
+    "Cos": _abstract_tensor_method("cos"),
+    "Tan": _abstract_tensor_method("tan"),
+    "Exp": _abstract_tensor_method("exp"),
+    "Log": _abstract_tensor_method("log"),
+    "Sqrt": _abstract_tensor_method("sqrt"),
+    "Abs": _abstract_tensor_method("abs"),
+    "Sum": _abstract_tensor_sum,
+    "Max": _abstract_tensor_maximum,
+    "Min": _abstract_tensor_minimum,
+    "Indexed": _abstract_tensor_index,
+    "IndexedBase": _abstract_tensor_identity,
+    "Idx": _abstract_tensor_index,
+    "MatrixElement": _abstract_tensor_index,
+    "MatrixSymbol": _abstract_tensor_identity,
+    "Store": _abstract_tensor_identity,
+    "Tuple": _abstract_tensor_tuple,
+    "ExprCondPair": _abstract_tensor_tuple,
+    "Piecewise": lambda *values: _abstract_tensor_where(
+        _abstract_tensor_values(*values)[2],
+        _abstract_tensor_values(*values)[0],
+        _abstract_tensor_values(*values)[1],
+    ),
+    "BooleanTrue": _abstract_tensor_constant(True),
+    "BooleanFalse": _abstract_tensor_constant(False),
+    "Float": _abstract_tensor_static("get_tensor"),
+    "Half": _abstract_tensor_constant(0.5),
+    "Pi": _abstract_tensor_constant(np.pi),
+    "E": _abstract_tensor_constant(np.e),
+    "ImaginaryUnit": _abstract_tensor_constant(1j),
+
+    # Canonical AbstractTensor and Python-call spellings.  Keeping these in
+    # the same table lets ProcessGraph nodes produced by AST, SymPy, tape, or
+    # another graph importer share one backend adapter.
+    "add": _at_add,
+    "sub": _at_sub,
+    "mul": _at_mul,
+    "div": _at_div,
+    "truediv": _at_div,
+    "mod": _at_mod,
+    "pow": _at_pow,
+    "matmul": _at_matmul,
+    "bitand": _at_and,
+    "bitor": _at_or,
+    "bitxor": _at_xor,
+    "logical_and": _at_and,
+    "logical_or": _at_or,
+    "logical_not": _abstract_tensor_method("logical_not"),
+    "equal": _abstract_tensor_reduce(lambda left, right: left == right),
+    "not_equal": _abstract_tensor_reduce(lambda left, right: left != right),
+    "less": _abstract_tensor_reduce(lambda left, right: left < right),
+    "less_equal": _abstract_tensor_reduce(lambda left, right: left <= right),
+    "greater": _abstract_tensor_reduce(lambda left, right: left > right),
+    "greater_equal": _abstract_tensor_reduce(lambda left, right: left >= right),
+    "sin": _abstract_tensor_method("sin"),
+    "cos": _abstract_tensor_method("cos"),
+    "tan": _abstract_tensor_method("tan"),
+    "asin": _abstract_tensor_method("asin"),
+    "acos": _abstract_tensor_method("acos"),
+    "atan": _abstract_tensor_method("atan"),
+    "sinh": _abstract_tensor_method("sinh"),
+    "cosh": _abstract_tensor_method("cosh"),
+    "tanh": _abstract_tensor_method("tanh"),
+    "asinh": _abstract_tensor_method("asinh"),
+    "acosh": _abstract_tensor_method("acosh"),
+    "atanh": _abstract_tensor_method("atanh"),
+    "exp": _abstract_tensor_method("exp"),
+    "erf": _abstract_tensor_erf,
+    "log": _abstract_tensor_method("log"),
+    "sqrt": _abstract_tensor_method("sqrt"),
+    "abs": _abstract_tensor_method("abs"),
+    "sign": _abstract_tensor_method("sign"),
+    "round": _abstract_tensor_primitive("round"),
+    "trunc": _abstract_tensor_primitive("trunc"),
+    "floor": _abstract_tensor_primitive("floor"),
+    "ceil": _abstract_tensor_primitive("ceil"),
+    "ceiling": _abstract_tensor_primitive("ceil"),
+    "isfinite": _abstract_tensor_method("isfinite"),
+    "isnan": _abstract_tensor_method("isnan"),
+    "isinf": _abstract_tensor_method("isinf"),
+    "maximum": _abstract_tensor_maximum,
+    "minimum": _abstract_tensor_minimum,
+    "sum": _abstract_tensor_sum,
+    "mean": _abstract_tensor_method("mean"),
+    "max": _abstract_tensor_method("max"),
+    "min": _abstract_tensor_method("min"),
+    "reshape": _abstract_tensor_method("reshape"),
+    "view": _abstract_tensor_method("view"),
+    "flatten": _abstract_tensor_method("flatten"),
+    "transpose": _abstract_tensor_method("transpose"),
+    "permute": _abstract_tensor_method("permute"),
+    "unsqueeze": _abstract_tensor_method("unsqueeze"),
+    "squeeze": _abstract_tensor_method("squeeze"),
+    "repeat": _abstract_tensor_method("repeat"),
+    "repeat_interleave": _abstract_tensor_method("repeat_interleave"),
+    "swapaxes": _abstract_tensor_method("swapaxes"),
+    "eye_like": _abstract_tensor_method("eye_like"),
+    "zeros_like": _abstract_tensor_method("zeros_like"),
+    "ones_like": _abstract_tensor_method("ones_like"),
+    "full_like": _abstract_tensor_method("full_like"),
+    "rand_like": _abstract_tensor_method("rand_like"),
+    "randn": _abstract_tensor_method("randn"),
+    "randint_like": _abstract_tensor_method("randint_like"),
+    "argmax": _abstract_tensor_method("argmax"),
+    "argmin": _abstract_tensor_method("argmin"),
+    "prod": _abstract_tensor_method("prod"),
+    "all": _abstract_tensor_method("all"),
+    "any": _abstract_tensor_method("any"),
+    "nonzero": _abstract_tensor_method("nonzero"),
+    "isinfinite": _abstract_tensor_method("isinfinite"),
+    "allclose": _abstract_tensor_method("allclose"),
+    "argwhere": _abstract_tensor_method("argwhere"),
+    "sec": _abstract_tensor_method("sec"),
+    "csc": _abstract_tensor_method("csc"),
+    "cot": _abstract_tensor_method("cot"),
+    "sech": _abstract_tensor_method("sech"),
+    "csch": _abstract_tensor_method("csch"),
+    "coth": _abstract_tensor_method("coth"),
+    "sinc": _abstract_tensor_method("sinc"),
+    "deg2rad": _abstract_tensor_method("deg2rad"),
+    "rad2deg": _abstract_tensor_method("rad2deg"),
+    "to": _abstract_tensor_method("to"),
+    "astype": _abstract_tensor_method("astype"),
+    "long_cast": _abstract_tensor_method("long_cast"),
+    "float": _abstract_tensor_method("float"),
+    "double": _abstract_tensor_method("double"),
+    "int": _abstract_tensor_method("int"),
+    "long": _abstract_tensor_method("long"),
+    "bool": _abstract_tensor_method("bool"),
+    "cpu": _abstract_tensor_method("cpu"),
+    "cuda": _abstract_tensor_method("cuda"),
+    "softmax": _abstract_tensor_method("softmax"),
+    "log_softmax": _abstract_tensor_method("log_softmax"),
+    "pad": _abstract_tensor_method("pad"),
+    "gather": _abstract_tensor_method("gather"),
+    "topk": _abstract_tensor_topk,
+    "stack": _abstract_tensor_stack,
+    "cat": _abstract_tensor_cat,
+    "concat": _abstract_tensor_cat,
+    "concatenate": _abstract_tensor_cat,
+    "where": _abstract_tensor_where,
+    "dot": _abstract_tensor_static("dot"),
+    "norm": _abstract_tensor_static("norm"),
+    "cross": _abstract_tensor_static("cross"),
+    "trace": _abstract_tensor_static("trace"),
+    "det": _abstract_tensor_static("det"),
+    "solve": _abstract_tensor_static("solve"),
+    "inv": _abstract_tensor_static("inv"),
+    "inverse": _abstract_tensor_static("inverse"),
+    "eigh": _abstract_tensor_static("eigh"),
+    "cholesky": _abstract_tensor_static("cholesky"),
+    "fft": _abstract_tensor_method("fft"),
+    "ifft": _abstract_tensor_method("ifft"),
+    "tuple": _abstract_tensor_tuple,
+    "store": _abstract_tensor_identity,
+}
+
+# Complete the ProcessGraph execution table from the canonical AbstractTensor
+# inventory.  Bespoke handlers above remain authoritative; this fills only
+# names whose ordinary behavior is a public method, constructor, primitive, or
+# observable tensor attribute.
+_attribute_operator_names = {"device", "dtype", "ndim", "shape", "tensor_type"}
+_static_operator_targets = {
+    name: name for name in CREATION_OPERATORS
+}
+_static_operator_targets.update(
+    {
+        "load": "load",
+        "pi": "pi",
+        # The public compatibility spelling omits the backend-hook suffix.
+        "tensor_from_list": "tensor_from_list_",
+    }
+)
+for _name in sorted(CANONICAL_ABSTRACT_TENSOR_OPERATORS):
+    if _name in abstract_tensor_funcs:
+        continue
+    if _name in _attribute_operator_names:
+        _handler = _abstract_tensor_attribute(_name)
+    elif _name in _static_operator_targets:
+        _handler = _abstract_tensor_static(_static_operator_targets[_name])
+    elif _name in ELEMENTWISE_UNARY:
+        _handler = _abstract_tensor_primitive(_name)
+    elif _name == "floordiv":
+        _handler = _abstract_tensor_reduce(
+            lambda left, right: left // right
+        )
+    else:
+        _handler = _abstract_tensor_method(_name)
+    abstract_tensor_funcs[_name] = _handler
+
+for _alias, _canonical in OPERATOR_ALIASES.items():
+    abstract_tensor_funcs.setdefault(
+        _alias,
+        abstract_tensor_funcs[_canonical],
+    )
+
+_abstract_tensor_unary_names = {
+    "Sin", "Cos", "Tan", "Exp", "Log", "Sqrt", "Abs", "Not",
+    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
+    "tanh", "asinh", "acosh", "atanh", "exp", "log", "sqrt", "abs",
+    "sign", "round", "trunc", "floor", "ceil", "ceiling", "isfinite",
+    "isnan", "isinf", "isinfinite", "logical_not", "argmax", "argmin",
+    "prod", "all", "any", "nonzero", "argwhere", "sec", "csc", "cot",
+    "sech", "csch", "coth", "sinc", "deg2rad", "rad2deg", "float",
+    "double", "int", "long", "bool", "cpu", "cuda", "det", "inv", "erf",
+    "inverse", "cholesky", "fft", "ifft",
+}
+_abstract_tensor_binary_names = {
+    "Add", "Sub", "Mul", "Div", "Mod", "Pow", "Rational", "MatMult",
+    "And", "Or", "Equality", "Unequality", "StrictLessThan",
+    "LessThanOrEqual", "StrictGreaterThan", "GreaterThanOrEqual",
+    "add", "sub", "mul", "div", "truediv", "mod", "pow", "matmul",
+    "bitand", "bitor", "bitxor", "logical_and", "logical_or", "equal",
+    "not_equal", "less", "less_equal", "greater", "greater_equal",
+    "maximum", "minimum", "allclose", "dot", "cross", "solve",
+}
+_abstract_tensor_constant_names = {
+    "BooleanTrue", "BooleanFalse", "Half", "Pi", "E", "ImaginaryUnit",
+    "MatrixSymbol",
+}
+_abstract_tensor_store_names = {"Store", "store"}
+abstract_tensor_sigs = {
+    name: (
+        sig_constant
+        if name in _abstract_tensor_constant_names
+        else sig_store
+        if name in _abstract_tensor_store_names
+        else sig_unary_elementwise
+        if name in _abstract_tensor_unary_names
+        else sig_binary_elementwise
+        if name in _abstract_tensor_binary_names
+        else operator_signatures.get(name, sig_sum_like)
+    )
+    for name in abstract_tensor_funcs
+}
+
+# Constructors may have no tensor-valued predecessor; accessors always consume
+# exactly one.  The remaining newly catalogued methods conservatively retain
+# the established variadic tensor-method schema.
+_sig_creation = {
+    'min_inputs': 0, 'max_inputs': None,
+    'min_outputs': 1, 'max_outputs': None,
+    'concurrency': SIMD_DEFAULT_CONCURRENCY,
+    'allows_inplace': False,
+}
+for _name in CREATION_OPERATORS | {"load", "pi"}:
+    abstract_tensor_sigs[_name] = _sig_creation
+for _name in ACCESSOR_OPERATORS:
+    abstract_tensor_sigs[_name] = sig_unary_elementwise
+for _alias, _canonical in OPERATOR_ALIASES.items():
+    abstract_tensor_sigs[_alias] = abstract_tensor_sigs[_canonical]
+
+# Make the shared ProcessGraph signature surface aware of the canonical
+# AbstractTensor spellings without replacing any established SymPy/AST entry.
+for _name, _signature in abstract_tensor_sigs.items():
+    operator_signatures.setdefault(_name, _signature)
+
+
 
 numpy_sigs = {k: v for k, v in operator_signatures.items() if k in numpy_funcs}
 torch_sigs = {k: v for k, v in operator_signatures.items() if k in torch_funcs}
@@ -657,7 +1130,9 @@ numpy_funcs = debug_numpy_funcs
 #!/usr/bin/env python3
 """
 Generate a name_map from Sympy node names to SSA Handler enum.
-Collects all keys from operator_defs handler dicts (default_funcs, numpy_funcs, torch_funcs, math_funcs) and outputs a mapping suitable for SympyToSSA name_map.
+Collects all keys from operator_defs handler dicts (default_funcs, numpy_funcs,
+torch_funcs, abstract_tensor_funcs, math_funcs) and outputs a mapping suitable
+for SympyToSSA name_map.
 """
 
 from . import operator_defs
@@ -670,6 +1145,7 @@ def main():
     key_sets.append(set(operator_defs.default_funcs.keys()))
     key_sets.append(set(operator_defs.numpy_funcs.keys()))
     key_sets.append(set(operator_defs.torch_funcs.keys()))
+    key_sets.append(set(operator_defs.abstract_tensor_funcs.keys()))
     # Include math_funcs if available
     if hasattr(operator_defs, 'math_funcs'):
         key_sets.append(set(operator_defs.math_funcs.keys()))

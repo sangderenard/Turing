@@ -1,15 +1,12 @@
-"""Whole-source Mandelbrot-to-JFIF ProcessGraph entry point.
-
-The numerical function composes the original Mandelbrot, palette, and JPEG
-functions.  ``build_mandelbrot_encoder_process_graph`` imports this file, the
-original demo file, and every compression source file as one semantic program.
-It does not execute or record an AbstractTensor tape.
-"""
+"""One explicit AbstractTensor Mandelbrot-to-JFIF ProcessGraph entry point."""
 
 from __future__ import annotations
 
 import ast
-import copy
+import contextlib
+import io
+import inspect
+import textwrap
 from pathlib import Path
 
 from ..abstraction import AbstractTensor
@@ -57,7 +54,7 @@ def mandelbrot_display_master(
     return counts, luminance, blue_difference, red_difference
 
 
-def mandelbrot_jpeg_master(
+def mandelbrot_recording_program(
     unit_x: AbstractTensor,
     unit_y: AbstractTensor,
     center_x: AbstractTensor,
@@ -72,18 +69,33 @@ def mandelbrot_jpeg_master(
     width: int,
     height: int,
     iterations: int,
-    resources,
+    avi_writer,
+    audio_samples=None,
+    resources=None,
 ):
-    """Compose the original solve and complete 4:4:4 JFIF encoder."""
+    """Solve, encode one JPEG frame, then interleave it into an AVI stream."""
 
-    # Avoid eagerly importing the demo/UI module from this source-compiler
-    # entrypoint. The AST resolves these original definitions from the supplied
-    # source bundle; ordinary execution imports them when the master is called.
     from .demo_mandelbrot_fusion import (
         mandelbrot_jpeg_planes,
         parametric_mandelbrot_escape,
     )
-    from ..compression.jpeg.frame import encode_ycbcr_jfif
+    from ..autograd import autograd
+    from ..compression.block_transform import (
+        block_view_2d,
+        dct_2d_blocks,
+    )
+    from ..compression.coefficient_events import (
+        collect_component_block_coefficient_events,
+        slice_block_coefficient_events,
+    )
+    from ..compression.jpeg.frame import (
+        _EntropyTensorAccumulator,
+        _color_header,
+        prepare_jpeg_encoding_resources,
+    )
+    from ..compression.jpeg.scan import (
+        encode_baseline_color_component_scan,
+    )
 
     counts = parametric_mandelbrot_escape(
         unit_x,
@@ -107,233 +119,160 @@ def mandelbrot_jpeg_master(
         blue_difference.reshape(height, width),
         red_difference.reshape(height, width),
     )
-    encoded = encode_ycbcr_jfif(
-        planes,
-        mcu_rows_per_batch=(height + 7) // 8,
-        resources=resources,
+    resources = resources or prepare_jpeg_encoding_resources(planes[0])
+
+    with autograd.no_grad():
+        # Keep every numerical compression stage in this submitted function:
+        # component batching/blocking -> DCT -> quantization -> rounding ->
+        # zigzag ordering.  Each operation remains ordinary AbstractTensor
+        # composition and therefore stays visible to ProcessGraph lowering.
+        component_samples = AbstractTensor.stack(planes, dim=0)
+        blocks = block_view_2d(
+            component_samples - 128.0,
+            block_height=8,
+            block_width=8,
+        )
+        transformed = dct_2d_blocks(
+            blocks,
+            basis=resources.dct_basis,
+        )
+        scaled = transformed / resources.ycbcr_quantization
+        quantized = scaled.sign() * ((scaled.abs() + 0.500001) // 1)
+        flattened = quantized.reshape(
+            *(quantized.shape[:-2] + (64,))
+        )
+        coefficients = flattened[..., resources.zigzag]
+
+        # Coefficient events are the explicit boundary between the numerical
+        # tensor transform and the canonical JPEG Huffman tables.
+        events = collect_component_block_coefficient_events(
+            coefficients,
+            max_magnitude_bits=11,
+            previous_dc=(0, 0, 0),
+        )
+        block_count = coefficients[0].reshape(-1, 64).shape[0]
+        y_events = slice_block_coefficient_events(
+            events,
+            0,
+            block_count,
+        )
+        chroma_events = slice_block_coefficient_events(
+            events,
+            block_count,
+            block_count * 3,
+        )
+        huffman_scan = encode_baseline_color_component_scan(
+            y_events,
+            chroma_events,
+            luma_dc_table=resources.luma_dc_table,
+            luma_ac_table=resources.luma_ac_table,
+            chroma_dc_table=resources.chroma_dc_table,
+            chroma_ac_table=resources.chroma_ac_table,
+        )
+        entropy = _EntropyTensorAccumulator()
+        entropy_bytes = entropy.append(huffman_scan, final=True)
+        trailing_bytes = entropy.finish()
+
+    jpeg_frame = b"".join(
+        (
+            _color_header(height, width),
+            entropy_bytes,
+            trailing_bytes,
+            b"\xFF\xD9",
+        )
     )
-    return counts, encoded
+
+    # AVI/OpenDML framing and A/V ordering remain explicit in the same
+    # ProcessGraph entrypoint: one video packet, followed by its PCM packet.
+    avi_writer.append_frame(jpeg_frame)
+    if audio_samples is not None:
+        avi_writer.append_audio_tensor(audio_samples)
+
+    return counts, planes, coefficients, jpeg_frame
 
 
-def mandelbrot_encoder_source_files() -> tuple[Path, ...]:
-    """Return the original source bundle constituting the master program."""
-
-    tensor_root = Path(__file__).resolve().parents[1]
-    compression = tensor_root / "compression"
-    sources = [
-        Path(__file__).resolve(),
-        Path(__file__).with_name("demo_mandelbrot_fusion.py"),
-    ]
-    sources.extend(sorted(compression.rglob("*.py")))
-    return tuple(sources)
+# Compatibility name for callers that used the former entrypoint spelling.
+mandelbrot_jpeg_master = mandelbrot_recording_program
 
 
 def mandelbrot_recording_function_ast() -> ast.Module:
-    """Put the complete recording program inside one extracted function AST.
+    """Load only the saved, explicit AbstractTensor program into Python AST."""
 
-    The source files remain authoritative. A source-level dependency walk
-    collects the definitions referenced by ``animate_glsl``; no ProcessGraph
-    is built during this step. Those original definitions are copied into the
-    body of one outer function, followed by the original recording entrypoint
-    body. The returned module has exactly one top-level definition and is the
-    sole input to ProcessGraph ingestion.
-    """
-
-    parsed_sources: list[tuple[str, ast.Module]] = []
-    candidates: dict[
-        str,
-        list[
-            tuple[
-                str,
-                ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-            ]
-        ],
-    ] = {}
-    for source_path in mandelbrot_encoder_source_files():
-        resolved = str(source_path.resolve())
-        tree = ast.parse(
-            source_path.read_text(encoding="utf-8"),
-            filename=resolved,
-        )
-        parsed_sources.append((resolved, tree))
-        for statement in tree.body:
-            if isinstance(
-                statement,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                candidates.setdefault(statement.name, []).append(
-                    (resolved, statement)
-                )
-
-    roots = [
-        item for item in candidates.get("animate_glsl", ())
-        if Path(item[0]).name == "demo_mandelbrot_fusion.py"
-    ]
-    if len(roots) != 1:
-        raise RuntimeError("animate_glsl source definition is ambiguous")
-
-    selected: dict[
-        tuple[str, str, int | None],
-        ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-    ] = {}
-    pending = [roots[0]]
-
-    def select_candidate(
-        name: str,
-        *,
-        referring_file: str,
-    ) -> tuple[
-        str,
-        ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-    ] | None:
-        options = candidates.get(name, ())
-        local = [item for item in options if item[0] == referring_file]
-        if len(local) == 1:
-            return local[0]
-        if len(options) == 1:
-            return options[0]
-        return None
-
-    while pending:
-        source_name, definition = pending.pop()
-        key = (
-            source_name,
-            definition.name,
-            getattr(definition, "lineno", None),
-        )
-        if key in selected:
-            continue
-        selected[key] = definition
-        referenced_names = {
-            node.id
-            for node in ast.walk(definition)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-        }
-        for call in (
-            node for node in ast.walk(definition)
-            if isinstance(node, ast.Call)
-        ):
-            if isinstance(call.func, ast.Name):
-                referenced_names.add(call.func.id)
-            elif isinstance(call.func, ast.Attribute):
-                referenced_names.add(call.func.attr)
-            for keyword in call.keywords:
-                if (
-                    keyword.arg == "entrypoint"
-                    and isinstance(keyword.value, ast.Constant)
-                    and isinstance(keyword.value.value, str)
-                ):
-                    referenced_names.add(keyword.value.value)
-        for name in referenced_names:
-            candidate = select_candidate(
-                name,
-                referring_file=source_name,
-            )
-            if candidate is not None:
-                pending.append(candidate)
-
-    selected_files = {key[0] for key in selected}
-
-    root: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-    dependencies: list[ast.stmt] = []
-    support: list[ast.stmt] = []
-    for resolved, tree in parsed_sources:
-        if resolved in selected_files:
-            support.extend(
-                copy.deepcopy(statement)
-                for statement in tree.body
-                if isinstance(
-                    statement,
-                    (ast.Import, ast.Assign, ast.AnnAssign),
-                )
-                or (
-                    isinstance(statement, ast.ImportFrom)
-                    and statement.module != "__future__"
-                )
-            )
-        for statement in tree.body:
-            if not isinstance(
-                statement,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                continue
-            key = (resolved, statement.name, getattr(statement, "lineno", None))
-            if key not in selected:
-                continue
-            if statement.name == "animate_glsl":
-                if not isinstance(
-                    statement, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ):
-                    raise TypeError("animate_glsl must be a function")
-                root = copy.deepcopy(statement)
-            else:
-                dependencies.append(copy.deepcopy(statement))
-
-    if root is None:
-        raise RuntimeError("animate_glsl source definition was not found")
-
-    master = ast.FunctionDef(
-        name="mandelbrot_recording_program",
-        args=copy.deepcopy(root.args),
-        body=[*support, *dependencies, *copy.deepcopy(root.body)],
-        decorator_list=[],
-        returns=copy.deepcopy(root.returns),
-        type_comment=getattr(root, "type_comment", None),
+    source = textwrap.dedent(inspect.getsource(mandelbrot_recording_program))
+    return ast.parse(
+        source,
+        filename=str(Path(__file__).resolve()),
     )
-    ast.copy_location(master, root)
-    module = ast.Module(body=[master], type_ignores=[])
-    return ast.fix_missing_locations(module)
+
+
+def mandelbrot_display_function_ast() -> ast.Module:
+    """Collect the complete solve/display/encode entrypoint program AST."""
+
+    from .demo_mandelbrot_fusion import (
+        mandelbrot_jpeg_planes,
+        parametric_mandelbrot_escape,
+    )
+
+    source = "\n\n".join(
+        textwrap.dedent(inspect.getsource(function))
+        for function in (
+            parametric_mandelbrot_escape,
+            mandelbrot_jpeg_planes,
+            mandelbrot_display_master,
+            mandelbrot_recording_program,
+        )
+    )
+    return ast.parse(source, filename=str(Path(__file__).resolve()))
 
 
 def build_mandelbrot_encoder_process_graph(
     *,
     profile: str = "tensor_control",
-    entrypoint: str = "mandelbrot_jpeg_master",
+    entrypoint: str = "mandelbrot_recording_program",
 ):
-    """Ingest the source bundle without executing the program.
-
-    ``tensor_control`` is the numerical compiler projection, ``program`` keeps
-    every node in the transitive entrypoint program, and ``complete`` retains
-    the entire source bundle for syntax-coverage and archaeology audits.
-    """
+    """Build the complete structural solve/JPEG/AVI ProcessGraph."""
 
     from ....transmogrifier.graph.graph_express2 import ProcessGraph
 
     graph = ProcessGraph(materialize_memory=False)
-    graph.build_from_ast(
-        mandelbrot_encoder_source_files(),
-        entrypoint=entrypoint,
-        profile=profile,
-    )
-    return graph
-
-
-def build_mandelbrot_recording_process_graph(*, profile: str = "program"):
-    """Ingest one function AST containing the complete recording program."""
-
-    from ....transmogrifier.graph.graph_express2 import ProcessGraph
-
-    graph = ProcessGraph(materialize_memory=False)
-    graph.build_from_ast(
-        mandelbrot_recording_function_ast(),
-        filename="<mandelbrot_recording_program>",
-        entrypoint="mandelbrot_recording_program",
-        profile=profile,
-    )
+    # The legacy structural importer still prints its node walk
+    # unconditionally.  That diagnostic is not part of this demo's compiler
+    # contract, so keep it out of the live render/profile stream.
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(mandelbrot_display_function_ast())
     graph.G.graph.update(
-        program_name="mandelbrot_recording",
-        program_entrypoint="mandelbrot_recording_program",
-        source_entrypoint="animate_glsl",
-        single_function_ast=True,
+        program_name="mandelbrot_display",
+        program_entrypoint=entrypoint,
+        semantic_profile=profile,
     )
     return graph
+
+
+def build_mandelbrot_recording_process_graph():
+    """Submit the complete saved recording function to ``build_from_ast``."""
+
+    from ....transmogrifier.graph.graph_express2 import ProcessGraph
+    from ..topological_reducer import reduce_abstract_tensor_topology
+
+    program_ast = mandelbrot_recording_function_ast()
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_ast(program_ast)
+    graph.G.graph.update(
+        program_name="mandelbrot_recording_program",
+        program_entrypoint="mandelbrot_recording_program",
+        source_kind="python_ast",
+        source_scope="solve_through_avi",
+    )
+    reduced_graph = reduce_abstract_tensor_topology(graph)
+    return reduced_graph
 
 
 __all__ = [
     "build_mandelbrot_encoder_process_graph",
     "build_mandelbrot_recording_process_graph",
+    "mandelbrot_display_function_ast",
     "mandelbrot_display_master",
-    "mandelbrot_encoder_source_files",
     "mandelbrot_jpeg_master",
     "mandelbrot_recording_function_ast",
+    "mandelbrot_recording_program",
 ]

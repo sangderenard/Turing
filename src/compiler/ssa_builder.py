@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Dict, List, TYPE_CHECKING
 
 from ..transmogrifier.ssa import SSAValue, Instr
-from .process_graph_contract import NON_VALUE_EDGE_ROLES
 
 if TYPE_CHECKING:  # pragma: no cover - optional heavy deps
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
@@ -40,11 +39,7 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
         expr_obj = data.get("expr_obj")
         if op is None and expr_obj is not None:
             op = type(expr_obj).__name__
-        parent_items = [
-            (parent, role)
-            for parent, role in data.get("parents", [])
-            if role not in NON_VALUE_EDGE_ROLES
-        ]
+        parent_items = list(data.get("parents", []))
         parents = [p for p, _ in parent_items]
         roles = [role for _, role in parent_items]
         tensor = data.get("tensor") or {}

@@ -17,6 +17,33 @@ from __future__ import annotations
 import textwrap, inspect, hashlib, types
 from typing import Any, Callable, Dict, List, Tuple
 
+import networkx as nx
+
+
+def _graph_input_name(label: str) -> str:
+    """Return the established keyword name for one graph input."""
+
+    import re
+
+    name = str(label).strip()
+    lowered = name.lower()
+    match = re.match(r"([a-zA-Z]+)[_\d]*$", lowered)
+    root = match.group(1) if match else lowered
+    if root in ("i", "j", "k", "l", "m", "n"):
+        prefix = "int"
+    elif (
+        lowered.startswith("num")
+        or lowered.endswith("idx")
+        or lowered.isdigit()
+    ):
+        prefix = "int"
+    elif lowered.startswith("is_") or lowered.startswith("has_"):
+        prefix = "bool"
+    else:
+        prefix = "float"
+    return f"{prefix}{name}"
+
+
 class GraphDeepCompiler:
     """Compile a *level‑sorted* ProcessGraph into one Python function."""
 
@@ -27,6 +54,11 @@ class GraphDeepCompiler:
         self.pg        = pg
         self.op_table  = op_table
         self.op_table["Store"] = lambda a: a  # Store just returns its input
+        from ..function_table import FunctionTable
+        self.function_table = getattr(pg, "function_table", None)
+        if self.function_table is None:
+            self.function_table = FunctionTable()
+            pg.function_table = self.function_table
         self._code     = None          # str
         self._fn       = None          # compiled callable
         self.signatures = signatures
@@ -53,6 +85,121 @@ class GraphDeepCompiler:
     def print_source(self):
         """Print the generated source for the compiled graph."""
         print(self._code)
+
+    @classmethod
+    def assemble_function_table(
+        cls,
+        function_table,
+        op_table: Dict[str, Callable],
+        signatures: Dict[str, Dict[str, Any]],
+        *,
+        target: str = "python",
+        device=None,
+    ):
+        """Compile function graphs against predeclared callable slots."""
+
+        from ..function_table import StaticFunctionSlot
+
+        entries = sorted(
+            (
+                entry
+                for entry in function_table
+                if entry.graph is not None
+            ),
+            key=lambda entry: entry.reference.address,
+        )
+        slots = {
+            entry.reference: StaticFunctionSlot(entry.reference)
+            for entry in entries
+        }
+        for reference, slot in slots.items():
+            function_table.install_implementation(reference, target, slot)
+
+        definitions = {}
+        for entry in entries:
+            reference = entry.reference
+            if (
+                not entry.graph.levels
+                or set(entry.graph.levels) != set(entry.graph.G)
+            ):
+                if not nx.is_directed_acyclic_graph(entry.graph.G):
+                    raise RuntimeError(
+                        "a function body ProcessGraph must remain acyclic; "
+                        "recursion belongs in its Call reference"
+                    )
+                levels = {}
+                for node_id in nx.topological_sort(entry.graph.G):
+                    levels[node_id] = max(
+                        (
+                            levels[parent] + 1
+                            for parent in entry.graph.G.predecessors(node_id)
+                        ),
+                        default=0,
+                    )
+                entry.graph.levels = levels
+
+            compiler = cls(
+                entry.graph,
+                dict(op_table),
+                signatures,
+            )
+            raw_definition = compiler.build_function(device=device)
+            positional = tuple(
+                entry.graph.G.graph.get("positional_parameters", ())
+            )
+            keyword_only = tuple(
+                entry.graph.G.graph.get("keyword_only_parameters", ())
+            )
+
+            def bind_definition(
+                raw=raw_definition,
+                positional_names=positional,
+                keyword_only_names=keyword_only,
+            ):
+                def definition(*args, **kwargs):
+                    if len(args) > len(positional_names):
+                        raise TypeError(
+                            "too many positional arguments for compiled "
+                            "ProcessGraph function"
+                        )
+                    values = dict(zip(positional_names, args))
+                    valid_names = {
+                        *positional_names,
+                        *keyword_only_names,
+                    }
+                    for name, value in kwargs.items():
+                        if name not in valid_names:
+                            raise TypeError(
+                                f"unexpected keyword argument {name!r}"
+                            )
+                        if name in values:
+                            raise TypeError(
+                                f"multiple values for argument {name!r}"
+                            )
+                        values[name] = value
+                    missing = valid_names.difference(values)
+                    if missing:
+                        names = ", ".join(sorted(missing))
+                        raise TypeError(
+                            "missing arguments for compiled ProcessGraph "
+                            f"function: {names}"
+                        )
+                    outputs = raw(
+                        **{
+                            _graph_input_name(name): values[name]
+                            for name in valid_names
+                        }
+                    )
+                    return outputs[0] if len(outputs) == 1 else outputs
+
+                return definition
+
+            definition = bind_definition()
+            slots[reference].bind(definition)
+            entry.metadata[f"{target}_source"] = compiler._code
+            definitions[reference] = slots[reference]
+
+        return definitions
 
     # ------------------------------------------------------------------
     # helpers
@@ -86,60 +233,37 @@ class GraphDeepCompiler:
             if ntype in ("Symbol", "Input", "Var", "IndexedBase", "Integer", "NegativeOne", "One", "Zero"):
                 # pure argument
                 label = node["label"]
-                def parse_guess_type_from_string_content(s):
-                    try:
-                        int(s)
-                        return "int"
-                    except Exception:
-                        try:
-                            float(s)
-                            return "float"
-                        except Exception:
-                            # Variable name heuristics (single-letter or known schemes)
-                            import re
-
-                            def parse_common_variable_schemes(name):
-                                name = name.strip()
-                                name_lower = name.lower()
-                                
-                                # Regex: root letters, then digits or _digits (subscript/numeral)
-                                m = re.match(r"([a-zA-Z]+)[_\d]*$", name_lower)
-                                root = m.group(1) if m else name_lower
-
-                                # Single-letter/symbolic float variables
-                                if root in ("x", "y", "z", "t", "a", "b", "c"):
-                                    return "float"
-                                # Single-letter int/index variables
-                                if root in ("i", "j", "k", "l", "m", "n"):
-                                    return "int"
-                                # Explicit int hints (common for indexing, etc.)
-                                if (
-                                    name_lower.startswith("num") or
-                                    name_lower.endswith("idx") or
-                                    root in ("n", "k") or
-                                    name_lower.isdigit()
-                                ):
-                                    return "int"
-                                # Explicit float hints
-                                if (
-                                    name_lower.startswith("float") or
-                                    name_lower.endswith("val") or
-                                    name_lower.endswith("amp") or
-                                    name_lower.endswith("pos")
-                                ):
-                                    return "float"
-                                # Boolean flags
-                                if name_lower.startswith("is_") or name_lower.startswith("has_"):
-                                    return "bool"
-                                # Fallback
-                                return "float"
-                            return parse_common_variable_schemes(s)
                 if ntype in ("Symbol", "Input", "Var"):
-                    lines.append(f"{indent}{lhs} = inputs['{parse_guess_type_from_string_content(label)}{label}']")
+                    lines.append(
+                        f"{indent}{lhs} = inputs[{_graph_input_name(label)!r}]"
+                    )
                 elif ntype in ("IndexedBase"):
                     lines.append(f"{indent}{lhs} = inputs['domain{''.join(self.pg.G.nodes[nid]['domain_shape'])}{label}']")
                 else:
                     lines.append(f"{indent}{lhs} = {label}")
+                continue
+
+            if ntype in ("Const", "Constant"):
+                if "constant" in node:
+                    literal = node["constant"]
+                else:
+                    expression = node.get("expr_obj")
+                    if not hasattr(expression, "value"):
+                        raise KeyError(
+                            f"{ntype} node {nid} has no literal payload"
+                        )
+                    literal = expression.value
+                if isinstance(literal, str):
+                    literal = literal.encode("utf-8")
+                if literal is not Ellipsis and not isinstance(
+                    literal,
+                    (bytes, int, float, complex, bool, type(None)),
+                ):
+                    raise TypeError(
+                        f"{ntype} node {nid} has unsupported literal type "
+                        f"{type(literal).__name__}"
+                    )
+                lines.append(f"{indent}{lhs} = {literal!r}")
                 continue
                 
 
@@ -149,6 +273,66 @@ class GraphDeepCompiler:
                 lhs = f"v{nid}"
                 rhs = f" {op_map} ".join(f"v{pid}" for pid, _ in node["parents"])
                 lines.append(f"{indent}{lhs} = {rhs}")
+                continue
+            elif ntype == "Call":
+                role_parents = list(node["parents"])
+                attributes = dict(node.get("attributes") or {})
+                callee_ref = attributes.get("callee_ref")
+                target = None
+                if callee_ref is not None:
+                    entry = self.function_table.entry(callee_ref)
+                    target = self.function_table.implementation(
+                        callee_ref,
+                        "python",
+                    )
+                    if target is None:
+                        target = entry.python_callable
+
+                if target is None:
+                    callee = next(
+                        (
+                            parent
+                            for parent, role in role_parents
+                            if role in {"func", "callee"}
+                        ),
+                        None,
+                    )
+                    if callee is None:
+                        raise KeyError(
+                            f"Call node {nid} has no resolved function "
+                            "reference or callee input"
+                        )
+                    callee_expression = f"v{callee}"
+                else:
+                    callee_name = f"function_{callee_ref}"
+                    env[callee_name] = target
+                    callee_expression = callee_name
+
+                positional = [
+                    f"v{parent}"
+                    for parent, role in role_parents
+                    if role in {"args", "arg"}
+                    or str(role).startswith("arg:")
+                ]
+                keywords = []
+                unresolved_keywords = []
+                for parent, role in role_parents:
+                    role = str(role)
+                    if role.startswith("kw:"):
+                        keywords.append(
+                            f"{role[3:]}=v{parent}"
+                        )
+                    elif role in {"keywords", "keyword"}:
+                        unresolved_keywords.append(parent)
+                if unresolved_keywords:
+                    raise KeyError(
+                        f"Call node {nid} has unresolved AST keyword nodes "
+                        f"{unresolved_keywords}"
+                    )
+                arguments = ", ".join((*positional, *keywords))
+                lines.append(
+                    f"{indent}{lhs} = {callee_expression}({arguments})"
+                )
                 continue
             else:
                 # operator

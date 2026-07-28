@@ -155,13 +155,19 @@ def capture_parametric_mandelbrot_encoder(iterations: int):
 
 
 def compile_parametric_mandelbrot_glsl(iterations: int):
-    """Refuse the deleted AST-reinterpretation compiler shortcut."""
+    """Submit the whole recording ProcessGraph through GLSL deployment."""
 
-    raise RuntimeError(
-        "ProcessGraph-to-GLSL compilation is unavailable: the structural AST "
-        "reinterpretation shortcut was removed because it did not compile "
-        "the ProcessGraph's scheduled operation and control nodes."
+    from ....compiler.glsl_deployment_strategy import (
+        strategize_glsl_deployment,
     )
+    from .mandelbrot_encoder_program import (
+        build_mandelbrot_recording_process_graph,
+    )
+
+    graph = build_mandelbrot_recording_process_graph()
+    deployment_class = strategize_glsl_deployment(graph)
+    deployment = deployment_class(iterations=int(iterations))
+    return deployment, graph
 
 
 def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
@@ -517,9 +523,7 @@ def animate_glsl(
         shader_cache_stats,
     )
 
-    compile_started = time.perf_counter()
     program, _ = compile_parametric_mandelbrot_glsl(iterations)
-    compile_ms = (time.perf_counter() - compile_started) * 1e3
     unit_x, unit_y = normalized_plane(width, height)
 
     pygame.init()
@@ -539,8 +543,7 @@ def animate_glsl(
         f"gpu     : {info['renderer']} (context: {info['source']})\n"
         f"program : {program.source_node_count} selected ProcessGraph nodes -> "
         f"{program.primitive_count} GLSL primitives + "
-        f"{program.loop_count} structured loop; one dispatch\n"
-        f"compile : {compile_ms:.1f} ms AST/ProcessGraph/source",
+        f"{program.loop_count} structured loop; one dispatch",
         flush=True,
     )
 
@@ -643,24 +646,30 @@ def animate_glsl(
             flush=True,
         )
 
+    initial_scalar_values = np.asarray(
+        [
+            center.real,
+            center.imag,
+            span,
+            0.0,
+            -0.72,
+            0.24,
+            0.0,
+            0.52,
+        ],
+        np.float32,
+    )
+    # Scalar controls are rewritten every frame.  A small resident ring keeps
+    # that 32-byte upload from waiting on the preceding dispatch's read of the
+    # same SSBO.
+    scalar_feed_ring = tuple(
+        GLChunk.from_numpy(initial_scalar_values).to_gpu()
+        for _ in range(4)
+    )
     feeds = {
         "unit_x": GLChunk.from_numpy(unit_x).to_gpu(),
         "unit_y": GLChunk.from_numpy(unit_y).to_gpu(),
-        program.scalar_buffer_name: GLChunk.from_numpy(
-            np.asarray(
-                [
-                    center.real,
-                    center.imag,
-                    span,
-                    0.0,
-                    -0.72,
-                    0.24,
-                    0.0,
-                    0.52,
-                ],
-                np.float32,
-            )
-        ).to_gpu(),
+        program.scalar_buffer_name: scalar_feed_ring[0],
     }
     fused_outputs = {
         name: GLChunk((height * width,), dtype=dtype).to_gpu()
@@ -821,7 +830,8 @@ def animate_glsl(
                 "palette_phase": palette_phase,
                 "color_drive": color_drive,
             }
-            feeds[program.scalar_buffer_name].update_numpy(
+            scalar_feed = scalar_feed_ring[frame % len(scalar_feed_ring)]
+            scalar_feed.update_numpy(
                 np.asarray(
                     [
                         scalar_values[name]
@@ -830,6 +840,7 @@ def animate_glsl(
                     np.float32,
                 )
             ).to_gpu()
+            feeds[program.scalar_buffer_name] = scalar_feed
             uploads_finished = time.perf_counter()
             query = None
             if profile:
@@ -994,7 +1005,7 @@ def animate_glsl(
                     flush=True,
                 )
     finally:
-        for chunk in feeds.values():
+        for chunk in (feeds["unit_x"], feeds["unit_y"], *scalar_feed_ring):
             chunk.release()
         for chunk in fused_outputs.values():
             chunk.release()

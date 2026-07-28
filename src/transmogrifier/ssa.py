@@ -30,6 +30,7 @@
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
+from .function_table import FunctionTable
 
 # -----------------------------------------------------------------------------
 # Core SSA Data Structures
@@ -95,6 +96,7 @@ class Function:
 @dataclass
 class IRModule:
     functions: Dict[str, Function]
+    function_table: FunctionTable = field(default_factory=FunctionTable)
 
 # -----------------------------------------------------------------------------
 # Correlator for Language <-> SSA Operation Mappings
