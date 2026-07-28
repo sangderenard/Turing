@@ -1,10 +1,9 @@
-"""Mandelbrot/JPEG compiler demo awaiting complete AST-to-ProcessGraph input.
+"""Mandelbrot/JPEG demo awaiting a real ProcessGraph-to-GLSL compiler.
 
-The former GradTape-to-FusedProgram shortcut is deliberately disabled. It
-captured only an executed elementwise prefix and therefore did not represent
-the encoder or its control flow. The mathematical and rendering helpers remain
-here, but the capture entry points fail until the complete program is compiled
-through AST -> ProcessGraph before backend optimization and lowering.
+The former structural-AST reinterpretation shortcut is deliberately removed.
+The mathematical, compression, and rendering helpers remain here, but GLSL
+compilation must not resume until it consumes the ProcessGraph's scheduled
+operation and control nodes directly.
 """
 
 from __future__ import annotations
@@ -156,45 +155,13 @@ def capture_parametric_mandelbrot_encoder(iterations: int):
 
 
 def compile_parametric_mandelbrot_glsl(iterations: int):
-    """Compile the AST/ProcessGraph display program to one structured shader."""
+    """Refuse the deleted AST-reinterpretation compiler shortcut."""
 
-    from ....compiler.glsl_process_graph import compile_process_graph_glsl
-    from ..fused_ir import Meta
-    from .mandelbrot_encoder_program import (
-        build_mandelbrot_encoder_process_graph,
+    raise RuntimeError(
+        "ProcessGraph-to-GLSL compilation is unavailable: the structural AST "
+        "reinterpretation shortcut was removed because it did not compile "
+        "the ProcessGraph's scheduled operation and control nodes."
     )
-
-    tensor_inputs = (
-        "unit_x",
-        "unit_y",
-        "center_x",
-        "center_y",
-        "span",
-        "family_mix",
-        "julia_x",
-        "julia_y",
-        "palette_phase",
-        "color_drive",
-    )
-    graph = build_mandelbrot_encoder_process_graph(
-        entrypoint="mandelbrot_display_master"
-    )
-    compiled = compile_process_graph_glsl(
-        graph,
-        specializations={"iterations": int(iterations)},
-        input_meta={
-            name: Meta(dtype="float32", device="glsl")
-            for name in tensor_inputs
-        },
-        scalar_tensor_inputs=tensor_inputs[2:],
-        output_names=(
-            "counts",
-            "luminance",
-            "blue_difference",
-            "red_difference",
-        ),
-    )
-    return compiled, graph
 
 
 def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
