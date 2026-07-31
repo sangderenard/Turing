@@ -517,6 +517,24 @@
                     after * sizeof(double));
     }
 
+    void slice_copy_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, int start, int step, int count) {
+        int before = 1;
+        int after = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        int source_count = shape[dim];
+        for (int b = 0; b < before; ++b)
+            for (int j = 0; j < count; ++j)
+                memcpy(
+                    output + (b * count + j) * after,
+                    input + (
+                        b * source_count + start + j * step
+                    ) * after,
+                    after * sizeof(double));
+    }
+
     void index_assign_double(
         double* target, const int* shape, int ndim,
         const int* axis_offsets, const int* axis_indices,
@@ -526,33 +544,34 @@
             return;
         }
         int selected_count = 1;
-        int target_stride = 1;
-        int* selection_stride = (int*)malloc(ndim * sizeof(int));
-        int* target_strides = (int*)malloc(ndim * sizeof(int));
-        if (!selection_stride || !target_strides) {
-            free(selection_stride);
-            free(target_strides);
-            return;
-        }
-        for (int axis = ndim - 1; axis >= 0; --axis) {
+        for (int axis = 0; axis < ndim; ++axis) {
             int axis_count = axis_offsets[axis + 1] - axis_offsets[axis];
-            selection_stride[axis] = selected_count;
             selected_count *= axis_count;
-            target_strides[axis] = target_stride;
-            target_stride *= shape[axis];
         }
         for (int flat = 0; flat < selected_count; ++flat) {
             int target_flat = 0;
             for (int axis = 0; axis < ndim; ++axis) {
                 int axis_count = axis_offsets[axis + 1] - axis_offsets[axis];
-                int coordinate = (flat / selection_stride[axis]) % axis_count;
+                int selection_stride = 1;
+                int target_stride = 1;
+                for (int later = axis + 1; later < ndim; ++later) {
+                    selection_stride *= (
+                        axis_offsets[later + 1] - axis_offsets[later]
+                    );
+                    target_stride *= shape[later];
+                }
+                int coordinate = (flat / selection_stride) % axis_count;
                 int selected = axis_indices[axis_offsets[axis] + coordinate];
-                target_flat += selected * target_strides[axis];
+                target_flat += selected * target_stride;
             }
             target[target_flat] = values[value_count == 1 ? 0 : flat];
         }
-        free(selection_stride);
-        free(target_strides);
+    }
+
+    void sign_double(const double* input, double* output, int n) {
+        for (int i = 0; i < n; ++i)
+            output[i] = input[i] > 0.0 ? 1.0 : (
+                input[i] < 0.0 ? -1.0 : 0.0);
     }
 
     int count_true_double(const double* mask, int n) {

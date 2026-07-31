@@ -1,5 +1,6 @@
 from io import BytesIO
 
+import numpy as np
 import pytest
 
 from src.common.tensors.abstraction import AbstractTensor as AT
@@ -7,7 +8,40 @@ from src.common.tensors.compression.jpeg.frame import (
     encode_color_jfif,
     encode_grayscale_jfif,
     encode_jfif,
+    encode_jfif_resident,
 )
+
+
+def test_resident_jfif_packet_matches_host_serialization():
+    samples = np.arange(8 * 8 * 3, dtype=np.float32).reshape(8, 8, 3)
+    with AT.use_backend("numpy"):
+        tensor = AT.tensor(samples)
+        resident = encode_jfif_resident(tensor)
+        expected = encode_jfif(tensor)
+
+    assert resident.to_bytes() == expected
+
+
+def test_glsl_resident_jfif_packet_matches_numpy():
+    from src.common.tensors.accelerator_backends.glsl_backend import (
+        GLContextUnavailable,
+        require_gl_context,
+    )
+
+    try:
+        require_gl_context()
+    except GLContextUnavailable as exc:
+        pytest.skip(f"no OpenGL 4.3+ compute context: {exc}")
+
+    samples = np.arange(8 * 8 * 3, dtype=np.float32).reshape(8, 8, 3)
+    with AT.use_backend("numpy"):
+        expected = encode_jfif(AT.tensor(samples))
+    with AT.use_backend("glsl"):
+        resident = encode_jfif_resident(AT.tensor(samples))
+
+    assert resident.to_bytes() == expected
+
+
 from src.common.tensors.compression.jpeg.huffman import (
     JPEG_AC_LUMINANCE_SYMBOLS,
     jpeg_standard_ac_luminance,

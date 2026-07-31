@@ -4,6 +4,7 @@ import numpy as np
 import ast
 import importlib
 import inspect
+import os
 import textwrap
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
@@ -15,6 +16,7 @@ from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
 import colorsys
 import random
+import time
 from collections import deque
 
 class _RandomFloatQueue(deque):
@@ -82,14 +84,76 @@ def _source_ast_definition(value):
     )
 
 
+def _filter_discovered_definition(definition, module):
+    """Discard unreferenced class surface before recursive discovery."""
+
+    if not isinstance(definition, ast.ClassDef):
+        return definition
+    requested_attributes = {
+        node.func.attr
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    }
+    methods = {
+        member.name: member
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    retained_methods = requested_attributes | {"__new__", "__init__"}
+    pending = list(retained_methods)
+    while pending:
+        method_name = pending.pop()
+        method = methods.get(method_name)
+        if method is None:
+            continue
+        dependencies = {
+            node.func.attr
+            for node in ast.walk(method)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"self", "cls"}
+            )
+        }
+        for dependency in dependencies - retained_methods:
+            retained_methods.add(dependency)
+            pending.append(dependency)
+    retained_body = [
+        member
+        for member in definition.body
+        if isinstance(member, (ast.Assign, ast.AnnAssign))
+        or (
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name
+            in retained_methods
+        )
+    ]
+    if not retained_body:
+        retained_body = [ast.copy_location(ast.Pass(), definition)]
+    filtered = ast.ClassDef(
+        name=definition.name,
+        bases=[],
+        keywords=[],
+        body=retained_body,
+        decorator_list=[],
+        type_params=list(getattr(definition, "type_params", ())),
+    )
+    return ast.copy_location(filtered, definition)
+
+
 def _ast_definition_bindings(value):
     """Obtain names needed only while recursively discovering source AST."""
 
     if inspect.ismethod(value):
         value = value.__func__
     module = inspect.getmodule(value)
-    bindings = dict(vars(module)) if module is not None else {}
+    bindings = {}
     if inspect.isfunction(value):
+        # getclosurevars returns only names actually referenced by this
+        # function.  Copying vars(module) here makes unrelated module members
+        # look eligible for discovery and destroys lexical ownership.
         closure = inspect.getclosurevars(value)
         bindings.update(closure.builtins)
         bindings.update(closure.globals)
@@ -114,6 +178,26 @@ def _ast_definition_bindings(value):
                 ]
                 if parameters:
                     bindings[parameters[0].arg] = owner
+    elif inspect.isclass(value) and module is not None:
+        definition = _source_ast_definition(value)
+        referenced_names = (
+            {
+                member.id
+                for member in ast.walk(definition)
+                if isinstance(member, ast.Name)
+                and isinstance(member.ctx, ast.Load)
+            }
+            if definition is not None
+            else set()
+        )
+        module_bindings = vars(module)
+        bindings.update(
+            {
+                name: module_bindings[name]
+                for name in referenced_names
+                if name in module_bindings
+            }
+        )
     return bindings
 
 
@@ -155,6 +239,7 @@ def _expand_unresolved_ast_parents(
     *,
     package=None,
     include=None,
+    profile_verbose=False,
 ):
     """Discover missing source definitions and return AST parent links.
 
@@ -169,7 +254,13 @@ def _expand_unresolved_ast_parents(
         module = ast.Module(body=[tree], type_ignores=[])
         ast.fix_missing_locations(module)
 
-    bindings = _import_ast_bindings(module, bindings, package=package)
+    root_bindings = _import_ast_bindings(module, bindings, package=package)
+    # Resolution context belongs to the definition containing a call.  Never
+    # merge module globals from one discovered function into another
+    # function's namespace: globals are lookup material, not dependency edges.
+    node_bindings = {
+        id(member): root_bindings for member in ast.walk(module)
+    }
     definitions = [
         node
         for node in ast.walk(module)
@@ -180,16 +271,32 @@ def _expand_unresolved_ast_parents(
     ]
     definitions_by_name = {}
     for definition in definitions:
+        definition._python_bindings = root_bindings
         definitions_by_name.setdefault(definition.name, []).append(definition)
 
     unavailable_identities = set()
     target_definitions = {}
+    started = time.perf_counter()
+    pass_index = 0
     while True:
+        pass_index += 1
         added_definition = False
+        if profile_verbose:
+            print(
+                "[ast-parent-profile] "
+                f"pass={pass_index} definitions={len(definitions)} "
+                f"calls={sum(isinstance(node, ast.Call) for node in ast.walk(module))} "
+                f"elapsed={time.perf_counter() - started:.3f}s",
+                flush=True,
+            )
         for node in tuple(ast.walk(module)):
             if not isinstance(node, ast.Call):
                 continue
-            target = _resolve_ast_parent_reference(node.func, bindings)
+            call_bindings = node_bindings.get(id(node), root_bindings)
+            target = _resolve_ast_parent_reference(
+                node.func,
+                call_bindings,
+            )
             identity_target = (
                 target.__func__ if inspect.ismethod(target) else target
             )
@@ -222,7 +329,9 @@ def _expand_unresolved_ast_parents(
             existing = definitions_by_name.get(call_name, ())
             if len(existing) == 1:
                 target_definitions[identity] = existing[0]
-                bindings.update(_ast_definition_bindings(identity_target))
+                existing[0]._python_bindings = _ast_definition_bindings(
+                    identity_target
+                )
                 continue
 
             source_target = identity_target
@@ -230,14 +339,32 @@ def _expand_unresolved_ast_parents(
             if isinstance(node.func, ast.Attribute):
                 owner = _resolve_ast_parent_reference(
                     node.func.value,
-                    bindings,
+                    call_bindings,
                 )
-                if inspect.isclass(owner):
-                    source_target = owner
             source_definition = _source_ast_definition(source_target)
             if source_definition is None:
                 unavailable_identities.add(identity)
                 continue
+            process_graph_boundary = getattr(
+                source_target,
+                "__process_graph_boundary__",
+                None,
+            )
+            if process_graph_boundary is not None:
+                # Preserve an explicitly declared terminal boundary while the
+                # callable is still available for source discovery.  Ordinary
+                # discovered functions retain AST only; this callable marker
+                # is intentionally limited to the declared host crossing.
+                source_definition._process_graph_boundary = (
+                    process_graph_boundary
+                )
+                source_definition._process_graph_boundary_callable = (
+                    source_target
+                )
+            source_definition = _filter_discovered_definition(
+                source_definition,
+                module,
+            )
 
             module.body.append(source_definition)
             new_definitions = [
@@ -258,28 +385,18 @@ def _expand_unresolved_ast_parents(
                     new_definition.name,
                     [],
                 ).append(new_definition)
-            if inspect.isclass(owner):
-                method_candidates = [
-                    member
-                    for member in source_definition.body
-                    if isinstance(
-                        member,
-                        (ast.FunctionDef, ast.AsyncFunctionDef),
-                    )
-                    and member.name == node.func.attr
-                ]
-                definition = (
-                    method_candidates[0]
-                    if len(method_candidates) == 1
-                    else source_definition
-                )
-            else:
-                definition = source_definition
+            # Attribute selection is a dependency edge to the selected
+            # attribute, not to every definition on its owning object.  Keep
+            # the owner available to _ast_definition_bindings() as lexical
+            # context for self/cls, but ingest only the requested method AST.
+            # Appending the whole class here makes unrelated methods look like
+            # executed dependencies and recursively pulls their callees into
+            # the submitted program.
+            definition = source_definition
             target_definitions[identity] = definition
-            bindings.update(_ast_definition_bindings(source_target))
-            bindings = _import_ast_bindings(
+            definition_bindings = _import_ast_bindings(
                 source_definition,
-                bindings,
+                _ast_definition_bindings(source_target),
                 package=str(
                     getattr(
                         inspect.getmodule(source_target),
@@ -289,6 +406,19 @@ def _expand_unresolved_ast_parents(
                     or ""
                 ),
             )
+            for member in ast.walk(source_definition):
+                node_bindings[id(member)] = definition_bindings
+            for new_definition in new_definitions:
+                new_definition._python_bindings = definition_bindings
+            if profile_verbose:
+                print(
+                    "[ast-parent-profile] "
+                    f"resolved={identity[0]}.{identity[1]} "
+                    f"new_definitions={len(new_definitions)} "
+                    f"total_definitions={len(definitions)} "
+                    f"elapsed={time.perf_counter() - started:.3f}s",
+                    flush=True,
+                )
             added_definition = True
         if not added_definition:
             break
@@ -298,7 +428,11 @@ def _expand_unresolved_ast_parents(
     for call in (
         node for node in ast.walk(module) if isinstance(node, ast.Call)
     ):
-        target = _resolve_ast_parent_reference(call.func, bindings)
+        call_bindings = node_bindings.get(id(call), root_bindings)
+        target = _resolve_ast_parent_reference(
+            call.func,
+            call_bindings,
+        )
         if inspect.ismethod(target):
             target = target.__func__
         definition = None
@@ -314,14 +448,14 @@ def _expand_unresolved_ast_parents(
                 ),
             )
             definition = target_definitions.get(identity)
-        if definition is None:
-            if isinstance(call.func, ast.Name):
-                name = call.func.id
-            elif isinstance(call.func, ast.Attribute):
-                name = call.func.attr
-            else:
-                name = None
-            candidates = definitions_by_name.get(name, ())
+        if definition is None and isinstance(call.func, ast.Name):
+            # A lexical function name can be matched to its unique in-scope
+            # definition.  An attribute spelling cannot: ``items.append`` is
+            # not a reference to an unrelated discovered class's ``append``
+            # method.  Owner resolution above is the only sound way to link
+            # an attribute call.  Falling back by basename aliases unrelated
+            # methods and routes runtime receivers into the wrong shell.
+            candidates = definitions_by_name.get(call.func.id, ())
             if len(candidates) == 1:
                 definition = candidates[0]
         if definition is not None and definition is not call:
@@ -333,7 +467,10 @@ def _expand_unresolved_ast_parents(
             unresolved_name = call.func.attr
         else:
             unresolved_name = type(call.func).__name__
-        target = _resolve_ast_parent_reference(call.func, bindings)
+        target = _resolve_ast_parent_reference(
+            call.func,
+            call_bindings,
+        )
         identity_target = (
             target.__func__ if inspect.ismethod(target) else target
         )
@@ -355,6 +492,14 @@ def _expand_unresolved_ast_parents(
         )
 
     ast.fix_missing_locations(module)
+    if profile_verbose:
+        print(
+            "[ast-parent-profile] "
+            f"complete passes={pass_index} definitions={len(definitions)} "
+            f"parent_links={len(parent_links)} unresolved={len(unresolved_calls)} "
+            f"elapsed={time.perf_counter() - started:.3f}s",
+            flush=True,
+        )
     return module, tuple(parent_links), tuple(unresolved_calls)
 
 
@@ -643,7 +788,10 @@ class ProcessGraph:
     def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None):
         # For each role in spec, use the role_indices and a counter (schema_repeats) to determine which arg to use.
         
-        print(spec.items())
+        if os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            print(spec.items())
         
         for role, param in spec.items():
             if param == 1:
@@ -689,26 +837,36 @@ class ProcessGraph:
 
         node_type = type(node).__name__
         schema = self.role_schemas.get(node_type, None)
-        print(f"[build_graph] Node {nid} ({node_type}) with schema: {schema}")
-        print(f"[build_graph] Node {nid} args: {getattr(node, 'args', [])}")
+        # Graph ingestion can visit thousands of nodes.  Dumping every Python
+        # object here is neither shell profiling nor progress reporting: the
+        # formatting alone can dominate compilation and obscure the first
+        # useful control-shell event.  Keep the forensic dump available, but
+        # require an explicit ingestion-specific opt-in.
+        graph_build_verbose = os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if graph_build_verbose:
+            print(f"[build_graph] Node {nid} ({node_type}) with schema: {schema}")
+            print(f"[build_graph] Node {nid} args: {getattr(node, 'args', [])}")
         args = getattr(node, 'args', [])
         if isinstance(args, list):
             args = list(getattr(node, 'args', []))
         else:
             args = [args]
         if schema:
-            from pprint import pprint
-            print("=== DEBUG: Entering build_graph with schema ===")
-            print(f"Node ID: {nid}, Type: {node_type}")
-            try:
-                print("Node full content:")
-                pprint(node.__dict__)
-            except Exception as e:
-                print("Node representation (fallback):", repr(node))
-            print("Schema contents:")
-            pprint(schema)
-            print("Initial args:")
-            pprint(args)
+            if graph_build_verbose:
+                from pprint import pprint
+                print("=== DEBUG: Entering build_graph with schema ===")
+                print(f"Node ID: {nid}, Type: {node_type}")
+                try:
+                    print("Node full content:")
+                    pprint(node.__dict__)
+                except Exception:
+                    print("Node representation (fallback):", repr(node))
+                print("Schema contents:")
+                pprint(schema)
+                print("Initial args:")
+                pprint(args)
 
             # Build a mapping from each role (from schema.up and schema.down) to a list of positions in args.
             role_indices = {}
@@ -730,7 +888,8 @@ class ProcessGraph:
             # Initialize a repeat counter dictionary for each role.
             repeat_counter = { role: 0 for role in role_indices }
 
-            print(f"[build_graph] Node {nid} ({node_type}) has schema: {schema}")
+            if graph_build_verbose:
+                print(f"[build_graph] Node {nid} ({node_type}) has schema: {schema}")
             # Pass along repeat_counter and role_indices to _recurse_spec.
             self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
             self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
@@ -809,6 +968,7 @@ class ProcessGraph:
         resolve_unresolved_parents=False,
         parent_bindings=None,
         parent_include=None,
+        profile_verbose=False,
         **kwargs,
     ):
         """Import Python source as a structural AST ProcessGraph."""
@@ -839,12 +999,29 @@ class ProcessGraph:
                 _expand_unresolved_ast_parents(
                 tree,
                 bindings,
-                package=getattr(self, "python_package", None),
-                include=parent_include,
+                    package=getattr(self, "python_package", None),
+                    include=parent_include,
+                    profile_verbose=profile_verbose,
                 )
             )
 
+        if profile_verbose:
+            print(
+                "[ast-build-profile] begin build_graph "
+                f"definitions={sum(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for item in ast.walk(tree))} "
+                f"nodes={sum(1 for _ in ast.walk(tree))}",
+                flush=True,
+            )
+            build_started = time.perf_counter()
         root = self.build_graph(tree, *args, **kwargs)
+        if profile_verbose:
+            print(
+                "[ast-build-profile] complete build_graph "
+                f"graph_nodes={self.G.number_of_nodes()} "
+                f"graph_edges={self.G.number_of_edges()} "
+                f"elapsed={time.perf_counter() - build_started:.3f}s",
+                flush=True,
+            )
         for definition, call in parent_links:
             definition_id = id(definition)
             call_id = id(call)
@@ -1079,6 +1256,13 @@ class ProcessGraph:
     def build_from_expression(self, expr_or_tensor, *domain_dims):
         # bypass SymPy path for a recorded ProvenanceGraph
         from src.turing_machine.turing_provenance import ProvenanceGraph
+        if isinstance(expr_or_tensor, sympy.Basic):
+            from ...compiler.symbolic_process_graph import (
+                ingest_sympy_expression,
+            )
+
+            ingest_sympy_expression(self, expr_or_tensor)
+            return self
         if isinstance(expr_or_tensor, ProvenanceGraph):
             # Provenance is already a graph.  Import it directly instead of
             # asking the symbolic/AST introspector to interpret the recorder
@@ -1179,6 +1363,14 @@ class ProcessGraph:
 
 
     def to_sympy(self):
+        from ...compiler.symbolic_process_graph import (
+            process_graph_to_sympy_package,
+        )
+
+        return process_graph_to_sympy_package(self)
+
+        # Historical source-schema-specific implementation retained below for
+        # archaeology.  The canonical projector above is now authoritative.
         meta = self.extract_full_process_graph()
         nodes_meta = meta['nodes']
         cache = {}

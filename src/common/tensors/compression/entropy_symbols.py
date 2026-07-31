@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..abstraction import AbstractTensor
-from ..autograd import autograd
 from .coefficient_events import (
     BlockCoefficientEvents,
     SignedMagnitudeFields,
@@ -53,13 +52,12 @@ class EntropySymbolSequence:
             target = AbstractTensor.zeros(
                 (capacity + 1,), cls=type(field)
             )
-            with autograd.no_grad():
-                target = AbstractTensor.scatter(
-                    target,
-                    destinations,
-                    field * valid,
-                    dim=0,
-                )
+            target = AbstractTensor.scatter(
+                target,
+                destinations,
+                field * valid,
+                dim=0,
+            )
             return target[:capacity]
 
         slots = AbstractTensor.arange(capacity, cls=type(symbols))

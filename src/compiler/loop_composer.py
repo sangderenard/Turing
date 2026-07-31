@@ -9,9 +9,38 @@ control flow.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterable
+
+import networkx as nx
+
+from .control_source import (
+    ControlProgram,
+    ControlUniform,
+    LoopBlock,
+    SequenceBlock,
+    StatementBlock,
+    StreamPublishBlock,
+)
+from .loop_ir import (
+    ConditionDomain,
+    IterableDomain,
+    IterableAccess,
+    LoopCarriedState,
+    LoopDomainKind,
+    LoopEffects,
+    LoopPolicy,
+    LoopRealization,
+    LoopIterationOutput,
+    LoopStateEffect,
+    LoopStateEffectMode,
+    LoopValue,
+    RangeDomain,
+    SemanticLoop,
+)
+from .hierarchical_plan import PlanClosure, PlanLine
 
 
 class LoopStrategy(str, Enum):
@@ -35,8 +64,19 @@ class LoopDescriptor:
     start: Any = None
     stop: Any = None
     step: Any = None
+    start_node: int | None = None
+    stop_node: int | None = None
+    step_node: int | None = None
     iterable_node: int | None = None
+    iterable_constant: tuple[object, ...] | None = None
     trip_count: int | None = None
+    yield_nodes: tuple[int, ...] = ()
+    # (source statement node, published value node, optional count node).
+    # These are stream effects such as yield, not loop reductions.
+    publication_nodes: tuple[tuple[int, int, int | None], ...] = ()
+    state_effects: tuple[LoopStateEffect, ...] = ()
+    iteration_outputs: tuple[LoopIterationOutput, ...] = ()
+    backpressured_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -44,6 +84,80 @@ class LoopPlan:
     loop: LoopDescriptor
     strategy: LoopStrategy
     reason: str
+    semantic: SemanticLoop | None = None
+
+
+@dataclass(frozen=True)
+class LoopShaderReduction:
+    """Planner verdict for replacing coordinator iterations with one shader."""
+
+    loop_node_id: int
+    region_indices: tuple[int, ...]
+    carried_bindings: tuple[tuple[str, int, int], ...]
+    collapsible: bool
+    blockers: tuple[str, ...]
+    estimated_dispatches_removed: int | None
+    control_program: ControlProgram | None = None
+    preferred_shell: str = "glsl"
+    dispatch_closure_count: int = 0
+
+
+def planned_collection_bindings(
+    graph: Any,
+    loop: LoopDescriptor,
+    resident_value_ids: frozenset[int] | None = None,
+) -> tuple[tuple[int, int, str, int], ...]:
+    """Lower supported loop-state effects to resident indexed writes."""
+
+    induction_name = f"iteration_{int(loop.node_id)}"
+    source_start = int(0 if loop.start is None else loop.start)
+    bindings = []
+    for effect in loop.state_effects:
+        if (
+            effect.mode is not LoopStateEffectMode.INDEXED_PUBLICATION
+            or not effect.argument_value_ids
+            or effect.loop_result_id is None
+        ):
+            continue
+        value_id = int(effect.argument_value_ids[0])
+        value_attributes = graph.G.nodes[value_id].get("attributes") or {}
+        if value_attributes.get("producer_kind") == "aggregate":
+            continue
+        # The latch commits a carried result into its state slot before loop
+        # effects are published.  A body effect that consumes that result must
+        # therefore read the post-commit state slot, not the transient Phi
+        # endpoint that selected the result inside the body.
+        source_id = next(
+            (
+                int(initial)
+                for _name, initial, updated in loop.carried_bindings
+                if int(updated) == value_id
+            ),
+            value_id,
+        )
+        bindings.append((
+            source_id,
+            int(effect.loop_result_id),
+            induction_name,
+            source_start,
+        ))
+    for output in loop.iteration_outputs:
+        value_id = int(output.value_id)
+        if (
+            resident_value_ids is not None
+            and value_id not in resident_value_ids
+        ):
+            continue
+        value_attributes = graph.G.nodes[value_id].get("attributes") or {}
+        if value_attributes.get("producer_kind") == "aggregate":
+            continue
+        bindings.append((
+            value_id,
+            int(output.result_value_id),
+            induction_name,
+            source_start,
+        ))
+    return tuple(dict.fromkeys(bindings))
 
 
 @dataclass(frozen=True)
@@ -54,6 +168,901 @@ class LoopBackendCapabilities:
     dynamic_bounds: bool = False
     kpn: bool = False
     unroll_limit: int = 8
+
+
+def _rebuild_graph_edges(graph: Any) -> None:
+    """Make NetworkX edges and cached parent/child tables agree."""
+
+    graph.G.remove_edges_from(tuple(graph.G.edges))
+    for node_id in graph.G:
+        graph.G.nodes[node_id]["children"] = []
+    for node_id, data in graph.G.nodes(data=True):
+        normalized = []
+        for parent, role in data.get("parents") or ():
+            parent = int(parent)
+            if parent not in graph.G:
+                continue
+            normalized.append((parent, role))
+            graph.G.add_edge(parent, node_id, role=role)
+            graph.G.nodes[parent]["children"].append((node_id, role))
+        data["parents"] = normalized
+    graph.levels = {
+        int(node_id): int(level)
+        for level, generation in enumerate(
+            nx.topological_generations(graph.G)
+        )
+        for node_id in generation
+    }
+
+
+def _replace_parent_value(
+    graph: Any,
+    old_value_id: int,
+    replacements: tuple[int, ...],
+) -> None:
+    """Replace one value use without identifying its distinct consumers."""
+
+    old_value_id = int(old_value_id)
+    for _node_id, data in graph.G.nodes(data=True):
+        parents = tuple(data.get("parents") or ())
+        if not any(int(parent) == old_value_id for parent, _role in parents):
+            continue
+        rewritten = []
+        for parent, role in parents:
+            if int(parent) != old_value_id:
+                rewritten.append((int(parent), role))
+                continue
+            if len(replacements) == 1:
+                rewritten.append((int(replacements[0]), role))
+                continue
+            role_text = str(role)
+            prefix = (
+                "arg"
+                if role_text.startswith("arg")
+                else "elts"
+                if role_text in {"elt", "elts"}
+                else role_text
+            )
+            rewritten.extend(
+                (
+                    int(replacement),
+                    f"{prefix}{index}" if prefix == "arg" else prefix,
+                )
+                for index, replacement in enumerate(replacements)
+            )
+        data["parents"] = rewritten
+    graph.roots = [
+        (
+            int(replacements[-1])
+            if int(root) == old_value_id and replacements
+            else int(root)
+        )
+        for root in graph.roots
+    ]
+
+
+def evaporate_unrolled_loops(
+    graph: Any,
+    plans: Iterable[LoopPlan],
+) -> tuple[LoopPlan, ...]:
+    """Rewrite planner-selected finite loops into straight-line value SSA.
+
+    This runs only after graph value IDs are canonical.  It does not emit a
+    control block and it does not preserve source container syntax.  Each
+    iteration receives its own induction constants and numerical body values;
+    carried values are threaded directly between those copies.  Collection
+    effects and comprehension outputs become inputs of their existing,
+    distinct materialization producer.
+    """
+
+    if not graph.G.graph.get("canonical_value_ids"):
+        raise ValueError("loop evaporation requires canonical value IDs")
+
+    plans = tuple(plans)
+    plans_by_expression = {
+        id(graph.G.nodes[int(plan.loop.node_id)].get("expr_obj")): plan
+        for plan in plans
+        if int(plan.loop.node_id) in graph.G
+    }
+    nested_groups: dict[int, tuple[LoopPlan, ...]] = {}
+    for _node_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.GeneratorExp):
+            continue
+        group = tuple(
+            plans_by_expression[id(generator)]
+            for generator in expression.generators
+            if id(generator) in plans_by_expression
+        )
+        if len(group) < 2:
+            continue
+        for member in group:
+            nested_groups[int(member.loop.node_id)] = group
+    evaporated: list[LoopPlan] = []
+    handled_loop_ids: set[int] = set()
+    next_value_id = max(graph.G.nodes, default=-1) + 1
+
+    def add_clone(source_id: int, parents: tuple[tuple[int, str], ...]) -> int:
+        nonlocal next_value_id
+        clone_id = next_value_id
+        next_value_id += 1
+        cloned = copy.deepcopy(dict(graph.G.nodes[int(source_id)]))
+        cloned["parents"] = list(parents)
+        cloned["children"] = []
+        cloned["value_id"] = clone_id
+        attributes = dict(cloned.get("attributes") or {})
+        attributes["unrolled_from"] = int(source_id)
+        cloned["attributes"] = attributes
+        graph.G.add_node(clone_id, **cloned)
+        return clone_id
+
+    def add_constant(value: object, loop_id: int) -> int:
+        nonlocal next_value_id
+        constant_id = next_value_id
+        next_value_id += 1
+        expression = ast.Constant(value=value)
+        graph.G.add_node(
+            constant_id,
+            type="Constant",
+            label=repr(value),
+            op="const",
+            expr_obj=expression,
+            constant=value,
+            value_id=constant_id,
+            parents=[],
+            children=[],
+            attributes={
+                "value": value,
+                "unrolled_induction_of": int(loop_id),
+            },
+        )
+        return constant_id
+
+    for plan in plans:
+        loop_id = int(plan.loop.node_id)
+        if loop_id in handled_loop_ids:
+            continue
+        group = nested_groups.get(loop_id)
+        if group is not None and plan is not group[0]:
+            continue
+        selected_plans = group or (plan,)
+        loop = selected_plans[0].loop
+        iteration_assignments: tuple[dict[int, object], ...] | None = None
+        if group is not None:
+            generator_expression = next(
+                data.get("expr_obj")
+                for _node_id, data in graph.G.nodes(data=True)
+                if isinstance(data.get("expr_obj"), ast.GeneratorExp)
+                and tuple(
+                    id(generator)
+                    for generator in data["expr_obj"].generators
+                )
+                == tuple(
+                    id(graph.G.nodes[int(member.loop.node_id)]["expr_obj"])
+                    for member in group
+                )
+            )
+            specializations = {
+                **dict(graph.G.graph.get("parameter_defaults") or {}),
+                **dict(graph.G.graph.get("planner_specializations") or {}),
+            }
+            assignments: list[dict[int, object]] = []
+
+            def expand_generator(
+                index: int,
+                environment: dict[str, object],
+                bound: dict[int, object],
+            ) -> bool:
+                if index == len(group):
+                    assignments.append(dict(bound))
+                    return True
+                member = group[index]
+                generator = generator_expression.generators[index]
+                items = _static_iterable_expression(
+                    generator.iter,
+                    {**specializations, **environment},
+                )
+                if items is None:
+                    return False
+                target_bindings = member.loop.target_bindings
+                for item in items:
+                    values = (
+                        tuple(item)
+                        if len(target_bindings) > 1
+                        else (item,)
+                    )
+                    if len(values) != len(target_bindings):
+                        return False
+                    nested_environment = dict(environment)
+                    nested_bound = dict(bound)
+                    for (name, target_id), value in zip(
+                        target_bindings, values
+                    ):
+                        nested_environment[str(name)] = value
+                        nested_bound[int(target_id)] = value
+                    try:
+                        accepted = all(
+                            _static_predicate_expression(
+                                condition,
+                                {**specializations, **nested_environment},
+                            )
+                            for condition in generator.ifs
+                        )
+                    except ValueError:
+                        return False
+                    if accepted and not expand_generator(
+                        index + 1,
+                        nested_environment,
+                        nested_bound,
+                    ):
+                        return False
+                return True
+
+            if not expand_generator(0, {}, {}):
+                continue
+            iteration_assignments = tuple(assignments)
+            iteration_values = tuple(range(len(iteration_assignments)))
+        elif plan.strategy not in {
+            LoopStrategy.UNROLL,
+            LoopStrategy.CONSTANT,
+        }:
+            continue
+        elif loop.iterator_kind == "arithmetic_sequence":
+            if None in (loop.start, loop.stop, loop.step):
+                continue
+            iteration_values = tuple(
+                range(int(loop.start), int(loop.stop), int(loop.step))
+            )
+        elif loop.iterable_constant is not None:
+            iteration_values = tuple(loop.iterable_constant)
+        else:
+            continue
+
+        target_ids = tuple(dict.fromkeys(
+            int(target_id)
+            for member in selected_plans
+            for _name, target_id in member.loop.target_bindings
+        ))
+        body_ids = frozenset(
+            int(value_id)
+            for member in selected_plans
+            for value_id in member.loop.body_nodes
+        )
+        required_outputs = {
+            int(updated)
+            for member in selected_plans
+            for _name, _initial, updated in member.loop.carried_bindings
+        }
+        required_outputs.update(
+            int(value_id)
+            for member in selected_plans
+            for effect in member.loop.state_effects
+            for value_id in effect.argument_value_ids
+        )
+        required_outputs.update(
+            int(output.value_id)
+            for member in selected_plans
+            for output in member.loop.iteration_outputs
+        )
+        carried_bindings = tuple(dict.fromkeys(
+            binding
+            for member in selected_plans
+            for binding in member.loop.carried_bindings
+        ))
+        state_effects = tuple(dict.fromkeys(
+            effect
+            for member in selected_plans
+            for effect in member.loop.state_effects
+        ))
+        iteration_outputs = tuple(dict.fromkeys(
+            output
+            for member in selected_plans
+            for output in member.loop.iteration_outputs
+        ))
+        iteration_dependent = {
+            int(node_id)
+            for target_id in target_ids
+            for node_id in nx.descendants(graph.G, target_id)
+        }
+        iteration_dependent.discard(int(loop.node_id))
+        needed = set(required_outputs)
+        pending = list(required_outputs)
+        while pending:
+            value_id = pending.pop()
+            if value_id not in graph.G:
+                continue
+            for parent, _role in graph.G.nodes[value_id].get("parents") or ():
+                parent = int(parent)
+                if (
+                    parent in body_ids or parent in iteration_dependent
+                ) and parent not in needed:
+                    needed.add(parent)
+                    pending.append(parent)
+        body_order = tuple(
+            value_id
+            for value_id in nx.topological_sort(graph.G)
+            if (
+                int(value_id) in needed
+                and int(value_id) not in target_ids
+            )
+        )
+
+        carried_values = {
+            int(initial): int(initial)
+            for _name, initial, _updated in carried_bindings
+        }
+        publications: dict[int, list[int]] = {
+            int(
+                effect.state_input_id
+                if effect.loop_result_id is None
+                else effect.loop_result_id
+            ): []
+            for effect in state_effects
+            if effect.mode is LoopStateEffectMode.INDEXED_PUBLICATION
+        }
+        materializations: dict[int, list[int]] = {
+            int(output.materializer_node_id): []
+            for output in iteration_outputs
+        }
+        last_mapping: dict[int, int] = {}
+
+        for iteration_index, iteration in enumerate(iteration_values):
+            mapping = dict(carried_values)
+            if iteration_assignments is not None:
+                mapping.update(
+                    (
+                        target_id,
+                        add_constant(value, loop.node_id),
+                    )
+                    for target_id, value in (
+                        iteration_assignments[iteration_index].items()
+                    )
+                )
+            else:
+                values = (
+                    tuple(iteration)
+                    if len(target_ids) > 1
+                    else (iteration,)
+                )
+                if len(values) != len(target_ids):
+                    raise ValueError(
+                        "unrolled iterable item does not match loop target: "
+                        f"loop={loop.node_id}, item={iteration!r}"
+                    )
+                mapping.update(
+                    (target_id, add_constant(value, loop.node_id))
+                    for target_id, value in zip(target_ids, values)
+                )
+            for source_id in body_order:
+                parents = tuple(
+                    (int(mapping.get(int(parent), int(parent))), str(role))
+                    for parent, role in (
+                        graph.G.nodes[source_id].get("parents") or ()
+                    )
+                )
+                mapping[source_id] = add_clone(source_id, parents)
+            for _name, initial, updated in carried_bindings:
+                carried_values[int(initial)] = int(mapping[int(updated)])
+            for effect in state_effects:
+                if (
+                    effect.mode
+                    is not LoopStateEffectMode.INDEXED_PUBLICATION
+                    or not effect.argument_value_ids
+                ):
+                    continue
+                collection_id = int(
+                    effect.state_input_id
+                    if effect.loop_result_id is None
+                    else effect.loop_result_id
+                )
+                publications[collection_id].append(
+                    int(mapping.get(
+                        int(effect.argument_value_ids[0]),
+                        int(effect.argument_value_ids[0]),
+                    ))
+                )
+            for output in iteration_outputs:
+                materializations[
+                    int(output.materializer_node_id)
+                ].append(int(mapping[int(output.value_id)]))
+            last_mapping = mapping
+
+        for _name, _initial, updated in carried_bindings:
+            final_value = last_mapping.get(int(updated))
+            if final_value is not None:
+                _replace_parent_value(
+                    graph,
+                    next(
+                        (
+                            int(node_id)
+                            for node_id, data in graph.G.nodes(data=True)
+                            if data.get("type") == "LoopExit"
+                            and (
+                                data.get("attributes") or {}
+                            ).get("binding_name") == _name
+                            and any(
+                                int(parent) == int(loop.node_id)
+                                and str(role) == "control"
+                                for parent, role in (
+                                    data.get("parents") or ()
+                                )
+                            )
+                        ),
+                        int(updated),
+                    ),
+                    (int(final_value),),
+                )
+        for collection_id, values in publications.items():
+            if values:
+                _replace_parent_value(
+                    graph, int(collection_id), tuple(values)
+                )
+        for materializer_id, values in materializations.items():
+            if not values or materializer_id not in graph.G:
+                continue
+            materializer = graph.G.nodes[materializer_id]
+            parents = tuple(materializer.get("parents") or ())
+            structural = {
+                int(parent)
+                for parent, _role in parents
+                if parent in graph.G
+                and isinstance(
+                    graph.G.nodes[int(parent)].get("expr_obj"),
+                    (ast.GeneratorExp, ast.comprehension),
+                )
+            }
+            materializer["parents"] = [
+                (int(parent), role)
+                for parent, role in parents
+                if int(parent) not in structural
+                and int(parent) != int(loop.node_id)
+                and str(role) not in {"elt", "generators"}
+            ]
+            materializer["parents"].extend(
+                (int(value_id), f"arg{index}")
+                for index, value_id in enumerate(values)
+            )
+            attributes = dict(materializer.get("attributes") or {})
+            attributes["materialization_kind"] = "unrolled_loop"
+            attributes["materialized_value_ids"] = tuple(values)
+            materializer["attributes"] = attributes
+
+        removable = {
+            *(
+                int(member.loop.node_id)
+                for member in selected_plans
+            ),
+            *target_ids,
+            *body_ids,
+            *(
+                int(effect.state_output_id)
+                for effect in state_effects
+                if effect.state_output_id is not None
+            ),
+            *(
+                int(effect.loop_result_id)
+                for effect in state_effects
+                if effect.loop_result_id is not None
+            ),
+        }
+        removable.update(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if data.get("type") == "LoopExit"
+            and any(
+                int(parent) in {
+                    int(member.loop.node_id)
+                    for member in selected_plans
+                }
+                and str(role) == "control"
+                for parent, role in data.get("parents") or ()
+            )
+        )
+        _rebuild_graph_edges(graph)
+        removable = {
+            node_id
+            for node_id in removable
+            if node_id in graph.G and node_id not in graph.roots
+        }
+        externally_used = {
+            node_id
+            for node_id in removable
+            if any(
+                int(successor) not in removable
+                for successor in graph.G.successors(node_id)
+            )
+        }
+        graph.G.remove_nodes_from(removable - externally_used)
+        _rebuild_graph_edges(graph)
+        handled_loop_ids.update(
+            int(member.loop.node_id) for member in selected_plans
+        )
+        evaporated.extend(selected_plans)
+
+    if evaporated:
+        live = {
+            int(root)
+            for root in graph.roots
+            if int(root) in graph.G
+        }
+        for root in tuple(live):
+            live.update(int(node_id) for node_id in nx.ancestors(graph.G, root))
+        graph.G.remove_nodes_from(
+            tuple(node_id for node_id in graph.G if node_id not in live)
+        )
+        _rebuild_graph_edges(graph)
+        identities = graph.G.graph.get("identity_table") or {}
+        graph.G.graph["identity_table"] = {
+            str(name): tuple(
+                int(value_id)
+                for value_id in value_ids
+                if int(value_id) in graph.G
+            )
+            for name, value_ids in identities.items()
+            if any(int(value_id) in graph.G for value_id in value_ids)
+        }
+        graph.G.graph["evaporated_loop_plans"] = tuple(evaporated)
+        graph.G.graph["canonical_value_ids"] = True
+    return tuple(evaporated)
+
+
+def materialize_retained_loop_ports(
+    graph: Any,
+    plans: Iterable[LoopPlan],
+) -> tuple[LoopPlan, ...]:
+    """Create result/state ports only for loops that survived evaporation."""
+
+    if not graph.G.graph.get("canonical_value_ids"):
+        raise ValueError("retained loop ports require canonical value IDs")
+    next_value_id = max(graph.G.nodes, default=-1) + 1
+    identities = {
+        str(name): list(value_ids)
+        for name, value_ids in (
+            graph.G.graph.get("identity_table") or {}
+        ).items()
+    }
+    materialized_plans = []
+
+    def add_port(
+        node_type: str,
+        label: str,
+        parents: tuple[tuple[int, str], ...],
+        attributes: dict[str, object],
+    ) -> int:
+        nonlocal next_value_id
+        node_id = next_value_id
+        next_value_id += 1
+        graph.G.add_node(
+            node_id,
+            type=node_type,
+            label=label,
+            op=node_type.lower(),
+            expr_obj=None,
+            value_id=node_id,
+            parents=list(parents),
+            children=[],
+            attributes=attributes,
+        )
+        return node_id
+
+    def rewire_continuation(
+        old_value_id: int,
+        new_value_id: int,
+        owned_nodes: frozenset[int],
+    ) -> None:
+        for node_id, data in graph.G.nodes(data=True):
+            if int(node_id) in owned_nodes or int(node_id) == new_value_id:
+                continue
+            data["parents"] = [
+                (
+                    new_value_id if int(parent) == old_value_id else int(parent),
+                    role,
+                )
+                for parent, role in data.get("parents") or ()
+            ]
+        graph.roots = [
+            new_value_id if int(root) == old_value_id else int(root)
+            for root in graph.roots
+        ]
+
+    for plan in tuple(plans):
+        if plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}:
+            materialized_plans.append(plan)
+            continue
+        loop = plan.loop
+        loop_data = graph.G.nodes[int(loop.node_id)]
+        attributes = loop_data.setdefault("attributes", {})
+        if attributes.get("loop_ports_materialized"):
+            materialized_plans.append(plan)
+            continue
+        owned_nodes = frozenset((
+            int(loop.node_id),
+            *map(int, loop.body_nodes),
+            *(int(effect.effect_node_id) for effect in loop.state_effects),
+        ))
+
+        carried_results = {}
+        for name, _initial, updated in loop.carried_bindings:
+            result_id = add_port(
+                "LoopResult",
+                str(name),
+                (
+                    (int(updated), "value"),
+                    (int(loop.node_id), "control"),
+                ),
+                {
+                    "binding_name": str(name),
+                    "loop_id": int(loop.node_id),
+                    "result_kind": "carried",
+                },
+            )
+            rewire_continuation(
+                int(updated), result_id, owned_nodes
+            )
+            identities.setdefault(str(name), []).append(result_id)
+            carried_results[str(name)] = result_id
+
+        planned_iteration_outputs = []
+        for output_index, output in enumerate(loop.iteration_outputs):
+            collection_id = add_port(
+                "LoopResult",
+                f"iteration_output_{output_index}",
+                (
+                    (int(output.value_id), "value"),
+                    (int(loop.node_id), "control"),
+                ),
+                {
+                    "loop_id": int(loop.node_id),
+                    "result_kind": "collection",
+                    "materializer_node_id": int(
+                        output.materializer_node_id
+                    ),
+                },
+            )
+            materializer = graph.G.nodes[
+                int(output.materializer_node_id)
+            ]
+            materializer_attributes = dict(
+                materializer.get("attributes") or {}
+            )
+            materializer_attributes.update({
+                "producer_kind": "aggregate_materialization",
+                "materialized_source_value_ids": (collection_id,),
+                "collection_owner_id": collection_id,
+            })
+            materializer["attributes"] = materializer_attributes
+            planned_iteration_outputs.append(LoopIterationOutput(
+                value_id=int(output.value_id),
+                result_value_id=collection_id,
+                materializer_node_id=int(output.materializer_node_id),
+            ))
+
+        effects = []
+        for effect in loop.state_effects:
+            aggregate_leaves: tuple[int, ...] = ()
+            if effect.argument_value_ids:
+                argument_id = int(effect.argument_value_ids[0])
+                if argument_id in graph.G:
+                    argument_attributes = (
+                        graph.G.nodes[argument_id].get("attributes") or {}
+                    )
+                    if (
+                        argument_attributes.get("producer_kind")
+                        == "aggregate"
+                    ):
+                        aggregate_leaves = tuple(map(
+                            int,
+                            argument_attributes.get(
+                                "aggregate_leaf_value_ids",
+                                (),
+                            ),
+                        ))
+            if aggregate_leaves:
+                aggregate_consumers = tuple(
+                    int(node_id)
+                    for node_id, data in graph.G.nodes(data=True)
+                    if int(node_id) not in owned_nodes
+                    and any(
+                        int(parent) == int(effect.state_input_id)
+                        for parent, _role in (
+                            data.get("parents") or ()
+                        )
+                    )
+                )
+                result_ids = []
+                for path_index, leaf_id in enumerate(aggregate_leaves):
+                    state_port = add_port(
+                        "LoopStatePort",
+                        (
+                            f"{effect.state_name}."
+                            f"{path_index}.{effect.operator}"
+                        ),
+                        (
+                            (int(effect.state_input_id), "state"),
+                            (int(effect.effect_node_id), "effect"),
+                        ),
+                        {
+                            "binding_name": str(effect.state_name),
+                            "operator": str(effect.operator),
+                            "loop_id": int(loop.node_id),
+                            "aggregate_path": (int(path_index),),
+                        },
+                    )
+                    result_id = add_port(
+                        "LoopResult",
+                        f"{effect.state_name}.{path_index}",
+                        (
+                            (state_port, "value"),
+                            (int(loop.node_id), "control"),
+                        ),
+                        {
+                            "binding_name": str(effect.state_name),
+                            "loop_id": int(loop.node_id),
+                            "result_kind": "state_leaf",
+                            "aggregate_path": (int(path_index),),
+                        },
+                    )
+                    result_ids.append(result_id)
+                    effects.append({
+                        "state_name": str(effect.state_name),
+                        "operator": str(effect.operator),
+                        "effect_mode": effect.mode.value,
+                        "state_input_id": int(effect.state_input_id),
+                        "effect_node_id": int(effect.effect_node_id),
+                        "state_output_id": state_port,
+                        "loop_result_id": result_id,
+                        "argument_value_ids": (int(leaf_id),),
+                    })
+                for consumer_id in aggregate_consumers:
+                    consumer = graph.G.nodes[consumer_id]
+                    consumer["parents"] = [
+                        (int(parent), role)
+                        for parent, role in (
+                            consumer.get("parents") or ()
+                        )
+                        if int(parent) != int(effect.state_input_id)
+                    ]
+                    consumer["parents"].extend(
+                        (int(result_id), f"arg{index}")
+                        for index, result_id in enumerate(result_ids)
+                    )
+                    consumer_attributes = dict(
+                        consumer.get("attributes") or {}
+                    )
+                    consumer_attributes["materialization_kind"] = (
+                        "retained_loop_aggregate"
+                    )
+                    consumer_attributes["materialized_value_ids"] = tuple(
+                        result_ids
+                    )
+                    consumer_attributes["loop_aggregate_axis"] = 0
+                    consumer["attributes"] = consumer_attributes
+                if int(effect.state_input_id) in set(graph.roots):
+                    aggregate_id = add_port(
+                        "LoopAggregateResult",
+                        str(effect.state_name),
+                        tuple(
+                            (int(result_id), f"arg{index}")
+                            for index, result_id in enumerate(result_ids)
+                        ),
+                        {
+                            "binding_name": str(effect.state_name),
+                            "materialization_kind": (
+                                "retained_loop_aggregate"
+                            ),
+                            "materialized_value_ids": tuple(result_ids),
+                            "loop_aggregate_axis": 0,
+                        },
+                    )
+                    graph.roots = [
+                        aggregate_id
+                        if int(root) == int(effect.state_input_id)
+                        else int(root)
+                        for root in graph.roots
+                    ]
+                    identities.setdefault(
+                        str(effect.state_name), []
+                    ).append(aggregate_id)
+                continue
+            state_port = add_port(
+                "LoopStatePort",
+                f"{effect.state_name}.{effect.operator}",
+                (
+                    (int(effect.state_input_id), "state"),
+                    (int(effect.effect_node_id), "effect"),
+                ),
+                {
+                    "binding_name": str(effect.state_name),
+                    "operator": str(effect.operator),
+                    "loop_id": int(loop.node_id),
+                },
+            )
+            result_id = add_port(
+                "LoopResult",
+                str(effect.state_name),
+                (
+                    (state_port, "value"),
+                    (int(loop.node_id), "control"),
+                ),
+                {
+                    "binding_name": str(effect.state_name),
+                    "loop_id": int(loop.node_id),
+                    "result_kind": "state",
+                },
+            )
+            rewire_continuation(
+                int(effect.state_input_id),
+                result_id,
+                owned_nodes | {state_port},
+            )
+            identities.setdefault(
+                str(effect.state_name), []
+            ).append(result_id)
+            effects.append({
+                "state_name": str(effect.state_name),
+                "operator": str(effect.operator),
+                "effect_mode": effect.mode.value,
+                "state_input_id": int(effect.state_input_id),
+                "effect_node_id": int(effect.effect_node_id),
+                "state_output_id": state_port,
+                "loop_result_id": result_id,
+                "argument_value_ids": tuple(
+                    map(int, effect.argument_value_ids)
+                ),
+            })
+        if effects:
+            attributes["loop_state_effects"] = tuple(effects)
+        attributes["loop_result_ports"] = {
+            **carried_results,
+            **{
+                str(effect["state_name"]): int(effect["loop_result_id"])
+                for effect in effects
+            },
+        }
+        attributes["loop_ports_materialized"] = True
+        planned_effects = tuple(
+            LoopStateEffect(
+                state_name=str(effect["state_name"]),
+                operator=str(effect["operator"]),
+                state_input_id=int(effect["state_input_id"]),
+                effect_node_id=int(effect["effect_node_id"]),
+                state_output_id=int(effect["state_output_id"]),
+                loop_result_id=int(effect["loop_result_id"]),
+                argument_value_ids=tuple(
+                    map(int, effect["argument_value_ids"])
+                ),
+                mode=LoopStateEffectMode(
+                    effect.get("effect_mode", "opaque")
+                ),
+            )
+            for effect in effects
+        )
+        planned_loop = replace(
+            loop,
+            state_effects=planned_effects,
+            iteration_outputs=tuple(planned_iteration_outputs),
+        )
+        planned_semantic = (
+            None
+            if plan.semantic is None
+            else replace(
+                plan.semantic,
+                state_effects=planned_effects,
+                iteration_outputs=tuple(planned_iteration_outputs),
+            )
+        )
+        materialized_plans.append(replace(
+            plan,
+            loop=planned_loop,
+            semantic=planned_semantic,
+        ))
+
+    graph.G.graph["identity_table"] = {
+        name: tuple(dict.fromkeys(map(int, value_ids)))
+        for name, value_ids in identities.items()
+    }
+    _rebuild_graph_edges(graph)
+    return tuple(materialized_plans)
 
 
 def _constant(graph: Any, node_id: int | None) -> tuple[bool, Any]:
@@ -77,6 +1086,95 @@ def _trip_count(start: Any, stop: Any, step: Any) -> int | None:
     if step == 0:
         return None
     return len(range(start, stop, step))
+
+
+def _static_iterable_expression(
+    expression: ast.AST | None,
+    specializations: dict[str, object],
+) -> tuple[object, ...] | None:
+    """Evaluate structural iterable syntax from compiler-known literals only."""
+
+    def resolve(node: ast.AST):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in specializations:
+            return specializations[node.id]
+        if isinstance(node, (ast.Tuple, ast.List)):
+            values = [resolve(item) for item in node.elts]
+            return tuple(values) if isinstance(node, ast.Tuple) else values
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"range", "enumerate", "zip"}
+        ):
+            args = [resolve(argument) for argument in node.args]
+            keywords = {
+                keyword.arg: resolve(keyword.value)
+                for keyword in node.keywords
+                if keyword.arg is not None
+            }
+            constructor = {
+                "range": range,
+                "enumerate": enumerate,
+                "zip": zip,
+            }[node.func.id]
+            return constructor(*args, **keywords)
+        raise ValueError("expression is not a compiler-known iterable literal")
+
+    if expression is None:
+        return None
+    try:
+        value = resolve(expression)
+        if isinstance(value, (str, bytes, bytearray)):
+            return None
+        return tuple(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _static_predicate_expression(
+    expression: ast.AST,
+    environment: dict[str, object],
+) -> bool:
+    """Evaluate a comprehension predicate from source-known scalar values."""
+
+    def resolve(node: ast.AST):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in environment:
+            return environment[node.id]
+        if isinstance(node, ast.UnaryOp):
+            value = resolve(node.operand)
+            if isinstance(node.op, ast.Not):
+                return not value
+            if isinstance(node.op, ast.USub):
+                return -value
+        if isinstance(node, ast.BoolOp):
+            values = [bool(resolve(value)) for value in node.values]
+            return (
+                all(values)
+                if isinstance(node.op, ast.And)
+                else any(values)
+            )
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            left = resolve(node.left)
+            right = resolve(node.comparators[0])
+            operation = node.ops[0]
+            if isinstance(operation, ast.Eq):
+                return left == right
+            if isinstance(operation, ast.NotEq):
+                return left != right
+            if isinstance(operation, ast.Lt):
+                return left < right
+            if isinstance(operation, ast.LtE):
+                return left <= right
+            if isinstance(operation, ast.Gt):
+                return left > right
+            if isinstance(operation, ast.GtE):
+                return left >= right
+        raise ValueError("predicate is not source-static")
+
+    return bool(resolve(expression))
 
 
 class LoopComposer:
@@ -109,6 +1207,14 @@ class LoopComposer:
                 "while" if isinstance(expression, ast.While) else "iterable",
             )
         )
+        if (
+            isinstance(expression, (ast.For, ast.comprehension))
+            and iterator_kind == "arithmetic_sequence"
+        ):
+            # Arithmetic iteration is a source fact established below from an
+            # actual ``range(...)`` AST.  Discovery metadata is not allowed to
+            # relabel an arbitrary iterable as a numeric range.
+            iterator_kind = "iterable"
         body_nodes = tuple(
             by_role.get("body", ())
             or by_role.get("generators", ())
@@ -118,13 +1224,74 @@ class LoopComposer:
             for candidate, node_data in graph.G.nodes(data=True)
             if node_data.get("expr_obj") is not None
         }
-        if not body_nodes and isinstance(expression, (ast.For, ast.While)):
-            body_nodes = tuple(
+        def graph_node_for_ast(member: ast.AST) -> int | None:
+            direct = expression_nodes.get(id(member))
+            if direct is not None:
+                return int(direct)
+            signature = (
+                type(member),
+                getattr(member, "lineno", None),
+                getattr(member, "col_offset", None),
+                getattr(member, "end_lineno", None),
+                getattr(member, "end_col_offset", None),
+                ast.dump(member, include_attributes=False),
+            )
+            matches = []
+            for candidate, node_data in graph.G.nodes(data=True):
+                candidate_expression = node_data.get("expr_obj")
+                if not isinstance(candidate_expression, ast.AST):
+                    continue
+                candidate_signature = (
+                    type(candidate_expression),
+                    getattr(candidate_expression, "lineno", None),
+                    getattr(candidate_expression, "col_offset", None),
+                    getattr(candidate_expression, "end_lineno", None),
+                    getattr(candidate_expression, "end_col_offset", None),
+                    ast.dump(candidate_expression, include_attributes=False),
+                )
+                if candidate_signature == signature:
+                    matches.append(int(candidate))
+            return min(matches) if matches else None
+        # A range is control structure, not an opaque iterable value.  Some
+        # ingested graphs retain only the ``iterable`` edge on the loop node;
+        # recover the exact range-argument nodes from the already-ingested AST
+        # identities so dynamic bounds remain graph dependencies rather than
+        # becoming a fabricated ``u_control_None``.
+        iterator_expression = (
+            expression.iter
+            if isinstance(expression, (ast.For, ast.comprehension))
+            else None
+        )
+        if (
+            isinstance(iterator_expression, ast.Call)
+            and isinstance(iterator_expression.func, ast.Name)
+            and iterator_expression.func.id == "range"
+            and 1 <= len(iterator_expression.args) <= 3
+        ):
+            iterator_kind = "arithmetic_sequence"
+            argument_ids = tuple(
+                graph_node_for_ast(argument)
+                for argument in iterator_expression.args
+            )
+            if all(node is not None for node in argument_ids):
+                if len(argument_ids) == 1:
+                    by_role["stop"] = [argument_ids[0]]
+                else:
+                    by_role["start"] = [argument_ids[0]]
+                    by_role["stop"] = [argument_ids[1]]
+                    if len(argument_ids) == 3:
+                        by_role["step"] = [argument_ids[2]]
+        if isinstance(expression, (ast.For, ast.While)):
+            ast_body_nodes = tuple(
                 expression_nodes[id(member)]
                 for statement in expression.body
                 for member in ast.walk(statement)
                 if id(member) in expression_nodes
             )
+            body_nodes = tuple(dict.fromkeys((
+                *body_nodes,
+                *ast_body_nodes,
+            )))
         elif not body_nodes and isinstance(expression, ast.comprehension):
             body_nodes = tuple(
                 parent
@@ -138,6 +1305,35 @@ class LoopComposer:
                 )
                 if str(role) in {"elt", "key", "value"}
             )
+        if body_nodes:
+            original_position = {
+                int(member): position
+                for position, member in enumerate(body_nodes)
+            }
+
+            def body_order(member: int):
+                member_expression = graph.G.nodes[member].get("expr_obj")
+                return (
+                    getattr(member_expression, "lineno", float("inf")),
+                    getattr(member_expression, "col_offset", float("inf")),
+                    original_position.get(int(member), len(original_position)),
+                    int(member),
+                )
+
+            body_graph = graph.G.subgraph(tuple(dict.fromkeys(body_nodes)))
+            try:
+                body_nodes = tuple(
+                    int(member)
+                    for member in nx.lexicographical_topological_sort(
+                        body_graph,
+                        key=body_order,
+                    )
+                )
+            except nx.NetworkXUnfeasible as error:
+                raise ValueError(
+                    f"loop {node_id} has a cyclic single-iteration body; "
+                    "loop-carried dependencies must cross explicit ports"
+                ) from error
         condition_nodes = tuple(
             by_role.get("ifs", ())
             or by_role.get("test", ())
@@ -147,51 +1343,203 @@ class LoopComposer:
             None,
         )
 
-        start = attributes.get("start")
-        stop = attributes.get("stop")
-        step = attributes.get("step")
-        for role, default in (("start", 0), ("stop", None), ("step", 1)):
-            nodes = by_role.get(role, ())
-            if nodes:
-                known, value = _constant(graph, nodes[0])
-                if known:
-                    if role == "start":
-                        start = value
-                    elif role == "stop":
-                        stop = value
-                    else:
-                        step = value
-            elif role == "start" and start is None:
-                start = default
-            elif role == "step" and step is None:
-                step = default
+        # Numeric bounds belong only to source arithmetic sequences.  Graph
+        # ingestion may annotate an ordinary iterable loop with the iteration
+        # observed while discovering the program (often ``stop=1`` for one
+        # captured visit).  Treating that observation as a bound compiles an
+        # execution instance, drops the iterable binding, and severs every
+        # aggregate element/field identity.  A non-range loop is bounded by its
+        # iterable identity or by a source-static iterable—never by discovery
+        # values.
+        if iterator_kind == "arithmetic_sequence":
+            start = attributes.get("start")
+            stop = attributes.get("stop")
+            step = attributes.get("step")
+        else:
+            start = 0
+            stop = None
+            step = 1
+        if iterator_kind == "arithmetic_sequence":
+            for role, default in (
+                ("start", 0),
+                ("stop", None),
+                ("step", 1),
+            ):
+                nodes = by_role.get(role, ())
+                if nodes:
+                    known, value = _constant(graph, nodes[0])
+                    if known:
+                        if role == "start":
+                            start = value
+                        elif role == "stop":
+                            stop = value
+                        else:
+                            step = value
+                elif role == "start" and start is None:
+                    start = default
+                elif role == "step" and step is None:
+                    step = default
 
+        iterable_constant = None
         count = _trip_count(start, stop, step)
+        if count is None and iterator_kind != "arithmetic_sequence":
+            iterable_constant = _static_iterable_expression(
+                iterator_expression,
+                {
+                    **dict(
+                        graph.G.graph.get("parameter_defaults") or {}
+                    ),
+                    **dict(
+                        graph.G.graph.get("planner_specializations") or {}
+                    ),
+                },
+            )
+            if iterable_constant is not None:
+                count = len(iterable_constant)
+        if (
+            count is None
+            and iterator_kind != "arithmetic_sequence"
+            and isinstance(iterator_expression, (ast.Tuple, ast.List))
+        ):
+            try:
+                literal_iterable = ast.literal_eval(iterator_expression)
+            except (ValueError, TypeError):
+                literal_iterable = None
+            if isinstance(literal_iterable, (tuple, list)):
+                iterable_constant = tuple(literal_iterable)
+                count = len(iterable_constant)
         if count is None and iterable_node is not None:
             known, iterable = _constant(graph, iterable_node)
             if known and isinstance(iterable, (tuple, list, range)):
                 count = len(iterable)
+                iterable_constant = tuple(iterable)
 
+        yield_nodes = tuple(
+            sorted(
+                expression_nodes[id(member)]
+                for statement in (
+                    expression.body
+                    if isinstance(expression, (ast.For, ast.While))
+                    else ()
+                )
+                for member in ast.walk(statement)
+                if isinstance(member, (ast.Yield, ast.YieldFrom))
+                and id(member) in expression_nodes
+            )
+        )
+        state_effects = tuple(dict.fromkeys(
+            LoopStateEffect(
+                state_name=str(effect["state_name"]),
+                operator=str(effect["operator"]),
+                state_input_id=int(effect["state_input_id"]),
+                effect_node_id=int(effect["effect_node_id"]),
+                state_output_id=(
+                    None
+                    if effect.get("state_output_id") is None
+                    else int(effect["state_output_id"])
+                ),
+                loop_result_id=(
+                    None
+                    if effect.get("loop_result_id") is None
+                    else int(effect["loop_result_id"])
+                ),
+                argument_value_ids=tuple(
+                    int(value_id)
+                    for value_id in effect["argument_value_ids"]
+                ),
+                mode=LoopStateEffectMode(
+                    effect.get("effect_mode", "opaque")
+                ),
+            )
+            for effect in attributes.get("loop_state_effects", ())
+        ))
+        iteration_outputs = tuple(dict.fromkeys(
+            LoopIterationOutput(
+                value_id=int(output["value_id"]),
+                result_value_id=int(output["result_value_id"]),
+                materializer_node_id=int(
+                    output["materializer_node_id"]
+                ),
+            )
+            for output in attributes.get("loop_iteration_outputs", ())
+        ))
+        publication_nodes = tuple(
+            (
+                int(yield_id),
+                next(
+                    int(parent)
+                    for parent, role in (
+                        graph.G.nodes[yield_id].get("parents") or ()
+                    )
+                    if str(role) == "value"
+                ),
+                None,
+            )
+            for yield_id in yield_nodes
+        )
         target_bindings = dict(
             attributes.get("loop_target_bindings") or {}
         )
-        for name, target_id in tuple(target_bindings.items()):
-            if target_id in graph.G and graph.G.out_degree(target_id):
-                continue
-            candidates = [
-                candidate
-                for candidate, candidate_data in graph.G.nodes(data=True)
-                if candidate_data.get("type") == "Input"
-                and (
-                    candidate_data.get("attributes") or {}
-                ).get("binding_kind") == "loop"
-                and (
-                    candidate_data.get("attributes") or {}
-                ).get("binding_name") == name
-                and graph.G.out_degree(candidate)
-            ]
-            if candidates:
-                target_bindings[name] = min(candidates)
+
+        def lexical_target_names(target_node: ast.AST) -> tuple[str, ...]:
+            if isinstance(target_node, ast.Name):
+                return (target_node.id,)
+            if isinstance(target_node, (ast.Tuple, ast.List)):
+                return tuple(
+                    name
+                    for element in target_node.elts
+                    for name in lexical_target_names(element)
+                )
+            return ()
+
+        ordered_target_names = (
+            lexical_target_names(expression.target)
+            if isinstance(expression, (ast.For, ast.comprehension))
+            else tuple(target_bindings)
+        )
+        if (
+            iterable_constant is not None
+            and isinstance(expression, ast.comprehension)
+            and expression.ifs
+            and ordered_target_names
+        ):
+            filtered = []
+            specializations = dict(
+                graph.G.graph.get("parameter_defaults") or {}
+            )
+            specializations.update(
+                graph.G.graph.get("planner_specializations") or {}
+            )
+            for item in iterable_constant:
+                values = (
+                    tuple(item)
+                    if len(ordered_target_names) > 1
+                    else (item,)
+                )
+                if len(values) != len(ordered_target_names):
+                    raise ValueError(
+                        "static iterable item does not match loop target "
+                        f"destructuring: targets={ordered_target_names!r}, "
+                        f"item={item!r}"
+                    )
+                environment = {
+                    **specializations,
+                    **dict(zip(ordered_target_names, values)),
+                }
+                try:
+                    accepted = all(
+                        _static_predicate_expression(
+                            predicate,
+                            environment,
+                        )
+                        for predicate in expression.ifs
+                    )
+                except ValueError:
+                    accepted = True
+                if accepted:
+                    filtered.append(item)
+            iterable_constant = tuple(filtered)
+            count = len(iterable_constant)
 
         return LoopDescriptor(
             node_id=int(node_id),
@@ -201,13 +1549,12 @@ class LoopComposer:
             body_nodes=body_nodes,
             condition_nodes=condition_nodes,
             target_bindings=tuple(
-                sorted(
-                    (
-                        str(name),
-                        int(value_id),
-                    )
-                    for name, value_id in target_bindings.items()
+                (
+                    str(name),
+                    int(target_bindings[name]),
                 )
+                for name in ordered_target_names
+                if name in target_bindings
             ),
             carried_bindings=tuple(
                 sorted(
@@ -224,8 +1571,29 @@ class LoopComposer:
             start=start,
             stop=stop,
             step=step,
+            start_node=(
+                next(iter(by_role.get("start", ())), None)
+                if iterator_kind == "arithmetic_sequence"
+                else None
+            ),
+            stop_node=(
+                next(iter(by_role.get("stop", ())), None)
+                if iterator_kind == "arithmetic_sequence"
+                else None
+            ),
+            step_node=(
+                next(iter(by_role.get("step", ())), None)
+                if iterator_kind == "arithmetic_sequence"
+                else None
+            ),
             iterable_node=iterable_node,
+            iterable_constant=iterable_constant,
             trip_count=count,
+            yield_nodes=yield_nodes,
+            publication_nodes=publication_nodes,
+            state_effects=state_effects,
+            iteration_outputs=iteration_outputs,
+            backpressured_output=bool(publication_nodes),
         )
 
     def plan(self, loop: LoopDescriptor) -> LoopPlan:
@@ -238,6 +1606,11 @@ class LoopComposer:
         if (
             loop.trip_count is not None
             and loop.trip_count <= self.capabilities.unroll_limit
+            and all(
+                effect.mode
+                is LoopStateEffectMode.INDEXED_PUBLICATION
+                for effect in loop.state_effects
+            )
         ):
             return LoopPlan(
                 loop,
@@ -274,15 +1647,676 @@ class LoopComposer:
             "the loop requires planner-coordinated dispatches",
         )
 
-    def compose(self, graph: Any) -> tuple[LoopPlan, ...]:
+    def discover(self, graph: Any) -> tuple[LoopPlan, ...]:
+        """Discover and select loop realizations without constructing loop IR."""
+
+        if not graph.G.graph.get("canonical_value_ids"):
+            raise ValueError(
+                "loop discovery requires canonical value IDs and specialization"
+            )
         plans = []
         for node_id, data in graph.G.nodes(data=True):
             if isinstance(
                 data.get("expr_obj"),
                 (ast.For, ast.While, ast.comprehension),
             ):
-                plans.append(self.plan(self.describe(graph, node_id)))
+                descriptor = self.describe(graph, node_id)
+                plans.append(self.plan(descriptor))
         return tuple(plans)
+
+    def materialize_semantic_ir(
+        self,
+        graph: Any,
+        plans: Iterable[LoopPlan],
+    ) -> tuple[LoopPlan, ...]:
+        """Build exactly one semantic IR for each retained loop."""
+
+        if not graph.G.graph.get("canonical_value_ids"):
+            raise ValueError(
+                "semantic loop IR requires canonical value IDs"
+            )
+        plans = tuple(plans)
+        duplicate = tuple(
+            int(plan.loop.node_id)
+            for plan in plans
+            if plan.semantic is not None
+        )
+        if duplicate:
+            raise ValueError(
+                "semantic loop IR already exists for retained loops "
+                f"{duplicate!r}"
+            )
+        return tuple(
+            replace(plan, semantic=self._semantic_loop(graph, plan))
+            for plan in plans
+        )
+
+    def compose(self, graph: Any) -> tuple[LoopPlan, ...]:
+        """Compatibility API for callers that need semantic retained-loop IR."""
+
+        return self.materialize_semantic_ir(graph, self.discover(graph))
+
+    def _semantic_loop(self, graph: Any, plan: LoopPlan) -> SemanticLoop:
+        """Translate discovered structure into the shared configurable IR."""
+
+        loop = plan.loop
+        realization = {
+            LoopStrategy.UNROLL: LoopRealization.UNROLL,
+            LoopStrategy.NATIVE_SOURCE: LoopRealization.NATIVE,
+            LoopStrategy.KPN: LoopRealization.KPN,
+            LoopStrategy.DISPATCH: LoopRealization.DISPATCH,
+            LoopStrategy.CONSTANT: LoopRealization.UNROLL,
+        }[plan.strategy]
+        if loop.iterator_kind == "arithmetic_sequence":
+            kind = LoopDomainKind.RANGE
+            domain = RangeDomain(
+                LoopValue(loop.start_node, loop.start),
+                LoopValue(loop.stop_node, loop.stop),
+                LoopValue(loop.step_node, loop.step),
+            )
+        elif loop.source_type == "While":
+            if len(loop.condition_nodes) != 1:
+                raise ValueError(
+                    f"while loop {loop.node_id} needs one condition value"
+                )
+            kind = LoopDomainKind.CONDITION
+            domain = ConditionDomain(int(loop.condition_nodes[0]))
+        else:
+            if loop.iterable_node is None:
+                raise ValueError(
+                    f"iterable loop {loop.node_id} has no iterable value"
+                )
+            kind = LoopDomainKind.ITERABLE
+            access = (
+                IterableAccess.STATIC
+                if loop.iterable_constant is not None
+                else IterableAccess.RESIDENT
+            )
+            source_value_ids: tuple[int, ...] = ()
+            iterable_data = graph.G.nodes[int(loop.iterable_node)]
+            iterable_expression = iterable_data.get("expr_obj")
+            if isinstance(iterable_expression, ast.GeneratorExp):
+                access = IterableAccess.GENERATOR
+            elif (
+                (iterable_data.get("attributes") or {}).get("producer_kind")
+                in {
+                    "loop_materialization",
+                    "aggregate_materialization",
+                }
+            ):
+                argument_ids = tuple(map(
+                    int,
+                    (iterable_data.get("attributes") or {}).get(
+                        "materialized_source_value_ids",
+                        (),
+                    ),
+                ))
+                if not argument_ids:
+                    argument_ids = tuple(
+                        int(parent)
+                        for parent, role in (
+                            iterable_data.get("parents") or ()
+                        )
+                        if str(role).startswith("arg:")
+                    )
+                access = IterableAccess.CLOSURE_AGGREGATE
+                source_value_ids = argument_ids
+            domain = IterableDomain(
+                LoopValue(
+                    int(loop.iterable_node),
+                    loop.iterable_constant,
+                ),
+                loop.target_bindings,
+                access,
+                source_value_ids,
+            )
+        body = set(loop.body_nodes)
+        captures = tuple(sorted({
+            int(parent)
+            for node_id in body
+            if node_id in graph.G
+            for parent, _role in (
+                graph.G.nodes[node_id].get("parents") or ()
+            )
+            if parent not in body
+        }))
+        body_closure = PlanClosure(
+            name=f"loop_{loop.node_id}_body",
+            captures=captures,
+            items=tuple(
+                PlanLine.create(
+                    str(
+                        graph.G.nodes[node_id].get("op")
+                        or graph.G.nodes[node_id].get("type")
+                        or "node"
+                    ),
+                    inputs=tuple(
+                        parent
+                        for parent, _role in (
+                            graph.G.nodes[node_id].get("parents") or ()
+                        )
+                    ),
+                    outputs=(node_id,),
+                )
+                for node_id in loop.body_nodes
+                if node_id in graph.G
+            ),
+        )
+        return SemanticLoop(
+            loop_id=loop.node_id,
+            domain_kind=kind,
+            domain=domain,
+            body_node_ids=loop.body_nodes,
+            body_closure=body_closure,
+            carried=tuple(
+                LoopCarriedState(name, initial, updated)
+                for name, initial, updated in loop.carried_bindings
+            ),
+            state_effects=loop.state_effects,
+            iteration_outputs=loop.iteration_outputs,
+            effects=LoopEffects(
+                yield_value_ids=tuple(
+                    value_id
+                    for _statement_id, value_id, _count_id
+                    in loop.publication_nodes
+                )
+            ),
+            policy=LoopPolicy(
+                realization=realization,
+                unroll_limit=self.capabilities.unroll_limit,
+                backpressure=loop.backpressured_output,
+                allow_parallel_iterations=(
+                    not loop.carried_bindings
+                    and not loop.backpressured_output
+                    and bool(
+                        loop.state_effects or loop.iteration_outputs
+                    )
+                    and all(
+                        effect.mode
+                        is LoopStateEffectMode.INDEXED_PUBLICATION
+                        and effect.loop_result_id is not None
+                        for effect in loop.state_effects
+                    )
+                ),
+            ),
+        )
+
+
+def analyze_shader_loop_reductions(
+    graph: Any,
+    plans: Iterable[LoopPlan],
+    region_nodes: Iterable[Iterable[int]],
+) -> tuple[LoopShaderReduction, ...]:
+    """Classify loops after shader compartmentalization.
+
+    This is deliberately a second planner pass.  Loop discovery alone cannot
+    decide whether retaining a loop in backend source is profitable or legal;
+    that decision needs the actual deployment regions.  The pass records
+    blockers instead of silently falling back to a CPU iteration loop.
+    """
+
+    regions = tuple(tuple(nodes) for nodes in region_nodes)
+    forbidden = (
+        ast.Break,
+        ast.Continue,
+        ast.Raise,
+        ast.Try,
+        ast.With,
+        ast.AsyncWith,
+        ast.Await,
+    )
+    reductions = []
+    identity_table = graph.G.graph.get("identity_table") or {}
+
+    def control_scalar_expression(
+        node_id: int | None,
+        visiting: frozenset[int] = frozenset(),
+    ) -> tuple[str, tuple[int, ...]]:
+        """Lower a scalar bound expression to control source and root inputs."""
+
+        if node_id is None:
+            raise ValueError("control expression has no node")
+        node_id = int(node_id)
+        if node_id in visiting:
+            return f"u_control_{node_id}", (node_id,)
+        data = graph.G.nodes[node_id]
+        value = data.get("constant")
+        if value is None:
+            value = (data.get("attributes") or {}).get("value")
+        if isinstance(value, (bool, int, float)):
+            return repr(value), ()
+        if (
+            data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_kind")
+            == "parameter"
+        ):
+            return f"u_control_{node_id}", (node_id,)
+
+        parents = tuple(data.get("parents") or ())
+        binary = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "mult": "*",
+            "div": "/",
+            "floordiv": "/",
+            "mod": "%",
+        }.get(str(data.get("op") or data.get("type")).lower())
+        if binary is not None and len(parents) == 2:
+            ordered = sorted(
+                parents,
+                key=lambda item: {
+                    "lhs": 0,
+                    "left": 0,
+                    "rhs": 1,
+                    "right": 1,
+                }.get(str(item[1]), 2),
+            )
+            left, left_uniforms = control_scalar_expression(
+                int(ordered[0][0]), visiting | {node_id}
+            )
+            right, right_uniforms = control_scalar_expression(
+                int(ordered[1][0]), visiting | {node_id}
+            )
+            return (
+                f"({left} {binary} {right})",
+                tuple(dict.fromkeys((*left_uniforms, *right_uniforms))),
+            )
+        if (
+            str(data.get("op") or data.get("type")).lower()
+            in {"neg", "usub"}
+            and len(parents) == 1
+        ):
+            operand, uniforms = control_scalar_expression(
+                int(parents[0][0]), visiting | {node_id}
+            )
+            return f"(-{operand})", uniforms
+        return f"u_control_{node_id}", (node_id,)
+
+    for plan in plans:
+        loop = plan.loop
+        # Source spellings are not identities.  Separate lexical loops
+        # routinely reuse ``i``, ``item`` or ``packet``; using that spelling as
+        # a control key lets projection retain or discard another loop's
+        # bindings.  The planner-assigned loop node is stable and unique within
+        # this graph, so every backend receives an identity-derived induction
+        # symbol while the source name remains diagnostic metadata only.
+        induction_name = f"iteration_{int(loop.node_id)}"
+        dynamic_bounds = tuple(
+            (
+                name,
+                *control_scalar_expression(node_id),
+            )
+            for name, node_id, value in (
+                ("start", loop.start_node, loop.start),
+                ("stop", loop.stop_node, loop.stop),
+                ("step", loop.step_node, loop.step),
+            )
+            if node_id is not None and value is None
+        )
+        bound_expressions = {
+            name: expression
+            for name, expression, _uniforms in dynamic_bounds
+        }
+        bound_uniform_ids = tuple(dict.fromkeys(
+            value_id
+            for _name, _expression, uniforms in dynamic_bounds
+            for value_id in uniforms
+        ))
+        body = set(loop.body_nodes)
+        lexical_position = {
+            int(node_id): position
+            for position, node_id in enumerate(loop.body_nodes)
+        }
+        region_indices = tuple(sorted(
+            (
+            index
+            for index, nodes in enumerate(regions)
+            if body.intersection(nodes)
+            ),
+            key=lambda index: min(
+                lexical_position[node_id]
+                for node_id in regions[index]
+                if node_id in lexical_position
+            ),
+        ))
+        blockers = []
+        if plan.strategy not in {
+            LoopStrategy.NATIVE_SOURCE,
+            LoopStrategy.UNROLL,
+        }:
+            blockers.append(f"strategy={plan.strategy.value}")
+        if (
+            plan.semantic is not None
+            and isinstance(plan.semantic.domain, IterableDomain)
+            and plan.semantic.domain.access
+            in {
+                IterableAccess.CLOSURE_AGGREGATE,
+                IterableAccess.GENERATOR,
+            }
+        ):
+            if not (
+                plan.semantic.domain.access
+                is IterableAccess.CLOSURE_AGGREGATE
+                and plan.semantic.domain.source_value_ids
+                and len(loop.target_bindings) == 1
+            ):
+                blockers.append(
+                    f"iterable-access={plan.semantic.domain.access.value}"
+                )
+        if not region_indices:
+            blockers.append("no-shader-region")
+        if any(
+            effect.mode is LoopStateEffectMode.OPAQUE
+            for effect in loop.state_effects
+        ):
+            blockers.append("opaque-state-effect")
+        if (
+            loop.stop is None
+            and loop.stop_node is None
+            and not (
+                loop.iterable_node is not None
+                and bool(loop.target_bindings)
+                and (
+                    len(loop.target_bindings) == 1
+                    or loop.iterable_constant is not None
+                )
+            )
+        ):
+            blockers.append("unresolved-loop-bound")
+        for node_id in loop.body_nodes:
+            if node_id not in graph.G:
+                continue
+            expression = graph.G.nodes[node_id].get("expr_obj")
+            if isinstance(expression, forbidden):
+                blockers.append(type(expression).__name__)
+        blockers = list(dict.fromkeys(blockers))
+        trip_count = loop.trip_count
+        removed = (
+            None
+            if trip_count is None
+            else max(0, trip_count * len(region_indices) - len(region_indices))
+        )
+        # A retained extensive loop around a few coarse shader closures is a
+        # dispatch program, not shader-internal control.  Dissolve it to a C
+        # command shell by default.  Dense loops with many numerical regions
+        # remain candidates for genuine same-ABI GLSL fusion/workgroup
+        # mapping; they are not serialized into thousands of C commands.
+        prefer_c_dispatch = bool(
+            not blockers
+            and loop.iterator_kind == "arithmetic_sequence"
+            and not loop.carried_bindings
+            and bool(loop.state_effects or loop.iteration_outputs)
+            and 0 < len(region_indices) <= 4
+            and (
+                trip_count is None
+                or trip_count > int(
+                    (
+                        plan.semantic.policy.unroll_limit
+                        if plan.semantic is not None
+                        and plan.semantic.policy.unroll_limit is not None
+                        else 8
+                    )
+                )
+            )
+            and not loop.backpressured_output
+        )
+        reductions.append(LoopShaderReduction(
+            loop_node_id=loop.node_id,
+            region_indices=region_indices,
+            carried_bindings=loop.carried_bindings,
+            collapsible=not blockers,
+            blockers=tuple(blockers),
+            estimated_dispatches_removed=removed,
+            control_program=(
+                None
+                if blockers
+                else ControlProgram(
+                    region_indices=region_indices,
+                    uniforms=tuple(
+                        ControlUniform(
+                            f"u_control_{node_id}",
+                            int(node_id),
+                        )
+                        for node_id in bound_uniform_ids
+                    ),
+                    value_aliases=tuple(
+                        dict.fromkeys(
+                            (
+                                int(alias),
+                                int(initial),
+                            )
+                            for name, initial, updated
+                            in loop.carried_bindings
+                            for alias in (
+                                *tuple(identity_table.get(name, ())),
+                                updated,
+                            )
+                            if int(alias) != int(initial)
+                        )
+                    ),
+                    iterable_bindings=(
+                        (
+                            int(loop.iterable_node),
+                            int(loop.target_bindings[0][1]),
+                            induction_name,
+                        ),
+                    )
+                    if (
+                        loop.stop is None
+                        and loop.stop_node is None
+                        and loop.iterable_node is not None
+                        and len(loop.target_bindings) == 1
+                        and loop.iterable_constant is None
+                    )
+                    else (),
+                    static_iterable_bindings=tuple(
+                        (
+                            int(loop.iterable_node),
+                            int(target_id),
+                            induction_name,
+                            tuple(
+                                (
+                                    tuple(item)[position]
+                                    if len(loop.target_bindings) > 1
+                                    else item
+                                )
+                                for item in loop.iterable_constant
+                            ),
+                        )
+                        for position, (_name, target_id)
+                        in enumerate(loop.target_bindings)
+                    )
+                    if (
+                        loop.stop is None
+                        and loop.stop_node is None
+                        and loop.iterable_node is not None
+                        and bool(loop.target_bindings)
+                        and loop.iterable_constant is not None
+                    )
+                    else (),
+                    collection_bindings=planned_collection_bindings(
+                        graph,
+                        loop,
+                        frozenset(
+                            node_id
+                            for region in regions
+                            for node_id in region
+                        ),
+                    ),
+                    closure_iterable_bindings=(
+                        (
+                            int(loop.iterable_node),
+                            int(loop.target_bindings[0][1]),
+                            induction_name,
+                            tuple(
+                                int(value_id)
+                                for value_id in (
+                                    plan.semantic.domain.source_value_ids
+                                )
+                            ),
+                        ),
+                    )
+                    if (
+                        plan.semantic is not None
+                        and isinstance(
+                            plan.semantic.domain, IterableDomain
+                        )
+                        and plan.semantic.domain.access
+                        is IterableAccess.CLOSURE_AGGREGATE
+                        and plan.semantic.domain.source_value_ids
+                        and loop.iterable_node is not None
+                        and len(loop.target_bindings) == 1
+                    )
+                    else (),
+                    root=LoopBlock(
+                        induction=induction_name,
+                        start=(
+                            bound_expressions.get("start", "0")
+                            if loop.start is None
+                            else str(loop.start)
+                        ),
+                        stop=str(loop.stop) if loop.stop is not None else (
+                            (
+                                str(len(
+                                    plan.semantic.domain.source_value_ids
+                                ))
+                                if (
+                                    plan.semantic is not None
+                                    and isinstance(
+                                        plan.semantic.domain,
+                                        IterableDomain,
+                                    )
+                                    and plan.semantic.domain.access
+                                    is IterableAccess.CLOSURE_AGGREGATE
+                                    and (
+                                        plan.semantic.domain.source_value_ids
+                                    )
+                                )
+                                else
+                                f"__iterable_extent_{loop.iterable_node}__"
+                                if loop.stop_node is None
+                                and loop.iterable_node is not None
+                                and bool(loop.target_bindings)
+                                and loop.iterable_constant is None
+                                else str(len(loop.iterable_constant))
+                                if loop.iterable_constant is not None
+                                else bound_expressions.get(
+                                    "stop",
+                                    f"u_control_{loop.stop_node}",
+                                )
+                            )
+                        ),
+                        step=(
+                            bound_expressions.get("step", "1")
+                            if loop.step is None
+                            else str(loop.step)
+                        ),
+                        body=SequenceBlock(tuple(
+                            block
+                            for _position, block in sorted(
+                                (
+                                    *(
+                                        (
+                                            min(
+                                                lexical_position[node_id]
+                                                for node_id in regions[
+                                                    region_index
+                                                ]
+                                                if node_id
+                                                in lexical_position
+                                            ),
+                                            StatementBlock((
+                                                "__scheduled_region_"
+                                                f"{region_index}__",
+                                            )),
+                                        )
+                                        for region_index in region_indices
+                                    ),
+                                    *(
+                                        (
+                                            lexical_position[yield_id],
+                                            StreamPublishBlock(
+                                                stream_id=0,
+                                                value_id=publish_value_id,
+                                                count_value_id=(
+                                                    publish_count_id
+                                                ),
+                                                predicate_value_id=next(
+                                                    (
+                                                        int(parent)
+                                                        for owner_id, owner
+                                                        in graph.G.nodes(
+                                                            data=True
+                                                        )
+                                                        if any(
+                                                            int(candidate)
+                                                            == int(yield_id)
+                                                            and str(role)
+                                                            == "body"
+                                                            for candidate, role
+                                                            in (
+                                                                owner.get(
+                                                                    "parents"
+                                                                )
+                                                                or ()
+                                                            )
+                                                        )
+                                                        for parent, role in (
+                                                            owner.get(
+                                                                "parents"
+                                                            )
+                                                            or ()
+                                                        )
+                                                        if str(role) == "test"
+                                                    ),
+                                                    None,
+                                                ),
+                                            ),
+                                        )
+                                        for (
+                                            yield_id,
+                                            publish_value_id,
+                                            publish_count_id,
+                                        )
+                                        in loop.publication_nodes
+                                        if yield_id in lexical_position
+                                    ),
+                                ),
+                                key=lambda item: item[0],
+                            )
+                        )),
+                        carried_aliases=tuple(
+                            dict.fromkeys(
+                                (
+                                    int(alias),
+                                    int(initial),
+                                )
+                                for name, initial, updated
+                                in loop.carried_bindings
+                                for alias in (
+                                    *tuple(identity_table.get(name, ())),
+                                    updated,
+                                )
+                                if int(alias) != int(initial)
+                            )
+                        ),
+                        parallel_iterations=bool(
+                            not prefer_c_dispatch
+                            and
+                            plan.semantic is not None
+                            and plan.semantic.policy.allow_parallel_iterations
+                        ),
+                        dispatch_shell=(
+                            "c" if prefer_c_dispatch else "glsl"
+                        ),
+                    ),
+                )
+            ),
+            preferred_shell=("c" if prefer_c_dispatch else "glsl"),
+            dispatch_closure_count=len(region_indices),
+        ))
+    return tuple(reductions)
 
 
 def indent_source(lines: Iterable[str], spaces: int = 4) -> tuple[str, ...]:
@@ -295,6 +2329,11 @@ __all__ = [
     "LoopComposer",
     "LoopDescriptor",
     "LoopPlan",
+    "LoopShaderReduction",
     "LoopStrategy",
+    "analyze_shader_loop_reductions",
+    "evaporate_unrolled_loops",
     "indent_source",
+    "materialize_retained_loop_ports",
+    "planned_collection_bindings",
 ]

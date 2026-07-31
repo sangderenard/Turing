@@ -5,6 +5,17 @@ from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.autograd import GradTape, autograd
 
 
+def test_forward_capture_honors_an_explicit_empty_tape():
+    tape = GradTape()
+
+    with autograd.forward_capture(tape) as active:
+        assert active is tape
+        with AbstractTensor.use_backend("numpy"):
+            result = AbstractTensor.tensor([1.0]) + 1.0
+
+    assert id(result) in tape._nodes
+
+
 def test_forward_capture_records_nondifferentiable_primitives():
     with autograd.forward_capture() as tape:
         with AbstractTensor.use_backend("numpy"):

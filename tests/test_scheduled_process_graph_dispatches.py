@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import ast
+
 from src.compiler.process_graph_fusion import (
     extract_clean_process_subgraph,
+    reduce_scheduled_shader_regions,
     serialize_scheduled_operator_dispatches,
 )
-from src.compiler.glsl_deployment_strategy import _dispatch_subgraph
+from src.compiler.glsl_deployment_strategy import (
+    _control_partition_keys,
+    _dispatch_subgraph,
+    _is_dispatch_metadata_node,
+    _inert_routing_nodes,
+)
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
@@ -93,6 +101,73 @@ def test_same_operator_level_is_split_only_at_the_dispatch_cap():
     assert [pattern.batch_count for pattern in plan.patterns] == [3, 3, 3]
 
 
+def test_shader_region_reducer_applies_all_three_identities_to_fixed_point():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Input")
+    _add(graph, 2, "Add", (0,))
+    _add(graph, 3, "Add", (1,))
+    _add(graph, 4, "Sin", (2,))
+    _add(graph, 5, "Cos", (3,))
+    _add(graph, 6, "Neg", (0,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(2, 3, 4, 5, 6),
+    )
+
+    assert len(plan.dispatches) == 1
+    dispatch = plan.dispatches[0]
+    assert set(dispatch.node_ids) == {2, 3, 4, 5, 6}
+    assert "horizontal-batch" in dispatch.rewrite_history
+    assert "vertical-fusion" in dispatch.rewrite_history
+    assert "horizontal-shader-pack" in dispatch.rewrite_history
+
+
+def test_shader_region_reducer_never_crosses_a_planner_partition():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Mul", (1,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2),
+        partition_keys={1: ("outside",), 2: ("loop-7",)},
+    )
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (2,)]
+
+
+def test_shader_region_reducer_preserves_hidden_structural_dependency():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "coordinator", (1,))
+    _add(graph, 3, "Mul", (2,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 3),
+    )
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (3,)]
+
+
+def test_tensor_accessor_and_its_scalar_comparison_stay_with_coordinator():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "ndims", (0,))
+    _add(graph, 2, "Constant")
+    _add(graph, 3, "not_equal", (1, 2))
+    graph.G.nodes[1]["expr_obj"] = ast.parse("value.ndims()").body[0].value
+    graph.G.nodes[3]["expr_obj"] = ast.parse("rank != 1").body[0].value
+    graph.G.nodes[2]["constant"] = 1
+
+    assert _is_dispatch_metadata_node(graph, 1)
+    assert _is_dispatch_metadata_node(graph, 3)
+
+
 def test_clean_subgraph_drops_obligations_to_excluded_parents():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input")
@@ -110,6 +185,190 @@ def test_clean_subgraph_drops_obligations_to_excluded_parents():
     assert extracted.levels == {2: 1, 3: 2}
     assert extracted.roots == [3]
     assert graph.G.nodes[2]["parents"] == [(1, "arg0")]
+
+
+def test_shader_reducer_consumes_existing_process_graph_schedule():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Mul", (0,))
+    graph.levels = {0: 0, 1: 2, 2: 1}
+
+    def reject_reschedule(*_args, **_kwargs):
+        raise AssertionError("reducer replaced the planner schedule")
+
+    graph.compute_levels = reject_reschedule
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2),
+    )
+
+    assert plan.levels == ((0, (0,)), (1, (2,)), (2, (1,)))
+
+
+def test_shader_region_reducer_leaves_an_unfusible_operation_alone():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "sum", (1,))
+    _add(graph, 3, "Mul", (2,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2, 3),
+        fusible_node_ids=(1, 3),
+    )
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [
+        (1,),
+        (2,),
+        (3,),
+    ]
+
+
+def test_shader_region_reducer_keeps_multiple_published_values_fused():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Mul", (1,))
+    _add(graph, 3, "observer", (1,))
+    _add(graph, 4, "observer", (2,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2),
+    )
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1, 2)]
+
+
+def test_shader_region_reducer_honours_a_declared_hidden_dependency():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "coordinator")
+    _add(graph, 3, "Mul", (2,))
+
+    fused = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 3),
+    )
+    assert [dispatch.node_ids for dispatch in fused.dispatches] == [(1, 3)]
+
+    # Node 1 is routed into the coordinator by name, so node 3 transitively
+    # depends on it and the two cannot share one region.
+    split = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 3),
+        extra_dependency_edges=((1, 2),),
+    )
+    assert [dispatch.node_ids for dispatch in split.dispatches] == [(1,), (3,)]
+
+
+def test_region_planning_never_spans_a_conditional_branch():
+    tree = ast.parse("if flag:\n    a = x + 1\nelse:\n    a = x - 1\n")
+    conditional = tree.body[0]
+
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Add", (0,))
+    _add(graph, 3, "If", (1, 2))
+    graph.G.nodes[1]["expr_obj"] = conditional.body[0].value
+    graph.G.nodes[2]["expr_obj"] = conditional.orelse[0].value
+    graph.G.nodes[3]["expr_obj"] = conditional
+
+    keys = _control_partition_keys(graph, (), (1, 2))
+    assert keys[1] != keys[2]
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2),
+        partition_keys=keys,
+    )
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1,), (2,)]
+
+
+def test_region_planning_never_spans_a_nested_callsite():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Call", (1,))
+    graph.G.nodes[2]["attributes"]["callee_ref"] = 99
+    _add(graph, 3, "Mul", (2,))
+    _add(graph, 4, "Cos", (3,))
+
+    keys = _control_partition_keys(graph, (), (1, 3, 4))
+    assert keys[1] != keys[3]
+    assert keys[3] == keys[4]
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 3, 4),
+        partition_keys=keys,
+    )
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [
+        (1,),
+        (3, 4),
+    ]
+
+
+def test_region_reduction_is_open_to_every_executable_tensor_operation():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Mul", (0,))
+    _add(graph, 2, "reshape", (1,))
+    _add(graph, 3, "sum", (2,))
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_node_ids=(1, 2, 3),
+    )
+
+    assert [dispatch.node_ids for dispatch in plan.dispatches] == [(1, 2, 3)]
+
+
+def test_a_lookup_nobody_reads_is_not_a_region_boundary():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Attribute", (1,))
+    _add(graph, 3, "Mul", (1,))
+    graph.G.nodes[2]["expr_obj"] = ast.parse("value.sqrt").body[0].value
+    graph.compute_levels(method="asap", order="dependency")
+
+    inert = _inert_routing_nodes(graph)
+    assert inert == frozenset({2})
+
+    observed = _dispatch_subgraph(graph, (1, 3))
+    assert observed.G.graph["deployment_outputs"] == (1, 3)
+
+    ignored = _dispatch_subgraph(graph, (1, 3), inert_nodes=inert)
+    assert ignored.G.graph["deployment_outputs"] == (3,)
+
+
+def test_an_attribute_assignment_is_never_treated_as_inert():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Attribute", (0,))
+    graph.G.nodes[1]["expr_obj"] = ast.parse("obj.field = 1").body[0].targets[0]
+
+    assert _inert_routing_nodes(graph) == frozenset()
+
+
+def test_dispatch_exports_a_value_routed_by_identity():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 0, "Input")
+    _add(graph, 1, "Add", (0,))
+    _add(graph, 2, "Mul", (1,))
+    graph.compute_levels(method="asap", order="dependency")
+
+    dispatch = _dispatch_subgraph(
+        graph,
+        (1, 2),
+        required_outputs=frozenset({1}),
+    )
+
+    assert dispatch.G.graph["deployment_outputs"] == (1, 2)
 
 
 def test_dispatch_exports_an_internal_value_used_outside_the_region():

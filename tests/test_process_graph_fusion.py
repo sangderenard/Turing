@@ -62,10 +62,8 @@ def test_multi_output_glsl_emitter_writes_all_results_in_one_shader():
     )
 
     assert source.count("void main()") == 1
-    assert "binding = 2" in source
-    assert "binding = 3" in source
-    assert "outbuf0[gid]" in source
-    assert "outbuf1[gid]" in source
+    assert "arena[u_slot[2] + (gid)]" in source
+    assert "arena[u_slot[3] + (gid)]" in source
     assert source.count("sin(") == 1
     assert source.count("cos(") == 1
 
@@ -118,9 +116,9 @@ def test_dynamic_scalar_dependencies_remain_runtime_feeds():
     from src.common.tensors.autograd import autograd
     from src.common.tensors.numpy_backend import NumPyTensorOperations as NT
 
+    values = NT.tensor([1.0, 2.0, 3.0])
+    control = NT.tensor([0.25])
     with autograd.forward_capture() as tape:
-        values = NT.tensor([1.0, 2.0, 3.0])
-        control = NT.tensor([0.25])
         bounded = control.minimum(1.0).maximum(0.0)
         output = values + bounded * 2.0
     captured = compile_elementwise_tape(

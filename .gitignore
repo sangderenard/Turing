@@ -3,5 +3,34 @@ __pycache__
 .vscode
 *.zip
 pytest_run_times.log
+.turing-cache/
 .vs
 env
+
+# Agent scratch artifacts: probe drivers, captured run logs, and rendered
+# media produced while debugging.  These are session output, not sources.
+.codex-*
+.probe_*
+.conv_batch*.py
+.convert.py
+.a[0-9]*.log
+.b[0-9]*.log
+.s[0-9]*.log
+.d[0-9]*.log
+.o[0-9]*.log
+.oo.log
+.relabel.log
+.dispatch.avi
+.origin.avi
+.steady.avi
+*.avi
+*.wav
+takeover_*.jpg
+mandelbrot_*.jpg
+mandelbrot_*.png
+glsl_color_test.jpg
+actual_graph.jpg
+standard_graph.jpg
+
+# gfortran module files emitted next to generated sources
+*.mod

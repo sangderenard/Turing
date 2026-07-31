@@ -1,3 +1,6 @@
+import math
+import operator
+
 import numpy as np
 import sympy
 
@@ -611,6 +614,10 @@ def _abstract_tensor_method(name):
         operands = _abstract_tensor_values(*values)
         if not operands:
             raise ValueError(f"AbstractTensor.{name} requires an operand")
+        if not hasattr(operands[0], name):
+            scalar_function = getattr(math, name, None)
+            if callable(scalar_function):
+                return scalar_function(*operands, **kwargs)
         return getattr(operands[0], name)(*operands[1:], **kwargs)
     return apply
 
@@ -634,6 +641,16 @@ def _abstract_tensor_primitive(name):
                 f"AbstractTensor primitive {name} expects one operand"
             )
         tensor = operands[0]
+        if not hasattr(tensor, "_apply_operator"):
+            scalar_operators = {
+                "neg": operator.neg,
+                "logical_not": operator.not_,
+                "invert": operator.invert,
+                "abs": operator.abs,
+            }
+            scalar_operator = scalar_operators.get(name)
+            if scalar_operator is not None:
+                return scalar_operator(tensor)
         return tensor._apply_operator(name, tensor, None)
     return apply
 
@@ -642,7 +659,7 @@ def _abstract_tensor_static(name):
     def apply(*values, **kwargs):
         from ..common.tensors.abstraction import AbstractTensor
         return getattr(AbstractTensor, name)(
-            *_abstract_tensor_values(*values),
+            *values,
             **kwargs,
         )
     return apply
@@ -678,11 +695,11 @@ def _abstract_tensor_index(*values):
     return operands[0][index]
 
 
-def _abstract_tensor_sum(*values):
+def _abstract_tensor_sum(*values, **kwargs):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor sum requires an operand")
-    return operands[0].sum(*operands[1:])
+    return operands[0].sum(*operands[1:], **kwargs)
 
 
 def _abstract_tensor_maximum(*values):

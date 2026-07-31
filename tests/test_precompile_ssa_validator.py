@@ -38,48 +38,46 @@ def test_valid_precompile_reports_each_existing_ssa_operation_by_name():
     assert result.valid_precompile
     assert result.ssa_compatible
     assert result.compatibility_shortfalls == ()
-    assert {
-        (entry.precompile_name, entry.ssa_name)
+    compatibility = {
+        entry.precompile_name: entry.ssa_name
         for entry in result.compatible_operations
-    } == {("add", "Add"), ("mul", "Mul"), ("less", "Lt")}
+    }
+    assert all(
+        compatibility[name].startswith("Call[")
+        for name in ("add", "mul", "less")
+    )
     assert program == original
     assert require_precompile_ssa_compatible(program) is program
 
 
-def test_scan_groups_missing_ssa_operations_by_their_precompile_names():
+def test_scan_reports_sign_and_scatter_as_real_llvm_algorithm_calls():
     program = FusedProgram(
         version=1,
         feeds={0, 1, 2},
         steps=[
-            OpStep(0, "sin", [0], {}, 3),
-            OpStep(1, "stack", [1, 2], {"dim": 0}, 4),
-            OpStep(2, "sin", [4], {}, 5),
+            OpStep(0, "sign", [0], {}, 3),
+            OpStep(1, "scatter", [1, 2], {"dim": 0}, 4),
+            OpStep(2, "sign", [4], {}, 5),
         ],
         outputs={"result": 5},
         meta=_meta(0, 1, 2, 3, 4, 5),
-        extras={"kernel_kind": "stack"},
+        extras={"kernel_kind": "mixed"},
     )
 
     result = validate_precompile_ssa_compatibility(program)
 
     assert result.valid_precompile
-    assert not result.ssa_compatible
-    assert [
-        (item.operation_name, item.count)
-        for item in result.compatibility_shortfalls
-    ] == [
-        ("kernel_kind:stack", 1),
-        ("sin", 2),
-        ("stack", 1),
-    ]
-    report = result.compatibility_shortfall_report()
-    assert "sin: 2 occurrence(s)" in report
-    assert "stack: 1 occurrence(s)" in report
-    with pytest.raises(
-        PrecompileSSAValidationError,
-        match="precompile SSA compatibility shortfalls",
-    ):
-        require_precompile_ssa_compatible(program)
+    assert result.ssa_compatible
+    assert result.compatibility_shortfalls == ()
+    compatibility = {
+        item.precompile_name: item.ssa_name
+        for item in result.compatible_operations
+    }
+    assert compatibility == {
+        "scatter": "Call[index_assign_double]",
+        "sign": "Call[sign_double]",
+    }
+    assert require_precompile_ssa_compatible(program) is program
 
 
 def test_format_scan_finds_unproduced_values_duplicate_writers_and_metadata():
@@ -129,7 +127,7 @@ def test_native_matmul_is_recognized_but_unrepresented_reduction_is_named():
     assert [
         item.operation_name
         for item in reduction_result.compatibility_shortfalls
-    ] == ["kernel_kind:reduce", "sum"]
+    ] == ["kernel_kind:reduce"]
 
 
 def test_metadata_requirement_can_be_relaxed_for_legacy_precompile_packets():
@@ -148,3 +146,21 @@ def test_metadata_requirement_can_be_relaxed_for_legacy_precompile_packets():
 
     assert not strict.valid_precompile
     assert legacy.ssa_compatible
+
+
+def test_composed_precompile_may_retain_stage_local_step_ordinals():
+    program = FusedProgram(
+        version=1,
+        feeds={0},
+        steps=[
+            OpStep(0, "neg", [0], {}, 1),
+            OpStep(0, "abs", [1], {}, 2),
+        ],
+        outputs={"result": 2},
+        meta=_meta(0, 1, 2),
+    )
+
+    result = validate_precompile_ssa_compatibility(program)
+
+    assert result.valid_precompile
+    assert result.ssa_compatible

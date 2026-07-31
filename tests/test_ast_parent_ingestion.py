@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import io
+import types
 
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -32,6 +33,37 @@ class _WriterSource:
         if keyframe:
             return frame + 1
         return frame
+
+    def unrelated_method(self, frame):
+        return _unrelated_dependency(frame)
+
+
+def _unrelated_dependency(value):
+    return value - 1
+
+
+class _ConstructedSource:
+    def __init__(self, value):
+        self.value = value
+
+    def unrelated_method(self):
+        return _unrelated_dependency(self.value)
+
+
+def _scoped_dependency_a(value):
+    return value + 10
+
+
+def _scoped_dependency_b(value):
+    return value - 10
+
+
+def _scoped_root_a(value):
+    return dependency(value)
+
+
+def _scoped_root_b(value):
+    return dependency(value)
 
 
 def _ingest(source, bindings):
@@ -100,7 +132,48 @@ def record(writer, frame):
 
     assert graph.G.has_edge(method_id, call_id)
     assert call["attributes"]["resolved_ast_parent"] == method_id
+    assert not _definitions(graph, "unrelated_method")
+    assert not _definitions(graph, "_unrelated_dependency")
     assert len(graph.function_table) == 0
+
+
+def test_ingestion_filters_unreferenced_class_methods_before_recursing():
+    graph = _ingest(
+        """
+def construct(value):
+    return _ConstructedSource(value)
+""",
+        {"_ConstructedSource": _ConstructedSource},
+    )
+
+    assert len(_definitions(graph, "__init__")) == 1
+    assert not _definitions(graph, "unrelated_method")
+    assert not _definitions(graph, "_unrelated_dependency")
+
+
+def test_dynamic_attribute_call_does_not_alias_method_by_basename():
+    graph = _ingest(
+        """
+class Accumulator:
+    def append(self, value):
+        return value
+
+def collect(values, value):
+    values.append(value)
+""",
+        {},
+    )
+
+    method_id, _method = _definitions(graph, "append")[0]
+    call_id, call = next(
+        (node_id, data)
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+        and isinstance(data["expr_obj"].func, ast.Attribute)
+        and data["expr_obj"].func.attr == "append"
+    )
+    assert not graph.G.has_edge(method_id, call_id)
+    assert "resolved_ast_parent" not in call.get("attributes", {})
 
 
 def test_ingestion_recursion_adds_one_definition_and_links_both_calls():
@@ -161,6 +234,32 @@ def entry(value):
     assert graph.G.graph["missing_ast_parent_calls"] == ()
     assert graph.G.graph["ast_parent_closure_complete"]
     assert len(graph.function_table) == 0
+
+
+def test_ingestion_keeps_each_definition_globals_lexically_scoped():
+    root_a = types.FunctionType(
+        _scoped_root_a.__code__,
+        {"dependency": _scoped_dependency_a},
+        name=_scoped_root_a.__name__,
+    )
+    root_b = types.FunctionType(
+        _scoped_root_b.__code__,
+        {"dependency": _scoped_dependency_b},
+        name=_scoped_root_b.__name__,
+    )
+    graph = _ingest(
+        """
+def entry(value):
+    return _scoped_root_a(value) + _scoped_root_b(value)
+""",
+        {
+            "_scoped_root_a": root_a,
+            "_scoped_root_b": root_b,
+        },
+    )
+
+    assert len(_definitions(graph, "_scoped_dependency_a")) == 1
+    assert len(_definitions(graph, "_scoped_dependency_b")) == 1
 
 
 def test_ingestion_leaves_source_less_parent_unresolved():

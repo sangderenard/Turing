@@ -977,7 +977,15 @@ class Autograd:
         """
         previous_tape = self.tape
         previous_capture_all = self.capture_all
-        capture_tape = tape or GradTape(backward_overrides)
+        # An explicitly supplied tape is an ownership decision, not a
+        # truthiness hint.  GradTape is falsey while empty, so ``tape or
+        # GradTape()`` silently replaced the caller's one discovery tape on
+        # the first capture context.  That fractured a single source-program
+        # observation into hidden per-region tapes and made later loop values
+        # appear to have no producer.  Only absence permits allocation.
+        capture_tape = (
+            tape if tape is not None else GradTape(backward_overrides)
+        )
         if tape is not None and backward_overrides:
             capture_tape.backward_overrides.update(backward_overrides)
         self.tape = capture_tape

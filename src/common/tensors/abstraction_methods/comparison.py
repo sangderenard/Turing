@@ -8,7 +8,10 @@ def where(self, x: Any, y: Any) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(
+        track_time=self.track_time,
+        tape=getattr(self, "_tape", None),
+    )
     result.data = self.where_(x, y)
     return result
 def argwhere(self) -> "AbstractTensor":
@@ -16,7 +19,10 @@ def argwhere(self) -> "AbstractTensor":
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(
+        track_time=self.track_time,
+        tape=getattr(self, "_tape", None),
+    )
     result.data = self.argwhere_()
     return result
 
@@ -25,7 +31,10 @@ def all(self, dim=None) -> Any:
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(
+        track_time=self.track_time,
+        tape=getattr(self, "_tape", None),
+    )
     result.data = self.all_(dim)
     return result
 
@@ -34,7 +43,10 @@ def any(self, dim=None) -> Any:
     from ..abstraction import AbstractTensor
     if not isinstance(self, AbstractTensor):
         self = AbstractTensor.tensor(self)
-    result = type(self)(track_time=self.track_time)
+    result = type(self)(
+        track_time=self.track_time,
+        tape=getattr(self, "_tape", None),
+    )
     result.data = self.any_(dim)
     return result
 

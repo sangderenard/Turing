@@ -88,6 +88,7 @@ class FlatComputeDispatch:
     levels: tuple[int, ...]
     operator_pattern: tuple[str, ...]
     dependency_columns: tuple[tuple[int, ...], ...] = ()
+    rewrite_history: tuple[str, ...] = ()
 
     @property
     def operation_count(self) -> int:
@@ -188,6 +189,30 @@ def _isolated_dependency_columns(
     return tuple(columns)
 
 
+def _planner_levels(
+    graph: ProcessGraph,
+    *,
+    fallback_schedule: str,
+) -> Mapping[int, int]:
+    """Consume the ProcessGraph planner's schedule without replacing it."""
+
+    existing = dict(getattr(graph, "levels", {}) or {})
+    if set(existing) == set(graph.G):
+        return existing
+    computed = graph.compute_levels(
+        method=fallback_schedule,
+        order="dependency",
+    )
+    levels = computed if computed is not None else graph.levels
+    if set(levels) != set(graph.G):
+        missing = set(graph.G) - set(levels)
+        raise ValueError(
+            "ProcessGraph planner did not schedule every graph node: "
+            + ", ".join(map(str, sorted(missing)))
+        )
+    return dict(levels)
+
+
 def serialize_scheduled_operator_dispatches(
     graph: ProcessGraph,
     *,
@@ -195,6 +220,30 @@ def serialize_scheduled_operator_dispatches(
     schedule: str = "asap",
 ) -> ScheduledProcessGraphDispatchPlan:
     """Serialize scheduled operator batches and linear forward-record runs.
+
+    CRITICAL SHADER-PLANNING INVARIANTS
+    -----------------------------------
+    A topological schedule states which operations must precede which other
+    operations.  It does *not* state where shader or dispatch boundaries must
+    be placed.  Any planner built on this serialization must preserve all
+    three of these facts:
+
+    1. Horizontal groups of independent work can be lanes of one batched
+       dispatch.  They do not require one dispatch per graph operation.
+    2. Vertical dependency chains can be flattened into one shader.  Executing
+       the dependent expressions serially inside one shader invocation is
+       massively cheaper than paying for an individual GPU dispatch and
+       materialized intermediate at every step.
+    3. Causally separated subgraphs can coexist in that same shader, provided
+       the emitted shader obeys every dependency edge and execution-order
+       constraint.  Absence of a causal edge permits co-scheduling; it is not
+       a reason to manufacture sequential dispatches.
+
+    Consequently, grouping by schedule level or by identical operator is only
+    an intermediate description of available work.  It is not a valid final
+    fusion boundary.  Final shader regions should be maximal compatible DAGs,
+    split only by real backend, resource, synchronization, control-flow, or
+    externally observable materialization constraints.
 
     The ProcessGraph scheduler remains authoritative.  Within each level,
     nodes with the same operation form one pattern and are split only at the
@@ -211,9 +260,12 @@ def serialize_scheduled_operator_dispatches(
             "scheduled dispatch serialization requires an acyclic graph"
         )
 
-    computed = graph.compute_levels(method=schedule, order="dependency")
-    levels = computed if computed is not None else graph.levels
-    topological = tuple(nx.topological_sort(graph.G))
+    levels = _planner_levels(graph, fallback_schedule=schedule)
+    topological = tuple(
+        nx.lexicographical_topological_sort(
+            graph.G, key=lambda node_id: int(node_id)
+        )
+    )
     order_index = {
         node_id: index for index, node_id in enumerate(topological)
     }
@@ -326,6 +378,393 @@ def serialize_scheduled_operator_dispatches(
         dispatches=tuple(dispatches),
         dependency_columns=dependency_columns,
         levels=serialized_levels,
+        node_locations=node_locations,
+    )
+
+
+def reduce_scheduled_shader_regions(
+    graph: ProcessGraph,
+    executable_node_ids: Iterable[int],
+    *,
+    max_nodes_per_region: int = 256,
+    max_bindings_per_region: int | None = None,
+    partition_keys: Mapping[int, Any] | None = None,
+    extra_dependency_edges: Iterable[tuple[int, int]] = (),
+    fusible_node_ids: Iterable[int] | None = None,
+    schedule: str = "asap",
+) -> ScheduledProcessGraphDispatchPlan:
+    """Reduce executable nodes to maximal shader regions by fixed point.
+
+    The semantic ProcessGraph is never rewritten.  This function constructs a
+    quotient graph whose vertices are shader regions and monotonically merges
+    them using three ordered identities: homogeneous horizontal batching,
+    vertical dependency fusion, then heterogeneous same-level packing.
+    Because every accepted rewrite reduces the number of quotient vertices,
+    the process is guaranteed to terminate.
+
+    ``extra_dependency_edges`` declares causal ordering the caller knows about
+    but the graph does not spell as an edge — for example a value routed into
+    a callee by name through an identity table rather than through a parent
+    reference.  Those edges constrain legality and ordering exactly like
+    graph-visible edges through structural nodes; they are never treated as
+    direct numerical edges and therefore never justify vertical fusion.
+
+    ``fusible_node_ids`` restricts merging to operations the backend can emit
+    inside one shader body.  An operation outside that set is a real dispatch
+    boundary rather than a planning preference, so it stays alone in its own
+    region; the default admits every executable node.
+
+    """
+
+    cap = int(max_nodes_per_region)
+    if cap < 1:
+        raise ValueError("max_nodes_per_region must be positive")
+    if not nx.is_directed_acyclic_graph(graph.G):
+        raise ValueError("shader-region reduction requires an acyclic graph")
+
+    levels = _planner_levels(graph, fallback_schedule=schedule)
+    topological = tuple(
+        nx.lexicographical_topological_sort(
+            graph.G, key=lambda node_id: int(node_id)
+        )
+    )
+    order_index = {
+        node_id: index for index, node_id in enumerate(topological)
+    }
+    executable = {
+        node_id for node_id in executable_node_ids if node_id in graph.G
+    }
+    keys = dict(partition_keys or {})
+    fusible = (
+        set(executable)
+        if fusible_node_ids is None
+        else {node_id for node_id in fusible_node_ids if node_id in executable}
+    )
+    graph_edges = set(graph.G.edges)
+    semantic_edges = graph_edges | {
+        (parent, node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        for parent, _role in data.get("parents", ())
+        if parent in graph.G
+    } | {
+        (left, right)
+        for left, right in extra_dependency_edges
+        if left in graph.G and right in graph.G
+    }
+    semantic_successors: dict[int, set[int]] = {
+        node_id: set() for node_id in graph.G
+    }
+    for left, right in semantic_edges:
+        semantic_successors[left].add(right)
+    direct_execution_edges = {
+        (left, right)
+        for left, right in graph_edges
+        if left in executable and right in executable
+    }
+    # Structural/coordinator nodes are not shader instructions, but paths
+    # through them still impose causal ordering on numerical regions.  Project
+    # each such path onto its nearest executable endpoints so horizontal
+    # packing cannot accidentally contract a hidden A -> coordinator -> B path
+    # into a cyclic region.  These projected edges participate in legality and
+    # scheduling only; vertical fusion below still requires a direct numerical
+    # edge and therefore never absorbs a coordinator boundary.
+    projected_execution_edges = {
+        (left, right)
+        for left, right in semantic_edges
+        if left in executable and right in executable
+    }
+    for source in executable:
+        pending = [
+            child
+            for child in semantic_successors[source]
+            if child not in executable
+        ]
+        visited_structural = set()
+        while pending:
+            current = pending.pop()
+            if current in visited_structural:
+                continue
+            visited_structural.add(current)
+            for child in semantic_successors[current]:
+                if child in executable:
+                    projected_execution_edges.add((source, child))
+                else:
+                    pending.append(child)
+
+    level_nodes: dict[int, list[int]] = {}
+    for node_id in topological:
+        level_nodes.setdefault(int(levels[node_id]), []).append(node_id)
+    patterns = []
+    for level in sorted(level_nodes):
+        by_operator: dict[str, list[int]] = {}
+        for node_id in level_nodes[level]:
+            if node_id in executable:
+                by_operator.setdefault(
+                    _operation(graph, node_id), []
+                ).append(node_id)
+        for operator, node_ids in by_operator.items():
+            patterns.append(ScheduledOperatorPattern(
+                level=level,
+                operator=operator,
+                node_ids=tuple(node_ids),
+                batch_index=0,
+                batch_count=1,
+            ))
+
+    regions: dict[int, set[int]] = {
+        index: {node_id}
+        for index, node_id in enumerate(
+            node_id for node_id in topological if node_id in executable
+        )
+    }
+    histories: dict[int, list[str]] = {
+        region_id: [] for region_id in regions
+    }
+    next_region_id = len(regions)
+
+    def region_key(members):
+        member_keys = {keys.get(node_id) for node_id in members}
+        return next(iter(member_keys)) if len(member_keys) == 1 else object()
+
+    def quotient(candidate_regions=None):
+        active = regions if candidate_regions is None else candidate_regions
+        owner = {
+            node_id: region_id
+            for region_id, members in active.items()
+            for node_id in members
+        }
+        quotient_graph = nx.DiGraph()
+        quotient_graph.add_nodes_from(active)
+        for left, right in projected_execution_edges:
+            left_owner = owner.get(left)
+            right_owner = owner.get(right)
+            if (
+                left_owner is not None
+                and right_owner is not None
+                and left_owner != right_owner
+            ):
+                quotient_graph.add_edge(left_owner, right_owner)
+        return quotient_graph
+
+    def boundary_outputs(members):
+        return {
+            node_id
+            for node_id in members
+            if (
+                graph.G.out_degree(node_id) == 0
+                or any(
+                    child not in members
+                    for child in graph.G.successors(node_id)
+                )
+            )
+        }
+
+    def binding_count(members):
+        inputs = {
+            parent
+            for node_id in members
+            for parent in graph.G.predecessors(node_id)
+            if parent not in members
+        }
+        return len(inputs) + len(boundary_outputs(members))
+
+    def can_merge(region_ids, quotient_graph=None):
+        region_ids = tuple(dict.fromkeys(region_ids))
+        if len(region_ids) < 2:
+            return False
+        members = set().union(*(regions[item] for item in region_ids))
+        if len(members) > cap:
+            return False
+        if not members <= fusible:
+            # An operation the backend cannot emit inside a shader body is a
+            # dispatch of its own.  Absorbing it would produce a region no
+            # lowerer can accept, which is worse than not fusing at all.
+            return False
+        if any(
+            left in members
+            and right in members
+            and (left, right) not in direct_execution_edges
+            for left, right in projected_execution_edges
+        ):
+            # The dependency between these numerical endpoints crosses at
+            # least one structural/coordinator node.  Internalizing both ends
+            # would leave that structural node as an external shader input
+            # which itself depends on a shader-local result, creating an
+            # impossible region-boundary cycle.
+            return False
+        member_keys = {keys.get(node_id) for node_id in members}
+        if len(member_keys) > 1:
+            return False
+        if (
+            max_bindings_per_region is not None
+            and binding_count(members) > int(max_bindings_per_region)
+        ):
+            return False
+        # Contracting vertices in a DAG creates a cycle exactly when a path
+        # leaves the contracted set and later re-enters it.  Test that property
+        # directly on the current quotient instead of cloning every region,
+        # rebuilding the full quotient, and running a global DAG check for
+        # every candidate.  The old formulation made reduction superlinear in
+        # both allocations and graph traversals on large compiled shells.
+        current_quotient = (
+            quotient() if quotient_graph is None else quotient_graph
+        )
+        selected = set(region_ids)
+        pending = [
+            child
+            for region_id in selected
+            for child in current_quotient.successors(region_id)
+            if child not in selected
+        ]
+        visited = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for child in current_quotient.successors(current):
+                if child in selected:
+                    return False
+                pending.append(child)
+        return True
+
+    def merge(region_ids, identity):
+        nonlocal next_region_id
+        region_ids = tuple(dict.fromkeys(region_ids))
+        members = set().union(*(regions.pop(item) for item in region_ids))
+        history = [
+            entry
+            for item in region_ids
+            for entry in histories.pop(item)
+        ]
+        history.append(identity)
+        merged_id = next_region_id
+        next_region_id += 1
+        regions[merged_id] = members
+        histories[merged_id] = history
+        return merged_id
+
+    changed = True
+    while changed:
+        changed = False
+
+        # Identity 1: same-level calls of the same operator and execution
+        # partition become lanes of one horizontal batch.
+        quotient_graph = quotient()
+        quotient_levels = {
+            region_id: int(level)
+            for region_id, level in nx.get_node_attributes(
+                quotient_graph, "level"
+            ).items()
+        }
+        if not quotient_levels:
+            quotient_levels = {
+                region_id: generation
+                for generation, generation_nodes in enumerate(
+                    nx.topological_generations(quotient_graph)
+                )
+                for region_id in generation_nodes
+            }
+        homogeneous: dict[tuple[Any, ...], list[int]] = {}
+        for region_id, members in regions.items():
+            operators = {_operation(graph, node_id) for node_id in members}
+            if len(operators) != 1:
+                continue
+            homogeneous.setdefault((
+                quotient_levels[region_id],
+                next(iter(operators)),
+                region_key(members),
+            ), []).append(region_id)
+        for candidates in homogeneous.values():
+            while len(candidates) > 1:
+                group = candidates[:cap]
+                while len(group) > 1 and not can_merge(group):
+                    group.pop()
+                if len(group) < 2:
+                    break
+                merged = merge(group, "horizontal-batch")
+                candidates[:len(group)] = [merged]
+                changed = True
+
+        # Identity 2: dependency-connected regions become one internally
+        # topologically ordered shader.
+        while True:
+            quotient_graph = quotient()
+            merged_vertical = False
+            for left, right in sorted(
+                quotient_graph.edges,
+                key=lambda edge: (
+                    min(order_index[node] for node in regions[edge[0]]),
+                    min(order_index[node] for node in regions[edge[1]]),
+                ),
+            ):
+                if (
+                    any(
+                        source in regions[left]
+                        and target in regions[right]
+                        for source, target in direct_execution_edges
+                    )
+                    and can_merge((left, right), quotient_graph)
+                ):
+                    merge((left, right), "vertical-fusion")
+                    changed = True
+                    merged_vertical = True
+                    break
+            if not merged_vertical:
+                break
+
+        # Identity 3: causally independent regions ready at the same quotient
+        # level may share one shader, with their internal instructions emitted
+        # in a dependency-respecting order.
+        quotient_graph = quotient()
+        same_level: dict[tuple[int, Any], list[int]] = {}
+        for generation, generation_nodes in enumerate(
+            nx.topological_generations(quotient_graph)
+        ):
+            for region_id in generation_nodes:
+                same_level.setdefault((
+                    generation,
+                    region_key(regions[region_id]),
+                ), []).append(region_id)
+        for candidates in same_level.values():
+            while len(candidates) > 1:
+                group = candidates[:cap]
+                while len(group) > 1 and not can_merge(group):
+                    group.pop()
+                if len(group) < 2:
+                    break
+                merged = merge(group, "horizontal-shader-pack")
+                candidates[:len(group)] = [merged]
+                changed = True
+
+    dispatches = []
+    for region_id, members in regions.items():
+        ordered = tuple(sorted(members, key=order_index.__getitem__))
+        dispatches.append(FlatComputeDispatch(
+            kind="shader_region",
+            node_ids=ordered,
+            levels=tuple(sorted({int(levels[node]) for node in ordered})),
+            operator_pattern=tuple(_operation(graph, node) for node in ordered),
+            rewrite_history=tuple(histories[region_id]),
+        ))
+    dispatches.sort(
+        key=lambda dispatch: min(
+            order_index[node_id] for node_id in dispatch.node_ids
+        )
+    )
+    node_locations = {
+        node_id: (dispatch_index, lane_index)
+        for dispatch_index, dispatch in enumerate(dispatches)
+        for lane_index, node_id in enumerate(dispatch.node_ids)
+    }
+    return ScheduledProcessGraphDispatchPlan(
+        patterns=tuple(patterns),
+        dispatches=tuple(dispatches),
+        dependency_columns=(),
+        levels=tuple(
+            (level, tuple(level_nodes[level]))
+            for level in sorted(level_nodes)
+        ),
         node_locations=node_locations,
     )
 
@@ -497,7 +936,11 @@ def plan_process_graph_dispatches(
     }
     induced = graph.G.subgraph(fusible)
     components = list(nx.weakly_connected_components(induced))
-    topological = list(nx.topological_sort(graph.G))
+    topological = list(
+        nx.lexicographical_topological_sort(
+            graph.G, key=lambda node_id: int(node_id)
+        )
+    )
     order_index = {node_id: index for index, node_id in enumerate(topological)}
     regions: list[DispatchRegion] = []
     covered: set[int] = set()
@@ -625,5 +1068,6 @@ __all__ = [
     "dispatch_region_to_fused_program",
     "fused_program_to_process_graph",
     "plan_process_graph_dispatches",
+    "reduce_scheduled_shader_regions",
     "serialize_scheduled_operator_dispatches",
 ]

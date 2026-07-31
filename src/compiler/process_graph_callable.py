@@ -107,6 +107,39 @@ class EphemeralProcessGraphCallable:
             dynamic_scalar_ids=dynamic_scalar_ids,
         )
 
+    def discard_python_callable(self) -> None:
+        """Permanently remove the transient Python lowering projection.
+
+        Deployment compilation must call this after installing the compiled
+        artifact.  An ephemeral callable is a lowering tool, never a runtime
+        fallback.  Keeping or reconstructing it so runtime execution can pass
+        through Python, while describing the result as a compiled shell, is a
+        false claim about the execution boundary.
+        """
+
+        # This must be deletion, not merely a state flag.  Agents have
+        # repeatedly allowed the transient callable to survive compilation and
+        # then used it as the runtime program.  Anyone bypassing this deletion
+        # and still claiming compiled-shell behavior is lying and damaging the
+        # architecture.  If later execution needs this object, the compiled
+        # shell is incomplete and must be fixed instead of falling back.
+        # Use the instance dictionary, not ``hasattr``.  ``compiler`` is also
+        # a dataclass field with a class-level default, so after the first
+        # deletion ``hasattr(self, "compiler")`` remains true even though
+        # there is no instance attribute left for ``del self.compiler`` to
+        # remove.  A deployment may legitimately contain the same transient
+        # projection more than once; retirement must therefore be idempotent.
+        # This does not preserve or recreate any Python execution object.
+        self.__dict__.pop("_callable", None)
+        self.__dict__.pop("compiler", None)
+        self.__dict__.pop("generated_source", None)
+
+        # Do not weaken, conditionalize, or catch this assertion.  Its failure
+        # proves that the forbidden Python execution object still exists.
+        assert "_callable" not in self.__dict__
+        assert "compiler" not in self.__dict__
+        assert "generated_source" not in self.__dict__
+
 
 def make_process_graph_callable(graph: Any) -> EphemeralProcessGraphCallable:
     """Return the ephemeral AbstractTensor callable for ``graph``."""

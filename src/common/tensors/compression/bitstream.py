@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import math
 
 from ..abstraction import AbstractTensor
-from ..autograd import autograd
 from .huffman import CanonicalHuffmanTable, HuffmanCodewords
 
 
@@ -27,6 +26,118 @@ class PackedBitstream:
     def to_bytes(self) -> bytes:
         """Materialize bytes only when crossing from tensors into file I/O."""
         return tensor_octets_to_bytes(self.octets, count=self.byte_count)
+
+
+@dataclass(frozen=True)
+class ResidentBytePacket:
+    """Fixed-capacity octets with a device-resident logical byte count.
+
+    Variable serialized length is numerical program state.  It must not become
+    a Python slice bound observed during discovery, because doing so compiles
+    one captured packet instead of the reusable program.  Shell stream
+    descriptors consume ``byte_count`` while ``octets`` retains a stable arena
+    allocation.
+    """
+
+    octets: AbstractTensor
+    byte_count: AbstractTensor
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.octets, AbstractTensor):
+            raise TypeError("resident packet octets must be an AbstractTensor")
+        if self.octets.ndims() != 1:
+            raise ValueError("resident packet octets must be one-dimensional")
+        if not isinstance(self.byte_count, AbstractTensor):
+            raise TypeError(
+                "resident packet byte_count must be an AbstractTensor"
+            )
+
+    @property
+    def capacity(self) -> int:
+        return int(self.octets.shape[0])
+
+    def to_bytes(self) -> bytes:
+        """Materialize only at the terminal host/file boundary."""
+
+        return tensor_octets_to_bytes(
+            self.octets,
+            count=int(self.byte_count.item()),
+        )
+
+
+def resident_byte_packet(
+    octets: AbstractTensor,
+    byte_count: AbstractTensor | int | None = None,
+) -> ResidentBytePacket:
+    """Attach an explicit logical length to one resident octet allocation."""
+
+    if not isinstance(octets, AbstractTensor):
+        raise TypeError("octets must be an AbstractTensor")
+    if byte_count is None:
+        return ResidentBytePacket(
+            octets,
+            AbstractTensor.full(
+                (1,),
+                int(octets.shape[0]),
+                dtype="int64",
+                cls=type(octets),
+            ),
+        )
+    if not isinstance(byte_count, AbstractTensor):
+        return ResidentBytePacket(
+            octets,
+            AbstractTensor.full(
+                (1,),
+                int(byte_count),
+                dtype="int64",
+                cls=type(octets),
+            ),
+        )
+    return ResidentBytePacket(octets, byte_count)
+
+
+def concatenate_resident_byte_packets(
+    packets,
+) -> ResidentBytePacket:
+    """Concatenate packet prefixes without host reads or dynamic shapes."""
+
+    packets = tuple(packets)
+    if not packets:
+        raise ValueError("at least one resident byte packet is required")
+    if not all(isinstance(packet, ResidentBytePacket) for packet in packets):
+        raise TypeError("all packet parts must be ResidentBytePacket values")
+    exemplar = packets[0].octets
+    total_capacity = sum(packet.octets.shape[0] for packet in packets)
+    output_positions = AbstractTensor.arange(
+        total_capacity,
+        cls=type(exemplar),
+    )
+    output = AbstractTensor.zeros(
+        (total_capacity,),
+        dtype=exemplar.dtype,
+        cls=type(exemplar),
+    )
+    # This is loop-carried numerical state, so express its initialization as
+    # an ordinary AbstractTensor operation.  A scalar wrapped through
+    # ``ensure_tensor`` is a lifecycle conversion; reducing that conversion as
+    # an identity can detach the source literal from the loop's resident
+    # initial-value edge.  ``zeros`` gives every backend and the control-flow
+    # planner an explicit producer without specializing from discovery data.
+    prefix = AbstractTensor.zeros(
+        (1,),
+        dtype="int64",
+        cls=type(exemplar),
+    )
+    for packet in packets:
+        local = output_positions - prefix
+        valid = (local >= 0) & (local < packet.byte_count)
+        packet_capacity = packet.octets.shape[0]
+        safe = local.maximum(0).minimum(max(0, packet_capacity - 1))
+        output = output + packet.octets[safe.to_dtype("int64")] * valid
+        prefix = prefix + packet.byte_count
+    # Packet arithmetic, rather than the compiler or structural constructor,
+    # owns the public integer-count contract.
+    return resident_byte_packet(output, prefix.to_dtype("int64"))
 
 
 def tensor_octets_to_bytes(
@@ -127,15 +238,12 @@ def compact_codewords(codewords: HuffmanCodewords) -> PackedBitstream:
     stream_with_scratch = AbstractTensor.zeros(
         (capacity_bits + 1,), cls=type(bits)
     )
-    # Entropy coding is discrete. Avoid recording an enormous, meaningless
-    # differentiable index-update graph while still using the shared scatter op.
-    with autograd.no_grad():
-        stream_with_scratch = AbstractTensor.scatter(
-            stream_with_scratch,
-            safe_destinations.flatten(),
-            contributions.flatten(),
-            dim=0,
-        )
+    stream_with_scratch = AbstractTensor.scatter(
+        stream_with_scratch,
+        safe_destinations.flatten(),
+        contributions.flatten(),
+        dim=0,
+    )
     stream = stream_with_scratch[:capacity_bits]
 
     pad_bits = (-capacity_bits) % 8
@@ -326,13 +434,12 @@ def decode_huffman_octets(
     compact_with_scratch = AbstractTensor.zeros(
         (bit_count + 1,), cls=type(octets)
     )
-    with autograd.no_grad():
-        compact_with_scratch = AbstractTensor.scatter(
-            compact_with_scratch,
-            destinations,
-            symbol_at_bit * hit_at_bit,
-            dim=0,
-        )
+    compact_with_scratch = AbstractTensor.scatter(
+        compact_with_scratch,
+        destinations,
+        symbol_at_bit * hit_at_bit,
+        dim=0,
+    )
     symbols = compact_with_scratch[:bit_count]
     slots = AbstractTensor.arange(bit_count, cls=type(symbols))
     valid = (symbol_count - slots) > 0
@@ -346,11 +453,14 @@ def decode_huffman_octets(
 
 __all__ = [
     "PackedBitstream",
+    "ResidentBytePacket",
     "DecodedHuffmanStream",
     "UnpackedBitstream",
+    "concatenate_resident_byte_packets",
     "compact_codewords",
     "decode_huffman_octets",
     "decode_with_provenance",
     "tensor_octets_to_bytes",
+    "resident_byte_packet",
     "unpack_octets",
 ]

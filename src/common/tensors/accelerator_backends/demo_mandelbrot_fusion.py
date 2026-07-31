@@ -9,11 +9,56 @@ operation and control nodes directly.
 from __future__ import annotations
 
 import argparse
+from collections import namedtuple
+import os
 import time
+from functools import lru_cache
 from pathlib import Path
 import sys
 
 import numpy as np
+
+
+_ControlBands = namedtuple(
+    "_ControlBands",
+    ("loudness", "bass", "low_mid", "high_mid", "treble"),
+)
+
+
+class _ProceduralControlStream:
+    """Audio-compatible controls for recordings that provide no audio file."""
+
+    def __init__(self, duration: float, sample_rate: int = 48_000):
+        self.sample_rate = int(sample_rate)
+        self.path = None
+        self.samples = np.zeros(
+            max(1, int(np.ceil(float(duration) * self.sample_rate))),
+            dtype=np.float32,
+        )
+
+    def sample(self, logical_time: float):
+        logical_time = float(logical_time)
+        return _ControlBands(
+            0.38 + 0.22 * np.sin(logical_time * 1.31),
+            0.5 + 0.5 * np.sin(logical_time * 0.83),
+            0.5 + 0.5 * np.sin(logical_time * 0.57 + 0.8),
+            0.5 + 0.5 * np.sin(logical_time * 1.07 + 1.7),
+            0.5 + 0.5 * np.sin(logical_time * 1.73 + 2.2),
+        )
+
+    def close(self):
+        return None
+
+
+def _open_control_stream(audio_path, *, gain, duration):
+    if audio_path is None:
+        return _ProceduralControlStream(duration)
+    pluck = Path(__file__).resolve().parents[5] / "spectral-analyzer"
+    if str(pluck) not in sys.path:
+        sys.path.insert(0, str(pluck))
+    from audio_reactive_controls import AudioReactiveControlStream
+
+    return AudioReactiveControlStream(audio_path, gain=gain)
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +84,13 @@ def mandelbrot_escape(cx, cy, iterations: int, clamp: float = ORBIT_CLAMP):
     zx = cx * 0.0
     zy = cx * 0.0
     count = cx * 0.0
+    clamp_value = cx * 0.0 + clamp
     for _ in range(iterations):
         zx2, zy2 = zx * zx, zy * zy
         count = count + (zx2 + zy2 <= 4.0)
         zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
-        zx = zx.minimum(clamp).maximum(-clamp)
-        zy = zy.minimum(clamp).maximum(-clamp)
+        zx = zx.minimum(clamp_value).maximum(-clamp_value)
+        zy = zy.minimum(clamp_value).maximum(-clamp_value)
     return count
 
 
@@ -73,12 +119,13 @@ def parametric_mandelbrot_escape(
     constant_x = cx + family_mix * (julia_x - cx)
     constant_y = cy + family_mix * (julia_y - cy)
     count = cx * 0.0
+    clamp_value = cx * 0.0 + clamp
     for _ in range(iterations):
         zx2, zy2 = zx * zx, zy * zy
         count = count + (zx2 + zy2 <= 4.0)
         zx, zy = zx2 - zy2 + constant_x, 2.0 * zx * zy + constant_y
-        zx = zx.minimum(clamp).maximum(-clamp)
-        zy = zy.minimum(clamp).maximum(-clamp)
+        zx = zx.minimum(clamp_value).maximum(-clamp_value)
+        zy = zy.minimum(clamp_value).maximum(-clamp_value)
     return count
 
 
@@ -158,8 +205,11 @@ def build_parametric_mandelbrot_glsl_deployment(
     iterations: int,
     *,
     profiling: bool = False,
+    verbose_profile: bool = False,
+    entrypoint: str = "mandelbrot_recording_program",
+    legacy_fused_network: bool = False,
 ):
-    """Plan and select the recording function's stateful GLSL shell."""
+    """Plan and select an ingested Mandelbrot function's GLSL shell."""
 
     from ....compiler.glsl_deployment_strategy import (
         strategize_glsl_deployment,
@@ -168,25 +218,31 @@ def build_parametric_mandelbrot_glsl_deployment(
         build_mandelbrot_recording_process_graph,
     )
 
-    graph = build_mandelbrot_recording_process_graph()
+    graph = build_mandelbrot_recording_process_graph(
+        profile_verbose=verbose_profile,
+    )
     module_shell_type = strategize_glsl_deployment(graph)
     module_shell = module_shell_type(
         iterations=int(iterations),
         profiling=profiling,
+        verbose_profile=verbose_profile,
+        legacy_fused_network=legacy_fused_network,
     )
-    reference = graph.function_table.reference(
-        graph.G.graph["program_entrypoint"]
-    )
+    reference = graph.function_table.reference(entrypoint)
     if reference is None:
-        raise RuntimeError("Mandelbrot ProcessGraph entrypoint is undeclared")
+        raise RuntimeError(
+            f"Mandelbrot ProcessGraph entrypoint {entrypoint!r} is undeclared"
+        )
     try:
         deployment = module_shell.function_shells[reference.address]
     except KeyError as exc:
         raise RuntimeError(
-            "Mandelbrot ProcessGraph entrypoint has no deployment shell"
+            f"Mandelbrot ProcessGraph entrypoint {entrypoint!r} has no "
+            "deployment shell"
         ) from exc
     deployment.module_shell = module_shell
     deployment.entry_reference = reference
+    deployment.refresh_hierarchy_plan()
     return deployment, graph
 
 
@@ -207,6 +263,164 @@ def run_abstract_numpy(cx: np.ndarray, cy: np.ndarray, iterations: int):
         iterations,
     )
     return np.asarray(result.tolist(), dtype=cx.dtype)
+
+
+def run_abstract_backend(
+    backend: str,
+    cx: np.ndarray,
+    cy: np.ndarray,
+    iterations: int,
+) -> np.ndarray:
+    """Run the ordinary tensor program under one selected CPU backend."""
+
+    from ..abstraction import AbstractTensor
+
+    with AbstractTensor.use_backend(backend):
+        result = mandelbrot_escape(
+            AbstractTensor.tensor(cx),
+            AbstractTensor.tensor(cy),
+            iterations,
+        )
+    payload = getattr(result, "data", result)
+    if hasattr(payload, "tolist"):
+        return np.asarray(payload.tolist(), dtype=np.float32)
+    return np.asarray(result.tolist(), dtype=np.float32)
+
+
+@lru_cache(maxsize=None)
+def _compiled_c_mandelbrot_shell():
+    """Compile the complete CPU Mandelbrot control loop as one C function."""
+
+    from ....compiler.control_source import (
+        ControlProgram,
+        ControlTarget,
+        LoopBlock,
+        RegionCode,
+        SequenceBlock,
+        StatementBlock,
+        compile_cffi_shell,
+    )
+
+    logical = ControlProgram(
+        SequenceBlock((
+            StatementBlock((
+                "for (int element = 0; element < count; ++element) {",
+                "    zx[element] = 0.0f;",
+                "    zy[element] = 0.0f;",
+                "    output[element] = 0.0f;",
+                "}",
+            )),
+            LoopBlock(
+                "iteration",
+                "0",
+                "iterations",
+                "1",
+                StatementBlock(("__scheduled_region_0__",)),
+            ),
+        )),
+        region_indices=(0,),
+    )
+    return compile_cffi_shell(
+        logical,
+        (RegionCode(
+            0,
+            ControlTarget.C,
+            StatementBlock((
+                "for (int element = 0; element < count; ++element) {",
+                "    float old_x = zx[element];",
+                "    float old_y = zy[element];",
+                "    float x2 = old_x * old_x;",
+                "    float y2 = old_y * old_y;",
+                "    output[element] += (x2 + y2 <= 4.0f);",
+                "    float next_x = x2 - y2 + cx[element];",
+                "    float next_y = 2.0f * old_x * old_y + cy[element];",
+                "    zx[element] = fmaxf(-clamp, fminf(clamp, next_x));",
+                "    zy[element] = fmaxf(-clamp, fminf(clamp, next_y));",
+                "}",
+            )),
+        ),),
+        function_name="mandelbrot_c_shell",
+        parameters=(
+            "const float *cx",
+            "const float *cy",
+            "float *zx",
+            "float *zy",
+            "float *output",
+            "int count",
+            "int iterations",
+            "float clamp",
+        ),
+        c_declaration=(
+            "void mandelbrot_c_shell("
+            "const float *cx, const float *cy, float *zx, float *zy, "
+            "float *output, int count, int iterations, float clamp);"
+        ),
+        preamble="#include <math.h>",
+        extra_compile_args=(
+            ("/fp:strict",)
+            if os.name == "nt"
+            else ("-ffp-contract=off",)
+        ),
+    )
+
+
+def run_compiled_c_shell(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    iterations: int,
+) -> np.ndarray:
+    compiled = _compiled_c_mandelbrot_shell()
+    cx = np.ascontiguousarray(cx, dtype=np.float32)
+    cy = np.ascontiguousarray(cy, dtype=np.float32)
+    zx = np.empty_like(cx)
+    zy = np.empty_like(cy)
+    output = np.empty_like(cx)
+    pointer = lambda array: compiled.ffi.cast(
+        "float *", array.ctypes.data
+    )
+    compiled(
+        compiled.ffi.cast("const float *", cx.ctypes.data),
+        compiled.ffi.cast("const float *", cy.ctypes.data),
+        pointer(zx),
+        pointer(zy),
+        pointer(output),
+        cx.size,
+        int(iterations),
+        np.float32(ORBIT_CLAMP),
+    )
+    return output
+
+
+def benchmark_cpu_mandelbrot(
+    *,
+    shell: str,
+    backend: str,
+    width: int,
+    height: int,
+    iterations: int,
+    center: complex,
+    span: float,
+    repeats: int,
+) -> tuple[np.ndarray, tuple[float, ...]]:
+    cx, cy = complex_plane(width, height, center, span)
+    if shell == "python":
+        execute = lambda: run_abstract_backend(backend, cx, cy, iterations)
+    elif shell == "c":
+        if backend != "c":
+            raise ValueError("the C shell requires --backend c")
+        execute = lambda: run_compiled_c_shell(cx, cy, iterations)
+    else:
+        raise ValueError(f"{shell!r} is not a CPU shell")
+    # Materialize imports, backend registries, and CFFI compilation before
+    # measuring steady-state execution.  Mixing compilation into the first
+    # sample makes backend comparisons meaningless.
+    result = execute()
+    timings = []
+    for _ in range(max(1, int(repeats))):
+        started = time.perf_counter()
+        result = execute()
+        timings.append((time.perf_counter() - started) * 1e3)
+    return result, tuple(timings)
 
 
 def complex_plane(width: int, height: int, center: complex, span: float
@@ -514,7 +728,7 @@ def c_workspace_bytes(program, elements: int) -> int:
     return (len(program.feeds) + len(program.steps)) * elements * 8
 
 
-def animate_glsl(
+def _retired_display_only_animate_glsl(
     *,
     width: int,
     height: int,
@@ -531,27 +745,19 @@ def animate_glsl(
     detail_epochs: int = 20,
     play_audio: bool = True,
     max_frames: int | None = None,
-    record_avi: str | Path | None = None,
-    record_fps: float = 30.0,
-    record_pcm_dtype: str = "s16le",
-    record_segment_bytes: int = 1 << 30,
+    batch_size: int = 8,
+    timeline_fps: float = 60.0,
     profile: bool = False,
+    verbose_profile: bool = False,
 ) -> None:
-    """Run the parameterized solve continuously with resident GPU buffers."""
-    # AST-ROOT INTEGRITY WARNING:
-    #
-    # The recording branch in this older live-animation coordinator still
-    # constructs and drives MJPEGAVIWriter outside the ingested recording
-    # function.  That is a known architectural violation, not an approved
-    # execution boundary and not a pattern to preserve or extend.  It must be
-    # replaced by a stateful/multi-frame AST-root recording program whose
-    # ProcessGraph owns writer creation, every video/audio packet, indexing,
-    # and final closure.  Until then, this path must not be cited as evidence
-    # that the complete animated source-to-AVI program has been compiled.
-    #
-    # Never solve this by introducing another collector, callback, post-pass,
-    # or caller-owned writer.  If the full root cannot compile, expose and fix
-    # that compiler frontier.
+    """Removed: animation must execute the complete AVI-producing root."""
+    raise RuntimeError(
+        "display-only animation was removed; use the complete batched "
+        "AVI recording path"
+    )
+
+    # Unreachable historical body retained only until the surrounding
+    # in-progress compiler work is consolidated.
     import pygame
     from OpenGL import GL
     from OpenGL.GL.shaders import compileProgram, compileShader
@@ -564,8 +770,13 @@ def animate_glsl(
 
     deployment, _ = build_parametric_mandelbrot_glsl_deployment(
         iterations,
-        profiling=profile,
+        profiling=profile or verbose_profile,
+        verbose_profile=verbose_profile,
+        entrypoint="mandelbrot_frame_program",
     )
+    batch_size = max(1, int(batch_size))
+    if timeline_fps <= 0:
+        raise ValueError("timeline_fps must be positive")
     unit_x, unit_y = normalized_plane(width, height)
 
     print(
@@ -574,8 +785,6 @@ def animate_glsl(
         f"{deployment.dispatch_count} deployment regions",
         flush=True,
     )
-    deployment.require_ready()
-
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
@@ -590,9 +799,7 @@ def animate_glsl(
     pygame.display.set_caption("Parametric AbstractTensor Mandelbrot — GLSL")
     info = require_gl_context()
     print(
-        f"gpu     : {info['renderer']} (context: {info['source']})\n"
-        f"deploy  : {len(deployment.programs)} resident fused programs; "
-        "ProcessGraph-scheduled GLSL execution",
+        f"gpu     : {info['renderer']} (context: {info['source']})",
         flush=True,
     )
 
@@ -625,7 +832,7 @@ def animate_glsl(
         from audio_reactive_controls import AudioReactiveControlStream
 
         audio = AudioReactiveControlStream(audio_path, gain=audio_gain)
-        if play_audio and record_avi is None:
+        if play_audio:
             try:
                 pygame.mixer.init(
                     frequency=audio.sample_rate,
@@ -641,93 +848,38 @@ def animate_glsl(
                     "analysis continues",
                     flush=True,
                 )
-        elif play_audio and record_avi is not None:
-            print(
-                "audio   : live playback disabled during offline recording; "
-                "PCM remains synchronized to recorded frame time",
-                flush=True,
-            )
         print(
             f"audio   : {audio.path} | {audio.sample_rate} Hz | "
             "fftfree bass/low-mid/high-mid/treble controls",
             flush=True,
         )
 
-    recorder = None
-    audio_scheduler = None
-    recorded_audio_position = 0
-    if record_avi is not None:
-        # KNOWN TEMPORARY VIOLATION OF AST-ROOT INTEGRITY.
-        # See the contract above.  This block is retained only so its remaining
-        # migration work is visible; it must move into the ingested multi-frame
-        # recording root rather than becoming a permanent host-side feature.
-        from ..abstraction import AbstractTensor
-        from ..compression.containers.avi import MJPEGAVIWriter
-        from ..compression.pcm import PCMFormat, RationalAudioScheduler
-
-        pcm_format = (
-            PCMFormat(
-                sample_rate=audio.sample_rate,
-                channels=1,
-                sample_format=record_pcm_dtype,
-            )
-            if audio is not None
-            else None
-        )
-        recorder = MJPEGAVIWriter(
-            record_avi,
-            width=width,
-            height=height,
-            fps=record_fps,
-            pcm_format=pcm_format,
-            opendml=True,
-            segment_bytes=record_segment_bytes,
-        )
-        if pcm_format is not None:
-            audio_scheduler = RationalAudioScheduler(
-                sample_rate=pcm_format.sample_rate,
-                fps=record_fps,
-            )
-        print(
-            f"record  : {record_avi} | {record_fps:g} fps | "
-            "4:4:4 MJPEG/OpenDML"
-            + (
-                f" + {record_pcm_dtype} mono PCM"
-                if pcm_format is not None
-                else ""
-            ),
-            flush=True,
-        )
-
     static_feeds = {
         "unit_x": unit_x,
         "unit_y": unit_y,
+        "width": width,
+        "height": height,
+        "iterations": iterations,
     }
-    jpeg_resources = None
-    if recorder is not None:
-        from ..compression.jpeg.frame import (
-            prepare_jpeg_encoding_resources,
-        )
-        from .glsl_backend import fuse_elementwise, reshape_chunk
-        from .glsl_tensor_backend import GLSLTensorOperations
-
-        exemplar = GLSLTensorOperations()
-        exemplar.data = reshape_chunk(
-            deployment.execute_named({
-                **static_feeds,
-                "center_x": np.float32(center.real),
-                "center_y": np.float32(center.imag),
-                "span": np.float32(span),
-                "family_mix": np.float32(0.0),
-                "julia_x": np.float32(-0.72),
-                "julia_y": np.float32(0.24),
-                "palette_phase": np.float32(0.0),
-                "color_drive": np.float32(0.52),
-            })["luminance"],
-            (height, width),
-        )
-        with AbstractTensor.use_backend("glsl"), fuse_elementwise():
-            jpeg_resources = prepare_jpeg_encoding_resources(exemplar)
+    deployment.compile_process_graph()
+    deployment.capture_fused_programs({
+        **static_feeds,
+        "center_x": np.full(batch_size, center.real, dtype=np.float32),
+        "center_y": np.full(batch_size, center.imag, dtype=np.float32),
+        "span": np.full(batch_size, span, dtype=np.float32),
+        "family_mix": np.zeros(batch_size, dtype=np.float32),
+        "julia_x": np.full(batch_size, -0.72, dtype=np.float32),
+        "julia_y": np.full(batch_size, 0.24, dtype=np.float32),
+        "palette_phase": np.zeros(batch_size, dtype=np.float32),
+        "color_drive": np.full(batch_size, 0.52, dtype=np.float32),
+    })
+    deployment.require_ready()
+    print(
+        f"deploy  : batch {batch_size} x {width} x {height}; "
+        f"{len(deployment.captured_region_programs)} resident "
+        "CapturedFusedProgram shaders; ProcessGraph-scheduled GLSL execution",
+        flush=True,
+    )
     display_program = compileProgram(
         compileShader(
             """#version 430 core
@@ -738,26 +890,19 @@ def animate_glsl(
         ),
         compileShader(
             """#version 430 core
-            layout(std430, binding=0) readonly buffer YPlane { float y_plane[]; };
-            layout(std430, binding=1) readonly buffer CbPlane { float cb_plane[]; };
-            layout(std430, binding=2) readonly buffer CrPlane { float cr_plane[]; };
+            layout(std430, binding=0) readonly buffer RGBFrame { float rgb[]; };
             uniform uint image_width;
             uniform uint image_height;
+            uniform uint frame_index;
             out vec4 color;
             void main(){
                 uint x=uint(gl_FragCoord.x);
                 uint y=uint(gl_FragCoord.y);
                 if(x>=image_width || y>=image_height){ color=vec4(0); return; }
-                uint index=y*image_width+x;
-                float yy=y_plane[index];
-                float cb=cb_plane[index]-128.0;
-                float cr=cr_plane[index]-128.0;
-                vec3 rgb=vec3(
-                    yy+1.402*cr,
-                    yy-0.344136*cb-0.714136*cr,
-                    yy+1.772*cb
-                )/255.0;
-                color=vec4(clamp(rgb,0.0,1.0),1.0);
+                uint frame_stride=image_width*image_height*3u;
+                uint index=frame_index*frame_stride+(y*image_width+x)*3u;
+                vec3 pixel=vec3(rgb[index],rgb[index+1u],rgb[index+2u])/255.0;
+                color=vec4(clamp(pixel,0.0,1.0),1.0);
             }""",
             GL.GL_FRAGMENT_SHADER,
         ),
@@ -765,12 +910,13 @@ def animate_glsl(
     vao = int(GL.glGenVertexArrays(1))
     width_location = GL.glGetUniformLocation(display_program, "image_width")
     height_location = GL.glGetUniformLocation(display_program, "image_height")
+    frame_location = GL.glGetUniformLocation(display_program, "frame_index")
 
     if audio_playback_ready:
         pygame.mixer.music.play(loops=-1)
     started = time.perf_counter()
-    previous_time = started
     travel = 0.0
+    timeline_frame = 0
     report_started = started
     report_frames = 0
     frame = 0
@@ -782,101 +928,128 @@ def animate_glsl(
     running = True
     try:
         while running and (max_frames is None or frame < max_frames):
-            frame_started = time.perf_counter()
-            dispatch_before_frame = dispatch_stats()["calls"]
+            batch_started = time.perf_counter()
+            dispatch_before_batch = dispatch_stats()["calls"]
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
-            now = time.perf_counter()
-            if recorder is not None:
-                elapsed = frame / record_fps
-                delta = 1.0 / record_fps
-            else:
-                elapsed = now - started
-                delta = max(0.0, now - previous_time)
-            previous_time = now
-            if audio is not None:
-                controls = audio.sample(elapsed)
-                loudness = controls.loudness
-                bass = controls.bass
-                low_mid = controls.low_mid
-                high_mid = controls.high_mid
-                treble = controls.treble
-            else:
-                loudness = 0.38 + 0.22 * np.sin(elapsed * 1.31)
-                bass = 0.5 + 0.5 * np.sin(elapsed * 0.83)
-                low_mid = 0.5 + 0.5 * np.sin(elapsed * 0.57 + 0.8)
-                high_mid = 0.5 + 0.5 * np.sin(elapsed * 0.73 + 1.7)
-                treble = 0.5 + 0.5 * np.sin(elapsed * 1.17 + 0.3)
-            # The camera's path speed is the integral of loudness. The learned
-            # controller only changes how long we dwell: detailed states slow
-            # the tour, while predicted bland states pass quickly.
-            detail_speed = 1.0
-            if controller is not None:
-                candidates = travel + np.asarray([0.0, 0.45, 0.9])
-                candidate_features, _ = detail_state_features(
+            if not running:
+                break
+
+            batched_values = {
+                name: []
+                for name in (
+                    "center_x",
+                    "center_y",
+                    "span",
+                    "family_mix",
+                    "julia_x",
+                    "julia_y",
+                    "palette_phase",
+                    "color_drive",
+                )
+            }
+            loudness = bass = low_mid = high_mid = treble = 0.0
+            animated_span = span
+            family_mix = 0.0
+            logical_delta = 1.0 / timeline_fps
+            for batch_frame in range(batch_size):
+                logical_time = (
+                    timeline_frame + batch_frame
+                ) / timeline_fps
+                if audio is not None:
+                    controls = audio.sample(logical_time)
+                    loudness = controls.loudness
+                    bass = controls.bass
+                    low_mid = controls.low_mid
+                    high_mid = controls.high_mid
+                    treble = controls.treble
+                else:
+                    loudness = (
+                        0.38 + 0.22 * np.sin(logical_time * 1.31)
+                    )
+                    bass = 0.5 + 0.5 * np.sin(logical_time * 0.83)
+                    low_mid = (
+                        0.5
+                        + 0.5 * np.sin(logical_time * 0.57 + 0.8)
+                    )
+                    high_mid = (
+                        0.5
+                        + 0.5 * np.sin(logical_time * 0.73 + 1.7)
+                    )
+                    treble = (
+                        0.5
+                        + 0.5 * np.sin(logical_time * 1.17 + 0.3)
+                    )
+                # The camera's path speed is the integral of loudness. The
+                # learned controller changes dwell time, while every resulting
+                # state is still submitted as one row of the tensor batch.
+                detail_speed = 1.0
+                if controller is not None:
+                    candidates = travel + np.asarray([0.0, 0.45, 0.9])
+                    candidate_features, _ = detail_state_features(
+                        center,
+                        span,
+                        candidates,
+                        bass=np.full(3, bass),
+                        low_mid=np.full(3, low_mid),
+                        high_mid=np.full(3, high_mid),
+                        reaction=reaction,
+                        zoom_rate=zoom_rate,
+                    )
+                    predicted = controller.predict(candidate_features)
+                    predicted_detail = float(predicted[0])
+                    best_ahead = float(np.argmax(predicted)) * 0.45
+                    detail_speed = (
+                        0.45 + 1.8 * (1.0 - predicted_detail)
+                        + 0.35 * best_ahead
+                    )
+                travel += logical_delta * speed * detail_speed * (
+                    0.28 + reaction * 1.35 * loudness
+                )
+                (
+                    animated_center,
+                    animated_span,
+                    family_mix,
+                    julia_constant,
+                ) = dream_parameters(
                     center,
                     span,
-                    candidates,
-                    bass=np.full(3, bass),
-                    low_mid=np.full(3, low_mid),
-                    high_mid=np.full(3, high_mid),
+                    travel,
+                    bass=bass,
+                    low_mid=low_mid,
+                    high_mid=high_mid,
                     reaction=reaction,
                     zoom_rate=zoom_rate,
                 )
-                predicted = controller.predict(candidate_features)
-                predicted_detail = float(predicted[0])
-                best_ahead = float(np.argmax(predicted)) * 0.45
-                detail_speed = (
-                    0.45 + 1.8 * (1.0 - predicted_detail)
-                    + 0.35 * best_ahead
+                palette_phase = float(
+                    0.028 * travel
+                    + reaction * 0.09 * (treble - 0.5)
                 )
-            travel += delta * speed * detail_speed * (
-                0.28 + reaction * 1.35 * loudness
-            )
-            (
-                animated_center,
-                animated_span,
-                family_mix,
-                julia_constant,
-            ) = dream_parameters(
-                center,
-                span,
-                travel,
-                bass=bass,
-                low_mid=low_mid,
-                high_mid=high_mid,
-                reaction=reaction,
-                zoom_rate=zoom_rate,
-            )
-            julia_x, julia_y = julia_constant.real, julia_constant.imag
-            palette_phase = float(
-                0.028 * travel + reaction * 0.09 * (treble - 0.5)
-            )
-            color_drive = float(
-                0.52 + reaction * 0.24 * (high_mid - 0.5)
-            )
+                color_drive = float(
+                    0.52 + reaction * 0.24 * (high_mid - 0.5)
+                )
+                batched_values["center_x"].append(animated_center.real)
+                batched_values["center_y"].append(animated_center.imag)
+                batched_values["span"].append(animated_span)
+                batched_values["family_mix"].append(family_mix)
+                batched_values["julia_x"].append(julia_constant.real)
+                batched_values["julia_y"].append(julia_constant.imag)
+                batched_values["palette_phase"].append(palette_phase)
+                batched_values["color_drive"].append(color_drive)
+            timeline_frame += batch_size
             controls_finished = time.perf_counter()
-            scalar_values = {
-                "center_x": animated_center.real,
-                "center_y": animated_center.imag,
-                "span": animated_span,
-                "family_mix": family_mix,
-                "julia_x": julia_x,
-                "julia_y": julia_y,
-                "palette_phase": palette_phase,
-                "color_drive": color_drive,
+            tensor_controls = {
+                name: np.asarray(values, dtype=np.float32)
+                for name, values in batched_values.items()
             }
             uploads_finished = time.perf_counter()
             submit_started = time.perf_counter()
             fused_outputs = deployment.execute_named({
                 **static_feeds,
-                **{
-                    name: np.float32(value)
-                    for name, value in scalar_values.items()
-                },
+                **tensor_controls,
             })
             submit_finished = time.perf_counter()
             shell_report = deployment.profile_report()
@@ -888,93 +1061,74 @@ def animate_glsl(
             compute_finished = time.perf_counter()
 
             present_started = time.perf_counter()
-            surface = pygame.display.get_surface()
-            draw_width, draw_height = surface.get_size()
-            GL.glViewport(0, 0, draw_width, draw_height)
-            GL.glDisable(GL.GL_DEPTH_TEST)
-            GL.glClearColor(0.008, 0.012, 0.028, 1.0)
-            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
             GL.glUseProgram(display_program)
             GL.glUniform1ui(width_location, width)
             GL.glUniform1ui(height_location, height)
             GL.glBindBufferBase(
                 GL.GL_SHADER_STORAGE_BUFFER,
                 0,
-                fused_outputs["luminance"].buffer_id,
+                fused_outputs["frames"].data.buffer_id,
             )
-            GL.glBindBufferBase(
-                GL.GL_SHADER_STORAGE_BUFFER,
-                1,
-                fused_outputs["blue_difference"].buffer_id,
-            )
-            GL.glBindBufferBase(
-                GL.GL_SHADER_STORAGE_BUFFER,
-                2,
-                fused_outputs["red_difference"].buffer_id,
-            )
-            GL.glBindVertexArray(vao)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
-            GL.glBindVertexArray(0)
-            pygame.display.flip()
-            present_finished = time.perf_counter()
-            encode_started = present_finished
-            if recorder is not None:
-                recorder.append_frame(
-                    tensor_ycbcr_jpeg_bytes(
-                        (
-                            fused_outputs["luminance"],
-                            fused_outputs["blue_difference"],
-                            fused_outputs["red_difference"],
-                        ),
-                        width,
-                        height,
-                        resources=jpeg_resources,
-                    )
+            frames_to_present = batch_size
+            if max_frames is not None:
+                frames_to_present = min(
+                    frames_to_present,
+                    max_frames - frame,
                 )
-                if audio_scheduler is not None:
-                    count = audio_scheduler.samples_for_next_frame()
-                    indices = (
-                        np.arange(count, dtype=np.int64)
-                        + recorded_audio_position
-                    ) % len(audio.samples)
-                    with AbstractTensor.use_backend("glsl"):
-                        recorder.append_audio_tensor(
-                            AbstractTensor.tensor(audio.samples[indices])
-                        )
-                    recorded_audio_position += count
-            encode_finished = time.perf_counter()
-            frame += 1
+            for batch_frame in range(frames_to_present):
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    elif (
+                        event.type == pygame.KEYDOWN
+                        and event.key == pygame.K_ESCAPE
+                    ):
+                        running = False
+                if not running:
+                    break
+                surface = pygame.display.get_surface()
+                draw_width, draw_height = surface.get_size()
+                GL.glViewport(0, 0, draw_width, draw_height)
+                GL.glDisable(GL.GL_DEPTH_TEST)
+                GL.glClearColor(0.008, 0.012, 0.028, 1.0)
+                GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+                GL.glUniform1ui(frame_location, batch_frame)
+                GL.glBindVertexArray(vao)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+                GL.glBindVertexArray(0)
+                pygame.display.flip()
+                frame += 1
+                report_frames += 1
+            present_finished = time.perf_counter()
             frame_dispatches = (
-                dispatch_stats()["calls"] - dispatch_before_frame
+                dispatch_stats()["calls"] - dispatch_before_batch
             )
-            report_frames += 1
             if profile:
+                divisor = max(frames_to_present, 1)
                 profile_rows.append(
                     {
                         "control": (
-                            controls_finished - frame_started
-                        ) * 1e3,
+                            controls_finished - batch_started
+                        ) * 1e3 / divisor,
                         "uploads": (
                             uploads_finished - controls_finished
-                        ) * 1e3,
+                        ) * 1e3 / divisor,
                         "submit": (
                             submit_finished - submit_started
-                        ) * 1e3,
+                        ) * 1e3 / divisor,
                         "compute_wait": (
                             compute_finished - submit_started
-                        ) * 1e3,
-                        "gpu": gpu_ms,
+                        ) * 1e3 / divisor,
+                        "gpu": gpu_ms / divisor,
                         "present": (
                             present_finished - present_started
-                        ) * 1e3,
-                        "encode": (
-                            encode_finished - encode_started
-                        ) * 1e3,
+                        ) * 1e3 / divisor,
                         "total": (
-                            encode_finished - frame_started
-                        ) * 1e3,
+                            present_finished - batch_started
+                        ) * 1e3 / divisor,
                     }
                 )
+            now = time.perf_counter()
             if now - report_started >= 0.5:
                 fps = report_frames / (now - report_started)
                 hot_rows = [
@@ -1000,11 +1154,16 @@ def animate_glsl(
                     "Parametric AbstractTensor Mandelbrot — GLSL | "
                     f"{fps:.1f} solve+render fps | span {animated_span:.5g} | "
                     f"family {family_mix:.2f} | detail {predicted_detail:.2f} | "
-                    f"loud {loudness:.2f} | GL launches {frame_dispatches}"
+                    f"loud {loudness:.2f} | batch {batch_size} | "
+                    f"GL launches {frame_dispatches}"
                     + hot_caption
                 )
                 report_started, report_frames = now, 0
         elapsed = time.perf_counter() - started
+        sink_finalize_seconds = max(
+            0.0,
+            elapsed - feed_seconds - shell_seconds - sink_seconds,
+        )
         print(
             f"animated: {frame} solve+render frames in {elapsed:.3f}s "
             f"({frame / max(elapsed, 1e-9):.1f} fps)",
@@ -1035,7 +1194,6 @@ def animate_glsl(
                 "compute_wait",
                 "gpu",
                 "present",
-                "encode",
                 "total",
             ):
                 values = np.asarray(
@@ -1054,172 +1212,321 @@ def animate_glsl(
             audio.close()
         if audio_playback_ready:
             pygame.mixer.music.stop()
-        if recorder is not None:
-            recorder.close()
-        if jpeg_resources is not None:
-            jpeg_resources.release()
         GL.glDeleteVertexArrays(1, (vao,))
         GL.glDeleteProgram(display_program)
         pygame.quit()
 
 
-# ---------------------------------------------------------------------------
-# picture
-# ---------------------------------------------------------------------------
-
-def save_image(counts: np.ndarray, width: int, height: int, path: Path,
-               cmap: str = "blue_fire", vignette_tile: int = 0) -> Path:
-    """Colour with the repository's own colormap rather than a private one.
-
-    ``vignette_tile`` is off (0) by default and for a reason worth recording:
-    ``render_cache.add_vignette`` is not a border vignette, it **upscales**, turning
-    every input pixel into a ``tile x tile`` bubble. It is built for small conv
-    feature maps, where that reads as pixel art. Applied blind to a 1600x1200
-    render at its default ``tile=8`` it silently produces a 12800x9600, 11 MB
-    image -- which is exactly what the first version of this demo did.
-    """
-    from PIL import Image
-    from ..abstract_convolution.render_cache import add_vignette, apply_colormap
-
-    frame = counts.reshape(height, width)
-    # sqrt spreads the low counts, where nearly all the visible structure lives
-    rgb = apply_colormap(np.sqrt(frame), cmap=cmap)
-    if vignette_tile:
-        rgb = add_vignette(rgb, tile=vignette_tile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(rgb).save(path)
-    return path
-
-
-def tensor_jpeg_bytes(
-    counts,
+def animate_glsl(
+    *,
     width: int,
     height: int,
     iterations: int,
-    *,
-    palette_phase: float = 0.0,
-    color_drive: float = 0.52,
-) -> bytes:
-    """Encode the displayed GLSL palette through AbstractTensor JPEG."""
-    from ..abstraction import AbstractTensor as AT
-    from .glsl_backend import (
-        GLChunk,
-        dispatch_batch,
-        fuse_elementwise,
-        reshape_chunk,
-    )
-    from .glsl_tensor_backend import GLSLTensorOperations
-
-    if width % 8 or height % 8:
-        raise ValueError("JPEG dimensions must be divisible by eight")
-    with AT.use_backend("glsl"):
-        if isinstance(counts, GLChunk):
-            field = GLSLTensorOperations()
-            field.data = reshape_chunk(counts, (height, width))
-        else:
-            field = AT.tensor(counts.reshape(height, width))
-        with dispatch_batch(), fuse_elementwise():
-            phase = (
-                (field / max(iterations, 1)).clamp(0.0, 1.0).sqrt()
-                + float(palette_phase)
-            )
-            exponent = (
-                1.65
-                + (0.62 - 1.65) * min(1.0, max(0.0, float(color_drive)))
-            )
-            rgb = AT.stack(
-                (
-                    (
-                        0.5
-                        + 0.5
-                        * (6.283185307179586 * phase).cos()
-                    ) ** exponent,
-                    (
-                        0.5
-                        + 0.5
-                        * (
-                            6.283185307179586
-                            * (phase + 0.21)
-                        ).cos()
-                    ) ** exponent,
-                    (
-                        0.5
-                        + 0.5
-                        * (
-                            6.283185307179586
-                            * (phase + 0.43)
-                        ).cos()
-                    ) ** exponent,
-                ),
-                dim=-1,
-            ) * 255.0
-            samples = ((rgb + 0.5) // 1).clamp(0.0, 255.0)
-            # Fewer, wider MCU batches materially improve accelerator occupancy:
-            # each batch reuses the same AbstractTensor entropy pipeline, while
-            # tiny batches repeat hundreds of launches over undersized tensors.
-            return samples.jpg(
-                mcu_rows_per_batch=min(32, max(1, (height + 7) // 8))
-            )
-
-
-def tensor_ycbcr_jpeg_bytes(
-    planes,
-    width: int,
-    height: int,
-    *,
-    resources=None,
-) -> bytes:
-    """Encode resident Y/Cb/Cr outputs without rebuilding RGB."""
-
-    from ..abstraction import AbstractTensor as AT
-    from ..compression.jpeg.frame import encode_ycbcr_jfif
-    from .glsl_backend import (
-        GLChunk,
-        dispatch_batch,
-        fuse_elementwise,
-        reshape_chunk,
-    )
-    from .glsl_tensor_backend import GLSLTensorOperations
-
-    if width % 8 or height % 8:
-        raise ValueError("JPEG dimensions must be divisible by eight")
-    if len(planes) != 3:
-        raise ValueError("YCbCr encoding needs exactly three planes")
-    with AT.use_backend("glsl"):
-        wrapped = []
-        for plane in planes:
-            if isinstance(plane, GLChunk):
-                tensor = GLSLTensorOperations()
-                tensor.data = reshape_chunk(plane, (height, width))
-            else:
-                tensor = AT.tensor(plane.reshape(height, width))
-            wrapped.append(tensor)
-        # The ProcessGraph front end hands us resident Y/Cb/Cr planes. Keep
-        # every eligible encoder expression deferred until a true structural
-        # or reduction boundary, just as the older RGB entry point already
-        # does. Without this scope the graph-optimized front end accidentally
-        # fell back to one GLSL launch per primitive throughout JPEG.
-        with dispatch_batch(), fuse_elementwise():
-            return encode_ycbcr_jfif(
-                tuple(wrapped),
-                mcu_rows_per_batch=min(32, max(1, (height + 7) // 8)),
-                resources=resources,
-            )
-
-
-def save_tensor_jpeg(
-    counts: np.ndarray,
-    width: int,
-    height: int,
-    iterations: int,
-    path: Path,
+    center: complex,
+    span: float,
+    speed: float = 1.0,
+    zoom_rate: float = 0.0,
+    audio_path: str | Path | None = None,
+    audio_gain: float = 1.0,
+    reaction: float = 0.20,
+    detail_network: bool = True,
+    detail_samples: int = 60,
+    detail_epochs: int = 20,
+    max_frames: int | None = None,
+    batch_size: int = 8,
+    timeline_fps: float = 60.0,
+    record_avi: str | Path | None = None,
+    record_fps: float = 30.0,
+    record_pcm_dtype: str = "s16le",
+    record_segment_bytes: int = 1 << 30,
+    profile: bool = False,
+    verbose_profile: bool = False,
+    program_table: bool = False,
+    legacy_fused_network: bool = False,
 ) -> Path:
-    """Write one fused GLSL solve as a 4:4:4 AbstractTensor JPEG."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(
-        tensor_jpeg_bytes(counts, width, height, iterations)
+    """Submit one control batch through the complete AVI-producing root."""
+
+    if record_avi is None:
+        raise ValueError("batched animation recording requires record_avi")
+    if timeline_fps <= 0 or record_fps <= 0:
+        raise ValueError("timeline_fps and record_fps must be positive")
+
+    frame_count = max_frames if max_frames is not None else batch_size
+    frame_count = max(1, int(frame_count))
+    unit_x, unit_y = normalized_plane(width, height)
+
+    from .gl_context import require_gl_context
+    from .glsl_backend import shader_cache_stats
+
+    controller = None
+    if detail_network:
+        controller, measured_scores = build_detail_controller(
+            center,
+            span,
+            iterations=iterations,
+            samples=detail_samples,
+            epochs=detail_epochs,
+            reaction=reaction,
+            zoom_rate=zoom_rate,
+        )
+        print(
+            "detail  : AbstractNN/Adam "
+            f"{controller.samples} states x {controller.epochs} epochs | "
+            f"loss {controller.initial_loss:.4g}->"
+            f"{controller.final_loss:.4g} | "
+            f"holdout r={controller.validation_correlation:.3f} | "
+            f"measured {measured_scores.min():.2f}.."
+            f"{measured_scores.max():.2f}",
+            flush=True,
+        )
+
+    audio = _open_control_stream(
+        audio_path,
+        gain=audio_gain,
+        duration=frame_count / timeline_fps,
     )
-    return path
+    deployment = None
+    profile_reported = False
+    try:
+        controls_by_name = {
+            name: []
+            for name in (
+                "center_x",
+                "center_y",
+                "span",
+                "family_mix",
+                "julia_x",
+                "julia_y",
+                "palette_phase",
+                "color_drive",
+            )
+        }
+        travel = 0.0
+        predicted_detail = 1.0
+        for frame_index in range(frame_count):
+            logical_time = frame_index / timeline_fps
+            controls = audio.sample(logical_time)
+            detail_speed = 1.0
+            if controller is not None:
+                candidates = travel + np.asarray([0.0, 0.45, 0.9])
+                candidate_features, _ = detail_state_features(
+                    center,
+                    span,
+                    candidates,
+                    bass=np.full(3, controls.bass),
+                    low_mid=np.full(3, controls.low_mid),
+                    high_mid=np.full(3, controls.high_mid),
+                    reaction=reaction,
+                    zoom_rate=zoom_rate,
+                )
+                predicted = controller.predict(candidate_features)
+                predicted_detail = float(predicted[0])
+                best_ahead = float(np.argmax(predicted)) * 0.45
+                detail_speed = (
+                    0.45 + 1.8 * (1.0 - predicted_detail)
+                    + 0.35 * best_ahead
+                )
+            travel += (1.0 / timeline_fps) * speed * detail_speed * (
+                0.28 + reaction * 1.35 * controls.loudness
+            )
+            (
+                animated_center,
+                animated_span,
+                family_mix,
+                julia_constant,
+            ) = dream_parameters(
+                center,
+                span,
+                travel,
+                bass=controls.bass,
+                low_mid=controls.low_mid,
+                high_mid=controls.high_mid,
+                reaction=reaction,
+                zoom_rate=zoom_rate,
+            )
+            controls_by_name["center_x"].append(animated_center.real)
+            controls_by_name["center_y"].append(animated_center.imag)
+            controls_by_name["span"].append(animated_span)
+            controls_by_name["family_mix"].append(family_mix)
+            controls_by_name["julia_x"].append(julia_constant.real)
+            controls_by_name["julia_y"].append(julia_constant.imag)
+            controls_by_name["palette_phase"].append(
+                0.028 * travel
+                + reaction * 0.09 * (controls.treble - 0.5)
+            )
+            controls_by_name["color_drive"].append(
+                0.52 + reaction * 0.24 * (controls.high_mid - 0.5)
+            )
+
+        tensor_controls = {
+            name: np.asarray(values, dtype=np.float32)
+            for name, values in controls_by_name.items()
+        }
+        destination = Path(record_avi)
+        static_feeds = {
+            "unit_x": unit_x,
+            "unit_y": unit_y,
+            "width": width,
+            "height": height,
+            "iterations": iterations,
+        }
+
+        def batch_feeds(start, stop):
+            return {
+                **static_feeds,
+                **{
+                    name: values[start:stop]
+                    for name, values in tensor_controls.items()
+                },
+            }
+
+        deployment, _ = build_parametric_mandelbrot_glsl_deployment(
+            iterations,
+            profiling=profile or verbose_profile,
+            verbose_profile=verbose_profile,
+            legacy_fused_network=legacy_fused_network,
+            entrypoint="mandelbrot_recording_program",
+        )
+        planned_shells = {
+            id(shell): shell
+            for shell in (
+                deployment,
+                *deployment.function_shells.values(),
+            )
+        }.values()
+        planned_shells = tuple(planned_shells)
+        print(
+            f"program : {sum(shell.source_node_count for shell in planned_shells)} "
+            "ProcessGraph nodes -> "
+            f"{sum(shell.primitive_count for shell in planned_shells)} "
+            "scheduled nodes in "
+            f"{sum(shell.dispatch_count for shell in planned_shells)} "
+            f"deployment regions across {len(planned_shells)} function shells",
+            flush=True,
+        )
+        info = require_gl_context()
+        print(
+            f"gpu     : {info['renderer']} (context: {info['source']})",
+            flush=True,
+        )
+        print(
+            f"batch   : {frame_count} x {width} x {height} controls -> "
+            f"{destination}",
+            flush=True,
+        )
+
+        cache_before = shader_cache_stats()
+        phase_started = time.perf_counter()
+        deployment.compile_process_graph()
+        structural_compile_seconds = time.perf_counter() - phase_started
+        compile_stop = min(frame_count, max(1, int(batch_size)))
+        phase_started = time.perf_counter()
+        deployment.capture_fused_programs(batch_feeds(0, compile_stop))
+        capture_install_seconds = time.perf_counter() - phase_started
+        cache_after = shader_cache_stats()
+        print(
+            "prepare : "
+            f"structural {structural_compile_seconds:.3f}s | "
+            f"capture/install {capture_install_seconds:.3f}s | "
+            "shader cache "
+            f"{cache_after['persistent_hits'] - cache_before['persistent_hits']} "
+            "persistent hit(s), "
+            f"{cache_after['persistent_misses'] - cache_before['persistent_misses']} "
+            "miss(es)",
+            flush=True,
+        )
+        if program_table:
+            for line in deployment.program_table_lines():
+                print(line, flush=True)
+
+        from ..abstraction import AbstractTensor
+        from ..compression.containers.avi import DoubleBufferedAVISink
+        from ..compression.pcm import PCMFormat
+
+        pcm_format = PCMFormat(
+            sample_rate=audio.sample_rate,
+            channels=1,
+            sample_format=record_pcm_dtype,
+        )
+        started = time.perf_counter()
+        outputs = None
+        feed_seconds = 0.0
+        shell_seconds = 0.0
+        sink_seconds = 0.0
+        with DoubleBufferedAVISink(
+            destination,
+            width=width,
+            height=height,
+            fps=record_fps,
+            pcm_format=pcm_format,
+            audio=AbstractTensor.tensor(audio.samples),
+            opendml=True,
+            segment_bytes=record_segment_bytes,
+        ) as sink:
+            for batch_start in range(0, frame_count, batch_size):
+                batch_stop = min(frame_count, batch_start + batch_size)
+                phase_started = time.perf_counter()
+                feeds = batch_feeds(batch_start, batch_stop)
+                feed_seconds += time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
+                outputs = deployment.execute_named(feeds)
+                shell_seconds += time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
+                sink.submit(outputs["video_packets"])
+                sink_seconds += time.perf_counter() - phase_started
+        elapsed = time.perf_counter() - started
+        avi_output = destination
+        if not avi_output.is_file():
+            raise RuntimeError(
+                f"complete recording root returned without AVI: {avi_output}"
+            )
+        print(
+            f"recorded: {frame_count} frames | "
+            f"{avi_output.stat().st_size:,} bytes | "
+            f"{elapsed:.3f}s execution | detail {predicted_detail:.3f}",
+            flush=True,
+        )
+        print(
+            "host    : "
+            f"feeds {feed_seconds:.3f}s | "
+            f"installed shell {shell_seconds:.3f}s | "
+            f"AVI submit {sink_seconds:.3f}s | "
+            f"AVI wait/finalize {sink_finalize_seconds:.3f}s",
+            flush=True,
+        )
+        shell_tree = {
+            id(shell): shell
+            for shell in (
+                deployment,
+                *deployment.function_shells.values(),
+            )
+        }.values()
+        print(
+            f"compile : {sum(len(shell.captured_region_programs) for shell in shell_tree)} "
+            "CapturedFusedProgram shaders; "
+            f"{sum(len(shell.coordinator_region_indices) for shell in shell_tree)} "
+            "coordinator regions",
+            flush=True,
+        )
+        if profile or verbose_profile:
+            for line in deployment.profile_lines(window=60):
+                print(line, flush=True)
+            profile_reported = True
+        return avi_output
+    finally:
+        if deployment is not None:
+            if (profile or verbose_profile) and not profile_reported:
+                print(
+                    "profile : incomplete run; reporting events captured "
+                    "before failure",
+                    flush=True,
+                )
+                for line in deployment.profile_lines(window=60):
+                    print(line, flush=True)
+                for line in deployment.exception_lines(limit=12):
+                    print(line, flush=True)
+            deployment.release()
+        audio.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1233,14 +1540,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--iterations", type=int, default=64)
     ap.add_argument("--center", type=complex, default=complex(-0.743643887, 0.131825904))
     ap.add_argument("--span", type=float, default=0.004)
-    ap.add_argument("--cmap", default="blue_fire")
-    ap.add_argument("--vignette-tile", type=int, default=0,
-                    help="per-pixel bubble vignette; UPSCALES by this factor "
-                         "(render_cache.add_vignette default is 8). 0 = off.")
-    ap.add_argument("--out", type=Path, default=Path("mandelbrot_fused.png"))
     ap.add_argument("--c-probe", type=int, default=48,
                     help="edge length of the small grid cross-checked on the C backend")
     ap.add_argument("--skip-c", action="store_true")
+    ap.add_argument(
+        "--shell",
+        choices=("python", "c", "glsl"),
+        default="python",
+        help=(
+            "control-shell language; defaults to the CPU Python shell"
+        ),
+    )
+    ap.add_argument(
+        "--backend",
+        choices=("auto", "pure_python", "numpy", "c", "glsl"),
+        default="auto",
+        help=(
+            "interior tensor backend; auto selects numpy for Python, c for "
+            "C, and glsl for GLSL"
+        ),
+    )
+    ap.add_argument(
+        "--benchmark-repeats",
+        type=int,
+        default=3,
+        help="timed repetitions for static non-GLSL execution",
+    )
     ap.add_argument(
         "--only-glsl",
         action="store_true",
@@ -1249,19 +1574,31 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--animate",
         action="store_true",
-        help="continuously execute the scalar-parameterized GLSL solve",
+        help="record a finite batch of animated controls through the AVI root",
     )
     ap.add_argument(
         "--animation-speed",
         type=float,
         default=1.0,
-        help="camera parameter cycles per wall-clock second multiplier",
+        help="camera travel multiplier across the recording timeline",
     )
     ap.add_argument(
         "--animation-frames",
         type=int,
         default=0,
-        help="stop after this many frames; 0 runs until ESC",
+        help="frames in the single recording batch; 0 uses --animation-batch",
+    )
+    ap.add_argument(
+        "--animation-batch",
+        type=int,
+        default=8,
+        help="default complete recording batch size",
+    )
+    ap.add_argument(
+        "--animation-fps",
+        type=float,
+        default=60.0,
+        help="logical camera/audio timeline rate within a submitted batch",
     )
     ap.add_argument(
         "--zoom-rate",
@@ -1329,9 +1666,100 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="synchronize GPU timer queries and print per-stage timings",
     )
+    ap.add_argument(
+        "--profile-verbose",
+        action="store_true",
+        help=(
+            "stream routed tensor statistics, loop-carried state, region "
+            "activity, timings, and shell errors; intentionally synchronizes "
+            "the GPU frequently"
+        ),
+    )
+    ap.add_argument(
+        "--program-table",
+        action="store_true",
+        help=(
+            "print the compiled shell/call-site hierarchy and every shader "
+            "or coordinator region as console tables"
+        ),
+    )
+    ap.add_argument(
+        "--legacy-fused-network",
+        action="store_true",
+        help=(
+            "explicitly use the retired GLSLFusedProgramNetwork during the "
+            "composed-control runtime transition"
+        ),
+    )
     args = ap.parse_args(argv)
 
+    if args.only_glsl:
+        args.shell = "glsl"
+        args.backend = "glsl"
+    if args.backend == "auto":
+        args.backend = {
+            "python": "numpy",
+            "c": "c",
+            "glsl": "glsl",
+        }[args.shell]
+    compatible = {
+        "python": {"pure_python", "numpy", "c"},
+        "c": {"c"},
+        "glsl": {"glsl"},
+    }
+    if args.backend not in compatible[args.shell]:
+        ap.error(
+            f"--shell {args.shell} does not support --backend {args.backend}; "
+            f"choose from {sorted(compatible[args.shell])}"
+        )
+
+    if args.shell != "glsl":
+        if args.animate:
+            ap.error("CPU shell benchmarking does not support --animate")
+        result, timings = benchmark_cpu_mandelbrot(
+            shell=args.shell,
+            backend=args.backend,
+            width=args.width,
+            height=args.height,
+            iterations=args.iterations,
+            center=args.center,
+            span=args.span,
+            repeats=args.benchmark_repeats,
+        )
+        median_ms = float(np.median(timings))
+        print(f"shell   : {args.shell}")
+        print(f"backend : {args.backend}")
+        print(
+            f"problem : {args.width}x{args.height} x "
+            f"{args.iterations} iterations"
+        )
+        print(
+            f"timing  : median {median_ms:.3f} ms | "
+            f"{1e3 / max(median_ms, 1e-12):.2f} solves/s | "
+            f"samples {[round(value, 3) for value in timings]}"
+        )
+        if not (args.shell == "python" and args.backend == "numpy"):
+            cx, cy = complex_plane(
+                args.width,
+                args.height,
+                args.center,
+                args.span,
+            )
+            reference = run_abstract_numpy(cx, cy, args.iterations)
+            exact = float(np.mean(result == reference) * 100.0)
+            max_error = float(np.max(np.abs(result - reference)))
+            print(
+                f"parity  : {exact:.4f}% exact vs numpy | "
+                f"max |diff|={max_error:g}"
+            )
+        return 0
+
     if args.animate:
+        if args.record_avi is None:
+            ap.error(
+                "--animate executes the complete recording root and requires "
+                "--record-avi"
+            )
         animate_glsl(
             width=args.width,
             height=args.height,
@@ -1346,34 +1774,51 @@ def main(argv: list[str] | None = None) -> int:
             detail_network=not args.no_detail_network,
             detail_samples=args.detail_samples,
             detail_epochs=args.detail_epochs,
-            play_audio=not args.silent_audio,
             max_frames=args.animation_frames or None,
+            batch_size=args.animation_batch,
+            timeline_fps=args.animation_fps,
             record_avi=args.record_avi,
             record_fps=args.record_fps,
             record_pcm_dtype=args.record_pcm_dtype,
             record_segment_bytes=args.record_segment_bytes,
-            profile=args.profile,
+            profile=args.profile or args.profile_verbose,
+            verbose_profile=args.profile_verbose,
+            program_table=args.program_table,
+            legacy_fused_network=args.legacy_fused_network,
         )
         return 0
+
+    if args.record_avi is None:
+        ap.error(
+            "the complete AbstractTensor program requires --record-avi"
+        )
 
     elements = args.width * args.height
     print(f"image   : {args.width}x{args.height} = {elements:,} pixels")
 
     deployment, _ = build_parametric_mandelbrot_glsl_deployment(
         args.iterations,
-        profiling=args.profile,
+        profiling=args.profile or args.profile_verbose,
+        verbose_profile=args.profile_verbose,
+        legacy_fused_network=args.legacy_fused_network,
     )
     print(
         f"program : {deployment.source_node_count} ProcessGraph nodes -> "
         f"{deployment.primitive_count} scheduled nodes in "
         f"{deployment.dispatch_count} deployment regions"
     )
+    print(f"runtime : {deployment.control_runtime}")
     # -- GPU ---------------------------------------------------------------
     from .gl_context import require_gl_context
     info = require_gl_context()
     print(f"gpu     : {info['renderer']} (context: {info['source']})")
 
     unit_x, unit_y = normalized_plane(args.width, args.height)
+    audio = _open_control_stream(
+        args.audio,
+        gain=args.audio_gain,
+        duration=max(1.0, 1.0 / args.animation_fps),
+    )
     static_scalars = {
         "center_x": args.center.real,
         "center_y": args.center.imag,
@@ -1401,16 +1846,24 @@ def main(argv: list[str] | None = None) -> int:
         "avi_fps": args.record_fps,
         "avi_opendml": True,
         "avi_segment_bytes": args.record_segment_bytes,
-        "audio_samples": None,
-        "resources": None,
+        "audio_samples": audio.samples,
+        "audio_sample_rate": audio.sample_rate,
+        "audio_channels": 1,
+        "audio_sample_format": args.record_pcm_dtype,
     }
-    deployment.compile_process_graph()
-    deployment.capture_fused_programs(feeds)
-    t0 = time.perf_counter()
-    recording_outputs = deployment.execute_named(feeds)
-    gpu = recording_outputs["counts"].numpy().copy()
-    jpeg_frame = recording_outputs["jpeg_frame"]
-    gpu_ms = (time.perf_counter() - t0) * 1e3
+    try:
+        deployment.compile_process_graph()
+        deployment.capture_fused_programs(feeds)
+        if args.program_table:
+            for line in deployment.program_table_lines():
+                print(line, flush=True)
+        t0 = time.perf_counter()
+        recording_outputs = deployment.execute_named(feeds)
+        gpu = recording_outputs["counts"].numpy().copy()
+        avi_output = recording_outputs["avi_output"]
+        gpu_ms = (time.perf_counter() - t0) * 1e3
+    finally:
+        audio.close()
     print(
         f"glsl    : {gpu_ms:8.1f} ms  "
         f"({args.iterations} loop iterations x {elements:,} px, "
@@ -1422,7 +1875,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(deployment.coordinator_region_indices)} scalar/shape "
         "coordinator regions"
     )
-    if args.profile:
+    if args.profile or args.profile_verbose:
         for line in deployment.profile_lines():
             print(line)
     deployment.release()
@@ -1477,20 +1930,7 @@ def main(argv: list[str] | None = None) -> int:
             "ProcessGraph loops (no tape fallback)"
         )
 
-    if args.out.suffix.lower() in {".jpg", ".jpeg"}:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_bytes(jpeg_frame)
-        out = args.out
-    else:
-        out = save_image(
-            gpu,
-            args.width,
-            args.height,
-            args.out,
-            args.cmap,
-            vignette_tile=args.vignette_tile,
-        )
-    print(f"wrote   : {out}")
+    print(f"wrote   : {avi_output}")
     return 0
 
 

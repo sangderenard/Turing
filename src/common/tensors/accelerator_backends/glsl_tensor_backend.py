@@ -36,6 +36,7 @@ from .glsl_backend import (
     run_op,
     stack_chunks,
     topk_chunks,
+    where_chunks,
 )
 
 
@@ -56,6 +57,9 @@ class GLSLTensorOperations(AbstractTensor):
         if op in {"matmul", "rmatmul", "imatmul"}:
             return matmul_chunks(left, right, reverse=op == "rmatmul")
         return run_op(op, left, right)
+
+    def where_(self, x, y):
+        return where_chunks(self.data, _raw(x), _raw(y))
 
     # Creation and explicit transfer boundaries.
     def tensor_from_list_(self, data, dtype=None, device=None):

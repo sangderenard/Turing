@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 import struct
 from typing import BinaryIO, Iterable
+
+import numpy as np
 
 from ..pcm import PCMFormat, RationalAudioScheduler, encode_pcm
 
@@ -596,6 +599,173 @@ class MJPEGAVIWriter:
             self._closed = True
 
 
+def encode_tensor_mjpeg_frames(frames, *, jpeg_options=None) -> tuple[bytes, ...]:
+    """Encode a tensor frame stack into shell-streamable JPEG packets."""
+
+    from ...abstraction import AbstractTensor
+    from ..jpeg.frame import encode_jfif
+
+    if not isinstance(frames, AbstractTensor):
+        raise TypeError("frames must be an AbstractTensor")
+    options = {} if jpeg_options is None else dict(jpeg_options)
+    if frames.ndims() == 2 or (
+        frames.ndims() == 3 and frames.shape[-1] == 3
+    ):
+        source = (frames,)
+    elif frames.ndims() == 3:
+        source = (frames[index] for index in range(frames.shape[0]))
+    elif frames.ndims() == 4 and frames.shape[-1] == 3:
+        source = (frames[index] for index in range(frames.shape[0]))
+    else:
+        raise ValueError("MJPEG packets require one image or a frame stack")
+    return tuple(encode_jfif(frame, **options) for frame in source)
+
+
+class DoubleBufferedAVISink:
+    """Shell-owned asynchronous AVI sink with two bounded host buffers."""
+
+    def __init__(
+        self,
+        path,
+        *,
+        width,
+        height,
+        fps,
+        pcm_format,
+        audio,
+        opendml=True,
+        segment_bytes=1 << 30,
+    ):
+        self.writer = MJPEGAVIWriter(
+            path,
+            width=width,
+            height=height,
+            fps=fps,
+            pcm_format=pcm_format,
+            opendml=opendml,
+            segment_bytes=segment_bytes,
+        )
+        self.audio = audio
+        self.scheduler = RationalAudioScheduler(
+            sample_rate=pcm_format.sample_rate,
+            fps=fps,
+        )
+        self.audio_position = 0
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="avi-shell-sink",
+        )
+        self._buffers = [None, None]
+        self._futures = [None, None]
+        self._next_buffer = 0
+
+    def _flush(self, payload):
+        for packet_index, (video, audio) in enumerate(payload):
+            try:
+                self.writer.append_frame(video)
+            except Exception as error:
+                encoded = bytes(video)
+                last_nonzero = max(
+                    (
+                        index
+                        for index, value in enumerate(encoded)
+                        if value
+                    ),
+                    default=-1,
+                )
+                raise ValueError(
+                    "AVI sink received an invalid compiled video packet; "
+                    f"buffer_packet={packet_index}, bytes={len(encoded)}, "
+                    f"soi={encoded.find(bytes((0xFF, 0xD8)))}, "
+                    f"eoi={encoded.rfind(bytes((0xFF, 0xD9)))}, "
+                    f"last_nonzero={last_nonzero}, "
+                    f"head={encoded[:16].hex()}, "
+                    f"tail={encoded[-16:].hex()}"
+                ) from error
+            self.writer.append_audio(audio)
+
+    def submit(self, video_packets):
+        """Fill one buffer, then flush it while the shell fills the other."""
+
+        from ...abstraction import AbstractTensor
+
+        payload = []
+        for video in video_packets:
+            if isinstance(video, tuple) and len(video) == 2:
+                octets, byte_count = video
+                octets = (
+                    octets.numpy()
+                    if callable(getattr(octets, "numpy", None))
+                    else np.asarray(octets)
+                )
+                byte_count = (
+                    byte_count.numpy()
+                    if callable(getattr(byte_count, "numpy", None))
+                    else np.asarray(byte_count)
+                )
+                count = int(np.asarray(byte_count).reshape(-1)[0])
+                flat_octets = np.asarray(octets).reshape(-1)
+                if count < 0 or count > flat_octets.size:
+                    raise ValueError(
+                        "compiled resident packet byte count is outside "
+                        "its octet allocation"
+                    )
+                video = bytes(
+                    flat_octets[:count].astype(np.uint8, copy=False)
+                )
+            sample_count = self.scheduler.samples_for_next_frame()
+            stop = min(self.audio.shape[0], self.audio_position + sample_count)
+            samples = self.audio[self.audio_position:stop]
+            self.audio_position = stop
+            if samples.shape[0] < sample_count:
+                missing = sample_count - samples.shape[0]
+                samples = AbstractTensor.cat(
+                    (
+                        samples,
+                        AbstractTensor.zeros(
+                            (missing,),
+                            cls=type(self.audio),
+                        ),
+                    ),
+                    dim=0,
+                )
+            payload.append(
+                (
+                    bytes(video),
+                    encode_pcm(samples, pcm_format=self.writer.pcm_format),
+                )
+            )
+
+        index = self._next_buffer
+        prior = self._futures[index]
+        if prior is not None:
+            prior.result()
+        self._buffers[index] = tuple(payload)
+        self._futures[index] = self._executor.submit(
+            self._flush,
+            self._buffers[index],
+        )
+        self._next_buffer = 1 - index
+
+    def close(self):
+        for future in self._futures:
+            if future is not None:
+                future.result()
+        self._executor.shutdown(wait=True)
+        return self.writer.close()
+
+    def __enter__(self) -> "DoubleBufferedAVISink":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self.writer._file.close()
+            self.writer._closed = True
+
+
 def write_mjpeg_avi(
     path: str | Path,
     frames: Iterable[bytes],
@@ -674,7 +844,7 @@ def write_grayscale_mjpeg_avi(
 
 
 def write_tensor_mjpeg_avi(
-    path: str | Path,
+    path: str | Path | MJPEGAVIWriter,
     frames,
     *,
     fps: int | float | Fraction = 30,
@@ -728,22 +898,37 @@ def write_tensor_mjpeg_avi(
             sample_format=pcm_dtype,
         )
     options = {} if jpeg_options is None else dict(jpeg_options)
-    scheduler = (
-        RationalAudioScheduler(sample_rate=sample_rate, fps=fps)
-        if pcm_format is not None
-        else None
+    supplied_writer = isinstance(path, MJPEGAVIWriter)
+    writer = (
+        path
+        if supplied_writer
+        else MJPEGAVIWriter(
+            path,
+            width=int(width),
+            height=int(height),
+            fps=fps,
+            pcm_format=pcm_format,
+            opendml=opendml,
+            segment_bytes=segment_bytes,
+        )
     )
-    audio_position = 0
+    if supplied_writer:
+        if (writer.width, writer.height) != (int(width), int(height)):
+            raise ValueError("AVI batch dimensions changed between appends")
+        if (writer.rate, writer.scale) != (
+            Fraction(fps).limit_denominator(1_000_000).numerator,
+            Fraction(fps).limit_denominator(1_000_000).denominator,
+        ):
+            raise ValueError("AVI batch frame rate changed between appends")
 
-    with MJPEGAVIWriter(
-        path,
-        width=int(width),
-        height=int(height),
-        fps=fps,
-        pcm_format=pcm_format,
-        opendml=opendml,
-        segment_bytes=segment_bytes,
-    ) as writer:
+    scheduler = getattr(writer, "_tensor_audio_scheduler", None)
+    if pcm_format is not None and scheduler is None:
+        scheduler = RationalAudioScheduler(sample_rate=sample_rate, fps=fps)
+        writer._tensor_audio_scheduler = scheduler
+        writer._tensor_audio_position = 0
+    audio_position = int(getattr(writer, "_tensor_audio_position", 0))
+
+    try:
         for frame in frame_source:
             writer.append_frame(encode_jfif(frame, **options))
             if scheduler is None:
@@ -772,6 +957,10 @@ def write_tensor_mjpeg_avi(
                 gain=audio_gain,
                 clip=clip,
             )
+        writer._tensor_audio_position = audio_position
+    finally:
+        if not supplied_writer:
+            writer.close()
     return writer.path
 
 

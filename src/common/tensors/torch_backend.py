@@ -101,11 +101,23 @@ class PyTorchTensorOperations(AbstractTensor):
     def maximum_(self, other):
         import torch
         other = other.data if isinstance(other, AbstractTensor) else other
+        if not isinstance(other, torch.Tensor):
+            other = torch.as_tensor(
+                other,
+                dtype=self.data.dtype,
+                device=self.data.device,
+            )
         return torch.maximum(self.data, other)
 
     def minimum_(self, other):
         import torch
         other = other.data if isinstance(other, AbstractTensor) else other
+        if not isinstance(other, torch.Tensor):
+            other = torch.as_tensor(
+                other,
+                dtype=self.data.dtype,
+                device=self.data.device,
+            )
         return torch.minimum(self.data, other)
 
     def clamp_(self, min_val=None, max_val=None):

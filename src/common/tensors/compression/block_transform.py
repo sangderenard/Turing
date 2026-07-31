@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from ..abstraction import AbstractTensor
 
 
@@ -15,12 +13,15 @@ def orthonormal_dct_basis(
     """Construct an orthonormal DCT-II basis on ``like``'s backend."""
     if size < 1:
         raise ValueError("DCT size must be positive")
+    one = like.ensure_tensor(1.0)
+    two = like.ensure_tensor(2.0)
+    pi = (-one).acos()
     frequency = AbstractTensor.arange(size, cls=type(like)).unsqueeze(1)
     sample = AbstractTensor.arange(size, cls=type(like)).unsqueeze(0)
-    angle = (math.pi / size) * frequency * (sample + 0.5)
-    basis = angle.cos() * math.sqrt(2.0 / size)
+    angle = (pi / size) * frequency * (sample + 0.5)
+    basis = angle.cos() * (two / size).sqrt()
     dc_scale = (frequency == 0).to_dtype("float32")
-    scale = 1.0 + dc_scale * (1.0 / math.sqrt(2.0) - 1.0)
+    scale = 1.0 + dc_scale * (one / two.sqrt() - 1.0)
     return basis * scale
 
 
@@ -39,7 +40,11 @@ def block_view_2d(
         raise ValueError("block_view_2d requires at least two dimensions")
     height, width = values.shape[-2:]
     if height % block_height or width % block_width:
-        raise ValueError("input dimensions must be divisible by block dimensions")
+        raise ValueError(
+            "input dimensions must be divisible by block dimensions; "
+            f"shape={tuple(values.shape)!r} "
+            f"block=({block_height}, {block_width})"
+        )
 
     prefix = values.shape[:-2]
     prefix_rank = len(prefix)

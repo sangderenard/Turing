@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from src.common.tensors.accelerator_backends.glsl_backend import (
+    _broadcast_index_source,
     GLSL_OPS,
     GLChunk,
     GLContextUnavailable,
@@ -62,6 +63,13 @@ from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.common.tensors.accelerator_backends import gl_context as glctx
 
 RTOL, ATOL = 1e-5, 1e-5
+
+
+def test_equal_extent_rank_change_uses_the_recorded_linear_index():
+    lines, index = _broadcast_index_source("value", (1,), ())
+
+    assert lines == []
+    assert index == "gid"
 
 
 def _program(feeds, specs, output):
@@ -315,11 +323,12 @@ def test_repeat_and_reduction_emitters_are_single_dispatch_kernels():
     assert "outbuf[gid] = total" in reduce_src
 
 
-def test_cumsum_emitter_assigns_one_independent_axis_line_per_invocation():
+def test_cumsum_emitter_assigns_one_bounded_output_per_invocation():
     src = emit_cumsum_source((2, 3, 4), dim=1, dtype=np.int32)
-    assert "uint line = turing_linear_gid()" in src
-    assert "k < uint(3)" in src
-    assert "outbuf[index] = total" in src
+    assert "uint axis_index = block % uint(3)" in src
+    assert "k <= axis_index" in src
+    assert "arena[u_slot[1] + (gid)] = uint(total)" in src
+    assert "u_slot[1] + (index)" not in src
 
 
 def test_emitter_rejects_reading_an_unwritten_slot():
@@ -1236,6 +1245,39 @@ def test_partial_glsl_view_cannot_replace_shared_storage(gl):
     finally:
         prefix.release()
         source.release()
+
+
+def test_zero_copy_view_retains_arena_allocation_after_source_release(gl):
+    values = np.arange(12, dtype=np.float32)
+    source = GLChunk.from_numpy(values).to_gpu()
+    viewed = source.view((3, 4))
+
+    source.release()
+    replacement = GLChunk.from_numpy(
+        np.full(12, -99.0, dtype=np.float32)
+    ).to_gpu()
+    try:
+        np.testing.assert_array_equal(viewed.numpy(), values.reshape(3, 4))
+    finally:
+        replacement.release()
+        viewed.release()
+
+
+def test_temporary_glsl_tensor_survives_unsqueeze_view(gl):
+    from src.common.tensors.abstraction import AbstractTensor
+
+    with AbstractTensor.use_backend("glsl"):
+        # The arange result has no Python name and dies immediately after
+        # reshape returns.  The view must itself retain the resident slot.
+        column = AbstractTensor.arange(8).to_dtype("float32").unsqueeze(1)
+        row = AbstractTensor.arange(8).to_dtype("float32").unsqueeze(0)
+        outer = column * (row + 0.5)
+
+    expected = (
+        np.arange(8, dtype=np.float32)[:, None]
+        * (np.arange(8, dtype=np.float32)[None, :] + 0.5)
+    )
+    np.testing.assert_array_equal(outer.numpy(), expected)
 
 
 def test_aligned_first_axis_range_slice_is_zero_dispatch(gl):

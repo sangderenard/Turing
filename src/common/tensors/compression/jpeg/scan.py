@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ...abstraction import AbstractTensor
-from ...autograd import autograd
 from ..bitstream import PackedBitstream, compact_codewords
 from ..coefficient_events import (
     BlockCoefficientEvents,
@@ -96,13 +95,12 @@ def jpeg_ac_entropy_symbols(
         target = AbstractTensor.zeros(
             (scratch + 1,), cls=type(field)
         )
-        with autograd.no_grad():
-            target = AbstractTensor.scatter(
-                target,
-                destinations.flatten(),
-                (field * validity).flatten(),
-                dim=0,
-            )
+        target = AbstractTensor.scatter(
+            target,
+            destinations.flatten(),
+            (field * validity).flatten(),
+            dim=0,
+        )
         return target[:scratch].reshape(
             block_count, JPEG_AC_CAPACITY
         )

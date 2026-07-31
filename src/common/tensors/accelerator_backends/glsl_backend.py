@@ -43,14 +43,23 @@ those values as floats would silently change their meaning.
 
 from __future__ import annotations
 
+import ast
 import ctypes
+from collections import Counter
 import hashlib
 import itertools
+import json
 import math
+import re
 import os
+from pathlib import Path
+import struct
+import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -86,6 +95,10 @@ __all__ = [
     "emit_program_source",
     "emit_multi_output_program_source",
     "emit_native_for_loop",
+    "compose_control_shader",
+    "ComposedGLSLControlArtifact",
+    "InstalledGLSLControlShell",
+    "build_control_shader_artifact",
     "emit_op_source",
     "emit_cat_source",
     "emit_arange_source",
@@ -101,6 +114,7 @@ __all__ = [
     "emit_reduce_source",
     "emit_stack_source",
     "emit_topk_offsets_source",
+    "emit_where_source",
     "compile_glsl_source",
     "run_op",
     "cat_chunks",
@@ -121,6 +135,7 @@ __all__ = [
     "slice_axis_chunk",
     "stack_chunks",
     "topk_chunks",
+    "where_chunks",
     "execute_program",
     "execute_multi_output_program",
     "execute_captured_fused_program",
@@ -325,6 +340,128 @@ def _glsl_type(dtype: Any) -> str:
     return {"f": "float", "i": "int", "u": "uint", "b": "uint"}[kind]
 
 
+class _GLArena:
+    """The one shader storage buffer that backs every resident value.
+
+    A dataflow graph has no races, so a buffer per value buys nothing and
+    spends the scarcest resource a compute shader has: SSBO binding points,
+    sixteen on this device.  Every value is a slot in one arena, so a shader
+    binds the arena once and reaches any value by index.
+
+    Slots are four-byte words whatever the logical type -- ``_glsl_type``
+    admits only ``float``, ``int`` and ``uint`` -- so one ``uint`` arena
+    carries every value losslessly and callers reinterpret on access.  Freed
+    slots return to a size-keyed free list; without one the arena could only
+    grow, and pinned GL storage is what kills this process first.
+    """
+
+    __slots__ = (
+        "buffer", "capacity", "high_water", "_free", "_alignment",
+        "_execution_lock", "_executing",
+    )
+
+    def __init__(self) -> None:
+        self.buffer: int | None = None
+        self.capacity = 0
+        self.high_water = 0
+        self._free: dict[int, list[int]] = {}
+        self._alignment = 0
+        self._execution_lock = threading.Lock()
+        self._executing = False
+
+    def _slot_words(self) -> int:
+        """Slot granularity, in words.
+
+        While any emitter still declares its own storage block, slots are
+        reached with ``glBindBufferRange`` and must satisfy the device's SSBO
+        offset alignment.  Once every shader indexes the arena instead, this
+        can drop to one.
+        """
+
+        if not self._alignment:
+            try:
+                self._alignment = max(
+                    1, _compute_limits().ssbo_offset_alignment // 4
+                )
+            except Exception:
+                self._alignment = 1
+        return self._alignment
+
+    def allocate(self, count: int) -> tuple[int, int]:
+        if self._executing:
+            raise RuntimeError(
+                "GL arena allocation is forbidden during planned execution"
+            )
+        granularity = self._slot_words()
+        reserved = max(1, int(count))
+        reserved = ((reserved + granularity - 1) // granularity) * granularity
+        pool = self._free.get(reserved)
+        if pool:
+            return pool.pop(), reserved
+        offset = self.high_water
+        self.high_water += reserved
+        return offset, reserved
+
+    def free(self, offset: int, reserved: int) -> None:
+        self._free.setdefault(int(reserved), []).append(int(offset))
+
+    def reserve(self) -> int:
+        """Grow the device buffer so every allocated slot is addressable."""
+
+        from OpenGL import GL
+
+        if self.buffer is not None and self.capacity >= self.high_water:
+            return self.buffer
+        target = max(1 << 20, 1 << max(0, (self.high_water - 1).bit_length()))
+        grown = int(GL.glGenBuffers(1))
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, grown)
+        GL.glBufferData(
+            GL.GL_SHADER_STORAGE_BUFFER, target * 4, None, GL.GL_DYNAMIC_DRAW
+        )
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        if self.buffer is not None and self.capacity:
+            GL.glBindBuffer(GL.GL_COPY_READ_BUFFER, self.buffer)
+            GL.glBindBuffer(GL.GL_COPY_WRITE_BUFFER, grown)
+            GL.glCopyBufferSubData(
+                GL.GL_COPY_READ_BUFFER, GL.GL_COPY_WRITE_BUFFER,
+                0, 0, self.capacity * 4,
+            )
+            GL.glBindBuffer(GL.GL_COPY_READ_BUFFER, 0)
+            GL.glBindBuffer(GL.GL_COPY_WRITE_BUFFER, 0)
+            GL.glDeleteBuffers(1, [self.buffer])
+        self.buffer = grown
+        self.capacity = target
+        return self.buffer
+
+    @contextmanager
+    def execution(self):
+        """Exclusively lease stable arena storage for one planned launch."""
+
+        if not self._execution_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "GL arena is already owned by another shell execution"
+            )
+        try:
+            if self._executing:
+                raise RuntimeError("recursive GL arena execution is forbidden")
+            self.reserve()
+            self._executing = True
+            yield
+        finally:
+            self._executing = False
+            self._execution_lock.release()
+
+
+_ARENA = _GLArena()
+
+ARENA_BINDING = 0
+
+_ARENA_BLOCK = (
+    f"layout(std430, binding = {ARENA_BINDING}) buffer Arena "
+    "{ uint arena[]; };"
+)
+
+
 class _GLStorage:
     """Shared physical storage for one or more differently shaped GL views."""
 
@@ -361,6 +498,42 @@ class _GLStorage:
         self.refs = 1
 
 
+class _ArenaAllocation:
+    """Reference-count one allocation shared by zero-copy arena views.
+
+    A view is not merely an offset: it is an owner of the allocation containing
+    that offset.  In particular, expressions such as ``arange(8).unsqueeze(1)``
+    immediately discard the temporary source chunk.  Returning the source slot
+    to the arena at that point leaves the still-live view pointing into storage
+    that the next tensor may overwrite.  Keep the allocation alive until the
+    final base chunk, reshape, prefix, or range view releases it.
+    """
+
+    __slots__ = ("offset", "reserved", "refs", "released")
+
+    def __init__(self, offset: int, reserved: int) -> None:
+        self.offset = int(offset)
+        self.reserved = int(reserved)
+        self.refs = 1
+        self.released = False
+
+    def retain(self) -> "_ArenaAllocation":
+        if self.released:
+            raise RuntimeError("cannot retain a released GL arena allocation")
+        self.refs += 1
+        return self
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.refs -= 1
+        if self.refs < 0:
+            raise RuntimeError("GL arena allocation reference count underflow")
+        if self.refs == 0:
+            self.released = True
+            _ARENA.free(self.offset, self.reserved)
+
+
 class GLChunk:
     """An equally-shaped typed block resident on the CPU, the GPU, or both.
 
@@ -374,7 +547,12 @@ class GLChunk:
         "_shape",
         "_count",
         "_offset",
+        "_reserved",
+        "_dtype",
+        "_host",
+        "_gpu_valid",
         "_storage",
+        "_allocation",
         "_deferred",
         "_released",
     )
@@ -388,7 +566,6 @@ class GLChunk:
     ) -> None:
         self._shape = tuple(int(d) for d in shape)
         self._count = int(np.prod(self._shape)) if self._shape else 1
-        self._offset = 0
         logical_dtype = _normalize_dtype(
             host.dtype if host is not None and dtype is None else dtype
         )
@@ -400,7 +577,13 @@ class GLChunk:
                     f"host contains {host_array.size} elements for shape "
                     f"{self._shape} ({self._count} required)"
                 )
-        self._storage = _GLStorage(logical_dtype, self._count, host_array)
+            host_array = np.ascontiguousarray(host_array).reshape(-1)
+        self._dtype = logical_dtype
+        self._host = host_array
+        self._gpu_valid = False
+        self._offset, self._reserved = _ARENA.allocate(self._count)
+        self._allocation = _ArenaAllocation(self._offset, self._reserved)
+        self._storage = None
         self._deferred = None
         self._released = False
 
@@ -440,9 +623,20 @@ class GLChunk:
         ``release()`` will not delete a wrapped buffer.
         """
         chunk = cls(shape, None, dtype=dtype)
-        chunk._storage.buffer = int(buffer_id)
-        chunk._storage.owns_buffer = False
-        chunk._storage.gpu_valid = True
+        # A foreign buffer cannot live in the arena, so give the slot back and
+        # keep a private storage record pointing at the host's own SSBO.
+        chunk._allocation.release()
+        chunk._allocation = None
+        chunk._offset = 0
+        chunk._reserved = 0
+        chunk._storage = _GLStorage(
+            dtype,
+            chunk._count,
+            buffer=int(buffer_id),
+            owns_buffer=False,
+            gpu_valid=True,
+        )
+        chunk._gpu_valid = True
         return chunk
 
     def view(self, shape: Sequence[int]) -> "GLChunk":
@@ -516,12 +710,21 @@ class GLChunk:
             chunk = GLChunk(shape, dtype=self.dtype)
             chunk._deferred = _DeferredElementwise(program, deferred.feeds)
             return chunk
+        self._to_gpu_current()
         chunk = object.__new__(type(self))
         chunk._shape = shape
         chunk._count = count
         chunk._offset = self._offset
+        chunk._reserved = 0          # a borrowed slot: the source still owns it
+        chunk._dtype = self._dtype
+        chunk._host = None
+        chunk._gpu_valid = True
         chunk._storage = self._storage
-        chunk._storage.refs += 1
+        chunk._allocation = (
+            self._allocation.retain()
+            if self._allocation is not None
+            else None
+        )
         chunk._deferred = None
         chunk._released = False
         return chunk
@@ -550,8 +753,16 @@ class GLChunk:
         chunk._shape = shape
         chunk._count = count
         chunk._offset = self._offset
+        chunk._reserved = 0          # a borrowed slot: the source still owns it
+        chunk._dtype = self._dtype
+        chunk._host = None
+        chunk._gpu_valid = True
         chunk._storage = self._storage
-        chunk._storage.refs += 1
+        chunk._allocation = (
+            self._allocation.retain()
+            if self._allocation is not None
+            else None
+        )
         chunk._deferred = None
         chunk._released = False
         return chunk
@@ -586,8 +797,16 @@ class GLChunk:
         chunk._shape = shape
         chunk._count = count
         chunk._offset = self._offset + offset
+        chunk._reserved = 0          # a borrowed slot: the source still owns it
+        chunk._dtype = self._dtype
+        chunk._host = None
+        chunk._gpu_valid = True
         chunk._storage = self._storage
-        chunk._storage.refs += 1
+        chunk._allocation = (
+            self._allocation.retain()
+            if self._allocation is not None
+            else None
+        )
         chunk._deferred = None
         chunk._released = False
         return chunk
@@ -612,7 +831,7 @@ class GLChunk:
 
     @property
     def dtype(self):
-        return self._storage.dtype
+        return self._dtype
 
     @property
     def nbytes(self) -> int:
@@ -620,21 +839,25 @@ class GLChunk:
 
     @property
     def on_cpu(self) -> bool:
-        return not self._released and self._storage.host is not None
+        return not self._released and self._host is not None
 
     @property
     def on_gpu(self) -> bool:
         return (
             not self._released
-            and self._storage.buffer is not None
-            and self._storage.gpu_valid
+            and _ARENA.buffer is not None
+            and self._gpu_valid
         )
 
     @property
     def buffer_id(self) -> int | None:
         if not self._released and self._deferred is not None:
             self.to_gpu()
-        return None if self._released else self._storage.buffer
+        if self._released:
+            return None
+        if self._storage is not None:
+            return self._storage.buffer
+        return _ARENA.buffer
 
     # -- transfer ----------------------------------------------------------
 
@@ -658,30 +881,25 @@ class GLChunk:
             return self
         from OpenGL import GL
 
-        storage = self._storage
-        if storage.buffer is None:
-            storage.buffer = int(GL.glGenBuffers(1))
-            storage.owns_buffer = True
-            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, storage.buffer)
-            GL.glBufferData(
-                GL.GL_SHADER_STORAGE_BUFFER, self.nbytes, None, GL.GL_DYNAMIC_DRAW
-            )
-            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
-            storage.gpu_valid = False
-
-        if not storage.gpu_valid:
-            if storage.host is None:
+        buffer = _ARENA.reserve()
+        if not self._gpu_valid:
+            if self._host is None:
                 # Allocated but never written and nothing to upload: it is an
                 # output slot. Leave contents undefined but mark it live.
-                storage.gpu_valid = True
+                self._gpu_valid = True
                 return self
             data = np.ascontiguousarray(
-                storage.host, dtype=_storage_dtype(storage.dtype)
+                self._host, dtype=_storage_dtype(self._dtype)
             )
-            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, storage.buffer)
-            GL.glBufferSubData(GL.GL_SHADER_STORAGE_BUFFER, 0, self.nbytes, data)
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, buffer)
+            GL.glBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                self._offset * 4,
+                self.nbytes,
+                data,
+            )
             GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
-            storage.gpu_valid = True
+            self._gpu_valid = True
         return self
 
     def update_numpy(self, array: Any) -> "GLChunk":
@@ -692,18 +910,14 @@ class GLChunk:
         """
         if self._released:
             raise RuntimeError("cannot update a released GLChunk")
-        if self._offset != 0 or self._count != self._storage.capacity:
-            raise RuntimeError(
-                "cannot replace storage through a partial GLChunk view"
-            )
         self._deferred = None
         data = np.ascontiguousarray(np.asarray(array, dtype=self.dtype))
         if data.shape != self._shape:
             raise ValueError(
                 f"updated data must keep shape {self._shape}, got {data.shape}"
             )
-        self._storage.host = data.reshape(-1)
-        self._storage.gpu_valid = False
+        self._host = data.reshape(-1)
+        self._gpu_valid = False
         return self
 
     def upload_numpy(self, array: Any) -> "GLChunk":
@@ -722,7 +936,7 @@ class GLChunk:
                 f"uploaded data must keep shape {self._shape}, got {data.shape}"
             )
         self._to_gpu_current()
-        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self._storage.buffer)
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, _ARENA.buffer)
         GL.glBufferSubData(
             GL.GL_SHADER_STORAGE_BUFFER,
             self._offset * 4,
@@ -730,16 +944,15 @@ class GLChunk:
             data,
         )
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
-        # A partial write invalidates any cached full-storage host image.
-        self._storage.host = None
-        self._storage.gpu_valid = True
+        self._host = None
+        self._gpu_valid = True
         return self
 
     def discard_host(self) -> "GLChunk":
         """Drop a staging/readback copy while preserving the live SSBO."""
         if not self.on_gpu:
             raise RuntimeError("cannot discard the only valid GLChunk storage")
-        self._storage.host = None
+        self._host = None
         return self
 
     def _mark_gpu_written(self) -> None:
@@ -747,8 +960,8 @@ class GLChunk:
         if self._released:
             raise RuntimeError("cannot mark a released GLChunk")
         self._deferred = None
-        self._storage.host = None
-        self._storage.gpu_valid = True
+        self._host = None
+        self._gpu_valid = True
 
     def __len__(self) -> int:
         if not self._shape:
@@ -761,52 +974,37 @@ class GLChunk:
             raise RuntimeError("cannot read a released GLChunk")
         if self._deferred is not None:
             self.to_gpu()
-        if self._storage.host is not None:
-            start = self._offset
-            return self._storage.host[start:start + self._count].reshape(
-                self._shape
-            )
+        if self._host is not None:
+            return self._host[:self._count].reshape(self._shape)
         if not self.on_gpu:
             raise RuntimeError("chunk has no CPU data and no live GPU buffer")
         require_gl_context()
         from OpenGL import GL
 
         out = np.empty(self._count, dtype=_storage_dtype(self.dtype))
-        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self._storage.buffer)
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self.buffer_id)
         GL.glGetBufferSubData(
             GL.GL_SHADER_STORAGE_BUFFER, self._offset * 4, self.nbytes,
             out.ctypes.data_as(ctypes.c_void_p),
         )
         GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
-        result = out.astype(self.dtype, copy=False).reshape(self._shape)
-        if self._offset == 0 and self._count == self._storage.capacity:
-            self._storage.host = result.reshape(-1)
-        return result
+        return out.astype(self.dtype, copy=False).reshape(self._shape)
 
     def numpy(self) -> np.ndarray:
         """Host view, reading back from the GPU when that is the live copy."""
         return self.to_cpu()
 
     def release(self) -> None:
-        """Delete the GL buffer if we allocated it. Wrapped buffers are left alone."""
+        """Return this value's arena slot; the arena buffer itself persists."""
         if self._released:
             return
         self._released = True
         self._deferred = None
-        storage = self._storage
-        storage.refs -= 1
-        if storage.refs:
-            return
-        if storage.buffer is not None and storage.owns_buffer:
-            try:
-                from OpenGL import GL
-                GL.glDeleteBuffers(1, [storage.buffer])
-            except Exception:
-                pass  # context may already be gone during interpreter teardown
-        storage.buffer = None
-        storage.owns_buffer = False
-        storage.gpu_valid = False
-        storage.host = None
+        self._host = None
+        self._gpu_valid = False
+        if self._allocation is not None:
+            self._allocation.release()
+            self._allocation = None
 
     def __del__(self) -> None:
         try:
@@ -864,6 +1062,2570 @@ uint turing_linear_gid() {{
          + gl_GlobalInvocationID.z * launch_size.x * launch_size.y;
 }}
 """
+
+_WORKGROUP_CONTROL_SHADER_HEADER = """#version 430
+// GENERATED by turing glsl_backend control lowering -- do not edit by hand.
+//
+// One planner-proved independent loop iteration is assigned to each
+// workgroup.  Numerical lanes are local to that iteration/frame.
+layout(local_size_x = {local_size}) in;
+
+uint turing_linear_gid() {{
+    return gl_LocalInvocationID.x;
+}}
+"""
+
+
+@dataclass(frozen=True)
+class ShaderSnippet:
+    """One operation's body lines, not a shader.
+
+    An operation contributes statements, the arena slots it reads and writes,
+    and any helper functions its expressions call.  It does not carry a
+    version directive, a storage declaration, or a ``main``: those exist once
+    per compiled program, and a program is only finished when a shell control
+    interruption actually forces a dispatch.  Until then operations keep
+    accumulating into the same body.
+    """
+
+    lines: tuple[str, ...]
+    slots: int
+    helpers: tuple[str, ...] = ()
+    shared: tuple[str, ...] = ()
+    guard: bool = True
+
+    def guarded(
+        self,
+        index: int,
+        *,
+        device_resident: bool = False,
+    ) -> tuple[str, ...]:
+        """Bracket the body so this operation runs over its own extent.
+
+        A snippet that does its own launch-geometry arithmetic -- a tiled
+        kernel indexing by workgroup rather than by flat output element --
+        sets ``guard`` false and is emitted in a bare scope instead.
+        """
+
+        if not self.guard:
+            return ("    {", *("        " + line for line in self.lines), "    }")
+        if device_resident:
+            return (
+                "    {",
+                "        for (uint gid = gl_LocalInvocationID.x; "
+                f"gid < u_extent[{index}]; "
+                "gid += gl_WorkGroupSize.x) {",
+                *("            " + line for line in self.lines),
+                "        }",
+                "    }",
+            )
+        return (
+            "    {",
+            "        uint gid = turing_linear_gid();",
+            f"        if (gid < u_extent[{index}]) {{",
+            *("            " + line for line in self.lines),
+            "        }",
+            "    }",
+        )
+
+    def rebased(self, base: int) -> "ShaderSnippet":
+        """Relocate this fragment's local arena slots into a larger program."""
+
+        offset = int(base)
+        if offset == 0:
+            return self
+
+        def relocate(line: str) -> str:
+            return re.sub(
+                r"u_slot\[(\d+)\]",
+                lambda match: f"u_slot[{int(match.group(1)) + offset}]",
+                line,
+            )
+
+        return ShaderSnippet(
+            lines=tuple(relocate(line) for line in self.lines),
+            slots=self.slots,
+            helpers=self.helpers,
+            shared=self.shared,
+            guard=self.guard,
+        )
+
+
+@dataclass(frozen=True)
+class ComposedGLSLControlArtifact:
+    """One fully selected GLSL shell before device installation."""
+
+    source: str
+    slot_value_ids: tuple[int, ...]
+    extents: tuple[int, ...]
+    slot_extents: tuple[int, ...]
+    value_meta: Mapping[int, Meta]
+    external_value_ids: tuple[int, ...]
+    terminal_outputs: Mapping[str, int]
+    uniform_value_ids: Mapping[str, int]
+    value_aliases: Mapping[int, int]
+    contiguous_plan: Any = None
+    phase_sources: tuple[str, ...] = ()
+    specialized_values: Mapping[int, Any] = field(default_factory=dict)
+    instrumentation: bool = False
+    debug_capacity: int = 65536
+    device_resident: bool = False
+    local_size: int = _LOCAL_SIZE
+    stream_publications: tuple[Any, ...] = ()
+    stream_outputs: Mapping[str, int] = field(default_factory=dict)
+    stream_continuation_count: int = 0
+    slot_contract_diagnostics: Mapping[int, Any] = field(
+        default_factory=dict
+    )
+    snippet_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    stream_word_capacity: int = 1 << 24
+    stream_descriptor_capacity: int = 4096
+    phase_cache_identities: tuple[str, ...] = ()
+    workgroup_loop_bounds: tuple[str, str, str] | None = None
+    c_dispatch_loop_bounds: tuple[str, str, str] | None = None
+    private_value_capacities: Mapping[int, int] = field(
+        default_factory=dict
+    )
+
+
+def _control_stream_publications(root: Any) -> tuple[Any, ...]:
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+        StreamPublishBlock,
+    )
+
+    if isinstance(root, StreamPublishBlock):
+        return (root,)
+    children = ()
+    if isinstance(root, SequenceBlock):
+        children = root.blocks
+    elif isinstance(root, LoopBlock):
+        children = (root.body,)
+    elif isinstance(root, StateMachineTick):
+        children = tuple(body for _case, body in root.cases)
+    elif isinstance(root, ParallelDeployment):
+        children = root.lanes
+    elif isinstance(root, CallBlock):
+        children = (root.callee,)
+    return tuple(
+        publication
+        for child in children
+        for publication in _control_stream_publications(child)
+    )
+
+
+def _selected_workgroup_loop(root: Any):
+    """Return the outermost planner-approved loop for the dispatch x axis."""
+
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+    )
+
+    if isinstance(root, LoopBlock):
+        if root.parallel_iterations:
+            return root
+        return _selected_workgroup_loop(root.body)
+    if isinstance(root, SequenceBlock):
+        children = root.blocks
+    elif isinstance(root, StateMachineTick):
+        children = tuple(body for _case, body in root.cases)
+    elif isinstance(root, ParallelDeployment):
+        children = root.lanes
+    elif isinstance(root, CallBlock):
+        children = (root.callee,)
+    else:
+        children = ()
+    for child in children:
+        selected = _selected_workgroup_loop(child)
+        if selected is not None:
+            return selected
+    return None
+
+
+def _selected_c_dispatch_loop(root: Any):
+    """Return the outermost loop dissolved into C-planned dispatches."""
+
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+    )
+
+    def children(block):
+        if isinstance(block, LoopBlock):
+            return (block.body,)
+        if isinstance(block, SequenceBlock):
+            return block.blocks
+        if isinstance(block, StateMachineTick):
+            return tuple(body for _case, body in block.cases)
+        if isinstance(block, ParallelDeployment):
+            return block.lanes
+        if isinstance(block, CallBlock):
+            return (block.callee,)
+        return ()
+
+    candidates = []
+
+    def gather(block):
+        if isinstance(block, LoopBlock) and block.dispatch_shell == "c":
+            candidates.append(block)
+        for child in children(block):
+            gather(child)
+
+    def contains(block, target) -> bool:
+        return block is target or any(
+            contains(child, target) for child in children(block)
+        )
+
+    gather(root)
+    if not candidates:
+        return None
+    outer = candidates[0]
+    # One C command stream can dissolve nested loops into the selected
+    # closure, but cannot represent two disjoint control segments without
+    # separate shader variants.  Keep disjoint loops native until that richer
+    # schedule is explicitly constructed.
+    if all(contains(outer.body, candidate) for candidate in candidates[1:]):
+        return outer
+    return None
+
+
+def _control_scheduled_regions(root: Any) -> tuple[int, ...]:
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+        StatementBlock,
+    )
+
+    if isinstance(root, StatementBlock):
+        if (
+            len(root.lines) == 1
+            and root.lines[0].startswith("__scheduled_region_")
+            and root.lines[0].endswith("__")
+        ):
+            return (
+                int(root.lines[0][len("__scheduled_region_"):-2]),
+            )
+        return ()
+    if isinstance(root, SequenceBlock):
+        children = root.blocks
+    elif isinstance(root, LoopBlock):
+        children = (root.body,)
+    elif isinstance(root, StateMachineTick):
+        children = tuple(body for _case, body in root.cases)
+    elif isinstance(root, ParallelDeployment):
+        children = root.lanes
+    elif isinstance(root, CallBlock):
+        children = (root.callee,)
+    else:
+        children = ()
+    return tuple(
+        region
+        for child in children
+        for region in _control_scheduled_regions(child)
+    )
+
+
+def _direct_stream_publications(root: Any) -> tuple[Any, ...]:
+    """Return publications in one lexical execution scope.
+
+    Sequence and absorbed-call blocks remain in the same scope.  A nested
+    loop/state-machine/parallel lane owns its own continuation and is therefore
+    deliberately not traversed here.
+    """
+
+    from src.compiler.control_source import (
+        CallBlock,
+        SequenceBlock,
+        StreamPublishBlock,
+    )
+
+    if isinstance(root, StreamPublishBlock):
+        return (root,)
+    if isinstance(root, SequenceBlock):
+        children = root.blocks
+    elif isinstance(root, CallBlock):
+        children = (root.callee,)
+    else:
+        return ()
+    return tuple(
+        publication
+        for child in children
+        for publication in _direct_stream_publications(child)
+    )
+
+
+def _stream_continuation_count(root: Any, *, _root: bool = True) -> int:
+    """Count planner scopes which need persistent resident continuation."""
+
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+    )
+
+    count = int(
+        _root
+        and not isinstance(root, LoopBlock)
+        and bool(_direct_stream_publications(root))
+    )
+    if isinstance(root, LoopBlock):
+        count += int(bool(_direct_stream_publications(root.body)))
+        children = (root.body,)
+    elif isinstance(root, SequenceBlock):
+        children = root.blocks
+    elif isinstance(root, StateMachineTick):
+        children = tuple(body for _case, body in root.cases)
+    elif isinstance(root, ParallelDeployment):
+        children = root.lanes
+    elif isinstance(root, CallBlock):
+        children = (root.callee,)
+    else:
+        children = ()
+    return count + sum(
+        _stream_continuation_count(child, _root=False)
+        for child in children
+    )
+
+
+def compose_shader(
+    snippets: Sequence[ShaderSnippet],
+    *,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Assemble accumulated operation bodies into one compilable program.
+
+    This is the only place a shader is finished.  Everything upstream composes
+    snippets; nothing upstream emits a header, a storage block, or a ``main``.
+    """
+
+    snippets = tuple(snippets)
+    total_slots = sum(snippet.slots for snippet in snippets)
+    helpers: list[str] = []
+    shared: list[str] = []
+    for snippet in snippets:
+        for helper in snippet.helpers:
+            if helper and helper not in helpers:
+                helpers.append(helper)
+        for declaration in snippet.shared:
+            if declaration and declaration not in shared:
+                shared.append(declaration)
+    body: list[str] = []
+    for index, snippet in enumerate(snippets):
+        if index:
+            # Later operations may read what earlier ones wrote.
+            body.append("    barrier();")
+            body.append("    memoryBarrierBuffer();")
+        body.extend(snippet.guarded(index))
+    return "\n".join(
+        [
+            _SHADER_HEADER.format(local_size=local_size),
+            _ARENA_BLOCK,
+            "",
+            "uniform uint u_count;",
+            f"uniform uint u_extent[{max(1, len(snippets))}];",
+            f"uniform uint u_slot[{max(1, total_slots)}];",
+            *shared,
+            "",
+            *([*helpers, ""] if helpers else []),
+            "void main() {",
+            *body,
+            "}",
+            "",
+        ]
+    ) + "\n"
+
+
+def compose_control_shader(
+    control_program,
+    captured_regions: Mapping[int, Any],
+    *,
+    local_size: int = _LOCAL_SIZE,
+    instrumentation: bool = False,
+    active_program_indices: Iterable[int] | None = None,
+    emit_validations: bool = True,
+    device_resident: bool = False,
+) -> str:
+    """Absorb scheduled elementwise regions into one compiled control shader.
+
+    ``control_program`` is planner-owned structure from ``control_source``.
+    Region markers are substituted exactly once and in the order selected by
+    that plan.  This function never discovers control flow or computes a new
+    schedule.
+    """
+
+    from src.compiler.control_source import (
+        CallBlock,
+        ControlTarget,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+        StatementBlock,
+        StreamPublishBlock,
+        ValidationBlock,
+        render_control_block,
+    )
+
+    def contains_validation(block) -> bool:
+        if isinstance(block, ValidationBlock):
+            return True
+        if isinstance(block, SequenceBlock):
+            return any(contains_validation(child) for child in block.blocks)
+        if isinstance(block, LoopBlock):
+            return contains_validation(block.body)
+        if isinstance(block, StateMachineTick):
+            return any(
+                contains_validation(body) for _value, body in block.cases
+            )
+        if isinstance(block, ParallelDeployment):
+            return any(contains_validation(lane) for lane in block.lanes)
+        if isinstance(block, CallBlock):
+            return contains_validation(block.callee)
+        if isinstance(block, StreamPublishBlock):
+            return False
+        return False
+
+    stream_publications = _control_stream_publications(
+        control_program.root
+    )
+    selected_workgroup_loop = _selected_workgroup_loop(
+        control_program.root
+    )
+    selected_workgroup_induction = (
+        None
+        if selected_workgroup_loop is None
+        else str(selected_workgroup_loop.induction)
+    )
+    selected_c_dispatch_loop = _selected_c_dispatch_loop(
+        control_program.root
+    )
+    selected_c_dispatch_induction = (
+        None
+        if selected_c_dispatch_loop is None
+        else str(selected_c_dispatch_loop.induction)
+    )
+
+    trace_instrumentation = bool(instrumentation)
+    debug_enabled = bool(
+        trace_instrumentation
+        or contains_validation(control_program.root)
+    )
+
+    expected = tuple(control_program.region_indices)
+    if set(captured_regions) != set(expected):
+        raise ValueError(
+            "control shader regions do not match the planner submission: "
+            f"expected={expected!r}, supplied={tuple(captured_regions)!r}"
+        )
+
+    active_program_indices = (
+        None
+        if active_program_indices is None
+        else frozenset(int(index) for index in active_program_indices)
+    )
+    region_snippets: dict[
+        int, tuple[tuple[int, int, ShaderSnippet], ...]
+    ] = {}
+    region_slot_ids: dict[int, tuple[int, ...]] = {}
+    all_slot_ids: list[int] = []
+    all_slot_meta: list[Meta | None] = []
+    static_scalar_values: dict[int, Any] = {}
+    scalar_trace_slots: dict[int, tuple[int, ...]] = {}
+    closure_source_trace_indices: set[int] = set()
+    closure_scalar_source_producers: dict[int, tuple[int, int]] = {}
+    closure_source_ids = {
+        int(source_id)
+        for _iterable_id, _target_id, _induction, source_ids
+        in control_program.closure_iterable_bindings
+        for source_id in source_ids
+    }
+    base = 0
+    snippet_index = 0
+    program_index = 0
+    for region_index in expected:
+        captured = captured_regions[region_index]
+        stages = tuple(getattr(captured, "stages", ()) or ())
+        parts = (
+            tuple(type(captured)(stage, {}) for stage in stages)
+            if stages
+            else (captured,)
+        )
+        lowered = []
+        region_values = []
+        for part in parts:
+            part_base = base
+            current_snippet_index = snippet_index
+            try:
+                snippet = captured_program_snippet(
+                    part,
+                    base=base,
+                    local_size=local_size,
+                )
+            except Exception as error:
+                fragment_error = RuntimeError(
+                    "failed to emit captured control-shader fragment: "
+                    f"region={region_index}, stage={snippet_index}, "
+                    f"feeds={tuple(ordered_feed_ids(part.program))!r}, "
+                    f"outputs={tuple(part.program.outputs.items())!r}, "
+                    f"steps={tuple((step.op_name, tuple(step.input_ids), int(step.result_id)) for step in part.program.steps)!r}, "
+                    f"shapes={{{', '.join(f'{int(value_id)}: {tuple(meta.shape or ())!r}' for value_id, meta in (part.program.meta or {}).items())}}}"
+                )
+                fragment_error.region_index = int(region_index)
+                fragment_error.program = part.program
+                raise fragment_error from error
+            lowered.append((snippet_index, program_index, snippet))
+            snippet_index += 1
+            program_index += 1
+            base += snippet.slots
+            local_values = (
+                *ordered_feed_ids(part.program),
+                *tuple(part.program.outputs.values()),
+            )
+            # Native snippets consume operands in the operation's positional
+            # ABI.  A FusedProgram's ``feeds`` is a set and cannot preserve
+            # either that order or repetition such as stack(a, b, b).
+            # Elementwise snippets are different: program_snippet reads the
+            # canonical ordered feed set, so forcing positional order there
+            # swaps slots whenever value IDs sort differently.
+            kernel_kind = (part.program.extras or {}).get("kernel_kind")
+            if (
+                len(part.program.steps) == 1
+                and kernel_kind not in {None, "linear_reshape_copy"}
+            ):
+                positional_values = (
+                    *tuple(part.program.steps[0].input_ids),
+                    *tuple(part.program.outputs.values()),
+                )
+                if len(positional_values) == snippet.slots:
+                    local_values = positional_values
+            if len(local_values) != snippet.slots:
+                raise ValueError(
+                    "captured fragment slot count does not match its value "
+                    f"ABI: region={region_index}, stage={snippet_index - 1}, "
+                    f"snippet_slots={snippet.slots}, "
+                    f"feed_ids={ordered_feed_ids(part.program)!r}, "
+                    f"outputs={tuple(part.program.outputs.items())!r}, "
+                    "steps="
+                    f"{tuple((step.op_name, tuple(step.input_ids), step.result_id) for step in part.program.steps)!r}"
+                )
+            kernel_kind = (part.program.extras or {}).get("kernel_kind")
+            if (
+                len(part.program.steps) == 1
+                and kernel_kind not in {None, "linear_reshape_copy"}
+            ):
+                step = part.program.steps[0]
+                values = tuple(step.attrs.get("values", ()))
+                if (
+                    step.op_name == "tensor_from_list"
+                    and len(values) == 1
+                ):
+                    static_scalar_values[int(step.result_id)] = values[0]
+            local_meta = tuple(
+                (part.program.meta or {}).get(int(value_id))
+                for value_id in local_values
+            )
+            output_metas = tuple(
+                (part.program.meta or {}).get(int(value_id))
+                for value_id in part.program.outputs.values()
+            )
+            scalar_output_slots = tuple(
+                part_base + len(local_values) - len(output_metas) + offset
+                for offset, meta in enumerate(output_metas)
+                if (
+                    meta is not None
+                    and meta.shape is not None
+                    and _shape_product(tuple(meta.shape or ())) == 1
+                )
+            )
+            if scalar_output_slots:
+                scalar_trace_slots[current_snippet_index] = (
+                    scalar_output_slots
+                )
+                output_ids = tuple(
+                    map(int, part.program.outputs.values())
+                )
+                if closure_source_ids.intersection(output_ids):
+                    closure_source_trace_indices.add(
+                        current_snippet_index
+                    )
+                    for output_id, output_slot, meta in zip(
+                        output_ids,
+                        range(
+                            part_base + len(local_values) - len(output_metas),
+                            part_base + len(local_values),
+                        ),
+                        output_metas,
+                    ):
+                        if (
+                            output_id in closure_source_ids
+                            and meta is not None
+                            and meta.shape is not None
+                            and _shape_product(
+                                tuple(meta.shape or ())
+                            ) == 1
+                        ):
+                            closure_scalar_source_producers[output_id] = (
+                                int(current_snippet_index),
+                                int(output_slot),
+                            )
+            region_values.extend(int(value_id) for value_id in local_values)
+            all_slot_ids.extend(int(value_id) for value_id in local_values)
+            all_slot_meta.extend(local_meta)
+        region_snippets[region_index] = tuple(lowered)
+        region_slot_ids[region_index] = tuple(region_values)
+
+    # Iterable control operands are part of the shell ABI even when no
+    # numerical region consumes the iterable as an ordinary tensor input.
+    # Give each one a resident arena slot so the shader can bind the current
+    # element directly, without a host-side assignment per iteration.
+    for iterable_id, _target_id, _induction in (
+        control_program.iterable_bindings
+    ):
+        if int(iterable_id) not in all_slot_ids:
+            all_slot_ids.append(int(iterable_id))
+            all_slot_meta.append(None)
+            base += 1
+    for _iterable_id, target_id, _induction, values in (
+        control_program.static_iterable_bindings
+    ):
+        if int(target_id) in all_slot_ids:
+            continue
+        values = tuple(values)
+        dtype = (
+            "float32"
+            if any(isinstance(value, float) for value in values)
+            else "bool"
+            if values and all(isinstance(value, bool) for value in values)
+            else "int32"
+        )
+        all_slot_ids.append(int(target_id))
+        all_slot_meta.append(Meta(shape=(1,), dtype=dtype, device="glsl"))
+        base += 1
+    for _source_id, collection_id, _induction, _start in (
+        control_program.collection_bindings
+    ):
+        if int(collection_id) in all_slot_ids:
+            continue
+        all_slot_ids.append(int(collection_id))
+        collection_meta = next(
+            (
+                (program.meta or {}).get(int(collection_id))
+                for captured in captured_regions.values()
+                for program in (
+                    tuple(getattr(captured, "stages", ()) or ())
+                    or (captured.program,)
+                )
+                if (program.meta or {}).get(int(collection_id)) is not None
+            ),
+            None,
+        )
+        all_slot_meta.append(collection_meta)
+        base += 1
+    for _iterable_id, target_id, _induction, source_ids in (
+        control_program.closure_iterable_bindings
+    ):
+        for value_id in (int(target_id), *map(int, source_ids)):
+            if value_id in all_slot_ids:
+                continue
+            all_slot_ids.append(value_id)
+            all_slot_meta.append(None)
+            base += 1
+    # Loop-carried endpoints are executable data dependencies even when one
+    # endpoint is hidden behind a structural LoopExit and therefore is not a
+    # public numerical terminal.  Control composition addresses both ranges
+    # for the state commit, so both identities belong to the slot ABI.
+    for updated_id, initial_id in control_program.value_aliases:
+        for value_id in (int(updated_id), int(initial_id)):
+            if value_id in all_slot_ids:
+                continue
+            all_slot_ids.append(value_id)
+            all_slot_meta.append(None)
+            base += 1
+    for publication in stream_publications:
+        for value_id in (
+            publication.value_id,
+            publication.count_value_id,
+            publication.predicate_value_id,
+        ):
+            if value_id is None or int(value_id) in all_slot_ids:
+                continue
+            all_slot_ids.append(int(value_id))
+            all_slot_meta.append(None)
+            base += 1
+
+    def scheduled_regions(block) -> tuple[int, ...]:
+        if isinstance(block, StatementBlock):
+            if (
+                len(block.lines) == 1
+                and block.lines[0].startswith("__scheduled_region_")
+                and block.lines[0].endswith("__")
+            ):
+                return (int(block.lines[0][len("__scheduled_region_"):-2]),)
+            return ()
+        if isinstance(block, SequenceBlock):
+            children = block.blocks
+        elif isinstance(block, LoopBlock):
+            children = (block.body,)
+        elif isinstance(block, StateMachineTick):
+            children = tuple(body for _case, body in block.cases)
+        elif isinstance(block, ParallelDeployment):
+            children = block.lanes
+        elif isinstance(block, CallBlock):
+            children = (block.callee,)
+        else:
+            children = ()
+        return tuple(
+            region
+            for child in children
+            for region in scheduled_regions(child)
+        )
+
+    parallel_private_value_ids: set[int] = set()
+    if selected_workgroup_loop is not None:
+        for region_index in scheduled_regions(
+            selected_workgroup_loop.body
+        ):
+            captured = captured_regions[int(region_index)]
+            stages = tuple(getattr(captured, "stages", ()) or ())
+            programs = (
+                stages if stages else (captured.program,)
+            )
+            parallel_private_value_ids.update(
+                int(value_id)
+                for program in programs
+                for value_id in program.outputs.values()
+            )
+    parallel_private_slots = frozenset(
+        index
+        for index, value_id in enumerate(all_slot_ids)
+        if int(value_id) in parallel_private_value_ids
+    )
+
+    consumed: list[int] = []
+    next_stream_continuation = 0
+
+    def publication_source(block: StreamPublishBlock) -> tuple[str, str]:
+        """Return the predicate and one boolean resident publication call."""
+
+        try:
+            payload_slot = all_slot_ids.index(int(block.value_id))
+        except ValueError as error:
+            raise ValueError(
+                "stream payload has no composed shader slot: "
+                f"{block.value_id}"
+            ) from error
+        count_expression = (
+            f"u_extent_control[{payload_slot}]"
+            if block.count_value_id is None
+            else (
+                "arena[u_slot["
+                f"{all_slot_ids.index(int(block.count_value_id))}"
+                "]]"
+            )
+        )
+        predicate = "true"
+        if block.predicate_value_id is not None:
+            predicate_slot = all_slot_ids.index(
+                int(block.predicate_value_id)
+            )
+            predicate = f"arena[u_slot[{predicate_slot}]] != 0u"
+        call = (
+            f"turing_stream_publish({int(block.stream_id)}u, "
+            f"u_slot[{payload_slot}], {count_expression}, "
+            f"{'true' if block.final else 'false'})"
+        )
+        return predicate, call
+
+    def flatten_execution_scope(block):
+        """Flatten only sequence/call composition, preserving nested control."""
+
+        if isinstance(block, SequenceBlock):
+            return tuple(
+                item
+                for child in block.blocks
+                for item in flatten_execution_scope(child)
+            )
+        if isinstance(block, CallBlock):
+            return flatten_execution_scope(block.callee)
+        return (block,)
+
+    def resumable_loop_source(
+        block: LoopBlock,
+        continuation_index: int,
+    ) -> StatementBlock:
+        """Lower one planner loop to a lossless resident continuation.
+
+        Completed iterations are never replayed.  If a publication cannot fit,
+        the exact induction value and publication point are saved after all
+        invocations converge.  The next dispatch of this same installed shell
+        resumes at the publication, preserving its already-computed payload.
+        """
+
+        items = flatten_execution_scope(block.body)
+        publications = tuple(
+            item for item in items if isinstance(item, StreamPublishBlock)
+        )
+        if not publications:
+            raise ValueError("resumable loop has no direct publication")
+        continuation_base = (
+            "(8u + stream_state[5] * 4u + "
+            f"{2 * int(continuation_index)}u)"
+        )
+        marker_name = (
+            f"turing_resume_marker_{int(continuation_index)}"
+        )
+        active_name = (
+            f"turing_resume_active_{int(continuation_index)}"
+        )
+        start_name = f"turing_resume_start_{int(continuation_index)}"
+        lines = [
+            "{",
+            f"    uint turing_resume_base = {continuation_base};",
+            f"    uint {marker_name} = "
+            "stream_state[turing_resume_base + 1u];",
+            f"    int {start_name} = "
+            f"({marker_name} == 0u) ? int({block.start}) : "
+            "int(stream_state[turing_resume_base]);",
+            f"    for (int {block.induction} = {start_name}; "
+            f"{block.induction} < {block.stop}; "
+            f"{block.induction} += {block.step}) {{",
+            f"        bool {active_name} = ({marker_name} == 0u);",
+        ]
+        publication_index = 0
+        for item in items:
+            if isinstance(item, StreamPublishBlock):
+                publication_index += 1
+                predicate, call = publication_source(item)
+                marker = int(publication_index)
+                lines.extend((
+                    f"        if ({active_name} || "
+                    f"{marker_name} == {marker}u) {{",
+                    f"            if ({predicate} && !{call}) {{",
+                    "                if (gl_LocalInvocationID.x == 0u) {",
+                    "                    stream_state[turing_resume_base] = "
+                    f"uint({block.induction});",
+                    "                    stream_state["
+                    "turing_resume_base + 1u] = "
+                    f"{marker}u;",
+                    "                }",
+                    "                barrier();",
+                    "                return;",
+                    "            }",
+                    f"            {marker_name} = 0u;",
+                    f"            {active_name} = true;",
+                    "        }",
+                ))
+                continue
+            rendered = render_control_block(item, ControlTarget.GLSL)
+            lines.append(f"        if ({active_name}) {{")
+            lines.extend(f"            {line}" for line in rendered)
+            lines.append("        }")
+        lines.extend((
+            "        if (gl_LocalInvocationID.x == 0u) {",
+            "            stream_state[turing_resume_base] = "
+            f"uint({block.induction} + ({block.step}));",
+            "            stream_state[turing_resume_base + 1u] = 0u;",
+            "        }",
+            "        barrier();",
+            f"        {marker_name} = 0u;",
+            "    }",
+            "    if (gl_LocalInvocationID.x == 0u) {",
+            "        stream_state[turing_resume_base] = "
+            f"uint(int({block.start}));",
+            "        stream_state[turing_resume_base + 1u] = 0u;",
+            "    }",
+            "    barrier();",
+            "}",
+        ))
+        return StatementBlock(tuple(lines))
+
+    def parallelize_private_access(line: str) -> str:
+        for slot in parallel_private_slots:
+            line = line.replace(
+                f"arena[u_slot[{slot}] + ",
+                f"arena[u_slot[{slot}] + "
+                f"uint(gl_WorkGroupID.x) * "
+                f"u_extent_control[{slot}] + ",
+            )
+        return line
+
+    def substitute(block, parallel_scope: bool = False):
+        nonlocal next_stream_continuation
+        if isinstance(block, StatementBlock):
+            if len(block.lines) != 1:
+                return block
+            marker = block.lines[0]
+            prefix = "__scheduled_region_"
+            if not marker.startswith(prefix) or not marker.endswith("__"):
+                return block
+            region_index = int(marker[len(prefix):-2])
+            if region_index not in region_snippets:
+                raise ValueError(
+                    f"control program references absent region {region_index}"
+                )
+            consumed.append(region_index)
+            blocks = []
+            if trace_instrumentation:
+                blocks.append(StatementBlock((
+                    f"turing_debug_event(3u, {region_index}u, "
+                    f"{sum(1 for _snippet_index, program_index, _snippet in region_snippets[region_index] if active_program_indices is None or program_index in active_program_indices)}u, u_count);",
+                )))
+            for index, current_program_index, snippet in (
+                region_snippets[region_index]
+            ):
+                if (
+                    active_program_indices is not None
+                    and current_program_index not in active_program_indices
+                ):
+                    continue
+                checkpoint = ()
+                if (
+                    trace_instrumentation
+                    and index in scalar_trace_slots
+                    and (
+                        index >= max(0, snippet_index - 128)
+                        or index in closure_source_trace_indices
+                    )
+                ):
+                    checkpoint = tuple(
+                            f"turing_debug_event(8u, {int(index)}u, "
+                            f"arena[u_slot[{output_slot}]], "
+                            f"u_extent[{output_slot}]);"
+                            for output_slot in scalar_trace_slots[index]
+                        )
+                guarded = snippet.guarded(
+                        index,
+                        device_resident=device_resident,
+                    )
+                if parallel_scope:
+                    guarded = tuple(
+                        parallelize_private_access(line)
+                        for line in guarded
+                    )
+                blocks.append(StatementBlock((
+                    *guarded,
+                    # This orders one invocation's arena spill before that
+                    # invocation consumes it in the next same-index snippet.
+                    # It is deliberately not ``barrier()`` and makes no claim
+                    # of synchronizing workgroups; cross-invocation edges are
+                    # separated by the contiguation plan into real dispatches.
+                    "memoryBarrierBuffer();",
+                    *(("barrier();",) if device_resident else ()),
+                    *checkpoint,
+                )))
+            active_region_snippets = tuple(
+                item
+                for item in region_snippets[region_index]
+                if (
+                    active_program_indices is None
+                    or item[1] in active_program_indices
+                )
+            )
+            if trace_instrumentation and active_region_snippets:
+                last_region_snippet = max(
+                    index
+                    for index, _program_index, _snippet
+                    in active_region_snippets
+                )
+                lifetime_checks = tuple(
+                    f"turing_debug_event(9u, {source_id}u, "
+                    f"arena[u_slot[{source_slot}]], {region_index}u);"
+                    for source_id, (producer_index, source_slot)
+                    in closure_scalar_source_producers.items()
+                    if producer_index <= last_region_snippet
+                )
+                if lifetime_checks:
+                    blocks.append(StatementBlock(lifetime_checks))
+            return SequenceBlock(tuple(blocks))
+        if isinstance(block, SequenceBlock):
+            return SequenceBlock(tuple(
+                substitute(child, parallel_scope)
+                for child in block.blocks
+            ))
+        if isinstance(block, LoopBlock):
+            is_selected_workgroup = (
+                str(block.induction) == selected_workgroup_induction
+            )
+            body = substitute(
+                block.body,
+                parallel_scope or is_selected_workgroup,
+            )
+            stop = block.stop
+            static_bindings = []
+            closure_bindings = []
+            for iterable_id, target_id, induction in (
+                control_program.iterable_bindings
+            ):
+                if induction != block.induction:
+                    continue
+                iterable_slot = all_slot_ids.index(int(iterable_id))
+                stop = stop.replace(
+                    f"__iterable_extent_{int(iterable_id)}__",
+                    f"int(u_extent_control[{iterable_slot}])",
+                )
+                target_slots = tuple(
+                    index
+                    for index, value_id in enumerate(all_slot_ids)
+                    if int(value_id) == int(target_id)
+                )
+
+                def bind_iterable(child):
+                    if isinstance(child, StatementBlock):
+                        replacement = (
+                            f"arena[u_slot[{iterable_slot}] + "
+                            f"uint({block.induction})]"
+                        )
+                        lines = []
+                        for line in child.lines:
+                            for target_slot in target_slots:
+                                line = line.replace(
+                                    f"arena[u_slot[{target_slot}] + (gid)]",
+                                    replacement,
+                                ).replace(
+                                    f"arena[u_slot[{target_slot}] + (0)]",
+                                    replacement,
+                                )
+                            lines.append(line)
+                        return StatementBlock(tuple(lines))
+                    if isinstance(child, SequenceBlock):
+                        return SequenceBlock(tuple(
+                            bind_iterable(item) for item in child.blocks
+                        ))
+                    if isinstance(child, CallBlock):
+                        return CallBlock(
+                            child.callsite_id,
+                            bind_iterable(child.callee),
+                            child.argument_bindings,
+                            child.result_bindings,
+                        )
+                    if isinstance(child, ValidationBlock):
+                        return child
+                    return child
+
+                body = bind_iterable(body)
+            for _iterable_id, target_id, induction, values in (
+                control_program.static_iterable_bindings
+            ):
+                if induction != block.induction:
+                    continue
+                target_slots = tuple(
+                    index
+                    for index, value_id in enumerate(all_slot_ids)
+                    if int(value_id) == int(target_id)
+                )
+                if not target_slots:
+                    raise ValueError(
+                        "static iterable target has no composed shader slot: "
+                        f"{target_id}"
+                    )
+                static_bindings.append((
+                    target_slots,
+                    tuple(values),
+                ))
+            for _iterable_id, target_id, induction, source_ids in (
+                control_program.closure_iterable_bindings
+            ):
+                if induction != block.induction:
+                    continue
+                target_slots = tuple(
+                    index
+                    for index, value_id in enumerate(all_slot_ids)
+                    if int(value_id) == int(target_id)
+                )
+                source_slots = tuple(
+                    all_slot_ids.index(int(source_id))
+                    for source_id in source_ids
+                )
+                if not target_slots or not source_slots:
+                    raise ValueError(
+                        "closure iterable has no composed resident slots: "
+                        f"target={target_id}, sources={tuple(source_ids)!r}"
+                    )
+                closure_bindings.append((target_slots, source_slots))
+            if static_bindings and len({
+                len(values) for _slots, values in static_bindings
+            }) != 1:
+                raise ValueError(
+                    "destructured static iterable bindings have unequal "
+                    "iteration counts"
+                )
+            commits = []
+            for updated, initial in block.carried_aliases:
+                try:
+                    initial_slot = all_slot_ids.index(int(initial))
+                    updated_slot = all_slot_ids.index(int(updated))
+                except ValueError as error:
+                    raise ValueError(
+                        "loop-carried value has no composed shader slot: "
+                        f"{initial}->{updated}"
+                    ) from error
+                commits.append(
+                    "uint control_gid = turing_linear_gid();"
+                    if not commits else ""
+                )
+                commits.extend((
+                    "if (control_gid < u_count) {",
+                    f"    arena[u_slot[{initial_slot}] + control_gid] = "
+                    f"arena[u_slot[{updated_slot}] + control_gid];",
+                    "}",
+                ))
+            for binding_index, (
+                source_id,
+                collection_id,
+                induction,
+                start,
+            ) in enumerate(control_program.collection_bindings):
+                if induction != block.induction:
+                    continue
+                try:
+                    source_slot = all_slot_ids.index(int(source_id))
+                    collection_slot = all_slot_ids.index(
+                        int(collection_id)
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        "loop collection value has no composed shader slot: "
+                        f"{source_id}->{collection_id}"
+                    ) from error
+                gid_name = f"collection_gid_{binding_index}"
+                extent_name = f"collection_extent_{binding_index}"
+                iteration_name = f"collection_iteration_{binding_index}"
+                source_frame_offset = (
+                    f"uint(gl_WorkGroupID.x) * "
+                    f"u_extent_control[{source_slot}] + "
+                    if (
+                        str(block.induction)
+                        == selected_workgroup_induction
+                        and source_slot in parallel_private_slots
+                    )
+                    else ""
+                )
+                commits.extend((
+                    f"uint {extent_name} = "
+                    f"u_extent_control[{source_slot}];",
+                    f"for (uint {gid_name} = gl_LocalInvocationID.x; "
+                    f"{gid_name} < {extent_name}; "
+                    f"{gid_name} += gl_WorkGroupSize.x) {{",
+                    f"    uint {iteration_name} = uint("
+                    f"({block.induction} - ({int(start)})) / "
+                    f"int({block.step}));",
+                    f"    arena[u_slot[{collection_slot}] + "
+                    f"{iteration_name} * {extent_name} + "
+                    f"{gid_name}] = "
+                    f"arena[u_slot[{source_slot}] + "
+                    f"{source_frame_offset}{gid_name}];",
+                    "}",
+                ))
+            if commits:
+                body = SequenceBlock((
+                    body,
+                    StatementBlock(tuple(commits)),
+                    *(
+                        (StatementBlock((
+                            f"turing_debug_event(4u, 0u, "
+                            f"uint({block.induction}), u_count);",
+                        )),)
+                        if trace_instrumentation else ()
+                    ),
+                ))
+            if trace_instrumentation and not static_bindings:
+                body = SequenceBlock((
+                    StatementBlock((
+                        f"turing_debug_event(2u, 0u, "
+                        f"uint({block.induction}), u_count);",
+                    )),
+                    body,
+                ))
+            if static_bindings:
+                iteration_count = len(static_bindings[0][1])
+                selection = [
+                    f"switch (int({block.induction})) {{"
+                ]
+                for iteration_index in range(iteration_count):
+                    selection.append(f"case {int(iteration_index)}:")
+                    for target_slots, values in static_bindings:
+                        value = values[iteration_index]
+                        for target_slot in target_slots:
+                            meta = all_slot_meta[target_slot]
+                            dtype = (
+                                "" if meta is None or meta.dtype is None
+                                else str(meta.dtype)
+                            )
+                            if "float" in dtype:
+                                encoded = (
+                                    f"floatBitsToUint(float({value!r}))"
+                                )
+                            elif "bool" in dtype:
+                                encoded = (
+                                    "uint(1)" if bool(value) else "uint(0)"
+                                )
+                            else:
+                                encoded = f"uint(int({value!r}))"
+                            selection.append(
+                                f"    arena[u_slot[{target_slot}]] = "
+                                f"{encoded};"
+                            )
+                    selection.append("    break;")
+                selection.extend(("}", "memoryBarrierBuffer();"))
+                body = SequenceBlock((
+                    StatementBlock(tuple(selection)),
+                    body,
+                ))
+                stop = str(iteration_count)
+            if closure_bindings:
+                source_counts = {
+                    len(source_slots)
+                    for _target_slots, source_slots in closure_bindings
+                }
+                if len(source_counts) != 1:
+                    raise ValueError(
+                        "destructured closure aggregate bindings have unequal "
+                        "iteration counts"
+                    )
+
+                def bind_source(
+                    child,
+                    target_slots,
+                    source_offset,
+                    source_extent,
+                ):
+                    if isinstance(child, StatementBlock):
+                        lines = []
+                        for line in child.lines:
+                            for target_slot in target_slots:
+                                line = line.replace(
+                                    f"u_slot[{target_slot}]",
+                                    source_offset,
+                                ).replace(
+                                    f"u_extent_control[{target_slot}]",
+                                    source_extent,
+                                )
+                            lines.append(line)
+                        return StatementBlock(tuple(lines))
+                    if isinstance(child, SequenceBlock):
+                        return SequenceBlock(tuple(
+                            bind_source(
+                                item,
+                                target_slots,
+                                source_offset,
+                                source_extent,
+                            )
+                            for item in child.blocks
+                        ))
+                    if isinstance(child, CallBlock):
+                        return CallBlock(
+                            child.callsite_id,
+                            bind_source(
+                                child.callee,
+                                target_slots,
+                                source_offset,
+                                source_extent,
+                            ),
+                            child.argument_bindings,
+                            child.result_bindings,
+                        )
+                    return child
+
+                selection = []
+                for binding_index, (
+                    target_slots,
+                    source_slots,
+                ) in enumerate(closure_bindings):
+                    offset_name = (
+                        f"closure_source_{block.induction}_{binding_index}"
+                    )
+                    extent_name = (
+                        f"closure_extent_{block.induction}_{binding_index}"
+                    )
+                    selection.extend((
+                        f"uint {offset_name} = 0u;",
+                        f"uint {extent_name} = 0u;",
+                        f"switch (int({block.induction})) {{",
+                    ))
+                    for iteration_index, source_slot in enumerate(
+                        source_slots
+                    ):
+                        selection.extend((
+                            f"case {int(iteration_index)}:",
+                            f"    {offset_name} = u_slot[{source_slot}];",
+                            f"    {extent_name} = "
+                            f"u_extent_control[{source_slot}];",
+                            "    break;",
+                        ))
+                    selection.append("}")
+                    body = bind_source(
+                        body,
+                        target_slots,
+                        offset_name,
+                        extent_name,
+                    )
+                body = SequenceBlock((
+                    StatementBlock(tuple(selection)),
+                    body,
+                ))
+                stop = str(next(iter(source_counts)))
+            lowered_loop = LoopBlock(
+                block.induction,
+                block.start,
+                stop,
+                block.step,
+                body,
+                block.carried_aliases,
+                bool(
+                    block.parallel_iterations
+                    and str(block.induction)
+                    == selected_workgroup_induction
+                ),
+                (
+                    "c"
+                    if str(block.induction)
+                    == selected_c_dispatch_induction
+                    else "glsl"
+                ),
+            )
+            if (
+                device_resident
+                and _direct_stream_publications(lowered_loop.body)
+            ):
+                continuation_index = next_stream_continuation
+                next_stream_continuation += 1
+                return resumable_loop_source(
+                    lowered_loop,
+                    continuation_index,
+                )
+            return lowered_loop
+        if isinstance(block, StateMachineTick):
+            return StateMachineTick(
+                block.state,
+                tuple(
+                    (value, substitute(body, parallel_scope))
+                    for value, body in block.cases
+                ),
+            )
+        if isinstance(block, ParallelDeployment):
+            return ParallelDeployment(tuple(
+                substitute(lane, parallel_scope) for lane in block.lanes
+            ))
+        if isinstance(block, CallBlock):
+            return CallBlock(
+                block.callsite_id,
+                substitute(block.callee, parallel_scope),
+                block.argument_bindings,
+                block.result_bindings,
+            )
+        if isinstance(block, ValidationBlock):
+            if not emit_validations:
+                return StatementBlock(())
+            try:
+                predicate_slot = all_slot_ids.index(
+                    int(block.predicate_value_id)
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "validation predicate has no composed shader slot: "
+                    f"{block.predicate_value_id}"
+                ) from error
+            comparison = "== 0u" if block.expect_true else "!= 0u"
+            return StatementBlock((
+                "if (turing_linear_gid() == 0u && "
+                f"arena[u_slot[{predicate_slot}]] {comparison}) {{",
+                f"    turing_debug_event(6u, "
+                f"{int(block.error_code)}u, 0u, 0u);",
+                "}",
+            ))
+        if isinstance(block, StreamPublishBlock):
+            if device_resident:
+                # Keep the logical effect intact until its owning loop has
+                # converted it into a resident suspension point.
+                return block
+            predicate, call = publication_source(block)
+            return StatementBlock((
+                f"if ({predicate}) {{",
+                f"    {call};",
+                "}",
+            ))
+        raise TypeError(f"unknown control block {type(block).__name__}")
+
+    substituted_root = substitute(control_program.root)
+    remaining_publications = _control_stream_publications(substituted_root)
+    if device_resident and remaining_publications:
+        direct_publications = _direct_stream_publications(substituted_root)
+        if direct_publications != remaining_publications:
+            raise ValueError(
+                "device-resident stream publication lacks a planner-owned "
+                "resumable execution scope: "
+                f"{remaining_publications!r}"
+            )
+        # A root-level publication is a one-iteration execution scope.  Give
+        # it the same persistent continuation semantics as an explicit loop
+        # so a full downstream queue never causes producer replay.
+        continuation_index = next_stream_continuation
+        next_stream_continuation += 1
+        substituted_root = resumable_loop_source(
+            LoopBlock(
+                f"turing_root_once_{continuation_index}",
+                "0",
+                "1",
+                "1",
+                substituted_root,
+            ),
+            continuation_index,
+        )
+    body = render_control_block(substituted_root, ControlTarget.GLSL)
+    # Control values belong to the installed shell, not to the driver's tiny
+    # legacy uniform register file.  Large, honestly composed programs can
+    # contain thousands of scheduled extents and loop controls; spelling each
+    # one as a GLSL uniform makes program size determine whether the driver can
+    # compile it.  Index them through one resident table instead.  This is an
+    # ABI rewrite of planner identities, not specialization from discovery
+    # values and emphatically not another tape/capture pass.
+    control_table_indices = {
+        uniform.name: index
+        for index, uniform in enumerate(control_program.uniforms)
+    }
+    for name, index in control_table_indices.items():
+        body = tuple(
+            re.sub(
+                rf"\b{re.escape(name)}\b",
+                f"int(u_control[{index}])",
+                line,
+            )
+            for line in body
+        )
+    # A scalar constant stage has extent one, so only invocation zero executes
+    # its arena write.  Textually placing a later broadcast consumer after it
+    # does not create a device-wide execution barrier: other workgroups may
+    # read the old word.  Constants are compile-time values, not runtime state,
+    # so replace every *read* of their slots with the typed literal.  This is
+    # both the correct vertical-chain reduction and avoids pretending that
+    # source order is a global synchronization primitive.
+    static_slots = {
+        index: (
+            static_scalar_values[value_id],
+            all_slot_meta[index],
+        )
+        for index, value_id in enumerate(all_slot_ids)
+        if value_id in static_scalar_values
+    }
+    for slot, (value, meta) in static_slots.items():
+        dtype = "" if meta is None else str(meta.dtype or "")
+        if "float" in dtype:
+            encoded = (
+                f"floatBitsToUint(float({float(value)!r}))"
+            )
+        elif "bool" in dtype:
+            encoded = (
+                "uint(1)" if bool(value) else "uint(0)"
+            )
+        else:
+            encoded = f"uint(int({int(value)}))"
+        static_slots[slot] = (encoded, meta)
+    if static_slots:
+        static_read = re.compile(
+            r"arena\[u_slot\[(\d+)\] \+ \([^)]*\)\]"
+        )
+
+        def replace_static_read(match):
+            fixed = static_slots.get(int(match.group(1)))
+            return match.group(0) if fixed is None else fixed[0]
+
+        rewritten = []
+        for line in body:
+            if "=" not in line:
+                rewritten.append(line)
+                continue
+            lhs, rhs = line.split("=", 1)
+            rewritten.append(
+                lhs + "=" + static_read.sub(replace_static_read, rhs)
+            )
+        body = tuple(rewritten)
+    if Counter(consumed) != Counter(expected):
+        raise ValueError(
+            "control program must consume each submitted region exactly once: "
+            f"expected={expected!r}, consumed={tuple(consumed)!r}"
+        )
+    helpers = tuple(dict.fromkeys(
+        helper
+        for region_index in expected
+        for _index, current_program_index, snippet
+        in region_snippets[region_index]
+        if (
+            active_program_indices is None
+            or current_program_index in active_program_indices
+        )
+        for helper in snippet.helpers
+        if helper
+    ))
+    shared = tuple(dict.fromkeys(
+        declaration
+        for region_index in expected
+        for _index, current_program_index, snippet
+        in region_snippets[region_index]
+        if (
+            active_program_indices is None
+            or current_program_index in active_program_indices
+        )
+        for declaration in snippet.shared
+        if declaration
+    ))
+    return "\n".join([
+        (
+            _WORKGROUP_CONTROL_SHADER_HEADER
+            if selected_workgroup_induction is not None
+            else _SHADER_HEADER
+        ).format(local_size=local_size),
+        _ARENA_BLOCK,
+        *(
+            (
+                "layout(std430, binding = 1) buffer TuringDebugLog "
+                "{ uint debug_words[]; };",
+                "uniform uint u_debug_capacity;",
+            )
+            if debug_enabled else ()
+        ),
+        *(
+            (
+                "layout(std430, binding = 2) buffer "
+                "TuringStreamState { uint stream_state[]; };",
+                "layout(std430, binding = 3) buffer "
+                "TuringStreamWords { uint stream_words[]; };",
+                "shared uint turing_stream_start;",
+                "shared uint turing_stream_count;",
+                "shared uint turing_stream_descriptor;",
+                "shared uint turing_stream_accept;",
+            )
+            if stream_publications else ()
+        ),
+        (
+            "layout(std430, binding = 4) readonly buffer "
+            "TuringSlotTable { uint u_slot[]; };"
+        ),
+        (
+            "layout(std430, binding = 5) readonly buffer "
+            "TuringControlExtents { uint u_extent_control[]; };"
+        ),
+        (
+            "layout(std430, binding = 6) readonly buffer "
+            "TuringDispatchExtents { uint u_extent[]; };"
+        ),
+        (
+            "layout(std430, binding = 7) readonly buffer "
+            "TuringControlValues { uint u_control[]; };"
+        ),
+        "",
+        "uniform uint u_count;",
+        *(
+            ("uniform int u_dispatch_iteration;",)
+            if selected_c_dispatch_loop is not None
+            else ()
+        ),
+        *(
+            (
+                "bool turing_stream_publish(",
+                "    uint stream_id, uint source, uint count, bool final",
+                ") {",
+                "    if (gl_LocalInvocationID.x == 0u) {",
+                "        uint used_words = stream_state[0] - stream_state[1];",
+                "        uint used_desc = stream_state[2] - stream_state[3];",
+                "        uint word_capacity = stream_state[4];",
+                "        uint desc_capacity = stream_state[5];",
+                "        turing_stream_accept = uint(",
+                "            count <= word_capacity - used_words &&",
+                "            used_desc < desc_capacity",
+                "        );",
+                "        if (turing_stream_accept != 0u) {",
+                "            turing_stream_start = stream_state[0];",
+                "            turing_stream_count = count;",
+                "            turing_stream_descriptor = stream_state[2];",
+                "        } else {",
+                "            stream_state[6] = "
+                "(count > word_capacity) ? 2u : 1u;",
+                "            stream_state[7] = count;",
+                "        }",
+                "    }",
+                "    barrier();",
+                "    if (turing_stream_accept == 0u) return false;",
+                "    uint word_capacity = stream_state[4];",
+                "    for (uint index = gl_LocalInvocationID.x; index < count;",
+                "         index += gl_WorkGroupSize.x) {",
+                "        stream_words[(turing_stream_start + index) % "
+                "word_capacity] = arena[source + index];",
+                "    }",
+                "    barrier();",
+                "    if (gl_LocalInvocationID.x == 0u) {",
+                "        uint desc_capacity = stream_state[5];",
+                "        uint desc = 8u + "
+                "(turing_stream_descriptor % desc_capacity) * 4u;",
+                "        stream_state[desc] = turing_stream_start;",
+                "        stream_state[desc + 1u] = turing_stream_count;",
+                "        stream_state[desc + 2u] = stream_id;",
+                "        stream_state[desc + 3u] = uint(final);",
+                "        memoryBarrierBuffer();",
+                "        stream_state[0] += turing_stream_count;",
+                "        stream_state[2] += 1u;",
+                "        stream_state[6] = 0u;",
+                "    }",
+                "    barrier();",
+                "    return true;",
+                "}",
+                "",
+            )
+            if stream_publications else ()
+        ),
+        *shared,
+        "",
+        *([*helpers, ""] if helpers else []),
+        *(
+            (
+                "void turing_debug_event(",
+                "    uint code, uint subject, uint payload0, uint payload1",
+                ") {",
+                "    if (turing_linear_gid() != 0u) return;",
+                "    uint index = atomicAdd(debug_words[0], 1u);",
+                "    if (index >= u_debug_capacity) {",
+                "        atomicAdd(debug_words[1], 1u);",
+                "        return;",
+                "    }",
+                "    uint base = 4u + index * 4u;",
+                "    debug_words[base] = code;",
+                "    debug_words[base + 1u] = subject;",
+                "    debug_words[base + 2u] = payload0;",
+                "    debug_words[base + 3u] = payload1;",
+                "}",
+                "",
+            )
+            if debug_enabled else ()
+        ),
+        "void main() {",
+        *(
+            ("    turing_debug_event(1u, 0u, u_count, 0u);",)
+            if trace_instrumentation else ()
+        ),
+        *_indent_control_shader_body(body),
+        *(
+            ("    turing_debug_event(5u, 0u, u_count, 0u);",)
+            if trace_instrumentation else ()
+        ),
+        "}",
+        "",
+    ]) + "\n"
+
+
+def _canonical_cache_value(value: Any) -> Any:
+    """Convert compiler IR into deterministic, address-free JSON data."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        payload = bytes(value)
+        return {
+            "bytes_type": (
+                f"{type(value).__module__}.{type(value).__qualname__}"
+            ),
+            "bytes_length": len(payload),
+            "bytes_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    if isinstance(value, np.ndarray):
+        contiguous = np.ascontiguousarray(value)
+        return {
+            "array_dtype": str(contiguous.dtype),
+            "array_shape": list(contiguous.shape),
+            "array_sha256": hashlib.sha256(
+                contiguous.tobytes()
+            ).hexdigest(),
+        }
+    if isinstance(value, np.generic):
+        return _canonical_cache_value(value.item())
+    if isinstance(value, Enum):
+        return {
+            "enum": f"{type(value).__module__}.{type(value).__qualname__}",
+            "value": _canonical_cache_value(value.value),
+        }
+    if isinstance(value, FusedProgram):
+        return {
+            "type": "FusedProgram",
+            "version": int(value.version),
+            "feeds": sorted(map(int, value.feeds)),
+            # Fused steps are SSA operations.  Their list order is a lowering
+            # schedule, not semantics, so use producer identity as the stable
+            # order while retaining every dependency and attribute.
+            "steps": [
+                _canonical_cache_value(step)
+                for step in sorted(
+                    value.steps,
+                    key=lambda step: (
+                        int(step.result_id),
+                        int(step.step_id),
+                    ),
+                )
+            ],
+            "outputs": _canonical_cache_value(value.outputs),
+            "state_in": _canonical_cache_value(value.state_in),
+            "meta": _canonical_cache_value(value.meta),
+            "extras": _canonical_cache_value(value.extras),
+        }
+    if isinstance(value, OpStep):
+        return {
+            "type": "OpStep",
+            "op_name": str(value.op_name),
+            "input_ids": tuple(map(int, value.input_ids)),
+            "attrs": _canonical_cache_value(value.attrs),
+            "result_id": int(value.result_id),
+            "mode_sensitive": bool(value.mode_sensitive),
+        }
+    if is_dataclass(value):
+        return {
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "fields": {
+                item.name: _canonical_cache_value(
+                    getattr(value, item.name)
+                )
+                for item in fields(value)
+            },
+        }
+    if isinstance(value, Mapping):
+        items = [
+            (
+                _canonical_cache_value(key),
+                _canonical_cache_value(item),
+            )
+            for key, item in value.items()
+        ]
+        items.sort(
+            key=lambda pair: json.dumps(
+                pair[0], sort_keys=True, separators=(",", ":")
+            )
+        )
+        return {"mapping": items}
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_cache_value(item) for item in value]
+        items.sort(
+            key=lambda item: json.dumps(
+                item, sort_keys=True, separators=(",", ":")
+            )
+        )
+        return {"set": items}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_cache_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (np.dtype, type)):
+        return str(value)
+    raise TypeError(
+        "GLSL semantic cache identity cannot encode "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def _semantic_cache_digest(value: Any) -> str:
+    payload = json.dumps(
+        _canonical_cache_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _lowering_implementation_digest() -> str:
+    """Fingerprint code that turns the semantic artifact into GLSL."""
+
+    digest = hashlib.sha256()
+    paths = (
+        Path(__file__),
+        Path(__file__).parents[3] / "compiler" / "control_source.py",
+        Path(__file__).parents[3] / "compiler" / "loop_ir.py",
+        Path(__file__).parents[3] / "compiler" / "loop_composer.py",
+        Path(__file__).parents[3] / "compiler"
+        / "hierarchical_control.py",
+        Path(__file__).parents[3] / "compiler"
+        / "glsl_deployment_strategy.py",
+    )
+    for path in paths:
+        digest.update(str(path.name).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def build_control_shader_artifact(
+    control_program,
+    captured_regions: Mapping[int, Any],
+    *,
+    local_size: int = _LOCAL_SIZE,
+    value_meta: Mapping[int, Meta] | None = None,
+    value_contract_diagnostics: Mapping[
+        int, Sequence[Mapping[str, Any]]
+    ] | None = None,
+    instrumentation: bool = False,
+    terminal_outputs: Mapping[str, int] | None = None,
+    stream_outputs: Mapping[str, int] | None = None,
+    specialized_values: Mapping[int, Any] | None = None,
+    device_resident: bool = False,
+) -> ComposedGLSLControlArtifact:
+    """Build source and the value-routing plan required to execute it."""
+
+    source = compose_control_shader(
+        control_program,
+        captured_regions,
+        local_size=local_size,
+        instrumentation=instrumentation,
+        device_resident=device_resident,
+    )
+    instrumentation = bool(
+        instrumentation or "turing_debug_event(6u" in source
+    )
+    program_records = []
+    snippet_diagnostics = []
+    slot_base = 0
+    for region_index in control_program.region_indices:
+        captured = captured_regions[region_index]
+        stages = tuple(getattr(captured, "stages", ()) or ())
+        parts = (
+            tuple(type(captured)(stage, {}) for stage in stages)
+            if stages
+            else (captured,)
+        )
+        for stage_index, part in enumerate(parts):
+            snippet = captured_program_snippet(
+                part,
+                base=slot_base,
+                local_size=local_size,
+            )
+            local_values = (
+                *ordered_feed_ids(part.program),
+                *tuple(part.program.outputs.values()),
+            )
+            kernel_kind = (part.program.extras or {}).get("kernel_kind")
+            if (
+                len(part.program.steps) == 1
+                and kernel_kind not in {None, "linear_reshape_copy"}
+            ):
+                positional_values = (
+                    *tuple(part.program.steps[0].input_ids),
+                    *tuple(part.program.outputs.values()),
+                )
+                if len(positional_values) == snippet.slots:
+                    local_values = positional_values
+            if len(local_values) != snippet.slots:
+                raise ValueError(
+                    "artifact slot ABI disagrees with emitted shader: "
+                    f"region={region_index}, base={slot_base}, "
+                    f"snippet_slots={snippet.slots}, values={local_values!r}"
+                )
+            program_records.append((part.program, tuple(
+                int(value_id) for value_id in local_values
+            )))
+            snippet_diagnostics.append({
+                "index": len(snippet_diagnostics),
+                "region": int(region_index),
+                "stage": int(stage_index),
+                "slot_base": int(slot_base),
+                "slot_count": int(snippet.slots),
+                "output_slot": int(slot_base + snippet.slots - 1),
+                "feeds": tuple(map(int, ordered_feed_ids(part.program))),
+                "outputs": tuple(
+                    (str(name), int(value_id))
+                    for name, value_id in part.program.outputs.items()
+                ),
+                "operations": tuple(
+                    str(step.op_name) for step in part.program.steps
+                ),
+            })
+            slot_base += snippet.slots
+    programs = tuple(program for program, _slots in program_records)
+
+    raw_aliases = {
+        int(alias): int(owner)
+        for alias, owner in control_program.value_aliases
+    }
+
+    def canonical_alias(value_id: int) -> int:
+        current = int(value_id)
+        seen = set()
+        while current in raw_aliases:
+            if current in seen:
+                raise ValueError(
+                    "compiled GLSL value-alias cycle: "
+                    + " -> ".join(map(str, (*seen, current)))
+                )
+            seen.add(current)
+            current = int(raw_aliases[current])
+        return current
+
+    aliases = {
+        alias: canonical_alias(alias)
+        for alias in raw_aliases
+    }
+
+    produced = {
+        int(value_id)
+        for program in programs
+        for value_id in program.outputs.values()
+    }
+    consumed = {
+        int(value_id)
+        for program in programs
+        for value_id in program.feeds
+    }
+    slot_value_ids = []
+    extents = []
+    metadata: dict[int, Meta] = {}
+    output_names: dict[int, str] = {}
+    for program, local_slots in program_records:
+        slot_value_ids.extend(local_slots)
+        for value_id, meta in (program.meta or {}).items():
+            metadata.setdefault(int(value_id), meta)
+        output_id = next(iter(program.outputs.values()))
+        output_meta = (program.meta or {})[output_id]
+        extents.append(_shape_product(tuple(output_meta.shape or ())))
+        for name, value_id in program.outputs.items():
+            output_names[int(value_id)] = str(name)
+
+    for value_id, meta in (value_meta or {}).items():
+        metadata.setdefault(int(value_id), meta)
+
+    def propagate_storage_contracts() -> None:
+        """Close storage facts over every identity relation to a fixed point.
+
+        Metadata discovery is intentionally distributed: numerical lowering,
+        lexical/static loop analysis, hierarchy projection, and collection
+        planning each learn different structural facts.  Their order must not
+        decide whether an otherwise identical SSA value receives storage.
+        """
+
+        changed = True
+        while changed:
+            changed = False
+            for alias_id, owner_id in aliases.items():
+                alias_id = int(alias_id)
+                owner_id = int(owner_id)
+                alias_meta = metadata.get(alias_id)
+                owner_meta = metadata.get(owner_id)
+                if owner_meta is None and alias_meta is not None:
+                    metadata[owner_id] = alias_meta
+                    changed = True
+                elif alias_meta is None and owner_meta is not None:
+                    metadata[alias_id] = owner_meta
+                    changed = True
+            for _iterable_id, target_id, _induction, source_ids in (
+                control_program.closure_iterable_bindings
+            ):
+                target_id = int(target_id)
+                target_meta = metadata.get(target_id)
+                if target_meta is None:
+                    target_meta = next(
+                        (
+                            metadata.get(int(aliases.get(
+                                int(source_id), int(source_id)
+                            )))
+                            or metadata.get(int(source_id))
+                            for source_id in source_ids
+                            if (
+                                metadata.get(int(aliases.get(
+                                    int(source_id), int(source_id)
+                                )))
+                                or metadata.get(int(source_id))
+                            ) is not None
+                        ),
+                        None,
+                    )
+                    if target_meta is not None:
+                        metadata[target_id] = target_meta
+                        changed = True
+                if target_meta is None:
+                    continue
+                # Every projected source occupies the same lexical field
+                # position consumed by the one compiled loop body.  Therefore
+                # the target ABI is also the source ABI.
+                for source_id in source_ids:
+                    source_id = int(source_id)
+                    owner_id = int(aliases.get(source_id, source_id))
+                    if metadata.get(source_id) is None:
+                        metadata[source_id] = target_meta
+                        changed = True
+                    if metadata.get(owner_id) is None:
+                        metadata[owner_id] = target_meta
+                        changed = True
+
+    # Structural lowering can split one capture into stages.  Scalar values
+    # crossing those stage boundaries are genuine program feeds, but older
+    # captures did not attach Meta to them.  Recover only their storage
+    # contract from the typed operation relation; never inspect a captured
+    # payload or bake its value into the shader.
+    for program in programs:
+        for feed_id in program.feeds:
+            feed_id = int(feed_id)
+            if feed_id in metadata:
+                continue
+            inferred_dtype = None
+            for step in program.steps:
+                if feed_id not in step.input_ids:
+                    continue
+                candidates = (
+                    metadata.get(int(step.result_id)),
+                    *(
+                        metadata.get(int(other_id))
+                        for other_id in step.input_ids
+                        if int(other_id) != feed_id
+                    ),
+                )
+                inferred_dtype = next(
+                    (
+                        str(meta.dtype)
+                        for meta in candidates
+                        if meta is not None and meta.dtype is not None
+                    ),
+                    None,
+                )
+                if inferred_dtype is not None:
+                    break
+            if inferred_dtype is not None:
+                metadata[feed_id] = Meta((), inferred_dtype, "glsl")
+
+    for _iterable_id, target_id, _induction, values in (
+        control_program.static_iterable_bindings
+    ):
+        target_id = int(target_id)
+        if target_id in metadata:
+            continue
+        values = tuple(values)
+        if values and all(
+            isinstance(value, (bool, np.bool_)) for value in values
+        ):
+            dtype = "bool"
+        elif values and all(
+            isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_))
+            for value in values
+        ):
+            dtype = "int32"
+        elif values and all(
+            isinstance(value, (int, float, np.integer, np.floating))
+            and not isinstance(value, (bool, np.bool_))
+            for value in values
+        ):
+            dtype = "float32"
+        else:
+            raise TypeError(
+                "static loop binding needs a homogeneous scalar storage "
+                f"contract: target={target_id}, values={values!r}"
+            )
+        # This records storage for a planner-owned source literal; it does not
+        # convert a tensor or override AbstractTensor dtype selection.
+        metadata[target_id] = Meta((), dtype, "glsl")
+
+    for publication in _control_stream_publications(control_program.root):
+        if publication.count_value_id is not None:
+            metadata.setdefault(
+                int(publication.count_value_id),
+                Meta((), "int32", "glsl"),
+            )
+        if publication.predicate_value_id is not None:
+            metadata.setdefault(
+                int(publication.predicate_value_id),
+                Meta((), "bool", "glsl"),
+            )
+
+    propagate_storage_contracts()
+
+    from src.compiler.control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+    )
+
+    loop_trip_counts: dict[str, int] = {}
+
+    specialized_controls = {
+        f"u_control_{int(value_id)}": int(
+            value.item() if hasattr(value, "item") else value
+        )
+        for value_id, value in (specialized_values or {}).items()
+        if isinstance(
+            value.item() if hasattr(value, "item") else value,
+            (bool, int, np.bool_, np.integer),
+        )
+    }
+
+    def resolve_control_int(source: str) -> int:
+        expression = ast.parse(str(source), mode="eval").body
+
+        def evaluate(node) -> int:
+            if isinstance(node, ast.Constant) and isinstance(
+                node.value, (bool, int)
+            ):
+                return int(node.value)
+            if isinstance(node, ast.Name) and node.id in specialized_controls:
+                return int(specialized_controls[node.id])
+            if isinstance(node, ast.UnaryOp):
+                operand = evaluate(node.operand)
+                if isinstance(node.op, ast.USub):
+                    return -operand
+                if isinstance(node.op, ast.UAdd):
+                    return operand
+            if isinstance(node, ast.BinOp):
+                left = evaluate(node.left)
+                right = evaluate(node.right)
+                operations = {
+                    ast.Add: lambda: left + right,
+                    ast.Sub: lambda: left - right,
+                    ast.Mult: lambda: left * right,
+                    ast.FloorDiv: lambda: left // right,
+                    ast.Mod: lambda: left % right,
+                }
+                operation = operations.get(type(node.op))
+                if operation is not None:
+                    return int(operation())
+            raise ValueError(source)
+
+        return evaluate(expression)
+
+    def gather_loop_trip_counts(block) -> None:
+        if isinstance(block, LoopBlock):
+            try:
+                loop_range = range(
+                    resolve_control_int(block.start),
+                    resolve_control_int(block.stop),
+                    resolve_control_int(block.step),
+                )
+            except (SyntaxError, ValueError, ZeroDivisionError):
+                pass
+            else:
+                loop_trip_counts[str(block.induction)] = len(loop_range)
+            gather_loop_trip_counts(block.body)
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                gather_loop_trip_counts(child)
+        elif isinstance(block, StateMachineTick):
+            for _case, body in block.cases:
+                gather_loop_trip_counts(body)
+        elif isinstance(block, ParallelDeployment):
+            for lane in block.lanes:
+                gather_loop_trip_counts(lane)
+        elif isinstance(block, CallBlock):
+            gather_loop_trip_counts(block.callee)
+
+    gather_loop_trip_counts(control_program.root)
+    for source_id, collection_id, induction, _start in (
+        control_program.collection_bindings
+    ):
+        source_id = int(source_id)
+        collection_id = int(collection_id)
+        if collection_id in metadata:
+            continue
+        source_meta = metadata.get(
+            int(aliases.get(source_id, source_id))
+        )
+        iterations = loop_trip_counts.get(str(induction))
+        if (
+            source_meta is not None
+            and source_meta.shape is not None
+            and source_meta.dtype is not None
+            and iterations is not None
+        ):
+            metadata[collection_id] = Meta(
+                (int(iterations), *tuple(source_meta.shape or ())),
+                source_meta.dtype,
+                "glsl",
+            )
+
+    # Collection inference happens after loop-bound resolution, so close the
+    # same relation set once more.  This is one monotone fixed-point analysis,
+    # not a phase-order-dependent series of special cases.
+    propagate_storage_contracts()
+
+    for iterable_id, _target_id, _induction in (
+        control_program.iterable_bindings
+    ):
+        iterable_id = int(iterable_id)
+        if iterable_id not in slot_value_ids:
+            slot_value_ids.append(iterable_id)
+
+    for _iterable_id, target_id, _induction, _values in (
+        control_program.static_iterable_bindings
+    ):
+        target_id = int(target_id)
+        if target_id not in slot_value_ids:
+            slot_value_ids.append(target_id)
+
+    for _source_id, collection_id, _induction, _start in (
+        control_program.collection_bindings
+    ):
+        collection_id = int(collection_id)
+        if collection_id not in slot_value_ids:
+            slot_value_ids.append(collection_id)
+
+    for _iterable_id, target_id, _induction, source_ids in (
+        control_program.closure_iterable_bindings
+    ):
+        for value_id in (int(target_id), *map(int, source_ids)):
+            if value_id not in slot_value_ids:
+                slot_value_ids.append(value_id)
+    for updated_id, initial_id in control_program.value_aliases:
+        for value_id in (int(updated_id), int(initial_id)):
+            if value_id not in slot_value_ids:
+                slot_value_ids.append(value_id)
+    # Keep the executable slot ABI identical to compose_control_shader().
+    # Stream-only values may not be feeds or outputs of a numerical region,
+    # but the control shader still addresses their resident ranges.  Omitting
+    # them here leaves valid source indexing beyond the uploaded slot/extent
+    # tables and silently publishes zero words.
+    for publication in _control_stream_publications(
+        control_program.root
+    ):
+        for value_id in (
+            publication.value_id,
+            publication.count_value_id,
+            publication.predicate_value_id,
+        ):
+            if value_id is None:
+                continue
+            value_id = int(value_id)
+            if value_id not in slot_value_ids:
+                slot_value_ids.append(value_id)
+
+    static_targets = {
+        int(target_id)
+        for _iterable_id, target_id, _induction, _values
+        in control_program.static_iterable_bindings
+    }
+    static_iterables = {
+        int(iterable_id)
+        for iterable_id, _target_id, _induction, _values
+        in control_program.static_iterable_bindings
+    }
+    collection_targets = {
+        int(collection_id)
+        for _source_id, collection_id, _induction, _start
+        in control_program.collection_bindings
+    }
+    closure_targets = {
+        int(target_id)
+        for _iterable_id, target_id, _induction, _sources
+        in control_program.closure_iterable_bindings
+    }
+    closure_aggregates = {
+        int(iterable_id)
+        for iterable_id, _target_id, _induction, _sources
+        in control_program.closure_iterable_bindings
+    }
+    external = tuple(dict.fromkeys(
+        int(value_id)
+        for program in programs
+        for value_id in ordered_feed_ids(program)
+        if int(value_id) not in produced
+        and int(value_id) not in static_targets
+        and int(value_id) not in static_iterables
+        and int(value_id) not in collection_targets
+        and int(value_id) not in closure_targets
+        and int(value_id) not in closure_aggregates
+        and int(value_id) not in aliases
+    ))
+    if terminal_outputs is not None:
+        terminal = {
+            str(name): int(value_id)
+            for name, value_id in terminal_outputs.items()
+        }
+        absent = set(terminal.values()) - set(slot_value_ids)
+        if absent:
+            raise ValueError(
+                "planner-declared terminal values have no composed shader "
+                f"slot: {tuple(sorted(absent))!r}"
+            )
+    else:
+        terminal = {
+            output_names[value_id]: int(value_id)
+            for value_id in produced - consumed
+            if value_id in output_names
+        }
+    if not terminal and programs:
+        terminal = {
+            str(name): int(value_id)
+            for name, value_id in programs[-1].outputs.items()
+        }
+    from src.compiler.contiguous_execution import contiguate
+
+    contiguous_plan = contiguate(programs)
+    phase_sources = (
+        (source,)
+        if device_resident
+        else tuple(
+            compose_control_shader(
+                control_program,
+                captured_regions,
+                local_size=local_size,
+                instrumentation=instrumentation,
+                active_program_indices=phase.program_indices,
+                emit_validations=(
+                    phase_index == len(contiguous_plan.phases) - 1
+                ),
+            )
+            for phase_index, phase in enumerate(contiguous_plan.phases)
+        )
+    )
+    slot_contract_diagnostics: dict[int, list[dict[str, Any]]] = {
+        int(value_id): [dict(row) for row in rows]
+        for value_id, rows in (value_contract_diagnostics or {}).items()
+    }
+    for source_id, collection_id, induction, start in (
+        control_program.collection_bindings
+    ):
+        slot_contract_diagnostics.setdefault(
+            int(collection_id), []
+        ).append({
+            "kind": "collection",
+            "source": int(source_id),
+            "source_owner": int(aliases.get(int(source_id), int(source_id))),
+            "source_meta": metadata.get(
+                int(aliases.get(int(source_id), int(source_id)))
+            ),
+            "induction": str(induction),
+            "trip_count": loop_trip_counts.get(str(induction)),
+            "start": int(start),
+        })
+    for iterable_id, target_id, induction, source_ids in (
+        control_program.closure_iterable_bindings
+    ):
+        row = {
+            "kind": "closure-iterable",
+            "iterable": int(iterable_id),
+            "target": int(target_id),
+            "target_meta": metadata.get(int(target_id)),
+            "induction": str(induction),
+            "sources": tuple(
+                (
+                    int(source_id),
+                    int(aliases.get(int(source_id), int(source_id))),
+                    metadata.get(
+                        int(aliases.get(int(source_id), int(source_id)))
+                    ),
+                )
+                for source_id in source_ids
+            ),
+        }
+        for value_id in (int(target_id), *map(int, source_ids)):
+            slot_contract_diagnostics.setdefault(value_id, []).append(row)
+    for publication in _control_stream_publications(control_program.root):
+        row = {
+            "kind": "stream",
+            "stream": int(publication.stream_id),
+            "value": int(publication.value_id),
+            "count": (
+                None
+                if publication.count_value_id is None
+                else int(publication.count_value_id)
+            ),
+        }
+        for value_id in (
+            publication.value_id,
+            publication.count_value_id,
+            publication.predicate_value_id,
+        ):
+            if value_id is not None:
+                slot_contract_diagnostics.setdefault(
+                    int(value_id), []
+                ).append(row)
+    selected_workgroup_loop = _selected_workgroup_loop(
+        control_program.root
+    )
+    workgroup_loop_bounds = (
+        None
+        if selected_workgroup_loop is None
+        else (
+            str(selected_workgroup_loop.start),
+            str(selected_workgroup_loop.stop),
+            str(selected_workgroup_loop.step),
+        )
+    )
+    selected_c_dispatch_loop = _selected_c_dispatch_loop(
+        control_program.root
+    )
+    c_dispatch_loop_bounds = (
+        None
+        if selected_c_dispatch_loop is None
+        else (
+            str(selected_c_dispatch_loop.start),
+            str(selected_c_dispatch_loop.stop),
+            str(selected_c_dispatch_loop.step),
+        )
+    )
+    private_value_capacities: dict[int, int] = {}
+    if selected_workgroup_loop is not None:
+        induction = str(selected_workgroup_loop.induction)
+        trip_capacity = loop_trip_counts.get(induction)
+        if trip_capacity is None:
+            for source_id, collection_id, binding_induction, _start in (
+                control_program.collection_bindings
+            ):
+                if str(binding_induction) != induction:
+                    continue
+                source_meta = metadata.get(
+                    int(aliases.get(int(source_id), int(source_id)))
+                )
+                collection_meta = metadata.get(
+                    int(aliases.get(
+                        int(collection_id), int(collection_id)
+                    ))
+                )
+                if source_meta is None or collection_meta is None:
+                    continue
+                source_extent = _shape_product(
+                    tuple(source_meta.shape or ())
+                )
+                collection_extent = _shape_product(
+                    tuple(collection_meta.shape or ())
+                )
+                if (
+                    source_extent > 0
+                    and collection_extent % source_extent == 0
+                ):
+                    trip_capacity = collection_extent // source_extent
+                    break
+        if trip_capacity is None:
+            raise ValueError(
+                "workgroup-parallel loop lacks a resident batch capacity: "
+                f"{induction}"
+            )
+        private_ids = set()
+        for region_index in _control_scheduled_regions(
+            selected_workgroup_loop.body
+        ):
+            captured = captured_regions[int(region_index)]
+            stages = tuple(getattr(captured, "stages", ()) or ())
+            for program in (
+                stages if stages else (captured.program,)
+            ):
+                private_ids.update(
+                    map(int, program.outputs.values())
+                )
+        for value_id in private_ids:
+            owner = int(aliases.get(value_id, value_id))
+            meta = metadata.get(owner)
+            if meta is None or meta.shape is None:
+                raise ValueError(
+                    "workgroup-private value lacks a storage contract: "
+                    f"{value_id}->{owner}"
+                )
+            private_value_capacities[owner] = (
+                int(trip_capacity)
+                * _shape_product(tuple(meta.shape or ()))
+            )
+    semantic_cache_record = {
+        "cache_schema": "turing-glsl-semantic-v2",
+        "lowering_implementation": _lowering_implementation_digest(),
+        "control_program": control_program,
+        "program_records": tuple(program_records),
+        "slot_value_ids": tuple(slot_value_ids),
+        "extents": tuple(extents),
+        "metadata": metadata,
+        "aliases": aliases,
+        "external": external,
+        "terminal": terminal,
+        "specialized_values": {
+            int(value_id): value
+            for value_id, value in (specialized_values or {}).items()
+        },
+        "instrumentation": bool(instrumentation),
+        "device_resident": bool(device_resident),
+        "local_size": int(local_size),
+        "workgroup_loop_bounds": workgroup_loop_bounds,
+        "c_dispatch_loop_bounds": c_dispatch_loop_bounds,
+        "private_value_capacities": private_value_capacities,
+    }
+    semantic_base = _semantic_cache_digest(semantic_cache_record)
+    phase_cache_identities = tuple(
+        _semantic_cache_digest({
+            "semantic_base": semantic_base,
+            "phase": int(phase_index),
+            "program_indices": (
+                tuple(range(len(programs)))
+                if device_resident
+                else tuple(
+                    contiguous_plan.phases[
+                        phase_index
+                    ].program_indices
+                )
+            ),
+            "emits_validations": bool(
+                device_resident
+                or phase_index == len(phase_sources) - 1
+            ),
+        })
+        for phase_index in range(len(phase_sources))
+    )
+    return ComposedGLSLControlArtifact(
+        source=source,
+        slot_value_ids=tuple(slot_value_ids),
+        extents=tuple(extents),
+        slot_extents=tuple(
+            (
+                _shape_product(tuple(
+                    metadata[
+                        int(aliases.get(value_id, value_id))
+                    ].shape or ()
+                ))
+                if int(aliases.get(value_id, value_id)) in metadata
+                else 0
+            )
+            for value_id in slot_value_ids
+        ),
+        value_meta=metadata,
+        external_value_ids=external,
+        terminal_outputs=terminal,
+        uniform_value_ids={
+            uniform.name: int(uniform.value_id)
+            for uniform in control_program.uniforms
+        },
+        value_aliases=aliases,
+        contiguous_plan=contiguous_plan,
+        phase_sources=phase_sources,
+        specialized_values={
+            int(value_id): value
+            for value_id, value in (specialized_values or {}).items()
+        },
+        instrumentation=bool(instrumentation),
+        device_resident=bool(device_resident),
+        local_size=int(local_size),
+        stream_publications=_control_stream_publications(
+            control_program.root
+        ),
+        stream_outputs={
+            str(name): int(stream_id)
+            for name, stream_id in (stream_outputs or {}).items()
+        },
+        stream_continuation_count=_stream_continuation_count(
+            control_program.root
+        ),
+        slot_contract_diagnostics={
+            value_id: tuple(rows)
+            for value_id, rows in slot_contract_diagnostics.items()
+        },
+        snippet_diagnostics=tuple(snippet_diagnostics),
+        phase_cache_identities=phase_cache_identities,
+        workgroup_loop_bounds=workgroup_loop_bounds,
+        c_dispatch_loop_bounds=c_dispatch_loop_bounds,
+        private_value_capacities=private_value_capacities,
+    )
+
+
+def _indent_control_shader_body(lines: Iterable[str]) -> tuple[str, ...]:
+    return tuple("    " + line if line else line for line in lines)
 
 
 def emit_native_for_loop(
@@ -956,18 +3718,27 @@ def _validate_program(program: FusedProgram) -> tuple[tuple[int, ...], int]:
     return feed_ids, outputs[0][1]
 
 
-def _emit_program_source(
+
+def program_snippet(
     program: FusedProgram,
-    local_size: int = _LOCAL_SIZE,
     *,
     scalar_feeds: Iterable[int] = (),
     feed_shapes: Mapping[int, Sequence[int]] | None = None,
     output_shape: Sequence[int] | None = None,
     allow_multiple_outputs: bool = False,
-) -> str:
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a straight-line elementwise region to the program.
+
+    Every intermediate stays a register; only the region's feeds and published
+    results touch the arena.
+    """
+
     feed_ids, outputs = _validate_program_outputs(program)
     if not allow_multiple_outputs and len(outputs) != 1:
-        raise ValueError("elementwise fused backends require exactly one output")
+        raise ValueError(
+            "elementwise fused backends require exactly one output"
+        )
     scalar_feeds = frozenset(int(value_id) for value_id in scalar_feeds)
     unknown_scalars = scalar_feeds - set(feed_ids)
     if unknown_scalars:
@@ -1009,30 +3780,8 @@ def _emit_program_source(
     output_dtypes = {
         name: metadata_dtype(output_id) for name, output_id in outputs
     }
-    declarations: list[str] = [_SHADER_HEADER.format(local_size=local_size)]
 
-    for i, feed_id in enumerate(feed_ids):
-        declarations.append(
-            f"layout(std430, binding = {i}) readonly buffer Feed{i} "
-            f"{{ {_glsl_type(value_dtypes[feed_id])} feed{i}[]; }};"
-        )
-    for output_index, (name, _output_id) in enumerate(outputs):
-        suffix = "" if len(outputs) == 1 else str(output_index)
-        out_binding = len(feed_ids) + output_index
-        declarations.append(
-            f"layout(std430, binding = {out_binding}) writeonly buffer "
-            f"OutBuf{suffix} {{ {_glsl_type(output_dtypes[name])} "
-            f"outbuf{suffix}[]; }};"
-        )
-    body = [
-        "",
-        "uniform uint u_count;",
-        "",
-        "void main() {",
-        "    uint gid = turing_linear_gid();",
-        "    if (gid >= u_count) { return; }",
-    ]
-
+    lines: list[str] = []
     value_names: dict[int, str] = {}
     for i, feed_id in enumerate(feed_ids):
         if feed_id in scalar_feeds:
@@ -1043,12 +3792,12 @@ def _emit_program_source(
                 normalized_feed_shapes[feed_id],
                 output_shape,
             )
-            body.extend(index_lines)
+            lines.extend(line.strip() for line in index_lines)
         else:
             index = "gid"
-        body.append(
-            f"    {_glsl_type(value_dtypes[feed_id])} s{i} = "
-            f"feed{i}[{index}];"
+        lines.append(
+            f"{_glsl_type(value_dtypes[feed_id])} s{i} = "
+            f"{_arena_read(value_dtypes[feed_id], i, index, base)};"
         )
         value_names[feed_id] = f"s{i}"
 
@@ -1069,37 +3818,58 @@ def _emit_program_source(
             right_dtype = _normalize_dtype(np.asarray(scalar).dtype)
             b = _glsl_literal(scalar, right_dtype)
         else:
-            raise ValueError(f"binary op {step.op_name!r} has no right operand")
+            raise ValueError(
+                f"binary op {step.op_name!r} has no right operand"
+            )
         inferred_dtype = _result_dtype(op, left_dtype, right_dtype)
         result_dtype = metadata_dtype(step.result_id, inferred_dtype)
         helper, expression = _typed_expr(
-            op,
-            a,
-            b,
-            reverse,
-            left_dtype,
-            right_dtype,
-            result_dtype,
+            op, a, b, reverse, left_dtype, right_dtype, result_dtype,
         )
         if helper and helper not in helpers:
             helpers.append(helper)
         value_names[step.result_id] = f"s{index}"
         value_dtypes[step.result_id] = result_dtype
-        body.append(
-            f"    {_glsl_type(result_dtype)} s{index} = {expression};"
-        )
+        lines.append(f"{_glsl_type(result_dtype)} s{index} = {expression};")
 
     for output_index, (name, output_id) in enumerate(outputs):
-        suffix = "" if len(outputs) == 1 else str(output_index)
         output_dtype = output_dtypes[name]
         output_value = value_names[output_id]
         if value_dtypes[output_id] != output_dtype:
             output_value = f"{_glsl_type(output_dtype)}({output_value})"
-        body.append(f"    outbuf{suffix}[gid] = {output_value};")
-    body.append("}")
-    return "\n".join(
-        declarations + ([""] + helpers if helpers else []) + body
-    ) + "\n"
+        slot = len(feed_ids) + output_index
+        lines.append(
+            _arena_write(output_dtype, slot, "gid", output_value, base) + ";"
+        )
+
+    return ShaderSnippet(
+        lines=tuple(lines),
+        slots=len(feed_ids) + len(outputs),
+        helpers=tuple(helpers),
+    )
+
+
+def _emit_program_source(
+    program: FusedProgram,
+    local_size: int = _LOCAL_SIZE,
+    *,
+    scalar_feeds: Iterable[int] = (),
+    feed_shapes: Mapping[int, Sequence[int]] | None = None,
+    output_shape: Sequence[int] | None = None,
+    allow_multiple_outputs: bool = False,
+) -> str:
+    """Finish a program containing one elementwise region."""
+
+    return compose_shader(
+        [program_snippet(
+            program,
+            scalar_feeds=scalar_feeds,
+            feed_shapes=feed_shapes,
+            output_shape=output_shape,
+            allow_multiple_outputs=allow_multiple_outputs,
+        )],
+        local_size=local_size,
+    )
 
 
 def emit_program_source(
@@ -1400,6 +4170,32 @@ def _broadcast_shape(
     return tuple(result)
 
 
+def _arena_read(dtype: Any, slot: int, index: str, base: int = 0) -> str:
+    """Read one value's element out of the arena, reinterpreting the word."""
+
+    kind = _normalize_dtype(dtype).kind
+    word = f"arena[u_slot[{slot + base}] + ({index})]"
+    if kind == "f":
+        return f"uintBitsToFloat({word})"
+    if kind == "u" or kind == "b":
+        return word
+    return f"int({word})"
+
+
+def _arena_write(
+    dtype: Any, slot: int, index: str, value: str, base: int = 0
+) -> str:
+    """Store one value's element into the arena as a raw word."""
+
+    kind = _normalize_dtype(dtype).kind
+    word = f"arena[u_slot[{slot + base}] + ({index})]"
+    if kind == "f":
+        return f"{word} = floatBitsToUint({value})"
+    if kind == "u" or kind == "b":
+        return f"{word} = uint({value})"
+    return f"{word} = uint({value})"
+
+
 def _broadcast_index_source(
     name: str,
     input_shape: Sequence[int],
@@ -1409,6 +4205,13 @@ def _broadcast_index_source(
     input_shape = tuple(int(size) for size in input_shape)
     output_shape = tuple(int(size) for size in output_shape)
     if input_shape == output_shape:
+        return [], "gid"
+    if _shape_product(input_shape) == _shape_product(output_shape):
+        # AbstractTensor has already established the result shape.  Equal
+        # extents require no broadcast reconstruction: corresponding values
+        # have the same linear resident index even when their logical ranks
+        # differ (notably ``(1,)`` and ``()``).  Do not second-guess that
+        # recorded shape with a stricter compiler-only broadcasting rule.
         return [], "gid"
     if _broadcast_shape(input_shape, output_shape) != output_shape:
         raise ValueError(
@@ -1442,6 +4245,60 @@ def _broadcast_index_source(
     return lines, f"{name}_index"
 
 
+
+def primitive_snippet(
+    op: str,
+    *,
+    left_dtype: Any,
+    right_dtype: Any | None,
+    out_dtype: Any,
+    left_shape: Sequence[int],
+    right_shape: Sequence[int] | None,
+    out_shape: Sequence[int],
+    left_scalar: Any | None = None,
+    right_scalar: Any | None = None,
+    reverse: bool = False,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute one typed primitive operation to the program being built."""
+
+    feeds: list[tuple[str, Any, Sequence[int]]] = []
+    index_lines: list[str] = []
+    if left_scalar is None:
+        feeds.append(("lhs", left_dtype, left_shape))
+        left_lines, left_index = _broadcast_index_source(
+            "lhs", left_shape, out_shape
+        )
+        index_lines.extend(left_lines)
+        a = _arena_read(left_dtype, len(feeds) - 1, left_index, base)
+    else:
+        a = _glsl_literal(left_scalar, left_dtype)
+    if right_dtype is None:
+        b = None
+    elif right_scalar is None:
+        assert right_shape is not None
+        feeds.append(("rhs", right_dtype, right_shape))
+        right_lines, right_index = _broadcast_index_source(
+            "rhs", right_shape, out_shape
+        )
+        index_lines.extend(right_lines)
+        b = _arena_read(right_dtype, len(feeds) - 1, right_index, base)
+    else:
+        b = _glsl_literal(right_scalar, right_dtype)
+
+    helper, expression = _typed_expr(
+        op, a, b, reverse, left_dtype, right_dtype, out_dtype
+    )
+    return ShaderSnippet(
+        lines=(
+            *(line.strip() for line in index_lines),
+            _arena_write(out_dtype, len(feeds), "gid", expression, base) + ";",
+        ),
+        slots=len(feeds) + 1,
+        helpers=(helper.rstrip(),) if helper else (),
+    )
+
+
 def _emit_primitive_source(
     op: str,
     *,
@@ -1456,57 +4313,23 @@ def _emit_primitive_source(
     reverse: bool = False,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    feeds: list[tuple[str, Any, Sequence[int]]] = []
-    index_lines: list[str] = []
-    if left_scalar is None:
-        feeds.append(("lhs", left_dtype, left_shape))
-        left_lines, left_index = _broadcast_index_source(
-            "lhs", left_shape, out_shape
-        )
-        index_lines.extend(left_lines)
-        a = f"lhs[{left_index}]"
-    else:
-        a = _glsl_literal(left_scalar, left_dtype)
-    if right_dtype is None:
-        b = None
-    elif right_scalar is None:
-        assert right_shape is not None
-        feeds.append(("rhs", right_dtype, right_shape))
-        right_lines, right_index = _broadcast_index_source(
-            "rhs", right_shape, out_shape
-        )
-        index_lines.extend(right_lines)
-        b = f"rhs[{right_index}]"
-    else:
-        b = _glsl_literal(right_scalar, right_dtype)
+    """Finish a program containing one typed primitive operation."""
 
-    helper, expression = _typed_expr(
-        op, a, b, reverse, left_dtype, right_dtype, out_dtype
+    return compose_shader(
+        [primitive_snippet(
+            op,
+            left_dtype=left_dtype,
+            right_dtype=right_dtype,
+            out_dtype=out_dtype,
+            left_shape=left_shape,
+            right_shape=right_shape,
+            out_shape=out_shape,
+            left_scalar=left_scalar,
+            right_scalar=right_scalar,
+            reverse=reverse,
+        )],
+        local_size=local_size,
     )
-    lines = [_SHADER_HEADER.format(local_size=local_size)]
-    for binding, (name, dtype, _) in enumerate(feeds):
-        lines.append(
-            f"layout(std430, binding = {binding}) readonly buffer "
-            f"{name.title()}Buf {{ {_glsl_type(dtype)} {name}[]; }};"
-        )
-    lines.append(
-        f"layout(std430, binding = {len(feeds)}) writeonly buffer OutBuf "
-        f"{{ {_glsl_type(out_dtype)} outbuf[]; }};"
-    )
-    lines.extend(["", "uniform uint u_count;", ""])
-    if helper:
-        lines.extend([helper.rstrip(), ""])
-    lines.extend(
-        [
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            *index_lines,
-            f"    outbuf[gid] = {expression};",
-            "}",
-        ]
-    )
-    return "\n".join(lines) + "\n"
 
 
 def emit_op_source(
@@ -1548,6 +4371,81 @@ def emit_op_source(
     )
 
 
+def where_snippet(
+    condition_shape: Sequence[int],
+    true_shape: Sequence[int],
+    false_shape: Sequence[int],
+    *,
+    condition_dtype: Any,
+    true_dtype: Any,
+    false_dtype: Any,
+    output_dtype: Any,
+    output_shape: Sequence[int],
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute one typed, broadcast-aware conditional selection."""
+
+    shapes = (
+        tuple(condition_shape),
+        tuple(true_shape),
+        tuple(false_shape),
+    )
+    dtypes = (
+        _normalize_dtype(condition_dtype),
+        _normalize_dtype(true_dtype),
+        _normalize_dtype(false_dtype),
+    )
+    output_dtype = _normalize_dtype(output_dtype)
+    output_shape = tuple(output_shape)
+    values = []
+    lines = []
+    for slot, (name, shape, dtype) in enumerate(
+        zip(("condition", "if_true", "if_false"), shapes, dtypes)
+    ):
+        index_lines, index = _broadcast_index_source(
+            name, shape, output_shape
+        )
+        lines.extend(line.strip() for line in index_lines)
+        values.append(_arena_read(dtype, slot, index, base))
+    output_type = _glsl_type(output_dtype)
+    expression = (
+        f"(({values[0]}) != {_glsl_literal(0, dtypes[0])} ? "
+        f"{_cast_expr(values[1], output_type)} : "
+        f"{_cast_expr(values[2], output_type)})"
+    )
+    lines.append(
+        _arena_write(output_dtype, 3, "gid", expression, base) + ";"
+    )
+    return ShaderSnippet(lines=tuple(lines), slots=4)
+
+
+def emit_where_source(
+    condition_shape: Sequence[int],
+    true_shape: Sequence[int],
+    false_shape: Sequence[int],
+    *,
+    condition_dtype: Any,
+    true_dtype: Any,
+    false_dtype: Any,
+    output_dtype: Any,
+    output_shape: Sequence[int],
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    return compose_shader(
+        [where_snippet(
+            condition_shape,
+            true_shape,
+            false_shape,
+            condition_dtype=condition_dtype,
+            true_dtype=true_dtype,
+            false_dtype=false_dtype,
+            output_dtype=output_dtype,
+            output_shape=output_shape,
+        )],
+        local_size=local_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # device-native creation
 # ---------------------------------------------------------------------------
@@ -1582,37 +4480,50 @@ def _arange_dtype(start: Any, end: Any, step: Any, dtype: Any) -> np.dtype:
     return result
 
 
+
+def arange_snippet(
+    start: Any, step: Any, *, dtype: Any = np.float32, base: int = 0
+) -> ShaderSnippet:
+    """Contribute an arithmetic sequence to the program being built."""
+
+    dtype = _normalize_dtype(dtype)
+    if _normalize_dtype(dtype).kind == "b":
+        raise TypeError("arange does not support boolean dtype")
+    scalar_type = _glsl_type(dtype)
+    value = (
+        f"{_glsl_literal(start, dtype)} + {scalar_type}(gid) * "
+        f"{_glsl_literal(step, dtype)}"
+    )
+    return ShaderSnippet(
+        lines=(_arena_write(dtype, 0, "gid", value, base) + ";",),
+        slots=1,
+    )
+
+
 def emit_arange_source(
     start: Any,
-    step: Any,
+    step: Any = 1,
     *,
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit a device-native 1-D arithmetic-sequence creation shader."""
+    """Finish a program whose only operation is an arithmetic sequence."""
+
+    return compose_shader(
+        [arange_snippet(start, step, dtype=dtype)], local_size=local_size
+    )
+
+
+def fill_snippet(
+    value: Any, *, dtype: Any = np.float32, base: int = 0
+) -> ShaderSnippet:
+    """Contribute a typed constant fill to the program being built."""
+
     dtype = _normalize_dtype(dtype)
-    if dtype.kind == "b":
-        raise TypeError("arange does not support boolean dtype")
-    scalar_type = _glsl_type(dtype)
-    start_literal = _glsl_literal(start, dtype)
-    step_literal = _glsl_literal(step, dtype)
-    gid_value = f"{scalar_type}(gid)"
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    outbuf[gid] = {start_literal} + "
-            f"{gid_value} * {step_literal};",
-            "}",
-            "",
-        ]
+    literal = _glsl_literal(value, dtype)
+    return ShaderSnippet(
+        lines=(_arena_write(dtype, 0, "gid", literal, base) + ";",),
+        slots=1,
     )
 
 
@@ -1622,26 +4533,44 @@ def emit_fill_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit a typed constant-fill shader."""
+    """Finish a program whose only operation is a constant fill."""
+
+    return compose_shader(
+        [fill_snippet(value, dtype=dtype)], local_size=local_size
+    )
+
+
+
+def constant_snippet(
+    values: Sequence[Any], *, dtype: Any = np.float32, base: int = 0
+) -> ShaderSnippet:
+    """Contribute an immutable literal payload to the program being built."""
 
     dtype = _normalize_dtype(dtype)
     scalar_type = _glsl_type(dtype)
-    literal = _glsl_literal(value, dtype)
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    outbuf[gid] = {literal};",
-            "}",
-            "",
-        ]
+    literals = ", ".join(_glsl_literal(value, dtype) for value in values)
+    count = len(values)
+    table = f"table{base}"
+    return ShaderSnippet(
+        lines=(
+            f"const {scalar_type} {table}[{count}] = "
+            f"{scalar_type}[{count}]({literals});",
+            _arena_write(dtype, 0, "gid", f"{table}[gid]", base) + ";",
+        ),
+        slots=1,
+    )
+
+
+def emit_constant_source(
+    values: Sequence[Any],
+    *,
+    dtype: Any = np.float32,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a literal payload."""
+
+    return compose_shader(
+        [constant_snippet(values, dtype=dtype)], local_size=local_size
     )
 
 
@@ -1663,6 +4592,35 @@ def _resolve_expand_shape(
     return aligned_source, tuple(target)
 
 
+
+def expand_snippet(
+    source_shape: Sequence[int],
+    target_shape: Sequence[int],
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a direct broadcast copy to the program being built."""
+
+    source_shape, target_shape = _resolve_expand_shape(
+        source_shape, target_shape
+    )
+    dtype = _normalize_dtype(dtype)
+    index_lines, source_index = _broadcast_index_source(
+        "source", source_shape, target_shape
+    )
+    return ShaderSnippet(
+        lines=(
+            *(line.strip() for line in index_lines),
+            _arena_write(
+                dtype, 1, "gid",
+                _arena_read(dtype, 0, source_index, base), base,
+            ) + ";",
+        ),
+        slots=2,
+    )
+
+
 def emit_expand_source(
     source_shape: Sequence[int],
     target_shape: Sequence[int],
@@ -1670,33 +4628,11 @@ def emit_expand_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit one direct broadcast-copy shader without an expanded intermediate."""
-    source_shape, target_shape = _resolve_expand_shape(
-        source_shape, target_shape
-    )
-    dtype = _normalize_dtype(dtype)
-    scalar_type = _glsl_type(dtype)
-    index_lines, source_index = _broadcast_index_source(
-        "source", source_shape, target_shape
-    )
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {scalar_type} input0[]; }};",
-            "layout(std430, binding = 1) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            *index_lines,
-            f"    outbuf[gid] = input0[{source_index}];",
-            "}",
-            "",
-        ]
+    """Finish a program whose only operation is a broadcast copy."""
+
+    return compose_shader(
+        [expand_snippet(source_shape, target_shape, dtype=dtype)],
+        local_size=local_size,
     )
 
 
@@ -1711,12 +4647,13 @@ def emit_expand_source(
 # resident GPU backend can do better: map each output address directly to its
 # source and complete the whole layout transform in one compute dispatch.
 #
-# These emitters keep that specialization isolated below the common tensor
+# These snippets keep that specialization isolated below the common tensor
 # semantics.  They preserve arbitrary rank and dtype, never read an SSBO back
 # through NumPy, and leave room for later GLSL-specific improvements (subgroup
-# copies, shared-memory tiling, or multi-stage plans for very large input lists)
-# without changing AbstractTensor's public ``cat``/``stack`` contract.
+# copies, shared-memory tiling, or multi-stage plans for very large input
+# lists) without changing AbstractTensor's public ``cat``/``stack`` contract.
 # ---------------------------------------------------------------------------
+
 
 def _shape_product(shape: Sequence[int]) -> int:
     result = 1
@@ -1759,16 +4696,18 @@ def _validate_cat_layout(
     return normalized, dim, tuple(output)
 
 
-def emit_cat_source(
+
+def cat_snippet(
     shapes: Sequence[Sequence[int]],
     dim: int = 0,
     *,
     dtype: Any = np.float32,
     input_dtypes: Sequence[Any] | None = None,
     output_dtype: Any | None = None,
-    local_size: int = _LOCAL_SIZE,
-) -> str:
-    """Emit one arbitrary-rank concatenate shader for homogeneous SSBOs."""
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute an arbitrary-rank concatenate to the program being built."""
+
     shapes, dim, output_shape = _validate_cat_layout(shapes, dim)
     if input_dtypes is None:
         input_dtypes = [dtype] * len(shapes)
@@ -1782,47 +4721,52 @@ def emit_cat_source(
     after = _shape_product(output_shape[dim + 1:])
     output_axis = output_shape[dim]
 
-    lines = [_STRUCTURAL_SHADER_HEADER.format(local_size=local_size)]
-    for index, input_dtype in enumerate(input_dtypes):
-        lines.append(
-            f"layout(std430, binding = {index}) readonly buffer Input{index} "
-            f"{{ {_glsl_type(input_dtype)} input{index}[]; }};"
-        )
-    lines.extend(
-        [
-            f"layout(std430, binding = {len(shapes)}) writeonly buffer OutBuf "
-            f"{{ {output_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    uint inner = gid % uint({after});",
-            f"    uint block = gid / uint({after});",
-            f"    uint axis_index = block % uint({output_axis});",
-            f"    uint outer = block / uint({output_axis});",
-        ]
-    )
-
+    lines = [
+        f"uint inner = gid % uint({after});",
+        f"uint block = gid / uint({after});",
+        f"uint axis_index = block % uint({output_axis});",
+        f"uint outer = block / uint({output_axis});",
+    ]
     prefix = 0
     for index, shape in enumerate(shapes):
         axis_size = shape[dim]
         condition = "if" if index == 0 else "else if"
-        lines.extend(
-            [
-                f"    {condition} (axis_index < uint({prefix + axis_size})) {{",
-                f"        uint local_axis = axis_index - uint({prefix});",
-                "        uint source_index = "
-                f"(outer * uint({axis_size}) + local_axis) * uint({after}) + inner;",
-                f"        outbuf[gid] = "
-                f"{output_type}(input{index}[source_index]);",
-                "    }",
-            ]
-        )
+        lines.extend([
+            f"{condition} (axis_index < uint({prefix + axis_size})) {{",
+            f"    uint local_axis = axis_index - uint({prefix});",
+            f"    uint source_index = (outer * uint({axis_size}) + "
+            f"local_axis) * uint({after}) + inner;",
+            "    " + _arena_write(
+                output_dtype, len(shapes), "gid",
+                f"{output_type}("
+                + _arena_read(input_dtypes[index], index, "source_index", base)
+                + ")",
+                base,
+            ) + ";",
+            "}",
+        ])
         prefix += axis_size
-    lines.extend(["}", ""])
-    return "\n".join(lines)
+    return ShaderSnippet(lines=tuple(lines), slots=len(shapes) + 1)
+
+
+def emit_cat_source(
+    shapes: Sequence[Sequence[int]],
+    dim: int = 0,
+    *,
+    dtype: Any = np.float32,
+    input_dtypes: Sequence[Any] | None = None,
+    output_dtype: Any | None = None,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a concatenate."""
+
+    return compose_shader(
+        [cat_snippet(
+            shapes, dim, dtype=dtype,
+            input_dtypes=input_dtypes, output_dtype=output_dtype,
+        )],
+        local_size=local_size,
+    )
 
 
 def _validate_stack_layout(
@@ -1882,6 +4826,37 @@ def _row_major_strides(shape: Sequence[int]) -> tuple[int, ...]:
     return tuple(result)
 
 
+
+def permute_snippet(
+    shape: Sequence[int],
+    dims: Sequence[int],
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a row-major axis permutation to the program being built."""
+
+    shape, dims, output_shape = _validate_permute_layout(shape, dims)
+    input_strides = _row_major_strides(shape)
+    output_strides = _row_major_strides(output_shape)
+    lines = ["uint remaining = gid;", "uint source_index = uint(0);"]
+    for output_axis, source_axis in enumerate(dims):
+        output_stride = output_strides[output_axis]
+        source_stride = input_strides[source_axis]
+        lines.extend([
+            f"uint coord{output_axis} = remaining / uint({output_stride});",
+            f"remaining %= uint({output_stride});",
+            f"source_index += coord{output_axis} * uint({source_stride});",
+        ])
+    lines.append(
+        _arena_write(
+            dtype, 1, "gid",
+            _arena_read(dtype, 0, "source_index", base), base,
+        ) + ";"
+    )
+    return ShaderSnippet(lines=tuple(lines), slots=2)
+
+
 def emit_permute_source(
     shape: Sequence[int],
     dims: Sequence[int],
@@ -1889,40 +4864,11 @@ def emit_permute_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit one arbitrary-rank row-major axis-permutation shader."""
-    shape, dims, output_shape = _validate_permute_layout(shape, dims)
-    scalar_type = _glsl_type(dtype)
-    input_strides = _row_major_strides(shape)
-    output_strides = _row_major_strides(output_shape)
-    lines = [
-        _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-        "layout(std430, binding = 0) readonly buffer Input0 "
-        f"{{ {scalar_type} input0[]; }};",
-        "layout(std430, binding = 1) writeonly buffer OutBuf "
-        f"{{ {scalar_type} outbuf[]; }};",
-        "",
-        "uniform uint u_count;",
-        "",
-        "void main() {",
-        "    uint gid = turing_linear_gid();",
-        "    if (gid >= u_count) { return; }",
-        "    uint remaining = gid;",
-        "    uint source_index = uint(0);",
-    ]
-    for output_axis, source_axis in enumerate(dims):
-        output_stride = output_strides[output_axis]
-        source_stride = input_strides[source_axis]
-        lines.extend(
-            [
-                f"    uint coord{output_axis} = "
-                f"remaining / uint({output_stride});",
-                f"    remaining %= uint({output_stride});",
-                f"    source_index += coord{output_axis} * "
-                f"uint({source_stride});",
-            ]
-        )
-    lines.extend(["    outbuf[gid] = input0[source_index];", "}", ""])
-    return "\n".join(lines)
+    """Finish a program whose only operation is an axis permutation."""
+
+    return compose_shader(
+        [permute_snippet(shape, dims, dtype=dtype)], local_size=local_size
+    )
 
 
 def _matmul_layout(
@@ -1956,7 +4902,8 @@ def _matmul_layout(
     return padded_left, padded_right, batch_shape, output_shape
 
 
-def emit_matmul_source(
+
+def matmul_snippet(
     left_shape: Sequence[int],
     right_shape: Sequence[int],
     *,
@@ -1964,8 +4911,15 @@ def emit_matmul_source(
     right_dtype: Any = np.float32,
     output_dtype: Any | None = None,
     local_size: int = _LOCAL_SIZE,
-) -> str:
-    """Emit one cooperative tiled, broadcasted batched matmul shader."""
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a cooperative tiled batched matmul to the program.
+
+    This snippet derives its own launch geometry from the workgroup builtins
+    and cooperates through shared tiles, so it opts out of the flat linear
+    guard and carries its tile declarations up to file scope.
+    """
+
     left_shape, right_shape, batch_shape, output_shape = _matmul_layout(
         left_shape, right_shape
     )
@@ -1988,28 +4942,15 @@ def emit_matmul_source(
     output_type = _glsl_type(output_dtype)
     tile = 1 << max(0, int(math.isqrt(int(local_size))).bit_length() - 1)
     tile = min(tile, 16)
-    thread_count = tile * tile
     row_tiles = (rows + tile - 1) // tile
     column_tiles = (columns + tile - 1) // tile
     group_count = batch_count * row_tiles * column_tiles
+
     lines = [
-        _STRUCTURAL_SHADER_HEADER.format(local_size=thread_count),
-        "layout(std430, binding = 0) readonly buffer LeftBuf "
-        f"{{ {_glsl_type(left_dtype)} lhs[]; }};",
-        "layout(std430, binding = 1) readonly buffer RightBuf "
-        f"{{ {_glsl_type(right_dtype)} rhs[]; }};",
-        "layout(std430, binding = 2) writeonly buffer OutBuf "
-        f"{{ {output_type} outbuf[]; }};",
-        "",
-        "uniform uint u_count;",
-        f"shared {output_type} left_tile[{tile}][{tile}];",
-        f"shared {output_type} right_tile[{tile}][{tile}];",
-        "",
-        "void main() {",
-        "    uint group_index = gl_WorkGroupID.x",
-        "        + gl_WorkGroupID.y * gl_NumWorkGroups.x",
-        "        + gl_WorkGroupID.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y;",
-        f"    if (group_index >= uint({group_count})) {{ return; }}",
+        "uint group_index = gl_WorkGroupID.x",
+        "    + gl_WorkGroupID.y * gl_NumWorkGroups.x",
+        "    + gl_WorkGroupID.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y;",
+        f"if (group_index < uint({group_count})) {{",
         f"    uint tile_column = group_index % uint({column_tiles});",
         f"    uint matrix_tile = group_index / uint({column_tiles});",
         f"    uint tile_row = matrix_tile % uint({row_tiles});",
@@ -2024,13 +4965,11 @@ def emit_matmul_source(
         "    uint right_offset = uint(0);",
     ]
     for axis, batch_stride in enumerate(batch_strides):
-        lines.extend(
-            [
-                f"    uint batch_coord{axis} = "
-                f"batch_remaining / uint({batch_stride});",
-                f"    batch_remaining %= uint({batch_stride});",
-            ]
-        )
+        lines.extend([
+            f"    uint batch_coord{axis} = "
+            f"batch_remaining / uint({batch_stride});",
+            f"    batch_remaining %= uint({batch_stride});",
+        ])
         if left_shape[axis] != 1:
             lines.append(
                 f"    left_offset += batch_coord{axis} * "
@@ -2041,38 +4980,74 @@ def emit_matmul_source(
                 f"    right_offset += batch_coord{axis} * "
                 f"uint({right_strides[axis]});"
             )
-    lines.extend(
-        [
-            f"    {output_type} total = {output_type}(0);",
-            f"    for (uint tile_k = uint(0); tile_k < "
-            f"uint({(inner + tile - 1) // tile}); ++tile_k) {{",
-            f"        uint left_k = tile_k * uint({tile}) + local_column;",
-            f"        uint right_k = tile_k * uint({tile}) + local_row;",
-            f"        left_tile[local_row][local_column] = "
-            f"(row < uint({rows}) && left_k < uint({inner}))",
-            f"            ? {output_type}(lhs[left_offset + "
-            f"row * uint({inner}) + left_k]) : {output_type}(0);",
-            f"        right_tile[local_row][local_column] = "
-            f"(right_k < uint({inner}) && column < uint({columns}))",
-            f"            ? {output_type}(rhs[right_offset + "
-            f"right_k * uint({columns}) + column]) : {output_type}(0);",
-            "        barrier();",
-            f"        for (uint k = uint(0); k < uint({tile}); ++k) {{",
-            "            total += left_tile[local_row][k] "
-            "* right_tile[k][local_column];",
-            "        }",
-            "        barrier();",
-            "    }",
-            f"    if (row < uint({rows}) && column < uint({columns})) {{",
-            f"        uint output_index = (batch_index * uint({rows}) + row) "
-            f"* uint({columns}) + column;",
-            "        outbuf[output_index] = total;",
-            "    }",
-            "}",
-            "",
-        ]
+    lines.extend([
+        f"    {output_type} total = {output_type}(0);",
+        f"    for (uint tile_k = uint(0); tile_k < "
+        f"uint({(inner + tile - 1) // tile}); ++tile_k) {{",
+        f"        uint left_k = tile_k * uint({tile}) + local_column;",
+        f"        uint right_k = tile_k * uint({tile}) + local_row;",
+        f"        left_tile[local_row][local_column] = "
+        f"(row < uint({rows}) && left_k < uint({inner}))",
+        f"            ? {output_type}("
+        + _arena_read(
+            left_dtype, 0,
+            f"left_offset + row * uint({inner}) + left_k", base,
+        )
+        + f") : {output_type}(0);",
+        f"        right_tile[local_row][local_column] = "
+        f"(right_k < uint({inner}) && column < uint({columns}))",
+        f"            ? {output_type}("
+        + _arena_read(
+            right_dtype, 1,
+            f"right_offset + right_k * uint({columns}) + column", base,
+        )
+        + f") : {output_type}(0);",
+        "        barrier();",
+        f"        for (uint k = uint(0); k < uint({tile}); ++k) {{",
+        "            total += left_tile[local_row][k] "
+        "* right_tile[k][local_column];",
+        "        }",
+        "        barrier();",
+        "    }",
+        f"    if (row < uint({rows}) && column < uint({columns})) {{",
+        f"        uint output_index = (batch_index * uint({rows}) + row) "
+        f"* uint({columns}) + column;",
+        "        " + _arena_write(
+            output_dtype, 2, "output_index", "total", base
+        ) + ";",
+        "    }",
+        "}",
+    ])
+    return ShaderSnippet(
+        lines=tuple(lines),
+        slots=3,
+        shared=(
+            f"shared {output_type} left_tile[{tile}][{tile}];",
+            f"shared {output_type} right_tile[{tile}][{tile}];",
+        ),
+        guard=False,
     )
-    return "\n".join(lines)
+
+
+def emit_matmul_source(
+    left_shape: Sequence[int],
+    right_shape: Sequence[int],
+    *,
+    left_dtype: Any = np.float32,
+    right_dtype: Any = np.float32,
+    output_dtype: Any | None = None,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a batched matmul."""
+
+    return compose_shader(
+        [matmul_snippet(
+            left_shape, right_shape,
+            left_dtype=left_dtype, right_dtype=right_dtype,
+            output_dtype=output_dtype, local_size=local_size,
+        )],
+        local_size=local_size,
+    )
 
 
 def _resolve_repeat_layout(
@@ -2104,6 +5079,41 @@ def _resolve_repeat_layout(
     return source_shape, tuple(factors), output_shape
 
 
+
+def repeat_snippet(
+    source_shape: Sequence[int],
+    repeats: Any,
+    dim: int = 0,
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a tile/repeat to the program being built."""
+
+    source_shape, _, output_shape = _resolve_repeat_layout(
+        source_shape, repeats, dim
+    )
+    source_strides = _row_major_strides(source_shape)
+    output_strides = _row_major_strides(output_shape)
+    lines = ["uint remaining = gid;", "uint source_index = uint(0);"]
+    for axis, (source_size, source_stride, output_stride) in enumerate(
+        zip(source_shape, source_strides, output_strides)
+    ):
+        lines.extend([
+            f"uint coord{axis} = remaining / uint({output_stride});",
+            f"remaining %= uint({output_stride});",
+            f"source_index += (coord{axis} % uint({source_size})) "
+            f"* uint({source_stride});",
+        ])
+    lines.append(
+        _arena_write(
+            dtype, 1, "gid",
+            _arena_read(dtype, 0, "source_index", base), base,
+        ) + ";"
+    )
+    return ShaderSnippet(lines=tuple(lines), slots=2)
+
+
 def emit_repeat_source(
     source_shape: Sequence[int],
     repeats: Any,
@@ -2112,42 +5122,34 @@ def emit_repeat_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit one arbitrary-rank tile/repeat shader."""
-    source_shape, _, output_shape = _resolve_repeat_layout(
-        source_shape, repeats, dim
+    """Finish a program whose only operation is a tile/repeat."""
+
+    return compose_shader(
+        [repeat_snippet(source_shape, repeats, dim, dtype=dtype)],
+        local_size=local_size,
     )
-    scalar_type = _glsl_type(dtype)
-    source_strides = _row_major_strides(source_shape)
-    output_strides = _row_major_strides(output_shape)
-    lines = [
-        _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-        "layout(std430, binding = 0) readonly buffer Input0 "
-        f"{{ {scalar_type} input0[]; }};",
-        "layout(std430, binding = 1) writeonly buffer OutBuf "
-        f"{{ {scalar_type} outbuf[]; }};",
-        "",
-        "uniform uint u_count;",
-        "",
-        "void main() {",
-        "    uint gid = turing_linear_gid();",
-        "    if (gid >= u_count) { return; }",
-        "    uint remaining = gid;",
-        "    uint source_index = uint(0);",
-    ]
-    for axis, (source_size, source_stride, output_stride) in enumerate(
-        zip(source_shape, source_strides, output_strides)
-    ):
-        lines.extend(
-            [
-                f"    uint coord{axis} = "
-                f"remaining / uint({output_stride});",
-                f"    remaining %= uint({output_stride});",
-                f"    source_index += (coord{axis} % uint({source_size})) "
-                f"* uint({source_stride});",
-            ]
-        )
-    lines.extend(["    outbuf[gid] = input0[source_index];", "}", ""])
-    return "\n".join(lines)
+
+
+
+def gather_snippet(
+    *, dtype: Any = np.float32, base: int = 0
+) -> ShaderSnippet:
+    """Contribute an arbitrary-offset gather to the program being built."""
+
+    return ShaderSnippet(
+        lines=(
+            _arena_write(
+                dtype, 2, "gid",
+                _arena_read(
+                    dtype, 0,
+                    "uint(" + _arena_read(np.int32, 1, "gid", base) + ")",
+                    base,
+                ),
+                base,
+            ) + ";",
+        ),
+        slots=3,
+    )
 
 
 def emit_gather_source(
@@ -2155,44 +5157,101 @@ def emit_gather_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit an arbitrary-offset gather over a resident flat tensor."""
-    scalar_type = _glsl_type(dtype)
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {scalar_type} input0[]; }};",
-            "layout(std430, binding = 1) readonly buffer OffsetBuf "
-            "{ int offsets[]; };",
-            "layout(std430, binding = 2) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            "    outbuf[gid] = input0[uint(offsets[gid])];",
-            "}",
-            "",
-        ]
+    """Finish a program whose only operation is a gather."""
+
+    return compose_shader(
+        [gather_snippet(dtype=dtype)], local_size=local_size
     )
 
 
-def emit_topk_offsets_source(
-    shape: Sequence[int],
-    k: int,
+
+def scatter_snippet(
+    base_shape: Sequence[int],
+    index_shape: Sequence[int],
+    dim: int,
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a resident scatter-add to the program being built."""
+
+    base_shape = tuple(int(size) for size in base_shape)
+    index_shape = tuple(int(size) for size in index_shape)
+    dim = int(dim)
+    if dim < 0:
+        dim += len(base_shape)
+    if len(index_shape) != len(base_shape):
+        raise ValueError(
+            "captured scatter requires index rank to match base rank"
+        )
+    scalar_type = _glsl_type(dtype)
+    base_strides = tuple(
+        _shape_product(base_shape[axis + 1:])
+        for axis in range(len(base_shape))
+    )
+    index_strides = tuple(
+        _shape_product(index_shape[axis + 1:])
+        for axis in range(len(index_shape))
+    )
+    target_terms = []
+    for axis, stride in enumerate(base_strides):
+        if axis == dim:
+            target_terms.append(
+                "(uint(" + _arena_read(np.int32, 1, "k", base)
+                + f") * {stride}u)"
+            )
+        else:
+            target_terms.append(
+                f"(((k / {index_strides[axis]}u) % "
+                f"{index_shape[axis]}u) * {stride}u)"
+            )
+    target = " + ".join(target_terms) or "0u"
+    return ShaderSnippet(
+        lines=(
+            f"{scalar_type} accumulated = "
+            + _arena_read(dtype, 0, "gid", base) + ";",
+            f"for (uint k = 0u; k < {_shape_product(index_shape)}u; ++k) {{",
+            f"    uint target = {target};",
+            "    if (target == gid) { accumulated += "
+            + _arena_read(dtype, 2, "k", base) + "; }",
+            "}",
+            _arena_write(dtype, 3, "gid", "accumulated", base) + ";",
+        ),
+        slots=4,
+    )
+
+
+def emit_scatter_source(
+    base_shape: Sequence[int],
+    index_shape: Sequence[int],
     dim: int,
     *,
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit a deterministic arbitrary-axis top-k offset selector.
+    """Finish a program whose only operation is a scatter-add."""
 
-    Each invocation owns one output rank in one axis slice. It performs a small
-    repeated selection locally and writes the selected flat source offset.
-    Values are then obtained through the backend's ordinary resident gather,
-    keeping selection and transport as reusable structural primitives.
+    return compose_shader(
+        [scatter_snippet(base_shape, index_shape, dim, dtype=dtype)],
+        local_size=local_size,
+    )
+
+
+
+def topk_offsets_snippet(
+    shape: Sequence[int],
+    k: int,
+    dim: int,
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a deterministic top-k offset selection to the program.
+
+    Each invocation owns one output rank in one axis slice, performs a small
+    repeated selection locally, and writes the selected flat source offset.
+    Values are then obtained through the ordinary resident gather, keeping
+    selection and transport separate reusable primitives.
     """
 
     shape = tuple(int(size) for size in shape)
@@ -2206,74 +5265,107 @@ def emit_topk_offsets_source(
     axis_size = shape[dim]
     k = int(k)
     if k < 1 or k > axis_size:
-        raise ValueError("topk k must be between one and the selected axis size")
+        raise ValueError(
+            "topk k must be between one and the selected axis size"
+        )
     dtype = _normalize_dtype(dtype)
     scalar_type = _glsl_type(dtype)
     inner = _shape_product(shape[dim + 1:])
-    nan_order = ""
     if dtype.kind == "f":
         nan_order = (
-            "            bool candidate_nan = isnan(candidate);\n"
-            "            bool best_nan = isnan(best);\n"
-            "            bool better = !found\n"
-            "                || (candidate_nan && !best_nan)\n"
-            "                || (candidate_nan == best_nan\n"
-            "                    && (candidate > best\n"
-            "                        || (candidate == best\n"
-            "                            && axis_index < best_axis)));"
+            "        bool candidate_nan = isnan(candidate);\n"
+            "        bool best_nan = isnan(best);\n"
+            "        bool better = !found\n"
+            "            || (candidate_nan && !best_nan)\n"
+            "            || (candidate_nan == best_nan\n"
+            "                && (candidate > best\n"
+            "                    || (candidate == best\n"
+            "                        && axis_index < best_axis)));"
         )
     else:
         nan_order = (
-            "            bool better = !found || candidate > best\n"
-            "                || (candidate == best && axis_index < best_axis);"
+            "        bool better = !found || candidate > best\n"
+            "            || (candidate == best && axis_index < best_axis);"
         )
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {scalar_type} input0[]; }};",
-            "layout(std430, binding = 1) writeonly buffer OffsetBuf "
-            "{ int offsets[]; };",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    uint inner_index = gid % uint({inner});",
-            f"    uint slot = gid / uint({inner});",
-            f"    uint rank = slot % uint({k});",
-            f"    uint outer = slot / uint({k});",
-            f"    uint base = outer * uint({axis_size * inner}) + inner_index;",
-            f"    uint chosen[{k}];",
-            "    uint best_axis = uint(0);",
-            "    for (uint selection = uint(0); selection <= rank; "
-            "++selection) {",
-            "        bool found = false;",
-            f"        {scalar_type} best = {scalar_type}(0);",
-            f"        for (uint axis_index = uint(0); axis_index < "
+    return ShaderSnippet(
+        lines=(
+            f"uint inner_index = gid % uint({inner});",
+            f"uint slot = gid / uint({inner});",
+            f"uint rank = slot % uint({k});",
+            f"uint outer = slot / uint({k});",
+            f"uint base_offset = outer * uint({axis_size * inner}) "
+            "+ inner_index;",
+            f"uint chosen[{k}];",
+            "uint best_axis = uint(0);",
+            "for (uint selection = uint(0); selection <= rank; ++selection) {",
+            "    bool found = false;",
+            f"    {scalar_type} best = {scalar_type}(0);",
+            f"    for (uint axis_index = uint(0); axis_index < "
             f"uint({axis_size}); ++axis_index) {{",
-            "            bool used = false;",
-            "            for (uint prior = uint(0); prior < selection; "
-            "++prior) {",
-            "                used = used || chosen[prior] == axis_index;",
-            "            }",
-            "            if (used) { continue; }",
-            f"            {scalar_type} candidate = "
-            f"input0[base + axis_index * uint({inner})];",
-            nan_order,
-            "            if (better) {",
-            "                found = true;",
-            "                best = candidate;",
-            "                best_axis = axis_index;",
-            "            }",
+            "        bool used = false;",
+            "        for (uint prior = uint(0); prior < selection; ++prior) {",
+            "            used = used || chosen[prior] == axis_index;",
             "        }",
-            "        chosen[selection] = best_axis;",
+            "        if (used) { continue; }",
+            f"        {scalar_type} candidate = "
+            + _arena_read(
+                dtype, 0, f"base_offset + axis_index * uint({inner})", base
+            ) + ";",
+            nan_order,
+            "        if (better) {",
+            "            found = true;",
+            "            best = candidate;",
+            "            best_axis = axis_index;",
+            "        }",
             "    }",
-            f"    offsets[gid] = int(base + best_axis * uint({inner}));",
+            "    chosen[selection] = best_axis;",
             "}",
-            "",
-        ]
+            _arena_write(
+                np.int32, 1, "gid",
+                f"int(base_offset + best_axis * uint({inner}))", base,
+            ) + ";",
+        ),
+        slots=2,
+    )
+
+
+def emit_topk_offsets_source(
+    shape: Sequence[int],
+    k: int,
+    dim: int,
+    *,
+    dtype: Any = np.float32,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a top-k offset selection."""
+
+    return compose_shader(
+        [topk_offsets_snippet(shape, k, dim, dtype=dtype)],
+        local_size=local_size,
+    )
+
+
+
+def index_assign_snippet(
+    *,
+    dtype: Any = np.float32,
+    index_dtype: Any = np.int32,
+    scalar_value: bool = False,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute an arbitrary-offset assignment to the program being built."""
+
+    value_index = "uint(0)" if scalar_value else "gid"
+    return ShaderSnippet(
+        lines=(
+            _arena_write(
+                dtype, 2,
+                "uint(" + _arena_read(index_dtype, 0, "gid", base) + ")",
+                _arena_read(dtype, 1, value_index, base),
+                base,
+            ) + ";",
+        ),
+        slots=3,
     )
 
 
@@ -2284,29 +5376,56 @@ def emit_index_assign_source(
     scalar_value: bool = False,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit arbitrary-offset assignment into an existing resident tensor."""
-    scalar_type = _glsl_type(dtype)
-    index_type = _glsl_type(index_dtype)
-    value_index = "uint(0)" if scalar_value else "gid"
-    return "\n".join(
+    """Finish a program whose only operation is an indexed assignment."""
+
+    return compose_shader(
+        [index_assign_snippet(
+            dtype=dtype, index_dtype=index_dtype, scalar_value=scalar_value
+        )],
+        local_size=local_size,
+    )
+
+
+def index_select_snippet(
+    shape: Sequence[int],
+    dim: int,
+    index_count: int,
+    *,
+    dtype: Any = np.float32,
+    index_dtype: Any = np.int32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute a shaped integer selection to the program being built."""
+
+    shape = tuple(int(size) for size in shape)
+    dim = int(dim) % len(shape)
+    axis_size = shape[dim]
+    after = _shape_product(shape[dim + 1:])
+    read_index = _arena_read(index_dtype, 1, "index_position", base)
+    selected_lines = (
         [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer OffsetBuf "
-            f"{{ {index_type} offsets[]; }};",
-            "layout(std430, binding = 1) readonly buffer ValueBuf "
-            f"{{ {scalar_type} values[]; }};",
-            "layout(std430, binding = 2) buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    outbuf[uint(offsets[gid])] = values[{value_index}];",
-            "}",
-            "",
+            f"int selected = {read_index};",
+            f"if (selected < 0) {{ selected += int({axis_size}); }}",
+            "uint selected_index = uint(selected);",
         ]
+        if _normalize_dtype(index_dtype).kind == "i"
+        else [f"uint selected_index = uint({read_index});"]
+    )
+    return ShaderSnippet(
+        lines=(
+            f"uint inner = gid % uint({after});",
+            f"uint block = gid / uint({after});",
+            f"uint index_position = block % uint({index_count});",
+            f"uint outer = block / uint({index_count});",
+            *selected_lines,
+            f"uint source_index = (outer * uint({axis_size}) + "
+            f"selected_index) * uint({after}) + inner;",
+            _arena_write(
+                dtype, 2, "gid",
+                _arena_read(dtype, 0, "source_index", base), base,
+            ) + ";",
+        ),
+        slots=3,
     )
 
 
@@ -2319,48 +5438,48 @@ def emit_index_select_source(
     index_dtype: Any = np.int32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit a shaped integer-array selection along one source axis."""
+    """Finish a program whose only operation is an index selection."""
+
+    return compose_shader(
+        [index_select_snippet(
+            shape, dim, index_count, dtype=dtype, index_dtype=index_dtype
+        )],
+        local_size=local_size,
+    )
+
+
+def slice_axis_snippet(
+    shape: Sequence[int],
+    dim: int,
+    start: int,
+    step: int,
+    count: int,
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute an affine single-axis slice to the program being built."""
+
     shape = tuple(int(size) for size in shape)
     dim = int(dim) % len(shape)
     axis_size = shape[dim]
     after = _shape_product(shape[dim + 1:])
-    scalar_type = _glsl_type(dtype)
-    index_type = _glsl_type(index_dtype)
-    selected_lines = (
-        [
-            "    int selected = indices[index_position];",
-            f"    if (selected < 0) {{ selected += int({axis_size}); }}",
-            "    uint selected_index = uint(selected);",
-        ]
-        if _normalize_dtype(index_dtype).kind == "i"
-        else ["    uint selected_index = uint(indices[index_position]);"]
-    )
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {scalar_type} input0[]; }};",
-            "layout(std430, binding = 1) readonly buffer IndexBuf "
-            f"{{ {index_type} indices[]; }};",
-            "layout(std430, binding = 2) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    uint inner = gid % uint({after});",
-            f"    uint block = gid / uint({after});",
-            f"    uint index_position = block % uint({index_count});",
-            f"    uint outer = block / uint({index_count});",
-            *selected_lines,
-            f"    uint source_index = (outer * uint({axis_size}) + "
-            f"selected_index) * uint({after}) + inner;",
-            "    outbuf[gid] = input0[source_index];",
-            "}",
-            "",
-        ]
+    return ShaderSnippet(
+        lines=(
+            f"uint inner = gid % uint({after});",
+            f"uint block = gid / uint({after});",
+            f"uint selected_position = block % uint({count});",
+            f"uint outer = block / uint({count});",
+            f"int selected = int({start}) + "
+            f"int(selected_position) * int({step});",
+            f"uint source_index = (outer * uint({axis_size}) + "
+            f"uint(selected)) * uint({after}) + inner;",
+            _arena_write(
+                dtype, 1, "gid",
+                _arena_read(dtype, 0, "source_index", base), base,
+            ) + ";",
+        ),
+        slots=2,
     )
 
 
@@ -2374,37 +5493,11 @@ def emit_slice_axis_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit an affine slice along one axis without an index buffer."""
-    shape = tuple(int(size) for size in shape)
-    dim = int(dim) % len(shape)
-    axis_size = shape[dim]
-    after = _shape_product(shape[dim + 1:])
-    scalar_type = _glsl_type(dtype)
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {scalar_type} input0[]; }};",
-            "layout(std430, binding = 1) writeonly buffer OutBuf "
-            f"{{ {scalar_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    uint inner = gid % uint({after});",
-            f"    uint block = gid / uint({after});",
-            f"    uint selected_position = block % uint({count});",
-            f"    uint outer = block / uint({count});",
-            f"    int selected = int({start}) + "
-            f"int(selected_position) * int({step});",
-            f"    uint source_index = (outer * uint({axis_size}) + "
-            f"uint(selected)) * uint({after}) + inner;",
-            "    outbuf[gid] = input0[source_index];",
-            "}",
-            "",
-        ]
+    """Finish a program whose only operation is an affine slice."""
+
+    return compose_shader(
+        [slice_axis_snippet(shape, dim, start, step, count, dtype=dtype)],
+        local_size=local_size,
     )
 
 
@@ -2446,6 +5539,62 @@ def _reduction_dtype(op: str, dtype: Any) -> np.dtype:
     return dtype
 
 
+
+def reduce_snippet(
+    op: str,
+    shape: Sequence[int],
+    dim: int | None = None,
+    keepdim: bool = False,
+    *,
+    dtype: Any = np.float32,
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute an axis reduction to the program being built."""
+
+    if op not in {"sum", "mean", "min", "max", "any", "all"}:
+        raise ValueError(f"unsupported GLSL reduction {op!r}")
+    source_shape, axis, _, extent = _reduce_layout(shape, dim, keepdim)
+    input_dtype = _normalize_dtype(dtype)
+    output_dtype = _reduction_dtype(op, input_dtype)
+    output_type = _glsl_type(output_dtype)
+    after = _shape_product(source_shape[axis + 1:])
+
+    if op in {"min", "max"} and extent == 0:
+        raise ValueError(f"{op} reduction has no identity for an empty axis")
+    initial = "uint(1)" if op == "all" else f"{output_type}(0)"
+
+    src = _arena_read(input_dtype, 0, "source_index", base)
+    value = f"{output_type}({src})"
+    if op == "sum":
+        update = f"total += {value};"
+    elif op == "mean":
+        update = f"total += float({src});"
+    elif op == "min":
+        update = f"total = (k == uint(0)) ? {value} : min(total, {value});"
+    elif op == "max":
+        update = f"total = (k == uint(0)) ? {value} : max(total, {value});"
+    elif op == "any":
+        update = f"total |= uint({src} != 0);"
+    else:
+        update = f"total &= uint({src} != 0);"
+
+    final = f"total / float({extent})" if op == "mean" and extent else "total"
+    return ShaderSnippet(
+        lines=(
+            f"uint inner = gid % uint({after});",
+            f"uint outer = gid / uint({after});",
+            f"uint line_base = outer * uint({extent * after}) + inner;",
+            f"{output_type} total = {initial};",
+            f"for (uint k = uint(0); k < uint({extent}); ++k) {{",
+            f"    uint source_index = line_base + k * uint({after});",
+            f"    {update}",
+            "}",
+            _arena_write(output_dtype, 1, "gid", final, base) + ";",
+        ),
+        slots=2,
+    )
+
+
 def emit_reduce_source(
     op: str,
     shape: Sequence[int],
@@ -2455,77 +5604,31 @@ def emit_reduce_source(
     dtype: Any = np.float32,
     local_size: int = _LOCAL_SIZE,
 ) -> str:
-    """Emit one axis reduction shader with one invocation per output value."""
-    if op not in {"sum", "mean", "min", "max", "any", "all"}:
-        raise ValueError(f"unsupported GLSL reduction {op!r}")
-    source_shape, axis, _, extent = _reduce_layout(shape, dim, keepdim)
-    input_dtype = _normalize_dtype(dtype)
-    output_dtype = _reduction_dtype(op, input_dtype)
-    input_type = _glsl_type(input_dtype)
-    output_type = _glsl_type(output_dtype)
-    after = _shape_product(source_shape[axis + 1:])
+    """Finish a program whose only operation is an axis reduction."""
 
-    if op in {"min", "max"} and extent == 0:
-        raise ValueError(f"{op} reduction has no identity for an empty axis")
-    if op == "all":
-        initial = "uint(1)"
-    else:
-        initial = f"{output_type}(0)"
-
-    value = f"{output_type}(input0[source_index])"
-    if op == "sum":
-        update = f"total += {value};"
-    elif op == "mean":
-        update = f"total += float(input0[source_index]);"
-    elif op == "min":
-        update = (
-            f"total = (k == uint(0)) ? {value} : min(total, {value});"
-        )
-    elif op == "max":
-        update = (
-            f"total = (k == uint(0)) ? {value} : max(total, {value});"
-        )
-    elif op == "any":
-        update = "total |= uint(input0[source_index] != 0);"
-    else:
-        update = "total &= uint(input0[source_index] != 0);"
-
-    final = f"total / float({extent})" if op == "mean" and extent else "total"
-    lines = [
-        _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-        "layout(std430, binding = 0) readonly buffer Input0 "
-        f"{{ {input_type} input0[]; }};",
-        "layout(std430, binding = 1) writeonly buffer OutBuf "
-        f"{{ {output_type} outbuf[]; }};",
-        "",
-        "uniform uint u_count;",
-        "",
-        "void main() {",
-        "    uint gid = turing_linear_gid();",
-        "    if (gid >= u_count) { return; }",
-        f"    uint inner = gid % uint({after});",
-        f"    uint outer = gid / uint({after});",
-        f"    uint base = outer * uint({extent * after}) + inner;",
-        f"    {output_type} total = {initial};",
-        f"    for (uint k = uint(0); k < uint({extent}); ++k) {{",
-        f"        uint source_index = base + k * uint({after});",
-        f"        {update}",
-        "    }",
-        f"    outbuf[gid] = {final};",
-        "}",
-        "",
-    ]
-    return "\n".join(lines)
+    return compose_shader(
+        [reduce_snippet(op, shape, dim, keepdim, dtype=dtype)],
+        local_size=local_size,
+    )
 
 
-def emit_cumsum_source(
+
+def cumsum_snippet(
     shape: Sequence[int],
     dim: int = 0,
     *,
     dtype: Any = np.float32,
-    local_size: int = _LOCAL_SIZE,
-) -> str:
-    """Emit an axis-line prefix-sum kernel with one invocation per line."""
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute one bounded prefix result per output invocation.
+
+    Every invocation owns exactly ``output[gid]``.  Treating ``gid`` as a
+    whole axis line while dispatching the full output extent makes each
+    invocation write ``extent`` words and overruns the resident allocation by
+    that factor.  Recover the output element's axis coordinate instead, scan
+    only through that coordinate, and perform one in-range write.
+    """
+
     shape = tuple(int(size) for size in shape)
     if not shape:
         raise ValueError("cumsum requires at least one dimension")
@@ -2536,39 +5639,45 @@ def emit_cumsum_source(
         raise ValueError("dim out of range")
     input_dtype = _normalize_dtype(dtype)
     output_dtype = _reduction_dtype("sum", input_dtype)
-    input_type = _glsl_type(input_dtype)
     output_type = _glsl_type(output_dtype)
     extent = shape[dim]
     after = _shape_product(shape[dim + 1:])
-    return "\n".join(
-        [
-            _STRUCTURAL_SHADER_HEADER.format(local_size=local_size),
-            "layout(std430, binding = 0) readonly buffer Input0 "
-            f"{{ {input_type} input0[]; }};",
-            "layout(std430, binding = 1) writeonly buffer OutBuf "
-            f"{{ {output_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint line = turing_linear_gid();",
-            "    if (line >= u_count) { return; }",
-            f"    uint inner = line % uint({after});",
-            f"    uint outer = line / uint({after});",
-            f"    uint base = outer * uint({extent * after}) + inner;",
-            f"    {output_type} total = {output_type}(0);",
-            f"    for (uint k = uint(0); k < uint({extent}); ++k) {{",
-            f"        uint index = base + k * uint({after});",
-            f"        total += {output_type}(input0[index]);",
-            "        outbuf[index] = total;",
-            "    }",
+    if extent == 0:
+        return ShaderSnippet(lines=(), slots=2)
+    return ShaderSnippet(
+        lines=(
+            f"uint inner = gid % uint({after});",
+            f"uint block = gid / uint({after});",
+            f"uint axis_index = block % uint({extent});",
+            f"uint outer = block / uint({extent});",
+            f"uint line_base = outer * uint({extent * after}) + inner;",
+            f"{output_type} total = {output_type}(0);",
+            "for (uint k = uint(0); k <= axis_index; ++k) {",
+            f"    uint source_index = line_base + k * uint({after});",
+            f"    total += {output_type}("
+            + _arena_read(input_dtype, 0, "source_index", base) + ");",
             "}",
-            "",
-        ]
+            _arena_write(output_dtype, 1, "gid", "total", base) + ";",
+        ),
+        slots=2,
     )
 
 
-def emit_stack_source(
+def emit_cumsum_source(
+    shape: Sequence[int],
+    dim: int = 0,
+    *,
+    dtype: Any = np.float32,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a prefix sum."""
+
+    return compose_shader(
+        [cumsum_snippet(shape, dim, dtype=dtype)], local_size=local_size
+    )
+
+
+def stack_snippet(
     shape: Sequence[int],
     input_count: int,
     dim: int = 0,
@@ -2576,9 +5685,10 @@ def emit_stack_source(
     dtype: Any = np.float32,
     input_dtypes: Sequence[Any] | None = None,
     output_dtype: Any | None = None,
-    local_size: int = _LOCAL_SIZE,
-) -> str:
-    """Emit one arbitrary-rank stack shader for equally-shaped SSBOs."""
+    base: int = 0,
+) -> ShaderSnippet:
+    """Contribute an arbitrary-rank stack to the program being built."""
+
     shape, dim, _ = _validate_stack_layout(shape, input_count, dim)
     if input_dtypes is None:
         input_dtypes = [dtype] * input_count
@@ -2591,51 +5701,303 @@ def emit_stack_source(
     output_type = _glsl_type(output_dtype)
     after = _shape_product(shape[dim:])
 
-    lines = [_STRUCTURAL_SHADER_HEADER.format(local_size=local_size)]
-    for index, input_dtype in enumerate(input_dtypes):
-        lines.append(
-            f"layout(std430, binding = {index}) readonly buffer Input{index} "
-            f"{{ {_glsl_type(input_dtype)} input{index}[]; }};"
-        )
-    lines.extend(
-        [
-            f"layout(std430, binding = {input_count}) writeonly buffer OutBuf "
-            f"{{ {output_type} outbuf[]; }};",
-            "",
-            "uniform uint u_count;",
-            "",
-            "void main() {",
-            "    uint gid = turing_linear_gid();",
-            "    if (gid >= u_count) { return; }",
-            f"    uint inner = gid % uint({after});",
-            f"    uint block = gid / uint({after});",
-            f"    uint source_number = block % uint({input_count});",
-            f"    uint outer = block / uint({input_count});",
-            f"    uint source_index = outer * uint({after}) + inner;",
-        ]
-    )
+    lines = [
+        f"uint inner = gid % uint({after});",
+        f"uint block = gid / uint({after});",
+        f"uint source_number = block % uint({input_count});",
+        f"uint outer = block / uint({input_count});",
+        f"uint source_index = outer * uint({after}) + inner;",
+    ]
     for index in range(input_count):
         condition = "if" if index == 0 else "else if"
-        lines.extend(
-            [
-                f"    {condition} (source_number == uint({index})) {{",
-                f"        outbuf[gid] = "
-                f"{output_type}(input{index}[source_index]);",
-                "    }",
-            ]
-        )
-    lines.extend(["}", ""])
-    return "\n".join(lines)
+        lines.extend([
+            f"{condition} (source_number == uint({index})) {{",
+            "    " + _arena_write(
+                output_dtype, input_count, "gid",
+                f"{output_type}("
+                + _arena_read(input_dtypes[index], index, "source_index", base)
+                + ")",
+                base,
+            ) + ";",
+            "}",
+        ])
+    return ShaderSnippet(lines=tuple(lines), slots=input_count + 1)
+
+
+def emit_stack_source(
+    shape: Sequence[int],
+    input_count: int,
+    dim: int = 0,
+    *,
+    dtype: Any = np.float32,
+    input_dtypes: Sequence[Any] | None = None,
+    output_dtype: Any | None = None,
+    local_size: int = _LOCAL_SIZE,
+) -> str:
+    """Finish a program whose only operation is a stack."""
+
+    return compose_shader(
+        [stack_snippet(
+            shape, input_count, dim, dtype=dtype,
+            input_dtypes=input_dtypes, output_dtype=output_dtype,
+        )],
+        local_size=local_size,
+    )
 
 
 # ---------------------------------------------------------------------------
 # compilation + cache
 # ---------------------------------------------------------------------------
 
-_program_cache: dict[str, int] = {}
+_program_cache: dict[tuple[int, str], int] = {}
 _uniform_location_cache: dict[tuple[int, str], int] = {}
-_cache_stats = {"hits": 0, "misses": 0}
+_cache_stats = {
+    "hits": 0,
+    "misses": 0,
+    "persistent_hits": 0,
+    "persistent_misses": 0,
+    "persistent_writes": 0,
+}
 _dispatch_stats = {"calls": 0, "work_items": 0}
+_PROGRAM_BINARY_MAGIC = b"TURGLSL1"
+_c_dispatch_planner_cache: dict[
+    tuple[tuple[str, str, str], tuple[str, ...]], Any
+] = {}
+
+
+def _c_dispatch_expression_names(
+    bounds: tuple[str, str, str],
+) -> tuple[str, ...]:
+    """Validate compiler-generated integer expressions and list their inputs."""
+
+    names: set[str] = set()
+    allowed = (
+        ast.Expression,
+        ast.Constant,
+        ast.Name,
+        ast.UnaryOp,
+        ast.UAdd,
+        ast.USub,
+        ast.BinOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Load,
+    )
+    for source in bounds:
+        expression = ast.parse(str(source), mode="eval")
+        for node in ast.walk(expression):
+            if not isinstance(node, allowed):
+                raise ValueError(
+                    "C dispatch loop bound contains unsupported syntax: "
+                    f"{source!r} ({type(node).__name__})"
+                )
+            if isinstance(node, ast.Name):
+                names.add(str(node.id))
+    return tuple(sorted(names))
+
+
+def _compile_c_dispatch_planner(
+    bounds: tuple[str, str, str],
+    uniform_names: Iterable[str],
+):
+    """Compile the retained loop itself as a C command-producing shell."""
+
+    names = _c_dispatch_expression_names(bounds)
+    unknown = set(names) - set(map(str, uniform_names))
+    if unknown:
+        raise ValueError(
+            "C dispatch loop references unavailable controls: "
+            + ", ".join(sorted(unknown))
+        )
+    key = (tuple(map(str, bounds)), names)
+    cached = _c_dispatch_planner_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from cffi import FFI
+
+    start, stop, step = map(str, bounds)
+    parameters = ", ".join(
+        [*(f"int {name}" for name in names), "int *commands", "size_t capacity"]
+    )
+    declaration = ", ".join(
+        [*("int" for _name in names), "int *", "size_t"]
+    )
+    source = f"""
+#include <stddef.h>
+#include <stdint.h>
+#include <limits.h>
+size_t turing_plan_dispatch({parameters}) {{
+    const int turing_start = (int)({start});
+    const int turing_stop = (int)({stop});
+    const int turing_step = (int)({step});
+    size_t count = 0;
+    if (turing_step == 0) return SIZE_MAX;
+    for (
+        int iteration = turing_start;
+        turing_step > 0 ? iteration < turing_stop : iteration > turing_stop;
+        iteration += turing_step
+    ) {{
+        if (commands != NULL && count < capacity) commands[count] = iteration;
+        if (count == (size_t)INT_MAX) return SIZE_MAX;
+        ++count;
+    }}
+    return count;
+}}
+"""
+    ffi = FFI()
+    ffi.cdef(
+        f"size_t turing_plan_dispatch({declaration});"
+    )
+    library = ffi.verify(source)
+    planner = (ffi, library.turing_plan_dispatch, names)
+    _c_dispatch_planner_cache[key] = planner
+    return planner
+
+
+def _c_dispatch_iterations(
+    bounds: tuple[str, str, str],
+    uniforms: Mapping[str, int],
+) -> tuple[int, ...]:
+    ffi, planner, names = _compile_c_dispatch_planner(
+        bounds, uniforms
+    )
+    arguments = tuple(int(uniforms[name]) for name in names)
+    count = int(planner(*arguments, ffi.NULL, 0))
+    if count == int(ffi.cast("size_t", -1)):
+        raise ValueError("C dispatch loop has a zero step or excessive extent")
+    commands = ffi.new("int[]", max(1, count))
+    written = int(planner(*arguments, commands, count))
+    if written != count:
+        raise RuntimeError(
+            f"C dispatch planner changed extent: {count} -> {written}"
+        )
+    return tuple(int(commands[index]) for index in range(count))
+
+
+def _persistent_shader_cache_directory() -> Path:
+    configured = os.environ.get("TURING_GLSL_CACHE_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    from .artifact_cache import repository_cache_root
+
+    return repository_cache_root() / "glsl-programs"
+
+
+def _program_binary_cache_path(GL, cache_identity: str) -> Path | None:
+    try:
+        if int(GL.glGetIntegerv(GL.GL_NUM_PROGRAM_BINARY_FORMATS)) <= 0:
+            return None
+        driver = b"\0".join(
+            bytes(GL.glGetString(token) or b"")
+            for token in (GL.GL_VENDOR, GL.GL_RENDERER, GL.GL_VERSION)
+        )
+    except Exception:
+        return None
+    driver_digest = hashlib.sha256(driver).hexdigest()[:24]
+    return (
+        _persistent_shader_cache_directory()
+        / driver_digest
+        / f"{cache_identity}.bin"
+    )
+
+
+def _load_program_binary(GL, path: Path) -> int | None:
+    program = None
+    try:
+        payload = path.read_bytes()
+        header_size = struct.calcsize("<8sI")
+        magic, binary_format = struct.unpack(
+            "<8sI", payload[:header_size]
+        )
+        binary = payload[header_size:]
+        if magic != _PROGRAM_BINARY_MAGIC or not binary:
+            raise ValueError("invalid persistent GLSL program cache entry")
+        program = GL.glCreateProgram()
+        GL.glProgramBinary(
+            program,
+            int(binary_format),
+            binary,
+            len(binary),
+        )
+        if bool(GL.glGetProgramiv(program, GL.GL_LINK_STATUS)):
+            return int(program)
+        GL.glDeleteProgram(program)
+    except Exception:
+        if program is not None:
+            try:
+                GL.glDeleteProgram(program)
+            except Exception:
+                pass
+        # A program binary is an optional driver-specific cache artifact.
+        # Corruption or driver rejection must become a cache miss, not prevent
+        # recompilation from authoritative GLSL source.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return None
+
+
+def _store_program_binary(GL, program: int, path: Path) -> bool:
+    try:
+        length = int(
+            GL.glGetProgramiv(program, GL.GL_PROGRAM_BINARY_LENGTH)
+        )
+        if length <= 0:
+            return False
+        written = ctypes.c_int()
+        binary_format = ctypes.c_uint()
+        binary = (ctypes.c_ubyte * length)()
+        GL.glGetProgramBinary(
+            program,
+            length,
+            ctypes.byref(written),
+            ctypes.byref(binary_format),
+            binary,
+        )
+        payload = (
+            struct.pack(
+                "<8sI",
+                _PROGRAM_BINARY_MAGIC,
+                int(binary_format.value),
+            )
+            + bytes(binary[:written.value])
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+        return True
+    except Exception:
+        return False
+
+
+def _write_shader_cache_manifest(
+    binary_path: Path | None,
+    fields: Mapping[str, Any],
+) -> None:
+    if binary_path is None:
+        return
+    path = binary_path.with_suffix(".json")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(dict(fields), sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 @dataclass(frozen=True)
@@ -2745,43 +6107,222 @@ def dispatch_stats(*, reset: bool = False) -> dict[str, int]:
     return snapshot
 
 
-def _compile(source: str) -> int:
-    """Compile+link a compute shader, caching by source hash."""
-    key = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    cached = _program_cache.get(key)
-    if cached is not None:
-        _cache_stats["hits"] += 1
-        return cached
-    _cache_stats["misses"] += 1
-
+def _compile(
+    source: str,
+    *,
+    cache_identity: str | None = None,
+) -> int:
+    """Compile+link a compute shader using planner semantics as cache identity."""
     require_gl_context()
     from OpenGL import GL
+    from OpenGL import platform
 
+    context = int(platform.PLATFORM.GetCurrentContext() or 0)
+    source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    identity = str(cache_identity or source_digest)
+    key = (context, identity)
+    cached = _program_cache.get(key)
+    if cached is not None and bool(GL.glIsProgram(int(cached))):
+        _cache_stats["hits"] += 1
+        return int(cached)
+    if cached is not None:
+        # A context teardown, or older code which deleted a borrowed cached
+        # program, may leave a numeric name behind.  Never hand that stale name
+        # to glUseProgram.
+        _program_cache.pop(key, None)
+    _cache_stats["misses"] += 1
+    binary_path = _program_binary_cache_path(GL, identity)
+    cache_trace = os.environ.get("TURING_GLSL_CACHE_TRACE") == "1"
+    trace_entry = bool(
+        cache_trace
+        and (cache_identity is not None or len(source) >= 100_000)
+    )
+    manifest = {
+        "cache_identity": identity,
+        "source_sha256": source_digest,
+        "semantic": cache_identity is not None,
+        "source_characters": len(source),
+        "source_lines": source.count("\n") + 1,
+        "pid": os.getpid(),
+        "updated_unix": time.time(),
+    }
+    if (
+        binary_path is not None
+        and (
+            os.environ.get("TURING_GLSL_CACHE_SOURCES") == "1"
+            or len(source) >= 100_000
+        )
+    ):
+        try:
+            binary_path.parent.mkdir(parents=True, exist_ok=True)
+            binary_path.with_suffix(".glsl").write_text(
+                source,
+                encoding="utf-8",
+            )
+        except OSError:
+            # Source dumps are diagnostics.  Cache permissions must not turn a
+            # valid shader into a compilation failure.
+            pass
+        _write_shader_cache_manifest(
+            binary_path,
+            dict(manifest, status="source-ready"),
+        )
+    if binary_path is not None and binary_path.is_file():
+        program = _load_program_binary(GL, binary_path)
+        if program is not None:
+            _cache_stats["persistent_hits"] += 1
+            _write_shader_cache_manifest(
+                binary_path,
+                dict(
+                    manifest,
+                    status="ready",
+                    result="persistent-hit",
+                    updated_unix=time.time(),
+                ),
+            )
+            if trace_entry:
+                print(
+                    "[glsl-cache] persistent hit "
+                    f"identity={identity} source={source_digest}",
+                    flush=True,
+                )
+            _program_cache[key] = program
+            return program
+    if binary_path is not None:
+        _cache_stats["persistent_misses"] += 1
+        if trace_entry:
+            print(
+                "[glsl-cache] persistent miss "
+                f"identity={identity} source={source_digest}",
+                flush=True,
+            )
+
+    compile_started = time.perf_counter()
+    _write_shader_cache_manifest(
+        binary_path,
+        dict(
+            manifest,
+            status="compiling",
+            started_unix=time.time(),
+        ),
+    )
+    if trace_entry:
+        print(
+            "[glsl-cache] driver compile begin "
+            f"identity={identity} chars={len(source)} "
+            f"lines={source.count(chr(10)) + 1}",
+            flush=True,
+        )
     shader = GL.glCreateShader(GL.GL_COMPUTE_SHADER)
     GL.glShaderSource(shader, source)
+    _write_shader_cache_manifest(
+        binary_path,
+        dict(
+            manifest,
+            status="compiling",
+            stage="shader-compile",
+            started_unix=time.time(),
+        ),
+    )
     GL.glCompileShader(shader)
     if not GL.glGetShaderiv(shader, GL.GL_COMPILE_STATUS):
         log = GL.glGetShaderInfoLog(shader)
         GL.glDeleteShader(shader)
+        _write_shader_cache_manifest(
+            binary_path,
+            dict(
+                manifest,
+                status="failed",
+                stage="compile",
+                elapsed_seconds=(
+                    time.perf_counter() - compile_started
+                ),
+                driver_log=str(log)[:4096],
+                updated_unix=time.time(),
+            ),
+        )
         raise GLSLCompileError(_annotate(source, log))
 
     program = GL.glCreateProgram()
+    if binary_path is not None:
+        GL.glProgramParameteri(
+            program,
+            GL.GL_PROGRAM_BINARY_RETRIEVABLE_HINT,
+            GL.GL_TRUE,
+        )
     GL.glAttachShader(program, shader)
+    _write_shader_cache_manifest(
+        binary_path,
+        dict(
+            manifest,
+            status="compiling",
+            stage="program-link",
+            started_unix=time.time(),
+            elapsed_seconds=time.perf_counter() - compile_started,
+        ),
+    )
     GL.glLinkProgram(program)
     GL.glDeleteShader(shader)
     if not GL.glGetProgramiv(program, GL.GL_LINK_STATUS):
         log = GL.glGetProgramInfoLog(program)
         GL.glDeleteProgram(program)
+        _write_shader_cache_manifest(
+            binary_path,
+            dict(
+                manifest,
+                status="failed",
+                stage="link",
+                elapsed_seconds=(
+                    time.perf_counter() - compile_started
+                ),
+                driver_log=str(log)[:4096],
+                updated_unix=time.time(),
+            ),
+        )
         raise GLSLCompileError(_annotate(source, log))
 
     _program_cache[key] = program
+    binary_written = bool(
+        binary_path is not None
+        and _store_program_binary(GL, program, binary_path)
+    )
+    if binary_written:
+        _cache_stats["persistent_writes"] += 1
+        if trace_entry:
+            print(
+                "[glsl-cache] persistent write "
+                f"identity={identity} source={source_digest}",
+                flush=True,
+            )
+    elapsed_seconds = time.perf_counter() - compile_started
+    _write_shader_cache_manifest(
+        binary_path,
+        dict(
+            manifest,
+            status="ready",
+            result="compiled",
+            elapsed_seconds=elapsed_seconds,
+            binary_written=binary_written,
+            updated_unix=time.time(),
+        ),
+    )
+    if trace_entry:
+        print(
+            "[glsl-cache] driver compile complete "
+            f"identity={identity} seconds={elapsed_seconds:.3f}",
+            flush=True,
+        )
     return program
 
 
-def compile_glsl_source(source: str) -> int:
+def compile_glsl_source(
+    source: str,
+    *,
+    cache_identity: str | None = None,
+) -> int:
     """Compile one fully composed GLSL compute-shader source."""
 
-    return _compile(source)
+    return _compile(source, cache_identity=cache_identity)
 
 
 def _annotate(source: str, log: Any) -> str:
@@ -3006,6 +6547,47 @@ def _bind_chunk(binding: int, chunk: GLChunk) -> None:
         )
 
 
+def _uniform_uint_array(program_id: int, name: str, values) -> None:
+    """Upload one ``uniform uint[]`` by name, if the program declares it."""
+
+    from OpenGL import GL
+
+    key = (program_id, name)
+    loc = _uniform_location_cache.get(key)
+    if loc is None:
+        loc = int(GL.glGetUniformLocation(program_id, name))
+        _uniform_location_cache[key] = loc
+    values = [int(value) for value in values]
+    if loc != -1 and values:
+        GL.glUniform1uiv(
+            loc, len(values), (GL.GLuint * len(values))(*values)
+        )
+
+
+def _bind_arena(
+    program_id: int, chunks, outputs, extents=None
+) -> None:
+    """Bind the one arena and hand the shader its slot offsets and extents.
+
+    Nothing else is bound.  A value is reached by index, so the number of
+    values a shader touches no longer competes for binding points.  Each
+    composed operation also gets its own element count, because operations
+    sharing a program do not have to share an extent.
+    """
+
+    from OpenGL import GL
+
+    _ARENA.reserve()
+    GL.glBindBufferBase(
+        GL.GL_SHADER_STORAGE_BUFFER, ARENA_BINDING, _ARENA.buffer
+    )
+    _uniform_uint_array(
+        program_id, "u_slot",
+        [chunk._offset for chunk in (*chunks, *outputs)],
+    )
+    _uniform_uint_array(program_id, "u_extent", extents or ())
+
+
 def _dispatch_many(
     program_id: int,
     chunks: Sequence[GLChunk],
@@ -3018,13 +6600,7 @@ def _dispatch_many(
         return
     if not outputs:
         raise ValueError("a compute dispatch needs at least one output")
-    binding_count = len(chunks) + len(outputs)
-    if binding_count > plan.limits.max_dispatch_ssbo_blocks:
-        raise ValueError(
-            f"launch requires {binding_count} SSBO bindings, but the active "
-            "compute stage supports "
-            f"{plan.limits.max_dispatch_ssbo_blocks}"
-        )
+    binding_count = 1
     _dispatch_stats["calls"] += 1
     _dispatch_stats["work_items"] += int(plan.count)
 
@@ -3048,10 +6624,7 @@ def _dispatch_many(
             _uniform_location_cache[uniform_key] = loc
         if loc != -1:
             GL.glUniform1ui(loc, plan.count)
-        for binding, chunk in enumerate(chunks):
-            _bind_chunk(binding, chunk)
-        for output_index, output in enumerate(outputs, len(chunks)):
-            _bind_chunk(output_index, output)
+        _bind_arena(program_id, chunks, outputs, (plan.count,))
         GL.glDispatchCompute(*plan.groups)
         GL.glMemoryBarrier(
             GL.GL_SHADER_STORAGE_BARRIER_BIT
@@ -3081,10 +6654,7 @@ def _dispatch_many(
         if loc != -1:
             GL.glUniform1ui(loc, plan.count)
 
-        for binding, chunk in enumerate(chunks):
-            _bind_chunk(binding, chunk)
-        for output_index, output in enumerate(outputs, len(chunks)):
-            _bind_chunk(output_index, output)
+        _bind_arena(program_id, chunks, outputs, (plan.count,))
 
         GL.glDispatchCompute(*plan.groups)
         # Without this the readback may observe stale memory. It is the GPU
@@ -3109,6 +6679,888 @@ def _dispatch_many(
             raise RuntimeError(
                 f"OpenGL error 0x{error:04X} during compute dispatch"
             )
+
+
+def _dispatch_composed_control(
+    program_id: int,
+    slots: Sequence[GLChunk],
+    written: Sequence[GLChunk],
+    plan: GLLaunchPlan,
+    debug_buffer: int = 0,
+    debug_capacity: int = 0,
+    stream_state_buffer: int = 0,
+    stream_words_buffer: int = 0,
+    slot_table_buffer: int = 0,
+    extent_table_buffer: int = 0,
+    dispatch_extent_buffer: int = 0,
+    control_value_buffer: int = 0,
+    dispatch_iteration: int | None = None,
+) -> None:
+    """Launch one already-composed shell with its exact slot table."""
+
+    from OpenGL import GL
+
+    if plan.skipped:
+        return
+    for chunk in slots:
+        chunk._to_gpu_current()
+    GL.glUseProgram(program_id)
+    if debug_buffer:
+        GL.glBindBufferBase(
+            GL.GL_SHADER_STORAGE_BUFFER, 1, int(debug_buffer)
+        )
+        location = int(
+            GL.glGetUniformLocation(program_id, "u_debug_capacity")
+        )
+        if location != -1:
+            GL.glUniform1ui(location, int(debug_capacity))
+    if stream_state_buffer:
+        GL.glBindBufferBase(
+            GL.GL_SHADER_STORAGE_BUFFER, 2, int(stream_state_buffer)
+        )
+        GL.glBindBufferBase(
+            GL.GL_SHADER_STORAGE_BUFFER, 3, int(stream_words_buffer)
+        )
+    count_location = int(GL.glGetUniformLocation(program_id, "u_count"))
+    if count_location != -1:
+        GL.glUniform1ui(count_location, plan.count)
+    if dispatch_iteration is not None:
+        iteration_location = int(
+            GL.glGetUniformLocation(
+                program_id, "u_dispatch_iteration"
+            )
+        )
+        if iteration_location == -1:
+            raise RuntimeError(
+                "C-planned GLSL closure lacks u_dispatch_iteration"
+            )
+        GL.glUniform1i(iteration_location, int(dispatch_iteration))
+    _bind_arena(program_id, slots, (), ())
+    for binding, buffer_id in (
+        (4, slot_table_buffer),
+        (5, extent_table_buffer),
+        (6, dispatch_extent_buffer),
+        (7, control_value_buffer),
+    ):
+        GL.glBindBufferBase(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            int(binding),
+            int(buffer_id),
+        )
+    _dispatch_stats["calls"] += 1
+    _dispatch_stats["work_items"] += int(plan.count)
+    GL.glDispatchCompute(*plan.groups)
+    GL.glMemoryBarrier(
+        GL.GL_SHADER_STORAGE_BARRIER_BIT
+        | GL.GL_BUFFER_UPDATE_BARRIER_BIT
+    )
+    for chunk in written:
+        chunk._mark_gpu_written()
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, ARENA_BINDING, 0)
+    if debug_buffer:
+        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 1, 0)
+    if stream_state_buffer:
+        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 2, 0)
+        GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 3, 0)
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 4, 0)
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 5, 0)
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 6, 0)
+    GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 7, 0)
+    GL.glUseProgram(0)
+    error = int(GL.glGetError())
+    if error != int(GL.GL_NO_ERROR):
+        raise RuntimeError(
+            f"OpenGL error 0x{error:04X} during composed control dispatch"
+        )
+
+
+class InstalledGLSLControlShell:
+    """Device-installed single-dispatch realization of a control artifact."""
+
+    def __init__(self, artifact: ComposedGLSLControlArtifact):
+        self.artifact = artifact
+        contract_errors = []
+        for alias, owner in artifact.value_aliases.items():
+            alias_meta = artifact.value_meta.get(alias)
+            owner_meta = artifact.value_meta.get(owner)
+            if (
+                alias_meta is not None
+                and owner_meta is not None
+                and (
+                    tuple(alias_meta.shape or ())
+                    != tuple(owner_meta.shape or ())
+                    or str(alias_meta.dtype) != str(owner_meta.dtype)
+                )
+            ):
+                contract_errors.append(
+                    f"alias {alias}->{owner} changes storage contract"
+                )
+        owner_ids = {
+            int(artifact.value_aliases.get(value_id, value_id))
+            for value_id in artifact.slot_value_ids
+        }
+        for value_id in sorted(owner_ids):
+            meta = artifact.value_meta.get(value_id)
+            if meta is not None and meta.shape is not None and meta.dtype is not None:
+                continue
+            slot_indices = tuple(
+                index
+                for index, candidate in enumerate(artifact.slot_value_ids)
+                if int(artifact.value_aliases.get(candidate, candidate))
+                == value_id
+            )
+            source_uses = tuple(
+                line.strip()
+                for line in artifact.source.splitlines()
+                if any(
+                    f"u_slot[{index}]" in line
+                    for index in slot_indices
+                )
+            )
+            contract_errors.append(
+                f"value {value_id} lacks shape/dtype metadata; "
+                f"slots={slot_indices!r}; source_uses={source_uses[:8]!r}; "
+                "bindings="
+                f"{artifact.slot_contract_diagnostics.get(value_id, ())!r}"
+            )
+        if contract_errors:
+            raise ValueError(
+                "composed GLSL storage contract audit failed before driver "
+                "compilation: "
+                + " | ".join(contract_errors)
+            )
+        sources = artifact.phase_sources or (artifact.source,)
+        cache_identities = artifact.phase_cache_identities
+        if cache_identities and len(cache_identities) != len(sources):
+            raise ValueError(
+                "GLSL artifact phase cache identities do not match phase "
+                f"sources: {len(cache_identities)} != {len(sources)}"
+            )
+        self.program_ids = tuple(
+            compile_glsl_source(
+                source,
+                cache_identity=(
+                    cache_identities[index]
+                    if cache_identities
+                    else None
+                ),
+            )
+            for index, source in enumerate(sources)
+        )
+        self.program_id = self.program_ids[0]
+        self.debug_buffer = 0
+        self.stream_state_buffer = 0
+        self.stream_words_buffer = 0
+        self.slot_table_buffer = 0
+        self.extent_table_buffer = 0
+        self.dispatch_extent_buffer = 0
+        self.control_value_buffer = 0
+        self.last_debug_records: tuple[tuple[int, int, int, int], ...] = ()
+        self.last_debug_header: tuple[int, int, int, int] = (0, 0, 1, 0)
+        self.last_gpu_ms = 0.0
+        self.last_dispatches = 0
+        self.last_stream_status = 0
+        if artifact.instrumentation:
+            from OpenGL import GL
+
+            self.debug_buffer = int(GL.glGenBuffers(1))
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, self.debug_buffer)
+            GL.glBufferData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                (4 + 4 * int(artifact.debug_capacity)) * 4,
+                None,
+                GL.GL_DYNAMIC_READ,
+            )
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        if artifact.stream_publications:
+            from OpenGL import GL
+
+            word_capacity = int(artifact.stream_word_capacity)
+            descriptor_capacity = int(
+                artifact.stream_descriptor_capacity
+            )
+            if word_capacity < 1 or descriptor_capacity < 1:
+                raise ValueError("resident stream capacities must be positive")
+            self.stream_state_buffer = int(GL.glGenBuffers(1))
+            self.stream_words_buffer = int(GL.glGenBuffers(1))
+            state = np.zeros(
+                8
+                + descriptor_capacity * 4
+                + 2 * int(artifact.stream_continuation_count),
+                dtype=np.uint32,
+            )
+            state[4] = word_capacity
+            state[5] = descriptor_capacity
+            GL.glBindBuffer(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                self.stream_state_buffer,
+            )
+            GL.glBufferData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                state.nbytes,
+                state,
+                GL.GL_DYNAMIC_READ,
+            )
+            GL.glBindBuffer(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                self.stream_words_buffer,
+            )
+            GL.glBufferData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                word_capacity * 4,
+                None,
+                GL.GL_DYNAMIC_READ,
+            )
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        from OpenGL import GL
+
+        self.slot_table_buffer = int(GL.glGenBuffers(1))
+        self.extent_table_buffer = int(GL.glGenBuffers(1))
+        self.dispatch_extent_buffer = int(GL.glGenBuffers(1))
+        self.control_value_buffer = int(GL.glGenBuffers(1))
+        self.values: dict[int, GLChunk] = {}
+        for alias, owner in artifact.value_aliases.items():
+            alias_meta = artifact.value_meta.get(alias)
+            owner_meta = artifact.value_meta.get(owner)
+            if (
+                alias_meta is not None
+                and owner_meta is not None
+                and (
+                    tuple(alias_meta.shape or ())
+                    != tuple(owner_meta.shape or ())
+                    or str(alias_meta.dtype) != str(owner_meta.dtype)
+                )
+            ):
+                raise ValueError(
+                    "loop-carried GLSL alias changes storage contract: "
+                    f"{alias}->{owner}"
+                )
+        owner_ids = {
+            int(artifact.value_aliases.get(value_id, value_id))
+            for value_id in artifact.slot_value_ids
+        }
+        private_backings: list[GLChunk] = []
+        for value_id in owner_ids:
+            meta = artifact.value_meta.get(value_id)
+            if meta is None or meta.shape is None or meta.dtype is None:
+                slot_indices = tuple(
+                    index
+                    for index, candidate in enumerate(
+                        artifact.slot_value_ids
+                    )
+                    if candidate == value_id
+                )
+                source_uses = tuple(
+                    line.strip()
+                    for line in artifact.source.splitlines()
+                    if any(
+                        f"u_slot[{index}]" in line
+                        for index in slot_indices
+                    )
+                )
+                raise ValueError(
+                    f"composed GLSL value {value_id} lacks shape/dtype "
+                    f"metadata; slots={slot_indices!r}; "
+                    f"source_uses={source_uses[:8]!r}"
+                )
+            shape = tuple(int(size) for size in meta.shape)
+            logical_extent = _shape_product(shape)
+            storage_extent = int(
+                artifact.private_value_capacities.get(
+                    value_id, logical_extent
+                )
+            )
+            if storage_extent < logical_extent:
+                raise ValueError(
+                    "workgroup-private storage capacity is smaller than its "
+                    f"logical value: {value_id} "
+                    f"{storage_extent} < {logical_extent}"
+                )
+            if storage_extent > logical_extent:
+                backing = GLChunk(
+                    (storage_extent,), dtype=meta.dtype
+                ).to_gpu()
+                private_backings.append(backing)
+                self.values[value_id] = backing.range_view(
+                    shape, offset=0
+                )
+            else:
+                self.values[value_id] = GLChunk(
+                    shape, dtype=meta.dtype
+                ).to_gpu()
+        for value_id in set(artifact.slot_value_ids):
+            owner = int(artifact.value_aliases.get(value_id, value_id))
+            self.values[value_id] = self.values[owner]
+        _ARENA.reserve()
+        self._owned_chunks = tuple({
+            id(chunk): chunk
+            for chunk in (
+                *self.values.values(),
+                *private_backings,
+            )
+        }.values())
+        slots = tuple(
+            self.values[value_id] for value_id in artifact.slot_value_ids
+        )
+        static_tables = (
+            (
+                self.slot_table_buffer,
+                np.asarray(
+                    [chunk._offset for chunk in slots],
+                    dtype=np.uint32,
+                ),
+            ),
+            (
+                self.extent_table_buffer,
+                np.asarray(artifact.slot_extents, dtype=np.uint32),
+            ),
+            (
+                self.dispatch_extent_buffer,
+                np.asarray(artifact.extents, dtype=np.uint32),
+            ),
+        )
+        for buffer_id, values in static_tables:
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, int(buffer_id))
+            GL.glBufferData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                max(4, int(values.nbytes)),
+                values if values.size else None,
+                GL.GL_STATIC_DRAW,
+            )
+        GL.glBindBuffer(
+            GL.GL_SHADER_STORAGE_BUFFER, self.control_value_buffer
+        )
+        GL.glBufferData(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            max(4, 4 * len(artifact.uniform_value_ids)),
+            None,
+            GL.GL_DYNAMIC_DRAW,
+        )
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        self._last_control_values: tuple[int, ...] | None = None
+
+    def _upload_control_values(self, values: Sequence[int]) -> None:
+        """Update only dynamic control words, and only when they changed.
+
+        Slot offsets, tensor extents, and dispatch extents are properties of
+        the installed compiled shell.  Reallocating and re-uploading those
+        tables for each dispatch turns immutable program metadata into host
+        churn and can force driver synchronization.
+        """
+
+        normalized = tuple(int(value) for value in values)
+        if normalized == self._last_control_values:
+            return
+        from OpenGL import GL
+
+        words = np.asarray(normalized, dtype=np.uint32)
+        if words.size:
+            GL.glBindBuffer(
+                GL.GL_SHADER_STORAGE_BUFFER, self.control_value_buffer
+            )
+            GL.glBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                0,
+                words.nbytes,
+                words,
+            )
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        self._last_control_values = normalized
+
+    def execute(
+        self,
+        feeds: Mapping[int, Any],
+        *,
+        uniform_feeds: Mapping[int, Any] | None = None,
+        _resume: bool = False,
+    ) -> dict[str, GLChunk]:
+        runtime_values = dict(self.values)
+        uniforms: dict[str, int] = {}
+        if _resume and feeds:
+            raise ValueError(
+                "resident continuation resumes installed ranges and accepts "
+                "no replacement feeds"
+            )
+        for value_id, expected in (
+            ()
+            if _resume
+            else self.artifact.specialized_values.items()
+        ):
+            # Specialization records the value used while compiling shape or
+            # control structure.  It is not, by itself, a runtime ABI input:
+            # nested closures commonly specialize ordinary lexical constants.
+            # If the value is also an external/uniform input it is supplied
+            # and checked here; otherwise the compiled internal specialization
+            # is authoritative and no fake host feed is invented for it.
+            if value_id not in feeds:
+                continue
+            actual = feeds[value_id]
+            if hasattr(actual, "item"):
+                actual = actual.item()
+            if hasattr(expected, "item"):
+                expected = expected.item()
+            if actual != expected:
+                raise ValueError(
+                    "GLSL shell specialization mismatch for value "
+                    f"{value_id}: compiled={expected!r}, runtime={actual!r}"
+                )
+        for value_id in (
+            () if _resume else self.artifact.external_value_ids
+        ):
+            try:
+                value = feeds[value_id]
+            except KeyError as error:
+                raise KeyError(
+                    f"missing composed GLSL feed {value_id}"
+                ) from error
+            if isinstance(value, GLChunk):
+                raise TypeError(
+                    "a planned GLSL shell owns its feed ranges; resident "
+                    "GLChunk handoff needs an explicit arena-range transfer "
+                    "plan and cannot replace a slot during execution"
+                )
+            runtime_values[value_id].upload_numpy(value)
+        if not _resume:
+            scalar_values = dict(feeds)
+            scalar_values.update(uniform_feeds or {})
+            for name, value_id in self.artifact.uniform_value_ids.items():
+                if value_id in scalar_values:
+                    value = scalar_values[value_id]
+                elif value_id in self.artifact.specialized_values:
+                    value = self.artifact.specialized_values[value_id]
+                else:
+                    raise KeyError(
+                        f"missing composed GLSL control value {value_id}"
+                    )
+                if hasattr(value, "item"):
+                    value = value.item()
+                uniforms[name] = int(value)
+            self._upload_control_values(tuple(uniforms.values()))
+        elif (
+            self.artifact.uniform_value_ids
+            and self._last_control_values is None
+        ):
+            raise RuntimeError(
+                "resident shell cannot resume before its initial controls "
+                "have been installed"
+            )
+        slots = tuple(
+            runtime_values[value_id]
+            for value_id in self.artifact.slot_value_ids
+        )
+        count = max(self.artifact.extents, default=0)
+        plan = plan_launch(count, binding_count=1)
+        if self.artifact.device_resident and count:
+            plan = GLLaunchPlan(
+                count,
+                int(self.artifact.local_size),
+                (1, 1, 1),
+                plan.limits,
+            )
+        if self.artifact.workgroup_loop_bounds is not None:
+            if _resume:
+                raise RuntimeError(
+                    "workgroup-parallel loops do not use resident resume"
+                )
+            workgroup_iterations = _c_dispatch_iterations(
+                self.artifact.workgroup_loop_bounds,
+                uniforms,
+            )
+            workgroup_count = len(workgroup_iterations)
+            if workgroup_count > plan.limits.max_group_count[0]:
+                raise ValueError(
+                    "frame batch exceeds the GLSL x workgroup limit: "
+                    f"{workgroup_count} > "
+                    f"{plan.limits.max_group_count[0]}"
+                )
+            capacities = [
+                int(capacity)
+                // max(
+                    1,
+                    _shape_product(tuple(
+                        self.artifact.value_meta[value_id].shape or ()
+                    )),
+                )
+                for value_id, capacity
+                in self.artifact.private_value_capacities.items()
+            ]
+            if capacities and workgroup_count > min(capacities):
+                raise ValueError(
+                    "frame batch exceeds compiled workgroup-private "
+                    f"capacity: {workgroup_count} > {min(capacities)}"
+                )
+            plan = GLLaunchPlan(
+                (count if workgroup_count else 0),
+                int(self.artifact.local_size),
+                (max(1, workgroup_count), 1, 1),
+                plan.limits,
+            )
+        dispatch_iterations: tuple[int | None, ...] = (None,)
+        if self.artifact.c_dispatch_loop_bounds is not None:
+            if _resume:
+                raise RuntimeError(
+                    "C-planned dispatch loops do not use resident resume"
+                )
+            dispatch_iterations = tuple(
+                _c_dispatch_iterations(
+                    self.artifact.c_dispatch_loop_bounds,
+                    uniforms,
+                )
+            )
+        written = tuple(dict.fromkeys(
+            runtime_values[value_id]
+            for value_id in self.artifact.terminal_outputs.values()
+        ))
+        with _ARENA.execution():
+            if self.debug_buffer:
+                from OpenGL import GL
+
+                zero = np.asarray((0, 0, 1, 0), dtype=np.uint32)
+                GL.glBindBuffer(
+                    GL.GL_SHADER_STORAGE_BUFFER, self.debug_buffer
+                )
+                GL.glBufferSubData(
+                    GL.GL_SHADER_STORAGE_BUFFER, 0, zero.nbytes, zero
+                )
+                GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+            query = 0
+            if self.debug_buffer:
+                from OpenGL import GL
+
+                query = int(
+                    np.asarray(GL.glGenQueries(1)).reshape(-1)[0]
+                )
+                GL.glBeginQuery(GL.GL_TIME_ELAPSED, query)
+            self.last_dispatches = 0
+            for dispatch_iteration in dispatch_iterations:
+                for program_id in self.program_ids:
+                    _dispatch_composed_control(
+                        program_id,
+                        slots,
+                        written,
+                        plan,
+                        self.debug_buffer,
+                        self.artifact.debug_capacity,
+                        self.stream_state_buffer,
+                        self.stream_words_buffer,
+                        self.slot_table_buffer,
+                        self.extent_table_buffer,
+                        self.dispatch_extent_buffer,
+                        self.control_value_buffer,
+                        dispatch_iteration,
+                    )
+                    self.last_dispatches += 1
+            if query:
+                from OpenGL import GL
+
+                GL.glEndQuery(GL.GL_TIME_ELAPSED)
+                elapsed_ns = ctypes.c_uint64()
+                GL.glGetQueryObjectui64v(
+                    query,
+                    GL.GL_QUERY_RESULT,
+                    ctypes.byref(elapsed_ns),
+                )
+                GL.glDeleteQueries(1, (query,))
+                self.last_gpu_ms = elapsed_ns.value / 1e6
+            if self.debug_buffer:
+                from OpenGL import GL
+
+                GL.glBindBuffer(
+                    GL.GL_SHADER_STORAGE_BUFFER, self.debug_buffer
+                )
+                header = np.empty(4, dtype=np.uint32)
+                GL.glGetBufferSubData(
+                    GL.GL_SHADER_STORAGE_BUFFER,
+                    0,
+                    header.nbytes,
+                    header.ctypes.data_as(ctypes.c_void_p),
+                )
+                count = min(
+                    int(header[0]), int(self.artifact.debug_capacity)
+                )
+                self.last_debug_header = tuple(
+                    int(value) for value in header
+                )
+                words = np.empty(count * 4, dtype=np.uint32)
+                if count:
+                    GL.glGetBufferSubData(
+                        GL.GL_SHADER_STORAGE_BUFFER,
+                        16,
+                        words.nbytes,
+                        words.ctypes.data_as(ctypes.c_void_p),
+                    )
+                GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+                self.last_debug_records = tuple(
+                    tuple(int(value) for value in row)
+                    for row in words.reshape(-1, 4)
+                )
+                validation_errors = tuple(
+                    record
+                    for record in self.last_debug_records
+                    if record[0] == 6
+                )
+                if validation_errors:
+                    codes = tuple(
+                        record[1] for record in validation_errors
+                    )
+                    raise RuntimeError(
+                        "compiled GLSL shell device validation failed; "
+                        f"error_codes={codes!r}"
+                    )
+        return {
+            name: runtime_values[value_id]
+            for name, value_id in self.artifact.terminal_outputs.items()
+        }
+
+    def resume(self) -> dict[str, GLChunk]:
+        """Continue the same installed shell from resident suspension state."""
+
+        if not self.stream_state_buffer:
+            raise RuntimeError(
+                "compiled GLSL shell has no resident stream continuation"
+            )
+        if self.last_stream_status != 1:
+            raise RuntimeError(
+                "compiled GLSL shell is not suspended on downstream capacity"
+            )
+        return self.execute({}, _resume=True)
+
+    def drain_stream(self, max_items: int | None = None):
+        """Consume published resident ranges in descriptor order.
+
+        This is an ABI operation for a C/host shell, not shader orchestration:
+        the compiled GLSL shell owns production and backpressure state.  A
+        caller may drain any prefix, update the consumer sequences once, and
+        dispatch the same installed shell again if it had suspended on a full
+        queue.
+        """
+
+        if not self.stream_state_buffer:
+            return ()
+        from OpenGL import GL
+
+        header = np.empty(8, dtype=np.uint32)
+        GL.glBindBuffer(
+            GL.GL_SHADER_STORAGE_BUFFER, self.stream_state_buffer
+        )
+        GL.glGetBufferSubData(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            0,
+            header.nbytes,
+            header.ctypes.data_as(ctypes.c_void_p),
+        )
+        write_words, read_words, write_desc, read_desc = (
+            int(value) for value in header[:4]
+        )
+        self.last_stream_status = int(header[6])
+        word_capacity = int(header[4])
+        descriptor_capacity = int(header[5])
+        if self.last_stream_status == 2:
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+            raise RuntimeError(
+                "resident stream publication exceeds its fixed payload "
+                f"capacity of {word_capacity} words; "
+                f"attempted={int(header[7])}"
+            )
+        available = write_desc - read_desc
+        if max_items is not None:
+            available = min(available, max(0, int(max_items)))
+        descriptors = np.empty((available, 4), dtype=np.uint32)
+        first_descriptors = min(
+            available,
+            descriptor_capacity - (read_desc % descriptor_capacity),
+        )
+        if first_descriptors:
+            GL.glGetBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                (8 + (read_desc % descriptor_capacity) * 4) * 4,
+                first_descriptors * 16,
+                descriptors[:first_descriptors].ctypes.data_as(
+                    ctypes.c_void_p
+                ),
+            )
+        if first_descriptors < available:
+            tail = descriptors[first_descriptors:]
+            GL.glGetBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                8 * 4,
+                tail.nbytes,
+                tail.ctypes.data_as(ctypes.c_void_p),
+            )
+        consumed_words = int(
+            np.asarray(descriptors[:, 1], dtype=np.uint64).sum()
+        )
+        if consumed_words > write_words - read_words:
+            GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+            raise RuntimeError(
+                "resident stream descriptors exceed published word range"
+            )
+        payload_words = np.empty(consumed_words, dtype=np.uint32)
+        first_words = min(
+            consumed_words,
+            word_capacity - (read_words % word_capacity),
+        )
+        GL.glBindBuffer(
+            GL.GL_SHADER_STORAGE_BUFFER, self.stream_words_buffer
+        )
+        if first_words:
+            GL.glGetBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                (read_words % word_capacity) * 4,
+                first_words * 4,
+                payload_words.ctypes.data_as(ctypes.c_void_p),
+            )
+        if first_words < consumed_words:
+            tail = payload_words[first_words:]
+            GL.glGetBufferSubData(
+                GL.GL_SHADER_STORAGE_BUFFER,
+                0,
+                tail.nbytes,
+                tail.ctypes.data_as(ctypes.c_void_p),
+            )
+        GL.glBindBuffer(
+            GL.GL_SHADER_STORAGE_BUFFER, self.stream_state_buffer
+        )
+        items = []
+        payload_offset = 0
+        expected_start = read_words
+        for descriptor in descriptors:
+            start, count, stream_id, final = (
+                int(value) for value in descriptor
+            )
+            if start != (expected_start & 0xFFFFFFFF):
+                GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+                raise RuntimeError(
+                    "resident stream descriptor order is not contiguous: "
+                    f"expected word sequence {expected_start}, got {start}"
+                )
+            payload = payload_words[payload_offset:payload_offset + count]
+            payload_offset += count
+            expected_start += count
+            items.append({
+                "stream_id": stream_id,
+                "words": payload.copy(),
+                "values": self._decode_stream_words(stream_id, payload),
+                "final": bool(final),
+            })
+        if available:
+            next_read_words = read_words + consumed_words
+            next_read_desc = read_desc + available
+            if (
+                next_read_words == write_words
+                and next_read_desc == write_desc
+            ):
+                # Empty rings have no ordering history to preserve.  Reset all
+                # four monotone sequences together so a long-lived installed
+                # shell cannot eventually wrap uint32 counters.
+                zero_sequences = np.zeros(4, dtype=np.uint32)
+                GL.glBufferSubData(
+                    GL.GL_SHADER_STORAGE_BUFFER,
+                    0,
+                    zero_sequences.nbytes,
+                    zero_sequences,
+                )
+            else:
+                updated_words = np.asarray(
+                    (next_read_words,), dtype=np.uint32
+                )
+                updated_descriptors = np.asarray(
+                    (next_read_desc,), dtype=np.uint32
+                )
+                GL.glBufferSubData(
+                    GL.GL_SHADER_STORAGE_BUFFER,
+                    4,
+                    updated_words.nbytes,
+                    updated_words,
+                )
+                GL.glBufferSubData(
+                    GL.GL_SHADER_STORAGE_BUFFER,
+                    12,
+                    updated_descriptors.nbytes,
+                    updated_descriptors,
+                )
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        return tuple(items)
+
+    def _decode_stream_words(self, stream_id: int, words: np.ndarray):
+        publication = next(
+            (
+                item
+                for item in self.artifact.stream_publications
+                if int(item.stream_id) == int(stream_id)
+            ),
+            None,
+        )
+        meta = (
+            None
+            if publication is None
+            else self.artifact.value_meta.get(
+                int(self.artifact.value_aliases.get(
+                    int(publication.value_id),
+                    int(publication.value_id),
+                ))
+            )
+        )
+        if meta is None or meta.dtype is None:
+            return words
+        dtype = np.dtype(meta.dtype)
+        if dtype.itemsize == 0 or dtype.kind in {"S", "a"}:
+            # Python ``bytes`` is the terminal host view of one octet per
+            # arena word.  NumPy represents the abstract boundary as S0; an
+            # astype(S0) conversion silently produces a zero-byte array.
+            # Preserve the compiler's numerical storage contract and perform
+            # the one intentional byte materialization here.
+            return words.astype(np.uint8, copy=False)
+        if dtype.itemsize < np.dtype(np.uint32).itemsize:
+            return words.astype(dtype, copy=False)
+        if dtype.itemsize == np.dtype(np.uint32).itemsize:
+            return words.view(dtype)
+        raise ValueError(
+            "resident stream element exceeds one arena word: "
+            f"stream={stream_id}, dtype={dtype}"
+        )
+
+    def release(self) -> None:
+        if self.debug_buffer:
+            from OpenGL import GL
+
+            GL.glDeleteBuffers(1, [self.debug_buffer])
+            self.debug_buffer = 0
+        if self.stream_state_buffer:
+            from OpenGL import GL
+
+            GL.glDeleteBuffers(
+                2,
+                [self.stream_state_buffer, self.stream_words_buffer],
+            )
+            self.stream_state_buffer = 0
+            self.stream_words_buffer = 0
+        if self.slot_table_buffer:
+            from OpenGL import GL
+
+            GL.glDeleteBuffers(
+                4,
+                [
+                    self.slot_table_buffer,
+                    self.extent_table_buffer,
+                    self.dispatch_extent_buffer,
+                    self.control_value_buffer,
+                ],
+            )
+            self.slot_table_buffer = 0
+            self.extent_table_buffer = 0
+            self.dispatch_extent_buffer = 0
+            self.control_value_buffer = 0
+        for chunk in self._owned_chunks:
+            chunk.release()
+        if self.program_ids:
+            # Compiled programs are context-scoped cache assets shared by
+            # installed shells.  Buffers/ranges belong to this installation,
+            # but deleting a borrowed program here poisons the cache and makes
+            # the next identical shell receive an invalid GL name.
+            self.program_ids = ()
+            self.program_id = 0
+        self.values.clear()
 
 
 def _structural_chunks(values: Sequence[Any]) -> list[GLChunk]:
@@ -3248,6 +7700,31 @@ def arange_chunk(
     return out
 
 
+def where_chunks(condition: Any, if_true: Any, if_false: Any) -> GLChunk:
+    chunks = _structural_chunks((condition, if_true, if_false))
+    condition_chunk, true_chunk, false_chunk = chunks
+    output_shape = _broadcast_shape(
+        _broadcast_shape(condition_chunk.shape, true_chunk.shape),
+        false_chunk.shape,
+    )
+    output_dtype = _promote_dtype(true_chunk.dtype, false_chunk.dtype)
+    out = GLChunk(output_shape, dtype=output_dtype)
+    plan = plan_launch(out.count, binding_count=4)
+    source = emit_where_source(
+        condition_chunk.shape,
+        true_chunk.shape,
+        false_chunk.shape,
+        condition_dtype=condition_chunk.dtype,
+        true_dtype=true_chunk.dtype,
+        false_dtype=false_chunk.dtype,
+        output_dtype=output_dtype,
+        output_shape=output_shape,
+        local_size=plan.local_size,
+    )
+    _dispatch(_compile(source), chunks, out, plan)
+    return out
+
+
 def full_chunk(
     shape: Sequence[int],
     fill_value: Any,
@@ -3265,6 +7742,30 @@ def full_chunk(
     plan = plan_launch(out.count, binding_count=1)
     source = emit_fill_source(
         fill_value,
+        dtype=out.dtype,
+        local_size=plan.local_size,
+    )
+    _dispatch(_compile(source), [], out, plan)
+    return out
+
+
+def constant_chunk(
+    shape: Sequence[int],
+    values: Sequence[Any],
+    *,
+    dtype: Any = None,
+) -> GLChunk:
+    """Materialize compile-time literal values in one resident dispatch."""
+
+    shape = tuple(int(size) for size in shape)
+    out = GLChunk(shape, dtype=_normalize_dtype(dtype))
+    if out.count == 0:
+        return out
+    if len(values) != out.count:
+        raise ValueError("constant payload size does not match output shape")
+    plan = plan_launch(out.count, binding_count=1)
+    source = emit_constant_source(
+        values,
         dtype=out.dtype,
         local_size=plan.local_size,
     )
@@ -3772,8 +8273,7 @@ def cumsum_chunk(chunk: GLChunk, dim: int = 0) -> GLChunk:
         )
 
     out = GLChunk(chunk.shape, dtype=output_dtype)
-    line_count = chunk.count // chunk.shape[dim]
-    plan = plan_launch(line_count, binding_count=2)
+    plan = plan_launch(out.count, binding_count=2)
     source = emit_cumsum_source(
         chunk.shape,
         dim,
@@ -3977,7 +8477,7 @@ def execute_captured_fused_program(
     captured,
     runtime_feeds: Mapping[int, Any],
 ) -> dict[str, GLChunk]:
-    """Execute one captured ProcessGraph region as one GLSL dispatch."""
+    """Execute one captured ProcessGraph region through compiled GLSL stages."""
 
     program = captured.program
     merged = dict(captured.feeds)
@@ -3990,6 +8490,31 @@ def execute_captured_fused_program(
         )
         for value_id, value in merged.items()
     }
+    stages = tuple(getattr(captured, "stages", ()) or ())
+    if stages:
+        for stage in stages:
+            missing = set(stage.feeds) - set(chunks)
+            if missing:
+                raise KeyError(
+                    "captured GLSL stage is missing routed values: "
+                    + ", ".join(map(str, sorted(missing)))
+                )
+            stage_capture = type(captured)(
+                stage,
+                {
+                    value_id: chunks[value_id]
+                    for value_id in stage.feeds
+                },
+            )
+            results = execute_captured_fused_program(stage_capture, {})
+            chunks.update({
+                value_id: results[name]
+                for name, value_id in stage.outputs.items()
+            })
+        return {
+            name: chunks[value_id]
+            for name, value_id in program.outputs.items()
+        }
     kind = (program.extras or {}).get("kernel_kind")
     if kind in {None, "linear_reshape_copy"}:
         return execute_multi_output_program(program, chunks)
@@ -4005,6 +8530,14 @@ def execute_captured_fused_program(
         result = full_chunk(
             step.attrs["shape"],
             step.attrs["fill_value"],
+            dtype=(program.meta or {})[
+                next(iter(program.outputs.values()))
+            ].dtype,
+        )
+    elif kind == "constant":
+        result = constant_chunk(
+            step.attrs["shape"],
+            step.attrs["values"],
             dtype=(program.meta or {})[
                 next(iter(program.outputs.values()))
             ].dtype,
@@ -4057,6 +8590,25 @@ def execute_captured_fused_program(
         result = cumsum_chunk(
             input_chunks[0],
             int(step.attrs.get("dim", 0)),
+        )
+    elif kind == "where":
+        result = where_chunks(*input_chunks)
+    elif kind == "scatter":
+        output_id = next(iter(program.outputs.values()))
+        output_meta = (program.meta or {})[output_id]
+        result = GLChunk(
+            tuple(int(size) for size in output_meta.shape),
+            dtype=output_meta.dtype,
+        )
+        plan = plan_launch(result.count, binding_count=4)
+        _dispatch(
+            _compile(_emit_captured_fused_program_source(
+                captured,
+                local_size=plan.local_size,
+            )),
+            input_chunks,
+            result,
+            plan,
         )
     elif kind == "slice":
         output_id = next(iter(program.outputs.values()))
@@ -4126,10 +8678,24 @@ def _emit_captured_fused_program_source(
             dtype=output_meta.dtype,
             local_size=local_size,
         )
+    if kind == "constant":
+        return emit_constant_source(
+            step.attrs["values"],
+            dtype=output_meta.dtype,
+            local_size=local_size,
+        )
     if kind == "arange":
         return emit_arange_source(
             step.attrs["start"],
             step.attrs.get("step", 1),
+            dtype=output_meta.dtype,
+            local_size=local_size,
+        )
+    if kind == "scatter":
+        return emit_scatter_source(
+            metadata[step.input_ids[0]].shape,
+            metadata[step.input_ids[1]].shape,
+            int(step.attrs.get("dim", 0)),
             dtype=output_meta.dtype,
             local_size=local_size,
         )
@@ -4213,6 +8779,21 @@ def _emit_captured_fused_program_source(
             dtype=source_meta.dtype,
             local_size=local_size,
         )
+    if kind == "where":
+        condition_meta, true_meta, false_meta = (
+            metadata[value_id] for value_id in step.input_ids
+        )
+        return emit_where_source(
+            tuple(condition_meta.shape or ()),
+            tuple(true_meta.shape or ()),
+            tuple(false_meta.shape or ()),
+            condition_dtype=condition_meta.dtype,
+            true_dtype=true_meta.dtype,
+            false_dtype=false_meta.dtype,
+            output_dtype=output_meta.dtype,
+            output_shape=tuple(output_meta.shape or ()),
+            local_size=local_size,
+        )
     if kind == "slice":
         slice_kind = step.attrs.get("slice_kind")
         if slice_kind == "axis":
@@ -4221,6 +8802,16 @@ def _emit_captured_fused_program_source(
                 int(step.attrs["dim"]),
                 int(step.attrs["start"]),
                 int(step.attrs["step"]),
+                int(step.attrs["count"]),
+                dtype=source_meta.dtype,
+                local_size=local_size,
+            )
+        if slice_kind == "flat":
+            return emit_slice_axis_source(
+                (int(step.attrs["source_count"]),),
+                0,
+                int(step.attrs["start"]),
+                int(step.attrs.get("step", 1)),
                 int(step.attrs["count"]),
                 dtype=source_meta.dtype,
                 local_size=local_size,
@@ -4239,9 +8830,246 @@ def _emit_captured_fused_program_source(
     raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
 
 
+def captured_program_snippet(
+    captured,
+    *,
+    base: int = 0,
+    local_size: int = _LOCAL_SIZE,
+) -> ShaderSnippet:
+    """Lower one captured numerical stage without finishing a shader."""
+
+    if getattr(captured, "stages", ()):
+        raise ValueError(
+            "lower captured stages individually before control composition"
+        )
+    program = captured.program
+    kind = (program.extras or {}).get("kernel_kind")
+    metadata = program.meta or {}
+    output_id = next(iter(program.outputs.values()))
+    output_meta = metadata[output_id]
+    if kind in {None, "linear_reshape_copy"}:
+        output_shape = tuple(int(size) for size in (output_meta.shape or ()))
+        return program_snippet(
+            program,
+            feed_shapes={
+                value_id: (
+                    output_shape
+                    if kind == "linear_reshape_copy"
+                    else tuple(int(size) for size in (
+                        metadata[value_id].shape or ()
+                    ))
+                )
+                for value_id in program.feeds
+            },
+            output_shape=output_shape,
+            allow_multiple_outputs=True,
+            base=base,
+        )
+
+    step = program.steps[0]
+    if kind == "fill":
+        return fill_snippet(
+            step.attrs["fill_value"], dtype=output_meta.dtype, base=base
+        )
+    if kind == "constant":
+        return constant_snippet(
+            step.attrs["values"], dtype=output_meta.dtype, base=base
+        )
+    if kind == "arange":
+        return arange_snippet(
+            step.attrs["start"],
+            step.attrs.get("step", 1),
+            dtype=output_meta.dtype,
+            base=base,
+        )
+    if kind == "scatter":
+        return scatter_snippet(
+            metadata[step.input_ids[0]].shape,
+            metadata[step.input_ids[1]].shape,
+            int(step.attrs.get("dim", 0)),
+            dtype=output_meta.dtype,
+            base=base,
+        )
+    source_meta = metadata[step.input_ids[0]]
+    if kind == "stack":
+        return stack_snippet(
+            tuple(source_meta.shape or ()),
+            len(step.input_ids),
+            int(step.attrs.get("dim", 0)),
+            input_dtypes=[
+                metadata[value_id].dtype for value_id in step.input_ids
+            ],
+            output_dtype=output_meta.dtype,
+            base=base,
+        )
+    if kind == "cat":
+        return cat_snippet(
+            [
+                tuple(metadata[value_id].shape or ())
+                for value_id in step.input_ids
+            ],
+            int(step.attrs.get("dim", 0)),
+            input_dtypes=[
+                metadata[value_id].dtype for value_id in step.input_ids
+            ],
+            output_dtype=output_meta.dtype,
+            base=base,
+        )
+    if kind == "expand":
+        return expand_snippet(
+            tuple(source_meta.shape or ()),
+            tuple(step.attrs["shape"]),
+            dtype=source_meta.dtype,
+            base=base,
+        )
+    if kind == "permute":
+        return permute_snippet(
+            tuple(source_meta.shape or ()),
+            tuple(step.attrs["dims"]),
+            dtype=source_meta.dtype,
+            base=base,
+        )
+    if kind == "repeat":
+        return repeat_snippet(
+            tuple(source_meta.shape or ()),
+            step.attrs.get("repeats"),
+            int(step.attrs.get("dim", 0)),
+            dtype=source_meta.dtype,
+            base=base,
+        )
+    if kind == "matmul":
+        right_meta = metadata[step.input_ids[1]]
+        return matmul_snippet(
+            tuple(source_meta.shape or ()),
+            tuple(right_meta.shape or ()),
+            left_dtype=source_meta.dtype,
+            right_dtype=right_meta.dtype,
+            output_dtype=output_meta.dtype,
+            local_size=local_size,
+            base=base,
+        )
+    if kind == "index_select":
+        index_meta = metadata[step.input_ids[1]]
+        return index_select_snippet(
+            tuple(source_meta.shape or ()),
+            int(step.attrs.get("dim", 0)),
+            _shape_product(tuple(index_meta.shape or ())),
+            dtype=source_meta.dtype,
+            index_dtype=index_meta.dtype,
+            base=base,
+        )
+    if kind == "reduce":
+        return reduce_snippet(
+            step.attrs["reduce_op"],
+            tuple(source_meta.shape or ()),
+            step.attrs.get("axis"),
+            bool(step.attrs.get("keepdim", False)),
+            dtype=source_meta.dtype,
+            base=base,
+        )
+    if kind == "cumsum":
+        return cumsum_snippet(
+            tuple(source_meta.shape or ()),
+            int(step.attrs.get("dim", 0)),
+            dtype=source_meta.dtype,
+            base=base,
+        )
+    if kind == "where":
+        condition_meta, true_meta, false_meta = (
+            metadata[value_id] for value_id in step.input_ids
+        )
+        return where_snippet(
+            tuple(condition_meta.shape or ()),
+            tuple(true_meta.shape or ()),
+            tuple(false_meta.shape or ()),
+            condition_dtype=condition_meta.dtype,
+            true_dtype=true_meta.dtype,
+            false_dtype=false_meta.dtype,
+            output_dtype=output_meta.dtype,
+            output_shape=tuple(output_meta.shape or ()),
+            base=base,
+        )
+    if kind == "slice":
+        slice_kind = step.attrs.get("slice_kind")
+        if slice_kind in {"axis", "flat"}:
+            shape = (
+                tuple(source_meta.shape or ())
+                if slice_kind == "axis"
+                else (int(step.attrs["source_count"]),)
+            )
+            return slice_axis_snippet(
+                shape,
+                int(step.attrs["dim"]) if slice_kind == "axis" else 0,
+                int(step.attrs["start"]),
+                int(step.attrs.get("step", 1)),
+                int(step.attrs["count"]),
+                dtype=source_meta.dtype,
+                base=base,
+            )
+        if slice_kind == "index_select":
+            index_meta = metadata[step.input_ids[1]]
+            return index_select_snippet(
+                tuple(source_meta.shape or ()),
+                int(step.attrs["dim"]),
+                _shape_product(tuple(index_meta.shape or ())),
+                dtype=source_meta.dtype,
+                index_dtype=index_meta.dtype,
+                base=base,
+            )
+    raise ValueError(f"unsupported captured GLSL kernel kind {kind!r}")
+
+
 def compile_captured_fused_program(captured) -> str:
     """Compile and cache the shader for one captured numerical region."""
 
+    stages = tuple(getattr(captured, "stages", ()) or ())
+    if stages:
+        return "\n".join(
+            f"// captured stage {index}\n"
+            + compile_captured_fused_program(type(captured)(stage, {}))
+            for index, stage in enumerate(stages)
+        )
+    program = captured.program
+    kind = (program.extras or {}).get("kernel_kind")
+    if kind == "stack":
+        step = program.steps[0]
+        max_inputs = _compute_limits().max_dispatch_ssbo_blocks - 1
+        if len(step.input_ids) > max_inputs:
+            metadata = program.meta or {}
+            dim = int(step.attrs.get("dim", 0))
+            groups = [
+                step.input_ids[start:start + max_inputs]
+                for start in range(0, len(step.input_ids), max_inputs)
+            ]
+            sources = []
+            partial_shapes = []
+            output_dtype = metadata[
+                next(iter(program.outputs.values()))
+            ].dtype
+            for group in groups:
+                base_shape = tuple(metadata[group[0]].shape or ())
+                _, normalized_dim, partial_shape = _validate_stack_layout(
+                    base_shape, len(group), dim
+                )
+                partial_shapes.append(partial_shape)
+                source = emit_stack_source(
+                    base_shape,
+                    len(group),
+                    normalized_dim,
+                    input_dtypes=[metadata[value_id].dtype for value_id in group],
+                    output_dtype=output_dtype,
+                )
+                _compile(source)
+                sources.append(source)
+            cat_source = emit_cat_source(
+                partial_shapes,
+                normalized_dim,
+                input_dtypes=[output_dtype] * len(partial_shapes),
+                output_dtype=output_dtype,
+            )
+            _compile(cat_source)
+            sources.append(cat_source)
+            return "\n".join(sources)
     source = _emit_captured_fused_program_source(captured)
     _compile(source)
     return source

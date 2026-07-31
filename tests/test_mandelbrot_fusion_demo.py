@@ -9,6 +9,7 @@ from src.common.tensors.accelerator_backends.demo_mandelbrot_fusion import (
     dream_parameters,
     normalized_plane,
     parametric_mandelbrot_escape,
+    benchmark_cpu_mandelbrot,
 )
 from src.common.tensors.accelerator_backends.demo_mandelbrot_fusion import (
     mandelbrot_escape,
@@ -109,3 +110,28 @@ def test_dream_path_preserves_a_detailed_mandelbrot_chart():
             expected_span *= np.exp(0.35 * 0.08 * (0.5 - bass))
             assert abs(recovered_center - expected_center) < 1e-12
             assert abs(recovered_span - expected_span) < 1e-12
+
+
+def test_compiled_c_shell_matches_numpy_cpu_shell():
+    kwargs = dict(
+        width=64,
+        height=32,
+        iterations=20,
+        center=complex(-0.743643887, 0.131825904),
+        span=0.004,
+        repeats=1,
+    )
+    numpy_result, numpy_times = benchmark_cpu_mandelbrot(
+        shell="python",
+        backend="numpy",
+        **kwargs,
+    )
+    c_result, c_times = benchmark_cpu_mandelbrot(
+        shell="c",
+        backend="c",
+        **kwargs,
+    )
+
+    np.testing.assert_array_equal(c_result, numpy_result)
+    assert numpy_times[0] > 0
+    assert c_times[0] > 0

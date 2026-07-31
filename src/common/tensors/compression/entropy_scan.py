@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from ..abstraction import AbstractTensor
-from ..autograd import autograd
 from .bitstream import PackedBitstream, compact_codewords
 from .entropy_symbols import EntropySymbolSequence
 from .huffman import CanonicalHuffmanTable, HuffmanCodewords
@@ -94,13 +93,12 @@ def interleave_codewords_and_payloads(
     code_bits = codewords.bits.reshape(
         symbol_count, codewords.max_bits
     ) * code_valid
-    with autograd.no_grad():
-        target = AbstractTensor.scatter(
-            target,
-            safe_code_destinations.flatten(),
-            code_bits.flatten(),
-            dim=0,
-        )
+    target = AbstractTensor.scatter(
+        target,
+        safe_code_destinations.flatten(),
+        code_bits.flatten(),
+        dim=0,
+    )
 
     payload_positions = AbstractTensor.arange(
         payload_limit, cls=type(payload_widths)
@@ -126,13 +124,12 @@ def interleave_codewords_and_payloads(
         payload_destinations * numeric_payload_valid
         + scratch * (1 - numeric_payload_valid)
     ).to_dtype("int64")
-    with autograd.no_grad():
-        target = AbstractTensor.scatter(
-            target,
-            safe_payload_destinations.flatten(),
-            payload_bits.flatten(),
-            dim=0,
-        )
+    target = AbstractTensor.scatter(
+        target,
+        safe_payload_destinations.flatten(),
+        payload_bits.flatten(),
+        dim=0,
+    )
 
     total_lengths = lengths + payload_widths
     positions = AbstractTensor.arange(row_width, cls=type(lengths))
@@ -333,13 +330,12 @@ def decode_entropy_octets(
         target = AbstractTensor.zeros(
             (bit_count + 1,), cls=type(field)
         )
-        with autograd.no_grad():
-            target = AbstractTensor.scatter(
-                target,
-                destinations,
-                field * hit_at_bit,
-                dim=0,
-            )
+        target = AbstractTensor.scatter(
+            target,
+            destinations,
+            field * hit_at_bit,
+            dim=0,
+        )
         return target[:bit_count]
 
     slots = AbstractTensor.arange(bit_count, cls=type(octets))

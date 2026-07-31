@@ -6,6 +6,7 @@ from src.common.tensors import AbstractTensor
 from src.common.tensors.abstract_nn import ProgramRunner
 from src.common.tensors.accelerator_backends.c_primitive_program import (
     compile_elementwise_tape,
+    compile_recorded_fused_tape,
     execute_fused_program,
     prepare_fused_program,
 )
@@ -136,6 +137,80 @@ def test_integer_trace_preserves_tape_dtype_in_fused_metadata():
     assert tape.node(result).ctx["result_dtype"] == result.dtype
     assert captured.program.meta[feed_id].dtype == "int32"
     assert captured.program.meta[output_id].dtype == "int32"
+
+
+def test_one_element_tensor_is_not_frozen_as_a_binary_literal():
+    with autograd.forward_capture() as tape:
+        values = NumPyTensorOperations.tensor(
+            np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+        )
+        runtime_tensor = NumPyTensorOperations.tensor(
+            np.asarray([4.0], dtype=np.float32)
+        )
+        result = values + runtime_tensor
+
+    captured = compile_elementwise_tape(tape, result)
+    step = captured.program.steps[-1]
+
+    assert id(runtime_tensor) in captured.program.feeds
+    assert step.input_ids == [id(values), id(runtime_tensor)]
+    assert "right_scalar" not in step.attrs
+
+
+def test_one_element_tensor_remains_the_input_to_a_unary_cast():
+    with autograd.forward_capture() as tape:
+        runtime_tensor = NumPyTensorOperations.tensor(
+            np.asarray([3.75], dtype=np.float32)
+        )
+        result = runtime_tensor.to_dtype("int32")
+
+    captured = compile_elementwise_tape(tape, result)
+    step = captured.program.steps[-1]
+
+    assert id(runtime_tensor) in captured.program.feeds
+    assert step.op_name == "fptosi"
+    assert step.input_ids == [id(runtime_tensor)]
+
+
+def test_requested_empty_tensor_output_may_pass_through_a_recorded_region():
+    empty = NumPyTensorOperations.tensor(
+        np.asarray([], dtype=np.float32)
+    )
+    source = NumPyTensorOperations.tensor(
+        np.asarray([1.0, 2.0], dtype=np.float32)
+    )
+    with autograd.forward_capture() as tape:
+        computed = source + source
+
+    captured = compile_recorded_fused_tape(
+        tape,
+        outputs={"computed": computed, "empty": empty},
+    )
+
+    assert captured.program.outputs["empty"] == id(empty)
+    assert id(empty) in captured.program.feeds
+    assert captured.program.meta[id(empty)].shape == (0,)
+
+
+def test_strict_requested_outputs_require_a_recorded_producer():
+    passthrough = NumPyTensorOperations.tensor(
+        np.asarray([1.0], dtype=np.float32)
+    )
+    source = NumPyTensorOperations.tensor(
+        np.asarray([2.0], dtype=np.float32)
+    )
+    with autograd.forward_capture() as tape:
+        computed = source + source
+
+    with pytest.raises(
+        ValueError,
+        match="requested captured output is not produced",
+    ):
+        compile_recorded_fused_tape(
+            tape,
+            outputs={"computed": computed, "passthrough": passthrough},
+            strict_outputs=True,
+        )
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "c"])

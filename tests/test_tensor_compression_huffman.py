@@ -8,12 +8,29 @@ from src.common.tensors.compression.huffman import (
     length_limited_huffman_code_lengths,
 )
 from src.common.tensors.compression.bitstream import (
+    concatenate_resident_byte_packets,
     compact_codewords,
     decode_huffman_octets,
     decode_with_provenance,
+    resident_byte_packet,
     tensor_octets_to_bytes,
     unpack_octets,
 )
+
+
+def test_resident_byte_packet_concatenation_keeps_count_as_tensor_state():
+    with AT.use_backend("numpy"):
+        first = resident_byte_packet(AT.tensor([1, 2, 99, 99]), AT.tensor(2))
+        second = resident_byte_packet(
+            AT.tensor([3, 4, 5, 99]),
+            AT.tensor(3),
+        )
+        combined = concatenate_resident_byte_packets((first, second))
+
+    assert combined.capacity == 8
+    assert combined.byte_count.tolist() == [5]
+    assert combined.octets.tolist()[:5] == [1, 2, 3, 4, 5]
+    assert combined.to_bytes() == b"\x01\x02\x03\x04\x05"
 from src.common.tensors.compression.jpeg.huffman import (
     jpeg_standard_dc_luminance,
 )
@@ -304,3 +321,4 @@ def test_frequency_tree_is_built_in_abstract_tensor(backend):
 
     assert lengths.tolist() == [4, 4, 3, 3, 3, 1]
     assert table.lengths.tolist() == [4, 4, 3, 3, 3, 1]
+    resident_byte_packet,

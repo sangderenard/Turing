@@ -4,24 +4,46 @@ from __future__ import annotations
 
 import ast
 import builtins
+import gc
 import operator
 import time
 import traceback
 from collections import deque
 from contextlib import contextmanager
-from typing import Any
+from contextvars import ContextVar
+from typing import Any, Iterable, Mapping
 
 import networkx as nx
+import numpy as np
 
 from .deployment_fifo import DeploymentFIFO
+from .control_source import (
+    ControlProgram,
+    SequenceBlock,
+    StreamPublishBlock,
+    ValidationBlock,
+    overlay_scheduled_control,
+    project_control_regions,
+)
+from .hierarchical_control import compose_hierarchical_control
+from .hierarchical_plan import (
+    PlanCall,
+    PlanClosure,
+    PlanLine,
+    assign_hierarchy_ids,
+    reduce_hierarchy_identities,
+)
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
+    analyze_shader_loop_reductions,
+    evaporate_unrolled_loops,
+    materialize_retained_loop_ports,
 )
 from .process_graph_callable import EphemeralProcessGraphCallable
 from .process_graph_fusion import (
     extract_clean_process_subgraph,
-    serialize_scheduled_operator_dispatches,
+    reduce_scheduled_shader_regions,
 )
 from .shell_reference_tables import build_shell_reference_tables
 from ..common.tensors.abstraction import AbstractTensor
@@ -33,7 +55,10 @@ from ..common.tensors.accelerator_backends.c_primitive_program import (
     compile_recorded_fused_tape,
 )
 from ..common.tensors.accelerator_backends.glsl_backend import (
+    InstalledGLSLControlShell,
+    build_control_shader_artifact,
     compile_captured_fused_program,
+    compose_control_shader,
     dispatch_stats,
     emit_multi_output_program_source,
     execute_captured_fused_program,
@@ -41,16 +66,185 @@ from ..common.tensors.accelerator_backends.glsl_backend import (
 from ..common.tensors.accelerator_backends.glsl_tensor_backend import (
     GLSLTensorOperations,
 )
-from ..common.tensors.autograd import autograd
+from ..common.tensors.accelerator_backends.precompile_observer_backend import (
+    PrecompileObserverTensorOperations,
+)
+from ..common.tensors.autograd import GradTape, autograd
 from ..common.tensors.fused_ir import (
     FusedProgram,
+    Meta,
     OpStep,
+    ordered_feed_ids,
 )
+from ..common.tensors.operator_catalog import ACCESSOR_OPERATORS
 from ..transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
 from ..transmogrifier.operator_defs import (
     abstract_tensor_funcs,
     abstract_tensor_sigs,
 )
+
+
+_scheduled_capture_backend: ContextVar[str] = ContextVar(
+    "scheduled_capture_backend",
+    default="glsl",
+)
+
+
+@contextmanager
+def _use_scheduled_capture_backend(name: str):
+    """Select the numerical observer used by one discovery traversal."""
+
+    token = _scheduled_capture_backend.set(str(name))
+    try:
+        yield
+    finally:
+        _scheduled_capture_backend.reset(token)
+
+
+_planned_capture_context: ContextVar[dict[str, Any] | None] = ContextVar(
+    "planned_process_graph_capture",
+    default=None,
+)
+
+
+def _observe_process_graph_node(
+    node_id: int,
+    parent_ids: tuple[int, ...],
+    parent_values: tuple[Any, ...],
+    result: Any,
+) -> Any:
+    """Correlate one planned node with its immediate primitive occurrence.
+
+    The ProcessGraph node ID is supplied by generated region code at the exact
+    operation invocation.  The observer records only integer IDs and never
+    compares payloads, wrappers, storage, shapes, or values.  It therefore
+    cannot infer an alias or dependency; it only connects the already-planned
+    operation to the primitive implementation occurrence revealed by the one
+    forward capture.
+    """
+
+    context = _planned_capture_context.get()
+    if context is None:
+        return result
+    tape = context["tape"]
+    capture_id = id(result)
+    if capture_id in tape._nodes:
+        primitive = tape._nodes[capture_id]
+        existing_owner = primitive.ctx.get("process_graph_node_id")
+        if existing_owner is not None:
+            # A structural Store, call return, or other pass-through node may
+            # observe the exact same tensor produced by an earlier operation.
+            # That does not create a new primitive or a new value identity.
+            # Producer ownership is single-assignment; the ProcessGraph's
+            # explicit call/store binding carries the alias relationship.
+            return result
+        context["node_capture_ids"].setdefault(
+            int(node_id), []
+        ).append(int(capture_id))
+        primitive.ctx["process_graph_node_id"] = int(node_id)
+        graph = context.get("graph")
+        collection_owners = context.get("collection_owner_ids", frozenset())
+
+        def collection_source(value_id: int) -> int | None:
+            current = int(value_id)
+            seen = set()
+            while current not in seen:
+                seen.add(current)
+                if current in collection_owners:
+                    return current
+                if graph is None or current not in graph.G:
+                    return None
+                attributes = graph.G.nodes[current].get("attributes") or {}
+                if attributes.get("producer_kind") not in {
+                    "aggregate_materialization",
+                    "loop_materialization",
+                }:
+                    return None
+                sources = tuple(map(
+                    int,
+                    attributes.get("materialized_source_value_ids", ()),
+                ))
+                if len(sources) != 1:
+                    return None
+                current = sources[0]
+            return None
+
+        collection_parents = tuple(dict.fromkeys(
+            owner
+            for parent_id in parent_ids
+            if (owner := collection_source(int(parent_id))) is not None
+        ))
+        params = primitive.ctx.get("params", {})
+        raw_materialization_dim = params.get("dim", 0)
+        materialization_dim = int(
+            0
+            if raw_materialization_dim is None
+            else raw_materialization_dim
+        )
+        if (
+            len(collection_parents) == 1
+            and str(primitive.op) in {"stack", "cat", "concat"}
+            and materialization_dim == 0
+        ):
+            # Only a planner-owned resident collection may cross this
+            # producer boundary as a zero-copy view.  A Python list/tuple
+            # observed during discovery proves nothing about storage
+            # ownership.  Leading-axis stack/cat preserves the resident
+            # collection's contiguous publication order; other axes require
+            # a real numerical materialization producer.
+            context["collection_materializations"][int(capture_id)] = (
+                collection_parents[0]
+            )
+            return result
+        # The generated ProcessGraph callsite supplies each parent ID beside
+        # the exact Python value used for that operand.  Use those pairs
+        # directly.  GradTape's parent list/slot convention is backend
+        # bookkeeping and is not the ProcessGraph ABI.
+        primitive_parents = tuple(sorted(
+            primitive.parents,
+            key=lambda parent: int(parent[1]),
+        ))
+        if primitive_parents:
+            primitive_ids = {
+                int(primitive_id)
+                for primitive_id, _slot in primitive_parents
+            }
+            exact = []
+            matched_graph_ids = set()
+            matched_primitive_ids = set()
+            for graph_id, parent_value in zip(
+                parent_ids, parent_values
+            ):
+                primitive_id = id(parent_value)
+                if primitive_id not in primitive_ids:
+                    continue
+                exact.append((int(primitive_id), int(graph_id)))
+                matched_graph_ids.add(int(graph_id))
+                matched_primitive_ids.add(int(primitive_id))
+            remaining_primitives = tuple(
+                int(primitive_id)
+                for primitive_id, _slot in primitive_parents
+                if int(primitive_id) not in matched_primitive_ids
+            )
+            remaining_graph_ids = tuple(
+                int(graph_id)
+                for graph_id in parent_ids
+                if int(graph_id) not in matched_graph_ids
+            )
+            # A scalar literal can be tensorized inside the AbstractTensor
+            # operator, so its source Python value has no tape ID.  Once all
+            # exact tensor operands are removed, the remaining one-to-one
+            # socket is unambiguous.
+            if len(remaining_primitives) == len(remaining_graph_ids):
+                exact.extend(zip(
+                    remaining_primitives,
+                    remaining_graph_ids,
+                ))
+            if exact:
+                context["step_input_ids"][int(capture_id)] = tuple(
+                    exact
+                )
+    return result
 
 
 class DeploymentErrorBuffer:
@@ -114,14 +308,57 @@ class DeploymentErrorBuffer:
 class DeploymentProfiler:
     """Single-owner hierarchical profiler shared by a deployment shell tree."""
 
-    def __init__(self, enabled: bool = False, *, history: int = 240) -> None:
+    def __init__(
+        self,
+        enabled: bool = False,
+        *,
+        history: int = 240,
+        verbose: bool = False,
+    ) -> None:
         self.enabled = bool(enabled)
+        self.verbose = bool(verbose)
         self.history = deque(maxlen=max(1, int(history)))
+        self.trace_history = deque(maxlen=max(1, int(history)) * 64)
+        self.device_trace_history = deque(
+            maxlen=max(1, int(history)) * 256
+        )
         self.depth = 0
         self.sequence = 0
         self._events: list[dict[str, Any]] = []
         self._root_started_ns = 0
+        self._gpu_query_depth = 0
+        self._runtime_suppression = 0
         self.error_buffer = DeploymentErrorBuffer(history)
+
+    def trace(
+        self,
+        *,
+        path: str,
+        section: str,
+        label: str,
+        fields: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.verbose:
+            return
+        self.sequence += 1
+        record = {
+            "sequence": self.sequence,
+            "path": str(path),
+            "section": str(section),
+            "label": str(label),
+            "fields": dict(fields or {}),
+        }
+        self.trace_history.append(record)
+        details = " | ".join(
+            f"{name}={value}"
+            for name, value in record["fields"].items()
+        )
+        print(
+            f"[shell-trace {record['sequence']}] {record['path']} | "
+            f"{record['section']} | {record['label']}"
+            + (f" | {details}" if details else ""),
+            flush=True,
+        )
 
     @property
     def exceptions(self):
@@ -130,7 +367,7 @@ class DeploymentProfiler:
         return self.error_buffer.records
 
     def begin_shell(self, path: str) -> tuple[int, bool] | None:
-        if not self.enabled:
+        if not self.enabled or self._runtime_suppression:
             return None
         root = self.depth == 0
         if root:
@@ -168,8 +405,9 @@ class DeploymentProfiler:
         cpu_ms: float,
         dispatches: int = 0,
         gpu_query: int | None = None,
+        gpu_ms: float | None = None,
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or self._runtime_suppression:
             return
         self._events.append({
             "path": path,
@@ -177,8 +415,57 @@ class DeploymentProfiler:
             "label": label,
             "cpu_ms": float(cpu_ms),
             "gpu_query": gpu_query,
+            "gpu_ms": 0.0 if gpu_ms is None else float(gpu_ms),
             "dispatches": int(dispatches),
         })
+
+    def record_device_trace(
+        self,
+        *,
+        path: str,
+        records,
+        header,
+    ) -> None:
+        """Ingest records written by a compiled shell's logging SSBO."""
+
+        if not self.enabled or self._runtime_suppression:
+            return
+        # ``_finish_root`` assigns this number to the invocation after the
+        # device records have been read.  Keeping it on every SSBO record lets
+        # summary(window=...) apply exactly the same window to host timings and
+        # shader-written profiling data.
+        invocation = self.sequence + 1
+        labels = {
+            1: "closure-enter",
+            2: "loop-enter",
+            3: "region-execute",
+            4: "state-commit",
+            5: "output-publish",
+            8: "snippet-output",
+            9: "closure-source-lifetime",
+            255: "error",
+        }
+        for code, subject, payload0, payload1 in records:
+            self.device_trace_history.append({
+                "invocation": invocation,
+                "path": str(path),
+                "code": int(code),
+                "label": labels.get(int(code), f"event-{int(code)}"),
+                "subject": int(subject),
+                "payload0": int(payload0),
+                "payload1": int(payload1),
+            })
+        dropped = int(header[1]) if len(header) > 1 else 0
+        if dropped:
+            self.device_trace_history.append({
+                "invocation": invocation,
+                "path": str(path),
+                "code": 255,
+                "label": "ssbo-overflow",
+                "subject": 0,
+                "payload0": dropped,
+                "payload1": int(header[0]),
+            })
 
     def record_exception(
         self,
@@ -205,7 +492,7 @@ class DeploymentProfiler:
 
         rows: dict[tuple[str, str, str], dict[str, Any]] = {}
         for event in self._events:
-            gpu_ms = 0.0
+            gpu_ms = float(event.pop("gpu_ms", 0.0))
             query = event.pop("gpu_query")
             if query is not None:
                 elapsed_ns = ctypes.c_uint64()
@@ -251,10 +538,12 @@ class DeploymentProfiler:
                 "total_ms": 0.0,
                 "rows": (),
                 "exceptions": self.error_buffer.snapshot(),
+                "device_events": tuple(self.device_trace_history),
             }
         return {
             **self.history[-1],
             "exceptions": self.error_buffer.snapshot(),
+            "device_events": tuple(self.device_trace_history),
         }
 
     def summary(self, *, window: int = 60) -> dict[str, Any]:
@@ -265,6 +554,7 @@ class DeploymentProfiler:
                 "total_mean_ms": 0.0,
                 "total_p95_ms": 0.0,
                 "rows": (),
+                "device_rows": (),
             }
 
         def percentile95(values):
@@ -311,11 +601,43 @@ class DeploymentProfiler:
                 "dispatches_mean": sum(dispatches) / len(dispatches),
             })
         totals = [report["total_ms"] for report in reports]
+        report_sequences = {
+            int(report["sequence"]) for report in reports
+        }
+        device_groups: dict[tuple[str, int, str], dict[str, int]] = {}
+        for event in self.device_trace_history:
+            if int(event.get("invocation", -1)) not in report_sequences:
+                continue
+            key = (
+                str(event["path"]),
+                int(event["code"]),
+                str(event["label"]),
+            )
+            group = device_groups.setdefault(key, {
+                "events": 0,
+                "payload0": 0,
+                "payload1": 0,
+            })
+            group["events"] += 1
+            group["payload0"] += int(event["payload0"])
+            group["payload1"] += int(event["payload1"])
+        device_rows = tuple({
+            "path": path,
+            "code": code,
+            "label": label,
+            "events_mean": values["events"] / len(reports),
+            "payload0_mean": values["payload0"] / len(reports),
+            "payload1_mean": values["payload1"] / len(reports),
+        } for (path, code, label), values in sorted(
+            device_groups.items(),
+            key=lambda item: (item[0][0], item[0][1]),
+        ))
         return {
             "frames": len(reports),
             "total_mean_ms": sum(totals) / len(totals),
             "total_p95_ms": percentile95(totals),
             "rows": tuple(rows),
+            "device_rows": device_rows,
         }
 
 
@@ -345,7 +667,16 @@ def _attach_profiler(
     for ephemeral in getattr(shell, "ephemeral_callables", ()):
         ephemeral.error_buffer = profiler.error_buffer
         ephemeral.compiler.error_buffer = profiler.error_buffer
-    for reference, child in shell.function_shells.items():
+    children = (
+        *getattr(shell, "function_shells", {}).items(),
+        *(
+            (f"callsite-{node_id}", child)
+            for node_id, child in getattr(
+                shell, "callsite_function_shells", {}
+            ).items()
+        ),
+    )
+    for reference, child in children:
         if id(child) in visited:
             continue
         _attach_profiler(
@@ -354,6 +685,3097 @@ def _attach_profiler(
             f"{path}/{_shell_profile_name(child)}@{reference}",
             visited=visited,
         )
+
+
+def _walk_planned_shells(shell: Any):
+    """Yield every planner-created shell instance exactly once."""
+    pending = [shell]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend(
+            getattr(current, "function_shells", {}).values()
+        )
+        pending.extend(
+            getattr(current, "callsite_function_shells", {}).values()
+        )
+
+
+def _deployment_program_table_lines(shell: Any) -> tuple[str, ...]:
+    """Render the planner-owned shell hierarchy and region compartments."""
+
+    def shell_name(current):
+        return str(
+            current.process_graph.G.graph.get("function_name")
+            or type(current).__name__
+        )
+
+    def render_table(headers, rows):
+        rows = [tuple(str(cell) for cell in row) for row in rows]
+        widths = [
+            max(len(str(header)), *(len(row[index]) for row in rows))
+            for index, header in enumerate(headers)
+        ]
+        yield " | ".join(
+            str(header).ljust(widths[index])
+            for index, header in enumerate(headers)
+        )
+        yield "-+-".join("-" * width for width in widths)
+        for row in rows:
+            yield " | ".join(
+                cell.ljust(widths[index])
+                for index, cell in enumerate(row)
+            )
+
+    hierarchy = []
+    ordered_shells = []
+    seen = set()
+
+    def visit(current, depth, compartment):
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        shell_index = len(ordered_shells)
+        ordered_shells.append(current)
+        compiled = {
+            key[-2] if isinstance(key, tuple) else key
+            for key in current.captured_region_programs
+        }
+        hierarchy.append((
+            shell_index,
+            depth,
+            compartment,
+            ("  " * depth) + shell_name(current),
+            current.source_node_count,
+            current.primitive_count,
+            current.dispatch_count,
+            len(compiled),
+            len(current.coordinator_region_indices),
+            current.planned_invocation_slots,
+        ))
+        for node_id, child in sorted(
+            current.callsite_function_shells.items(),
+            key=lambda item: item[0],
+        ):
+            visit(child, depth + 1, f"callsite-{node_id}")
+
+    visit(shell, 0, "root")
+    lines = [
+        f"runtime selection: {shell.control_runtime}",
+        "compiled program shell hierarchy",
+    ]
+    lines.extend(render_table(
+        (
+            "id", "depth", "compartment", "shell", "graph", "scheduled",
+            "regions", "shaders", "coord", "slots",
+        ),
+        hierarchy,
+    ))
+
+    regions = []
+    for shell_index, current in enumerate(ordered_shells):
+        compiled = {
+            key[-2] if isinstance(key, tuple) else key
+            for key in current.captured_region_programs
+        }
+        for region_index, subgraph in enumerate(current.dispatch_subgraphs):
+            if region_index in current.coordinator_region_indices:
+                kind = "coordinator"
+            elif region_index in compiled:
+                kind = "shader"
+            else:
+                kind = "uncaptured"
+            operations = " -> ".join(
+                str(
+                    subgraph.G.nodes[node_id].get("op")
+                    or subgraph.G.nodes[node_id].get("type")
+                )
+                for node_id in subgraph.G.graph.get("deployment_nodes", ())
+            )
+            regions.append((
+                shell_index,
+                region_index,
+                kind,
+                len(subgraph.G.graph.get("deployment_inputs", ())),
+                len(subgraph.G.graph.get("deployment_outputs", ())),
+                len(subgraph.G.graph.get("compartment_schedule", ())),
+                ",".join(subgraph.G.graph.get("rewrite_history", ())) or "-",
+                operations or "-",
+            ))
+    lines.extend(("", "compiled program region compartments"))
+    lines.extend(render_table(
+        (
+            "shell", "region", "kind", "in", "out", "waves", "identities",
+            "operations",
+        ),
+        regions,
+    ))
+    loop_reductions = []
+    for shell_index, current in enumerate(ordered_shells):
+        for reduction in current.loop_shader_reductions:
+            loop_reductions.append((
+                shell_index,
+                reduction.loop_node_id,
+                ",".join(map(str, reduction.region_indices)) or "-",
+                "collapse" if reduction.collapsible else "coordinator",
+                (
+                    "dynamic"
+                    if reduction.estimated_dispatches_removed is None
+                    else reduction.estimated_dispatches_removed
+                ),
+                ",".join(reduction.blockers) or "-",
+                ",".join(
+                    name for name, _initial, _updated
+                    in reduction.carried_bindings
+                ) or "-",
+            ))
+    if loop_reductions:
+        lines.extend(("", "planner loop-to-shader reduction analysis"))
+        lines.extend(render_table(
+            (
+                "shell", "loop", "regions", "verdict",
+                "dispatches removed", "blockers", "carried",
+            ),
+            loop_reductions,
+        ))
+    return tuple(lines)
+
+
+def _identity_parameter_projection(graph) -> tuple[int, str] | None:
+    """Recognize a closure that only forwards or scalar-projects a parameter."""
+
+    identities = graph.graph.get("identity_table") or {}
+    outputs = tuple(
+        int(identities[name][-1])
+        for name in graph.graph.get("function_outputs", ())
+        if identities.get(name)
+    )
+    if len(outputs) != 1:
+        return None
+    current = outputs[0]
+    data = graph.nodes[current]
+    if (
+        data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+    ):
+        return current, "direct"
+    attributes = data.get("attributes") or {}
+    if not (
+        isinstance(data.get("expr_obj"), ast.Call)
+        and str(attributes.get("static_python_reference", "")).rsplit(
+            ".", 1
+        )[-1] == "bool"
+    ):
+        return None
+    parents = tuple(
+        int(parent)
+        for parent, role in (data.get("parents") or ())
+        if str(role) not in {"callee", "func", "definition"}
+    )
+    if len(parents) != 1:
+        return None
+    item_id = parents[0]
+    item = graph.nodes[item_id]
+    if str(item.get("op", "")).lower() != "item":
+        return None
+    item_parents = tuple(
+        int(parent)
+        for parent, role in (item.get("parents") or ())
+        if str(role) in {"operand", "value", "base", "arg:0", "arg0"}
+    )
+    if len(item_parents) != 1:
+        return None
+    source = item_parents[0]
+    source_data = graph.nodes[source]
+    if (
+        source_data.get("type") == "Input"
+        and (source_data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+    ):
+        return source, "device_scalar"
+    return None
+
+
+def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
+    """Translate ordinary ``if predicate: raise`` guards into typed control."""
+
+    graph = shell.process_graph.G
+    expression_nodes = {
+        id(data.get("expr_obj")): int(node_id)
+        for node_id, data in graph.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    blocks = []
+    for node_id, data in graph.nodes(data=True):
+        statement = data.get("expr_obj")
+        if not (
+            isinstance(statement, ast.If)
+            and statement.body
+            and all(isinstance(item, ast.Raise) for item in statement.body)
+            and not statement.orelse
+        ):
+            continue
+        test = statement.test
+        raises_when_true = True
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            test = test.operand
+            raises_when_true = False
+        predicate_id = expression_nodes.get(id(test))
+        if predicate_id is None:
+            continue
+        child = shell.callsite_function_shells.get(predicate_id)
+        if child is not None:
+            projection = _identity_parameter_projection(
+                child.process_graph.G
+            )
+            if projection is None or projection[1] != "device_scalar":
+                continue
+            # The projection call itself has no device storage after hierarchy
+            # identity reduction.  Bind validation to the caller value passed
+            # into the projected parameter; retaining the callsite ID here
+            # creates a fake SSBO operand for a closure that no longer exists.
+            predicate_id = next((
+                int(parent)
+                for parent, role in (
+                    graph.nodes[predicate_id].get("parents") or ()
+                )
+                if str(role) in {"arg:0", "arg0", "operand", "value"}
+            ), predicate_id)
+        else:
+            # Static scalar/shape guards are resolved during planning; only a
+            # tensor scalar projection becomes runtime validation control.
+            continue
+        blocks.append(ValidationBlock(
+            predicate_id,
+            int(node_id),
+            expect_true=not raises_when_true,
+        ))
+    return tuple(blocks)
+
+
+def _positional_argument_index(role: str) -> int | None:
+    """Normalize the two ProcessGraph spellings used for positional edges."""
+
+    role = str(role)
+    if role.startswith("arg:") and role[4:].isdigit():
+        return int(role[4:])
+    if role.startswith("arg") and role[3:].isdigit():
+        return int(role[3:])
+    return None
+
+
+def _method_parameter_layout(graph: Any) -> tuple[
+    str | None, tuple[str, ...], tuple[str, ...]
+]:
+    """Return receiver, positional-call parameters, and every parameter.
+
+    ProcessGraph parameter identities are SSA-oriented and their combined
+    ``function_parameters`` tuple is not an ABI guarantee: in particular an
+    instance receiver can appear after another parameter.  Call binding must
+    identify the receiver as a receiver, not manufacture an offset into that
+    tuple.  The source spellings ``self`` and ``cls`` are authoritative when
+    retained; a source positional list is the fallback for unconventional
+    receiver names.
+    """
+
+    metadata = graph.graph
+    all_parameters = tuple(metadata.get("function_parameters", ()))
+    positional = tuple(
+        metadata.get("positional_parameters", ())
+        or all_parameters
+    )
+    binding = metadata.get("method_binding")
+    receiver = None
+    if binding == "instance":
+        receiver = next(
+            (name for name in all_parameters if name == "self"),
+            positional[0] if positional else None,
+        )
+    elif binding == "class":
+        receiver = next(
+            (name for name in all_parameters if name == "cls"),
+            positional[0] if positional else None,
+        )
+    call_positional = tuple(
+        name for name in positional if name != receiver
+    )
+    return receiver, call_positional, all_parameters
+
+
+def _declared_output_terminals(
+    graph: Any,
+    *,
+    produced_values: set[int] | None = None,
+) -> dict[str, int]:
+    """Expand structural return aggregates into their numerical SSA leaves."""
+
+    identities = graph.G.graph.get("identity_table") or {}
+    terminals: dict[str, int] = {}
+    visiting: set[int] = set()
+
+    def expand(name: str, node_id: int) -> None:
+        node_id = int(node_id)
+        if node_id in visiting or node_id not in graph.G:
+            return
+        visiting.add(node_id)
+        data = graph.G.nodes[node_id]
+        expression = data.get("expr_obj")
+        attributes = data.get("attributes") or {}
+        class_name = attributes.get("class_ref")
+        if data.get("type") in {"LoopExit", "LoopResult"}:
+            value_parent = next(
+                (
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) == "value"
+                ),
+                None,
+            )
+            if value_parent is not None:
+                expand(name, value_parent)
+        elif isinstance(expression, ast.Call) and class_name is not None:
+            descriptor = (
+                graph.G.graph.get("class_table", {}).get(class_name)
+                or {}
+            )
+            fields = tuple(descriptor.get("fields") or ())
+            parents = tuple(
+                (int(parent), str(role))
+                for parent, role in (data.get("parents") or ())
+                if str(role) not in {"callee", "func", "definition"}
+            )
+            positional = {
+                position: parent
+                for parent, role in parents
+                if (
+                    position := _positional_argument_index(role)
+                ) is not None
+            }
+            keywords = {
+                role[3:]: parent
+                for parent, role in parents
+                if role.startswith("kw:")
+            }
+            for index, field in enumerate(fields):
+                parent = keywords.get(field, positional.get(index))
+                if parent is not None:
+                    expand(f"{name}.{field}", parent)
+        elif isinstance(
+            expression, (ast.Tuple, ast.List)
+        ):
+            elements = [
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"elts", "element", "item"}
+            ]
+            for index, parent in enumerate(elements):
+                expand(f"{name}.{index}", parent)
+        elif produced_values is None or node_id in produced_values:
+            terminals[str(name)] = node_id
+        visiting.remove(node_id)
+
+    for name in graph.G.graph.get("function_outputs", ()):
+        values = identities.get(name, ())
+        if values:
+            expand(str(name), int(values[-1]))
+    return terminals
+
+
+def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
+    """Freeze call/region ownership before backend source composition."""
+
+    graph = shell.process_graph
+    region_by_node = {
+        int(node_id): int(region_index)
+        for region_index, subgraph in enumerate(shell.dispatch_subgraphs)
+        for node_id in subgraph.G.graph.get("deployment_nodes", ())
+    }
+    emitted_regions = set()
+    items = []
+    topological_nodes = tuple(
+        nx.lexicographical_topological_sort(
+            graph.G, key=lambda node_id: int(node_id)
+        )
+    )
+    order_index = {
+        int(node_id): index
+        for index, node_id in enumerate(topological_nodes)
+    }
+
+    def source_position(node_id: int) -> tuple[int, int] | None:
+        expression = graph.G.nodes[int(node_id)].get("expr_obj")
+        line = getattr(expression, "lineno", None)
+        column = getattr(expression, "col_offset", None)
+        if line is None:
+            return None
+        return int(line), int(column or 0)
+
+    caller_identities = graph.G.graph.get("identity_table") or {}
+    for node_id in topological_nodes:
+        child = shell.callsite_function_shells.get(node_id)
+        if child is not None:
+            call_parents = tuple(
+                (int(parent), str(role))
+                for parent, role in (
+                    graph.G.nodes[node_id].get("parents") or ()
+                )
+                if str(role) not in {"callee", "func", "definition"}
+            )
+            parents = tuple(parent for parent, _role in call_parents)
+            child_graph = child.process_graph.G
+            child_identities = (
+                child_graph.graph.get("identity_table") or {}
+            )
+            receiver_parameter, positional_parameters, _parameters = (
+                _method_parameter_layout(child_graph)
+            )
+            argument_bindings = []
+            for parent, role in call_parents:
+                position = _positional_argument_index(role)
+                if position is not None:
+                    name = (
+                        positional_parameters[position]
+                        if position < len(positional_parameters)
+                        else None
+                    )
+                elif (
+                    role == "operand"
+                    and receiver_parameter is not None
+                ):
+                    name = receiver_parameter
+                elif role.startswith("kw:"):
+                    name = role.split(":", 1)[1]
+                else:
+                    name = None
+                identities = child_identities.get(name, ())
+                if identities:
+                    argument_bindings.append(
+                        (parent, int(identities[0]))
+                    )
+            bound_child_inputs = {
+                int(child_input)
+                for _caller, child_input in argument_bindings
+            }
+            for child_input, child_data in child_graph.nodes(data=True):
+                child_attributes = child_data.get("attributes") or {}
+                if (
+                    child_data.get("type") != "Input"
+                    or child_attributes.get("binding_kind") != "external"
+                    or int(child_input) in bound_child_inputs
+                ):
+                    continue
+                name = child_attributes.get("binding_name")
+                call_position = source_position(int(node_id))
+                candidates = [
+                    int(definition)
+                    for definition in caller_identities.get(name, ())
+                    if (
+                        int(definition) in order_index
+                        and (
+                            (
+                                call_position is not None
+                                and source_position(int(definition))
+                                is not None
+                                and source_position(int(definition))
+                                < call_position
+                            )
+                            or (
+                                (
+                                    call_position is None
+                                    or source_position(int(definition))
+                                    is None
+                                )
+                                and order_index[int(definition)]
+                                < order_index[int(node_id)]
+                            )
+                        )
+                    )
+                ]
+                if candidates:
+                    argument_bindings.append((
+                        max(
+                            candidates,
+                            key=lambda definition: (
+                                source_position(definition)
+                                or (-1, order_index[definition])
+                            ),
+                        ),
+                        int(child_input),
+                    ))
+            child_outputs = tuple(
+                int(child_identities[name][-1])
+                for name in child_graph.graph.get(
+                    "function_outputs", ()
+                )
+                if child_identities.get(name)
+            )
+            unpacked = {}
+            for successor in graph.G.successors(node_id):
+                successor_data = graph.G.nodes[successor]
+                if str(successor_data.get("op", "")).lower() != "indexed":
+                    continue
+                index_parents = tuple(
+                    int(parent)
+                    for parent, role in (
+                        successor_data.get("parents") or ()
+                    )
+                    if str(role) == "index"
+                )
+                if not index_parents:
+                    continue
+                index_data = graph.G.nodes[index_parents[0]]
+                index_value = index_data.get("constant")
+                if index_value is None:
+                    index_value = (
+                        index_data.get("attributes") or {}
+                    ).get("value")
+                if isinstance(index_value, int):
+                    unpacked[int(index_value)] = int(successor)
+            if len(child_outputs) == 1:
+                result_bindings = ((child_outputs[0], int(node_id)),)
+            else:
+                result_bindings = tuple(
+                    (child_output, unpacked[index])
+                    for index, child_output in enumerate(child_outputs)
+                    if index in unpacked
+                )
+            items.append(PlanCall(
+                int(node_id),
+                _build_shell_hierarchy_plan(child),
+                parents,
+                tuple(caller for _callee, caller in result_bindings),
+                tuple(argument_bindings),
+                tuple(result_bindings),
+                tuple(
+                    int(plan.loop.node_id)
+                    for plan in sorted(
+                        (
+                            plan
+                            for plan in shell.loop_plans
+                            if int(node_id) in plan.loop.body_nodes
+                        ),
+                        key=lambda plan: -len(plan.loop.body_nodes),
+                    )
+                ),
+            ))
+            continue
+        region_index = region_by_node.get(int(node_id))
+        if (
+            region_index is None
+            or region_index in emitted_regions
+        ):
+            continue
+        emitted_regions.add(region_index)
+        subgraph = shell.dispatch_subgraphs[region_index]
+        region_nodes = tuple(
+            int(value)
+            for value in subgraph.G.graph.get("deployment_nodes", ())
+        )
+        items.append(PlanClosure(
+            name=f"region_{region_index}",
+            captures=tuple(
+                int(value)
+                for value in subgraph.G.graph.get("deployment_inputs", ())
+            ),
+            items=tuple(
+                PlanLine.create(
+                    str(
+                        graph.G.nodes[value].get("op")
+                        or graph.G.nodes[value].get("type")
+                    ),
+                    inputs=tuple(
+                        int(parent)
+                        for parent, _role in (
+                            graph.G.nodes[value].get("parents") or ()
+                        )
+                    ),
+                    outputs=(value,),
+                    attributes={"region": region_index},
+                )
+                for value in region_nodes
+            ),
+        ))
+    control_values = set()
+    control = getattr(shell, "shell_control_program", None)
+    if control is not None:
+        control_values.update(
+            int(uniform.value_id) for uniform in control.uniforms
+        )
+        control_values.update(
+            int(value_id)
+            for iterable, target, _induction, sources
+            in control.closure_iterable_bindings
+            for value_id in (iterable, target, *sources)
+        )
+        control_values.update(
+            int(value_id)
+            for pair in control.value_aliases
+            for value_id in pair
+        )
+        control_values.update(
+            int(value_id)
+            for iterable, target, _induction
+            in control.iterable_bindings
+            for value_id in (iterable, target)
+        )
+        control_values.update(
+            int(value_id)
+            for source, collection, _induction, _start
+            in control.collection_bindings
+            for value_id in (source, collection)
+        )
+        control_values.update(
+            int(value_id)
+            for iterable, target, _induction, _values
+            in control.static_iterable_bindings
+            for value_id in (iterable, target)
+        )
+
+        def validation_values(block) -> None:
+            from .control_source import (
+                CallBlock,
+                LoopBlock,
+                ParallelDeployment,
+                SequenceBlock,
+                StateMachineTick,
+            )
+
+            if isinstance(block, ValidationBlock):
+                control_values.add(int(block.predicate_value_id))
+            elif isinstance(block, StreamPublishBlock):
+                control_values.add(int(block.value_id))
+                if block.count_value_id is not None:
+                    control_values.add(int(block.count_value_id))
+                if block.predicate_value_id is not None:
+                    control_values.add(int(block.predicate_value_id))
+            elif isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    validation_values(child)
+            elif isinstance(block, LoopBlock):
+                validation_values(block.body)
+            elif isinstance(block, StateMachineTick):
+                for _value, body in block.cases:
+                    validation_values(body)
+            elif isinstance(block, ParallelDeployment):
+                for lane in block.lanes:
+                    validation_values(lane)
+            elif isinstance(block, CallBlock):
+                validation_values(block.callee)
+
+        validation_values(control.root)
+
+    return PlanClosure(
+        name=str(
+            graph.G.graph.get("function_name")
+            or type(shell).__name__
+        ),
+        captures=tuple(dict.fromkeys((
+            *sorted(control_values),
+            *(
+            int(node_id)
+            for node_id, data in graph.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and graph.G.out_degree(node_id)
+            ),
+        ))),
+        items=tuple(items),
+    )
+
+
+def _refresh_hierarchy_control_captures(
+    closure: PlanClosure,
+    shell: Any,
+) -> PlanClosure:
+    """Update final control captures without rediscovering source structure.
+
+    The pre-capture hierarchy already freezes every callsite, argument/result
+    binding and region closure.  Numerical lowering only adds control ABI
+    values.  Re-running graph topological discovery for the entire call tree
+    at that point is redundant and becomes quadratic on deeply composed
+    programs, so preserve the structural plan and refresh capture identities
+    directly from each shell's final ControlProgram.
+    """
+
+    from .control_source import (
+        CallBlock,
+        LoopBlock,
+        ParallelDeployment,
+        SequenceBlock,
+        StateMachineTick,
+    )
+
+    values: set[int] = set()
+    control = shell.shell_control_program
+    if control is not None:
+        values.update(int(uniform.value_id) for uniform in control.uniforms)
+        values.update(
+            int(value_id)
+            for pair in control.value_aliases
+            for value_id in pair
+        )
+        values.update(
+            int(value_id)
+            for iterable, target, _induction in control.iterable_bindings
+            for value_id in (iterable, target)
+        )
+        values.update(
+            int(value_id)
+            for iterable, target, _induction, _items
+            in control.static_iterable_bindings
+            for value_id in (iterable, target)
+        )
+        values.update(
+            int(value_id)
+            for source, collection, _induction, _start
+            in control.collection_bindings
+            for value_id in (source, collection)
+        )
+        values.update(
+            int(value_id)
+            for iterable, target, _induction, sources
+            in control.closure_iterable_bindings
+            for value_id in (iterable, target, *sources)
+        )
+
+        def visit(block) -> None:
+            if isinstance(block, ValidationBlock):
+                values.add(int(block.predicate_value_id))
+            elif isinstance(block, StreamPublishBlock):
+                values.add(int(block.value_id))
+                if block.count_value_id is not None:
+                    values.add(int(block.count_value_id))
+                if block.predicate_value_id is not None:
+                    values.add(int(block.predicate_value_id))
+            elif isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    visit(child)
+            elif isinstance(block, LoopBlock):
+                visit(block.body)
+            elif isinstance(block, StateMachineTick):
+                for _case, body in block.cases:
+                    visit(body)
+            elif isinstance(block, ParallelDeployment):
+                for lane in block.lanes:
+                    visit(lane)
+            elif isinstance(block, CallBlock):
+                visit(block.callee)
+
+        visit(control.root)
+
+    refreshed_items = []
+    for item in closure.items:
+        if not isinstance(item, PlanCall):
+            refreshed_items.append(item)
+            continue
+        child = shell.callsite_function_shells.get(item.callsite_id)
+        if child is None:
+            refreshed_items.append(item)
+            continue
+        refreshed_items.append(PlanCall(
+            item.callsite_id,
+            _refresh_hierarchy_control_captures(item.callee, child),
+            item.argument_value_ids,
+            item.result_value_ids,
+            item.argument_bindings,
+            item.result_bindings,
+            item.enclosing_loop_ids,
+        ))
+    return PlanClosure(
+        closure.name,
+        tuple(dict.fromkeys((*closure.captures, *sorted(values)))),
+        tuple(refreshed_items),
+        closure.closure_id,
+    )
+
+
+def _build_hierarchical_glsl_artifact(shell: Any):
+    """Lower a captured call tree into one globally-namespaced shell."""
+
+    compose_started = time.perf_counter()
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="begin",
+        fields={},
+    )
+    shell.hierarchical_compose_failure = None
+    hierarchy = shell.hierarchy_plan
+    value_table = shell.hierarchy_value_table
+
+    identity_closures: dict[int, tuple[int, str]] = {}
+    identity_call_sources: dict[
+        tuple[int, int], tuple[int, int]
+    ] = {}
+
+    def find_identities(closure: PlanClosure, owner: Any) -> None:
+        graph = owner.process_graph.G
+        identity = _identity_parameter_projection(graph)
+        if identity is not None:
+            identity_closures[int(closure.closure_id)] = identity
+        for item in closure.items:
+            if not isinstance(item, PlanCall):
+                continue
+            child = owner.callsite_function_shells.get(item.callsite_id)
+            if child is not None:
+                find_identities(item.callee, child)
+                identity = identity_closures.get(
+                    int(item.callee.closure_id)
+                )
+                if identity is not None:
+                    source_parameter, _kind = identity
+                    caller_source = next((
+                        int(caller)
+                        for caller, callee in item.argument_bindings
+                        if int(callee) == int(source_parameter)
+                    ), None)
+                    if caller_source is not None:
+                        identity_call_sources[(
+                            int(closure.closure_id),
+                            int(item.callsite_id),
+                        )] = (
+                            int(closure.closure_id),
+                            caller_source,
+                        )
+
+    find_identities(hierarchy, shell)
+    identity_reduction = reduce_hierarchy_identities(
+        hierarchy, set(identity_closures)
+    )
+    hierarchy = identity_reduction.root
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="identity reduction complete",
+        fields={
+            "elapsed_ms": round(
+                (time.perf_counter() - compose_started) * 1e3,
+                3,
+            ),
+        },
+    )
+    shell.hierarchy_identity_collapses = (
+        identity_reduction.collapsed_callsites
+    )
+    shell.hierarchy_identity_rounds = identity_reduction.rounds
+    shell.hierarchy_remaining_callsite_ids = tuple(
+        int(item.callsite_id)
+        for item in hierarchy.items
+        if isinstance(item, PlanCall)
+    )
+    controls: dict[int, ControlProgram] = {}
+    shells: dict[int, Any] = {}
+    closures: dict[int, PlanClosure] = {}
+    calls: dict[tuple[int, int], PlanCall] = {}
+    argument_sources: dict[tuple[int, int], tuple[int, int]] = {}
+
+    def gather(closure: PlanClosure, owner: Any) -> bool:
+        closure_id = int(closure.closure_id)
+        closures[closure_id] = closure
+        shells[closure_id] = owner
+        control = owner.shell_control_program
+        if control is None:
+            if owner.dispatch_subgraphs:
+                shell.hierarchical_compose_failure = {
+                    "reason": "missing-control-program",
+                    "closure_id": closure_id,
+                    "function": owner.process_graph.G.graph.get(
+                        "function_name"
+                    ),
+                    "dispatch_regions": len(owner.dispatch_subgraphs),
+                }
+                return False
+            control = ControlProgram(SequenceBlock(()), ())
+        controls[closure_id] = control
+        for item in closure.items:
+            if not isinstance(item, PlanCall):
+                continue
+            calls[(closure_id, int(item.callsite_id))] = item
+            for caller_local, callee_local in item.argument_bindings:
+                argument_sources[(
+                    int(item.callee.closure_id),
+                    int(callee_local),
+                )] = (closure_id, int(caller_local))
+            child = owner.callsite_function_shells.get(item.callsite_id)
+            if child is None or not gather(item.callee, child):
+                return False
+        return True
+
+    if not gather(hierarchy, shell):
+        return None
+    # The loop planner has already performed the control-flow/SSA analysis.
+    # Its aliases are therefore authoritative value edges, not hints for a
+    # later runtime reconstruction.  Carry them into hierarchy identity
+    # resolution before numerical programs are globally namespaced.  In
+    # particular, a LoopExit names the planner-selected carried value; mapping
+    # it back to the syntactic list initializer would sever the real producer
+    # edge and manufacture an external shader input.
+    collection_owner_endpoints = {
+        (int(closure_id), int(collection))
+        for closure_id, control in controls.items()
+        for _source, collection, _induction, _start
+        in control.collection_bindings
+    }
+    control_alias_sources = {
+        (int(closure_id), int(updated)): (
+            int(closure_id),
+            int(initial),
+        )
+        for closure_id, control in controls.items()
+        for updated, initial in control.value_aliases
+        if (int(closure_id), int(updated))
+        not in collection_owner_endpoints
+    }
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="control gather complete",
+        fields={
+            "closures": len(closures),
+            "elapsed_ms": round(
+                (time.perf_counter() - compose_started) * 1e3,
+                3,
+            ),
+        },
+    )
+    global_redirects = {}
+    for identity_endpoint, source_endpoint in identity_call_sources.items():
+        try:
+            identity_global = value_table.global_id(*identity_endpoint)
+            source_global = value_table.global_id(*source_endpoint)
+        except KeyError:
+            continue
+        if identity_global != source_global:
+            global_redirects[int(identity_global)] = int(source_global)
+
+    def redirected(global_id: int) -> int:
+        seen = set()
+        current = int(global_id)
+        while current in global_redirects and current not in seen:
+            seen.add(current)
+            current = global_redirects[current]
+        return current
+
+    if global_redirects:
+        value_table = type(value_table)(tuple(
+            (closure_id, local_id, redirected(global_id))
+            for closure_id, local_id, global_id
+            in value_table.correlations
+        ))
+    shell.hierarchical_effective_value_table = value_table
+    hierarchical = compose_hierarchical_control(
+        hierarchy, controls, value_table
+    )
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="control composition complete",
+        fields={
+            "regions": len(hierarchical.program.region_indices),
+            "elapsed_ms": round(
+                (time.perf_counter() - compose_started) * 1e3,
+                3,
+            ),
+        },
+    )
+    region_lookup = {
+        (closure_id, local_region): global_region
+        for closure_id, local_region, global_region
+        in hierarchical.region_correlations
+    }
+    next_value = 1 + max(
+        (
+            global_id
+            for _closure, _local, global_id
+            in value_table.correlations
+        ),
+        default=-1,
+    )
+    private_values: dict[tuple[int, int], int] = {}
+    capture_values: dict[int, int] = {}
+    endpoint_meta: dict[tuple[int, int], Any] = {}
+    for closure_id, owner in shells.items():
+        for value_id, meta in owner.compiled_feed_meta.items():
+            endpoint_meta.setdefault(
+                (int(closure_id), int(value_id)),
+                meta,
+            )
+        for captured in owner.captured_region_programs.values():
+            for program in (captured.program, *captured.stages):
+                for value_id, meta in (program.meta or {}).items():
+                    endpoint_meta.setdefault(
+                        (int(closure_id), int(value_id)),
+                        meta,
+                    )
+
+    def global_value(closure_id: int, local_id: int) -> int:
+        nonlocal next_value
+        try:
+            return value_table.global_id(closure_id, local_id)
+        except KeyError:
+            endpoint = (int(closure_id), int(local_id))
+            owner = shells.get(int(closure_id))
+            is_synthetic = endpoint in synthetic_field_paths
+            if (
+                owner is not None
+                and int(local_id) not in owner.process_graph.G
+                and not is_synthetic
+            ):
+                # The discovery tape is one global program observation.  A
+                # transient result identity therefore means the same value
+                # when it crosses function compartments; closure-namespacing
+                # it severs the producer/consumer edge and fabricates a shell
+                # input.  Graph-local IDs and compiler-created field
+                # endpoints remain scoped, but raw tape identities are
+                # canonical across the hierarchy.
+                capture_id = int(local_id)
+                if capture_id not in capture_values:
+                    capture_values[capture_id] = next_value
+                    next_value += 1
+                return capture_values[capture_id]
+            key = endpoint
+            if key not in private_values:
+                private_values[key] = next_value
+                next_value += 1
+            return private_values[key]
+
+    # Python classes crossing function boundaries are logical aggregate SSA
+    # values, not runtime buffers and never host callables.  Resolve only the
+    # field that an ordinary Attribute expression requests, following call
+    # arguments and returns through the hierarchy.  This keeps source programs
+    # normal Python while making aggregate erasure a general compiler rule.
+    resolving: set[tuple[int, int]] = set()
+    resolved_leaves: dict[
+        tuple[int, int],
+        dict[tuple[object, ...], tuple[int, int]],
+    ] = {}
+    synthetic_field_endpoints: dict[
+        tuple[int, int, tuple[str, ...]], tuple[int, int]
+    ] = {}
+    synthetic_field_paths: dict[
+        tuple[int, int], tuple[tuple[int, int], tuple[str, ...]]
+    ] = {}
+    synthetic_static_values: dict[tuple[int, int], Any] = {}
+    next_synthetic_local = -1
+    unresolved_static = object()
+    metadata_links = {
+        **identity_call_sources,
+        **argument_sources,
+    }
+    changed = True
+    while changed:
+        changed = False
+        for target, source in metadata_links.items():
+            target_meta = endpoint_meta.get(target)
+            source_meta = endpoint_meta.get(source)
+            if target_meta is None and source_meta is not None:
+                endpoint_meta[target] = source_meta
+                changed = True
+            elif source_meta is None and target_meta is not None:
+                endpoint_meta[source] = target_meta
+                changed = True
+        by_global: dict[int, list[tuple[int, int]]] = {}
+        for closure_id, local_id, global_id in value_table.correlations:
+            by_global.setdefault(int(global_id), []).append(
+                (int(closure_id), int(local_id))
+            )
+        for endpoints in by_global.values():
+            known = next(
+                (
+                    endpoint_meta[endpoint]
+                    for endpoint in endpoints
+                    if endpoint in endpoint_meta
+                ),
+                None,
+            )
+            if known is None:
+                continue
+            for endpoint in endpoints:
+                if endpoint not in endpoint_meta:
+                    endpoint_meta[endpoint] = known
+                    changed = True
+    global_meta: dict[int, Any] = {}
+    for closure_id, local_id, global_id in value_table.correlations:
+        meta = endpoint_meta.get((int(closure_id), int(local_id)))
+        if meta is not None:
+            global_meta.setdefault(int(global_id), meta)
+
+    def value_meta(
+        endpoint: tuple[int, int],
+        visiting: set[tuple[int, int]] | None = None,
+    ) -> Any | None:
+        endpoint = (int(endpoint[0]), int(endpoint[1]))
+        visiting = set() if visiting is None else set(visiting)
+        if endpoint in visiting:
+            return None
+        visiting.add(endpoint)
+        direct = endpoint_meta.get(endpoint)
+        if direct is not None:
+            return direct
+        source = metadata_links.get(endpoint)
+        if source is not None:
+            inherited = value_meta(source, visiting)
+            if inherited is not None:
+                return inherited
+        try:
+            correlated = value_table.global_id(*endpoint)
+        except KeyError:
+            correlated = None
+        if correlated is not None:
+            inherited = global_meta.get(int(correlated))
+            if inherited is not None:
+                return inherited
+        owner = shells.get(endpoint[0])
+        graph = None if owner is None else owner.process_graph.G
+        if graph is None or endpoint[1] not in graph:
+            return None
+        data = graph.nodes[endpoint[1]]
+        parents = tuple(
+            (int(parent), str(role))
+            for parent, role in (data.get("parents") or ())
+            if str(role) not in {"callee", "func", "definition"}
+        )
+        if data.get("type") in {"Indexed", "indexed"}:
+            base = next((
+                parent for parent, role in parents if role == "base"
+            ), None)
+            index_node = next((
+                parent for parent, role in parents if role == "index"
+            ), None)
+            index = None
+            if index_node is not None and index_node in graph:
+                try:
+                    index = _constant_value(graph.nodes[index_node])
+                except KeyError:
+                    pass
+            if base is not None and isinstance(index, int):
+                call = calls.get((endpoint[0], base))
+                if call is not None:
+                    child_id = int(call.callee.closure_id)
+                    child_graph = shells[child_id].process_graph.G
+                    output_names = tuple(
+                        child_graph.graph.get("function_outputs", ())
+                    )
+                    if -len(output_names) <= index < len(output_names):
+                        output_name = output_names[index]
+                        identities = (
+                            child_graph.graph.get("identity_table") or {}
+                        )
+                        output_ids = identities.get(output_name, ())
+                        if output_ids:
+                            inherited = value_meta(
+                                (child_id, int(output_ids[-1])),
+                                visiting,
+                            )
+                            if inherited is not None:
+                                return inherited
+        call = calls.get(endpoint)
+        if call is not None:
+            child_id = int(call.callee.closure_id)
+            child_graph = shells[child_id].process_graph.G
+            output_names = tuple(
+                child_graph.graph.get("function_outputs", ())
+            )
+            if len(output_names) == 1:
+                identities = child_graph.graph.get("identity_table") or {}
+                output_ids = identities.get(output_names[0], ())
+                if output_ids:
+                    return value_meta(
+                        (child_id, int(output_ids[-1])),
+                        visiting,
+                    )
+        return None
+
+    def field_endpoint(
+        source: tuple[int, int],
+        field: str,
+    ) -> tuple[int, int]:
+        nonlocal next_synthetic_local
+        rooted = synthetic_field_paths.get(source)
+        if rooted is None:
+            root, path = source, ()
+        else:
+            root, path = rooted
+        full_path = (*path, str(field))
+        key = (int(root[0]), int(root[1]), full_path)
+        endpoint = synthetic_field_endpoints.get(key)
+        if endpoint is None:
+            endpoint = (int(root[0]), next_synthetic_local)
+            next_synthetic_local -= 1
+            synthetic_field_endpoints[key] = endpoint
+            synthetic_field_paths[endpoint] = (root, full_path)
+        return endpoint
+
+    def static_endpoint_value(
+        endpoint: tuple[int, int],
+        visiting: set[tuple[int, int]] | None = None,
+    ) -> Any:
+        visiting = set() if visiting is None else set(visiting)
+        endpoint = (int(endpoint[0]), int(endpoint[1]))
+        if endpoint in visiting:
+            return unresolved_static
+        visiting.add(endpoint)
+        rooted = synthetic_field_paths.get(endpoint)
+        if rooted is not None:
+            if endpoint in synthetic_static_values:
+                return synthetic_static_values[endpoint]
+            root, path = rooted
+            projected = leaves(*root)
+            target = projected.get(tuple(path))
+            if target is not None and target != endpoint:
+                return static_endpoint_value(target, visiting)
+            return unresolved_static
+        source = identity_call_sources.get(endpoint)
+        if source is None:
+            source = argument_sources.get(endpoint)
+        if source is not None:
+            return static_endpoint_value(source, visiting)
+        owner = shells.get(endpoint[0])
+        if owner is None or endpoint[1] not in owner.process_graph.G:
+            return unresolved_static
+        graph = owner.process_graph.G
+        data = graph.nodes[endpoint[1]]
+        if data.get("type") in {
+            "Constant", "Const", "const", "StaticReference"
+        }:
+            try:
+                return _constant_value(data)
+            except KeyError:
+                return unresolved_static
+        if data.get("type") == "Input":
+            name = (data.get("attributes") or {}).get("binding_name")
+            specializations = (
+                graph.graph.get("planner_specializations") or {}
+            )
+            if name in specializations:
+                return specializations[name]
+            defaults = graph.graph.get("parameter_defaults") or {}
+            if name in defaults:
+                return defaults[name]
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+            if str(role) not in {"callee", "func", "definition"}
+        }
+        expression = data.get("expr_obj")
+        if data.get("type") == "Phi":
+            test = parents.get("test")
+            body = parents.get("body")
+            orelse = parents.get("orelse")
+            predicate = (
+                unresolved_static
+                if test is None
+                else static_endpoint_value((endpoint[0], test), visiting)
+            )
+            selected = (
+                body
+                if predicate is not unresolved_static and bool(predicate)
+                else (
+                    orelse
+                    if predicate is not unresolved_static
+                    else None
+                )
+            )
+            if selected is not None:
+                return static_endpoint_value(
+                    (endpoint[0], selected), visiting
+                )
+            if body is not None and orelse is not None:
+                body_value = static_endpoint_value(
+                    (endpoint[0], body), visiting
+                )
+                else_value = static_endpoint_value(
+                    (endpoint[0], orelse), visiting
+                )
+                if (
+                    body_value is not unresolved_static
+                    and else_value is not unresolved_static
+                    and type(body_value) is type(else_value)
+                    and body_value == else_value
+                ):
+                    return body_value
+        if isinstance(expression, ast.Attribute) and expression.attr == "shape":
+            base = next((
+                parent
+                for role, parent in parents.items()
+                if role in {"value", "base", "operand", "object"}
+            ), None)
+            if base is not None:
+                meta = value_meta((endpoint[0], base))
+                if meta is None:
+                    projected = leaves(endpoint[0], base)
+                    if len(projected) == 1 and () in projected:
+                        meta = value_meta(projected[()])
+                shape = None if meta is None else meta.shape
+                if shape is not None:
+                    return tuple(int(size) for size in shape)
+        if (
+            isinstance(expression, ast.Subscript)
+            or data.get("type") in {"Indexed", "indexed"}
+        ):
+            base = next((
+                parent
+                for role, parent in parents.items()
+                if role in {"value", "base", "operand", "object"}
+            ), None)
+            index = next((
+                parent
+                for role, parent in parents.items()
+                if role in {"slice", "index", "subscript"}
+            ), None)
+            if base is not None and index is not None:
+                container = static_endpoint_value(
+                    (endpoint[0], base), visiting
+                )
+                position = static_endpoint_value(
+                    (endpoint[0], index), visiting
+                )
+                if (
+                    container is not unresolved_static
+                    and position is not unresolved_static
+                    and isinstance(position, (int, slice))
+                ):
+                    try:
+                        return container[position]
+                    except (IndexError, KeyError, TypeError):
+                        pass
+        if isinstance(expression, ast.UnaryOp):
+            operand = next((
+                parent
+                for role, parent in parents.items()
+                if role in {"operand", "value"}
+            ), None)
+            fixed = (
+                unresolved_static
+                if operand is None
+                else static_endpoint_value((endpoint[0], operand), visiting)
+            )
+            if fixed is not unresolved_static:
+                if isinstance(expression.op, ast.USub):
+                    return -fixed
+                if isinstance(expression.op, ast.UAdd):
+                    return +fixed
+                if isinstance(expression.op, ast.Not):
+                    return not fixed
+        if isinstance(expression, ast.BinOp):
+            left = parents.get("lhs", parents.get("left"))
+            right = parents.get("rhs", parents.get("right"))
+            lhs = (
+                unresolved_static
+                if left is None
+                else static_endpoint_value((endpoint[0], left), visiting)
+            )
+            rhs = (
+                unresolved_static
+                if right is None
+                else static_endpoint_value((endpoint[0], right), visiting)
+            )
+            if lhs is not unresolved_static and rhs is not unresolved_static:
+                operation = expression.op
+                try:
+                    if isinstance(operation, ast.Add):
+                        return lhs + rhs
+                    if isinstance(operation, ast.Sub):
+                        return lhs - rhs
+                    if isinstance(operation, ast.Mult):
+                        return lhs * rhs
+                    if isinstance(operation, ast.Div):
+                        return lhs / rhs
+                    if isinstance(operation, ast.FloorDiv):
+                        return lhs // rhs
+                    if isinstance(operation, ast.Mod):
+                        return lhs % rhs
+                    if isinstance(operation, ast.Pow):
+                        return lhs ** rhs
+                except (ArithmeticError, TypeError, ValueError):
+                    pass
+        if isinstance(expression, ast.Compare) and len(expression.ops) == 1:
+            left = parents.get("lhs", parents.get("left"))
+            right = parents.get("rhs", parents.get("right"))
+            lhs = (
+                unresolved_static
+                if left is None
+                else static_endpoint_value((endpoint[0], left), visiting)
+            )
+            rhs = (
+                unresolved_static
+                if right is None
+                else static_endpoint_value((endpoint[0], right), visiting)
+            )
+            if lhs is not unresolved_static and rhs is not unresolved_static:
+                operation = expression.ops[0]
+                if isinstance(operation, ast.Eq):
+                    return lhs == rhs
+                if isinstance(operation, ast.NotEq):
+                    return lhs != rhs
+                if isinstance(operation, ast.Lt):
+                    return lhs < rhs
+                if isinstance(operation, ast.LtE):
+                    return lhs <= rhs
+                if isinstance(operation, ast.Gt):
+                    return lhs > rhs
+                if isinstance(operation, ast.GtE):
+                    return lhs >= rhs
+                if isinstance(operation, ast.Is):
+                    return lhs is rhs
+                if isinstance(operation, ast.IsNot):
+                    return lhs is not rhs
+        if isinstance(expression, ast.BoolOp):
+            operands = [
+                parent
+                for role, parent in sorted(parents.items())
+                if role.startswith("value")
+            ]
+            if operands:
+                result = (
+                    False if isinstance(expression.op, ast.Or) else True
+                )
+                for operand in operands:
+                    fixed = static_endpoint_value(
+                        (endpoint[0], operand), visiting
+                    )
+                    if fixed is unresolved_static:
+                        return unresolved_static
+                    result = bool(fixed)
+                    if (
+                        isinstance(expression.op, ast.Or) and result
+                    ) or (
+                        isinstance(expression.op, ast.And) and not result
+                    ):
+                        return result
+                return result
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+            and expression.func.attr == "ndims"
+        ):
+            base = next((
+                parent
+                for role, parent in parents.items()
+                if role in {"operand", "value", "base", "object"}
+            ), None)
+            if base is not None:
+                meta = value_meta((endpoint[0], base))
+                if meta is None:
+                    projected = leaves(endpoint[0], base)
+                    if len(projected) == 1 and () in projected:
+                        meta = value_meta(projected[()])
+                shape = None if meta is None else meta.shape
+                if shape is not None:
+                    return len(shape)
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id in {"bool", "int", "float"}
+        ):
+            argument = next((
+                parent
+                for role, parent in parents.items()
+                if _positional_argument_index(role) == 0
+            ), None)
+            fixed = (
+                unresolved_static
+                if argument is None
+                else static_endpoint_value(
+                    (endpoint[0], argument), visiting
+                )
+            )
+            if fixed is not unresolved_static:
+                try:
+                    return {
+                        "bool": bool,
+                        "int": int,
+                        "float": float,
+                    }[expression.func.id](fixed)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if isinstance(data.get("expr_obj"), ast.Attribute):
+            projected = leaves(*endpoint)
+            if len(projected) == 1 and () in projected:
+                target = projected[()]
+                if target != endpoint:
+                    return static_endpoint_value(target, visiting)
+        return unresolved_static
+
+    def static_predicate(
+        closure_id: int,
+        local_id: int,
+    ) -> bool | None:
+        owner = shells[int(closure_id)]
+        graph = owner.process_graph.G
+        data = graph.nodes[int(local_id)]
+        expression = data.get("expr_obj")
+        # Ordinary Python selection such as ``cached or build()`` becomes a
+        # Phi whose test is the cached SSA value itself.  If that endpoint is
+        # a source-static scalar (most importantly an optional parameter with
+        # default None), resolve its truth value before considering comparison
+        # syntax.  Tensor truth remains deliberately unresolved.
+        direct_leaves = leaves(int(closure_id), int(local_id))
+        if len(direct_leaves) == 1 and () in direct_leaves:
+            direct = static_endpoint_value(direct_leaves[()])
+            if direct is not unresolved_static and (
+                direct is None
+                or isinstance(direct, (bool, int, float, str, bytes))
+            ):
+                return bool(direct)
+        if isinstance(expression, ast.UnaryOp) and isinstance(
+            expression.op, ast.Not
+        ):
+            operand = next(
+                (
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) in {"operand", "value"}
+                ),
+                None,
+            )
+            if operand is not None:
+                resolved = static_predicate(int(closure_id), operand)
+                if resolved is not None:
+                    return not resolved
+        if (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Name)
+            and expression.func.id == "isinstance"
+            and len(expression.args) == 2
+            and isinstance(expression.args[1], ast.Name)
+            and expression.args[1].id == "AbstractTensor"
+        ):
+            argument = next(
+                (
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if _positional_argument_index(str(role)) == 0
+                ),
+                None,
+            )
+            if argument is not None:
+                projected = leaves(int(closure_id), argument)
+                if len(projected) == 1 and () in projected:
+                    # Tensor metadata is the compiler's structural type fact;
+                    # this does not inspect or specialize the captured value.
+                    if value_meta(projected[()]) is not None:
+                        return True
+        if not (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+        ):
+            return None
+        if (
+            isinstance(expression.left, ast.Name)
+            and isinstance(expression.comparators[0], ast.Constant)
+            and expression.comparators[0].value is None
+            and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+        ):
+            identities = graph.graph.get("identity_table") or {}
+            parameter_ids = identities.get(expression.left.id, ())
+            if parameter_ids and (
+                int(closure_id), int(parameter_ids[0])
+            ) in argument_sources:
+                # An explicitly bound argument is a value edge, regardless of
+                # whether its runtime payload is a tensor or aggregate.  It
+                # cannot be the omitted/default None branch.
+                return isinstance(expression.ops[0], ast.IsNot)
+        parents = {
+            str(role): int(parent)
+            for parent, role in (data.get("parents") or ())
+        }
+        left = parents.get("lhs")
+        right = parents.get("rhs")
+        if left is None or right is None:
+            return None
+        left_leaves = leaves(int(closure_id), left)
+        right_leaves = leaves(int(closure_id), right)
+        if not (
+            len(left_leaves) == len(right_leaves) == 1
+            and () in left_leaves
+            and () in right_leaves
+        ):
+            if isinstance(expression.ops[0], (ast.Is, ast.IsNot)):
+                shell._profiler.trace(
+                    path=owner.profile_path,
+                    section="hierarchy-static-predicate",
+                    label="non-scalar-identity-comparison",
+                    fields={
+                        "node": int(local_id),
+                        "lhs": tuple(left_leaves.items()),
+                        "rhs": tuple(right_leaves.items()),
+                    },
+                )
+            return None
+        lhs = static_endpoint_value(left_leaves[()])
+        rhs = static_endpoint_value(right_leaves[()])
+        if (
+            lhs is unresolved_static or rhs is unresolved_static
+        ) and isinstance(operation := expression.ops[0], (ast.Is, ast.IsNot)):
+            shell._profiler.trace(
+                path=owner.profile_path,
+                section="hierarchy-static-predicate",
+                label="unresolved-identity-comparison",
+                fields={
+                    "node": int(local_id),
+                    "lhs_endpoint": left_leaves[()],
+                    "rhs_endpoint": right_leaves[()],
+                    "lhs": (
+                        "<unresolved>"
+                        if lhs is unresolved_static
+                        else repr(lhs)
+                    ),
+                    "rhs": (
+                        "<unresolved>"
+                        if rhs is unresolved_static
+                        else repr(rhs)
+                    ),
+                },
+            )
+        if lhs is unresolved_static or rhs is unresolved_static:
+            return None
+        operation = expression.ops[0]
+        if isinstance(operation, ast.Is):
+            return lhs is rhs
+        if isinstance(operation, ast.IsNot):
+            return lhs is not rhs
+        if isinstance(operation, ast.Eq):
+            return lhs == rhs
+        if isinstance(operation, ast.NotEq):
+            return lhs != rhs
+        return None
+
+    def leaves(
+        closure_id: int,
+        local_id: int,
+    ) -> dict[tuple[object, ...], tuple[int, int]]:
+        key = (int(closure_id), int(local_id))
+        cached = resolved_leaves.get(key)
+        if cached is not None:
+            return cached
+        if key in resolving:
+            return {(): key}
+        resolving.add(key)
+        owner = shells[key[0]]
+        graph = owner.process_graph.G
+        result: dict[tuple[object, ...], tuple[int, int]] = {}
+        source = identity_call_sources.get(key)
+        if source is None:
+            source = argument_sources.get(key)
+        if source is None:
+            source = control_alias_sources.get(key)
+        if key in collection_owner_endpoints:
+            # Planner collection/publication is a producer boundary.  In
+            # particular, a LoopExit may retain the source initializer on its
+            # syntactic ``value`` edge, but that initializer neither owns nor
+            # produces the resident collection.
+            result = {(): key}
+        elif source is not None:
+            result = leaves(*source)
+        elif key[1] not in graph:
+            result = {(): key}
+        else:
+            data = graph.nodes[key[1]]
+            expression = data.get("expr_obj")
+            attributes = data.get("attributes") or {}
+            parents = tuple(
+                (int(parent), str(role))
+                for parent, role in (data.get("parents") or ())
+                if str(role) not in {"callee", "func", "definition"}
+            )
+            if data.get("type") in {"LoopExit", "LoopResult"}:
+                # LoopExit is a control-qualified SSA identity, not a new
+                # numerical allocation.  The planner owns the control edge;
+                # hierarchy/value reduction must carry the value edge through
+                # so callers, returns, stream publications, and numerical
+                # regions all name the same resident range.  Leaving the
+                # wrapper as a distinct value fabricates an unproduced shell
+                # slot and loses the producer's storage contract.
+                value_parent = next(
+                    (
+                        parent
+                        for parent, role in parents
+                        if role == "value"
+                    ),
+                    None,
+                )
+                if (
+                    value_parent is not None
+                    and key not in collection_owner_endpoints
+                ):
+                    result = leaves(key[0], value_parent)
+            elif data.get("type") == "Phi":
+                test_id = next((
+                    parent for parent, role in parents if role == "test"
+                ), None)
+                predicate = (
+                    None
+                    if test_id is None
+                    else static_predicate(key[0], test_id)
+                )
+                selected_role = (
+                    None
+                    if predicate is None
+                    else ("body" if predicate else "orelse")
+                )
+                selected = next((
+                    parent
+                    for parent, role in parents
+                    if role == selected_role
+                ), None)
+                if selected is None:
+                    phi_meta = value_meta(key)
+                    if phi_meta is not None:
+                        candidates = [
+                            parent
+                            for parent, role in parents
+                            if role in {"body", "orelse"}
+                            and (
+                                candidate_meta := value_meta(
+                                    (key[0], parent)
+                                )
+                            ) is not None
+                            and tuple(candidate_meta.shape or ())
+                            == tuple(phi_meta.shape or ())
+                            and str(candidate_meta.dtype)
+                            == str(phi_meta.dtype)
+                        ]
+                        if len(candidates) == 1:
+                            selected = candidates[0]
+                if selected is not None:
+                    result = leaves(key[0], selected)
+            elif isinstance(expression, ast.BoolOp):
+                # Python ``a or b`` / ``a and b`` returns one operand; it is
+                # not a numerical operation.  When operand truth is a source
+                # fact (for example an optional parameter defaulting to
+                # None), preserve the selected operand's SSA identity so
+                # aggregate fields and tensor dependencies remain visible.
+                operands = [
+                    parent
+                    for parent, role in parents
+                    if (
+                        str(role).startswith("value")
+                        or str(role).startswith("arg")
+                        or str(role) in {"operand", "values"}
+                    )
+                ]
+                if not operands:
+                    operands = [parent for parent, _role in parents]
+                selected = None
+                for index, operand in enumerate(operands):
+                    projected = leaves(key[0], operand)
+                    fixed = (
+                        unresolved_static
+                        if len(projected) != 1 or () not in projected
+                        else static_endpoint_value(projected[()])
+                    )
+                    last = index == len(operands) - 1
+                    if last:
+                        selected = operand
+                        break
+                    if fixed is unresolved_static:
+                        break
+                    truth = bool(fixed)
+                    if (
+                        isinstance(expression.op, ast.Or) and truth
+                    ) or (
+                        isinstance(expression.op, ast.And) and not truth
+                    ):
+                        selected = operand
+                        break
+                if selected is not None:
+                    result = leaves(key[0], selected)
+            elif isinstance(expression, ast.IfExp):
+                # Optional-parameter selection is a hierarchy fact when the
+                # caller explicitly supplied that parameter.  Collapse
+                # ``x if x is not None else ...`` to the supplied SSA
+                # reference without consulting the captured tensor value.
+                test = expression.test
+                selected_role = None
+                if (
+                    isinstance(test, ast.Compare)
+                    and len(test.ops) == 1
+                    and len(test.comparators) == 1
+                    and isinstance(test.left, ast.Name)
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value is None
+                    and isinstance(test.ops[0], (ast.Is, ast.IsNot))
+                ):
+                    identities = graph.graph.get("identity_table") or {}
+                    parameter_ids = identities.get(test.left.id, ())
+                    if parameter_ids:
+                        parameter_id = int(parameter_ids[0])
+                        explicitly_supplied = (
+                            (key[0], parameter_id) in argument_sources
+                        )
+                        if explicitly_supplied:
+                            selected_role = (
+                                "body"
+                                if isinstance(test.ops[0], ast.IsNot)
+                                else "orelse"
+                            )
+                        elif (
+                            test.left.id
+                            in (
+                                graph.graph.get("parameter_defaults")
+                                or {}
+                            )
+                        ):
+                            default_is_none = (
+                                graph.graph["parameter_defaults"][
+                                    test.left.id
+                                ]
+                                is None
+                            )
+                            predicate = (
+                                not default_is_none
+                                if isinstance(test.ops[0], ast.IsNot)
+                                else default_is_none
+                            )
+                            selected_role = (
+                                "body" if predicate else "orelse"
+                            )
+                selected = next((
+                    parent
+                    for parent, role in parents
+                    if role == selected_role
+                ), None)
+                if selected is not None:
+                    result = leaves(key[0], selected)
+            elif (
+                attributes.get("materialization_kind")
+                in {"unrolled_loop", "retained_loop_aggregate"}
+            ):
+                materialized = tuple(
+                    int(value_id)
+                    for value_id in attributes.get(
+                        "materialized_value_ids", ()
+                    )
+                )
+                for index, parent in enumerate(materialized):
+                    for path, endpoint in leaves(
+                        key[0], parent
+                    ).items():
+                        result[(int(index), *path)] = endpoint
+            elif attributes.get("producer_kind") == "aggregate":
+                elements = tuple(
+                    int(value_id)
+                    for value_id in attributes.get(
+                        "aggregate_leaf_value_ids",
+                        (),
+                    )
+                )
+                for index, parent in enumerate(elements):
+                    for path, endpoint in leaves(
+                        key[0], parent
+                    ).items():
+                        result[(int(index), *path)] = endpoint
+            elif data.get("type") in {"Indexed", "indexed"}:
+                base = next((
+                    parent for parent, role in parents
+                    if role in {"base", "value", "object"}
+                ), None)
+                index = next((
+                    parent for parent, role in parents
+                    if role in {"index", "slice", "subscript"}
+                ), None)
+                fixed_index = (
+                    unresolved_static
+                    if index is None
+                    else static_endpoint_value((key[0], index))
+                )
+                if (
+                    base is not None
+                    and isinstance(fixed_index, int)
+                ):
+                    projected = leaves(key[0], base)
+                    result = {
+                        path[1:]: endpoint
+                        for path, endpoint in projected.items()
+                        if path and path[0] == fixed_index
+                    }
+            elif isinstance(expression, ast.Attribute):
+                base = next((
+                    parent for parent, role in parents
+                    if role in {"value", "base", "operand", "object"}
+                ), None)
+                projected = {} if base is None else leaves(key[0], base)
+                field = str(expression.attr)
+                result = {
+                    path[1:]: endpoint
+                    for path, endpoint in projected.items()
+                    if path and str(path[0]) == field
+                }
+                if (
+                    not result
+                    and len(projected) == 1
+                    and () in projected
+                ):
+                    # The aggregate may be a public/captured parameter whose
+                    # Python class is intentionally absent.  A field reference
+                    # is still a precise SSA identity: aggregate endpoint plus
+                    # field path.  Canonicalize that identity instead of
+                    # assigning every repeated Attribute AST node a new fake
+                    # buffer ID.
+                    result = {
+                        (): field_endpoint(projected[()], field)
+                    }
+            elif attributes.get("producer_kind") in {
+                "aggregate_materialization",
+                "loop_materialization",
+            }:
+                # Materializing an iterable container does not create new
+                # numerical values.  Preserve the source aggregate's ordered
+                # leaves so downstream stack/cat operations can correlate the
+                # one tape's transient leaf IDs with planner-owned identities.
+                sources = tuple(
+                    int(value_id)
+                    for value_id in attributes.get(
+                        "materialized_source_value_ids",
+                        (),
+                    )
+                )
+                if len(sources) == 1:
+                    result = leaves(key[0], sources[0])
+                else:
+                    for index, source_id in enumerate(sources):
+                        for path, endpoint in leaves(
+                            key[0], source_id
+                        ).items():
+                            result[(int(index), *path)] = endpoint
+            elif isinstance(expression, ast.Call) and (
+                attributes.get("class_ref") is not None
+                or (
+                    isinstance(expression.func, ast.Name)
+                    and expression.func.id
+                    in (graph.graph.get("class_table") or {})
+                )
+                or (
+                    graph.graph.get("method_binding") == "class"
+                    and any(
+                        role in {"callee", "func"}
+                        and graph.nodes[parent].get("type") == "Input"
+                        and (
+                            graph.nodes[parent].get("attributes") or {}
+                        ).get("binding_name") == "cls"
+                        for parent, role in (
+                            data.get("parents") or ()
+                        )
+                    )
+                )
+            ):
+                # A classmethod commonly returns ``cls(...)``.  AST ingestion
+                # cannot attach a concrete class_ref to that call because
+                # ``cls`` is deliberately an SSA parameter, but the method's
+                # lexical owner is still a compiler fact.  Treating the result
+                # as opaque makes later ``result.field`` accesses escape as
+                # fake shell inputs.  Resolve the aggregate schema from the
+                # method owner without evaluating or retaining the Python
+                # class object.
+                class_name = (
+                    attributes.get("class_ref")
+                    or (
+                        expression.func.id
+                        if isinstance(expression.func, ast.Name)
+                        and expression.func.id
+                        in (graph.graph.get("class_table") or {})
+                        else None
+                    )
+                    or graph.graph.get("method_owner")
+                )
+                descriptor = (
+                    graph.graph.get("class_table", {}).get(
+                        class_name
+                    ) or {}
+                )
+                fields = tuple(descriptor.get("fields") or ())
+                field_defaults = descriptor.get("field_defaults") or {}
+                positional = {
+                    position: parent
+                    for parent, role in parents
+                    if (
+                        position := _positional_argument_index(role)
+                    ) is not None
+                }
+                keywords = {
+                    role.split(":", 1)[1]: parent
+                    for parent, role in parents
+                    if role.startswith("kw:")
+                }
+                for index, field in enumerate(fields):
+                    parent = keywords.get(field, positional.get(index))
+                    if parent is None:
+                        if field in field_defaults:
+                            endpoint = field_endpoint(key, str(field))
+                            synthetic_static_values[endpoint] = (
+                                field_defaults[field]
+                            )
+                            result[(str(field),)] = endpoint
+                        continue
+                    for path, endpoint in leaves(key[0], parent).items():
+                        result[(str(field), *path)] = endpoint
+            elif isinstance(expression, ast.Call) and (
+                call := calls.get(key)
+            ) is not None:
+                child_id = int(call.callee.closure_id)
+                child = shells[child_id].process_graph.G
+                output_names = tuple(
+                    child.graph.get("function_outputs", ())
+                )
+                identities = child.graph.get("identity_table") or {}
+                for output_index, name in enumerate(output_names):
+                    values = identities.get(name, ())
+                    if not values:
+                        continue
+                    prefix = (
+                        () if len(output_names) == 1 else (output_index,)
+                    )
+                    for path, endpoint in leaves(
+                        child_id, int(values[-1])
+                    ).items():
+                        result[(*prefix, *path)] = endpoint
+            if not result:
+                result = {(): key}
+        resolving.remove(key)
+        resolved_leaves[key] = result
+        return result
+
+    def canonical_global(closure_id: int, local_id: int) -> int:
+        projected = leaves(closure_id, local_id)
+        if len(projected) == 1 and () in projected:
+            return global_value(*projected[()])
+        return global_value(closure_id, local_id)
+
+    # Canonicalization must apply to the hierarchy's shared value table, not
+    # only to numerical region payloads.  A structural Phi/call/attribute and
+    # a raw tape endpoint can already share one pre-reduction global ID.  If
+    # only the numerical side follows the resolved source, composed control
+    # retains the stale ID and fabricates a second, external shader input for
+    # the same value.
+    #
+    # First discover an unambiguous redirect for every pre-reduction global
+    # identity.  Then apply that redirect to *all* correlated endpoints and
+    # compose control again from the unified table.  This is graph identity
+    # reduction over immutable IR; it neither consults captured values nor
+    # creates/replays a tape.
+    projected_correlations = tuple(
+        (
+            int(closure_id),
+            int(local_id),
+            int(global_id),
+            (
+                canonical_global(int(closure_id), int(local_id))
+                if int(closure_id) in shells
+                else int(global_id)
+            ),
+        )
+        for closure_id, local_id, global_id
+        in value_table.correlations
+    )
+    projection_targets: dict[int, set[int]] = {}
+    for _closure_id, _local_id, original, projected in (
+        projected_correlations
+    ):
+        if projected != original:
+            projection_targets.setdefault(original, set()).add(projected)
+    aggregate_redirect_diagnostics = {}
+    for closure_id, owner in shells.items():
+        for aggregate_map in owner.compiled_aggregate_feed_paths:
+            for capture_id, graph_input_id, path in aggregate_map:
+                projected = leaves(
+                    int(closure_id), int(graph_input_id)
+                )
+                target = projected.get(tuple(path))
+                if target is None:
+                    aggregate_redirect_diagnostics.setdefault(
+                        int(closure_id), []
+                    ).append({
+                        "capture": int(capture_id),
+                        "input": int(graph_input_id),
+                        "path": tuple(path),
+                        "projected": tuple(projected.items()),
+                        "target": None,
+                    })
+                    continue
+                original = global_value(
+                    int(closure_id), int(capture_id)
+                )
+                destination = global_value(*target)
+                aggregate_redirect_diagnostics.setdefault(
+                    int(closure_id), []
+                ).append({
+                    "capture": int(capture_id),
+                    "input": int(graph_input_id),
+                    "path": tuple(path),
+                    "projected": tuple(projected.items()),
+                    "target": tuple(target),
+                    "original": int(original),
+                    "destination": int(destination),
+                })
+                if original != destination:
+                    projection_targets.setdefault(
+                        original, set()
+                    ).add(destination)
+    canonical_redirects = {
+        original: next(iter(targets))
+        for original, targets in projection_targets.items()
+        if len(targets) == 1
+    }
+    shell.hierarchical_aggregate_redirect_diagnostics = {
+        closure_id: tuple(rows)
+        for closure_id, rows in aggregate_redirect_diagnostics.items()
+    }
+
+    def canonical_redirect(value_id: int) -> int:
+        current = int(value_id)
+        seen = set()
+        while current in canonical_redirects and current not in seen:
+            seen.add(current)
+            current = int(canonical_redirects[current])
+        return current
+
+    def composed_global(closure_id: int, local_id: int) -> int:
+        return canonical_redirect(canonical_global(closure_id, local_id))
+
+    # A loop over an aggregate needs one resident binding per field actually
+    # consumed by its body.  The local loop plan initially names the aggregate
+    # target (for example ``packet``), while numerical regions name precise
+    # field endpoints (``packet.octets`` and ``packet.byte_count``).  Expand
+    # that one structural binding into field-wise source lists after hierarchy
+    # leaves are known.  This is identity projection only: it neither reads a
+    # captured object nor reconstructs the container at runtime.
+    aggregate_binding_expansions: dict[
+        tuple[int, int, str],
+        tuple[tuple[int, int, str, tuple[int, ...]], ...],
+    ] = {}
+    aggregate_resident_bindings: set[tuple[int, int, str]] = set()
+    aggregate_loop_bounds: dict[
+        tuple[str, str, str],
+        int,
+    ] = {}
+    aggregate_candidate_diagnostics: dict[int, list[dict[str, Any]]] = {}
+    shell.hierarchical_control_binding_diagnostics = {
+        int(closure_id): {
+            "function": (
+                shells[int(closure_id)].process_graph.G.graph.get(
+                    "function_name"
+                )
+                if int(closure_id) in shells
+                else None
+            ),
+            "iterable": tuple(control.iterable_bindings),
+            "static": tuple(control.static_iterable_bindings),
+            "closure": tuple(control.closure_iterable_bindings),
+            "root": repr(control.root),
+            "loop_plans": tuple(
+                (
+                    int(plan.loop.node_id),
+                    plan.strategy.value,
+                    int(plan.loop.iterable_node)
+                    if plan.loop.iterable_node is not None
+                    else None,
+                    tuple(plan.loop.target_bindings),
+                    tuple(plan.loop.publication_nodes),
+                )
+                for plan in shells[int(closure_id)].loop_plans
+            ),
+            "loop_reductions": tuple(
+                (
+                    int(reduction.loop_node_id),
+                    bool(reduction.collapsible),
+                    tuple(reduction.blockers),
+                    reduction.control_program is not None,
+                )
+                for reduction
+                in shells[int(closure_id)].loop_shader_reductions
+            ),
+        }
+        for closure_id, control in controls.items()
+        if int(closure_id) in shells
+        and shells[int(closure_id)].process_graph.G.graph.get(
+            "function_name"
+        ) == "concatenate_resident_byte_packets"
+    }
+    for closure_id, local_control in controls.items():
+        closure_id = int(closure_id)
+        owner = shells.get(closure_id)
+        if owner is None:
+            continue
+        owner_graph = owner.process_graph.G
+        aggregate_candidates = (
+            *tuple(
+                (
+                    iterable_id,
+                    target_id,
+                    induction,
+                    source_ids,
+                    False,
+                )
+                for iterable_id, target_id, induction, source_ids
+                in local_control.closure_iterable_bindings
+            ),
+            *tuple(
+                (
+                    iterable_id,
+                    target_id,
+                    induction,
+                    (iterable_id,),
+                    True,
+                )
+                for iterable_id, target_id, induction
+                in local_control.iterable_bindings
+            ),
+        )
+        for (
+            iterable_id,
+            target_id,
+            induction,
+            _source_ids,
+            was_resident,
+        ) in aggregate_candidates:
+            composed_induction = (
+                f"{str(induction)}_closure_{closure_id}"
+            )
+            target_endpoint = (closure_id, int(target_id))
+            # Demand only attribute nodes downstream of this lexical target so
+            # field_endpoint() has established every field the loop body uses.
+            if int(target_id) in owner_graph:
+                for descendant in nx.descendants(
+                    owner_graph, int(target_id)
+                ):
+                    if isinstance(
+                        owner_graph.nodes[descendant].get("expr_obj"),
+                        ast.Attribute,
+                    ):
+                        leaves(closure_id, int(descendant))
+            field_targets = {
+                tuple(str(part) for part in path): endpoint
+                for endpoint, (root, path)
+                in synthetic_field_paths.items()
+                if root == target_endpoint and path
+            }
+            if not field_targets:
+                aggregate_candidate_diagnostics.setdefault(
+                    closure_id, []
+                ).append({
+                    "iterable": int(iterable_id),
+                    "target": int(target_id),
+                    "induction": str(induction),
+                    "resident": bool(was_resident),
+                    "argument_source": argument_sources.get(
+                        (closure_id, int(iterable_id))
+                    ),
+                    "projected": (),
+                    "fields": (),
+                })
+                continue
+            projected_iterable = leaves(
+                closure_id, int(iterable_id)
+            )
+            aggregate_candidate_diagnostics.setdefault(
+                closure_id, []
+            ).append({
+                "iterable": int(iterable_id),
+                "target": int(target_id),
+                "induction": str(induction),
+                "resident": bool(was_resident),
+                "argument_source": argument_sources.get(
+                    (closure_id, int(iterable_id))
+                ),
+                "projected": tuple(projected_iterable.items()),
+                "fields": tuple(field_targets.items()),
+            })
+            expanded = []
+            for field_path, field_target in sorted(
+                field_targets.items()
+            ):
+                indexed_sources = sorted(
+                    (
+                        int(path[0]),
+                        endpoint,
+                    )
+                    for path, endpoint in projected_iterable.items()
+                    if (
+                        path
+                        and isinstance(path[0], int)
+                        and tuple(str(part) for part in path[1:])
+                        == field_path
+                    )
+                )
+                if not indexed_sources:
+                    continue
+                indices = tuple(index for index, _ in indexed_sources)
+                if indices != tuple(range(len(indices))):
+                    continue
+                expanded.append((
+                    composed_global(closure_id, int(iterable_id)),
+                    composed_global(*field_target),
+                    composed_induction,
+                    tuple(
+                        composed_global(*source)
+                        for _index, source in indexed_sources
+                    ),
+                ))
+            if expanded:
+                global_key = (
+                    composed_global(closure_id, int(iterable_id)),
+                    composed_global(closure_id, int(target_id)),
+                    composed_induction,
+                )
+                aggregate_binding_expansions[global_key] = tuple(expanded)
+                if was_resident:
+                    aggregate_resident_bindings.add(global_key)
+                aggregate_loop_bounds[(
+                    composed_induction,
+                    f"__iterable_extent_{int(iterable_id)}__",
+                    f"__iterable_extent_{global_key[0]}__",
+                )] = len(expanded[0][3])
+
+    value_table = type(value_table)(tuple(
+        (
+            closure_id,
+            local_id,
+            canonical_redirect(projected),
+        )
+        for closure_id, local_id, _original, projected
+        in projected_correlations
+    ))
+    shell.hierarchical_effective_value_table = value_table
+    shell.hierarchical_aggregate_candidate_diagnostics = {
+        closure_id: tuple(rows)
+        for closure_id, rows in aggregate_candidate_diagnostics.items()
+    }
+    hierarchical = compose_hierarchical_control(
+        hierarchy, controls, value_table
+    )
+    if aggregate_binding_expansions:
+        expanded_bindings = []
+        expanded_keys = set()
+        for binding in hierarchical.program.closure_iterable_bindings:
+            binding_key = (
+                int(binding[0]),
+                int(binding[1]),
+                str(binding[2]),
+            )
+            replacement = aggregate_binding_expansions.get(binding_key)
+            if replacement is None:
+                expanded_bindings.append(binding)
+            else:
+                expanded_bindings.extend(replacement)
+                expanded_keys.add(binding_key)
+        for binding_key in aggregate_resident_bindings:
+            if binding_key in expanded_keys:
+                continue
+            expanded_bindings.extend(
+                aggregate_binding_expansions[binding_key]
+            )
+
+        def fix_aggregate_loop_bounds(block):
+            from .control_source import (
+                CallBlock,
+                LoopBlock,
+                ParallelDeployment,
+                StateMachineTick,
+            )
+
+            if isinstance(block, LoopBlock):
+                stop = str(block.stop)
+                for (
+                    induction,
+                    local_marker,
+                    global_marker,
+                ), count in aggregate_loop_bounds.items():
+                    if (
+                        str(block.induction) == induction
+                        and (
+                            local_marker in stop
+                            or global_marker in stop
+                        )
+                    ):
+                        stop = str(int(count))
+                return LoopBlock(
+                    block.induction,
+                    block.start,
+                    stop,
+                    block.step,
+                    fix_aggregate_loop_bounds(block.body),
+                    block.carried_aliases,
+                    block.parallel_iterations,
+                    block.dispatch_shell,
+                )
+            if isinstance(block, SequenceBlock):
+                return SequenceBlock(tuple(
+                    fix_aggregate_loop_bounds(child)
+                    for child in block.blocks
+                ))
+            if isinstance(block, StateMachineTick):
+                return StateMachineTick(
+                    block.state,
+                    tuple(
+                        (case, fix_aggregate_loop_bounds(body))
+                        for case, body in block.cases
+                    ),
+                )
+            if isinstance(block, ParallelDeployment):
+                return ParallelDeployment(tuple(
+                    fix_aggregate_loop_bounds(lane)
+                    for lane in block.lanes
+                ))
+            if isinstance(block, CallBlock):
+                return CallBlock(
+                    block.callsite_id,
+                    fix_aggregate_loop_bounds(block.callee),
+                    block.argument_bindings,
+                    block.result_bindings,
+                )
+            return block
+
+        program = hierarchical.program
+        hierarchical = type(hierarchical)(
+            ControlProgram(
+                fix_aggregate_loop_bounds(program.root),
+                program.region_indices,
+                program.uniforms,
+                program.value_aliases,
+                tuple(
+                    binding
+                    for binding in program.iterable_bindings
+                    if (
+                        int(binding[0]),
+                        int(binding[1]),
+                        str(binding[2]),
+                    ) not in aggregate_resident_bindings
+                ),
+                program.static_iterable_bindings,
+                program.collection_bindings,
+                tuple(dict.fromkeys(expanded_bindings)),
+            ),
+            hierarchical.region_correlations,
+        )
+    shell.hierarchical_composed_closure_iterable_bindings = tuple(
+        hierarchical.program.closure_iterable_bindings
+    )
+    shell.hierarchical_region_correlations = tuple(
+        hierarchical.region_correlations
+    )
+    region_lookup = {
+        (closure_id, local_region): global_region
+        for closure_id, local_region, global_region
+        in hierarchical.region_correlations
+    }
+
+    captured_regions = {}
+    specialized_values = {}
+    control_uniform_ids = {
+        int(uniform.value_id)
+        for uniform in hierarchical.program.uniforms
+    }
+
+    def add_specialization(global_id: int, fixed: Any) -> None:
+        previous = specialized_values.get(global_id, fixed)
+        if previous != fixed:
+            raise ValueError(
+                "hierarchical GLSL specialization conflict for "
+                f"value {global_id}: {previous!r} != {fixed!r}"
+            )
+        specialized_values[global_id] = fixed
+
+    for closure_id, owner in shells.items():
+        for region_key, captured in owner.captured_region_programs.items():
+            local_region = int(
+                region_key
+                if not isinstance(region_key, tuple)
+                else region_key[-2]
+            )
+            global_region = region_lookup.get(
+                (closure_id, local_region)
+            )
+            if global_region is None:
+                continue
+            programs = (captured.program, *captured.stages)
+            all_ids = {
+                int(value_id)
+                for program in programs
+                for value_id in (
+                    *program.feeds,
+                    *program.outputs.values(),
+                    *(step.result_id for step in program.steps),
+                    *(
+                        input_id
+                        for step in program.steps
+                        for input_id in step.input_ids
+                    ),
+                )
+            }
+            id_map = {
+                value_id: composed_global(closure_id, value_id)
+                for value_id in all_ids
+            }
+            captured_regions[global_region] = (
+                _remap_captured_all_ids(captured, id_map)
+            )
+        # Nested callsite shells are logical compartments of this artifact,
+        # not separately finalized shaders.  Carry their typed specialization
+        # facts directly from local lowering; requiring a throwaway child
+        # shader merely to recover this map creates enormous compile-time CPU
+        # churn and falsely treats every source call as a deployment.
+        for value_id, fixed in (
+            owner.composed_shell_specialized_values.items()
+        ):
+            global_id = composed_global(closure_id, int(value_id))
+            add_specialization(global_id, fixed)
+        owner_graph = owner.process_graph.G
+        # Literal scalar nodes are already part of the source program.  When
+        # hierarchy composition promotes one to control-uniform syntax, carry
+        # the literal into the artifact specialization map instead of
+        # inventing a host ABI input for it.
+        for local_id, data in owner_graph.nodes(data=True):
+            if data.get("type") not in {
+                "Constant", "Const", "const", "StaticReference"
+            }:
+                continue
+            try:
+                fixed = _constant_value(data)
+            except KeyError:
+                continue
+            if isinstance(fixed, (bool, int, float)):
+                global_id = composed_global(
+                    closure_id, int(local_id)
+                )
+                if global_id in control_uniform_ids:
+                    add_specialization(global_id, fixed)
+    # Defaulted scalar parameters and source-static predicate values are
+    # compiler facts even when they are not literal nodes.  Resolve them
+    # through explicit call bindings/defaults and specialize their canonical
+    # identities; leaving them in the external set fabricates root ABI inputs
+    # for nested optional arguments.
+    inferred_static: dict[int, list[Any]] = {}
+    for closure_id, local_id, _global_id in value_table.correlations:
+        fixed = static_endpoint_value((closure_id, local_id))
+        if isinstance(fixed, (bool, int, float)):
+            inferred_static.setdefault(
+                composed_global(closure_id, local_id), []
+            ).append(fixed)
+    for global_id, candidates in inferred_static.items():
+        first = candidates[0]
+        if not all(
+            type(candidate) is type(first) and candidate == first
+            for candidate in candidates[1:]
+        ):
+            continue
+        previous = specialized_values.get(global_id, first)
+        if type(previous) is type(first) and previous == first:
+            specialized_values[global_id] = first
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="numerical remap complete",
+        fields={
+            "regions": len(captured_regions),
+            "elapsed_ms": round(
+                (time.perf_counter() - compose_started) * 1e3,
+                3,
+            ),
+        },
+    )
+    program_value_origins: dict[int, list[dict[str, Any]]] = {}
+    region_owners = {
+        int(global_region): {
+            "closure": int(closure_id),
+            "function": shells[int(closure_id)].process_graph.G.graph.get(
+                "function_name"
+            ),
+            "local_region": int(local_region),
+        }
+        for closure_id, local_region, global_region
+        in hierarchical.region_correlations
+        if int(closure_id) in shells
+    }
+    for global_region, captured in captured_regions.items():
+        programs = (
+            tuple(captured.stages)
+            if captured.stages
+            else (captured.program,)
+        )
+        for stage_index, program in enumerate(programs):
+            def note(value_id: int, role: str, **extra: Any) -> None:
+                program_value_origins.setdefault(
+                    int(value_id), []
+                ).append({
+                    "region": int(global_region),
+                    **region_owners.get(int(global_region), {}),
+                    "stage": int(stage_index),
+                    "role": str(role),
+                    **extra,
+                })
+
+            for value_id in ordered_feed_ids(program):
+                note(value_id, "feed")
+            for name, value_id in program.outputs.items():
+                note(value_id, "output", name=str(name))
+            for step_index, step in enumerate(program.steps):
+                for input_index, value_id in enumerate(step.input_ids):
+                    note(
+                        value_id,
+                        "step-input",
+                        step=int(step_index),
+                        input=int(input_index),
+                        op=str(step.op_name),
+                    )
+                note(
+                    step.result_id,
+                    "step-result",
+                    step=int(step_index),
+                    op=str(step.op_name),
+                )
+    shell.hierarchical_program_value_origins = {
+        value_id: tuple(origins)
+        for value_id, origins in program_value_origins.items()
+    }
+    hierarchical_value_ids = {
+        int(value_id)
+        for captured in captured_regions.values()
+        for program in (
+            tuple(captured.stages)
+            if captured.stages
+            else (captured.program,)
+        )
+        for value_id in (
+            *ordered_feed_ids(program),
+            *tuple(program.outputs.values()),
+        )
+    }
+    hierarchical = type(hierarchical)(
+        project_control_regions(
+            hierarchical.program,
+            hierarchical.program.region_indices,
+            retained_value_ids=hierarchical_value_ids,
+        ),
+        hierarchical.region_correlations,
+    )
+    if set(captured_regions) != set(
+        hierarchical.program.region_indices
+    ):
+        shell.hierarchical_compose_failure = {
+            "reason": "captured-control-region-mismatch",
+            "captured_only": tuple(sorted(
+                set(captured_regions)
+                - set(hierarchical.program.region_indices)
+            )),
+            "control_only": tuple(sorted(
+                set(hierarchical.program.region_indices)
+                - set(captured_regions)
+            )),
+            "captured_only_origins": tuple(
+                (
+                    int(global_region),
+                    int(closure_id),
+                    int(local_region),
+                    shells[int(closure_id)].process_graph.G.graph.get(
+                        "function_name"
+                    ),
+                )
+                for closure_id, local_region, global_region
+                in hierarchical.region_correlations
+                if global_region in (
+                    set(captured_regions)
+                    - set(hierarchical.program.region_indices)
+                )
+            )[:12],
+        }
+        return None
+    root_id = int(hierarchy.closure_id)
+    root_locals = {
+        int(local_id)
+        for closure_id, local_id, _global_id
+        in value_table.correlations
+        if int(closure_id) == root_id
+    }
+    # Identity-call reduction may erase a parameter's explicit correlation
+    # after all of its uses move into a child closure.  It remains a public
+    # root ABI value and must still receive its canonical global identity.
+    # Derive root inputs from the source graph, not merely from the reduced
+    # correlation table, or valid parameters surface as anonymous private
+    # shader feeds.
+    root_locals.update(
+        int(local_id)
+        for local_id, data in shell.process_graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and shell.process_graph.G.out_degree(local_id)
+    )
+    shell.hierarchical_root_value_ids = {
+        local_id: composed_global(root_id, local_id)
+        for local_id in root_locals
+    }
+    # Preserve the compiler-generated portion of the global namespace as
+    # identities only.  These are not captured values and carry no Python
+    # objects; the table makes any accidentally exposed private operand
+    # diagnosable as its owning closure/local SSA endpoint instead of an
+    # inscrutable integer in the shell ABI.
+    shell.hierarchical_private_value_ids = {
+        int(global_id): (int(closure_id), int(local_id))
+        for (closure_id, local_id), global_id in private_values.items()
+    }
+    shell.hierarchical_capture_value_ids = {
+        int(global_id): int(capture_id)
+        for capture_id, global_id in capture_values.items()
+    }
+    shell.hierarchical_synthetic_field_paths = {
+        int(global_id): (
+            (int(root[0]), int(root[1])),
+            tuple(str(part) for part in path),
+        )
+        for endpoint, (root, path) in synthetic_field_paths.items()
+        if (global_id := private_values.get(endpoint)) is not None
+    }
+    endpoint_details: dict[int, list[dict[str, Any]]] = {}
+
+    def describe_endpoint(
+        global_id: int,
+        closure_id: int,
+        local_id: int,
+    ) -> None:
+        owner = shells.get(int(closure_id))
+        graph = None if owner is None else owner.process_graph.G
+        data = (
+            {}
+            if graph is None or int(local_id) not in graph
+            else graph.nodes[int(local_id)]
+        )
+        meta = value_meta((int(closure_id), int(local_id)))
+        endpoint_details.setdefault(int(global_id), []).append({
+            "closure": int(closure_id),
+            "function": (
+                None
+                if graph is None
+                else graph.graph.get("function_name")
+            ),
+            "local": int(local_id),
+            "type": data.get("type"),
+            "op": data.get("op"),
+            "label": data.get("label"),
+            "parents": tuple(
+                (int(parent), str(role))
+                for parent, role in (data.get("parents") or ())
+            ),
+            "attributes": {
+                str(name): value
+                for name, value in (data.get("attributes") or {}).items()
+                if isinstance(value, (bool, int, float, str, type(None)))
+            },
+            "meta": (
+                None
+                if meta is None
+                else {
+                    "shape": tuple(meta.shape or ()),
+                    "dtype": str(meta.dtype),
+                }
+            ),
+            "compiled_feed_meta": (
+                {}
+                if owner is None
+                else {
+                    int(value_id): {
+                        "shape": tuple(value_meta.shape or ()),
+                        "dtype": str(value_meta.dtype),
+                    }
+                    for value_id, value_meta
+                    in owner.compiled_feed_meta.items()
+                }
+            ),
+            "expr": (
+                None
+                if not isinstance(data.get("expr_obj"), ast.AST)
+                else ast.dump(
+                    data["expr_obj"],
+                    annotate_fields=False,
+                    include_attributes=False,
+                )[:240]
+            ),
+        })
+
+    for closure_id, local_id, global_id in value_table.correlations:
+        describe_endpoint(global_id, closure_id, local_id)
+    for (closure_id, local_id), global_id in private_values.items():
+        describe_endpoint(global_id, closure_id, local_id)
+        rooted = synthetic_field_paths.get((closure_id, local_id))
+        if rooted is not None:
+            (root_closure, root_local), field_path = rooted
+            describe_endpoint(global_id, root_closure, root_local)
+            endpoint_details[int(global_id)][-1]["field_path"] = tuple(
+                str(part) for part in field_path
+            )
+    shell.hierarchical_endpoint_details = {
+        global_id: tuple(details)
+        for global_id, details in endpoint_details.items()
+    }
+    root_parameter_names = {
+        str((data.get("attributes") or {}).get("binding_name"))
+        for _node_id, data in shell.process_graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_kind")
+        == "parameter"
+    }
+
+    def attribute_path(local_id: int) -> str | None:
+        if int(local_id) not in shell.process_graph.G:
+            return None
+        data = shell.process_graph.G.nodes[int(local_id)]
+        expression = data.get("expr_obj")
+        if not isinstance(expression, ast.Attribute):
+            return None
+        parts = [str(expression.attr)]
+        current = expression.value
+        while isinstance(current, ast.Attribute):
+            parts.append(str(current.attr))
+            current = current.value
+        if (
+            not isinstance(current, ast.Name)
+            or current.id not in root_parameter_names
+        ):
+            return None
+        return ".".join((current.id, *reversed(parts)))
+
+    shell.hierarchical_root_field_value_ids = {
+        path: int(global_id)
+        for global_id, (closure_id, local_id)
+        in shell.hierarchical_private_value_ids.items()
+        if int(closure_id) == root_id
+        and (path := attribute_path(local_id)) is not None
+    }
+    for global_id, endpoint in (
+        shell.hierarchical_private_value_ids.items()
+    ):
+        rooted = synthetic_field_paths.get(endpoint)
+        if rooted is None:
+            continue
+        (closure_id, local_id), field_path = rooted
+        if int(closure_id) != root_id:
+            continue
+        root_graph = shell.process_graph.G
+        if int(local_id) not in root_graph:
+            continue
+        root_data = root_graph.nodes[int(local_id)]
+        root_attributes = root_data.get("attributes") or {}
+        if (
+            root_data.get("type") != "Input"
+            or root_attributes.get("binding_kind") != "parameter"
+        ):
+            continue
+        name = root_attributes.get("binding_name")
+        if name is not None:
+            shell.hierarchical_root_field_value_ids[
+                ".".join((str(name), *field_path))
+            ] = int(global_id)
+    graph = shell.process_graph.G
+    identities = graph.graph.get("identity_table") or {}
+    terminals = {}
+    root_output_leaves = set()
+    for name in graph.graph.get("function_outputs", ()):
+        if not identities.get(name):
+            continue
+        for path, endpoint in leaves(
+            root_id, int(identities[name][-1])
+        ).items():
+            global_id = global_value(*endpoint)
+            suffix = "".join(f".{part}" for part in path)
+            terminals[f"{name}{suffix}"] = global_id
+            root_output_leaves.add(global_id)
+    resident_values = {
+        int(value_id)
+        for captured in captured_regions.values()
+        for program in (
+            tuple(captured.stages)
+            if captured.stages
+            else (captured.program,)
+        )
+        for value_id in (
+            *ordered_feed_ids(program),
+            *tuple(program.outputs.values()),
+        )
+    }
+    resident_values.update(
+        int(collection_id)
+        for _source_id, collection_id, _induction, _start
+        in hierarchical.program.collection_bindings
+    )
+    terminals = {
+        name: value_id
+        for name, value_id in terminals.items()
+        if value_id in resident_values
+    }
+    shell.hierarchical_public_output_ids = set(terminals.values())
+    stream_outputs = {}
+    for plan in shell.loop_plans:
+        for statement_id, published_value_id, _count_id in (
+            plan.loop.publication_nodes
+        ):
+            for name in graph.graph.get("function_outputs", ()):
+                output_ids = tuple(identities.get(name, ()))
+                if not output_ids:
+                    continue
+                output_id = int(output_ids[-1])
+                if (
+                    statement_id in graph
+                    and output_id in graph
+                    and nx.has_path(graph, statement_id, output_id)
+                ):
+                    stream_outputs[str(name)] = int(
+                        shell.hierarchical_root_value_ids[
+                            int(published_value_id)
+                        ]
+                    )
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="shader artifact begin",
+        fields={
+            "regions": len(captured_regions),
+            "terminals": len(terminals),
+        },
+    )
+    hierarchical_storage_meta = dict(global_meta)
+    for endpoint, global_id in private_values.items():
+        meta = value_meta(endpoint)
+        if meta is not None:
+            hierarchical_storage_meta.setdefault(int(global_id), meta)
+    for closure_id, local_id, global_id in value_table.correlations:
+        meta = value_meta((int(closure_id), int(local_id)))
+        if meta is not None:
+            hierarchical_storage_meta.setdefault(int(global_id), meta)
+    for capture_id, global_id in capture_values.items():
+        meta = next(
+            (
+                value_meta((int(closure_id), int(capture_id)))
+                for closure_id in shells
+                if value_meta((int(closure_id), int(capture_id))) is not None
+            ),
+            None,
+        )
+        if meta is not None:
+            hierarchical_storage_meta.setdefault(int(global_id), meta)
+    hierarchy_contract_diagnostics = {
+        int(global_id): ({
+            "kind": "hierarchy",
+            "private_endpoint": (
+                shell.hierarchical_private_value_ids.get(int(global_id))
+            ),
+            "capture_endpoint": (
+                shell.hierarchical_capture_value_ids.get(int(global_id))
+            ),
+            "endpoints": tuple(details),
+            "program_origins": tuple(
+                shell.hierarchical_program_value_origins.get(
+                    int(global_id), ()
+                )
+            ),
+            "synthetic_field": (
+                shell.hierarchical_synthetic_field_paths.get(
+                    int(global_id)
+                )
+            ),
+        },)
+        for global_id, details in shell.hierarchical_endpoint_details.items()
+    }
+    try:
+        artifact = build_control_shader_artifact(
+            hierarchical.program,
+            captured_regions,
+            value_meta=hierarchical_storage_meta,
+            value_contract_diagnostics=hierarchy_contract_diagnostics,
+            instrumentation=shell._profiler.verbose,
+            terminal_outputs=terminals or None,
+            stream_outputs=stream_outputs,
+            specialized_values=specialized_values,
+            device_resident=(shell.shell_language == "glsl"),
+        )
+    except Exception as error:
+        program = getattr(error, "program", None)
+        value_ids = (
+            ()
+            if program is None
+            else tuple(dict.fromkeys((
+                *ordered_feed_ids(program),
+                *program.outputs.values(),
+                *(step.result_id for step in program.steps),
+            )))
+        )
+        raise RuntimeError(
+            f"{error}; endpoint_details="
+            f"{ {int(value_id): shell.hierarchical_endpoint_details.get(int(value_id), ()) for value_id in value_ids}!r}"
+        ) from error
+    shell._profiler.trace(
+        path=shell.profile_path,
+        section="hierarchical-artifact",
+        label="complete",
+        fields={
+            "elapsed_ms": round(
+                (time.perf_counter() - compose_started) * 1e3,
+                3,
+            ),
+        },
+    )
+    return artifact
+
+
+def _diagnostic_value_summary(value: Any) -> str:
+    """Describe one routed value without creating AbstractTensor operations."""
+
+    if isinstance(value, type):
+        return f"type:{value.__module__}.{value.__qualname__}"
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    device = getattr(value, "device", None)
+    prefix = type(value).__name__
+    if shape is not None:
+        prefix += f"(shape={tuple(shape)},dtype={dtype},device={device})"
+    data = getattr(value, "data", value)
+    materialize = getattr(data, "numpy", None)
+    if not callable(materialize):
+        return prefix + f":{value!r}" if shape is None else prefix
+    try:
+        import numpy as np
+
+        array = np.asarray(materialize())
+        if not array.size:
+            return prefix + "[empty]"
+        finite = np.isfinite(array)
+        finite_count = int(finite.sum())
+        if finite_count:
+            selected = array[finite]
+            stats = (
+                f"min={selected.min():.7g},max={selected.max():.7g},"
+                f"mean={selected.mean():.7g}"
+            )
+        else:
+            stats = "min=nan,max=nan,mean=nan"
+        return (
+            prefix
+            + f"[{stats},finite={finite_count}/{array.size}]"
+        )
+    except Exception as error:
+        return prefix + f"[diagnostic={type(error).__name__}:{error}]"
+
+
+def _captured_storage_meta(values: dict[int, Any]) -> dict[int, Meta]:
+    """Extract arena storage contracts without consuming numerical values."""
+
+    result = {}
+    for value_id, value in values.items():
+        if isinstance(value, AbstractTensor):
+            result[int(value_id)] = Meta(
+                shape=tuple(int(size) for size in value.shape),
+                dtype=str(value.dtype),
+                device="glsl",
+            )
+        elif isinstance(value, bool):
+            result[int(value_id)] = Meta((), "bool", "glsl")
+        elif isinstance(value, int):
+            result[int(value_id)] = Meta((), "int32", "glsl")
+        elif isinstance(value, float):
+            result[int(value_id)] = Meta((), "float32", "glsl")
+    return result
 
 
 @contextmanager
@@ -370,7 +3792,8 @@ def _profile_event(
         return
 
     query = None
-    if gpu:
+    owns_gpu_query = bool(gpu and profiler._gpu_query_depth == 0)
+    if owns_gpu_query:
         from OpenGL import GL
 
         generated = GL.glGenQueries(1)
@@ -379,12 +3802,16 @@ def _profile_event(
         except (IndexError, TypeError):
             query = int(generated)
         GL.glBeginQuery(GL.GL_TIME_ELAPSED, query)
+    if gpu:
+        profiler._gpu_query_depth += 1
     before_dispatches = dispatch_stats()["calls"]
     started_ns = time.perf_counter_ns()
     try:
         yield
     finally:
-        if query is not None:
+        if gpu:
+            profiler._gpu_query_depth -= 1
+        if owns_gpu_query:
             from OpenGL import GL
 
             GL.glEndQuery(GL.GL_TIME_ELAPSED)
@@ -421,6 +3848,54 @@ def _is_ast_metadata_node(graph: Any, node_id: int) -> bool:
     )
 
 
+def _semantic_children(graph: Any) -> dict[int, set[int]]:
+    """Union the edge and parent-reference views of who consumes each node."""
+
+    children: dict[int, set[int]] = {
+        node_id: set(graph.G.successors(node_id)) for node_id in graph.G
+    }
+    for node_id, data in graph.G.nodes(data=True):
+        for parent, _role in data.get("parents", ()):
+            if parent in children:
+                children[parent].add(node_id)
+    return children
+
+
+def _inert_routing_nodes(graph: Any) -> frozenset[int]:
+    """Find attribute lookups whose result nothing ever reads.
+
+    Ingesting ``x.foo()`` records the attribute lookup beside the call even
+    when the call already references ``x`` directly, so the lookup is left with
+    no consumer.  Evaluating it anyway is not free: it demands a materialized
+    value for ``x``, which forces an otherwise shader-local intermediate to
+    become a published region output.  Naming these nodes lets both the region
+    extractor and the coordinator ignore work no one observes.  Only the
+    side-effect-free lookup itself qualifies: only a load, never an assignment
+    or deletion target, and never a call or statement with no consumer.
+    """
+
+    roots = set(getattr(graph, "roots", ()) or ())
+    children = _semantic_children(graph)
+    inert: set[int] = set()
+    for node_id in reversed(tuple(
+        nx.lexicographical_topological_sort(
+            graph.G, key=lambda value_id: int(value_id)
+        )
+    )):
+        if node_id in roots:
+            continue
+        expression = graph.G.nodes[node_id].get("expr_obj")
+        if not isinstance(expression, ast.Attribute):
+            continue
+        if not isinstance(getattr(expression, "ctx", None), ast.Load):
+            # ``obj.field = value`` mutates the receiver.  Its node has no
+            # consumer by construction, which is exactly why it must still run.
+            continue
+        if all(child in inert for child in children[node_id]):
+            inert.add(node_id)
+    return frozenset(inert)
+
+
 def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     """Return whether a node routes syntax but performs no computation."""
 
@@ -442,7 +3917,7 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         and (
             str(data.get("label", "")).startswith("unpack[")
             or graph.G.nodes[indexed_base].get("type")
-            in {"Tuple", "List", "Set", "Dict", "Attribute"}
+            in {"Tuple", "List", "Set", "Dict"}
         )
     )
     compares_none = (
@@ -461,6 +3936,11 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         candidate_data = graph.G.nodes[candidate]
         candidate_expression = candidate_data.get("expr_obj")
         candidate_type = str(candidate_data.get("type"))
+        candidate_op = str(
+            candidate_data.get("op") or candidate_type
+        )
+        if candidate_op in ACCESSOR_OPERATORS:
+            return True
         if candidate_type in {"Const", "const", "Constant"}:
             return True
         if candidate_type in {"Input", "input"}:
@@ -492,15 +3972,28 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             for parent, _role in parents
         )
     )
+    coordinator_accessor = (
+        str(data.get("op") or node_type) in ACCESSOR_OPERATORS
+    )
     coordinator_bit_shift = (
         isinstance(expression, ast.BinOp)
         and isinstance(expression.op, (ast.LShift, ast.RShift))
+    )
+    coordinator_boolean_not = (
+        isinstance(expression, ast.UnaryOp)
+        and isinstance(expression.op, ast.Not)
     )
     chained_comparison = (
         isinstance(expression, ast.Compare)
         and len(expression.ops) > 1
     )
     return (
+        bool(
+            (data.get("attributes") or {}).get(
+                "coordinator_short_circuit"
+            )
+        )
+        or
         node_type in {
             "Input",
             "input",
@@ -514,6 +4007,16 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
             "Return",
             "return",
             "Call",
+            "StaticReference",
+            "SetAttr",
+            "Phi",
+            "LoopExit",
+            "LoopStateTransition",
+            "LoopResult",
+            "LoopStatePort",
+            "LoopAggregateResult",
+            "Yield",
+            "YieldFrom",
             "no_grad",
         }
         or
@@ -543,6 +4046,10 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
                 ast.withitem,
                 ast.If,
                 ast.Raise,
+                ast.Assert,
+                ast.Pass,
+                ast.Break,
+                ast.Continue,
                 ast.Try,
                 ast.ExceptHandler,
                 ast.For,
@@ -556,6 +4063,7 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
                 ast.FormattedValue,
                 ast.IfExp,
                 ast.BoolOp,
+                ast.Lambda,
                 ast.Starred,
                 ast.Tuple,
                 ast.List,
@@ -567,7 +4075,9 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         or python_routing_index
         or compares_none
         or static_scalar_expression
+        or coordinator_accessor
         or coordinator_bit_shift
+        or coordinator_boolean_not
         or chained_comparison
         or (
             data.get("type") == "Load"
@@ -576,10 +4086,45 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
     )
 
 
-def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
-    """Return the planned dispatch as an independent ProcessGraph subgraph."""
+def _dispatch_subgraph(
+    graph: Any,
+    node_ids: tuple[int, ...],
+    *,
+    required_outputs: frozenset[int] = frozenset(),
+    inert_nodes: frozenset[int] = frozenset(),
+) -> Any:
+    """Return the planned dispatch as an independent ProcessGraph subgraph.
+
+    ``required_outputs`` names values the coordinator observes by identity
+    rather than through a dataflow edge.  Such a value is a compartment
+    boundary even when every graph-visible consumer lives inside this region,
+    so it must be published instead of staying shader-local.
+
+    ``inert_nodes`` names lookups nobody reads.  They are not consumers, so
+    they never turn a shader-local intermediate into a published output.
+    """
 
     selected = set(node_ids)
+    semantic_parents = {
+        node_id: {
+            *graph.G.predecessors(node_id),
+            *(
+                parent
+                for parent, _role in graph.G.nodes[node_id].get(
+                    "parents", ()
+                )
+                if parent in graph.G
+            ),
+        }
+        for node_id in graph.G
+    }
+    semantic_children = {
+        node_id: set(graph.G.successors(node_id))
+        for node_id in graph.G
+    }
+    for child, parents in semantic_parents.items():
+        for parent in parents:
+            semantic_children[parent].add(child)
     # Container literals are routing, not dispatches of their own.  When one
     # feeds a numerical region, inline the container and expose its leaves as
     # the region boundary so a captured tensor operation retains each feed's
@@ -587,7 +4132,7 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
     pending = list(selected)
     while pending:
         child = pending.pop()
-        for parent in graph.G.predecessors(child):
+        for parent in semantic_parents[child]:
             if parent in selected:
                 continue
             expression = graph.G.nodes[parent].get("expr_obj")
@@ -597,12 +4142,25 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
     boundary = {
         parent
         for node_id in selected
-        for parent in graph.G.predecessors(node_id)
+        for parent in semantic_parents[node_id]
         if parent not in selected
         and not _is_ast_metadata_node(graph, parent)
     }
     included = selected | boundary
     subgraph = extract_clean_process_subgraph(graph, included)
+    for child in included:
+        roles = {
+            parent: role
+            for parent, role in graph.G.nodes[child].get("parents", ())
+            if parent in included
+        }
+        for parent in semantic_parents[child]:
+            if parent in included and not subgraph.G.has_edge(parent, child):
+                subgraph.G.add_edge(
+                    parent,
+                    child,
+                    role=roles.get(parent, "dependency"),
+                )
 
     for node_id in boundary:
         data = subgraph.G.nodes[node_id]
@@ -615,23 +4173,19 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
         for parent in tuple(subgraph.G.predecessors(node_id)):
             subgraph.G.remove_edge(parent, node_id)
 
-    source_levels = graph.levels
-    minimum_level = min(
-        (int(source_levels.get(node_id, 0)) for node_id in included),
-        default=0,
-    )
-    subgraph.levels = {
-        node_id: int(source_levels.get(node_id, 0)) - minimum_level
-        for node_id in included
+    observed_children = {
+        node_id: children - inert_nodes
+        for node_id, children in semantic_children.items()
     }
     subgraph.roots = [
         node_id
         for node_id in node_ids
         if (
-            graph.G.out_degree(node_id) == 0
+            node_id in required_outputs
+            or not observed_children[node_id]
             or any(
                 child not in selected
-                for child in graph.G.successors(node_id)
+                for child in observed_children[node_id]
             )
         )
     ]
@@ -640,7 +4194,6 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
         (node_id for node_id in graph.G if isinstance(node_id, int)),
         default=0,
     ) + 1
-    output_level = max(subgraph.levels.values(), default=0) + 1
     store_nodes = []
     for output_id in deployment_outputs:
         while next_node_id in subgraph.G:
@@ -659,9 +4212,33 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
         subgraph.G.nodes[output_id].setdefault("children", []).append(
             (store_id, "value")
         )
-        subgraph.levels[store_id] = output_level
         store_nodes.append(store_id)
     subgraph.roots = store_nodes
+    # Compartmentalization changes both the region boundary and its available
+    # inputs, so inherited levels from the source graph are no longer an
+    # execution schedule for this subgraph.  Schedule every compartment from
+    # its reconstructed internal dependencies.  The source schedule guided
+    # legal region formation; this local schedule governs emitted instruction
+    # order inside the resulting shader.
+    computed_levels = subgraph.compute_levels(
+        method="asap",
+        order="dependency",
+    )
+    if computed_levels is not None:
+        subgraph.levels = computed_levels
+    subgraph.G.graph["compartment_schedule"] = tuple(
+        (
+            level,
+            tuple(
+                node_id
+                for node_id in nx.lexicographical_topological_sort(
+                    subgraph.G, key=lambda value_id: int(value_id)
+                )
+                if int(subgraph.levels.get(node_id, 0)) == level
+            ),
+        )
+        for level in sorted(set(subgraph.levels.values()))
+    )
     subgraph.G.graph["deployment_inputs"] = tuple(
         node_id
         for node_id, data in subgraph.G.nodes(data=True)
@@ -673,6 +4250,196 @@ def _dispatch_subgraph(graph: Any, node_ids: tuple[int, ...]) -> Any:
         node_id for node_id in node_ids if node_id in subgraph.G
     )
     return subgraph
+
+
+def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
+    """Map every node to the conditional branches that guard it.
+
+    A branch body only runs when its test selects it.  The coordinator honours
+    that by withholding controlled nodes from the ordinary topological sweep,
+    but a shader region is executed as a unit: pulling any of its members
+    forces every member to run.  Recording branch membership lets region
+    planning refuse to mix guarded work with work that runs unconditionally,
+    or to mix two branches of the same test with each other.
+    """
+
+    expression_nodes = {
+        id(data.get("expr_obj")): node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.AST)
+    }
+    memberships: dict[int, set[tuple[int, str]]] = {}
+    for control_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if isinstance(expression, ast.If):
+            branches = {
+                "body": tuple(expression.body),
+                "orelse": tuple(expression.orelse),
+            }
+        elif isinstance(expression, ast.IfExp):
+            branches = {
+                "body": (expression.body,),
+                "orelse": (expression.orelse,),
+            }
+        elif isinstance(expression, ast.Try):
+            branches = {
+                "body": tuple(expression.body),
+                "handlers": tuple(expression.handlers),
+                "orelse": tuple(expression.orelse),
+                "finalbody": tuple(expression.finalbody),
+            }
+        elif isinstance(expression, ast.BoolOp):
+            # Only the first operand of a short-circuiting operator is
+            # guaranteed to run; the rest are guarded by its outcome.
+            branches = {
+                f"operand:{index}": (value,)
+                for index, value in enumerate(expression.values)
+                if index
+            }
+        else:
+            continue
+        for role, statements in branches.items():
+            for statement in statements:
+                for member in ast.walk(statement):
+                    guarded = expression_nodes.get(id(member))
+                    if guarded is not None and guarded != control_id:
+                        memberships.setdefault(guarded, set()).add(
+                            (control_id, role)
+                        )
+    return {
+        node_id: frozenset(roles)
+        for node_id, roles in memberships.items()
+    }
+
+
+def _control_partition_keys(
+    graph: Any,
+    loop_plans: Iterable[Any],
+    node_ids: Iterable[int],
+) -> dict[int, tuple[Any, ...]]:
+    """Key nodes by lexical control and nested-call execution frontiers.
+
+    A parent numerical region cannot span a nested function call.  Hierarchy
+    composition inserts the child at the callsite, while one region marker is
+    indivisible; allowing a region to contain work from both sides causes its
+    post-call stages to execute before the child has produced their inputs.
+    Descendant membership supplies the exact semantic frontier without
+    separating independent work merely because of an arbitrary topological
+    ordering.
+    """
+
+    plans = tuple(loop_plans)
+    branches = _branch_compartments(graph)
+    callsites = tuple(
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if (
+            attributes.get("callee_ref") is not None
+            or attributes.get("method_ref") is not None
+        )
+    )
+    call_descendants = {
+        callsite: nx.descendants(graph.G, callsite)
+        for callsite in callsites
+    }
+    return {
+        node_id: (
+            tuple(
+                plan.loop.node_id
+                for plan in plans
+                if node_id in plan.loop.body_nodes
+            ),
+            tuple(sorted(branches.get(node_id, ()))),
+            tuple(
+                callsite
+                for callsite in callsites
+                if node_id in call_descendants[callsite]
+            ),
+        )
+        for node_id in node_ids
+    }
+
+
+def _closure_routing_dependencies(
+    graph: Any,
+) -> tuple[frozenset[tuple[int, int]], frozenset[int]]:
+    """Recover causal facts carried by closure routing rather than by edges.
+
+    A call to a compiled function supplies that callee's free variables by
+    name: the coordinator looks the name up in this graph's identity table and
+    evaluates whichever definition precedes the call.  No parent reference or
+    graph edge records that read, so region planning cannot see it.  Two
+    consequences follow, and both are returned here.
+
+    The routed definition is observed from outside the shader, so it is a
+    compartment boundary value and must be published.  The call also depends
+    on it, so a region may not internalize both the definition and any value
+    produced by that call; doing so would make the region depend on its own
+    unpublished result.  The returned edges are declared to the reducer as
+    structural dependencies exactly like a path through a coordinator node.
+    """
+
+    identities = graph.G.graph.get("identity_table", {}) or {}
+    if not identities:
+        return frozenset(), frozenset()
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return frozenset(), frozenset()
+
+    def free_binding_names(reference: int) -> frozenset[str]:
+        try:
+            entry = function_table.entry(int(reference))
+        except (KeyError, TypeError, ValueError):
+            return frozenset()
+        callee = getattr(entry, "graph", None)
+        if callee is None:
+            return frozenset()
+        return frozenset(
+            str(name)
+            for _node_id, data in callee.G.nodes(data=True)
+            if data.get("type") == "Input"
+            for attributes in ((data.get("attributes") or {}),)
+            if attributes.get("binding_kind") == "external"
+            for name in (attributes.get("binding_name"),)
+            if name is not None
+        )
+
+    order_index = {
+        node_id: index
+        for index, node_id in enumerate(
+            nx.lexicographical_topological_sort(
+                graph.G, key=lambda value_id: int(value_id)
+            )
+        )
+    }
+    free_names: dict[int, frozenset[str]] = {}
+    edges: set[tuple[int, int]] = set()
+    routed: set[int] = set()
+    for call_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        reference = attributes.get("callee_ref")
+        if reference is None:
+            reference = attributes.get("method_ref")
+        if reference is None:
+            continue
+        names = free_names.get(int(reference))
+        if names is None:
+            names = free_binding_names(reference)
+            free_names[int(reference)] = names
+        call_position = order_index[call_id]
+        for name in names:
+            for definition in identities.get(name, ()):
+                # Only a definition that can already have executed is a
+                # candidate for this call site.  Declaring a later one would
+                # invent a backward dependency the schedule cannot satisfy.
+                if (
+                    definition in order_index
+                    and order_index[definition] < call_position
+                ):
+                    edges.add((definition, call_id))
+                    routed.add(definition)
+    return frozenset(edges), frozenset(routed)
 
 
 def _compiler_input_name(label: str) -> str:
@@ -699,18 +4466,59 @@ def _compiler_input_name(label: str) -> str:
     return f"{prefix}{name}"
 
 
-def _bind_capture_tape(value: Any, tape: Any) -> Any:
-    """Wrap resident tensor storage in the tape for the current region."""
+def _bind_capture_tape(
+    value: Any,
+    tape: Any,
+    cache: dict[int, Any] | None = None,
+) -> Any:
+    """Bind tensor storage to the one discovery tape without copying values."""
 
+    if isinstance(value, tuple):
+        return tuple(_bind_capture_tape(item, tape, cache) for item in value)
+    if isinstance(value, list):
+        return [_bind_capture_tape(item, tape, cache) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _bind_capture_tape(item, tape, cache)
+            for key, item in value.items()
+        }
     if not isinstance(value, AbstractTensor):
         return value
+    if getattr(value, "_tape", None) is tape:
+        return value
+    identity = id(value)
+    if cache is not None and identity in cache:
+        return cache[identity]
     rebound = type(value)(
         track_time=value.track_time,
         requires_grad=value.requires_grad,
         tape=tape,
     )
     rebound.data = value.data
+    if cache is not None:
+        cache[identity] = rebound
     return rebound
+
+
+def _capture_storage_identity(value: Any):
+    """Return the exact resident range represented by a capture wrapper."""
+
+    storage = (
+        value
+        if getattr(value, "_storage", None) is not None
+        else getattr(value, "data", None)
+    )
+    if storage is None:
+        return None
+    physical = getattr(storage, "_storage", None)
+    if physical is not None:
+        return (
+            id(physical),
+            getattr(storage, "_offset", None),
+            getattr(storage, "_count", None),
+            str(getattr(storage, "_dtype", None)),
+        )
+    return ("object", id(storage))
 
 
 def _remap_captured_program(
@@ -730,47 +4538,548 @@ def _remap_captured_program(
     id_map = dict(feed_ids)
     id_map.update(zip(captured_outputs, output_ids))
     remap = lambda value_id: id_map.get(value_id, value_id)
-    remapped = FusedProgram(
-        version=program.version,
-        feeds={remap(value_id) for value_id in program.feeds},
-        steps=[
-            OpStep(
-                step_id=step.step_id,
-                op_name=step.op_name,
-                input_ids=[remap(value_id) for value_id in step.input_ids],
-                attrs=dict(step.attrs),
-                result_id=remap(step.result_id),
-                mode_sensitive=step.mode_sensitive,
-                level=step.level,
-            )
-            for step in program.steps
-        ],
-        outputs={
-            f"value_{output_id}": output_id
-            for output_id in output_ids
-        },
-        state_in=(
-            None
-            if program.state_in is None
-            else {remap(value_id) for value_id in program.state_in}
-        ),
-        meta={
-            remap(value_id): meta
-            for value_id, meta in (program.meta or {}).items()
-        },
-        extras=program.extras,
-    )
-    if hasattr(program, "glsl_linear_output_shape"):
-        remapped.glsl_linear_output_shape = tuple(
-            program.glsl_linear_output_shape
+    captured_feed_meta = _captured_storage_meta({
+        int(value_id): value
+        for value_id, value in captured.feeds.items()
+    })
+    def remap_program(source, *, public_outputs=False):
+        target = FusedProgram(
+            version=source.version,
+            feeds={remap(value_id) for value_id in source.feeds},
+            steps=[
+                OpStep(
+                    step_id=step.step_id,
+                    op_name=step.op_name,
+                    input_ids=[
+                        remap(value_id) for value_id in step.input_ids
+                    ],
+                    attrs=dict(step.attrs),
+                    result_id=remap(step.result_id),
+                    mode_sensitive=step.mode_sensitive,
+                    level=step.level,
+                )
+                for step in source.steps
+            ],
+            outputs=(
+                {
+                    f"value_{output_id}": output_id
+                    for output_id in output_ids
+                }
+                if public_outputs
+                else {
+                    name: remap(value_id)
+                    for name, value_id in source.outputs.items()
+                }
+            ),
+            state_in=(
+                None
+                if source.state_in is None
+                else {remap(value_id) for value_id in source.state_in}
+            ),
+            meta={
+                **{
+                    remap(value_id): meta
+                    for value_id, meta in captured_feed_meta.items()
+                    if value_id in source.feeds
+                },
+                **{
+                    remap(value_id): meta
+                    for value_id, meta in (source.meta or {}).items()
+                },
+            },
+            extras=source.extras,
         )
+        if hasattr(source, "glsl_linear_output_shape"):
+            target.glsl_linear_output_shape = tuple(
+                source.glsl_linear_output_shape
+            )
+        return target
+
+    remapped = remap_program(program, public_outputs=True)
     return CapturedFusedProgram(
         remapped,
-        {
-            remap(value_id): value
-            for value_id, value in captured.feeds.items()
-        },
+        # Captured tensors are evidence used to reveal the operation sequence;
+        # they are not part of the compiled program.  Runtime data enters only
+        # through the remapped feed IDs.  Retaining numeric payloads here would
+        # compile an observed instance instead of the program.
+        {},
+        tuple(
+            remap_program(stage)
+            for stage in captured.stages
+        ),
     )
+
+
+def _remap_captured_all_ids(
+    captured: CapturedFusedProgram,
+    id_map: Mapping[int, int],
+) -> CapturedFusedProgram:
+    """Namespace every captured IR identity for hierarchical composition."""
+
+    def remap_program(source):
+        remap = lambda value_id: int(
+            id_map.get(int(value_id), int(value_id))
+        )
+        target = FusedProgram(
+            version=source.version,
+            feeds={remap(value_id) for value_id in source.feeds},
+            steps=[
+                OpStep(
+                    step.step_id,
+                    step.op_name,
+                    [remap(value_id) for value_id in step.input_ids],
+                    dict(step.attrs),
+                    remap(step.result_id),
+                    step.mode_sensitive,
+                    step.level,
+                )
+                for step in source.steps
+            ],
+            outputs={
+                name: remap(value_id)
+                for name, value_id in source.outputs.items()
+            },
+            state_in=(
+                None
+                if source.state_in is None
+                else {remap(value_id) for value_id in source.state_in}
+            ),
+            meta={
+                remap(value_id): meta
+                for value_id, meta in (source.meta or {}).items()
+            },
+            extras=source.extras,
+        )
+        if hasattr(source, "glsl_linear_output_shape"):
+            target.glsl_linear_output_shape = tuple(
+                source.glsl_linear_output_shape
+            )
+        return target
+
+    return CapturedFusedProgram(
+        remap_program(captured.program),
+        {},
+        tuple(remap_program(stage) for stage in captured.stages),
+    )
+
+
+def _wire_planned_step_inputs(
+    captured: CapturedFusedProgram,
+    step_inputs: Mapping[int, tuple[tuple[int, int], ...]],
+) -> CapturedFusedProgram:
+    """Replace primitive operand IDs with their planned PG input positions.
+
+    ``step_inputs`` is emitted synchronously by GraphDeepCompiler for one
+    operation invocation.  Keys are primitive result occurrence IDs and
+    values are the ProcessGraph parent IDs already present in the compartment.
+    No payload, object, storage, or tape traversal participates here.
+    """
+
+    def rewrite(source: FusedProgram) -> FusedProgram:
+        steps = []
+        for step in source.steps:
+            planned = step_inputs.get(int(step.result_id))
+            inputs = (
+                tuple(int(graph_id) for _primitive_id, graph_id in planned)
+                if planned is not None
+                and len(planned) == len(step.input_ids)
+                else tuple(map(int, step.input_ids))
+            )
+            steps.append(OpStep(
+                step.step_id,
+                step.op_name,
+                inputs,
+                dict(step.attrs),
+                int(step.result_id),
+                step.mode_sensitive,
+                step.level,
+            ))
+        produced = {int(step.result_id) for step in steps}
+        feeds = {
+            int(value_id)
+            for step in steps
+            for value_id in step.input_ids
+            if int(value_id) not in produced
+        }
+        meta = dict(source.meta or {})
+        for positional_inputs in step_inputs.values():
+            for primitive_id, graph_id in positional_inputs:
+                if int(primitive_id) in meta:
+                    meta.setdefault(int(graph_id), meta[int(primitive_id)])
+        return FusedProgram(
+            version=source.version,
+            feeds=feeds,
+            steps=steps,
+            outputs=dict(source.outputs),
+            state_in=source.state_in,
+            meta=meta,
+            extras=source.extras,
+        )
+
+    return CapturedFusedProgram(
+        rewrite(captured.program),
+        {},
+        tuple(rewrite(stage) for stage in captured.stages),
+    )
+
+
+def _collapse_planned_collection_materializations(
+    captured: CapturedFusedProgram,
+    aliases: Mapping[int, int],
+) -> CapturedFusedProgram:
+    """Replace observed aggregate leaves with one planner collection input.
+
+    The materialization remains a real numerical producer with its own result
+    ID.  Only its discovery-time variadic inputs are replaced; the loop plan's
+    resident result is the single runtime input.
+    """
+
+    aliases = {
+        int(result_id): int(collection_id)
+        for result_id, collection_id in aliases.items()
+    }
+    if not aliases:
+        return captured
+
+    def rewrite(source: FusedProgram) -> FusedProgram:
+        metadata = dict(source.meta or {})
+        steps = [
+            OpStep(
+                step.step_id,
+                step.op_name,
+                (
+                    [aliases[int(step.result_id)]]
+                    if int(step.result_id) in aliases
+                    else list(step.input_ids)
+                ),
+                dict(step.attrs),
+                int(step.result_id),
+                step.mode_sensitive,
+                step.level,
+            )
+            for step in source.steps
+        ]
+        for step in source.steps:
+            collection_id = aliases.get(int(step.result_id))
+            result_meta = metadata.get(int(step.result_id))
+            if collection_id is not None and result_meta is not None:
+                metadata.setdefault(int(collection_id), result_meta)
+        produced = {int(step.result_id) for step in steps}
+        feeds = {
+            int(value_id)
+            for step in steps
+            for value_id in step.input_ids
+            if int(value_id) not in produced
+        }
+        target = FusedProgram(
+            version=source.version,
+            feeds=feeds,
+            steps=steps,
+            outputs={
+                name: int(value_id)
+                for name, value_id in source.outputs.items()
+            },
+            state_in=(
+                None
+                if source.state_in is None
+                else {int(value_id) for value_id in source.state_in}
+            ),
+            meta=metadata,
+            extras=source.extras,
+        )
+        if hasattr(source, "glsl_linear_output_shape"):
+            target.glsl_linear_output_shape = tuple(
+                source.glsl_linear_output_shape
+            )
+        return target
+
+    full = rewrite(captured.program)
+    stages = tuple(
+        rewritten
+        for stage in captured.stages
+        if (rewritten := rewrite(stage)).steps
+    )
+    return CapturedFusedProgram(full, {}, stages)
+
+
+def _project_captured_program(
+    captured: CapturedFusedProgram,
+    *,
+    output_ids: tuple[int, ...],
+    boundary_ids: tuple[int, ...],
+    allowed_result_ids: tuple[int, ...] | None = None,
+) -> CapturedFusedProgram:
+    """Project a planner region from an already-lowered shell program.
+
+    This function operates only on backend-neutral IR.  It deliberately has
+    no access to a GradTape or captured tensor payload, so requesting another
+    region cannot rediscover, replay, or recursively lower the Python
+    execution.  ``boundary_ids`` are planner cut points: dependencies stop
+    there even if another region in the complete shell produces that value.
+    """
+
+    outputs = tuple(int(value) for value in output_ids)
+    boundaries = {int(value) for value in boundary_ids}
+    allowed_results = (
+        None
+        if allowed_result_ids is None
+        else {int(value) for value in allowed_result_ids}
+    )
+    all_steps = [
+        step
+        for program in captured.execution_programs
+        for step in program.steps
+    ]
+    all_meta = {
+        int(value_id): meta
+        for program in (captured.program, *captured.execution_programs)
+        for value_id, meta in (program.meta or {}).items()
+    }
+    producers = {int(step.result_id): step for step in all_steps}
+    available_feeds = {
+        int(value_id)
+        for program in (captured.program, *captured.execution_programs)
+        for value_id in program.feeds
+    }
+    missing_outputs = tuple(
+        value_id for value_id in outputs
+        if value_id not in producers and value_id not in available_feeds
+    )
+    if missing_outputs:
+        raise ValueError(
+            "planner region outputs are absent from the once-lowered shell "
+            f"program: missing={missing_outputs!r}; "
+            f"available={tuple(sorted(producers))!r}"
+        )
+    # A value may be consumed again inside the stage that creates it and also
+    # cross a later stage/region boundary.  `produced - consumed` alone is
+    # therefore not liveness: it drops such values from the stage ABI and the
+    # later consumer is misclassified as an external shell input.  The
+    # once-lowered program already states every cross-stage feed, while the
+    # planner states every region output; retain both sets as explicit
+    # materialization boundaries.
+    cross_stage_feeds = {
+        int(value_id)
+        for source in captured.execution_programs
+        for value_id in source.feeds
+    }
+    required_live_outs = set(outputs) | cross_stage_feeds
+    needed = set(outputs)
+    selected: set[int] = set()
+    pending = [(value_id, True) for value_id in outputs]
+    while pending:
+        value_id, is_region_output = pending.pop()
+        value_id = int(value_id)
+        if (
+            (value_id in boundaries and not is_region_output)
+            or (
+                allowed_results is not None
+                and value_id not in allowed_results
+                and not is_region_output
+            )
+            or value_id in selected
+        ):
+            continue
+        step = producers.get(value_id)
+        if step is None:
+            continue
+        selected.add(value_id)
+        for input_id in step.input_ids:
+            input_id = int(input_id)
+            needed.add(input_id)
+            if (
+                input_id not in boundaries
+                and (
+                    allowed_results is None
+                    or input_id in allowed_results
+                )
+            ):
+                pending.append((input_id, False))
+
+    def project(source: FusedProgram, *, public: bool = False):
+        steps = [
+            OpStep(
+                step.step_id,
+                step.op_name,
+                list(step.input_ids),
+                dict(step.attrs),
+                step.result_id,
+                step.mode_sensitive,
+                step.level,
+            )
+            for step in source.steps
+            if int(step.result_id) in selected
+        ]
+        produced = {int(step.result_id) for step in steps}
+        consumed = {
+            int(input_id)
+            for step in steps
+            for input_id in step.input_ids
+        }
+        stage_terminals = (
+            (produced - consumed)
+            | (produced & required_live_outs)
+        )
+        feeds = {
+            int(input_id)
+            for step in steps
+            for input_id in step.input_ids
+            if int(input_id) not in produced
+        }
+        if public:
+            feeds.update(
+                value_id
+                for value_id in outputs
+                if value_id not in produced
+            )
+        target = FusedProgram(
+            version=source.version,
+            feeds=feeds,
+            steps=steps,
+            outputs=(
+                {f"value_{value_id}": value_id for value_id in outputs}
+                if public
+                else {
+                    f"value_{value_id}": value_id
+                    for value_id in sorted(stage_terminals)
+                }
+            ),
+            state_in=(
+                None
+                if source.state_in is None
+                else {
+                    int(value_id)
+                    for value_id in source.state_in
+                    if int(value_id) in needed
+                }
+            ),
+            meta={
+                value_id: (
+                    (source.meta or {}).get(value_id)
+                    or all_meta[value_id]
+                )
+                for value_id in (
+                    needed | produced | feeds | set(outputs)
+                )
+                if (
+                    value_id in (source.meta or {})
+                    or value_id in all_meta
+                )
+            },
+            extras=source.extras,
+        )
+        if hasattr(source, "glsl_linear_output_shape"):
+            target.glsl_linear_output_shape = tuple(
+                source.glsl_linear_output_shape
+            )
+        return target
+
+    manifest = project(captured.program, public=True)
+    stages = tuple(
+        projected
+        for source in captured.execution_programs
+        if (projected := project(source)).steps
+    )
+    return CapturedFusedProgram(manifest, {}, stages)
+
+
+def _capture_feed_aliases(
+    captured: CapturedFusedProgram,
+    feed_ids: dict[int, int],
+) -> dict[int, int]:
+    """Correlate capture wrappers that share one resident boundary value."""
+
+    remapped = dict(feed_ids)
+
+    anchors = {
+        feed_id: (
+            captured.feeds[feed_id],
+            _capture_storage_identity(captured.feeds[feed_id]),
+        )
+        for feed_id in feed_ids
+        if feed_id in captured.feeds
+    }
+    for candidate_id, candidate in captured.feeds.items():
+        if candidate_id in remapped:
+            continue
+        candidate_storage = _capture_storage_identity(candidate)
+        for anchor_id, (anchor, anchor_storage) in anchors.items():
+            if (
+                candidate is anchor
+                or (
+                    candidate_storage is not None
+                    and candidate_storage == anchor_storage
+                )
+            ):
+                remapped[candidate_id] = feed_ids[anchor_id]
+                break
+        if candidate_id in remapped:
+            continue
+        origin = (
+            (captured.program.extras or {})
+            .get("capture_feed_origins", {})
+            .get(candidate_id)
+        )
+        if origin is not None and origin.get("op") is not None:
+            # A recorded result that becomes a later stage feed is an
+            # on-device program value.  Similar shape/dtype does not make it
+            # an alias of a source boundary—doing so can rewrite a loop result
+            # back to its initial input and erase the operation.
+            continue
+        metadata = captured.program.meta or {}
+        candidate_meta = metadata.get(candidate_id)
+        compatible = [
+            anchor_id
+            for anchor_id in anchors
+            if metadata.get(anchor_id) == candidate_meta
+        ]
+        # A non-recorded capture root with one uniquely compatible boundary
+        # descriptor is another wrapper for that boundary value.  Shape/dtype
+        # matching is deliberately not used when two graph inputs are
+        # compatible; that ambiguity must remain an error.
+        if len(compatible) == 1:
+            remapped[candidate_id] = feed_ids[compatible[0]]
+    return remapped
+
+
+def _unique_runtime_feed_aliases(
+    program: FusedProgram,
+    missing_feed_ids: Iterable[int],
+    runtime_feeds: dict[int, Any],
+) -> dict[int, AbstractTensor]:
+    """Resolve an orphan feed only when one runtime tensor can match it."""
+
+    leaves: list[AbstractTensor] = []
+
+    def collect(value):
+        if isinstance(value, AbstractTensor):
+            leaves.append(value)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    for value in runtime_feeds.values():
+        collect(value)
+
+    resolved = {}
+    metadata = program.meta or {}
+    for feed_id in missing_feed_ids:
+        meta = metadata.get(feed_id)
+        if meta is None:
+            continue
+        compatible = [
+            value
+            for value in leaves
+            if tuple(value.shape) == tuple(meta.shape or ())
+            and str(value.dtype).lower().rsplit(".", 1)[-1]
+            == str(meta.dtype).lower().rsplit(".", 1)[-1]
+        ]
+        if len(compatible) == 1:
+            resolved[feed_id] = compatible[0]
+    return resolved
 
 
 def _constant_value(data: dict[str, Any]) -> Any:
@@ -818,8 +5127,8 @@ def _call_arguments(
     for role, value in (static_arguments or {}).items():
         if role.startswith("kw:"):
             keywords[role[3:]] = value
-        elif role.startswith("arg:"):
-            positional[int(role[4:])] = value
+        elif (index := _positional_argument_index(role)) is not None:
+            positional[index] = value
     return [positional[index] for index in sorted(positional)], keywords
 
 
@@ -843,6 +5152,26 @@ def _tensorize_graph_input(value: Any, *, device: Any) -> Any:
 
     if isinstance(value, AbstractTensor):
         return value
+    if isinstance(value, np.dtype):
+        # NumPy dtype descriptors misleadingly expose ``shape == ()`` even
+        # though they are type metadata, not zero-dimensional array payloads.
+        # Dtype expressions belong to the AbstractTensor program and must
+        # arrive at calls such as ``zeros(..., dtype=octets.dtype)`` unchanged.
+        # Uploading the descriptor would manufacture an object-dtype tensor
+        # and make the compiler fight the tensor operation's own type rules.
+        return value
+    if isinstance(value, _CompiledStructuralObject):
+        # Dataclass/closure state can contain tensor fields and therefore
+        # expose a derived ``shape`` through structural resolution.  The
+        # aggregate itself is not an ndarray and must stay decomposable into
+        # its named fields; coercing it produces an object-dtype array and
+        # destroys the compiler-visible packet/closure schema.
+        return value
+    if isinstance(value, type):
+        # A retained Python class is a structural reference the coordinator
+        # calls through.  Its ``shape`` attribute is the unbound descriptor of
+        # its instances, not the extent of an array-shaped input.
+        return value
     shape = getattr(value, "shape", None)
     if shape is None:
         return value
@@ -855,6 +5184,7 @@ def _coordinate_scheduled_capture_impl(
     *,
     device: Any = None,
     capture: bool = True,
+    discovery_session: dict[str, Any] | None = None,
 ) -> Any:
     """Execute structural boundaries and capture each planned numeric region.
 
@@ -865,6 +5195,15 @@ def _coordinate_scheduled_capture_impl(
     forward capture for backend compilation.
     """
 
+    if capture:
+        invocation_slot = shell._capture_invocations
+        shell._capture_invocations += 1
+    else:
+        invocation_slot = (
+            shell._execute_invocations
+            % max(1, shell.planned_invocation_slots)
+        )
+        shell._execute_invocations += 1
     graph = shell.process_graph
     supplied = dict(initial_values)
     values: dict[int, Any] = {
@@ -885,7 +5224,17 @@ def _coordinate_scheduled_capture_impl(
             binding_kind = (
                 (data.get("attributes") or {}).get("binding_kind")
             )
-            if binding_kind == "loop":
+            if binding_kind in {"loop", "exception"}:
+                continue
+            class_descriptor = graph.G.graph.get(
+                "class_table",
+                {},
+            ).get(name)
+            if binding_kind == "external" and class_descriptor is not None:
+                values[node_id] = _CompiledStructuralClass(
+                    name,
+                    class_descriptor,
+                )
                 continue
             if (
                 binding_kind == "external"
@@ -894,9 +5243,14 @@ def _coordinate_scheduled_capture_impl(
                 values[node_id] = shell.static_python_bindings[name]
                 continue
             if name not in supplied:
-                raise KeyError(f"missing ProcessGraph input {name!r}")
+                raise KeyError(
+                    f"missing ProcessGraph input {name!r} in "
+                    f"{graph.G.graph.get('function_name', '?')} at node "
+                    f"{node_id}; binding_kind={binding_kind!r}"
+                )
             values[node_id] = supplied[name]
 
+    inert_nodes = _inert_routing_nodes(graph)
     regions = tuple(
         zip(
             shell.deep_compilers,
@@ -954,14 +5308,69 @@ def _coordinate_scheduled_capture_impl(
         if data.get("type") == "Input"
         and (
             data.get("attributes") or {}
-        ).get("binding_kind") == "loop"
+        ).get("binding_kind") in {"loop", "exception"}
     )
+    for loop_binding in tuple(controlled_nodes):
+        if (
+            loop_binding in graph.G
+            and graph.G.nodes[loop_binding].get("type") == "Input"
+            and (
+                graph.G.nodes[loop_binding].get("attributes") or {}
+            ).get("binding_kind") == "loop"
+        ):
+            controlled_nodes.update(
+                nx.descendants(graph.G, loop_binding)
+            )
+    for boolean_node, boolean_data in graph.G.nodes(data=True):
+        if isinstance(boolean_data.get("expr_obj"), ast.BoolOp):
+            controlled_nodes.add(boolean_node)
+            controlled_nodes.update(
+                nx.ancestors(graph.G, boolean_node)
+            )
     loop_plans_by_node = {
         plan.loop.node_id: plan for plan in shell.loop_plans
     }
+    comprehension_owner_by_binding: dict[int, int] = {}
+    comprehension_owner_by_generator: dict[int, int] = {}
+    for plan in shell.loop_plans:
+        loop_expression = graph.G.nodes[
+            plan.loop.node_id
+        ].get("expr_obj")
+        if not isinstance(loop_expression, ast.comprehension):
+            continue
+        owner = next(
+            (
+                successor
+                for successor in graph.G.successors(plan.loop.node_id)
+                if isinstance(
+                    graph.G.nodes[successor].get("expr_obj"),
+                    (
+                        ast.ListComp,
+                        ast.SetComp,
+                        ast.DictComp,
+                        ast.GeneratorExp,
+                    ),
+                )
+            ),
+            None,
+        )
+        if owner is not None:
+            comprehension_owner_by_generator[plan.loop.node_id] = owner
+            for _name, binding in plan.loop.target_bindings:
+                comprehension_owner_by_binding[binding] = owner
+    loop_invalidated_nodes: dict[int, set[int]] = {}
     for plan in shell.loop_plans:
         controlled_nodes.add(plan.loop.node_id)
         controlled_nodes.update(plan.loop.body_nodes)
+        invalidated = set(plan.loop.body_nodes)
+        for body_node in plan.loop.body_nodes:
+            invalidated.update(nx.descendants(graph.G, body_node))
+        loop_invalidated_nodes[plan.loop.node_id] = invalidated
+        # The planner loop owns the complete work cone fed by its body,
+        # including numerical regions that consume the induction binding.
+        # Leaving descendants in the ordinary topological sweep evaluates
+        # them before the loop has supplied that binding.
+        controlled_nodes.update(invalidated)
         controlled_nodes.update(
             binding for _name, binding in plan.loop.target_bindings
         )
@@ -971,18 +5380,135 @@ def _coordinate_scheduled_capture_impl(
                 (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
             ):
                 controlled_nodes.update(nx.ancestors(graph.G, successor))
+    loop_runtime_region_indices = {
+        loop_node: tuple(
+            region_index
+            for region_index, (_compiler, subgraph, _ephemeral)
+            in enumerate(regions)
+            if set(
+                subgraph.G.graph.get("deployment_nodes", ())
+            ).intersection(invalidated)
+            or set(
+                subgraph.G.graph.get("deployment_outputs", ())
+            ).intersection(invalidated)
+        )
+        for loop_node, invalidated in loop_invalidated_nodes.items()
+    }
+    downstream_loop_nodes = {
+        candidate
+        for candidate in loop_plans_by_node
+        if any(
+            owner != candidate
+            and owner in nx.ancestors(graph.G, candidate)
+            for owner in loop_plans_by_node
+        )
+    }
+    has_comprehension_owner = any(
+        isinstance(
+            graph.G.nodes[loop_node].get("expr_obj"),
+            ast.comprehension,
+        )
+        for loop_node in loop_plans_by_node
+    )
     completed_regions: set[int] = set()
     active_nodes: set[int] = set()
     active_exceptions: dict[int, BaseException] = {}
-    tapes = []
-    feed_maps = []
-    captured_subgraphs = []
-    captured_compilers = []
-    captured_region_indices = []
+    # One source function owns one discovery tape, and only the explicit
+    # compilation/discovery invocation may create it.  Planned regions retain
+    # separate output/feed cut points into that tape, but loops, frames and
+    # repeated calls never create new tapes or capture observed values as new
+    # constants.  Compilation consumes these cut points and then destroys the
+    # tape before any installed shell can execute.
+    #
+    # In particular, do not "helpfully" create a tape for capture=False.
+    # That mode is an ordinary coordinator execution and cannot rediscover,
+    # extend, or rebuild the program.  Runtime must enter the installed shell;
+    # retaining this non-capture path for diagnostics does not grant it any
+    # compilation authority.
+    discovery_tape = None
+    if capture:
+        if discovery_session is not None:
+            # Nested source shells are compartments in the one source program,
+            # not independently observed programs.  They record into the
+            # owner's already-existing tape and may only contribute planner
+            # cut points.  Creating or lowering another tape here would turn
+            # function boundaries into executions and make the captured
+            # example, rather than the planner, determine program count.
+            discovery_tape = discovery_session["tape"]
+            shell._discovery_tape = discovery_tape
+            shell._discovery_tape_owner = False
+        elif shell._discovery_tape is not None:
+            discovery_tape = shell._discovery_tape
+            discovery_session = shell._discovery_session
+        else:
+            if shell._discovery_tape_complete:
+                raise RuntimeError(
+                    "compiled source program attempted to create another "
+                    "discovery tape"
+                )
+            discovery_tape = GradTape()
+            shell._discovery_tape = discovery_tape
+            shell._discovery_tape_owner = True
+            shell._discovery_tape_creations += 1
+            if shell._discovery_tape_creations != 1:
+                raise RuntimeError(
+                    "one source program created more than one discovery tape"
+                )
+            discovery_session = {
+                "owner": shell,
+                "tape": discovery_tape,
+                "bindings": {},
+                "lowered_program": None,
+            }
+            shell._discovery_session = discovery_session
+    tape_bindings: dict[int, Any] = (
+        discovery_session["bindings"]
+        if capture and discovery_session is not None
+        else {}
+    )
+    shell._discovery_tape_bindings = tape_bindings
+    feed_maps = list(shell.forward_feed_ids)
+    aggregate_feed_maps = list(shell.forward_aggregate_feed_paths)
+    captured_subgraphs = list(shell.forward_subgraphs)
+    captured_compilers = list(shell.forward_compilers)
+    captured_region_indices = list(shell.forward_region_indices)
+    captured_output_values = list(shell.forward_output_values)
+    captured_region_node_ids = list(
+        shell.forward_region_capture_node_ids
+    )
+    captured_region_planned_ids = list(
+        shell.forward_region_planned_capture_ids
+    )
+    captured_region_planned_input_ids = list(
+        shell.forward_region_planned_input_ids
+    )
+    captured_region_slots: dict[int, int] = {
+        int(
+            region_index
+            if not isinstance(region_index, tuple)
+            else region_index[-2]
+        ): slot
+        for slot, region_index in enumerate(captured_region_indices)
+    }
+    region_occurrences: dict[int, int] = {}
+
+    def is_shader_internal_node(node_id: int) -> bool:
+        region_index = region_for_node.get(node_id)
+        if region_index is None:
+            return False
+        subgraph = regions[region_index][1]
+        return (
+            node_id in subgraph.G.graph.get("deployment_nodes", ())
+            and node_id
+            not in subgraph.G.graph.get("deployment_outputs", ())
+        )
 
     def evaluate_region(region_index: int) -> None:
         if region_index in completed_regions:
             return
+        occurrence = region_occurrences.get(region_index, 0)
+        region_occurrences[region_index] = occurrence + 1
+        region_key = (invocation_slot, region_index, occurrence)
         compiler, subgraph, ephemeral = regions[region_index]
         inputs: dict[str, Any] = {}
         for input_id in subgraph.G.graph["deployment_inputs"]:
@@ -998,20 +5524,211 @@ def _coordinate_scheduled_capture_impl(
             for node_id in subgraph.G.graph.get("deployment_nodes", ())
         ]
         label = f"region {region_index}: " + " -> ".join(operations)
+        if shell._profiler.verbose:
+            shell._profiler.trace(
+                path=shell.profile_path,
+                section="region-input",
+                label=label,
+                fields={
+                    name: _diagnostic_value_summary(value)
+                    for name, value in inputs.items()
+                },
+            )
 
         def run_region() -> None:
-            captured_program = shell.captured_region_programs.get(region_index)
+            captured_program = (
+                shell.captured_region_programs.get(region_index)
+                or shell.captured_region_programs.get(region_key)
+            )
             if captured_program is not None:
-                chunks = execute_captured_fused_program(
-                    captured_program,
-                    {
-                        input_id: evaluate_node(input_id)
-                        for input_id in subgraph.G.graph["deployment_inputs"]
-                    },
+                runtime_region_feeds = {
+                    input_id: evaluate_node(input_id)
+                    for input_id in subgraph.G.graph["deployment_inputs"]
+                }
+                missing_feed_ids = [
+                    feed_id
+                    for feed_id in ordered_feed_ids(captured_program.program)
+                    if feed_id not in runtime_region_feeds
+                ]
+                unique_aliases = _unique_runtime_feed_aliases(
+                    captured_program.program,
+                    missing_feed_ids,
+                    runtime_region_feeds,
                 )
+                runtime_region_feeds.update(unique_aliases)
+                missing_feed_ids = [
+                    feed_id
+                    for feed_id in missing_feed_ids
+                    if feed_id not in unique_aliases
+                ]
+                if shell._profiler.verbose:
+                    shell._profiler.trace(
+                        path=shell.profile_path,
+                        section="feed-resolution",
+                        label=label,
+                        fields={
+                            "program": tuple(
+                                ordered_feed_ids(captured_program.program)
+                            ),
+                            "captured": tuple(
+                                sorted(captured_program.feeds)
+                            ),
+                            "runtime": tuple(
+                                sorted(runtime_region_feeds)
+                            ),
+                            "unresolved": tuple(missing_feed_ids),
+                        },
+                )
+                if missing_feed_ids:
+                    tensor_leaves = []
+                    exactly_routed_tensors = {
+                        id(value)
+                        for input_id, value in runtime_region_feeds.items()
+                        if (
+                            input_id in captured_program.program.feeds
+                            and isinstance(value, AbstractTensor)
+                        )
+                    }
+
+                    def collect_tensor_leaves(value):
+                        if isinstance(value, AbstractTensor):
+                            if id(value) not in exactly_routed_tensors:
+                                tensor_leaves.append(value)
+                        elif isinstance(value, (tuple, list)):
+                            for item in value:
+                                collect_tensor_leaves(item)
+                        elif isinstance(value, dict):
+                            for item in value.values():
+                                collect_tensor_leaves(item)
+
+                    for input_id, value in runtime_region_feeds.items():
+                        if input_id not in captured_program.program.feeds:
+                            collect_tensor_leaves(value)
+                    if len(tensor_leaves) != len(missing_feed_ids):
+                        runtime_tensor_meta = []
+
+                        def collect_runtime_meta(input_id, value):
+                            if isinstance(value, AbstractTensor):
+                                runtime_tensor_meta.append((
+                                    input_id,
+                                    tuple(value.shape),
+                                    str(value.dtype),
+                                ))
+                            elif isinstance(value, (tuple, list)):
+                                for item in value:
+                                    collect_runtime_meta(input_id, item)
+                            elif isinstance(value, dict):
+                                for item in value.values():
+                                    collect_runtime_meta(input_id, item)
+
+                        for input_id, value in runtime_region_feeds.items():
+                            collect_runtime_meta(input_id, value)
+                        raise RuntimeError(
+                            f"compiled region {region_index} ({tuple(operations)!r}) "
+                            "cannot project structured tensor feeds exactly; "
+                            f"missing_feeds={len(missing_feed_ids)} "
+                            f"tensor_leaves={len(tensor_leaves)}; "
+                            f"program_feed_ids={tuple(ordered_feed_ids(captured_program.program))!r}; "
+                            f"runtime_feed_ids={tuple(sorted(runtime_region_feeds))!r}; "
+                            f"unresolved_feed_ids={tuple(missing_feed_ids)!r}; "
+                            "unresolved_meta="
+                            f"{tuple((feed_id, captured_program.program.meta.get(feed_id)) for feed_id in missing_feed_ids)!r}; "
+                            "unresolved_origins="
+                            f"{tuple((feed_id, (captured_program.program.extras or {}).get('capture_feed_origins', {}).get(feed_id)) for feed_id in missing_feed_ids)!r}; "
+                            f"runtime_tensor_meta={tuple(runtime_tensor_meta)!r}"
+                        )
+                    runtime_region_feeds.update(
+                        zip(missing_feed_ids, tensor_leaves)
+                    )
+                try:
+                    chunks = execute_captured_fused_program(
+                        captured_program,
+                        runtime_region_feeds,
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"compiled shell {_shell_profile_name(shell)!r} "
+                        f"id={id(shell)} region {region_index} "
+                        f"({tuple(operations)!r}) "
+                        "failed strict resident routing; "
+                        f"cause={str(error)!r}; "
+                        f"program_feeds={tuple(sorted(captured_program.program.feeds))!r}; "
+                        f"runtime_feeds={tuple(sorted(runtime_region_feeds))!r}; "
+                        f"step_inputs={tuple(tuple(step.input_ids) for step in captured_program.program.steps)!r}; "
+                        f"stages={len(captured_program.stages)}"
+                    ) from error
                 for output_id in subgraph.G.graph["deployment_outputs"]:
+                    output_name = f"value_{output_id}"
+                    if output_name not in chunks:
+                        def structural_value(structural_id):
+                            if structural_id in values:
+                                return values[structural_id]
+                            data = subgraph.G.nodes[structural_id]
+                            expression = data.get("expr_obj")
+                            structural_parents = data.get("parents", ())
+                            if isinstance(expression, ast.Constant):
+                                result = expression.value
+                            elif isinstance(expression, ast.Attribute):
+                                parent = structural_value(
+                                    structural_parents[0][0]
+                                )
+                                result = getattr(parent, expression.attr)
+                            elif isinstance(expression, ast.Subscript):
+                                base_id = next(
+                                    parent
+                                    for parent, role in structural_parents
+                                    if str(role) == "base"
+                                )
+                                base = structural_value(base_id)
+                                if isinstance(base, AbstractTensor):
+                                    raise RuntimeError(
+                                        "tensor indexing output was omitted "
+                                        "from its compiled region"
+                                    )
+                                indices = [
+                                    structural_value(parent)
+                                    for parent, role in structural_parents
+                                    if str(role) == "index"
+                                ]
+                                index = (
+                                    indices[0]
+                                    if len(indices) == 1
+                                    else tuple(indices)
+                                )
+                                result = base[index]
+                            elif isinstance(expression, ast.BinOp):
+                                operands = [
+                                    structural_value(parent)
+                                    for parent, _role in structural_parents
+                                ]
+                                if any(
+                                    isinstance(value, AbstractTensor)
+                                    for value in operands
+                                ):
+                                    raise RuntimeError(
+                                        "tensor arithmetic output was omitted "
+                                        "from its compiled region"
+                                    )
+                                binary = {
+                                    ast.Add: operator.add,
+                                    ast.Sub: operator.sub,
+                                    ast.Mult: operator.mul,
+                                    ast.Div: operator.truediv,
+                                    ast.FloorDiv: operator.floordiv,
+                                    ast.Mod: operator.mod,
+                                }.get(type(expression.op))
+                                if binary is None:
+                                    raise KeyError(output_name)
+                                result = binary(*operands)
+                            else:
+                                result = evaluate_node(structural_id)
+                            values[structural_id] = result
+                            return result
+
+                        values[output_id] = structural_value(output_id)
+                        continue
                     output = GLSLTensorOperations()
-                    output.data = chunks[f"value_{output_id}"]
+                    output.data = chunks[output_name]
                     values[output_id] = output
                 completed_regions.add(region_index)
                 return
@@ -1021,23 +5738,76 @@ def _coordinate_scheduled_capture_impl(
                 if shell.compiled_dispatch_functions
                 else ephemeral
             )
-            if capture:
-                capture_context = autograd.forward_capture()
+            record_region = capture and region_index not in captured_region_slots
+            if record_region:
+                # The ProcessGraph planner already owns repetition,
+                # cardinality, carried values and back-pressure.  Discovery
+                # records exactly one primitive implementation exemplar for
+                # this planned region.  Recording later loop occurrences
+                # would unroll one observed execution into the program,
+                # inflate the tape, and make runtime values decide program
+                # structure.  Later occurrences may execute only to complete
+                # this one discovery invocation; they cannot add tape nodes.
+                capture_context = autograd.forward_capture(discovery_tape)
             else:
                 capture_context = autograd.no_grad()
+            region_nodes_before = (
+                set(discovery_tape._nodes)
+                if capture and discovery_tape is not None
+                else set()
+            )
             with capture_context as tape:
-                bound_inputs = {
-                    name: _bind_capture_tape(value, tape)
-                    for name, value in inputs.items()
+                bound_inputs = (
+                    {
+                        name: _bind_capture_tape(value, tape, tape_bindings)
+                        for name, value in inputs.items()
+                    }
+                    if capture
+                    else inputs
+                )
+                planned_capture = {
+                    "tape": discovery_tape,
+                    "graph": graph,
+                    "node_capture_ids": {},
+                    "step_input_ids": {},
+                    "collection_materializations": (
+                        shell.forward_planned_collection_materializations
+                    ),
+                    "value_aliases": (
+                        shell.compiled_process_graph_aliases
+                    ),
+                    "collection_owner_ids": frozenset(
+                        int(collection_id)
+                        for reduction in shell.loop_shader_reductions
+                        if reduction.control_program is not None
+                        for (
+                            _source_id,
+                            collection_id,
+                            _induction,
+                            _start,
+                        ) in reduction.control_program.collection_bindings
+                    ),
                 }
+                observer_token = (
+                    _planned_capture_context.set(planned_capture)
+                    if record_region
+                    else None
+                )
                 try:
                     results = function(**bound_inputs)
                 except Exception as error:
                     raise RuntimeError(
                         "ProcessGraph numerical region failed in "
                         f"{graph.G.graph.get('function_name', '?')} "
-                        f"region {region_index}"
+                        f"region {region_index}; "
+                        f"nodes={subgraph.G.graph.get('deployment_nodes', ())!r}; "
+                        f"inputs={subgraph.G.graph.get('deployment_inputs', ())!r}; "
+                        f"outputs={subgraph.G.graph.get('deployment_outputs', ())!r}; "
+                        f"bound={tuple((name, _diagnostic_value_summary(value)) for name, value in bound_inputs.items())!r}"
                     ) from error
+                finally:
+                    if observer_token is not None:
+                        _planned_capture_context.reset(observer_token)
             if not isinstance(results, tuple):
                 results = (results,)
             returned = dict(zip(compiler._outs, results))
@@ -1048,8 +5818,109 @@ def _coordinate_scheduled_capture_impl(
                 values[output_id] = returned[store_id]
 
             completed_regions.add(region_index)
-            if capture and tape._nodes:
-                tapes.append(tape)
+            tensor_outputs_captured = any(
+                isinstance(values.get(output_id), AbstractTensor)
+                for output_id in subgraph.G.graph["deployment_outputs"]
+            )
+            if shell._profiler.verbose:
+                shell._profiler.trace(
+                    path=shell.profile_path,
+                    section="capture-state",
+                    label=label,
+                    fields={
+                        "record_region": record_region,
+                        "tape_nodes": (
+                            len(tape._nodes) if tape is not None else 0
+                        ),
+                        "tensor_outputs": tensor_outputs_captured,
+                        "output_tape_state": tuple(
+                            (
+                                int(output_id),
+                                id(values.get(output_id)),
+                                (
+                                    id(values.get(output_id))
+                                    in discovery_tape._nodes
+                                    if isinstance(
+                                        values.get(output_id),
+                                        AbstractTensor,
+                                    )
+                                    else None
+                                ),
+                                (
+                                    getattr(
+                                        values.get(output_id),
+                                        "_tape",
+                                        None,
+                                    )
+                                    is discovery_tape
+                                    if isinstance(
+                                        values.get(output_id),
+                                        AbstractTensor,
+                                    )
+                                    else None
+                                ),
+                            )
+                            for output_id in subgraph.G.graph[
+                                "deployment_outputs"
+                            ]
+                        ),
+                        "shell_id": id(shell),
+                    },
+                )
+            occurrence_node_ids = tuple(
+                int(node_id)
+                for node_id in discovery_tape._nodes
+                if int(node_id) not in region_nodes_before
+            ) if record_region else ()
+            # Repeated executions of one planned region are implementation
+            # observations of the same ProcessGraph program.  Keep the first
+            # occurrence as the primitive lowering exemplar; the planner's
+            # LoopBlock owns repetition and cardinality.  Appending later tape
+            # occurrences here would unroll one discovery execution into the
+            # compiled program and create duplicate SSA writers.
+            if (
+                record_region
+                and discovery_tape._nodes
+                and occurrence_node_ids
+            ):
+                # Region ownership comes from the AST/ProcessGraph schedule,
+                # not from the Python shape of its return value.  A region
+                # may return a tuple or an ordinary object whose tensor fields
+                # are consumed later.  Requiring the immediate graph output
+                # itself to be an AbstractTensor silently drops every SSA
+                # definition hidden behind that OOP boundary and forces a
+                # later consumer to rediscover the producer by walking the
+                # tape backward.  Record the region's owned forward nodes now;
+                # lowering below computes only the live cross-region values.
+                captured_region_slots[region_index] = len(
+                    captured_region_indices
+                )
+                captured_region_node_ids.append(occurrence_node_ids)
+                captured_region_planned_ids.append(tuple(
+                    (
+                        int(graph_node_id),
+                        tuple(map(int, capture_ids)),
+                    )
+                    for graph_node_id, capture_ids
+                    in planned_capture["node_capture_ids"].items()
+                ))
+                captured_region_planned_input_ids.append(tuple(
+                    sorted(
+                        (
+                            int(result_capture_id),
+                            tuple(
+                                (
+                                    int(primitive_id),
+                                    int(graph_id),
+                                )
+                                for primitive_id, graph_id
+                                in positional_inputs
+                            ),
+                        )
+                        for result_capture_id, positional_inputs
+                        in planned_capture["step_input_ids"].items()
+                    )
+                ))
                 feed_maps.append(
                     {
                         id(bound_inputs[
@@ -1070,9 +5941,103 @@ def _coordinate_scheduled_capture_impl(
                         )
                     }
                 )
+                aggregate_paths = {}
+                rebound_originals = {}
+                for original_id, rebound in tape_bindings.items():
+                    rebound_originals.setdefault(
+                        id(rebound), []
+                    ).append(int(original_id))
+
+                def record_aggregate_paths(
+                    graph_input_id: int,
+                    value: Any,
+                    path: tuple[object, ...] = (),
+                ) -> None:
+                    if isinstance(value, AbstractTensor):
+                        if path:
+                            leaf = (
+                                int(graph_input_id),
+                                tuple(path),
+                                _capture_storage_identity(value),
+                            )
+                            aggregate_paths[id(value)] = leaf
+                            rebound_aliases = {id(value)}
+                            pending_aliases = [id(value)]
+                            while pending_aliases:
+                                rebound_id = pending_aliases.pop()
+                                for original_id in (
+                                    rebound_originals.get(
+                                        rebound_id, ()
+                                    )
+                                ):
+                                    if original_id in rebound_aliases:
+                                        continue
+                                    rebound_aliases.add(original_id)
+                                    pending_aliases.append(original_id)
+                            aggregate_paths.update({
+                                int(alias_id): leaf
+                                for alias_id in rebound_aliases
+                            })
+                            # Some primitive hooks retain the tensor's resident
+                            # storage wrapper as their operand.  It is a direct
+                            # alias of this aggregate leaf, not a new value.
+                            # Record that identity now so lowering can erase
+                            # the Python wrapper without fabricating a shell
+                            # input later.
+                            storage_value = getattr(value, "data", None)
+                            if storage_value is not None:
+                                aggregate_paths[id(storage_value)] = leaf
+                        return
+                    if isinstance(value, (tuple, list)):
+                        for index, item in enumerate(value):
+                            record_aggregate_paths(
+                                graph_input_id,
+                                item,
+                                (*path, int(index)),
+                            )
+                    elif isinstance(value, Mapping):
+                        for name, item in value.items():
+                            record_aggregate_paths(
+                                graph_input_id,
+                                item,
+                                (*path, name),
+                            )
+
+                for input_id in subgraph.G.graph["deployment_inputs"]:
+                    name = _compiler_input_name(
+                        subgraph.G.nodes[input_id]["label"]
+                    )
+                    record_aggregate_paths(
+                        int(input_id), bound_inputs[name]
+                    )
+                aggregate_by_storage = {
+                    storage: (graph_input_id, path, storage)
+                    for graph_input_id, path, storage
+                    in aggregate_paths.values()
+                    if storage is not None
+                }
+                for value in values.values():
+                    if not isinstance(value, AbstractTensor):
+                        continue
+                    storage = _capture_storage_identity(value)
+                    leaf = aggregate_by_storage.get(storage)
+                    if leaf is None:
+                        continue
+                    aggregate_paths[id(value)] = leaf
+                    storage_value = getattr(value, "data", None)
+                    if storage_value is not None:
+                        aggregate_paths[id(storage_value)] = leaf
+                aggregate_feed_maps.append(aggregate_paths)
                 captured_subgraphs.append(subgraph)
                 captured_compilers.append(compiler)
                 captured_region_indices.append(region_index)
+                captured_output_values.append({
+                    f"result_{index}": values[output_id]
+                    for index, output_id in enumerate(
+                        subgraph.G.graph["deployment_outputs"]
+                    )
+                    if isinstance(values.get(output_id), AbstractTensor)
+                })
 
         with _profile_event(
             shell,
@@ -1081,34 +6046,108 @@ def _coordinate_scheduled_capture_impl(
             gpu=True,
         ):
             run_region()
+        if shell._profiler.verbose:
+            shell._profiler.trace(
+                path=shell.profile_path,
+                section="region-output",
+                label=label,
+                fields={
+                    f"value_{output_id}": _diagnostic_value_summary(
+                        values.get(output_id)
+                    )
+                    for output_id in subgraph.G.graph[
+                        "deployment_outputs"
+                    ]
+                },
+            )
 
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
             return values[node_id]
+        if node_id in inert_nodes:
+            # A name or attribute lookup nobody reads.  Producing it would
+            # demand a materialized receiver and force an otherwise
+            # shader-local intermediate to become a published region output.
+            return None
         if node_id in active_nodes:
             raise RuntimeError(
-                f"recursive runtime dependency at ProcessGraph node {node_id}"
+                f"recursive runtime dependency at ProcessGraph node {node_id}; "
+                f"shell={_shell_profile_name(shell)!r}; "
+                f"active_nodes={tuple(sorted(active_nodes))!r}; "
+                f"region={region_for_node.get(node_id)!r}"
             )
         active_nodes.add(node_id)
         try:
             region_index = region_for_node.get(node_id)
             if region_index is not None:
                 evaluate_region(region_index)
+                if node_id not in values:
+                    subgraph = regions[region_index][1]
+                    if is_shader_internal_node(node_id):
+                        raise RuntimeError(
+                            "shader-local ProcessGraph node was requested as "
+                            "a compartment boundary value; "
+                            f"node={node_id}; region={region_index}; "
+                            f"shell={_shell_profile_name(shell)!r}. "
+                            "The region extractor must export every value "
+                            "observed by structural execution."
+                        )
+                    completed_regions.discard(region_index)
+                    evaluate_region(region_index)
+                if node_id not in values:
+                    raise RuntimeError(
+                        f"ProcessGraph region {region_index} did not publish "
+                        f"requested boundary output node {node_id}; "
+                        f"shell={_shell_profile_name(shell)!r}; "
+                        f"deployment_outputs="
+                        f"{subgraph.G.graph.get('deployment_outputs', ())!r}"
+                    )
                 return values[node_id]
 
             data = graph.G.nodes[node_id]
             node_type = str(data.get("type"))
             expression = data.get("expr_obj")
             parents = tuple(data.get("parents") or ())
+            attributes = data.get("attributes") or {}
 
             if node_type in {"Input", "input"}:
+                if node_id in generator_binding_values:
+                    result = generator_binding_values[node_id]
+                    values[node_id] = result
+                    return result
+                comprehension_owner = (
+                    comprehension_owner_by_binding.get(node_id)
+                )
+                if comprehension_owner is not None:
+                    evaluate_node(comprehension_owner)
+                    if node_id in generator_binding_values:
+                        result = generator_binding_values[node_id]
+                        values[node_id] = result
+                        return result
                 name = str(data.get("label", node_id))
                 raise KeyError(
                     f"missing ProcessGraph input {name!r} in "
-                    f"{graph.G.graph.get('function_name', '?')}"
+                    f"{graph.G.graph.get('function_name', '?')} at node "
+                    f"{node_id}; loop targets="
+                    f"{tuple(plan.loop.target_bindings for plan in shell.loop_plans)!r}; "
+                    f"active generator bindings={tuple(generator_binding_values)!r}"
                 )
             if node_type in {"Const", "const", "Constant"}:
                 result = _constant_value(data)
+            elif node_type in {"LoopExit", "LoopResult"}:
+                by_role = {str(role): parent for parent, role in parents}
+                evaluate_node(by_role["control"])
+                result = evaluate_node(by_role["value"])
+            elif node_type in {"LoopStateTransition", "LoopStatePort"}:
+                by_role = {str(role): parent for parent, role in parents}
+                evaluate_node(by_role["effect"])
+                result = evaluate_node(by_role["state"])
+            elif node_type == "LoopAggregateResult":
+                result = tuple(
+                    evaluate_node(parent)
+                    for parent, role in parents
+                    if str(role).startswith("arg")
+                )
             elif isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
                 items = [
                     evaluate_node(parent)
@@ -1132,13 +6171,37 @@ def _coordinate_scheduled_capture_impl(
                     if str(role) == "values"
                 ]
                 result = dict(zip(keys, items))
-            elif isinstance(expression, ast.Attribute):
+            elif (
+                isinstance(expression, ast.Attribute)
+                and node_type != "SetAttr"
+            ):
                 parent = next(
-                    parent
-                    for parent, role in parents
-                    if str(role) == "value"
+                    (
+                        parent
+                        for parent, role in parents
+                        if str(role) == "value"
+                    ),
+                    None,
                 )
-                result = getattr(evaluate_node(parent), expression.attr)
+                if parent is None:
+                    raise RuntimeError(
+                        "attribute node has no receiver in "
+                        f"{graph.G.graph.get('function_name', '?')} at "
+                        f"node {node_id}: "
+                        f"{ast.dump(expression, include_attributes=False)}; "
+                        f"parents={parents!r}; attributes="
+                        f"{(data.get('attributes') or {})!r}"
+                    )
+                receiver = evaluate_node(parent)
+                try:
+                    result = getattr(receiver, expression.attr)
+                except AttributeError as exc:
+                    raise AttributeError(
+                        f"{graph.G.graph.get('function_name', '?')} attribute "
+                        f"{expression.attr!r} at node {node_id} has receiver "
+                        f"{type(receiver).__name__}; parent={parent}, "
+                        f"parents={parents!r}"
+                    ) from exc
             elif isinstance(expression, ast.Slice):
                 parts = {
                     str(role): evaluate_node(parent)
@@ -1184,8 +6247,19 @@ def _coordinate_scheduled_capture_impl(
             elif isinstance(expression, ast.BoolOp):
                 if isinstance(expression.op, ast.And):
                     result = True
-                    for parent, _role in parents:
+                    for parent, role in parents:
                         result = evaluate_node(parent)
+                        if shell._profiler.verbose:
+                            shell._profiler.trace(
+                                path=shell.profile_path,
+                                section="boolop",
+                                label=f"node {node_id} {role}",
+                                fields={
+                                    "value": _diagnostic_value_summary(
+                                        result
+                                    )
+                                },
+                            )
                         if not result:
                             break
                 else:
@@ -1202,6 +6276,25 @@ def _coordinate_scheduled_capture_impl(
                     evaluate_node(by_role["test"])
                 ) else "orelse"
                 result = evaluate_node(by_role[branch])
+            elif (
+                attributes.get("materialization_kind")
+                in {"unrolled_loop", "retained_loop_aggregate"}
+                and isinstance(
+                    expression,
+                    (ast.ListComp, ast.SetComp, ast.DictComp),
+                )
+            ):
+                materialized = [
+                    evaluate_node(parent)
+                    for parent, role in parents
+                    if str(role).startswith("arg")
+                ]
+                if isinstance(expression, ast.SetComp):
+                    result = set(materialized)
+                elif isinstance(expression, ast.DictComp):
+                    result = dict(materialized)
+                else:
+                    result = materialized
             elif isinstance(
                 expression,
                 (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
@@ -1231,9 +6324,31 @@ def _coordinate_scheduled_capture_impl(
                             )
                         return
                     generator_node = generator_nodes[index]
-                    plan = loop_plans_by_node[generator_node]
+                    try:
+                        plan = loop_plans_by_node[generator_node]
+                    except KeyError as error:
+                        raise RuntimeError(
+                            "aggregate retained an evaporated generator "
+                            f"in {graph.G.graph.get('function_name', '?')}: "
+                            f"aggregate={node_id}, generator={generator_node}, "
+                            f"planned={tuple(loop_plans_by_node)!r}, "
+                            f"specializations="
+                            f"{graph.G.graph.get('planner_specializations')!r}, "
+                            f"attributes={attributes!r}"
+                        ) from error
                     loop = plan.loop
-                    iterator = iter(evaluate_node(loop.iterable_node))
+                    iterable = evaluate_node(loop.iterable_node)
+                    if shell._profiler.verbose:
+                        shell._profiler.trace(
+                            path=shell.profile_path,
+                            section="comprehension",
+                            label=f"generator {generator_node}",
+                            fields={
+                                "iterable": _diagnostic_value_summary(iterable),
+                                "targets": loop.target_bindings,
+                            },
+                        )
+                    iterator = iter(iterable)
                     for item in iterator:
                         targets = loop.target_bindings
                         items = (
@@ -1242,15 +6357,18 @@ def _coordinate_scheduled_capture_impl(
                             else (item,)
                         )
                         invalidated = set()
-                        for (_name, binding), value in zip(targets, items):
-                            values[binding] = value
+                        assignments = tuple(zip(targets, items))
+                        for (_name, binding), _value in assignments:
                             invalidated.update(
                                 nx.descendants(graph.G, binding)
                             )
                         invalidated.discard(node_id)
                         for dependent in invalidated:
                             values.pop(dependent, None)
-                        for region_index in shell.loop_region_indices.get(
+                        for (_name, binding), value in assignments:
+                            generator_binding_values[binding] = value
+                        values.update(generator_binding_values)
+                        for region_index in loop_runtime_region_indices.get(
                             generator_node,
                             (),
                         ):
@@ -1268,6 +6386,28 @@ def _coordinate_scheduled_capture_impl(
                     result = set(collected)
                 else:
                     result = collected
+                if capture and isinstance(
+                    expression, (ast.ListComp, ast.SetComp)
+                ):
+                    # Retain the actual wrappers until the one lowering.
+                    # Integer-only identity tracking is invalid here because
+                    # temporary wrappers can die during a long discovery run
+                    # and CPython may reuse their addresses for unrelated
+                    # values before the collection is materialized.
+                    shell.collection_observations[int(node_id)] = tuple(
+                        item
+                        for item in result
+                        if isinstance(item, AbstractTensor)
+                    )
+            elif isinstance(expression, ast.comprehension):
+                owner = comprehension_owner_by_generator.get(node_id)
+                if owner is None:
+                    raise RuntimeError(
+                        "comprehension control node has no planner-owned "
+                        f"expression in {graph.G.graph.get('function_name', '?')} "
+                        f"at node {node_id}"
+                    )
+                result = evaluate_node(owner)
             elif isinstance(expression, ast.Compare):
                 operands = [
                     evaluate_node(parent)
@@ -1335,6 +6475,14 @@ def _coordinate_scheduled_capture_impl(
                         "unsupported structural binary operator "
                         f"{type(expression.op).__name__}"
                     )
+                if len(operands) != 2:
+                    raise RuntimeError(
+                        "structural binary expression requires two operands "
+                        f"in {graph.G.graph.get('function_name', '?')} at "
+                        f"node {node_id}: "
+                        f"{ast.dump(expression, include_attributes=False)}; "
+                        f"parents={parents!r}"
+                    )
                 result = binary(operands[0], operands[1])
             elif isinstance(expression, ast.Call):
                 for parent, _role in parents:
@@ -1356,7 +6504,22 @@ def _coordinate_scheduled_capture_impl(
                 )
                 external_ref = attributes.get("external_callee_ref")
                 callee_ref = attributes.get("callee_ref")
-                if external_ref is not None:
+                class_ref = attributes.get("class_ref")
+                if class_ref is not None:
+                    descriptor = (
+                        graph.G.graph.get("class_table", {}).get(class_ref)
+                    )
+                    if descriptor is None:
+                        raise RuntimeError(
+                            f"unknown compiled class reference {class_ref!r}"
+                        )
+                    result = _CompiledStructuralObject(
+                        class_ref,
+                        descriptor,
+                        args,
+                        kwargs,
+                    )
+                elif external_ref is not None:
                     try:
                         external_label = (
                             shell.external_function_table
@@ -1378,9 +6541,33 @@ def _coordinate_scheduled_capture_impl(
                         )
                 elif (
                     callee_ref is not None
-                    and not attributes.get("static_python_reference")
                 ):
-                    nested = shell.function_shells[int(callee_ref)]
+                    nested = (
+                        getattr(shell, "callsite_function_shells", {}).get(
+                            node_id
+                        )
+                        or shell.function_shells[int(callee_ref)]
+                    )
+                    if shell._profiler.verbose:
+                        shell._profiler.trace(
+                            path=shell.profile_path,
+                            section="function-call",
+                            label=(
+                                f"{graph.G.graph.get('function_name', '?')} "
+                                f"node {node_id} -> "
+                                f"{nested.process_graph.G.graph.get('function_name', callee_ref)}"
+                            ),
+                            fields={
+                                "positional": tuple(
+                                    _diagnostic_value_summary(value)
+                                    for value in args
+                                ),
+                                "keywords": {
+                                    name: _diagnostic_value_summary(value)
+                                    for name, value in kwargs.items()
+                                },
+                            },
+                        )
                     if nested.process_graph_boundary:
                         if nested.python_callable is None:
                             raise RuntimeError(
@@ -1390,16 +6577,32 @@ def _coordinate_scheduled_capture_impl(
                         result = nested.python_callable(*args, **kwargs)
                         values[node_id] = result
                         return result
-                    nested_inputs = (
-                        dict(zip(
-                            nested.process_graph.G.graph.get(
-                                "function_parameters",
-                                (),
-                            ),
-                            args,
-                        ))
-                        | kwargs
+                    nested_graph_metadata = nested.process_graph.G.graph
+                    receiver_parameter, positional_parameters, _ = (
+                        _method_parameter_layout(
+                            nested.process_graph.G
+                        )
                     )
+                    receiver_value = None
+                    if nested_graph_metadata.get("method_binding") == "class":
+                        owner = nested_graph_metadata.get("method_owner")
+                        descriptor = (
+                            nested_graph_metadata.get("class_table", {})
+                            .get(owner)
+                        )
+                        if descriptor is None:
+                            raise RuntimeError(
+                                "compiled classmethod has no class descriptor: "
+                                f"{owner!r}"
+                            )
+                        receiver_value = _CompiledStructuralClass(
+                            owner, descriptor
+                        )
+                    nested_inputs = dict(
+                        zip(positional_parameters, args)
+                    ) | kwargs
+                    if receiver_parameter is not None and receiver_value is not None:
+                        nested_inputs[receiver_parameter] = receiver_value
                     caller_identities = graph.G.graph.get(
                         "identity_table",
                         {},
@@ -1419,14 +6622,28 @@ def _coordinate_scheduled_capture_impl(
                         name = input_attributes.get("binding_name")
                         if name in nested_inputs:
                             continue
+                        resolution_errors = []
                         for identity in reversed(
                             caller_identities.get(name, ())
                         ):
                             try:
                                 nested_inputs[name] = evaluate_node(identity)
-                            except (KeyError, RuntimeError):
+                            except (KeyError, RuntimeError) as error:
+                                resolution_errors.append(
+                                    (identity, str(error))
+                                )
                                 continue
                             break
+                        if (
+                            name not in nested_inputs
+                            and caller_identities.get(name)
+                        ):
+                            raise RuntimeError(
+                                f"failed to route closure {name!r} into "
+                                f"{nested.process_graph.G.graph.get('function_name', '?')}; "
+                                f"caller identities={caller_identities[name]!r}; "
+                                f"errors={tuple(resolution_errors)!r}"
+                            )
                     for name, value in (
                         nested.process_graph.G.graph.get(
                             "parameter_defaults",
@@ -1434,7 +6651,19 @@ def _coordinate_scheduled_capture_impl(
                         ).items()
                     ):
                         nested_inputs.setdefault(name, value)
-                    if nested.whole_program_compiled:
+                    # Literal callsite specializations were propagated across
+                    # the function table before deployment planning.  Values
+                    # observed here are runtime inputs, not authority to
+                    # rebuild loop IR or invalidate the region schedule.
+                    if capture:
+                        _coordinate_scheduled_capture(
+                            nested,
+                            nested_inputs,
+                            device=device,
+                            capture=True,
+                            discovery_session=discovery_session,
+                        )
+                    elif nested.whole_program_compiled:
                         nested.execute_process_graph(nested_inputs)
                     else:
                         nested.coordinate_first_invocation(
@@ -1443,11 +6672,111 @@ def _coordinate_scheduled_capture_impl(
                         )
                     result = nested.last_result
                 elif attributes.get("static_python_reference"):
-                    callable_value = _static_python_value(
-                        shell.static_python_bindings,
-                        attributes["static_python_reference"],
+                    reference = attributes["static_python_reference"]
+                    structural_constructors = {
+                        "tuple": tuple,
+                        "list": list,
+                        "set": set,
+                        "dict": dict,
+                    }
+                    constructor = structural_constructors.get(reference)
+                    if constructor is not None:
+                        if (
+                            attributes.get("materialization_kind")
+                            in {
+                                "unrolled_loop",
+                                "retained_loop_aggregate",
+                            }
+                        ):
+                            if kwargs:
+                                raise TypeError(
+                                    "loop materialization cannot have "
+                                    "keyword arguments"
+                                )
+                            result = constructor(args)
+                        else:
+                            result = constructor(*args, **kwargs)
+                    else:
+                        callable_value = _static_python_value(
+                            shell.static_python_bindings,
+                            reference,
+                        )
+                        result = callable_value(*args, **kwargs)
+                elif any(
+                    str(role) == "callee" for _parent, role in parents
+                ):
+                    callee_parent = next(
+                        parent
+                        for parent, role in parents
+                        if str(role) == "callee"
                     )
-                    result = callable_value(*args, **kwargs)
+                    callee_value = evaluate_node(callee_parent)
+                    if not isinstance(
+                        callee_value,
+                        (
+                            _CompiledStructuralClass,
+                            _CompiledStructuralMethod,
+                        ),
+                    ):
+                        raise RuntimeError(
+                            "runtime callee edge is not a compiled "
+                            f"structural class at node {node_id}: "
+                            f"{type(callee_value).__name__}"
+                        )
+                    if isinstance(
+                        callee_value,
+                        _CompiledStructuralClass,
+                    ):
+                        result = _CompiledStructuralObject(
+                            callee_value.class_ref,
+                            callee_value.descriptor,
+                            args,
+                            kwargs,
+                        )
+                    else:
+                        nested = (
+                            getattr(shell, "callsite_function_shells", {}).get(
+                                node_id
+                            )
+                            or shell.function_shells[
+                                int(callee_value.method_ref)
+                            ]
+                        )
+                        receiver_parameter, positional_parameters, _ = (
+                            _method_parameter_layout(
+                                nested.process_graph.G
+                            )
+                        )
+                        nested_inputs = dict(
+                            zip(positional_parameters, args)
+                        ) | kwargs
+                        if receiver_parameter is not None:
+                            nested_inputs[receiver_parameter] = (
+                                callee_value.receiver
+                            )
+                        for name, value in (
+                            nested.process_graph.G.graph.get(
+                                "parameter_defaults",
+                                {},
+                            ).items()
+                        ):
+                            nested_inputs.setdefault(name, value)
+                        if capture:
+                            _coordinate_scheduled_capture(
+                                nested,
+                                nested_inputs,
+                                device=device,
+                                capture=True,
+                                discovery_session=discovery_session,
+                            )
+                        elif nested.whole_program_compiled:
+                            nested.execute_process_graph(nested_inputs)
+                        else:
+                            nested.coordinate_first_invocation(
+                                nested_inputs,
+                                device=device,
+                            )
+                        result = nested.last_result
                 elif isinstance(expression.func, ast.Attribute):
                     callable_parent = next(
                         (
@@ -1479,13 +6808,70 @@ def _coordinate_scheduled_capture_impl(
                                 f"parents={parents!r}"
                             )
                         receiver = evaluate_node(receiver_parent)
-                        result = getattr(
-                            receiver,
-                            expression.func.attr,
-                        )(*args, **kwargs)
+                        if isinstance(receiver, _CompiledStructuralObject):
+                            method_ref = receiver.methods.get(
+                                expression.func.attr
+                            )
+                            if method_ref is None:
+                                raise RuntimeError(
+                                    f"compiled class {receiver.class_ref!r} "
+                                    "has no retained method "
+                                    f"{expression.func.attr!r}"
+                                )
+                            nested = (
+                                getattr(
+                                    shell,
+                                    "callsite_function_shells",
+                                    {},
+                                ).get(node_id)
+                                or shell.function_shells[int(method_ref)]
+                            )
+                            (
+                                receiver_parameter,
+                                positional_parameters,
+                                _,
+                            ) = _method_parameter_layout(
+                                nested.process_graph.G
+                            )
+                            nested_inputs = dict(
+                                zip(positional_parameters, args)
+                            ) | kwargs
+                            if receiver_parameter is not None:
+                                nested_inputs[receiver_parameter] = receiver
+                            for name, value in (
+                                nested.process_graph.G.graph.get(
+                                    "parameter_defaults",
+                                    {},
+                                ).items()
+                            ):
+                                nested_inputs.setdefault(name, value)
+                            if capture:
+                                _coordinate_scheduled_capture(
+                                    nested,
+                                    nested_inputs,
+                                    device=device,
+                                    capture=True,
+                                    discovery_session=discovery_session,
+                                )
+                            elif nested.whole_program_compiled:
+                                nested.execute_process_graph(nested_inputs)
+                            else:
+                                nested.coordinate_first_invocation(
+                                    nested_inputs,
+                                    device=device,
+                                )
+                            result = nested.last_result
+                        else:
+                            result = getattr(
+                                receiver,
+                                expression.func.attr,
+                            )(*args, **kwargs)
                 else:
                     raise RuntimeError(
-                        f"unresolved ProcessGraph Call node {node_id}"
+                        f"unresolved ProcessGraph Call node {node_id} in "
+                        f"{graph.G.graph.get('function_name', '?')}: "
+                        f"{ast.dump(expression, include_attributes=False)}; "
+                        f"parents={parents!r}; attributes={attributes!r}"
                     )
             elif isinstance(expression, ast.If):
                 test_id = next(
@@ -1503,6 +6889,16 @@ def _coordinate_scheduled_capture_impl(
                 result = None
                 for branch_node in branch_nodes:
                     result = evaluate_node(branch_node)
+            elif node_type == "Phi":
+                by_role = {
+                    str(role): parent for parent, role in parents
+                }
+                selected = (
+                    by_role["body"]
+                    if bool(evaluate_node(by_role["test"]))
+                    else by_role["orelse"]
+                )
+                result = evaluate_node(selected)
             elif isinstance(expression, ast.Try):
                 by_role: dict[str, list[int]] = {}
                 for parent, role in parents:
@@ -1621,6 +7017,21 @@ def _coordinate_scheduled_capture_impl(
 
                 result = None
                 iterations_completed = 0
+                if shell._profiler.verbose:
+                    shell._profiler.trace(
+                        path=shell.profile_path,
+                        section="loop",
+                        label=f"node {node_id} begin",
+                        fields={
+                            "strategy": plan.strategy.value,
+                            "trip_count": loop.trip_count,
+                            "carried": tuple(
+                                name
+                                for name, _initial, _updated
+                                in loop.carried_bindings
+                            ),
+                        },
+                    )
                 while True:
                     if isinstance(expression, ast.For):
                         try:
@@ -1633,9 +7044,9 @@ def _coordinate_scheduled_capture_impl(
                             if len(targets) > 1
                             else (item,)
                         )
-                        for (_name, binding), value in zip(targets, items):
-                            values[binding] = value
+                        target_assignments = tuple(zip(targets, items))
                     else:
+                        target_assignments = ()
                         test_parent = next(
                             parent
                             for parent, role in parents
@@ -1644,20 +7055,49 @@ def _coordinate_scheduled_capture_impl(
                         if not bool(evaluate_node(test_parent)):
                             break
 
-                    for body_node in loop.body_nodes:
-                        values.pop(body_node, None)
-                    for region_index in shell.loop_region_indices.get(
+                    # Generated binding nodes (for example tuple-unpack
+                    # ``Indexed`` nodes) can sit just beyond the lexical AST
+                    # body while still depending on this iteration.  Clear
+                    # the full downstream value cone so those bindings and
+                    # any prematurely cached post-loop values cannot retain
+                    # the preceding iteration.
+                    for dependent in loop_invalidated_nodes[node_id]:
+                        values.pop(dependent, None)
+                    for (_name, binding), value in target_assignments:
+                        values[binding] = value
+                    for region_index in loop_runtime_region_indices.get(
                         node_id,
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    for body_node in nx.topological_sort(
-                        graph.G.subgraph(loop.body_nodes)
+                    for body_node in nx.lexicographical_topological_sort(
+                        graph.G.subgraph(loop.body_nodes),
+                        key=lambda value_id: int(value_id),
                     ):
-                        result = evaluate_node(body_node)
+                        body_region = region_for_node.get(body_node)
+                        if is_shader_internal_node(body_node):
+                            evaluate_region(body_region)
+                        else:
+                            result = evaluate_node(body_node)
                     for _name, initial, updated in loop.carried_bindings:
                         values[initial] = evaluate_node(updated)
                     iterations_completed += 1
+                    if shell._profiler.verbose:
+                        shell._profiler.trace(
+                            path=shell.profile_path,
+                            section="loop-iteration",
+                            label=(
+                                f"node {node_id} iteration "
+                                f"{iterations_completed}"
+                            ),
+                            fields={
+                                name: _diagnostic_value_summary(
+                                    values.get(initial)
+                                )
+                                for name, initial, _updated
+                                in loop.carried_bindings
+                            },
+                        )
                     if (
                         isinstance(expression, ast.While)
                         and iterations_completed > 1_000_000
@@ -1665,6 +7105,13 @@ def _coordinate_scheduled_capture_impl(
                         raise RuntimeError(
                             "ProcessGraph while loop exceeded safety limit"
                         )
+                if shell._profiler.verbose:
+                    shell._profiler.trace(
+                        path=shell.profile_path,
+                        section="loop",
+                        label=f"node {node_id} end",
+                        fields={"iterations": iterations_completed},
+                    )
             elif isinstance(expression, ast.Raise):
                 exception = (
                     evaluate_node(parents[0][0])
@@ -1672,6 +7119,40 @@ def _coordinate_scheduled_capture_impl(
                     else RuntimeError("ProcessGraph bare raise")
                 )
                 raise exception
+            elif isinstance(expression, ast.Assert):
+                by_role = {
+                    str(role): parent for parent, role in parents
+                }
+                if not bool(evaluate_node(by_role["test"])):
+                    message_id = by_role.get("msg")
+                    message = (
+                        evaluate_node(message_id)
+                        if message_id is not None
+                        else None
+                    )
+                    raise AssertionError(message)
+                result = None
+            elif node_type == "SetAttr":
+                by_role = {
+                    str(role): parent for parent, role in parents
+                }
+                receiver = evaluate_node(by_role["object"])
+                value = evaluate_node(by_role["value"])
+                setattr(
+                    receiver,
+                    (data.get("attributes") or {})["attribute"],
+                    value,
+                )
+                result = value
+            elif node_type == "StaticReference":
+                # This is a compiler-owned link to a function subgraph or
+                # structural symbol.  It is deliberately not a Python object
+                # and performs no runtime work.
+                attributes = data.get("attributes") or {}
+                result = attributes.get(
+                    "function_ref",
+                    attributes.get("static_python_reference"),
+                )
             elif node_type in {"Return", "return", "Store", "store", "Output", "output"}:
                 result = (
                     evaluate_node(parents[0][0])
@@ -1688,26 +7169,348 @@ def _coordinate_scheduled_capture_impl(
         finally:
             active_nodes.remove(node_id)
 
-    with AbstractTensor.use_backend("glsl", device):
-        for node_id in nx.topological_sort(graph.G):
+    generator_binding_values: dict[int, Any] = {}
+
+    def execute_generator_statements(statements):
+        for statement in statements:
+            if isinstance(statement, ast.Expr) and isinstance(
+                statement.value,
+                (ast.Yield, ast.YieldFrom),
+            ):
+                yielded = statement.value
+                value_node = (
+                    expression_nodes.get(id(yielded.value))
+                    if yielded.value is not None
+                    else None
+                )
+                if yielded.value is not None and value_node is None:
+                    yield_node = expression_nodes.get(id(yielded))
+                    if yield_node is not None:
+                        value_node = next(
+                            (
+                                parent
+                                for parent, role in (
+                                    graph.G.nodes[yield_node].get(
+                                        "parents",
+                                        (),
+                                    )
+                                )
+                                if str(role) in {"value", "operand"}
+                            ),
+                            None,
+                        )
+                if yielded.value is not None and value_node is None:
+                    raise RuntimeError(
+                        "generator yield value was not retained in "
+                        f"{graph.G.graph.get('function_name', '?')}: "
+                        f"{ast.dump(yielded, include_attributes=False)}"
+                    )
+                value = (
+                    evaluate_node(value_node)
+                    if value_node is not None
+                    else None
+                )
+                if isinstance(yielded, ast.YieldFrom):
+                    yield from value
+                else:
+                    yield value
+                continue
+            if isinstance(statement, ast.If):
+                test_node = expression_nodes.get(id(statement.test))
+                if test_node is None:
+                    statement_node = expression_nodes.get(id(statement))
+                    if statement_node is not None:
+                        test_node = next(
+                            (
+                                parent
+                                for parent, role in (
+                                    graph.G.nodes[statement_node].get(
+                                        "parents",
+                                        (),
+                                    )
+                                )
+                                if str(role) == "test"
+                            ),
+                            None,
+                        )
+                if test_node is None:
+                    raise RuntimeError(
+                        "generator branch test was not retained in "
+                        f"{graph.G.graph.get('function_name', '?')}: "
+                        f"{ast.dump(statement.test, include_attributes=False)}"
+                    )
+                test = evaluate_node(test_node)
+                if shell._profiler.verbose:
+                    shell._profiler.trace(
+                        path=shell.profile_path,
+                        section="generator-branch",
+                        label=ast.dump(
+                            statement.test,
+                            include_attributes=False,
+                        ),
+                        fields={
+                            "value": _diagnostic_value_summary(test),
+                            "selected": (
+                                "body" if bool(test) else "orelse"
+                            ),
+                        },
+                    )
+                branch = statement.body if bool(test) else statement.orelse
+                yield from execute_generator_statements(branch)
+                continue
+            if isinstance(statement, ast.For):
+                loop_node = expression_nodes[id(statement)]
+                plan = loop_plans_by_node[loop_node]
+                loop = plan.loop
+                if loop.iterator_kind == "arithmetic_sequence":
+                    by_role = {
+                        str(role): parent
+                        for parent, role in (
+                            graph.G.nodes[loop_node].get("parents") or ()
+                        )
+                    }
+                    start = (
+                        loop.start
+                        if loop.start is not None
+                        else evaluate_node(by_role["start"])
+                    )
+                    stop = (
+                        loop.stop
+                        if loop.stop is not None
+                        else evaluate_node(by_role["stop"])
+                    )
+                    step = (
+                        loop.step
+                        if loop.step is not None
+                        else evaluate_node(by_role["step"])
+                    )
+                    iterator = iter(range(
+                        int(start),
+                        int(stop),
+                        int(step),
+                    ))
+                else:
+                    iterator = iter(evaluate_node(loop.iterable_node))
+                for item in iterator:
+                    items = (
+                        tuple(item)
+                        if len(loop.target_bindings) > 1
+                        else (item,)
+                    )
+                    assignments = tuple(zip(
+                        loop.target_bindings,
+                        items,
+                    ))
+                    for dependent in loop_invalidated_nodes[loop_node]:
+                        values.pop(dependent, None)
+                    for (_name, binding), bound_value in assignments:
+                        generator_binding_values[binding] = bound_value
+                    values.update(generator_binding_values)
+                    for region_index in loop_runtime_region_indices.get(
+                        loop_node,
+                        (),
+                    ):
+                        completed_regions.discard(region_index)
+                    yield from execute_generator_statements(statement.body)
+                    for _name, initial, updated in loop.carried_bindings:
+                        values[initial] = evaluate_node(updated)
+                # The generator interpreter is the planner-owned execution of
+                # this loop.  Publish completion so a downstream LoopExit
+                # cannot replay the same body through the generic flat loop
+                # evaluator (which would also lose nested branch semantics).
+                values[loop_node] = None
+                yield from execute_generator_statements(statement.orelse)
+                continue
+            if isinstance(statement, ast.While):
+                loop_node = expression_nodes[id(statement)]
+                iterations = 0
+                while bool(
+                    evaluate_node(expression_nodes[id(statement.test)])
+                ):
+                    for dependent in loop_invalidated_nodes[loop_node]:
+                        values.pop(dependent, None)
+                    for region_index in loop_runtime_region_indices.get(
+                        loop_node,
+                        (),
+                    ):
+                        completed_regions.discard(region_index)
+                    yield from execute_generator_statements(statement.body)
+                    iterations += 1
+                    if iterations > 1_000_000:
+                        raise RuntimeError(
+                            "ProcessGraph generator while loop exceeded "
+                            "safety limit"
+                        )
+                values[loop_node] = None
+                yield from execute_generator_statements(statement.orelse)
+                continue
+            if isinstance(statement, ast.Return):
+                if statement.value is not None:
+                    evaluate_node(expression_nodes[id(statement.value)])
+                return
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value_expression = statement.value
+                if value_expression is not None:
+                    evaluate_node(expression_nodes[id(value_expression)])
+                targets = (
+                    tuple(statement.targets)
+                    if isinstance(statement, ast.Assign)
+                    else (statement.target,)
+                )
+                for target in targets:
+                    target_node = expression_nodes.get(id(target))
+                    if (
+                        target_node is not None
+                        and target_node in graph.G
+                        and graph.G.nodes[target_node].get("type")
+                        == "SetAttr"
+                    ):
+                        evaluate_node(target_node)
+                continue
+            statement_node = expression_nodes.get(id(statement))
+            if statement_node is not None and statement_node in graph.G:
+                evaluate_node(statement_node)
+                continue
+            for member in ast.iter_child_nodes(statement):
+                member_node = expression_nodes.get(id(member))
+                if member_node is not None and member_node in graph.G:
+                    evaluate_node(member_node)
+
+    if graph.G.graph.get("generator_stream"):
+        for input_id in tuple(values):
+            values[input_id] = _tensorize_graph_input(
+                values[input_id],
+                device=device,
+            )
+
+        def generator_producer():
+            try:
+                with AbstractTensor.use_backend(
+                    _scheduled_capture_backend.get(),
+                    device,
+                ):
+                    yield from execute_generator_statements(
+                        graph.G.graph.get("function_body", ())
+                    )
+            finally:
+                if capture:
+                    shell.forward_feed_ids = tuple(feed_maps)
+                    shell.forward_aggregate_feed_paths = tuple(
+                        aggregate_feed_maps
+                    )
+                    shell.forward_subgraphs = tuple(captured_subgraphs)
+                    shell.forward_compilers = tuple(captured_compilers)
+                    shell.forward_region_indices = tuple(
+                        captured_region_indices
+                    )
+                    shell.forward_output_values = tuple(
+                        captured_output_values
+                    )
+                    shell.forward_region_capture_node_ids = tuple(
+                        captured_region_node_ids
+                    )
+                    shell.forward_region_planned_capture_ids = tuple(
+                        captured_region_planned_ids
+                    )
+                    shell.forward_region_planned_input_ids = tuple(
+                        captured_region_planned_input_ids
+                    )
+                shell.captured_values = values
+
+        shell.last_result = _GreedyGeneratorStream(
+            generator_producer(),
+            fifo_slots=2,
+        )
+        return shell.last_result
+
+    with AbstractTensor.use_backend(
+        _scheduled_capture_backend.get(),
+        device,
+    ):
+        # Runtime control operands are outputs of the compiled program just as
+        # surely as returned tensors are.  A predicate used only by
+        # ``if tensor_scalar: raise`` may otherwise remain hidden beneath the
+        # planner-owned statement branch: ordinary topological demand never
+        # reaches it, then control-source composition discovers the predicate
+        # ID after numerical capture has already ended.
+        #
+        # Demand every retained validation predicate here, while the source
+        # function's one discovery tape is active.  This does not execute the
+        # validation on the host, replay a region, or create a second tape. It
+        # merely makes the predicate-producing region a terminal of the same
+        # program observation so its resident slot can be consumed by the
+        # compiled shell's ValidationBlock.
+        if capture:
+            for validation in _validation_control_blocks(shell):
+                evaluate_node(int(validation.predicate_value_id))
+
+        for node_id in nx.lexicographical_topological_sort(
+            graph.G, key=lambda value_id: int(value_id)
+        ):
+            if node_id in inert_nodes:
+                continue
             if node_id in controlled_nodes:
+                # The planner owns statement loops and comprehension loops.
+                # A statement loop with no controlling loop ancestor may
+                # execute here; downstream loops defer until their owner,
+                # LoopExit, returned value, or graph root demands them.
+                if (
+                    isinstance(
+                        graph.G.nodes[node_id].get("expr_obj"),
+                        (ast.For, ast.While),
+                    )
+                    and node_id not in downstream_loop_nodes
+                    and not has_comprehension_owner
+                ):
+                    evaluate_node(node_id)
                 continue
             if node_id in values:
-                values[node_id] = _tensorize_graph_input(
-                    values[node_id],
-                    device=device,
-                )
+                try:
+                    values[node_id] = _tensorize_graph_input(
+                        values[node_id],
+                        device=device,
+                    )
+                except Exception as error:
+                    value = values[node_id]
+                    node = graph.G.nodes[node_id]
+                    value_dtype = getattr(value, "dtype", None)
+                    value_shape = getattr(value, "shape", None)
+                    raise TypeError(
+                        "failed to tensorize a scheduled graph input: "
+                        f"shell={shell.profile_path!r}, node={node_id!r}, "
+                        f"label={node.get('label')!r}, "
+                        f"op={node.get('op')!r}, "
+                        f"value_type={type(value).__module__}."
+                        f"{type(value).__qualname__}, "
+                        f"shape={value_shape!r}, dtype={value_dtype!r}, "
+                        f"value={value!r}"
+                    ) from error
+            elif is_shader_internal_node(node_id):
+                # Topological traversal schedules its containing region, but
+                # does not ask the region to materialize this shader-local
+                # intermediate as a coordinator-visible value.
+                evaluate_region(region_for_node[node_id])
             else:
                 evaluate_node(node_id)
 
+    roots = tuple(evaluate_node(node_id) for node_id in graph.roots)
     if capture:
-        shell.forward_tapes = tuple(tapes)
         shell.forward_feed_ids = tuple(feed_maps)
+        shell.forward_aggregate_feed_paths = tuple(aggregate_feed_maps)
         shell.forward_subgraphs = tuple(captured_subgraphs)
         shell.forward_compilers = tuple(captured_compilers)
         shell.forward_region_indices = tuple(captured_region_indices)
+        shell.forward_output_values = tuple(captured_output_values)
+        shell.forward_region_capture_node_ids = tuple(
+            captured_region_node_ids
+        )
+        shell.forward_region_planned_capture_ids = tuple(
+            captured_region_planned_ids
+        )
+        shell.forward_region_planned_input_ids = tuple(
+            captured_region_planned_input_ids
+        )
     shell.captured_values = values
-    roots = tuple(evaluate_node(node_id) for node_id in graph.roots)
     shell.last_result = roots[0] if len(roots) == 1 else roots
     return shell.last_result
 
@@ -1718,9 +7521,16 @@ def _coordinate_scheduled_capture(
     *,
     device: Any = None,
     capture: bool = True,
+    discovery_session: dict[str, Any] | None = None,
 ) -> Any:
     """Profile-aware boundary around one scheduled shell invocation."""
 
+    if capture:
+        # Discovery/compilation diagnostics remain available through verbose
+        # trace and the error buffer, but they are not runtime frames.  Mixing
+        # their eager region dispatches into steady-state shell statistics made
+        # one execution report as two invocations and obscured CPU churn.
+        shell._profiler._runtime_suppression += 1
     token = shell._profiler.begin_shell(shell.profile_path)
     try:
         return _coordinate_scheduled_capture_impl(
@@ -1728,6 +7538,7 @@ def _coordinate_scheduled_capture(
             initial_values,
             device=device,
             capture=capture,
+            discovery_session=discovery_session,
         )
     except Exception as error:
         shell._profiler.record_exception(
@@ -1738,6 +7549,8 @@ def _coordinate_scheduled_capture(
         raise
     finally:
         shell._profiler.end_shell(shell.profile_path, token)
+        if capture:
+            shell._profiler._runtime_suppression -= 1
 
 
 def _compile_whole_process_graph(
@@ -1791,16 +7604,20 @@ def _compile_whole_process_graph(
         ephemeral.prepare(device=device)
         functions.append(ephemeral)
         sources.append(ephemeral.generated_source)
-    direct_callees = {
-        int(callee_ref)
-        for _node_id, data in shell.process_graph.G.nodes(data=True)
-        for callee_ref in (
-            (data.get("attributes") or {}).get("callee_ref"),
+    direct_callees = [
+        (node_id, int(reference))
+        for node_id, data in shell.process_graph.G.nodes(data=True)
+        for reference in (
+            (data.get("attributes") or {}).get("callee_ref")
+            or (data.get("attributes") or {}).get("method_ref"),
         )
-        if callee_ref is not None
-    }
-    for reference in sorted(direct_callees):
-        function_shell = shell.function_shells.get(reference)
+        if reference is not None
+    ]
+    for node_id, reference in direct_callees:
+        function_shell = (
+            getattr(shell, "callsite_function_shells", {}).get(node_id)
+            or shell.function_shells.get(reference)
+        )
         if function_shell is None:
             raise RuntimeError(
                 "ProcessGraph references a function with no deployment "
@@ -1818,6 +7635,271 @@ def _compile_whole_process_graph(
     return shell
 
 
+def _source_static_value(graph: Any, node_id: int, visiting=None) -> bool:
+    """Whether a call argument is structural source data, not runtime data."""
+
+    visiting = set() if visiting is None else set(visiting)
+    node_id = int(node_id)
+    if node_id in visiting or node_id not in graph.G:
+        return False
+    visiting.add(node_id)
+    data = graph.G.nodes[node_id]
+    if data.get("type") in {"Constant", "Const", "const", "StaticReference"}:
+        return True
+    expression = data.get("expr_obj")
+    if isinstance(expression, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+        return all(
+            _source_static_value(graph, parent, visiting)
+            for parent, _role in (data.get("parents") or ())
+        )
+    return False
+
+
+def _source_static_literal(
+    graph: Any,
+    node_id: int,
+    visiting: frozenset[int] = frozenset(),
+) -> Any:
+    """Evaluate only literal aggregate syntax admitted by source planning."""
+
+    node_id = int(node_id)
+    if node_id in visiting or node_id not in graph.G:
+        raise ValueError("value is not source-static")
+    data = graph.G.nodes[node_id]
+    if data.get("type") in {"Constant", "Const", "const"}:
+        return _constant_value(data)
+    expression = data.get("expr_obj")
+    parents = tuple(data.get("parents") or ())
+    nested = visiting | {node_id}
+    if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+        values = tuple(
+            _source_static_literal(graph, parent, nested)
+            for parent, _role in parents
+        )
+        if isinstance(expression, ast.Tuple):
+            return values
+        if isinstance(expression, ast.Set):
+            return frozenset(values)
+        return list(values)
+    if isinstance(expression, ast.Dict):
+        keys = tuple(expression.keys)
+        values = tuple(expression.values)
+        if len(keys) != len(values):
+            raise ValueError("invalid static dictionary")
+        resolved = [
+            _source_static_literal(graph, parent, nested)
+            for parent, _role in parents
+        ]
+        if len(resolved) != len(keys) * 2:
+            raise ValueError("dictionary parents are not literal leaves")
+        return dict(zip(resolved[::2], resolved[1::2]))
+    raise ValueError("value is not source-static")
+
+
+def _propagate_callsite_planner_specializations(graph: Any) -> None:
+    """Resolve consistent literal call arguments before any loop is planned."""
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    graphs = [graph]
+    graphs.extend(
+        entry.graph for entry in function_table if entry.graph is not None
+    )
+    candidates: dict[tuple[int, str], list[Any]] = {}
+    for caller in graphs:
+        for _node_id, data in caller.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            reference = attributes.get("callee_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            if callee is None:
+                continue
+            _receiver, positional, _all = _method_parameter_layout(callee.G)
+            for parent, role_value in data.get("parents") or ():
+                role = str(role_value)
+                position = _positional_argument_index(role)
+                parameter = (
+                    positional[position]
+                    if (
+                        position is not None
+                        and position < len(positional)
+                    )
+                    else role[3:]
+                    if role.startswith("kw:")
+                    else None
+                )
+                if parameter is None or not _source_static_value(
+                    caller, int(parent)
+                ):
+                    continue
+                try:
+                    value = _source_static_literal(caller, int(parent))
+                except ValueError:
+                    continue
+                candidates.setdefault(
+                    (int(reference), str(parameter)), []
+                ).append(value)
+    for (reference, parameter), values in candidates.items():
+        if not values:
+            continue
+        first = values[0]
+        try:
+            consistent = all(value == first for value in values[1:])
+        except (TypeError, ValueError):
+            consistent = False
+        if not consistent:
+            continue
+        callee = function_table.entry(reference).graph
+        if callee is not None:
+            callee.G.graph.setdefault(
+                "planner_specializations", {}
+            )[parameter] = first
+
+
+_CALLSITE_SHELL_TYPE_CACHE: dict[tuple[object, ...], type] = {}
+
+
+def _callsite_specialized_shell_type(
+    owner: Any,
+    node_id: int,
+    reference: int,
+    fallback: type,
+    max_nodes_per_dispatch: int,
+) -> type:
+    """Plan one literal callsite once, before its shell is instantiated."""
+
+    caller = owner.process_graph
+    if int(node_id) not in caller.G:
+        return fallback
+    function_table = getattr(caller, "function_table", None)
+    if function_table is None:
+        return fallback
+    try:
+        original = function_table.entry(int(reference)).graph
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    if original is None:
+        return fallback
+    _receiver, positional, _all = _method_parameter_layout(original.G)
+    specializations = {}
+    data = caller.G.nodes[int(node_id)]
+    for parent, role_value in data.get("parents") or ():
+        role = str(role_value)
+        position = _positional_argument_index(role)
+        parameter = (
+            positional[position]
+            if position is not None and position < len(positional)
+            else role[3:]
+            if role.startswith("kw:")
+            else None
+        )
+        if parameter is None or not _source_static_value(
+            caller, int(parent)
+        ):
+            continue
+        try:
+            specializations[str(parameter)] = _source_static_literal(
+                caller, int(parent)
+            )
+        except ValueError:
+            continue
+    if not specializations:
+        return fallback
+
+    def stable(value: Any) -> object:
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (stable(key), stable(item))
+                for key, item in value.items()
+            ))
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return tuple(stable(item) for item in value)
+        try:
+            hash(value)
+        except TypeError:
+            return repr(value)
+        return value
+
+    key = (
+        id(function_table),
+        int(reference),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in specializations.items()
+        )),
+        int(max_nodes_per_dispatch),
+    )
+    cached = _CALLSITE_SHELL_TYPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    specialized = extract_clean_process_subgraph(
+        original,
+        original.G,
+    )
+    specialized.G.graph.setdefault(
+        "planner_specializations", {}
+    ).update(specializations)
+    planned = strategize_glsl_deployment(
+        specialized,
+        max_nodes_per_dispatch=int(max_nodes_per_dispatch),
+        _function_table_stack=(id(function_table),),
+    )
+    _CALLSITE_SHELL_TYPE_CACHE[key] = planned
+    return planned
+
+
+def _resolve_unambiguous_method_references(graph: Any) -> None:
+    """Attach a method-table reference when the retained name is unique."""
+
+    references_by_name: dict[str, set[int]] = {}
+    for descriptor in (
+        graph.G.graph.get("class_table") or {}
+    ).values():
+        for name, reference in (
+            descriptor.get("methods") or {}
+        ).items():
+            references_by_name.setdefault(str(name), set()).add(
+                int(reference)
+            )
+    unique = {
+        name: next(iter(references))
+        for name, references in references_by_name.items()
+        if len(references) == 1
+        # Name uniqueness is sufficient only for the live, tensor-oriented
+        # aggregate methods whose receiver participates in the shader graph.
+        # Generic/dead control methods (append, validate, finish, to_bytes)
+        # require reachability and receiver-type proof before planning; adding
+        # them by spelling alone creates hierarchy entries for branches that
+        # source specialization has already removed.
+        and name in {"encode_codewords", "lookup"}
+    }
+    for _node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (
+            attributes.get("callee_ref") is not None
+            or attributes.get("method_ref") is not None
+        ):
+            continue
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Call)
+            and isinstance(expression.func, ast.Attribute)
+        ):
+            continue
+        reference = unique.get(str(expression.func.attr))
+        if reference is None:
+            continue
+        attributes = dict(attributes)
+        attributes["method_ref"] = int(reference)
+        attributes["method_resolution"] = "unique-class-table-name"
+        data["attributes"] = attributes
+
+
 def strategize_glsl_deployment(
     graph: Any,
     *,
@@ -1826,7 +7908,11 @@ def strategize_glsl_deployment(
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule."""
 
-    loop_plans = LoopComposer(
+    _propagate_callsite_planner_specializations(graph)
+    canonical_value_ids = bool(
+        graph.G.graph.get("canonical_value_ids")
+    )
+    loop_composer = LoopComposer(
         LoopBackendCapabilities(
             backend="glsl",
             native_for=True,
@@ -1834,7 +7920,39 @@ def strategize_glsl_deployment(
             dynamic_bounds=True,
             kpn=False,
         )
-    ).compose(graph)
+    )
+    discovered_loop_plans = (
+        loop_composer.discover(graph)
+        if canonical_value_ids
+        else ()
+    )
+    evaporated_loop_plans = (
+        evaporate_unrolled_loops(graph, discovered_loop_plans)
+        if discovered_loop_plans
+        else ()
+    )
+    evaporated_loop_ids = {
+        int(plan.loop.node_id) for plan in evaporated_loop_plans
+    }
+    retained_loop_plans = tuple(
+        plan
+        for plan in discovered_loop_plans
+        if int(plan.loop.node_id) not in evaporated_loop_ids
+        and int(plan.loop.node_id) in graph.G
+    )
+    semantic_loop_plans = (
+        loop_composer.materialize_semantic_ir(
+            graph,
+            retained_loop_plans,
+        )
+        if retained_loop_plans
+        else ()
+    )
+    loop_plans = (
+        materialize_retained_loop_ports(graph, semantic_loop_plans)
+        if semantic_loop_plans
+        else ()
+    )
     function_entry = None
     function_reference = graph.G.graph.get("function_ref")
     function_table = getattr(graph, "function_table", None)
@@ -1848,24 +7966,53 @@ def strategize_glsl_deployment(
     python_callable = (
         None if function_entry is None else function_entry.python_callable
     )
+    _resolve_unambiguous_method_references(graph)
     reference_tables = build_shell_reference_tables(graph)
-    dispatch_plan = serialize_scheduled_operator_dispatches(
+    executable_nodes = tuple(
+        node_id
+        for node_id in nx.lexicographical_topological_sort(
+            graph.G, key=lambda value_id: int(value_id)
+        )
+        if not _is_dispatch_metadata_node(graph, node_id)
+    )
+    # Control membership is a semantic partition: numerical work may be
+    # reduced freely inside one planner-owned loop body or conditional branch,
+    # but never fused across that control boundary.  All other dispatch
+    # boundaries are produced by the fixed-point shader-region identities
+    # rather than inherited from schedule levels or operator spelling.
+    partition_keys = _control_partition_keys(
         graph,
-        max_nodes_per_dispatch=max_nodes_per_dispatch,
+        loop_plans,
+        executable_nodes,
+    )
+    inert_nodes = _inert_routing_nodes(graph)
+    closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    dispatch_plan = reduce_scheduled_shader_regions(
+        graph,
+        executable_nodes,
+        max_nodes_per_region=max_nodes_per_dispatch,
+        partition_keys=partition_keys,
+        extra_dependency_edges=closure_edges,
     )
     executable_dispatch_nodes = tuple(
-        tuple(
-            node_id
-            for node_id in dispatch.node_ids
-            if not _is_dispatch_metadata_node(graph, node_id)
-        )
+        dispatch.node_ids
         for dispatch in dispatch_plan.dispatches
     )
     dispatch_subgraphs = tuple(
-        _dispatch_subgraph(graph, node_ids)
+        _dispatch_subgraph(
+            graph,
+            node_ids,
+            required_outputs=closure_outputs,
+            inert_nodes=inert_nodes,
+        )
         for node_ids in executable_dispatch_nodes
         if node_ids
     )
+    for subgraph, dispatch in zip(
+        dispatch_subgraphs,
+        dispatch_plan.dispatches,
+    ):
+        subgraph.G.graph["rewrite_history"] = dispatch.rewrite_history
     loop_region_indices = {
         plan.loop.node_id: tuple(
             region_index
@@ -1876,11 +8023,17 @@ def strategize_glsl_deployment(
         )
         for plan in loop_plans
     }
+    loop_shader_reductions = analyze_shader_loop_reductions(
+        graph,
+        loop_plans,
+        executable_dispatch_nodes,
+    )
     deep_compilers = tuple(
         GraphDeepCompiler(
             subgraph,
             dict(abstract_tensor_funcs),
             abstract_tensor_sigs,
+            node_observer=_observe_process_graph_node,
         )
         for subgraph in dispatch_subgraphs
     )
@@ -1905,8 +8058,9 @@ class ProcessGraphGLSLDeployment:
     dispatch_plan = __dispatch_plan__
     loop_plans = __loop_plans__
     loop_region_indices = __loop_region_indices__
+    loop_shader_reductions = __loop_shader_reductions__
     process_graph_boundary = __process_graph_boundary__
-    python_callable = __python_callable__
+    python_callable = staticmethod(__python_callable__)
     dispatch_subgraphs = __dispatch_subgraphs__
     deep_compilers = __deep_compilers__
     ephemeral_callables = __ephemeral_callables__
@@ -1922,19 +8076,40 @@ class ProcessGraphGLSLDeployment:
         *,
         batch_size=None,
         profiling=False,
+        verbose_profile=False,
         input_slots=64,
         output_slots=64,
+        legacy_fused_network=False,
+        shell_language="glsl",
         **tuning,
     ):
+        tuning = dict(tuning)
+        tuning["legacy_fused_network"] = bool(legacy_fused_network)
+        tuning["shell_language"] = str(shell_language)
         self.state = {}
         self.tuning = dict(tuning)
+        self.legacy_fused_network = bool(legacy_fused_network)
+        self.shell_language = str(shell_language)
+        if self.shell_language not in {"python", "c", "glsl"}:
+            raise ValueError(
+                "shell_language must be python, c, or glsl"
+            )
+        self.control_runtime = (
+            "legacy_fused_network"
+            if self.legacy_fused_network
+            else "composed_control"
+        )
         self.batch_size = dict(
             __deployment_batches__
             if batch_size is None
             else batch_size
         )
-        self.profiling = profiling
-        self._profiler = DeploymentProfiler(profiling)
+        self.profiling = bool(profiling or verbose_profile)
+        self.verbose_profile = bool(verbose_profile)
+        self._profiler = DeploymentProfiler(
+            self.profiling,
+            verbose=self.verbose_profile,
+        )
         self.error_buffer = self._profiler.error_buffer
         self.profile = self._profiler
         self.profile_path = _shell_profile_name(self)
@@ -1953,33 +8128,133 @@ class ProcessGraphGLSLDeployment:
         for function_shell in self.function_shells.values():
             function_shell.function_shells = self.function_shells
             function_shell._owns_function_shells = False
+        def plan_callsites(owner, active_references=()):
+            owner.callsite_function_shells = {}
+            for node_id, data in owner.process_graph.G.nodes(data=True):
+                attributes = data.get("attributes") or {}
+                reference = attributes.get("callee_ref")
+                if reference is None:
+                    reference = attributes.get("method_ref")
+                if reference is None:
+                    continue
+                reference = int(reference)
+                shell_type = self.function_shell_types.get(reference)
+                if shell_type is None or reference in active_references:
+                    continue
+                shell_type = _callsite_specialized_shell_type(
+                    owner,
+                    node_id,
+                    reference,
+                    shell_type,
+                    __max_nodes_per_dispatch__,
+                )
+                planned = shell_type(**tuning)
+                planned.function_shells = self.function_shells
+                planned._owns_function_shells = False
+                owner.callsite_function_shells[node_id] = planned
+                plan_callsites(
+                    planned,
+                    (*active_references, reference),
+                )
+        for function_shell in self.function_shells.values():
+            plan_callsites(function_shell)
+            (
+                function_shell.hierarchy_plan,
+                function_shell.hierarchy_value_table,
+            ) = assign_hierarchy_ids(
+                _build_shell_hierarchy_plan(function_shell)
+            )
+        plan_callsites(self)
+        (
+            self.hierarchy_plan,
+            self.hierarchy_value_table,
+        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
         _attach_profiler(
             self,
             self._profiler,
             self.profile_path,
         )
         self.fused_network = None
+        self.compiled_shell_callable = None
         self.whole_program_compiled = False
         self.whole_program_device = None
         self.compiled_dispatch_functions = ()
         self.compiled_dispatch_sources = ()
         self.forward_tapes = ()
         self.forward_feed_ids = ()
+        self.forward_aggregate_feed_paths = ()
+        self.compiled_aggregate_feed_paths = ()
+        self.compiled_feed_meta = {}
         self.forward_subgraphs = ()
         self.forward_compilers = ()
         self.forward_region_indices = ()
+        self.forward_output_values = ()
+        self.forward_region_capture_node_ids = ()
+        self.forward_region_planned_capture_ids = ()
+        self.forward_region_planned_input_ids = ()
+        self.forward_planned_collection_materializations = {}
+        self.compiled_process_graph_aliases = {}
         self.compiled_tapes = ()
+        self.compiled_shell_program = None
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
+        self._capture_invocations = 0
+        self._execute_invocations = 0
+        self._discovery_tape_creations = 0
+        self._discovery_tape_lowerings = 0
+        self._discovery_tape = None
+        self._discovery_tape_owner = False
+        self._discovery_session = None
+        self._discovery_tape_bindings = {}
+        self._discovery_tape_complete = False
+        self.collection_observations = {}
+        self.collection_collapse_report = {}
+        self.planned_invocation_slots = 1
         self.coordinator_region_indices = set()
+        self.compile_time_region_indices = set()
         self.compile_failures = ()
         self.glsl_sources = ()
+        self.composed_loop_sources = {}
+        self.composed_loop_artifacts = {}
+        self.installed_control_shell = None
+        self.composed_shell_artifact = None
+        self.composed_shell_specialized_values = {}
+        self.shell_control_program = None
+        self.hierarchical_shell_composed = False
+        self.hierarchical_root_value_ids = {}
+        self.hierarchical_private_value_ids = {}
+        self.hierarchical_capture_value_ids = {}
+        self.hierarchical_synthetic_field_paths = {}
+        self.hierarchical_program_value_origins = {}
+        self.hierarchical_aggregate_redirect_diagnostics = {}
+        self.hierarchical_aggregate_candidate_diagnostics = {}
+        self.hierarchical_control_binding_diagnostics = {}
+        self.hierarchical_composed_closure_iterable_bindings = ()
+        self.hierarchical_region_correlations = ()
+        self.hierarchical_endpoint_details = {}
+        self.hierarchical_root_field_value_ids = {}
+        self.hierarchical_effective_value_table = None
+        self.hierarchical_compose_failure = None
+        self.hierarchical_public_output_ids = set()
+        self.hierarchy_identity_collapses = ()
+        self.hierarchy_identity_rounds = 0
+        self.hierarchy_remaining_callsite_ids = None
+        self.composed_shell_complete = False
+        self.composed_shell_blockers = ()
         self.input_bindings = {}
         self.output_bindings = {}
+        self.output_aggregate_bindings = {}
+        self.output_loop_aggregate_bindings = {}
 
     @property
     def ready(self):
-        return self.whole_program_compiled or self.fused_network is not None
+        if not self.legacy_fused_network:
+            return self.installed_control_shell is not None
+        return (
+            self.installed_control_shell is not None
+            or self.whole_program_compiled
+            or self.fused_network is not None
+        )
 
     @property
     def programs(self):
@@ -1991,6 +8266,19 @@ class ProcessGraphGLSLDeployment:
         self._profiler.enabled = bool(enabled)
         self.profiling = bool(enabled)
         return self
+
+    def enable_verbose_profiling(self, enabled=True):
+        self._profiler.verbose = bool(enabled)
+        if enabled:
+            self.enable_profiling(True)
+        self.verbose_profile = bool(enabled)
+        return self
+
+    def trace_report(self, *, limit=None):
+        records = tuple(self._profiler.trace_history)
+        if limit is not None:
+            records = records[-max(0, int(limit)):]
+        return records
 
     def profile_report(self):
         return self._profiler.report()
@@ -2045,7 +8333,18 @@ class ProcessGraphGLSLDeployment:
                 f"{row['gpu_p95_ms']:.3f} ms mean/p95 | "
                 f"dispatches {row['dispatches_mean']:.1f}"
             )
+        for row in report["device_rows"]:
+            lines.append(
+                f"  {row['path']} | logging-ssbo | "
+                f"{row['label']}[{row['code']}] | "
+                f"events {row['events_mean']:.1f}/invocation | "
+                f"payload {row['payload0_mean']:.1f},"
+                f"{row['payload1_mean']:.1f}"
+            )
         return tuple(lines)
+
+    def program_table_lines(self):
+        return _deployment_program_table_lines(self)
 
     def require_ready(self):
         if not self.ready:
@@ -2069,41 +8368,11 @@ class ProcessGraphGLSLDeployment:
         *,
         device=None,
     ):
-        if len(dispatch_inputs) != len(self.deep_compilers):
-            raise ValueError(
-                "dispatch_inputs must provide one input mapping per "
-                "planned subgraph"
-            )
-        tapes = []
-        feed_maps = []
-        with AbstractTensor.use_backend("glsl", device):
-            for compiler, subgraph, inputs in zip(
-                self.deep_compilers,
-                self.dispatch_subgraphs,
-                dispatch_inputs,
-            ):
-                function = compiler.build_function(device=device)
-                with autograd.forward_capture() as tape:
-                    bound_inputs = {
-                        name: _bind_capture_tape(value, tape)
-                        for name, value in dict(inputs).items()
-                    }
-                    function(**bound_inputs)
-                tapes.append(tape)
-                feed_maps.append({
-                    id(bound_inputs[
-                        _compiler_input_name(
-                            subgraph.G.nodes[node_id]["label"]
-                        )
-                    ]): node_id
-                    for node_id in subgraph.G.graph["deployment_inputs"]
-                })
-        self.forward_tapes = tuple(tapes)
-        self.forward_feed_ids = tuple(feed_maps)
-        self.forward_subgraphs = self.dispatch_subgraphs
-        self.forward_compilers = self.deep_compilers
-        self.forward_region_indices = tuple(range(len(self.forward_tapes)))
-        return self.forward_tapes
+        raise RuntimeError(
+            "per-region tape capture has been retired: call "
+            "capture_fused_programs() once to discover the complete source "
+            "program, compile its shell, and destroy the discovery tape"
+        )
 
     def capture_scheduled_forward_tapes(
         self,
@@ -2111,72 +8380,12 @@ class ProcessGraphGLSLDeployment:
         *,
         device=None,
     ):
-        tapes = []
-        feed_maps = []
-        with AbstractTensor.use_backend("glsl", device):
-            values = {
-                node_id: (
-                    value
-                    if isinstance(value, AbstractTensor)
-                    else AbstractTensor.tensor(value, device=device)
-                )
-                for node_id, value in dict(initial_values).items()
-            }
-            for compiler, subgraph in zip(
-                self.deep_compilers,
-                self.dispatch_subgraphs,
-            ):
-                inputs = {}
-                for node_id in subgraph.G.graph["deployment_inputs"]:
-                    if node_id not in values:
-                        raise KeyError(
-                            "scheduled dispatch input has no routed value: "
-                            f"{node_id}"
-                        )
-                    name = _compiler_input_name(
-                        subgraph.G.nodes[node_id]["label"]
-                    )
-                    inputs[name] = values[node_id]
-
-                function = compiler.build_function(device=device)
-                with autograd.forward_capture() as tape:
-                    bound_inputs = {
-                        name: _bind_capture_tape(value, tape)
-                        for name, value in inputs.items()
-                    }
-                    try:
-                        results = function(**bound_inputs)
-                    except Exception as error:
-                        raise RuntimeError(
-                            "ProcessGraph numerical region failed in "
-                            f"{graph.G.graph.get('function_name', '?')} "
-                            f"region {region_index}"
-                        ) from error
-                if not isinstance(results, tuple):
-                    results = (results,)
-                returned = dict(zip(compiler._outs, results))
-                for output_id, store_id in zip(
-                    subgraph.G.graph["deployment_outputs"],
-                    subgraph.G.graph["deployment_store_nodes"],
-                ):
-                    values[output_id] = returned[store_id]
-
-                tapes.append(tape)
-                feed_maps.append({
-                    id(bound_inputs[
-                        _compiler_input_name(
-                            subgraph.G.nodes[node_id]["label"]
-                        )
-                    ]): node_id
-                    for node_id in subgraph.G.graph["deployment_inputs"]
-                })
-        self.forward_tapes = tuple(tapes)
-        self.forward_feed_ids = tuple(feed_maps)
-        self.forward_subgraphs = self.dispatch_subgraphs
-        self.forward_compilers = self.deep_compilers
-        self.forward_region_indices = tuple(range(len(self.forward_tapes)))
-        self.captured_values = values
-        return self.forward_tapes
+        raise RuntimeError(
+            "per-region scheduled tape capture has been retired: call "
+            "capture_fused_programs() once; the planner's region boundaries "
+            "are cut points within that single discovery tape, not separate "
+            "executions"
+        )
 
     def coordinate_first_invocation(self, initial_values, *, device=None):
         return _coordinate_scheduled_capture(
@@ -2186,37 +8395,697 @@ class ProcessGraphGLSLDeployment:
             capture=True,
         )
 
-    def capture_fused_programs(self, initial_values, *, device=None):
+    def refresh_hierarchy_plan(self):
+        # Freeze hierarchy only after all callsite shells are attached.
+
+        (
+            self.hierarchy_plan,
+            self.hierarchy_value_table,
+        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self))
+        return self.hierarchy_plan
+
+    def capture_fused_programs(
+        self,
+        initial_values,
+        *,
+        device=None,
+        precompile_only=False,
+    ):
+        if self._discovery_tape_complete:
+            raise RuntimeError(
+                "this source program has already consumed its one discovery "
+                "tape; execute the installed compiled shell"
+            )
+        self.refresh_hierarchy_plan()
         if not self.whole_program_compiled:
             self.compile_process_graph(device=device)
-        result = _coordinate_scheduled_capture(
-            self,
-            initial_values,
-            device=device,
-            capture=True,
+        observer_backend = (
+            "precompile_observer" if precompile_only else "glsl"
         )
-        self.compile_forward_tapes(strict=True)
-        captured = set(self.compiled_region_indices)
-        missing = set(range(len(self.ephemeral_callables))) - captured
-        for region_index in missing:
-            subgraph = self.dispatch_subgraphs[region_index]
-            tensor_outputs = [
-                output_id
-                for output_id in subgraph.G.graph["deployment_outputs"]
-                if isinstance(self.captured_values.get(output_id), AbstractTensor)
-            ]
-            if tensor_outputs:
-                raise RuntimeError(
-                    "every tensor-producing ProcessGraph callable must become "
-                    "one CapturedFusedProgram; region "
-                    f"{region_index} left tensor outputs {tensor_outputs}"
+        with _use_scheduled_capture_backend(observer_backend):
+            result = _coordinate_scheduled_capture(
+                self,
+                initial_values,
+                device=device,
+                capture=True,
+            )
+        targets = []
+        seen = set()
+        for target in _walk_planned_shells(self):
+            identity = id(target)
+            if identity in seen or target._discovery_tape is None:
+                continue
+            seen.add(identity)
+            targets.append(target)
+        observed_target_ids = {id(target) for target in targets}
+        for target in _walk_planned_shells(self):
+            if id(target) in observed_target_ids:
+                continue
+            # The program's one discovery sequence did not enter this
+            # callsite (for example the grayscale side of a statically color
+            # branch).  Record reachability as an explicit empty structural
+            # compartment.  Do not execute it, create a tape for it, or infer
+            # numerical constants.  If pruning it removes required numerical
+            # output, the root artifact's public-output completeness check
+            # still rejects the compiled shell.
+            target.compiled_shell_program = CapturedFusedProgram(
+                FusedProgram(
+                    version=1,
+                    feeds=set(),
+                    steps=[],
+                    outputs={},
+                    meta={},
+                    extras={"kernel_kind": "structural-unreached"},
+                ),
+                {},
+            )
+            target.compiled_tapes = ()
+            target.compiled_region_indices = ()
+            target.compile_time_region_indices = set(
+                range(len(target.dispatch_subgraphs))
+            )
+            target.shell_control_program = ControlProgram(
+                SequenceBlock(()),
+                (),
+            )
+        incomplete_shells = []
+        # Freeze the one discovery run's wrapper identities before any child
+        # shell is lowered and discarded.  This table exists only during
+        # compilation so a nested structured argument can be correlated with
+        # its caller's SSA result; it is cleared with ``_discovery_session``
+        # before the installed shell can execute.
+        discovery_capture_objects = {}
+
+        def collect_discovery_capture_objects(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect_discovery_capture_objects(item)
+                return
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    collect_discovery_capture_objects(item)
+                return
+            if isinstance(value, AbstractTensor):
+                discovery_capture_objects[id(value)] = value
+                storage_value = getattr(value, "data", None)
+                if storage_value is not None:
+                    discovery_capture_objects[id(storage_value)] = (
+                        storage_value
+                    )
+
+        for target in _walk_planned_shells(self):
+            collect_discovery_capture_objects(
+                getattr(target, "captured_values", {})
+            )
+        if self._discovery_session is not None:
+            self._discovery_session["capture_objects"] = (
+                discovery_capture_objects
+            )
+        # Lower the compilation tree's single observation exactly once at its
+        # owner.  Child shells below only project their planner cut points from
+        # this immutable IR; they never receive the tape and cannot lower it.
+        lowered_program = self.compile_discovery_program(
+            strict=True,
+            emit_glsl=not precompile_only,
+        )
+        if lowered_program is None:
+            raise RuntimeError(
+                "the compilation owner did not produce lowered program IR"
+            )
+
+        def discard_discovery_payloads(target):
+            # Remove observed values while retaining only compiled IR.  This
+            # class is generated from an outer triple-quoted source string, so
+            # keep this as a comment rather than an embedded docstring.
+
+            target.forward_tapes = ()
+            target.forward_feed_ids = ()
+            target.forward_aggregate_feed_paths = ()
+            target.forward_subgraphs = ()
+            target.forward_compilers = ()
+            target.forward_region_indices = ()
+            target.forward_output_values = ()
+            target.forward_region_capture_node_ids = ()
+            target.forward_region_planned_capture_ids = ()
+            target.forward_region_planned_input_ids = ()
+            target.forward_planned_collection_materializations = {}
+            target.captured_values = {}
+            target.collection_observations = {}
+            target._discovery_tape_bindings = {}
+            target.last_result = None
+            assert not target.forward_tapes
+            assert not target.forward_aggregate_feed_paths
+            assert not target.captured_values
+            assert not target.collection_observations
+            assert not target._discovery_tape_bindings
+            assert target._discovery_tape_creations == (
+                1 if target is self else 0
+            )
+            assert target._discovery_tape_lowerings == (
+                1 if target is self else 0
+            )
+            assert target.compiled_shell_program is not None
+
+        for target in reversed(targets):
+            if target is not self:
+                target.compile_discovery_program(
+                    strict=True,
+                    lowered_program=lowered_program,
+                    emit_glsl=not precompile_only,
                 )
-        self.coordinator_region_indices = missing
-        self.captured_region_programs = dict(zip(
-            self.compiled_region_indices,
-            self.compiled_tapes,
-        ))
-        return result
+            # Numerical lowering establishes the final control ABI (uniform
+            # bounds, carried aliases, iterable bindings and validations).
+            # The hierarchy is a property of the complete source program, not
+            # of every suffix subtree.  Rebuilding and re-numbering it once
+            # per nested shell repeatedly traverses the same descendants and
+            # turns deep ordinary-Python call trees into quadratic compiler
+            # work.  Rebuild it exactly once at the discovery owner, which is
+            # visited after its children in this reversed traversal and can
+            # therefore see every child's final control ABI.
+            if target is self:
+                hierarchy_refresh_started = time.perf_counter()
+                target._profiler.trace(
+                    path=target.profile_path,
+                    section="hierarchy-refresh",
+                    label="begin",
+                    fields={},
+                )
+                (
+                    target.hierarchy_plan,
+                    target.hierarchy_value_table,
+                ) = assign_hierarchy_ids(
+                    _refresh_hierarchy_control_captures(
+                        target.hierarchy_plan,
+                        target,
+                    ),
+                    target.hierarchy_value_table,
+                )
+                target._profiler.trace(
+                    path=target.profile_path,
+                    section="hierarchy-refresh",
+                    label="complete",
+                    fields={
+                        "elapsed_ms": round(
+                            (
+                                time.perf_counter()
+                                - hierarchy_refresh_started
+                            ) * 1e3,
+                            3,
+                        ),
+                    },
+                )
+            target.planned_invocation_slots = max(
+                1, target._capture_invocations
+            )
+            target._execute_invocations = 0
+            captured = {
+                (
+                    region_key
+                    if not isinstance(region_key, tuple)
+                    else region_key[-2]
+                )
+                for region_key in target.compiled_region_indices
+            }
+            missing = (
+                set(range(len(target.ephemeral_callables))) - captured
+            )
+            for region_index in missing:
+                subgraph = target.dispatch_subgraphs[region_index]
+                tensor_outputs = [
+                    output_id
+                    for output_id in subgraph.G.graph[
+                        "deployment_outputs"
+                    ]
+                    if isinstance(
+                        target.captured_values.get(output_id),
+                        AbstractTensor,
+                    )
+                    and int(output_id) not in (
+                        target.compiled_process_graph_aliases
+                    )
+                ]
+                if tensor_outputs:
+                    raise RuntimeError(
+                        "every tensor-producing ProcessGraph callable must "
+                        "become one CapturedFusedProgram; "
+                        f"{target.process_graph.G.graph.get('function_name', '?')} "
+                        f"region {region_index} left tensor outputs "
+                        f"{tensor_outputs}; operations="
+                        f"{tuple(str(subgraph.G.nodes[node].get('op') or subgraph.G.nodes[node].get('type')) for node in subgraph.G.graph.get('deployment_nodes', ()))!r}; "
+                        f"recorded_regions={target.forward_region_indices!r}; "
+                        f"compiled_regions={target.compiled_region_indices!r}; "
+                        f"shell_id={id(target)}"
+                    )
+            target.coordinator_region_indices = missing
+            target.captured_region_programs = dict(zip(
+                target.compiled_region_indices,
+                target.compiled_tapes,
+            ))
+            if target is self and precompile_only:
+                # SSA and other IR consumers stop at the Turing precompile
+                # boundary.  They need the complete numerical manifest,
+                # projected regions, and planned control, but must not build,
+                # cache, emit, install, or driver-compile a GLSL artifact.
+                target.composed_shell_blockers = (
+                    "precompile-only",
+                )
+                target.composed_shell_complete = False
+                discard_discovery_payloads(target)
+                continue
+            if target is not self:
+                # A nested source function is a planner compartment, not a
+                # separately deployed shell.  Its local control, projected
+                # numerical IR and specialization map are all the root
+                # hierarchy consumes.  Auditing a synthetic child ABI walks
+                # large source subgraphs, invents "missing shell" blockers,
+                # and repeats deployment work that has no runtime meaning.
+                target.composed_shell_blockers = (
+                    "planner-compartment-awaits-root-composition",
+                )
+                target.composed_shell_complete = False
+                cleanup_started = time.perf_counter()
+                target._profiler.trace(
+                    path=target.profile_path,
+                    section="discovery-cleanup",
+                    label="begin",
+                    fields={},
+                )
+                discard_discovery_payloads(target)
+                target._profiler.trace(
+                    path=target.profile_path,
+                    section="discovery-cleanup",
+                    label="complete",
+                    fields={
+                        "elapsed_ms": round(
+                            (
+                                time.perf_counter() - cleanup_started
+                            ) * 1e3,
+                            3,
+                        ),
+                    },
+                )
+                continue
+            if target is self and target.callsite_function_shells:
+                hierarchical_artifact = (
+                    _build_hierarchical_glsl_artifact(target)
+                )
+                if hierarchical_artifact is not None:
+                    target.composed_shell_artifact = (
+                        hierarchical_artifact
+                    )
+                    target.hierarchical_shell_composed = True
+            artifact = target.composed_shell_artifact
+            required_inputs = (
+                set()
+                if artifact is None
+                else set(artifact.external_value_ids)
+                | set(artifact.uniform_value_ids.values())
+            )
+            public_inputs = {
+                int(node_id)
+                for node_id, data in target.process_graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (
+                    data.get("attributes") or {}
+                ).get("binding_kind") == "parameter"
+                and target.process_graph.G.out_degree(node_id)
+            }
+            if target.hierarchical_shell_composed:
+                public_inputs = {
+                    target.hierarchical_root_value_ids.get(
+                        node_id, node_id
+                    )
+                    for node_id in public_inputs
+                }
+            if artifact is not None:
+                # Only specializations originating at the shell's public
+                # parameter boundary are runtime constraints.  Specialized
+                # lexical constants inside nested closures are compiled facts,
+                # not fabricated root inputs.
+                required_inputs.update(
+                    set(artifact.specialized_values) & public_inputs
+                )
+            if artifact is not None:
+                # A source-level parameter is not necessarily a runtime shader
+                # operand.  Parameters such as AbstractTensor's `like=` carry
+                # construction/type context and can legitimately disappear
+                # during typed lowering.  Requiring an SSBO merely because the
+                # source graph retains that informational edge invents runtime
+                # work and makes metadata look like executable data.  Only
+                # parameters referenced by the emitted artifact belong to its
+                # runtime ABI; every such operand must still be covered below.
+                artifact_references = set(artifact.slot_value_ids) | set(
+                    artifact.uniform_value_ids.values()
+                ) | set(artifact.specialized_values)
+                public_inputs &= artifact_references
+            locally_produced_values = {
+                int(value_id)
+                for captured in target.captured_region_programs.values()
+                for program in (
+                    tuple(captured.stages)
+                    if captured.stages
+                    else (captured.program,)
+                )
+                for value_id in program.outputs.values()
+            }
+            public_outputs = set(_declared_output_terminals(
+                target.process_graph,
+                produced_values=locally_produced_values,
+            ).values())
+            if target.hierarchical_shell_composed:
+                public_outputs = set(
+                    target.hierarchical_public_output_ids
+                )
+            artifact_outputs = (
+                set()
+                if artifact is None
+                else set(artifact.terminal_outputs.values())
+            )
+            hierarchy_inputs = None
+            if (
+                artifact is not None
+                and target.hierarchical_shell_composed
+            ):
+                # Nested lexical specializations are compiler-owned constants
+                # and are filled from the artifact.  A specialization at the
+                # public parameter boundary remains part of the ABI so execute
+                # can reject a caller that violates the compiled contract.
+                root_runtime_inputs = (
+                    required_inputs
+                    - set(artifact.specialized_values)
+                    | (
+                        set(artifact.specialized_values)
+                        & public_inputs
+                    )
+                )
+                hierarchy_inputs = {
+                    str(data.get("label")): global_id
+                    for local_id, data in (
+                        target.process_graph.G.nodes(data=True)
+                    )
+                    if data.get("type") == "Input"
+                    and (
+                        global_id := (
+                            target.hierarchical_root_value_ids.get(
+                                int(local_id)
+                            )
+                        )
+                    ) in root_runtime_inputs
+                }
+                hierarchy_inputs.update({
+                    str(path): int(global_id)
+                    for path, global_id in (
+                        target.hierarchical_root_field_value_ids.items()
+                    )
+                    if int(global_id) in root_runtime_inputs
+                })
+            blockers = []
+            compile_time_only = (
+                target.compiled_shell_program is not None
+                and not target.compiled_shell_program.program.steps
+                and not target.compiled_shell_program.program.feeds
+                and not target.compiled_shell_program.program.outputs
+                and (
+                    target.compiled_shell_program.program.extras or {}
+                ).get("kernel_kind") == "structural"
+            )
+            if artifact is None and not compile_time_only:
+                blockers.append("no-composed-artifact")
+            if (
+                target.callsite_function_shells
+                and not target.hierarchical_shell_composed
+                and not compile_time_only
+            ):
+                remaining_calls = (
+                    tuple(sorted(target.callsite_function_shells))
+                    if target.hierarchy_remaining_callsite_ids is None
+                    else target.hierarchy_remaining_callsite_ids
+                )
+                blockers.append(
+                    "callee-artifacts-not-absorbed:"
+                    + ",".join(map(str, remaining_calls))
+                    + (
+                        ""
+                        if target.hierarchical_compose_failure is None
+                        else "[compose-failure="
+                        f"{target.hierarchical_compose_failure!r}]"
+                    )
+                )
+            if (
+                artifact is not None
+                and not compile_time_only
+                and not public_inputs.issubset(
+                required_inputs
+                )
+            ):
+                blockers.append(
+                    "public-inputs-not-covered:"
+                    + ",".join(map(str, sorted(
+                        public_inputs - required_inputs
+                    )))
+                )
+            if (
+                artifact is not None
+                and not compile_time_only
+                and not public_outputs.issubset(
+                artifact_outputs
+                )
+            ):
+                blockers.append(
+                    "public-outputs-not-covered:"
+                    + ",".join(map(str, sorted(
+                        public_outputs - artifact_outputs
+                    )))
+                )
+            if (
+                hierarchy_inputs is not None
+                and not compile_time_only
+                and set(hierarchy_inputs.values()) != root_runtime_inputs
+            ):
+                missing_hierarchy_inputs = (
+                    root_runtime_inputs
+                    - set(hierarchy_inputs.values())
+                )
+                parameter_id_map = {
+                    int(local_id): int(global_id)
+                    for local_id, global_id in (
+                        target.hierarchical_root_value_ids.items()
+                    )
+                    if local_id in target.process_graph.G
+                    and target.process_graph.G.nodes[local_id].get("type")
+                    == "Input"
+                }
+                target.hierarchical_unbound_diagnostics = {
+                    "missing": tuple(sorted(missing_hierarchy_inputs)),
+                    "parameter_ids": parameter_id_map,
+                    "field_ids": dict(
+                        target.hierarchical_root_field_value_ids
+                    ),
+                    "private_endpoints": {
+                        int(value_id): (
+                            target.hierarchical_private_value_ids.get(
+                                int(value_id)
+                            )
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "capture_endpoints": {
+                        int(value_id): (
+                            target.hierarchical_capture_value_ids.get(
+                                int(value_id)
+                            )
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "endpoint_details": {
+                        int(value_id): (
+                            target.hierarchical_endpoint_details.get(
+                                int(value_id), ()
+                            )
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "synthetic_fields": {
+                        int(value_id): (
+                            target.hierarchical_synthetic_field_paths.get(
+                                int(value_id)
+                            )
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "correlated_endpoints": {
+                        int(value_id): tuple(
+                            (int(closure_id), int(local_id))
+                            for closure_id, local_id, global_id
+                            in (
+                                target.hierarchical_effective_value_table
+                                .correlations
+                            )
+                            if int(global_id) == int(value_id)
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "program_origins": {
+                        int(value_id): (
+                            target.hierarchical_program_value_origins.get(
+                                int(value_id), ()
+                            )
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "aggregate_redirects": {
+                        int(value_id): tuple(
+                            row
+                            for rows in (
+                                target
+                                .hierarchical_aggregate_redirect_diagnostics
+                                .values()
+                            )
+                            for row in rows
+                            if row.get("original") == int(value_id)
+                        )
+                        for value_id in missing_hierarchy_inputs
+                    },
+                    "aggregate_closure_rows": {
+                        int(closure_id): tuple(
+                            target
+                            .hierarchical_aggregate_redirect_diagnostics
+                            .get(int(closure_id), ())
+                        )
+                        for closure_id in {
+                            int(origin["closure"])
+                            for value_id in missing_hierarchy_inputs
+                            for origin in (
+                                target
+                                .hierarchical_program_value_origins.get(
+                                    int(value_id), ()
+                                )
+                            )
+                            if "closure" in origin
+                        }
+                    },
+                }
+                blockers.append(
+                    "hierarchical-inputs-not-root-bound:"
+                    + ",".join(map(str, sorted(
+                        missing_hierarchy_inputs
+                    )))
+                    + f"[parameter-map={parameter_id_map!r},"
+                    f"field-map={target.hierarchical_root_field_value_ids!r},"
+                    "private="
+                    f"{target.hierarchical_unbound_diagnostics['private_endpoints']!r},"
+                    "capture="
+                    f"{target.hierarchical_unbound_diagnostics['capture_endpoints']!r},"
+                    "details="
+                    f"{target.hierarchical_unbound_diagnostics['endpoint_details']!r},"
+                    "fields="
+                    f"{target.hierarchical_unbound_diagnostics['synthetic_fields']!r},"
+                    "correlated="
+                    f"{target.hierarchical_unbound_diagnostics['correlated_endpoints']!r},"
+                    "program-origins="
+                    f"{target.hierarchical_unbound_diagnostics['program_origins']!r},"
+                    "aggregate-redirects="
+                    f"{target.hierarchical_unbound_diagnostics['aggregate_redirects']!r},"
+                    "aggregate-closure-rows="
+                    f"{target.hierarchical_unbound_diagnostics['aggregate_closure_rows']!r},"
+                    "aggregate-candidates="
+                    f"{target.hierarchical_aggregate_candidate_diagnostics!r},"
+                    "control-bindings="
+                    f"{target.hierarchical_control_binding_diagnostics!r}]"
+                )
+            target.composed_shell_blockers = tuple(blockers)
+            target.composed_shell_complete = not blockers
+            if not target.legacy_fused_network:
+                if (
+                    target.composed_shell_complete
+                    and artifact is not None
+                    and (
+                        target is self
+                        or not target.hierarchical_shell_composed
+                    )
+                ):
+                    # A hierarchically composed child is source owned by its
+                    # enclosing shell, not another runtime deployment.
+                    # Installing every complete subtree allocates competing
+                    # resident lifetimes and turns composition back into
+                    # orchestration.  Leaf artifacts remain installable for
+                    # differential tests while the parent is incomplete.
+                    target.install_composed_control(
+                        target.composed_shell_artifact,
+                        input_bindings=hierarchy_inputs,
+                    )
+                elif (
+                    target is self
+                    and not target.composed_shell_complete
+                ):
+                    # Nested callsite shells are planner compartments inside
+                    # the one source program, not separately deployable
+                    # programs.  A method subtree may legitimately expose an
+                    # aggregate field or unresolved branch which its caller
+                    # later binds/collapses.  Requiring every subtree to have
+                    # a standalone public ABI recreates function calls and
+                    # defeats whole-shell hierarchy reduction.  Preserve each
+                    # child's blockers for diagnostics, but gate installation
+                    # only on the compilation root after all descendants have
+                    # been absorbed.
+                    incomplete_shells.append((
+                        target.profile_path,
+                        target.composed_shell_blockers,
+                    ))
+
+            # A tape is compile-time evidence of operation order, not retained
+            # runtime state.  Its nodes hold every concrete tensor produced
+            # while revealing the sequence; keeping them after lowering pins
+            # all corresponding GL buffers and causes GPU memory to grow until
+            # the driver terminates the process.  The compiled programs above
+            # contain identities, metadata, and operations only—their captured
+            # feed payloads have already been discarded.
+            discard_discovery_payloads(target)
+
+        # Structural helpers may legitimately produce no tensor region and
+        # therefore never enter ``targets`` above.  They still participated in
+        # the one discovery execution and must lose their tape here.  Runtime
+        # ownership begins only after every function shell's discovery object
+        # has been destroyed.
+        for target in _walk_planned_shells(self):
+            if target._discovery_tape_creations:
+                target._discovery_tape = None
+                target._discovery_tape_complete = True
+                assert target._discovery_tape is None
+            elif target._discovery_tape is not None:
+                target._discovery_tape = None
+                target._discovery_tape_complete = True
+                assert target._discovery_tape is None
+        if self._discovery_session is not None:
+            self._discovery_session.clear()
+            self._discovery_session = None
+
+        # Drop the root capture result as well.  Returning it would keep the
+        # observed frame tensors alive even though capture exists solely to
+        # produce the reusable programs.
+        result = None
+        gc.collect()
+        if incomplete_shells and not self.legacy_fused_network:
+            details = "; ".join(
+                f"{path}: {', '.join(blockers)}"
+                for path, blockers in incomplete_shells[:12]
+            )
+            if len(incomplete_shells) > 12:
+                details += (
+                    f"; ... {len(incomplete_shells) - 12} more shells"
+                )
+            error = RuntimeError(
+                "cannot install a truthful complete GLSL shell; "
+                f"{len(incomplete_shells)} function shells retain uncovered "
+                f"public ABI or control: {details}"
+            )
+            self._profiler.record_exception(
+                error,
+                path=self.profile_path,
+                phase="shell-completeness",
+            )
+            raise error
+        return None
 
     def compile_process_graph(self, *, device=None):
         try:
@@ -2241,77 +9110,1168 @@ class ProcessGraphGLSLDeployment:
             capture=False,
         )
 
-    def compile_forward_tapes(
+    def compile_discovery_program(
         self,
         *,
         dynamic_scalar_ids=(),
         strict=False,
+        lowered_program=None,
+        emit_glsl=True,
     ):
-        if not self.forward_tapes:
-            raise RuntimeError("capture forward tapes before compiling them")
-        if dynamic_scalar_ids and (
-            len(dynamic_scalar_ids) != len(self.forward_tapes)
-        ):
-            raise ValueError(
-                "dynamic_scalar_ids must provide one sequence per tape"
-            )
-        scalar_ids = (
-            dynamic_scalar_ids
-            if dynamic_scalar_ids
-            else ((),) * len(self.forward_tapes)
+        projection_started = time.perf_counter()
+        self._profiler.trace(
+            path=self.profile_path,
+            section="numerical-projection",
+            label="begin",
+            fields={
+                "regions": len(self.dispatch_subgraphs),
+                "owner": bool(self._discovery_tape_owner),
+                "shared_ir": lowered_program is not None,
+                "emit_glsl": bool(emit_glsl),
+            },
         )
+        if self._discovery_tape is None:
+            raise RuntimeError(
+                "capture the source shell's discovery tape before compiling"
+            )
+        if dynamic_scalar_ids and len(dynamic_scalar_ids) != 1:
+            raise ValueError(
+                "dynamic_scalar_ids must provide one sequence for the one "
+                "discovery tape"
+            )
+        tape = self._discovery_tape
+        if lowered_program is None:
+            if not self._discovery_tape_owner:
+                raise RuntimeError(
+                    "a nested shell attempted to lower the compilation "
+                    "owner's discovery tape"
+                )
+            if self._discovery_tape_lowerings:
+                raise RuntimeError(
+                    "the source program's discovery tape has already been "
+                    "lowered; planner work must use compiled_shell_program"
+                )
+            self._discovery_tape_lowerings += 1
+            if self._discovery_tape_lowerings != 1:
+                raise RuntimeError(
+                    "one source program lowered its discovery tape more than "
+                    "once"
+                )
+        if not tape._nodes:
+            # A structural-only shell still consumed its single discovery
+            # observation, but there is no numerical program to lower or
+            # fabricate.  Preserve an explicit empty IR manifest so cleanup
+            # can prove the tape was consumed exactly once.
+            self.compiled_shell_program = CapturedFusedProgram(
+                FusedProgram(
+                    version=1,
+                    feeds=set(),
+                    steps=[],
+                    outputs={},
+                    meta={},
+                    extras={"kernel_kind": "structural"},
+                ),
+                {},
+            )
+            self.compiled_tapes = ()
+            self.compiled_region_indices = ()
+            self.compile_failures = ()
+            self.glsl_sources = ()
+            self.compile_time_region_indices = set(
+                range(len(self.dispatch_subgraphs))
+            )
+            self.shell_control_program = ControlProgram(
+                SequenceBlock(()),
+                (),
+            )
+            return self
         compiled = []
         compiled_region_indices = []
         failures = []
         sources = []
-        subgraphs = self.forward_subgraphs or self.dispatch_subgraphs
-        region_indices = (
-            self.forward_region_indices
-            or tuple(range(len(self.forward_tapes)))
+        # Projection is a cut through the one observed program IR.  Never
+        # substitute every planned region when a shell contributed no cut
+        # points: that fabricates executions (especially beneath lazy
+        # generator boundaries) and attempts to infer feeds from an example
+        # that never ran.  The planner still owns those regions and the
+        # completeness audit must report them until generalized control
+        # lowering makes them reachable.
+        subgraphs = tuple(self.forward_subgraphs)
+        region_indices = tuple(self.forward_region_indices)
+        captured_outputs = tuple(
+            self.forward_output_values
+            or (None,) * len(subgraphs)
         )
-        for tape, feed_ids, subgraph, dynamic_ids, region_index in zip(
-            self.forward_tapes,
-            self.forward_feed_ids,
-            subgraphs,
-            scalar_ids,
-            region_indices,
+        if not (
+            len(self.forward_feed_ids)
+            == len(subgraphs)
+            == len(region_indices)
+            == len(captured_outputs)
         ):
-            try:
-                captured = compile_recorded_fused_tape(
+            raise RuntimeError(
+                "discovery cut-point tables have inconsistent lengths; "
+                "the tape is singular while region metadata is per cut point; "
+                f"shell={self.profile_path!r}; "
+                f"feeds={len(self.forward_feed_ids)} "
+                f"subgraphs={len(subgraphs)} "
+                f"regions={len(region_indices)} "
+                f"outputs={len(captured_outputs)}"
+            )
+
+        if lowered_program is not None and not subgraphs:
+            # This child contributed no numerical cut point to the program's
+            # one observation.  It is a structural compartment, not an owner
+            # of the root numerical manifest.  Preserve an explicit empty
+            # artifact so hierarchy composition can erase it without
+            # pretending it lowered or executed another program.
+            self.compiled_shell_program = CapturedFusedProgram(
+                FusedProgram(
+                    version=1,
+                    feeds=set(),
+                    steps=[],
+                    outputs={},
+                    meta={},
+                    extras={"kernel_kind": "structural"},
+                ),
+                {},
+            )
+            self.compiled_tapes = ()
+            self.compiled_region_indices = ()
+            self.compile_failures = ()
+            self.glsl_sources = ()
+            self.compile_time_region_indices = set(
+                range(len(self.dispatch_subgraphs))
+            )
+            self.shell_control_program = ControlProgram(
+                SequenceBlock(()),
+                (),
+            )
+            self._profiler.trace(
+                path=self.profile_path,
+                section="numerical-projection",
+                label="structural complete",
+                fields={
+                    "elapsed_ms": round(
+                        (time.perf_counter() - projection_started) * 1e3,
+                        3,
+                    ),
+                },
+            )
+            return lowered_program
+
+        # Lower the complete observed numerical program exactly once.  Nothing
+        # below this call receives ``tape``: region programs are dependency
+        # projections of this backend-neutral IR, never repeated tape solves.
+        try:
+            whole = lowered_program
+            if whole is None:
+                whole = compile_recorded_fused_tape(
                     tape,
-                    dynamic_scalar_ids=tuple(dynamic_ids),
+                    dynamic_scalar_ids=(
+                        tuple(dynamic_scalar_ids[0])
+                        if dynamic_scalar_ids
+                        else ()
+                    ),
                 )
+            whole = _collapse_planned_collection_materializations(
+                whole,
+                self.forward_planned_collection_materializations,
+            )
+            # Discovery observations are diagnostic samples, not compiler
+            # identity.  In particular, matching a stack's transient operand
+            # IDs to observed loop items must never erase the stack producer
+            # and alias its tensor result to the resident collection.  The
+            # planner-owned mapping above rewires only the producer's inputs
+            # and deliberately preserves its distinct result ID.
+            self.collection_collapse_report = {
+                int(result_id): {
+                    "collection_id": int(collection_id),
+                    "producer_preserved": True,
+                }
+                for result_id, collection_id in (
+                    self.forward_planned_collection_materializations.items()
+                )
+            }
+        except ValueError as error:
+            if strict:
+                raise RuntimeError(
+                    "the source shell's one discovery tape did not lower to "
+                    "one complete FusedProgram"
+                ) from error
+            self.compile_failures = ({
+                "region_index": None,
+                "outputs": (),
+                "unsupported_ops": (),
+                "reason": str(error),
+            },)
+            return self
+
+        whole.program.extras = {
+            **(whole.program.extras or {}),
+            "capture_feed_origins": {
+                feed_id: {
+                    "op": (
+                        None
+                        if tape._nodes.get(feed_id) is None
+                        else str(tape._nodes[feed_id].op)
+                    ),
+                    "parameter_names": (
+                        tuple(sorted(
+                            tape._nodes[feed_id].ctx.get("params") or {}
+                        ))
+                        if tape._nodes.get(feed_id) is not None
+                        else ()
+                    ),
+                }
+                for feed_id in whole.program.feeds
+            },
+        }
+        boundary_aliases = {}
+        for feed_map in self.forward_feed_ids:
+            boundary_aliases.update(feed_map)
+        self.compiled_feed_meta = {
+            int(graph_id): meta
+            for feed_map in self.forward_feed_ids
+            for transient_id, graph_id in feed_map.items()
+            if (
+                meta := (whole.program.meta or {}).get(
+                    int(transient_id)
+                )
+            ) is not None
+        }
+        boundary_aliases = _capture_feed_aliases(
+            whole,
+            boundary_aliases,
+        )
+        # Keep occurrence identities unique in the whole-shell IR.  A loop
+        # revisits the same ProcessGraph node, so globally replacing every
+        # observed result with that graph ID would create several producers
+        # for one value and corrupt dependency/shape selection.  Stable graph
+        # IDs are assigned only after each planner cut point is projected.
+        self.compiled_shell_program = _remap_captured_all_ids(whole, {})
+        # Aggregate leaf paths are identities derived while lowering the one
+        # discovery tape.  Freeze only those integer/path facts into compiled
+        # IR before capture payload disposal.  The tape, tensor wrappers and
+        # observed values remain forbidden after this point; hierarchical
+        # composition must not rediscover them or run Python again.
+        compiled_feed_values = {
+            int(capture_id): value
+            for capture_id, value in whole.feeds.items()
+        }
+        capture_objects = {}
+
+        def collect_capture_objects(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    collect_capture_objects(item)
+                return
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    collect_capture_objects(item)
+                return
+            if (
+                isinstance(value, AbstractTensor)
+                or _capture_storage_identity(value) is not None
+            ):
+                capture_objects[id(value)] = value
+                if isinstance(value, AbstractTensor):
+                    collect_capture_objects(getattr(value, "data", None))
+
+        for node in tape._nodes.values():
+            collect_capture_objects(node.ctx.get("result"))
+            collect_capture_objects(node.ctx.get("inputs", ()))
+            collect_capture_objects(node.ctx.get("params") or {})
+        discovery_owner = (
+            None
+            if self._discovery_session is None
+            else self._discovery_session.get("owner")
+        )
+        if discovery_owner is not None:
+            for planned_shell in _walk_planned_shells(discovery_owner):
+                collect_capture_objects(
+                    getattr(planned_shell, "captured_values", {})
+                )
+        capture_objects.update(compiled_feed_values)
+        if self._discovery_session is not None:
+            capture_objects.update(
+                self._discovery_session.get("capture_objects") or {}
+            )
+        self.compiled_aggregate_feed_paths = tuple(
+            tuple(dict.fromkeys(
+                (
+                    int(alias_id),
+                    int(graph_input_id),
+                    tuple(path),
+                )
+                for capture_id, (
+                    graph_input_id,
+                    path,
+                    storage,
+                ) in aggregate_map.items()
+                for alias_id in (
+                    int(capture_id),
+                    *(
+                        int(candidate_id)
+                        for candidate_id, candidate
+                        in capture_objects.items()
+                        if (
+                            storage is not None
+                            and _capture_storage_identity(candidate) == storage
+                        )
+                    ),
+                )
+            ))
+            for aggregate_map in self.forward_aggregate_feed_paths
+        )
+
+        def is_parameter_aggregate_origin(
+            graph_input_id: int,
+            visiting=None,
+        ) -> bool:
+            visiting = set() if visiting is None else set(visiting)
+            graph_input_id = int(graph_input_id)
+            if graph_input_id in visiting or graph_input_id not in self.process_graph.G:
+                return False
+            visiting.add(graph_input_id)
+            data = self.process_graph.G.nodes[graph_input_id]
+            attributes = data.get("attributes") or {}
+            if data.get("type") == "Input":
+                return attributes.get("binding_kind") == "parameter"
+            expression = data.get("expr_obj")
+            function_expression = getattr(expression, "func", None)
+            if not (
+                type(expression).__name__ == "Call"
+                and type(function_expression).__name__ == "Name"
+                and getattr(function_expression, "id", None)
+                in {"tuple", "list"}
+            ):
+                return False
+            source = next((
+                int(parent)
+                for parent, role in (data.get("parents") or ())
+                if str(role) in {"arg", "args", "arg:0", "arg0"}
+            ), None)
+            return (
+                source is not None
+                and is_parameter_aggregate_origin(source, visiting)
+            )
+
+        # Convert the once-lowered program into forward SSA ownership facts
+        # before region projection.  The AST planner has already decided the
+        # logic and the region boundaries; the lowered IR now supplies the
+        # exact numerical edges between those regions.
+        #
+        # Do not reconstruct these edges by inspecting captured Python
+        # wrappers, object identity, storage identity, values, or autograd
+        # ancestry.  A backend may legitimately replace a wrapper while
+        # retaining the same SSA value, and storage may be shared or reused.
+        # Both cases made real producers appear terminal and then left their
+        # consumers as unbound shell inputs.  Once FusedProgram exists, its
+        # integer input/result IDs are the sole numerical dependency
+        # authority.  Forward capture has finished revealing primitive
+        # operations at this point and is never asked to rediscover logic.
+        ssa_consumers: dict[int, set[int]] = {}
+        whole_result_ids: set[int] = set()
+        for execution_program in whole.execution_programs:
+            for step in execution_program.steps:
+                consumer_id = int(step.result_id)
+                whole_result_ids.add(consumer_id)
+                ssa_consumers.setdefault(consumer_id, set())
+                for producer_id in step.input_ids:
+                    ssa_consumers.setdefault(
+                        int(producer_id), set()
+                    ).add(consumer_id)
+
+        # Equal typed literals are a mathematical identity already stated by
+        # the ProcessGraph itself.  AbstractTensor may materialize one backend
+        # constant primitive and reuse it at several source occurrences.  Use
+        # the lowest existing ProcessGraph node ID as their canonical wire;
+        # never invent an ID and never inspect a captured runtime value.
+        endpoint_identity: dict[int, int] = {}
+        literal_ids: dict[tuple[type, Any], int] = {}
+        attribute_ids: dict[tuple[int, str], int] = {}
+        for node_id, data in sorted(
+            self.process_graph.G.nodes(data=True),
+            key=lambda item: int(item[0]),
+        ):
+            node_id = int(node_id)
+            if data.get("type") == "Attribute":
+                parents = tuple(
+                    int(parent)
+                    for parent, role in (data.get("parents") or ())
+                    if str(role) == "value"
+                )
+                expression = data.get("expr_obj")
+                attribute = getattr(expression, "attr", None)
+                if len(parents) == 1 and attribute is not None:
+                    parent = endpoint_identity.get(
+                        parents[0], parents[0]
+                    )
+                    key = (parent, str(attribute))
+                    endpoint_identity[node_id] = (
+                        attribute_ids.setdefault(key, node_id)
+                    )
+                continue
+            if data.get("type") not in {"Constant", "Const", "const"}:
+                continue
+            try:
+                literal = _constant_value(data)
+            except KeyError:
+                continue
+            if not isinstance(
+                literal, (type(None), bool, int, float, str, bytes)
+            ):
+                continue
+            key = (type(literal), literal)
+            canonical = literal_ids.setdefault(key, node_id)
+            endpoint_identity[node_id] = canonical
+
+        for (
+            feed_ids,
+            aggregate_feed_paths,
+            region_capture_node_ids,
+            region_planned_capture_ids,
+            region_planned_input_ids,
+            subgraph,
+            region_index,
+            captured_output_values,
+        ) in zip(
+            self.forward_feed_ids,
+            self.compiled_aggregate_feed_paths,
+            self.forward_region_capture_node_ids,
+            self.forward_region_planned_capture_ids,
+            self.forward_region_planned_input_ids,
+            subgraphs,
+            region_indices,
+            captured_outputs,
+        ):
+            output_ids = tuple(
+                subgraph.G.graph["deployment_outputs"]
+            )
+            parameter_aggregate_capture_ids = tuple(
+                int(capture_id)
+                for capture_id, input_id, _path in aggregate_feed_paths
+                if is_parameter_aggregate_origin(input_id)
+            )
+            owned_result_ids = tuple(dict.fromkeys(
+                int(value_id)
+                for value_id in region_capture_node_ids
+                if (
+                    int(value_id) in tape._nodes
+                    and int(value_id) in whole_result_ids
+                )
+            ))
+            if not owned_result_ids:
+                continue
+            owned_set = set(owned_result_ids)
+            # Generated region code reports this correspondence at the exact
+            # planned operation invocation.  It is tab-A-to-slot-B wiring:
+            # no wrapper/storage/value comparison and no reconstruction from
+            # tape topology is involved.
+            direct_output_ids = {
+                int(capture_id): int(graph_node_id)
+                for graph_node_id, capture_ids
+                in region_planned_capture_ids
+                if int(graph_node_id) in output_ids
+                for capture_id in capture_ids
+            }
+            # Apply ProcessGraph identities only after the planner-owned
+            # region has been projected from the complete primitive program.
+            # Local node IDs are scoped to a function/closure and therefore
+            # cannot safely be substituted into the whole discovery capture:
+            # unrelated compartments routinely reuse the same integers.
+            #
+            # The positional rows and result rows below are emitted at the
+            # exact generated ProcessGraph operation.  They are the complete
+            # tab-A-to-slot-B correspondence for this compartment.  Remapping
+            # both sides together also keeps literal tensor constructors and
+            # intermediate results as real producers instead of fabricating
+            # their ProcessGraph IDs as external shell inputs.
+            planned_region_id_map: dict[int, int] = {}
+
+            def add_planned_id(primitive_id: int, graph_id: int) -> None:
+                primitive_id = int(primitive_id)
+                graph_id = endpoint_identity.get(
+                    int(graph_id), int(graph_id)
+                )
+                previous = planned_region_id_map.get(
+                    primitive_id, graph_id
+                )
+                if previous != graph_id:
+                    raise RuntimeError(
+                        "one primitive occurrence was assigned to two "
+                        "ProcessGraph endpoints in region "
+                        f"{region_index}: primitive={primitive_id}, "
+                        f"first={previous}, second={graph_id}, "
+                        f"function={self.process_graph.G.graph.get('function_name', '?')!r}, "
+                        f"first_node={dict(self.process_graph.G.nodes[previous]) if previous in self.process_graph.G else None!r}, "
+                        f"second_node={dict(self.process_graph.G.nodes[graph_id]) if graph_id in self.process_graph.G else None!r}"
+                    )
+                planned_region_id_map[primitive_id] = graph_id
+
+            for graph_node_id, capture_ids in region_planned_capture_ids:
+                for capture_id in capture_ids:
+                    add_planned_id(capture_id, graph_node_id)
+            for _result_capture_id, positional_inputs in (
+                region_planned_input_ids
+            ):
+                for primitive_id, graph_id in positional_inputs:
+                    add_planned_id(primitive_id, graph_id)
+            live_result_ids = tuple(
+                value_id
+                for value_id in owned_result_ids
+                if (
+                    value_id in direct_output_ids
+                    or not ssa_consumers.get(value_id)
+                    or any(
+                        consumer_id not in owned_set
+                        for consumer_id in ssa_consumers.get(value_id, ())
+                    )
+                )
+            )
+            if not live_result_ids:
+                # This region's numerical definitions are dead within its
+                # own AST compartment.  It needs no shader region, and no
+                # observed payload or host fallback is retained.
+                continue
+            try:
+                captured = _project_captured_program(
+                    whole,
+                    output_ids=live_result_ids,
+                    boundary_ids=tuple(dict.fromkeys((
+                        *feed_ids,
+                        *parameter_aggregate_capture_ids,
+                    ))),
+                    # AST/ProcessGraph planning has already assigned logic and
+                    # scope before the tape is lowered.  The tape contributes
+                    # only the tensor operations observed while this region
+                    # executed; it is not allowed to walk backward into an
+                    # operation owned by a caller, callee, sibling, or loop
+                    # compartment merely because lazy materialization joined
+                    # their backend expressions.  Repeated occurrences are
+                    # accumulated into this one region-owned set above, so
+                    # planner-owned loops remain complete without allowing
+                    # forward capture to rediscover control flow.
+                    allowed_result_ids=tuple(region_capture_node_ids),
+                )
+                captured = _remap_captured_program(
+                    captured,
+                    feed_ids={
+                        **{
+                            transient_id: graph_id
+                            for transient_id, graph_id
+                            in boundary_aliases.items()
+                            if (
+                                transient_id in captured.program.feeds
+                                or transient_id in feed_ids
+                            )
+                        },
+                        # Exact planned correspondences override legacy
+                        # boundary aliases.  The latter remain temporarily
+                        # below for untouched aggregate paths, but may never
+                        # override an explicit ProcessGraph endpoint.
+                        **planned_region_id_map,
+                    },
+                    output_ids=tuple(
+                        direct_output_ids.get(value_id, value_id)
+                        for value_id in live_result_ids
+                    ),
+                )
+                canonical_literals = set(literal_ids.values())
+                for program in captured.execution_programs:
+                    metadata = program.meta or {}
+                    for literal_id in canonical_literals:
+                        meta = metadata.get(int(literal_id))
+                        if meta is None:
+                            continue
+                        metadata[int(literal_id)] = Meta(
+                            (),
+                            meta.dtype,
+                            meta.device,
+                        )
             except ValueError as error:
                 if strict:
                     raise RuntimeError(
-                        "ProcessGraph numerical region "
-                        f"{region_index} did not lower to one "
-                        "CapturedFusedProgram"
+                        "ProcessGraph numerical region projection "
+                        f"{self.process_graph.G.graph.get('function_name', '?')} "
+                        f"region {region_index} did not project to one "
+                        f"CapturedFusedProgram; operations="
+                        f"{tuple(str(subgraph.G.nodes[node].get('op') or subgraph.G.nodes[node].get('type')) for node in subgraph.G.graph.get('deployment_nodes', ()))!r}; "
+                        "owned_results="
+                        f"{owned_result_ids!r}; live_results="
+                        f"{live_result_ids!r}; direct_outputs="
+                        f"{tuple(sorted(direct_output_ids.items()))!r}"
                     ) from error
                 failures.append({
                     "region_index": region_index,
                     "outputs": tuple(
-                        subgraph.G.graph["deployment_outputs"]
+                        output_ids
                     ),
                     "unsupported_ops": (),
                     "reason": str(error),
                 })
                 continue
-            captured = _remap_captured_program(
-                captured,
-                feed_ids=feed_ids,
-                output_ids=tuple(
-                    subgraph.G.graph["deployment_outputs"]
-                ),
-            )
             compiled.append(captured)
             compiled_region_indices.append(region_index)
-            sources.append(compile_captured_fused_program(captured))
+            if not (
+                self._discovery_tape_owner
+                and not self.callsite_function_shells
+            ):
+                # This projected region belongs to a compartment inside a
+                # larger source shell.  Keep the CapturedFusedProgram IR for
+                # hierarchical composition, but do not emit a throwaway
+                # standalone shader.  The one root artifact emits every
+                # snippet in its real control/dependency context and is the
+                # authoritative GLSL validation point.
+                continue
+            if not emit_glsl:
+                continue
+            try:
+                sources.append(compile_captured_fused_program(captured))
+            except Exception as error:
+                stage_shapes = tuple(
+                    {
+                        "steps": tuple(
+                            (
+                                step.op_name,
+                                tuple(step.input_ids),
+                                int(step.result_id),
+                            )
+                            for step in stage.steps
+                        ),
+                        "feeds": {
+                            int(value_id): (
+                                None
+                                if (stage.meta or {}).get(value_id) is None
+                                else tuple(
+                                    (stage.meta or {})[value_id].shape or ()
+                                )
+                            )
+                            for value_id in stage.feeds
+                        },
+                        "outputs": {
+                            name: (
+                                int(value_id),
+                                None
+                                if (stage.meta or {}).get(value_id) is None
+                                else tuple(
+                                    (stage.meta or {})[value_id].shape or ()
+                                ),
+                            )
+                            for name, value_id in stage.outputs.items()
+                        },
+                    }
+                    for stage in captured.execution_programs
+                )
+                raise RuntimeError(
+                    "failed to compile captured GLSL source for ProcessGraph "
+                    f"{self.process_graph.G.graph.get('function_name', '?')} "
+                    f"region {region_index}; operations="
+                    f"{tuple(str(subgraph.G.nodes[node].get('op') or subgraph.G.nodes[node].get('type')) for node in subgraph.G.graph.get('deployment_nodes', ()))!r}; "
+                    f"projected_stages={stage_shapes!r}"
+                ) from error
         self.compiled_tapes = tuple(compiled)
         self.compiled_region_indices = tuple(compiled_region_indices)
         self.compile_failures = tuple(failures)
         self.glsl_sources = tuple(sources)
-        return self.glsl_sources
+        self._profiler.trace(
+            path=self.profile_path,
+            section="numerical-projection",
+            label="complete",
+            fields={
+                "compiled_regions": len(compiled_region_indices),
+                "elapsed_ms": round(
+                    (time.perf_counter() - projection_started) * 1e3,
+                    3,
+                ),
+            },
+        )
+        if self._discovery_tape_owner:
+            self._discovery_session["lowered_program"] = whole
+        by_region = {
+            int(
+                region_index
+                if not isinstance(region_index, tuple)
+                else region_index[-2]
+            ): captured
+            for region_index, captured in zip(
+                compiled_region_indices,
+                compiled,
+            )
+        }
+        composed_loops = {}
+        for reduction in self.loop_shader_reductions:
+            if not emit_glsl:
+                continue
+            if not reduction.collapsible or reduction.control_program is None:
+                continue
+            missing = tuple(
+                region_index
+                for region_index in reduction.region_indices
+                if region_index not in by_region
+            )
+            if missing:
+                self._profiler.trace(
+                    path=self.profile_path,
+                    section="control-lowering",
+                    label=f"loop {reduction.loop_node_id} not composed",
+                    fields={
+                        "reason": "regions have no captured GLSL program",
+                        "regions": missing,
+                    },
+                )
+                continue
+            loop_regions = {
+                region_index: by_region[region_index]
+                for region_index in reduction.region_indices
+            }
+            available_loop_values = {
+                int(value_id)
+                for captured in loop_regions.values()
+                for program in (
+                    captured.program,
+                    *tuple(captured.stages),
+                )
+                for value_id in (
+                    *tuple(program.feeds),
+                    *tuple(program.outputs.values()),
+                    *(step.result_id for step in program.steps),
+                )
+            }
+            deferred_sources = tuple(
+                int(source_id)
+                for source_id, _collection_id, _induction, _start
+                in reduction.control_program.collection_bindings
+                if int(source_id) not in available_loop_values
+            )
+            if deferred_sources:
+                self._profiler.trace(
+                    path=self.profile_path,
+                    section="control-lowering",
+                    label=(
+                        f"loop {reduction.loop_node_id} deferred "
+                        "to hierarchy"
+                    ),
+                    fields={
+                        "collection_sources": deferred_sources,
+                    },
+                )
+                continue
+            artifact = build_control_shader_artifact(
+                reduction.control_program,
+                loop_regions,
+                value_meta=_captured_storage_meta(self.captured_values),
+                instrumentation=self._profiler.verbose,
+            )
+            composed_loops[reduction.loop_node_id] = artifact.source
+            self.composed_loop_artifacts[reduction.loop_node_id] = artifact
+        self.composed_loop_sources = composed_loops
+        # A ProcessGraph deployment region is not automatically a runtime
+        # shader.  Shape/type predicates and other structural calculations can
+        # be fully resolved while discovering the program and produce no
+        # tensor output.  Requiring such a region to fabricate an SSBO result
+        # prevents the real numerical regions from composing and resurrects a
+        # host coordinator for work that no longer exists.
+        #
+        # Only tensor-producing regions enter the shader schedule.  The
+        # capture_fused_programs completeness audit below independently rejects
+        # any omitted region that actually has a tensor output, so this cannot
+        # hide failed numerical lowering.
+        complete_regions = tuple(
+            region_index
+            for region_index in range(len(self.dispatch_subgraphs))
+            if region_index in by_region
+        )
+        self.compile_time_region_indices = (
+            set(range(len(self.dispatch_subgraphs))) - set(complete_regions)
+        )
+        retained_value_ids = {
+            int(value_id)
+            for captured in by_region.values()
+            for program in (
+                tuple(captured.stages)
+                if captured.stages
+                else (captured.program,)
+            )
+            for value_id in (
+                *ordered_feed_ids(program),
+                *tuple(program.outputs.values()),
+            )
+        }
+        all_loops_lowered = all(
+            not reduction.region_indices
+            or (
+                reduction.collapsible
+                and reduction.control_program is not None
+            )
+            for reduction in self.loop_shader_reductions
+        )
+        if by_region and all_loops_lowered:
+            control_compose_started = time.perf_counter()
+            self._profiler.trace(
+                path=self.profile_path,
+                section="control-compose",
+                label="overlay begin",
+                fields={
+                    "regions": len(complete_regions),
+                    "loops": len(self.loop_shader_reductions),
+                },
+            )
+            shell_control = overlay_scheduled_control(
+                complete_regions,
+                tuple(
+                    project_control_regions(
+                        reduction.control_program,
+                        complete_regions,
+                        retained_value_ids=retained_value_ids,
+                    )
+                    for reduction in self.loop_shader_reductions
+                    if reduction.collapsible
+                    and reduction.control_program is not None
+                ),
+            )
+            validations = _validation_control_blocks(self)
+            if validations:
+                shell_control = ControlProgram(
+                    SequenceBlock((
+                        shell_control.root,
+                        *validations,
+                    )),
+                    shell_control.region_indices,
+                    shell_control.uniforms,
+                    shell_control.value_aliases,
+                    shell_control.iterable_bindings,
+                    shell_control.static_iterable_bindings,
+                    shell_control.collection_bindings,
+                    shell_control.closure_iterable_bindings,
+                )
+            shell_control = project_control_regions(
+                shell_control,
+                complete_regions,
+                retained_value_ids=retained_value_ids,
+            )
+            if self.compiled_process_graph_aliases:
+                shell_control = ControlProgram(
+                    shell_control.root,
+                    shell_control.region_indices,
+                    shell_control.uniforms,
+                    tuple(dict.fromkeys((
+                        *shell_control.value_aliases,
+                        *(
+                            (int(alias), int(owner))
+                            for alias, owner in
+                            self.compiled_process_graph_aliases.items()
+                        ),
+                    ))),
+                    shell_control.iterable_bindings,
+                    shell_control.static_iterable_bindings,
+                    shell_control.collection_bindings,
+                    shell_control.closure_iterable_bindings,
+                )
+            self.shell_control_program = shell_control
+            self._profiler.trace(
+                path=self.profile_path,
+                section="control-compose",
+                label="overlay complete",
+                fields={
+                    "elapsed_ms": round(
+                        (
+                            time.perf_counter()
+                            - control_compose_started
+                        ) * 1e3,
+                        3,
+                    ),
+                },
+            )
+            produced_values = {
+                int(value_id)
+                for captured in by_region.values()
+                for program in (
+                    tuple(captured.stages)
+                    if captured.stages
+                    else (captured.program,)
+                )
+                for value_id in program.outputs.values()
+            }
+            declared_terminals = _declared_output_terminals(
+                self.process_graph,
+                produced_values=produced_values,
+            )
+            used_value_ids = {
+                int(value_id)
+                for captured in by_region.values()
+                for program in (
+                    tuple(captured.stages)
+                    if captured.stages
+                    else (captured.program,)
+                )
+                for value_id in (
+                    *program.feeds,
+                    *program.outputs.values(),
+                )
+            }
+            specialized_values = {
+                int(node_id): self.captured_values[node_id]
+                for node_id, data in self.process_graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and str(data.get("label")) not in (
+                    self.process_graph.G.graph.get(
+                        "planner_specializations", {}
+                    )
+                )
+                and (
+                    data.get("attributes") or {}
+                ).get("value_kind") == "scalar"
+                and node_id not in used_value_ids
+                and node_id not in {
+                    int(uniform.value_id)
+                    for uniform in shell_control.uniforms
+                }
+                and node_id in self.captured_values
+            }
+            self.composed_shell_specialized_values = dict(
+                specialized_values
+            )
+            # A child callsite is an IR compartment awaiting absorption into
+            # its source program's root hierarchy.  Finalizing it here would
+            # generate a shader that is never deployed, then repeat that work
+            # for every ancestor.  Only a standalone leaf source is complete
+            # at this level; a root with callees is finalized once by
+            # _build_hierarchical_glsl_artifact after every compartment has
+            # supplied control and numerical IR.
+            if (
+                emit_glsl
+                and self._discovery_tape_owner
+                and not self.callsite_function_shells
+            ):
+                artifact_started = time.perf_counter()
+                self._profiler.trace(
+                    path=self.profile_path,
+                    section="control-compose",
+                    label="artifact begin",
+                    fields={
+                        "regions": len(complete_regions),
+                        "terminals": len(declared_terminals),
+                    },
+                )
+                self.composed_shell_artifact = build_control_shader_artifact(
+                    shell_control,
+                    {
+                        region_index: by_region[region_index]
+                        for region_index in complete_regions
+                    },
+                    value_meta=_captured_storage_meta(self.captured_values),
+                    instrumentation=self._profiler.verbose,
+                    terminal_outputs=(
+                        declared_terminals or None
+                    ),
+                    specialized_values=specialized_values,
+                    device_resident=(self.shell_language == "glsl"),
+                )
+                self._profiler.trace(
+                    path=self.profile_path,
+                    section="control-compose",
+                    label="artifact complete",
+                    fields={
+                        "elapsed_ms": round(
+                            (
+                                time.perf_counter() - artifact_started
+                            ) * 1e3,
+                            3,
+                        ),
+                    },
+                )
+        return whole
+
+    def install_composed_control(
+        self,
+        artifact,
+        *,
+        input_bindings=None,
+        output_bindings=None,
+    ):
+        if self.installed_control_shell is not None:
+            self.installed_control_shell.release()
+        try:
+            installed = InstalledGLSLControlShell(artifact)
+        except Exception as error:
+            raise RuntimeError(
+                "failed to install composed GLSL closure "
+                f"{self.profile_path}"
+            ) from error
+        public_parameter_ids = {
+            int(node_id)
+            for node_id, data in self.process_graph.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and (
+                data.get("attributes") or {}
+            ).get("binding_kind") == "parameter"
+            and self.process_graph.G.out_degree(node_id)
+        }
+        if self.hierarchical_shell_composed:
+            public_parameter_ids = {
+                self.hierarchical_root_value_ids.get(node_id, node_id)
+                for node_id in public_parameter_ids
+            }
+        specialized_inputs = (
+            set(artifact.specialized_values) & public_parameter_ids
+        )
+        inferred_inputs = {
+            (
+                str(self.process_graph.G.nodes[value_id].get("label"))
+                if value_id in self.process_graph.G
+                and self.process_graph.G.nodes[value_id].get("label")
+                else f"value_{value_id}"
+            ): value_id
+            for value_id in (
+                *artifact.external_value_ids,
+                *artifact.uniform_value_ids.values(),
+                *specialized_inputs,
+            )
+        }
+        self.input_bindings = dict(
+            inferred_inputs if input_bindings is None else input_bindings
+        )
+        required_inputs = (
+            set(artifact.external_value_ids)
+            | (
+                set(artifact.uniform_value_ids.values())
+                - set(artifact.specialized_values)
+            )
+            | specialized_inputs
+        )
+        if set(self.input_bindings.values()) != required_inputs:
+            installed.release()
+            raise ValueError(
+                "composed-control input bindings must cover every external "
+                "buffer and dynamic control uniform exactly once; "
+                f"declared={tuple(sorted(self.input_bindings.values()))!r}; "
+                f"required={tuple(sorted(required_inputs))!r}; "
+                f"missing={tuple(sorted(required_inputs - set(self.input_bindings.values())))!r}; "
+                f"extra={tuple(sorted(set(self.input_bindings.values()) - required_inputs))!r}"
+            )
+        terminal_by_value = {
+            int(value_id): terminal_name
+            for terminal_name, value_id
+            in artifact.terminal_outputs.items()
+        }
+        identity_table = (
+            self.process_graph.G.graph.get("identity_table") or {}
+        )
+        inferred_outputs = {}
+        for public_name in (
+            self.process_graph.G.graph.get("function_outputs") or ()
+        ):
+            identities = tuple(identity_table.get(public_name, ()))
+            if not identities:
+                continue
+            value_id = int(identities[-1])
+            if self.hierarchical_shell_composed:
+                # The artifact is globally namespaced after closure
+                # composition.  Function-output identities in the root
+                # ProcessGraph remain local, exactly like its input
+                # identities, so translate them through the same root value
+                # table before matching a terminal.
+                value_id = int(
+                    self.hierarchical_root_value_ids.get(
+                        value_id,
+                        value_id,
+                    )
+                )
+            terminal_name = terminal_by_value.get(value_id)
+            if terminal_name is not None:
+                inferred_outputs[str(public_name)] = terminal_name
+        if not inferred_outputs:
+            inferred_outputs = {
+                name: name for name in artifact.terminal_outputs
+            }
+        self.output_bindings = dict(
+            inferred_outputs if output_bindings is None else output_bindings
+        )
+        self.output_aggregate_bindings = {}
+        self.output_loop_aggregate_bindings = {}
+        for public_name in (
+            self.process_graph.G.graph.get("function_outputs") or ()
+        ):
+            identities = tuple(identity_table.get(public_name, ()))
+            output_id = int(identities[-1]) if identities else None
+            output_attributes = (
+                self.process_graph.G.nodes[output_id].get("attributes") or {}
+                if output_id is not None
+                and output_id in self.process_graph.G
+                else {}
+            )
+            if (
+                output_attributes.get("materialization_kind")
+                == "retained_loop_aggregate"
+            ):
+                terminal_names = []
+                for leaf_id in output_attributes.get(
+                    "materialized_value_ids", ()
+                ):
+                    value_id = int(leaf_id)
+                    if self.hierarchical_shell_composed:
+                        value_id = int(
+                            self.hierarchical_root_value_ids.get(
+                                value_id,
+                                value_id,
+                            )
+                        )
+                    terminal_name = terminal_by_value.get(value_id)
+                    if terminal_name is None:
+                        break
+                    terminal_names.append(terminal_name)
+                else:
+                    if terminal_names:
+                        self.output_loop_aggregate_bindings[
+                            str(public_name)
+                        ] = (
+                            int(output_attributes.get(
+                                "loop_aggregate_axis", 0
+                            )),
+                            tuple(terminal_names),
+                        )
+                        continue
+            prefix = f"{public_name}."
+            leaves = []
+            for terminal_name in artifact.terminal_outputs:
+                if not str(terminal_name).startswith(prefix):
+                    continue
+                path = tuple(
+                    int(part) if part.isdigit() else part
+                    for part in str(terminal_name)[len(prefix):].split(".")
+                )
+                leaves.append((path, str(terminal_name)))
+            if leaves:
+                self.output_aggregate_bindings[str(public_name)] = tuple(
+                    leaves
+                )
+        unknown = (
+            set(self.output_bindings.values())
+            - set(artifact.terminal_outputs)
+        )
+        if unknown:
+            installed.release()
+            raise ValueError(
+                "composed-control output bindings name unknown terminals: "
+                + ", ".join(sorted(map(str, unknown)))
+            )
+        self.installed_control_shell = installed
+        transient_callables = tuple(self.ephemeral_callables)
+        for transient in transient_callables:
+            transient.discard_python_callable()
+            assert not hasattr(transient, "_callable")
+        self.ephemeral_callables = ()
+        self.compiled_dispatch_functions = ()
+        self.compiled_shell_callable = installed.execute
+        assert callable(self.compiled_shell_callable)
+        return self
+
+    def compile_forward_tapes(self, *args, **kwargs):
+        raise RuntimeError(
+            "compile_forward_tapes is retired: a source shell owns one "
+            "discovery tape, which compile_discovery_program lowers once"
+        )
 
     def install_fused_programs(
         self,
@@ -2321,6 +10281,13 @@ class ProcessGraphGLSLDeployment:
         input_bindings=None,
         output_bindings=None,
     ):
+        if not self.legacy_fused_network:
+            raise RuntimeError(
+                "GLSLFusedProgramNetwork is retired by the "
+                "composed-control runtime flag. Install the planner-composed "
+                "control artifact; pass legacy_fused_network=True only for "
+                "explicit transition diagnostics."
+            )
         normalized = tuple(
             getattr(program, "program", program)
             for program in programs
@@ -2380,6 +10347,60 @@ class ProcessGraphGLSLDeployment:
                 "output bindings name unknown fused terminals: "
                 + ", ".join(sorted(map(str, unknown_outputs)))
             )
+        # ------------------------------------------------------------------
+        # NON-NEGOTIABLE COMPILED-SHELL INVARIANT
+        #
+        # ProcessGraph-derived Python callables exist only to *make* the
+        # compiled program.  They are compile-time lowering instruments.  They
+        # are not the deployed program, they are not an acceptable fallback,
+        # and executing them after compilation is not compiled-shell behavior.
+        #
+        # Agents have repeatedly violated this invariant by retaining these
+        # Python objects, running them through a Python coordinator, setting a
+        # flag named ``whole_program_compiled``, and then claiming that the
+        # shell was compiled.  That claim is false.  Producing correct output,
+        # or dispatching compiled numerical fragments from Python, does not
+        # make the controlling shell a compiled program.
+        #
+        # Anyone who changes this code to bypass, weaken, mock, or remove the
+        # deletion and assertions below while continuing to claim
+        # compiled-shell execution is lying about what the program does and
+        # is ruining the compiler boundary this code exists to enforce.  This
+        # has happened repeatedly and it must stop now.
+        #
+        # The proof is deliberately mechanical:
+        #
+        #   1. Every transient Python callable is physically discarded.
+        #   2. The deployment retains no ephemeral callable collection.
+        #   3. A real installed compiled-shell callable exists.
+        #
+        # Do not replace deletion with ``None`` while retaining another
+        # reference.  Do not rename a Python coordinator and store it in
+        # ``compiled_shell_callable``.  Do not make the assertions conditional.
+        # Fix the compiler if these assertions fail.
+        #
+        # Likewise, do not evade these assertions earlier in the pipeline by
+        # wrapping a tensor algorithm in an opaque host-boundary call.  A
+        # Python codec that internally performs thousands of tensor/GLSL
+        # operations is not one compiled operation.  Marking it external only
+        # blinds the planner, leaves the work eager, and falsely makes the
+        # remaining graph look compiled.  The numerical topology must remain
+        # visible through planning and lowering; only the true terminal host
+        # effect may cross the boundary.
+        # ------------------------------------------------------------------
+        transient_callables = tuple(self.ephemeral_callables)
+        for transient in transient_callables:
+            transient.discard_python_callable()
+            assert not hasattr(transient, "_callable")
+        self.ephemeral_callables = ()
+        self.compiled_dispatch_functions = ()
+        self.compiled_shell_callable = self.fused_network.execute
+
+        # These assertions are the executable definition of the deployment
+        # boundary described above.  A failure means compilation is incomplete;
+        # it must never be hidden by falling back to ProcessGraph execution.
+        assert not self.ephemeral_callables
+        assert callable(self.compiled_shell_callable)
         return self
 
     def install_compiled_tapes(
@@ -2399,17 +10420,177 @@ class ProcessGraphGLSLDeployment:
         )
 
     def execute(self, feeds):
+        if (
+            not self.legacy_fused_network
+            and self.installed_control_shell is None
+        ):
+            raise RuntimeError(
+                "composed GLSL execution requires the installed compiled "
+                "shell; consume the program's one discovery tape with "
+                "capture_fused_programs() before runtime"
+            )
         if not self.ready:
             self.compile_process_graph()
         self.require_ready()
+        if self.installed_control_shell is not None:
+            return self.installed_control_shell.execute(feeds)
         if self.whole_program_compiled:
             return self.execute_process_graph(feeds)
         return self.fused_network.execute(feeds)
 
     def execute_named(self, feeds):
+        if (
+            not self.legacy_fused_network
+            and self.installed_control_shell is None
+        ):
+            raise RuntimeError(
+                "composed GLSL execution requires the installed compiled "
+                "shell; consume the program's one discovery tape with "
+                "capture_fused_programs() before runtime"
+            )
         if not self.ready:
             self.compile_process_graph()
         self.require_ready()
+        if self.installed_control_shell is not None:
+            unknown = set(feeds) - set(self.input_bindings)
+            if unknown:
+                raise KeyError(
+                    "unknown deployment inputs: "
+                    + ", ".join(sorted(map(str, unknown)))
+                )
+            token = self._profiler.begin_shell(self.profile_path)
+            started_ns = time.perf_counter_ns()
+            try:
+                installed = self.installed_control_shell
+                outputs = installed.execute({
+                    self.input_bindings[name]: value
+                    for name, value in feeds.items()
+                })
+                gpu_ms = installed.last_gpu_ms
+                dispatches = installed.last_dispatches
+                self._profiler.record_device_trace(
+                    path=self.profile_path,
+                    records=installed.last_debug_records,
+                    header=installed.last_debug_header,
+                )
+                streamed = {}
+                if installed.artifact.stream_outputs:
+                    while True:
+                        drained = installed.drain_stream()
+                        for item in drained:
+                            streamed.setdefault(
+                                int(item["stream_id"]),
+                                [],
+                            ).append(
+                                item["values"]
+                                if getattr(
+                                    item["values"], "nbytes", 0
+                                )
+                                or not item["words"].size
+                                else item["words"].astype(
+                                    "uint8",
+                                    copy=False,
+                                )
+                            )
+                        if installed.last_stream_status != 1:
+                            break
+                        if not drained:
+                            raise RuntimeError(
+                                "compiled GLSL shell suspended for "
+                                "downstream capacity without publishing a "
+                                "drainable resident prefix"
+                            )
+                        outputs = installed.resume()
+                        gpu_ms += installed.last_gpu_ms
+                        dispatches += installed.last_dispatches
+                        self._profiler.record_device_trace(
+                            path=self.profile_path,
+                            records=installed.last_debug_records,
+                            header=installed.last_debug_header,
+                        )
+                self._profiler.record(
+                    path=self.profile_path,
+                    section="compiled-glsl",
+                    label="composed-shell-dispatch",
+                    cpu_ms=(
+                        time.perf_counter_ns() - started_ns
+                    ) / 1e6,
+                    gpu_ms=gpu_ms,
+                    dispatches=dispatches,
+                )
+                named_outputs = {
+                    public_name: outputs[terminal_name]
+                    for public_name, terminal_name
+                    in self.output_bindings.items()
+                }
+                for public_name, leaves in (
+                    self.output_aggregate_bindings.items()
+                ):
+                    tree = {}
+                    for path, terminal_name in leaves:
+                        current = tree
+                        for part in path[:-1]:
+                            current = current.setdefault(part, {})
+                        current[path[-1]] = outputs[terminal_name]
+
+                    def freeze_aggregate(value):
+                        if not isinstance(value, dict):
+                            return value
+                        if value and all(
+                            isinstance(key, int) for key in value
+                        ):
+                            return tuple(
+                                freeze_aggregate(value[index])
+                                for index in range(max(value) + 1)
+                            )
+                        return {
+                            key: freeze_aggregate(item)
+                            for key, item in value.items()
+                        }
+
+                    named_outputs[public_name] = freeze_aggregate(tree)
+                for public_name, (
+                    axis,
+                    terminal_names,
+                ) in self.output_loop_aggregate_bindings.items():
+                    leaf_values = [
+                        outputs[terminal_name]
+                        for terminal_name in terminal_names
+                    ]
+                    leaf_arrays = [
+                        (
+                            value.numpy()
+                            if callable(getattr(value, "numpy", None))
+                            else np.asarray(value)
+                        )
+                        for value in leaf_values
+                    ]
+                    extents = {
+                        int(array.shape[axis])
+                        for array in leaf_arrays
+                    }
+                    if len(extents) != 1:
+                        raise RuntimeError(
+                            "retained loop aggregate leaves disagree on "
+                            f"axis {axis} extent: {tuple(sorted(extents))!r}"
+                        )
+                    named_outputs[public_name] = tuple(
+                        tuple(
+                            np.take(array, iteration, axis=axis)
+                            for array in leaf_arrays
+                        )
+                        for iteration in range(next(iter(extents)))
+                    )
+                if installed.artifact.stream_outputs:
+                    for public_name, stream_id in (
+                        installed.artifact.stream_outputs.items()
+                    ):
+                        named_outputs[str(public_name)] = tuple(
+                            streamed.get(int(stream_id), ())
+                        )
+                return named_outputs
+            finally:
+                self._profiler.end_shell(self.profile_path, token)
         if self.whole_program_compiled:
             result = self.execute_process_graph(feeds)
             values = result if isinstance(result, tuple) else (result,)
@@ -2467,11 +10648,16 @@ class ProcessGraphGLSLDeployment:
         return self.execute_named(feeds)
 
     def release(self):
+        if self.installed_control_shell is not None:
+            self.installed_control_shell.release()
+            self.installed_control_shell = None
         if self.fused_network is not None:
             self.fused_network.release()
             self.fused_network = None
         if self._owns_function_shells:
-            for shell in self.function_shells.values():
+            for shell in _walk_planned_shells(self):
+                if shell is self:
+                    continue
                 shell.release()
 
     def __enter__(self):
@@ -2504,6 +10690,7 @@ class ProcessGraphGLSLDeployment:
         ),
         "__dispatch_plan__": dispatch_plan,
         "__loop_plans__": loop_plans,
+        "__loop_shader_reductions__": loop_shader_reductions,
         "__loop_region_indices__": loop_region_indices,
         "__process_graph_boundary__": process_graph_boundary,
         "__python_callable__": python_callable,
@@ -2522,28 +10709,75 @@ class ProcessGraphGLSLDeployment:
             if str(data.get("type")) in {"For", "AsyncFor", "While"}
         ),
         "__dispatch_count__": len(dispatch_subgraphs),
+        "__max_nodes_per_dispatch__": int(max_nodes_per_dispatch),
         "__deployment_batches__": node_locations,
         "DeploymentFIFO": DeploymentFIFO,
         "DeploymentProfiler": DeploymentProfiler,
+        "time": time,
+        "gc": gc,
         "GLSLFusedProgramNetwork": GLSLFusedProgramNetwork,
+        "PrecompileObserverTensorOperations": (
+            PrecompileObserverTensorOperations
+        ),
+        "CapturedFusedProgram": CapturedFusedProgram,
+        "FusedProgram": FusedProgram,
+        "Meta": Meta,
         "compile_recorded_fused_tape": (
             compile_recorded_fused_tape
         ),
         "emit_multi_output_program_source": (
             emit_multi_output_program_source
         ),
+        "compose_control_shader": compose_control_shader,
+        "build_control_shader_artifact": build_control_shader_artifact,
+        "InstalledGLSLControlShell": InstalledGLSLControlShell,
+        "ControlProgram": ControlProgram,
+        "SequenceBlock": SequenceBlock,
+        "overlay_scheduled_control": overlay_scheduled_control,
+        "project_control_regions": project_control_regions,
+        "ordered_feed_ids": ordered_feed_ids,
         "_compiler_input_name": _compiler_input_name,
         "_bind_capture_tape": _bind_capture_tape,
+        "_capture_storage_identity": _capture_storage_identity,
         "_remap_captured_program": _remap_captured_program,
+        "_remap_captured_all_ids": _remap_captured_all_ids,
+        "_project_captured_program": _project_captured_program,
+        "_capture_feed_aliases": _capture_feed_aliases,
+        "_wire_planned_step_inputs": _wire_planned_step_inputs,
+        "_collapse_planned_collection_materializations": (
+            _collapse_planned_collection_materializations
+        ),
+        "_unique_runtime_feed_aliases": _unique_runtime_feed_aliases,
         "_coordinate_scheduled_capture": _coordinate_scheduled_capture,
+        "_use_scheduled_capture_backend": _use_scheduled_capture_backend,
         "_compile_whole_process_graph": _compile_whole_process_graph,
+        "_source_static_value": _source_static_value,
+        "_callsite_specialized_shell_type": (
+            _callsite_specialized_shell_type
+        ),
+        "_constant_value": _constant_value,
         "_attach_profiler": _attach_profiler,
+        "_walk_planned_shells": _walk_planned_shells,
+        "_deployment_program_table_lines": _deployment_program_table_lines,
+        "_build_shell_hierarchy_plan": _build_shell_hierarchy_plan,
+        "_refresh_hierarchy_control_captures": (
+            _refresh_hierarchy_control_captures
+        ),
+        "_declared_output_terminals": _declared_output_terminals,
+        "_validation_control_blocks": _validation_control_blocks,
+        "_build_hierarchical_glsl_artifact": (
+            _build_hierarchical_glsl_artifact
+        ),
+        "assign_hierarchy_ids": assign_hierarchy_ids,
+        "_diagnostic_value_summary": _diagnostic_value_summary,
+        "_captured_storage_meta": _captured_storage_meta,
         "_shell_profile_name": _shell_profile_name,
         "execute_captured_fused_program": execute_captured_fused_program,
         "compile_captured_fused_program": compile_captured_fused_program,
         "GLSLTensorOperations": GLSLTensorOperations,
         "AbstractTensor": AbstractTensor,
         "autograd": autograd,
+        "np": np,
     }
     exec(
         compile(
@@ -2586,3 +10820,85 @@ __all__ = [
     "DeploymentProfiler",
     "strategize_glsl_deployment",
 ]
+class _CompiledStructuralObject:
+    """Shell-owned state whose methods are compiled function subgraphs."""
+
+    __slots__ = ("class_ref", "methods", "state")
+
+    def __init__(self, class_ref, descriptor, args, kwargs):
+        self.class_ref = str(class_ref)
+        self.methods = dict(descriptor.get("methods") or {})
+        fields = tuple(descriptor.get("fields") or ())
+        self.state = dict(zip(fields, args))
+        self.state.update(kwargs)
+        for field in fields:
+            self.state.setdefault(field, None)
+
+    def __getattr__(self, name):
+        method_ref = self.methods.get(name)
+        if method_ref is not None:
+            return _CompiledStructuralMethod(self, method_ref)
+        try:
+            return self.state[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        if name in {"class_ref", "methods", "state"}:
+            object.__setattr__(self, name, value)
+        else:
+            self.state[name] = value
+
+
+class _CompiledStructuralMethod:
+    """A method edge into a compiled function shell."""
+
+    __slots__ = ("receiver", "method_ref")
+
+    def __init__(self, receiver, method_ref):
+        self.receiver = receiver
+        self.method_ref = int(method_ref)
+
+
+class _CompiledStructuralClass:
+    """Shell primitive for a compiled class, never a retained Python class."""
+
+    __slots__ = ("class_ref", "descriptor")
+
+    def __init__(self, class_ref, descriptor):
+        self.class_ref = str(class_ref)
+        self.descriptor = descriptor
+
+    def __call__(self, *args, **kwargs):
+        return _CompiledStructuralObject(
+            self.class_ref,
+            self.descriptor,
+            args,
+            kwargs,
+        )
+
+
+class _GreedyGeneratorStream:
+    """Pull-driven shell stream that fills available FIFO capacity per pull."""
+
+    def __init__(self, producer, *, fifo_slots=2):
+        self._producer = iter(producer)
+        self._fifo = DeploymentFIFO(slots=fifo_slots)
+        self._exhausted = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while not self._exhausted and self._fifo.unread < self._fifo.slots:
+            try:
+                item = next(self._producer)
+            except StopIteration:
+                self._exhausted = True
+                break
+            if not self._fifo.publish(item):
+                break
+        available, value = self._fifo.consume()
+        if not available:
+            raise StopIteration
+        return value

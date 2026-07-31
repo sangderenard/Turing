@@ -15,6 +15,9 @@ from enum import Enum
 from typing import Any, Iterable
 
 from ..common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+    translations_for_operation,
+)
 from ..transmogrifier.ssa_registry import Handler
 
 
@@ -135,6 +138,10 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
 
 
 def ssa_handler_for_precompile(operation_name: str) -> Handler | None:
+    if operation_name == "tensor_from_list":
+        return Handler.Const
+    if translations_for_operation(operation_name):
+        return Handler.Call
     mapped = PRECOMPILE_TO_SSA.get(operation_name)
     if mapped is not None:
         return mapped
@@ -145,6 +152,21 @@ def ssa_handler_for_precompile(operation_name: str) -> Handler | None:
             return Handler[operation_name]
         except KeyError:
             return None
+
+
+def ssa_compatibility_name_for_precompile(
+    operation_name: str,
+) -> str | None:
+    if operation_name == "tensor_from_list":
+        return Handler.Const.value
+    translations = translations_for_operation(operation_name)
+    if translations:
+        callees = "|".join(
+            dict.fromkeys(item.llvm_symbol for item in translations)
+        )
+        return f"{Handler.Call.value}[{callees}]"
+    handler = ssa_handler_for_precompile(operation_name)
+    return None if handler is None else handler.value
 
 
 def _programs(artifact: Any) -> tuple[tuple[str, Any], ...]:
@@ -217,7 +239,6 @@ def _validate_program_format(
         steps = program.steps
 
     available = set(feed_ids)
-    step_ids: set[int] = set()
     for index, step in enumerate(steps):
         if not isinstance(step, OpStep):
             report(
@@ -236,14 +257,6 @@ def _validate_program_format(
                 "step_id must be a non-negative integer",
                 step_index=index,
             )
-        elif step.step_id in step_ids:
-            report(
-                "PRECOMPILE_DUPLICATE_STEP_ID",
-                f"step_id {step.step_id} is used more than once",
-                step_index=index,
-            )
-        else:
-            step_ids.add(step.step_id)
         if not isinstance(step.op_name, str) or not step.op_name:
             report(
                 "PRECOMPILE_OPERATION_NAME",
@@ -413,14 +426,16 @@ def validate_precompile_ssa_compatibility(
             ):
                 continue
             location = f"program:step[{index}]"
-            handler = ssa_handler_for_precompile(step.op_name)
-            if handler is None:
+            compatibility_name = ssa_compatibility_name_for_precompile(
+                step.op_name
+            )
+            if compatibility_name is None:
                 shortfall_locations.setdefault(step.op_name, []).append(
                     location
                 )
             else:
                 compatible_locations.setdefault(
-                    (step.op_name, handler.value), []
+                    (step.op_name, compatibility_name), []
                 ).append(location)
         kernel_kind = (
             semantic.extras.get("kernel_kind")
@@ -436,7 +451,12 @@ def validate_precompile_ssa_compatibility(
             # Validate its name independently so a compatible placeholder
             # step (for example add-zero around a reshape copy) cannot hide a
             # lowering operation that SSA does not represent.
-            if ssa_handler_for_precompile(str(kernel_kind)) is None:
+            # ``mixed`` describes the precompile container.  It is not an
+            # executable operation and must evaporate at this boundary.
+            if (
+                str(kernel_kind) != "mixed"
+                and ssa_handler_for_precompile(str(kernel_kind)) is None
+            ):
                 name = f"kernel_kind:{kernel_kind}"
                 shortfall_locations.setdefault(name, []).append(
                     "program:extras.kernel_kind"
@@ -492,5 +512,6 @@ __all__ = [
     "SSAOperationCompatibility",
     "require_precompile_ssa_compatible",
     "ssa_handler_for_precompile",
+    "ssa_compatibility_name_for_precompile",
     "validate_precompile_ssa_compatibility",
 ]

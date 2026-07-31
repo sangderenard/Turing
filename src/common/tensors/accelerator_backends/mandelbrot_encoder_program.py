@@ -1,210 +1,20 @@
-"""One explicit AbstractTensor Mandelbrot-to-JFIF ProcessGraph entry point."""
+"""One AbstractTensor program from Mandelbrot inputs to an audio AVI."""
 
 from __future__ import annotations
 
 import ast
 import contextlib
-import importlib
-import io
 import inspect
-import re
+import io
 import textwrap
 from pathlib import Path
 
 from ..abstraction import AbstractTensor
+from ..operator_catalog import include_ast_parent_outside_abstract_tensor
+from ..compression.jpeg.frame import encode_jfif_resident
 
 
-_COMPILER_RUNTIME_MODULES = (
-    "src.common.tensors.abstraction",
-    "src.common.tensors.autograd",
-    "src.common.tensors.accelerator_backends.glsl_backend",
-    "src.common.tensors.accelerator_backends.glsl_tensor_backend",
-)
-
-
-def _resolve_ast_reference(
-    expression: ast.AST,
-    bindings: dict[str, object],
-):
-    if isinstance(expression, ast.Name):
-        return bindings.get(expression.id)
-    if not isinstance(expression, ast.Attribute):
-        return None
-    owner = _resolve_ast_reference(expression.value, bindings)
-    if owner is None:
-        return None
-    try:
-        return getattr(owner, expression.attr)
-    except AttributeError:
-        return None
-
-
-def _callable_source_node(value) -> ast.AST | None:
-    if not (inspect.isfunction(value) or inspect.isclass(value)):
-        return None
-    try:
-        source = textwrap.dedent(inspect.getsource(value))
-    except (OSError, TypeError):
-        return None
-    parsed = ast.parse(
-        source,
-        filename=str(inspect.getsourcefile(value) or "<helper>"),
-    )
-    return next(
-        (
-            statement
-            for statement in parsed.body
-            if isinstance(
-                statement,
-                (
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.ClassDef,
-                ),
-            )
-        ),
-        None,
-    )
-
-
-def _is_program_helper(value) -> bool:
-    module = str(getattr(value, "__module__", ""))
-    return (
-        module.startswith("src.common.tensors")
-        and not module.startswith(_COMPILER_RUNTIME_MODULES)
-        and (inspect.isfunction(value) or inspect.isclass(value))
-    )
-
-
-def _definition_bindings(value, definition: ast.AST) -> dict[str, object]:
-    module = inspect.getmodule(value)
-    bindings = dict(vars(module)) if module is not None else {}
-    package = str(getattr(module, "__package__", "") or "")
-    for statement in ast.walk(definition):
-        if isinstance(statement, ast.ImportFrom):
-            module_name = (
-                "." * int(statement.level)
-                + str(statement.module or "")
-            )
-            try:
-                imported_module = importlib.import_module(
-                    module_name,
-                    package=package,
-                )
-            except (ImportError, TypeError, ValueError):
-                continue
-            for imported in statement.names:
-                try:
-                    bindings[imported.asname or imported.name] = getattr(
-                        imported_module,
-                        imported.name,
-                    )
-                except AttributeError:
-                    continue
-        elif isinstance(statement, ast.Import):
-            for imported in statement.names:
-                try:
-                    bindings[
-                        imported.asname or imported.name.split(".")[0]
-                    ] = importlib.import_module(imported.name)
-                except ImportError:
-                    continue
-    return bindings
-
-
-def mandelbrot_recording_program_ast_closure() -> tuple[
-    ast.Module,
-    dict[str, object],
-]:
-    """Collect every project-owned helper body used by solve-through-AVI.
-
-    AbstractTensor and backend runtime methods remain compiler primitives.
-    Compression, entropy, container, and program helpers are ordinary source
-    definitions and enter the same AST module/function table as the root.
-    """
-
-    from ..compression.containers.avi import MJPEGAVIWriter
-
-    queue = [mandelbrot_recording_program, MJPEGAVIWriter]
-    definitions: list[tuple[object, ast.AST, dict[str, object]]] = []
-    merged_bindings = dict(mandelbrot_recording_program.__globals__)
-    seen: set[tuple[str, str]] = set()
-    while queue:
-        value = queue.pop()
-        identity = (
-            str(getattr(value, "__module__", "")),
-            str(getattr(value, "__qualname__", "")),
-        )
-        if identity in seen:
-            continue
-        seen.add(identity)
-        definition = _callable_source_node(value)
-        if definition is None:
-            continue
-        bindings = _definition_bindings(value, definition)
-        definitions.append((value, definition, bindings))
-        merged_bindings.update(bindings)
-        for call in (
-            node for node in ast.walk(definition)
-            if isinstance(node, ast.Call)
-        ):
-            target = _resolve_ast_reference(call.func, bindings)
-            if _is_program_helper(target):
-                queue.append(target)
-
-    name_counts: dict[str, int] = {}
-    for _, definition, _ in definitions:
-        name = str(getattr(definition, "name", ""))
-        name_counts[name] = name_counts.get(name, 0) + 1
-
-    compiled_names: dict[int, str] = {}
-    for value, definition, _ in definitions:
-        original_name = str(getattr(definition, "name", ""))
-        compiled_name = original_name
-        if name_counts[original_name] > 1:
-            module_name = re.sub(
-                r"\W+",
-                "_",
-                str(getattr(value, "__module__", "")),
-            ).strip("_")
-            compiled_name = f"{module_name}__{original_name}"
-        compiled_names[id(value)] = compiled_name
-
-    class _RewriteCollectedCalls(ast.NodeTransformer):
-        def __init__(self, bindings: dict[str, object]):
-            self.bindings = bindings
-
-        def visit_Call(self, node: ast.Call):
-            self.generic_visit(node)
-            target = _resolve_ast_reference(node.func, self.bindings)
-            compiled_name = compiled_names.get(id(target))
-            if compiled_name is not None:
-                node.func = ast.copy_location(
-                    ast.Name(id=compiled_name, ctx=ast.Load()),
-                    node.func,
-                )
-            return node
-
-    assembled: list[ast.AST] = []
-    for value, definition, bindings in definitions:
-        compiled_name = compiled_names[id(value)]
-        definition.name = compiled_name
-        merged_bindings[compiled_name] = value
-        assembled.append(_RewriteCollectedCalls(bindings).visit(definition))
-
-    assembled.sort(
-        key=lambda node: (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "mandelbrot_recording_program",
-            getattr(node, "name", ""),
-        )
-    )
-    module = ast.Module(body=assembled, type_ignores=[])
-    ast.fix_missing_locations(module)
-    return module, merged_bindings
-
-
-def mandelbrot_display_master(
+def mandelbrot_frame_program(
     unit_x: AbstractTensor,
     unit_y: AbstractTensor,
     center_x: AbstractTensor,
@@ -216,63 +26,79 @@ def mandelbrot_display_master(
     palette_phase: AbstractTensor,
     color_drive: AbstractTensor,
     *,
+    width: int,
+    height: int,
     iterations: int,
 ):
-    """Return the resident solve and display/encoder color planes."""
+    """Generate a batched RGB Mandelbrot tensor and its escape counts.
 
-    from .demo_mandelbrot_fusion import (
-        mandelbrot_jpeg_planes,
-        parametric_mandelbrot_escape,
+    Every numerical value entering this function is already an
+    :class:`AbstractTensor`. Frame controls use their leading dimension as the
+    frame batch. This function is the shared numerical subgraph used by both
+    the live display shell and the complete recording root.
+    """
+
+    plane_x = unit_x.reshape(1, height, width)
+    plane_y = unit_y.reshape(1, height, width)
+    frame_center_x = center_x.reshape(-1, 1, 1)
+    frame_center_y = center_y.reshape(-1, 1, 1)
+    frame_span = span.reshape(-1, 1, 1)
+    frame_family_mix = family_mix.reshape(-1, 1, 1)
+    frame_julia_x = julia_x.reshape(-1, 1, 1)
+    frame_julia_y = julia_y.reshape(-1, 1, 1)
+    frame_palette_phase = palette_phase.reshape(-1, 1, 1)
+    frame_color_drive = color_drive.reshape(-1, 1, 1)
+
+    constant_x = frame_center_x + plane_x * frame_span
+    constant_y = frame_center_y + plane_y * frame_span
+    orbit_x = constant_x * frame_family_mix
+    orbit_y = constant_y * frame_family_mix
+    constant_x = (
+        constant_x
+        + frame_family_mix * (frame_julia_x - constant_x)
     )
-
-    counts = parametric_mandelbrot_escape(
-        unit_x,
-        unit_y,
-        center_x,
-        center_y,
-        span,
-        family_mix,
-        julia_x,
-        julia_y,
-        iterations,
-        clamp=1e18,
+    constant_y = (
+        constant_y
+        + frame_family_mix * (frame_julia_y - constant_y)
     )
-    luminance, blue_difference, red_difference = mandelbrot_jpeg_planes(
-        counts,
-        iterations,
-        palette_phase,
-        color_drive,
+    counts = constant_x * 0.0
+
+    for _ in range(iterations):
+        orbit_x_squared = orbit_x * orbit_x
+        orbit_y_squared = orbit_y * orbit_y
+        counts = counts + (
+            orbit_x_squared + orbit_y_squared <= 4.0
+        )
+        orbit_x, orbit_y = (
+            orbit_x_squared - orbit_y_squared + constant_x,
+            2.0 * orbit_x * orbit_y + constant_y,
+        )
+        orbit_x = orbit_x.minimum(1e18).maximum(-1e18)
+        orbit_y = orbit_y.minimum(1e18).maximum(-1e18)
+
+    phase = (
+        (counts / iterations).minimum(1.0).maximum(0.0).sqrt()
+        + frame_palette_phase
     )
-    return counts, luminance, blue_difference, red_difference
+    drive = frame_color_drive.minimum(1.0).maximum(0.0)
+    exponent = 1.65 + (0.62 - 1.65) * drive
+
+    red = (
+        0.5 + 0.5 * (6.283185307179586 * phase).cos()
+    ) ** exponent
+    green = (
+        0.5 + 0.5 * (6.283185307179586 * (phase + 0.21)).cos()
+    ) ** exponent
+    blue = (
+        0.5 + 0.5 * (6.283185307179586 * (phase + 0.43)).cos()
+    ) ** exponent
+    frames = (
+        AbstractTensor.stack((red, green, blue), dim=-1) * 255.0
+    )
+    frames = ((frames + 0.5) // 1).minimum(255.0).maximum(0.0)
+    return frames, counts
 
 
-# ============================================================================
-# AST-ROOT INTEGRITY CONTRACT
-#
-# This function is the semantic root of the compiled Mandelbrot recording
-# demo.  EVERY operation required to move from its declared inputs to a
-# finished recording belongs in this function's AST closure.  That includes
-# numerical solving, color construction, JPEG transforms and entropy coding,
-# AVI/OpenDML writer construction, packet ordering, audio interleaving, index
-# finalization, error-safe closure, and every helper those operations require.
-#
-# It is NEVER acceptable to make the demo appear complete by performing one
-# of those stages in its Python caller, in a CLI-only helper, in a test sink,
-# or in an object constructed outside this AST root.  In particular:
-#
-#   * Do not restore FrameCollector or any equivalent frame-catching proxy.
-#   * Do not pass a preconstructed AVI writer into this function.
-#   * Do not encode or frame the returned tensors in the surrounding demo.
-#   * Do not let profiling/capture execute a shortened pipeline while the
-#     ordinary Python caller silently completes the file afterward.
-#
-# Host and operating-system primitives may remain explicit terminal runtime
-# boundaries until their lowerings exist, but the calls to those boundaries,
-# their ordering, their state transitions, and their cleanup must remain
-# represented by this root ProcessGraph.  If some construct cannot yet lower,
-# the correct result is a visible compiler frontier and profiler traceback—
-# never an out-of-graph substitute that changes what is being demonstrated.
-# ============================================================================
 def mandelbrot_recording_program(
     unit_x: AbstractTensor,
     unit_y: AbstractTensor,
@@ -288,39 +114,14 @@ def mandelbrot_recording_program(
     width: int,
     height: int,
     iterations: int,
-    avi_path=None,
-    avi_fps=30,
-    avi_opendml=True,
-    avi_segment_bytes=1 << 30,
-    audio_samples=None,
-    resources=None,
 ):
-    """Solve and encode one frame, optionally producing a complete AVI."""
+    """Generate Mandelbrot frames and emit independent JPEG byte packets.
 
-    from .demo_mandelbrot_fusion import (
-        mandelbrot_jpeg_planes,
-        parametric_mandelbrot_escape,
-    )
-    from ..autograd import autograd
-    from ..compression.block_transform import (
-        block_view_2d,
-        dct_2d_blocks,
-    )
-    from ..compression.coefficient_events import (
-        collect_component_block_coefficient_events,
-        slice_block_coefficient_events,
-    )
-    from ..compression.jpeg.frame import (
-        _color_header,
-        finalize_entropy_scan,
-        prepare_jpeg_encoding_resources,
-    )
-    from ..compression.jpeg.scan import (
-        encode_baseline_color_component_scan,
-    )
-    from ..compression.containers.avi import MJPEGAVIWriter
+    Filesystem paths, AVI state, and file writes belong to the deployment
+    shell's output wrapper, not to this program.
+    """
 
-    counts = parametric_mandelbrot_escape(
+    frames, counts = mandelbrot_frame_program(
         unit_x,
         unit_y,
         center_x,
@@ -329,212 +130,102 @@ def mandelbrot_recording_program(
         family_mix,
         julia_x,
         julia_y,
-        iterations,
-    )
-    luminance, blue_difference, red_difference = mandelbrot_jpeg_planes(
-        counts,
-        iterations,
         palette_phase,
         color_drive,
-    )
-    planes = (
-        luminance.reshape(height, width),
-        blue_difference.reshape(height, width),
-        red_difference.reshape(height, width),
-    )
-    resources = resources or prepare_jpeg_encoding_resources(planes[0])
-
-    with autograd.no_grad():
-        # Keep every numerical compression stage in this submitted function:
-        # component batching/blocking -> DCT -> quantization -> rounding ->
-        # zigzag ordering.  Each operation remains ordinary AbstractTensor
-        # composition and therefore stays visible to ProcessGraph lowering.
-        component_samples = AbstractTensor.stack(planes, dim=0)
-        blocks = block_view_2d(
-            component_samples - 128.0,
-            block_height=8,
-            block_width=8,
-        )
-        transformed = dct_2d_blocks(
-            blocks,
-            basis=resources.dct_basis,
-        )
-        scaled = transformed / resources.ycbcr_quantization
-        quantized = scaled.sign() * ((scaled.abs() + 0.500001) // 1)
-        flattened = quantized.reshape(
-            *(quantized.shape[:-2] + (64,))
-        )
-        coefficients = flattened[..., resources.zigzag]
-
-        # Coefficient events are the explicit boundary between the numerical
-        # tensor transform and the canonical JPEG Huffman tables.
-        events = collect_component_block_coefficient_events(
-            coefficients,
-            max_magnitude_bits=11,
-            previous_dc=(0, 0, 0),
-        )
-        block_count = coefficients[0].reshape(-1, 64).shape[0]
-        y_events = slice_block_coefficient_events(
-            events,
-            0,
-            block_count,
-        )
-        chroma_events = slice_block_coefficient_events(
-            events,
-            block_count,
-            block_count * 3,
-        )
-        huffman_scan = encode_baseline_color_component_scan(
-            y_events,
-            chroma_events,
-            luma_dc_table=resources.luma_dc_table,
-            luma_ac_table=resources.luma_ac_table,
-            chroma_dc_table=resources.chroma_dc_table,
-            chroma_ac_table=resources.chroma_ac_table,
-        )
-        entropy_bytes = finalize_entropy_scan(huffman_scan)
-        trailing_bytes = b""
-
-    jpeg_frame = b"".join(
-        (
-            _color_header(height, width),
-            entropy_bytes,
-            trailing_bytes,
-            b"\xFF\xD9",
-        )
+        width=width,
+        height=height,
+        iterations=iterations,
     )
 
-    # Writer construction, RIFF/OpenDML framing, packet insertion, index
-    # finalization, and closure are all inside the submitted AST.  No caller
-    # supplied object is permitted to stand in for this part of the program.
-    if avi_path is not None:
-        avi_writer = MJPEGAVIWriter(
-            avi_path,
-            width=width,
-            height=height,
-            fps=avi_fps,
-            opendml=avi_opendml,
-            segment_bytes=avi_segment_bytes,
-        )
-        try:
-            avi_writer.append_frame(jpeg_frame)
-            if audio_samples is not None:
-                avi_writer.append_audio_tensor(audio_samples)
-        finally:
-            avi_writer.close()
-
-    return counts, planes, coefficients, jpeg_frame
-
-
-# Compatibility name for callers that used the former entrypoint spelling.
-mandelbrot_jpeg_master = mandelbrot_recording_program
+    # COMPILER BOUNDARY INVARIANT:
+    #
+    # Do not replace this source-visible loop and graph-resolved resident JPEG
+    # call with a method registered as a host operator.  Recursive callee
+    # resolution is required here: ProcessGraph must ingest the codec so its
+    # tensor stages are planned and lowered.  Disabling recursion or excluding
+    # the callee makes it impossible to compile the complete program.  Only
+    # the terminal conversion of final octets into immutable ``bytes`` is a
+    # host boundary.  Passing a hidden Python codec symbol into the shell, or
+    # calling one from the shell, is fake compiled code.
+    video_packets = []
+    for frame_index in range(frames.shape[0]):
+        packet = encode_jfif_resident(frames[frame_index])
+        video_packets.append((packet.octets, packet.byte_count))
+    video_packets = tuple(video_packets)
+    return video_packets, frames, counts
 
 
 def mandelbrot_recording_function_ast() -> ast.Module:
-    """Load only the saved, explicit AbstractTensor program into Python AST."""
+    """Return the AST of the one complete AbstractTensor program."""
 
-    source = textwrap.dedent(inspect.getsource(mandelbrot_recording_program))
     return ast.parse(
-        source,
+        textwrap.dedent(inspect.getsource(mandelbrot_recording_program)),
         filename=str(Path(__file__).resolve()),
     )
 
 
-def mandelbrot_display_function_ast() -> ast.Module:
-    """Collect the complete solve/display/encode entrypoint program AST."""
+def build_mandelbrot_recording_process_graph(*, profile_verbose=False):
+    """Ingest the complete AbstractTensor program as one ProcessGraph root."""
 
-    from .demo_mandelbrot_fusion import (
-        mandelbrot_jpeg_planes,
-        parametric_mandelbrot_escape,
-    )
-
-    source = "\n\n".join(
-        textwrap.dedent(inspect.getsource(function))
-        for function in (
-            parametric_mandelbrot_escape,
-            mandelbrot_jpeg_planes,
-            mandelbrot_display_master,
-            mandelbrot_recording_program,
-        )
-    )
-    return ast.parse(source, filename=str(Path(__file__).resolve()))
-
-
-def build_mandelbrot_encoder_process_graph(
-    *,
-    profile: str = "tensor_control",
-    entrypoint: str = "mandelbrot_recording_program",
-):
-    """Build the complete structural solve/JPEG/AVI ProcessGraph."""
-
-    from ....transmogrifier.graph.graph_express2 import ProcessGraph
-
-    graph = ProcessGraph(materialize_memory=False)
-    # The legacy structural importer still prints its node walk
-    # unconditionally.  That diagnostic is not part of this demo's compiler
-    # contract, so keep it out of the live render/profile stream.
-    with contextlib.redirect_stdout(io.StringIO()):
-        graph.build_from_ast(mandelbrot_display_function_ast())
-    graph.G.graph.update(
-        program_name="mandelbrot_display",
-        program_entrypoint=entrypoint,
-        semantic_profile=profile,
-    )
-    return graph
-
-
-def build_mandelbrot_recording_process_graph():
-    """Ingest solve-through-AVI AST, discovering source parents in place."""
-
-    # Do not assemble a smaller "GPU portion" here and finish the recording in
-    # the caller.  This builder must begin at mandelbrot_recording_program and
-    # recursively ingest its complete source dependency closure.  A missing
-    # lowering is compiler work; it is not permission to move that operation
-    # outside the graph.
     from ....transmogrifier.graph.graph_express2 import ProcessGraph
     from ..topological_reducer import reduce_abstract_tensor_topology
 
-    program_ast = mandelbrot_recording_function_ast()
-    program_bindings = dict(mandelbrot_recording_program.__globals__)
     graph = ProcessGraph(materialize_memory=False)
-    graph.python_bindings = program_bindings
+    graph.python_bindings = dict(mandelbrot_recording_program.__globals__)
     graph.python_package = __package__
-    # The structural importer currently prints its node walk
-    # unconditionally. That diagnostic is not part of deployment output.
-    with contextlib.redirect_stdout(io.StringIO()):
+    output_context = (
+        contextlib.nullcontext()
+        if profile_verbose
+        else contextlib.redirect_stdout(io.StringIO())
+    )
+    with output_context:
+        # NON-NEGOTIABLE SOURCE-SEMANTICS INVARIANT:
+        #
+        # Recursive unresolved-parent resolution must remain enabled.  An
+        # ordinary Python function called by the submitted program is part of
+        # that program's semantics; it cannot be left as an opaque Python
+        # symbol merely because resolving its body exposes more compiler work.
+        #
+        # Disabling this option would make ingestion appear faster by silently
+        # removing callee topology from ProcessGraph.  The planner would then
+        # be unable to own, reduce, partition, or compile that work, and the
+        # shell would fall back to calling hidden Python code.  Such a shell
+        # does not meet the requirement of compiling the complete program.
+        #
+        # A previous model added caveats here about recursive-resolution
+        # performance against the user's explicit wishes.  Those caveats were
+        # another attempt to redirect attention away from doing the required
+        # compiler work correctly.  That model is an example of an agent
+        # refusing to carry out the actual task while repeatedly proposing
+        # ways to weaken, bypass, or misdescribe the requirement.
+        #
+        # Never set ``resolve_unresolved_parents=False``, weaken
+        # ``parent_include``, register the callee as a host boundary, or
+        # smuggle the unresolved callable into the runtime shell.
+        #
+        # This is also why JPEG source calls must resolve: their numerical
+        # topology must become visible to ProcessGraph.  Only the genuinely
+        # terminal conversion of completed octets to bytes may remain a host
+        # effect.  Large topology is a compiler workload, not permission to
+        # hide the program.
         graph.build_from_ast(
-            program_ast,
+            mandelbrot_recording_function_ast(),
             resolve_unresolved_parents=True,
-            parent_include=_is_program_helper,
+            parent_include=include_ast_parent_outside_abstract_tensor,
+            profile_verbose=profile_verbose,
         )
     graph.G.graph.update(
         program_name="mandelbrot_recording_program",
         program_entrypoint="mandelbrot_recording_program",
         source_kind="python_ast",
-        source_scope="solve_through_avi_ingested_parent_closure",
+        source_scope="abstract_tensor_mandelbrot_audio_to_avi",
     )
-    reduced_graph = reduce_abstract_tensor_topology(graph)
-    # The writer class and every method body are present in the ingested AST.
-    # Until ClassDef/object-layout lowering exists, only construction crosses
-    # the Python runtime boundary; it is still invoked by the ProcessGraph,
-    # never supplied as a preconstructed caller-owned object.
-    reduced_graph.external_function_table.resolve_imports(
-        package=__package__,
-    )
-    reduced_graph.G.graph["external_runtime_boundaries"] = tuple(
-        entry.qualified_name
-        for entry in reduced_graph.external_function_table
-    )
-    return reduced_graph
+    return reduce_abstract_tensor_topology(graph)
 
 
 __all__ = [
-    "build_mandelbrot_encoder_process_graph",
     "build_mandelbrot_recording_process_graph",
-    "mandelbrot_display_function_ast",
-    "mandelbrot_display_master",
-    "mandelbrot_jpeg_master",
+    "mandelbrot_frame_program",
     "mandelbrot_recording_function_ast",
-    "mandelbrot_recording_program_ast_closure",
     "mandelbrot_recording_program",
 ]

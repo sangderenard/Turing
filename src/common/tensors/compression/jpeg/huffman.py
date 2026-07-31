@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from ...abstraction import AbstractTensor
-from ...autograd import autograd
 from ..huffman import CanonicalHuffmanTable
 
 
@@ -118,13 +117,12 @@ def jpeg_huffman_table(
         (alphabet_size,), cls=type(ordered_symbols)
     )
     indices = ordered_symbols.to_dtype("int64")
-    with autograd.no_grad():
-        dense_codes = AbstractTensor.scatter(
-            dense_codes, indices, ordered.codes, dim=0
-        )
-        dense_lengths = AbstractTensor.scatter(
-            dense_lengths, indices, ordered.lengths, dim=0
-        )
+    dense_codes = AbstractTensor.scatter(
+        dense_codes, indices, ordered.codes, dim=0
+    )
+    dense_lengths = AbstractTensor.scatter(
+        dense_lengths, indices, ordered.lengths, dim=0
+    )
     return CanonicalHuffmanTable(
         codes=dense_codes,
         lengths=dense_lengths,

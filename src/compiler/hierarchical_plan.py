@@ -1,0 +1,363 @@
+"""Hierarchical, printable planning objects.
+
+Text is a view, never the authority.  Each logical line is a typed item and
+each nested scope is an explicit closure with an explicit capture set.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import cached_property
+from typing import Any, Mapping
+
+
+@dataclass(frozen=True)
+class PlanLine:
+    opcode: str
+    inputs: tuple[int, ...] = ()
+    outputs: tuple[int, ...] = ()
+    attributes: tuple[tuple[str, Any], ...] = ()
+
+    @classmethod
+    def create(
+        cls,
+        opcode: str,
+        *,
+        inputs=(),
+        outputs=(),
+        attributes: Mapping[str, Any] | None = None,
+    ) -> "PlanLine":
+        return cls(
+            str(opcode),
+            tuple(int(value) for value in inputs),
+            tuple(int(value) for value in outputs),
+            tuple(sorted((attributes or {}).items())),
+        )
+
+
+@dataclass(frozen=True)
+class PlanClosure:
+    name: str
+    captures: tuple[int, ...]
+    items: tuple["PlanItem", ...]
+    closure_id: int = -1
+
+
+@dataclass(frozen=True)
+class PlanCall:
+    """A typed call edge between two planned closures.
+
+    The call owns its argument/result correlation.  Backend lowering may
+    inline the callee, retain a native call, or split deployment, but it must
+    never rediscover this relationship from source names or runtime values.
+    """
+
+    callsite_id: int
+    callee: PlanClosure
+    argument_value_ids: tuple[int, ...] = ()
+    result_value_ids: tuple[int, ...] = ()
+    argument_bindings: tuple[tuple[int, int], ...] = ()
+    result_bindings: tuple[tuple[int, int], ...] = ()
+    enclosing_loop_ids: tuple[int, ...] = ()
+
+
+PlanItem = PlanLine | PlanClosure | PlanCall
+
+
+@dataclass(frozen=True)
+class HierarchyValueTable:
+    """Collision-free IDs for values whose local IDs live in many shells."""
+
+    correlations: tuple[tuple[int, int, int], ...]
+
+    @cached_property
+    def _global_ids(self) -> dict[tuple[int, int], int]:
+        """Index the immutable correlation table once.
+
+        Hierarchical composition asks for the same endpoint mappings many
+        times while nesting calls, control blocks, bindings and shader
+        storage.  Scanning ``correlations`` for every request makes that
+        otherwise-linear compiler stage quadratic in the number of scoped
+        values.  The tuple remains the canonical, printable representation;
+        this index is only its exact lookup form and does not derive IDs from
+        names, observed values, or runtime state.
+        """
+
+        return {
+            (int(scope), int(local)): int(global_id)
+            for scope, local, global_id in self.correlations
+        }
+
+    def global_id(self, closure_id: int, local_value_id: int) -> int:
+        return self._global_ids[(int(closure_id), int(local_value_id))]
+
+
+@dataclass(frozen=True)
+class HierarchyIdentityReduction:
+    """Result of removing semantically transparent call closures."""
+
+    root: PlanClosure
+    collapsed_callsites: tuple[int, ...]
+    rounds: int
+
+
+def reduce_hierarchy_identities(
+    root: PlanClosure,
+    identity_closure_ids: set[int] | frozenset[int],
+) -> HierarchyIdentityReduction:
+    """Remove post-planning call boundaries proven to be SSA identities.
+
+    Identity discovery happens only after hierarchy construction, when argument
+    and result bindings are explicit.  Value unification therefore remains the
+    authority: this pass removes the now-redundant closure/control boundary but
+    never invents an alias from source names or observed runtime values.
+
+    The rewrite is a fixed point so future identities that erase enclosing
+    structural reasons can expose further collapses without changing callers.
+    """
+
+    identities = frozenset(int(value) for value in identity_closure_ids)
+    collapsed: list[int] = []
+    rounds = 0
+    current = root
+    while True:
+        changed = False
+
+        def rewrite(closure: PlanClosure) -> PlanClosure:
+            nonlocal changed
+            items = []
+            for item in closure.items:
+                if isinstance(item, PlanCall):
+                    callee = rewrite(item.callee)
+                    if int(callee.closure_id) in identities:
+                        collapsed.append(int(item.callsite_id))
+                        changed = True
+                        continue
+                    items.append(PlanCall(
+                        item.callsite_id,
+                        callee,
+                        item.argument_value_ids,
+                        item.result_value_ids,
+                        item.argument_bindings,
+                        item.result_bindings,
+                        item.enclosing_loop_ids,
+                    ))
+                elif isinstance(item, PlanClosure):
+                    items.append(rewrite(item))
+                else:
+                    items.append(item)
+            return PlanClosure(
+                closure.name,
+                closure.captures,
+                tuple(items),
+                closure.closure_id,
+            )
+
+        updated = rewrite(current)
+        if not changed:
+            break
+        current = updated
+        rounds += 1
+    return HierarchyIdentityReduction(
+        current,
+        tuple(dict.fromkeys(collapsed)),
+        rounds,
+    )
+
+
+def assign_hierarchy_ids(
+    root: PlanClosure,
+    previous: HierarchyValueTable | None = None,
+) -> tuple[PlanClosure, HierarchyValueTable]:
+    """Assign canonical IDs once and preserve them when a plan is extended.
+
+    ``(closure_id, local_id)`` is a scoped source address, not a second
+    runtime identity.  The returned global ID is the one semantic identity
+    used by every later compiler stage.  A refresh may append newly exposed
+    control endpoints, but it must never renumber an endpoint that was
+    already assigned.
+    """
+
+    next_closure = 0
+
+    def number(closure: PlanClosure) -> PlanClosure:
+        nonlocal next_closure
+        closure_id = next_closure
+        next_closure += 1
+        items = tuple(
+            PlanCall(
+                item.callsite_id,
+                number(item.callee),
+                item.argument_value_ids,
+                item.result_value_ids,
+                item.argument_bindings,
+                item.result_bindings,
+                item.enclosing_loop_ids,
+            )
+            if isinstance(item, PlanCall)
+            else number(item)
+            if isinstance(item, PlanClosure)
+            else item
+            for item in closure.items
+        )
+        return PlanClosure(
+            closure.name,
+            closure.captures,
+            items,
+            closure_id,
+        )
+
+    planned = number(root)
+    keys: set[tuple[int, int]] = set()
+    unions: list[
+        tuple[tuple[int, int], tuple[int, int]]
+    ] = []
+
+    def collect(closure: PlanClosure) -> None:
+        closure_id = int(closure.closure_id)
+        for local_id in closure.captures:
+            keys.add((closure_id, int(local_id)))
+        for item in closure.items:
+            if isinstance(item, PlanLine):
+                for local_id in (*item.inputs, *item.outputs):
+                    keys.add((closure_id, int(local_id)))
+            elif isinstance(item, PlanCall):
+                child_id = int(item.callee.closure_id)
+                for local_id in (
+                    *item.argument_value_ids,
+                    *item.result_value_ids,
+                ):
+                    keys.add((closure_id, int(local_id)))
+                for caller, callee in item.argument_bindings:
+                    left = (closure_id, int(caller))
+                    right = (child_id, int(callee))
+                    keys.update((left, right))
+                    unions.append((left, right))
+                for callee, caller in item.result_bindings:
+                    left = (child_id, int(callee))
+                    right = (closure_id, int(caller))
+                    keys.update((left, right))
+                    unions.append((left, right))
+                collect(item.callee)
+            elif isinstance(item, PlanClosure):
+                collect(item)
+
+    collect(planned)
+    parents = {key: key for key in keys}
+
+    def find(key):
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    for left, right in unions:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    previous_ids = (
+        {}
+        if previous is None
+        else {
+            (int(scope), int(local)): int(global_id)
+            for scope, local, global_id in previous.correlations
+        }
+    )
+    class_previous_ids: dict[tuple[int, int], set[int]] = {}
+    for key in keys:
+        if key in previous_ids:
+            class_previous_ids.setdefault(find(key), set()).add(
+                previous_ids[key]
+            )
+    conflicting = {
+        root_key: tuple(sorted(ids))
+        for root_key, ids in class_previous_ids.items()
+        if len(ids) > 1
+    }
+    if conflicting:
+        raise ValueError(
+            "hierarchy refresh attempted to merge previously distinct "
+            f"canonical IDs: {conflicting!r}"
+        )
+
+    root_ids: dict[tuple[int, int], int] = {
+        root_key: next(iter(ids))
+        for root_key, ids in class_previous_ids.items()
+    }
+    next_global_id = 1 + max(previous_ids.values(), default=-1)
+    correlations = []
+    for closure_id, local_id in sorted(keys):
+        root_key = find((closure_id, local_id))
+        if root_key not in root_ids:
+            root_ids[root_key] = next_global_id
+            next_global_id += 1
+        global_id = root_ids[root_key]
+        correlations.append((closure_id, local_id, global_id))
+    return planned, HierarchyValueTable(tuple(correlations))
+
+
+def render_plan_ascii(root: PlanClosure) -> str:
+    """Render a stable tree view without changing the planning object."""
+
+    lines: list[str] = []
+
+    def visit(item: PlanItem, prefix: str, last: bool) -> None:
+        branch = "`- " if last else "|- "
+        if isinstance(item, PlanCall):
+            arguments = ",".join(map(str, item.argument_value_ids)) or "-"
+            results = ",".join(map(str, item.result_value_ids)) or "-"
+            argument_bindings = ",".join(
+                f"{caller}->{callee}"
+                for caller, callee in item.argument_bindings
+            ) or "-"
+            result_bindings = ",".join(
+                f"{callee}->{caller}"
+                for callee, caller in item.result_bindings
+            ) or "-"
+            lines.append(
+                f"{prefix}{branch}call #{item.callsite_id} "
+                f"args=[{arguments}] results=[{results}] "
+                f"arg-bind=[{argument_bindings}] "
+                f"result-bind=[{result_bindings}]"
+            )
+            child_prefix = prefix + ("   " if last else "|  ")
+            visit(item.callee, child_prefix, True)
+            return
+        if isinstance(item, PlanClosure):
+            captures = ",".join(map(str, item.captures)) or "-"
+            lines.append(
+                f"{prefix}{branch}closure {item.name} "
+                f"id={item.closure_id} captures=[{captures}]"
+            )
+            child_prefix = prefix + ("   " if last else "|  ")
+            for index, child in enumerate(item.items):
+                visit(child, child_prefix, index == len(item.items) - 1)
+            return
+        inputs = ",".join(map(str, item.inputs)) or "-"
+        outputs = ",".join(map(str, item.outputs)) or "-"
+        attributes = " ".join(
+            f"{name}={value!r}" for name, value in item.attributes
+        )
+        suffix = f" {attributes}" if attributes else ""
+        lines.append(
+            f"{prefix}{branch}{item.opcode} in=[{inputs}] out=[{outputs}]"
+            f"{suffix}"
+        )
+
+    visit(root, "", True)
+    return "\n".join(lines)
+
+
+__all__ = [
+    "PlanCall",
+    "PlanClosure",
+    "PlanItem",
+    "PlanLine",
+    "HierarchyValueTable",
+    "HierarchyIdentityReduction",
+    "assign_hierarchy_ids",
+    "reduce_hierarchy_identities",
+    "render_plan_ascii",
+]

@@ -212,8 +212,9 @@ def scatter(x: Any, index: Any, src: Any, dim: int = 0):
     # record autograd before update
     from ..abstraction import AbstractTensor
     finalize = AbstractTensor._pre_autograd('scatter', [x, index, src], params={'dim': dim})
+    result = x.clone()
     # fetch existing values and add
     old = x[tuple(indexer)]
-    x[tuple(indexer)] = old + src
-    return finalize(x)
+    result[tuple(indexer)] = old + src
+    return finalize(result)
 

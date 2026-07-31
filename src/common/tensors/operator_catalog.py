@@ -8,6 +8,8 @@ deliberately not an operation in a numerical program.
 
 from __future__ import annotations
 
+import inspect
+
 from .fused_ir import ELEMENTWISE_BINARY, ELEMENTWISE_UNARY
 
 
@@ -217,6 +219,32 @@ ACCESSOR_OPERATORS = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# HOST-BOUNDARY SAFETY RULE
+#
+# This set is for operations whose *implementation is intrinsically external*
+# to the tensor/compiler program: filesystem access, foreign host memory, or a
+# final materialization crossing.  It must never be used as a convenient way
+# to hide a large tensor algorithm from ProcessGraph.
+#
+# In particular, a codec does not become a host operation merely because its
+# terminal value is ``bytes``.  DCT, quantization, coefficient transforms,
+# scans, prefix work, and every other tensor/numerical portion must remain
+# visible to ProcessGraph so the planner can reduce, partition, and compile
+# it.  Only the final, genuinely non-tensor byte publication belongs at the
+# host boundary.
+#
+# Agents have repeatedly wrapped visible tensor work in one Python function,
+# added its name here, observed thousands of eager backend calls, and then
+# spoken as though the topology had proved impossible to reduce.  That is
+# false: adding a name here prevents the planner from seeing the topology at
+# all.  It is a compiler bypass, not a compiler result.
+#
+# Do not add an operator to this set to make ingestion, planning, capture, or
+# lowering appear to succeed.  If an operation contains compiler-relevant
+# tensor work, expose that work and fix the compiler.  Hiding it here ruins
+# the execution boundary and guarantees Python/host churn at runtime.
+# ---------------------------------------------------------------------------
 HOST_BOUNDARY_OPERATORS = frozenset(
     {
         "avi",
@@ -355,6 +383,23 @@ def canonical_operator_name(name: str) -> str:
     return OPERATOR_ALIASES.get(name, name)
 
 
+def include_ast_parent_outside_abstract_tensor(value) -> bool:
+    """Expand Python parents until reaching a canonical tensor operation."""
+
+    target = value.__func__ if inspect.ismethod(value) else value
+    name = str(getattr(target, "__name__", ""))
+    module = str(getattr(target, "__module__", ""))
+    canonical = canonical_operator_name(name)
+    tensor_module = (
+        module == "src.common.tensors"
+        or module.startswith("src.common.tensors.")
+    )
+    return not (
+        tensor_module
+        and canonical in CANONICAL_ABSTRACT_TENSOR_OPERATORS
+    )
+
+
 __all__ = [
     "ACCESSOR_OPERATORS",
     "CANONICAL_ABSTRACT_TENSOR_OPERATORS",
@@ -370,4 +415,5 @@ __all__ = [
     "TYPE_AND_DEVICE_OPERATORS",
     "VALUE_LIFECYCLE_OPERATORS",
     "canonical_operator_name",
+    "include_ast_parent_outside_abstract_tensor",
 ]

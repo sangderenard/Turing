@@ -21,6 +21,7 @@ class Handler(Enum):
     FloorDiv      = "FloorDiv"
     Mod           = "Mod"
     Pow           = "Pow"
+    MatMul        = "MatMul"
     Neg           = "Neg"
     Abs           = "Abs"
 
@@ -103,6 +104,8 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'div':                 Handler.Div,
     'mod':                 Handler.Mod,
     'pow':                 Handler.Pow,
+    'matmul':              Handler.MatMul,
+    'matmult':             Handler.MatMul,
     'neg':                 Handler.Neg,
     'abs':                 Handler.Abs,
 
@@ -482,6 +485,10 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'yield',
         'yieldfrom',
     ),
+    Handler.MatMul: (
+        'matmult',
+        'binop:matmult',
+    ),
     Handler.Call: (
         'call',
         'await',
@@ -491,8 +498,6 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'notin',
         'compare:in',
         'compare:notin',
-        'matmult',
-        'binop:matmult',
     ),
     Handler.Select: (
         'ifexp',

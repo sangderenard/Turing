@@ -28,3 +28,15 @@ def test_process_graph_callable_executes_and_captures_forward_path():
     assert [step.op_name for step in captured.program.steps] == ["sin"]
     assert captured.program.outputs.keys() == {"result"}
     assert tuple(captured.feeds.values()) == (value,)
+
+
+def test_discard_python_callable_is_idempotent_and_removes_instance_objects():
+    with contextlib.redirect_stdout(io.StringIO()):
+        callable_graph = make_process_graph_callable(_elementwise_graph())
+
+    callable_graph.discard_python_callable()
+    callable_graph.discard_python_callable()
+
+    assert "_callable" not in callable_graph.__dict__
+    assert "compiler" not in callable_graph.__dict__
+    assert "generated_source" not in callable_graph.__dict__

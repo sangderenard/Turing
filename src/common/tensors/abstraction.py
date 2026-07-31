@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Tuple, Optional, List, Union, Callable, Dict, Deque, NamedTuple, Iterable, TYPE_CHECKING
 import math
 import inspect
+from functools import wraps
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -1726,6 +1727,12 @@ class AbstractTensor:
 
         return write_tensor_mjpeg_avi(path, self, **kwargs)
 
+    def mjpeg_frames(self, **kwargs):
+        """Encode a frame or frame stack into independent JPEG byte packets."""
+        from .compression.containers.avi import encode_tensor_mjpeg_frames
+
+        return encode_tensor_mjpeg_frames(self, **kwargs)
+
     def load(
         self, filepath: str, dtype: Any = None, device: Any = None
     ) -> "AbstractTensor":
@@ -1736,7 +1743,36 @@ class AbstractTensor:
     def to_dtype(self, dtype: str = "float") -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
-        return result
+        source_kind = getattr(
+            getattr(getattr(self, "data", None), "dtype", None),
+            "kind",
+            None,
+        )
+        target_kind = getattr(
+            getattr(getattr(result, "data", None), "dtype", None),
+            "kind",
+            None,
+        )
+        if target_kind == source_kind:
+            operation = "reshape"
+            params = {"shape": tuple(result.shape)}
+        elif target_kind == "b":
+            operation = "not_equal"
+            params = {"right_scalar": 0}
+        elif target_kind == "f":
+            operation = "uitofp" if source_kind in {"u", "b"} else "sitofp"
+            params = {}
+        elif target_kind == "u":
+            operation = "fptoui" if source_kind == "f" else "zext"
+            params = {}
+        else:
+            operation = "fptosi" if source_kind == "f" else "sext"
+            params = {}
+        return AbstractTensor._pre_autograd(
+            operation,
+            [self],
+            params=params,
+        )(result)
 
     # --- Pure-abstraction utilities ---------------------------------------
     @staticmethod
@@ -2057,6 +2093,15 @@ class AbstractTensor:
             numpy_tensor.data = tensor
             return numpy_tensor.to_backend(self)
         if isinstance(tensor, (list, tuple)):
+            finalize = AbstractTensor._pre_autograd(
+                "tensor_from_list",
+                [],
+                params={
+                    "data": tensor,
+                    "dtype": None,
+                    "device": None,
+                },
+            )
             # Mixed or nested sequences are routed through the nested packer
             if any(isinstance(elem, (list, tuple, AbstractTensor)) for elem in tensor):
                 # Ensure nested creation attaches to this tensor's tape
@@ -2065,7 +2110,7 @@ class AbstractTensor:
                 try:
                     if getattr(self, "_tape", None) is not None:
                         _autograd.autograd.tape = getattr(self, "_tape", None)
-                    return self.__class__.from_nested(tensor)
+                    return finalize(self.__class__.from_nested(tensor))
                 finally:
                     _autograd.autograd.tape = prev
             try:
@@ -2074,7 +2119,7 @@ class AbstractTensor:
                 try:
                     if getattr(self, "_tape", None) is not None:
                         _autograd.autograd.tape = getattr(self, "_tape", None)
-                    return type(self)._tensor_from_list(tensor, dtype=None, device=None, tape=getattr(self, "_tape", None))
+                    return finalize(type(self)._tensor_from_list(tensor, dtype=None, device=None, tape=getattr(self, "_tape", None)))
                 finally:
                     _autograd.autograd.tape = prev
             except Exception:
@@ -2084,7 +2129,7 @@ class AbstractTensor:
                 try:
                     if getattr(self, "_tape", None) is not None:
                         _autograd.autograd.tape = getattr(self, "_tape", None)
-                    return self.__class__.from_nested(tensor)
+                    return finalize(self.__class__.from_nested(tensor))
                 finally:
                     _autograd.autograd.tape = prev
         if hasattr(tensor, "tolist"):
@@ -2094,7 +2139,21 @@ class AbstractTensor:
         try:
             if getattr(self, "_tape", None) is not None:
                 _autograd.autograd.tape = getattr(self, "_tape", None)
-            return type(self)._tensor_from_list([tensor], dtype=None, device=None, tape=getattr(self, "_tape", None))
+            result = type(self)._tensor_from_list(
+                [tensor],
+                dtype=None,
+                device=None,
+                tape=getattr(self, "_tape", None),
+            )
+            return AbstractTensor._pre_autograd(
+                "tensor_from_list",
+                [],
+                params={
+                    "data": [tensor],
+                    "dtype": None,
+                    "device": None,
+                },
+            )(result)
         finally:
             _autograd.autograd.tape = prev
 
@@ -2986,6 +3045,7 @@ def _wrap_creation_fn(op_name: str, raw_fn):
       - tape: Optional[GradTape] = None
     and records the op.
     """
+    @wraps(raw_fn)
     def wrapped(*args, requires_grad: bool = False, tape=None, **kwargs):
         from . import autograd as _autograd
         # If requires_grad=True, force use of the global tape regardless of provided tape
@@ -3021,6 +3081,7 @@ def _wrap_creation_fn(op_name: str, raw_fn):
 def _wrap_meshgrid_fn(raw_fn):
     """Special wrapper for ``meshgrid`` that preserves tuple output."""
 
+    @wraps(raw_fn)
     def wrapped(*args, requires_grad: bool = False, tape=None, **kwargs):
         from . import autograd as _autograd
 
@@ -3095,6 +3156,7 @@ try:   # Ensure random also supports requires_grad + tape and force global tape 
 except Exception:
     pass
 def _wrap_with_autograd(name: str, func: Callable) -> Callable:
+    @wraps(func)
     def wrapped(self, *args, **kwargs):
         from . import autograd as _autograd
 

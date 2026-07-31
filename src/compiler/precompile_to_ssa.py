@@ -26,6 +26,13 @@ from .precompile_ssa_validator import (
     validate_precompile_ssa_compatibility,
 )
 from ..common.tensors.fused_ir import FusedProgram, Meta, OpStep
+from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+    LLVM_SSA_MODULE,
+    translations_for_operation,
+)
+from ..common.tensors.accelerator_backends.llvm_repository_ssa import (
+    import_llvm_to_repository_ssa,
+)
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -126,9 +133,67 @@ def lower_fused_program_to_ssa(
     instructions: list[Instr] = []
     shortfalls: list[SSALoweringShortfall] = []
 
+    def element_count(value_id: int) -> int:
+        meta = metadata.get(value_id)
+        count = 1
+        for extent in (() if meta is None else (meta.shape or ())):
+            count *= int(extent)
+        return count
+
+    def tensor_algorithm(step: OpStep) -> str | None:
+        translations = translations_for_operation(step.op_name)
+        if not translations:
+            return None
+        symbols = {item.llvm_symbol for item in translations}
+        if step.op_name == "slice":
+            return (
+                "index_select_double"
+                if step.attrs.get("slice_kind") == "index_select"
+                else "slice_copy_double"
+            )
+        if (
+            "binary_scalar_double" in symbols
+            and len(step.input_ids) == 1
+            and any(name.endswith("_scalar") for name in step.attrs)
+        ):
+            return "binary_scalar_double"
+        if {
+            "binary_double",
+            "binary_scalar_double",
+        } <= symbols and len(step.input_ids) == 2:
+            left_count, right_count = (
+                element_count(value_id)
+                for value_id in step.input_ids
+            )
+            return (
+                "binary_scalar_double"
+                if 1 in {left_count, right_count}
+                and left_count != right_count
+                else "binary_double"
+            )
+        if step.op_name == "sum":
+            return (
+                "reduce_dim_double"
+                if step.attrs.get("axis") is not None
+                else "sum_double"
+            )
+        # Prefer the public tensor kernel over scalar helpers when more than
+        # one exact C/LLVM correspondence names the operation.
+        for item in translations:
+            if item.llvm_symbol != "binary_value":
+                return item.llvm_symbol
+        return translations[0].llvm_symbol
+
     for index, step in enumerate(program.steps):
         location = f"{function_name}:step[{index}]"
-        handler = ssa_handler_for_precompile(step.op_name)
+        algorithm = tensor_algorithm(step)
+        handler = (
+            Handler.Const
+            if step.op_name == "tensor_from_list"
+            else Handler.Call
+            if algorithm is not None
+            else ssa_handler_for_precompile(step.op_name)
+        )
         if handler is None:
             shortfalls.append(
                 SSALoweringShortfall(
@@ -155,12 +220,24 @@ def lower_fused_program_to_ssa(
                 )
             )
             continue
+        attributes = dict(step.attrs)
+        if algorithm is not None:
+            attributes.update({
+                "callee": algorithm,
+                "tensor_operation": step.op_name,
+                "lowered_from": "c_backend_llvm_ssa.TRANSLATIONS",
+            })
+        if step.op_name == "tensor_from_list":
+            attributes.update({
+                "value": attributes.get("data"),
+                "tensor_operation": step.op_name,
+            })
         instructions.append(
             Instr(
                 handler.value,
                 [values[value_id] for value_id in step.input_ids],
                 values[step.result_id],
-                attributes=dict(step.attrs),
+                attributes=attributes,
             )
         )
         available.add(step.result_id)
@@ -209,6 +286,9 @@ class _ControlSSABuilder:
         function_name: str,
         first_value_id: int,
         region_callees: dict[int, str] | None,
+        region_signatures: dict[
+            int, tuple[tuple[int, ...], tuple[int, ...]]
+        ] | None,
     ):
         self.program = program
         self.function_name = function_name
@@ -217,6 +297,7 @@ class _ControlSSABuilder:
         self.block_counts: dict[str, int] = {}
         self.shortfalls: list[SSALoweringShortfall] = []
         self.region_callees = dict(region_callees or {})
+        self.region_signatures = dict(region_signatures or {})
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
         self.uniform_values: dict[str, SSAValue] = {}
@@ -232,6 +313,16 @@ class _ControlSSABuilder:
             self.next_value_id = max(
                 self.next_value_id,
                 max(self.external_values) + 1,
+            )
+        signature_ids = {
+            value_id
+            for feeds, outputs in self.region_signatures.values()
+            for value_id in (*feeds, *outputs)
+        }
+        if signature_ids:
+            self.next_value_id = max(
+                self.next_value_id,
+                max(signature_ids) + 1,
             )
         self.current = self.new_block("entry")
 
@@ -258,6 +349,103 @@ class _ControlSSABuilder:
             self.external_values[value_id] = value
             self.arguments.append(value)
         return value
+
+    def produced_value(
+        self,
+        value_id: int,
+        *,
+        dtype: str | None = None,
+    ) -> SSAValue:
+        value_id = int(value_id)
+        value = self.external_values.get(value_id)
+        if value is not None:
+            if value in self.arguments:
+                self.shortfalls.append(
+                    SSALoweringShortfall(
+                        "control",
+                        "producer_identity",
+                        self.current.name,
+                        f"value {value_id} is both a control argument and "
+                        "a scheduled-region result",
+                    )
+                )
+                value = self.fresh_value(dtype=dtype)
+                value.accounting["source_value_id"] = value_id
+                self.external_values[value_id] = value
+            return value
+        value = SSAValue(value_id, dtype=dtype)
+        self.external_values[value_id] = value
+        return value
+
+    def constant_value(self, literal: int) -> SSAValue:
+        value = self.fresh_value(dtype="int")
+        self.emit(
+            Handler.Const,
+            [],
+            value,
+            attributes={"value": int(literal)},
+        )
+        return value
+
+    def indexed_load(
+        self,
+        source: SSAValue,
+        index: SSAValue,
+        result_id: int,
+        *,
+        attributes: dict[str, Any],
+    ) -> SSAValue:
+        address = self.fresh_value(dtype="ptr")
+        self.emit(
+            Handler.GetElementPtr,
+            [source, index],
+            address,
+            attributes=attributes,
+        )
+        result = self.produced_value(result_id)
+        self.emit(Handler.Load, [address], result, attributes=attributes)
+        return result
+
+    def emit_region_call(self, region_index: int, *, location: str) -> None:
+        callee = self.region_callees.get(
+            region_index,
+            f"numerical_region_{region_index}",
+        )
+        feeds, outputs = self.region_signatures.get(
+            region_index, ((), ())
+        )
+        arguments = [self.external_value(value_id) for value_id in feeds]
+        aggregate = (
+            self.fresh_value(dtype="ssa.aggregate")
+            if outputs
+            else None
+        )
+        self.emit(
+            Handler.Call,
+            arguments,
+            aggregate,
+            attributes={
+                "callee": callee,
+                "region_index": region_index,
+                "feed_ids": feeds,
+                "output_ids": outputs,
+                "result_convention": "ssa.aggregate",
+            },
+        )
+        if aggregate is None:
+            return
+        for output_index, output_id in enumerate(outputs):
+            index = self.constant_value(output_index)
+            self.indexed_load(
+                aggregate,
+                index,
+                output_id,
+                attributes={
+                    "region_index": region_index,
+                    "aggregate_index": output_index,
+                    "source_output_id": output_id,
+                },
+            )
 
     def new_block(self, stem: str) -> BasicBlock:
         count = self.block_counts.get(stem, 0)
@@ -358,17 +546,9 @@ class _ControlSSABuilder:
                 location = f"{path}.statement[{index}]"
                 if match is not None:
                     region_index = int(match.group(1))
-                    callee = self.region_callees.get(
+                    self.emit_region_call(
                         region_index,
-                        f"numerical_region_{region_index}",
-                    )
-                    self.emit(
-                        Handler.Call,
-                        [],
-                        attributes={
-                            "callee": callee,
-                            "region_index": region_index,
-                        },
+                        location=location,
                     )
                 else:
                     self.emit(
@@ -392,15 +572,9 @@ class _ControlSSABuilder:
             self.lower_loop(block, path=path)
             return
         if isinstance(block, CallBlock):
-            self.emit(
-                Handler.Call,
-                [],
-                attributes={
-                    "callee": f"planned_callsite_{block.callsite_id}",
-                    "argument_bindings": block.argument_bindings,
-                    "result_bindings": block.result_bindings,
-                },
-            )
+            # Hierarchy planning has already unified the bound value IDs.
+            # CallBlock is lexical organization around the nested compiled
+            # control, not an additional runtime invocation.
             self.lower(block.callee, path=f"{path}.callee")
             return
         if isinstance(block, ValidationBlock):
@@ -451,14 +625,9 @@ class _ControlSSABuilder:
             self.lower_state_machine(block, path=path)
             return
         if isinstance(block, ParallelDeployment):
-            self.shortfalls.append(
-                SSALoweringShortfall(
-                    "control",
-                    "parallel_deployment",
-                    path,
-                    "parallel lane semantics require an SSA region construct",
-                )
-            )
+            # The lanes are independent.  A linear SSA listing is a valid
+            # schedule of that partial order; a target may re-parallelize it
+            # from the retained lane structure before this final lowering.
             for index, lane in enumerate(block.lanes):
                 self.lower(lane, path=f"{path}.lane[{index}]")
             return
@@ -478,6 +647,36 @@ class _ControlSSABuilder:
             loop.step,
             location=f"{path}.step",
         )
+        carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
+        for updated_id, initial_id in loop.carried_aliases:
+            updated_id = int(updated_id)
+            initial_id = int(initial_id)
+            initial_value = self.external_value(initial_id)
+            updated_value = SSAValue(
+                updated_id,
+                dtype=initial_value.dtype,
+                shape=initial_value.shape,
+            )
+            current_value = self.fresh_value(
+                dtype=initial_value.dtype,
+                shape=initial_value.shape,
+            )
+            current_value.accounting.update({
+                "source_value_id": initial_id,
+                "carried_from_value_id": updated_id,
+            })
+            # Region output extraction will use this exact object as the
+            # backedge definition referenced by the Phi below.
+            self.external_values[updated_id] = updated_value
+            carried.append(
+                (
+                    updated_id,
+                    initial_id,
+                    initial_value,
+                    updated_value,
+                    current_value,
+                )
+            )
         header = self.new_block("loop_header")
         body = self.new_block("loop_body")
         latch = self.new_block("loop_latch")
@@ -497,12 +696,159 @@ class _ControlSSABuilder:
                 "source_name": loop.induction,
             },
         )
+        for (
+            updated_id,
+            initial_id,
+            initial_value,
+            updated_value,
+            current_value,
+        ) in carried:
+            self.emit(
+                Handler.Phi,
+                [initial_value, updated_value],
+                current_value,
+                attributes={
+                    "incoming_blocks": (preheader.name, latch.name),
+                    "binding": "loop_carried",
+                    "initial_value_id": initial_id,
+                    "updated_value_id": updated_id,
+                },
+            )
+            self.external_values[initial_id] = current_value
         condition = self.fresh_value(dtype="bool")
         self.emit(Handler.Lt, [induction, stop], condition)
         self.conditional_branch(condition, body, exit_block)
 
         self.current = body
+        restored_values: dict[int, SSAValue | None] = {}
+        for iterable_id, target_id, induction_name in (
+            self.program.iterable_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            restored_values[int(target_id)] = self.external_values.get(
+                int(target_id)
+            )
+            self.indexed_load(
+                self.external_value(iterable_id),
+                induction,
+                target_id,
+                attributes={
+                    "binding": "iterable",
+                    "induction": loop.induction,
+                },
+            )
+        for iterable_id, target_id, induction_name, values in (
+            self.program.static_iterable_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            restored_values[int(target_id)] = self.external_values.get(
+                int(target_id)
+            )
+            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            self.emit(
+                Handler.Const,
+                [],
+                aggregate,
+                attributes={
+                    "value": tuple(values),
+                    "binding": "static_iterable",
+                    "source_value_id": int(iterable_id),
+                },
+            )
+            self.indexed_load(
+                aggregate,
+                induction,
+                target_id,
+                attributes={
+                    "binding": "static_iterable",
+                    "induction": loop.induction,
+                },
+            )
+        for aggregate_id, target_id, induction_name, source_ids in (
+            self.program.closure_iterable_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            restored_values[int(target_id)] = self.external_values.get(
+                int(target_id)
+            )
+            aggregate = self.fresh_value(dtype="ssa.aggregate")
+            self.emit(
+                Handler.Const,
+                [self.external_value(value_id) for value_id in source_ids],
+                aggregate,
+                attributes={
+                    "binding": "closure_iterable",
+                    "source_value_id": int(aggregate_id),
+                    "resident_source_ids": tuple(source_ids),
+                },
+            )
+            self.indexed_load(
+                aggregate,
+                induction,
+                target_id,
+                attributes={
+                    "binding": "closure_iterable",
+                    "induction": loop.induction,
+                },
+            )
         self.lower(loop.body, path=f"{path}.body")
+        produced_results = {
+            id(instruction.res)
+            for basic_block in self.blocks.values()
+            for instruction in basic_block.instrs
+            if instruction.res is not None
+        }
+        for updated_id, _initial_id, _initial, updated, _current in carried:
+            if id(updated) not in produced_results:
+                self.shortfalls.append(
+                    SSALoweringShortfall(
+                        "control",
+                        "loop_carried",
+                        f"{path}.body",
+                        f"carried update value {updated_id} has no producer "
+                        "inside the loop body",
+                    )
+                )
+        for source_id, collection_id, induction_name, start in (
+            self.program.collection_bindings
+        ):
+            if induction_name != loop.induction:
+                continue
+            publication_index = induction
+            if int(start):
+                offset = self.constant_value(int(start))
+                publication_index = self.fresh_value(dtype="int")
+                self.emit(
+                    Handler.Add,
+                    [induction, offset],
+                    publication_index,
+                    attributes={"binding": "collection_offset"},
+                )
+            address = self.fresh_value(dtype="ptr")
+            self.emit(
+                Handler.GetElementPtr,
+                [
+                    self.external_value(collection_id),
+                    publication_index,
+                ],
+                address,
+                attributes={
+                    "binding": "collection_publication",
+                    "collection_value_id": int(collection_id),
+                    "induction": loop.induction,
+                },
+            )
+            self.emit(
+                Handler.Store,
+                [self.external_value(source_id), address],
+                attributes={
+                    "binding": "collection_publication",
+                    "source_value_id": int(source_id),
+                },
+            )
         if not self.current.successors:
             self.branch(latch)
 
@@ -513,6 +859,16 @@ class _ControlSSABuilder:
             next_induction,
         )
         self.branch(header)
+        for target_id, previous in restored_values.items():
+            if previous is None:
+                self.external_values.pop(target_id, None)
+            else:
+                self.external_values[target_id] = previous
+        for updated_id, initial_id, _initial, _updated, current in carried:
+            # On the exit edge the header Phi is the final carried value and
+            # dominates every post-loop consumer, including a zero-trip loop.
+            self.external_values[initial_id] = current
+            self.external_values[updated_id] = current
         self.current = exit_block
 
     def lower_state_machine(
@@ -570,12 +926,16 @@ def lower_control_program_to_ssa(
     function_name: str = "planned_control",
     first_value_id: int = 0,
     region_callees: dict[int, str] | None = None,
+    region_signatures: dict[
+        int, tuple[tuple[int, ...], tuple[int, ...]]
+    ] | None = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
         function_name=function_name,
         first_value_id=first_value_id,
         region_callees=region_callees,
+        region_signatures=region_signatures,
     )
     builder.lower(program.root)
     return builder.finish()
@@ -644,8 +1004,13 @@ def lower_precompile_and_control_to_ssa(
         for instruction in block.instrs
         if instruction.res is not None
     }
-    functions = {numerical.name: numerical}
+    algorithm_import = import_llvm_to_repository_ssa(LLVM_SSA_MODULE)
+    functions = dict(algorithm_import.module.functions)
+    functions[numerical.name] = numerical
     region_callees: dict[int, str] = {}
+    region_signatures: dict[
+        int, tuple[tuple[int, ...], tuple[int, ...]]
+    ] = {}
     region_shortfalls: list[SSALoweringShortfall] = []
     for region_index, region_artifact in sorted(
         (region_programs or {}).items()
@@ -662,6 +1027,13 @@ def lower_precompile_and_control_to_ssa(
         )
         functions[region_name] = region_function
         region_callees[int(region_index)] = region_name
+        region_signatures[int(region_index)] = (
+            tuple(sorted(int(value_id) for value_id in region_program.feeds)),
+            tuple(
+                int(value_id)
+                for value_id in region_program.outputs.values()
+            ),
+        )
         region_shortfalls.extend(shortfalls)
     if not region_callees:
         region_callees = {
@@ -673,6 +1045,7 @@ def lower_precompile_and_control_to_ssa(
         function_name=control_name,
         first_value_id=max(used_ids, default=-1) + 1,
         region_callees=region_callees,
+        region_signatures=region_signatures,
     )
     functions[control_function.name] = control_function
     module = IRModule(functions)
@@ -687,6 +1060,15 @@ def lower_precompile_and_control_to_ssa(
             *numerical_shortfalls,
             *region_shortfalls,
             *control_shortfalls,
+            *(
+                SSALoweringShortfall(
+                    "llvm",
+                    item.opcode,
+                    f"{item.function}:{item.block}",
+                    item.reason,
+                )
+                for item in algorithm_import.shortfalls
+            ),
         )),
         tuple(cycles),
     )

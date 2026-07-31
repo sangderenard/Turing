@@ -83,6 +83,36 @@ void batched_matmul_indexed_double(
     int n,
     int p);
 
+void slice_copy_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    int start,
+    int step,
+    int count);
+
+void index_select_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int* indices,
+    int index_count);
+
+void index_assign_double(
+    double* target,
+    const int* shape,
+    int ndim,
+    const int* axis_offsets,
+    const int* axis_indices,
+    const double* values,
+    int value_count);
+
+void sign_double(const double* input, double* output, int n);
+
 int ctensor_execute_primitive_program(
     const CTensorPrimitiveInstruction* instructions,
     int instruction_count,

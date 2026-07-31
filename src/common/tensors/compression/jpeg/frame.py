@@ -6,9 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...abstraction import AbstractTensor
-from ...autograd import autograd
 from ..block_transform import orthonormal_dct_basis
-from ..bitstream import tensor_octets_to_bytes, unpack_octets
+from ..bitstream import (
+    ResidentBytePacket,
+    concatenate_resident_byte_packets,
+    resident_byte_packet,
+    tensor_octets_to_bytes,
+    unpack_octets,
+)
 from ..coefficient_events import (
     collect_block_coefficient_events,
     collect_component_block_coefficient_events,
@@ -92,27 +97,26 @@ def prepare_jpeg_encoding_resources(
 
     if not isinstance(like, AbstractTensor):
         raise TypeError("JPEG resources require an AbstractTensor exemplar")
-    with autograd.no_grad():
-        luma_quantization = like.ensure_tensor(JPEG_LUMA_QUANTIZATION)
-        chroma_quantization = like.ensure_tensor(JPEG_CHROMA_QUANTIZATION)
-        return JPEGEncodingResources(
-            dct_basis=orthonormal_dct_basis(8, like=like),
-            luma_quantization=luma_quantization,
-            chroma_quantization=chroma_quantization,
-            ycbcr_quantization=AbstractTensor.stack(
-                (
-                    luma_quantization,
-                    chroma_quantization,
-                    chroma_quantization,
-                ),
-                dim=0,
-            ).reshape(3, 1, 1, 8, 8),
-            zigzag=like.ensure_tensor(JPEG_ZIGZAG).to_dtype("int64"),
-            luma_dc_table=jpeg_standard_dc_luminance(like),
-            luma_ac_table=jpeg_standard_ac_luminance(like),
-            chroma_dc_table=jpeg_standard_dc_chrominance(like),
-            chroma_ac_table=jpeg_standard_ac_chrominance(like),
-        )
+    luma_quantization = like.ensure_tensor(JPEG_LUMA_QUANTIZATION)
+    chroma_quantization = like.ensure_tensor(JPEG_CHROMA_QUANTIZATION)
+    return JPEGEncodingResources(
+        dct_basis=orthonormal_dct_basis(8, like=like),
+        luma_quantization=luma_quantization,
+        chroma_quantization=chroma_quantization,
+        ycbcr_quantization=AbstractTensor.stack(
+            (
+                luma_quantization,
+                chroma_quantization,
+                chroma_quantization,
+            ),
+            dim=0,
+        ).reshape(3, 1, 1, 8, 8),
+        zigzag=like.ensure_tensor(JPEG_ZIGZAG).to_dtype("int64"),
+        luma_dc_table=jpeg_standard_dc_luminance(like),
+        luma_ac_table=jpeg_standard_ac_luminance(like),
+        chroma_dc_table=jpeg_standard_dc_chrominance(like),
+        chroma_ac_table=jpeg_standard_ac_chrominance(like),
+    )
 
 
 def _u16(value: int) -> bytes:
@@ -161,30 +165,71 @@ def _stuff_entropy_octets(octets: AbstractTensor) -> AbstractTensor:
         dtype=octets.dtype,
         cls=type(octets),
     )
-    with autograd.no_grad():
-        stuffed = AbstractTensor.scatter(
-            stuffed,
-            destinations,
-            octets,
-            dim=0,
-        )
+    stuffed = AbstractTensor.scatter(
+        stuffed,
+        destinations,
+        octets,
+        dim=0,
+    )
     return stuffed
+
+
+def stuff_resident_entropy_octets(
+    packet: ResidentBytePacket,
+) -> ResidentBytePacket:
+    """JPEG-stuff a fixed-capacity packet without reading its logical count."""
+
+    octets = packet.octets
+    capacity = octets.shape[0]
+    if capacity == 0:
+        return packet
+    positions = AbstractTensor.arange(capacity, cls=type(octets))
+    valid = positions < packet.byte_count
+    markers = (octets == 0xFF).to_dtype("int64") * valid
+    preceding = markers.cumsum(dim=0) - markers
+    destinations = (positions + preceding).to_dtype("int64")
+    stuffed = AbstractTensor.zeros(
+        (capacity * 2,),
+        dtype=octets.dtype,
+        cls=type(octets),
+    )
+    stuffed = AbstractTensor.scatter(
+        stuffed,
+        destinations,
+        octets * valid,
+        dim=0,
+    )
+    return resident_byte_packet(
+        # Serialized octets have an integer tensor contract.  State this at
+        # the codec boundary so every backend observes the same operation;
+        # the compiler must not reinterpret float storage bits as byte words.
+        stuffed.to_dtype("int64"),
+        (packet.byte_count + markers.sum()).to_dtype("int64"),
+    )
+
+
+def finalize_entropy_scan_resident(scan) -> ResidentBytePacket:
+    """Finish a packed scan while keeping byte count as tensor state."""
+
+    octets = scan.octets
+    capacity = octets.shape[0]
+    positions = AbstractTensor.arange(capacity, cls=type(octets))
+    byte_count = (scan.valid_bits + 7) // 8
+    remainder = scan.valid_bits % 8
+    has_remainder = remainder != 0
+    fill = ((2 ** (8 - remainder)) - 1) * has_remainder
+    final_position = byte_count - 1
+    adjusted = octets + (positions == final_position) * fill
+    adjusted = adjusted * (positions < byte_count)
+    return stuff_resident_entropy_octets(
+        resident_byte_packet(adjusted, byte_count)
+    )
 
 
 def finalize_entropy_scan(scan) -> bytes:
     """Finish one complete packed scan without a byte-aligned carry state."""
 
-    bit_count = int(scan.valid_bits.item())
-    byte_count = (bit_count + 7) // 8
-    octets = scan.octets[:byte_count]
-    remainder = bit_count % 8
-    if remainder:
-        fill = (1 << (8 - remainder)) - 1
-        octets = AbstractTensor.cat(
-            (octets[:-1], octets[-1:] + fill),
-            dim=0,
-        )
-    return tensor_octets_to_bytes(_stuff_entropy_octets(octets))
+    return finalize_entropy_scan_resident(scan).to_bytes()
 
 
 class _EntropyTensorAccumulator:
@@ -425,65 +470,61 @@ def iter_jfif_chunks(
     chroma_ac_table = resources.chroma_ac_table
     for row_start in range(0, height, rows_per_batch):
         row_stop = min(height, row_start + rows_per_batch)
-        # JPEG serialization is a terminal, quantized byte boundary. Recording
-        # thousands of entropy-coding primitives on the training tape retains
-        # intermediates that can never participate in a useful backward pass.
-        with autograd.no_grad():
-            batch = samples[row_start:row_stop]
-            if color:
-                planes = rgb_to_ycbcr(batch)
-                component_coefficients = jpeg_ycbcr_coefficients(
-                    planes,
-                    basis=resources.dct_basis,
-                    quantization=resources.ycbcr_quantization,
-                    zigzag=resources.zigzag,
-                )
-                combined_events = collect_component_block_coefficient_events(
-                    component_coefficients,
-                    max_magnitude_bits=11,
-                    previous_dc=previous_dc,
-                )
-                block_count = component_coefficients[0].reshape(-1, 64).shape[0]
-                y_events = slice_block_coefficient_events(
-                    combined_events, 0, block_count
-                )
-                chroma_events = slice_block_coefficient_events(
-                    combined_events, block_count, block_count * 3
-                )
-                previous_dc = [
-                    component_coefficients[component].reshape(-1, 64)[-1, 0]
-                    for component in range(3)
-                ]
-                scan = encode_baseline_color_component_scan(
-                    y_events,
-                    chroma_events,
-                    luma_dc_table=luma_dc_table,
-                    luma_ac_table=luma_ac_table,
-                    chroma_dc_table=chroma_dc_table,
-                    chroma_ac_table=chroma_ac_table,
-                )
-            else:
-                coefficients = jpeg_luma_coefficients(
-                    batch,
-                    basis=resources.dct_basis,
-                    quantization=resources.luma_quantization,
-                    zigzag=resources.zigzag,
-                )
-                events = collect_block_coefficient_events(
-                    coefficients,
-                    max_magnitude_bits=11,
-                    previous_dc=previous_dc[0],
-                )
-                previous_dc[0] = coefficients.reshape(-1, 64)[-1, 0]
-                scan = encode_baseline_luma_scan(
-                    events,
-                    dc_table=luma_dc_table,
-                    ac_table=luma_ac_table,
-                )
-            encoded = entropy.append(
-                scan,
-                final=row_start == 0 and row_stop == height,
+        batch = samples[row_start:row_stop]
+        if color:
+            planes = rgb_to_ycbcr(batch)
+            component_coefficients = jpeg_ycbcr_coefficients(
+                planes,
+                basis=resources.dct_basis,
+                quantization=resources.ycbcr_quantization,
+                zigzag=resources.zigzag,
             )
+            combined_events = collect_component_block_coefficient_events(
+                component_coefficients,
+                max_magnitude_bits=11,
+                previous_dc=previous_dc,
+            )
+            block_count = component_coefficients[0].reshape(-1, 64).shape[0]
+            y_events = slice_block_coefficient_events(
+                combined_events, 0, block_count
+            )
+            chroma_events = slice_block_coefficient_events(
+                combined_events, block_count, block_count * 3
+            )
+            previous_dc = [
+                component_coefficients[component].reshape(-1, 64)[-1, 0]
+                for component in range(3)
+            ]
+            scan = encode_baseline_color_component_scan(
+                y_events,
+                chroma_events,
+                luma_dc_table=luma_dc_table,
+                luma_ac_table=luma_ac_table,
+                chroma_dc_table=chroma_dc_table,
+                chroma_ac_table=chroma_ac_table,
+            )
+        else:
+            coefficients = jpeg_luma_coefficients(
+                batch,
+                basis=resources.dct_basis,
+                quantization=resources.luma_quantization,
+                zigzag=resources.zigzag,
+            )
+            events = collect_block_coefficient_events(
+                coefficients,
+                max_magnitude_bits=11,
+                previous_dc=previous_dc[0],
+            )
+            previous_dc[0] = coefficients.reshape(-1, 64)[-1, 0]
+            scan = encode_baseline_luma_scan(
+                events,
+                dc_table=luma_dc_table,
+                ac_table=luma_ac_table,
+            )
+        encoded = entropy.append(
+            scan,
+            final=row_start == 0 and row_stop == height,
+        )
         if encoded:
             yield encoded
     tail = entropy.finish()
@@ -529,42 +570,41 @@ def iter_ycbcr_jfif_chunks(
     chroma_ac_table = resources.chroma_ac_table
     for row_start in range(0, height, rows_per_batch):
         row_stop = min(height, row_start + rows_per_batch)
-        with autograd.no_grad():
-            batches = tuple(plane[row_start:row_stop] for plane in planes)
-            component_coefficients = jpeg_ycbcr_coefficients(
-                batches,
-                basis=resources.dct_basis,
-                quantization=resources.ycbcr_quantization,
-                zigzag=resources.zigzag,
-            )
-            combined_events = collect_component_block_coefficient_events(
-                component_coefficients,
-                max_magnitude_bits=11,
-                previous_dc=previous_dc,
-            )
-            block_count = component_coefficients[0].reshape(-1, 64).shape[0]
-            y_events = slice_block_coefficient_events(
-                combined_events, 0, block_count
-            )
-            chroma_events = slice_block_coefficient_events(
-                combined_events, block_count, block_count * 3
-            )
-            previous_dc = [
-                component_coefficients[component].reshape(-1, 64)[-1, 0]
-                for component in range(3)
-            ]
-            scan = encode_baseline_color_component_scan(
-                y_events,
-                chroma_events,
-                luma_dc_table=luma_dc_table,
-                luma_ac_table=luma_ac_table,
-                chroma_dc_table=chroma_dc_table,
-                chroma_ac_table=chroma_ac_table,
-            )
-            encoded = entropy.append(
-                scan,
-                final=row_start == 0 and row_stop == height,
-            )
+        batches = tuple(plane[row_start:row_stop] for plane in planes)
+        component_coefficients = jpeg_ycbcr_coefficients(
+            batches,
+            basis=resources.dct_basis,
+            quantization=resources.ycbcr_quantization,
+            zigzag=resources.zigzag,
+        )
+        combined_events = collect_component_block_coefficient_events(
+            component_coefficients,
+            max_magnitude_bits=11,
+            previous_dc=previous_dc,
+        )
+        block_count = component_coefficients[0].reshape(-1, 64).shape[0]
+        y_events = slice_block_coefficient_events(
+            combined_events, 0, block_count
+        )
+        chroma_events = slice_block_coefficient_events(
+            combined_events, block_count, block_count * 3
+        )
+        previous_dc = [
+            component_coefficients[component].reshape(-1, 64)[-1, 0]
+            for component in range(3)
+        ]
+        scan = encode_baseline_color_component_scan(
+            y_events,
+            chroma_events,
+            luma_dc_table=luma_dc_table,
+            luma_ac_table=luma_ac_table,
+            chroma_dc_table=chroma_dc_table,
+            chroma_ac_table=chroma_ac_table,
+        )
+        encoded = entropy.append(
+            scan,
+            final=row_start == 0 and row_stop == height,
+        )
         if encoded:
             yield encoded
     tail = entropy.finish()
@@ -646,6 +686,95 @@ def encode_jfif(
     )
 
 
+def encode_jfif_resident(
+    samples: AbstractTensor,
+    *,
+    resources: JPEGEncodingResources | None = None,
+) -> ResidentBytePacket:
+    """Encode one complete JFIF as resident capacity plus logical byte count.
+
+    Unlike ``encode_jfif``, this is a numerical compiler boundary: it performs
+    no ``tolist()``, ``bytes()``, file I/O, or scalar host read.  The fixed
+    allocation may be larger than the serialized packet; ``byte_count`` is the
+    device value consumed by a shell stream descriptor.
+    """
+
+    if not isinstance(samples, AbstractTensor):
+        raise TypeError("samples must be an AbstractTensor")
+    color = samples.ndims() == 3 and samples.shape[-1] == 3
+    if not color and samples.ndims() != 2:
+        raise ValueError(
+            "JFIF input must have shape (height, width) or (height, width, 3)"
+        )
+    height, width = _validate_frame(samples, color=color)
+    resources = resources or prepare_jpeg_encoding_resources(samples)
+    if color:
+        planes = rgb_to_ycbcr(samples)
+        coefficients = jpeg_ycbcr_coefficients(
+            planes,
+            basis=resources.dct_basis,
+            quantization=resources.ycbcr_quantization,
+            zigzag=resources.zigzag,
+        )
+        events = collect_component_block_coefficient_events(
+            coefficients,
+            max_magnitude_bits=11,
+            previous_dc=(0, 0, 0),
+        )
+        block_count = coefficients[0].reshape(-1, 64).shape[0]
+        scan = encode_baseline_color_component_scan(
+            slice_block_coefficient_events(events, 0, block_count),
+            slice_block_coefficient_events(
+                events,
+                block_count,
+                block_count * 3,
+            ),
+            luma_dc_table=resources.luma_dc_table,
+            luma_ac_table=resources.luma_ac_table,
+            chroma_dc_table=resources.chroma_dc_table,
+            chroma_ac_table=resources.chroma_ac_table,
+        )
+        header = _color_header(height, width)
+    else:
+        coefficients = jpeg_luma_coefficients(
+            samples,
+            basis=resources.dct_basis,
+            quantization=resources.luma_quantization,
+            zigzag=resources.zigzag,
+        )
+        events = collect_block_coefficient_events(
+            coefficients,
+            max_magnitude_bits=11,
+            previous_dc=0,
+        )
+        scan = encode_baseline_luma_scan(
+            events,
+            dc_table=resources.luma_dc_table,
+            ac_table=resources.luma_ac_table,
+        )
+        header = _grayscale_header(height, width)
+
+    def static_packet(payload: bytes) -> ResidentBytePacket:
+        octets = samples.ensure_tensor(tuple(payload)).to_dtype("int64")
+        # Keep both aggregate fields as explicit caller-side tensor producers.
+        # Branch-sensitive hierarchy projection must not mistake the
+        # constructor's scalar parameter identity for the tensor created from
+        # that scalar inside a selected branch.
+        byte_count = AbstractTensor.full(
+            (1,),
+            len(payload),
+            dtype="int64",
+            cls=type(samples),
+        )
+        return resident_byte_packet(octets, byte_count)
+
+    return concatenate_resident_byte_packets((
+        static_packet(header),
+        finalize_entropy_scan_resident(scan),
+        static_packet(b"\xFF\xD9"),
+    ))
+
+
 def write_grayscale_jfif(
     path: str | Path,
     samples: AbstractTensor,
@@ -679,6 +808,7 @@ __all__ = [
     "encode_color_jfif",
     "encode_grayscale_jfif",
     "encode_jfif",
+    "encode_jfif_resident",
     "encode_ycbcr_jfif",
     "iter_jfif_chunks",
     "iter_ycbcr_jfif_chunks",

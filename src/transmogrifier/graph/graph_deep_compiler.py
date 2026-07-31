@@ -14,7 +14,7 @@ Example
 """
 from __future__ import annotations
 
-import textwrap, inspect, hashlib, types
+import enum, textwrap, inspect, hashlib, types
 from typing import Any, Callable, Dict, List, Tuple
 
 import networkx as nx
@@ -44,13 +44,47 @@ def _graph_input_name(label: str) -> str:
     return f"{prefix}{name}"
 
 
+def _is_emittable_literal(value: Any) -> bool:
+    """True when ``repr(value)`` is a closed literal with no runtime symbols.
+
+    ProcessGraph constants may contain immutable structural tuples (for
+    example, JPEG quantization tables).  They are data owned by the compiled
+    program, not Python callables or names to resolve at runtime.  Validate
+    every leaf before embedding the representation so accepting a tuple
+    cannot become a route for smuggling arbitrary Python objects into a
+    compiled shell.
+    """
+
+    if value is Ellipsis or isinstance(
+        value, (str, bytes, int, float, complex, bool, type(None))
+    ):
+        return True
+    if isinstance(value, (tuple, list)):
+        return all(_is_emittable_literal(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _is_emittable_literal(key) and _is_emittable_literal(item)
+            for key, item in value.items()
+        )
+    return False
+
+
 class GraphDeepCompiler:
     """Compile a *level‑sorted* ProcessGraph into one Python function."""
 
     #: attribute names we expect on ProcessGraph nodes
     _REQ = ("type", "label", "parents")
 
-    def __init__(self, pg: "ProcessGraph", op_table: Dict[str, Callable], signatures: Dict[str, Dict[str, Any]]):
+    def __init__(
+        self,
+        pg: "ProcessGraph",
+        op_table: Dict[str, Callable],
+        signatures: Dict[str, Dict[str, Any]],
+        *,
+        node_observer: Callable[
+            [int, tuple[int, ...], tuple[Any, ...], Any], Any
+        ] | None = None,
+    ):
         self.pg        = pg
         self.op_table  = op_table
         self.op_table["Store"] = lambda a: a  # Store just returns its input
@@ -62,6 +96,13 @@ class GraphDeepCompiler:
         self._code     = None          # str
         self._fn       = None          # compiled callable
         self.signatures = signatures
+        # This optional compilation observer receives the already-authoritative
+        # ProcessGraph node identity and that node's immediate result.  It is
+        # deliberately not a graph builder: it may correlate a backend's
+        # primitive implementation occurrence with the planned node while a
+        # one-shot forward capture is active, but it cannot add dependencies,
+        # infer aliases, inspect values, or change the result.
+        self.node_observer = node_observer
     # ------------------------------------------------------------------
     # public api
     # ------------------------------------------------------------------
@@ -217,6 +258,43 @@ class GraphDeepCompiler:
         lines: List[str] = ["def graph_fn(**inputs):"]
         env: Dict[str, Any] = {}
         indent = " " * 4
+        if self.node_observer is not None:
+            env["_observe_process_graph_node"] = self.node_observer
+
+        def observe(
+            nid: int,
+            parent_ids: tuple[int, ...],
+            expression: str,
+        ) -> str:
+            if self.node_observer is None:
+                return expression
+            def operand_leaves(parent_id: int) -> tuple[int, ...]:
+                parent = G.nodes[int(parent_id)]
+                if parent.get("type") not in {"List", "Tuple"}:
+                    return (int(parent_id),)
+                leaves = []
+                for child, role in parent.get("parents", ()):
+                    if str(role) in {"elts", "element", "item"}:
+                        leaves.extend(operand_leaves(int(child)))
+                return tuple(leaves)
+
+            parent_ids = tuple(
+                leaf
+                for parent_id in parent_ids
+                for leaf in operand_leaves(int(parent_id))
+            )
+            parent_values = (
+                "("
+                + ", ".join(f"v{parent}" for parent in parent_ids)
+                + ("," if len(parent_ids) == 1 else "")
+                + ")"
+            )
+            return (
+                f"_observe_process_graph_node("
+                f"{int(nid)}, {tuple(map(int, parent_ids))!r}, "
+                f"{parent_values}, "
+                f"{expression})"
+            )
 
 
         for nid in run_order:
@@ -254,12 +332,15 @@ class GraphDeepCompiler:
                             f"{ntype} node {nid} has no literal payload"
                         )
                     literal = expression.value
+                # IntEnum reprs name their defining Python type and are not
+                # valid standalone source expressions.  The graph constant is
+                # the integer value; do not retain or resolve the enum class
+                # as a runtime symbol in the compiled shell.
+                if isinstance(literal, enum.IntEnum):
+                    literal = int(literal)
                 if isinstance(literal, str):
                     literal = literal.encode("utf-8")
-                if literal is not Ellipsis and not isinstance(
-                    literal,
-                    (bytes, int, float, complex, bool, type(None)),
-                ):
+                if not _is_emittable_literal(literal):
                     raise TypeError(
                         f"{ntype} node {nid} has unsupported literal type "
                         f"{type(literal).__name__}"
@@ -273,7 +354,31 @@ class GraphDeepCompiler:
                 # these are simple operators we can directly code them
                 lhs = f"v{nid}"
                 rhs = f" {op_map} ".join(f"v{pid}" for pid, _ in node["parents"])
-                lines.append(f"{indent}{lhs} = {rhs}")
+                lines.append(
+                    f"{indent}{lhs} = {observe(nid, tuple(parent for parent, _role in role_parents), rhs)}"
+                )
+                continue
+            elif ntype in {"List", "Tuple"}:
+                elements = ", ".join(
+                    f"v{parent}"
+                    for parent, role in role_parents
+                    if str(role) in {"elts", "element", "item"}
+                )
+                if ntype == "List":
+                    expression = f"[{elements}]"
+                else:
+                    expression = (
+                        f"({elements},)"
+                        if len([
+                            parent
+                            for parent, role in role_parents
+                            if str(role) in {"elts", "element", "item"}
+                        ]) == 1
+                        else f"({elements})"
+                    )
+                lines.append(
+                    f"{indent}{lhs} = {observe(nid, tuple(parent for parent, _role in role_parents), expression)}"
+                )
                 continue
             elif ntype == "Call":
                 attributes = dict(node.get("attributes") or {})
@@ -331,7 +436,8 @@ class GraphDeepCompiler:
                     )
                 arguments = ", ".join((*positional, *keywords))
                 lines.append(
-                    f"{indent}{lhs} = {callee_expression}({arguments})"
+                    f"{indent}{lhs} = "
+                    f"{observe(nid, tuple(parent for parent, role in role_parents if role not in {'func', 'callee'}), f'{callee_expression}({arguments})')}"
                 )
                 continue
             else:
@@ -365,7 +471,10 @@ class GraphDeepCompiler:
                     args = f"[{', '.join(f'v{pid}' for pid,_ in node['parents'])}]"
                 else:
                     args = ", ".join(f"v{pid}" for pid, _ in node["parents"])
-                lines.append(f"{indent}{lhs} = {fn_name}({args})")
+                lines.append(
+                    f"{indent}{lhs} = "
+                    f"{observe(nid, tuple((*positional_parents, *(parent for parent, _name in keyword_parents))), f'{fn_name}({args})')}"
+                )
 
         #  final return – collect nodes marked as outputs / Store
         outputs = [n for n, data in G.nodes(data=True)
