@@ -314,7 +314,7 @@ def _shim_source(
     arg_count: int,
     output_count: int,
     extent_names: tuple[str, ...],
-    element_counts: tuple[int, ...],
+    shapes: tuple[tuple[int, ...], ...],
     kernel_module: str,
 ) -> str:
     """The launch boundary, in Fortran.
@@ -337,18 +337,30 @@ def _shim_source(
         [f"{value}_c_int" for value in extent_values]
         + [f"argument_{index}" for index in range(total)]
     )
+    def element_count(shape: tuple[int, ...]) -> int:
+        total_elements = 1
+        for size in shape:
+            total_elements *= int(size)
+        return total_elements
+
+    # A reduction's result is a scalar, not a one-element array, and its
+    # dummy is declared scalar to match; binding it as rank-1 is a rank
+    # mismatch the compiler rejects outright. Arrays bind as rank-1 over
+    # their element count -- sequence association then passes a contiguous
+    # rank-1 actual to an explicit-shape dummy of any rank.
     pointer_declarations = [
-        f"    real(c_double), pointer :: argument_{index}(:)"
-        for index in range(total)
+        f"    real(c_double), pointer :: argument_{index}"
+        + ("" if not shape else "(:)")
+        for index, shape in enumerate(shapes)
     ]
-    # Each handle is bound as a rank-1 array over its own element count. The
-    # kernel's dummies restate the real ranks from their own extents, and
-    # Fortran's sequence association passes a contiguous rank-1 actual to an
-    # explicit-shape dummy of any rank with the same element count.
     pointer_bindings = [
-        f"    call c_f_pointer(handles({index + 1}), argument_{index}, "
-        f"[{max(int(count), 1)}])"
-        for index, count in enumerate(element_counts)
+        f"    call c_f_pointer(handles({index + 1}), argument_{index})"
+        if not shape
+        else (
+            f"    call c_f_pointer(handles({index + 1}), argument_{index}, "
+            f"[{max(element_count(shape), 1)}])"
+        )
+        for index, shape in enumerate(shapes)
     ]
     return "\n".join(
         (
@@ -497,21 +509,15 @@ def compile_torture_case_to_fortran(
             raise FortranJITShortfall(
                 "; ".join(shortfall.format() for shortfall in module.shortfalls)
             )
-        def element_count(shape) -> int:
-            total = 1
-            for size in shape:
-                total *= int(size)
-            return total
-
         shim = _shim_source(
             fortran_name=function_name,
             shell_name=shell_name,
             arg_count=len(feed_names),
             output_count=len(outputs),
             extent_names=extent_names,
-            element_counts=(
-                *(element_count(value.shape) for value in function.args),
-                *(element_count(value.shape) for value in output_values),
+            shapes=(
+                *(tuple(value.shape) for value in function.args),
+                *(tuple(value.shape) for value in output_values),
             ),
             kernel_module="turing_torture_fortran",
         )

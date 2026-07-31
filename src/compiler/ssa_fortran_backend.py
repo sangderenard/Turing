@@ -330,7 +330,9 @@ class _FunctionEmitter:
             return False
         return uses[0][0] == block.name
 
-    def _structural(self, instr: Instr, args: list[str]) -> str | None:
+    def _structural(
+        self, instr: Instr, args: list[str], op: str | None = None
+    ) -> str | None:
         """Shape-and-layout ops, as native Fortran array expressions.
 
         These are not elementwise, so they are absent from the intrinsic
@@ -340,7 +342,11 @@ class _FunctionEmitter:
         is reported as a shortfall rather than guessed at.
         """
 
-        operation = instr.attributes.get("tensor_operation")
+        # The precompile lowering wraps ops in Handler.Call and records the
+        # canonical name under "tensor_operation"; the tape JIT builds the
+        # instruction with that name as its opcode directly. Both name the
+        # same operation, so both resolve here rather than in two emitters.
+        operation = instr.attributes.get("tensor_operation") or op or instr.op
         if instr.res is None:
             return None
         attributes = instr.attributes
@@ -437,7 +443,7 @@ class _FunctionEmitter:
         ``_expression``.
         """
 
-        operation = instr.attributes.get("tensor_operation")
+        operation = instr.attributes.get("tensor_operation") or instr.op
         if (
             operation not in ("cumsum", "scatter", "stack", "concat")
             or instr.res is None
@@ -550,7 +556,7 @@ class _FunctionEmitter:
                 return _literal(instr.attributes["value"])
             return _literal(constant)
 
-        structural = self._structural(instr, args)
+        structural = self._structural(instr, args, op)
         if structural is not None:
             return structural
 
