@@ -97,12 +97,37 @@ class CapturedTortureCase:
     outputs: Mapping[str, Any]
 
 
-def _isolated_cases() -> tuple[TensorTortureCase, ...]:
-    signed = np.linspace(-1.75, 2.25, 24, dtype=np.float64).reshape(4, 6)
-    positive = np.linspace(0.125, 3.0, 24, dtype=np.float64).reshape(4, 6)
-    other = np.linspace(2.5, -1.0, 24, dtype=np.float64).reshape(4, 6)
-    left = np.linspace(-1.0, 1.0, 15, dtype=np.float64).reshape(3, 5)
-    right = np.linspace(0.25, 1.75, 20, dtype=np.float64).reshape(5, 4)
+def _isolated_cases(
+    *,
+    tier: TortureTier = TortureTier.ISOLATED,
+    shape: tuple[int, int] = (4, 6),
+    matmul_shape: tuple[int, int, int] = (3, 5, 4),
+    name_suffix: str = "",
+) -> tuple[TensorTortureCase, ...]:
+    """The per-operator cases, at whichever size the tier asks for.
+
+    The operator set is the same at every size on purpose: which backend wins
+    is a function of size, so comparing backends only at one shape answers the
+    wrong question.  The large tier reuses these definitions rather than
+    inventing separate ones, so a difference between tiers is a difference in
+    size and nothing else.
+    """
+
+    count = int(np.prod(shape))
+    signed = np.linspace(-1.75, 2.25, count, dtype=np.float64).reshape(shape)
+    positive = np.linspace(0.125, 3.0, count, dtype=np.float64).reshape(shape)
+    other = np.linspace(2.5, -1.0, count, dtype=np.float64).reshape(shape)
+    rows, inner, columns = matmul_shape
+    left = np.linspace(
+        -1.0, 1.0, rows * inner, dtype=np.float64
+    ).reshape(rows, inner)
+    right = np.linspace(
+        0.25, 1.75, inner * columns, dtype=np.float64
+    ).reshape(inner, columns)
+
+    # A rank-3 target for the reshape/permute case, derived from the element
+    # count rather than hard-coded, so the same case works at every tier size.
+    reshape_target = (2, count // (2 * shape[-1]), shape[-1])
 
     def elementwise(
         name: str,
@@ -111,8 +136,8 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
         tensor_operation: Callable[[Any, Any], Any],
     ) -> TensorTortureCase:
         return TensorTortureCase(
-            name=name,
-            tier=TortureTier.ISOLATED,
+            name=name + name_suffix,
+            tier=tier,
             inputs={"left": signed, "right": other},
             numpy_program=lambda values: {
                 "result": numpy_operation(values["left"], values["right"])
@@ -130,8 +155,8 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
         tensor_operation: Callable[[Any], Any],
     ) -> TensorTortureCase:
         return TensorTortureCase(
-            name=name,
-            tier=TortureTier.ISOLATED,
+            name=name + name_suffix,
+            tier=tier,
             inputs={"value": source},
             numpy_program=lambda values: {
                 "result": numpy_operation(values["value"])
@@ -167,16 +192,16 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
         unary("cos", signed, np.cos, lambda value: value.cos()),
         unary("tan", signed * 0.4, np.tan, lambda value: value.tan()),
         TensorTortureCase(
-            name="scalar_broadcast",
-            tier=TortureTier.ISOLATED,
+            name="scalar_broadcast" + name_suffix,
+            tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {"result": values["value"] * 1.75 + 0.25},
             tensor_program=lambda values: {"result": values["value"] * 1.75 + 0.25},
             operations=("mul", "add"),
         ),
         TensorTortureCase(
-            name="where",
-            tier=TortureTier.ISOLATED,
+            name="where" + name_suffix,
+            tier=tier,
             inputs={"left": signed, "right": other},
             numpy_program=lambda values: {
                 "result": np.where(
@@ -195,16 +220,16 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
             operations=("greater", "where"),
         ),
         TensorTortureCase(
-            name="flat_sum",
-            tier=TortureTier.ISOLATED,
+            name="flat_sum" + name_suffix,
+            tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {"result": values["value"].sum()},
             tensor_program=lambda values: {"result": values["value"].sum()},
             operations=("sum",),
         ),
         TensorTortureCase(
-            name="dim_sum",
-            tier=TortureTier.ISOLATED,
+            name="dim_sum" + name_suffix,
+            tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {
                 "result": values["value"].sum(axis=1, keepdims=True)
@@ -215,8 +240,8 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
             operations=("sum",),
         ),
         TensorTortureCase(
-            name="cumsum",
-            tier=TortureTier.ISOLATED,
+            name="cumsum" + name_suffix,
+            tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {
                 "result": values["value"].cumsum(axis=1)
@@ -225,8 +250,8 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
             operations=("cumsum",),
         ),
         TensorTortureCase(
-            name="matmul",
-            tier=TortureTier.ISOLATED,
+            name="matmul" + name_suffix,
+            tier=tier,
             inputs={"left": left, "right": right},
             numpy_program=lambda values: {
                 "result": values["left"] @ values["right"]
@@ -237,20 +262,24 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
             operations=("matmul",),
         ),
         TensorTortureCase(
-            name="reshape_transpose",
-            tier=TortureTier.ISOLATED,
+            name="reshape_transpose" + name_suffix,
+            tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {
-                "result": values["value"].reshape(2, 3, 4).transpose(2, 0, 1)
+                "result": values["value"]
+                .reshape(*reshape_target)
+                .transpose(2, 0, 1)
             },
             tensor_program=lambda values: {
-                "result": values["value"].reshape(2, 3, 4).permute(2, 0, 1)
+                "result": values["value"]
+                .reshape(*reshape_target)
+                .permute(2, 0, 1)
             },
             operations=("reshape", "permute"),
         ),
         TensorTortureCase(
-            name="stack",
-            tier=TortureTier.ISOLATED,
+            name="stack" + name_suffix,
+            tier=tier,
             inputs={"left": signed, "right": other},
             numpy_program=lambda values: {
                 "result": np.stack((values["left"], values["right"]), axis=1)
@@ -263,8 +292,8 @@ def _isolated_cases() -> tuple[TensorTortureCase, ...]:
             operations=("stack",),
         ),
         TensorTortureCase(
-            name="cat",
-            tier=TortureTier.ISOLATED,
+            name="cat" + name_suffix,
+            tier=tier,
             inputs={"left": signed, "right": other},
             numpy_program=lambda values: {
                 "result": np.concatenate((values["left"], values["right"]), axis=0)
@@ -385,6 +414,13 @@ def _advanced_case() -> TensorTortureCase:
     )
 
 
+# One megaelement per operand: past every cache level, so the large tier
+# measures memory behaviour rather than launch overhead.  Matmul is sized
+# separately because its cost is cubic and it would otherwise dominate the run.
+LARGE_SHAPE = (1024, 1024)
+LARGE_MATMUL_SHAPE = (256, 256, 256)
+
+
 def _large_cases() -> tuple[TensorTortureCase, ...]:
     frame_shape = (8, 512, 512)
     count = int(np.prod(frame_shape))
@@ -483,7 +519,19 @@ def tensor_torture_cases(
     include_large: bool = False,
 ) -> tuple[TensorTortureCase, ...]:
     cases = (*_isolated_cases(), _grab_bag_case(), _advanced_case())
-    return (*cases, *_large_cases()) if include_large else cases
+    if not include_large:
+        return cases
+    # The same operators again at size, plus the bespoke frame/reduction cases.
+    return (
+        *cases,
+        *_isolated_cases(
+            tier=TortureTier.LARGE,
+            shape=LARGE_SHAPE,
+            matmul_shape=LARGE_MATMUL_SHAPE,
+            name_suffix="_large",
+        ),
+        *_large_cases(),
+    )
 
 
 def eager_backend_result(

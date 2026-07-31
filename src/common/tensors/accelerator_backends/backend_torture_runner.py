@@ -97,6 +97,7 @@ def _run_one(
     compile_only: bool,
     trig_solver: str,
     trig_epsilon: float | None,
+    llvm_profile: Any | None = None,
 ) -> TortureMatrixRow:
     compile_started = perf_counter_ns()
     execute_ns = 0
@@ -147,6 +148,7 @@ def _run_one(
                 compiled = compile_torture_case_to_llvm(
                     captured,
                     cache=cache,
+                    llvm_profile=llvm_profile,
                     trig_solver=trig_solver,
                     trig_epsilon=trig_epsilon,
                 )
@@ -209,6 +211,17 @@ def _run_one(
         )
 
 
+def _resolve_llvm_profile(name: str):
+    """Map the CLI name onto an optimization profile."""
+
+    from ....compiler.llvm_optimizing_pipeline import (
+        REFERENCE_PROFILE,
+        tuned_host_profile,
+    )
+
+    return REFERENCE_PROFILE if name == "reference" else tuned_host_profile()
+
+
 def run_torture_matrix(
     *,
     backends: Iterable[str] = BACKENDS,
@@ -218,6 +231,7 @@ def run_torture_matrix(
     trig_solver: str = "libm",
     trig_epsilon: float | None = None,
     cache: RepositoryArtifactCache | None = None,
+    llvm_profile: Any | None = None,
 ) -> tuple[TortureMatrixRow, ...]:
     selected_backends = tuple(backends)
     unknown = set(selected_backends) - set(BACKENDS)
@@ -246,6 +260,7 @@ def run_torture_matrix(
             compile_only=compile_only,
             trig_solver=trig_solver,
             trig_epsilon=trig_epsilon,
+            llvm_profile=llvm_profile,
         )
         for case in cases
         for backend in selected_backends
@@ -295,6 +310,17 @@ def main(argv: list[str] | None = None) -> int:
         default="libm",
     )
     parser.add_argument("--trig-epsilon", type=float)
+    parser.add_argument(
+        "--llvm-profile",
+        choices=("tuned", "reference"),
+        default="tuned",
+        help=(
+            "LLVM codegen settings. 'tuned' runs -O3 with the host CPU named, "
+            "noalias asserted, and the host's preferred vector width; "
+            "'reference' is the unoptimized opt=0 path, kept as a "
+            "differential baseline."
+        ),
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args(argv)
 
@@ -305,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
         compile_only=args.compile_only,
         trig_solver=args.trig_solver,
         trig_epsilon=args.trig_epsilon,
+        llvm_profile=_resolve_llvm_profile(args.llvm_profile),
     )
     print(format_torture_matrix(rows))
     report_path = args.json

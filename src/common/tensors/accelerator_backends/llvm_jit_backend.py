@@ -208,17 +208,36 @@ def compile_torture_case_to_llvm(
     trig_solver: str = "libm",
     trig_epsilon: float | None = None,
     cache: RepositoryArtifactCache | None = None,
+    llvm_profile: Any | None = None,
 ) -> LLVMJITProgram:
-    """Compile one complete case without running LLVM optimization passes."""
+    """Compile one complete case.
+
+    Codegen runs the tuned host profile by default: -O3, the host CPU named,
+    noalias asserted on kernel buffers, and the vector width the host executes
+    at full rate.  Pass ``llvm_profile=REFERENCE_PROFILE`` for the previous
+    unoptimized behaviour, which remains useful as a differential reference.
+    """
+
+    from ....compiler.llvm_optimizing_pipeline import tuned_host_profile
 
     cache = cache or RepositoryArtifactCache()
+    resolved_profile = llvm_profile or tuned_host_profile()
     function_name = "turing_torture_compute"
     shell_name = "turing_torture_c_shell_entry"
     record = {
         "case": captured.case.semantic_record(),
         "compiler": "turing-direct-c-kernel-llvm",
         "implementation": _llvm_implementation_digest(),
-        "optimization": False,
+        # The optimization settings are part of the artifact identity.  A bare
+        # False here would let an opt=0 module be served from cache for a tuned
+        # request, silently returning code the caller did not ask for.
+        "optimization": {
+            "opt": resolved_profile.opt,
+            "host_cpu": resolved_profile.use_host_cpu,
+            "noalias": resolved_profile.annotate_noalias,
+            "fast_math": resolved_profile.fast_math,
+            "vector_width": resolved_profile.prefer_vector_width,
+        },
         "trig_solver": str(trig_solver),
         "trig_epsilon": trig_epsilon,
         "machine": platform.machine(),
@@ -314,6 +333,7 @@ def compile_torture_case_to_llvm(
         outputs=outputs,
         workspace_sizes=workspace_sizes,
         cache_artifact=stored,
+        _llvm_profile=resolved_profile,
     )
 
 
