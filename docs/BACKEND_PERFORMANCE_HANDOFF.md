@@ -198,14 +198,33 @@ Each of these cost real time this session.
 
 ## 6. Open work
 
-### Immediate, small, and changes existing numbers
+### Done since the numbers above were measured
 
-**Torch rows are CPU-only.** `torch 2.5.1+cu124`, CUDA available, RTX 3060 with
-28 SMs present — but `PyTorchTensorOperations` defaults to
-`AbstractTensor._preferred_device or "cpu"`. Every `torch` row in the matrix so
-far is torch-CPU, which is why it looks catastrophic. Add a `torch_cuda` backend
-(and fix the `torch` row's device selection) before drawing any GPU conclusion.
-The published torch numbers are currently misleading.
+**`torch_cuda` backend.** `BACKENDS` in `backend_torture_runner.py` now has a
+`torch_cuda` entry that threads `device="cuda"` through to
+`PyTorchTensorOperations` (`eager_backend_result` gained a `device` kwarg); it
+raises rather than silently falling back if CUDA is unavailable. The plain
+`torch` row is unchanged (still CPU) so the two are directly comparable. The
+matrix in section 3 above still reflects the old torch-CPU-only numbers — a
+GPU-conclusion rerun of the fused chain and the 15×9×4 sweep with `torch_cuda`
+included is still open.
+
+**`fortran` torture backend row.** `fortran_jit_backend.py` bridges a captured
+tape straight into an SSA `Function`
+(`ssa_fortran_backend.py`'s `emit_module`/`compile_module` machinery), links a
+generated C shim into the same `turing_compute_closure` ABI the C/LLVM
+backends use, and loads the result with `ctypes.CDLL` — not cffi, on purpose:
+`ffi.verify` is the 10x-slower path this doc's own numbers (section 3, "native
+compile vs cffi") rule out. Only elementwise-shaped tapes are covered: the
+Fortran emitter declares every array dummy over one shared extent, so
+anything shape-changing (matmul, permute, cumsum along an axis, stack, cat,
+dim-scoped reductions) reports a `FortranJITShortfall` instead of being
+guessed at. All of the isolated-tier elementwise cases, `where`, `flat_sum`,
+`operator_grab_bag`, and — the one that matters for section 3's headline
+number — `fused_chain` all pass. Not yet run against the large tier or folded
+into a fresh fused-chain comparison table.
+
+### Immediate, small, and changes existing numbers
 
 ### Threading in the C++ shell
 
@@ -240,16 +259,16 @@ no code. This is a from-scratch binary-format target; read those two docs first.
 
 ### Smaller items
 
-- **Fortran torture backend row.** The Fortran *control target* is done; a
-  `fortran` entry in `BACKENDS` needs a `FusedProgram` → Fortran bridge, since
-  `ssa_fortran_backend` lowers from an SSA `Function`, not a captured program.
 - **Arithmetic-only fused chain.** The existing chain is transcendental-heavy,
   where fusion cannot win. `llvm_jit` already beats raw NumPy on single-op `add`
   (4.7 ms vs 15.2 ms at 1M), so a 15-op arithmetic chain should show fusion's
   real case. Add it beside the current one.
 - **Structural ops in the Fortran emitter.** `reshape`, `cat`, `stack`,
-  `permute`, `cumsum` are reported as shortfalls, not silently wrong. The
-  emitter models flat 1-D arrays; these need real shape modelling.
+  `permute`, `cumsum` (and anything mixing array extents, e.g. `matmul`,
+  `dim_sum`) are reported as `FortranJITShortfall`s by `fortran_jit_backend.py`,
+  not silently wrong. The emitter declares every array over one shared
+  extent; these need real shape modelling before they can be more than a
+  shortfall.
 - **Full-matrix crash.** All backends × all three default tiers in one process
   exits 255. Each backend alone and each tier alone pass. Looks like cumulative
   resource exhaustion across GPU contexts, JIT allocations and cffi modules.

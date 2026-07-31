@@ -50,7 +50,12 @@ def _v1_valuewise(self, op: str, *, annotate: Dict[str, Any] | None = None):
             return out
     flat = self.reshape(-1).tolist()
     K = self._scalar_kernel(op)
-    out = [K(self._as_scalar(a)) for a in flat]
+    # tolist() already guarantees plain Python scalars (that is its whole
+    # contract, on every backend) -- routing each one through _as_scalar's
+    # try/except .item() is a no-op that only pays for the failed attempt.
+    # Across a real-sized tensor that failed-exception cost, not the
+    # comparison itself, was the actual bottleneck.
+    out = [K(a) for a in flat]
     out = self.ensure_tensor(out).reshape(*self.get_shape())
     out = finalize(out)
     tape = getattr(out, "_tape", None)
@@ -122,7 +127,10 @@ def _v2_valuewise(
     lifted = {"left": left_lift, "right": right_lift}
 
     K = self._scalar_kernel(op)
-    out = [K(self._as_scalar(a[i]), self._as_scalar(b[i])) for i in range(target)]
+    # Same reasoning as _v1_valuewise: a/b came from tolist(), so they are
+    # already plain scalars -- the per-element _as_scalar try/except was
+    # pure waste, not part of the comparison's actual cost.
+    out = [K(x, y) for x, y in zip(a, b)]
     shape = self.get_shape() if na == target else other_t.get_shape()
     out = self.ensure_tensor(out).reshape(shape)
     out = finalize(out)
@@ -188,7 +196,9 @@ def _v3_valuewise(
     c, liftC = lift(c, "cond", allow_div=True)
 
     K = self._scalar_kernel("where")
-    out = [K(self._as_scalar(c[i]), self._as_scalar(A[i]), self._as_scalar(B[i])) for i in range(target)]
+    # Same reasoning as _v2_valuewise: c/A/B came from tolist(), already
+    # plain scalars -- skip the no-op try/except unwrap per element.
+    out = [K(*triple) for triple in zip(c, A, B)]
 
     # Determine result shape using the operand that originally carried the target length
     if orig_len_a == target and orig_len_a != 1:

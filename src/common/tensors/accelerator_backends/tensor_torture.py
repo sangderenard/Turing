@@ -49,6 +49,15 @@ class TensorTortureCase:
     operations: tuple[str, ...]
     rtol: float = 1.0e-5
     atol: float = 1.0e-6
+    # Real `def` source for the AOT precompiler path
+    # (accelerator_backends.aot_compile.compile_ast_aot), which needs actual
+    # parseable Python source -- not a lambda closure -- and, per the one
+    # verified working shape, an entrypoint that calls another function
+    # rather than computing its result inline. None for cases not expressed
+    # this way; the AOT backends report those as unsupported rather than
+    # guess at a translation.
+    ast_source: str | None = None
+    ast_entrypoint: str | None = None
 
     def numpy_reference(self) -> dict[str, np.ndarray]:
         outputs = self.numpy_program(
@@ -144,11 +153,35 @@ def _isolated_cases(
             f"reshape target {reshape_target} does not hold {count} elements"
         )
 
+    def _binary_ast_source(op_name: str, expression: str) -> str:
+        # Two functions, not one: the AOT precompiler
+        # (accelerator_backends.aot_compile.compile_ast_aot) only has a
+        # verified-working shape when the entrypoint calls another function
+        # rather than computing its result inline.
+        return (
+            f"def {op_name}(left, right):\n"
+            f"    return {expression}\n"
+            "\n"
+            "def compute(left, right):\n"
+            f"    return {op_name}(left=left, right=right)\n"
+        )
+
+    def _unary_ast_source(op_name: str, expression: str) -> str:
+        return (
+            f"def {op_name}(value):\n"
+            f"    return {expression}\n"
+            "\n"
+            "def compute(value):\n"
+            f"    return {op_name}(value=value)\n"
+        )
+
     def elementwise(
         name: str,
         operation: str,
         numpy_operation: Callable[[np.ndarray, np.ndarray], Any],
         tensor_operation: Callable[[Any, Any], Any],
+        *,
+        ast_expression: str | None = None,
     ) -> TensorTortureCase:
         return TensorTortureCase(
             name=name + name_suffix,
@@ -161,6 +194,12 @@ def _isolated_cases(
                 "result": tensor_operation(values["left"], values["right"])
             },
             operations=(operation,),
+            ast_source=(
+                _binary_ast_source(name, ast_expression)
+                if ast_expression is not None
+                else None
+            ),
+            ast_entrypoint="compute" if ast_expression is not None else None,
         )
 
     def unary(
@@ -168,6 +207,8 @@ def _isolated_cases(
         source: np.ndarray,
         numpy_operation: Callable[[np.ndarray], Any],
         tensor_operation: Callable[[Any], Any],
+        *,
+        ast_expression: str | None = None,
     ) -> TensorTortureCase:
         return TensorTortureCase(
             name=name + name_suffix,
@@ -180,38 +221,92 @@ def _isolated_cases(
                 "result": tensor_operation(values["value"])
             },
             operations=(name,),
+            ast_source=(
+                _unary_ast_source(name, ast_expression)
+                if ast_expression is not None
+                else None
+            ),
+            ast_entrypoint="compute" if ast_expression is not None else None,
         )
 
     cases = [
-        elementwise("add", "add", np.add, lambda a, b: a + b),
-        elementwise("subtract", "sub", np.subtract, lambda a, b: a - b),
-        elementwise("multiply", "mul", np.multiply, lambda a, b: a * b),
+        elementwise(
+            "add", "add", np.add, lambda a, b: a + b,
+            ast_expression="left + right",
+        ),
+        elementwise(
+            "subtract", "sub", np.subtract, lambda a, b: a - b,
+            ast_expression="left - right",
+        ),
+        elementwise(
+            "multiply", "mul", np.multiply, lambda a, b: a * b,
+            ast_expression="left * right",
+        ),
         elementwise(
             "divide",
             "truediv",
             lambda a, b: a / (np.abs(b) + 1.0),
             lambda a, b: a / (b.abs() + 1.0),
+            ast_expression="left / (right.abs() + 1.0)",
         ),
-        elementwise("maximum", "maximum", np.maximum, lambda a, b: a.maximum(b)),
-        elementwise("minimum", "minimum", np.minimum, lambda a, b: a.minimum(b)),
-        elementwise("less", "less", np.less, lambda a, b: a < b),
         elementwise(
-            "greater_equal", "greater_equal", np.greater_equal, lambda a, b: a >= b
+            "maximum", "maximum", np.maximum, lambda a, b: a.maximum(b),
+            ast_expression="left.maximum(right)",
         ),
-        unary("neg", signed, np.negative, lambda value: -value),
-        unary("abs", signed, np.abs, lambda value: value.abs()),
-        unary("sqrt", positive, np.sqrt, lambda value: value.sqrt()),
-        unary("exp", signed, np.exp, lambda value: value.exp()),
-        unary("log", positive, np.log, lambda value: value.log()),
-        unary("sin", signed, np.sin, lambda value: value.sin()),
-        unary("cos", signed, np.cos, lambda value: value.cos()),
-        unary("tan", signed * 0.4, np.tan, lambda value: value.tan()),
+        elementwise(
+            "minimum", "minimum", np.minimum, lambda a, b: a.minimum(b),
+            ast_expression="left.minimum(right)",
+        ),
+        elementwise(
+            "less", "less", np.less, lambda a, b: a < b,
+            ast_expression="left < right",
+        ),
+        elementwise(
+            "greater_equal", "greater_equal", np.greater_equal, lambda a, b: a >= b,
+            ast_expression="left >= right",
+        ),
+        unary(
+            "neg", signed, np.negative, lambda value: -value,
+            ast_expression="-value",
+        ),
+        unary(
+            "abs", signed, np.abs, lambda value: value.abs(),
+            ast_expression="value.abs()",
+        ),
+        unary(
+            "sqrt", positive, np.sqrt, lambda value: value.sqrt(),
+            ast_expression="value.sqrt()",
+        ),
+        unary(
+            "exp", signed, np.exp, lambda value: value.exp(),
+            ast_expression="value.exp()",
+        ),
+        unary(
+            "log", positive, np.log, lambda value: value.log(),
+            ast_expression="value.log()",
+        ),
+        unary(
+            "sin", signed, np.sin, lambda value: value.sin(),
+            ast_expression="value.sin()",
+        ),
+        unary(
+            "cos", signed, np.cos, lambda value: value.cos(),
+            ast_expression="value.cos()",
+        ),
+        unary(
+            "tan", signed * 0.4, np.tan, lambda value: value.tan(),
+            ast_expression="value.tan()",
+        ),
         TensorTortureCase(
             name="scalar_broadcast" + name_suffix,
             tier=tier,
             inputs={"value": signed},
             numpy_program=lambda values: {"result": values["value"] * 1.75 + 0.25},
             tensor_program=lambda values: {"result": values["value"] * 1.75 + 0.25},
+            ast_source=_unary_ast_source(
+                "scalar_broadcast", "value * 1.75 + 0.25"
+            ),
+            ast_entrypoint="compute",
             operations=("mul", "add"),
         ),
         TensorTortureCase(
@@ -241,6 +336,8 @@ def _isolated_cases(
             numpy_program=lambda values: {"result": values["value"].sum()},
             tensor_program=lambda values: {"result": values["value"].sum()},
             operations=("sum",),
+            ast_source=_unary_ast_source("flat_sum", "value.sum()"),
+            ast_entrypoint="compute",
         ),
         TensorTortureCase(
             name="dim_sum" + name_suffix,
@@ -253,6 +350,10 @@ def _isolated_cases(
                 "result": values["value"].sum(dim=1, keepdim=True)
             },
             operations=("sum",),
+            ast_source=_unary_ast_source(
+                "dim_sum", "value.sum(dim=1, keepdim=True)"
+            ),
+            ast_entrypoint="compute",
         ),
         TensorTortureCase(
             name="cumsum" + name_suffix,
@@ -263,6 +364,8 @@ def _isolated_cases(
             },
             tensor_program=lambda values: {"result": values["value"].cumsum(1)},
             operations=("cumsum",),
+            ast_source=_unary_ast_source("cumsum_op", "value.cumsum(1)"),
+            ast_entrypoint="compute",
         ),
         TensorTortureCase(
             name="matmul" + name_suffix,
@@ -275,6 +378,8 @@ def _isolated_cases(
                 "result": values["left"] @ values["right"]
             },
             operations=("matmul",),
+            ast_source=_binary_ast_source("matmul_op", "left.matmul(right)"),
+            ast_entrypoint="compute",
         ),
         TensorTortureCase(
             name="reshape_transpose" + name_suffix,
@@ -291,6 +396,12 @@ def _isolated_cases(
                 .permute(2, 0, 1)
             },
             operations=("reshape", "permute"),
+            ast_source=_unary_ast_source(
+                "reshape_transpose_op",
+                f"value.reshape({', '.join(map(str, reshape_target))})"
+                ".permute(2, 0, 1)",
+            ),
+            ast_entrypoint="compute",
         ),
         TensorTortureCase(
             name="stack" + name_suffix,
@@ -636,15 +747,17 @@ def tensor_torture_cases(
 def eager_backend_result(
     case: TensorTortureCase,
     backend_type: type,
+    *,
+    device: str | None = None,
 ) -> dict[str, np.ndarray]:
     values = {
-        name: backend_type.tensor(np.asarray(value).copy())
+        name: backend_type.tensor(np.asarray(value).copy(), device=device)
         for name, value in case.inputs.items()
     }
     outputs = case.tensor_program(values)
     return {
         name: np.asarray(
-            value.numpy() if hasattr(value, "numpy") else value.tolist()
+            value.data.detach().cpu().numpy() if hasattr(getattr(value, "data", None), "detach") else (value.numpy() if hasattr(value, "numpy") else value.tolist())
         )
         for name, value in outputs.items()
     }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import networkx as nx
 
@@ -289,8 +289,10 @@ class _ControlSSABuilder:
         region_signatures: dict[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
+        region_value_meta: Mapping[int, Meta] | None = None,
     ):
         self.program = program
+        self.region_value_meta = dict(region_value_meta or {})
         self.function_name = function_name
         self.next_value_id = int(first_value_id)
         self.blocks: dict[str, BasicBlock] = {}
@@ -345,10 +347,26 @@ class _ControlSSABuilder:
         value_id = int(value_id)
         value = self.external_values.get(value_id)
         if value is None:
-            value = SSAValue(value_id, dtype=dtype)
+            value = self._value_from_meta(value_id, dtype=dtype)
             self.external_values[value_id] = value
             self.arguments.append(value)
         return value
+
+    def _value_from_meta(
+        self, value_id: int, *, dtype: str | None = None
+    ) -> SSAValue:
+        """An SSA value carrying whatever the owning region already knows.
+
+        The control program names values that regions define; only the region
+        records their dtype and shape.  Building the value without that turns
+        an array into a shapeless scalar, which every pointer-based backend
+        tolerates and Fortran cannot express.
+        """
+
+        meta = self.region_value_meta.get(int(value_id))
+        if meta is None:
+            return SSAValue(int(value_id), dtype=dtype)
+        return _ssa_value(int(value_id), meta)
 
     def produced_value(
         self,
@@ -373,7 +391,7 @@ class _ControlSSABuilder:
                 value.accounting["source_value_id"] = value_id
                 self.external_values[value_id] = value
             return value
-        value = SSAValue(value_id, dtype=dtype)
+        value = self._value_from_meta(value_id, dtype=dtype)
         self.external_values[value_id] = value
         return value
 
@@ -929,6 +947,7 @@ def lower_control_program_to_ssa(
     region_signatures: dict[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
+    region_value_meta: Mapping[int, Meta] | None = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -936,6 +955,7 @@ def lower_control_program_to_ssa(
         first_value_id=first_value_id,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_value_meta=region_value_meta,
     )
     builder.lower(program.root)
     return builder.finish()
@@ -1011,6 +1031,7 @@ def lower_precompile_and_control_to_ssa(
     region_signatures: dict[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] = {}
+    region_value_meta: dict[int, Meta] = {}
     region_shortfalls: list[SSALoweringShortfall] = []
     for region_index, region_artifact in sorted(
         (region_programs or {}).items()
@@ -1034,6 +1055,14 @@ def lower_precompile_and_control_to_ssa(
                 for value_id in region_program.outputs.values()
             ),
         )
+        # A region states the dtype and shape of the values it consumes and
+        # produces. The control program refers to those same value ids but
+        # carries no metadata of its own, so without this the control
+        # function's SSA values are shapeless -- which a target that must
+        # declare every variable (Fortran) cannot express at all, and which
+        # silently degrades an array to a scalar.
+        for value_id, meta in (region_program.meta or {}).items():
+            region_value_meta.setdefault(int(value_id), meta)
         region_shortfalls.extend(shortfalls)
     if not region_callees:
         region_callees = {
@@ -1046,6 +1075,7 @@ def lower_precompile_and_control_to_ssa(
         first_value_id=max(used_ids, default=-1) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_value_meta=region_value_meta,
     )
     functions[control_function.name] = control_function
     module = IRModule(functions)

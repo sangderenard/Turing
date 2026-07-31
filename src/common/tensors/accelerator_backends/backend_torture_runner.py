@@ -24,9 +24,13 @@ BACKENDS = (
     "raw_numpy",
     "numpy",
     "torch",
+    "torch_cuda",
     "c_jit",
     "glsl_jit",
     "llvm_jit",
+    "fortran",
+    "c_aot",
+    "glsl_aot",
 )
 DEFAULT_TIERS = (
     TortureTier.ISOLATED,
@@ -112,7 +116,8 @@ def _run_one(
             execute_started = perf_counter_ns()
             actual = case.numpy_reference()
             execute_ns = perf_counter_ns() - execute_started
-        elif backend in {"numpy", "torch"}:
+        elif backend in {"numpy", "torch", "torch_cuda"}:
+            device = None
             if backend == "numpy":
                 from ..numpy_backend import NumPyTensorOperations
 
@@ -123,11 +128,42 @@ def _run_one(
                 if torch is None:
                     raise RuntimeError("PyTorch is not installed")
                 backend_type = PyTorchTensorOperations
+                if backend == "torch_cuda":
+                    if not torch.cuda.is_available():
+                        raise RuntimeError("CUDA is not available for torch_cuda")
+                    device = "cuda"
             compiled = None
             compile_ns = perf_counter_ns() - compile_started
             execute_started = perf_counter_ns()
-            actual = eager_backend_result(case, backend_type)
+            actual = eager_backend_result(case, backend_type, device=device)
             execute_ns = perf_counter_ns() - execute_started
+        elif backend in {"c_aot", "glsl_aot"}:
+            # AOT precompiler route: ProcessGraph.build_from_ast ->
+            # reduce_abstract_tensor_topology -> strategize_glsl_deployment
+            # -> compile_process_graph/capture_fused_programs, not the
+            # tape-walking JIT backends above. See aot_compile.py and
+            # docs/PIPELINE_STAGE_DISAMBIGUATION.md.
+            if case.ast_source is None or case.ast_entrypoint is None:
+                raise ValueError(
+                    f"{case.name} has no ast_source; not expressible for "
+                    "the AOT precompiler route"
+                )
+            from .aot_compile import compile_ast_aot
+
+            aot_backend = "glsl" if backend == "glsl_aot" else "c"
+            compiled = None
+            compile_ns = perf_counter_ns() - compile_started
+            execute_started = perf_counter_ns()
+            result = compile_ast_aot(
+                case.ast_source,
+                case.ast_entrypoint,
+                case.inputs,
+                backend=aot_backend,
+            )
+            execute_ns = perf_counter_ns() - execute_started
+            (_, value), = result.outputs.items()
+            value = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+            actual = {next(iter(case.numpy_reference())): value}
         else:
             captured = capture_torture_case(case)
             if backend == "c_jit":
@@ -152,6 +188,10 @@ def _run_one(
                     trig_solver=trig_solver,
                     trig_epsilon=trig_epsilon,
                 )
+            elif backend == "fortran":
+                from .fortran_jit_backend import compile_torture_case_to_fortran
+
+                compiled = compile_torture_case_to_fortran(captured, cache=cache)
             else:
                 raise ValueError(f"unknown torture backend {backend!r}")
             compile_ns = perf_counter_ns() - compile_started
@@ -274,7 +314,7 @@ def format_torture_matrix(rows: Iterable[TortureMatrixRow]) -> str:
             f"compile={row.compile_ns / 1e6:.3f}ms "
             f"execute={row.execute_ns / 1e6:.3f}ms"
         )
-        if row.backend in {"c_jit", "glsl_jit", "llvm_jit"}:
+        if row.backend in {"c_jit", "glsl_jit", "llvm_jit", "fortran"}:
             timing += (
                 f" shell={row.shell_ns / 1e6:.3f}ms"
                 f" device={row.device_ns / 1e6:.3f}ms"

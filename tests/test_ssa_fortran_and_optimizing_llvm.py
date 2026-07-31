@@ -170,9 +170,13 @@ def test_bind_c_arrays_are_explicit_shape_over_a_passed_extent():
     function, activated, total = _elementwise_function()
     source = emit_function(function, outputs=[activated, total]).source
 
-    assert "integer(c_int), intent(in), value :: n_elements" in source
-    assert "intent(in) :: t0(n_elements)" in source
-    assert "intent(out) :: t5(n_elements)" in source
+    # One extent parameter per distinct dimension size, named after the
+    # size itself (dimension_extents), not a single shared "n_elements" --
+    # this is what lets a different-shaped op like matmul share the same
+    # emitter instead of being permanently out of reach.
+    assert "integer(c_int), intent(in), value :: extent_64" in source
+    assert "intent(in) :: t0(extent_64)" in source
+    assert "intent(out) :: t5(extent_64)" in source
     assert "intent(out) :: t2" in source
     # No assumed-shape dummy may survive anywhere in a bind(C) subroutine,
     # and nothing may reach the heap.

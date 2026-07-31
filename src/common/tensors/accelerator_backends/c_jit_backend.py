@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
 import json
 from math import prod
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -453,24 +455,21 @@ class CJITProgram:
     def __init__(
         self,
         *,
-        ffi: Any,
         library: Any,
+        shell_address: int,
         function_name: str,
         shell_name: str,
         feed_names: tuple[str, ...],
         outputs: tuple[COutputSpec, ...],
         source_artifact: CachedArtifact,
     ):
-        self.ffi = ffi
         self.library = library
         self.function_name = function_name
         self.shell_name = shell_name
         self.feed_names = feed_names
         self.output_specs = outputs
         self.source_artifact = source_artifact
-        self._shell_address = int(
-            getattr(library, f"{shell_name}_address")()
-        )
+        self._shell_address = shell_address
 
     def execute(
         self,
@@ -568,35 +567,54 @@ def compile_torture_case_to_c(
             COutputSpec(item["name"], tuple(item["shape"]))
             for item in metadata["outputs"]
         )
-    from cffi import FFI
+    # gcc + ctypes, not cffi: ffi.verify builds a full CPython extension
+    # (Python-header compile, interpreter linkage, import machinery) to get
+    # a raw function pointer for the launch shell -- 10x slower than a
+    # direct compile per this repo's own numbers (native gcc -> dll +
+    # ctypes: 548ms; cffi.verify: 5,591ms; see
+    # docs/BACKEND_PERFORMANCE_HANDOFF.md, "native compile vs cffi").
+    # native_library.py exists specifically for this: real compiler, plain
+    # shared library, dlopen, read the symbol address.
+    from .native_library import NativeLibrary, compile_and_load
 
-    ffi = FFI()
-    ffi.cdef(
-        f"int {shell_name}(void *, unsigned long long *);"
-        f"size_t {shell_name}_address(void);"
-    )
-    # CFFI derives its extension name from the source but writes through a
-    # shared temporary directory.  On Windows, one loaded extension prevents
-    # the linker from replacing that DLL.  Give each immutable source identity
-    # its own build directory so distinct torture programs never contend for a
-    # loaded module path.
+    # One build directory per immutable source identity, matching the old
+    # cffi tmpdir convention, so distinct torture programs never contend
+    # for a loaded module path.
     build_directory = (
         repository_cache_root()
         / "c"
-        / "cffi"
+        / "native"
         / artifact.identity[:16]
     )
     build_directory.mkdir(parents=True, exist_ok=True)
-    library = ffi.verify(
-        artifact.source,
-        include_dirs=[
-            str(Path(__file__).resolve().parent / "c_backend")
-        ],
-        tmpdir=str(build_directory),
+    suffix = ".dll" if sys.platform == "win32" else ".so"
+    library_path = build_directory / f"turing_torture_c{suffix}"
+    if library_path.exists():
+        # Skip recompiling an unchanged, already-built artifact -- source
+        # identity already gates this directory, so anything here matches
+        # artifact.source by construction.
+        library = NativeLibrary(
+            path=library_path,
+            toolchain="cached",
+            handle=ctypes.CDLL(str(library_path)),
+        )
+    else:
+        library = compile_and_load(
+            artifact.source,
+            name="turing_torture_c",
+            directory=build_directory,
+            extra_flags=[
+                "-I",
+                str(Path(__file__).resolve().parent / "c_backend"),
+            ],
+        )
+    address_fn = library.function(
+        f"{shell_name}_address", restype=ctypes.c_size_t
     )
+    shell_address = int(address_fn())
     return CJITProgram(
-        ffi=ffi,
         library=library,
+        shell_address=shell_address,
         function_name=function_name,
         shell_name=shell_name,
         feed_names=feed_names,

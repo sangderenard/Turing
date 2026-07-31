@@ -7904,9 +7904,23 @@ def strategize_glsl_deployment(
     graph: Any,
     *,
     max_nodes_per_dispatch: int = 256,
+    backend: str = "glsl",
+    remove_loops: bool = False,
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
-    """Build a stateful shell around the graph's flat dispatch schedule."""
+    """Build a stateful shell around the graph's flat dispatch schedule.
+
+    ``backend`` only tags the loop-composition capability profile below --
+    it does not change GLSL emission, which stays gated behind
+    ``capture_fused_programs(precompile_only=...)`` regardless of this
+    argument. Callers that only want the FusedProgram/ControlProgram/SSA
+    stages (any backend) should pass ``precompile_only=True`` there and
+    never reach GLSL-specific emission at all.
+
+    ``remove_loops`` disables native loop retention, so
+    ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
+    instruction sequence instead of a real ``LoopBlock``.
+    """
 
     _propagate_callsite_planner_specializations(graph)
     canonical_value_ids = bool(
@@ -7914,10 +7928,10 @@ def strategize_glsl_deployment(
     )
     loop_composer = LoopComposer(
         LoopBackendCapabilities(
-            backend="glsl",
-            native_for=True,
-            native_while=True,
-            dynamic_bounds=True,
+            backend=backend,
+            native_for=not remove_loops,
+            native_while=not remove_loops,
+            dynamic_bounds=not remove_loops,
             kpn=False,
         )
     )

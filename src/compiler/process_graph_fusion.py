@@ -909,7 +909,20 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
 
 def _operation(graph: ProcessGraph, node_id: int) -> str:
     data = graph.G.nodes[node_id]
-    return str(data.get("op") or data.get("type") or data.get("label"))
+    raw = str(data.get("op") or data.get("type") or data.get("label"))
+    # A ProcessGraph built from a SymPy expression carries SSA-Handler-style
+    # capitalized spellings ("Add", "Mul", "Pow", ...; see
+    # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
+    # module's lowercase tape-op vocabulary. Canonicalize once, here, so both
+    # the fusibility check below and dispatch_region_to_fused_program's
+    # OpStep.op_name agree with profile.fusible_ops, which is stated in the
+    # lowercase vocabulary. Non-elementwise labels ("const", "input",
+    # "return") have no canonical form and pass through unchanged.
+    try:
+        canonical, _ = canonical_elementwise_op(raw)
+    except KeyError:
+        return raw
+    return canonical
 
 
 def plan_process_graph_dispatches(
@@ -972,6 +985,17 @@ def plan_process_graph_dispatches(
                 else:
                     name = f"value_{node_id}"
                 output_names.setdefault(node_id, name)
+        # A component member that is also a graph root has no consumer at
+        # all -- inside the region or out -- which is exactly what "root"
+        # means for this graph. That makes it a program output by
+        # definition, not something to drop for lack of a successor edge.
+        # graph_express2.ProcessGraph.build_from_expression records roots
+        # this way without also inserting an explicit "return" node.
+        for node_id in nodes:
+            if node_id in output_names:
+                continue
+            if node_id in graph.roots:
+                output_names[node_id] = f"value_{node_id}"
         if not output_names:
             continue
         outputs = tuple(

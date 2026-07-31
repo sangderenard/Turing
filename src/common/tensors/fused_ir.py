@@ -135,6 +135,14 @@ def canonical_elementwise_op(op: str) -> tuple[str, bool]:
         base = ELEMENTWISE_ALIASES.get(name[1:], name[1:])
         if base in known:
             return base, name[0] == "r"
+    # ProcessGraph nodes built from a SymPy expression carry SSA-Handler-style
+    # capitalized spellings ("Add", "Mul", "Pow", ...; see
+    # symbolic_process_graph.py's _SYMPY_TO_CANONICAL) rather than this
+    # module's lowercase tape-op vocabulary. Accept that spelling here, once,
+    # instead of every caller lowercasing before calling in.
+    lowered = name.lower()
+    if lowered != name and lowered in known:
+        return lowered, False
     raise KeyError(op)
 
 

@@ -872,9 +872,18 @@ class ProcessGraph:
             role_indices = {}
             all_keys = list(schema.get('up', {}).keys()) + list(schema.get('down', {}).keys())
             for key in all_keys:
-                # If the attribute is not already in args, get it and add it (extending if a list)
-                if key not in args:
-                    val = getattr(node, key, None)
+                # If the attribute's own value is not already in args, add it
+                # (extending if a list). The membership check must compare
+                # the resolved attribute *value*, not the role-name string
+                # itself: for a node whose attribute is a plain string (e.g.
+                # ast.keyword.arg), comparing the role name against args
+                # produces a false positive whenever that string happens to
+                # equal a later role's name (e.g. an ast.keyword.arg value
+                # of "value" colliding with the keyword schema's own
+                # "value" role) -- which silently skipped appending the real
+                # attribute and pointed that role at the wrong element.
+                val = getattr(node, key, None)
+                if val not in args:
                     if isinstance(val, list):
                         start = len(args)
                         args.extend(val)
@@ -884,7 +893,7 @@ class ProcessGraph:
                         role_indices[key] = [len(args)-1]
                 else:
                     # If already present, record its index (wrapped as list)
-                    role_indices[key] = [args.index(key)]
+                    role_indices[key] = [args.index(val)]
             # Initialize a repeat counter dictionary for each role.
             repeat_counter = { role: 0 for role in role_indices }
 

@@ -71,6 +71,16 @@ _BINARY: dict[str, str] = {
     "maximum": "max({0}, {1})",
     "minimum": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
+    "mod": "modulo({0}, {1})",
+    "floordiv": "floor({0} / {1})",
+    "less": "({0} < {1})",
+    "less_equal": "({0} <= {1})",
+    "greater": "({0} > {1})",
+    "greater_equal": "({0} >= {1})",
+    "equal": "({0} == {1})",
+    "not_equal": "({0} /= {1})",
+    "logical_and": "({0} .and. {1})",
+    "logical_or": "({0} .or. {1})",
 }
 
 _UNARY: dict[str, str] = {
@@ -78,6 +88,20 @@ _UNARY: dict[str, str] = {
     "Abs": "abs({0})",
     "Not": "not({0})",
     "LNot": "(.not. {0})",
+    # Numeric conversions. These arrive named after their LLVM opcodes,
+    # because the precompile lowering shares an instruction vocabulary with
+    # the LLVM backend, but each is an ordinary Fortran conversion intrinsic.
+    # SExt/ZExt widen an integer, which in Fortran is just the integer kind
+    # the target is already declared with.
+    "SExt": "int({0}, c_int)",
+    "ZExt": "int({0}, c_int)",
+    "Trunc": "int({0}, c_int)",
+    "FpToSi": "int({0}, c_int)",
+    "FpToUi": "int({0}, c_int)",
+    "SiToFp": "real({0}, c_double)",
+    "UiToFp": "real({0}, c_double)",
+    "FpExt": "real({0}, c_double)",
+    "FpTrunc": "real({0}, c_double)",
     "neg": "(-{0})",
     "abs": "abs({0})",
     "sqrt": "sqrt({0})",
@@ -97,6 +121,16 @@ _UNARY: dict[str, str] = {
     "round": "nint({0})",
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
+    "asinh": "asinh({0})",
+    "acosh": "acosh({0})",
+    "atanh": "atanh({0})",
+    "trunc": "aint({0})",
+    "copy": "{0}",
+    # Every other backend in the torture matrix reports a comparison as a
+    # plain 0.0/1.0 double, not a native boolean -- callers compare outputs
+    # with assert_allclose, not a boolean buffer.  Match that at the
+    # boundary rather than exporting a LOGICAL dummy no caller expects.
+    "bool_to_float64": "merge(1.0_c_double, 0.0_c_double, {0})",
 }
 
 # Reductions collapse an array to a scalar; they are emitted as whole-array
@@ -169,6 +203,58 @@ def _is_array(value: SSAValue) -> bool:
     return bool(value.shape)
 
 
+def _element_count(shape: tuple[int, ...]) -> int:
+    total = 1
+    for size in shape:
+        total *= int(size)
+    return total
+
+
+def dimension_extents(values: Iterable[SSAValue]) -> dict[int, str]:
+    """Map each distinct array dimension size across ``values`` to a Fortran
+    extent parameter name.
+
+    One name per distinct size, not one name per array: two arrays that
+    happen to share a dimension size reuse the same parameter, and a matmul
+    chain's differing row/inner/column counts each get their own. This is
+    the single source of truth for extent naming -- the emitter uses it to
+    declare arrays, and any caller building a shim that must pass matching
+    extent arguments (fortran_jit_backend.py) uses the exact same function
+    so the two never disagree on names or order.
+    """
+
+    sizes: dict[int, str] = {}
+    for value in values:
+        for size in value.shape:
+            size = int(size)
+            if size not in sizes:
+                sizes[size] = f"extent_{size}"
+    return sizes
+
+
+def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
+    """A Fortran array constructor for an SSA array constant.
+
+    Fortran expresses this natively: ``[a, b, c]`` is an array constructor,
+    and ``reshape`` gives it a rank.  A constant whose elements are all equal
+    needs neither -- Fortran broadcasts a scalar across a whole array on
+    assignment, which is both the shortest source and the form a compiler
+    folds best, so an all-``.false.`` mask of 124416 elements stays one token
+    instead of 124416.
+    """
+
+    elements = tuple(values)
+    if not elements:
+        raise FortranEmissionError("cannot express an empty array constant")
+    if len(set(elements)) == 1:
+        return _literal(elements[0])
+    constructor = "[" + ", ".join(_literal(element) for element in elements) + "]"
+    if len(shape) <= 1:
+        return constructor
+    extents = ", ".join(str(int(size)) for size in shape)
+    return f"reshape({constructor}, [{extents}])"
+
+
 def _literal(value: Any) -> str:
     if isinstance(value, bool):
         return ".true._c_bool" if value else ".false._c_bool"
@@ -201,8 +287,6 @@ class _FunctionEmitter:
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.shortfalls: list[FortranShortfall] = []
-        # Named so it cannot collide with the tNN value namespace.
-        self.extent_name = "n_elements"
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
         # chain becomes one Fortran array expression.  Emitting a statement per
@@ -213,6 +297,7 @@ class _FunctionEmitter:
         self._use_sites: dict[int, list[tuple[str, int]]] = {}
         self._locals: dict[int, SSAValue] = {}
         self._phi_targets: dict[str, list[tuple[str, SSAValue, SSAValue]]] = {}
+        self._loop_variables: list[str] = []
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -245,13 +330,229 @@ class _FunctionEmitter:
             return False
         return uses[0][0] == block.name
 
+    def _structural(self, instr: Instr, args: list[str]) -> str | None:
+        """Shape-and-layout ops, as native Fortran array expressions.
+
+        These are not elementwise, so they are absent from the intrinsic
+        tables; Fortran still says all of them directly -- array sections,
+        array constructors, ``reshape``. Anything whose Fortran form would
+        depend on a memory layout this emitter cannot confirm returns None and
+        is reported as a shortfall rather than guessed at.
+        """
+
+        operation = instr.attributes.get("tensor_operation")
+        if instr.res is None:
+            return None
+        attributes = instr.attributes
+        shape = instr.res.shape
+        rank = len(shape)
+
+        if operation in ("zeros", "full"):
+            # A scalar broadcasts across a whole array on assignment.
+            fill = attributes.get("fill_value", 0)
+            if instr.res.dtype in ("float64", "float32", "double"):
+                fill = float(fill)
+            return _literal(fill)
+
+        if operation == "arange":
+            start = int(attributes.get("start", 0))
+            step = int(attributes.get("step", 1))
+            end = int(attributes["end"])
+            index = self._loop_variable()
+            # An implied-do array constructor: the Fortran form of arange,
+            # with no materialised element list regardless of length.
+            return (
+                f"[({index}, {index} = {start}, {end - 1}, {step})]"
+            )
+
+        if operation == "slice" and attributes.get("slice_kind") == "index_select":
+            # A gather. Fortran applies a vector subscript along one
+            # dimension directly, so no loop and no temporary are needed.
+            if len(args) != 2:
+                return None
+            source = instr.args[0]
+            source_rank = len(source.shape)
+            dim = int(attributes.get("dim", 0)) % source_rank
+            subscripts = [":"] * source_rank
+            # SSA indices are 0-based; Fortran subscripts start at 1.
+            subscripts[dim] = f"{args[1]} + 1"
+            return f"{args[0]}({', '.join(subscripts)})"
+
+        if operation == "slice":
+            if attributes.get("slice_kind") != "axis" or len(args) != 1:
+                return None
+            source = instr.args[0]
+            source_rank = len(source.shape)
+            dim = int(attributes.get("dim", 0))
+            start = int(attributes.get("start", 0))
+            step = int(attributes.get("step", 1))
+            count = int(attributes.get("count", 1))
+            # Arrays are declared in SSA dimension order (see dims() in
+            # emit()), so Fortran subscript k+1 is SSA dim k.
+            axis = (dim % source_rank) + 1
+            subscripts = [":"] * source_rank
+            if count == 1 and rank == source_rank - 1:
+                # A single index drops the rank, matching the result shape.
+                subscripts[axis - 1] = str(start + 1)
+            else:
+                stop = start + count * step
+                subscripts[axis - 1] = (
+                    f"{start + 1}:{stop}:{step}" if step != 1
+                    else f"{start + 1}:{stop}"
+                )
+            return f"{args[0]}({', '.join(subscripts)})"
+
+        if operation == "permute":
+            dims = list(attributes.get("dims") or ())
+            if len(dims) != rank or sorted(dims) != list(range(rank)):
+                return None
+            # RESHAPE fills the result so that its dimension ORDER(k) takes
+            # the source's k-th dimension; for a permutation that makes ORDER
+            # the inverse of the requested dims. Arrays are declared in SSA
+            # dimension order, so this is a plain 1-based inverse with no
+            # reversal.
+            inverse = [0] * rank
+            for position, source_dim in enumerate(dims):
+                inverse[source_dim] = position + 1
+            order = ", ".join(str(value) for value in inverse)
+            extents = ", ".join(str(int(size)) for size in shape)
+            return f"reshape({args[0]}, [{extents}], order=[{order}])"
+
+        return None
+
+    def _loop_variable(self) -> str:
+        """An integer loop index, declared alongside the locals."""
+
+        name = f"i_loop{len(self._loop_variables)}"
+        self._loop_variables.append(name)
+        return name
+
+    def _statements(self, instr: Instr) -> list[str] | None:
+        """Ops that are a Fortran *statement* rather than one expression.
+
+        A running sum or an indexed assignment has no single-expression
+        intrinsic form, so returning None from ``_expression`` and reporting a
+        shortfall would be wrong -- Fortran expresses both directly, just as
+        statements. Everything a single array expression can say stays in
+        ``_expression``.
+        """
+
+        operation = instr.attributes.get("tensor_operation")
+        if (
+            operation not in ("cumsum", "scatter", "stack", "concat")
+            or instr.res is None
+        ):
+            return None
+        target = _name(instr.res)
+
+        if operation == "concat":
+            # Concatenation writes each source into its own run of the joined
+            # dimension. Fortran has no general concat intrinsic, but a
+            # section assignment per source says it exactly, at any rank.
+            rank = len(instr.res.shape)
+            dim = int(instr.attributes.get("dim", 0)) % rank
+            statements = []
+            offset = 0
+            for argument in instr.args:
+                extent = int(argument.shape[dim]) if argument.shape else 1
+                subscripts = [":"] * rank
+                subscripts[dim] = f"{offset + 1}:{offset + extent}"
+                statements.append(
+                    f"    {target}({', '.join(subscripts)}) = "
+                    f"{self._operand(argument)}"
+                )
+                offset += extent
+            return statements
+
+        if operation == "stack":
+            # Stacking adds a new dimension, so each source fills one slice of
+            # it -- a sequence of section assignments, which is exactly what
+            # Fortran writes. Arrays are declared in SSA dimension order, so
+            # the new axis sits where the op says it does.
+            rank = len(instr.res.shape)
+            dim = int(instr.attributes.get("dim", 0)) % rank
+            statements = []
+            for position, argument in enumerate(instr.args, start=1):
+                subscripts = [":"] * rank
+                subscripts[dim] = str(position)
+                statements.append(
+                    f"    {target}({', '.join(subscripts)}) = "
+                    f"{self._operand(argument)}"
+                )
+            return statements
+
+        if operation == "cumsum":
+            source = self._operand(instr.args[0])
+            rank = len(instr.res.shape)
+            dim = int(instr.attributes.get("dim", 0)) % rank
+            # Arrays are declared in SSA dimension order (see dims() in
+            # emit()), so Fortran subscript k+1 is SSA dim k.
+            axis = dim + 1
+            index = self._loop_variable()
+            def section(position: str) -> str:
+                subscripts = [":"] * rank
+                subscripts[axis - 1] = position
+                return f"{target}({', '.join(subscripts)})"
+            return [
+                f"    {target} = {source}",
+                f"    do {index} = 2, size({target}, {axis})",
+                f"      {section(index)} = {section(index)} + "
+                f"{section(f'{index} - 1')}",
+                "    end do",
+            ]
+
+        # scatter: copy, then assign through the index vector. Fortran applies
+        # a vector subscript elementwise, so no loop is needed.
+        if len(instr.args) != 3:
+            return None
+        base, indices, values = (self._operand(a) for a in instr.args)
+        if len(instr.res.shape) != 1:
+            return None
+        return [
+            f"    {target} = {base}",
+            # SSA indices are 0-based; Fortran subscripts start at 1.
+            f"    {target}({indices} + 1) = {values}",
+        ]
+
     def _expression(self, instr: Instr) -> str | None:
         op = instr.op
+        if op in ("Call", "call"):
+            # precompile_to_ssa.lower_fused_program_to_ssa wraps almost
+            # every tensor op in Handler.Call (it names the C/LLVM kernel
+            # symbol as "callee" for those backends), but it preserves the
+            # original canonical op name under "tensor_operation" precisely
+            # so a target that doesn't dispatch by callee symbol -- this one
+            # -- can still recognise the operation. Without this, every
+            # instruction coming from that lowering path reports as an
+            # unsupported "Call" shortfall, even ops this emitter already
+            # knows how to express (add, sin, sum, matmul, ...).
+            tensor_operation = instr.attributes.get("tensor_operation")
+            if tensor_operation is not None:
+                op = str(tensor_operation)
         args = [self._operand(a) for a in instr.args]
         constant = instr.attributes.get("constant", None)
 
         if op in ("Const", "const"):
+            if constant is None and "values" in instr.attributes:
+                # An array constant carries its elements under "values", not
+                # the scalar "constant" key.  Reading only "constant" here
+                # yielded None and reported "cannot express literal None",
+                # which named the missing key rather than the real content.
+                return _array_literal(
+                    instr.attributes["values"], instr.res.shape
+                )
+            if constant is None and instr.attributes.get("value") is not None:
+                # Control-flow scalars (loop bounds, strides) are recorded
+                # under "value" rather than "constant".  This is checked after
+                # "values" on purpose: an array constant carries both keys,
+                # with a vestigial "value" of None, so testing it first would
+                # discard the real elements.
+                return _literal(instr.attributes["value"])
             return _literal(constant)
+
+        structural = self._structural(instr, args)
+        if structural is not None:
+            return structural
 
         # Scalar operands recorded as attributes rather than SSA values.
         right = instr.attributes.get("right_scalar")
@@ -304,6 +605,12 @@ class _FunctionEmitter:
                 continue
             if instr.op in ("Ret", "ret", "Return", "return"):
                 body.append("    return")
+                continue
+
+            statements = self._statements(instr)
+            if statements is not None:
+                self._locals[instr.res.id] = instr.res
+                body.extend(statements)
                 continue
 
             expression = self._expression(instr)
@@ -381,28 +688,42 @@ class _FunctionEmitter:
 
         # A bind(C) procedure may not take assumed-shape (``x(:)``) dummies:
         # those need a descriptor the C caller has no way to build before
-        # Fortran 2018 / TS 29113.  Arrays are therefore explicit-shape over an
-        # extent passed as the leading argument, which is what a C caller would
+        # Fortran 2018 / TS 29113.  Arrays are therefore explicit-shape over
+        # extents passed as leading arguments, which is what a C caller would
         # have to supply anyway and lets the compiler see the trip count.
-        arrays_present = any(
-            _is_array(value)
-            for value in (*self.function.args, *self.outputs)
+        #
+        # Every array keeps its own shape here -- one extent parameter per
+        # distinct dimension size actually present, not one extent shared by
+        # every array in the function.  A matmul's (rows, inner) x
+        # (inner, cols) -> (rows, cols) genuinely has three different sizes;
+        # forcing them through one shared extent either rejects it outright
+        # or -- worse -- silently declares mismatched-size arrays under one
+        # extent, which compiles cleanly and corrupts memory at runtime.
+        all_values = (
+            *self.function.args,
+            *self.outputs,
+            *self._locals.values(),
         )
-        extent = self.extent_name
-        arguments = [extent] if arrays_present else []
+        arrays_present = any(_is_array(value) for value in all_values)
+        dim_extents = dimension_extents(all_values) if arrays_present else {}
+
+        def dims(value: SSAValue) -> str:
+            return ", ".join(dim_extents[int(size)] for size in value.shape)
+
+        extent_names = sorted(dim_extents.values())
+        arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
         arguments.extend(_name(value) for value in self.outputs)
 
-        declarations: list[str] = []
-        if arrays_present:
-            declarations.append(
-                f"    integer(c_int), intent(in), value :: {extent}"
-            )
+        declarations: list[str] = [
+            f"    integer(c_int), intent(in), value :: {extent}"
+            for extent in extent_names
+        ]
         for argument in self.function.args:
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
             if _is_array(argument):
                 declarations.append(
-                    f"    {kind}, intent(in) :: {_name(argument)}({extent})"
+                    f"    {kind}, intent(in) :: {_name(argument)}({dims(argument)})"
                 )
             else:
                 declarations.append(
@@ -412,7 +733,7 @@ class _FunctionEmitter:
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             if _is_array(value):
                 declarations.append(
-                    f"    {kind}, intent(out) :: {_name(value)}({extent})"
+                    f"    {kind}, intent(out) :: {_name(value)}({dims(value)})"
                 )
             else:
                 declarations.append(
@@ -427,12 +748,17 @@ class _FunctionEmitter:
                 continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             if _is_array(value):
-                # An automatic array sized by the extent: no allocate, no heap.
+                # An automatic array sized by its own extents: no allocate,
+                # no heap.
                 declarations.append(
-                    f"    {kind} :: {_name(value)}({extent})"
+                    f"    {kind} :: {_name(value)}({dims(value)})"
                 )
             else:
                 declarations.append(f"    {kind} :: {_name(value)}")
+
+        declarations.extend(
+            f"    integer(c_int) :: {index}" for index in self._loop_variables
+        )
 
         name = self.function.name
         lines = [
@@ -621,6 +947,7 @@ __all__ = [
     "FortranShortfall",
     "FortranSubroutine",
     "compile_module",
+    "dimension_extents",
     "emit_function",
     "emit_module",
     "fortran_compiler",
