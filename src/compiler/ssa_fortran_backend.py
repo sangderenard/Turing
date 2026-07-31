@@ -414,6 +414,8 @@ class _FunctionEmitter:
         self._consumed: set[int] = set()
         self._address_producers: dict[int, tuple[SSAValue, SSAValue]] = {}
         self._producers: dict[int, Instr] = {}
+        # Collection value id -> the induction that indexes it.
+        self._collections: dict[int, SSAValue] = {}
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -473,6 +475,12 @@ class _FunctionEmitter:
             return True
         if consumer.res is None:
             return False
+        if (
+            operation in _SHAPE_CHANGING_BINARY
+            and len(consumer.res.shape) > 2
+        ):
+            # A batched matmul indexes each operand per batch element.
+            return True
         # An elementwise operand of a different shape is conformed by
         # indexing (a broadcast) rather than by an intrinsic call.
         if operation in _BINARY and operation not in _SHAPE_CHANGING_BINARY:
@@ -668,6 +676,67 @@ class _FunctionEmitter:
             or operation in _LOGICAL_BINARY
             or operation in _LOGICAL_RESULT_UNARY
         )
+
+    def _batched_matmul(self, instr: Instr, operation: str) -> list[str] | None:
+        """A matmul over leading batch dimensions, as nested loops.
+
+        Fortran's MATMUL takes rank-1 and rank-2 arguments only, while the
+        recorded program follows numpy: the last two dimensions are the
+        matrix and everything before them is a batch that broadcasts.  So the
+        batch has to become real loops around a rank-2 MATMUL -- there is no
+        single-expression form, and emitting one anyway is what produced
+        "'matrix_b' argument of 'matmul' must be of rank 1".
+        """
+
+        if operation not in ("matmul", "MatMul") or len(instr.args) != 2:
+            return None
+        result_shape = tuple(instr.res.shape)
+        batch_rank = len(result_shape) - 2
+        if batch_rank <= 0:
+            # Rank 2 or less is exactly what MATMUL already accepts.
+            return None
+        if any(len(argument.shape) < 2 for argument in instr.args):
+            return None
+
+        indices = [self._loop_variable() for _ in range(batch_rank)]
+
+        def batch_subscripts(value: SSAValue) -> str:
+            """This operand's own batch subscripts, aligned from the right.
+
+            An operand carrying fewer dimensions is broadcast across the
+            batch, and one whose batch extent is 1 repeats -- the same rule
+            the elementwise conforming path follows.
+            """
+
+            own_batch = len(value.shape) - 2
+            if own_batch <= 0:
+                return ""
+            offset = batch_rank - own_batch
+            parts = []
+            for position in range(own_batch):
+                extent = int(value.shape[position])
+                parts.append(
+                    "1" if extent == 1 else indices[offset + position]
+                )
+            return ", ".join(parts) + ", "
+
+        left, right = instr.args
+        target = _name(instr.res)
+        statements: list[str] = []
+        for depth, index in enumerate(indices):
+            pad = "    " + "  " * depth
+            statements.append(
+                f"{pad}do {index} = 1, {int(result_shape[depth])}"
+            )
+        pad = "    " + "  " * batch_rank
+        statements.append(
+            f"{pad}{target}({', '.join(indices)}, :, :) = matmul("
+            f"{self._operand(left)}({batch_subscripts(left)}:, :), "
+            f"{self._operand(right)}({batch_subscripts(right)}:, :))"
+        )
+        for depth in range(batch_rank - 1, -1, -1):
+            statements.append("    " + "  " * depth + "end do")
+        return statements
 
     def _instruction_is_logical(self, instr: Instr) -> bool:
         """Whether this instruction's expression evaluates to LOGICAL.
@@ -909,6 +978,32 @@ class _FunctionEmitter:
                     instr.args[0],
                     instr.args[1],
                 )
+                # A collection is written once per iteration, so it holds one
+                # element per trip: it is a member of the enclosing object,
+                # not a local, and nothing else in the program declares its
+                # extent.
+                self._collections[instr.args[0].id] = instr.args[1]
+
+    def _collection_extent(self, induction: SSAValue) -> str | None:
+        """The trip count governing a collection, as a Fortran expression.
+
+        The loop's own exit test states it -- ``induction < bound`` in the
+        header -- so the bound is read from there rather than assumed. It is
+        typically a control uniform, which is already a dummy argument, so
+        the collection can be declared explicit-shape over it.
+        """
+
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                operation = (
+                    instr.attributes.get("tensor_operation") or instr.op
+                )
+                if operation not in ("Lt", "Le", "less", "less_equal"):
+                    continue
+                if len(instr.args) != 2 or instr.args[0].id != induction.id:
+                    continue
+                return _name(instr.args[1])
+        return None
 
     def _loop_variable(self) -> str:
         """An integer loop index, declared alongside the locals."""
@@ -928,10 +1023,12 @@ class _FunctionEmitter:
         """
 
         operation = instr.attributes.get("tensor_operation") or instr.op
-        if (
-            operation not in ("cumsum", "scatter", "stack", "concat")
-            or instr.res is None
-        ):
+        if instr.res is None:
+            return None
+        batched = self._batched_matmul(instr, operation)
+        if batched is not None:
+            return batched
+        if operation not in ("cumsum", "scatter", "stack", "concat"):
             return None
         target = _name(instr.res)
 
@@ -1295,6 +1392,17 @@ class _FunctionEmitter:
         ]
         for argument in self.function.args:
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
+            if argument.id in self._collections:
+                # A collection accumulates one element per iteration and is
+                # read back by the caller, so it is neither a scalar nor
+                # intent(in) -- declaring it as the shapeless argument the IR
+                # describes is what made indexing it unclassifiable.
+                extent = self._collection_extent(self._collections[argument.id])
+                if extent is not None:
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}({extent})"
+                    )
+                    continue
             if _is_array(argument):
                 declarations.append(
                     f"    {kind}, intent(in) :: {_name(argument)}({dims(argument)})"
