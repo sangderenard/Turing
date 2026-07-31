@@ -61,7 +61,10 @@ class TensorTortureCase:
 
     def semantic_record(self) -> dict[str, Any]:
         return {
-            "schema": "turing-abstract-tensor-torture-v1",
+            # v2 adds the reference output signature.  v1 hashed only the
+            # inputs, so editing a case body left the digest unchanged and a
+            # stale compiled artifact was served for the new program.
+            "schema": "turing-abstract-tensor-torture-v2",
             "name": self.name,
             "tier": self.tier.value,
             "operations": list(self.operations),
@@ -74,6 +77,13 @@ class TensorTortureCase:
                     ).hexdigest(),
                 }
                 for name, value in sorted(self.inputs.items())
+            },
+            "outputs": {
+                name: {
+                    "shape": list(np.asarray(value).shape),
+                    "dtype": np.asarray(value).dtype.str,
+                }
+                for name, value in sorted(self.numpy_reference().items())
             },
             "rtol": self.rtol,
             "atol": self.atol,
@@ -102,6 +112,7 @@ def _isolated_cases(
     tier: TortureTier = TortureTier.ISOLATED,
     shape: tuple[int, int] = (4, 6),
     matmul_shape: tuple[int, int, int] = (3, 5, 4),
+    reshape_target: tuple[int, int, int] = (2, 3, 4),
     name_suffix: str = "",
 ) -> tuple[TensorTortureCase, ...]:
     """The per-operator cases, at whichever size the tier asks for.
@@ -125,9 +136,13 @@ def _isolated_cases(
         0.25, 1.75, inner * columns, dtype=np.float64
     ).reshape(inner, columns)
 
-    # A rank-3 target for the reshape/permute case, derived from the element
-    # count rather than hard-coded, so the same case works at every tier size.
-    reshape_target = (2, count // (2 * shape[-1]), shape[-1])
+    # Stated rather than derived: the reshape target is part of what the case
+    # means, and quietly recomputing it would change the operation being
+    # measured whenever the shape moved.
+    if int(np.prod(reshape_target)) != count:
+        raise ValueError(
+            f"reshape target {reshape_target} does not hold {count} elements"
+        )
 
     def elementwise(
         name: str,
@@ -309,6 +324,78 @@ def _isolated_cases(
     return tuple(cases)
 
 
+
+def _fused_chain_case(
+    *,
+    tier: TortureTier = TortureTier.ISOLATED,
+    shape: tuple[int, int] = (4, 6),
+    name_suffix: str = "",
+) -> TensorTortureCase:
+    """One long elementwise chain that lowers to a single fused program.
+
+    The per-operator cases measure one operation surrounded by launch
+    overhead, which is the regime where an eager backend looks best: NumPy
+    pays one pass and one temporary, and so does everything else.
+
+    A long chain measures the opposite thing.  Eager evaluation walks memory
+    once per operation and materialises a temporary each time; a fused program
+    walks it once for the whole chain.  That difference is the entire argument
+    for compiling, and it is invisible until the chain is long.
+    """
+
+    count = int(np.prod(shape))
+    left = np.linspace(0.35, 2.4, count, dtype=np.float64).reshape(shape)
+    right = np.linspace(2.1, 0.4, count, dtype=np.float64).reshape(shape)
+
+    def numpy_program(values):
+        a = values["left"]
+        b = values["right"]
+        x = a * 1.25 + b * 0.5
+        x = np.sin(x) + np.cos(b * 0.125)
+        x = x * x + a * 0.75
+        x = np.sqrt(np.abs(x) + 0.5)
+        x = x - b * 0.25
+        x = np.exp(-np.abs(x) * 0.5)
+        x = x + np.log(np.abs(a) + 1.5)
+        x = np.maximum(x, b * 0.1)
+        x = np.minimum(x, a * 3.0)
+        x = x * 0.5 + np.sin(a * 0.25)
+        x = x / (np.abs(b) + 1.25)
+        x = np.where(x > 0.0, x, -x)
+        return {"result": x * 2.0 - 0.125}
+
+    def tensor_program(values):
+        a = values["left"]
+        b = values["right"]
+        x = a * 1.25 + b * 0.5
+        x = x.sin() + (b * 0.125).cos()
+        x = x * x + a * 0.75
+        x = ((x.abs() + 0.5)).sqrt()
+        x = x - b * 0.25
+        x = (-(x.abs() * 0.5)).exp()
+        x = x + (a.abs() + 1.5).log()
+        x = type(a).maximum(x, b * 0.1)
+        x = type(a).minimum(x, a * 3.0)
+        x = x * 0.5 + (a * 0.25).sin()
+        x = x / (b.abs() + 1.25)
+        x = type(a).where(x > 0.0, x, -x)
+        return {"result": x * 2.0 - 0.125}
+
+    return TensorTortureCase(
+        name="fused_chain" + name_suffix,
+        tier=tier,
+        inputs={"left": left, "right": right},
+        numpy_program=numpy_program,
+        tensor_program=tensor_program,
+        operations=(
+            "mul", "add", "sin", "cos", "sqrt", "abs", "sub", "neg",
+            "exp", "log", "maximum", "minimum", "truediv", "greater", "where",
+        ),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+
 def _grab_bag_case() -> TensorTortureCase:
     left = np.linspace(-1.5, 2.0, 48, dtype=np.float64).reshape(6, 8)
     right = np.linspace(2.25, -0.75, 48, dtype=np.float64).reshape(6, 8)
@@ -419,6 +506,7 @@ def _advanced_case() -> TensorTortureCase:
 # separately because its cost is cubic and it would otherwise dominate the run.
 LARGE_SHAPE = (1024, 1024)
 LARGE_MATMUL_SHAPE = (256, 256, 256)
+LARGE_RESHAPE_TARGET = (2, 512, 1024)
 
 
 def _large_cases() -> tuple[TensorTortureCase, ...]:
@@ -518,7 +606,12 @@ def tensor_torture_cases(
     *,
     include_large: bool = False,
 ) -> tuple[TensorTortureCase, ...]:
-    cases = (*_isolated_cases(), _grab_bag_case(), _advanced_case())
+    cases = (
+        *_isolated_cases(),
+        _fused_chain_case(),
+        _grab_bag_case(),
+        _advanced_case(),
+    )
     if not include_large:
         return cases
     # The same operators again at size, plus the bespoke frame/reduction cases.
@@ -528,6 +621,12 @@ def tensor_torture_cases(
             tier=TortureTier.LARGE,
             shape=LARGE_SHAPE,
             matmul_shape=LARGE_MATMUL_SHAPE,
+            reshape_target=LARGE_RESHAPE_TARGET,
+            name_suffix="_large",
+        ),
+        _fused_chain_case(
+            tier=TortureTier.LARGE,
+            shape=LARGE_SHAPE,
             name_suffix="_large",
         ),
         *_large_cases(),
