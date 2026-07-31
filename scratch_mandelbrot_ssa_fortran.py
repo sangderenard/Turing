@@ -162,7 +162,36 @@ from src.transmogrifier.ssa import IRModule
 program_module = IRModule(
     {name: lowering.module.functions[name] for name in PROGRAM_FUNCTIONS}
 )
-module = emit_module(program_module, name="mandelbrot_recording_fortran", outputs={})
+
+# A function's outputs must be named, or its results stay dead locals instead
+# of becoming intent(out) arguments -- and then a caller passing them is
+# "More actual than formal". The regions state their own outputs.
+def _values_by_id(function):
+    values = {value.id: value for value in function.args}
+    for block in function.blocks.values():
+        for instr in block.instrs:
+            if instr.res is not None:
+                values[instr.res.id] = instr.res
+    return values
+
+
+emit_outputs = {}
+for region_index, captured_region in region_programs.items():
+    name = f"numerical_region_{int(region_index)}"
+    if name not in PROGRAM_FUNCTIONS:
+        continue
+    values = _values_by_id(lowering.module.functions[name])
+    emit_outputs[name] = [
+        values[int(value_id)]
+        for value_id in captured_region.program.outputs.values()
+        if int(value_id) in values
+    ]
+
+module = emit_module(
+    program_module,
+    name="mandelbrot_recording_fortran",
+    outputs=emit_outputs,
+)
 print("\n---- Fortran emission ----")
 print("complete:", module.complete)
 if not module.complete:

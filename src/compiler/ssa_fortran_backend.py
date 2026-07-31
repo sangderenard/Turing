@@ -47,7 +47,7 @@ _BINARY: dict[str, str] = {
     "Div": "({0} / {1})",
     "Pow": "({0} ** {1})",
     "Mod": "modulo({0}, {1})",
-    "FloorDiv": "floor({0} / {1})",
+    "FloorDiv": "real(floor({0} / {1}), c_double)",
     "Eq": "({0} == {1})",
     "Ne": "({0} /= {1})",
     "Lt": "({0} < {1})",
@@ -72,7 +72,7 @@ _BINARY: dict[str, str] = {
     "minimum": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
     "mod": "modulo({0}, {1})",
-    "floordiv": "floor({0} / {1})",
+    "floordiv": "real(floor({0} / {1}), c_double)",
     "less": "({0} < {1})",
     "less_equal": "({0} <= {1})",
     "greater": "({0} > {1})",
@@ -116,9 +116,15 @@ _UNARY: dict[str, str] = {
     "sinh": "sinh({0})",
     "cosh": "cosh({0})",
     "tanh": "tanh({0})",
-    "floor": "floor({0})",
-    "ceil": "ceiling({0})",
-    "round": "nint({0})",
+    # FLOOR/CEILING/NINT return INTEGER in Fortran, where the numpy
+    # equivalents return a float. Keeping the recorded program's type means
+    # converting back, which also stops these from poisoning every intrinsic
+    # downstream that then sees mixed INTEGER and REAL operands. Fortran
+    # assignment converts on the way into an integer variable, so this is
+    # safe even when the result is declared integer.
+    "floor": "real(floor({0}), c_double)",
+    "ceil": "real(ceiling({0}), c_double)",
+    "round": "real(nint({0}), c_double)",
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
     "asinh": "asinh({0})",
@@ -158,7 +164,14 @@ _LOGICAL_BINARY = frozenset(
         "Eq", "Ne", "equal", "not_equal",
     }
 )
+# Unary operations that take a LOGICAL operand, so it must not be converted
+# to a number on the way in.
 _LOGICAL_UNARY = frozenset({"LNot", "Not", "logical_not", "bool_to_float64"})
+
+# Of those, the ones that also *produce* LOGICAL. bool_to_float64 is the
+# conversion itself: it consumes a mask and yields a number, so treating its
+# result as logical would convert what was just converted.
+_LOGICAL_RESULT_UNARY = frozenset({"LNot", "Not", "logical_not"})
 
 # Comparisons yield LOGICAL; everything else here yields a number.
 _COMPARISON = frozenset(
@@ -167,6 +180,18 @@ _COMPARISON = frozenset(
         "equal", "not_equal", "less", "less_equal", "greater",
         "greater_equal",
     }
+)
+
+# Operations whose Fortran template requires REAL operands whatever the
+# result is declared to be.
+# Operations that rearrange values without computing new ones, so the type of
+# the result is the type of what went in.
+_SHAPE_ONLY = frozenset(
+    {"slice", "reshape", "view", "permute", "stack", "concat", "scatter"}
+)
+
+_REAL_OPERAND = frozenset(
+    {"sign", "floor", "ceil", "round", "trunc", "sqrt", "exp", "log"}
 )
 
 _INTEGER_DTYPES = frozenset(
@@ -388,6 +413,7 @@ class _FunctionEmitter:
         # an indexed store) rather than one at a time.
         self._consumed: set[int] = set()
         self._address_producers: dict[int, tuple[SSAValue, SSAValue]] = {}
+        self._producers: dict[int, Instr] = {}
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -599,9 +625,73 @@ class _FunctionEmitter:
 
         return None
 
-    @staticmethod
-    def _is_logical(value: SSAValue) -> bool:
-        return str(getattr(value, "dtype", "") or "") in ("bool", "logical")
+    def _is_logical(self, value: SSAValue) -> bool:
+        """Whether this value's *emitted* expression is LOGICAL.
+
+        The declared dtype alone is not enough. A value can be recorded as
+        ``bool`` and still be produced by arithmetic -- numpy makes no
+        distinction, so ``mask + 0`` keeps the boolean dtype while plainly
+        being a number. Emitting MERGE against that gives a non-LOGICAL mask,
+        which Fortran rejects. An inlined value's real type is decided by the
+        instruction that produced it.
+        """
+
+        producer = self._producers.get(value.id)
+        if producer is not None and value.id in self._inlined:
+            operation = (
+                producer.attributes.get("tensor_operation") or producer.op
+            )
+            if operation in _SHAPE_ONLY and producer.args:
+                return self._is_logical(producer.args[0])
+            if (
+                operation in _COMPARISON
+                or operation in _LOGICAL_BINARY
+                or operation in _LOGICAL_RESULT_UNARY
+            ):
+                return True
+            # Produced by arithmetic: a number, whatever the dtype claims.
+            return False
+        if str(getattr(value, "dtype", "") or "") not in ("bool", "logical"):
+            return False
+        if producer is None or value.id not in self._inlined:
+            # A declared LOGICAL variable, or an argument: the declaration is
+            # the truth.
+            return True
+        operation = (
+            producer.attributes.get("tensor_operation") or producer.op
+        )
+        if operation in _SHAPE_ONLY and producer.args:
+            # Rearranging a mask does not stop it being a mask.
+            return self._is_logical(producer.args[0])
+        return (
+            operation in _COMPARISON
+            or operation in _LOGICAL_BINARY
+            or operation in _LOGICAL_RESULT_UNARY
+        )
+
+    def _instruction_is_logical(self, instr: Instr) -> bool:
+        """Whether this instruction's expression evaluates to LOGICAL.
+
+        Asked of the instruction rather than its result, because the result
+        is about to be assigned to a declared variable and so is never
+        inlined -- the value-level test would look at the declaration and
+        answer with what we are trying to check.
+        """
+
+        operation = instr.attributes.get("tensor_operation") or instr.op
+        if operation in _SHAPE_ONLY and instr.args:
+            return self._is_logical(instr.args[0])
+        return (
+            operation in _COMPARISON
+            or operation in _LOGICAL_BINARY
+            or operation in _LOGICAL_RESULT_UNARY
+        )
+
+    def _collect_producers(self) -> None:
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                if instr.res is not None:
+                    self._producers[instr.res.id] = instr
 
     def _numeric(self, instr: Instr, args: list[str]) -> list[str]:
         """Give a LOGICAL operand a numeric value where one is required.
@@ -615,7 +705,12 @@ class _FunctionEmitter:
         """
 
         operation = instr.attributes.get("tensor_operation") or instr.op
-        if operation in _COMPARISON:
+        if operation in _REAL_OPERAND:
+            # These templates name a REAL constant of their own (sign) or
+            # feed a REAL-only intrinsic, so an integer operand is a kind
+            # mismatch regardless of what the result is declared as.
+            target_real = True
+        elif operation in _COMPARISON:
             # A comparison's result is LOGICAL, which says nothing about how
             # its operands should promote -- they promote to each other.
             target_real = any(
@@ -981,15 +1076,11 @@ class _FunctionEmitter:
                 args = self._numeric(instr, args)
             if instr.attributes.get("reverse"):
                 args = [args[1], args[0]]
-            expression = template.format(*args)
-            if op in _COMPARISON and instr.res is not None:
-                # A comparison is LOGICAL, but the recorded program may store
-                # it where a number is expected (numpy keeps no such
-                # distinction). Assigning it directly is a type error.
-                result_dtype = str(instr.res.dtype or self.dtype)
-                if result_dtype not in ("bool", "logical"):
-                    return _UNARY["bool_to_float64"].format(expression)
-            return expression
+            # A comparison landing in a numeric variable is converted at the
+            # assignment, and one inlined into a numeric context is converted
+            # by _numeric on its consumer. Converting here as well would
+            # wrap what was already wrapped.
+            return template.format(*args)
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY:
                 args = self._numeric(instr, args)
@@ -1081,6 +1172,23 @@ class _FunctionEmitter:
                 self._inlined[instr.res.id] = expression
                 continue
             self._locals[instr.res.id] = instr.res
+            if (
+                self._instruction_is_logical(instr)
+                and str(instr.res.dtype or self.dtype)
+                not in ("bool", "logical")
+            ):
+                # A mask reaching a numeric variable. Fortran will not
+                # convert LOGICAL on assignment the way it converts between
+                # numeric kinds, so it is written out.
+                expression = _UNARY["bool_to_float64"].format(expression)
+            elif (
+                not self._instruction_is_logical(instr)
+                and str(instr.res.dtype or self.dtype) in ("bool", "logical")
+            ):
+                # And the reverse: a number recorded as bool, reaching a
+                # variable declared LOGICAL. Non-zero is true, which is the
+                # rule numpy applied when it produced the value.
+                expression = f"(({expression}) /= 0)"
             body.append(f"    {_name(instr.res)} = {expression}")
 
     def _emit_phi_copies(
@@ -1146,6 +1254,7 @@ class _FunctionEmitter:
         self._collect_use_sites()
         self._collect_phis()
         self._collect_address_producers()
+        self._collect_producers()
         body: list[str] = []
         for block in self.function.blocks.values():
             self._emit_block(block, body)
