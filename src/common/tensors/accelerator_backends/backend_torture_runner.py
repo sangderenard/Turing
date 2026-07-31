@@ -25,12 +25,16 @@ BACKENDS = (
     "numpy",
     "torch",
     "torch_cuda",
+    "nodus",
     "c_jit",
     "glsl_jit",
     "llvm_jit",
     "fortran",
     "c_aot",
     "glsl_aot",
+    "python_numpy",
+    "python_torch",
+    "python_nodus",
 )
 DEFAULT_TIERS = (
     TortureTier.ISOLATED,
@@ -116,12 +120,16 @@ def _run_one(
             execute_started = perf_counter_ns()
             actual = case.numpy_reference()
             execute_ns = perf_counter_ns() - execute_started
-        elif backend in {"numpy", "torch", "torch_cuda"}:
+        elif backend in {"numpy", "torch", "torch_cuda", "nodus"}:
             device = None
             if backend == "numpy":
                 from ..numpy_backend import NumPyTensorOperations
 
                 backend_type = NumPyTensorOperations
+            elif backend == "nodus":
+                from .nodus_backend import NodusTensorOperations
+
+                backend_type = NodusTensorOperations
             else:
                 from ..torch_backend import PyTorchTensorOperations, torch
 
@@ -164,6 +172,85 @@ def _run_one(
             (_, value), = result.outputs.items()
             value = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
             actual = {next(iter(case.numpy_reference())): value}
+        elif backend in {"python_numpy", "python_torch", "python_nodus"}:
+            # The tape-walking JIT route (see program_order.py's module
+            # docstring: this is a different product from the AOT
+            # ast=/c_aot/glsl_aot route above, not the same pipeline). The
+            # exact recorded AbstractTensor program is captured as a
+            # FusedProgram, then that numeric IR is lowered to a real
+            # ast.Module in the requested dialect
+            # (fused_program_python_backend) instead of compiling C/GLSL/
+            # LLVM -- elementwise-only, so non-elementwise cases (matmul,
+            # reshape, reductions, where, stack/cat) fail here by design.
+            from ....compiler.fused_program_python_backend import (
+                compile_single_region_python,
+            )
+            from ..fused_ir import ordered_feed_ids
+            from .c_primitive_program import compile_elementwise_tape
+
+            dialect = {
+                "python_numpy": "numpy",
+                "python_torch": "torch",
+                "python_nodus": "abstract_tensor",
+            }[backend]
+            captured = capture_torture_case(case)
+            output_name = next(iter(captured.outputs))
+            capture = compile_elementwise_tape(captured.tape, dict(captured.outputs))
+            feed_names = {
+                id(tensor): name for name, tensor in captured.inputs.items()
+            }
+            compiled_program = compile_single_region_python(
+                capture.program,
+                feed_names,
+                dialect=dialect,
+                abstract_tensor_backend="nodus" if dialect == "abstract_tensor" else None,
+            )
+            compile_ns = perf_counter_ns() - compile_started
+            if compile_only:
+                return TortureMatrixRow(
+                    case=case.name,
+                    tier=case.tier.value,
+                    backend=backend,
+                    status="compiled",
+                    compile_ns=compile_ns,
+                    execute_ns=0,
+                    shell_ns=0,
+                    device_ns=0,
+                    cache_hit=None,
+                    max_abs_error=None,
+                    error=None,
+                )
+            execute_started = perf_counter_ns()
+            if dialect == "numpy":
+                call_inputs = {
+                    name: np.asarray(value) for name, value in case.inputs.items()
+                }
+            elif dialect == "torch":
+                import torch
+
+                call_inputs = {
+                    name: torch.as_tensor(np.asarray(value))
+                    for name, value in case.inputs.items()
+                }
+            else:
+                from ..abstraction import AbstractTensor
+
+                call_inputs = {
+                    name: AbstractTensor.tensor(np.asarray(value))
+                    for name, value in case.inputs.items()
+                }
+            parameters = tuple(
+                feed_names[feed_id] for feed_id in ordered_feed_ids(capture.program)
+            )
+            result = compiled_program.callable(
+                *(call_inputs[name] for name in parameters)
+            )
+            execute_ns = perf_counter_ns() - execute_started
+            if hasattr(result, "detach"):
+                result_value = result.detach().cpu().numpy()
+            else:
+                result_value = getattr(result, "data", result)
+            actual = {output_name: np.asarray(result_value)}
         else:
             captured = capture_torture_case(case)
             if backend == "c_jit":
