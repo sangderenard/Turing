@@ -16,6 +16,10 @@ class ControlTarget(str, Enum):
     PYTHON = "python"
     C = "c"
     GLSL = "glsl"
+    # Fortran renders the same control structure with `do`/`select case`.  It
+    # is worth having as a launch environment because its arrays cannot alias,
+    # which is the freedom the C and LLVM routes must assert explicitly.
+    FORTRAN = "fortran"
 
 
 @dataclass(frozen=True)
@@ -189,6 +193,15 @@ def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
             f"{block.start}, {block.stop}, {block.step}):",
             *body,
         )
+    if target is ControlTarget.FORTRAN:
+        # A Fortran do-loop bound is inclusive, so the exclusive stop used by
+        # every other target becomes stop - 1.
+        return (
+            f"do {block.induction} = {block.start}, "
+            f"({block.stop}) - 1, {block.step}",
+            *body,
+            "end do",
+        )
     declaration = "int " if target in {ControlTarget.C, ControlTarget.GLSL} else ""
     return (
         f"for ({declaration}{block.induction} = {block.start}; "
@@ -209,6 +222,13 @@ def _render_tick(
             keyword = "if" if index == 0 else "elif"
             lines.append(f"{keyword} {block.state} == {value}:")
             lines.extend(_indent(render_control_block(body, target)))
+        return tuple(lines)
+    if target is ControlTarget.FORTRAN:
+        lines = [f"select case ({block.state})"]
+        for value, body in block.cases:
+            lines.append(f"case ({value})")
+            lines.extend(_indent(render_control_block(body, target)))
+        lines.append("end select")
         return tuple(lines)
     lines = [f"switch ({block.state}) {{"]
     for value, body in block.cases:

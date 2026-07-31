@@ -39,6 +39,11 @@ class AcceleratedControlTarget(str, Enum):
     C = "c"
     LLVM_SSA = "llvm_ssa"
     GLSL = "glsl"
+    # A Fortran launch environment.  Compatible whenever the control structure
+    # is loops, sequences and state ticks over already-lowered region bodies --
+    # which is what the planner produces.  Its value is that Fortran arrays
+    # cannot alias, so the region bodies need no aliasing assertions.
+    FORTRAN = "fortran"
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,31 @@ class AcceleratedControlSource:
     function_name: str
     source: str
     region_indices: tuple[int, ...]
+
+
+def _loop_inductions(block: ControlBlock) -> set[str]:
+    """Every loop induction variable in a control tree.
+
+    Fortran has no in-statement declaration, so a `do` variable must be
+    declared in the subroutine body before use.
+    """
+
+    found: set[str] = set()
+    if isinstance(block, LoopBlock):
+        found.add(str(block.induction))
+        found |= _loop_inductions(block.body)
+    elif isinstance(block, SequenceBlock):
+        for child in block.blocks:
+            found |= _loop_inductions(child)
+    elif isinstance(block, StateMachineTick):
+        for _value, body in block.cases:
+            found |= _loop_inductions(body)
+    elif isinstance(block, ParallelDeployment):
+        for lane in block.lanes:
+            found |= _loop_inductions(lane)
+    elif isinstance(block, CallBlock):
+        found |= _loop_inductions(block.callee)
+    return found
 
 
 def _region_index(block: StatementBlock) -> int | None:
@@ -86,11 +116,11 @@ def _render_c_or_glsl(
     function_name: str,
     region_bodies: Mapping[int, Sequence[str]],
 ) -> AcceleratedControlSource:
-    control_target = (
-        ControlTarget.C
-        if target is AcceleratedControlTarget.C
-        else ControlTarget.GLSL
-    )
+    control_target = {
+        AcceleratedControlTarget.C: ControlTarget.C,
+        AcceleratedControlTarget.GLSL: ControlTarget.GLSL,
+        AcceleratedControlTarget.FORTRAN: ControlTarget.FORTRAN,
+    }[target]
     selected = {
         region.region_index: region.body
         for region in _region_codes(program, control_target, region_bodies)
@@ -153,19 +183,41 @@ def _render_c_or_glsl(
             f"expected={program.region_indices!r}, consumed={tuple(consumed)!r}"
         )
     lines = render_control_block(composed.root, control_target)
-    prefix = "void"
-    source = "\n".join(
-        (
-            (
-                f"{prefix} {function_name}(void) {{"
-                if target is AcceleratedControlTarget.C
-                else f"{prefix} {function_name}() {{"
-            ),
-            *(f"    {line}" if line else "" for line in lines),
-            "}",
-            "",
+    if target is AcceleratedControlTarget.FORTRAN:
+        # Fortran declares loop variables up front and closes with a named
+        # `end subroutine` rather than a brace.  bind(C) keeps the launch
+        # environment callable through the same shell ABI as every other
+        # target.
+        induction = sorted(_loop_inductions(composed.root))
+        declarations = (
+            [f"    integer :: {', '.join(induction)}"] if induction else []
         )
-    )
+        source = "\n".join(
+            (
+                f'subroutine {function_name}() '
+                f'bind(C, name="{function_name}")',
+                "    use, intrinsic :: iso_c_binding",
+                "    implicit none",
+                *declarations,
+                *(f"    {line}" if line else "" for line in lines),
+                f"end subroutine {function_name}",
+                "",
+            )
+        )
+    else:
+        prefix = "void"
+        source = "\n".join(
+            (
+                (
+                    f"{prefix} {function_name}(void) {{"
+                    if target is AcceleratedControlTarget.C
+                    else f"{prefix} {function_name}() {{"
+                ),
+                *(f"    {line}" if line else "" for line in lines),
+                "}",
+                "",
+            )
+        )
     return AcceleratedControlSource(
         target=target,
         function_name=function_name,
@@ -428,6 +480,11 @@ def reduce_control_ir(
                 index: (f"call void @turing_region_{index}()",)
                 for index in program.region_indices
             }
+        elif target is AcceleratedControlTarget.FORTRAN:
+            bodies = {
+                index: (f"call turing_region_{index}()",)
+                for index in program.region_indices
+            }
         else:
             bodies = {
                 index: (f"turing_region_{index}();",)
@@ -436,6 +493,7 @@ def reduce_control_ir(
     if target in {
         AcceleratedControlTarget.C,
         AcceleratedControlTarget.GLSL,
+        AcceleratedControlTarget.FORTRAN,
     }:
         return _render_c_or_glsl(
             program,
