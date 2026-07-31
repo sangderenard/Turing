@@ -138,3 +138,85 @@ def test_the_arena_reserves_virtual_address_space(arena):
     stats = arena.stats()
     assert stats.reserve_bytes > 0
     assert stats.span_nodes_capacity > 0
+
+
+def test_canonical_arity_sets_do_not_overlap():
+    """CanonicalOp is classified by enum range inside nodus, and the ranges
+    are not contiguous -- NEG/ABS/SIGN/INVERT sit inside the binary block. A
+    transcription that assumed contiguity would put them in both sets."""
+
+    assert not (na.UNARY_OPS & na.BINARY_OPS)
+    for name in ("neg", "abs", "sign", "invert", "sqrt", "tanh"):
+        assert name in na.UNARY_OPS, name
+    for name in ("add", "sub", "mul", "maximum", "less"):
+        assert name in na.BINARY_OPS, name
+
+
+def test_unary_operators_run_through_nodus(arena):
+    handle = arena.from_values(na.F64, (4,), [1.0, 4.0, 9.0, 16.0])
+    try:
+        result = arena.unary("sqrt", handle)
+        try:
+            assert arena.to_values(result) == (1.0, 2.0, 3.0, 4.0)
+        finally:
+            arena.destroy(result)
+    finally:
+        arena.destroy(handle)
+
+
+def test_binary_operators_run_through_nodus(arena):
+    left = arena.from_values(na.F64, (4,), [1.0, 4.0, 9.0, 16.0])
+    right = arena.from_values(na.F64, (4,), [1.0, 2.0, 3.0, 4.0])
+    try:
+        total = arena.binary("add", left, right)
+        product = arena.binary("mul", left, right)
+        try:
+            assert arena.to_values(total) == (2.0, 6.0, 12.0, 20.0)
+            assert arena.to_values(product) == (1.0, 8.0, 27.0, 64.0)
+        finally:
+            arena.destroy(total)
+            arena.destroy(product)
+    finally:
+        arena.destroy(left)
+        arena.destroy(right)
+
+
+def test_scalar_side_decides_non_commutative_results(arena):
+    """scalar_on_left is the difference between value - tensor and
+    tensor - value, and a commutative op would hide the mistake."""
+
+    handle = arena.from_values(na.F64, (3,), [1.0, 2.0, 3.0])
+    try:
+        right = arena.scalar("sub", handle, 10.0)
+        left = arena.scalar("sub", handle, 10.0, scalar_on_left=True)
+        try:
+            assert arena.to_values(right) == (-9.0, -8.0, -7.0)
+            assert arena.to_values(left) == (9.0, 8.0, 7.0)
+        finally:
+            arena.destroy(right)
+            arena.destroy(left)
+    finally:
+        arena.destroy(handle)
+
+
+def test_an_unknown_operation_is_refused_not_guessed(arena):
+    handle = arena.create(na.F64, (2,))
+    try:
+        with pytest.raises(na.NodusArenaError):
+            arena.unary("definitely_not_an_op", handle)
+    finally:
+        arena.destroy(handle)
+
+
+def test_connect_warns_loudly_when_the_core_is_missing(monkeypatch):
+    """A silent fallback is the bad outcome: the pure-Python path still
+    computes, so a missing core looks like nothing worse than a slow day."""
+
+    monkeypatch.setattr(na, "_ARENA", None)
+
+    def _unavailable(*args, **kwargs):
+        raise na.NodusArenaUnavailable("looked in: nowhere")
+
+    monkeypatch.setattr(na, "NodusArena", _unavailable)
+    with pytest.warns(RuntimeWarning, match="NOT connected"):
+        assert na.connect() is None

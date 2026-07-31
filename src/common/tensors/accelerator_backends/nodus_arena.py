@@ -269,6 +269,88 @@ class NodusArena:
         ]
         library.nodus_tensor_dtype_size.restype = ctypes.c_uint32
         library.nodus_tensor_dtype_size.argtypes = [ctypes.c_int32]
+        library.nodus_tensor_unary.restype = ctypes.c_int32
+        library.nodus_tensor_unary.argtypes = [
+            ctypes.c_int32, ctypes.c_uint64, ctypes.c_uint64
+        ]
+        library.nodus_tensor_binary.restype = ctypes.c_int32
+        library.nodus_tensor_binary.argtypes = [
+            ctypes.c_int32, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64
+        ]
+        library.nodus_tensor_scalar.restype = ctypes.c_int32
+        library.nodus_tensor_scalar.argtypes = [
+            ctypes.c_int32, ctypes.c_uint64, ctypes.c_double,
+            ctypes.c_int32, ctypes.c_uint64
+        ]
+
+    # -- operators --------------------------------------------------------
+
+    def _op_code(self, op: str) -> int:
+        code = CANONICAL_OPS.get(op)
+        if code is None:
+            raise NodusArenaError(f"{op!r} is not a canonical nodus operation")
+        return code
+
+    def unary(self, op: str, source: int, out: int | None = None) -> int:
+        """Apply a one-operand canonical operation.
+
+        ``out`` is created to match the operand when not supplied, so a caller
+        that only wants a result does not have to know the shape rules.
+        """
+
+        if out is None:
+            desc = self.describe(source)
+            out = self.create(
+                int(desc.dtype), [desc.shape[i] for i in range(desc.rank)]
+            )
+        _check(
+            self._library.nodus_tensor_unary(self._op_code(op), source, out),
+            f"unary {op}",
+        )
+        return out
+
+    def binary(self, op: str, left: int, right: int, out: int | None = None) -> int:
+        if out is None:
+            desc = self.describe(left)
+            out = self.create(
+                int(desc.dtype), [desc.shape[i] for i in range(desc.rank)]
+            )
+        _check(
+            self._library.nodus_tensor_binary(
+                self._op_code(op), left, right, out
+            ),
+            f"binary {op}",
+        )
+        return out
+
+    def scalar(
+        self,
+        op: str,
+        tensor: int,
+        value: float,
+        *,
+        scalar_on_left: bool = False,
+        out: int | None = None,
+    ) -> int:
+        """Apply a canonical operation against a Python number.
+
+        ``scalar_on_left`` separates ``value - tensor`` from ``tensor -
+        value``; for a commutative operation it makes no difference.
+        """
+
+        if out is None:
+            desc = self.describe(tensor)
+            out = self.create(
+                int(desc.dtype), [desc.shape[i] for i in range(desc.rank)]
+            )
+        _check(
+            self._library.nodus_tensor_scalar(
+                self._op_code(op), tensor, float(value),
+                1 if scalar_on_left else 0, out,
+            ),
+            f"scalar {op}",
+        )
+        return out
 
     # -- arena ------------------------------------------------------------
 
@@ -433,6 +515,35 @@ class NodusArena:
         return struct.unpack(f"<{count}{code}", raw)
 
 
+# nodus::ops::CanonicalOp, by name. The two repositories already agreed on
+# these codes before this bridge existed -- they are the CT_OP_* values the C
+# backend's _OP_NAMES table uses -- so this is a transcription of a shared
+# vocabulary, not a new one.
+CANONICAL_OPS: dict[str, int] = {
+    "add": 0, "sub": 1, "mul": 2, "truediv": 3, "pow": 4, "mod": 5,
+    "floordiv": 6, "sqrt": 7, "exp": 8, "log": 9, "neg": 10, "abs": 11,
+    "round": 12, "trunc": 13, "floor": 14, "ceil": 15, "isfinite": 16,
+    "isnan": 17, "isinf": 18, "logical_not": 19, "less": 20,
+    "less_equal": 21, "greater": 22, "greater_equal": 23, "equal": 24,
+    "not_equal": 25, "maximum": 26, "minimum": 27, "sign": 28, "invert": 29,
+    "sin": 30, "cos": 31, "tan": 32, "asin": 33, "acos": 34, "atan": 35,
+    "sinh": 36, "cosh": 37, "tanh": 38, "asinh": 39, "acosh": 40,
+    "atanh": 41, "bitand": 42, "bitor": 43, "bitxor": 44,
+}
+
+# Arity is not exposed by the ABI on purpose (see tensor_abi.h): the
+# classification lives inside nodus's operator table, and a second copy could
+# disagree with it. These are the ranges that table itself uses.
+UNARY_OPS = frozenset(
+    name for name, code in CANONICAL_OPS.items()
+    if 7 <= code <= 19 or 30 <= code <= 41 or code in (10, 11, 28, 29)
+)
+BINARY_OPS = frozenset(
+    name for name, code in CANONICAL_OPS.items()
+    if code <= 6 or 20 <= code <= 27 or 42 <= code <= 44
+)
+
+
 _ARENA: NodusArena | None = None
 
 
@@ -446,7 +557,99 @@ def arena() -> NodusArena:
     return _ARENA
 
 
+def connect(*, warn: bool = True) -> NodusArena | None:
+    """Attach to nodus, complaining loudly rather than quietly degrading.
+
+    A silent fallback here is the bad outcome: the pure-Python path still
+    computes, so a missing tensor core looks like nothing more than a slow
+    day, and the reason the run was slow is invisible in the log.
+    """
+
+    global _ARENA
+    if _ARENA is not None:
+        return _ARENA
+    try:
+        _ARENA = NodusArena()
+        return _ARENA
+    except NodusArenaUnavailable as error:
+        if warn:
+            import warnings
+
+            warnings.warn(
+                "nodus tensor core is NOT connected -- AbstractTensor is "
+                "running on its pure-Python backends, which are far slower "
+                f"and do not share nodus's arena. Reason: {error} "
+                "Build the nodus_tensor_core target, or set "
+                "NODUS_TENSOR_CORE to an existing library.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Coverage audit -- 2026-07-31
+#
+# Measured, not assumed: abstraction.py names 58 methods a backend "must
+# implement", and nodus::ops::CanonicalOp carries 45 operations. The overlap
+# is smaller than either number suggests, and the gap is not the one earlier
+# audits recorded. Those counted whole methods absent; what actually blocks a
+# full InMemory backend is subtler in three distinct ways.
+#
+# 1. Composable, so no nodus primitive is owed at all.
+#    softmax_ / log_softmax_ have no definition anywhere in
+#    abstraction_methods -- they are named as required and never written. Both
+#    fall out of exp/max/sum/div, which CanonicalOp already covers, so the
+#    honest fix is a Python composition on top of this ABI rather than an
+#    entry in the operator table. Writing them natively in nodus would add a
+#    second place for the numerics to disagree.
+#
+# 2. Named as composable, but actually pass-throughs.
+#    This is the one previous audits got wrong in the other direction.
+#    repeat_interleave (reshape.py:246) and argwhere (comparison.py:17) look
+#    like compositions because they live beside real ones, but each is a
+#    single delegation to its own trailing-underscore primitive:
+#        return _wrap_result(self, self.repeat_interleave_(repeats, dim))
+#        result.data = self.argwhere_()
+#    There is no composition standing behind them. argwhere_ is the harder of
+#    the two and does not reduce at all: its output extent is data-dependent,
+#    so it cannot be expressed as a shaped elementwise program, and every
+#    backend here implements it natively.
+#
+# 3. Present on both sides but not equivalent, which is the subtlest class.
+#    - Arity: CanonicalOp is classified by *enum range* inside
+#      tensor_math.cpp (file-static canonical_is_unary/is_binary). The ranges
+#      are not contiguous -- NEG/ABS/SIGN/INVERT sit inside the binary block
+#      -- so any transcription of the enum that assumes contiguity is wrong
+#      for exactly those four. UNARY_OPS/BINARY_OPS above encode the real
+#      ranges; they are the second copy tensor_abi.h declines to expose, and
+#      they will drift if that table changes.
+#    - Payload vs lease: a lease is aligned up to 64 bytes, so a tensor's
+#      mapping is routinely larger than the tensor. Anything sizing work from
+#      the mapping rather than the descriptor silently runs past the extent
+#      while staying inside allocated memory. Already fixed in the ABI, but
+#      the same trap exists for any future caller of map().
+#    - Strides: TensorStrides is in *elements*; NodusTensorDesc keeps that
+#      unit deliberately. A byte-addressed consumer must scale, and nothing
+#      in the type system will catch it if it does not.
+#
+# Not reducible and genuinely absent from nodus: the fft_ family (fft_, ifft_,
+# rfft_, irfft_, fftfreq_, rfftfreq_). These need a real transform, not
+# elementwise composition. The workspace has an fftfree checkout, which is
+# where that likely belongs rather than in the tensor core.
+#
+# So the InMemory surface owed by nodus is: the CanonicalOp dispatch (done
+# below), then the shape and reduction ops that are not elementwise --
+# reshape, permute, slice, concat, stack, matmul, and the axis reductions --
+# then argwhere_ and repeat_interleave_ natively. The rest composes in Python.
+# ---------------------------------------------------------------------------
+
+
 __all__ = [
+    "BINARY_OPS",
+    "CANONICAL_OPS",
+    "UNARY_OPS",
+    "connect",
     "MAX_RANK",
     "NodusArena",
     "NodusArenaError",
