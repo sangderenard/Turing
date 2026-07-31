@@ -117,15 +117,87 @@ def test_multi_block_control_flow_reports_shortfall():
     assert "control flow" in module.shortfalls[0].reason
 
 
-def test_array_argument_reports_shortfall():
-    a = SSAValue(0, "float64", (4,))
-    block = BasicBlock("entry", [Instr("Ret", [], None)])
-    function = Function("arrfn", [a], {"entry": block})
+def test_array_elementwise_chain_unrolls_and_validates():
+    a = SSAValue(0, "float32", (4,))
+    b = SSAValue(1, "float32", (4,))
+    total = SSAValue(2, "float32", (4,))
+    block = BasicBlock(
+        "entry",
+        [Instr("add", [a, b], total), Instr("Ret", [], None)],
+    )
+    function = Function("vec_add", [a, b], {"entry": block})
 
-    module = emit_function(function)
+    module = emit_function(function, outputs=[total])
+
+    assert module.complete
+    # One OpAccessChain/OpLoad pair per operand per element, plus one store.
+    assert module.source.count("OpFAdd") == 4
+    assert module.source.count("OpStore") == 4
+    assert "OpTypeArray %float32 %cu" in module.source
+    assert "%vec_add = OpFunction" in module.source
+
+    if shutil.which("spirv-as") is None:
+        return
+    workdir = Path(tempfile.mkdtemp(prefix="turing_spirv_test_")).resolve()
+    source = module.write(workdir)
+    binary = workdir / f"{module.name}.spv"
+    assembled = subprocess.run(
+        ["spirv-as", str(source), "-o", str(binary)], capture_output=True, text=True
+    )
+    assert assembled.returncode == 0, assembled.stderr
+    validator = shutil.which("spirv-val")
+    if validator is not None:
+        validated = subprocess.run([validator, str(binary)], capture_output=True, text=True)
+        assert validated.returncode == 0, validated.stderr
+
+
+def test_array_broadcast_against_scalar_operand():
+    a = SSAValue(0, "float32", (3,))
+    scaled = SSAValue(1, "float32", (3,))
+    block = BasicBlock(
+        "entry",
+        [
+            Instr("mul", [a], scaled, attributes={"right_scalar": 2.0}),
+            Instr("Ret", [], None),
+        ],
+    )
+    function = Function("scale_vec", [a], {"entry": block})
+
+    module = emit_function(function, outputs=[scaled])
+
+    assert module.complete
+    assert module.source.count("OpFMul") == 3
+
+
+def test_array_rank_mismatch_reports_shortfall():
+    a = SSAValue(0, "float32", (2, 3))
+    b = SSAValue(1, "float32", (4,))
+    total = SSAValue(2, "float32", (2, 3))
+    block = BasicBlock(
+        "entry",
+        [Instr("add", [a, b], total), Instr("Ret", [], None)],
+    )
+    function = Function("bad_broadcast", [a, b], {"entry": block})
+
+    module = emit_function(function, outputs=[total])
 
     assert not module.complete
-    assert "array" in module.shortfalls[0].reason
+    assert "broadcast" in module.shortfalls[0].reason
+
+
+def test_reduction_over_array_reports_shortfall():
+    a = SSAValue(0, "float32", (4,))
+    total = SSAValue(1, "float32", ())
+    block = BasicBlock(
+        "entry",
+        [Instr("sum", [a], total), Instr("Ret", [], None)],
+    )
+    function = Function("reduce_sum", [a], {"entry": block})
+
+    module = emit_function(function, outputs=[total])
+
+    assert not module.complete
+    assert "reductions" in module.shortfalls[0].reason
 
 
 def test_region_call_reports_shortfall():

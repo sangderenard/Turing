@@ -5,10 +5,11 @@ This is the first cut of the ``SSA -> SPIR-V`` route named in
 operations -> SPIR-V module") and tracked as "not started" in
 ``docs/BACKEND_PERFORMANCE_HANDOFF.md``. It follows the same incremental
 scoping this repo already used for ``ssa_fortran_backend.py``: land straight-
-line scalar elementwise chains first, and report everything else (array
-operands, structural ops, multi-block control flow, region calls) as an
-honest shortfall rather than a guess. Widening scope is follow-up work, not a
-redesign -- the block/shortfall structure below already accommodates it.
+line scalar elementwise chains first, then array-shaped elementwise chains,
+and report everything else (structural ops, reductions, multi-block control
+flow, region calls) as an honest shortfall rather than a guess. Widening
+scope further is follow-up work, not a redesign -- the block/shortfall
+structure below already accommodates it.
 
 SPIR-V differs from every other backend in this repo in one structural way
 worth stating up front: ids and type/constant declarations are **module**
@@ -17,11 +18,25 @@ redeclare ``OpTypeFloat 64`` or fight over id numbers. ``_ModuleBuilder``
 exists for exactly that reason -- one shared id/type/constant namespace,
 threaded through every ``_FunctionEmitter`` in a module.
 
-The array/buffer binding ABI (SSBOs, descriptor sets, workgroup dispatch) is
-deliberately out of scope here: it is its own milestone in the interop doc
+Array-shaped SSA values are represented as ``Function``-storage pointers to
+nested ``OpTypeArray``s (dimension 0 outermost, matching this repo's SSA
+dimension order directly -- no Fortran-style column-major reversal needed).
+An array argument arrives as an ``OpTypePointer(Function, ...)`` parameter;
+an array-shaped instruction result gets its own ``OpVariable`` declared at
+the top of the entry block (SPIR-V requires every ``Function``-storage
+``OpVariable`` to precede all other instructions in the block). Elementwise
+ops over arrays are **unrolled** into one ``OpAccessChain``/``OpLoad``/
+.../``OpStore`` sequence per flat index rather than looped -- shapes are
+always statically known here, and a real loop needs structured control flow,
+which is a separate, later milestone (see the handoff doc). This keeps every
+function single-block, consistent with everything else in this module.
+
+The buffer/descriptor binding ABI (SSBOs, descriptor sets, workgroup
+dispatch) needed to hand real GPU-resident data to one of these functions is
+still deliberately out of scope: it is its own milestone in the interop doc
 ("Specify a shared tensor descriptor ..."), not a prerequisite for proving
 the op-level translation. Each SSA ``Function`` is emitted as an ordinary
-SPIR-V library function (``OpFunction`` / scalar ``OpFunctionParameter``s /
+SPIR-V library function (``OpFunction`` / ``OpFunctionParameter``s /
 ``OpReturnValue``), decorated ``LinkageAttributes ... Export`` so the module
 is valid with no ``OpEntryPoint`` at all (the ``Linkage`` capability exists
 for precisely this). Wiring a function into a real GLCompute/Vulkan entry
@@ -31,6 +46,7 @@ reason to block on it.
 
 from __future__ import annotations
 
+import itertools
 import shutil
 import subprocess
 import tempfile
@@ -169,6 +185,14 @@ _EXTINST_FLOAT16_32_ONLY: frozenset[str] = frozenset(
     }
 )
 
+# Whole-array-to-scalar reductions -- not in any op table above (they need
+# accumulation across elements, not a single instruction), so they would
+# otherwise fall through to the generic "no opcode registered" shortfall.
+# Naming them lets that case report what it actually is.
+_REDUCTION_OPS: frozenset[str] = frozenset(
+    {"sum", "prod", "max", "min", "mean", "all", "any"}
+)
+
 
 class SPIRVEmissionError(ValueError):
     """Raised when an SSA construct has no honest SPIR-V spelling."""
@@ -302,9 +326,58 @@ class _ModuleBuilder:
         self.needs_glsl_ext = True
         return "%glsl"
 
+    def uint_type(self) -> str:
+        if "uint" not in self.type_ids:
+            self.type_ids["uint"] = "%uint"
+            self.type_lines.append("%uint = OpTypeInt 32 0")
+        return self.type_ids["uint"]
+
+    def uint_constant(self, value: int) -> str:
+        type_id = self.uint_type()
+        key = (type_id, "uint", int(value))
+        if key not in self.const_ids:
+            id_ = self.fresh("cu")
+            self.type_lines.append(f"{id_} = OpConstant {type_id} {int(value)}")
+            self.const_ids[key] = id_
+        return self.const_ids[key]
+
+    def array_type(self, elem_type: str, dims: tuple[int, ...]) -> str:
+        """A (possibly nested) ``OpTypeArray`` over ``dims``.
+
+        Dimension 0 is outermost, matching this repo's SSA dimension order
+        directly -- built inside-out so the innermost (fastest-varying)
+        dimension nests first.
+        """
+
+        if not dims:
+            raise SPIRVEmissionError("array_type requires at least one dimension")
+        type_id = elem_type
+        for size in reversed(dims):
+            length_id = self.uint_constant(int(size))
+            key = f"arr({type_id};{length_id})"
+            if key not in self.type_ids:
+                id_ = self.fresh("arrty")
+                self.type_lines.append(f"{id_} = OpTypeArray {type_id} {length_id}")
+                self.type_ids[key] = id_
+            type_id = self.type_ids[key]
+        return type_id
+
+    def pointer_type(self, storage_class: str, pointee: str) -> str:
+        key = f"ptr({storage_class};{pointee})"
+        if key not in self.type_ids:
+            id_ = self.fresh("ptrty")
+            self.type_lines.append(f"{id_} = OpTypePointer {storage_class} {pointee}")
+            self.type_ids[key] = id_
+        return self.type_ids[key]
+
 
 class _FunctionEmitter:
-    """Translate one straight-line scalar SSA ``Function`` into SPIR-V."""
+    """Translate one straight-line SSA ``Function`` into SPIR-V.
+
+    Scalar values pass by value; array-shaped values are represented as
+    ``Function``-storage pointers (see module docstring). Control flow stays
+    single-block -- array elementwise ops are unrolled, not looped.
+    """
 
     def __init__(
         self,
@@ -319,6 +392,11 @@ class _FunctionEmitter:
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.shortfalls: list[SPIRVShortfall] = []
+        # Array-shaped SSA value id -> the Function-storage pointer holding
+        # it (an OpFunctionParameter for arguments, an OpVariable for
+        # computed temporaries). Scalars never appear here -- they pass by
+        # value under their own %tN name.
+        self._array_pointer: dict[int, str] = {}
 
     def _name(self, value: SSAValue) -> str:
         return f"%t{value.id}"
@@ -340,22 +418,6 @@ class _FunctionEmitter:
             )
         block = next(iter(function.blocks.values()))
 
-        for argument in function.args:
-            if argument.shape:
-                return self._bail(
-                    "<function>", block.name,
-                    "array-shaped arguments are not yet supported by the "
-                    "SPIR-V backend (the buffer/binding ABI is separate, "
-                    "later work)",
-                )
-        for value in self.outputs:
-            if value.shape:
-                return self._bail(
-                    "<function>", block.name,
-                    "array-shaped outputs are not yet supported by the "
-                    "SPIR-V backend (the buffer/binding ABI is separate, "
-                    "later work)",
-                )
         if len(self.outputs) > 1:
             return self._bail(
                 "<function>", block.name,
@@ -364,22 +426,37 @@ class _FunctionEmitter:
             )
 
         return_type = (
-            self.builder.scalar_type(self.outputs[0].dtype or self.dtype)
+            self._plain_type(self.outputs[0])
             if self.outputs
             else self.builder.void_type()
         )
-        param_types = [
-            self.builder.scalar_type(a.dtype or self.dtype) for a in function.args
-        ]
+        param_types = [self._value_type(a) for a in function.args]
         fn_type = self.builder.function_type(return_type, param_types)
 
         body: list[str] = []
         fn_id = f"%{function.name}"
         body.append(f"{fn_id} = OpFunction {return_type} None {fn_type}")
-        for argument in function.args:
-            type_id = self.builder.scalar_type(argument.dtype or self.dtype)
-            body.append(f"{self._name(argument)} = OpFunctionParameter {type_id}")
+        for argument, param_type in zip(function.args, param_types):
+            body.append(f"{self._name(argument)} = OpFunctionParameter {param_type}")
+            if argument.shape:
+                self._array_pointer[argument.id] = self._name(argument)
         body.append(f"%{function.name}_entry = OpLabel")
+
+        # Every Function-storage OpVariable must precede all other
+        # instructions in the block -- declare storage for every
+        # array-shaped result up front, before emitting any computation.
+        for instr in block.instrs:
+            if instr.res is None or not instr.res.shape:
+                continue
+            if instr.res.id in self._array_pointer:
+                continue
+            # _value_type() returns the *pointer* type for a shaped value
+            # (that's what a parameter/return needs); OpVariable's Result
+            # Type must itself be that pointer type, not a pointer to it.
+            ptr_type = self._value_type(instr.res)
+            var_id = f"%t{instr.res.id}_arr"
+            body.append(f"{var_id} = OpVariable {ptr_type} Function")
+            self._array_pointer[instr.res.id] = var_id
 
         for instr in block.instrs:
             self._emit_instr(instr, block, body)
@@ -387,6 +464,182 @@ class _FunctionEmitter:
         body.append("OpFunctionEnd")
         self.builder.exported.append(function.name)
         return SPIRVFunction(function.name, tuple(body), tuple(self.shortfalls))
+
+    def _plain_type(self, value: SSAValue) -> str:
+        """The plain (non-pointer) SPIR-V type of ``value``.
+
+        A scalar's own type, or the array type itself (not a pointer to it)
+        -- what ``OpReturnValue`` and ``OpLoad`` both need as a Result Type.
+        """
+
+        elem_type = self.builder.scalar_type(value.dtype or self.dtype)
+        if not value.shape:
+            return elem_type
+        return self.builder.array_type(
+            elem_type, tuple(int(size) for size in value.shape)
+        )
+
+    def _value_type(self, value: SSAValue) -> str:
+        """The SPIR-V type of ``value`` as it flows through the function.
+
+        A scalar's own type; an array's storage pointer type (arrays never
+        pass by value here except as a return value -- see the module
+        docstring and ``_plain_type``).
+        """
+
+        elem_type = self.builder.scalar_type(value.dtype or self.dtype)
+        if not value.shape:
+            return elem_type
+        array_type = self.builder.array_type(
+            elem_type, tuple(int(size) for size in value.shape)
+        )
+        return self.builder.pointer_type("Function", array_type)
+
+    @staticmethod
+    def _resolve(op: str, operand_dtype: str | None, arity: int) -> tuple[str, str] | None:
+        """The SPIR-V opcode/extended-instruction for ``op``, or ``None``.
+
+        Resolution depends only on the op name, the operand dtype bucket,
+        and how many operands there are -- not on whether any operand is an
+        array, which is exactly what lets one lookup serve both the scalar
+        path and the per-element array path below.
+        """
+
+        bucket = _DTYPE_KIND.get(operand_dtype or DEFAULT_DTYPE)
+        binary_table = _BINARY_INT if bucket == "int" else _BINARY_FLOAT
+        if arity == 2 and op in binary_table:
+            return ("binary", binary_table[op])
+        if arity == 2 and op in _BOOL_BINARY:
+            return ("binary", _BOOL_BINARY[op])
+        if arity == 2 and op in _BINARY_EXTINST:
+            return ("extinst_binary", _BINARY_EXTINST[op])
+        if arity == 1 and op in _CAST_NATIVE:
+            return ("cast", _CAST_NATIVE[op])
+        if arity == 1 and op in _UNARY_NATIVE:
+            return ("unary", _UNARY_NATIVE[op])
+        if arity == 1 and op in _UNARY_EXTINST:
+            return ("extinst_unary", _UNARY_EXTINST[op])
+        if arity == 3 and op in ("Select", "where"):
+            return ("select", "")
+        return None
+
+    def _apply(
+        self,
+        kind: str,
+        payload: str,
+        result_type: str,
+        result_id: str,
+        operand_ids: list[str],
+        instr: Instr,
+        body: list[str],
+    ) -> None:
+        """Emit exactly one SPIR-V instruction computing ``result_id``.
+
+        Shared by the scalar path (operand_ids are plain SSA value names)
+        and the array path (operand_ids are per-element loaded values) --
+        neither knows or cares which.
+        """
+
+        if kind == "binary":
+            ids = operand_ids
+            if instr.attributes.get("reverse"):
+                ids = [ids[1], ids[0]]
+            body.append(f"    {result_id} = {payload} {result_type} {ids[0]} {ids[1]}")
+        elif kind == "extinst_binary":
+            ext = self.builder.glsl_ext()
+            body.append(
+                f"    {result_id} = OpExtInst {result_type} {ext} "
+                f"{payload} {operand_ids[0]} {operand_ids[1]}"
+            )
+        elif kind in ("cast", "unary"):
+            body.append(f"    {result_id} = {payload} {result_type} {operand_ids[0]}")
+        elif kind == "extinst_unary":
+            ext = self.builder.glsl_ext()
+            body.append(
+                f"    {result_id} = OpExtInst {result_type} {ext} "
+                f"{payload} {operand_ids[0]}"
+            )
+        elif kind == "select":
+            body.append(
+                f"    {result_id} = OpSelect {result_type} "
+                f"{operand_ids[0]} {operand_ids[1]} {operand_ids[2]}"
+            )
+
+    def _augment_scalar_attrs(
+        self, instr: Instr, operand_ids: list[str], operand_dtype: str | None
+    ) -> list[str]:
+        """Fold ``right_scalar``/``left_scalar`` attributes into ``operand_ids``."""
+
+        right = instr.attributes.get("right_scalar")
+        left = instr.attributes.get("left_scalar")
+        if right is not None and len(operand_ids) == 1:
+            return [operand_ids[0], self.builder.constant(operand_dtype, right)]
+        if left is not None and len(operand_ids) == 1:
+            return [self.builder.constant(operand_dtype, left), operand_ids[0]]
+        return operand_ids
+
+    @staticmethod
+    def _broadcast_index(
+        operand_shape: tuple[int, ...],
+        result_shape: tuple[int, ...],
+        index: tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        """numpy-style broadcast of a flat ``result_shape`` index onto ``operand_shape``.
+
+        Dimensions align from the right; an extent-one operand dimension
+        always reads index 0 regardless of the result index there.
+        """
+
+        rank = len(result_shape)
+        if len(operand_shape) > rank:
+            return None
+        offset = rank - len(operand_shape)
+        operand_index = []
+        for position, size in enumerate(operand_shape):
+            size = int(size)
+            result_position = offset + position
+            if size == 1:
+                operand_index.append(0)
+            elif size == int(result_shape[result_position]):
+                operand_index.append(index[result_position])
+            else:
+                return None
+        return tuple(operand_index)
+
+    def _load_element(
+        self,
+        pointer: str,
+        index: tuple[int, ...],
+        elem_type: str,
+        body: list[str],
+    ) -> str:
+        index_ids = [self.builder.uint_constant(i) for i in index]
+        ptr_type = self.builder.pointer_type("Function", elem_type)
+        access = self.builder.fresh("ap")
+        body.append(
+            f"    {access} = OpAccessChain {ptr_type} {pointer} "
+            f"{' '.join(index_ids)}"
+        )
+        loaded = self.builder.fresh("v")
+        body.append(f"    {loaded} = OpLoad {elem_type} {access}")
+        return loaded
+
+    def _store_element(
+        self,
+        pointer: str,
+        index: tuple[int, ...],
+        elem_type: str,
+        value_id: str,
+        body: list[str],
+    ) -> None:
+        index_ids = [self.builder.uint_constant(i) for i in index]
+        ptr_type = self.builder.pointer_type("Function", elem_type)
+        access = self.builder.fresh("ap")
+        body.append(
+            f"    {access} = OpAccessChain {ptr_type} {pointer} "
+            f"{' '.join(index_ids)}"
+        )
+        body.append(f"    OpStore {access} {value_id}")
 
     def _emit_instr(self, instr: Instr, block: BasicBlock, body: list[str]) -> None:
         if instr.op in ("Br", "br", "CondBr", "condbr", "Phi", "phi"):
@@ -398,7 +651,21 @@ class _FunctionEmitter:
             return
         if instr.op in ("Ret", "ret", "Return", "return"):
             if self.outputs:
-                body.append(f"    OpReturnValue {self._name(self.outputs[0])}")
+                out = self.outputs[0]
+                if out.shape:
+                    pointer = self._array_pointer.get(out.id)
+                    if pointer is None:
+                        self._shortfall(
+                            instr.op, block.name,
+                            "the function output has no known array storage",
+                        )
+                        return
+                    array_type = self._plain_type(out)
+                    value_id = self.builder.fresh("v")
+                    body.append(f"    {value_id} = OpLoad {array_type} {pointer}")
+                    body.append(f"    OpReturnValue {value_id}")
+                else:
+                    body.append(f"    OpReturnValue {self._name(out)}")
             else:
                 body.append("    OpReturn")
             return
@@ -429,98 +696,117 @@ class _FunctionEmitter:
             )
             return
 
-        result_id = self._name(instr.res)
         result_dtype = instr.res.dtype or self.dtype
-        result_type = self.builder.scalar_type(result_dtype)
+        result_shape = tuple(int(size) for size in instr.res.shape)
+        elem_type = self.builder.scalar_type(result_dtype)
 
         if op in ("Const", "const"):
-            value = instr.attributes.get("constant")
-            if value is None:
-                value = instr.attributes.get("value")
-            if value is None:
+            if result_shape:
                 self._shortfall(
                     op, block.name,
                     "array constants are not yet supported by the SPIR-V "
                     "backend",
                 )
                 return
+            value = instr.attributes.get("constant")
+            if value is None:
+                value = instr.attributes.get("value")
+            if value is None:
+                self._shortfall(
+                    op, block.name,
+                    "no literal value is recorded for this constant",
+                )
+                return
             const_id = self.builder.constant(result_dtype, value)
-            body.append(f"    {result_id} = OpCopyObject {result_type} {const_id}")
+            body.append(f"    {self._name(instr.res)} = OpCopyObject {elem_type} {const_id}")
             return
 
-        args = [self._name(a) for a in instr.args]
+        if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
+            self._shortfall(
+                op, block.name,
+                "reductions over arrays are not yet supported by the "
+                "SPIR-V backend",
+            )
+            return
 
-        # Scalar operands recorded as attributes rather than SSA values.
-        right = instr.attributes.get("right_scalar")
-        left = instr.attributes.get("left_scalar")
         operand_dtype = instr.args[0].dtype if instr.args else result_dtype
-        if right is not None and len(args) == 1:
-            args = [args[0], self.builder.constant(operand_dtype, right)]
-        elif left is not None and len(args) == 1:
-            args = [self.builder.constant(operand_dtype, left), args[0]]
-
-        bucket = _DTYPE_KIND.get(operand_dtype or self.dtype)
-        binary_table = _BINARY_INT if bucket == "int" else _BINARY_FLOAT
-
-        if op in binary_table and len(args) == 2:
-            if instr.attributes.get("reverse"):
-                args = [args[1], args[0]]
-            body.append(f"    {result_id} = {binary_table[op]} {result_type} {args[0]} {args[1]}")
-            return
-
-        if op in _BOOL_BINARY and len(args) == 2:
-            body.append(f"    {result_id} = {_BOOL_BINARY[op]} {result_type} {args[0]} {args[1]}")
-            return
-
-        if op in _BINARY_EXTINST and len(args) == 2:
-            extinst = _BINARY_EXTINST[op]
-            if extinst in _EXTINST_FLOAT16_32_ONLY and _DTYPE_WIDTH.get(result_dtype) == 64:
-                self._shortfall(
-                    op, block.name,
-                    f"GLSL.std.450 {extinst} is restricted to 16/32-bit "
-                    "float operands; this value is float64",
-                )
-                return
-            ext = self.builder.glsl_ext()
-            body.append(
-                f"    {result_id} = OpExtInst {result_type} {ext} "
-                f"{extinst} {args[0]} {args[1]}"
-            )
-            return
-
-        if op in _CAST_NATIVE and len(args) == 1:
-            body.append(f"    {result_id} = {_CAST_NATIVE[op]} {result_type} {args[0]}")
-            return
-
-        if op in _UNARY_NATIVE and len(args) == 1:
-            body.append(f"    {result_id} = {_UNARY_NATIVE[op]} {result_type} {args[0]}")
-            return
-
-        if op in _UNARY_EXTINST and len(args) == 1:
-            extinst = _UNARY_EXTINST[op]
-            if extinst in _EXTINST_FLOAT16_32_ONLY and _DTYPE_WIDTH.get(result_dtype) == 64:
-                self._shortfall(
-                    op, block.name,
-                    f"GLSL.std.450 {extinst} is restricted to 16/32-bit "
-                    "float operands; this value is float64",
-                )
-                return
-            ext = self.builder.glsl_ext()
-            body.append(
-                f"    {result_id} = OpExtInst {result_type} {ext} "
-                f"{extinst} {args[0]}"
-            )
-            return
-
-        if op in ("Select", "where") and len(args) == 3:
-            body.append(f"    {result_id} = OpSelect {result_type} {args[0]} {args[1]} {args[2]}")
-            return
-
-        self._shortfall(
-            op, block.name,
-            "no SPIR-V opcode or GLSL.std.450 extended instruction is "
-            "registered",
+        has_scalar_attr = (
+            instr.attributes.get("right_scalar") is not None
+            or instr.attributes.get("left_scalar") is not None
         )
+        arity = len(instr.args) + (1 if has_scalar_attr else 0)
+        resolved = self._resolve(op, operand_dtype, arity)
+        if resolved is None:
+            self._shortfall(
+                op, block.name,
+                "no SPIR-V opcode or GLSL.std.450 extended instruction is "
+                "registered",
+            )
+            return
+        kind, payload = resolved
+        if kind in ("extinst_binary", "extinst_unary"):
+            if payload in _EXTINST_FLOAT16_32_ONLY and _DTYPE_WIDTH.get(result_dtype) == 64:
+                self._shortfall(
+                    op, block.name,
+                    f"GLSL.std.450 {payload} is restricted to 16/32-bit "
+                    "float operands; this value is float64",
+                )
+                return
+
+        array_operands = any(a.shape for a in instr.args)
+
+        if not result_shape and not array_operands:
+            operand_ids = self._augment_scalar_attrs(
+                instr, [self._name(a) for a in instr.args], operand_dtype
+            )
+            self._apply(kind, payload, elem_type, self._name(instr.res), operand_ids, instr, body)
+            return
+
+        if not result_shape:
+            # An array operand feeding a scalar result outside the Const/
+            # aggregate-call cases above is a reduction -- not yet supported.
+            self._shortfall(
+                op, block.name,
+                "reductions over arrays are not yet supported by the "
+                "SPIR-V backend",
+            )
+            return
+
+        pointer = self._array_pointer.get(instr.res.id)
+        if pointer is None:
+            self._shortfall(
+                op, block.name, "internal: no storage allocated for this array result"
+            )
+            return
+
+        for index in itertools.product(*(range(size) for size in result_shape)):
+            operand_ids: list[str] = []
+            for argument in instr.args:
+                argument_shape = tuple(int(size) for size in argument.shape)
+                if not argument_shape:
+                    operand_ids.append(self._name(argument))
+                    continue
+                argument_index = self._broadcast_index(argument_shape, result_shape, index)
+                if argument_index is None:
+                    self._shortfall(
+                        op, block.name,
+                        "operand shape does not broadcast to the result shape",
+                    )
+                    return
+                argument_pointer = self._array_pointer.get(argument.id)
+                if argument_pointer is None:
+                    self._shortfall(
+                        op, block.name, "array operand has no known storage"
+                    )
+                    return
+                argument_elem_type = self.builder.scalar_type(argument.dtype or self.dtype)
+                operand_ids.append(
+                    self._load_element(argument_pointer, argument_index, argument_elem_type, body)
+                )
+            operand_ids = self._augment_scalar_attrs(instr, operand_ids, operand_dtype)
+            elem_result_id = self.builder.fresh("v")
+            self._apply(kind, payload, elem_type, elem_result_id, operand_ids, instr, body)
+            self._store_element(pointer, index, elem_type, elem_result_id, body)
 
 
 def _emit_function(

@@ -252,21 +252,43 @@ compared rather than conflated.
 
 ### SSA → SPIR-V
 
-**First cut landed.** `src/compiler/ssa_spirv_backend.py` mirrors
-`ssa_fortran_backend.py`'s structure — `emit_function`/`emit_module`,
+**First cut landed, now with array support.** `src/compiler/ssa_spirv_backend.py`
+mirrors `ssa_fortran_backend.py`'s structure — `emit_function`/`emit_module`,
 non-raising `SPIRVShortfall` collection, an optional `compile_module` that
 shells out to `spirv-as` when present — but consumes stage 4's SSA
 `IRModule` (`precompile_to_ssa.py`) rather than a tape, so control and
 numeric are already unified by the time this backend sees them (see
-`docs/PIPELINE_STAGE_DISAMBIGUATION.md`). Scoped the same way the Fortran
-backend was on its first pass: straight-line, single-block, scalar-only
-functions. Array operands/outputs, multi-block control flow (`Br`/`CondBr`/
-`Phi`), structural ops, and region calls all report an honest
-`SPIRVShortfall` rather than being guessed at — none of those are silently
-wrong, they are just not reached yet. `tests/test_ssa_spirv_backend.py`
-covers each shortfall path plus one emitted module actually assembled and
-validated through the real `spirv-as`/`spirv-val` toolchain (present on this
-machine via the Vulkan SDK; the test skips cleanly where it isn't).
+`docs/PIPELINE_STAGE_DISAMBIGUATION.md`).
+
+Array-shaped SSA values are `Function`-storage pointers to nested
+`OpTypeArray`s (dimension 0 outermost — this repo's SSA order directly, no
+Fortran-style column-major reversal). Elementwise ops over arrays are
+**unrolled**, not looped: one `OpAccessChain`/`OpLoad`/.../`OpStore`
+sequence per flat index, with numpy-style broadcasting resolved per operand
+per index (`_broadcast_index`). This keeps every function single-block,
+matching the still-unsupported multi-block-control-flow shortfall below —
+real looping is separate, later work. Still out of scope, reported as an
+honest `SPIRVShortfall` rather than guessed at: reductions (`sum`/`prod`/
+`max`/`min`/`mean`/`all`/`any` — need accumulation, not a single op),
+structural ops (`reshape`/`cumsum`/`stack`/`permute`/...), array constants,
+multi-block control flow (`Br`/`CondBr`/`Phi`), and region calls.
+`tests/test_ssa_spirv_backend.py` covers each shortfall path plus several
+emitted modules (scalar, 1-D array, 2-D-against-1-D broadcast) actually
+assembled and validated through the real `spirv-as`/`spirv-val` toolchain
+(present on this machine via the Vulkan SDK; those tests skip cleanly where
+it isn't).
+
+Two real bugs the validator caught while building the array path, worth
+knowing if you touch this again: (1) `OpVariable`'s Result Type must be the
+pointer type itself, not a pointer to the pointer — `_value_type()` already
+returns the pointer type for a shaped value, so declaring array temporaries
+by wrapping it in another `pointer_type()` call produced a double pointer
+that only `spirv-val` caught, not `spirv-as`. (2) A function's
+`OpReturnValue`/return type must be the *plain* value type (the array type
+itself), never the pointer type used for parameters — conflating the two
+(originally both routed through `_value_type()`) assembled fine but failed
+validation with a return-type mismatch. `_plain_type()` now exists
+specifically to keep these two cases from being reunified by a future edit.
 
 Two things worth knowing before extending this:
 
