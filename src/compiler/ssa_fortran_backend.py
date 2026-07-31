@@ -145,6 +145,10 @@ _REDUCTION: dict[str, str] = {
     "any": "any({0})",
 }
 
+# Binary operators whose result shape is meant to differ from their operands',
+# so conforming the operands to the result would be wrong.
+_SHAPE_CHANGING_BINARY = frozenset({"MatMul", "matmul"})
+
 _DTYPE_KIND: dict[str, str] = {
     "float64": "real(c_double)",
     "float32": "real(c_float)",
@@ -232,6 +236,59 @@ def dimension_extents(values: Iterable[SSAValue]) -> dict[int, str]:
     return sizes
 
 
+def _broadcast(
+    expression: str,
+    shape: tuple[int, ...],
+    result_shape: tuple[int, ...],
+) -> str | None:
+    """Expand ``expression`` from ``shape`` to ``result_shape``.
+
+    numpy broadcasting is fully described by the two shapes: dimensions align
+    from the right, and any operand dimension of extent one repeats to meet
+    the result.  Fortran spells that repetition ``SPREAD``, which inserts a
+    dimension rather than stretching one -- so each extent-one dimension is
+    first indexed away (removing it) and then spread back at its own
+    position with the result's extent.  Working left to right keeps every
+    position valid as dimensions are reinserted.
+    """
+
+    rank = len(result_shape)
+    if len(shape) > rank:
+        return None
+    # Align from the right, the way numpy does.
+    aligned = (1,) * (rank - len(shape)) + tuple(int(size) for size in shape)
+    expanding: list[int] = []
+    for position, (size, target) in enumerate(zip(aligned, result_shape)):
+        if size == int(target):
+            continue
+        if size != 1:
+            return None
+        expanding.append(position)
+    if not expanding:
+        return None
+
+    # Only the operand's *own* extent-one dimensions need indexing away.
+    # The dimensions alignment prepended do not exist on it, and SPREAD
+    # introduces them; reshaping to the aligned rank first and then indexing
+    # those positions back out would be a no-op -- and an illegal one, since
+    # the result of RESHAPE is an expression, which Fortran will not
+    # subscript.
+    offset = rank - len(shape)
+    subscripts = [
+        "1" if (offset + position) in expanding else ":"
+        for position in range(len(shape))
+    ]
+    result = (
+        f"{expression}({', '.join(subscripts)})" if subscripts else expression
+    )
+    for position in expanding:
+        result = (
+            f"spread({result}, dim={position + 1}, "
+            f"ncopies={int(result_shape[position])})"
+        )
+    return result
+
+
 def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
     """A Fortran array constructor for an SSA array constant.
 
@@ -298,6 +355,10 @@ class _FunctionEmitter:
         self._locals: dict[int, SSAValue] = {}
         self._phi_targets: dict[str, list[tuple[str, SSAValue, SSAValue]]] = {}
         self._loop_variables: list[str] = []
+        # Values emitted as part of a multi-instruction group (a region call,
+        # an indexed store) rather than one at a time.
+        self._consumed: set[int] = set()
+        self._address_producers: dict[int, tuple[SSAValue, SSAValue]] = {}
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -328,7 +389,43 @@ class _FunctionEmitter:
         uses = self._use_sites.get(result.id, ())
         if len(uses) != 1:
             return False
-        return uses[0][0] == block.name
+        if uses[0][0] != block.name:
+            return False
+        return not self._is_subscripted_by(result, uses[0])
+
+    def _is_subscripted_by(
+        self, value: SSAValue, use: tuple[str, int]
+    ) -> bool:
+        """Whether this value's one consumer will subscript it.
+
+        Fortran subscripts an array designator, never an arbitrary
+        expression: ``(a + b)(1, :)`` is a syntax error.  So a value that its
+        consumer has to index -- to take a section, or to conform a shape by
+        indexing an extent-one dimension away -- must stay a named temporary
+        even though it is used once.  Inlining it would be a folding
+        optimisation that produces source no compiler accepts.
+        """
+
+        block_name, position = use
+        block = self.function.blocks.get(block_name)
+        if block is None or position >= len(block.instrs):
+            return False
+        consumer = block.instrs[position]
+        operation = (
+            consumer.attributes.get("tensor_operation") or consumer.op
+        )
+        if operation in ("slice", "scatter", "cumsum"):
+            return True
+        if consumer.res is None:
+            return False
+        # An elementwise operand of a different shape is conformed by
+        # indexing (a broadcast) rather than by an intrinsic call.
+        if operation in _BINARY and operation not in _SHAPE_CHANGING_BINARY:
+            shape = tuple(value.shape)
+            result_shape = tuple(consumer.res.shape)
+            if shape and shape != result_shape:
+                return True
+        return False
 
     def _structural(
         self, instr: Instr, args: list[str], op: str | None = None
@@ -352,6 +449,53 @@ class _FunctionEmitter:
         attributes = instr.attributes
         shape = instr.res.shape
         rank = len(shape)
+
+        if operation in _REDUCTION and "dim" in attributes and len(args) == 1:
+            # Fortran reduces along one dimension natively. Arrays are
+            # declared in SSA dimension order, so the axis needs no
+            # translation; sum(a, dim=k) drops that dimension, and keepdim
+            # asks for it back as an extent of one.
+            source_rank = len(instr.args[0].shape)
+            axis = (int(attributes["dim"]) % source_rank) + 1
+            reduced = _REDUCTION[operation].format(
+                f"{args[0]}, dim={axis}"
+            )
+            if len(shape) == source_rank:
+                extents = ", ".join(str(int(size)) for size in shape)
+                return f"reshape({reduced}, [{extents}])"
+            return reduced
+
+        if operation in ("reshape", "view") and len(args) == 1:
+            # A reshape is defined by row-major element order, but Fortran
+            # traverses column-major, so both ends need stating.
+            #
+            # Destination: ORDER=[n..1] makes the last dimension vary
+            # fastest, which is the row-major fill.
+            #
+            # Source: a rank>1 operand's Fortran element order is
+            # column-major, which is *not* the order the reshape reads it
+            # in. Reversing its dimensions first yields an array whose
+            # column-major traversal is the operand's row-major traversal.
+            # For a rank-1 operand the two coincide and this collapses away.
+            source = args[0]
+            source_shape = tuple(instr.args[0].shape)
+            source_rank = len(source_shape)
+            if source_rank > 1:
+                reversed_extents = ", ".join(
+                    str(int(size)) for size in reversed(source_shape)
+                )
+                source_order = ", ".join(
+                    str(value) for value in range(source_rank, 0, -1)
+                )
+                source = (
+                    f"reshape({source}, [{reversed_extents}], "
+                    f"order=[{source_order}])"
+                )
+            if rank <= 1:
+                return f"reshape({source}, [{_element_count(shape)}])"
+            extents = ", ".join(str(int(size)) for size in shape)
+            order = ", ".join(str(value) for value in range(rank, 0, -1))
+            return f"reshape({source}, [{extents}], order=[{order}])"
 
         if operation in ("zeros", "full"):
             # A scalar broadcasts across a whole array on assignment.
@@ -425,6 +569,166 @@ class _FunctionEmitter:
             return f"reshape({args[0]}, [{extents}], order=[{order}])"
 
         return None
+
+    def _conform(self, instr: Instr, args: list[str]) -> list[str] | None:
+        """Make an elementwise op's operands conform to its result shape.
+
+        numpy broadcasts, so the recorded program freely combines a
+        ``(2304,)`` with a ``(1, 48, 48)`` or a one-element array with a
+        whole field.  Fortran's whole-array operators require identical
+        shapes, with exactly one exception: a scalar combines with any array.
+        Emitting the operands unchanged produces "Incompatible ranks", so
+        each is restated at the result's shape.
+        """
+
+        if instr.res is None:
+            return args
+        result_shape = tuple(instr.res.shape)
+        result_count = _element_count(result_shape)
+        conformed: list[str] = []
+        for position, expression in enumerate(args):
+            if position >= len(instr.args):
+                # A scalar recorded as an attribute rather than an SSA value
+                # (right_scalar/left_scalar) was appended to args. It is
+                # already a Fortran scalar and conforms to anything.
+                conformed.append(expression)
+                continue
+            value = instr.args[position]
+            shape = tuple(value.shape)
+            if shape == result_shape or not shape:
+                conformed.append(expression)
+                continue
+            count = _element_count(shape)
+            if count == result_count:
+                # Same elements, different rank: restate the shape. Both
+                # sides are already in this emitter's dimension order, so
+                # this is a pure re-description, not a reordering.
+                if not result_shape:
+                    conformed.append(f"{expression}({', '.join(['1'] * len(shape))})")
+                    continue
+                extents = ", ".join(str(int(size)) for size in result_shape)
+                conformed.append(f"reshape({expression}, [{extents}])")
+                continue
+            if count == 1:
+                # A one-element array acting as a scalar: index it, so
+                # Fortran's scalar-to-array broadcast applies.
+                subscripts = ", ".join(["1"] * len(shape))
+                conformed.append(f"{expression}({subscripts})")
+                continue
+            broadcast = _broadcast(expression, shape, result_shape)
+            if broadcast is None:
+                return None
+            conformed.append(broadcast)
+        return conformed
+
+    def _region_call(
+        self, block: BasicBlock, index: int
+    ) -> list[str] | None:
+        """A scheduled region's call, as one Fortran ``call`` statement.
+
+        The lowering states a region call the way a pointer-based backend
+        consumes it: return an aggregate, then walk into it per output.
+
+            %agg = Call region(...)      result_convention='ssa.aggregate'
+            %c   = Const <k>
+            %ptr = GetElementPtr %agg, %c
+            %out = Load %ptr
+
+        Fortran has no pointer arithmetic and returns through arguments, so
+        ``GetElementPtr`` has no standalone meaning here -- only the group
+        does. Recognising the group turns all of it into one call whose
+        outputs are actual arguments, which is what the callee already
+        declares (its own ``intent(out)`` dummies).
+        """
+
+        instr = block.instrs[index]
+        if instr.op not in ("Call", "call"):
+            return None
+        if instr.attributes.get("result_convention") != "ssa.aggregate":
+            return None
+        callee = instr.attributes.get("callee")
+        if not callee:
+            return None
+        aggregate = instr.res
+        outputs: dict[int, SSAValue] = {}
+        consumed: list[SSAValue] = []
+        if aggregate is not None:
+            addresses: dict[int, int] = {}
+            for follower in block.instrs[index + 1:]:
+                if follower.res is None:
+                    continue
+                if follower.op == "GetElementPtr" and follower.args and (
+                    follower.args[0].id == aggregate.id
+                ):
+                    position = follower.attributes.get("aggregate_index")
+                    if position is None:
+                        return None
+                    addresses[follower.res.id] = int(position)
+                    consumed.append(follower.res)
+                elif follower.op == "Load" and follower.args and (
+                    follower.args[0].id in addresses
+                ):
+                    outputs[addresses[follower.args[0].id]] = follower.res
+                    consumed.append(follower.res)
+            if not outputs:
+                return None
+            consumed.append(aggregate)
+
+        ordered_outputs = [outputs[key] for key in sorted(outputs)]
+        for value in ordered_outputs:
+            self._locals[value.id] = value
+        for value in consumed:
+            self._consumed.add(value.id)
+
+        # The callee is emitted by this same module, so its argument order is
+        # known: its own extents first, then feeds, then outputs.
+        call_values = [*instr.args, *ordered_outputs]
+        extents = sorted(dimension_extents(call_values).values())
+        arguments = [
+            *extents,
+            *(self._operand(value) for value in instr.args),
+            *(_name(value) for value in ordered_outputs),
+        ]
+        return [f"    call {callee}({', '.join(arguments)})"]
+
+    def _indexed_store(self, instr: Instr) -> list[str] | None:
+        """``collection[i] = value``, without materialising an address.
+
+        A ``GetElementPtr``/``Store`` pair is how a pointer-based backend
+        writes one iteration's value into a resident collection.  Fortran
+        indexes the array directly, so the address never becomes a value and
+        the pair collapses into one assignment.
+        """
+
+        if instr.op != "Store" or len(instr.args) != 2:
+            return None
+        source, address = instr.args
+        producer = self._address_producers.get(address.id)
+        if producer is None:
+            return None
+        collection, position = producer
+        self._consumed.add(address.id)
+        # SSA induction values are 0-based; Fortran subscripts start at 1.
+        return [
+            f"    {self._operand(collection)}({self._operand(position)} + 1)"
+            f" = {self._operand(source)}"
+        ]
+
+    def _collect_address_producers(self) -> None:
+        """Index every ``GetElementPtr`` that addresses a collection slot."""
+
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                if instr.op != "GetElementPtr" or instr.res is None:
+                    continue
+                if instr.attributes.get("binding") != "collection_publication":
+                    continue
+                if len(instr.args) != 2:
+                    continue
+                self._address_producers[instr.res.id] = (
+                    instr.args[0],
+                    instr.args[1],
+                )
 
     def _loop_variable(self) -> str:
         """An integer loop index, declared alongside the locals."""
@@ -572,6 +876,13 @@ class _FunctionEmitter:
             return _REDUCTION[op].format(*args)
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
+            if op not in _SHAPE_CHANGING_BINARY:
+                # Only elementwise operators require conforming shapes.
+                # matmul's operands are meant to differ from its result.
+                conformed = self._conform(instr, args)
+                if conformed is None:
+                    return None
+                args = conformed
             if instr.attributes.get("reverse"):
                 args = [args[1], args[0]]
             return template.format(*args)
@@ -588,7 +899,7 @@ class _FunctionEmitter:
         # an unreferenced label is a compiler warning and pure noise.
         if block.name in self._branch_targets:
             body.append(f"{self._label(block.name)} continue")
-        for instr in block.instrs:
+        for index, instr in enumerate(block.instrs):
             if instr.op in ("Phi", "phi"):
                 # Phi is realised by the predecessors, not here.
                 continue
@@ -611,6 +922,24 @@ class _FunctionEmitter:
                 continue
             if instr.op in ("Ret", "ret", "Return", "return"):
                 body.append("    return")
+                continue
+
+            if instr.res is not None and instr.res.id in self._consumed:
+                # Already emitted as part of a multi-instruction group.
+                continue
+            if instr.res is not None and instr.res.id in self._address_producers:
+                # The address is folded into the subscript of the assignment
+                # its Store becomes, so it never needs to exist as a value.
+                continue
+
+            group = self._region_call(block, index)
+            if group is not None:
+                body.extend(group)
+                continue
+
+            store = self._indexed_store(instr)
+            if store is not None:
+                body.extend(store)
                 continue
 
             statements = self._statements(instr)
@@ -688,6 +1017,7 @@ class _FunctionEmitter:
         self._collect_branch_targets()
         self._collect_use_sites()
         self._collect_phis()
+        self._collect_address_producers()
         body: list[str] = []
         for block in self.function.blocks.values():
             self._emit_block(block, body)

@@ -195,7 +195,19 @@ def _lower_tape_to_fortran_function(
                 raise FortranJITShortfall(
                     f"{original_operation} is not a compatible zero-copy view"
                 )
-            ssa_by_id[result_id] = operand_values[0]
+            if tuple(result.shape) == tuple(operands[0].shape):
+                ssa_by_id[result_id] = operand_values[0]
+                continue
+            # Aliasing the operand would leave the value declared with its
+            # old shape. That is harmless only while nothing looks at the
+            # shape; a Fortran dummy is explicit-shape, so any later op --
+            # permute, a section, a dimension-wise reduction -- would be
+            # emitted against the wrong rank.
+            ssa = new_value(shape=tuple(result.shape))
+            instrs.append(
+                Instr(op="reshape", args=operand_values, res=ssa)
+            )
+            ssa_by_id[result_id] = ssa
             continue
 
         try:
@@ -232,15 +244,63 @@ def _lower_tape_to_fortran_function(
             ssa_by_id[result_id] = ssa
             continue
 
+        # Shape ops are defined by a parameter -- which axis, which
+        # permutation -- so it must reach the instruction. Dropping it and
+        # letting the emitter assume a default does not produce a shortfall,
+        # it produces the wrong answer silently.
+        if operation in {"stack", "concat", "cat", "cumsum", "permute"}:
+            parameters = dict(node.ctx.get("params") or {})
+            attributes: dict[str, Any] = {}
+            if operation == "permute":
+                perm = parameters.get("perm", parameters.get("dims"))
+                if perm is None:
+                    raise FortranJITShortfall(
+                        "permute has no recorded permutation"
+                    )
+                attributes["dims"] = [int(entry) for entry in perm]
+            else:
+                dim = parameters.get("dim", parameters.get("axis"))
+                if dim is None:
+                    raise FortranJITShortfall(
+                        f"{operation} has no recorded dimension"
+                    )
+                attributes["dim"] = int(dim)
+            canonical = "concat" if operation in {"cat", "concat"} else operation
+            ssa = new_value(shape=tuple(result.shape))
+            instrs.append(
+                Instr(
+                    op=canonical,
+                    args=operand_values,
+                    res=ssa,
+                    attributes=attributes,
+                )
+            )
+            ssa_by_id[result_id] = ssa
+            continue
+
         if operation in _REDUCTION_OPS:
             parameters = dict(node.ctx.get("params") or {})
-            if parameters.get("axis") is not None:
-                raise FortranJITShortfall(
-                    f"{operation} along an axis is not a whole-array Fortran "
-                    "reduction"
-                )
+            axis = parameters.get("axis", parameters.get("dim"))
             if len(operand_values) != 1:
                 raise FortranJITShortfall(f"{operation} requires one operand")
+            if axis is not None:
+                # Fortran reduces along one dimension natively --
+                # sum(a, dim=k) -- so an axis reduction is expressible; it is
+                # only the result rank that differs, and keepdim restores it.
+                ssa = new_value(shape=tuple(result.shape))
+                instrs.append(
+                    Instr(
+                        op=operation,
+                        args=operand_values,
+                        res=ssa,
+                        attributes={
+                            "dim": int(axis),
+                            "keepdim": bool(parameters.get("keepdim")),
+                        },
+                    )
+                )
+                ssa_by_id[result_id] = ssa
+                continue
             ssa = new_value(shape=())
             instrs.append(Instr(op=operation, args=operand_values, res=ssa))
             ssa_by_id[result_id] = ssa
