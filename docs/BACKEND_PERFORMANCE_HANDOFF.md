@@ -250,12 +250,53 @@ ratio.
 Wanted as a **distinct category** from non-workgroup dispatch, so the two are
 compared rather than conflated.
 
-### SSA → Nodus SPIR-V
+### SSA → SPIR-V
 
-**Not started.** `src/compiler/nodus_graph_ir.py` is only
-`process_graph_to_nodus_graph_ir(graph) -> str`, a text emitter. SPIR-V appears
-only in `docs/c_backend_status.md` and `docs/C_NODUS_INTEROP_AND_FUSION.md` —
-no code. This is a from-scratch binary-format target; read those two docs first.
+**First cut landed.** `src/compiler/ssa_spirv_backend.py` mirrors
+`ssa_fortran_backend.py`'s structure — `emit_function`/`emit_module`,
+non-raising `SPIRVShortfall` collection, an optional `compile_module` that
+shells out to `spirv-as` when present — but consumes stage 4's SSA
+`IRModule` (`precompile_to_ssa.py`) rather than a tape, so control and
+numeric are already unified by the time this backend sees them (see
+`docs/PIPELINE_STAGE_DISAMBIGUATION.md`). Scoped the same way the Fortran
+backend was on its first pass: straight-line, single-block, scalar-only
+functions. Array operands/outputs, multi-block control flow (`Br`/`CondBr`/
+`Phi`), structural ops, and region calls all report an honest
+`SPIRVShortfall` rather than being guessed at — none of those are silently
+wrong, they are just not reached yet. `tests/test_ssa_spirv_backend.py`
+covers each shortfall path plus one emitted module actually assembled and
+validated through the real `spirv-as`/`spirv-val` toolchain (present on this
+machine via the Vulkan SDK; the test skips cleanly where it isn't).
+
+Two things worth knowing before extending this:
+
+- **float64 breaks GLSL.std.450's trig/exp/log/pow subset.** `spirv-val`
+  rejects `Sin`/`Cos`/`Tan`/`Exp`/`Log`/`Pow`/`Tanh`/etc. on a `double`
+  operand outright — that extended-instruction subset is specified for
+  16/32-bit float only, unlike the "common" subset (`Sqrt`, `FAbs`, `FSign`,
+  `Floor`, `Ceil`, `Trunc`, `RoundEven`, `FMin`, `FMax`), which does allow
+  double. Since float64 is this repo's default dtype everywhere else, this
+  is a real, expected shortfall (`_EXTINST_FLOAT16_32_ONLY` in the backend),
+  not an edge case — any transcendental-heavy float64 chain will report it
+  until there's a deliberate narrowing/promotion story.
+- **`CondBr` attribute mismatch, discovered while grounding this work.**
+  `precompile_to_ssa.py`'s `_ControlSSABuilder` emits
+  `attributes={"true_target": ..., "false_target": ...}` on `CondBr`, but
+  `ssa_fortran_backend.py` (and the hand-built test fixtures) only read
+  `"true"`/`"false"`. So control-flow SSA coming out of the real
+  `lower_precompile_and_control_to_ssa` pipeline does not have its branches
+  correctly resolved by the *existing* Fortran backend either — this
+  predates the SPIR-V work and needs a decision (fix on one canonical key
+  pair, or read both) before either backend's multi-block support is real.
+
+The buffer/descriptor binding ABI (SSBOs, descriptor sets, workgroup
+dispatch) needed to turn one of these functions into an actual runnable
+GLCompute/Vulkan kernel is still separate, later work — this backend proves
+the op-level translation, not the deployment story. `nodus_graph_ir.py`
+(`process_graph_to_nodus_graph_ir(graph) -> str`) remains a distinct, older
+text emitter straight off `ProcessGraph` (stage 1), not this pipeline; worth
+not confusing the two just because both eventually target Nodus/SPIR-V-style
+consumers.
 
 ### Smaller items
 
