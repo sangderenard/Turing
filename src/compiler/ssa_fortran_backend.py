@@ -149,6 +149,30 @@ _REDUCTION: dict[str, str] = {
 # so conforming the operands to the result would be wrong.
 _SHAPE_CHANGING_BINARY = frozenset({"MatMul", "matmul"})
 
+# Operators that take LOGICAL operands natively, so a boolean reaching them
+# must be left alone rather than converted to a number.
+_LOGICAL_BINARY = frozenset(
+    {
+        "LAnd", "LOr", "logical_and", "logical_or",
+        "And", "Or", "Xor",
+        "Eq", "Ne", "equal", "not_equal",
+    }
+)
+_LOGICAL_UNARY = frozenset({"LNot", "Not", "logical_not", "bool_to_float64"})
+
+# Comparisons yield LOGICAL; everything else here yields a number.
+_COMPARISON = frozenset(
+    {
+        "Eq", "Ne", "Lt", "Le", "Gt", "Ge",
+        "equal", "not_equal", "less", "less_equal", "greater",
+        "greater_equal",
+    }
+)
+
+_INTEGER_DTYPES = frozenset(
+    {"int", "int8", "int16", "int32", "int64", "i32", "i64", "bool", "logical"}
+)
+
 _DTYPE_KIND: dict[str, str] = {
     "float64": "real(c_double)",
     "float32": "real(c_float)",
@@ -186,6 +210,9 @@ class FortranSubroutine:
     name: str
     source: str
     shortfalls: tuple[FortranShortfall, ...] = ()
+    # The extent parameters this subroutine declares, in argument order, so a
+    # caller in the same module can pass exactly what it expects.
+    extent_names: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -339,10 +366,12 @@ class _FunctionEmitter:
         *,
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
+        callee_extents: Mapping[str, Sequence[str]] | None = None,
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
+        self.callee_extents = dict(callee_extents or {})
         self.shortfalls: list[FortranShortfall] = []
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
@@ -570,6 +599,55 @@ class _FunctionEmitter:
 
         return None
 
+    @staticmethod
+    def _is_logical(value: SSAValue) -> bool:
+        return str(getattr(value, "dtype", "") or "") in ("bool", "logical")
+
+    def _numeric(self, instr: Instr, args: list[str]) -> list[str]:
+        """Give a LOGICAL operand a numeric value where one is required.
+
+        A comparison produces LOGICAL, and the recorded program then uses it
+        in arithmetic the way numpy does, where ``True`` is 1.  Fortran keeps
+        the types apart and rejects LOGICAL at every numeric intrinsic and
+        operator, so the conversion has to be written out -- ``MERGE`` is how
+        Fortran says it, and it is what this emitter already uses for a
+        boolean leaving through a real buffer.
+        """
+
+        operation = instr.attributes.get("tensor_operation") or instr.op
+        if operation in _COMPARISON:
+            # A comparison's result is LOGICAL, which says nothing about how
+            # its operands should promote -- they promote to each other.
+            target_real = any(
+                str(getattr(value, "dtype", None) or self.dtype)
+                not in _INTEGER_DTYPES
+                for value in instr.args
+            )
+        else:
+            result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
+            target_real = result_dtype not in _INTEGER_DTYPES
+        converted = list(args)
+        for position, value in enumerate(instr.args):
+            if position >= len(converted):
+                continue
+            if self._is_logical(value):
+                converted[position] = _UNARY["bool_to_float64"].format(
+                    converted[position]
+                )
+                continue
+            # numpy promotes mixed integer/real operands silently; Fortran
+            # rejects them, so the promotion is written out.
+            dtype = str(getattr(value, "dtype", None) or self.dtype)
+            operand_real = dtype not in _INTEGER_DTYPES
+            if operand_real == target_real:
+                continue
+            converted[position] = (
+                f"real({converted[position]}, c_double)"
+                if target_real
+                else f"int({converted[position]}, c_int)"
+            )
+        return converted
+
     def _conform(self, instr: Instr, args: list[str]) -> list[str] | None:
         """Make an elementwise op's operands conform to its result shape.
 
@@ -681,9 +759,16 @@ class _FunctionEmitter:
             self._consumed.add(value.id)
 
         # The callee is emitted by this same module, so its argument order is
-        # known: its own extents first, then feeds, then outputs.
-        call_values = [*instr.args, *ordered_outputs]
-        extents = sorted(dimension_extents(call_values).values())
+        # known: its own extents first, then feeds, then outputs. The extents
+        # must be the ones it actually declares -- rederiving them from the
+        # call site gives a different set whenever the callee has interior
+        # arrays whose sizes never appear in its signature.
+        declared = self.callee_extents.get(str(callee))
+        if declared is not None:
+            extents = list(declared)
+        else:
+            call_values = [*instr.args, *ordered_outputs]
+            extents = sorted(dimension_extents(call_values).values())
         arguments = [
             *extents,
             *(self._operand(value) for value in instr.args),
@@ -873,9 +958,18 @@ class _FunctionEmitter:
             args = [_literal(left), args[0]]
 
         if op in _REDUCTION and len(args) == 1:
+            if op == "sum" and self._is_logical(instr.args[0]):
+                # Summing a mask counts its true elements, which Fortran
+                # states directly; SUM rejects a LOGICAL argument outright.
+                return f"count({args[0]})"
+            args = self._numeric(instr, args)
             return _REDUCTION[op].format(*args)
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
+            # Shape first, then type. Conforming subscripts an operand to
+            # index away an extent-one dimension, and Fortran will not
+            # subscript the result of an intrinsic -- so converting first
+            # would produce real(x, c_double)(1), which is a syntax error.
             if op not in _SHAPE_CHANGING_BINARY:
                 # Only elementwise operators require conforming shapes.
                 # matmul's operands are meant to differ from its result.
@@ -883,10 +977,22 @@ class _FunctionEmitter:
                 if conformed is None:
                     return None
                 args = conformed
+            if op not in _LOGICAL_BINARY:
+                args = self._numeric(instr, args)
             if instr.attributes.get("reverse"):
                 args = [args[1], args[0]]
-            return template.format(*args)
+            expression = template.format(*args)
+            if op in _COMPARISON and instr.res is not None:
+                # A comparison is LOGICAL, but the recorded program may store
+                # it where a number is expected (numpy keeps no such
+                # distinction). Assigning it directly is a type error.
+                result_dtype = str(instr.res.dtype or self.dtype)
+                if result_dtype not in ("bool", "logical"):
+                    return _UNARY["bool_to_float64"].format(expression)
+            return expression
         if op in _UNARY and len(args) == 1:
+            if op not in _LOGICAL_UNARY:
+                args = self._numeric(instr, args)
             return _UNARY[op].format(*args)
         if op in ("Select", "where") and len(args) == 3:
             return f"merge({args[1]}, {args[2]}, {args[0]})"
@@ -909,8 +1015,20 @@ class _FunctionEmitter:
                 body.append(f"    goto {self._label(target)}")
                 continue
             if instr.op in ("CondBr", "condbr"):
-                true_target = str(instr.attributes.get("true", ""))
-                false_target = str(instr.attributes.get("false", ""))
+                # Both spellings occur: the control lowering emits
+                # true_target/false_target, hand-built SSA uses true/false.
+                # An unrecognised name silently resolved to the first block,
+                # so every branch went to the same wrong label.
+                true_target = str(
+                    instr.attributes.get("true")
+                    or instr.attributes.get("true_target")
+                    or ""
+                )
+                false_target = str(
+                    instr.attributes.get("false")
+                    or instr.attributes.get("false_target")
+                    or ""
+                )
                 condition = self._operand(instr.args[0])
                 body.append(f"    if ({condition}) then")
                 self._emit_phi_copies(block.name, true_target, body, indent=6)
@@ -991,11 +1109,21 @@ class _FunctionEmitter:
                         str(instr.attributes.get("target", ""))
                     )
                 elif instr.op in ("CondBr", "condbr"):
+                    # Must recognise the same spellings _emit_block does, or
+                    # a branch is emitted to a label that is never placed.
                     self._branch_targets.add(
-                        str(instr.attributes.get("true", ""))
+                        str(
+                            instr.attributes.get("true")
+                            or instr.attributes.get("true_target")
+                            or ""
+                        )
                     )
                     self._branch_targets.add(
-                        str(instr.attributes.get("false", ""))
+                        str(
+                            instr.attributes.get("false")
+                            or instr.attributes.get("false_target")
+                            or ""
+                        )
                     )
 
     def _collect_phis(self) -> None:
@@ -1047,6 +1175,7 @@ class _FunctionEmitter:
             return ", ".join(dim_extents[int(size)] for size in value.shape)
 
         extent_names = sorted(dim_extents.values())
+        self.extent_names = tuple(extent_names)
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
         arguments.extend(_name(value) for value in self.outputs)
@@ -1106,7 +1235,12 @@ class _FunctionEmitter:
             *body,
             f"  end subroutine {name}",
         ]
-        return FortranSubroutine(name, "\n".join(lines), tuple(self.shortfalls))
+        return FortranSubroutine(
+            name,
+            "\n".join(lines),
+            tuple(self.shortfalls),
+            tuple(extent_names),
+        )
 
 
 def emit_function(
@@ -1114,15 +1248,25 @@ def emit_function(
     *,
     dtype: str = DEFAULT_DTYPE,
     outputs: Sequence[SSAValue] = (),
+    callee_extents: Mapping[str, Sequence[str]] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
     ``outputs`` names the SSA values that leave the subroutine.  SSA itself
     records only arguments, so results would otherwise be emitted as dead
     locals; naming them promotes them to ``intent(out)`` parameters.
+
+    ``callee_extents`` maps a called subroutine's name to the extent
+    parameters it declares, so a call passes exactly the extents that
+    subroutine expects rather than extents rederived at the call site.
     """
 
-    return _FunctionEmitter(function, dtype=dtype, outputs=outputs).emit()
+    return _FunctionEmitter(
+        function,
+        dtype=dtype,
+        outputs=outputs,
+        callee_extents=callee_extents,
+    ).emit()
 
 
 @dataclass
@@ -1163,11 +1307,23 @@ def emit_module(
         module.functions if isinstance(module, IRModule) else dict(module)
     )
     named_outputs = dict(outputs or {})
+    # Two passes: a subroutine that calls another must pass exactly the
+    # extents that one declares, and those are only known once it has been
+    # emitted. The first pass is discarded apart from its signatures.
+    callee_extents = {
+        function_name: emit_function(
+            function,
+            dtype=dtype,
+            outputs=named_outputs.get(function_name, ()),
+        ).extent_names
+        for function_name, function in functions.items()
+    }
     subroutines = tuple(
         emit_function(
             function,
             dtype=dtype,
             outputs=named_outputs.get(function_name, ()),
+            callee_extents=callee_extents,
         )
         for function_name, function in functions.items()
     )
