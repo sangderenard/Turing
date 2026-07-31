@@ -39,6 +39,17 @@ try:
 except ImportError:
     CTensor = None  # TYPE: ignore
 
+# Attach to nodus's tensor arena unconditionally, at import time, rather than
+# waiting for a caller to opt in. A silent fallback here is the bad outcome:
+# the pure-Python/NumPy paths still compute without it, so a missing tensor
+# core looks like nothing worse than a slow day, and the reason is invisible
+# unless this runs every time the module loads.
+try:
+    from .accelerator_backends import nodus_arena as _nodus_arena
+    _nodus_arena.connect()
+except ImportError:
+    _nodus_arena = None  # TYPE: ignore
+
 # TYPE: register_conversion, CONVERSION_REGISTRY, DEBUG, _get_ops_for_class
 from . import DEBUG
 from .logger import get_tensors_logger
@@ -809,6 +820,8 @@ class AbstractTensor:
                 "pure_python": "pure_backend",
                 "c": "accelerator_backends.c_backend",
                 "glsl": "accelerator_backends.glsl_tensor_backend",
+                "nodus": "accelerator_backends.nodus_backend",
+                "in_memory": "accelerator_backends.nodus_backend",
             }.get(preferred)
             if module_name is None:
                 raise ValueError(f"unknown tensor backend: {preferred}")
@@ -827,6 +840,10 @@ class AbstractTensor:
             except Exception:
                 pass
             try:
+                from .accelerator_backends import nodus_backend  # noqa: F401
+            except Exception:
+                pass
+            try:
                 from . import torch_backend  # noqa: F401
             except Exception:
                 pass
@@ -835,7 +852,11 @@ class AbstractTensor:
             except Exception:
                 pass
 
-        for backend_name in ("numpy", "torch", "pure_python"):
+        # "nodus" first: when the arena is connected this routes canonical
+        # elementwise ops through it instead of NumPy; when it is not,
+        # NodusTensorOperations falls back to the inherited NumPy behaviour
+        # per-op, so preferring it here costs nothing when nodus is absent.
+        for backend_name in ("nodus", "numpy", "torch", "pure_python"):
             backend_cls = BACKEND_REGISTRY.get(backend_name)
             if backend_cls is not None:
                 cls = backend_cls
