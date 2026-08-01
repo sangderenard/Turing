@@ -1,0 +1,233 @@
+"""The calling contract for an auto-compiled program, written beside it.
+
+A compiled artifact is useless without knowing how to call it, and until now
+every caller rediscovered that by reading emitted source and guessing: which
+subroutine is the entry point, how many arguments it takes, which are passed
+by value and which by reference, what each one's element type is, and which
+of them are results rather than inputs. Guessing wrong does not fail
+cleanly -- passing an ``int`` by value where a Fortran dummy expects a
+reference is an access violation, and passing the numeric subroutine instead
+of the control one silently runs the loop body once.
+
+So the contract is emitted with the artifact, as YAML, from the same
+``Function`` objects the code generator used. It is a description of what was
+generated, not a second source of truth that could disagree.
+
+Read one back with ``load_api`` (or plain ``yaml.safe_load``; the file is
+ordinary YAML with no custom tags).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+from ..transmogrifier.ssa import Function, SSAValue
+
+SCHEMA = "turing-compiled-program-api-v1"
+
+
+# How an SSA dtype is spelled for a C-ABI caller, alongside the ctypes name a
+# Python caller needs. Both are recorded because a caller in another language
+# needs the first and cannot use the second.
+_C_TYPES: dict[str, tuple[str, str]] = {
+    "float": ("float", "c_float"),
+    "float32": ("float", "c_float"),
+    "f32": ("float", "c_float"),
+    "double": ("double", "c_double"),
+    "float64": ("double", "c_double"),
+    "f64": ("double", "c_double"),
+    "int": ("int32_t", "c_int32"),
+    "int32": ("int32_t", "c_int32"),
+    "i32": ("int32_t", "c_int32"),
+    "int64": ("int64_t", "c_int64"),
+    "i64": ("int64_t", "c_int64"),
+    "bool": ("bool", "c_bool"),
+    "logical": ("bool", "c_bool"),
+}
+
+
+@dataclass(frozen=True)
+class Parameter:
+    """One dummy argument, in declaration order."""
+
+    name: str
+    role: str  # "extent" | "input" | "output"
+    dtype: str
+    c_type: str
+    ctypes_name: str
+    # Fortran passes scalars declared `value` by value and everything else by
+    # reference. A caller that gets this backwards gets an access violation,
+    # not a wrong number, so it is stated rather than inferred from role.
+    passing: str  # "value" | "reference"
+    shape: tuple[int, ...] = ()
+    extent: str | None = None
+
+    def to_mapping(self) -> dict[str, Any]:
+        mapping: dict[str, Any] = {
+            "name": self.name,
+            "role": self.role,
+            "dtype": self.dtype,
+            "c_type": self.c_type,
+            "ctypes": self.ctypes_name,
+            "passing": self.passing,
+        }
+        if self.shape:
+            mapping["shape"] = list(self.shape)
+        if self.extent is not None:
+            mapping["extent"] = self.extent
+        return mapping
+
+
+@dataclass(frozen=True)
+class EntryPoint:
+    name: str
+    symbol: str
+    kind: str  # "control" | "numerical" | "region"
+    parameters: tuple[Parameter, ...] = ()
+    # Which entry point a caller should actually invoke, and why. A program
+    # with a loop has its iteration in the control subroutine; calling the
+    # numerical one directly runs the body once.
+    note: str | None = None
+
+    def to_mapping(self) -> dict[str, Any]:
+        mapping: dict[str, Any] = {
+            "name": self.name,
+            "symbol": self.symbol,
+            "kind": self.kind,
+            "parameters": [p.to_mapping() for p in self.parameters],
+        }
+        if self.note:
+            mapping["note"] = self.note
+        return mapping
+
+
+@dataclass(frozen=True)
+class CompiledProgramAPI:
+    module: str
+    language: str
+    entry: str | None
+    entry_points: tuple[EntryPoint, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": SCHEMA,
+            "module": self.module,
+            "language": self.language,
+            "entry": self.entry,
+            "metadata": dict(self.metadata),
+            "entry_points": [e.to_mapping() for e in self.entry_points],
+        }
+
+    def to_yaml(self) -> str:
+        import yaml
+
+        return yaml.safe_dump(self.to_mapping(), sort_keys=False)
+
+    def write(self, path: str | Path) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(self.to_yaml(), encoding="utf-8")
+        return destination
+
+    def entry_point(self, name: str) -> EntryPoint:
+        for candidate in self.entry_points:
+            if candidate.name == name:
+                return candidate
+        raise KeyError(f"{name!r} is not an entry point of {self.module}")
+
+
+def _c_type_for(dtype: str | None) -> tuple[str, str]:
+    return _C_TYPES.get(str(dtype or "float64"), ("double", "c_double"))
+
+
+def describe_fortran_function(
+    name: str,
+    function: Function,
+    *,
+    extent_names: Sequence[str] = (),
+    outputs: Iterable[SSAValue] = (),
+    kind: str = "numerical",
+    note: str | None = None,
+) -> EntryPoint:
+    """Describe one emitted Fortran subroutine's calling contract.
+
+    Argument order mirrors ``emit_function`` exactly: the extents it declares
+    first (scalars, passed by value), then its SSA arguments, then the values
+    named as outputs.
+    """
+
+    parameters: list[Parameter] = []
+    for extent in extent_names:
+        parameters.append(
+            Parameter(
+                name=str(extent),
+                role="extent",
+                dtype="int32",
+                c_type="int32_t",
+                ctypes_name="c_int32",
+                passing="value",
+            )
+        )
+    output_ids = {value.id for value in outputs}
+    for value in function.args:
+        c_type, ctypes_name = _c_type_for(value.dtype)
+        array = bool(value.shape)
+        parameters.append(
+            Parameter(
+                name=f"t{value.id}",
+                role="output" if value.id in output_ids else "input",
+                dtype=str(value.dtype or "float64"),
+                c_type=c_type,
+                ctypes_name=ctypes_name,
+                # A scalar dummy is declared `value` by the emitter; an array
+                # never is.
+                passing="reference" if array else "value",
+                shape=tuple(value.shape or ()),
+                extent=str(extent_names[-1]) if array and extent_names else None,
+            )
+        )
+    for value in outputs:
+        if value.id in {argument.id for argument in function.args}:
+            continue
+        c_type, ctypes_name = _c_type_for(value.dtype)
+        parameters.append(
+            Parameter(
+                name=f"t{value.id}",
+                role="output",
+                dtype=str(value.dtype or "float64"),
+                c_type=c_type,
+                ctypes_name=ctypes_name,
+                passing="reference",
+                shape=tuple(value.shape or ()),
+                extent=str(extent_names[-1]) if extent_names else None,
+            )
+        )
+    return EntryPoint(
+        name=name, symbol=name, kind=kind, parameters=tuple(parameters), note=note
+    )
+
+
+def load_api(path: str | Path) -> dict[str, Any]:
+    """Read a descriptor back."""
+
+    import yaml
+
+    loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, Mapping) or loaded.get("schema") != SCHEMA:
+        raise ValueError(
+            f"{path} is not a {SCHEMA} descriptor"
+        )
+    return dict(loaded)
+
+
+__all__ = [
+    "SCHEMA",
+    "CompiledProgramAPI",
+    "EntryPoint",
+    "Parameter",
+    "describe_fortran_function",
+    "load_api",
+]

@@ -392,11 +392,13 @@ class _FunctionEmitter:
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
         callee_extents: Mapping[str, Sequence[str]] | None = None,
+        callee_arity: Mapping[str, int] | None = None,
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.callee_extents = dict(callee_extents or {})
+        self.callee_arity = dict(callee_arity or {})
         self.shortfalls: list[FortranShortfall] = []
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
@@ -750,6 +752,27 @@ class _FunctionEmitter:
         operation = instr.attributes.get("tensor_operation") or instr.op
         if operation in _SHAPE_ONLY and instr.args:
             return self._is_logical(instr.args[0])
+        # Tested against instr.op, not `operation`: a constant carries
+        # tensor_operation="tensor_from_list", which shadows the Const op
+        # name that `operation` would otherwise report.
+        if instr.op in ("Const", "const"):
+            # A boolean constant emits a LOGICAL literal (_literal writes
+            # .true._c_bool), so it is already LOGICAL whatever its recorded
+            # dtype says. Missing this wrapped the literal as
+            # ((.true._c_bool) /= 0), which gfortran rejects for comparing
+            # LOGICAL against INTEGER.
+            for key in ("constant", "value"):
+                candidate = instr.attributes.get(key)
+                if isinstance(candidate, bool):
+                    return True
+            # An array constant keeps its elements under "values" and leaves
+            # the scalar keys None, so a boolean mask constant is only
+            # visible here.
+            values = instr.attributes.get("values")
+            if values is not None and len(values) and all(
+                isinstance(element, bool) for element in values
+            ):
+                return True
         return (
             operation in _COMPARISON
             or operation in _LOGICAL_BINARY
@@ -933,11 +956,18 @@ class _FunctionEmitter:
         else:
             call_values = [*instr.args, *ordered_outputs]
             extents = sorted(dimension_extents(call_values).values())
+        # A region subroutine's declared parameters already include the
+        # values it writes, so appending ordered_outputs again passed each
+        # one twice -- "More actual than formal arguments in procedure
+        # call". Outputs are only appended when the callee really does
+        # declare more parameters than the call supplies.
+        arity = self.callee_arity.get(str(callee))
         arguments = [
             *extents,
             *(self._operand(value) for value in instr.args),
-            *(_name(value) for value in ordered_outputs),
         ]
+        if arity is None or arity > len(instr.args):
+            arguments.extend(_name(value) for value in ordered_outputs)
         return [f"    call {callee}({', '.join(arguments)})"]
 
     def _indexed_store(self, instr: Instr) -> list[str] | None:
@@ -1466,6 +1496,7 @@ def emit_function(
     dtype: str = DEFAULT_DTYPE,
     outputs: Sequence[SSAValue] = (),
     callee_extents: Mapping[str, Sequence[str]] | None = None,
+    callee_arity: Mapping[str, int] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -1483,6 +1514,7 @@ def emit_function(
         dtype=dtype,
         outputs=outputs,
         callee_extents=callee_extents,
+        callee_arity=callee_arity,
     ).emit()
 
 
@@ -1493,6 +1525,11 @@ class FortranModule:
     name: str
     source: str
     subroutines: tuple[FortranSubroutine, ...] = ()
+    # The calling contract for what was just generated. Emitted from the same
+    # Function objects, so a caller binds argument order, element types and
+    # by-value/by-reference from a record rather than by reading the source
+    # and guessing. See compiler/compiled_program_api.py.
+    api: Any = None
 
     @property
     def shortfalls(self) -> tuple[FortranShortfall, ...]:
@@ -1505,6 +1542,10 @@ class FortranModule:
     def write(self, directory: str | Path) -> Path:
         path = Path(directory) / f"{self.name}.f90"
         path.write_text(self.source, encoding="utf-8")
+        if self.api is not None:
+            # Beside the source, same stem: the artifact and its contract
+            # travel together or the contract is worthless.
+            self.api.write(path.with_suffix(".api.yaml"))
         return path
 
 
@@ -1535,12 +1576,17 @@ def emit_module(
         ).extent_names
         for function_name, function in functions.items()
     }
+    callee_arity = {
+        function_name: len(function.args)
+        for function_name, function in functions.items()
+    }
     subroutines = tuple(
         emit_function(
             function,
             dtype=dtype,
             outputs=named_outputs.get(function_name, ()),
             callee_extents=callee_extents,
+            callee_arity=callee_arity,
         )
         for function_name, function in functions.items()
     )
@@ -1554,7 +1600,46 @@ def emit_module(
         "",
         f"end module {name}",
     ]
-    return FortranModule(name, "\n".join(lines) + "\n", subroutines)
+    # Describe what was generated, from the same Function objects, so callers
+    # stop rediscovering the signature by reading emitted source.
+    from .compiled_program_api import CompiledProgramAPI, describe_fortran_function
+
+    def _kind(function_name: str) -> str:
+        if function_name.startswith("numerical_region_"):
+            return "region"
+        if function_name.endswith("_control"):
+            return "control"
+        return "numerical"
+
+    entry_points = []
+    for function_name, function in functions.items():
+        kind = _kind(function_name)
+        note = None
+        if kind == "control":
+            note = (
+                "call this one: a program whose control shell has a loop "
+                "iterates here, and calling the numerical subroutine "
+                "directly runs the loop body once"
+            )
+        entry_points.append(
+            describe_fortran_function(
+                function_name,
+                function,
+                extent_names=callee_extents.get(function_name, ()),
+                outputs=named_outputs.get(function_name, ()),
+                kind=kind,
+                note=note,
+            )
+        )
+    control_entries = [e.name for e in entry_points if e.kind == "control"]
+    api = CompiledProgramAPI(
+        module=name,
+        language="fortran",
+        entry=control_entries[0] if control_entries else None,
+        entry_points=tuple(entry_points),
+        metadata={"dtype": dtype},
+    )
+    return FortranModule(name, "\n".join(lines) + "\n", subroutines, api=api)
 
 
 # Toolchains that are commonly installed but left off PATH on Windows.  A

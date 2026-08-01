@@ -393,6 +393,25 @@ def run_compiled_c_shell(
     return output
 
 
+# =====================================================================
+# NOTE: NO SIMULTANEOUS TUPLE ASSIGNMENT IN THIS LOOP -- ON PURPOSE.
+# =====================================================================
+# The obvious way to write a Mandelbrot step is
+#
+#     zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
+#
+# and that is what this source used to say. It does not lower: a tuple
+# assignment binds each name to a tuple temporary, so the loop's carried
+# update names that temporary instead of a value produced in the body, and
+# lower_precompile_and_control_to_ssa fails with
+#
+#     carried update value N has no producer inside the loop body
+#
+# The loop is still discovered and the ControlProgram still contains a real
+# LoopBlock, so the failure looks unrelated to the assignment. Each carried
+# name is therefore assigned exactly once per iteration, from a named value
+# computed in the body. Same computation; see aot_compile.py's docstring.
+# Do not "simplify" this back into a tuple assignment.
 _MANDELBROT_FORTRAN_AOT_SOURCE = f"""
 def mandelbrot_escape_aot(cx, cy, iterations):
     zx = cx * 0.0
@@ -403,9 +422,10 @@ def mandelbrot_escape_aot(cx, cy, iterations):
         zx2 = zx * zx
         zy2 = zy * zy
         count = count + (zx2 + zy2 <= 4.0)
-        zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
-        zx = zx.minimum(clamp_value).maximum(-clamp_value)
-        zy = zy.minimum(clamp_value).maximum(-clamp_value)
+        next_zx = zx2 - zy2 + cx
+        next_zy = 2.0 * zx * zy + cy
+        zx = next_zx.minimum(clamp_value).maximum(-clamp_value)
+        zy = next_zy.minimum(clamp_value).maximum(-clamp_value)
     return count
 
 
@@ -437,28 +457,27 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
         "cy": placeholder,
         "iterations": int(iterations),
     }
+    # precompile_only: this route wants the backend-agnostic
+    # FusedProgram/ControlProgram pair, not a GLSL emission and execution.
     aot = compile_ast_aot(
         _MANDELBROT_FORTRAN_AOT_SOURCE,
         "run_mandelbrot_aot",
         feeds,
         backend="fortran",
+        precompile_only=True,
     )
     numerical_name = "mandelbrot_fortran_numerical"
     control_name = "mandelbrot_fortran_control"
-    control = aot.shell_control_program
-    if control is None:
-        # A program with no loops or branches produces no control program --
-        # shell_control_program is Optional on DualIRShell for exactly this
-        # reason. The whole computation is then the numeric artifact, so the
-        # control side is the empty shell with no scheduled regions, which is
-        # the same construction program_order.py uses when it has to supply
-        # one. Passing None instead reaches control.region_indices and fails.
-        from ....compiler.control_source import ControlProgram, SequenceBlock
-
-        control = ControlProgram(root=SequenceBlock(()), region_indices=())
+    if aot.shell_control_program is None:
+        raise RuntimeError(
+            "the AOT run produced no control program, so the iteration loop "
+            "was not captured; a Fortran shell built from that would be one "
+            "unrolled step rather than the loop"
+        )
     lowering = lower_precompile_and_control_to_ssa(
         aot.compiled_shell_program,
-        control,
+        aot.shell_control_program,
+        region_programs=aot.region_programs,
         numerical_name=numerical_name,
         control_name=control_name,
     )
@@ -469,16 +488,36 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
 
     program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
     values = _values_by_id(lowering.module.functions[numerical_name])
+    # The loop's result is carried in the control subroutine, not the
+    # numerical one -- the numerical body is a single iteration. Naming those
+    # values as control outputs is what turns them into intent(out) dummies;
+    # without it the control subroutine computes the answer into a local and
+    # the caller has nothing to read.
+    control_values = _values_by_id(lowering.module.functions[control_name])
     emit_outputs = {
         numerical_name: [
             values[int(value_id)]
             for value_id in program.outputs.values()
             if int(value_id) in values
-        ]
+        ],
+        control_name: [
+            control_values[int(value_id)]
+            for value_id in program.outputs.values()
+            if int(value_id) in control_values
+        ],
     }
+    # The control subroutine calls one numerical_region_N per scheduled
+    # region, so those must travel with it; emitting only the numerical and
+    # control pair produced source that compiled and then failed to link
+    # with "undefined reference to numerical_region_0_".
+    region_function_names = tuple(
+        name
+        for name in lowering.module.functions
+        if name.startswith("numerical_region_")
+    )
     program_module = IRModule({
         name: lowering.module.functions[name]
-        for name in (numerical_name, control_name)
+        for name in (numerical_name, control_name, *region_function_names)
     })
     module = emit_module(
         program_module, name="mandelbrot_fortran_aot", outputs=emit_outputs
@@ -494,35 +533,102 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
     return ctypes.CDLL(str(library_path))
 
 
-@lru_cache(maxsize=None)
-def _compiled_fortran_mandelbrot_library(count: int, iterations: int):
-    # Absolute: compile_module invokes the Fortran compiler as a subprocess,
-    # and a relative cache path is only correct while the working directory
-    # happens to be the repository root.
-    out_path = (
+def _fortran_artifact_path() -> Path:
+    """Where the emitted .f90 (and, beside it, the .api.yaml) lives.
+
+    One definition: the compile step and the descriptor lookup must not be
+    able to disagree about the path. Absolute, because compile_module runs
+    the Fortran compiler as a subprocess and a relative cache path is only
+    correct while the working directory happens to be the repository root.
+    """
+
+    return (
         Path(__file__).resolve().parents[4]
         / ".turing-cache"
         / "mandelbrot_fortran_aot.f90"
     )
-    return _aot_compile_mandelbrot_fortran(count, iterations, out_path)
+
+
+@lru_cache(maxsize=None)
+def _compiled_fortran_mandelbrot_library(count: int, iterations: int):
+    return _aot_compile_mandelbrot_fortran(
+        count, iterations, _fortran_artifact_path()
+    )
 
 
 def run_compiled_fortran_shell(cx: np.ndarray, cy: np.ndarray, iterations: int) -> np.ndarray:
+    """Call the compiled program through its emitted API descriptor.
+
+    Nothing here is hardcoded about the signature. The descriptor written
+    beside the artifact (``*.api.yaml``, see compiler/compiled_program_api.py)
+    names the entry point, the argument order, each argument's element type,
+    and whether it is passed by value or by reference -- all of which this
+    demo previously guessed, and got wrong in three separate ways at once.
+    """
+
+    import yaml
+
     count = cx.size
     lib = _compiled_fortran_mandelbrot_library(count, iterations)
-    fn = getattr(lib, "mandelbrot_fortran_numerical")
-    fn.restype = None
-    cx_arr = np.ascontiguousarray(cx.reshape(-1), dtype=np.float64)
-    cy_arr = np.ascontiguousarray(cy.reshape(-1), dtype=np.float64)
-    out = np.zeros(count, dtype=np.float64)
-    fn(
-        ctypes.c_int(count),
-        cx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-        cy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-        ctypes.c_int(iterations),
-        out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-    )
-    return out.reshape(cx.shape)
+    descriptor_path = _fortran_artifact_path().with_suffix(".api.yaml")
+    api = yaml.safe_load(descriptor_path.read_text(encoding="utf-8"))
+    entry_name = api["entry"]
+    entry = next(e for e in api["entry_points"] if e["name"] == entry_name)
+
+    outputs = [p for p in entry["parameters"] if p["role"] == "output"]
+    if not outputs:
+        raise NotImplementedError(
+            f"{entry_name} declares no output parameter, so the iteration "
+            "result cannot be read back. The loop is captured and the "
+            "program compiles and links, but the control subroutine's "
+            "loop-carried result is still a local rather than an "
+            "intent(out) argument -- emit_module needs to be told which "
+            "control values are outputs. Descriptor: " + str(descriptor_path)
+        )
+
+    ctypes_by_name = {
+        "c_float": ctypes.c_float, "c_double": ctypes.c_double,
+        "c_int32": ctypes.c_int32, "c_int64": ctypes.c_int64,
+        "c_bool": ctypes.c_bool,
+    }
+    function = getattr(lib, entry["symbol"])
+    function.restype = None
+
+    supplied = {"cx": cx, "cy": cy}
+    feed_arrays = [np.ascontiguousarray(v.reshape(-1)) for v in supplied.values()]
+    arguments = []
+    argument_types = []
+    feeds = iter(feed_arrays)
+    results: list[np.ndarray] = []
+    for parameter in entry["parameters"]:
+        element = ctypes_by_name[parameter["ctypes"]]
+        if parameter["role"] == "extent":
+            arguments.append(element(count))
+            argument_types.append(element)
+        elif parameter["passing"] == "value":
+            # A by-value scalar input is the iteration count uniform.
+            arguments.append(element(iterations))
+            argument_types.append(element)
+        elif parameter["role"] == "input":
+            array = next(feeds).astype(
+                np.float32 if parameter["ctypes"] == "c_float" else np.float64,
+                copy=False,
+            )
+            arguments.append(array.ctypes.data_as(ctypes.POINTER(element)))
+            argument_types.append(ctypes.POINTER(element))
+        else:
+            extent = int(np.prod(parameter.get("shape") or (count,)))
+            buffer = np.zeros(
+                extent,
+                dtype=np.float32 if parameter["ctypes"] == "c_float" else np.float64,
+            )
+            results.append(buffer)
+            arguments.append(buffer.ctypes.data_as(ctypes.POINTER(element)))
+            argument_types.append(ctypes.POINTER(element))
+
+    function.argtypes = argument_types
+    function(*arguments)
+    return results[0].reshape(cx.shape)
 
 
 def benchmark_cpu_mandelbrot(
