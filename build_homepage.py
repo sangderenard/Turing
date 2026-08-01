@@ -204,8 +204,14 @@ def _bind_expressions(api) -> dict:
     inputs = [p["name"] for p in entry["parameters"] if p["role"] == "input"]
 
     known = {
-        "unit_x": "(x/(w-1) - 0.5) * 2.6",
-        "unit_y": "(y/(h-1) - 0.5) * 2.6",
+        # normalized_plane, exactly: y spans [-0.5, 0.5] and x spans that
+        # times the aspect ratio. The camera computes a span and then places
+        # the view assuming the grid covers it -- so the grid multiplier IS
+        # the zoom level, and 2.6 here silently showed 2.6x more plane than
+        # the span the camera had chosen. Every lateral excursion was then
+        # 2.6x smaller against the frame, and the deep view was never deep.
+        "unit_x": "(x/(w-1) - 0.5) * (w/h)",
+        "unit_y": "(y/(h-1) - 0.5)",
         "interest": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos(t * 0.04)",
     }
     expressions = {name: known[name] for name in inputs if name in known}
