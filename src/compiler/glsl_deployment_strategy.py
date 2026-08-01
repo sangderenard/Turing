@@ -4983,6 +4983,31 @@ def _project_captured_program(
     return CapturedFusedProgram(manifest, {}, stages)
 
 
+def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
+    """Which source parameter a feed came from, if the capture knows.
+
+    Object identity is tried first and is exact when it survives. When the
+    value was rewrapped on its way to the tape -- which is the usual case --
+    the resident range underneath is unchanged, so the storage recorded at
+    binding time still identifies it.
+    """
+
+    names = getattr(shell, "_capture_input_names", None) or {}
+    direct = names.get(feed_id)
+    if direct:
+        return direct
+    by_storage = getattr(shell, "_capture_input_storage", None) or {}
+    if not by_storage:
+        return None
+    value = (getattr(captured, "feeds", None) or {}).get(feed_id)
+    if value is None:
+        return None
+    storage = _capture_storage_identity(value)
+    if storage is None:
+        return None
+    return by_storage.get(storage)
+
+
 def _capture_feed_aliases(
     captured: CapturedFusedProgram,
     feed_ids: dict[int, int],
@@ -5249,9 +5274,16 @@ def _coordinate_scheduled_capture_impl(
                     f"{node_id}; binding_kind={binding_kind!r}"
                 )
             values[node_id] = supplied[name]
-            # Keep the name against the object that will become a feed.
+            # Keep the name against both the object and the storage under
+            # it. The object is wrapped into an AbstractTensor before it is
+            # ever used, so object identity alone does not survive to the
+            # feed; the resident range does, which is the same correlation
+            # _capture_feed_aliases uses.
             try:
                 shell._capture_input_names[id(values[node_id])] = str(name)
+                storage = _capture_storage_identity(values[node_id])
+                if storage is not None:
+                    shell._capture_input_storage[storage] = str(name)
             except AttributeError:
                 pass
 
@@ -8275,6 +8307,9 @@ class ProcessGraphGLSLDeployment:
         # descriptor that can say "feed0" but not "cx", so a caller has to
         # guess which array goes where.
         self._capture_input_names = {}
+        # The same names, keyed by the resident range instead of by object
+        # identity, so a value that was rewrapped can still be recognised.
+        self._capture_input_storage = {}
         self._execute_invocations = 0
         self._discovery_tape_creations = 0
         self._discovery_tape_lowerings = 0
@@ -9395,9 +9430,7 @@ class ProcessGraphGLSLDeployment:
                     # when the graph's Input nodes were bound. A feed is a
                     # trace root and has no tape node, so the old lookup
                     # through tape params could only ever return empty.
-                    "binding_name": getattr(
-                        self, "_capture_input_names", {}
-                    ).get(feed_id),
+                    "binding_name": _resolve_binding_name(self, whole, feed_id),
                     "parameter_names": (
                         tuple(sorted(
                             tape._nodes[feed_id].ctx.get("params") or {}
@@ -10855,6 +10888,9 @@ class ProcessGraphGLSLDeployment:
         "_diagnostic_value_summary": _diagnostic_value_summary,
         "_captured_storage_meta": _captured_storage_meta,
         "_shell_profile_name": _shell_profile_name,
+        # The generated class runs in this namespace only, so anything it
+        # calls has to be handed in explicitly.
+        "_resolve_binding_name": _resolve_binding_name,
         "execute_captured_fused_program": execute_captured_fused_program,
         "compile_captured_fused_program": compile_captured_fused_program,
         "GLSLTensorOperations": GLSLTensorOperations,

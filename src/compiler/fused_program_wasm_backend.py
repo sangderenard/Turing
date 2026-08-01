@@ -306,7 +306,10 @@ def emit_wasm_module(
         local = f"$v{len(names)}"
         names[feed_id] = local
         locals_declared.append(f"(local {local} {value_type})")
-        body.extend(element_address(f"$feed{index}"))
+        # The same label the signature declares -- emitting $feed{index}
+        # here while the header says $unit_x produces WAT that does not
+        # refer to its own parameters.
+        body.extend(element_address("$" + labels[index]))
         body.append(f"      {load}")
         body.append(f"      local.set {local}")
 
@@ -858,10 +861,11 @@ def _describe(
             passing="value",
         )
     ]
+    labels = list(input_names or [f"feed{i}" for i in range(len(feed_ids))])
     for index, _ in enumerate(feed_ids):
         parameters.append(
             Parameter(
-                name=f"feed{index}",
+                name=labels[index],
                 role="input",
                 dtype=value_type,
                 c_type="int32_t",

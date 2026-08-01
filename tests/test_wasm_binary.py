@@ -216,3 +216,61 @@ def test_a_feed_nothing_reads_still_gets_a_parameter():
     )
     assert set(program_feed_order(program)) == {7, 3}
     assert program_feed_order(program)[0] == 7
+
+
+def test_feeds_are_named_after_their_source_parameters():
+    """A descriptor that can only say "feed0" makes a caller work out which
+    array goes where. The program records the binding each feed came from,
+    so the contract can say what it is."""
+
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import feed_names
+
+    program = FusedProgram(
+        version=1, feeds={11, 22},
+        steps=[OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)],
+        outputs={"result": 3},
+        extras={"capture_feed_origins": {
+            11: {"binding_name": "cx"}, 22: {"binding_name": "cy"},
+        }},
+    )
+    assert feed_names(program, [11, 22]) == ["cx", "cy"]
+
+
+def test_unnamed_or_unusable_names_fall_back_positionally():
+    """A hand-built program knows no names, and a name that is not an
+    identifier would produce a contract nothing can bind against."""
+
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import feed_names
+
+    steps = [OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)]
+    bare = FusedProgram(version=1, feeds={11, 22}, steps=steps,
+                        outputs={"result": 3})
+    assert feed_names(bare, [11, 22]) == ["feed0", "feed1"]
+
+    awkward = FusedProgram(
+        version=1, feeds={11, 22}, steps=steps, outputs={"result": 3},
+        extras={"capture_feed_origins": {
+            11: {"binding_name": "not an identifier"},
+            22: {"binding_name": "cx"},
+        }},
+    )
+    assert feed_names(awkward, [11, 22]) == ["feed0", "cx"]
+
+
+def test_colliding_names_are_made_unique():
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import feed_names
+
+    program = FusedProgram(
+        version=1, feeds={11, 22},
+        steps=[OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)],
+        outputs={"result": 3},
+        extras={"capture_feed_origins": {
+            11: {"binding_name": "x"}, 22: {"binding_name": "x"},
+        }},
+    )
+    names = feed_names(program, [11, 22])
+    assert names[0] == "x" and names[1] != "x"
+    assert len(set(names)) == 2
