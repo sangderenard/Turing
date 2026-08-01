@@ -604,7 +604,7 @@ function wireTabs() {
     select.addEventListener("change", () => {
       const name = select.id.slice(5);
       $("row_values_" + name).hidden = select.value !== "values";
-      $("row_expr_" + name).hidden = select.value !== "expression";
+      $("row_expr_" + name).hidden = select.value !== "expression" && select.value !== "network";
       $("row_gauss_" + name).hidden = select.value !== "gaussian";
     });
     select.dispatchEvent(new Event("change"));
@@ -729,6 +729,7 @@ def _signature_rows(parameters: Sequence[Mapping[str, Any]]) -> str:
 def _input_rows(
     parameters: Sequence[Mapping[str, Any]],
     feed_expressions: Mapping[str, str] | None = None,
+    network_routes: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     """One row per feed, each able to be literal values or an expression.
 
@@ -739,18 +740,21 @@ def _input_rows(
     """
 
     expressions = dict(feed_expressions or {})
+    routes = dict(network_routes or {})
     feeds = [p for p in parameters if p["role"] == "input"]
     rows = []
     for parameter in feeds:
         name = str(parameter["name"])
         expression = expressions.get(name, "i")
-        default_mode = "expression" if name in expressions else "values"
+        route = routes.get(name, {})
+        default_mode = "network" if route else ("expression" if name in expressions else "values")
         rows.append(
             '<div class="row">'
             f'<div class="name">{_escape(name)}</div>'
             f'<select id="mode_{_escape(name)}">'
             f'<option value="values"{"" if default_mode == "values" else ""}>values</option>'
             f'<option value="expression"{" selected" if default_mode == "expression" else ""}>expression</option>'
+            f'<option value="network"{" selected" if default_mode == "network" else ""}>network trajectory</option>'
             '<option value="gaussian">gaussian</option>'
             "</select>"
             '<div class="grow">'
@@ -905,6 +909,7 @@ def emit_html_shell(
     network_mapping = dict(network_manifest or {})
     network_mapping.setdefault("name", "No feedback network attached")
     network_mapping.setdefault("routes", [])
+    network_routes = {str(route["feed"]): route for route in network_mapping["routes"] if isinstance(route, Mapping) and route.get("feed")}
     script = (
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
@@ -997,7 +1002,7 @@ def emit_html_shell(
   <div class="panel">
     <div class="panel-title">Inputs</div>
     {picker}
-    {_input_rows(parameters, feed_expressions)}
+    {_input_rows(parameters, feed_expressions, network_routes)}
     <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>

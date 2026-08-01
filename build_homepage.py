@@ -135,7 +135,8 @@ def build(destination: Path) -> Path:
             "name": "Mandelbrot interest controller",
             "routes": [{
                 "feed": "feed2",
-                "effect": "interest network → Mandelbrot coordinates → JPEG image",
+                "label": "network trajectory",
+                "effect": "compiled interest recommendation → camera displacement → JPEG image",
             }],
         },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes
@@ -149,7 +150,7 @@ def build(destination: Path) -> Path:
                      "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
             "feed1": "0.131826 + (y/(h-1) - 0.5) * 2.4 * "
                      "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
-            "feed2": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos((x + y) * 0.035 + t * 0.04)",
+            "feed2": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos(t * 0.04)",
         },
         build_parameters={
             "iterations (unrolled)": ITERATIONS,
@@ -157,8 +158,8 @@ def build(destination: Path) -> Path:
             "wasm bytes": len(module.binary),
             "interest model": "frozen 3→2→1 tanh network",
         },
-        default_width=512,
-        default_height=512,
+        default_width=256,
+        default_height=256,
     )
     written = shell.write(destination)
     served = len(sources.available())
