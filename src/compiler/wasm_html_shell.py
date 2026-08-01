@@ -78,6 +78,7 @@ body {
 .meta { opacity: .6; font-size: .8rem; min-width: 12rem; }
 .grow { flex: 1; }
 input[type=text], input[type=number], textarea {
+  min-height: 8rem;
   font: inherit;
   font-family: ui-monospace, monospace;
   width: 100%;
@@ -133,6 +134,19 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .logline.error { color: var(--bad); }
 .logline.ok, .logline.call { color: var(--good); }
 .logline.warn { opacity: .8; }
+.logline.profile { color: #a78bfa; }
+.logline.progress { color: var(--accent); }
+.bar { height: .5rem; border-radius: .25rem; background: var(--soft); overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent);
+  transition: width .12s linear; }
+.barlabel { display: flex; justify-content: space-between; font-size: .75rem;
+  opacity: .7; margin-bottom: .25rem; }
+.kv { display: flex; gap: .5rem; font-size: .8rem; padding: .15rem 0; }
+.kv b { font-family: ui-monospace, monospace; font-weight: 600; min-width: 9rem; }
+.chip { display: inline-block; font-size: .72rem; font-family: ui-monospace, monospace;
+  padding: .1rem .4rem; border-radius: .25rem; background: var(--soft); margin: .1rem; }
+.filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
+.filters label { cursor: pointer; opacity: .75; }
 .good { color: var(--good); }
 details summary { cursor: pointer; font-weight: 600; font-size: .8rem; opacity: .65;
   text-transform: uppercase; letter-spacing: .04em; }
@@ -150,7 +164,18 @@ _BOOT_JS = r"""
 // dies at load looks identical to a shell that simply does nothing -- the
 // controls render either way, because they are static HTML -- so the failure
 // has to announce itself here rather than only in a console nobody opened.
-const LOG = [];
+const BUILD_TELEMETRY = __TELEMETRY__;
+// Build-time and run-time records share one schema and one list, so the
+// compilation and the execution read as a single timeline rather than two
+// logs a person has to interleave by eye.
+const LOG = (BUILD_TELEMETRY.records || []).map(r => ({
+  at: (r.at_ns / 1e6).toFixed(1) + "ms",
+  kind: r.kind,
+  message: r.message,
+  detail: Object.keys(r.detail || {}).length ? r.detail : null,
+  path: r.path || "",
+  phase: "build"
+}));
 function log(kind, message, detail) {
   const entry = {
     at: new Date().toISOString().slice(11, 23),
@@ -158,17 +183,33 @@ function log(kind, message, detail) {
     message: String(message),
     detail: detail === undefined ? null : detail
   };
+  entry.phase = "run";
   LOG.push(entry);
+  if (kind === "progress" && detail) setProgress(detail.done, detail.total, message);
   const pane = document.getElementById("log");
   if (pane) {
     const line = document.createElement("div");
     line.className = "logline " + kind;
-    line.textContent = entry.at + "  " + kind.toUpperCase() + "  " + entry.message +
+    line.textContent = entry.at + "  " + kind.toUpperCase() + "  " +
+      (entry.path ? "[" + entry.path + "] " : "") + entry.message +
       (entry.detail === null ? "" : "  " + JSON.stringify(entry.detail));
     pane.appendChild(line);
     pane.scrollTop = pane.scrollHeight;
   }
   return entry;
+}
+
+function setProgress(done, total, label) {
+  const bar = document.getElementById("bar-wrap");
+  const fill = document.getElementById("barfill");
+  const text = document.getElementById("bartext");
+  const pct = document.getElementById("barpct");
+  if (!bar) return;
+  bar.hidden = false;
+  const fraction = total ? Math.max(0, Math.min(1, done / total)) : 0;
+  fill.style.width = (fraction * 100).toFixed(1) + "%";
+  if (text) text.textContent = label || "";
+  if (pct) pct.textContent = done + " / " + total;
 }
 
 window.addEventListener("error", (event) => {
@@ -195,6 +236,7 @@ _JS = r"""const API = __API__;
 const WASM_BASE64 = __WASM__;
 
 const $ = (id) => document.getElementById(id);
+const GRAPH = __GRAPH__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
@@ -222,6 +264,7 @@ function parseNumbers(text) {
 async function run() {
   if (!moduleBytes) { setStatus("No .wasm loaded yet.", "bad"); log("warn", "run with no module"); return; }
   try {
+    log("progress", "instantiating", { done: 1, total: 4 });
     log("info", "instantiating", { bytes: moduleBytes.length });
     const { instance } = await WebAssembly.instantiate(moduleBytes, {});
     const memory = instance.exports[API.metadata.memory_export || "memory"];
@@ -251,6 +294,7 @@ async function run() {
       new View(memory.buffer, offsets[i], count).set(feeds[i].slice(0, count));
     });
 
+    log("progress", "writing feeds", { done: 2, total: 4 });
     const args = [count, ...offsets];
     // The exact call, recorded: argument order and the memory offsets it
     // computed are the two things most likely to be wrong, and the two least
@@ -259,6 +303,7 @@ async function run() {
       count: count, offsets: offsets, elementBytes: bytes,
       memoryPages: memory.buffer.byteLength / 65536
     });
+    log("progress", "executing", { done: 3, total: 4 });
     const started = performance.now();
     fn(...args);
     const elapsed = performance.now() - started;
@@ -268,6 +313,7 @@ async function run() {
       name: p.name,
       values: Array.from(new View(memory.buffer, offsets[inputs.length + i], count))
     }));
+    log("progress", "reading outputs", { done: 4, total: 4 });
     renderActiveTab();
     setStatus("ran " + count + " elements in " + elapsed.toFixed(3) + " ms", "good");
   } catch (err) {
@@ -342,6 +388,38 @@ function renderActiveTab() {
   if (active === "raw") renderRaw(); else renderImage();
 }
 
+function wireFilters() {
+  document.querySelectorAll(".filters input").forEach(box => {
+    box.addEventListener("change", () => {
+      const on = new Set(
+        Array.from(document.querySelectorAll(".filters input"))
+          .filter(b => b.checked).map(b => b.dataset.kind));
+      document.querySelectorAll(".logline").forEach(line => {
+        const kind = line.className.split(" ")[1];
+        line.hidden = !on.has(kind === "info" ? "log" : kind);
+      });
+    });
+  });
+}
+
+function renderGraph() {
+  const target = document.getElementById("graph");
+  if (!target || !GRAPH || !GRAPH.nodes) return;
+  const hist = Object.entries(GRAPH.histogram || {})
+    .map(([k, v]) => '<span class="chip">' + k + " x" + v + "</span>").join("");
+  const rows = (GRAPH.table || []).map(n =>
+    '<div class="kv"><b>' + n.id + "</b><span>" + n.type + "</span><span>" +
+    (n.label || "") + "</span><span class=meta>" +
+    (n.parents.length ? "&larr; " + n.parents.join(", ") : "") + "</span></div>"
+  ).join("");
+  target.innerHTML =
+    '<div class="kv"><b>nodes</b><span>' + GRAPH.nodes + "</span></div>" +
+    '<div class="kv"><b>edges</b><span>' + GRAPH.edges + "</span></div>" +
+    "<div>" + hist + "</div>" +
+    (GRAPH.truncated ? '<div class="meta">table truncated</div>' : "") +
+    rows;
+}
+
 function wireTabs() {
   document.querySelectorAll(".tab").forEach(tab => {
     tab.addEventListener("click", () => {
@@ -369,10 +447,37 @@ function wireFilePicker() {
 wireFilePicker();
 wireTabs();
 $("run").addEventListener("click", run);
+$("copyapi").addEventListener("click", () => {
+  navigator.clipboard.writeText($("apiyaml").value);
+  log("info", "API descriptor copied");
+});
+$("apiyaml").addEventListener("input", () => {
+  // The page binds against the JSON it was generated with, so an edit here
+  // is not live yet. Say that at the moment it starts to matter, rather
+  // than letting someone type into a field that quietly does nothing.
+  $("apistatus").textContent = "edited -- not applied (submission not wired up)";
+  $("apistatus").className = "out warn";
+});
+
 $("copylog").addEventListener("click", () => {
   navigator.clipboard.writeText(JSON.stringify(LOG, null, 2));
   log("info", "log copied to clipboard");
 });
+// Show what happened before the page existed, in order, then continue in
+// the same pane.
+(BUILD_TELEMETRY.records || []).forEach(r => {
+  const pane = document.getElementById("log");
+  if (!pane) return;
+  const line = document.createElement("div");
+  line.className = "logline " + r.kind;
+  line.textContent = (r.at_ns / 1e6).toFixed(1) + "ms  BUILD " + r.kind.toUpperCase() +
+    "  " + (r.path ? "[" + r.path + "] " : "") + r.message +
+    (Object.keys(r.detail || {}).length ? "  " + JSON.stringify(r.detail) : "");
+  pane.appendChild(line);
+});
+wireFilters();
+renderGraph();
+
 log("info", "shell ready", {
   entry: entry.symbol,
   parameters: params.length,
@@ -449,6 +554,9 @@ def emit_html_shell(
     source: str = "",
     wasm_bytes: bytes | None = None,
     name: str | None = None,
+    telemetry: Any = None,
+    process_graph: Any = None,
+    origin_source: str = "",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -456,6 +564,19 @@ def emit_html_shell(
     WAT, shown for reading. ``wasm_bytes`` is the assembled binary when one
     exists; without it the page offers a file picker instead of pretending
     it can assemble text itself.
+
+    ``telemetry`` is a ``shell_telemetry.TelemetryChannel`` (or its mapping)
+    carrying what happened while the program was compiled. Its records share
+    a schema with the ones the page produces at run time, so the page shows
+    one timeline rather than a build log and a run log side by side --
+    including progress, which drives the bar from the same records that
+    appear in the pane, so the two cannot disagree.
+
+    ``process_graph`` is a ``ProcessGraph`` (or an already-summarized
+    mapping) and ``origin_source`` the Python the program was compiled from.
+    Both are shown because "what did this come from" is the first question
+    asked of a compiled artifact and the hardest to answer from the artifact
+    alone.
     """
 
     mapping = api.to_mapping() if hasattr(api, "to_mapping") else dict(api)
@@ -472,10 +593,28 @@ def emit_html_shell(
         if wasm_bytes
         else "null"
     )
+    if telemetry is None:
+        telemetry_mapping: dict[str, Any] = {"records": []}
+    elif hasattr(telemetry, "to_mapping"):
+        telemetry_mapping = telemetry.to_mapping()
+    else:
+        telemetry_mapping = dict(telemetry)
+    if process_graph is None:
+        graph_mapping: dict[str, Any] = {}
+    elif hasattr(process_graph, "G") or hasattr(process_graph, "nodes"):
+        from .shell_telemetry import summarize_process_graph
+
+        graph_mapping = summarize_process_graph(process_graph)
+    else:
+        graph_mapping = dict(process_graph)
     script = (
-        _JS.replace("__API__", json.dumps(mapping)).replace("__WASM__", encoded)
+        _JS.replace("__API__", json.dumps(mapping))
+        .replace("__WASM__", encoded)
+        .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
     )
-    boot_script = _BOOT_JS
+    boot_script = _BOOT_JS.replace(
+        "__TELEMETRY__", json.dumps(telemetry_mapping, default=str)
+    )
 
     if wasm_bytes:
         banner = (
@@ -497,6 +636,12 @@ def emit_html_shell(
             "</div>"
         )
         disabled = " disabled"
+
+    try:
+        api_yaml = api.to_yaml() if hasattr(api, "to_yaml") else ""
+    except Exception:
+        # A descriptor that cannot render is not a reason to lose the page.
+        api_yaml = ""
 
     note = entry.get("note")
     note_html = f'<div class="note">{_escape(str(note))}</div>' if note else ""
@@ -557,8 +702,49 @@ def emit_html_shell(
 
   <div class="panel">
     <div class="panel-title">Diagnostics</div>
+    <div id="bar-wrap" hidden>
+      <div class="barlabel"><span id="bartext"></span><span id="barpct"></span></div>
+      <div class="bar"><i id="barfill"></i></div>
+    </div>
+    <div class="filters">
+      <label><input type="checkbox" data-kind="log" checked> log</label>
+      <label><input type="checkbox" data-kind="error" checked> error</label>
+      <label><input type="checkbox" data-kind="profile" checked> profile</label>
+      <label><input type="checkbox" data-kind="progress" checked> progress</label>
+      <label><input type="checkbox" data-kind="call" checked> call</label>
+      <label><input type="checkbox" data-kind="ok" checked> ok</label>
+    </div>
     <div id="log"></div>
     <div class="row"><button id="copylog">Copy log</button></div>
+  </div>
+
+  <div class="panel">
+    <details>
+      <summary>API descriptor</summary>
+      <div class="meta">The contract this page binds against. Editing it here
+        does not yet change anything -- applying an edited descriptor is not
+        wired up, and pretending otherwise would be worse than saying so.</div>
+      <textarea id="apiyaml" rows="16" spellcheck="false">{_escape(api_yaml)}</textarea>
+      <div class="row">
+        <button id="applyapi" disabled title="not wired up yet">Apply</button>
+        <button id="copyapi">Copy</button>
+        <div class="grow"><div id="apistatus" class="out"></div></div>
+      </div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <details>
+      <summary>Process graph</summary>
+      <div id="graph"></div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <details>
+      <summary>Original source</summary>
+      <pre>{_escape(origin_source)}</pre>
+    </details>
   </div>
 
   <div class="panel">
@@ -576,7 +762,14 @@ def emit_html_shell(
     return HtmlShell(name=shell_name, html=html, embedded=wasm_bytes is not None)
 
 
-def shell_for_artifact(artifact: Any, *, wasm_bytes: bytes | None = None) -> HtmlShell:
+def shell_for_artifact(
+    artifact: Any,
+    *,
+    wasm_bytes: bytes | None = None,
+    telemetry: Any = None,
+    process_graph: Any = None,
+    origin_source: str = "",
+) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
 
     if artifact.api is None:
@@ -589,6 +782,9 @@ def shell_for_artifact(artifact: Any, *, wasm_bytes: bytes | None = None) -> Htm
         source=artifact.source,
         wasm_bytes=wasm_bytes,
         name=f"{artifact.name}_shell",
+        telemetry=telemetry,
+        process_graph=process_graph,
+        origin_source=origin_source,
     )
 
 

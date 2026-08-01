@@ -154,3 +154,46 @@ def test_the_javascript_has_no_stray_real_newline_inside_a_string_literal():
             # not closed on that line.
             unescaped = line.replace('\\"', "")
             assert unescaped.count('"') % 2 == 0, f"{name} line {number}: {line!r}"
+
+
+def test_the_shell_receives_telemetry_progress_graph_and_both_sources():
+    from src.compiler.shell_telemetry import TelemetryChannel
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    channel = TelemetryChannel(name="build")
+    with channel.stepped("compiling", 2) as advance:
+        channel.log("frontend done", path="frontend", nodes=83)
+        advance("graph")
+        channel.profile("emission", nanoseconds=1234, path="wasm")
+        advance("wasm")
+
+    artifact = _artifact()
+    shell = emit_html_shell(
+        artifact.api,
+        source=artifact.source,
+        wasm_bytes=b"\x00asm\x01\x00\x00\x00",
+        telemetry=channel,
+        process_graph={"nodes": 83, "edges": 88, "histogram": {"Load": 34},
+                       "table": [], "truncated": False},
+        origin_source="def kernel(a, b):\n    return a - b\n",
+    )
+    html = shell.html
+
+    # Build records travel with the page, so the timeline starts before it.
+    assert "frontend done" in html and "compiling" in html
+    assert '"nodes": 83' in html or '"nodes":83' in html
+    # Progress drives the bar from the same records shown in the pane.
+    assert 'id="barfill"' in html and 'setProgress(' in html
+    # Both sources, and the descriptor, are readable from the page.
+    assert "def kernel(a, b):" in html
+    assert "API descriptor" in html and 'id="apiyaml"' in html
+    assert "schema: turing-compiled-program-api-v1" in html
+
+
+def test_an_edited_descriptor_does_not_pretend_to_apply():
+    """Applying an edited descriptor is not wired up; a control that looks
+    live but is not is worse than one that says so."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert 'id="applyapi" disabled' in html
+    assert "not wired up" in html
