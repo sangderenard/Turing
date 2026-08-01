@@ -304,6 +304,40 @@ function reportTimings(timings, count) {
     "<span>" + (timings.length / (total / 1000)).toFixed(1) + " fps</span>";
 }
 
+
+// Resume after the browser has actually painted.
+//
+// A requestAnimationFrame callback runs *before* the repaint it is
+// scheduling, so resuming there and immediately calling the kernel again
+// saturates the main thread and blocks the very paint being waited for. On
+// a desktop that mostly squeaks through; on a phone it does not, and the
+// document sits there looking frozen while the loop happily keeps running.
+// Two nested frames means the first repaint has completed before the second
+// callback fires.
+//
+// rAF is also suspended entirely while the document is hidden, so a bare
+// await here would hang the loop forever rather than pause it. The timeout
+// is the floor that keeps the loop answerable in that case.
+function presented() {
+  // The draw has already happened, synchronously, in the loop. This waits
+  // for the frame carrying it to be presented before the loop computes
+  // again, so a completed picture is never overwritten by the next one
+  // before it has been seen.
+  //
+  // requestAnimationFrame is suspended while the document is hidden, so the
+  // timeout is the floor that keeps the loop answerable rather than hung.
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 250);
+  });
+}
+
 function domain() {
   const w = Math.max(1, Number($("dom_w").value) | 0);
   const h = Math.max(1, Number($("dom_h").value) | 0);
@@ -375,10 +409,17 @@ async function advanceFeedback(ticks = 1) {
   const inputs = runtime.entry.parameters.filter(p => p.role === "input");
   const outputs = runtime.entry.parameters.filter(p => p.role === "output");
   const elementBytes = runtime.api.metadata.element_bytes || 8;
-  const required = (inputs.length + outputs.length) * count * elementBytes;
+  // A module that needed a baked table carries it at offset 0 and says how
+  // far it reaches. Laying arrays out from 0 anyway overwrites the table --
+  // and this module's activation IS that table, so the first tick destroys
+  // the network it is about to ask. The scores then drift to garbage, the
+  // trajectory stops advancing, and every subsequent frame is identical:
+  // the loop keeps running at full speed while the picture sits still.
+  const reserved = runtime.api.metadata.reserved_bytes || 0;
+  const required = reserved + (inputs.length + outputs.length) * count * elementBytes;
   if (required > memory.buffer.byteLength) memory.grow(Math.ceil((required - memory.buffer.byteLength) / 65536));
   const View = runtime.api.metadata.value_type === "f32" ? Float32Array : Float64Array;
-  const offsetsBytes = Array.from({length: inputs.length + outputs.length}, (_, i) => i * count * elementBytes);
+  const offsetsBytes = Array.from({length: inputs.length + outputs.length}, (_, i) => reserved + i * count * elementBytes);
   new View(memory.buffer, offsetsBytes[0], count).fill(feedbackState.travel);
   new View(memory.buffer, offsetsBytes[1], count).set(offsets.map(value => feedbackState.travel + value));
   fn(count, ...offsetsBytes);
@@ -387,7 +428,17 @@ async function advanceFeedback(ticks = 1) {
   for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
   feedbackState.scores = scores;
   feedbackState.speed = 0.45 + 1.8 * (1 - scores[0]) + 0.35 * best;
-  feedbackState.travel += feedbackState.speed / Math.max(1, contract.fps || 120);
+  const step = feedbackState.speed / Math.max(1, contract.fps || 120);
+  if (!Number.isFinite(step)) {
+    // Say so instead of advancing by NaN. A NaN trajectory fills the feed
+    // with NaN, every escape count comes out equal, and the result looks
+    // exactly like a page that has stopped redrawing.
+    log("error", "feedback trajectory is not finite; holding position", {
+      scores: scores, speed: feedbackState.speed
+    });
+    return;
+  }
+  feedbackState.travel += step;
 }
 }
 
@@ -434,14 +485,17 @@ async function run() {
 
     // The caller owns memory, so the layout is decided here: every array
     // gets its own contiguous block, feeds first and then outputs.
-    const need = (inputs.length + outputs.length) * count * bytes;
+    // Same rule as the feedback module: start past anything the program
+    // baked into its own memory. Zero for a program that needed no table.
+    const reservedBytes = API.metadata.reserved_bytes || 0;
+    const need = reservedBytes + (inputs.length + outputs.length) * count * bytes;
     const have = memory.buffer.byteLength;
     if (need > have) {
       memory.grow(Math.ceil((need - have) / 65536));
     }
     const View = isF32 ? Float32Array : Float64Array;
     const offsets = [];
-    let cursor = 0;
+    let cursor = reservedBytes;
     for (let i = 0; i < inputs.length + outputs.length; i++) {
       offsets.push(cursor);
       cursor += count * bytes;
@@ -503,12 +557,20 @@ async function run() {
           name: p.name,
           values: new View(memory.buffer, offsets[inputs.length + i], count)
         }));
+        if ((r % 15) === 0) reportTimings(timings, count);
+        // The redraw is synchronous and inside the computation loop: the
+        // loop calls it directly and does not continue until it has
+        // finished. Handing it to a frame callback deferred it out of the
+        // loop, which is what left the compute running with nothing being
+        // drawn.
         renderActiveTab();
         renderNetworkStats(activeFeeds);
-        if ((r % 15) === 0) reportTimings(timings, count);
-        await new Promise(resolve => requestAnimationFrame(resolve));
+        await presented();
         const remaining = 1000 / renderFps - (performance.now() - frameStarted);
-        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
+        // Always yield, even when the frame already overran its budget --
+        // which on a phone is every frame. Without this the only yield was
+        // the frame above, and a negative `remaining` meant none at all.
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, remaining)));
       } else if (!continuous && repeats > 1 && (r % 200) === 0) {
         // Even a non-animated sweep should not freeze the page.
         await new Promise(resolve => setTimeout(resolve, 0));
@@ -579,6 +641,11 @@ function renderWebGLPalette(canvas, values, w, h, lo, span, invert) {
   const scalar = new Uint8Array(w * h);
   for (let i = 0; i < scalar.length; i++) scalar[i] = Math.max(0, Math.min(255, Math.round(255 * ((values[i] - lo) / span))));
   gl.viewport(0, 0, w, h); gl.useProgram(state.program); gl.bindVertexArray(state.vao); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state.texture); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, scalar); gl.uniform1i(state.invert, invert ? 1 : 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // Wait for the draw to actually complete. drawArrays only queues commands;
+  // returning here lets the loop start the next compute while this frame is
+  // still sitting in the queue, so nothing reaches the screen. finish()
+  // blocks until the GPU has drained it.
+  gl.finish();
   return true;
 }
 function renderRaw() {
