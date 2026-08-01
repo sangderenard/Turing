@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import sympy
 
@@ -27,6 +27,8 @@ class SympyMathDocument:
     node_count: int
     program_relation_head: str
     program_relation_arity: int
+    program_kind: str
+    program_name: str
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -46,6 +48,12 @@ class SympyMathDocument:
                 "head": self.program_relation_head,
                 "arity": self.program_relation_arity,
                 "arguments": "equations[*]",
+            },
+            "depiction": {
+                "kind": self.program_kind,
+                "name": self.program_name,
+                "inputs": list(self.input_names),
+                "outputs": [str(output["name"]) for output in self.outputs],
             },
             "equations": [dict(equation) for equation in self.equations],
         }
@@ -69,7 +77,12 @@ def _presentation_mathml(expression: sympy.Basic) -> str:
     )
 
 
-def render_reduced_program_mathematics(program: Any) -> SympyMathDocument:
+def render_reduced_program_mathematics(
+    program: Any,
+    *,
+    input_names: Sequence[str] | None = None,
+    program_name: str = "program",
+) -> SympyMathDocument:
     """Select the existing SymPy target for a normalized reduced program.
 
     Scalar constructor folding and dead-step pruning are the same normalization
@@ -99,6 +112,19 @@ def render_reduced_program_mathematics(program: Any) -> SympyMathDocument:
     # genuine SymPy object here; the JSON document references its clauses
     # rather than duplicating several megabytes of MathML in one expression.
     program_relation = sympy.And(*model.relations, evaluate=False)
+    metadata = reduced.meta or {}
+    output_dtypes = tuple(
+        str(getattr(metadata.get(node_id), "dtype", "")).lower()
+        for node_id in output_ids
+    )
+    if reduced.state_in:
+        program_kind = "transition"
+    elif output_dtypes and all("bool" in dtype for dtype in output_dtypes):
+        program_kind = "predicate"
+    elif output_ids:
+        program_kind = "function"
+    else:
+        program_kind = "relation"
 
     equation_by_symbol = {
         equation.lhs: equation
@@ -135,12 +161,14 @@ def render_reduced_program_mathematics(program: Any) -> SympyMathDocument:
     return SympyMathDocument(
         equations=tuple(equations),
         outputs=tuple(outputs),
-        input_names=tuple(map(str, model.inputs)),
+        input_names=tuple(map(str, input_names or model.inputs)),
         constraint_count=len(model.constraints),
         uninterpreted=tuple(model.uninterpreted),
         node_count=len(model.node_specs),
         program_relation_head=type(program_relation).__name__,
         program_relation_arity=len(program_relation.args),
+        program_kind=program_kind,
+        program_name=str(program_name),
     )
 
 

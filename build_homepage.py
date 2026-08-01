@@ -503,7 +503,12 @@ def build(destination: Path) -> Path:
             )
             source_entries = _write_source_downloads(destination, sources)
             mathematics = _write_mathematics(
-                destination, render_reduced_program_mathematics(wanted)
+                destination,
+                render_reduced_program_mathematics(
+                    wanted,
+                    input_names=tuple(_bind_expressions(api)),
+                    program_name=aot.entrypoint,
+                ),
             )
         advance("sources")
 

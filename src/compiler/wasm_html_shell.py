@@ -137,8 +137,7 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .logline.profile { color: #a78bfa; }
 .logline.progress { color: var(--accent); }
 .bar { height: .5rem; border-radius: .25rem; background: var(--soft); overflow: hidden; }
-.bar > i { display: block; height: 100%; width: 0; background: var(--accent);
-  transition: width .12s linear; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); }
 .barlabel { display: flex; justify-content: space-between; font-size: .75rem;
   opacity: .7; margin-bottom: .25rem; }
 .kv { display: flex; gap: .5rem; font-size: .8rem; padding: .15rem 0; }
@@ -152,7 +151,7 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .schedule-level-label { width: 4rem; flex: 0 0 4rem; font: .72rem ui-monospace, monospace;
   opacity: .6; padding-top: .35rem; }
 .deployment-node { flex: 1; min-width: 10rem; border: 1px solid var(--line);
-  border-radius: .35rem; padding: .4rem .55rem; transition: .12s ease;
+  border-radius: .35rem; padding: .4rem .55rem;
   cursor: pointer; background: var(--soft); }
 .deployment-node b { display: block; font: 600 .74rem ui-monospace, monospace; }
 .deployment-node .node-state { font: .68rem ui-monospace, monospace; opacity: .75; }
@@ -168,8 +167,16 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .graph-view-button[aria-pressed="true"] { background: var(--accent); color: white; }
 .graph-scroll { max-height: 26rem; overflow: auto; border: 1px solid var(--line);
   border-radius: .45rem; background: #05070c; }
-#process-graph-canvas { display: block; max-width: none; border: 0; border-radius: 0;
-  image-rendering: auto; }
+.process-graph-grid { display: grid; min-width: 42rem; min-height: 22rem;
+  grid-template-columns: repeat(var(--graph-columns), minmax(2px, 1fr));
+  grid-template-rows: repeat(var(--graph-rows), 4px); padding: .7rem; }
+.graph-indicator { width: 3px; height: 3px; border-radius: 50%; align-self: center;
+  justify-self: center; cursor: pointer; background: rgb(var(--node-r) var(--node-g) var(--node-b));
+  opacity: var(--node-opacity, .26); transform: scale(var(--node-scale, 1));
+  box-shadow: 0 0 var(--node-blur, 0) rgb(var(--node-r) var(--node-g) var(--node-b)); }
+.graph-indicator[data-selected="true"] { outline: 1px solid #fff; outline-offset: 2px; }
+.graph-profile-stats { padding: .35rem .5rem; border-radius: .3rem;
+  background: color-mix(in srgb, var(--accent) var(--profile-glow, 0%), transparent); }
 .graph-option { display: inline-flex; align-items: center; gap: .25rem; cursor: pointer; }
 .filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
 .filters label { cursor: pointer; opacity: .75; }
@@ -179,18 +186,9 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
   border: 1px solid transparent; font-family: ui-monospace, monospace; }
 .srctab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
 .srcview[hidden] { display: none; }
-.math-output, .math-equation { overflow: auto; padding: .55rem .7rem;
-  margin-top: .45rem; border-radius: .35rem; background: var(--soft); }
-.program-relation { overflow: auto; margin: .65rem 0; padding: .65rem .8rem;
-  border: 1px solid var(--line); border-radius: .35rem; }
-.math-output b { font: 600 .75rem ui-monospace, monospace; }
-.math-output math, .math-equation math { min-width: max-content; }
-.math-browser { margin-top: .65rem; }
-.math-controls { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap;
-  margin-top: .55rem; }
-.math-controls button { background: var(--soft); color: inherit;
-  border: 1px solid var(--line); }
-.math-equation-head { font: .7rem ui-monospace, monospace; opacity: .58; }
+.chalkboard { overflow: auto; margin: .65rem 0; padding: .85rem 1rem;
+  border: 1px solid var(--line); border-radius: .35rem; background: var(--soft); }
+.chalkboard math { min-width: max-content; font-size: 1.08rem; }
 .stat { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .8rem;
   font-family: ui-monospace, monospace; margin-top: .4rem; }
 .good { color: var(--good); }
@@ -627,7 +625,7 @@ class ClassGraphRunner {
         markDeploymentNode(method.module, "running");
         const started = performance.now();
         coordinate(count, this.inventoryOffset, method.index, method.index + 1);
-        markDeploymentNode(method.module, "done", performance.now() - started);
+        markDeploymentNode(method.module, "done", performance.now() - started, "latched method");
         if (index + 1 < activeMethods.length && running) {
           await waitForCardLatch(index + 1, activeMethods.length);
         }
@@ -638,7 +636,8 @@ class ClassGraphRunner {
       coordinate(count, this.inventoryOffset, start, rangeEnd);
       const elapsed = performance.now() - started;
       activeMethods.forEach(method => markDeploymentNode(
-        method.module, "done", elapsed / Math.max(1, activeMethods.length)
+        method.module, "done", elapsed / Math.max(1, activeMethods.length),
+        "coordinator amortized"
       ));
     }
     return outputs.map(parameter => {
@@ -1154,10 +1153,10 @@ function wireFilters() {
 }
 
 let activeGraphView = "original";
-let graphLayout = null;
-let graphFrame = null;
 let graphSelectedNode = null;
-const graphPulses = new Map();
+let graphIndicatorIdsByIdentity = new Map();
+let graphNodesById = new Map();
+const graphProfileSamples = [];
 
 function hueRgb(hue) {
   const h = ((hue % 360) + 360) % 360 / 60;
@@ -1184,144 +1183,130 @@ function mixedIdentityRgb(contributors) {
   return hueRgb(mixed);
 }
 
-// Rolling phosphor integrator. Calls faster than the display refresh are not
-// dropped: every completed region deposits energy, and the exponentially
-// decaying window determines the node's visible colour on the next redraw.
-function phosphorColor(node, now) {
-  const decay = Math.max(80, Number($("graph-decay") && $("graph-decay").value) || 1200);
-  const pulses = graphPulses.get(String(node.id)) || [];
-  let energy = 0;
-  const live = [];
-  for (const pulse of pulses) {
-    const age = Math.max(0, now - pulse.at);
-    if (age > decay * 7) continue;
-    energy += pulse.energy * Math.exp(-age / decay);
-    live.push(pulse);
-  }
-  if (live.length !== pulses.length) graphPulses.set(String(node.id), live);
-  const base = mixedIdentityRgb(node.contributors);
-  const glow = 1 - Math.exp(-energy);
-  return {
-    rgb: base.map(value => Math.min(255, Math.round(value * (0.28 + glow * 0.9)))),
-    alpha: 0.28 + glow * 0.72,
-    glow: glow,
-    active: live.length > 0,
-  };
+function graphDecayMs() {
+  return Math.max(80, Number($("graph-decay") && $("graph-decay").value) || 1200);
 }
 
-function pulseGraphNodes(nodeIds, elapsedMs) {
+function graphIndicatorId(viewName, nodeId) {
+  return "graph-node-" + viewName + "-" + String(nodeId).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function percentile(sorted, fraction) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction))];
+}
+
+function updateGraphProfileStats(now = performance.now()) {
+  const pane = $("graph-profile-stats");
+  const decay = graphDecayMs();
+  const live = graphProfileSamples.filter(sample => now - sample.at <= decay * 4);
+  const root = document.documentElement;
+  root.style.setProperty("--profile-decay-ms", decay.toFixed(0));
+  if (!live.length) {
+    root.style.setProperty("--profile-glow", "0%");
+    root.style.setProperty("--profile-normalizer-us", "0");
+    if (pane) pane.innerHTML = "<span>awaiting execution samples</span><span>τ " +
+      decay.toFixed(0) + " ms · half-life " + (decay * Math.LN2).toFixed(0) + " ms</span>";
+    return;
+  }
+  const elapsed = live.map(sample => sample.elapsedMs).sort((a, b) => a - b);
+  const perNode = live.map(sample => sample.perNodeUs).sort((a, b) => a - b);
+  const median = percentile(elapsed, .5);
+  const p95 = percentile(elapsed, .95);
+  const normalizerUs = Math.max(.001, percentile(perNode, .95));
+  const load = Math.min(100, Math.log1p(p95) * 24);
+  root.style.setProperty("--profile-median-ms", median.toFixed(4));
+  root.style.setProperty("--profile-p95-ms", p95.toFixed(4));
+  root.style.setProperty("--profile-normalizer-us", normalizerUs.toFixed(3));
+  root.style.setProperty("--profile-glow", load.toFixed(1) + "%");
+  if (pane) pane.innerHTML =
+    "<span>window samples " + live.length + "</span>" +
+    "<span>median " + median.toFixed(3) + " ms/card</span>" +
+    "<span>p95 " + p95.toFixed(3) + " ms/card</span>" +
+    "<span>median " + percentile(perNode, .5).toFixed(2) + " μs/node</span>" +
+    "<span>phosphor scale p95 " + normalizerUs.toFixed(2) + " μs/node</span>" +
+    "<span>latest intensity " + (live[live.length - 1].intensity * 100).toFixed(0) + "%</span>" +
+    "<span>latest " + live[live.length - 1].module + "</span>" +
+    "<span>" + live[live.length - 1].scope + "</span>" +
+    "<span>τ " + decay.toFixed(0) + " ms</span>";
+}
+
+function pulseIndicator(element, depositedEnergy, at, decay) {
+  if (!element) return;
+  const previousAt = Number(element.dataset.profileAt || at);
+  const previousEnergy = Number(element.dataset.profileEnergy || 0);
+  const energy = previousEnergy * Math.exp(-Math.max(0, at - previousAt) / decay) + depositedEnergy;
+  element.dataset.profileAt = String(at);
+  element.dataset.profileEnergy = String(energy);
+  element.style.setProperty("--node-opacity", Math.min(1, .26 + energy * .48).toFixed(3));
+  element.style.setProperty("--node-scale", (1 + Math.min(2.5, energy * 1.3)).toFixed(3));
+  element.style.setProperty("--node-blur", Math.min(15, energy * 7).toFixed(2) + "px");
+}
+
+function pulseGraphNodes(nodeIds, elapsedMs, moduleName = "program", scope = "method") {
   const at = performance.now();
-  const energy = Math.max(0.14, Math.log1p(Math.max(0, elapsedMs || 0)) * 0.5);
-  for (const nodeId of nodeIds || []) {
-    const key = String(nodeId);
-    const pulses = graphPulses.get(key) || [];
-    pulses.push({at: at, energy: energy});
-    if (pulses.length > 96) pulses.splice(0, pulses.length - 96);
-    graphPulses.set(key, pulses);
-  }
-  if (!graphFrame) graphFrame = requestAnimationFrame(drawProcessGraph);
-}
-
-function prepareProcessGraph() {
-  const canvas = $("process-graph-canvas");
-  const view = GRAPH_VIEWS.views && GRAPH_VIEWS.views[activeGraphView];
-  if (!canvas || !view) return;
-  const groups = Math.max(1, view.groups || 1);
-  const levels = Math.max(1, (view.level_max || 0) - (view.level_min || 0) + 1);
-  const width = Math.max(680, groups * 92);
-  const height = Math.max(360, Math.min(18000, levels * 5 + 28));
-  canvas.width = width; canvas.height = height;
-  const buckets = new Map();
-  const positions = new Map();
-  for (const node of view.nodes) {
-    const key = node.level + "::" + node.group;
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(node);
-  }
-  for (const [key, nodes] of buckets) {
-    const [level, group] = key.split("::").map(Number);
-    nodes.forEach((node, index) => {
-      const span = 72;
-      const x = 10 + group * 92 + (index + 1) * span / (nodes.length + 1);
-      const y = 16 + (level - (view.level_min || 0)) * ((height - 24) / levels);
-      positions.set(String(node.id), {x, y, node});
-    });
-  }
-  graphLayout = {view, positions};
-  drawProcessGraph(performance.now());
-}
-
-function drawProcessGraph(now) {
-  graphFrame = null;
-  const canvas = $("process-graph-canvas");
-  if (!canvas || !graphLayout) return;
-  const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "#05070c"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const showAllEdges = Boolean($("graph-edges") && $("graph-edges").checked);
-  if (showAllEdges || graphSelectedNode !== null) {
-    ctx.strokeStyle = showAllEdges
-      ? "rgba(150,170,210,.055)" : "rgba(205,220,255,.30)";
-    ctx.lineWidth = showAllEdges ? .65 : 1;
-    ctx.beginPath();
-    for (const [left, right] of graphLayout.view.edges) {
-      if (!showAllEdges && String(left) !== graphSelectedNode && String(right) !== graphSelectedNode) continue;
-      const a = graphLayout.positions.get(String(left));
-      const b = graphLayout.positions.get(String(right));
-      if (!a || !b) continue;
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  const ids = nodeIds || [];
+  const measuredMs = Math.max(0, Number(elapsedMs) || 0);
+  const perNodeUs = measuredMs * 1000 / Math.max(1, ids.length);
+  const decay = graphDecayMs();
+  const normalizationWindow = graphProfileSamples
+    .filter(sample => at - sample.at <= decay * 4)
+    .map(sample => sample.perNodeUs);
+  normalizationWindow.push(perNodeUs);
+  normalizationWindow.sort((a, b) => a - b);
+  const normalizerUs = Math.max(.001, percentile(normalizationWindow, .95));
+  const intensity = Math.min(1.5, perNodeUs / normalizerUs);
+  const energy = .08 + intensity * .92;
+  const targets = new Set();
+  const reduced = ((((GRAPH_VIEWS && GRAPH_VIEWS.views) || {}).reduced) || {nodes: []}).nodes || [];
+  const reducedById = new Map(reduced.map(node => [String(node.id), node]));
+  for (const nodeId of ids) {
+    const direct = document.getElementById(graphIndicatorId(activeGraphView, nodeId));
+    if (direct) targets.add(direct);
+    const reducedNode = reducedById.get(String(nodeId));
+    for (const identity of (reducedNode && reducedNode.contributors) || []) {
+      for (const elementId of graphIndicatorIdsByIdentity.get(String(identity)) || []) {
+        const element = document.getElementById(elementId);
+        if (element) targets.add(element);
+      }
     }
-    ctx.stroke();
   }
-  let stillGlowing = false;
-  for (const {x, y, node} of graphLayout.positions.values()) {
-    const colour = phosphorColor(node, now);
-    stillGlowing = stillGlowing || colour.active;
-    ctx.fillStyle = "rgba(" + colour.rgb.join(",") + "," + colour.alpha.toFixed(3) + ")";
-    if (colour.glow > .08) {
-      ctx.shadowColor = "rgb(" + colour.rgb.join(",") + ")";
-      ctx.shadowBlur = 1 + colour.glow * 7;
-    } else ctx.shadowBlur = 0;
-    ctx.beginPath(); ctx.arc(x, y, 1.65 + colour.glow * 2.2, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.shadowBlur = 0;
-  if (stillGlowing) graphFrame = requestAnimationFrame(drawProcessGraph);
+  targets.forEach(element => pulseIndicator(element, energy, at, decay));
+  graphProfileSamples.push({
+    at, elapsedMs: measuredMs, perNodeUs, nodeCount: ids.length,
+    normalizerUs, intensity, module: moduleName, scope,
+  });
+  if (graphProfileSamples.length > 768) graphProfileSamples.splice(0, graphProfileSamples.length - 768);
+  updateGraphProfileStats(at);
 }
 
-function wireProcessGraphCanvas() {
+function wireProcessGraphIndicators() {
   document.querySelectorAll(".graph-view-button").forEach(button => {
     button.addEventListener("click", () => {
       activeGraphView = button.dataset.graphView;
       graphSelectedNode = null;
-      document.querySelectorAll(".graph-view-button").forEach(candidate =>
-        candidate.setAttribute("aria-pressed", String(candidate === button))
-      );
-      prepareProcessGraph();
+      renderGraph();
     });
   });
   const decay = $("graph-decay");
-  if (decay) decay.addEventListener("input", () => drawProcessGraph(performance.now()));
-  const edges = $("graph-edges");
-  if (edges) edges.addEventListener("change", () => drawProcessGraph(performance.now()));
-  const canvas = $("process-graph-canvas");
-  if (canvas) canvas.addEventListener("click", event => {
-    if (!graphLayout) return;
-    let best = null, distance = Infinity;
-    for (const position of graphLayout.positions.values()) {
-      const d = Math.hypot(position.x - event.offsetX, position.y - event.offsetY);
-      if (d < distance) { distance = d; best = position.node; }
-    }
-    if (best && distance < 12) {
-      graphSelectedNode = String(best.id);
-      const labels = (best.contributors || []).map(identity =>
-        (GRAPH_VIEWS.identities[identity] || {label: identity}).label
-      );
-      $("graph-node-inspector").textContent = best.id + " · " + best.type + " · level " +
-        best.level + " · group " + best.group + " · " + best.label +
-        " · contributors [" + labels.join(", ") + "]";
-      drawProcessGraph(performance.now());
-    }
+  if (decay) decay.addEventListener("input", () => updateGraphProfileStats(performance.now()));
+  const grid = $("process-graph-grid");
+  if (grid) grid.addEventListener("click", event => {
+    const indicator = event.target.closest(".graph-indicator");
+    if (!indicator) return;
+    const previous = grid.querySelector('[data-selected="true"]');
+    if (previous) previous.removeAttribute("data-selected");
+    indicator.setAttribute("data-selected", "true");
+    graphSelectedNode = indicator.dataset.nodeId;
+    const node = graphNodesById.get(graphSelectedNode) || {};
+    const labels = (node.contributors || []).map(identity =>
+      (GRAPH_VIEWS.identities[identity] || {label: identity}).label
+    );
+    $("graph-node-inspector").textContent = graphSelectedNode + " · " + node.type +
+      " · level " + node.level + " · group " + node.group + " · " + node.label +
+      " · contributors [" + labels.join(", ") + "]";
   });
-  prepareProcessGraph();
+  updateGraphProfileStats(performance.now());
 }
 
 function renderGraph() {
@@ -1331,14 +1316,45 @@ function renderGraph() {
   if (GRAPH_VIEWS && GRAPH_VIEWS.views) {
     const original = GRAPH_VIEWS.views.original || {nodes: []};
     const reduced = GRAPH_VIEWS.views.reduced || {nodes: []};
-    html += '<div class="graph-toolbar">' +
-      '<button class="graph-view-button" data-graph-view="original" aria-pressed="true">Original · ' + original.nodes.length + '</button>' +
-      '<button class="graph-view-button" data-graph-view="reduced" aria-pressed="false">Reduced · ' + reduced.nodes.length + '</button>' +
-      '<label class="meta graph-option"><input id="graph-edges" type="checkbox"> all edges</label>' +
-      '<label class="meta">phosphor decay <input id="graph-decay" type="range" min="80" max="5000" value="1200"> rolling window</label>' +
-      '</div><div class="meta">Compact schedule: levels flow down, groups run across. Colour is blended provenance; click a node for only its immediate edges. Runtime energy glows, then decays.</div>' +
-      '<div class="graph-scroll"><canvas id="process-graph-canvas"></canvas></div>' +
-      '<div id="graph-node-inspector" class="note node-detail">Click a node to inspect its contributors.</div>';
+    const view = GRAPH_VIEWS.views[activeGraphView] || original;
+    const bucketSizes = new Map();
+    for (const node of view.nodes) {
+      const key = node.level + "::" + node.group;
+      bucketSizes.set(key, (bucketSizes.get(key) || 0) + 1);
+    }
+    const maxBucket = Math.max(1, ...bucketSizes.values());
+    const bucketSlots = new Map();
+    const levelMin = view.level_min || 0;
+    graphIndicatorIdsByIdentity = new Map();
+    graphNodesById = new Map();
+    const indicators = view.nodes.map(node => {
+      const key = node.level + "::" + node.group;
+      const slot = bucketSlots.get(key) || 0;
+      bucketSlots.set(key, slot + 1);
+      const column = node.group * maxBucket + slot + 1;
+      const row = node.level - levelMin + 1;
+      const id = graphIndicatorId(activeGraphView, node.id);
+      const rgb = mixedIdentityRgb(node.contributors);
+      graphNodesById.set(String(node.id), node);
+      for (const identity of node.contributors || []) {
+        const identityKey = String(identity);
+        if (!graphIndicatorIdsByIdentity.has(identityKey)) graphIndicatorIdsByIdentity.set(identityKey, []);
+        graphIndicatorIdsByIdentity.get(identityKey).push(id);
+      }
+      return `<div id="${id}" class="graph-indicator" data-node-id="${node.id}" style="grid-column:${column};grid-row:${row};--node-r:${rgb[0]};--node-g:${rgb[1]};--node-b:${rgb[2]}"></div>`;
+    }).join("");
+    const originalSelected = activeGraphView === "original";
+    const graphColumns = Math.max(1, (view.groups || 1) * maxBucket);
+    const graphRows = Math.max(1, (view.level_max || 0) - levelMin + 1);
+    html += `<div class="graph-toolbar">` +
+      `<button class="graph-view-button" data-graph-view="original" aria-pressed="${originalSelected}">Original · ${original.nodes.length}</button>` +
+      `<button class="graph-view-button" data-graph-view="reduced" aria-pressed="${!originalSelected}">Reduced · ${reduced.nodes.length}</button>` +
+      `<label class="meta">profiling decay τ <input id="graph-decay" type="range" min="80" max="5000" value="1200"> ms</label>` +
+      `</div><div class="meta">Unique-ID document indicators: schedule levels flow down, groups run across, and runtime profiling writes explicit CSS values. There is no graph canvas, shader, edge scan, or animation.</div>` +
+      `<div id="graph-profile-stats" class="stat graph-profile-stats"><span>awaiting execution samples</span></div>` +
+      `<div class="graph-scroll"><div id="process-graph-grid" class="process-graph-grid" style="--graph-columns:${graphColumns};--graph-rows:${graphRows}">` +
+      `${indicators}</div></div>` +
+      `<div id="graph-node-inspector" class="note node-detail">Click a node to inspect its contributors.</div>`;
   } else if (GRAPH && GRAPH.nodes) {
     const hist = Object.entries(GRAPH.histogram || {})
       .map(([k, v]) => '<span class="chip">' + k + " x" + v + "</span>").join("");
@@ -1377,7 +1393,7 @@ function renderGraph() {
       deploymentRows + '<div id="node-detail" class="note node-detail">Select a punch card.</div>';
   }
   target.innerHTML = html;
-  wireProcessGraphCanvas();
+  wireProcessGraphIndicators();
   document.querySelectorAll(".deployment-node").forEach(node => {
     const show = () => {
       const spec = deployment.modules.find(module => module.name === node.dataset.module) || {};
@@ -1391,7 +1407,7 @@ function renderGraph() {
   });
 }
 
-function markDeploymentNode(moduleName, state, elapsedMs) {
+function markDeploymentNode(moduleName, state, elapsedMs, profileScope = "method") {
   const node = document.querySelector('.deployment-node[data-module="' + CSS.escape(moduleName) + '"]');
   if (!node) return;
   node.dataset.state = state;
@@ -1403,7 +1419,7 @@ function markDeploymentNode(moduleName, state, elapsedMs) {
   if (state === "done") {
     const deployment = activeStagedManifest();
     const spec = deployment && deployment.modules.find(module => module.name === moduleName);
-    if (spec) pulseGraphNodes(spec.node_ids, elapsedMs);
+    if (spec) pulseGraphNodes(spec.node_ids, elapsedMs, moduleName, profileScope);
   }
 }
 
@@ -1411,6 +1427,12 @@ function markContiguousState(state, elapsedMs) {
   const label = $("contiguous-state");
   if (!label) return;
   label.textContent = state + (elapsedMs === undefined ? "" : " · " + elapsedMs.toFixed(3) + " ms");
+  if (state === "done") {
+    const reduced = ((((GRAPH_VIEWS && GRAPH_VIEWS.views) || {}).reduced) || {nodes: []}).nodes || [];
+    pulseGraphNodes(
+      reduced.map(node => node.id), elapsedMs, "contiguous program", "whole-program amortized"
+    );
+  }
 }
 
 function wireSourceTabs() {
@@ -1449,74 +1471,31 @@ function wireSourceTabs() {
   });
 }
 
-let mathEquations = [];
-let mathPage = 0;
-const MATH_PAGE_SIZE = 18;
-
-function appendNativeMath(target, markup) {
-  const mathmlNamespace = "http:" + "//www.w3.org/1998/Math/MathML";
-  const parsed = new DOMParser().parseFromString(markup, "application/xml");
-  const root = parsed.documentElement;
-  const invalid = root.localName !== "math" ||
-    root.namespaceURI !== mathmlNamespace ||
-    Array.from(root.querySelectorAll("*")).some(node =>
-      node.namespaceURI !== mathmlNamespace ||
-      Array.from(node.attributes).some(attribute => /^on/i.test(attribute.name))
-    );
-  if (invalid) {
-    target.textContent = "Mathematical markup was rejected.";
-    return;
-  }
-  target.appendChild(document.importNode(root, true));
-}
-
-function renderMathPage() {
-  const target = $("math-equations");
-  if (!target) return;
-  target.replaceChildren();
-  const pages = Math.max(1, Math.ceil(mathEquations.length / MATH_PAGE_SIZE));
-  mathPage = Math.max(0, Math.min(mathPage, pages - 1));
-  const start = mathPage * MATH_PAGE_SIZE;
-  mathEquations.slice(start, start + MATH_PAGE_SIZE).forEach((equation, index) => {
-    const row = document.createElement("div");
-    row.className = "math-equation";
-    const head = document.createElement("div");
-    head.className = "math-equation-head";
-    head.textContent = "relation " + (start + index + 1) + " · " +
-      equation.operation + (equation.node_id === null ? "" : " · node " + equation.node_id);
-    row.appendChild(head);
-    appendNativeMath(row, equation.mathml);
-    target.appendChild(row);
-  });
-  $("math-page").textContent = "page " + (mathPage + 1) + " / " + pages;
-  $("math-prev").disabled = mathPage === 0;
-  $("math-next").disabled = mathPage + 1 >= pages;
-}
-
 function wireMathematics() {
-  const button = $("load-mathematics");
+  const button = $("download-mathematics");
   if (!button || !MATHEMATICS || !MATHEMATICS.url) return;
   button.addEventListener("click", async () => {
     button.disabled = true;
-    button.textContent = "Loading symbolic relations…";
+    const old = button.textContent;
+    button.textContent = "Downloading…";
     try {
       const response = await fetch(MATHEMATICS.url);
       if (!response.ok) throw new Error("HTTP " + response.status);
-      const document = await response.json();
-      mathEquations = document.equations || [];
-      mathPage = 0;
-      renderMathPage();
-      $("math-controls").hidden = false;
-      button.hidden = true;
-      log("ok", "SymPy process model loaded", {equations: mathEquations.length});
+      const blob = await response.blob();
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = MATHEMATICS.filename || MATHEMATICS.url.split("/").pop();
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 1000);
+      log("ok", "exact SymPy model downloaded", {bytes: blob.size});
     } catch (error) {
+      log("error", "SymPy model download failed", {message: error.message});
+    } finally {
       button.disabled = false;
-      button.textContent = "Retry symbolic program";
-      log("error", "symbolic program load failed", {message: error.message});
+      button.textContent = old;
     }
   });
-  $("math-prev").addEventListener("click", () => { mathPage -= 1; renderMathPage(); });
-  $("math-next").addEventListener("click", () => { mathPage += 1; renderMathPage(); });
 }
 
 function wireExecutionModes() {
@@ -1809,20 +1788,67 @@ def _build_rows(parameters: Mapping[str, Any]) -> str:
 
 
 def _mathematics_panel(mathematics: Mapping[str, Any] | None) -> str:
-    """A compact preview; the full relation inventory remains click-lazy."""
+    """Show semantic chalkboard notation; keep exact SSA relations click-lazy."""
 
     if not mathematics:
         return ""
-    outputs = "".join(
-        '<div class="math-output">'
-        f'<b>{_escape(str(output.get("name", "output")))}</b>'
-        f'{output.get("mathml", "")}'
-        "</div>"
-        for output in mathematics.get("outputs", ())
+    depiction = dict(mathematics.get("depiction") or {})
+    kind = str(depiction.get("kind") or "relation")
+    name = _escape(str(depiction.get("name") or "program"))
+    inputs = [_escape(str(value)) for value in depiction.get("inputs", ())]
+    outputs = [_escape(str(value)) for value in depiction.get("outputs", ())]
+    input_count = len(inputs)
+    output_count = len(outputs)
+    input_tuple = "<mo>,</mo>".join(f"<mi>{value}</mi>" for value in inputs)
+    output_tuple = "<mo>,</mo>".join(f"<mi>{value}</mi>" for value in outputs)
+    domain = f"<msup><mi>ℝ</mi><mn>{input_count}</mn></msup>"
+    codomain = f"<msup><mi>ℝ</mi><mn>{output_count}</mn></msup>"
+
+    if kind == "function":
+        title = "Deterministic numeric map"
+        statement = (
+            f"<mi>{name}</mi><mo>:</mo>{domain}<mo>→</mo>{codomain}"
+            f"<mspace width='1.2em'/><mi>{name}</mi><mo>(</mo>{input_tuple}<mo>)</mo>"
+            f"<mo>=</mo><mo>[</mo>{output_tuple}<mo>]</mo>"
+        )
+        interpretation = (
+            "The compiled program is one map from its public inputs to its named outputs. "
+            "Its inverse problem is the preimage of a desired output, not a page of SSA assignments."
+        )
+        secondary = (
+            f"<mrow><mo>{{</mo><mi>x</mi><mo>∈</mo>{domain}<mo>|</mo>"
+            f"<mi>{name}</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>=</mo>"
+            "<msup><mi>y</mi><mo>*</mo></msup><mo>}}</mo></mrow>"
+        )
+    elif kind == "predicate":
+        title = "Boolean predicate"
+        statement = f"<mi>{name}</mi><mo>:</mo>{domain}<mo>→</mo><mi>𝔹</mi>"
+        interpretation = "The program defines the set of public inputs for which its predicate is true."
+        secondary = (
+            f"<mi>S</mi><mo>=</mo><mo>{{</mo><mi>x</mi><mo>∈</mo>{domain}<mo>|</mo>"
+            f"<mi>{name}</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>}}</mo>"
+        )
+    elif kind == "transition":
+        title = "State transition"
+        statement = (
+            f"<mo>(</mo><msub><mi>s</mi><mrow><mi>k</mi><mo>+</mo><mn>1</mn></mrow></msub>"
+            f"<mo>,</mo><msub><mi>y</mi><mi>k</mi></msub><mo>)</mo><mo>=</mo>"
+            f"<mi>{name}</mi><mo>(</mo><msub><mi>s</mi><mi>k</mi></msub><mo>,</mo>"
+            f"<msub><mi>x</mi><mi>k</mi></msub><mo>)</mo>"
+        )
+        interpretation = "The program advances state and emits observations one schedule step at a time."
+        secondary = ""
+    else:
+        title = "Implicit relation"
+        statement = f"<msub><mi>R</mi><mi>{name}</mi></msub><mo>⊆</mo>{domain}<mo>×</mo>{codomain}"
+        interpretation = "The program is presented as a relation because no narrower semantic shape applies."
+        secondary = ""
+
+    second_line = (
+        f'<math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow>{secondary}</mrow></math>'
+        if secondary else ""
     )
     operation_count = len(mathematics.get("uninterpreted", ()))
-    aggregate = dict(mathematics.get("program_relation") or {})
-    aggregate_arity = int(aggregate.get("arity") or 0)
     return f"""
   <div class="panel">
     <div class="panel-title">Mathematics</div>
@@ -1836,25 +1862,18 @@ def _mathematics_panel(mathematics: Mapping[str, Any] | None) -> str:
       <span>{operation_count} explicit uninterpreted operations</span>
       <span>SymPy &rarr; native MathML</span>
     </div>
-    <div class="program-relation">
-      <div class="meta">One SymPy <code>{_escape(str(aggregate.get("head", "And")))}</code>
-        relation with {aggregate_arity} exact clauses; internal SSA values are
-        the relation's intermediate variables.</div>
+    <div class="chalkboard">
+      <div class="meta">{title}</div>
       <math xmlns="http://www.w3.org/1998/Math/MathML" display="block">
-        <mrow><mi>𝒫</mi><mo>≡</mo><munderover><mo>⋀</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>{aggregate_arity}</mn></munderover><msub><mi>R</mi><mi>i</mi></msub></mrow>
+        <mrow>{statement}</mrow>
       </math>
+      {second_line}
+      <div class="note">{interpretation}</div>
     </div>
-    {outputs}
     <div class="math-browser">
-      <button id="load-mathematics">Load and render the symbolic program</button>
-      <div class="meta">The full equation inventory is fetched only after this
-        button is clicked. Language source files remain separate and unloaded.</div>
-      <div id="math-controls" class="math-controls" hidden>
-        <button id="math-prev">Previous</button>
-        <span id="math-page" class="meta"></span>
-        <button id="math-next">Next</button>
-      </div>
-      <div id="math-equations"></div>
+      <button id="download-mathematics">Download exact SymPy model</button>
+      <div class="meta">The exact reduced ProcessGraph, including its SSA relations,
+        is not loaded by this page. It is fetched only after you request the file.</div>
     </div>
   </div>"""
 

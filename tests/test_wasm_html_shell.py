@@ -61,14 +61,16 @@ def test_the_emitted_source_travels_with_the_page_for_reading():
     assert "f64.abs" in shell.html
 
 
-def test_no_layout_engine_creeps_in():
+def test_no_component_or_third_party_layout_engine_creeps_in():
     """Layout belongs to a different subrepo. This is a stack of labelled
     rows; if it grows a grid engine or a component model, it should be handed
     over rather than extended here."""
 
     html = shell_for_artifact(_artifact()).html
     assert "<table" not in html
-    assert "grid-template" not in html
+    # The live graph uses the browser's native CSS grid, not a JS layout
+    # engine or component framework.
+    assert "process-graph-grid" in html
     # And no third-party anything: the page must open with no network.
     assert "http://" not in html and "https://" not in html
     assert "<script src" not in html
@@ -261,10 +263,6 @@ def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():
 
 
 def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
-    mathml = (
-        '<math xmlns="http://www.w3.org/1998/Math/MathML" display="block">'
-        "<mrow><mi>y</mi><mo>=</mo><mi>x</mi></mrow></math>"
-    )
     html = emit_html_shell(
         _artifact().api,
         mathematics={
@@ -277,32 +275,83 @@ def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
             "program_relation": {
                 "head": "And", "arity": 2, "arguments": "equations[*]",
             },
+            "depiction": {
+                "kind": "function", "name": "demo",
+                "inputs": ["x", "parameter"], "outputs": ["result"],
+            },
             "outputs": [{
-                "name": "result", "node_id": 5, "mathml": mathml,
+                "name": "result", "node_id": 5,
             }],
             "url": "site/v3/math/render/sympy-process-model.json",
         },
     ).html
 
     assert "Math is programming is math" in html
-    assert "existing SymPy target" in html
-    assert mathml in html
+    assert "Deterministic numeric map" in html
+    assert "<mi>demo</mi>" in html
+    assert "<mi>result</mi>" in html
     assert "site/v3/math/render/sympy-process-model.json" in html
-    assert "Load and render the symbolic program" in html
-    assert "One SymPy <code>And</code>" in html
-    assert "<mo>⋀</mo>" in html
+    assert "Download exact SymPy model" in html
     assert "await fetch(MATHEMATICS.url)" in html
-    assert "DOMParser" in html
+    assert "relation 1" not in html
+    assert "math-equations" not in html
+
+
+@pytest.mark.parametrize(
+    ("kind", "heading"),
+    [
+        ("predicate", "Boolean predicate"),
+        ("transition", "State transition"),
+        ("relation", "Implicit relation"),
+    ],
+)
+def test_sympy_chalkboard_uses_the_program_semantic_shape(kind, heading):
+    html = emit_html_shell(
+        _artifact().api,
+        mathematics={
+            "target": "sympy",
+            "node_count": 1,
+            "equation_count": 1,
+            "constraint_count": 0,
+            "uninterpreted": [],
+            "depiction": {
+                "kind": kind, "name": "demo",
+                "inputs": ["x"], "outputs": ["result"],
+            },
+            "url": "sympy-model.json",
+        },
+    ).html
+
+    assert heading in html
+    assert "Download exact SymPy model" in html
+    assert "math-equations" not in html
 
 
 def test_graph_phosphor_integrates_profile_pulses_with_decay():
     html = shell_for_artifact(_artifact()).html
-    assert "function phosphorColor(node, now)" in html
-    assert "Math.exp(-age / decay)" in html
-    assert "pulseGraphNodes(spec.node_ids, elapsedMs)" in html
+    assert '<canvas id="process-graph-canvas"' not in html
+    assert "process-graph-grid" in html
+    assert "graph-indicator" in html
+    assert 'return "graph-node-" + viewName' in html
+    assert "function drawProcessGraph" not in html
+    assert "function phosphorColor" not in html
+    assert "previousEnergy * Math.exp" in html
+    assert 'element.style.setProperty("--node-opacity"' in html
+    assert 'element.style.setProperty("--node-scale"' in html
+    assert 'element.style.setProperty("--node-blur"' in html
+    assert "@keyframes graph-phosphor" not in html
+    assert "data-pulse" not in html
+    assert "transition:" not in html
+    assert "animation:" not in html
+    assert "graph-profile-stats" in html
+    assert 'root.style.setProperty("--profile-median-ms"' in html
+    assert 'root.style.setProperty("--profile-normalizer-us"' in html
+    assert "perNodeUs / normalizerUs" in html
+    assert "phosphor scale p95" in html
+    assert "document.getElementById(graphIndicatorId(activeGraphView, nodeId))" in html
+    assert 'event.target.closest(".graph-indicator")' in html
     assert 'id="graph-decay"' in html or "graph-decay" in html
-    assert 'id="graph-edges" type="checkbox"' in html
-    assert "showAllEdges || graphSelectedNode !== null" in html
+    assert 'id="graph-edges"' not in html
     assert "Math.atan2(vector[1], vector[0])" in html
 
 
