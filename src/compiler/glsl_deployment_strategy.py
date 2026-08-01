@@ -4992,20 +4992,30 @@ def _resolve_binding_name(shell: Any, captured: Any, feed_id: int):
     binding time still identifies it.
     """
 
-    names = getattr(shell, "_capture_input_names", None) or {}
-    direct = names.get(feed_id)
-    if direct:
-        return direct
-    by_storage = getattr(shell, "_capture_input_storage", None) or {}
-    if not by_storage:
-        return None
+    # The shell that recorded the binding is not always the shell that
+    # lowers the program: a function's inputs are bound in its own shell,
+    # while the owner is the one that builds the origins. Search the whole
+    # planned tree rather than assuming they are the same object.
     value = (getattr(captured, "feeds", None) or {}).get(feed_id)
-    if value is None:
-        return None
-    storage = _capture_storage_identity(value)
+    storage = _capture_storage_identity(value) if value is not None else None
+    candidates = [shell]
+    try:
+        candidates.extend(_walk_planned_shells(shell))
+    except Exception:
+        pass
+    for candidate in candidates:
+        names = getattr(candidate, "_capture_input_names", None) or {}
+        direct = names.get(feed_id)
+        if direct:
+            return direct
     if storage is None:
         return None
-    return by_storage.get(storage)
+    for candidate in candidates:
+        by_storage = getattr(candidate, "_capture_input_storage", None) or {}
+        found = by_storage.get(storage)
+        if found:
+            return found
+    return None
 
 
 def _capture_feed_aliases(

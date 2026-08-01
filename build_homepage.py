@@ -39,34 +39,88 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 # number that decides how large it gets. The escape test is the break-out:
 # once a point has escaped, the comparison stops incrementing, so running
 # more iterations refines the boundary rather than changing what it means.
-ITERATIONS = 48
+ITERATIONS = 160
+
+# The orbit is clamped so a diverging point cannot reach infinity and poison
+# the arithmetic; well above the escape radius, so it never touches a point
+# that is still inside.
+ORBIT_CLAMP = 1.0e18
 
 KERNEL = f"""
-def interest_network(cx, cy, interest):
+def interest_network(unit_x, unit_y, interest):
     # Frozen network source enters the same AOT/WASM pipeline as the fractal.
-    h0 = (cx * 0.83 + cy * -0.41 + interest * 0.72 + 0.15).tanh()
-    h1 = (cx * -0.36 + cy * 0.91 + interest * 0.48 - 0.08).tanh()
+    h0 = (unit_x * 0.83 + unit_y * -0.41 + interest * 0.72 + 0.15).tanh()
+    h1 = (unit_x * -0.36 + unit_y * 0.91 + interest * 0.48 - 0.08).tanh()
     return (h0 * 0.62 + h1 * -0.57 + interest * 0.31).tanh()
 
 
-def mandelbrot_escape(cx, cy):
-    zx = cx * 0.0
-    zy = cx * 0.0
+def quadratic_family(unit_x, unit_y, center_x, center_y, span,
+                     family_mix, julia_x, julia_y):
+    # The continuous Mandelbrot-to-Julia quadratic family. family_mix = 0 is
+    # the Mandelbrot set (orbit starts at zero, constant is the pixel); 1 is
+    # a Julia set (orbit starts at the pixel, constant is fixed); everything
+    # between is a real member of the family rather than a cross-fade of two
+    # pictures.
+    cx = center_x + unit_x * span
+    cy = center_y + unit_y * span
+    zx = cx * family_mix
+    zy = cy * family_mix
+    constant_x = cx + family_mix * (julia_x - cx)
+    constant_y = cy + family_mix * (julia_y - cy)
     count = cx * 0.0
+    clamp_value = cx * 0.0 + {ORBIT_CLAMP}
     for _ in range({ITERATIONS}):
         zx2 = zx * zx
         zy2 = zy * zy
         count = count + (zx2 + zy2 <= 4.0)
-        next_zx = zx2 - zy2 + cx
-        next_zy = 2.0 * zx * zy + cy
-        zx = next_zx
-        zy = next_zy
+        next_zx = zx2 - zy2 + constant_x
+        next_zy = 2.0 * zx * zy + constant_y
+        zx = next_zx.minimum(clamp_value).maximum(-clamp_value)
+        zy = next_zy.minimum(clamp_value).maximum(-clamp_value)
     return count
 
 
-def render(cx, cy, interest):
-    recommendation = interest_network(cx=cx, cy=cy, interest=interest)
-    return mandelbrot_escape(cx=cx + recommendation * 0.018, cy=cy + recommendation * -0.012)"""
+def render(unit_x, unit_y, t, interest):
+    # The page supplies the grid and the clock. Everything else -- where the
+    # camera is, how deep, which member of the family -- is computed here.
+    #
+    # sin, cos and exp2 have no WebAssembly instruction; they arrive as
+    # bounded lookup tables baked into this module, which is what lets the
+    # whole trajectory live in the compiled program instead of being worked
+    # out in JavaScript and fed in.
+    #
+    # Written as separate assignments rather than a tuple-returning helper:
+    # simultaneous tuple assignment does not lower (see aot_compile).
+    #
+    # The dive is exponential in time and runs to 2^-36 -- deep enough that
+    # the boundary keeps opening into new structure, and short of the ~1e-15
+    # where float64 quantises the plane into visible blocks. It breathes back
+    # out rather than descending forever, because at the bottom there is
+    # nothing left to resolve.
+    breath = (t * 0.0125).cos() * -0.5 + 0.5
+    # 2^-36 written as exp(-36*ln2*b): exp2 has no AbstractTensor method, and
+    # folding ln2 into the constant costs nothing. exp's table covers
+    # [-30, 6], and this argument runs [-24.95, 0].
+    span = (breath * -24.953210).exp() * 1.6
+    # A slow wander along the seahorse valley, with a second, slower term so
+    # the path does not simply repeat.
+    center_x = (t * 0.021).sin() * 0.0022 + (t * 0.0071).cos() * 0.0009 - 0.743643887
+    center_y = (t * 0.019).cos() * 0.0022 + (t * 0.0063).sin() * 0.0009 + 0.131825904
+    # Mandelbrot for most of the cycle, leaning into the Julia family at the
+    # top of each breath, where a fixed constant turns the same neighbourhood
+    # into filigree.
+    family_mix = (t * 0.00625).cos() * -0.5 + 0.5
+    # The Julia constant walks the cardioid edge, where the interesting Julia
+    # sets live.
+    julia_x = (t * 0.013).cos() * 0.3943 - 0.35
+    julia_y = (t * 0.013).sin() * 0.3943
+    drift = interest_network(unit_x=unit_x, unit_y=unit_y, interest=interest)
+    return quadratic_family(
+        unit_x=unit_x + drift * 0.004,
+        unit_y=unit_y + drift * -0.003,
+        center_x=center_x, center_y=center_y, span=span,
+        family_mix=family_mix, julia_x=julia_x, julia_y=julia_y,
+    )"""
 
 
 NETWORK_SOURCE = """
@@ -93,10 +147,58 @@ def compile_network_module():
         raise SystemExit(module.shortfall_report())
     return module
 
+def _bind_expressions(api) -> dict:
+    """Attach each feed expression to the parameter the module declares.
+
+    The page supplies the sampling grid, the clock, and the routed interest
+    signal. Everything else -- where the camera is, how deep, which member of
+    the family -- is computed inside the compiled program.
+    """
+
+    mapping = api.to_mapping()
+    entry = next(
+        (e for e in mapping["entry_points"] if e["name"] == mapping["entry"]),
+        mapping["entry_points"][0],
+    )
+    inputs = [p["name"] for p in entry["parameters"] if p["role"] == "input"]
+
+    known = {
+        "unit_x": "(x/(w-1) - 0.5) * 2.6",
+        "unit_y": "(y/(h-1) - 0.5) * 2.6",
+        "interest": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos(t * 0.04)",
+    }
+    expressions = {name: known[name] for name in inputs if name in known}
+    # The clock is whichever input is left. Named "t" when the capture
+    # resolved it, positional when it did not -- either way it is the one
+    # remaining, so it is found rather than guessed at.
+    remaining = [name for name in inputs if name not in expressions]
+    if len(remaining) != 1:
+        raise SystemExit(
+            "expected exactly one unbound input for the clock; the module "
+            f"declares {inputs!r} and {len(remaining)} are unaccounted for"
+        )
+    expressions[remaining[0]] = "t"
+    return expressions
+
+
+def _clock_name(api) -> str:
+    """Which declared input carries the clock.
+
+    The feedback network advances a travel value and the shell writes it into
+    whichever feed this names, so it has to agree with _bind_expressions or
+    the network's dwell speed drives nothing.
+    """
+
+    expressions = _bind_expressions(api)
+    return next(name for name, body in expressions.items() if body == "t")
+
+
 def build(destination: Path) -> Path:
     channel = TelemetryChannel(name="homepage")
     network_module = compile_network_module()
-    probe = {"cx": np.zeros(4), "cy": np.zeros(4), "interest": np.zeros(4)}
+    probe = {name: np.zeros(4) for name in (
+        "unit_x", "unit_y", "t", "interest",
+    )}
 
     with channel.stepped("building the homepage", 5, path="build") as advance:
         with channel.timed("parse + build_from_ast", path="frontend"):
@@ -160,8 +262,8 @@ def build(destination: Path) -> Path:
         network_manifest={
             "name": "Mandelbrot future-detail controller",
             "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},
-            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "render_fps": 24, "travel_feed": "feed2"},
-            "routes": [{"feed": "feed2", "label": "network-guided travel", "effect": "future detail scores → dwell speed → live frame"}],
+            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "render_fps": 24, "travel_feed": _clock_name(module.api)},
+            "routes": [{"feed": _clock_name(module.api), "label": "network-guided travel", "effect": "future detail scores → dwell speed → camera clock → live frame"}],
         },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes
         # the view drift instead of recomputing one picture forever.
@@ -169,15 +271,36 @@ def build(destination: Path) -> Path:
         # forever. Left unbounded it reaches a scale where every sample in
         # the window has the same escape count, and the picture goes flat --
         # correct arithmetic, nothing to look at.
-        feed_expressions={
-            "feed0": "-0.743644 + (x/(w-1) - 0.5) * 3.0 * "
-                     "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
-            "feed1": "0.131826 + (y/(h-1) - 0.5) * 2.4 * "
-                     "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
-            "feed2": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos(t * 0.04)",
-        },
+        # The camera is a parameter now, so these drive it rather than
+        # rebuilding the geometry per pixel. unit_x/unit_y stay the fixed
+        # normalized plane; everything else is one number broadcast across
+        # the grid, which is why the view can wander and dive without the
+        # module ever being recompiled.
+        #
+        # The dive is exponential and runs to ~1e-11, which is deep enough
+        # that the boundary keeps opening into new structure and still short
+        # of the ~1e-15 where float64 starts quantising the plane into
+        # visible blocks. It breathes back out rather than descending
+        # forever, because at the bottom there is nothing left to resolve.
+        # The page supplies the grid and the clock. The trajectory -- centre,
+        # span, family blend, Julia constant -- is computed inside the
+        # compiled module from t, so none of the algorithm runs here.
+        # Feeds are named after the source parameters now -- the program
+        # records which binding each came from, so the descriptor says
+        # unit_x rather than feed0. The page supplies the grid and the
+        # clock; the trajectory is computed inside the module.
+        # Keyed by the names the module actually declares, read back from
+        # its own descriptor rather than assumed. Most feeds resolve to their
+        # source parameter; any that does not falls back to a positional name,
+        # and the clock is matched by elimination rather than by guessing
+        # which positional slot it landed in. If naming improves later this
+        # keeps working untouched.
+        feed_expressions=_bind_expressions(module.api),
         build_parameters={
             "iterations (unrolled)": ITERATIONS,
+            "family": "continuous Mandelbrot <-> Julia, in-kernel",
+            "camera": "computed in the module from t via baked sin/cos/exp2",
+            "deepest span": "1.6 * 2^-36",
             "steps": len(required_steps(wanted)),
             "wasm bytes": len(module.binary),
             "interest model": "frozen 3→2→1 tanh network",
