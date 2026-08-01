@@ -287,6 +287,22 @@ function gaussian() {
   return radius * Math.cos(angle);
 }
 
+const RUN_LABEL = "Run __ENTRY__";
+
+function reportTimings(timings, count) {
+  if (timings.length < 2) { $("stats").innerHTML = ""; return; }
+  const ordered = timings.slice().sort((a, b) => a - b);
+  const total = timings.reduce((a, b) => a + b, 0);
+  const median = ordered[ordered.length >> 1];
+  $("stats").innerHTML =
+    "<span>runs " + timings.length + "</span>" +
+    "<span>median " + median.toFixed(3) + " ms</span>" +
+    "<span>min " + ordered[0].toFixed(3) + "</span>" +
+    "<span>max " + ordered[ordered.length - 1].toFixed(3) + "</span>" +
+    "<span>" + (count * timings.length / total / 1000).toFixed(1) + " Melem/s</span>" +
+    "<span>" + (timings.length / (total / 1000)).toFixed(1) + " fps</span>";
+}
+
 function domain() {
   const w = Math.max(1, Number($("dom_w").value) | 0);
   const h = Math.max(1, Number($("dom_h").value) | 0);
@@ -296,7 +312,9 @@ function domain() {
 // Compiled once per run rather than per element: a 256,000-element feed
 // evaluated through a fresh Function each time is the difference between a
 // responsive page and a hung one.
-function feedValues(param, n, d) {
+let frameIndex = 0;
+
+function feedValues(param, n, d, t) {
   const mode = $("mode_" + param.name).value;
   if (mode === "values") {
     return parseNumbers($("in_" + param.name).value);
@@ -311,14 +329,14 @@ function feedValues(param, n, d) {
   const body = $("expr_" + param.name).value;
   let fn;
   try {
-    fn = new Function("i", "x", "y", "w", "h", "return (" + body + ");");
+    fn = new Function("i", "x", "y", "w", "h", "t", "return (" + body + ");");
   } catch (err) {
     throw new Error("feed " + param.name + ": " + err.message);
   }
   const out = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const x = i % d.w, y = (i / d.w) | 0;
-    const value = fn(i, x, y, d.w, d.h);
+    const value = fn(i, x, y, d.w, d.h, t);
     if (!Number.isFinite(value)) {
       throw new Error("feed " + param.name + " gave " + value + " at i=" + i);
     }
@@ -327,7 +345,13 @@ function feedValues(param, n, d) {
   return out;
 }
 
+let running = false;
+
 async function run() {
+  if (running) {            // the button is a toggle while a run is live
+    running = false;
+    return;
+  }
   if (!moduleBytes) { setStatus("No .wasm loaded yet.", "bad"); log("warn", "run with no module"); return; }
   try {
     log("progress", "instantiating", { done: 1, total: 4 });
@@ -339,7 +363,8 @@ async function run() {
 
     const d = domain();
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
-    const feeds = inputs.map(p => feedValues(p, d.n, d));
+    const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
+    const feeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
     // An expression covers the whole grid; literal values only go as far as
     // the shortest list supplied.
     const count = anyExpression
@@ -347,7 +372,7 @@ async function run() {
       : (feeds.length ? Math.min(...feeds.map(f => f.length)) : d.n);
     if (!count) throw new Error("no elements to run");
     log("info", "domain", { width: d.w, height: d.h, elements: count,
-                            generated: anyExpression });
+                            generated: anyExpression, frame: frameIndex });
 
     // The caller owns memory, so the layout is decided here: every array
     // gets its own contiguous block, feeds first and then outputs.
@@ -377,36 +402,60 @@ async function run() {
       memoryPages: memory.buffer.byteLength / 65536
     });
     log("progress", "executing", { done: 3, total: 4 });
-    // Steady state, not one sample. A single call measures instantiation
-    // effects, first-touch of the memory, and whatever the JIT had not done
-    // yet; repeating and reporting the spread is what says how fast the
-    // kernel actually is.
-    const repeats = Math.max(1, Number($("repeats").value) | 0);
+    // Steady state, not one sample: a single call measures instantiation,
+    // first touch of the memory, and whatever the JIT had not done yet.
+    // Each repeat is also a frame -- feeds are regenerated for it, so a
+    // gaussian feed redraws and an expression sees a new `t`. Only the
+    // kernel call is timed, so the numbers still describe the kernel rather
+    // than the feed generation around it.
+    // 0 (or blank) means keep going until stopped.
+    const repeats = Math.max(0, Number($("repeats").value) | 0);
+    const continuous = repeats === 0;
     const timings = [];
-    for (let r = 0; r < repeats; r++) {
+    const animated = (continuous || repeats > 1) && (anyExpression || anyGaussian);
+    running = true;
+    $("run").textContent = "Stop";
+    for (let r = 0; running && (continuous || r < repeats); r++) {
+      if (r > 0 && animated) {
+        frameIndex = r;
+        const refreshed = inputs.map(p => feedValues(p, count, d, frameIndex));
+        inputs.forEach((p, i) => {
+          new View(memory.buffer, offsets[i], count).set(
+            refreshed[i].slice(0, count));
+        });
+      }
       const t0 = performance.now();
       fn(...args);
       timings.push(performance.now() - t0);
+      if (animated) {
+        // Read this frame out and paint it before the next one starts,
+        // otherwise the loop finishes and only the last frame is ever seen.
+        lastOutputs = outputs.map((p, i) => ({
+          name: p.name,
+          values: Array.from(
+            new View(memory.buffer, offsets[inputs.length + i], count))
+        }));
+        renderActiveTab();
+        if ((r % 15) === 0) reportTimings(timings, count);
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      } else if (!continuous && repeats > 1 && (r % 200) === 0) {
+        // Even a non-animated sweep should not freeze the page.
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
     }
-    timings.sort((a, b) => a - b);
-    const elapsed = timings[timings.length >> 1];
-    const total = timings.reduce((a, b) => a + b, 0);
-    if (repeats > 1) {
-      $("stats").innerHTML =
-        "<span>runs " + repeats + "</span>" +
-        "<span>median " + elapsed.toFixed(3) + " ms</span>" +
-        "<span>min " + timings[0].toFixed(3) + "</span>" +
-        "<span>max " + timings[timings.length - 1].toFixed(3) + "</span>" +
-        "<span>total " + total.toFixed(1) + " ms</span>" +
-        "<span>" + (count * repeats / total / 1000).toFixed(1) + " Melem/s</span>";
-      log("profile", "steady state over " + repeats + " runs", {
-        median_ms: Number(elapsed.toFixed(4)),
-        min_ms: Number(timings[0].toFixed(4)),
-        max_ms: Number(timings[timings.length - 1].toFixed(4)),
+    running = false;
+    $("run").textContent = RUN_LABEL;
+    frameIndex = 0;
+    const ordered = timings.slice().sort((a, b) => a - b);
+    const elapsed = ordered[ordered.length >> 1];
+    reportTimings(timings, count);
+    if (timings.length > 1) {
+      log("profile", "steady state over " + timings.length + " runs", {
+        median_ms: Number(ordered[ordered.length >> 1].toFixed(4)),
+        min_ms: Number(ordered[0].toFixed(4)),
+        max_ms: Number(ordered[ordered.length - 1].toFixed(4)),
         elements: count
       });
-    } else {
-      $("stats").innerHTML = "";
     }
     log("ok", "returned in " + elapsed.toFixed(3) + " ms");
 
@@ -418,6 +467,8 @@ async function run() {
     renderActiveTab();
     setStatus("ran " + count + " elements in " + elapsed.toFixed(3) + " ms", "good");
   } catch (err) {
+    running = false;
+    $("run").textContent = RUN_LABEL;
     $("raw").textContent = "";
     setStatus(String(err), "bad");
     log("error", err && err.message ? err.message : err,
@@ -685,7 +736,7 @@ def _input_rows(
             f'<div id="row_expr_{_escape(name)}" hidden>'
             f'<input type="text" id="expr_{_escape(name)}" '
             f'value="{_escape(expression)}" '
-            'placeholder="expression over i, x, y, w, h"></div>'
+            'placeholder="expression over i, x, y, w, h, t"></div>'
             f'<div id="row_gauss_{_escape(name)}" hidden class="imgctl">'
             f'<label>mean <input type="number" step="any" '
             f'id="mean_{_escape(name)}" value="0"></label>'
@@ -830,6 +881,7 @@ def emit_html_shell(
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
         .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
+        .replace("__ENTRY__", str(entry["name"]))
     )
     boot_script = _BOOT_JS.replace(
         "__TELEMETRY__", json.dumps(telemetry_mapping, default=str)
@@ -902,7 +954,10 @@ def emit_html_shell(
     <div class="panel-title">Domain</div>
     <div class="meta">A kernel's feeds are computed over a grid. Width and
       height set how many elements one run covers, and the image view uses
-      the same numbers.</div>
+      the same numbers. Feed expressions see <code>i</code>, <code>x</code>,
+      <code>y</code>, <code>w</code>, <code>h</code> and <code>t</code> &mdash;
+      <code>t</code> is the frame number, so anything an expression does with
+      it is what Animate shows.</div>
     <div class="imgctl">
       <label>width <input type="number" id="dom_w" min="1" value="{default_width}"></label>
       <label>height <input type="number" id="dom_h" min="1" value="{default_height}"></label>
@@ -917,8 +972,12 @@ def emit_html_shell(
     <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>
-      <label class="meta">repeat <input type="number" id="repeats" min="1"
-        value="1" style="width:5rem"></label>
+      <label class="meta">repeat&nbsp;<input type="number" id="repeats" min="0"
+        value="0" style="width:4.5rem" title="0 keeps going until you press
+        Stop. Each repeat is a frame: feeds are regenerated, so a gaussian
+        redraws and an expression sees a new t"></label>
+      <span class="meta">0 = continuous</span>
+
       <div class="grow"><div id="status" class="out"></div></div>
     </div>
   </div>

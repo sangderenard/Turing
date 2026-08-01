@@ -285,3 +285,29 @@ def test_the_program_can_be_looped_for_a_steady_state_measurement():
     assert 'id="repeats"' in html
     assert "median" in html and "Melem/s" in html
     assert 'log("profile", "steady state over ' in html
+
+
+def test_a_repeat_is_also_a_frame_so_the_picture_moves():
+    """Repeating with identical inputs measures speed and nothing else. Each
+    repeat regenerates the feeds, so a gaussian redraws and an expression
+    sees a new t -- that is what makes the output change over time, and it
+    is one mechanism rather than a separate animate button doing the same
+    thing."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert "frameIndex = r;" in html
+    assert "feedValues(p, count, d, frameIndex)" in html
+    # Painted per frame, or only the last frame would ever be seen.
+    assert "requestAnimationFrame" in html
+    assert "fps" in html
+    # t is offered to expressions and documented where they are entered.
+    assert '"i", "x", "y", "w", "h", "t"' in html
+    assert "expression over i, x, y, w, h, t" in html
+    # Only the kernel call is timed, not the feed regeneration around it.
+    assert html.index("const t0 = performance.now();") < html.index("fn(...args);")
+
+
+def test_animation_is_driven_by_repeats_not_a_second_control():
+    html = shell_for_artifact(_artifact()).html
+    assert 'id="animate"' not in html
+    assert 'id="frames"' not in html
