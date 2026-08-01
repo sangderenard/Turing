@@ -42,12 +42,13 @@ def test_elementwise_program_emits_a_complete_module():
     assert "br_if $done" in module.source
 
 
-def test_transcendentals_are_reported_not_approximated():
-    """WebAssembly has no exp/log/sin instruction. Emitting a polynomial
-    approximation would return a plausible wrong number, so the step is
-    named as a shortfall instead."""
+def test_what_has_no_table_is_reported_not_approximated():
+    """The transcendentals now arrive as bounded, measured tables. What is
+    left has no table for a stated reason -- tan's poles, or not being a
+    function of one float at all -- and is named as a shortfall rather than
+    approximated by something that happens to be nearby."""
 
-    for operation in ("exp", "log", "sin", "pow"):
+    for operation in ("tan", "pow", "mod", "sign"):
         module = emit_wasm_module(
             _program(
                 OpStep(step_id=0, op_name=operation, input_ids=[1], attrs={}, result_id=2),
@@ -139,7 +140,9 @@ def test_wasm_is_registered_and_declares_what_it_cannot_do():
     # It writes the elementwise walk itself but does not lower a program's
     # own control flow.
     assert wasm.control_flow is False
-    assert {"exp", "log", "sin", "pow"} <= wasm.unsupported_operations
+    assert {"tan", "pow", "mod", "sign"} <= wasm.unsupported_operations
+    # The tabulated functions are no longer advertised as out of reach.
+    assert not ({"sin", "cos", "exp", "log", "tanh"} & wasm.unsupported_operations)
 
 
 def test_the_hub_chooses_before_emitting_rather_than_by_failing():
@@ -148,14 +151,22 @@ def test_the_hub_chooses_before_emitting_rather_than_by_failing():
         feeds=(1, 2),
         outputs={"result": 3},
     )
-    transcendental = _program(
+    unreachable = _program(
+        OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2),
+        feeds=(1,),
+        outputs={"result": 2},
+    )
+    tabulated = _program(
         OpStep(step_id=0, op_name="sin", input_ids=[1], attrs={}, result_id=2),
         feeds=(1,),
         outputs={"result": 2},
     )
 
     assert "wasm" in machine_targets.targets_for(representable)
-    assert "wasm" not in machine_targets.targets_for(transcendental)
+    assert "wasm" not in machine_targets.targets_for(unreachable)
+    # A function with a table is reachable, and the hub knows it without
+    # having to emit first.
+    assert "wasm" in machine_targets.targets_for(tabulated)
 
 
 def test_every_target_returns_the_same_artifact_shape():

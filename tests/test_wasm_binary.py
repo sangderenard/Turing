@@ -73,11 +73,16 @@ def test_the_binary_declares_the_sections_the_spec_requires_in_order():
 
 def test_an_incomplete_program_assembles_nothing():
     """A program with a step WebAssembly cannot express must not produce a
-    binary that quietly omits it."""
+    binary that quietly omits it.
+
+    tan is the example now that the catalogue covers the transcendentals:
+    it has poles inside any interval worth tabulating, so no bounded table
+    describes it and it stays refused rather than approximated.
+    """
 
     module = emit_wasm_module(
         _program(
-            [OpStep(step_id=0, op_name="exp", input_ids=[1], attrs={}, result_id=2)],
+            [OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2)],
             (1,),
             {"result": 2},
         ),
@@ -154,16 +159,24 @@ def test_a_program_using_tanh_bakes_the_table_and_reserves_room_for_it():
     assert reserved > 0
 
 
-def test_tanh_is_no_longer_reported_as_unrepresentable():
-    """It was refused because WebAssembly has no instruction for it. It now
-    has a lowering, so the refusal would be stale."""
+def test_the_catalogue_decides_what_is_reachable():
+    """Every function with a table is emittable, and the two lists cannot
+    drift: _LUT_OPS is taken from the catalogue rather than written out
+    again beside it."""
 
-    from src.compiler.fused_program_wasm_backend import _NO_WASM_INSTRUCTION, _LUT_OPS
+    from src.compiler.fused_program_wasm_backend import (
+        _LUT_OPS, _NO_WASM_INSTRUCTION,
+    )
+    from src.compiler.wasm_math_tables import TABULATED
 
-    assert "tanh" not in _NO_WASM_INSTRUCTION
-    assert "tanh" in _LUT_OPS
-    # The ones with neither an instruction nor a table stay refused.
-    assert {"exp", "log", "sin", "pow"} <= _NO_WASM_INSTRUCTION
+    assert _LUT_OPS == TABULATED
+    assert {"sin", "cos", "tanh", "exp", "exp2", "log", "asin", "atan"} <= _LUT_OPS
+    # Nothing is both reachable and refused.
+    assert not (_LUT_OPS & _NO_WASM_INSTRUCTION)
+    # What stays refused is refused for a reason, not for want of a table:
+    # tan has poles, and the rest are predicates or shape operations rather
+    # than functions of one float.
+    assert {"tan", "pow", "mod", "sign", "isnan"} <= _NO_WASM_INSTRUCTION
 
 
 def test_feed_order_follows_the_program_not_the_id_allocator():

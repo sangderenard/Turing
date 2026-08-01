@@ -111,15 +111,26 @@ _COMPARISON_INSTRUCTION = {
 }
 
 # Named so the failure explains itself rather than reading as an oversight.
+# Genuinely out of reach: no instruction, and no table either. tan has poles
+# inside any interval worth covering, so no bounded table describes it -- a
+# program wanting it should divide sin by cos and decide for itself what
+# happens near the pole. The rest are shape or predicate operations rather
+# than functions of one float.
 _NO_WASM_INSTRUCTION = {
-    "exp", "log", "pow", "mod", "floordiv",
-    "tan", "asin", "acos", "atan",
-    "sinh", "cosh", "asinh", "acosh", "atanh",
+    "pow", "mod", "floordiv", "tan",
     "sign", "isfinite", "isnan", "isinf", "logical_not",
 }
-# Reachable only through a baked table (see tanh_table). f64 only: an f32
-# table would need its own sampling and has no caller yet.
-_LUT_OPS = {"tanh", "sin", "cos"}
+# Reachable through a baked table rather than an instruction. Taken from
+# the catalogue itself so the two cannot drift apart: adding a function to
+# wasm_math_tables makes it emittable here without a second edit. f64 only --
+# an f32 table would need its own sampling and has no caller yet.
+def _tabulated_ops() -> frozenset[str]:
+    from .wasm_math_tables import TABULATED
+
+    return TABULATED
+
+
+_LUT_OPS = _tabulated_ops()
 
 
 @dataclass(frozen=True)
@@ -637,60 +648,62 @@ def _power_of_two_ceiling(value: int) -> int:
     return 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
-def periodic_table(
-    function, epsilon: float = DEFAULT_LUT_EPSILON
-) -> tuple[list[float], float]:
-    """Sample one full period of a bounded periodic function.
-
-    Both sin and cos have max|f''| = 1, which is the same bound
-    llvm_signal_math uses for its own sine table -- the two paths size their
-    tables by the same reasoning so "accurate enough" means one thing.
-    """
-
-    maximum_step = _math.sqrt(8.0 * epsilon)
-    required = max(4, _math.ceil(_TAU / maximum_step))
-    intervals = _power_of_two_ceiling(required)
-    step = _TAU / intervals
-    bound = step * step / 8.0
-    return [function(step * index) for index in range(intervals + 1)], bound
-
-
-def lut_for(op: str, epsilon: float = DEFAULT_LUT_EPSILON):
+def lut_for(op: str, epsilon: float | None = None):
     """The table for one op, plus how its argument maps onto it.
 
-    Returns (table, bound, lower, upper, periodic). A periodic table wraps
-    the argument into [lower, upper); a saturating one clamps to it.
+    Returns (values, achieved_error, lower, upper, periodic). Sourced from
+    the repository cache when it is present, because sampling fifteen
+    functions to 1e-6 is deterministic and not worth repeating on every
+    build; falls back to computing it, so a fresh checkout that has not run
+    build_math_cache still works rather than failing at emission time.
+
+    The error reported is the one the table was *measured* to deliver, not
+    the one its sizing predicted. For a function whose curvature is singular
+    at an endpoint the prediction is optimistic, and a caller reasoning about
+    accuracy should see the worse number.
     """
 
-    if op == "tanh":
-        table, bound = tanh_table(epsilon)
-        return table, bound, -_TANH_LIMIT, _TANH_LIMIT, False
-    if op == "sin":
-        table, bound = periodic_table(_math.sin, epsilon)
-        return table, bound, 0.0, _TAU, True
-    if op == "cos":
-        table, bound = periodic_table(_math.cos, epsilon)
-        return table, bound, 0.0, _TAU, True
-    raise WasmEmissionError(f"no baked table defined for {op!r}")
+    from .wasm_math_tables import DEFAULT_EPSILON, FUNCTIONS, build_table
+
+    if epsilon is None:
+        epsilon = DEFAULT_EPSILON
+    function = FUNCTIONS.get(op)
+    if function is None:
+        raise WasmEmissionError(
+            f"no baked table defined for {op!r}; the catalogue is "
+            f"{sorted(FUNCTIONS)}"
+        )
+    if epsilon == DEFAULT_EPSILON:
+        try:
+            from .build_math_cache import load_manifest, load_table
+
+            manifest = load_manifest()
+            entry = manifest["tables"].get(op)
+            if entry is not None:
+                values = load_table(op)
+                achieved = entry.get("achieved", entry.get("bound"))
+                return (
+                    list(values), achieved,
+                    entry["lower"], entry["upper"], entry["periodic"],
+                )
+        except (FileNotFoundError, KeyError, OSError):
+            pass
+    table = build_table(op, epsilon)
+    return (
+        list(table.values), table.bound,
+        table.lower, table.upper, table.periodic,
+    )
 
 
-def tanh_table(epsilon: float = DEFAULT_LUT_EPSILON) -> tuple[list[float], float]:
-    """Sample tanh finely enough that linear interpolation stays under
-    ``epsilon``, and report the bound actually achieved."""
+def tanh_table(epsilon: float | None = None):
+    """Kept because callers and tests already use this name; the definition
+    now lives in the wasm_math_tables catalogue."""
 
-    span = 2.0 * _TANH_LIMIT
-    maximum_step = _math.sqrt(8.0 * epsilon / _TANH_CURVATURE)
-    required = max(4, _math.ceil(span / maximum_step))
-    intervals = _power_of_two_ceiling(required)
-    step = span / intervals
-    bound = _TANH_CURVATURE * step * step / 8.0
-    table = [
-        _math.tanh(-_TANH_LIMIT + step * index) for index in range(intervals + 1)
-    ]
-    return table, bound
+    values, achieved, _lower, _upper, _periodic = lut_for("tanh", epsilon)
+    return values, achieved
 
 
-def plan_tables(ops, epsilon: float = DEFAULT_LUT_EPSILON) -> dict:
+def plan_tables(ops, epsilon: float | None = None) -> dict:
     """Lay every table a program needs into one block of memory.
 
     Returns the packed bytes, the byte each table starts at, and the total
@@ -704,16 +717,16 @@ def plan_tables(ops, epsilon: float = DEFAULT_LUT_EPSILON) -> dict:
     entries: dict[str, dict] = {}
     payload = bytearray()
     for op in sorted(ops):
-        table, bound, lower, upper, periodic = lut_for(op, epsilon)
+        values, achieved, lower, upper, periodic = lut_for(op, epsilon)
         entries[op] = {
             "base": len(payload),
-            "intervals": len(table) - 1,
+            "intervals": len(values) - 1,
             "lower": lower,
             "upper": upper,
             "periodic": periodic,
-            "bound": bound,
+            "bound": achieved,
         }
-        for value in table:
+        for value in values:
             payload += _struct.pack("<d", value)
     return {
         "entries": entries,
