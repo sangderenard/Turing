@@ -111,6 +111,28 @@ pre {
 .out { font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
 .note { font-size: .85rem; padding: .6rem .75rem; border-radius: .35rem; background: var(--soft); }
 .bad { color: var(--bad); }
+.tabs { display: flex; gap: .25rem; margin-bottom: .75rem; }
+.tab {
+  padding: .3rem .8rem; border-radius: .3rem; cursor: pointer;
+  font-size: .8rem; font-weight: 600; background: var(--soft);
+  border: 1px solid transparent;
+}
+.tab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.tabview[hidden] { display: none; }
+canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
+  border: 1px solid var(--line); }
+.imgctl { display: flex; gap: .75rem; align-items: baseline; flex-wrap: wrap;
+  margin-bottom: .6rem; }
+.imgctl input[type=number] { width: 6rem; }
+.imgctl label { font-size: .8rem; opacity: .7; }
+#fatal { background: color-mix(in srgb, var(--bad) 15%, transparent);
+  border: 1px solid var(--bad); color: var(--bad); }
+#log { max-height: 14rem; overflow: auto; font-family: ui-monospace, monospace;
+  font-size: .75rem; }
+.logline { padding: .1rem 0; border-bottom: 1px solid var(--soft); white-space: pre-wrap; }
+.logline.error { color: var(--bad); }
+.logline.ok, .logline.call { color: var(--good); }
+.logline.warn { opacity: .8; }
 .good { color: var(--good); }
 details summary { cursor: pointer; font-weight: 600; font-size: .8rem; opacity: .65;
   text-transform: uppercase; letter-spacing: .04em; }
@@ -119,8 +141,57 @@ details summary { cursor: pointer; font-weight: 600; font-size: .8rem; opacity: 
 # The runtime. Written against the API descriptor rather than any particular
 # program: it lays the arrays out in the module's memory, calls the entry
 # point, and reads the outputs back.
-_JS = """
-const API = __API__;
+# Installed in its own <script> tag, ahead of the program script. A
+# handler defined inside a script cannot catch that script's own parse
+# error -- nothing in it has run yet -- so the shell would fail silently
+# and look merely inert. This one survives that and says so.
+_BOOT_JS = r"""
+// Diagnostics first, before anything that can fail. A shell whose script
+// dies at load looks identical to a shell that simply does nothing -- the
+// controls render either way, because they are static HTML -- so the failure
+// has to announce itself here rather than only in a console nobody opened.
+const LOG = [];
+function log(kind, message, detail) {
+  const entry = {
+    at: new Date().toISOString().slice(11, 23),
+    kind: kind,
+    message: String(message),
+    detail: detail === undefined ? null : detail
+  };
+  LOG.push(entry);
+  const pane = document.getElementById("log");
+  if (pane) {
+    const line = document.createElement("div");
+    line.className = "logline " + kind;
+    line.textContent = entry.at + "  " + kind.toUpperCase() + "  " + entry.message +
+      (entry.detail === null ? "" : "  " + JSON.stringify(entry.detail));
+    pane.appendChild(line);
+    pane.scrollTop = pane.scrollHeight;
+  }
+  return entry;
+}
+
+window.addEventListener("error", (event) => {
+  log("error", event.message, {
+    line: event.lineno, column: event.colno,
+    source: (event.filename || "").split("/").pop()
+  });
+  const banner = document.getElementById("fatal");
+  if (banner) {
+    banner.hidden = false;
+    banner.textContent = "This page's script failed to load: " + event.message +
+      " (line " + event.lineno + "). The controls below are inert.";
+  }
+});
+window.addEventListener("unhandledrejection", (event) => {
+  log("error", "unhandled rejection: " + (event.reason && event.reason.message
+    ? event.reason.message : event.reason));
+});
+
+"""
+
+# The program script proper.
+_JS = r"""const API = __API__;
 const WASM_BASE64 = __WASM__;
 
 const $ = (id) => document.getElementById(id);
@@ -145,12 +216,13 @@ function setStatus(text, kind) {
 }
 
 function parseNumbers(text) {
-  return text.split(/[\\s,]+/).filter(s => s.length).map(Number);
+  return text.split(/[\s,]+/).filter(s => s.length).map(Number);
 }
 
 async function run() {
-  if (!moduleBytes) { setStatus("No .wasm loaded yet.", "bad"); return; }
+  if (!moduleBytes) { setStatus("No .wasm loaded yet.", "bad"); log("warn", "run with no module"); return; }
   try {
+    log("info", "instantiating", { bytes: moduleBytes.length });
     const { instance } = await WebAssembly.instantiate(moduleBytes, {});
     const memory = instance.exports[API.metadata.memory_export || "memory"];
     const fn = instance.exports[entry.symbol];
@@ -180,20 +252,106 @@ async function run() {
     });
 
     const args = [count, ...offsets];
+    // The exact call, recorded: argument order and the memory offsets it
+    // computed are the two things most likely to be wrong, and the two least
+    // visible from a wrong answer alone.
+    log("call", entry.symbol + "(" + args.join(", ") + ")", {
+      count: count, offsets: offsets, elementBytes: bytes,
+      memoryPages: memory.buffer.byteLength / 65536
+    });
     const started = performance.now();
     fn(...args);
     const elapsed = performance.now() - started;
+    log("ok", "returned in " + elapsed.toFixed(3) + " ms");
 
-    const lines = outputs.map((p, i) => {
-      const view = new View(memory.buffer, offsets[inputs.length + i], count);
-      return p.name + ": [" + Array.from(view).join(", ") + "]";
-    });
-    $("results").textContent = lines.join("\\n");
+    lastOutputs = outputs.map((p, i) => ({
+      name: p.name,
+      values: Array.from(new View(memory.buffer, offsets[inputs.length + i], count))
+    }));
+    renderActiveTab();
     setStatus("ran " + count + " elements in " + elapsed.toFixed(3) + " ms", "good");
   } catch (err) {
-    $("results").textContent = "";
+    $("raw").textContent = "";
     setStatus(String(err), "bad");
+    log("error", err && err.message ? err.message : err,
+        { stack: err && err.stack ? err.stack.split("\n")[0] : null });
   }
+}
+
+// --- output views -------------------------------------------------------
+// The numbers a program returns are just numbers; how to *look* at them is
+// the caller's question, so it is a tab rather than a property of the
+// program. "raw" is the numbers; "image" reads the same buffer as a picture.
+
+let lastOutputs = null;
+
+function renderRaw() {
+  $("raw").textContent = (lastOutputs || [])
+    .map(o => o.name + ": [" + o.values.join(", ") + "]")
+    .join("\n");
+}
+
+function renderImage() {
+  const canvas = $("canvas");
+  const note = $("imgnote");
+  if (!lastOutputs || !lastOutputs.length) { note.textContent = "Run first."; return; }
+  const values = lastOutputs[0].values;
+  let w = Number($("img_w").value) | 0;
+  let h = Number($("img_h").value) | 0;
+  if (!w || !h) {
+    // Default to the squarest rectangle that fits, so a run with no stated
+    // geometry still shows something honest rather than nothing.
+    w = Math.round(Math.sqrt(values.length)) || 1;
+    h = Math.ceil(values.length / w);
+    $("img_w").value = w; $("img_h").value = h;
+  }
+  const invert = $("img_invert").checked;
+  let lo = Infinity, hi = -Infinity;
+  for (const v of values) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = (hi - lo) || 1;
+
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const image = ctx.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    const raw = i < values.length ? values[i] : lo;
+    let t = (raw - lo) / span;
+    if (invert) t = 1 - t;
+    // A simple perceptual ramp: dark blue -> orange -> white. Enough to see
+    // structure without pretending to be a colour science module.
+    const r = Math.round(255 * Math.min(1, Math.max(0, t * 1.6)));
+    const g = Math.round(255 * Math.min(1, Math.max(0, t * t * 1.4)));
+    const b = Math.round(255 * Math.min(1, Math.max(0, 0.35 + t * 0.65 - t * t)));
+    image.data[i*4+0] = r; image.data[i*4+1] = g; image.data[i*4+2] = b;
+    image.data[i*4+3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  const jpeg = canvas.toDataURL("image/jpeg", 0.92);
+  const link = $("download");
+  link.href = jpeg;
+  link.style.display = "inline";
+  note.textContent = w + "x" + h + ", range " + lo.toPrecision(4) + " to " +
+    hi.toPrecision(4) + ", jpeg " + Math.round((jpeg.length * 3) / 4 / 1024) + " KB";
+}
+
+function renderActiveTab() {
+  const active = document.querySelector('.tab[aria-selected="true"]').dataset.view;
+  document.querySelectorAll(".tabview").forEach(v => {
+    v.hidden = v.dataset.view !== active;
+  });
+  if (active === "raw") renderRaw(); else renderImage();
+}
+
+function wireTabs() {
+  document.querySelectorAll(".tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t =>
+        t.setAttribute("aria-selected", String(t === tab)));
+      renderActiveTab();
+    });
+  });
+  ["img_w", "img_h", "img_invert"].forEach(id =>
+    $(id).addEventListener("change", () => renderActiveTab()));
 }
 
 function wireFilePicker() {
@@ -209,7 +367,18 @@ function wireFilePicker() {
 }
 
 wireFilePicker();
+wireTabs();
 $("run").addEventListener("click", run);
+$("copylog").addEventListener("click", () => {
+  navigator.clipboard.writeText(JSON.stringify(LOG, null, 2));
+  log("info", "log copied to clipboard");
+});
+log("info", "shell ready", {
+  entry: entry.symbol,
+  parameters: params.length,
+  valueType: API.metadata.value_type,
+  embedded: Boolean(WASM_BASE64)
+});
 if (moduleBytes) setStatus("module embedded, ready", "good");
 """
 
@@ -306,6 +475,7 @@ def emit_html_shell(
     script = (
         _JS.replace("__API__", json.dumps(mapping)).replace("__WASM__", encoded)
     )
+    boot_script = _BOOT_JS
 
     if wasm_bytes:
         banner = (
@@ -345,6 +515,7 @@ def emit_html_shell(
     <code>{_escape(str(entry["name"]))}</code> &middot;
     {len(parameters)} parameters</div>
 
+  <div id="fatal" class="note" hidden></div>
   {banner}
   {note_html}
 
@@ -365,7 +536,29 @@ def emit_html_shell(
 
   <div class="panel">
     <div class="panel-title">Results</div>
-    <div id="results" class="out"></div>
+    <div class="tabs" role="tablist">
+      <div class="tab" data-view="raw" role="tab" aria-selected="true">Raw</div>
+      <div class="tab" data-view="image" role="tab" aria-selected="false">JPEG</div>
+    </div>
+    <div class="tabview" data-view="raw">
+      <div id="raw" class="out"></div>
+    </div>
+    <div class="tabview" data-view="image" hidden>
+      <div class="imgctl">
+        <label>width <input type="number" id="img_w" min="1" value="0"></label>
+        <label>height <input type="number" id="img_h" min="1" value="0"></label>
+        <label><input type="checkbox" id="img_invert"> invert</label>
+        <a id="download" download="output.jpg" style="display:none">download .jpg</a>
+      </div>
+      <div id="imgnote" class="meta"></div>
+      <canvas id="canvas" width="1" height="1"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Diagnostics</div>
+    <div id="log"></div>
+    <div class="row"><button id="copylog">Copy log</button></div>
   </div>
 
   <div class="panel">
@@ -375,6 +568,7 @@ def emit_html_shell(
     </details>
   </div>
 
+<script>{boot_script}</script>
 <script>{script}</script>
 </body>
 </html>

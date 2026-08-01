@@ -155,6 +155,54 @@ class WasmModule:
         return path
 
 
+def required_steps(program: FusedProgram) -> list[OpStep]:
+    """The steps the requested outputs actually depend on, in program order.
+
+    A captured program records every value the observation produced, and an
+    AST-compiled one keeps intermediates no output reads -- a comparison's
+    recorded result sitting beside the live comparison that produced it, for
+    instance. Emitting those is not wrong, but it costs locals and, for an
+    array-valued constant, would demand space in linear memory for something
+    nothing reads. Same traversal c_jit_backend._required_nodes performs for
+    the C and Fortran backends.
+    """
+
+    producers = {step.result_id: step for step in program.steps}
+    required: set[int] = set()
+    stack = list(program.outputs.values())
+    while stack:
+        value_id = stack.pop()
+        if value_id in required:
+            continue
+        step = producers.get(value_id)
+        if step is None:
+            continue
+        required.add(value_id)
+        stack.extend(step.input_ids)
+    return [step for step in program.steps if step.result_id in required]
+
+
+def _constant_scalar(step: OpStep) -> float | None:
+    """The scalar a ``tensor_from_list`` step contributes, if it is one.
+
+    An AST-compiled program carries its literals as recorded constructor
+    steps rather than as inline scalars (see c_primitive_program: turning
+    one back into a Python number would contradict AbstractTensor's own type
+    decision). A one-element constant is still just a number here, and
+    materialising it as an array in linear memory would be wasteful, so it
+    becomes a constant local instead.
+    """
+
+    if step.op_name != "tensor_from_list":
+        return None
+    values = step.attrs.get("values")
+    while isinstance(values, (list, tuple)) and len(values) == 1:
+        values = values[0]
+    if isinstance(values, (int, float)) and not isinstance(values, bool):
+        return float(values)
+    return None
+
+
 def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str, str]:
     if dtype is None:
         meta = program.meta or {}
@@ -220,7 +268,7 @@ def emit_wasm_module(
         body.append(f"      {load}")
         body.append(f"      local.set {local}")
 
-    for step in program.steps:
+    for step in required_steps(program):
         local = f"$v{len(names)}"
         locals_declared.append(f"(local {local} {value_type})")
         instructions = _step_instructions(step, names, value_type, shortfalls)
@@ -297,6 +345,18 @@ def _step_instructions(
     shortfalls: list[WasmShortfall],
 ) -> list[str] | None:
     op = step.op_name
+    constant = _constant_scalar(step)
+    if constant is not None:
+        return [f"      {value_type}.const {constant!r}"]
+    if op == "tensor_from_list":
+        shortfalls.append(
+            WasmShortfall(
+                step.step_id, op,
+                "only a one-element constant can become an immediate; a real "
+                "array constant would have to be placed in linear memory",
+            )
+        )
+        return None
     if op in _NO_WASM_INSTRUCTION:
         shortfalls.append(
             WasmShortfall(
@@ -416,8 +476,14 @@ def _assemble(
         builder.load()
         builder.local_set(local)
 
-    for step in program.steps:
+    for step in required_steps(program):
         local = builder.declare_local(value_type)
+        constant = _constant_scalar(step)
+        if constant is not None:
+            builder.value_const(constant)
+            locals_for[step.result_id] = local
+            builder.local_set(local)
+            continue
         left = locals_for[step.input_ids[0]]
 
         def push_right() -> None:

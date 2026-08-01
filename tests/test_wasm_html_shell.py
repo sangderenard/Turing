@@ -96,3 +96,61 @@ def test_a_mapping_is_accepted_as_well_as_a_descriptor_object():
     artifact = _artifact()
     shell = emit_html_shell(artifact.api.to_mapping(), source=artifact.source)
     assert "feed0" in shell.html
+
+
+# --- output views and diagnostics -----------------------------------------
+
+
+def test_output_views_are_tabs_over_the_same_numbers():
+    """How to look at a result is the caller's question, not a property of
+    the program, so it is a tab rather than a second compilation."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert 'data-view="raw"' in html
+    assert 'data-view="image"' in html
+    assert "<canvas" in html
+    assert "toDataURL(\"image/jpeg\"" in html
+    # Geometry is the caller's to state; a run does not know its own shape.
+    assert 'id="img_w"' in html and 'id="img_h"' in html
+
+
+def test_the_diagnostics_bootstrap_is_a_separate_script():
+    """A handler defined inside the program script cannot catch that
+    script's own parse error -- nothing in it has run yet. Two script tags
+    is what makes a dead shell announce itself instead of looking inert."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert html.count("<script>") == 2
+    boot, program = html.split("<script>")[1], html.split("<script>")[2]
+    assert 'addEventListener("error"' in boot
+    assert "const API =" in program
+    # The banner the handler reveals must exist before either script runs.
+    assert html.index('id="fatal"') < html.index("<script>")
+
+
+def test_the_call_itself_is_logged_not_just_the_result():
+    """Argument order and the memory offsets are the two things most likely
+    to be wrong and the least visible from a wrong answer alone."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert 'log("call"' in html
+    assert "offsets: offsets" in html
+    assert 'log("error"' in html
+    assert 'id="copylog"' in html
+
+
+def test_the_javascript_has_no_stray_real_newline_inside_a_string_literal():
+    """Twice, a JS escape written into a non-raw Python string became a real
+    newline and killed the whole shell at parse time. _JS is raw now; this
+    pins it, because the symptom (a page that renders but does nothing) is
+    far from the cause."""
+
+    from src.compiler import wasm_html_shell
+
+    for name in ("_BOOT_JS", "_JS"):
+        source = getattr(wasm_html_shell, name)
+        for number, line in enumerate(source.splitlines(), 1):
+            # An odd number of quotes on a line means a string was opened and
+            # not closed on that line.
+            unescaped = line.replace('\\"', "")
+            assert unescaped.count('"') % 2 == 0, f"{name} line {number}: {line!r}"
