@@ -312,3 +312,19 @@ def test_animation_is_driven_by_repeats_not_a_second_control():
     html = shell_for_artifact(_artifact()).html
     assert 'id="animate"' not in html
     assert 'id="frames"' not in html
+
+
+def test_feedback_network_contract_is_executable():
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    manifest = {
+        "name": "future scorer",
+        "module": {"api": {"entry_points": []}, "wasm_base64": "AGFzbQ=="},
+        "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "travel_feed": "feed0"},
+        "routes": [{"feed": "feed0", "effect": "future scores to speed"}],
+    }
+    html = emit_html_shell(_artifact().api, network_manifest=manifest).html
+    assert "advanceFeedback" in html
+    assert "candidate_offsets" in html
+    assert "feedbackState.speed" in html
+    assert "WebAssembly.instantiate(bytes" in html

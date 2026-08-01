@@ -346,6 +346,55 @@ function feedValues(param, n, d, t) {
   return out;
 }
 
+let feedbackRuntime = null;
+let feedbackState = { travel: 0, speed: 1, scores: [] };
+
+async function ensureFeedbackRuntime() {
+  const descriptor = NETWORK.module;
+  if (!descriptor || !descriptor.wasm_base64) return null;
+  if (feedbackRuntime) return feedbackRuntime;
+  const raw = atob(descriptor.wasm_base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const api = descriptor.api;
+  const entryPoint = api.entry_points.find(e => e.name === api.entry) || api.entry_points[0];
+  feedbackRuntime = { instance, api, entry: entryPoint };
+  return feedbackRuntime;
+}
+
+async function advanceFeedback() {
+  const runtime = await ensureFeedbackRuntime();
+  const contract = NETWORK.feedback;
+  if (!runtime || !contract) return;
+  const offsets = contract.candidate_offsets || [0, 0.45, 0.9];
+  const count = offsets.length;
+  const memory = runtime.instance.exports[runtime.api.metadata.memory_export || "memory"];
+  const fn = runtime.instance.exports[runtime.entry.symbol];
+  const inputs = runtime.entry.parameters.filter(p => p.role === "input");
+  const outputs = runtime.entry.parameters.filter(p => p.role === "output");
+  const elementBytes = runtime.api.metadata.element_bytes || 8;
+  const required = (inputs.length + outputs.length) * count * elementBytes;
+  if (required > memory.buffer.byteLength) memory.grow(Math.ceil((required - memory.buffer.byteLength) / 65536));
+  const View = runtime.api.metadata.value_type === "f32" ? Float32Array : Float64Array;
+  const offsetsBytes = Array.from({length: inputs.length + outputs.length}, (_, i) => i * count * elementBytes);
+  new View(memory.buffer, offsetsBytes[0], count).fill(feedbackState.travel);
+  new View(memory.buffer, offsetsBytes[1], count).set(offsets.map(value => feedbackState.travel + value));
+  fn(count, ...offsetsBytes);
+  const scores = Array.from(new View(memory.buffer, offsetsBytes[inputs.length], count));
+  let best = 0;
+  for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
+  feedbackState.scores = scores;
+  feedbackState.speed = 0.45 + 1.8 * (1 - scores[0]) + 0.35 * best;
+  feedbackState.travel += feedbackState.speed / Math.max(1, contract.fps || 120);
+}
+
+function applyFeedbackFeed(feeds, count) {
+  const contract = NETWORK.feedback;
+  if (!contract) return;
+  const index = inputs.findIndex(p => p.name === contract.travel_feed);
+  if (index >= 0) feeds[index] = new Float64Array(count).fill(feedbackState.travel);
+}
 let running = false;
 
 async function run() {
@@ -365,7 +414,10 @@ async function run() {
     const d = domain();
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
+    await advanceFeedback();
     const feeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
+    applyFeedbackFeed(feeds, d.n);
+    let activeFeeds = feeds;
     // An expression covers the whole grid; literal values only go as far as
     // the shortest list supplied.
     const count = anyExpression
@@ -419,7 +471,10 @@ async function run() {
     for (let r = 0; running && (continuous || r < repeats); r++) {
       if (r > 0 && animated) {
         frameIndex = r;
+        await advanceFeedback();
         const refreshed = inputs.map(p => feedValues(p, count, d, frameIndex));
+        applyFeedbackFeed(refreshed, count);
+        activeFeeds = refreshed;
         inputs.forEach((p, i) => {
           new View(memory.buffer, offsets[i], count).set(
             refreshed[i].slice(0, count));
@@ -437,6 +492,7 @@ async function run() {
             new View(memory.buffer, offsets[inputs.length + i], count))
         }));
         renderActiveTab();
+        renderNetworkStats(activeFeeds);
         if ((r % 15) === 0) reportTimings(timings, count);
         await new Promise(resolve => requestAnimationFrame(resolve));
       } else if (!continuous && repeats > 1 && (r % 200) === 0) {
@@ -624,7 +680,7 @@ function renderNetworkStats(feeds) {
   let low = Infinity, high = -Infinity, total = 0;
   for (const value of values) { low = Math.min(low, value); high = Math.max(high, value); total += value; }
   const output = lastOutputs[0] && lastOutputs[0].values || [];
-  pane.textContent = NETWORK.name + " · " + route.feed + " → " + route.effect +
+  pane.textContent = NETWORK.name + " · scores [" + feedbackState.scores.map(v => v.toFixed(3)).join(", ") + "] · speed " + feedbackState.speed.toFixed(3) + " · travel " + feedbackState.travel.toFixed(3) + " · " + route.feed + " → " + route.effect +
     " · " + values.length + " samples · mean " + (total / values.length).toFixed(4) +
     " · range [" + low.toFixed(4) + ", " + high.toFixed(4) + "]" +
     " · returned " + output.length + " image values";

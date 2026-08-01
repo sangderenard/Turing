@@ -20,6 +20,7 @@ root, and it works opened from disk too.
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import io
 from pathlib import Path
@@ -68,8 +69,33 @@ def render(cx, cy, interest):
     return mandelbrot_escape(cx=cx + recommendation * 0.018, cy=cy + recommendation * -0.012)"""
 
 
+NETWORK_SOURCE = """
+def detail_network(travel, candidate):
+    h0 = (travel * 0.18 + candidate * 0.72 - 0.31).tanh()
+    h1 = (travel * -0.11 + candidate * 0.43 + 0.27).tanh()
+    h2 = (travel * 0.07 + candidate * -0.61 + 0.08).tanh()
+    h3 = (travel * -0.04 + candidate * 0.35 - 0.16).tanh()
+    return (h0 * 0.52 + h1 * -0.33 + h2 * 0.41 + h3 * 0.28 + 0.5).tanh()
+
+
+def score(travel, candidate):
+    return detail_network(travel=travel, candidate=candidate)
+"""
+
+
+def compile_network_module():
+    aot = compile_ast_aot(NETWORK_SOURCE, "score", {"travel": np.zeros(3), "candidate": np.zeros(3)}, backend="c", remove_loops=True, unroll_limit=4096, precompile_only=True)
+    program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
+    arithmetic = [step for step in program.steps if step.op_name in {"add", "mul", "tanh"}]
+    selected = type(program)(version=program.version, feeds=program.feeds, steps=program.steps, outputs={"detail_score": arithmetic[-1].result_id}, state_in=program.state_in, meta=program.meta, extras=program.extras)
+    module = emit_wasm_module(selected, name="detail_network", dtype="float64")
+    if not module.complete:
+        raise SystemExit(module.shortfall_report())
+    return module
+
 def build(destination: Path) -> Path:
     channel = TelemetryChannel(name="homepage")
+    network_module = compile_network_module()
     probe = {"cx": np.zeros(4), "cy": np.zeros(4), "interest": np.zeros(4)}
 
     with channel.stepped("building the homepage", 5, path="build") as advance:
@@ -132,12 +158,10 @@ def build(destination: Path) -> Path:
         origin_source=KERNEL,
         backend_sources=sources,
         network_manifest={
-            "name": "Mandelbrot interest controller",
-            "routes": [{
-                "feed": "feed2",
-                "label": "network trajectory",
-                "effect": "compiled interest recommendation → camera displacement → JPEG image",
-            }],
+            "name": "Mandelbrot future-detail controller",
+            "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},
+            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "travel_feed": "feed2"},
+            "routes": [{"feed": "feed2", "label": "network-guided travel", "effect": "future detail scores → dwell speed → live frame"}],
         },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes
         # the view drift instead of recomputing one picture forever.
