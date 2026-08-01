@@ -7519,10 +7519,26 @@ def _coordinate_scheduled_capture_impl(
                 continue
             if node_id in values:
                 try:
+                    previous = values[node_id]
                     values[node_id] = _tensorize_graph_input(
-                        values[node_id],
+                        previous,
                         device=device,
                     )
+                    # This is where a supplied array becomes the tensor the
+                    # tape sees, so it is the identity a feed will carry.
+                    # Recording the name only at binding time meant a
+                    # parameter used directly by its own function -- rather
+                    # than passed on to a callee, whose shell records it
+                    # again -- lost its name here and could only fall back to
+                    # a positional one.
+                    named = getattr(shell, "_capture_input_names", None)
+                    if named is not None:
+                        carried = named.get(id(previous))
+                        if carried:
+                            named[id(values[node_id])] = carried
+                            storage = _capture_storage_identity(values[node_id])
+                            if storage is not None:
+                                shell._capture_input_storage[storage] = carried
                 except Exception as error:
                     value = values[node_id]
                     node = graph.G.nodes[node_id]
