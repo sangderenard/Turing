@@ -1,4 +1,5 @@
-"""Emit WebAssembly text (WAT) from a ``FusedProgram``.
+"""Emit WebAssembly -- both the readable text and the runnable binary -- from
+a ``FusedProgram``.
 
 Why this IR and not SSA or Fortran: WebAssembly has no ``goto``. Its control
 flow is structured (``block``/``loop``/``br``), so lowering an arbitrary SSA
@@ -12,11 +13,13 @@ So this is the same shape as ``fused_program_python_backend.py`` -- one
 lowering per ``OpStep``, in the program's own order -- with a different
 instruction set underneath.
 
-No toolchain is required to emit, matching ``ssa_fortran_backend``'s stance
-that emission and compilation are separate concerns: WAT is text. Turning it
-into a ``.wasm`` binary needs ``wat2wasm`` (WABT) or any equivalent
-assembler, and ``compile_wat`` below will use one if it is installed rather
-than pretending to.
+No toolchain is required, and that includes producing something runnable.
+WAT is the human-readable form; a browser only ever executes the binary, so
+emitting text alone would leave every compiled program readable but
+unrunnable unless ``wat2wasm`` happened to be installed. ``wasm_binary.py``
+assembles the module here instead, from this same lowering, so ``.wat`` and
+``.wasm`` describe the same program by construction. ``compile_wat`` remains
+for callers who would rather round-trip through WABT.
 
 Layout: every array is a byte offset into the module's exported linear
 memory, passed as an ``i32`` parameter, in the order the API descriptor
@@ -126,6 +129,11 @@ class WasmModule:
     parameters: tuple[str, ...] = ()
     value_type: str = "f64"
     api: Any = None
+    # The assembled module. Emitted here rather than left to wat2wasm: a
+    # browser only executes the binary, so without this the program could be
+    # read but never run. Built from this same lowering, so the two forms
+    # cannot disagree.
+    binary: bytes | None = None
 
     @property
     def complete(self) -> bool:
@@ -142,6 +150,8 @@ class WasmModule:
         path.write_text(self.source, encoding="utf-8")
         if self.api is not None:
             self.api.write(path.with_suffix(".api.yaml"))
+        if self.binary is not None:
+            path.with_suffix(".wasm").write_bytes(self.binary)
         return path
 
 
@@ -264,6 +274,11 @@ def emit_wasm_module(
     source = "\n".join(lines)
 
     api = _describe(name, function_name, feed_ids, output_ids, value_type, element_bytes)
+    binary = None
+    if not shortfalls:
+        binary = _assemble(
+            program, feed_ids, output_ids, value_type, element_bytes, function_name
+        )
     return WasmModule(
         name=name,
         source=source,
@@ -271,6 +286,7 @@ def emit_wasm_module(
         parameters=tuple(parameters),
         value_type=value_type,
         api=api,
+        binary=binary,
     )
 
 
@@ -349,6 +365,107 @@ def _step_instructions(
         WasmShortfall(step.step_id, op, "no binary instruction registered")
     )
     return None
+
+
+
+def _assemble(
+    program: FusedProgram,
+    feed_ids: Sequence[int],
+    output_ids: Sequence[int],
+    value_type: str,
+    element_bytes: int,
+    function_name: str,
+) -> bytes:
+    """Assemble the same program as a binary module.
+
+    Mirrors the WAT lowering above step for step -- same order, same
+    operands, same instructions -- because the two forms describing different
+    programs would be worse than having only one.
+    """
+
+    from .wasm_binary import CodeBuilder, build_module
+
+    parameter_count = 1 + len(feed_ids) + len(output_ids)
+    builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
+    count_param = 0
+    feed_params = {feed_id: 1 + i for i, feed_id in enumerate(feed_ids)}
+    output_params = [1 + len(feed_ids) + i for i in range(len(output_ids))]
+
+    index_local = builder.declare_local("i32")
+    locals_for: dict[int, int] = {}
+
+    def element_address(pointer_param: int) -> None:
+        builder.local_get(pointer_param)
+        builder.local_get(index_local)
+        builder.i32_const(element_bytes)
+        builder.raw(0x6C)  # i32.mul
+        builder.raw(0x6A)  # i32.add
+
+    # block { loop { if i >= count break; ...; i += 1; continue } }
+    builder.block()
+    builder.loop()
+    builder.local_get(index_local)
+    builder.local_get(count_param)
+    builder.raw(0x4E)  # i32.ge_s
+    builder.br_if(1)  # out of the enclosing block
+
+    for feed_id in feed_ids:
+        local = builder.declare_local(value_type)
+        locals_for[feed_id] = local
+        element_address(feed_params[feed_id])
+        builder.load()
+        builder.local_set(local)
+
+    for step in program.steps:
+        local = builder.declare_local(value_type)
+        left = locals_for[step.input_ids[0]]
+
+        def push_right() -> None:
+            if len(step.input_ids) == 2:
+                builder.local_get(locals_for[step.input_ids[1]])
+            else:
+                builder.value_const(float(step.attrs["right_scalar"]))
+
+        if step.op_name in ELEMENTWISE_UNARY:
+            builder.local_get(left)
+            builder.op(_UNARY_INSTRUCTION[step.op_name])
+        elif step.attrs.get("reverse", False):
+            push_right()
+            builder.local_get(left)
+        else:
+            builder.local_get(left)
+            push_right()
+
+        if step.op_name in ELEMENTWISE_BINARY:
+            instruction = _BINARY_INSTRUCTION.get(step.op_name)
+            if instruction is not None:
+                builder.op(instruction)
+            else:
+                builder.op(_COMPARISON_INSTRUCTION[step.op_name])
+                # A comparison yields i32; convert so the result carries the
+                # operand's own type, as every other backend reports it.
+                builder.op("convert_i32_u")
+        locals_for[step.result_id] = local
+        builder.local_set(local)
+
+    for slot, output_id in enumerate(output_ids):
+        element_address(output_params[slot])
+        builder.local_get(locals_for[output_id])
+        builder.store()
+
+    builder.local_get(index_local)
+    builder.i32_const(1)
+    builder.raw(0x6A)  # i32.add
+    builder.local_set(index_local)
+    builder.br(0)  # continue the loop
+    builder.end()  # loop
+    builder.end()  # block
+
+    return build_module(
+        function_name=function_name,
+        parameter_types=["i32"] * parameter_count,
+        body=builder,
+    )
 
 
 def _describe(
