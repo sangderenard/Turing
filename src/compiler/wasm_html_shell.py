@@ -497,8 +497,7 @@ async function run() {
         // otherwise the loop finishes and only the last frame is ever seen.
         lastOutputs = outputs.map((p, i) => ({
           name: p.name,
-          values: Array.from(
-            new View(memory.buffer, offsets[inputs.length + i], count))
+          values: new View(memory.buffer, offsets[inputs.length + i], count)
         }));
         renderActiveTab();
         renderNetworkStats(activeFeeds);
@@ -529,7 +528,7 @@ async function run() {
 
     lastOutputs = outputs.map((p, i) => ({
       name: p.name,
-      values: Array.from(new View(memory.buffer, offsets[inputs.length + i], count))
+      values: new View(memory.buffer, offsets[inputs.length + i], count)
     }));
     log("progress", "reading outputs", { done: 4, total: 4 });
     renderActiveTab();
@@ -552,6 +551,32 @@ async function run() {
 
 let lastOutputs = null;
 
+function renderWebGLPalette(canvas, values, w, h, lo, span, invert) {
+  // Resizing a canvas clears its WebGL drawing buffer and state.  Do it before
+  // retrieving/caching the context so an animated frame can reuse its GPU objects.
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h; canvas._turingWebGL = null;
+  }
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: false });
+  if (!gl) return false;
+  let state = canvas._turingWebGL;
+  if (!state) {
+    const vertex = "#version 300 es\nin vec2 p; out vec2 uv; void main(){ uv=(p+1.0)*0.5; gl_Position=vec4(p,0,1); }";
+    const fragment = "#version 300 es\nprecision highp float; uniform sampler2D scalar; uniform bool invert; in vec2 uv; out vec4 outColor; void main(){ float t=texture(scalar,uv).r; if(invert)t=1.0-t; vec3 c=vec3(min(1.0,t*1.6),min(1.0,t*t*1.4),min(1.0,max(0.0,0.35+t*0.65-t*t))); outColor=vec4(c,1.0); }";
+    const compile = (kind, source) => { const shader = gl.createShader(kind); gl.shaderSource(shader, source); gl.compileShader(shader); return shader; };
+    const program = gl.createProgram(); gl.attachShader(program, compile(gl.VERTEX_SHADER, vertex)); gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment)); gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return false;
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buffer); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    const location = gl.getAttribLocation(program, "p"); gl.enableVertexAttribArray(location); gl.vertexAttribPointer(location, 2, gl.FLOAT, false, 0, 0);
+    const texture = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, texture); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    state = canvas._turingWebGL = { program, vao, texture, invert: gl.getUniformLocation(program, "invert") };
+  }
+  const scalar = new Uint8Array(w * h);
+  for (let i = 0; i < scalar.length; i++) scalar[i] = Math.max(0, Math.min(255, Math.round(255 * ((values[i] - lo) / span))));
+  gl.viewport(0, 0, w, h); gl.useProgram(state.program); gl.bindVertexArray(state.vao); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, state.texture); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, scalar); gl.uniform1i(state.invert, invert ? 1 : 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  return true;
+}
 function renderRaw() {
   $("raw").textContent = (lastOutputs || [])
     .map(o => o.name + ": [" + o.values.join(", ") + "]")
@@ -581,6 +606,10 @@ function renderImage() {
   for (const v of values) { if (v < lo) lo = v; if (v > hi) hi = v; }
   const span = (hi - lo) || 1;
 
+  if (renderWebGLPalette(canvas, values, w, h, lo, span, invert)) {
+    note.textContent = w + "x" + h + ", raw scalar field rendered by WebGL RGB palette, range " + lo.toPrecision(4) + " to " + hi.toPrecision(4);
+    return;
+  }
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext("2d");
   const image = ctx.createImageData(w, h);
