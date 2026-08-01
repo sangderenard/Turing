@@ -145,7 +145,31 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .kv b { font-family: ui-monospace, monospace; font-weight: 600; min-width: 9rem; }
 .chip { display: inline-block; font-size: .72rem; font-family: ui-monospace, monospace;
   padding: .1rem .4rem; border-radius: .25rem; background: var(--soft); margin: .1rem; }
-.deployment-node.lit { background: var(--accent); color: white; }
+.execution-modes { display: flex; flex-wrap: wrap; gap: .45rem; margin: .5rem 0; }
+.execution-mode { background: var(--soft); color: inherit; border: 1px solid var(--line); }
+.execution-mode[aria-pressed="true"] { background: var(--accent); color: white; }
+.schedule-level { display: flex; align-items: stretch; gap: .45rem; padding: .3rem 0; }
+.schedule-level-label { width: 4rem; flex: 0 0 4rem; font: .72rem ui-monospace, monospace;
+  opacity: .6; padding-top: .35rem; }
+.deployment-node { flex: 1; min-width: 10rem; border: 1px solid var(--line);
+  border-radius: .35rem; padding: .4rem .55rem; transition: .12s ease;
+  cursor: pointer; background: var(--soft); }
+.deployment-node b { display: block; font: 600 .74rem ui-monospace, monospace; }
+.deployment-node .node-state { font: .68rem ui-monospace, monospace; opacity: .75; }
+.deployment-node[data-state="downloading"] { border-color: #f59e0b; }
+.deployment-node[data-state="running"] { background: var(--accent); color: white;
+  transform: translateY(-1px); box-shadow: 0 .2rem .7rem color-mix(in srgb, var(--accent) 35%, transparent); }
+.deployment-node[data-state="done"] { border-color: var(--good); }
+.deployment-node[data-state="error"] { border-color: var(--bad); color: var(--bad); }
+.node-detail { margin-top: .5rem; }
+.graph-toolbar { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center;
+  margin: .5rem 0; }
+.graph-view-button { background: var(--soft); color: inherit; border: 1px solid var(--line); }
+.graph-view-button[aria-pressed="true"] { background: var(--accent); color: white; }
+.graph-scroll { max-height: 34rem; overflow: auto; border: 1px solid var(--line);
+  border-radius: .35rem; background: #05070c; }
+#process-graph-canvas { display: block; max-width: none; border: 0; border-radius: 0;
+  image-rendering: auto; }
 .filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
 .filters label { cursor: pointer; opacity: .75; }
 .srctabs { display: flex; flex-wrap: wrap; gap: .25rem; margin: .5rem 0; }
@@ -246,8 +270,10 @@ const WASM_BASE64 = __WASM__;
 
 const $ = (id) => document.getElementById(id);
 const GRAPH = __GRAPH__;
+const GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
+const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
@@ -452,32 +478,44 @@ function applyFeedbackFeed(feeds, count) {
 }
 let running = false;
 
-// --- class-graph execution ----------------------------------------------
-// The public program may be deployed as several private modules, each with
-// its own memory and connected by ProcessGraph edges. The FIFO instantiates
-// a region only when execution reaches it; deployed pages fetch separate
-// .wasm files while self-contained callers may still provide base64 bytes.
+// --- shared-memory class-graph execution --------------------------------
+// Every punch card imports the same WebAssembly.Memory. JavaScript composes
+// byte offsets from the compiler-derived graph, calls the cards in schedule
+// order, and reads only the public outputs. No live tensor is copied through
+// JavaScript at a seam.
 class ClassGraphRunner {
   constructor(manifest) {
+    if (!manifest.shared_memory) throw new Error(
+      "segmented manifest does not declare the shared-memory ABI"
+    );
     this.manifest = manifest;
     this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
     this.instances = new Map();
-    this.pending = new Map();
-    this.outputs = new Map();
-    this.queue = [];
-    this.completed = new Set();
-    this.count = 1;
-    this.consumersOf = new Map();
+    this.offsetForInput = new Map();
+    this.offsetForOutput = new Map();
+    this.layoutCount = 0;
+    const staticBytes = Number(manifest.shared_static_bytes || 0);
+    this.memory = new WebAssembly.Memory({
+      initial: Math.max(1, Math.ceil(staticBytes / 65536))
+    });
+    this.sourceOf = new Map();
     for (const edge of manifest.edges || []) {
-      const key = edge.from.module + "::" + edge.from.output;
-      if (!this.consumersOf.has(key)) this.consumersOf.set(key, []);
-      this.consumersOf.get(key).push(edge.to);
+      this.sourceOf.set(
+        edge.to.module + "::" + edge.to.input,
+        "out::" + edge.from.module + "::" + edge.from.output
+      );
+    }
+    for (const [logicalName, targets] of Object.entries(manifest.logical_inputs || {})) {
+      for (const [moduleName, inputName] of targets) {
+        this.sourceOf.set(moduleName + "::" + inputName, "in::" + logicalName);
+      }
     }
   }
 
   async instance(name) {
     if (this.instances.has(name)) return this.instances.get(name);
     const spec = this.modulesByName.get(name);
+    markDeploymentNode(name, "downloading");
     let moduleBinary;
     if (spec.url) {
       const response = await fetch(spec.url);
@@ -492,111 +530,145 @@ class ClassGraphRunner {
     } else {
       throw new Error("private WASM region " + name + " has no URL or bytes");
     }
-    const { instance } = await WebAssembly.instantiate(moduleBinary, {});
+    const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
+    const imports = {};
+    imports[memoryImport.module] = {[memoryImport.field]: this.memory};
+    const { instance } = await WebAssembly.instantiate(moduleBinary, imports);
     this.instances.set(name, instance);
+    markDeploymentNode(name, "ready");
     return instance;
   }
 
-  deliver(moduleName, inputName, value) {
-    const spec = this.modulesByName.get(moduleName);
-    const bag = this.pending.get(moduleName) || {};
-    bag[inputName] = value;
-    this.pending.set(moduleName, bag);
-    const ready = spec.inputs.every(name => name in bag);
-    if (ready && !this.queue.includes(moduleName)) this.queue.push(moduleName);
+  layout(count) {
+    if (this.layoutCount === count) return;
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    let cursor = Math.ceil(Number(this.manifest.shared_static_bytes || 0) / elementBytes) * elementBytes;
+    this.offsetForInput.clear();
+    this.offsetForOutput.clear();
+    for (const logicalName of Object.keys(this.manifest.logical_inputs || {})) {
+      this.offsetForInput.set(logicalName, cursor);
+      cursor += count * elementBytes;
+    }
+    for (const spec of this.manifest.modules) {
+      for (const outputName of spec.outputs) {
+        this.offsetForOutput.set(spec.name + "::" + outputName, cursor);
+        cursor += count * elementBytes;
+      }
+    }
+    if (cursor > this.memory.buffer.byteLength) {
+      this.memory.grow(Math.ceil((cursor - this.memory.buffer.byteLength) / 65536));
+    }
+    this.layoutCount = count;
   }
 
-  async call(moduleName) {
+  offsetFor(source) {
+    if (source.startsWith("in::")) return this.offsetForInput.get(source.slice(4));
+    if (source.startsWith("out::")) return this.offsetForOutput.get(source.slice(5));
+    throw new Error("unknown shared-memory slot " + source);
+  }
+
+  async call(moduleName, count) {
     const spec = this.modulesByName.get(moduleName);
     const instance = await this.instance(moduleName);
-    const memory = instance.exports[spec.memory_export || "memory"];
-    const count = this.count;
-    const elementBytes = spec.element_bytes || 8;
-    const View = spec.value_type === "f32" ? Float32Array : Float64Array;
-    const inputValues = this.pending.get(moduleName) || {};
+    const inputOffsets = spec.inputs.map(name => {
+      const source = this.sourceOf.get(moduleName + "::" + name);
+      if (!source) throw new Error(moduleName + " input " + name + " has no graph binding");
+      return this.offsetFor(source);
+    });
+    const outputOffsets = spec.outputs.map(name =>
+      this.offsetForOutput.get(moduleName + "::" + name)
+    );
+    const args = [count, ...inputOffsets, ...outputOffsets];
+    markDeploymentNode(moduleName, "running");
+    const started = performance.now();
+    instance.exports[spec.entry](...args);
+    markDeploymentNode(moduleName, "done", performance.now() - started);
+  }
 
-    const names = [...spec.inputs, ...spec.outputs];
-    const layout = {};
-    let cursor = Math.ceil((spec.reserved_bytes || 0) / elementBytes) * elementBytes;
-    for (const name of names) { layout[name] = cursor; cursor += count * elementBytes; }
-    if (cursor > memory.buffer.byteLength) {
-      memory.grow(Math.ceil((cursor - memory.buffer.byteLength) / 65536));
-    }
-    for (const name of spec.inputs) {
-      const target = new View(memory.buffer, layout[name], count);
-      const source = inputValues[name];
+  async run(logicalInputs, count) {
+    this.layout(count);
+    const View = this.manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+    for (const [logicalName, source] of Object.entries(logicalInputs)) {
+      const offset = this.offsetForInput.get(logicalName);
+      if (offset === undefined) continue;
+      const target = new View(this.memory.buffer, offset, count);
       if (ArrayBuffer.isView(source) || Array.isArray(source)) {
         if (source.length === 1) target.fill(Number(source[0]));
-        else if (source.length >= count) target.set(source.slice(0, count));
-        else throw new Error(
-          moduleName + " input " + name + " has " + source.length +
-          " values for extent " + count
-        );
+        else if (source.length >= count) target.set(source.subarray ? source.subarray(0, count) : source.slice(0, count));
+        else throw new Error(logicalName + " has " + source.length + " values for extent " + count);
       } else {
         target.fill(Number(source));
       }
     }
-    const args = [count, ...spec.inputs.map(n => layout[n]), ...spec.outputs.map(n => layout[n])];
-    markDeploymentNode(moduleName);
-    instance.exports[spec.entry](...args);
-    const result = {};
-    for (const name of spec.outputs) {
-      result[name] = new View(memory.buffer, layout[name], count).slice();
-    }
-    return result;
+    const order = (this.manifest.schedule && this.manifest.schedule.nodes)
+      ? this.manifest.schedule.nodes.slice().sort((a, b) => a.level - b.level || a.id.localeCompare(b.id)).map(n => n.id)
+      : this.manifest.modules.map(module => module.name);
+    for (const moduleName of order) await this.call(moduleName, count);
+    return outputs.map(parameter => {
+      const binding = this.manifest.logical_outputs[parameter.name];
+      if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
+      const offset = this.offsetForOutput.get(binding[0] + "::" + binding[1]);
+      return new View(this.memory.buffer, offset, count).slice();
+    });
   }
+}
 
-  async run(graphInputs, count) {
-    this.pending = new Map();
-    this.outputs = new Map();
-    this.queue = [];
-    this.completed = new Set();
-    this.count = count;
-    for (const spec of this.manifest.modules) {
-      if (spec.inputs.length === 0) this.queue.push(spec.name);
+class ContiguousRunner {
+  constructor(spec) { this.spec = spec; this.runtime = null; }
+  async instance() {
+    if (this.runtime) return this.runtime;
+    markContiguousState("downloading");
+    const response = await fetch(this.spec.url);
+    if (!response.ok) throw new Error("failed to load contiguous WASM: HTTP " + response.status);
+    const {instance} = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+    this.runtime = instance;
+    markContiguousState("ready");
+    return instance;
+  }
+  async run(logicalInputs, count) {
+    const instance = await this.instance();
+    const memory = instance.exports[this.spec.memory_export || "memory"];
+    const elementBytes = Number(this.spec.element_bytes || 8);
+    const View = this.spec.value_type === "f32" ? Float32Array : Float64Array;
+    let cursor = Math.ceil(Number(this.spec.reserved_bytes || 0) / elementBytes) * elementBytes;
+    const offsets = {};
+    for (const name of [...this.spec.inputs, ...this.spec.outputs]) {
+      offsets[name] = cursor; cursor += count * elementBytes;
     }
-    for (const [moduleName, values] of Object.entries(graphInputs || {})) {
-      for (const [inputName, value] of Object.entries(values)) this.deliver(moduleName, inputName, value);
+    if (cursor > memory.buffer.byteLength) memory.grow(Math.ceil((cursor - memory.buffer.byteLength) / 65536));
+    for (const name of this.spec.inputs) {
+      const source = logicalInputs[name];
+      const target = new View(memory.buffer, offsets[name], count);
+      if (source.length === 1) target.fill(Number(source[0]));
+      else target.set(source.subarray ? source.subarray(0, count) : source.slice(0, count));
     }
-    while (this.queue.length > 0) {
-      const moduleName = this.queue.shift();
-      if (this.completed.has(moduleName)) continue;
-      const result = await this.call(moduleName);
-      this.completed.add(moduleName);
-      this.outputs.set(moduleName, result);
-      for (const [outputName, value] of Object.entries(result)) {
-        const consumers = this.consumersOf.get(moduleName + "::" + outputName) || [];
-        for (const target of consumers) this.deliver(target.module, target.input, value);
-      }
-    }
-    return Object.fromEntries(this.outputs);
+    markContiguousState("running");
+    const started = performance.now();
+    instance.exports[this.spec.entry](count, ...this.spec.inputs.map(n => offsets[n]), ...this.spec.outputs.map(n => offsets[n]));
+    markContiguousState("done", performance.now() - started);
+    return this.spec.outputs.map(name => new View(memory.buffer, offsets[name], count).slice());
   }
 }
 
 // One pass through every private module in the graph, using the full arrays
 // supplied through the logical program's public input contract.
 const classGraphRunner = CLASS_GRAPH ? new ClassGraphRunner(CLASS_GRAPH) : null;
+const contiguousRunner = CLASS_GRAPH && CLASS_GRAPH.contiguous
+  ? new ContiguousRunner(CLASS_GRAPH.contiguous) : null;
+let activeExecutionMode = "staged";
 
-async function computeViaClassGraph(feeds, count) {
-  const graphInputs = {};
-  for (const [logicalName, targets] of Object.entries(CLASS_GRAPH.logical_inputs || {})) {
+async function computeViaSelectedRunner(feeds, count) {
+  const logicalInputs = {};
+  for (const logicalName of Object.keys(CLASS_GRAPH.logical_inputs || {})) {
     const paramIndex = inputs.findIndex(p => p.name === logicalName);
     if (paramIndex < 0) throw new Error("logical input " + logicalName + " is not in the API");
-    const value = feeds[paramIndex];
-    for (const [moduleName, inputName] of targets) {
-      graphInputs[moduleName] = graphInputs[moduleName] || {};
-      graphInputs[moduleName][inputName] = value;
-    }
+    logicalInputs[logicalName] = feeds[paramIndex];
   }
-  const deployedOutputs = await classGraphRunner.run(graphInputs, count);
-  return outputs.map(parameter => {
-    const binding = CLASS_GRAPH.logical_outputs[parameter.name];
-    if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
-    const moduleOutputs = deployedOutputs[binding[0]] || {};
-    const value = moduleOutputs[binding[1]];
-    if (!value) throw new Error("deployment did not produce " + parameter.name);
-    return value;
-  });
+  if (activeExecutionMode === "contiguous") {
+    if (!contiguousRunner) throw new Error("no contiguous compile is published");
+    return contiguousRunner.run(logicalInputs, count);
+  }
+  return classGraphRunner.run(logicalInputs, count);
 }
 
 // The segmented deployment follows the same full-domain run loop as a
@@ -639,7 +711,7 @@ async function runClassGraphMode() {
     }
     running = true;
     $("run").textContent = "Stop";
-    log("info", "segmented deployment", {
+    log("info", activeExecutionMode + " deployment", {
       modules: CLASS_GRAPH.modules.length,
       elements: count,
     });
@@ -652,7 +724,7 @@ async function runClassGraphMode() {
       }
       const frameStarted = performance.now();
       const t0 = performance.now();
-      const result = await computeViaClassGraph(activeFeeds, count);
+      const result = await computeViaSelectedRunner(activeFeeds, count);
       timings.push(performance.now() - t0);
       lastOutputs = outputs.map((p, index) => ({
         name: p.name,
@@ -679,7 +751,7 @@ async function runClassGraphMode() {
     renderNetworkStats(activeFeeds);
     setStatus(
       "ran " + count + " elements in " + elapsed.toFixed(3) +
-      " ms (segmented WASM)",
+      " ms (" + (activeExecutionMode === "staged" ? "shared-memory staged" : "contiguous") + " WASM)",
       "good"
     );
     log("ok", "segmented run complete", {
@@ -1003,11 +1075,173 @@ function wireFilters() {
   });
 }
 
+let activeGraphView = "original";
+let graphLayout = null;
+let graphFrame = null;
+const graphPulses = new Map();
+
+function hueRgb(hue) {
+  const h = ((hue % 360) + 360) % 360 / 60;
+  const x = 1 - Math.abs(h % 2 - 1);
+  const table = [[1,x,0],[x,1,0],[0,1,x],[0,x,1],[x,0,1],[1,0,x]];
+  const rgb = table[Math.floor(h) % 6];
+  return rgb.map(value => Math.round((0.18 + value * 0.82) * 255));
+}
+
+function mixedIdentityRgb(contributors) {
+  const colours = (contributors || []).map(identity =>
+    hueRgb((GRAPH_VIEWS.identities[identity] || {hue: 210}).hue)
+  );
+  if (!colours.length) return [90, 110, 145];
+  return [0, 1, 2].map(channel => Math.round(
+    colours.reduce((sum, colour) => sum + colour[channel], 0) / colours.length
+  ));
+}
+
+// Rolling phosphor integrator. Calls faster than the display refresh are not
+// dropped: every completed region deposits energy, and the exponentially
+// decaying window determines the node's visible colour on the next redraw.
+function phosphorColor(node, now) {
+  const decay = Math.max(80, Number($("graph-decay") && $("graph-decay").value) || 1200);
+  const pulses = graphPulses.get(String(node.id)) || [];
+  let energy = 0;
+  const live = [];
+  for (const pulse of pulses) {
+    const age = Math.max(0, now - pulse.at);
+    if (age > decay * 7) continue;
+    energy += pulse.energy * Math.exp(-age / decay);
+    live.push(pulse);
+  }
+  if (live.length !== pulses.length) graphPulses.set(String(node.id), live);
+  const base = mixedIdentityRgb(node.contributors);
+  const glow = 1 - Math.exp(-energy);
+  return {
+    rgb: base.map(value => Math.min(255, Math.round(value * (0.28 + glow * 0.9)))),
+    alpha: 0.28 + glow * 0.72,
+    glow: glow,
+    active: live.length > 0,
+  };
+}
+
+function pulseGraphNodes(nodeIds, elapsedMs) {
+  const at = performance.now();
+  const energy = Math.max(0.14, Math.log1p(Math.max(0, elapsedMs || 0)) * 0.5);
+  for (const nodeId of nodeIds || []) {
+    const key = String(nodeId);
+    const pulses = graphPulses.get(key) || [];
+    pulses.push({at: at, energy: energy});
+    if (pulses.length > 96) pulses.splice(0, pulses.length - 96);
+    graphPulses.set(key, pulses);
+  }
+  if (!graphFrame) graphFrame = requestAnimationFrame(drawProcessGraph);
+}
+
+function prepareProcessGraph() {
+  const canvas = $("process-graph-canvas");
+  const view = GRAPH_VIEWS.views && GRAPH_VIEWS.views[activeGraphView];
+  if (!canvas || !view) return;
+  const groups = Math.max(1, view.groups || 1);
+  const levels = Math.max(1, (view.level_max || 0) - (view.level_min || 0) + 1);
+  const width = Math.max(760, groups * 180);
+  const height = Math.max(420, Math.min(30000, levels * 8 + 36));
+  canvas.width = width; canvas.height = height;
+  const buckets = new Map();
+  const positions = new Map();
+  for (const node of view.nodes) {
+    const key = node.level + "::" + node.group;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(node);
+  }
+  for (const [key, nodes] of buckets) {
+    const [level, group] = key.split("::").map(Number);
+    nodes.forEach((node, index) => {
+      const span = 150;
+      const x = 18 + group * 180 + (index + 1) * span / (nodes.length + 1);
+      const y = 25 + (level - (view.level_min || 0)) * ((height - 40) / levels);
+      positions.set(String(node.id), {x, y, node});
+    });
+  }
+  graphLayout = {view, positions};
+  drawProcessGraph(performance.now());
+}
+
+function drawProcessGraph(now) {
+  graphFrame = null;
+  const canvas = $("process-graph-canvas");
+  if (!canvas || !graphLayout) return;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#05070c"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = "rgba(150,170,210,.10)"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [left, right] of graphLayout.view.edges) {
+    const a = graphLayout.positions.get(String(left));
+    const b = graphLayout.positions.get(String(right));
+    if (!a || !b) continue;
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  }
+  ctx.stroke();
+  let stillGlowing = false;
+  for (const {x, y, node} of graphLayout.positions.values()) {
+    const colour = phosphorColor(node, now);
+    stillGlowing = stillGlowing || colour.active;
+    ctx.fillStyle = "rgba(" + colour.rgb.join(",") + "," + colour.alpha.toFixed(3) + ")";
+    if (colour.glow > .08) {
+      ctx.shadowColor = "rgb(" + colour.rgb.join(",") + ")";
+      ctx.shadowBlur = 2 + colour.glow * 10;
+    } else ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.arc(x, y, 2.2 + colour.glow * 2.8, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+  if (stillGlowing) graphFrame = requestAnimationFrame(drawProcessGraph);
+}
+
+function wireProcessGraphCanvas() {
+  document.querySelectorAll(".graph-view-button").forEach(button => {
+    button.addEventListener("click", () => {
+      activeGraphView = button.dataset.graphView;
+      document.querySelectorAll(".graph-view-button").forEach(candidate =>
+        candidate.setAttribute("aria-pressed", String(candidate === button))
+      );
+      prepareProcessGraph();
+    });
+  });
+  const decay = $("graph-decay");
+  if (decay) decay.addEventListener("input", () => drawProcessGraph(performance.now()));
+  const canvas = $("process-graph-canvas");
+  if (canvas) canvas.addEventListener("click", event => {
+    if (!graphLayout) return;
+    let best = null, distance = Infinity;
+    for (const position of graphLayout.positions.values()) {
+      const d = Math.hypot(position.x - event.offsetX, position.y - event.offsetY);
+      if (d < distance) { distance = d; best = position.node; }
+    }
+    if (best && distance < 12) {
+      const labels = (best.contributors || []).map(identity =>
+        (GRAPH_VIEWS.identities[identity] || {label: identity}).label
+      );
+      $("graph-node-inspector").textContent = best.id + " · " + best.type + " · level " +
+        best.level + " · group " + best.group + " · " + best.label +
+        " · contributors [" + labels.join(", ") + "]";
+    }
+  });
+  prepareProcessGraph();
+}
+
 function renderGraph() {
   const target = document.getElementById("graph");
   if (!target) return;
   let html = "";
-  if (GRAPH && GRAPH.nodes) {
+  if (GRAPH_VIEWS && GRAPH_VIEWS.views) {
+    const original = GRAPH_VIEWS.views.original || {nodes: []};
+    const reduced = GRAPH_VIEWS.views.reduced || {nodes: []};
+    html += '<div class="graph-toolbar">' +
+      '<button class="graph-view-button" data-graph-view="original" aria-pressed="true">Original ProcessGraph · ' + original.nodes.length + '</button>' +
+      '<button class="graph-view-button" data-graph-view="reduced" aria-pressed="false">Reduced ProcessGraph · ' + reduced.nodes.length + '</button>' +
+      '<label class="meta">phosphor decay <input id="graph-decay" type="range" min="80" max="5000" value="1200"> rolling window</label>' +
+      '</div><div class="meta">Rows preserve schedule levels; columns preserve groups. Region and feed identities mix at every node. Runtime profiles deposit coloured energy into an exponential rolling window, so sub-frame calls remain visible.</div>' +
+      '<div class="graph-scroll"><canvas id="process-graph-canvas"></canvas></div>' +
+      '<div id="graph-node-inspector" class="note node-detail">Click a node to inspect its contributors.</div>';
+  } else if (GRAPH && GRAPH.nodes) {
     const hist = Object.entries(GRAPH.histogram || {})
       .map(([k, v]) => '<span class="chip">' + k + " x" + v + "</span>").join("");
     const rows = (GRAPH.table || []).map(n =>
@@ -1024,28 +1258,59 @@ function renderGraph() {
   }
   if (CLASS_GRAPH && CLASS_GRAPH.schedule) {
     const moduleByName = new Map(CLASS_GRAPH.modules.map(module => [module.name, module]));
-    const deploymentRows = CLASS_GRAPH.schedule.nodes
-      .slice()
-      .sort((left, right) => left.level - right.level || left.id.localeCompare(right.id))
-      .map(node => {
+    const levels = new Map();
+    for (const node of CLASS_GRAPH.schedule.nodes) {
+      if (!levels.has(node.level)) levels.set(node.level, []);
+      levels.get(node.level).push(node);
+    }
+    const deploymentRows = Array.from(levels).sort((a, b) => a[0] - b[0]).map(([level, nodes]) => {
+      const cards = nodes.sort((a, b) => a.id.localeCompare(b.id)).map(node => {
         const module = moduleByName.get(node.id) || {};
-        return '<div class="kv deployment-node" data-module="' + node.id + '">' +
-          '<b>' + node.id + '</b><span>level ' + node.level + '</span><span>' +
-          (module.operation_count || 0) + ' ops</span><span class="meta">' +
-          (node.is_root ? "owns a logical output" : "private region") +
-          "</span></div>";
+        return '<div class="deployment-node" data-module="' + node.id + '" data-state="idle" tabindex="0">' +
+          '<b>' + node.id + '</b><span class="node-state">idle · ' +
+          (module.operation_count || 0) + ' ops</span></div>';
       }).join("");
-    html += '<div class="meta" style="margin-top:.7rem">Deployment overlay: ' +
-      CLASS_GRAPH.modules.length + ' private WASM regions behind the same API</div>' +
-      deploymentRows;
+      return '<div class="schedule-level"><div class="schedule-level-label">level ' + level +
+        '</div>' + cards + '</div>';
+    }).join("");
+    html += '<div class="meta" style="margin-top:.7rem">Live deployment schedule: ' +
+      CLASS_GRAPH.modules.length + ' punch cards sharing one global WASM memory. Click a node for its ABI.</div>' +
+      deploymentRows + '<div id="node-detail" class="note node-detail">Select a punch card.</div>';
   }
   target.innerHTML = html;
+  wireProcessGraphCanvas();
+  document.querySelectorAll(".deployment-node").forEach(node => {
+    const show = () => {
+      const spec = CLASS_GRAPH.modules.find(module => module.name === node.dataset.module) || {};
+      $("node-detail").textContent = spec.name + " · " + (spec.operation_count || 0) +
+        " operations · inputs [" + (spec.inputs || []).join(", ") + "] · outputs [" +
+        (spec.outputs || []).join(", ") + "] · ProcessGraph nodes [" +
+        (spec.node_ids || []).join(", ") + "]";
+    };
+    node.addEventListener("click", show);
+    node.addEventListener("keydown", event => { if (event.key === "Enter") show(); });
+  });
 }
 
-function markDeploymentNode(moduleName) {
-  document.querySelectorAll(".deployment-node").forEach(node =>
-    node.classList.toggle("lit", node.dataset.module === moduleName)
-  );
+function markDeploymentNode(moduleName, state, elapsedMs) {
+  const node = document.querySelector('.deployment-node[data-module="' + CSS.escape(moduleName) + '"]');
+  if (!node) return;
+  node.dataset.state = state;
+  const label = node.querySelector(".node-state");
+  const calls = Number(node.dataset.calls || 0) + (state === "done" ? 1 : 0);
+  if (state === "done") node.dataset.calls = String(calls);
+  const timing = elapsedMs === undefined ? "" : " · " + elapsedMs.toFixed(3) + " ms";
+  if (label) label.textContent = state + timing + (calls ? " · " + calls + " calls" : "");
+  if (state === "done") {
+    const spec = CLASS_GRAPH.modules.find(module => module.name === moduleName);
+    if (spec) pulseGraphNodes(spec.node_ids, elapsedMs);
+  }
+}
+
+function markContiguousState(state, elapsedMs) {
+  const label = $("contiguous-state");
+  if (!label) return;
+  label.textContent = state + (elapsedMs === undefined ? "" : " · " + elapsedMs.toFixed(3) + " ms");
 }
 
 function wireSourceTabs() {
@@ -1056,6 +1321,45 @@ function wireSourceTabs() {
       document.querySelectorAll(".srcview").forEach(v => {
         v.hidden = v.dataset.lang !== tab.dataset.lang;
       });
+    });
+  });
+  document.querySelectorAll(".download-source").forEach(button => {
+    button.addEventListener("click", async () => {
+      const descriptor = SOURCE_DOWNLOADS.find(source => source.language === button.dataset.lang);
+      if (!descriptor || !descriptor.url) return;
+      button.disabled = true;
+      const old = button.textContent;
+      button.textContent = "Downloading…";
+      try {
+        const response = await fetch(descriptor.url);
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const blob = await response.blob();
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = href; link.download = descriptor.filename || descriptor.url.split("/").pop();
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(href), 1000);
+        log("ok", "source downloaded", {language: descriptor.language, bytes: blob.size});
+      } catch (error) {
+        log("error", "source download failed", {language: descriptor.language, message: error.message});
+      } finally {
+        button.disabled = false; button.textContent = old;
+      }
+    });
+  });
+}
+
+function wireExecutionModes() {
+  document.querySelectorAll(".execution-mode").forEach(button => {
+    button.addEventListener("click", () => {
+      if (running) return;
+      activeExecutionMode = button.dataset.mode;
+      document.querySelectorAll(".execution-mode").forEach(candidate =>
+        candidate.setAttribute("aria-pressed", String(candidate === button))
+      );
+      setStatus(activeExecutionMode === "staged"
+        ? "staged punch cards selected; regions download on first use"
+        : "contiguous compile selected; full module downloads on first use", "good");
     });
   });
 }
@@ -1148,6 +1452,7 @@ $("copylog").addEventListener("click", () => {
 });
 wireFilters();
 wireSourceTabs();
+wireExecutionModes();
 renderGraph();
 
 log("info", "shell ready", {
@@ -1156,7 +1461,8 @@ log("info", "shell ready", {
   valueType: API.metadata.value_type,
   embedded: Boolean(WASM_BASE64)
 });
-if (moduleBytes || CLASS_GRAPH) setStatus("module embedded, ready", "good");
+if (moduleBytes) setStatus("module embedded, ready", "good");
+else if (CLASS_GRAPH) setStatus("manifest ready; staged artifacts are still unloaded", "good");
 """
 
 
@@ -1275,10 +1581,18 @@ def _source_tabs(sources: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
             f'aria-selected="{selected}">{_escape(str(entry["title"]))}{mark}</div>'
         )
         if entry.get("available"):
-            body = (
-                f'<div class="meta">{lines} lines</div>'
-                f"<pre>{_escape(str(entry.get('source') or ''))}</pre>"
-            )
+            if entry.get("url"):
+                body = (
+                    f'<div class="meta">{lines} lines &middot; not loaded</div>'
+                    f'<button class="download-source" data-lang="{_escape(language)}">'
+                    f'Download {_escape(str(entry["title"]))} source</button>'
+                    '<div class="meta">The file is fetched only after this button is clicked.</div>'
+                )
+            else:
+                body = (
+                    f'<div class="meta">{lines} lines</div>'
+                    f"<pre>{_escape(str(entry.get('source') or ''))}</pre>"
+                )
         else:
             body = (
                 '<div class="note">This backend did not serve the program: '
@@ -1327,6 +1641,7 @@ def emit_html_shell(
     backend_sources: Any = None,
     network_manifest: Mapping[str, Any] | None = None,
     class_graph: Mapping[str, Any] | None = None,
+    graph_views: Mapping[str, Any] | None = None,
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -1395,7 +1710,21 @@ def emit_html_shell(
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
         .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
+        .replace("__GRAPH_VIEWS__", json.dumps(dict(graph_views or {}), default=str))
         .replace("__NETWORK__", json.dumps(network_mapping, default=str))
+        .replace("__SOURCE_DOWNLOADS__", json.dumps([
+            {
+                "language": str(entry.get("language", "")),
+                "url": str(entry.get("url", "")),
+                "filename": str(entry.get("filename", "")),
+            }
+            for entry in (
+                backend_sources.to_mapping()["sources"]
+                if hasattr(backend_sources, "to_mapping")
+                else list(backend_sources or [])
+            )
+            if entry.get("url")
+        ], default=str))
         .replace(
             "__CLASS_GRAPH__",
             json.dumps(dict(class_graph), default=str) if class_graph else "null",
@@ -1406,7 +1735,18 @@ def emit_html_shell(
         "__TELEMETRY__", json.dumps(telemetry_mapping, default=str)
     )
 
-    if wasm_bytes or class_graph:
+    external_class_graph = bool(
+        class_graph and any(module.get("url") for module in class_graph.get("modules", ()))
+    )
+    if external_class_graph:
+        banner = (
+            '<div class="note good">Versioned deployment manifest loaded. '
+            'WebAssembly regions, the contiguous compile, and language source '
+            'files remain unloaded until their corresponding run or download action.</div>'
+        )
+        picker = ""
+        disabled = ""
+    elif wasm_bytes or class_graph:
         banner = (
             '<div class="note good">Binary embedded &mdash; this file is '
             "self-contained and runs offline.</div>"
@@ -1442,9 +1782,36 @@ def emit_html_shell(
     else:
         source_entries = list(backend_sources)
     source_tabs, source_views = _source_tabs(source_entries)
+    lazy_sources = any(entry.get("url") for entry in source_entries)
+    original_source_body = (
+        '<div class="meta">Use the Python source download above; it has not been loaded.</div>'
+        if lazy_sources else f'<pre>{_escape(origin_source)}</pre>'
+    )
+    emitted_source_body = (
+        '<div class="meta">Use the WebAssembly source download above; it has not been loaded.</div>'
+        if lazy_sources else f'<pre>{_escape(source)}</pre>'
+    )
 
     note = entry.get("note")
     note_html = f'<div class="note">{_escape(str(note))}</div>' if note else ""
+    execution_modes_html = ""
+    if class_graph:
+        contiguous = dict(class_graph).get("contiguous")
+        contiguous_button = (
+            '<button class="execution-mode" data-mode="contiguous" aria-pressed="false">'
+            'Lazy contiguous compile</button>'
+            if contiguous else ""
+        )
+        execution_modes_html = (
+            '<div class="panel"><div class="panel-title">Execution shape</div>'
+            '<div class="meta">Switch the same object and API between shared-memory '
+            'punch cards and a full contiguous compile. Neither artifact downloads until '
+            'its first run.</div><div class="execution-modes">'
+            '<button class="execution-mode" data-mode="staged" aria-pressed="true">'
+            'Staged punch cards</button>' + contiguous_button + '</div>'
+            '<div class="stat"><span>shared globals · offset ABI · zero tensor seam copies</span>'
+            '<span id="contiguous-state">contiguous not loaded</span></div></div>'
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1468,6 +1835,8 @@ def emit_html_shell(
     <div class="panel-title">Signature</div>
     {_signature_rows(parameters)}
   </div>
+
+  {execution_modes_html}
 
   <div class="panel">
     <div class="panel-title">Domain</div>
@@ -1579,14 +1948,14 @@ def emit_html_shell(
   <div class="panel">
     <details>
       <summary>Original source</summary>
-      <pre>{_escape(origin_source)}</pre>
+      {original_source_body}
     </details>
   </div>
 
   <div class="panel">
     <details>
       <summary>Emitted source</summary>
-      <pre>{_escape(source)}</pre>
+      {emitted_source_body}
     </details>
   </div>
 

@@ -159,6 +159,22 @@ def partition_reduced_program(
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
 
+    # A capture may retain observed values after the declared result. Those
+    # nodes are not part of the executable program and must not become a
+    # trailing deployment region that consumes live tensors and produces
+    # nothing. Prune once, before graph projection, so every later boundary
+    # calculation sees only the output-reachable calculation.
+    from .fused_program_wasm_backend import required_steps
+
+    program = FusedProgram(
+        version=program.version,
+        feeds=set(program.feeds),
+        steps=required_steps(program),
+        outputs=dict(program.outputs),
+        state_in=program.state_in,
+        meta=program.meta,
+        extras=program.extras,
+    )
     graph = fused_program_to_process_graph(program)
     topological = tuple(
         nx.lexicographical_topological_sort(graph.G, key=lambda n: int(n))
@@ -221,7 +237,7 @@ def partition_reduced_program(
 
 def emit_class_modules(
     specs: Sequence[ClassModuleSpec], *, dtype: str | None = None,
-    link_calls: bool = True,
+    link_calls: bool = True, shared_memory: bool = False,
 ):
     """Emit one ``WasmModule`` per spec, optionally import-linked.
 
@@ -230,10 +246,15 @@ def emit_class_modules(
     ``DispatchRegion`` cut), so unlike the closure-based approach this
     replaces, there is no separate numeric-lowering step to hand in.
 
-    ``link_calls`` controls whether a dependency gets a real WASM
+    ``shared_memory`` emits independently downloadable host-scheduled punch
+    cards that all import ``env.memory``. Their static data receives disjoint
+    absolute addresses and the browser passes graph-derived offsets, so no
+    tensor payload crosses JavaScript at a region seam.
+
+    ``link_calls`` is the older experimental mode controlling whether a dependency gets a real WASM
     import/export declaration (``WasmImport``, proven end to end in
     ``test_wasm_binary.py``) or none at all, for a page that instead carries
-    values between modules itself (``process_graph_runner.js``). See
+    values between independently owned memories itself. See
     ``test_wasm_binary.py``'s ``_main_module`` for how a caller's body would
     actually invoke a linked import -- nothing in this file writes that call
     for the caller yet.
@@ -242,10 +263,31 @@ def emit_class_modules(
     from .fused_program_wasm_backend import emit_wasm_module
     from .wasm_binary import WasmImport
 
+    if shared_memory and link_calls:
+        raise ValueError(
+            "shared-memory punch cards are host-scheduled; link_calls must be false"
+        )
+
     modules: dict[int, object] = {}
+    static_cursor = 0
     for spec in specs:
         imports: list[WasmImport] = []
-        if link_calls:
+        static_data_offset = 0
+        if shared_memory:
+            # Discover this module's private static payload, then place that
+            # payload at a unique address in the one imported memory. The
+            # final emission bakes absolute table/constant addresses into the
+            # punch card, so no instantiation can overwrite a peer's data.
+            probe = emit_wasm_module(spec.program, name=spec.module_name, dtype=dtype)
+            alignment = max(8, int(probe.api.metadata.get("element_bytes", 8)))
+            static_cursor = ((static_cursor + alignment - 1) // alignment) * alignment
+            static_data_offset = static_cursor
+            local_static_bytes = int(probe.api.metadata.get("reserved_bytes", 0))
+            imports.append(WasmImport(
+                module="env", field="memory", kind="memory", memory_pages=1,
+            ))
+            static_cursor += local_static_bytes
+        elif link_calls:
             for call in spec.calls:
                 callee_module = modules[call.callee_index]
                 imports.append(WasmImport(
@@ -265,6 +307,7 @@ def emit_class_modules(
             name=spec.module_name,
             dtype=dtype,
             imports=imports,
+            static_data_offset=static_data_offset,
         )
     return modules
 
@@ -403,6 +446,8 @@ def build_manifest(
             "element_bytes": module.api.metadata.get("element_bytes", 8),
             "memory_export": module.api.metadata.get("memory_export", "memory"),
             "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
+            "static_data_offset": module.api.metadata.get("static_data_offset", 0),
+            "shared_memory_import": module.api.metadata.get("shared_memory_import", {}),
             "operation_count": len(spec.region.node_ids),
             "node_ids": list(spec.region.node_ids),
             "is_root": spec.is_root,
@@ -429,10 +474,18 @@ def build_manifest(
                     (value_id, input_name)
                 )
 
+    shared_memory = all(
+        bool(entry.get("shared_memory_import")) for entry in module_entries
+    ) if module_entries else False
     return {
         "modules": module_entries,
         "edges": edges,
         "graph_input_value_ids": graph_input_value_ids,
+        "shared_memory": shared_memory,
+        "shared_static_bytes": max(
+            (int(entry.get("reserved_bytes", 0)) for entry in module_entries),
+            default=0,
+        ),
     }
 
 
@@ -519,6 +572,8 @@ def build_embedded_class_graph(
         "root_outputs": root_entry["outputs"],
         "logical_outputs": logical_outputs,
         "schedule": schedule_table(specs),
+        "shared_memory": manifest["shared_memory"],
+        "shared_static_bytes": manifest["shared_static_bytes"],
     }
 
 
@@ -625,6 +680,164 @@ def describe_process_graph_api(
     )
 
 
+def build_hued_process_graph_views(
+    original_graph,
+    program: FusedProgram,
+    specs: Sequence[ClassModuleSpec],
+) -> dict:
+    """Describe original and reduced schedules with provenance hue identities.
+
+    Hues identify concepts and deployment regions; they are not final pixel
+    colours. The web shell mixes every identity reaching a node and applies
+    its rolling phosphor/decay function at draw time, so profiling pulses can
+    accumulate even when execution is faster than the display refresh.
+    """
+
+    import networkx as nx
+    from .fused_program_wasm_backend import required_steps
+
+    identities: dict[str, dict] = {}
+
+    def stable_hue(label: str) -> float:
+        return float(sum((i + 1) * ord(ch) for i, ch in enumerate(label)) % 360)
+
+    def add_identity(identity: str, label: str, kind: str, hue: float | None = None):
+        identities.setdefault(identity, {
+            "label": label,
+            "kind": kind,
+            "hue": stable_hue(identity) if hue is None else float(hue) % 360.0,
+        })
+
+    def levels_of(nx_graph) -> dict:
+        if nx.is_directed_acyclic_graph(nx_graph):
+            return {
+                node_id: level
+                for level, generation in enumerate(nx.topological_generations(nx_graph))
+                for node_id in generation
+            }
+        return {node_id: 0 for node_id in nx_graph.nodes}
+
+    def node_payload(nx_graph, contributors, groups, regions=None):
+        levels = levels_of(nx_graph)
+        nodes = []
+        for node_id, data in nx_graph.nodes(data=True):
+            nodes.append({
+                "id": str(node_id),
+                "label": str(data.get("label") or data.get("op") or data.get("type") or node_id)[:96],
+                "type": str(data.get("type") or data.get("op") or "?"),
+                "level": int(levels.get(node_id, 0)),
+                "group": int(groups.get(node_id, 0)),
+                "region": None if regions is None else regions.get(node_id),
+                "contributors": sorted(contributors.get(node_id, ())),
+            })
+        return {
+            "nodes": nodes,
+            "edges": [[str(left), str(right)] for left, right in nx_graph.edges],
+            "level_min": min(levels.values(), default=0),
+            "level_max": max(levels.values(), default=0),
+            "groups": max(groups.values(), default=-1) + 1,
+        }
+
+    # Original AST ProcessGraph: top-level functions are the conceptual
+    # identities. Every structural node in a function's ancestry keeps that
+    # identity, while the Module/root naturally mixes all four.
+    original_nx = getattr(original_graph, "G", original_graph)
+    original_contributors: dict[object, set[str]] = {
+        node_id: set() for node_id in original_nx.nodes
+    }
+    original_groups: dict[object, int] = {}
+    functions = [
+        node_id for node_id, data in original_nx.nodes(data=True)
+        if str(data.get("type")) == "FunctionDef"
+    ]
+    for group, function_id in enumerate(functions):
+        data = original_nx.nodes[function_id]
+        name = next((
+            str(original_nx.nodes[parent].get("label"))
+            for parent, role in data.get("parents", ())
+            if role == "name" and parent in original_nx
+        ), f"function_{group}")
+        identity = f"concept:{name}"
+        add_identity(identity, name, "concept")
+        members = nx.ancestors(original_nx, function_id) | {function_id}
+        for node_id in members:
+            original_contributors[node_id].add(identity)
+            original_groups.setdefault(node_id, group)
+    structural = "concept:program-structure"
+    add_identity(structural, "program structure", "concept", 210.0)
+    for node_id in original_nx.nodes:
+        if not original_contributors[node_id]:
+            inherited = set().union(*(
+                original_contributors.get(parent, set())
+                for parent in original_nx.predecessors(node_id)
+            ))
+            original_contributors[node_id] = inherited or {structural}
+        original_groups.setdefault(node_id, len(functions))
+
+    # Reduced graph: every region is a procedural identity. Identities flow
+    # through dependencies, so an operation after a seam carries the mixed
+    # colours of every region that materially contributes to it.
+    live_program = FusedProgram(
+        version=program.version, feeds=set(program.feeds),
+        steps=required_steps(program), outputs=dict(program.outputs),
+        state_in=program.state_in, meta=program.meta, extras=program.extras,
+    )
+    reduced = fused_program_to_process_graph(live_program)
+    reduced_nx = reduced.G
+    region_of = {
+        node_id: spec.index
+        for spec in specs for node_id in spec.region.node_ids
+    }
+    for spec in specs:
+        add_identity(
+            f"region:{spec.index}", spec.module_name, "region",
+            360.0 * spec.index / max(1, len(specs)),
+        )
+    origins = (program.extras or {}).get("capture_feed_origins", {}) or {}
+    for feed_id in program.feeds:
+        name = str((origins.get(feed_id) or {}).get("binding_name") or f"feed_{feed_id}")
+        add_identity(f"feed:{name}", name, "feed")
+
+    reduced_contributors: dict[object, set[str]] = {}
+    reduced_groups: dict[object, int] = {}
+    order = (
+        list(nx.topological_sort(reduced_nx))
+        if nx.is_directed_acyclic_graph(reduced_nx) else list(reduced_nx.nodes)
+    )
+    for node_id in order:
+        contributors = set().union(*(
+            reduced_contributors.get(parent, set())
+            for parent in reduced_nx.predecessors(node_id)
+        ))
+        if node_id in program.feeds:
+            name = str((origins.get(node_id) or {}).get("binding_name") or f"feed_{node_id}")
+            contributors.add(f"feed:{name}")
+        region = region_of.get(node_id)
+        if region is not None:
+            contributors.add(f"region:{region}")
+            reduced_groups[node_id] = region
+        else:
+            parent_groups = [
+                reduced_groups[parent] for parent in reduced_nx.predecessors(node_id)
+                if parent in reduced_groups
+            ]
+            reduced_groups[node_id] = parent_groups[0] if parent_groups else 0
+        reduced_contributors[node_id] = contributors or {structural}
+
+    return {
+        "schema": "turing-process-graph-hues-v1",
+        "identities": identities,
+        "views": {
+            "original": node_payload(
+                original_nx, original_contributors, original_groups,
+            ),
+            "reduced": node_payload(
+                reduced_nx, reduced_contributors, reduced_groups, region_of,
+            ),
+        },
+    }
+
+
 def _entry_field(module) -> str:
     """The exported entry-point name a callee module's ``run`` function is
     reachable under -- ``emit_wasm_module`` always names it from its own
@@ -646,6 +859,7 @@ __all__ = [
     "ClassModuleCallSite",
     "ClassModuleSpec",
     "build_embedded_class_graph",
+    "build_hued_process_graph_views",
     "build_manifest",
     "build_module_process_graph",
     "describe_process_graph_api",

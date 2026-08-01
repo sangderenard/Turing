@@ -207,16 +207,21 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
             "wasm_base64": "AGFzbQEAAAA=",
             "entry": "kernel__0",
             "reserved_bytes": 24,
-            "inputs": [{"name": "feed0"}],
-            "outputs": [{"name": "value_2"}],
+            "inputs": ["feed0"],
+            "outputs": ["value_2"],
+            "value_type": "f64",
+            "element_bytes": 8,
+            "shared_memory_import": {"module": "env", "field": "memory"},
         }],
         "edges": [],
         "logical_inputs": {"feed0": [["private_region_0", "feed0"]]},
         "logical_outputs": {"result": ["private_region_0", "value_2"]},
         "root_module": "private_region_0",
         "root_outputs": ["value_2"],
+        "shared_memory": True,
+        "shared_static_bytes": 24,
         "schedule": {
-            "nodes": [{"name": "private_region_0", "level": 0,
+            "nodes": [{"id": "private_region_0", "level": 0,
                        "operation_count": 1, "is_root": True}],
             "levels": [{"level": 0, "modules": ["private_region_0"]}],
         },
@@ -228,12 +233,39 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
                        "table": [], "truncated": False},
     ).html
 
-    assert "source.slice(0, count)" in html
-    assert "spec.reserved_bytes || 0" in html
-    assert "logical_outputs[parameter.name]" in html
-    assert "Deployment overlay:" in html
+    assert "new WebAssembly.Memory" in html
+    assert "WebAssembly.instantiate(moduleBinary, imports)" in html
+    assert "No live tensor is copied through" in html
+    assert "shared-memory slot" in html
+    assert "Live deployment schedule:" in html
     assert "await fetch(spec.url)" in html
     assert "one element per call today" not in html
+
+
+def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():
+    html = emit_html_shell(
+        _artifact().api,
+        backend_sources=[{
+            "language": "fortran", "title": "Fortran", "available": True,
+            "source": "SECRET SOURCE BODY", "lines": 1,
+            "url": "site/v2/source/render/fortran/render.f90",
+            "filename": "render.f90",
+        }],
+    ).html
+
+    assert "SECRET SOURCE BODY" not in html
+    assert "site/v2/source/render/fortran/render.f90" in html
+    assert "The file is fetched only after this button is clicked" in html
+    assert 'button.addEventListener("click", async () =>' in html
+    assert "await fetch(descriptor.url)" in html
+
+
+def test_graph_phosphor_integrates_profile_pulses_with_decay():
+    html = shell_for_artifact(_artifact()).html
+    assert "function phosphorColor(node, now)" in html
+    assert "Math.exp(-age / decay)" in html
+    assert "pulseGraphNodes(spec.node_ids, elapsedMs)" in html
+    assert 'id="graph-decay"' in html or "graph-decay" in html
 
 
 def test_an_edited_descriptor_does_not_pretend_to_apply():

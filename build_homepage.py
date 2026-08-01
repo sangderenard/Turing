@@ -12,9 +12,10 @@ The kernel is a Mandelbrot escape count, chosen because it is short enough
 to read in full and its output is a picture, so a wrong answer is visible
 rather than a number nobody checks.
 
-The page is a single self-contained file -- the ``.wasm`` is embedded as
-base64 -- so GitHub Pages needs nothing but ``index.html`` at the repository
-root, and it works opened from disk too.
+The page is a small manifest shell. Versioned staged and contiguous ``.wasm``
+artifacts are fetched only when selected for execution, and versioned language
+sources are fetched only after an explicit Download click. GitHub Pages serves
+the root shell and ``site/v2/`` artifact tree together.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from src.compiler.fused_program_wasm_backend import emit_wasm_module, required_s
 from src.compiler.shell_telemetry import TelemetryChannel, summarize_process_graph
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph,
+    build_hued_process_graph_views,
     describe_process_graph_api,
     emit_class_modules,
     partition_reduced_program,
@@ -47,12 +49,48 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 # more iterations refines the boundary rather than changing what it means.
 ITERATIONS = 160
 WASM_REGION_STEPS = 400
-WASM_MODULE_DIR = "site/v1/wasm"
+SITE_VERSION = "v2"
+WASM_MODULE_DIR = f"site/{SITE_VERSION}/wasm"
+SOURCE_MODULE_DIR = f"site/{SITE_VERSION}/source/render"
 
 # The orbit is clamped so a diverging point cannot reach infinity and poison
 # the arithmetic; well above the escape radius, so it never touches a point
 # that is still inside.
 ORBIT_CLAMP = 1.0e18
+
+
+_SOURCE_EXTENSIONS = {
+    "python_source": "py", "ssa": "ssa", "fortran": "f90",
+    "spirv": "spvasm", "glsl": "comp.glsl", "wat": "wat",
+    "numpy": "py", "torch": "py", "abstract_tensor": "py",
+}
+
+
+def _write_source_downloads(destination: Path, sources) -> list[dict]:
+    """Write versioned source artifacts; return metadata without bodies."""
+
+    entries = [{
+        "language": "python_source", "title": "Original Python",
+        "source": KERNEL, "available": True, "reason": "",
+        "highlight": "python", "lines": KERNEL.count("\n") + 1,
+    }, *sources.to_mapping()["sources"]]
+    published = []
+    for entry in entries:
+        item = dict(entry)
+        source = str(item.pop("source", "") or "")
+        if item.get("available"):
+            language = str(item["language"])
+            extension = _SOURCE_EXTENSIONS.get(language, "txt")
+            filename = f"render.{extension}"
+            relative = Path(SOURCE_MODULE_DIR) / language / filename
+            path = destination / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+            item["url"] = relative.as_posix()
+            item["filename"] = filename
+            item["bytes"] = len(source.encode("utf-8"))
+        published.append(item)
+    return published
 
 KERNEL = f"""
 def interest_network(unit_x, unit_y, interest):
@@ -331,12 +369,18 @@ def build(destination: Path) -> Path:
                 specs,
                 dtype="float64",
                 link_calls=False,
+                shared_memory=True,
+            )
+            contiguous_module = emit_wasm_module(
+                wanted, name=f"{aot.entrypoint}_contiguous", dtype="float64",
             )
             incomplete = [
                 (spec, modules[spec.index])
                 for spec in specs
                 if not modules[spec.index].complete
             ]
+            if not contiguous_module.complete:
+                incomplete.append((None, contiguous_module))
             if incomplete:
                 raise SystemExit("\n".join(
                     module.shortfall_report()
@@ -356,12 +400,33 @@ def build(destination: Path) -> Path:
                 embed_binaries=False,
                 module_dir=WASM_MODULE_DIR,
             )
+            contiguous_entry = contiguous_module.api.entry_points[0]
+            class_graph["contiguous"] = {
+                "name": contiguous_module.name,
+                "url": f"{WASM_MODULE_DIR}/{contiguous_module.name}.wasm",
+                "entry": contiguous_module.api.entry,
+                "inputs": [
+                    parameter.name for parameter in contiguous_entry.parameters
+                    if parameter.role == "input"
+                ],
+                "outputs": [
+                    parameter.name for parameter in contiguous_entry.parameters
+                    if parameter.role == "output"
+                ],
+                "value_type": contiguous_module.api.metadata.get("value_type", "f64"),
+                "element_bytes": contiguous_module.api.metadata.get("element_bytes", 8),
+                "memory_export": contiguous_module.api.metadata.get("memory_export", "memory"),
+                "reserved_bytes": contiguous_module.api.metadata.get("reserved_bytes", 0),
+                "operation_count": len(required_steps(wanted)),
+            }
+            class_graph["runtime_version"] = f"{SITE_VERSION}-shared-memory"
+            graph_views = build_hued_process_graph_views(graph, wanted, specs)
             segmented_source = "\n\n".join(
                 modules[spec.index].source for spec in specs
             )
             wasm_bytes = sum(
                 len(modules[spec.index].binary) for spec in specs
-            )
+            ) + len(contiguous_module.binary)
         channel.profile("assembled", path="wasm", nanoseconds=0,
                         bytes=wasm_bytes, regions=len(specs))
         advance("wasm")
@@ -373,17 +438,19 @@ def build(destination: Path) -> Path:
                 wasm_source=segmented_source,
                 program=wanted,
             )
+            source_entries = _write_source_downloads(destination, sources)
         advance("sources")
 
     shell = emit_html_shell(
         api,
-        source=segmented_source,
+        source="",
         class_graph=class_graph,
         name="index",
         telemetry=channel,
         process_graph=summarize_process_graph(graph),
-        origin_source=KERNEL,
-        backend_sources=sources,
+        origin_source="",
+        backend_sources=source_entries,
+        graph_views=graph_views,
         network_manifest={
             "name": "Mandelbrot future-detail controller",
             "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},
@@ -430,6 +497,9 @@ def build(destination: Path) -> Path:
             "deepest span": "1.6 * 2^-36",
             "steps": len(required_steps(wanted)),
             "WASM regions": len(specs),
+            "execution ABI": "shared memory + coordinator-composed offsets",
+            "alternate": "lazy contiguous full compile",
+            "site artifact version": SITE_VERSION,
             "region step cap": WASM_REGION_STEPS,
             "wasm bytes": wasm_bytes,
             "interest model": "frozen 3→2→1 tanh network",
@@ -444,6 +514,9 @@ def build(destination: Path) -> Path:
         (region_directory / f"{spec.module_name}.wasm").write_bytes(
             modules[spec.index].binary
         )
+    (region_directory / f"{contiguous_module.name}.wasm").write_bytes(
+        contiguous_module.binary
+    )
     served = len(sources.available())
     print(f"{served}/{len(sources.sources)} backends emitted this program")
     for entry in sources.sources:
@@ -451,7 +524,7 @@ def build(destination: Path) -> Path:
         print(f"  {entry.title:16} {state} {entry.lines:6} lines"
               f"  {entry.reason[:60]}")
     print(f"wrote {written} ({written.stat().st_size // 1024} KB)")
-    print(f"wrote {len(specs)} lazy WASM regions to {region_directory}")
+    print(f"wrote {len(specs)} shared-memory WASM regions and one contiguous module to {region_directory}")
     return written
 
 

@@ -10,7 +10,7 @@ import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.wasm_class_modules import (
-    build_embedded_class_graph, build_manifest, build_module_process_graph,
+    build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
     partition_reduced_program, schedule_module_levels,
 )
@@ -92,6 +92,22 @@ def test_an_empty_program_still_produces_one_root_module():
     assert specs[0].is_root
 
 
+def test_partition_prunes_a_dead_tail_after_the_declared_output():
+    program = FusedProgram(
+        version=1, feeds={1},
+        steps=[
+            OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2),
+            OpStep(1, "mul", [2], {"right_scalar": 3.0}, 3),
+            OpStep(2, "mul", [3], {"right_scalar": 4.0}, 4),
+        ],
+        outputs={"result": 2},
+    )
+    specs = partition_reduced_program(program, chunk_size=1, owner_name="kernel")
+    assert len(specs) == 1
+    assert specs[0].region.node_ids == (2,)
+    assert specs[0].region.outputs == (("result", 2),)
+
+
 # --- emission: real, independently-lowered modules per chunk ---------------
 
 
@@ -121,6 +137,39 @@ def test_link_calls_false_produces_independently_instantiable_modules():
     modules = emit_class_modules(specs, link_calls=False)
     for module in modules.values():
         assert 2 not in _section_ids_of(module.binary)
+
+
+def test_shared_memory_modules_import_one_global_memory_with_disjoint_static_data():
+    program = FusedProgram(
+        version=1, feeds={1},
+        steps=[
+            OpStep(0, "sin", [1], {}, 2),
+            OpStep(1, "cos", [2], {}, 3),
+        ],
+        outputs={"result": 3},
+    )
+    specs = partition_reduced_program(program, chunk_size=1, owner_name="kernel")
+    modules = emit_class_modules(
+        specs, link_calls=False, shared_memory=True, dtype="float64",
+    )
+    manifest = build_manifest(specs, modules)
+
+    assert manifest["shared_memory"] is True
+    assert manifest["shared_static_bytes"] > 0
+    first, second = (modules[spec.index] for spec in specs)
+    assert 2 in _section_ids_of(first.binary)
+    assert 2 in _section_ids_of(second.binary)
+    assert second.api.metadata["static_data_offset"] >= first.api.metadata["reserved_bytes"]
+    assert all(
+        module.api.metadata["shared_memory_import"] == {"module": "env", "field": "memory"}
+        for module in modules.values()
+    )
+
+
+def test_shared_memory_and_function_linking_are_distinct_modes():
+    specs = partition_reduced_program(_linear_program(2), chunk_size=1, owner_name="kernel")
+    with pytest.raises(ValueError, match="link_calls must be false"):
+        emit_class_modules(specs, link_calls=True, shared_memory=True)
 
 
 def _section_ids_of(binary: bytes) -> list[int]:
@@ -421,3 +470,27 @@ def test_describe_process_graph_api_falls_back_to_a_synthetic_name():
     api = describe_process_graph_api(specs, modules, program, entrypoint="kernel")
     inputs = [p.name for p in api.entry_points[0].parameters if p.role == "input"]
     assert inputs == ["input_1"]
+
+
+def test_hue_identities_trickle_through_the_reduced_schedule():
+    import networkx as nx
+    from types import SimpleNamespace
+
+    original = nx.DiGraph()
+    original.add_node("source", type="Load", label="x")
+    original.add_node("result", type="Return", label="return")
+    original.add_edge("source", "result")
+
+    program = _linear_program(3)
+    specs = partition_reduced_program(program, chunk_size=1, owner_name="kernel")
+    views = build_hued_process_graph_views(
+        SimpleNamespace(G=original), program, specs,
+    )
+
+    assert set(views["views"]) == {"original", "reduced"}
+    assert all(f"region:{index}" in views["identities"] for index in range(3))
+    reduced = {node["id"]: node for node in views["views"]["reduced"]["nodes"]}
+    assert {"region:0", "region:1", "region:2"}.issubset(
+        set(reduced["102"]["contributors"])
+    )
+    assert reduced["102"]["level"] > reduced["100"]["level"]

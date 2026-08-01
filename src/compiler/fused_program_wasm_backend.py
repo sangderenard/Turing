@@ -265,6 +265,7 @@ def emit_wasm_module(
     function_name: str = "run",
     dtype: str | None = None,
     imports: Sequence[object] = (),
+    static_data_offset: int = 0,
 ) -> WasmModule:
     """Lower one elementwise ``FusedProgram`` to a WAT module.
 
@@ -281,7 +282,9 @@ def emit_wasm_module(
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
     live = required_steps(program)
-    static_data = plan_static_data(live, value_type)
+    static_data = plan_static_data(
+        live, value_type, data_offset=static_data_offset,
+    )
     shortfalls.extend(static_data["shortfalls"])
 
     feed_ids = program_feed_order(program)
@@ -352,11 +355,21 @@ def emit_wasm_module(
         body.append(f"      {store}")
 
     parameter_text = " ".join(f"(param {p} i32)" for p in parameters)
+    memory_import = next(
+        (entry for entry in imports if getattr(entry, "kind", None) == "memory"),
+        None,
+    )
+    memory_declaration = (
+        f'  (import "{memory_import.module}" "{memory_import.field}" (memory '
+        f'{memory_import.memory_pages}))'
+        if memory_import is not None
+        else '  (memory (export "memory") 1)'
+    )
     lines = [
         f"(module ;; {name}",
-        "  ;; The caller owns memory: it writes the feeds in and reads the",
-        "  ;; outputs back. A fused elementwise program keeps no state.",
-        "  (memory (export \"memory\") 1)",
+        "  ;; The coordinator owns memory and passes byte offsets. A fused",
+        "  ;; elementwise program keeps no private tensor state.",
+        memory_declaration,
         f"  (func (export \"{function_name}\") {parameter_text}",
         *(f"    {declaration}" for declaration in locals_declared),
         "    (block $done",
@@ -383,6 +396,11 @@ def emit_wasm_module(
     reserved = static_data["reserved_bytes"]
     api = _describe(name, function_name, feed_ids, output_ids, value_type,
                     element_bytes, reserved,
+                    static_data_offset=static_data_offset,
+                    shared_memory_import=(
+                        {"module": memory_import.module, "field": memory_import.field}
+                        if memory_import is not None else None
+                    ),
                     input_names=feed_names(program, feed_ids),
                     output_names=list(program.outputs.keys()))
     binary = None
@@ -643,6 +661,7 @@ def _assemble(
         body=builder,
         memory_pages=pages,
         data=data,
+        data_offset=int(tables.get("data_offset", 0)),
         imports=imports,
     )
 
@@ -777,12 +796,19 @@ def plan_tables(ops, epsilon: float | None = None) -> dict:
 def plan_static_data(
     steps: Sequence[OpStep],
     value_type: str,
+    *,
+    data_offset: int = 0,
 ) -> dict[str, Any]:
     """Pack lookup tables and varying tensor constants into module memory."""
+
+    if data_offset < 0:
+        raise ValueError("static data offset must be non-negative")
 
     import struct as _struct
 
     tables = plan_tables(sorted({step.op_name for step in steps} & _LUT_OPS))
+    for entry in tables["entries"].values():
+        entry["base"] += data_offset
     payload = bytearray(tables["data"])
     element_bytes = 4 if value_type == "f32" else 8
     pack_format = "<f" if value_type == "f32" else "<d"
@@ -802,7 +828,7 @@ def plan_static_data(
         padding = (-len(payload)) % element_bytes
         if padding:
             payload.extend(bytes(padding))
-        base = len(payload)
+        base = data_offset + len(payload)
         for value in values:
             payload.extend(_struct.pack(pack_format, value))
         constants[step.result_id] = {
@@ -814,7 +840,8 @@ def plan_static_data(
         "entries": tables["entries"],
         "constants": constants,
         "data": bytes(payload),
-        "reserved_bytes": len(payload),
+        "data_offset": data_offset,
+        "reserved_bytes": data_offset + len(payload),
         "shortfalls": tuple(shortfalls),
     }
 
@@ -924,6 +951,8 @@ def _describe(
     value_type: str,
     element_bytes: int,
     reserved_bytes: int = 0,
+    static_data_offset: int = 0,
+    shared_memory_import: Mapping[str, str] | None = None,
     input_names: Sequence[str] | None = None,
     output_names: Sequence[str] | None = None,
 ):
@@ -996,6 +1025,8 @@ def _describe(
             # A baked table sits at offset 0, so a caller's arrays start
             # here. Zero when the program needed no table.
             "reserved_bytes": int(reserved_bytes),
+            "static_data_offset": int(static_data_offset),
+            "shared_memory_import": dict(shared_memory_import or {}),
         },
     )
 
