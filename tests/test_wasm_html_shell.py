@@ -111,6 +111,8 @@ def test_output_views_are_tabs_over_the_same_numbers():
     assert "<canvas" in html
     assert "renderWebGLPalette" in html
     assert 'canvas.getContext("webgl2"' in html
+    assert "const anyNetwork" in html
+    assert "anyExpression || anyGaussian || anyNetwork" in html
     assert "raw scalar field rendered into RGB canvas pixels" in html
     assert "toDataURL(\"image/jpeg\"" not in html
     # Geometry is stated once, on the domain, and the image view follows it

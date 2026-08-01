@@ -416,6 +416,7 @@ async function run() {
     const d = domain();
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
+    const anyNetwork = inputs.some(p => $("mode_" + p.name).value === "network");
     const renderFps = Math.max(1, Number((NETWORK.feedback || {}).render_fps) || 24);
     const feedbackTicks = Math.max(1, Math.round((Number((NETWORK.feedback || {}).fps) || 120) / renderFps));
     await advanceFeedback(feedbackTicks);
@@ -469,7 +470,10 @@ async function run() {
     const repeats = Math.max(0, Number($("repeats").value) | 0);
     const continuous = repeats === 0;
     const timings = [];
-    const animated = (continuous || repeats > 1) && (anyExpression || anyGaussian);
+    // A routed network is a time-varying source too.  Without this term a page
+    // set entirely to network feeds runs its first frame but never reaches the
+    // redraw/yield path below.
+    const animated = (continuous || repeats > 1) && (anyExpression || anyGaussian || anyNetwork);
     if (animated) {
       document.querySelectorAll(".tab").forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.view === "image")));
       renderActiveTab();
