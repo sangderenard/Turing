@@ -61,37 +61,85 @@ def test_comparisons_come_back_as_bool_not_zero_one_float(arena):
     assert result.tolist() == [True, False, False]
 
 
-def test_mismatched_shapes_fall_back_instead_of_reaching_the_abi(arena, monkeypatch):
-    """The ABI has no broadcasting -- it reads whatever bytes sit at the
-    mismatched extent rather than refusing, so a shape mismatch must never
-    reach nodus_tensor_binary. NumPy's broadcasting must still run instead."""
+@pytest.mark.parametrize(
+    "left_shape,right_shape",
+    [((2, 3), (3,)), ((2, 3), (2, 1)), ((1, 3), (2, 1))],
+)
+def test_broadcasting_is_nodus_own_not_faked_by_numpy(
+    arena, monkeypatch, left_shape, right_shape
+):
+    """nodus broadcasts -- row, column, and outer -- so a shape mismatch is
+    handed straight to it rather than being quietly served by NumPy."""
 
-    calls = []
-    original = na.NodusArena.binary
-
-    def spy(self, op, left, right, out=None):
-        calls.append(op)
-        return original(self, op, left, right, out)
-
-    monkeypatch.setattr(na.NodusArena, "binary", spy)
-
-    a = AbstractTensor.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    b = AbstractTensor.tensor([1.0, 1.0, 1.0])
-    result = a + b
-    assert calls == []
-    assert result.data.tolist() == [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]]
-
-
-def test_matmul_is_not_elementwise_and_falls_back(arena, monkeypatch):
     calls = []
     original = na.NodusArena.binary
     monkeypatch.setattr(
         na.NodusArena, "binary",
-        lambda self, op, left, right, out=None: calls.append(op) or original(self, op, left, right, out),
+        lambda self, op, l, r, out=None: calls.append(op) or original(self, op, l, r, out),
     )
 
-    a = AbstractTensor.tensor([[1.0, 2.0], [3.0, 4.0]])
-    b = AbstractTensor.tensor([[1.0, 0.0], [0.0, 1.0]])
-    result = a @ b
-    assert calls == []
-    assert result.data.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    left = np.arange(np.prod(left_shape), dtype=np.float64).reshape(left_shape)
+    right = np.arange(np.prod(right_shape), dtype=np.float64).reshape(right_shape) + 10.0
+    result = AbstractTensor.tensor(left) + AbstractTensor.tensor(right)
+
+    assert calls == ["add"]
+    assert np.allclose(result.data, left + right)
+
+
+def test_matmul_goes_through_nodus_not_around_it(arena, monkeypatch):
+    """matmul is not a CanonicalOp -- it is not elementwise -- but nodus
+    implements it as tensor_matmul_f32/f64, so this backend uses it."""
+
+    calls = []
+    original = na.NodusArena.matmul
+    monkeypatch.setattr(
+        na.NodusArena, "matmul",
+        lambda self, l, r, out=None: calls.append("matmul") or original(self, l, r, out),
+    )
+
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    result = AbstractTensor.tensor(left) @ AbstractTensor.tensor(right)
+
+    assert calls == ["matmul"]
+    assert np.allclose(result.data, left @ right)
+
+
+def test_a_mismatched_matmul_is_refused_by_the_math_itself(arena):
+    """The rank/inner-extent check lives in TensorMathImpl::matmul, so every
+    caller of the shared math gets it -- not just this ABI. Before the fix it
+    computed a correctly-shaped wrong answer."""
+
+    left = arena.from_values(na.F64, (2, 3), [1.0] * 6)
+    right = arena.from_values(na.F64, (5, 5), [1.0] * 25)
+    out = arena.create(na.F64, (2, 5))
+    try:
+        with pytest.raises(na.NodusArenaError):
+            arena.matmul(left, right, out=out)
+    finally:
+        for handle in (left, right, out):
+            arena.destroy(handle)
+
+
+def test_dtype_promotion_matches_numpy(arena):
+    integers = AbstractTensor.tensor(np.array([1, 2, 3], dtype=np.int32))
+    floats = AbstractTensor.tensor(np.array([0.5, 0.5, 0.5]))
+    result = (integers + floats).data
+    assert result.dtype == np.float64
+    assert result.tolist() == [1.5, 2.5, 3.5]
+
+
+def test_a_missing_core_is_an_error_not_a_quiet_numpy_answer(monkeypatch):
+    """This backend was selected on purpose; computing the answer somewhere
+    else without saying so is the outcome connect() exists to prevent."""
+
+    from src.common.tensors.accelerator_backends import nodus_backend
+
+    monkeypatch.setattr(na, "_ARENA", None)
+    monkeypatch.setattr(na, "NodusArena", lambda *a, **k: (_ for _ in ()).throw(
+        na.NodusArenaUnavailable("looked in: nowhere")
+    ))
+    with pytest.raises(nodus_backend.NodusUnsupported, match="not connected"):
+        nodus_backend.NodusTensorOperations()._apply_operator__(
+            "add", np.array([1.0]), np.array([2.0])
+        )

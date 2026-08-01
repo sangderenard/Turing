@@ -220,3 +220,52 @@ def test_connect_warns_loudly_when_the_core_is_missing(monkeypatch):
     monkeypatch.setattr(na, "NodusArena", _unavailable)
     with pytest.warns(RuntimeWarning, match="NOT connected"):
         assert na.connect() is None
+
+
+def test_integer_exact_table_matches_what_the_abi_actually_accepts(arena):
+    """INTEGER_EXACT_OPS is a second copy of canonical_is_integer_exact in
+    tensor_math.cpp. Rather than trust it, ask the live ABI: every canonical
+    op is attempted on an int32 tensor and the table must predict the answer
+    exactly, so the two cannot drift apart unnoticed."""
+
+    disagreed = []
+    for name in sorted(na.CANONICAL_OPS):
+        left = arena.from_values(na.I32, (2,), [6, 3])
+        right = arena.from_values(na.I32, (2,), [3, 2])
+        out = arena.create(na.I32, (2,))
+        try:
+            try:
+                if name in na.UNARY_OPS:
+                    arena.unary(name, left, out=out)
+                else:
+                    arena.binary(name, left, right, out=out)
+                accepted = True
+            except na.NodusArenaError:
+                accepted = False
+        finally:
+            for handle in (left, right, out):
+                arena.destroy(handle)
+        if accepted != (name in na.INTEGER_EXACT_OPS):
+            disagreed.append((name, accepted, name in na.INTEGER_EXACT_OPS))
+    assert not disagreed, f"table disagrees with the ABI: {disagreed}"
+
+
+def test_integer_floor_and_mod_follow_python_not_c(arena):
+    """-7 // 2 is -4 and -7 % 2 is 1. C truncates toward zero and would give
+    -3 and -1, so this is the case that proves the integer path is not just
+    the float path with a cast."""
+
+    left = arena.from_values(na.I64, (2,), [-7, -7])
+    right = arena.from_values(na.I64, (2,), [2, 2])
+    try:
+        quotient = arena.binary("floordiv", left, right)
+        remainder = arena.binary("mod", left, right)
+        try:
+            assert arena.to_values(quotient) == (-4, -4)
+            assert arena.to_values(remainder) == (1, 1)
+        finally:
+            arena.destroy(quotient)
+            arena.destroy(remainder)
+    finally:
+        arena.destroy(left)
+        arena.destroy(right)

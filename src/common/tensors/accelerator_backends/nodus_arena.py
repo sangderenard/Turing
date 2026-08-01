@@ -282,6 +282,10 @@ class NodusArena:
             ctypes.c_int32, ctypes.c_uint64, ctypes.c_double,
             ctypes.c_int32, ctypes.c_uint64
         ]
+        library.nodus_tensor_matmul.restype = ctypes.c_int32
+        library.nodus_tensor_matmul.argtypes = [
+            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64
+        ]
 
     # -- operators --------------------------------------------------------
 
@@ -350,6 +354,27 @@ class NodusArena:
             ),
             f"scalar {op}",
         )
+        return out
+
+    def matmul(self, left: int, right: int, out: int | None = None) -> int:
+        """Matrix multiply, which is not a CanonicalOp -- it reaches
+        ``tensor_matmul_f32``/``f64``, the dense helpers tensor_math.h names
+        as in-memory-backend-only. f32/f64 only; the ABI refuses any other
+        dtype rather than converting it.
+        """
+
+        if out is None:
+            left_desc = self.describe(left)
+            right_desc = self.describe(right)
+            if left_desc.rank != 2 or right_desc.rank != 2:
+                raise NodusArenaError(
+                    "nodus matmul takes two rank-2 tensors; got ranks "
+                    f"{left_desc.rank} and {right_desc.rank}"
+                )
+            out = self.create(
+                int(left_desc.dtype), (left_desc.shape[0], right_desc.shape[1])
+            )
+        _check(self._library.nodus_tensor_matmul(left, right, out), "matmul")
         return out
 
     # -- arena ------------------------------------------------------------
@@ -543,6 +568,25 @@ BINARY_OPS = frozenset(
     if code <= 6 or 20 <= code <= 27 or 42 <= code <= 44
 )
 
+# Operations nodus evaluates at an integer element type. The rest are
+# real-valued -- an elementwise result carries its operand's dtype, so nodus
+# refuses them on an integer tensor rather than truncating sqrt(10) to 3 or
+# 1/2 to 0, and the caller promotes to F64 first (which is what NumPy's own
+# promotion does at the same point).
+#
+# Like UNARY_OPS/BINARY_OPS above, this is a second copy of a classification
+# that lives in tensor_math.cpp (canonical_is_integer_exact) and will drift
+# if that function changes. test_nodus_arena.py pins the two together by
+# asking the live ABI rather than trusting this table.
+INTEGER_EXACT_OPS = frozenset(
+    {
+        "add", "sub", "mul", "mod", "floordiv",
+        "neg", "abs", "logical_not",
+        "less", "less_equal", "greater", "greater_equal",
+        "equal", "not_equal", "maximum", "minimum",
+    }
+)
+
 
 _ARENA: NodusArena | None = None
 
@@ -648,6 +692,7 @@ def connect(*, warn: bool = True) -> NodusArena | None:
 __all__ = [
     "BINARY_OPS",
     "CANONICAL_OPS",
+    "INTEGER_EXACT_OPS",
     "UNARY_OPS",
     "connect",
     "MAX_RANK",
