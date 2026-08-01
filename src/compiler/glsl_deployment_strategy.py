@@ -5249,6 +5249,11 @@ def _coordinate_scheduled_capture_impl(
                     f"{node_id}; binding_kind={binding_kind!r}"
                 )
             values[node_id] = supplied[name]
+            # Keep the name against the object that will become a feed.
+            try:
+                shell._capture_input_names[id(values[node_id])] = str(name)
+            except AttributeError:
+                pass
 
     inert_nodes = _inert_routing_nodes(graph)
     regions = tuple(
@@ -7378,10 +7383,16 @@ def _coordinate_scheduled_capture_impl(
 
     if graph.G.graph.get("generator_stream"):
         for input_id in tuple(values):
+            previous = values[input_id]
             values[input_id] = _tensorize_graph_input(
-                values[input_id],
+                previous,
                 device=device,
             )
+            # Tensorising makes a new object; carry the name across or it is
+            # lost exactly when it starts to matter.
+            named = getattr(shell, "_capture_input_names", None)
+            if named is not None and id(previous) in named:
+                named[id(values[input_id])] = named[id(previous)]
 
         def generator_producer():
             try:
@@ -8258,6 +8269,12 @@ class ProcessGraphGLSLDeployment:
         self.compiled_region_indices = ()
         self.captured_region_programs = {}
         self._capture_invocations = 0
+        # Which source parameter each captured input tensor came from, by
+        # object identity. Feeds are identified downstream by id(), and
+        # without this the name is lost at the boundary -- leaving a
+        # descriptor that can say "feed0" but not "cx", so a caller has to
+        # guess which array goes where.
+        self._capture_input_names = {}
         self._execute_invocations = 0
         self._discovery_tape_creations = 0
         self._discovery_tape_lowerings = 0
@@ -9374,6 +9391,13 @@ class ProcessGraphGLSLDeployment:
                         if tape._nodes.get(feed_id) is None
                         else str(tape._nodes[feed_id].op)
                     ),
+                    # The source parameter this feed came from, recorded
+                    # when the graph's Input nodes were bound. A feed is a
+                    # trace root and has no tape node, so the old lookup
+                    # through tape params could only ever return empty.
+                    "binding_name": getattr(
+                        self, "_capture_input_names", {}
+                    ).get(feed_id),
                     "parameter_names": (
                         tuple(sorted(
                             tape._nodes[feed_id].ctx.get("params") or {}

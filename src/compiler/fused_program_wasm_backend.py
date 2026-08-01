@@ -280,9 +280,10 @@ def emit_wasm_module(
     feed_ids = program_feed_order(program)
     output_ids = list(program.outputs.values())
     names: dict[int, str] = {}
+    labels = feed_names(program, feed_ids)
     parameters: list[str] = ["$count"]
     for index, feed_id in enumerate(feed_ids):
-        parameters.append(f"$feed{index}")
+        parameters.append("$" + labels[index])
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
 
@@ -366,7 +367,8 @@ def emit_wasm_module(
         sorted({step.op_name for step in required_steps(program)} & _LUT_OPS)
     )["reserved_bytes"]
     api = _describe(name, function_name, feed_ids, output_ids, value_type,
-                    element_bytes, reserved)
+                    element_bytes, reserved,
+                    input_names=feed_names(program, feed_ids))
     binary = None
     if not shortfalls:
         binary = _assemble(
@@ -802,6 +804,36 @@ def _emit_lut(builder, source_local: int, op: str, table_base: int,
     builder.op("add")
 
 
+def feed_names(program: FusedProgram, feed_ids: Sequence[int]) -> list[str]:
+    """What to call each feed in the descriptor.
+
+    A program carries the source parameter each feed was bound to
+    (``capture_feed_origins[...]["binding_name"]``), so the contract can say
+    ``cx`` rather than ``feed0`` and a caller stops having to work out which
+    array goes where. Falls back to a positional name when the program does
+    not know -- a hand-built program, or one from a front end that does not
+    record it -- because a positional name is still better than none.
+
+    Names are made unique and identifier-safe: two parameters that collide,
+    or one that is not a usable identifier, would produce a descriptor a
+    caller cannot bind against.
+    """
+
+    origins = (program.extras or {}).get("capture_feed_origins", {}) or {}
+    used: set[str] = set()
+    names: list[str] = []
+    for index, feed_id in enumerate(feed_ids):
+        raw = (origins.get(feed_id) or {}).get("binding_name")
+        candidate = str(raw) if raw else f"feed{index}"
+        if not candidate.isidentifier():
+            candidate = f"feed{index}"
+        if candidate in used:
+            candidate = f"{candidate}_{index}"
+        used.add(candidate)
+        names.append(candidate)
+    return names
+
+
 def _describe(
     name: str,
     function_name: str,
@@ -810,6 +842,7 @@ def _describe(
     value_type: str,
     element_bytes: int,
     reserved_bytes: int = 0,
+    input_names: Sequence[str] | None = None,
 ):
     """The same calling-contract descriptor the Fortran path emits."""
 
