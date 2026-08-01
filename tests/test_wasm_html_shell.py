@@ -260,6 +260,41 @@ def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():
     assert "await fetch(descriptor.url)" in html
 
 
+def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
+    mathml = (
+        '<math xmlns="http://www.w3.org/1998/Math/MathML" display="block">'
+        "<mrow><mi>y</mi><mo>=</mo><mi>x</mi></mrow></math>"
+    )
+    html = emit_html_shell(
+        _artifact().api,
+        mathematics={
+            "target": "sympy",
+            "projection": "process_graph_to_sympy_relations",
+            "node_count": 3,
+            "equation_count": 2,
+            "constraint_count": 0,
+            "uninterpreted": [],
+            "program_relation": {
+                "head": "And", "arity": 2, "arguments": "equations[*]",
+            },
+            "outputs": [{
+                "name": "result", "node_id": 5, "mathml": mathml,
+            }],
+            "url": "site/v3/math/render/sympy-process-model.json",
+        },
+    ).html
+
+    assert "Math is programming is math" in html
+    assert "existing SymPy target" in html
+    assert mathml in html
+    assert "site/v3/math/render/sympy-process-model.json" in html
+    assert "Load and render the symbolic program" in html
+    assert "One SymPy <code>And</code>" in html
+    assert "<mo>⋀</mo>" in html
+    assert "await fetch(MATHEMATICS.url)" in html
+    assert "DOMParser" in html
+
+
 def test_graph_phosphor_integrates_profile_pulses_with_decay():
     html = shell_for_artifact(_artifact()).html
     assert "function phosphorColor(node, now)" in html

@@ -24,6 +24,7 @@ import ast
 import base64
 import contextlib
 import io
+import json
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,7 @@ from src.common.tensors.topological_reducer import reduce_abstract_tensor_topolo
 from src.compiler.backend_sources import collect_backend_sources
 from src.compiler.fused_program_wasm_backend import emit_wasm_module, required_steps
 from src.compiler.shell_telemetry import TelemetryChannel, summarize_process_graph
+from src.compiler.sympy_math_renderer import render_reduced_program_mathematics
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph,
     build_hued_process_graph_views,
@@ -57,6 +59,7 @@ WASM_REGION_STEP_OPTIONS = (200, 400, 800)
 SITE_VERSION = "v3"
 WASM_MODULE_DIR = f"site/{SITE_VERSION}/wasm"
 SOURCE_MODULE_DIR = f"site/{SITE_VERSION}/source/render"
+MATH_MODULE_DIR = f"site/{SITE_VERSION}/math/render"
 
 # The orbit is clamped so a diverging point cannot reach infinity and poison
 # the arithmetic; well above the escape radius, so it never touches a point
@@ -96,6 +99,22 @@ def _write_source_downloads(destination: Path, sources) -> list[dict]:
             item["bytes"] = len(source.encode("utf-8"))
         published.append(item)
     return published
+
+
+def _write_mathematics(destination: Path, document) -> dict:
+    """Publish the full symbolic relation inventory behind a compact shell."""
+
+    payload = document.to_mapping()
+    relative = Path(MATH_MODULE_DIR) / "sympy-process-model.json"
+    path = destination / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+    )
+    descriptor = {key: value for key, value in payload.items() if key != "equations"}
+    descriptor["url"] = relative.as_posix()
+    descriptor["bytes"] = path.stat().st_size
+    return descriptor
 
 KERNEL = f"""
 def interest_network(unit_x, unit_y, interest):
@@ -483,6 +502,9 @@ def build(destination: Path) -> Path:
                 program=wanted,
             )
             source_entries = _write_source_downloads(destination, sources)
+            mathematics = _write_mathematics(
+                destination, render_reduced_program_mathematics(wanted)
+            )
         advance("sources")
 
     shell = emit_html_shell(
@@ -494,6 +516,7 @@ def build(destination: Path) -> Path:
         process_graph=summarize_process_graph(graph),
         origin_source="",
         backend_sources=source_entries,
+        mathematics=mathematics,
         graph_views=graph_views,
         network_manifest={
             "name": "Mandelbrot future-detail controller",
@@ -573,7 +596,6 @@ def build(destination: Path) -> Path:
         (variant_directory / f"{coordinator.name}.wat").write_text(
             coordinator.wat, encoding="utf-8"
         )
-        import json
         (variant_directory / "class-inventory.json").write_text(
             json.dumps(coordinator.inventory.to_mapping(), indent=2),
             encoding="utf-8",

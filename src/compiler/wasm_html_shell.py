@@ -179,6 +179,18 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
   border: 1px solid transparent; font-family: ui-monospace, monospace; }
 .srctab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
 .srcview[hidden] { display: none; }
+.math-output, .math-equation { overflow: auto; padding: .55rem .7rem;
+  margin-top: .45rem; border-radius: .35rem; background: var(--soft); }
+.program-relation { overflow: auto; margin: .65rem 0; padding: .65rem .8rem;
+  border: 1px solid var(--line); border-radius: .35rem; }
+.math-output b { font: 600 .75rem ui-monospace, monospace; }
+.math-output math, .math-equation math { min-width: max-content; }
+.math-browser { margin-top: .65rem; }
+.math-controls { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap;
+  margin-top: .55rem; }
+.math-controls button { background: var(--soft); color: inherit;
+  border: 1px solid var(--line); }
+.math-equation-head { font: .7rem ui-monospace, monospace; opacity: .58; }
 .stat { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .8rem;
   font-family: ui-monospace, monospace; margin-top: .4rem; }
 .good { color: var(--good); }
@@ -275,6 +287,7 @@ let GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
+const MATHEMATICS = __MATHEMATICS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
@@ -1436,6 +1449,76 @@ function wireSourceTabs() {
   });
 }
 
+let mathEquations = [];
+let mathPage = 0;
+const MATH_PAGE_SIZE = 18;
+
+function appendNativeMath(target, markup) {
+  const mathmlNamespace = "http:" + "//www.w3.org/1998/Math/MathML";
+  const parsed = new DOMParser().parseFromString(markup, "application/xml");
+  const root = parsed.documentElement;
+  const invalid = root.localName !== "math" ||
+    root.namespaceURI !== mathmlNamespace ||
+    Array.from(root.querySelectorAll("*")).some(node =>
+      node.namespaceURI !== mathmlNamespace ||
+      Array.from(node.attributes).some(attribute => /^on/i.test(attribute.name))
+    );
+  if (invalid) {
+    target.textContent = "Mathematical markup was rejected.";
+    return;
+  }
+  target.appendChild(document.importNode(root, true));
+}
+
+function renderMathPage() {
+  const target = $("math-equations");
+  if (!target) return;
+  target.replaceChildren();
+  const pages = Math.max(1, Math.ceil(mathEquations.length / MATH_PAGE_SIZE));
+  mathPage = Math.max(0, Math.min(mathPage, pages - 1));
+  const start = mathPage * MATH_PAGE_SIZE;
+  mathEquations.slice(start, start + MATH_PAGE_SIZE).forEach((equation, index) => {
+    const row = document.createElement("div");
+    row.className = "math-equation";
+    const head = document.createElement("div");
+    head.className = "math-equation-head";
+    head.textContent = "relation " + (start + index + 1) + " · " +
+      equation.operation + (equation.node_id === null ? "" : " · node " + equation.node_id);
+    row.appendChild(head);
+    appendNativeMath(row, equation.mathml);
+    target.appendChild(row);
+  });
+  $("math-page").textContent = "page " + (mathPage + 1) + " / " + pages;
+  $("math-prev").disabled = mathPage === 0;
+  $("math-next").disabled = mathPage + 1 >= pages;
+}
+
+function wireMathematics() {
+  const button = $("load-mathematics");
+  if (!button || !MATHEMATICS || !MATHEMATICS.url) return;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "Loading symbolic relations…";
+    try {
+      const response = await fetch(MATHEMATICS.url);
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const document = await response.json();
+      mathEquations = document.equations || [];
+      mathPage = 0;
+      renderMathPage();
+      $("math-controls").hidden = false;
+      button.hidden = true;
+      log("ok", "SymPy process model loaded", {equations: mathEquations.length});
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Retry symbolic program";
+      log("error", "symbolic program load failed", {message: error.message});
+    }
+  });
+  $("math-prev").addEventListener("click", () => { mathPage -= 1; renderMathPage(); });
+  $("math-next").addEventListener("click", () => { mathPage += 1; renderMathPage(); });
+}
+
 function wireExecutionModes() {
   const continueButton = $("card-continue");
   if (continueButton) continueButton.addEventListener("click", () => {
@@ -1551,6 +1634,7 @@ $("copylog").addEventListener("click", () => {
 });
 wireFilters();
 wireSourceTabs();
+wireMathematics();
 wireExecutionModes();
 renderGraph();
 
@@ -1724,6 +1808,57 @@ def _build_rows(parameters: Mapping[str, Any]) -> str:
     )
 
 
+def _mathematics_panel(mathematics: Mapping[str, Any] | None) -> str:
+    """A compact preview; the full relation inventory remains click-lazy."""
+
+    if not mathematics:
+        return ""
+    outputs = "".join(
+        '<div class="math-output">'
+        f'<b>{_escape(str(output.get("name", "output")))}</b>'
+        f'{output.get("mathml", "")}'
+        "</div>"
+        for output in mathematics.get("outputs", ())
+    )
+    operation_count = len(mathematics.get("uninterpreted", ()))
+    aggregate = dict(mathematics.get("program_relation") or {})
+    aggregate_arity = int(aggregate.get("arity") or 0)
+    return f"""
+  <div class="panel">
+    <div class="panel-title">Mathematics</div>
+    <div class="note"><strong>Math is programming is math.</strong> This is
+      the reduced program selected through the existing SymPy target, not a
+      separately handwritten formula.</div>
+    <div class="stat">
+      <span>{_escape(str(mathematics.get("node_count", 0)))} symbolic nodes</span>
+      <span>{_escape(str(mathematics.get("equation_count", 0)))} equations</span>
+      <span>{_escape(str(mathematics.get("constraint_count", 0)))} constraints</span>
+      <span>{operation_count} explicit uninterpreted operations</span>
+      <span>SymPy &rarr; native MathML</span>
+    </div>
+    <div class="program-relation">
+      <div class="meta">One SymPy <code>{_escape(str(aggregate.get("head", "And")))}</code>
+        relation with {aggregate_arity} exact clauses; internal SSA values are
+        the relation's intermediate variables.</div>
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="block">
+        <mrow><mi>𝒫</mi><mo>≡</mo><munderover><mo>⋀</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>{aggregate_arity}</mn></munderover><msub><mi>R</mi><mi>i</mi></msub></mrow>
+      </math>
+    </div>
+    {outputs}
+    <div class="math-browser">
+      <button id="load-mathematics">Load and render the symbolic program</button>
+      <div class="meta">The full equation inventory is fetched only after this
+        button is clicked. Language source files remain separate and unloaded.</div>
+      <div id="math-controls" class="math-controls" hidden>
+        <button id="math-prev">Previous</button>
+        <span id="math-page" class="meta"></span>
+        <button id="math-next">Next</button>
+      </div>
+      <div id="math-equations"></div>
+    </div>
+  </div>"""
+
+
 def emit_html_shell(
     api: Any,
     *,
@@ -1738,6 +1873,7 @@ def emit_html_shell(
     default_width: int = 64,
     default_height: int = 40,
     backend_sources: Any = None,
+    mathematics: Mapping[str, Any] | None = None,
     network_manifest: Mapping[str, Any] | None = None,
     class_graph: Mapping[str, Any] | None = None,
     graph_views: Mapping[str, Any] | None = None,
@@ -1824,6 +1960,7 @@ def emit_html_shell(
             )
             if entry.get("url")
         ], default=str))
+        .replace("__MATHEMATICS__", json.dumps(dict(mathematics or {}), default=str))
         .replace(
             "__CLASS_GRAPH__",
             json.dumps(dict(class_graph), default=str) if class_graph else "null",
@@ -1873,6 +2010,7 @@ def emit_html_shell(
         api_yaml = ""
 
     build_rows = _build_rows(build_parameters or {})
+    mathematics_html = _mathematics_panel(mathematics)
 
     if backend_sources is None:
         source_entries: list[Mapping[str, Any]] = []
@@ -2031,6 +2169,8 @@ def emit_html_shell(
     </details>
   </div>
 
+{mathematics_html}
+
   <div class="panel">
     <details>
       <summary>API descriptor</summary>
@@ -2087,6 +2227,7 @@ def shell_for_artifact(
     default_width: int = 64,
     default_height: int = 40,
     backend_sources: Any = None,
+    mathematics: Mapping[str, Any] | None = None,
     network_manifest: Mapping[str, Any] | None = None,
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
@@ -2109,6 +2250,7 @@ def shell_for_artifact(
         default_width=default_width,
         default_height=default_height,
         backend_sources=backend_sources,
+        mathematics=mathematics,
     )
 
 
