@@ -161,6 +161,75 @@ def test_a_program_using_tanh_bakes_the_table_and_reserves_room_for_it():
     assert reserved > 0
 
 
+def test_a_uniform_captured_tensor_constant_becomes_one_immediate():
+    program = _program(
+        [
+            OpStep(0, "tensor_from_list", [], {"values": (2.0, 2.0, 2.0)}, 2),
+            OpStep(1, "mul", [1, 2], {}, 3),
+        ],
+        (1,),
+        {"result": 3},
+    )
+    module = emit_wasm_module(program, name="uniform")
+    assert module.complete
+    assert module.api.metadata["reserved_bytes"] == 0
+    assert "f64.const 2.0" in module.source
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node not on PATH"
+)
+def test_a_varying_tensor_constant_runs_from_the_wasm_data_segment(tmp_path):
+    import json
+    import subprocess
+
+    program = _program(
+        [
+            OpStep(0, "tensor_from_list", [], {"values": (1.0, 2.0, 3.0)}, 2),
+            OpStep(1, "mul", [1, 2], {}, 3),
+        ],
+        (1,),
+        {"result": 3},
+    )
+    module = emit_wasm_module(program, name="varying")
+    assert module.complete and module.binary
+    reserved = module.api.metadata["reserved_bytes"]
+    assert reserved == 3 * 8
+    assert "f64.load" in module.source
+
+    module_path = tmp_path / "varying.wasm"
+    module_path.write_bytes(module.binary)
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        """
+        import { readFileSync } from "node:fs";
+        const [modulePath, reservedText] = process.argv.slice(2);
+        const { instance } = await WebAssembly.instantiate(
+          readFileSync(modulePath), {}
+        );
+        const reserved = Number(reservedText);
+        const inputOffset = reserved;
+        const outputOffset = inputOffset + 24;
+        const view = new Float64Array(instance.exports.memory.buffer);
+        view.set([10, 20, 30], inputOffset / 8);
+        instance.exports.run(3, inputOffset, outputOffset);
+        console.log(JSON.stringify(
+          Array.from(new Float64Array(
+            instance.exports.memory.buffer, outputOffset, 3
+          ))
+        ));
+        """,
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(module_path), str(reserved)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(completed.stdout) == [10, 40, 90]
+
+
 def test_the_catalogue_decides_what_is_reachable():
     """Every function with a table is emittable, and the two lists cannot
     drift: _LUT_OPS is taken from the catalogue rather than written out

@@ -10,8 +10,9 @@ import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.wasm_class_modules import (
-    build_manifest, build_module_process_graph, describe_process_graph_api,
-    emit_class_modules, partition_reduced_program, schedule_module_levels,
+    build_embedded_class_graph, build_manifest, build_module_process_graph,
+    describe_process_graph_api, emit_class_modules,
+    partition_reduced_program, schedule_module_levels,
 )
 
 
@@ -207,6 +208,25 @@ def test_build_manifest_derives_edges_from_the_cut_boundary():
     assert manifest["graph_input_value_ids"][chunk0.module_name] == [(1, "feed0")]
 
 
+def test_manifest_uses_the_emitted_module_feed_order_not_boundary_set_order():
+    program = FusedProgram(
+        version=1,
+        feeds={1, 2},
+        steps=[OpStep(0, "sub", [2, 1], result_id=3)],
+        outputs={"result": 3},
+    )
+    specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
+    modules = emit_class_modules(specs, link_calls=False)
+    manifest = build_manifest(specs, modules)
+
+    # The graph boundary discovers feeds as 1,2, but the emitted function
+    # consumes 2 first and therefore assigns feed0 to value 2.
+    assert specs[0].region.input_ids == (1, 2)
+    assert manifest["graph_input_value_ids"][specs[0].module_name] == [
+        (2, "feed0"), (1, "feed1"),
+    ]
+
+
 def test_manifest_and_runner_compute_the_right_answer_in_the_browser_is_covered_elsewhere():
     """The actual numeric round-trip (real .wasm files, fetched, run through
     process_graph_runner.js, correct answer) is verified by hand in the
@@ -327,8 +347,9 @@ def test_describe_process_graph_api_resolves_the_real_source_parameter_name():
     assert api.entry == "kernel"
 
     entry_point = api.entry_points[0]
-    root_spec = next(s for s in specs if s.is_root)
-    assert entry_point.symbol == root_spec.module_name
+    assert entry_point.symbol == "kernel"
+    assert api.language == "wasm"
+    assert api.metadata["execution_mode"] == "segmented"
 
     names_by_role = {
         role: [p.name for p in entry_point.parameters if p.role == role]
@@ -339,6 +360,25 @@ def test_describe_process_graph_api_resolves_the_real_source_parameter_name():
     # or a raw feed label like "feed0".
     assert names_by_role["input"] == ["a"]
     assert len(names_by_role["output"]) == 1
+
+    embedded = build_embedded_class_graph(
+        specs, modules, program, entrypoint=aot.entrypoint,
+    )
+    output_name = next(iter(program.outputs))
+    assert embedded["logical_outputs"][output_name][0] in {
+        spec.module_name for spec in specs
+    }
+    assert len(embedded["schedule"]["nodes"]) == len(specs)
+    assert all(
+        "reserved_bytes" in module for module in embedded["modules"]
+    )
+    external = build_embedded_class_graph(
+        specs, modules, program, entrypoint=aot.entrypoint,
+        embed_binaries=False, module_dir="site-wasm",
+    )
+    assert all(module["url"].startswith("site-wasm/")
+               for module in external["modules"])
+    assert all("wasm_base64" not in module for module in external["modules"])
 
 
 def test_describe_process_graph_api_collapses_a_value_needed_by_several_chunks():

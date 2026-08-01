@@ -11,6 +11,7 @@ from src.common.tensors.compression.jpeg.frame import (
 from src.common.tensors.compression.jpeg.transform import rgb_to_ycbcr
 from src.compiler.process_graph_fusion import (
     BackendFusionProfile,
+    DispatchRegion,
     dispatch_region_to_fused_program,
     fused_program_to_process_graph,
     plan_process_graph_dispatches,
@@ -149,22 +150,65 @@ def test_standalone_tensor_from_list_becomes_a_const_node():
     )
     graph = fused_program_to_process_graph(program)
     assert graph.G.nodes[2]["type"] == "const"
-    assert graph.G.nodes[2]["constant"] == 2.0
+    assert graph.G.nodes[2]["constant"] == (2.0,)
     assert (2, 3) in graph.G.edges
 
 
-def test_a_multi_element_tensor_from_list_raises_rather_than_silently_dropping():
+def test_a_multi_element_tensor_from_list_survives_process_graph_round_trip():
     program = FusedProgram(
         version=1,
         feeds={1},
+        meta={2: Meta(shape=(2,), dtype="float64")},
         steps=[
             OpStep(0, "tensor_from_list", [], attrs={"values": (1.0, 2.0)}, result_id=2),
             OpStep(1, "mul", [1, 2], result_id=3),
         ],
         outputs={"result": 3},
     )
-    try:
-        fused_program_to_process_graph(program)
-        assert False, "expected a ValueError"
-    except ValueError as exc:
-        assert "tensor_from_list" in str(exc)
+    graph = fused_program_to_process_graph(program)
+    assert graph.G.nodes[2]["constant"] == (1.0, 2.0)
+    assert graph.G.nodes[2]["tensor"]["shape"] == (2,)
+
+    lowered = dispatch_region_to_fused_program(
+        graph,
+        DispatchRegion(
+            node_ids=(3,),
+            input_ids=(1,),
+            outputs=(("result", 3),),
+            score=0.0,
+        ),
+    )
+    assert [step.op_name for step in lowered.steps] == [
+        "tensor_from_list", "mul",
+    ]
+    assert lowered.steps[0].attrs["values"] == (1.0, 2.0)
+    assert lowered.steps[1].input_ids == [1, 2]
+
+
+def test_two_uniform_constants_remain_a_valid_graph_operation():
+    program = FusedProgram(
+        version=1,
+        feeds=set(),
+        steps=[
+            OpStep(0, "tensor_from_list", [],
+                   attrs={"values": (2.0, 2.0)}, result_id=1),
+            OpStep(1, "tensor_from_list", [],
+                   attrs={"values": (3.0, 3.0)}, result_id=2),
+            OpStep(2, "add", [1, 2], result_id=3),
+        ],
+        outputs={"result": 3},
+    )
+    graph = fused_program_to_process_graph(program)
+    lowered = dispatch_region_to_fused_program(
+        graph,
+        DispatchRegion(
+            node_ids=(3,), input_ids=(), outputs=(("result", 3),), score=0.0,
+        ),
+    )
+
+    assert [step.op_name for step in lowered.steps] == [
+        "tensor_from_list", "add",
+    ]
+    assert lowered.steps[0].attrs["values"] == (2.0, 2.0)
+    assert lowered.steps[1].input_ids == [1]
+    assert lowered.steps[1].attrs == {"right_scalar": 3.0}

@@ -50,7 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from ..common.tensors.fused_ir import FusedProgram
+from ..common.tensors.fused_ir import FusedProgram, ordered_feed_ids
 from .process_graph_fusion import (
     DispatchRegion, dispatch_region_to_fused_program,
     fused_program_to_process_graph,
@@ -377,6 +377,8 @@ def build_manifest(
     the caller supplies it directly, see ``graph_inputs`` below).
     """
 
+    from .fused_program_wasm_backend import program_feed_order
+
     specs_by_index = {spec.index: spec for spec in specs}
     producer_of_value: dict[int, tuple[str, str]] = {}
     for spec in specs:
@@ -395,14 +397,27 @@ def build_manifest(
             "name": spec.module_name,
             "url": f"{module_dir}/{spec.module_name}.wasm",
             "entry": module.api.entry,
-            "count": 1,
             "inputs": inputs,
             "outputs": outputs,
             "value_type": module.api.metadata.get("value_type", "f64"),
             "element_bytes": module.api.metadata.get("element_bytes", 8),
             "memory_export": module.api.metadata.get("memory_export", "memory"),
+            "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
+            "operation_count": len(spec.region.node_ids),
+            "node_ids": list(spec.region.node_ids),
+            "is_root": spec.is_root,
         })
-        for value_id, input_name in zip(spec.region.input_ids, inputs[:len(spec.region.input_ids)]):
+        # Pair names with the exact order used by emit_wasm_module. Region
+        # input_ids are boundary-set order, while the module ABI follows
+        # first use inside the lowered program; confusing them silently
+        # routes correctly-shaped arrays to the wrong operands.
+        emitted_feed_ids = program_feed_order(spec.program)
+        if len(emitted_feed_ids) != len(inputs):
+            raise ValueError(
+                f"{spec.module_name} declares {len(inputs)} inputs for "
+                f"{len(emitted_feed_ids)} program feeds"
+            )
+        for value_id, input_name in zip(emitted_feed_ids, inputs):
             producer = producer_of_value.get(value_id)
             if producer is not None:
                 edges.append({
@@ -427,12 +442,15 @@ def build_embedded_class_graph(
     program: FusedProgram,
     *,
     entrypoint: str,
+    embed_binaries: bool = True,
+    module_dir: str = "modules",
 ) -> dict:
-    """The same manifest ``build_manifest`` produces, adapted for a
-    self-contained page: each module's bytes are embedded as base64
-    (``wasm_base64``) instead of a fetchable ``url``, since a shell page
-    (``wasm_html_shell.py``) is one file, not a page plus a ``modules/``
-    directory the way ``wasm-gallery/`` pages are.
+    """Adapt ``build_manifest`` for a logical program's browser shell.
+
+    By default the historical self-contained representation is retained for
+    callers that need one file.  A deployed site should set
+    ``embed_binaries=False`` so the manifest keeps relative module URLs and
+    the runner fetches each private region lazily.
 
     Also includes ``logical_inputs`` -- ``{parameter_name: [[module,
     input], ...]}`` -- resolving every value nothing in the graph produces
@@ -444,17 +462,20 @@ def build_embedded_class_graph(
 
     import base64
 
-    manifest = build_manifest(specs, modules)
+    manifest = build_manifest(specs, modules, module_dir=module_dir)
     origins = (program.extras or {}).get("capture_feed_origins", {})
 
     module_entries = []
     for entry in manifest["modules"]:
         spec = next(s for s in specs if s.module_name == entry["name"])
         module = modules[spec.index]
-        module_entries.append({
-            **{k: v for k, v in entry.items() if k != "url"},
-            "wasm_base64": base64.b64encode(module.binary).decode("ascii"),
-        })
+        if embed_binaries:
+            module_entries.append({
+                **{k: v for k, v in entry.items() if k != "url"},
+                "wasm_base64": base64.b64encode(module.binary).decode("ascii"),
+            })
+        else:
+            module_entries.append(dict(entry))
 
     logical_inputs: dict[str, list[tuple[str, str]]] = {}
     for module_name, value_entries in manifest["graph_input_value_ids"].items():
@@ -470,6 +491,22 @@ def build_embedded_class_graph(
     root_entry = next(
         m for m in manifest["modules"] if m["name"] == root_spec.module_name
     )
+    producer_of_value = {
+        value_id: (spec.module_name, output_name)
+        for spec in specs
+        for output_name, value_id in spec.region.outputs
+    }
+    logical_outputs = {}
+    for output_name, value_id in program.outputs.items():
+        producer = producer_of_value.get(value_id)
+        if producer is None:
+            raise ValueError(
+                f"segmented program output {output_name!r} value {value_id} "
+                "has no producing module"
+            )
+        logical_outputs[output_name] = list(producer)
+
+    from .process_graph_shell import schedule_table
 
     return {
         "modules": module_entries,
@@ -480,6 +517,8 @@ def build_embedded_class_graph(
         },
         "root_module": root_spec.module_name,
         "root_outputs": root_entry["outputs"],
+        "logical_outputs": logical_outputs,
+        "schedule": schedule_table(specs),
     }
 
 
@@ -511,52 +550,67 @@ def describe_process_graph_api(
 
     root_spec = next(spec for spec in specs if spec.is_root)
     root_module = modules[root_spec.index]
-    root_output_parameters = tuple(
-        p for p in root_module.api.entry_points[0].parameters if p.role == "output"
-    )
     value_type = root_module.api.metadata.get("value_type", "f64")
+    c_type = "float" if value_type == "f32" else "double"
+    ctypes_name = "c_float" if value_type == "f32" else "c_double"
 
     # Every value nothing in the graph produces, across every chunk that
     # needs one directly, resolved back to its real source parameter --
     # several chunks needing the same page-level value collapse to the one
     # logical kernel input it actually is. Iterated in spec (dependency)
     # order, so the result is deterministic for a given compile.
-    seen: dict[int, str] = {}
-    for spec in specs:
-        for value_id, _input_name in manifest["graph_input_value_ids"].get(
-            spec.module_name, ()
-        ):
-            if value_id in seen:
-                continue
-            origin = origins.get(value_id)
-            binding_name = origin.get("binding_name") if origin else None
-            seen[value_id] = binding_name or f"input_{value_id}"
+    external_value_ids = {
+        value_id
+        for entries in manifest["graph_input_value_ids"].values()
+        for value_id, _input_name in entries
+    }
+    ordered_external_ids = [
+        value_id
+        for value_id in ordered_feed_ids(program)
+        if value_id in external_value_ids
+    ]
+    ordered_external_ids.extend(sorted(
+        external_value_ids - set(ordered_external_ids)
+    ))
+    input_names = []
+    used_names = set()
+    for index, value_id in enumerate(ordered_external_ids):
+        origin = origins.get(value_id)
+        binding_name = origin.get("binding_name") if origin else None
+        name = str(binding_name or f"input_{value_id}")
+        if not name.isidentifier() or name in used_names:
+            name = f"input_{index}"
+        used_names.add(name)
+        input_names.append(name)
 
     parameters = [Parameter(
         name="count", role="extent", dtype="int32", c_type="int32_t",
         ctypes_name="c_int32", passing="value",
     )]
-    for name in seen.values():
+    for name in input_names:
         parameters.append(Parameter(
-            name=name, role="input", dtype=value_type, c_type="int32_t",
-            ctypes_name="c_int32", passing="value", extent="count",
+            name=name, role="input", dtype=value_type, c_type=c_type,
+            ctypes_name=ctypes_name, passing="value", extent="count",
         ))
-    parameters.extend(root_output_parameters)
+    for name in program.outputs:
+        parameters.append(Parameter(
+            name=str(name), role="output", dtype=value_type, c_type=c_type,
+            ctypes_name=ctypes_name, passing="value", extent="count",
+        ))
 
     return CompiledProgramAPI(
         module=entrypoint,
-        language="wasm-class-graph",
+        language="wasm",
         entry=entrypoint,
         entry_points=(
             EntryPoint(
                 name=entrypoint,
-                symbol=root_spec.module_name,
+                symbol=entrypoint,
                 kind="numerical",
                 parameters=tuple(parameters),
                 note=(
-                    f"auto-segmented into {len(specs)} WASM class module(s) "
-                    f"run by process_graph_runner.js; {root_spec.module_name} "
-                    "is the module holding this kernel's own declared outputs"
+                    "one logical compiled program; its browser deployment is "
+                    f"privately segmented into {len(specs)} WASM regions"
                 ),
             ),
         ),
@@ -565,6 +619,7 @@ def describe_process_graph_api(
             "element_bytes": root_module.api.metadata.get("element_bytes", 8),
             "memory_export": root_module.api.metadata.get("memory_export", "memory"),
             "reserved_bytes": 0,
+            "execution_mode": "segmented",
             "class_graph_module_count": len(specs),
         },
     )

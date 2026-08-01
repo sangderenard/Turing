@@ -32,6 +32,12 @@ from src.common.tensors.topological_reducer import reduce_abstract_tensor_topolo
 from src.compiler.backend_sources import collect_backend_sources
 from src.compiler.fused_program_wasm_backend import emit_wasm_module, required_steps
 from src.compiler.shell_telemetry import TelemetryChannel, summarize_process_graph
+from src.compiler.wasm_class_modules import (
+    build_embedded_class_graph,
+    describe_process_graph_api,
+    emit_class_modules,
+    partition_reduced_program,
+)
 from src.compiler.wasm_html_shell import emit_html_shell
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -40,6 +46,8 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 # once a point has escaped, the comparison stops incrementing, so running
 # more iterations refines the boundary rather than changing what it means.
 ITERATIONS = 160
+WASM_REGION_STEPS = 400
+WASM_MODULE_DIR = "site-wasm"
 
 # The orbit is clamped so a diverging point cannot reach infinity and poison
 # the arithmetic; well above the escape radius, so it never touches a point
@@ -313,24 +321,64 @@ def build(destination: Path) -> Path:
                     dead_steps=len(program.steps) - len(required_steps(wanted)))
         advance("pruned")
 
-        with channel.timed("WebAssembly emission and assembly", path="wasm"):
-            module = emit_wasm_module(wanted, name="mandelbrot", dtype="float64")
-        if not module.complete:
-            raise SystemExit(module.shortfall_report())
+        with channel.timed("segmented WebAssembly emission and assembly", path="wasm"):
+            specs = partition_reduced_program(
+                wanted,
+                chunk_size=WASM_REGION_STEPS,
+                owner_name=aot.entrypoint,
+            )
+            modules = emit_class_modules(
+                specs,
+                dtype="float64",
+                link_calls=False,
+            )
+            incomplete = [
+                (spec, modules[spec.index])
+                for spec in specs
+                if not modules[spec.index].complete
+            ]
+            if incomplete:
+                raise SystemExit("\n".join(
+                    module.shortfall_report()
+                    for _spec, module in incomplete
+                ))
+            api = describe_process_graph_api(
+                specs,
+                modules,
+                wanted,
+                entrypoint=aot.entrypoint,
+            )
+            class_graph = build_embedded_class_graph(
+                specs,
+                modules,
+                wanted,
+                entrypoint=aot.entrypoint,
+                embed_binaries=False,
+                module_dir=WASM_MODULE_DIR,
+            )
+            segmented_source = "\n\n".join(
+                modules[spec.index].source for spec in specs
+            )
+            wasm_bytes = sum(
+                len(modules[spec.index].binary) for spec in specs
+            )
         channel.profile("assembled", path="wasm", nanoseconds=0,
-                        bytes=len(module.binary))
+                        bytes=wasm_bytes, regions=len(specs))
         advance("wasm")
 
         with channel.timed("emitting every backend", path="sources"):
             sources = collect_backend_sources(
-                aot, channel=channel, wasm_source=module.source, program=wanted
+                aot,
+                channel=channel,
+                wasm_source=segmented_source,
+                program=wanted,
             )
         advance("sources")
 
     shell = emit_html_shell(
-        module.api,
-        source=module.source,
-        wasm_bytes=module.binary,
+        api,
+        source=segmented_source,
+        class_graph=class_graph,
         name="index",
         telemetry=channel,
         process_graph=summarize_process_graph(graph),
@@ -339,8 +387,8 @@ def build(destination: Path) -> Path:
         network_manifest={
             "name": "Mandelbrot future-detail controller",
             "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},
-            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "render_fps": 24, "travel_feed": _clock_name(module.api)},
-            "routes": [{"feed": _clock_name(module.api), "label": "network-guided travel", "effect": "future detail scores → dwell speed → camera clock → live frame"}],
+            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "render_fps": 24, "travel_feed": _clock_name(api)},
+            "routes": [{"feed": _clock_name(api), "label": "network-guided travel", "effect": "future detail scores → dwell speed → camera clock → live frame"}],
         },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes
         # the view drift instead of recomputing one picture forever.
@@ -372,7 +420,7 @@ def build(destination: Path) -> Path:
         # and the clock is matched by elimination rather than by guessing
         # which positional slot it landed in. If naming improves later this
         # keeps working untouched.
-        feed_expressions=_bind_expressions(module.api),
+        feed_expressions=_bind_expressions(api),
         build_parameters={
             "iterations (unrolled)": ITERATIONS,
             "camera": "animated_camera + dream_parameters, in-kernel",
@@ -381,13 +429,21 @@ def build(destination: Path) -> Path:
             "camera": "computed in the module from t via baked sin/cos/exp2",
             "deepest span": "1.6 * 2^-36",
             "steps": len(required_steps(wanted)),
-            "wasm bytes": len(module.binary),
+            "WASM regions": len(specs),
+            "region step cap": WASM_REGION_STEPS,
+            "wasm bytes": wasm_bytes,
             "interest model": "frozen 3→2→1 tanh network",
         },
         default_width=256,
         default_height=256,
     )
     written = shell.write(destination)
+    region_directory = destination / WASM_MODULE_DIR
+    region_directory.mkdir(parents=True, exist_ok=True)
+    for spec in specs:
+        (region_directory / f"{spec.module_name}.wasm").write_bytes(
+            modules[spec.index].binary
+        )
     served = len(sources.available())
     print(f"{served}/{len(sources.sources)} backends emitted this program")
     for entry in sources.sources:
@@ -395,6 +451,7 @@ def build(destination: Path) -> Path:
         print(f"  {entry.title:16} {state} {entry.lines:6} lines"
               f"  {entry.reason[:60]}")
     print(f"wrote {written} ({written.stat().st_size // 1024} KB)")
+    print(f"wrote {len(specs)} lazy WASM regions to {region_directory}")
     return written
 
 
