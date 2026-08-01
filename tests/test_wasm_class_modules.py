@@ -374,9 +374,9 @@ def test_describe_process_graph_api_resolves_the_real_source_parameter_name():
     )
     external = build_embedded_class_graph(
         specs, modules, program, entrypoint=aot.entrypoint,
-        embed_binaries=False, module_dir="site-wasm",
+        embed_binaries=False, module_dir="site/v1/wasm",
     )
-    assert all(module["url"].startswith("site-wasm/")
+    assert all(module["url"].startswith("site/v1/wasm/")
                for module in external["modules"])
     assert all("wasm_base64" not in module for module in external["modules"])
 

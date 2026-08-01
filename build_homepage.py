@@ -47,7 +47,7 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 # more iterations refines the boundary rather than changing what it means.
 ITERATIONS = 160
 WASM_REGION_STEPS = 400
-WASM_MODULE_DIR = "site-wasm"
+WASM_MODULE_DIR = "site/v1/wasm"
 
 # The orbit is clamped so a diverging point cannot reach infinity and poison
 # the arithmetic; well above the escape radius, so it never touches a point

@@ -24,7 +24,7 @@ the published homepage and are not its build source.
 `build_homepage.py` compiles the existing kernel to a reduced `FusedProgram`,
 selects its RGB outputs, and calls
 `wasm_class_modules.partition_reduced_program`. The resulting regions are
-emitted independently and written to `site-wasm/*.wasm`.
+emitted independently and written to `site/v1/wasm/*.wasm`.
 
 `index.html` contains the logical API, graph/schedule description, controls,
 and source views. It does not contain the region binaries as base64. On Run,
@@ -36,7 +36,9 @@ features of the one logical program.
 
 `build_embedded_class_graph(..., embed_binaries=True)` remains available for
 callers that genuinely need a self-contained file. The homepage deliberately
-uses `embed_binaries=False` and relative `site-wasm/` URLs.
+uses `embed_binaries=False` and relative `site/v1/wasm/` URLs. The versioned
+directory makes future deployment-ABI changes additive instead of silently
+replacing the files used by an older generated page.
 
 ## Important correctness fixes
 
@@ -95,7 +97,7 @@ Real homepage build:
 ```text
 python build_homepage.py
 8/8 backend source views emitted
-8 lazy WASM regions written to site-wasm/
+8 lazy WASM regions written to site/v1/wasm/
 ```
 
 The generated directory was served over HTTP and loaded in isolated headless
@@ -119,7 +121,7 @@ From the Turing repository root:
 python build_homepage.py
 ```
 
-Commit `index.html`, `site-wasm/*.wasm`, and the compiler/runtime sources and
+Commit `index.html`, `site/v1/wasm/*.wasm`, and the compiler/runtime sources and
 tests that produced them. GitHub Pages serves the repository root, so relative
 module URLs resolve beneath the project page without a special loader or a
 second site.
