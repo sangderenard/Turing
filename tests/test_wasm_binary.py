@@ -164,3 +164,42 @@ def test_tanh_is_no_longer_reported_as_unrepresentable():
     assert "tanh" in _LUT_OPS
     # The ones with neither an instruction nor a table stay refused.
     assert {"exp", "log", "sin", "pow"} <= _NO_WASM_INSTRUCTION
+
+
+def test_feed_order_follows_the_program_not_the_id_allocator():
+    """A value id is an allocation address, so sorting by it made the
+    parameter order arbitrary for any program with more than one feed. That
+    does not fail loudly -- it computes a wrong answer from correctly-shaped
+    inputs."""
+
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import program_feed_order
+
+    # Ids deliberately out of use order.
+    high, low, mid = 900, 100, 500
+    program = FusedProgram(
+        version=1,
+        feeds={high, low, mid},
+        steps=[
+            OpStep(step_id=0, op_name="add", input_ids=[high, low], attrs={}, result_id=10),
+            OpStep(step_id=1, op_name="mul", input_ids=[10, mid], attrs={}, result_id=11),
+        ],
+        outputs={"result": 11},
+    )
+    assert program_feed_order(program) == (high, low, mid)
+    assert program_feed_order(program) != tuple(sorted(program.feeds))
+
+
+def test_a_feed_nothing_reads_still_gets_a_parameter():
+    """The count has to match the signature even when a feed is unused."""
+
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import program_feed_order
+
+    program = FusedProgram(
+        version=1, feeds={7, 3},
+        steps=[OpStep(step_id=0, op_name="abs", input_ids=[7], attrs={}, result_id=9)],
+        outputs={"result": 9},
+    )
+    assert set(program_feed_order(program)) == {7, 3}
+    assert program_feed_order(program)[0] == 7

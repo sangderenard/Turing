@@ -41,6 +41,13 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 ITERATIONS = 48
 
 KERNEL = f"""
+def interest_network(cx, cy, interest):
+    # Frozen network source enters the same AOT/WASM pipeline as the fractal.
+    h0 = (cx * 0.83 + cy * -0.41 + interest * 0.72 + 0.15).tanh()
+    h1 = (cx * -0.36 + cy * 0.91 + interest * 0.48 - 0.08).tanh()
+    return (h0 * 0.62 + h1 * -0.57 + interest * 0.31).tanh()
+
+
 def mandelbrot_escape(cx, cy):
     zx = cx * 0.0
     zy = cx * 0.0
@@ -56,14 +63,14 @@ def mandelbrot_escape(cx, cy):
     return count
 
 
-def render(cx, cy):
-    return mandelbrot_escape(cx=cx, cy=cy)
-"""
+def render(cx, cy, interest):
+    recommendation = interest_network(cx=cx, cy=cy, interest=interest)
+    return mandelbrot_escape(cx=cx + recommendation * 0.018, cy=cy + recommendation * -0.012)"""
 
 
 def build(destination: Path) -> Path:
     channel = TelemetryChannel(name="homepage")
-    probe = {"cx": np.zeros(4), "cy": np.zeros(4)}
+    probe = {"cx": np.zeros(4), "cy": np.zeros(4), "interest": np.zeros(4)}
 
     with channel.stepped("building the homepage", 5, path="build") as advance:
         with channel.timed("parse + build_from_ast", path="frontend"):
@@ -124,6 +131,13 @@ def build(destination: Path) -> Path:
         process_graph=summarize_process_graph(graph),
         origin_source=KERNEL,
         backend_sources=sources,
+        network_manifest={
+            "name": "Mandelbrot interest controller",
+            "routes": [{
+                "feed": "feed2",
+                "effect": "interest network → Mandelbrot coordinates → JPEG image",
+            }],
+        },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes
         # the view drift instead of recomputing one picture forever.
         # The zoom ping-pongs over a 160-frame cycle instead of descending
@@ -135,11 +149,13 @@ def build(destination: Path) -> Path:
                      "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
             "feed1": "0.131826 + (y/(h-1) - 0.5) * 2.4 * "
                      "Math.pow(0.955, 80 - Math.abs(80 - (t % 160)))",
+            "feed2": "0.65 * Math.sin(t * 0.09) + 0.35 * Math.cos((x + y) * 0.035 + t * 0.04)",
         },
         build_parameters={
             "iterations (unrolled)": ITERATIONS,
             "steps": len(required_steps(wanted)),
             "wasm bytes": len(module.binary),
+            "interest model": "frozen 3→2→1 tanh network",
         },
         default_width=512,
         default_height=512,

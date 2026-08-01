@@ -245,6 +245,7 @@ const WASM_BASE64 = __WASM__;
 
 const $ = (id) => document.getElementById(id);
 const GRAPH = __GRAPH__;
+const NETWORK = __NETWORK__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
@@ -465,6 +466,7 @@ async function run() {
     }));
     log("progress", "reading outputs", { done: 4, total: 4 });
     renderActiveTab();
+    renderNetworkStats(feeds);
     setStatus("ran " + count + " elements in " + elapsed.toFixed(3) + " ms", "good");
   } catch (err) {
     running = false;
@@ -609,6 +611,28 @@ function wireTabs() {
   });
 }
 
+function renderNetworkStats(feeds) {
+  const pane = $("networkstats");
+  if (!pane) return;
+  const route = NETWORK.routes && NETWORK.routes[0];
+  if (!route || !feeds || !feeds.length) {
+    pane.textContent = "No feedback route is attached to this module.";
+    return;
+  }
+  const index = inputs.findIndex(p => p.name === route.feed);
+  const values = index < 0 ? null : feeds[index];
+  if (!values || !values.length) {
+    pane.textContent = "Route " + route.feed + " is awaiting input.";
+    return;
+  }
+  let low = Infinity, high = -Infinity, total = 0;
+  for (const value of values) { low = Math.min(low, value); high = Math.max(high, value); total += value; }
+  const output = lastOutputs[0] && lastOutputs[0].values || [];
+  pane.textContent = NETWORK.name + " · " + route.feed + " → " + route.effect +
+    " · " + values.length + " samples · mean " + (total / values.length).toFixed(4) +
+    " · range [" + low.toFixed(4) + ", " + high.toFixed(4) + "]" +
+    " · returned " + output.length + " image values";
+}
 function wireFilePicker() {
   const picker = $("picker");
   if (!picker) return;
@@ -827,6 +851,7 @@ def emit_html_shell(
     default_width: int = 64,
     default_height: int = 40,
     backend_sources: Any = None,
+    network_manifest: Mapping[str, Any] | None = None,
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -877,10 +902,14 @@ def emit_html_shell(
         graph_mapping = summarize_process_graph(process_graph)
     else:
         graph_mapping = dict(process_graph)
+    network_mapping = dict(network_manifest or {})
+    network_mapping.setdefault("name", "No feedback network attached")
+    network_mapping.setdefault("routes", [])
     script = (
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
         .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
+        .replace("__NETWORK__", json.dumps(network_mapping, default=str))
         .replace("__ENTRY__", str(entry["name"]))
     )
     boot_script = _BOOT_JS.replace(
@@ -982,6 +1011,11 @@ def emit_html_shell(
     </div>
   </div>
 
+  <div class="panel">
+    <div class="panel-title">Feedback network</div>
+    <div class="meta">This is the standard routing surface for an optional compiled inference network. Its manifest records which feed it observes and what compiled output it can influence; a service can supply the same contract when it creates a new page.</div>
+    <div id="networkstats" class="stat">Awaiting a run.</div>
+  </div>
   <div class="panel">
     <div class="panel-title">Results</div>
     <div class="tabs" role="tablist">
@@ -1087,6 +1121,7 @@ def shell_for_artifact(
     default_width: int = 64,
     default_height: int = 40,
     backend_sources: Any = None,
+    network_manifest: Mapping[str, Any] | None = None,
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
 

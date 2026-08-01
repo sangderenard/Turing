@@ -158,6 +158,33 @@ class WasmModule:
         return path
 
 
+def program_feed_order(program: FusedProgram) -> tuple[int, ...]:
+    """Feed order as the program itself uses them, not as their ids sort.
+
+    ``ordered_feed_ids`` sorts by value id, and a value id is an allocation
+    address -- so for a program with more than one feed the parameter order
+    was effectively arbitrary. A caller then wrote its first array into
+    whichever parameter happened to sort first, which does not fail: it
+    computes a wrong answer from correctly-shaped inputs. Measured on an
+    11-input network, sorted order was a scrambled permutation of the
+    source's own parameter order.
+
+    First use is the program's own statement about order, and for anything
+    the AOT front end emits it is source order, because the first thing a
+    program does with an argument is in the order the arguments appear.
+    Feeds nothing reads are appended, so the count still matches.
+    """
+
+    feeds = set(program.feeds)
+    order: list[int] = []
+    for step in program.steps:
+        for value_id in step.input_ids:
+            if value_id in feeds and value_id not in order:
+                order.append(value_id)
+    order.extend(sorted(feeds - set(order)))
+    return tuple(order)
+
+
 def required_steps(program: FusedProgram) -> list[OpStep]:
     """The steps the requested outputs actually depend on, in program order.
 
@@ -239,7 +266,7 @@ def emit_wasm_module(
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
 
-    feed_ids = ordered_feed_ids(program)
+    feed_ids = program_feed_order(program)
     output_ids = list(program.outputs.values())
     names: dict[int, str] = {}
     parameters: list[str] = ["$count"]
