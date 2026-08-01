@@ -145,6 +145,7 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .kv b { font-family: ui-monospace, monospace; font-weight: 600; min-width: 9rem; }
 .chip { display: inline-block; font-size: .72rem; font-family: ui-monospace, monospace;
   padding: .1rem .4rem; border-radius: .25rem; background: var(--soft); margin: .1rem; }
+.deployment-node.lit { background: var(--accent); color: white; }
 .filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
 .filters label { cursor: pointer; opacity: .75; }
 .srctabs { display: flex; flex-wrap: wrap; gap: .25rem; margin: .5rem 0; }
@@ -452,15 +453,10 @@ function applyFeedbackFeed(feeds, count) {
 let running = false;
 
 // --- class-graph execution ----------------------------------------------
-// A program compiled through wasm_class_modules.py's segmentation is not
-// one module: it is several, each with its own private memory, chained by
-// the same edges wasm-gallery/shared/process_graph_runner.js already runs
-// in the browser. This is that same algorithm -- a FIFO of modules whose
-// inputs have all arrived, dispatched one at a time -- ported to instantiate
-// from CLASS_GRAPH's embedded base64 bytes instead of fetching separate
-// .wasm files, since this page is one self-contained file. See
-// process_graph_runner.js's own comments for why the FIFO needs no more
-// global knowledge than "what module is next".
+// The public program may be deployed as several private modules, each with
+// its own memory and connected by ProcessGraph edges. The FIFO instantiates
+// a region only when execution reaches it; deployed pages fetch separate
+// .wasm files while self-contained callers may still provide base64 bytes.
 class ClassGraphRunner {
   constructor(manifest) {
     this.manifest = manifest;
@@ -469,6 +465,8 @@ class ClassGraphRunner {
     this.pending = new Map();
     this.outputs = new Map();
     this.queue = [];
+    this.completed = new Set();
+    this.count = 1;
     this.consumersOf = new Map();
     for (const edge of manifest.edges || []) {
       const key = edge.from.module + "::" + edge.from.output;
@@ -480,9 +478,20 @@ class ClassGraphRunner {
   async instance(name) {
     if (this.instances.has(name)) return this.instances.get(name);
     const spec = this.modulesByName.get(name);
-    const raw = atob(spec.wasm_base64);
-    const moduleBinary = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+    let moduleBinary;
+    if (spec.url) {
+      const response = await fetch(spec.url);
+      if (!response.ok) throw new Error(
+        "failed to load private WASM region " + name + ": HTTP " + response.status
+      );
+      moduleBinary = await response.arrayBuffer();
+    } else if (spec.wasm_base64) {
+      const raw = atob(spec.wasm_base64);
+      moduleBinary = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+    } else {
+      throw new Error("private WASM region " + name + " has no URL or bytes");
+    }
     const { instance } = await WebAssembly.instantiate(moduleBinary, {});
     this.instances.set(name, instance);
     return instance;
@@ -501,35 +510,59 @@ class ClassGraphRunner {
     const spec = this.modulesByName.get(moduleName);
     const instance = await this.instance(moduleName);
     const memory = instance.exports[spec.memory_export || "memory"];
-    const count = spec.count || 1;
+    const count = this.count;
     const elementBytes = spec.element_bytes || 8;
     const View = spec.value_type === "f32" ? Float32Array : Float64Array;
     const inputValues = this.pending.get(moduleName) || {};
 
     const names = [...spec.inputs, ...spec.outputs];
     const layout = {};
-    let cursor = 0;
+    let cursor = Math.ceil((spec.reserved_bytes || 0) / elementBytes) * elementBytes;
     for (const name of names) { layout[name] = cursor; cursor += count * elementBytes; }
     if (cursor > memory.buffer.byteLength) {
       memory.grow(Math.ceil((cursor - memory.buffer.byteLength) / 65536));
     }
     for (const name of spec.inputs) {
-      new View(memory.buffer, layout[name], count).fill(inputValues[name]);
+      const target = new View(memory.buffer, layout[name], count);
+      const source = inputValues[name];
+      if (ArrayBuffer.isView(source) || Array.isArray(source)) {
+        if (source.length === 1) target.fill(Number(source[0]));
+        else if (source.length >= count) target.set(source.slice(0, count));
+        else throw new Error(
+          moduleName + " input " + name + " has " + source.length +
+          " values for extent " + count
+        );
+      } else {
+        target.fill(Number(source));
+      }
     }
     const args = [count, ...spec.inputs.map(n => layout[n]), ...spec.outputs.map(n => layout[n])];
+    markDeploymentNode(moduleName);
     instance.exports[spec.entry](...args);
     const result = {};
-    for (const name of spec.outputs) result[name] = new View(memory.buffer, layout[name], count)[0];
+    for (const name of spec.outputs) {
+      result[name] = new View(memory.buffer, layout[name], count).slice();
+    }
     return result;
   }
 
-  async run(graphInputs) {
+  async run(graphInputs, count) {
+    this.pending = new Map();
+    this.outputs = new Map();
+    this.queue = [];
+    this.completed = new Set();
+    this.count = count;
+    for (const spec of this.manifest.modules) {
+      if (spec.inputs.length === 0) this.queue.push(spec.name);
+    }
     for (const [moduleName, values] of Object.entries(graphInputs || {})) {
       for (const [inputName, value] of Object.entries(values)) this.deliver(moduleName, inputName, value);
     }
     while (this.queue.length > 0) {
       const moduleName = this.queue.shift();
+      if (this.completed.has(moduleName)) continue;
       const result = await this.call(moduleName);
+      this.completed.add(moduleName);
       this.outputs.set(moduleName, result);
       for (const [outputName, value] of Object.entries(result)) {
         const consumers = this.consumersOf.get(moduleName + "::" + outputName) || [];
@@ -540,53 +573,123 @@ class ClassGraphRunner {
   }
 }
 
-// One pass through every module in the graph, given this frame's feed
-// arrays in the same order as `inputs` -- only the first element of each is
-// used (a class-graph module runs one element at a time today; the
-// single-module path's per-element sweep over a whole array is a
-// still-open follow-on, not something faked here).
-async function computeViaClassGraph(feeds) {
-  const runner = new ClassGraphRunner(CLASS_GRAPH);
+// One pass through every private module in the graph, using the full arrays
+// supplied through the logical program's public input contract.
+const classGraphRunner = CLASS_GRAPH ? new ClassGraphRunner(CLASS_GRAPH) : null;
+
+async function computeViaClassGraph(feeds, count) {
   const graphInputs = {};
   for (const [logicalName, targets] of Object.entries(CLASS_GRAPH.logical_inputs || {})) {
     const paramIndex = inputs.findIndex(p => p.name === logicalName);
-    const value = paramIndex >= 0 ? feeds[paramIndex][0] : 0;
+    if (paramIndex < 0) throw new Error("logical input " + logicalName + " is not in the API");
+    const value = feeds[paramIndex];
     for (const [moduleName, inputName] of targets) {
       graphInputs[moduleName] = graphInputs[moduleName] || {};
       graphInputs[moduleName][inputName] = value;
     }
   }
-  const outputs_ = await runner.run(graphInputs);
-  const rootOutputs = outputs_[CLASS_GRAPH.root_module] || {};
-  return CLASS_GRAPH.root_outputs.map(name => rootOutputs[name]);
+  const deployedOutputs = await classGraphRunner.run(graphInputs, count);
+  return outputs.map(parameter => {
+    const binding = CLASS_GRAPH.logical_outputs[parameter.name];
+    if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
+    const moduleOutputs = deployedOutputs[binding[0]] || {};
+    const value = moduleOutputs[binding[1]];
+    if (!value) throw new Error("deployment did not produce " + parameter.name);
+    return value;
+  });
 }
 
-// A simplified run loop for a class-graph program: one element per call
-// (see computeViaClassGraph), repeats and timing exactly like the
-// single-module path below, but not (yet) the continuous
-// expression/gaussian/network-feedback animation loop that path supports --
-// a class-graph module runs one element per WASM call today, so an
-// animated per-frame sweep over a whole grid is a still-open follow-on.
+// The segmented deployment follows the same full-domain run loop as a
+// monolithic module.  Animation, feedback, rendering and timing all remain
+// properties of the one logical program exposed by the page.
 async function runClassGraphMode() {
+  if (running) {
+    running = false;
+    return;
+  }
   try {
     const d = domain();
-    const feeds = inputs.map(p => feedValues(p, 1, d, frameIndex));
-    log("info", "class-graph run", { modules: CLASS_GRAPH.modules.length });
-    const repeats = Math.max(0, Number($("repeats").value) | 0) || 1;
+    const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
+    const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
+    const anyNetwork = inputs.some(p => $("mode_" + p.name).value === "network");
+    const renderFps = Math.max(1, Number((NETWORK.feedback || {}).render_fps) || 24);
+    const feedbackTicks = Math.max(
+      1,
+      Math.round((Number((NETWORK.feedback || {}).fps) || 120) / renderFps)
+    );
+    await advanceFeedback(feedbackTicks);
+    let activeFeeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
+    applyFeedbackFeed(activeFeeds, d.n);
+    const count = anyExpression
+      ? d.n
+      : (activeFeeds.length
+          ? Math.min(...activeFeeds.map(feed => feed.length))
+          : d.n);
+    if (!count) throw new Error("no elements to run");
+    const repeats = Math.max(0, Number($("repeats").value) | 0);
+    const continuous = repeats === 0;
+    const animated = (continuous || repeats > 1) &&
+      (anyExpression || anyGaussian || anyNetwork);
     const timings = [];
-    let lastResult = null;
-    for (let r = 0; r < repeats; r++) {
-      const t0 = performance.now();
-      lastResult = await computeViaClassGraph(feeds);
-      timings.push(performance.now() - t0);
+    if (animated) {
+      document.querySelectorAll(".tab").forEach(tab =>
+        tab.setAttribute("aria-selected", String(tab.dataset.view === "image"))
+      );
+      renderActiveTab();
     }
+    running = true;
+    $("run").textContent = "Stop";
+    log("info", "segmented deployment", {
+      modules: CLASS_GRAPH.modules.length,
+      elements: count,
+    });
+    for (let r = 0; running && (continuous || r < repeats); r++) {
+      if (r > 0 && animated) {
+        frameIndex = r;
+        await advanceFeedback(feedbackTicks);
+        activeFeeds = inputs.map(p => feedValues(p, count, d, frameIndex));
+        applyFeedbackFeed(activeFeeds, count);
+      }
+      const frameStarted = performance.now();
+      const t0 = performance.now();
+      const result = await computeViaClassGraph(activeFeeds, count);
+      timings.push(performance.now() - t0);
+      lastOutputs = outputs.map((p, index) => ({
+        name: p.name,
+        values: result[index],
+      }));
+      if (animated) {
+        if ((r % 15) === 0) reportTimings(timings, count);
+        renderActiveTab();
+        renderNetworkStats(activeFeeds);
+        await presented();
+        const remaining = 1000 / renderFps - (performance.now() - frameStarted);
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, remaining)));
+      } else if (!continuous && repeats > 1 && (r % 200) === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    running = false;
+    $("run").textContent = RUN_LABEL;
+    frameIndex = 0;
     const ordered = timings.slice().sort((a, b) => a - b);
     const elapsed = ordered[ordered.length >> 1];
-    lastOutputs = outputs.map((p, i) => ({ name: p.name, values: [lastResult[i]] }));
+    reportTimings(timings, count);
     renderActiveTab();
-    setStatus("ran " + repeats + " call(s) in " + elapsed.toFixed(3) + " ms (class-graph)", "good");
-    log("ok", "class-graph run complete", { median_ms: Number(elapsed.toFixed(4)) });
+    renderNetworkStats(activeFeeds);
+    setStatus(
+      "ran " + count + " elements in " + elapsed.toFixed(3) +
+      " ms (segmented WASM)",
+      "good"
+    );
+    log("ok", "segmented run complete", {
+      median_ms: Number(elapsed.toFixed(4)),
+      elements: count,
+      modules: CLASS_GRAPH.modules.length,
+    });
   } catch (err) {
+    running = false;
+    $("run").textContent = RUN_LABEL;
     setStatus(String(err), "bad");
     log("error", err && err.message ? err.message : err,
         { stack: err && err.stack ? err.stack.split("\n")[0] : null });
@@ -902,20 +1005,47 @@ function wireFilters() {
 
 function renderGraph() {
   const target = document.getElementById("graph");
-  if (!target || !GRAPH || !GRAPH.nodes) return;
-  const hist = Object.entries(GRAPH.histogram || {})
-    .map(([k, v]) => '<span class="chip">' + k + " x" + v + "</span>").join("");
-  const rows = (GRAPH.table || []).map(n =>
-    '<div class="kv"><b>' + n.id + "</b><span>" + n.type + "</span><span>" +
-    (n.label || "") + "</span><span class=meta>" +
-    (n.parents.length ? "&larr; " + n.parents.join(", ") : "") + "</span></div>"
-  ).join("");
-  target.innerHTML =
-    '<div class="kv"><b>nodes</b><span>' + GRAPH.nodes + "</span></div>" +
-    '<div class="kv"><b>edges</b><span>' + GRAPH.edges + "</span></div>" +
-    "<div>" + hist + "</div>" +
-    (GRAPH.truncated ? '<div class="meta">table truncated</div>' : "") +
-    rows;
+  if (!target) return;
+  let html = "";
+  if (GRAPH && GRAPH.nodes) {
+    const hist = Object.entries(GRAPH.histogram || {})
+      .map(([k, v]) => '<span class="chip">' + k + " x" + v + "</span>").join("");
+    const rows = (GRAPH.table || []).map(n =>
+      '<div class="kv"><b>' + n.id + "</b><span>" + n.type + "</span><span>" +
+      (n.label || "") + "</span><span class=meta>" +
+      (n.parents.length ? "&larr; " + n.parents.join(", ") : "") + "</span></div>"
+    ).join("");
+    html += '<div class="meta">Logical ProcessGraph</div>' +
+      '<div class="kv"><b>nodes</b><span>' + GRAPH.nodes + "</span></div>" +
+      '<div class="kv"><b>edges</b><span>' + GRAPH.edges + "</span></div>" +
+      "<div>" + hist + "</div>" +
+      (GRAPH.truncated ? '<div class="meta">table truncated</div>' : "") +
+      rows;
+  }
+  if (CLASS_GRAPH && CLASS_GRAPH.schedule) {
+    const moduleByName = new Map(CLASS_GRAPH.modules.map(module => [module.name, module]));
+    const deploymentRows = CLASS_GRAPH.schedule.nodes
+      .slice()
+      .sort((left, right) => left.level - right.level || left.id.localeCompare(right.id))
+      .map(node => {
+        const module = moduleByName.get(node.id) || {};
+        return '<div class="kv deployment-node" data-module="' + node.id + '">' +
+          '<b>' + node.id + '</b><span>level ' + node.level + '</span><span>' +
+          (module.operation_count || 0) + ' ops</span><span class="meta">' +
+          (node.is_root ? "owns a logical output" : "private region") +
+          "</span></div>";
+      }).join("");
+    html += '<div class="meta" style="margin-top:.7rem">Deployment overlay: ' +
+      CLASS_GRAPH.modules.length + ' private WASM regions behind the same API</div>' +
+      deploymentRows;
+  }
+  target.innerHTML = html;
+}
+
+function markDeploymentNode(moduleName) {
+  document.querySelectorAll(".deployment-node").forEach(node =>
+    node.classList.toggle("lit", node.dataset.module === moduleName)
+  );
 }
 
 function wireSourceTabs() {

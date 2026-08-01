@@ -24,6 +24,7 @@ from ..common.tensors.fused_ir import (
     OpStep,
     canonical_elementwise_op,
     ordered_feed_ids,
+    uniform_tensor_constant,
 )
 from ..transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -851,28 +852,30 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
 
     for step in program.steps:
         if step.op_name == "tensor_from_list":
-            # A standalone constant-materialization step -- distinct from
-            # the *inline* right_scalar case just below, where a constant
-            # never got its own step at all. operator_catalog.py classifies
-            # tensor_from_list as a CREATION_OPERATOR, not an elementwise
-            # one, so canonical_elementwise_op has nothing to canonicalize
-            # it to; it becomes a "const" node directly, at its own
-            # result_id, the same value fused_program_wasm_backend's
-            # _constant_scalar already extracts for the WASM backend.
-            from .fused_program_wasm_backend import _constant_scalar
-
-            constant = _constant_scalar(step)
-            if constant is None:
+            # A constructor is semantic data, not a WASM policy decision.
+            # Preserve its complete nested value and tensor metadata here;
+            # a backend may later choose an immediate for a uniform value or
+            # materialize a varying value in its native storage.
+            if "values" not in step.attrs:
                 raise ValueError(
-                    f"step {step.step_id} is a tensor_from_list ProcessGraph "
-                    "translation does not support: only a one-element "
-                    "constant becomes a node here, the same limit "
-                    "fused_program_wasm_backend.emit_wasm_module reports as "
-                    "a WasmShortfall for the same op"
+                    f"step {step.step_id} tensor_from_list has no values"
                 )
+            constant = copy.deepcopy(step.attrs["values"])
+            attributes = {
+                key: copy.deepcopy(value)
+                for key, value in step.attrs.items()
+                if key != "values"
+            }
+            attributes["creation_op"] = "tensor_from_list"
             add_node(
                 step.result_id,
-                _node_payload("const", label=repr(constant), constant=constant),
+                _node_payload(
+                    "const",
+                    label=f"tensor constant %{step.result_id}",
+                    constant=constant,
+                    attributes=attributes,
+                    meta=metadata.get(step.result_id),
+                ),
             )
             continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
@@ -1069,6 +1072,37 @@ def dispatch_region_to_fused_program(
             device=tensor.get("device"),
         )
 
+    emitted_tensor_constants: set[int] = set()
+
+    def append_tensor_constant(
+        parent_id: int,
+        parent_data: Mapping[str, Any],
+    ) -> None:
+        if parent_id in emitted_tensor_constants:
+            return
+        tensor = parent_data.get("tensor") or {}
+        metadata[parent_id] = Meta(
+            shape=tuple(tensor.get("shape") or ()),
+            dtype=tensor.get("dtype"),
+            device=tensor.get("device"),
+        )
+        attrs = {
+            key: copy.deepcopy(value)
+            for key, value in (parent_data.get("attributes") or {}).items()
+            if key != "creation_op"
+        }
+        attrs["values"] = copy.deepcopy(parent_data.get("constant"))
+        steps.append(
+            OpStep(
+                step_id=len(steps),
+                op_name="tensor_from_list",
+                input_ids=[],
+                attrs=attrs,
+                result_id=parent_id,
+            )
+        )
+        emitted_tensor_constants.add(parent_id)
+
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
         op, _ = canonical_elementwise_op(_operation(graph, node_id))
@@ -1078,7 +1112,26 @@ def dispatch_region_to_fused_program(
         for parent_id, _role in parents:
             parent_data = graph.G.nodes[parent_id]
             if _operation(graph, parent_id) == "const":
-                scalar_parent = (parent_id, parent_data.get("constant"))
+                constant = parent_data.get("constant")
+                scalar = uniform_tensor_constant(constant)
+                if scalar is not None:
+                    if scalar_parent is not None:
+                        # FusedProgram represents a binary scalar operand in
+                        # right_scalar, so two constant operands cannot both
+                        # occupy that slot. Keep the first as an ordinary
+                        # tensor constructor and use the second as the scalar;
+                        # this preserves operand order without folding graph
+                        # semantics inside the ProcessGraph adapter.
+                        previous_id, _previous_scalar = scalar_parent
+                        append_tensor_constant(
+                            previous_id,
+                            graph.G.nodes[previous_id],
+                        )
+                        value_parents.append(previous_id)
+                    scalar_parent = (parent_id, scalar)
+                else:
+                    append_tensor_constant(parent_id, parent_data)
+                    value_parents.append(parent_id)
             else:
                 value_parents.append(parent_id)
         attrs: dict[str, Any] = {}

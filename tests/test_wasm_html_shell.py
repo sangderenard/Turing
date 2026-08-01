@@ -197,6 +197,45 @@ def test_the_shell_receives_telemetry_progress_graph_and_both_sources():
     assert "schema: turing-compiled-program-api-v1" in html
 
 
+def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    artifact = _artifact()
+    class_graph = {
+        "modules": [{
+            "name": "private_region_0",
+            "wasm_base64": "AGFzbQEAAAA=",
+            "entry": "kernel__0",
+            "reserved_bytes": 24,
+            "inputs": [{"name": "feed0"}],
+            "outputs": [{"name": "value_2"}],
+        }],
+        "edges": [],
+        "logical_inputs": {"feed0": [["private_region_0", "feed0"]]},
+        "logical_outputs": {"result": ["private_region_0", "value_2"]},
+        "root_module": "private_region_0",
+        "root_outputs": ["value_2"],
+        "schedule": {
+            "nodes": [{"name": "private_region_0", "level": 0,
+                       "operation_count": 1, "is_root": True}],
+            "levels": [{"level": 0, "modules": ["private_region_0"]}],
+        },
+    }
+    html = emit_html_shell(
+        artifact.api,
+        class_graph=class_graph,
+        process_graph={"nodes": 1, "edges": 0, "histogram": {},
+                       "table": [], "truncated": False},
+    ).html
+
+    assert "source.slice(0, count)" in html
+    assert "spec.reserved_bytes || 0" in html
+    assert "logical_outputs[parameter.name]" in html
+    assert "Deployment overlay:" in html
+    assert "await fetch(spec.url)" in html
+    assert "one element per call today" not in html
+
+
 def test_an_edited_descriptor_does_not_pretend_to_apply():
     """Applying an edited descriptor is not wired up; a control that looks
     live but is not is worse than one that says so."""

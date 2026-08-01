@@ -47,7 +47,9 @@ from ..common.tensors.fused_ir import (
     ELEMENTWISE_UNARY,
     FusedProgram,
     OpStep,
+    flatten_tensor_constant,
     ordered_feed_ids,
+    uniform_tensor_constant,
 )
 
 
@@ -236,12 +238,7 @@ def _constant_scalar(step: OpStep) -> float | None:
 
     if step.op_name != "tensor_from_list":
         return None
-    values = step.attrs.get("values")
-    while isinstance(values, (list, tuple)) and len(values) == 1:
-        values = values[0]
-    if isinstance(values, (int, float)) and not isinstance(values, bool):
-        return float(values)
-    return None
+    return uniform_tensor_constant(step.attrs.get("values"))
 
 
 def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str, str]:
@@ -283,6 +280,9 @@ def emit_wasm_module(
 
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
+    live = required_steps(program)
+    static_data = plan_static_data(live, value_type)
+    shortfalls.extend(static_data["shortfalls"])
 
     feed_ids = program_feed_order(program)
     output_ids = list(program.outputs.values())
@@ -320,10 +320,17 @@ def emit_wasm_module(
         body.append(f"      {load}")
         body.append(f"      local.set {local}")
 
-    for step in required_steps(program):
+    for step in live:
         local = f"$v{len(names)}"
         locals_declared.append(f"(local {local} {value_type})")
-        instructions = _step_instructions(step, names, value_type, shortfalls)
+        instructions = _step_instructions(
+            step,
+            names,
+            value_type,
+            element_bytes,
+            static_data["constants"],
+            shortfalls,
+        )
         if instructions is None:
             # Still bind a name so later steps referring to this result do
             # not also fail; the module is incomplete either way.
@@ -373,9 +380,7 @@ def emit_wasm_module(
     ]
     source = "\n".join(lines)
 
-    reserved = plan_tables(
-        sorted({step.op_name for step in required_steps(program)} & _LUT_OPS)
-    )["reserved_bytes"]
+    reserved = static_data["reserved_bytes"]
     api = _describe(name, function_name, feed_ids, output_ids, value_type,
                     element_bytes, reserved,
                     input_names=feed_names(program, feed_ids),
@@ -384,7 +389,7 @@ def emit_wasm_module(
     if not shortfalls:
         binary = _assemble(
             program, feed_ids, output_ids, value_type, element_bytes,
-            function_name, imports=imports,
+            function_name, static_data=static_data, imports=imports,
         )
     return WasmModule(
         name=name,
@@ -401,6 +406,8 @@ def _step_instructions(
     step: OpStep,
     names: Mapping[int, str],
     value_type: str,
+    element_bytes: int,
+    constant_entries: Mapping[int, Mapping[str, Any]],
     shortfalls: list[WasmShortfall],
 ) -> list[str] | None:
     op = step.op_name
@@ -408,14 +415,17 @@ def _step_instructions(
     if constant is not None:
         return [f"      {value_type}.const {constant!r}"]
     if op == "tensor_from_list":
-        shortfalls.append(
-            WasmShortfall(
-                step.step_id, op,
-                "only a one-element constant can become an immediate; a real "
-                "array constant would have to be placed in linear memory",
-            )
-        )
-        return None
+        entry = constant_entries.get(step.result_id)
+        if entry is None:
+            return None
+        return [
+            f"      i32.const {entry['base']}",
+            "      local.get $i",
+            f"      i32.const {element_bytes}",
+            "      i32.mul",
+            "      i32.add",
+            f"      {value_type}.load",
+        ]
     if op in _NO_WASM_INSTRUCTION:
         shortfalls.append(
             WasmShortfall(
@@ -502,6 +512,7 @@ def _assemble(
     element_bytes: int,
     function_name: str,
     *,
+    static_data: Mapping[str, Any],
     imports: Sequence[object] = (),
 ) -> bytes:
     """Assemble the same program as a binary module.
@@ -520,7 +531,7 @@ def _assemble(
             f"{lut_ops} is only baked for f64; an f32 table would need its "
             "own sampling and has no caller yet"
         )
-    tables = plan_tables(lut_ops)
+    tables = static_data
     reserved_bytes = tables["reserved_bytes"]
 
     parameter_count = 1 + len(feed_ids) + len(output_ids)
@@ -559,6 +570,17 @@ def _assemble(
         constant = _constant_scalar(step)
         if constant is not None:
             builder.value_const(constant)
+            locals_for[step.result_id] = local
+            builder.local_set(local)
+            continue
+        if step.op_name == "tensor_from_list":
+            entry = tables["constants"][step.result_id]
+            builder.i32_const(entry["base"])
+            builder.local_get(index_local)
+            builder.i32_const(element_bytes)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            builder.load()
             locals_for[step.result_id] = local
             builder.local_set(local)
             continue
@@ -749,6 +771,51 @@ def plan_tables(ops, epsilon: float | None = None) -> dict:
         "entries": entries,
         "data": bytes(payload),
         "reserved_bytes": len(payload),
+    }
+
+
+def plan_static_data(
+    steps: Sequence[OpStep],
+    value_type: str,
+) -> dict[str, Any]:
+    """Pack lookup tables and varying tensor constants into module memory."""
+
+    import struct as _struct
+
+    tables = plan_tables(sorted({step.op_name for step in steps} & _LUT_OPS))
+    payload = bytearray(tables["data"])
+    element_bytes = 4 if value_type == "f32" else 8
+    pack_format = "<f" if value_type == "f32" else "<d"
+    constants: dict[int, dict[str, int]] = {}
+    shortfalls: list[WasmShortfall] = []
+
+    for step in steps:
+        if step.op_name != "tensor_from_list" or _constant_scalar(step) is not None:
+            continue
+        try:
+            values = flatten_tensor_constant(step.attrs.get("values"))
+        except (TypeError, ValueError) as exc:
+            shortfalls.append(
+                WasmShortfall(step.step_id, step.op_name, str(exc))
+            )
+            continue
+        padding = (-len(payload)) % element_bytes
+        if padding:
+            payload.extend(bytes(padding))
+        base = len(payload)
+        for value in values:
+            payload.extend(_struct.pack(pack_format, value))
+        constants[step.result_id] = {
+            "base": base,
+            "count": len(values),
+        }
+
+    return {
+        "entries": tables["entries"],
+        "constants": constants,
+        "data": bytes(payload),
+        "reserved_bytes": len(payload),
+        "shortfalls": tuple(shortfalls),
     }
 
 

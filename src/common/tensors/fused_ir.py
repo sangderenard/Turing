@@ -9,6 +9,7 @@ the neural-network stack.  These are the same public IR classes re-exported by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 
@@ -45,6 +46,53 @@ class FusedProgram:
     state_in: Set[int] | None = None
     meta: Dict[int, Meta] | None = None
     extras: Dict[str, int] | None = None
+
+
+def flatten_tensor_constant(values: Any) -> tuple[float, ...]:
+    """Return a tensor constructor payload in row-major scalar order.
+
+    tensor_from_list is a backend-neutral creation operation. Keeping this
+    small structural interpretation beside the IR prevents individual
+    backends (or ProcessGraph adapters) from inventing incompatible ideas of
+    what its nested values attribute means.
+    """
+
+    flattened: list[float] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+            return
+        if isinstance(value, Real):
+            flattened.append(float(value))
+            return
+        raise TypeError(
+            "tensor_from_list values must be nested numeric sequences; "
+            f"found {type(value).__name__}"
+        )
+
+    visit(values)
+    if not flattened:
+        raise ValueError("tensor_from_list values must not be empty")
+    return tuple(flattened)
+
+
+def uniform_tensor_constant(values: Any) -> float | None:
+    """Return the broadcast scalar represented by a uniform tensor value.
+
+    Captured scalar literals are commonly materialized over the probe domain
+    before they reach FusedProgram (for example [2, 2, 2, 2]). They remain
+    semantically scalar broadcasts and may be emitted as immediates. A
+    genuinely varying tensor returns None and must stay a tensor.
+    """
+
+    try:
+        flattened = flatten_tensor_constant(values)
+    except (TypeError, ValueError):
+        return None
+    first = flattened[0]
+    return first if all(value == first for value in flattened[1:]) else None
 
 
 ELEMENTWISE_ALIASES = {
