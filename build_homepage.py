@@ -160,7 +160,7 @@ def build(destination: Path) -> Path:
         network_manifest={
             "name": "Mandelbrot future-detail controller",
             "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},
-            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "travel_feed": "feed2"},
+            "feedback": {"candidate_offsets": [0.0, 0.45, 0.9], "fps": 120, "render_fps": 24, "travel_feed": "feed2"},
             "routes": [{"feed": "feed2", "label": "network-guided travel", "effect": "future detail scores → dwell speed → live frame"}],
         },
         # t is the frame number, so leaving "repeat" at 0 (continuous) makes

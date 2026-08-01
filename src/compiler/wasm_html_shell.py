@@ -363,7 +363,8 @@ async function ensureFeedbackRuntime() {
   return feedbackRuntime;
 }
 
-async function advanceFeedback() {
+async function advanceFeedback(ticks = 1) {
+  for (let tick = 0; tick < ticks; tick++) {
   const runtime = await ensureFeedbackRuntime();
   const contract = NETWORK.feedback;
   if (!runtime || !contract) return;
@@ -387,6 +388,7 @@ async function advanceFeedback() {
   feedbackState.scores = scores;
   feedbackState.speed = 0.45 + 1.8 * (1 - scores[0]) + 0.35 * best;
   feedbackState.travel += feedbackState.speed / Math.max(1, contract.fps || 120);
+}
 }
 
 function applyFeedbackFeed(feeds, count) {
@@ -414,7 +416,9 @@ async function run() {
     const d = domain();
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
-    await advanceFeedback();
+    const renderFps = Math.max(1, Number((NETWORK.feedback || {}).render_fps) || 24);
+    const feedbackTicks = Math.max(1, Math.round((Number((NETWORK.feedback || {}).fps) || 120) / renderFps));
+    await advanceFeedback(feedbackTicks);
     const feeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
     applyFeedbackFeed(feeds, d.n);
     let activeFeeds = feeds;
@@ -466,12 +470,16 @@ async function run() {
     const continuous = repeats === 0;
     const timings = [];
     const animated = (continuous || repeats > 1) && (anyExpression || anyGaussian);
+    if (animated) {
+      document.querySelectorAll(".tab").forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.view === "image")));
+      renderActiveTab();
+    }
     running = true;
     $("run").textContent = "Stop";
     for (let r = 0; running && (continuous || r < repeats); r++) {
       if (r > 0 && animated) {
         frameIndex = r;
-        await advanceFeedback();
+        await advanceFeedback(feedbackTicks);
         const refreshed = inputs.map(p => feedValues(p, count, d, frameIndex));
         applyFeedbackFeed(refreshed, count);
         activeFeeds = refreshed;
@@ -480,7 +488,8 @@ async function run() {
             refreshed[i].slice(0, count));
         });
       }
-      const t0 = performance.now();
+      const frameStarted = performance.now();
+      const t0 = frameStarted;
       fn(...args);
       timings.push(performance.now() - t0);
       if (animated) {
@@ -495,6 +504,8 @@ async function run() {
         renderNetworkStats(activeFeeds);
         if ((r % 15) === 0) reportTimings(timings, count);
         await new Promise(resolve => requestAnimationFrame(resolve));
+        const remaining = 1000 / renderFps - (performance.now() - frameStarted);
+        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
       } else if (!continuous && repeats > 1 && (r % 200) === 0) {
         // Even a non-animated sweep should not freeze the page.
         await new Promise(resolve => setTimeout(resolve, 0));

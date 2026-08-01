@@ -305,7 +305,7 @@ def test_a_repeat_is_also_a_frame_so_the_picture_moves():
     assert '"i", "x", "y", "w", "h", "t"' in html
     assert "expression over i, x, y, w, h, t" in html
     # Only the kernel call is timed, not the feed regeneration around it.
-    assert html.index("const t0 = performance.now();") < html.index("fn(...args);")
+    assert html.index("const t0 = frameStarted;") < html.index("fn(...args);")
 
 
 def test_animation_is_driven_by_repeats_not_a_second_control():
