@@ -16,6 +16,8 @@ from functools import lru_cache
 from pathlib import Path
 import sys
 
+import ctypes
+
 import numpy as np
 
 
@@ -391,6 +393,138 @@ def run_compiled_c_shell(
     return output
 
 
+_MANDELBROT_FORTRAN_AOT_SOURCE = f"""
+def mandelbrot_escape_aot(cx, cy, iterations):
+    zx = cx * 0.0
+    zy = cx * 0.0
+    count = cx * 0.0
+    clamp_value = cx * 0.0 + {ORBIT_CLAMP}
+    for _ in range(iterations):
+        zx2 = zx * zx
+        zy2 = zy * zy
+        count = count + (zx2 + zy2 <= 4.0)
+        zx, zy = zx2 - zy2 + cx, 2.0 * zx * zy + cy
+        zx = zx.minimum(clamp_value).maximum(-clamp_value)
+        zy = zy.minimum(clamp_value).maximum(-clamp_value)
+    return count
+
+
+def run_mandelbrot_aot(cx, cy, iterations):
+    return mandelbrot_escape_aot(cx, cy, iterations)
+"""
+
+
+def _values_by_id(function):
+    # A function's outputs must be named, or its results stay dead locals
+    # instead of becoming intent(out) arguments (ssa_fortran_backend.py).
+    values = {value.id: value for value in function.args}
+    for block in function.blocks.values():
+        for instr in block.instrs:
+            if instr.res is not None:
+                values[instr.res.id] = instr.res
+    return values
+
+
+def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path):
+    from ....transmogrifier.ssa import IRModule
+    from .aot_compile import compile_ast_aot
+    from ....compiler.precompile_to_ssa import lower_precompile_and_control_to_ssa
+    from ....compiler.ssa_fortran_backend import emit_module, compile_module
+
+    placeholder = np.zeros(count, dtype=np.float32)
+    feeds = {
+        "cx": placeholder,
+        "cy": placeholder,
+        "iterations": int(iterations),
+    }
+    aot = compile_ast_aot(
+        _MANDELBROT_FORTRAN_AOT_SOURCE,
+        "run_mandelbrot_aot",
+        feeds,
+        backend="fortran",
+    )
+    numerical_name = "mandelbrot_fortran_numerical"
+    control_name = "mandelbrot_fortran_control"
+    control = aot.shell_control_program
+    if control is None:
+        # A program with no loops or branches produces no control program --
+        # shell_control_program is Optional on DualIRShell for exactly this
+        # reason. The whole computation is then the numeric artifact, so the
+        # control side is the empty shell with no scheduled regions, which is
+        # the same construction program_order.py uses when it has to supply
+        # one. Passing None instead reaches control.region_indices and fails.
+        from ....compiler.control_source import ControlProgram, SequenceBlock
+
+        control = ControlProgram(root=SequenceBlock(()), region_indices=())
+    lowering = lower_precompile_and_control_to_ssa(
+        aot.compiled_shell_program,
+        control,
+        numerical_name=numerical_name,
+        control_name=control_name,
+    )
+    if not lowering.complete:
+        raise RuntimeError(
+            "Fortran AOT lowering incomplete: " + lowering.shortfall_report()
+        )
+
+    program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
+    values = _values_by_id(lowering.module.functions[numerical_name])
+    emit_outputs = {
+        numerical_name: [
+            values[int(value_id)]
+            for value_id in program.outputs.values()
+            if int(value_id) in values
+        ]
+    }
+    program_module = IRModule({
+        name: lowering.module.functions[name]
+        for name in (numerical_name, control_name)
+    })
+    module = emit_module(
+        program_module, name="mandelbrot_fortran_aot", outputs=emit_outputs
+    )
+    if not module.complete:
+        raise RuntimeError(
+            "Fortran emission incomplete: "
+            + "; ".join(s.format() for s in module.shortfalls)
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(module.source, encoding="utf-8")
+    library_path = compile_module(module, directory=out_path.parent)
+    return ctypes.CDLL(str(library_path))
+
+
+@lru_cache(maxsize=None)
+def _compiled_fortran_mandelbrot_library(count: int, iterations: int):
+    # Absolute: compile_module invokes the Fortran compiler as a subprocess,
+    # and a relative cache path is only correct while the working directory
+    # happens to be the repository root.
+    out_path = (
+        Path(__file__).resolve().parents[4]
+        / ".turing-cache"
+        / "mandelbrot_fortran_aot.f90"
+    )
+    return _aot_compile_mandelbrot_fortran(count, iterations, out_path)
+
+
+def run_compiled_fortran_shell(cx: np.ndarray, cy: np.ndarray, iterations: int) -> np.ndarray:
+    count = cx.size
+    lib = _compiled_fortran_mandelbrot_library(count, iterations)
+    fn = getattr(lib, "mandelbrot_fortran_numerical")
+    fn.restype = None
+    cx_arr = np.ascontiguousarray(cx.reshape(-1), dtype=np.float64)
+    cy_arr = np.ascontiguousarray(cy.reshape(-1), dtype=np.float64)
+    out = np.zeros(count, dtype=np.float64)
+    fn(
+        ctypes.c_int(count),
+        cx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        cy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_int(iterations),
+        out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+    )
+    return out.reshape(cx.shape)
+
+
 def benchmark_cpu_mandelbrot(
     *,
     shell: str,
@@ -409,6 +543,10 @@ def benchmark_cpu_mandelbrot(
         if backend != "c":
             raise ValueError("the C shell requires --backend c")
         execute = lambda: run_compiled_c_shell(cx, cy, iterations)
+    elif shell == "fortran":
+        if backend != "fortran":
+            raise ValueError("the Fortran shell requires --backend fortran")
+        execute = lambda: run_compiled_fortran_shell(cx, cy, iterations)
     else:
         raise ValueError(f"{shell!r} is not a CPU shell")
     # Materialize imports, backend registries, and CFFI compilation before
@@ -1545,7 +1683,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-c", action="store_true")
     ap.add_argument(
         "--shell",
-        choices=("python", "c", "glsl"),
+        choices=("python", "c", "fortran", "glsl"),
         default="python",
         help=(
             "control-shell language; defaults to the CPU Python shell"
@@ -1553,7 +1691,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--backend",
-        choices=("auto", "pure_python", "numpy", "c", "glsl"),
+        choices=("auto", "pure_python", "numpy", "c", "fortran", "glsl"),
         default="auto",
         help=(
             "interior tensor backend; auto selects numpy for Python, c for "
@@ -1700,11 +1838,13 @@ def main(argv: list[str] | None = None) -> int:
         args.backend = {
             "python": "numpy",
             "c": "c",
+            "fortran": "fortran",
             "glsl": "glsl",
         }[args.shell]
     compatible = {
         "python": {"pure_python", "numpy", "c"},
         "c": {"c"},
+        "fortran": {"fortran"},
         "glsl": {"glsl"},
     }
     if args.backend not in compatible[args.shell]:
