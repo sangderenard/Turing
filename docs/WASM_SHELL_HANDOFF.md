@@ -49,12 +49,32 @@ argument `llvm_signal_math._continuous_terms` already uses (sin 8 terms, cos
 9, exp 15, atan 15). `exp` uses the Lagrange remainder instead, its terms
 being all positive.
 
-**In-emitter LUTs.** `sin`, `cos`, `tanh` are wired into
-`fused_program_wasm_backend`: `plan_tables` lays several tables end to end,
-each op addresses its own base, and `reserved_bytes` in the API descriptor
-tells a caller where its own arrays may start. Browser-verified to ~2.9e-07
-out to |x| = 2000, so periodic range reduction holds for an ever-growing
-frame counter.
+**In-emitter LUTs.** All fifteen catalogue functions are wired into
+`fused_program_wasm_backend`. `_LUT_OPS` is taken *from* the catalogue, so
+adding a function to `wasm_math_tables` makes it emittable without a second
+edit. `plan_tables` lays several tables end to end, each op addresses its own
+base, and `reserved_bytes` in the API descriptor tells a caller where its own
+arrays may start. Tables load from the cache and fall back to computing.
+Browser-verified: sin/cos/tanh to ~2.9e-07 out to |x| = 2000 (periodic range
+reduction holds for an ever-growing frame counter), and exp2 4.93e-07, exp
+2.28e-07, log 3.34e-07, asin 1.26e-07, atan 3.09e-07, sinh 2.07e-07, acosh
+4.96e-08.
+
+**Feeds are named after their source parameters.** `def compute(a, b)` yields
+the contract `['count', 'a', 'b', 'out0']`, in the descriptor and in the WAT.
+Three things had to line up: the name is kept against the resident range as
+well as the object (a supplied array is rewrapped before use, so object
+identity does not survive); the helper is handed into the generated
+deployment class's namespace, which is an explicit whitelist; and the
+descriptor loop actually uses the labels. Unnamed, non-identifier and
+colliding names fall back to something bindable.
+
+**The camera is in the ingested program.** `render` computes centre, span,
+family blend and Julia constant from `t` using baked `sin`/`cos`/`exp`. The
+page supplies only the grid, the clock and the routed interest. The network
+drives the clock: `advanceFeedback` scores three future candidates, the best
+sets a dwell speed, and that advances `travel`, which is the `t` feed via
+the manifest's `travel_feed`.
 
 **The shell.** `wasm_html_shell.py`. Telemetry, progress, per-kind log
 filters, the process graph, both sources, the editable API descriptor, output
@@ -62,35 +82,23 @@ tabs, gaussian and expression feeds, continuous-by-default repeats.
 
 ## What is not finished
 
-**1. The camera is still in JavaScript.** `build_homepage.py`'s
-`feed_expressions` compute `center_x/y`, `span`, `family_mix`, `julia_x/y`
-per frame. They belong inside `quadratic_family`, computed from a single `t`
-feed, so the page supplies only the grid and time.
-
-`sin`/`cos` are now baked, so the wander and the family blend are unblocked.
-The dive needs `exp2`, which is in the cache but **not yet wired into
-`_LUT_OPS`**. Wiring it is the same three lines `sin`/`cos` took.
-
-**2. The page is 11.7 MB, uncommitted.** The parametric kernel at 160
+**1. The page is ~12 MB, uncommitted.** The parametric kernel at 160
 unrolled iterations compiles fine, but the *source tabs* embed 133,920 lines
 of SPIR-V verbatim. The published page is still the older 1.5 MB one. Options:
 truncate each pane to a few hundred lines with a count (recommended — nobody
 reads 133k lines in a browser); drop to ~64 iterations (loses the deep dive);
 or fetch sources as files (page stops being self-contained).
 
-**3. Tables are still embedded, not fetched.** The intended design is that
+Most of the weight is now two things: 133k lines of SPIR-V in the source
+tabs, and `exp`'s 4 MB table embedded in the module (`reserved_bytes` reads
+4325408). The table is the easier win -- see item 2.
+
+**2. Tables are still embedded, not fetched.** The intended design is that
 the shell fetches from `math_cache/` and writes into the reserved region, so
 a page needing `sin`/`cos` pulls 64 KB instead of carrying it. `reserved_bytes`
 and the manifest are the two halves that make this straightforward.
 
-**4. `parameter_names` is empty.** `capture_feed_origins` carries the field
-but nothing populates it, so a descriptor cannot say "this feed is `cx`".
-`program_feed_order` uses first-use order as a sound proxy for AOT-emitted
-programs — this was a real bug, silently wrong rather than loud: sorted-by-id
-order was the permutation `[10,9,7,0,2,6,5,3,8,1,4]` of an 11-input network's
-actual parameter order. Recording the binding name at capture is the real fix.
-
-**5. Fortran Mandelbrot numeric check never completed.** Compiles and links;
+**3. Fortran Mandelbrot numeric check never completed.** Compiles and links;
 its output was never compared against NumPy. Unverified, not known-bad.
 
 ## Things that cost hours, so they are written down
@@ -112,6 +120,11 @@ its output was never compared against NumPy. Unverified, not known-bad.
   offset 0; the shell was laying arrays over it, destroying the activation of
   the network it was about to ask, after which scores are garbage and the
   trajectory stops — presenting as a frozen page at full frame rate.
+- **Feed order is first use, not sorted id.** A value id is an allocation
+  address; sorting by it made parameter order arbitrary, and getting it wrong
+  computes a wrong answer from correctly-shaped inputs rather than failing.
+  On an 11-input network sorted order was the permutation
+  `[10,9,7,0,2,6,5,3,8,1,4]` of the source's own order.
 - **`unroll_limit` was capped three ways**: hardcoded on
   `LoopBackendCapabilities`; not inherited by the callee's graph (a function's
   graph is built independently, and the callee is where loops live); and
