@@ -121,6 +121,10 @@ OP_I32_CONST = 0x41
 OP_I32_ADD = 0x6A
 OP_I32_MUL = 0x6C
 OP_I32_GE_S = 0x4E
+OP_I32_TRUNC_F64_S = 0xAA
+OP_F64_CONVERT_I32_S = 0xB7
+OP_F32_CONVERT_I32_S = 0xB2
+OP_I32_TRUNC_F32_S = 0xA8
 EMPTY_BLOCK = 0x40
 
 
@@ -246,8 +250,16 @@ def build_module(
     body: CodeBuilder,
     memory_pages: int = 1,
     memory_name: str = "memory",
+    data: bytes = b"",
+    data_offset: int = 0,
 ) -> bytes:
-    """Assemble one exported function plus one exported memory."""
+    """Assemble one exported function plus one exported memory.
+
+    ``data`` is placed at ``data_offset`` as an active data segment, which is
+    how a baked table -- a lookup table for a function WebAssembly has no
+    instruction for -- reaches the module. A caller laying out its own arrays
+    must start past it; the API descriptor records how far.
+    """
 
     type_section = _section(
         1,
@@ -267,6 +279,19 @@ def build_module(
         ]),
     )
     code_section = _section(10, _vector([body.to_body()]))
+    # An active data segment: memory index 0, a constant offset expression,
+    # then the bytes. Emitted after the code section, as the format requires.
+    data_section = b""
+    if data:
+        segment = (
+            uleb(0)
+            + bytes([OP_I32_CONST])
+            + sleb(int(data_offset))
+            + bytes([OP_END])
+            + uleb(len(data))
+            + data
+        )
+        data_section = _section(11, _vector([segment]))
     return (
         b"\x00asm"
         + struct.pack("<I", 1)
@@ -275,11 +300,14 @@ def build_module(
         + memory_section
         + export_section
         + code_section
+        + data_section
     )
 
 
 __all__ = [
     "CodeBuilder",
+    "OP_F64_CONVERT_I32_S",
+    "OP_I32_TRUNC_F64_S",
     "EMPTY_BLOCK",
     "F32",
     "F64",

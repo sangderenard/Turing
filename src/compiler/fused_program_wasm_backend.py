@@ -114,9 +114,12 @@ _COMPARISON_INSTRUCTION = {
 _NO_WASM_INSTRUCTION = {
     "exp", "log", "pow", "mod", "floordiv",
     "sin", "cos", "tan", "asin", "acos", "atan",
-    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "sinh", "cosh", "asinh", "acosh", "atanh",
     "sign", "isfinite", "isnan", "isinf", "logical_not",
 }
+# Reachable only through a baked table (see tanh_table). f64 only: an f32
+# table would need its own sampling and has no caller yet.
+_LUT_OPS = {"tanh"}
 
 
 @dataclass(frozen=True)
@@ -321,7 +324,11 @@ def emit_wasm_module(
     ]
     source = "\n".join(lines)
 
-    api = _describe(name, function_name, feed_ids, output_ids, value_type, element_bytes)
+    reserved = 0
+    if {step.op_name for step in required_steps(program)} & _LUT_OPS:
+        reserved = len(tanh_table()[0]) * 8
+    api = _describe(name, function_name, feed_ids, output_ids, value_type,
+                    element_bytes, reserved)
     binary = None
     if not shortfalls:
         binary = _assemble(
@@ -375,6 +382,13 @@ def _step_instructions(
             WasmShortfall(step.step_id, op, "operand was never produced")
         )
         return None
+
+    if op in _LUT_OPS:
+        # The binary carries the table and the interpolation; the text form
+        # names the step instead of inlining it, so the two are not pretending
+        # to be line-for-line the same. The binary is the artifact that runs.
+        return [f"      ;; {op} via baked lookup table (see the .wasm)",
+                f"      local.get {left}"]
 
     if op in ELEMENTWISE_UNARY:
         instruction = _UNARY_INSTRUCTION.get(op)
@@ -445,6 +459,18 @@ def _assemble(
 
     from .wasm_binary import CodeBuilder, build_module
 
+    live = required_steps(program)
+    lut_ops = {step.op_name for step in live} & _LUT_OPS
+    table: list[float] = []
+    if lut_ops:
+        if value_type != "f64":
+            raise WasmEmissionError(
+                f"{sorted(lut_ops)} is only baked for f64; an f32 table would "
+                "need its own sampling and has no caller yet"
+            )
+        table, _bound = tanh_table()
+    reserved_bytes = len(table) * 8
+
     parameter_count = 1 + len(feed_ids) + len(output_ids)
     builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
     count_param = 0
@@ -476,7 +502,7 @@ def _assemble(
         builder.load()
         builder.local_set(local)
 
-    for step in required_steps(program):
+    for step in live:
         local = builder.declare_local(value_type)
         constant = _constant_scalar(step)
         if constant is not None:
@@ -492,7 +518,9 @@ def _assemble(
             else:
                 builder.value_const(float(step.attrs["right_scalar"]))
 
-        if step.op_name in ELEMENTWISE_UNARY:
+        if step.op_name in _LUT_OPS:
+            _emit_tanh_lut(builder, left, len(table) - 1)
+        elif step.op_name in ELEMENTWISE_UNARY:
             builder.local_get(left)
             builder.op(_UNARY_INSTRUCTION[step.op_name])
         elif step.attrs.get("reverse", False):
@@ -527,11 +555,126 @@ def _assemble(
     builder.end()  # loop
     builder.end()  # block
 
+    import struct as _struct
+
+    data = b"".join(_struct.pack("<d", value) for value in table)
+    # One page for the table, plus room for whatever the caller lays out
+    # after it. A caller that needs more grows the memory itself.
+    pages = max(1, (reserved_bytes + 65535) // 65536 + 1)
     return build_module(
         function_name=function_name,
         parameter_types=["i32"] * parameter_count,
         body=builder,
+        memory_pages=pages,
+        data=data,
     )
+
+
+
+# --- baked lookup tables ---------------------------------------------------
+#
+# WebAssembly has no transcendental instructions, so a function like tanh has
+# to arrive as data rather than as an opcode. That is what llvm_signal_math
+# already does for sine on the LLVM path: size a table from an absolute error
+# target, interpolate linearly between entries, and state the bound. The same
+# reasoning is used here so the two paths agree about what "accurate enough"
+# means -- linear interpolation error is bounded by M*h^2/8, where M bounds
+# the second derivative over the sampled interval.
+#
+# This is an approximation, and that is exactly why it is declared. The
+# refusal elsewhere in this file is aimed at silently substituting a guess for
+# an operation a caller asked for; a table whose error is chosen, bounded and
+# tested is a different thing.
+
+import math as _math
+
+# max|tanh''| = 4/(3*sqrt(3)), at x = +/- asinh(1/sqrt(2)).
+_TANH_CURVATURE = 4.0 / (3.0 * _math.sqrt(3.0))
+
+# tanh(8) = 0.99999977..., so clamping outside this costs less than the
+# interpolation does inside it.
+_TANH_LIMIT = 8.0
+
+# Default absolute error target for a baked table, matching the scale
+# llvm_signal_math treats as conservative for its own solvers.
+DEFAULT_LUT_EPSILON = 1.0e-6
+
+
+def _power_of_two_ceiling(value: int) -> int:
+    return 1 if value <= 1 else 1 << (value - 1).bit_length()
+
+
+def tanh_table(epsilon: float = DEFAULT_LUT_EPSILON) -> tuple[list[float], float]:
+    """Sample tanh finely enough that linear interpolation stays under
+    ``epsilon``, and report the bound actually achieved."""
+
+    span = 2.0 * _TANH_LIMIT
+    maximum_step = _math.sqrt(8.0 * epsilon / _TANH_CURVATURE)
+    required = max(4, _math.ceil(span / maximum_step))
+    intervals = _power_of_two_ceiling(required)
+    step = span / intervals
+    bound = _TANH_CURVATURE * step * step / 8.0
+    table = [
+        _math.tanh(-_TANH_LIMIT + step * index) for index in range(intervals + 1)
+    ]
+    return table, bound
+
+
+def _emit_tanh_lut(builder, source_local: int, table_intervals: int) -> None:
+    """Interpolate the baked table for the value in ``source_local``.
+
+    Leaves the result on the stack. The table lives at offset 0 in linear
+    memory; a caller's arrays start after it, which the API descriptor
+    records as ``reserved_bytes``.
+    """
+
+    from .wasm_binary import OP_F64_CONVERT_I32_S, OP_I32_TRUNC_F64_S
+
+    scale = table_intervals / (2.0 * _TANH_LIMIT)
+    position = builder.declare_local("f64")
+    index = builder.declare_local("i32")
+    lower = builder.declare_local("f64")
+
+    # position = clamp(v, -LIMIT, LIMIT) mapped to [0, intervals], then held
+    # just short of the last sample so index+1 is always in the table.
+    builder.local_get(source_local)
+    builder.value_const(_TANH_LIMIT)
+    builder.op("min")
+    builder.value_const(-_TANH_LIMIT)
+    builder.op("max")
+    builder.value_const(_TANH_LIMIT)
+    builder.op("add")
+    builder.value_const(scale)
+    builder.op("mul")
+    builder.value_const(float(table_intervals) - 1.0e-9)
+    builder.op("min")
+    builder.local_set(position)
+
+    builder.local_get(position)
+    builder.raw(OP_I32_TRUNC_F64_S)
+    builder.local_set(index)
+
+    # lower = table[index]
+    builder.local_get(index)
+    builder.i32_const(8)
+    builder.raw(0x6C)  # i32.mul
+    builder.load(offset=0)
+    builder.local_set(lower)
+
+    # lower + (table[index + 1] - lower) * (position - index)
+    builder.local_get(lower)
+    builder.local_get(index)
+    builder.i32_const(8)
+    builder.raw(0x6C)
+    builder.load(offset=8)
+    builder.local_get(lower)
+    builder.op("sub")
+    builder.local_get(position)
+    builder.local_get(index)
+    builder.raw(OP_F64_CONVERT_I32_S)
+    builder.op("sub")
+    builder.op("mul")
+    builder.op("add")
 
 
 def _describe(
@@ -541,6 +684,7 @@ def _describe(
     output_ids: Sequence[int],
     value_type: str,
     element_bytes: int,
+    reserved_bytes: int = 0,
 ):
     """The same calling-contract descriptor the Fortran path emits."""
 
@@ -604,6 +748,9 @@ def _describe(
             "value_type": value_type,
             "element_bytes": element_bytes,
             "memory_export": "memory",
+            # A baked table sits at offset 0, so a caller's arrays start
+            # here. Zero when the program needed no table.
+            "reserved_bytes": int(reserved_bytes),
         },
     )
 

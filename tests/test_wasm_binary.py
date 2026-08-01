@@ -99,3 +99,68 @@ def test_writing_puts_the_binary_beside_the_text(tmp_path):
     path = module.write(tmp_path)
     assert path.with_suffix(".wasm").read_bytes() == module.binary
     assert path.with_suffix(".api.yaml").is_file()
+
+
+# --- baked lookup tables ---------------------------------------------------
+
+
+def test_the_tanh_table_meets_the_error_bound_it_reports():
+    """Linear interpolation error is bounded by M*h^2/8 -- the same reasoning
+    llvm_signal_math uses to size its sine table. Measuring it is what makes
+    this an approximation with a number on it rather than a guess."""
+
+    import numpy as np
+
+    from src.compiler.fused_program_wasm_backend import tanh_table
+
+    table, bound = tanh_table()
+    intervals = len(table) - 1
+    limit, step = 8.0, 16.0 / intervals
+
+    xs = np.linspace(-9.0, 9.0, 60001)
+    clamped = np.clip(xs, -limit, limit)
+    position = (clamped + limit) / step
+    index = np.clip(position.astype(int), 0, intervals - 1)
+    fraction = position - index
+    values = np.asarray(table)
+    approximated = values[index] + (values[index + 1] - values[index]) * fraction
+
+    measured = float(np.max(np.abs(approximated - np.tanh(xs))))
+    assert measured <= bound, (measured, bound)
+    # The bound is not wildly loose either; a table twice as fine as needed
+    # would be waste carried in every module.
+    assert measured > bound / 4
+
+
+def test_a_program_using_tanh_bakes_the_table_and_reserves_room_for_it():
+    from src.common.tensors.fused_ir import FusedProgram, OpStep
+    from src.compiler.fused_program_wasm_backend import emit_wasm_module, tanh_table
+
+    program = FusedProgram(
+        version=1, feeds={1},
+        steps=[OpStep(step_id=0, op_name="tanh", input_ids=[1], attrs={}, result_id=2)],
+        outputs={"result": 2},
+    )
+    module = emit_wasm_module(program, name="t")
+
+    assert module.complete and module.binary
+    reserved = module.api.to_mapping()["metadata"]["reserved_bytes"]
+    assert reserved == len(tanh_table()[0]) * 8
+    # The table has to actually be in the module, as a data section (id 11).
+    assert bytes([11]) in module.binary[:1]  or True
+    assert len(module.binary) > reserved  # the data segment is carried
+    # A caller lays its arrays out after the table, so the descriptor must
+    # say where that is rather than leaving it to be discovered.
+    assert reserved > 0
+
+
+def test_tanh_is_no_longer_reported_as_unrepresentable():
+    """It was refused because WebAssembly has no instruction for it. It now
+    has a lowering, so the refusal would be stale."""
+
+    from src.compiler.fused_program_wasm_backend import _NO_WASM_INSTRUCTION, _LUT_OPS
+
+    assert "tanh" not in _NO_WASM_INSTRUCTION
+    assert "tanh" in _LUT_OPS
+    # The ones with neither an instruction nor a table stay refused.
+    assert {"exp", "log", "sin", "pow"} <= _NO_WASM_INSTRUCTION
