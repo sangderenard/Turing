@@ -113,13 +113,13 @@ _COMPARISON_INSTRUCTION = {
 # Named so the failure explains itself rather than reading as an oversight.
 _NO_WASM_INSTRUCTION = {
     "exp", "log", "pow", "mod", "floordiv",
-    "sin", "cos", "tan", "asin", "acos", "atan",
+    "tan", "asin", "acos", "atan",
     "sinh", "cosh", "asinh", "acosh", "atanh",
     "sign", "isfinite", "isnan", "isinf", "logical_not",
 }
 # Reachable only through a baked table (see tanh_table). f64 only: an f32
 # table would need its own sampling and has no caller yet.
-_LUT_OPS = {"tanh"}
+_LUT_OPS = {"tanh", "sin", "cos"}
 
 
 @dataclass(frozen=True)
@@ -351,9 +351,9 @@ def emit_wasm_module(
     ]
     source = "\n".join(lines)
 
-    reserved = 0
-    if {step.op_name for step in required_steps(program)} & _LUT_OPS:
-        reserved = len(tanh_table()[0]) * 8
+    reserved = plan_tables(
+        sorted({step.op_name for step in required_steps(program)} & _LUT_OPS)
+    )["reserved_bytes"]
     api = _describe(name, function_name, feed_ids, output_ids, value_type,
                     element_bytes, reserved)
     binary = None
@@ -487,16 +487,14 @@ def _assemble(
     from .wasm_binary import CodeBuilder, build_module
 
     live = required_steps(program)
-    lut_ops = {step.op_name for step in live} & _LUT_OPS
-    table: list[float] = []
-    if lut_ops:
-        if value_type != "f64":
-            raise WasmEmissionError(
-                f"{sorted(lut_ops)} is only baked for f64; an f32 table would "
-                "need its own sampling and has no caller yet"
-            )
-        table, _bound = tanh_table()
-    reserved_bytes = len(table) * 8
+    lut_ops = sorted({step.op_name for step in live} & _LUT_OPS)
+    if lut_ops and value_type != "f64":
+        raise WasmEmissionError(
+            f"{lut_ops} is only baked for f64; an f32 table would need its "
+            "own sampling and has no caller yet"
+        )
+    tables = plan_tables(lut_ops)
+    reserved_bytes = tables["reserved_bytes"]
 
     parameter_count = 1 + len(feed_ids) + len(output_ids)
     builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
@@ -546,7 +544,11 @@ def _assemble(
                 builder.value_const(float(step.attrs["right_scalar"]))
 
         if step.op_name in _LUT_OPS:
-            _emit_tanh_lut(builder, left, len(table) - 1)
+            entry = tables["entries"][step.op_name]
+            _emit_lut(
+                builder, left, step.op_name, entry["base"], entry["intervals"],
+                entry["lower"], entry["upper"], entry["periodic"],
+            )
         elif step.op_name in ELEMENTWISE_UNARY:
             builder.local_get(left)
             builder.op(_UNARY_INSTRUCTION[step.op_name])
@@ -582,9 +584,7 @@ def _assemble(
     builder.end()  # loop
     builder.end()  # block
 
-    import struct as _struct
-
-    data = b"".join(_struct.pack("<d", value) for value in table)
+    data = tables["data"]
     # One page for the table, plus room for whatever the caller lays out
     # after it. A caller that needs more grows the memory itself.
     pages = max(1, (reserved_bytes + 65535) // 65536 + 1)
@@ -618,6 +618,12 @@ import math as _math
 # max|tanh''| = 4/(3*sqrt(3)), at x = +/- asinh(1/sqrt(2)).
 _TANH_CURVATURE = 4.0 / (3.0 * _math.sqrt(3.0))
 
+# Periodic functions are sampled over one full turn and the argument is
+# reduced into it. Reduction needs only floor, which WebAssembly has, so a
+# periodic table stays exact for arguments of any size -- which matters here
+# because the camera's angle grows without bound as the frame counter does.
+_TAU = 2.0 * _math.pi
+
 # tanh(8) = 0.99999977..., so clamping outside this costs less than the
 # interpolation does inside it.
 _TANH_LIMIT = 8.0
@@ -629,6 +635,43 @@ DEFAULT_LUT_EPSILON = 1.0e-6
 
 def _power_of_two_ceiling(value: int) -> int:
     return 1 if value <= 1 else 1 << (value - 1).bit_length()
+
+
+def periodic_table(
+    function, epsilon: float = DEFAULT_LUT_EPSILON
+) -> tuple[list[float], float]:
+    """Sample one full period of a bounded periodic function.
+
+    Both sin and cos have max|f''| = 1, which is the same bound
+    llvm_signal_math uses for its own sine table -- the two paths size their
+    tables by the same reasoning so "accurate enough" means one thing.
+    """
+
+    maximum_step = _math.sqrt(8.0 * epsilon)
+    required = max(4, _math.ceil(_TAU / maximum_step))
+    intervals = _power_of_two_ceiling(required)
+    step = _TAU / intervals
+    bound = step * step / 8.0
+    return [function(step * index) for index in range(intervals + 1)], bound
+
+
+def lut_for(op: str, epsilon: float = DEFAULT_LUT_EPSILON):
+    """The table for one op, plus how its argument maps onto it.
+
+    Returns (table, bound, lower, upper, periodic). A periodic table wraps
+    the argument into [lower, upper); a saturating one clamps to it.
+    """
+
+    if op == "tanh":
+        table, bound = tanh_table(epsilon)
+        return table, bound, -_TANH_LIMIT, _TANH_LIMIT, False
+    if op == "sin":
+        table, bound = periodic_table(_math.sin, epsilon)
+        return table, bound, 0.0, _TAU, True
+    if op == "cos":
+        table, bound = periodic_table(_math.cos, epsilon)
+        return table, bound, 0.0, _TAU, True
+    raise WasmEmissionError(f"no baked table defined for {op!r}")
 
 
 def tanh_table(epsilon: float = DEFAULT_LUT_EPSILON) -> tuple[list[float], float]:
@@ -647,54 +690,96 @@ def tanh_table(epsilon: float = DEFAULT_LUT_EPSILON) -> tuple[list[float], float
     return table, bound
 
 
-def _emit_tanh_lut(builder, source_local: int, table_intervals: int) -> None:
-    """Interpolate the baked table for the value in ``source_local``.
+def plan_tables(ops, epsilon: float = DEFAULT_LUT_EPSILON) -> dict:
+    """Lay every table a program needs into one block of memory.
 
-    Leaves the result on the stack. The table lives at offset 0 in linear
-    memory; a caller's arrays start after it, which the API descriptor
-    records as ``reserved_bytes``.
+    Returns the packed bytes, the byte each table starts at, and the total
+    reservation the caller must start past. Sorted, so the same program
+    always produces the same module rather than one that depends on set
+    iteration order.
+    """
+
+    import struct as _struct
+
+    entries: dict[str, dict] = {}
+    payload = bytearray()
+    for op in sorted(ops):
+        table, bound, lower, upper, periodic = lut_for(op, epsilon)
+        entries[op] = {
+            "base": len(payload),
+            "intervals": len(table) - 1,
+            "lower": lower,
+            "upper": upper,
+            "periodic": periodic,
+            "bound": bound,
+        }
+        for value in table:
+            payload += _struct.pack("<d", value)
+    return {
+        "entries": entries,
+        "data": bytes(payload),
+        "reserved_bytes": len(payload),
+    }
+
+
+def _emit_lut(builder, source_local: int, op: str, table_base: int,
+              intervals: int, lower: float, upper: float, periodic: bool) -> None:
+    """Interpolate a baked table for the value in ``source_local``.
+
+    Leaves the result on the stack. ``table_base`` is the byte offset the
+    table was placed at; several tables share linear memory, so each is
+    addressed from its own base rather than assuming offset zero.
     """
 
     from .wasm_binary import OP_F64_CONVERT_I32_S, OP_I32_TRUNC_F64_S
 
-    scale = table_intervals / (2.0 * _TANH_LIMIT)
+    span = upper - lower
+    scale = intervals / span
     position = builder.declare_local("f64")
     index = builder.declare_local("i32")
-    lower = builder.declare_local("f64")
+    lower_value = builder.declare_local("f64")
 
-    # position = clamp(v, -LIMIT, LIMIT) mapped to [0, intervals], then held
-    # just short of the last sample so index+1 is always in the table.
     builder.local_get(source_local)
-    builder.value_const(_TANH_LIMIT)
-    builder.op("min")
-    builder.value_const(-_TANH_LIMIT)
-    builder.op("max")
-    builder.value_const(_TANH_LIMIT)
-    builder.op("add")
+    if periodic:
+        # x - floor(x / span) * span, so any argument lands in one period.
+        builder.local_get(source_local)
+        builder.value_const(1.0 / span)
+        builder.op("mul")
+        builder.op("floor")
+        builder.value_const(span)
+        builder.op("mul")
+        builder.op("sub")
+    else:
+        builder.value_const(upper)
+        builder.op("min")
+        builder.value_const(lower)
+        builder.op("max")
+        builder.value_const(-lower)
+        builder.op("add")
     builder.value_const(scale)
     builder.op("mul")
-    builder.value_const(float(table_intervals) - 1.0e-9)
+    builder.value_const(float(intervals) - 1.0e-9)
     builder.op("min")
+    builder.value_const(0.0)
+    builder.op("max")
     builder.local_set(position)
 
     builder.local_get(position)
     builder.raw(OP_I32_TRUNC_F64_S)
     builder.local_set(index)
 
-    # lower = table[index]
-    builder.local_get(index)
-    builder.i32_const(8)
-    builder.raw(0x6C)  # i32.mul
-    builder.load(offset=0)
-    builder.local_set(lower)
-
-    # lower + (table[index + 1] - lower) * (position - index)
-    builder.local_get(lower)
     builder.local_get(index)
     builder.i32_const(8)
     builder.raw(0x6C)
-    builder.load(offset=8)
-    builder.local_get(lower)
+    builder.load(offset=table_base)
+    builder.local_set(lower_value)
+
+    builder.local_get(lower_value)
+    builder.local_get(index)
+    builder.i32_const(8)
+    builder.raw(0x6C)
+    builder.load(offset=table_base + 8)
+    builder.local_get(lower_value)
     builder.op("sub")
     builder.local_get(position)
     builder.local_get(index)
