@@ -317,12 +317,24 @@ def collect_backend_sources(
     # --- GLSL -----------------------------------------------------------
     try:
         from ..common.tensors.accelerator_backends.glsl_backend import (
+            emit_multi_output_program_source,
             emit_program_source,
+        )
+
+        # A same-shape multi-output region is one shader writing several
+        # SSBOs while sharing every intermediate -- the backend has done this
+        # since the four-plane Mandelbrot dispatch. Only the single-output
+        # entry point refuses it, so pick the door that matches the program
+        # rather than reporting the backend cannot serve it.
+        emit = (
+            emit_multi_output_program_source
+            if len(program.outputs) > 1
+            else emit_program_source
         )
 
         collected.append(BackendSource(
             language="glsl", title="GLSL",
-            source=emit_program_source(program), highlight="c",
+            source=emit(program), highlight="c",
         ))
         note("GLSL emitted")
     except Exception as error:
