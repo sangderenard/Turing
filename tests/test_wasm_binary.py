@@ -4,7 +4,9 @@ import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
-from src.compiler.wasm_binary import sleb, uleb
+from src.compiler.wasm_binary import (
+    CodeBuilder, WasmImport, build_module, sleb, uleb,
+)
 
 
 def _program(steps, feeds, outputs):
@@ -274,3 +276,164 @@ def test_colliding_names_are_made_unique():
     names = feed_names(program, [11, 22])
     assert names[0] == "x" and names[1] != "x"
     assert len(set(names)) == 2
+
+
+# --- imports: real WASM-to-WASM linking, no import section previously ------
+
+
+def _helper_module() -> bytes:
+    """Exports ``double(in_offset, out_offset)``: reads an f64 at
+    ``in_offset``, doubles it, stores it at ``out_offset``. Owns its own
+    memory -- a caller that wants to share it imports it (see below)."""
+
+    # to_body() appends the function-terminating end itself; .end() is only
+    # for closing an explicit block/loop, of which this body has none.
+    body = CodeBuilder(value_type="f64", parameter_count=2)
+    body.local_get(1)          # out_offset
+    body.local_get(0).load()   # in value
+    body.value_const(2.0).op("mul")
+    body.store()
+    return build_module(
+        function_name="double", parameter_types=["i32", "i32"], body=body,
+    )
+
+
+def _main_module() -> bytes:
+    """Imports ``helper``'s ``double`` function and its memory, and exports
+    ``run`` as a thin pass-through -- proof that a call crossing a module
+    boundary is a real WASM ``call`` instruction against an imported
+    function index, not JavaScript copying values between two buffers."""
+
+    imports = [
+        WasmImport(module="helper", field="double", kind="func",
+                   parameter_types=("i32", "i32")),
+        WasmImport(module="helper", field="memory", kind="memory",
+                   memory_pages=1),
+    ]
+    body = CodeBuilder(value_type="f64", parameter_count=2)
+    body.local_get(0)
+    body.local_get(1)
+    body.call(0)  # index 0: the sole "func" import
+    return build_module(
+        function_name="run", parameter_types=["i32", "i32"], body=body,
+        imports=imports,
+    )
+
+
+def test_a_module_with_no_imports_is_unchanged_by_the_new_parameter():
+    """The default ``imports=()`` must reproduce exactly what this
+    assembler has always produced -- no import section, function index 0 for
+    the module's own function, same as before this feature existed."""
+
+    with_default = emit_wasm_module(_simple(), name="t").binary
+    assert 2 not in _section_ids(with_default)
+
+
+def _section_ids(binary: bytes) -> list[int]:
+    cursor, seen = 8, []
+    while cursor < len(binary):
+        section_id = binary[cursor]
+        cursor += 1
+        length, shift = 0, 0
+        while True:
+            byte = binary[cursor]
+            cursor += 1
+            length |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                break
+            shift += 7
+        seen.append(section_id)
+        cursor += length
+    return seen
+
+
+def test_an_import_bearing_module_declares_the_import_section_in_order():
+    """type(1), import(2), function(3), export(7), code(10) -- no memory(5)
+    section, since ``main`` imports its memory rather than owning one."""
+
+    binary = _main_module()
+    assert binary[:4] == b"\x00asm"
+    assert _section_ids(binary) == [1, 2, 3, 7, 10]
+
+
+def test_a_module_with_only_a_function_import_still_owns_its_memory():
+    imports = [WasmImport(module="peer", field="fn", kind="func",
+                           parameter_types=("i32",))]
+    body = CodeBuilder(value_type="f64", parameter_count=1)
+    binary = build_module(
+        function_name="run", parameter_types=["i32"], body=body,
+        imports=imports,
+    )
+    assert _section_ids(binary) == [1, 2, 3, 5, 7, 10]
+
+
+def test_the_import_section_names_module_and_field_correctly():
+    binary = _main_module()
+    assert b"helper" in binary
+    assert b"double" in binary
+    assert b"memory" in binary
+
+
+def test_a_second_memory_import_is_rejected():
+    imports = [
+        WasmImport(module="a", field="memory", kind="memory", memory_pages=1),
+        WasmImport(module="b", field="memory", kind="memory", memory_pages=1),
+    ]
+    body = CodeBuilder(value_type="f64", parameter_count=0)
+    with pytest.raises(ValueError):
+        build_module(function_name="run", parameter_types=[], body=body,
+                      imports=imports)
+
+
+def test_a_memory_import_requires_a_page_count():
+    with pytest.raises(ValueError):
+        WasmImport(module="a", field="memory", kind="memory")
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node not on PATH"
+)
+def test_a_call_across_the_module_boundary_actually_runs(tmp_path):
+    """Byte-level section checks cannot catch a wrong function index or a
+    memory import wired to the wrong exporter -- only running it can. This
+    instantiates both modules in Node, exactly as the browser shell will,
+    and checks the value crossing the boundary is the one ``double``
+    computed, not a stale or zeroed buffer."""
+
+    import json
+    import subprocess
+
+    helper_path = tmp_path / "helper.wasm"
+    main_path = tmp_path / "main.wasm"
+    helper_path.write_bytes(_helper_module())
+    main_path.write_bytes(_main_module())
+
+    script = tmp_path / "run.mjs"
+    script.write_text(
+        """
+        import { readFileSync } from "node:fs";
+        const [helperPath, mainPath] = process.argv.slice(2);
+        const helperBytes = readFileSync(helperPath);
+        const helperMod = await WebAssembly.instantiate(helperBytes, {});
+        const helperInstance = helperMod.instance;
+        const mainBytes = readFileSync(mainPath);
+        const mainMod = await WebAssembly.instantiate(mainBytes, {
+          helper: {
+            double: helperInstance.exports.double,
+            memory: helperInstance.exports.memory,
+          },
+        });
+        const memory = helperInstance.exports.memory;
+        const view = new Float64Array(memory.buffer);
+        view[0] = 21.0;
+        mainMod.instance.exports.run(0, 8);
+        console.log(JSON.stringify({ result: view[1] }));
+        """,
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(helper_path), str(main_path)],
+        capture_output=True, text=True, check=True,
+    )
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["result"] == 42.0

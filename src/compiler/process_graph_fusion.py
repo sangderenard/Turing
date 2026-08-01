@@ -850,6 +850,31 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
     ) + 1
 
     for step in program.steps:
+        if step.op_name == "tensor_from_list":
+            # A standalone constant-materialization step -- distinct from
+            # the *inline* right_scalar case just below, where a constant
+            # never got its own step at all. operator_catalog.py classifies
+            # tensor_from_list as a CREATION_OPERATOR, not an elementwise
+            # one, so canonical_elementwise_op has nothing to canonicalize
+            # it to; it becomes a "const" node directly, at its own
+            # result_id, the same value fused_program_wasm_backend's
+            # _constant_scalar already extracts for the WASM backend.
+            from .fused_program_wasm_backend import _constant_scalar
+
+            constant = _constant_scalar(step)
+            if constant is None:
+                raise ValueError(
+                    f"step {step.step_id} is a tensor_from_list ProcessGraph "
+                    "translation does not support: only a one-element "
+                    "constant becomes a node here, the same limit "
+                    "fused_program_wasm_backend.emit_wasm_module reports as "
+                    "a WasmShortfall for the same op"
+                )
+            add_node(
+                step.result_id,
+                _node_payload("const", label=repr(constant), constant=constant),
+            )
+            continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
         attrs = dict(step.attrs)
         reverse = prefix_reverse ^ bool(attrs.pop("reverse", False))

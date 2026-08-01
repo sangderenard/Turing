@@ -9,26 +9,34 @@ correct about its situation.
 The binary format is closing that gap here instead. This is a real
 assembler, but a small one, because the instruction set a fused elementwise
 program needs is small: load, store, arithmetic on one float type, integer
-index arithmetic, and one counted loop. Nothing in the format's harder
-regions -- tables, globals, imports, multiple memories, indirect calls,
-custom sections -- is used, so this stays under the size where writing it is
-worse than depending on a toolchain.
+index arithmetic, one counted loop, and (now) calling a function another
+module exports. Most of the format's harder regions -- tables, globals,
+multiple memories, indirect calls, custom sections -- still go unused.
 
 Reference: the WebAssembly core specification's binary format. Sections are
-emitted in the order the spec requires (type, function, memory, export,
-code); integers are LEB128; floats are little-endian IEEE-754.
+emitted in the order the spec requires (type, import, function, memory,
+export, code); integers are LEB128; floats are little-endian IEEE-754.
 
 Emitting the binary alongside the WAT means the two must agree, so both come
 from the same lowering in ``fused_program_wasm_backend`` -- this module is
 handed an already-planned instruction list, not a second lowering that could
 disagree with the first.
+
+Imports (added for auto-segmented "class module" output, see
+``wasm_class_modules.py``): a module may import functions from another
+module by name, so that a caller-side closure can hold a real call edge to
+a callee-side closure instead of the caller and callee being glued by
+JavaScript copying values through two separately-owned memories. Per the
+spec, imported functions occupy the first indices in function-index space,
+ahead of any locally defined function -- callers of ``build_module`` must
+account for that when choosing indices for ``CodeBuilder.call``.
 """
 
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 # --- primitive encodings ---------------------------------------------------
 
@@ -115,6 +123,7 @@ OP_LOOP = 0x03
 OP_END = 0x0B
 OP_BR = 0x0C
 OP_BR_IF = 0x0D
+OP_CALL = 0x10
 OP_LOCAL_GET = 0x20
 OP_LOCAL_SET = 0x21
 OP_I32_CONST = 0x41
@@ -126,6 +135,38 @@ OP_F64_CONVERT_I32_S = 0xB7
 OP_F32_CONVERT_I32_S = 0xB2
 OP_I32_TRUNC_F32_S = 0xA8
 EMPTY_BLOCK = 0x40
+
+
+@dataclass(frozen=True)
+class WasmImport:
+    """One entry of a module's import section.
+
+    ``field`` is the name a class module exports its function or memory
+    under; ``module`` is the *importing* side's name for the module it is
+    importing from -- it need not match the exporter's own module name, the
+    same way a Python ``import x as y`` need not either. The host loader
+    (``class_graph_loader.js``) is what actually resolves ``module`` to a
+    concrete already-instantiated peer.
+
+    A function import needs ``parameter_types`` -- like the module's own
+    function, an imported function is assumed to take some ``i32``/``f32``/
+    ``f64`` parameters and return nothing (outputs travel through memory,
+    the same convention every locally defined function already follows), so
+    ``build_module`` can declare a matching entry in the type section on the
+    import's behalf. A memory import needs ``memory_pages`` (the minimum
+    page count the exporter promises, mirroring the local ``memory_pages``
+    a module would otherwise declare for itself).
+    """
+
+    module: str
+    field: str
+    kind: Literal["func", "memory"]
+    parameter_types: tuple[str, ...] = ()
+    memory_pages: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == "memory" and self.memory_pages is None:
+            raise ValueError("a memory import needs memory_pages")
 
 
 @dataclass
@@ -222,6 +263,16 @@ class CodeBuilder:
         self.code += bytes([OP_BR_IF]) + uleb(depth)
         return self
 
+    def call(self, function_index: int) -> "CodeBuilder":
+        """Call a function by index. Imported functions occupy the low
+        indices, ahead of any function this module defines itself -- pass
+        the index accordingly (an imported function's position in the
+        ``imports`` sequence handed to ``build_module``, since imports of
+        kind ``"func"`` are numbered first, in order)."""
+
+        self.code += bytes([OP_CALL]) + uleb(function_index)
+        return self
+
     def end(self) -> "CodeBuilder":
         self.code += bytes([OP_END])
         return self
@@ -252,6 +303,7 @@ def build_module(
     memory_name: str = "memory",
     data: bytes = b"",
     data_offset: int = 0,
+    imports: Sequence[WasmImport] = (),
 ) -> bytes:
     """Assemble one exported function plus one exported memory.
 
@@ -259,23 +311,69 @@ def build_module(
     how a baked table -- a lookup table for a function WebAssembly has no
     instruction for -- reaches the module. A caller laying out its own arrays
     must start past it; the API descriptor records how far.
+
+    ``imports`` wires this module to functions or a shared memory another
+    module exports (see ``WasmImport``). Passing none reproduces the
+    single-module shape this assembler has always produced -- every existing
+    caller is unaffected. A ``"memory"`` import replaces this module's own
+    memory declaration entirely (a module has exactly one memory, imported or
+    owned, never both); ``"func"`` imports occupy the low end of function
+    index space, ahead of ``function_name`` itself, per the spec's function
+    index space rule, so ``body`` must address them through
+    ``CodeBuilder.call`` using their position among the ``"func"``-kind
+    entries of ``imports``, in order.
     """
 
-    type_section = _section(
-        1,
-        _vector([
-            bytes([0x60])
-            + _vector([bytes([_VALUE_TYPE[t]]) for t in parameter_types])
-            + _vector([])  # no results; outputs are written through memory
-        ]),
+    func_imports = [entry for entry in imports if entry.kind == "func"]
+    memory_import = next((entry for entry in imports if entry.kind == "memory"), None)
+    if sum(1 for entry in imports if entry.kind == "memory") > 1:
+        raise ValueError("a module has exactly one memory; at most one memory import")
+
+    # Type section: the imported functions' signatures come first, so their
+    # type indices are known and stable, then this module's own function.
+    types = [
+        bytes([0x60])
+        + _vector([bytes([_VALUE_TYPE[t]]) for t in entry.parameter_types])
+        + _vector([])  # no results; outputs are written through memory
+        for entry in func_imports
+    ]
+    own_type_index = len(types)
+    types.append(
+        bytes([0x60])
+        + _vector([bytes([_VALUE_TYPE[t]]) for t in parameter_types])
+        + _vector([])
     )
-    function_section = _section(3, _vector([uleb(0)]))
-    memory_section = _section(5, _vector([bytes([0x00]) + uleb(memory_pages)]))
+    type_section = _section(1, _vector(types))
+
+    import_section = b""
+    if imports:
+        entries: list[bytes] = []
+        for index, entry in enumerate(func_imports):
+            entries.append(
+                _name(entry.module) + _name(entry.field)
+                + bytes([0x00]) + uleb(index)
+            )
+        if memory_import is not None:
+            entries.append(
+                _name(memory_import.module) + _name(memory_import.field)
+                + bytes([0x02]) + bytes([0x00]) + uleb(memory_import.memory_pages)
+            )
+        import_section = _section(2, _vector(entries))
+
+    # Function index space: imports of kind "func" first (already accounted
+    # for above), then this module's own function.
+    own_function_index = len(func_imports)
+    function_section = _section(3, _vector([uleb(own_type_index)]))
+
+    memory_section = b""
+    if memory_import is None:
+        memory_section = _section(5, _vector([bytes([0x00]) + uleb(memory_pages)]))
+
     export_section = _section(
         7,
         _vector([
             _name(memory_name) + bytes([0x02]) + uleb(0),
-            _name(function_name) + bytes([0x00]) + uleb(0),
+            _name(function_name) + bytes([0x00]) + uleb(own_function_index),
         ]),
     )
     code_section = _section(10, _vector([body.to_body()]))
@@ -296,6 +394,7 @@ def build_module(
         b"\x00asm"
         + struct.pack("<I", 1)
         + type_section
+        + import_section
         + function_section
         + memory_section
         + export_section
@@ -306,12 +405,14 @@ def build_module(
 
 __all__ = [
     "CodeBuilder",
+    "OP_CALL",
     "OP_F64_CONVERT_I32_S",
     "OP_I32_TRUNC_F64_S",
     "EMPTY_BLOCK",
     "F32",
     "F64",
     "I32",
+    "WasmImport",
     "build_module",
     "sleb",
     "uleb",

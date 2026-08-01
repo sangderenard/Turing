@@ -246,6 +246,7 @@ const WASM_BASE64 = __WASM__;
 const $ = (id) => document.getElementById(id);
 const GRAPH = __GRAPH__;
 const NETWORK = __NETWORK__;
+const CLASS_GRAPH = __CLASS_GRAPH__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
@@ -450,7 +451,150 @@ function applyFeedbackFeed(feeds, count) {
 }
 let running = false;
 
+// --- class-graph execution ----------------------------------------------
+// A program compiled through wasm_class_modules.py's segmentation is not
+// one module: it is several, each with its own private memory, chained by
+// the same edges wasm-gallery/shared/process_graph_runner.js already runs
+// in the browser. This is that same algorithm -- a FIFO of modules whose
+// inputs have all arrived, dispatched one at a time -- ported to instantiate
+// from CLASS_GRAPH's embedded base64 bytes instead of fetching separate
+// .wasm files, since this page is one self-contained file. See
+// process_graph_runner.js's own comments for why the FIFO needs no more
+// global knowledge than "what module is next".
+class ClassGraphRunner {
+  constructor(manifest) {
+    this.manifest = manifest;
+    this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
+    this.instances = new Map();
+    this.pending = new Map();
+    this.outputs = new Map();
+    this.queue = [];
+    this.consumersOf = new Map();
+    for (const edge of manifest.edges || []) {
+      const key = edge.from.module + "::" + edge.from.output;
+      if (!this.consumersOf.has(key)) this.consumersOf.set(key, []);
+      this.consumersOf.get(key).push(edge.to);
+    }
+  }
+
+  async instance(name) {
+    if (this.instances.has(name)) return this.instances.get(name);
+    const spec = this.modulesByName.get(name);
+    const raw = atob(spec.wasm_base64);
+    const moduleBinary = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+    const { instance } = await WebAssembly.instantiate(moduleBinary, {});
+    this.instances.set(name, instance);
+    return instance;
+  }
+
+  deliver(moduleName, inputName, value) {
+    const spec = this.modulesByName.get(moduleName);
+    const bag = this.pending.get(moduleName) || {};
+    bag[inputName] = value;
+    this.pending.set(moduleName, bag);
+    const ready = spec.inputs.every(name => name in bag);
+    if (ready && !this.queue.includes(moduleName)) this.queue.push(moduleName);
+  }
+
+  async call(moduleName) {
+    const spec = this.modulesByName.get(moduleName);
+    const instance = await this.instance(moduleName);
+    const memory = instance.exports[spec.memory_export || "memory"];
+    const count = spec.count || 1;
+    const elementBytes = spec.element_bytes || 8;
+    const View = spec.value_type === "f32" ? Float32Array : Float64Array;
+    const inputValues = this.pending.get(moduleName) || {};
+
+    const names = [...spec.inputs, ...spec.outputs];
+    const layout = {};
+    let cursor = 0;
+    for (const name of names) { layout[name] = cursor; cursor += count * elementBytes; }
+    if (cursor > memory.buffer.byteLength) {
+      memory.grow(Math.ceil((cursor - memory.buffer.byteLength) / 65536));
+    }
+    for (const name of spec.inputs) {
+      new View(memory.buffer, layout[name], count).fill(inputValues[name]);
+    }
+    const args = [count, ...spec.inputs.map(n => layout[n]), ...spec.outputs.map(n => layout[n])];
+    instance.exports[spec.entry](...args);
+    const result = {};
+    for (const name of spec.outputs) result[name] = new View(memory.buffer, layout[name], count)[0];
+    return result;
+  }
+
+  async run(graphInputs) {
+    for (const [moduleName, values] of Object.entries(graphInputs || {})) {
+      for (const [inputName, value] of Object.entries(values)) this.deliver(moduleName, inputName, value);
+    }
+    while (this.queue.length > 0) {
+      const moduleName = this.queue.shift();
+      const result = await this.call(moduleName);
+      this.outputs.set(moduleName, result);
+      for (const [outputName, value] of Object.entries(result)) {
+        const consumers = this.consumersOf.get(moduleName + "::" + outputName) || [];
+        for (const target of consumers) this.deliver(target.module, target.input, value);
+      }
+    }
+    return Object.fromEntries(this.outputs);
+  }
+}
+
+// One pass through every module in the graph, given this frame's feed
+// arrays in the same order as `inputs` -- only the first element of each is
+// used (a class-graph module runs one element at a time today; the
+// single-module path's per-element sweep over a whole array is a
+// still-open follow-on, not something faked here).
+async function computeViaClassGraph(feeds) {
+  const runner = new ClassGraphRunner(CLASS_GRAPH);
+  const graphInputs = {};
+  for (const [logicalName, targets] of Object.entries(CLASS_GRAPH.logical_inputs || {})) {
+    const paramIndex = inputs.findIndex(p => p.name === logicalName);
+    const value = paramIndex >= 0 ? feeds[paramIndex][0] : 0;
+    for (const [moduleName, inputName] of targets) {
+      graphInputs[moduleName] = graphInputs[moduleName] || {};
+      graphInputs[moduleName][inputName] = value;
+    }
+  }
+  const outputs_ = await runner.run(graphInputs);
+  const rootOutputs = outputs_[CLASS_GRAPH.root_module] || {};
+  return CLASS_GRAPH.root_outputs.map(name => rootOutputs[name]);
+}
+
+// A simplified run loop for a class-graph program: one element per call
+// (see computeViaClassGraph), repeats and timing exactly like the
+// single-module path below, but not (yet) the continuous
+// expression/gaussian/network-feedback animation loop that path supports --
+// a class-graph module runs one element per WASM call today, so an
+// animated per-frame sweep over a whole grid is a still-open follow-on.
+async function runClassGraphMode() {
+  try {
+    const d = domain();
+    const feeds = inputs.map(p => feedValues(p, 1, d, frameIndex));
+    log("info", "class-graph run", { modules: CLASS_GRAPH.modules.length });
+    const repeats = Math.max(0, Number($("repeats").value) | 0) || 1;
+    const timings = [];
+    let lastResult = null;
+    for (let r = 0; r < repeats; r++) {
+      const t0 = performance.now();
+      lastResult = await computeViaClassGraph(feeds);
+      timings.push(performance.now() - t0);
+    }
+    const ordered = timings.slice().sort((a, b) => a - b);
+    const elapsed = ordered[ordered.length >> 1];
+    lastOutputs = outputs.map((p, i) => ({ name: p.name, values: [lastResult[i]] }));
+    renderActiveTab();
+    setStatus("ran " + repeats + " call(s) in " + elapsed.toFixed(3) + " ms (class-graph)", "good");
+    log("ok", "class-graph run complete", { median_ms: Number(elapsed.toFixed(4)) });
+  } catch (err) {
+    setStatus(String(err), "bad");
+    log("error", err && err.message ? err.message : err,
+        { stack: err && err.stack ? err.stack.split("\n")[0] : null });
+  }
+}
+
 async function run() {
+  if (CLASS_GRAPH) { await runClassGraphMode(); return; }
   if (running) {            // the button is a toggle while a run is live
     running = false;
     return;
@@ -882,7 +1026,7 @@ log("info", "shell ready", {
   valueType: API.metadata.value_type,
   embedded: Boolean(WASM_BASE64)
 });
-if (moduleBytes) setStatus("module embedded, ready", "good");
+if (moduleBytes || CLASS_GRAPH) setStatus("module embedded, ready", "good");
 """
 
 
@@ -1052,6 +1196,7 @@ def emit_html_shell(
     default_height: int = 40,
     backend_sources: Any = None,
     network_manifest: Mapping[str, Any] | None = None,
+    class_graph: Mapping[str, Any] | None = None,
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -1072,6 +1217,16 @@ def emit_html_shell(
     Both are shown because "what did this come from" is the first question
     asked of a compiled artifact and the hardest to answer from the artifact
     alone.
+
+    ``class_graph`` -- ``wasm_class_modules.build_embedded_class_graph``'s
+    output -- switches the page's *execution* from one embedded module to
+    the segmented class-graph runner while leaving every existing control
+    (the input/output rows, the API panel, the source tabs) exactly as
+    ``api`` already describes them; see ``describe_process_graph_api`` for
+    building an ``api`` that matches a class graph. ``None`` (the default)
+    reproduces the exact single-module page this function has always
+    produced -- every existing caller, ``build_homepage.py`` included, is
+    unaffected.
     """
 
     mapping = api.to_mapping() if hasattr(api, "to_mapping") else dict(api)
@@ -1111,13 +1266,17 @@ def emit_html_shell(
         .replace("__WASM__", encoded)
         .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
         .replace("__NETWORK__", json.dumps(network_mapping, default=str))
+        .replace(
+            "__CLASS_GRAPH__",
+            json.dumps(dict(class_graph), default=str) if class_graph else "null",
+        )
         .replace("__ENTRY__", str(entry["name"]))
     )
     boot_script = _BOOT_JS.replace(
         "__TELEMETRY__", json.dumps(telemetry_mapping, default=str)
     )
 
-    if wasm_bytes:
+    if wasm_bytes or class_graph:
         banner = (
             '<div class="note good">Binary embedded &mdash; this file is '
             "self-contained and runs offline.</div>"

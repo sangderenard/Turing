@@ -267,11 +267,18 @@ def emit_wasm_module(
     name: str = "fused_program",
     function_name: str = "run",
     dtype: str | None = None,
+    imports: Sequence[object] = (),
 ) -> WasmModule:
     """Lower one elementwise ``FusedProgram`` to a WAT module.
 
     The emitted function is ``(count, feed0, feed1, ..., out0, ...)`` where
     every argument after ``count`` is a byte offset into the exported memory.
+
+    ``imports`` (``wasm_binary.WasmImport`` entries) wires this module to
+    another module's exported function/memory -- see
+    ``wasm_class_modules.py``. It defaults to empty, reproducing the exact
+    single-module output this function has always produced; every existing
+    caller (``build_homepage.py`` included) is unaffected.
     """
 
     value_type, element_bytes, load, store = _value_type(program, dtype)
@@ -376,7 +383,8 @@ def emit_wasm_module(
     binary = None
     if not shortfalls:
         binary = _assemble(
-            program, feed_ids, output_ids, value_type, element_bytes, function_name
+            program, feed_ids, output_ids, value_type, element_bytes,
+            function_name, imports=imports,
         )
     return WasmModule(
         name=name,
@@ -493,6 +501,8 @@ def _assemble(
     value_type: str,
     element_bytes: int,
     function_name: str,
+    *,
+    imports: Sequence[object] = (),
 ) -> bytes:
     """Assemble the same program as a binary module.
 
@@ -611,6 +621,7 @@ def _assemble(
         body=builder,
         memory_pages=pages,
         data=data,
+        imports=imports,
     )
 
 

@@ -129,3 +129,42 @@ def test_dynamic_scalar_dependencies_remain_runtime_feeds():
 
     assert id(control) in captured.program.feeds
     assert any(step.result_id == id(bounded) for step in captured.program.steps)
+
+
+def test_standalone_tensor_from_list_becomes_a_const_node():
+    """A tensor_from_list step that never got folded into a consuming op's
+    right_scalar attrs (operator_catalog.py classifies it as a
+    CREATION_OPERATOR, not elementwise) must become a "const" node at its
+    own result_id, not raise trying to canonicalize it as an elementwise op.
+    """
+
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(0, "tensor_from_list", [], attrs={"values": (2.0,)}, result_id=2),
+            OpStep(1, "mul", [1, 2], result_id=3),
+        ],
+        outputs={"result": 3},
+    )
+    graph = fused_program_to_process_graph(program)
+    assert graph.G.nodes[2]["type"] == "const"
+    assert graph.G.nodes[2]["constant"] == 2.0
+    assert (2, 3) in graph.G.edges
+
+
+def test_a_multi_element_tensor_from_list_raises_rather_than_silently_dropping():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(0, "tensor_from_list", [], attrs={"values": (1.0, 2.0)}, result_id=2),
+            OpStep(1, "mul", [1, 2], result_id=3),
+        ],
+        outputs={"result": 3},
+    )
+    try:
+        fused_program_to_process_graph(program)
+        assert False, "expected a ValueError"
+    except ValueError as exc:
+        assert "tensor_from_list" in str(exc)
