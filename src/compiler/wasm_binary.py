@@ -120,6 +120,7 @@ _OPCODES: dict[str, dict[str, int]] = {
 # Structural and integer opcodes, which do not vary with the value type.
 OP_BLOCK = 0x02
 OP_LOOP = 0x03
+OP_IF = 0x04
 OP_END = 0x0B
 OP_BR = 0x0C
 OP_BR_IF = 0x0D
@@ -127,8 +128,12 @@ OP_CALL = 0x10
 OP_LOCAL_GET = 0x20
 OP_LOCAL_SET = 0x21
 OP_I32_CONST = 0x41
+OP_I32_LT_S = 0x48
+OP_I32_LE_S = 0x4C
 OP_I32_ADD = 0x6A
 OP_I32_MUL = 0x6C
+OP_I32_AND = 0x71
+OP_I32_LOAD = 0x28
 OP_I32_GE_S = 0x4E
 OP_I32_TRUNC_F64_S = 0xAA
 OP_F64_CONVERT_I32_S = 0xB7
@@ -238,6 +243,12 @@ class CodeBuilder:
         )
         return self
 
+    def i32_load(self, *, align: int = 2, offset: int = 0) -> "CodeBuilder":
+        """Load an ``i32`` regardless of the numerical kernel value type."""
+
+        self.code += bytes([OP_I32_LOAD]) + uleb(align) + uleb(offset)
+        return self
+
     def store(self, *, align: int | None = None, offset: int = 0) -> "CodeBuilder":
         natural = 3 if self.value_type == "f64" else 2
         self.code += (
@@ -253,6 +264,10 @@ class CodeBuilder:
 
     def loop(self, block_type: int = EMPTY_BLOCK) -> "CodeBuilder":
         self.code += bytes([OP_LOOP, block_type])
+        return self
+
+    def if_(self, block_type: int = EMPTY_BLOCK) -> "CodeBuilder":
+        self.code += bytes([OP_IF, block_type])
         return self
 
     def br(self, depth: int) -> "CodeBuilder":
@@ -407,6 +422,9 @@ __all__ = [
     "CodeBuilder",
     "OP_CALL",
     "OP_F64_CONVERT_I32_S",
+    "OP_I32_AND",
+    "OP_I32_LE_S",
+    "OP_I32_LT_S",
     "OP_I32_TRUNC_F64_S",
     "EMPTY_BLOCK",
     "F32",

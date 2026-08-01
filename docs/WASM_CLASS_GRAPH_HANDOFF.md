@@ -2,6 +2,12 @@
 
 Corrected and verified 2026-08-01.
 
+> Historical v2 record. The host-scheduled deployment described below has
+> been superseded by the translated v3 coordinator and class-memory inventory
+> in [`WASM_CLASS_COORDINATOR.md`](WASM_CLASS_COORDINATOR.md). Keep this file
+> for the v2 ABI archaeology; do not treat its "deliberately unresolved"
+> coordinator note as current status.
+
 ## Product boundary
 
 The published Mandelbrot homepage is **one compiled program object** named

@@ -40,6 +40,10 @@ from src.compiler.wasm_class_modules import (
     emit_class_modules,
     partition_reduced_program,
 )
+from src.compiler.wasm_class_coordinator import (
+    build_class_inventory,
+    emit_wasm_class_coordinator,
+)
 from src.compiler.wasm_html_shell import emit_html_shell
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -49,7 +53,8 @@ from src.transmogrifier.graph.graph_express2 import ProcessGraph
 # more iterations refines the boundary rather than changing what it means.
 ITERATIONS = 160
 WASM_REGION_STEPS = 400
-SITE_VERSION = "v2"
+WASM_REGION_STEP_OPTIONS = (200, 400, 800)
+SITE_VERSION = "v3"
 WASM_MODULE_DIR = f"site/{SITE_VERSION}/wasm"
 SOURCE_MODULE_DIR = f"site/{SITE_VERSION}/source/render"
 
@@ -360,48 +365,83 @@ def build(destination: Path) -> Path:
         advance("pruned")
 
         with channel.timed("segmented WebAssembly emission and assembly", path="wasm"):
-            specs = partition_reduced_program(
-                wanted,
-                chunk_size=WASM_REGION_STEPS,
-                owner_name=aot.entrypoint,
-            )
-            modules = emit_class_modules(
-                specs,
-                dtype="float64",
-                link_calls=False,
-                shared_memory=True,
-            )
+            deployments = {}
+            wasm_bytes = 0
+            segmented_source = ""
+            api = None
+            representative_specs = None
             contiguous_module = emit_wasm_module(
                 wanted, name=f"{aot.entrypoint}_contiguous", dtype="float64",
             )
-            incomplete = [
-                (spec, modules[spec.index])
-                for spec in specs
-                if not modules[spec.index].complete
-            ]
             if not contiguous_module.complete:
-                incomplete.append((None, contiguous_module))
-            if incomplete:
-                raise SystemExit("\n".join(
-                    module.shortfall_report()
-                    for _spec, module in incomplete
-                ))
-            api = describe_process_graph_api(
-                specs,
-                modules,
-                wanted,
-                entrypoint=aot.entrypoint,
-            )
-            class_graph = build_embedded_class_graph(
-                specs,
-                modules,
-                wanted,
-                entrypoint=aot.entrypoint,
-                embed_binaries=False,
-                module_dir=WASM_MODULE_DIR,
-            )
+                raise SystemExit(contiguous_module.shortfall_report())
+            for region_steps in WASM_REGION_STEP_OPTIONS:
+                specs = partition_reduced_program(
+                    wanted,
+                    chunk_size=region_steps,
+                    owner_name=aot.entrypoint,
+                )
+                modules = emit_class_modules(
+                    specs,
+                    dtype="float64",
+                    link_calls=False,
+                    shared_memory=True,
+                )
+                incomplete = [
+                    modules[spec.index]
+                    for spec in specs
+                    if not modules[spec.index].complete
+                ]
+                if incomplete:
+                    raise SystemExit("\n".join(
+                        module.shortfall_report() for module in incomplete
+                    ))
+                variant_dir = f"{WASM_MODULE_DIR}/size-{region_steps}"
+                manifest = build_embedded_class_graph(
+                    specs,
+                    modules,
+                    wanted,
+                    entrypoint=aot.entrypoint,
+                    embed_binaries=False,
+                    module_dir=variant_dir,
+                )
+                inventory = build_class_inventory(manifest)
+                coordinator = emit_wasm_class_coordinator(
+                    inventory,
+                    name=f"{aot.entrypoint}_coordinator_{region_steps}",
+                )
+                manifest.update({
+                    "region_steps": region_steps,
+                    "class_inventory": inventory.to_mapping(),
+                    "coordinator": {
+                        "name": coordinator.name,
+                        "url": f"{variant_dir}/{coordinator.name}.wasm",
+                        "entry": "run_range",
+                        "memory_import": {"module": "env", "field": "memory"},
+                        "method_count": len(inventory.methods),
+                    },
+                    "graph_views": build_hued_process_graph_views(graph, wanted, specs),
+                })
+                deployments[str(region_steps)] = {
+                    "manifest": manifest,
+                    "specs": specs,
+                    "modules": modules,
+                    "coordinator": coordinator,
+                }
+                wasm_bytes += sum(len(module.binary) for module in modules.values())
+                wasm_bytes += len(coordinator.binary)
+                if region_steps == WASM_REGION_STEPS:
+                    representative_specs = specs
+                    api = describe_process_graph_api(
+                        specs, modules, wanted, entrypoint=aot.entrypoint,
+                    )
+                    segmented_source = "\n\n".join(
+                        modules[spec.index].source for spec in specs
+                    )
+            if api is None or representative_specs is None:
+                raise SystemExit("the representative punch-card size was not emitted")
             contiguous_entry = contiguous_module.api.entry_points[0]
-            class_graph["contiguous"] = {
+            contiguous = {
                 "name": contiguous_module.name,
                 "url": f"{WASM_MODULE_DIR}/{contiguous_module.name}.wasm",
                 "entry": contiguous_module.api.entry,
@@ -419,16 +459,20 @@ def build(destination: Path) -> Path:
                 "reserved_bytes": contiguous_module.api.metadata.get("reserved_bytes", 0),
                 "operation_count": len(required_steps(wanted)),
             }
-            class_graph["runtime_version"] = f"{SITE_VERSION}-shared-memory"
-            graph_views = build_hued_process_graph_views(graph, wanted, specs)
-            segmented_source = "\n\n".join(
-                modules[spec.index].source for spec in specs
-            )
-            wasm_bytes = sum(
-                len(modules[spec.index].binary) for spec in specs
-            ) + len(contiguous_module.binary)
+            representative = deployments[str(WASM_REGION_STEPS)]["manifest"]
+            class_graph = {
+                **representative,
+                "variants": {
+                    key: deployment["manifest"]
+                    for key, deployment in deployments.items()
+                },
+                "contiguous": contiguous,
+                "runtime_version": f"{SITE_VERSION}-class-inventory-v1",
+            }
+            graph_views = representative["graph_views"]
+            wasm_bytes += len(contiguous_module.binary)
         channel.profile("assembled", path="wasm", nanoseconds=0,
-                        bytes=wasm_bytes, regions=len(specs))
+                        bytes=wasm_bytes, variants=len(deployments))
         advance("wasm")
 
         with channel.timed("emitting every backend", path="sources"):
@@ -496,11 +540,14 @@ def build(destination: Path) -> Path:
             "camera": "computed in the module from t via baked sin/cos/exp2",
             "deepest span": "1.6 * 2^-36",
             "steps": len(required_steps(wanted)),
-            "WASM regions": len(specs),
-            "execution ABI": "shared memory + coordinator-composed offsets",
+            "WASM regions": ", ".join(
+                f"{size} steps → {len(deployment['specs'])} cards"
+                for size, deployment in deployments.items()
+            ),
+            "execution ABI": "class memory + field slots + method inventory",
             "alternate": "lazy contiguous full compile",
             "site artifact version": SITE_VERSION,
-            "region step cap": WASM_REGION_STEPS,
+            "region step sizes": ", ".join(map(str, WASM_REGION_STEP_OPTIONS)),
             "wasm bytes": wasm_bytes,
             "interest model": "frozen 3→2→1 tanh network",
         },
@@ -509,11 +556,29 @@ def build(destination: Path) -> Path:
     )
     written = shell.write(destination)
     region_directory = destination / WASM_MODULE_DIR
-    region_directory.mkdir(parents=True, exist_ok=True)
-    for spec in specs:
-        (region_directory / f"{spec.module_name}.wasm").write_bytes(
-            modules[spec.index].binary
+    for region_steps, deployment in deployments.items():
+        variant_directory = region_directory / f"size-{region_steps}"
+        variant_directory.mkdir(parents=True, exist_ok=True)
+        for spec in deployment["specs"]:
+            (variant_directory / f"{spec.module_name}.wasm").write_bytes(
+                deployment["modules"][spec.index].binary
+            )
+        coordinator = deployment["coordinator"]
+        (variant_directory / f"{coordinator.name}.wasm").write_bytes(
+            coordinator.binary
         )
+        (variant_directory / f"{coordinator.name}.py").write_text(
+            coordinator.python_source, encoding="utf-8"
+        )
+        (variant_directory / f"{coordinator.name}.wat").write_text(
+            coordinator.wat, encoding="utf-8"
+        )
+        import json
+        (variant_directory / "class-inventory.json").write_text(
+            json.dumps(coordinator.inventory.to_mapping(), indent=2),
+            encoding="utf-8",
+        )
+    region_directory.mkdir(parents=True, exist_ok=True)
     (region_directory / f"{contiguous_module.name}.wasm").write_bytes(
         contiguous_module.binary
     )
@@ -524,7 +589,7 @@ def build(destination: Path) -> Path:
         print(f"  {entry.title:16} {state} {entry.lines:6} lines"
               f"  {entry.reason[:60]}")
     print(f"wrote {written} ({written.stat().st_size // 1024} KB)")
-    print(f"wrote {len(specs)} shared-memory WASM regions and one contiguous module to {region_directory}")
+    print(f"wrote {len(deployments)} coordinated class variants and one contiguous module to {region_directory}")
     return written
 
 

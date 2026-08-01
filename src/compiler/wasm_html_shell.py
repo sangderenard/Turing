@@ -270,7 +270,7 @@ const WASM_BASE64 = __WASM__;
 
 const $ = (id) => document.getElementById(id);
 const GRAPH = __GRAPH__;
-const GRAPH_VIEWS = __GRAPH_VIEWS__;
+let GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
@@ -479,10 +479,10 @@ function applyFeedbackFeed(feeds, count) {
 let running = false;
 
 // --- shared-memory class-graph execution --------------------------------
-// Every punch card imports the same WebAssembly.Memory. JavaScript composes
-// byte offsets from the compiler-derived graph, calls the cards in schedule
-// order, and reads only the public outputs. No live tensor is copied through
-// JavaScript at a seam.
+// Every method card imports the same WebAssembly.Memory. JavaScript creates
+// the class instance (memory + field-slot table + method inventory), then
+// calls one translated WASM coordinator. Card-to-card calls stay in WASM.
+// No live tensor is copied through JavaScript at a seam.
 class ClassGraphRunner {
   constructor(manifest) {
     if (!manifest.shared_memory) throw new Error(
@@ -491,36 +491,35 @@ class ClassGraphRunner {
     this.manifest = manifest;
     this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
     this.instances = new Map();
-    this.offsetForInput = new Map();
-    this.offsetForOutput = new Map();
+    this.runtime = null;
+    this.fieldOffsets = [];
+    this.fieldIndex = new Map(
+      (manifest.class_inventory.field_slots || []).map(field => [field.key, field.index])
+    );
     this.layoutCount = 0;
+    this.inventoryOffset = 0;
     const staticBytes = Number(manifest.shared_static_bytes || 0);
     this.memory = new WebAssembly.Memory({
       initial: Math.max(1, Math.ceil(staticBytes / 65536))
     });
-    this.sourceOf = new Map();
-    for (const edge of manifest.edges || []) {
-      this.sourceOf.set(
-        edge.to.module + "::" + edge.to.input,
-        "out::" + edge.from.module + "::" + edge.from.output
-      );
-    }
-    for (const [logicalName, targets] of Object.entries(manifest.logical_inputs || {})) {
-      for (const [moduleName, inputName] of targets) {
-        this.sourceOf.set(moduleName + "::" + inputName, "in::" + logicalName);
-      }
-    }
   }
 
-  async instance(name) {
-    if (this.instances.has(name)) return this.instances.get(name);
-    const spec = this.modulesByName.get(name);
-    markDeploymentNode(name, "downloading");
+  async binary(url, label) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(
+      "failed to load " + label + ": HTTP " + response.status
+    );
+    return response.arrayBuffer();
+  }
+
+  async instantiateCard(spec) {
+    if (this.instances.has(spec.name)) return this.instances.get(spec.name);
+    markDeploymentNode(spec.name, "downloading");
     let moduleBinary;
     if (spec.url) {
       const response = await fetch(spec.url);
       if (!response.ok) throw new Error(
-        "failed to load private WASM region " + name + ": HTTP " + response.status
+        "failed to load method card " + spec.name + ": HTTP " + response.status
       );
       moduleBinary = await response.arrayBuffer();
     } else if (spec.wasm_base64) {
@@ -528,69 +527,70 @@ class ClassGraphRunner {
       moduleBinary = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
     } else {
-      throw new Error("private WASM region " + name + " has no URL or bytes");
+      throw new Error("method card " + spec.name + " has no URL or bytes");
     }
     const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
     const imports = {};
     imports[memoryImport.module] = {[memoryImport.field]: this.memory};
     const { instance } = await WebAssembly.instantiate(moduleBinary, imports);
-    this.instances.set(name, instance);
-    markDeploymentNode(name, "ready");
+    this.instances.set(spec.name, instance);
+    markDeploymentNode(spec.name, "ready");
+    return instance;
+  }
+
+  async ensureRuntime() {
+    if (this.runtime) return this.runtime;
+    if (!this.manifest.coordinator) throw new Error(
+      "class manifest has no translated coordinator"
+    );
+    const pairs = await Promise.all(this.manifest.modules.map(async spec => [
+      spec, await this.instantiateCard(spec)
+    ]));
+    const imports = {env: {memory: this.memory}};
+    for (const method of this.manifest.class_inventory.methods || []) {
+      const pair = pairs.find(([spec]) => spec.name === method.module);
+      if (!pair) throw new Error("inventory method module not loaded: " + method.module);
+      if (!imports[method.module]) imports[method.module] = {};
+      imports[method.module][method.entry] = pair[1].exports[method.entry];
+    }
+    const bytes = await this.binary(
+      this.manifest.coordinator.url, "class coordinator"
+    );
+    const {instance} = await WebAssembly.instantiate(bytes, imports);
+    this.runtime = instance;
     return instance;
   }
 
   layout(count) {
     if (this.layoutCount === count) return;
     const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
-    let cursor = Math.ceil(Number(this.manifest.shared_static_bytes || 0) / elementBytes) * elementBytes;
-    this.offsetForInput.clear();
-    this.offsetForOutput.clear();
-    for (const logicalName of Object.keys(this.manifest.logical_inputs || {})) {
-      this.offsetForInput.set(logicalName, cursor);
-      cursor += count * elementBytes;
-    }
-    for (const spec of this.manifest.modules) {
-      for (const outputName of spec.outputs) {
-        this.offsetForOutput.set(spec.name + "::" + outputName, cursor);
-        cursor += count * elementBytes;
-      }
-    }
+    const fields = this.manifest.class_inventory.field_slots || [];
+    this.inventoryOffset = Math.ceil(Number(this.manifest.shared_static_bytes || 0) / 4) * 4;
+    let cursor = this.inventoryOffset + fields.length * 4;
+    cursor = Math.ceil(cursor / elementBytes) * elementBytes;
+    this.fieldOffsets = fields.map(() => {
+      const offset = cursor; cursor += count * elementBytes; return offset;
+    });
     if (cursor > this.memory.buffer.byteLength) {
       this.memory.grow(Math.ceil((cursor - this.memory.buffer.byteLength) / 65536));
     }
+    new Int32Array(this.memory.buffer, this.inventoryOffset, fields.length).set(
+      this.fieldOffsets
+    );
     this.layoutCount = count;
   }
 
-  offsetFor(source) {
-    if (source.startsWith("in::")) return this.offsetForInput.get(source.slice(4));
-    if (source.startsWith("out::")) return this.offsetForOutput.get(source.slice(5));
-    throw new Error("unknown shared-memory slot " + source);
+  offsetForKey(key) {
+    const index = this.fieldIndex.get(key);
+    if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
+    return this.fieldOffsets[index];
   }
 
-  async call(moduleName, count) {
-    const spec = this.modulesByName.get(moduleName);
-    const instance = await this.instance(moduleName);
-    const inputOffsets = spec.inputs.map(name => {
-      const source = this.sourceOf.get(moduleName + "::" + name);
-      if (!source) throw new Error(moduleName + " input " + name + " has no graph binding");
-      return this.offsetFor(source);
-    });
-    const outputOffsets = spec.outputs.map(name =>
-      this.offsetForOutput.get(moduleName + "::" + name)
-    );
-    const args = [count, ...inputOffsets, ...outputOffsets];
-    markDeploymentNode(moduleName, "running");
-    const started = performance.now();
-    instance.exports[spec.entry](...args);
-    markDeploymentNode(moduleName, "done", performance.now() - started);
-  }
-
-  async run(logicalInputs, count) {
+  async run(logicalInputs, count, start = 0, end = null, latch = false) {
     this.layout(count);
     const View = this.manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
     for (const [logicalName, source] of Object.entries(logicalInputs)) {
-      const offset = this.offsetForInput.get(logicalName);
-      if (offset === undefined) continue;
+      const offset = this.offsetForKey("in::" + logicalName);
       const target = new View(this.memory.buffer, offset, count);
       if (ArrayBuffer.isView(source) || Array.isArray(source)) {
         if (source.length === 1) target.fill(Number(source[0]));
@@ -600,14 +600,37 @@ class ClassGraphRunner {
         target.fill(Number(source));
       }
     }
-    const order = (this.manifest.schedule && this.manifest.schedule.nodes)
-      ? this.manifest.schedule.nodes.slice().sort((a, b) => a.level - b.level || a.id.localeCompare(b.id)).map(n => n.id)
-      : this.manifest.modules.map(module => module.name);
-    for (const moduleName of order) await this.call(moduleName, count);
+    const runtime = await this.ensureRuntime();
+    const methodCount = Number(this.manifest.coordinator.method_count);
+    const rangeEnd = end === null ? methodCount : Math.min(methodCount, end);
+    const activeMethods = (this.manifest.class_inventory.methods || []).filter(
+      method => method.index >= start && method.index < rangeEnd
+    );
+    const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
+    if (latch) {
+      for (let index = 0; index < activeMethods.length && running; index++) {
+        const method = activeMethods[index];
+        markDeploymentNode(method.module, "running");
+        const started = performance.now();
+        coordinate(count, this.inventoryOffset, method.index, method.index + 1);
+        markDeploymentNode(method.module, "done", performance.now() - started);
+        if (index + 1 < activeMethods.length && running) {
+          await waitForCardLatch(index + 1, activeMethods.length);
+        }
+      }
+    } else {
+      activeMethods.forEach(method => markDeploymentNode(method.module, "running"));
+      const started = performance.now();
+      coordinate(count, this.inventoryOffset, start, rangeEnd);
+      const elapsed = performance.now() - started;
+      activeMethods.forEach(method => markDeploymentNode(
+        method.module, "done", elapsed / Math.max(1, activeMethods.length)
+      ));
+    }
     return outputs.map(parameter => {
       const binding = this.manifest.logical_outputs[parameter.name];
       if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
-      const offset = this.offsetForOutput.get(binding[0] + "::" + binding[1]);
+      const offset = this.offsetForKey("out::" + binding[0] + "::" + binding[1]);
       return new View(this.memory.buffer, offset, count).slice();
     });
   }
@@ -652,14 +675,43 @@ class ContiguousRunner {
 
 // One pass through every private module in the graph, using the full arrays
 // supplied through the logical program's public input contract.
-const classGraphRunner = CLASS_GRAPH ? new ClassGraphRunner(CLASS_GRAPH) : null;
+const classGraphRunners = new Map();
 const contiguousRunner = CLASS_GRAPH && CLASS_GRAPH.contiguous
   ? new ContiguousRunner(CLASS_GRAPH.contiguous) : null;
-let activeExecutionMode = "staged";
+let activeExecutionMode = null;
+let activeRegionSize = null;
+let releaseCardLatch = null;
+
+async function waitForCardLatch(completed, total) {
+  const button = $("card-continue");
+  if (!button) return;
+  button.disabled = false;
+  setStatus("breakpoint after method card " + completed + " / " + total, "good");
+  await new Promise(resolve => { releaseCardLatch = resolve; });
+  releaseCardLatch = null;
+  button.disabled = true;
+}
+
+function activeStagedManifest() {
+  if (!CLASS_GRAPH || activeRegionSize === null) return null;
+  return (CLASS_GRAPH.variants || {})[String(activeRegionSize)] || null;
+}
+
+function activeClassGraphRunner() {
+  const manifest = activeStagedManifest();
+  if (!manifest) return null;
+  const key = String(activeRegionSize);
+  if (!classGraphRunners.has(key)) {
+    classGraphRunners.set(key, new ClassGraphRunner(manifest));
+  }
+  return classGraphRunners.get(key);
+}
 
 async function computeViaSelectedRunner(feeds, count) {
   const logicalInputs = {};
-  for (const logicalName of Object.keys(CLASS_GRAPH.logical_inputs || {})) {
+  const manifest = activeExecutionMode === "staged" ? activeStagedManifest() : CLASS_GRAPH;
+  if (!manifest) throw new Error("choose an execution shape before running");
+  for (const logicalName of Object.keys(manifest.logical_inputs || {})) {
     const paramIndex = inputs.findIndex(p => p.name === logicalName);
     if (paramIndex < 0) throw new Error("logical input " + logicalName + " is not in the API");
     logicalInputs[logicalName] = feeds[paramIndex];
@@ -668,7 +720,12 @@ async function computeViaSelectedRunner(feeds, count) {
     if (!contiguousRunner) throw new Error("no contiguous compile is published");
     return contiguousRunner.run(logicalInputs, count);
   }
-  return classGraphRunner.run(logicalInputs, count);
+  const runner = activeClassGraphRunner();
+  if (!runner) throw new Error("choose a punch-card size before running");
+  return runner.run(
+    logicalInputs, count, 0, null,
+    Boolean($("card-latch") && $("card-latch").checked)
+  );
 }
 
 // The segmented deployment follows the same full-domain run loop as a
@@ -677,9 +734,15 @@ async function computeViaSelectedRunner(feeds, count) {
 async function runClassGraphMode() {
   if (running) {
     running = false;
+    if (releaseCardLatch) releaseCardLatch();
     return;
   }
   try {
+    if (!activeExecutionMode) throw new Error(
+      "choose Mono or a punch-card size before running"
+    );
+    const deployment = activeExecutionMode === "staged"
+      ? activeStagedManifest() : CLASS_GRAPH;
     const d = domain();
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
@@ -712,7 +775,8 @@ async function runClassGraphMode() {
     running = true;
     $("run").textContent = "Stop";
     log("info", activeExecutionMode + " deployment", {
-      modules: CLASS_GRAPH.modules.length,
+      modules: activeExecutionMode === "staged" ? deployment.modules.length : 1,
+      region_steps: activeRegionSize,
       elements: count,
     });
     for (let r = 0; running && (continuous || r < repeats); r++) {
@@ -751,13 +815,13 @@ async function runClassGraphMode() {
     renderNetworkStats(activeFeeds);
     setStatus(
       "ran " + count + " elements in " + elapsed.toFixed(3) +
-      " ms (" + (activeExecutionMode === "staged" ? "shared-memory staged" : "contiguous") + " WASM)",
+      " ms (" + (activeExecutionMode === "staged" ? "WASM-coordinated class" : "contiguous") + " WASM)",
       "good"
     );
     log("ok", "segmented run complete", {
       median_ms: Number(elapsed.toFixed(4)),
       elements: count,
-      modules: CLASS_GRAPH.modules.length,
+      modules: activeExecutionMode === "staged" ? deployment.modules.length : 1,
     });
   } catch (err) {
     running = false;
@@ -1256,10 +1320,11 @@ function renderGraph() {
       (GRAPH.truncated ? '<div class="meta">table truncated</div>' : "") +
       rows;
   }
-  if (CLASS_GRAPH && CLASS_GRAPH.schedule) {
-    const moduleByName = new Map(CLASS_GRAPH.modules.map(module => [module.name, module]));
+  const deployment = activeStagedManifest();
+  if (deployment && deployment.schedule) {
+    const moduleByName = new Map(deployment.modules.map(module => [module.name, module]));
     const levels = new Map();
-    for (const node of CLASS_GRAPH.schedule.nodes) {
+    for (const node of deployment.schedule.nodes) {
       if (!levels.has(node.level)) levels.set(node.level, []);
       levels.get(node.level).push(node);
     }
@@ -1274,14 +1339,14 @@ function renderGraph() {
         '</div>' + cards + '</div>';
     }).join("");
     html += '<div class="meta" style="margin-top:.7rem">Live deployment schedule: ' +
-      CLASS_GRAPH.modules.length + ' punch cards sharing one global WASM memory. Click a node for its ABI.</div>' +
+      deployment.modules.length + ' method cards coordinated inside WASM over one class memory. Click a node for its ABI.</div>' +
       deploymentRows + '<div id="node-detail" class="note node-detail">Select a punch card.</div>';
   }
   target.innerHTML = html;
   wireProcessGraphCanvas();
   document.querySelectorAll(".deployment-node").forEach(node => {
     const show = () => {
-      const spec = CLASS_GRAPH.modules.find(module => module.name === node.dataset.module) || {};
+      const spec = deployment.modules.find(module => module.name === node.dataset.module) || {};
       $("node-detail").textContent = spec.name + " · " + (spec.operation_count || 0) +
         " operations · inputs [" + (spec.inputs || []).join(", ") + "] · outputs [" +
         (spec.outputs || []).join(", ") + "] · ProcessGraph nodes [" +
@@ -1302,7 +1367,8 @@ function markDeploymentNode(moduleName, state, elapsedMs) {
   const timing = elapsedMs === undefined ? "" : " · " + elapsedMs.toFixed(3) + " ms";
   if (label) label.textContent = state + timing + (calls ? " · " + calls + " calls" : "");
   if (state === "done") {
-    const spec = CLASS_GRAPH.modules.find(module => module.name === moduleName);
+    const deployment = activeStagedManifest();
+    const spec = deployment && deployment.modules.find(module => module.name === moduleName);
     if (spec) pulseGraphNodes(spec.node_ids, elapsedMs);
   }
 }
@@ -1350,16 +1416,28 @@ function wireSourceTabs() {
 }
 
 function wireExecutionModes() {
+  const continueButton = $("card-continue");
+  if (continueButton) continueButton.addEventListener("click", () => {
+    if (releaseCardLatch) releaseCardLatch();
+  });
   document.querySelectorAll(".execution-mode").forEach(button => {
     button.addEventListener("click", () => {
       if (running) return;
       activeExecutionMode = button.dataset.mode;
+      activeRegionSize = button.dataset.size ? Number(button.dataset.size) : null;
       document.querySelectorAll(".execution-mode").forEach(candidate =>
         candidate.setAttribute("aria-pressed", String(candidate === button))
       );
-      setStatus(activeExecutionMode === "staged"
-        ? "staged punch cards selected; regions download on first use"
-        : "contiguous compile selected; full module downloads on first use", "good");
+      if (activeExecutionMode === "staged") {
+        const deployment = activeStagedManifest();
+        if (!deployment) throw new Error("no deployment for size " + activeRegionSize);
+        GRAPH_VIEWS = deployment.graph_views || GRAPH_VIEWS;
+        setStatus(activeRegionSize + " operations/card selected; method cards and coordinator download on first run", "good");
+      } else {
+        setStatus("Mono selected; contiguous compile downloads on first run", "good");
+      }
+      $("run").disabled = false;
+      renderGraph();
     });
   });
 }
@@ -1462,7 +1540,7 @@ log("info", "shell ready", {
   embedded: Boolean(WASM_BASE64)
 });
 if (moduleBytes) setStatus("module embedded, ready", "good");
-else if (CLASS_GRAPH) setStatus("manifest ready; staged artifacts are still unloaded", "good");
+else if (CLASS_GRAPH) setStatus("Choose Mono or a punch-card size; no runtime artifact is loaded.", "good");
 """
 
 
@@ -1745,14 +1823,14 @@ def emit_html_shell(
             'files remain unloaded until their corresponding run or download action.</div>'
         )
         picker = ""
-        disabled = ""
+        disabled = " disabled"
     elif wasm_bytes or class_graph:
         banner = (
             '<div class="note good">Binary embedded &mdash; this file is '
             "self-contained and runs offline.</div>"
         )
         picker = ""
-        disabled = ""
+        disabled = " disabled" if class_graph else ""
     else:
         banner = (
             '<div class="note">No assembled <code>.wasm</code> was available '
@@ -1799,18 +1877,27 @@ def emit_html_shell(
         contiguous = dict(class_graph).get("contiguous")
         contiguous_button = (
             '<button class="execution-mode" data-mode="contiguous" aria-pressed="false">'
-            'Lazy contiguous compile</button>'
+            'Mono · contiguous</button>'
             if contiguous else ""
+        )
+        variants = dict(class_graph).get("variants", {})
+        staged_buttons = "".join(
+            '<button class="execution-mode" data-mode="staged" '
+            f'data-size="{_escape(str(size))}" aria-pressed="false">'
+            f'{_escape(str(size))} operations/card</button>'
+            for size in sorted(variants, key=lambda value: int(value))
         )
         execution_modes_html = (
             '<div class="panel"><div class="panel-title">Execution shape</div>'
-            '<div class="meta">Switch the same object and API between shared-memory '
-            'punch cards and a full contiguous compile. Neither artifact downloads until '
-            'its first run.</div><div class="execution-modes">'
-            '<button class="execution-mode" data-mode="staged" aria-pressed="true">'
-            'Staged punch cards</button>' + contiguous_button + '</div>'
-            '<div class="stat"><span>shared globals · offset ABI · zero tensor seam copies</span>'
-            '<span id="contiguous-state">contiguous not loaded</span></div></div>'
+            '<div class="meta">Choose how the same object and API is deployed. Nothing '
+            'is selected by default, and no runtime artifact downloads before a choice '
+            'and first run. Size controls the maximum lowered operations in each method card.</div>'
+            '<div class="execution-modes">' + contiguous_button + staged_buttons + '</div>'
+            '<div class="stat"><span>class memory · field-slot table · WASM method inventory</span>'
+            '<span id="contiguous-state">contiguous not loaded</span></div>'
+            '<div class="execution-modes"><label class="meta"><input id="card-latch" '
+            'type="checkbox"> break at every method-card boundary</label>'
+            '<button id="card-continue" disabled>Release latch</button></div></div>'
         )
 
     html = f"""<!DOCTYPE html>

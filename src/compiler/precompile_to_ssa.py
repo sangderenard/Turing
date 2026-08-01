@@ -303,6 +303,11 @@ class _ControlSSABuilder:
         self.arguments: list[SSAValue] = []
         self.external_values: dict[int, SSAValue] = {}
         self.uniform_values: dict[str, SSAValue] = {}
+        # Lexical control names (currently loop induction variables) are SSA
+        # values too.  Keeping them here lets a StateMachineTick dispatch on
+        # the surrounding loop without degrading that name to a symbolic
+        # host-side load.
+        self.local_control_values: dict[str, SSAValue] = {}
         for uniform in program.uniforms:
             value = SSAValue(
                 int(uniform.value_id),
@@ -524,6 +529,9 @@ class _ControlSSABuilder:
         uniform = self.uniform_values.get(spelling)
         if uniform is not None:
             return uniform
+        local = self.local_control_values.get(spelling)
+        if local is not None:
+            return local
         try:
             literal = int(spelling, 10)
         except ValueError:
@@ -738,6 +746,8 @@ class _ControlSSABuilder:
         self.conditional_branch(condition, body, exit_block)
 
         self.current = body
+        previous_induction = self.local_control_values.get(loop.induction)
+        self.local_control_values[loop.induction] = induction
         restored_values: dict[int, SSAValue | None] = {}
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
@@ -882,6 +892,10 @@ class _ControlSSABuilder:
                 self.external_values.pop(target_id, None)
             else:
                 self.external_values[target_id] = previous
+        if previous_induction is None:
+            self.local_control_values.pop(loop.induction, None)
+        else:
+            self.local_control_values[loop.induction] = previous_induction
         for updated_id, initial_id, _initial, _updated, current in carried:
             # On the exit edge the header Phi is the final carried value and
             # dominates every post-loop consumer, including a zero-trip loop.
