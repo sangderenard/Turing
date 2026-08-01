@@ -371,7 +371,8 @@ def emit_wasm_module(
     )["reserved_bytes"]
     api = _describe(name, function_name, feed_ids, output_ids, value_type,
                     element_bytes, reserved,
-                    input_names=feed_names(program, feed_ids))
+                    input_names=feed_names(program, feed_ids),
+                    output_names=list(program.outputs.keys()))
     binary = None
     if not shortfalls:
         binary = _assemble(
@@ -846,6 +847,7 @@ def _describe(
     element_bytes: int,
     reserved_bytes: int = 0,
     input_names: Sequence[str] | None = None,
+    output_names: Sequence[str] | None = None,
 ):
     """The same calling-contract descriptor the Fortran path emits."""
 
@@ -878,9 +880,12 @@ def _describe(
             )
         )
     for index, _ in enumerate(output_ids):
+        # A program that named its outputs gets to keep those names: the
+        # caller reads them, and "red" carries information "out0" does not.
         parameters.append(
             Parameter(
-                name=f"out{index}",
+                name=(output_names[index] if output_names and index < len(output_names)
+                      else f"out{index}"),
                 role="output",
                 dtype=value_type,
                 c_type="int32_t",

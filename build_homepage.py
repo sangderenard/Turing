@@ -54,6 +54,36 @@ def interest_network(unit_x, unit_y, interest):
     return (h0 * 0.62 + h1 * -0.57 + interest * 0.31).tanh()
 
 
+def shade(count):
+    # mandelbrot_jpeg_planes, ported: sqrt of the normalised escape count,
+    # three cosine channels offset by 0, 0.21 and 0.43, scaled to 0-255 and
+    # clamped, exactly as the original composed its display planes.
+    #
+    # The original raised each channel to 1.65. WebAssembly has no pow
+    # instruction, and reaching it through exp/log would need log below the
+    # quarter its table starts at -- which is where a colour ramp spends most
+    # of its range. x^1.625 = x * sqrt(x) * sqrt(sqrt(sqrt(x))) uses only
+    # sqrt and multiply, both native, and differs from x^1.65 by under two
+    # percent across [0,1] -- below a quantisation step at 8 bits.
+    phase = (count * {1.0 / ITERATIONS!r}).minimum(1.0).maximum(0.0).sqrt()
+
+    wave_r = ((phase + 0.0) * 6.283185307179586).cos() * 0.5 + 0.5
+    r_half = wave_r.sqrt()
+    red = (wave_r * r_half * r_half.sqrt().sqrt() * 255.0 + 0.5).minimum(255.0).maximum(0.0)
+
+    wave_g = ((phase + 0.21) * 6.283185307179586).cos() * 0.5 + 0.5
+    g_half = wave_g.sqrt()
+    green = (wave_g * g_half * g_half.sqrt().sqrt() * 255.0 + 0.5).minimum(255.0).maximum(0.0)
+
+    wave_b = ((phase + 0.43) * 6.283185307179586).cos() * 0.5 + 0.5
+    b_half = wave_b.sqrt()
+    blue = (wave_b * b_half * b_half.sqrt().sqrt() * 255.0 + 0.5).minimum(255.0).maximum(0.0)
+
+    # A tuple return does not lower, so one channel is returned and all three
+    # remain as executed steps for the build to name as outputs.
+    return red + green * 0.0 + blue * 0.0
+
+
 def quadratic_family(unit_x, unit_y, center_x, center_y, span,
                      family_mix, julia_x, julia_y):
     # The continuous Mandelbrot-to-Julia quadratic family. family_mix = 0 is
@@ -92,35 +122,46 @@ def render(unit_x, unit_y, t, interest):
     # Written as separate assignments rather than a tuple-returning helper:
     # simultaneous tuple assignment does not lower (see aot_compile).
     #
-    # The dive is exponential in time and runs to 2^-36 -- deep enough that
-    # the boundary keeps opening into new structure, and short of the ~1e-15
-    # where float64 quantises the plane into visible blocks. It breathes back
-    # out rather than descending forever, because at the bottom there is
-    # nothing left to resolve.
-    breath = (t * 0.0125).cos() * -0.5 + 0.5
-    # 2^-36 written as exp(-36*ln2*b): exp2 has no AbstractTensor method, and
-    # folding ln2 into the constant costs nothing. exp's table covers
-    # [-30, 6], and this argument runs [-24.95, 0].
-    span = (breath * -24.953210).exp() * 1.6
-    # A slow wander along the seahorse valley, with a second, slower term so
-    # the path does not simply repeat.
-    center_x = (t * 0.021).sin() * 0.0022 + (t * 0.0071).cos() * 0.0009 - 0.743643887
-    center_y = (t * 0.019).cos() * 0.0022 + (t * 0.0063).sin() * 0.0009 + 0.131825904
-    # Mandelbrot for most of the cycle, leaning into the Julia family at the
-    # top of each breath, where a fixed constant turns the same neighbourhood
-    # into filigree.
-    family_mix = (t * 0.00625).cos() * -0.5 + 0.5
-    # The Julia constant walks the cardioid edge, where the interesting Julia
-    # sets live.
-    julia_x = (t * 0.013).cos() * 0.3943 - 0.35
-    julia_y = (t * 0.013).sin() * 0.3943
+    # animated_camera + dream_parameters from demo_mandelbrot_fusion,
+    # ported. The audio terms are the only omission -- the original modulated
+    # three of these with bass/low_mid/high_mid, and reaction = 0 removes
+    # exactly those. zoom_rate is 0 by default, so there is no progressive
+    # dive: the span oscillates about the base and returns.
+    #
+    # t is TRAVEL, not a frame count; every frequency here is in travel units.
+    log_zoom = (t * 0.71).sin() * 1.25 + (t * 1.93).sin() * 0.45
+    mandelbrot_span = log_zoom.exp() * 0.004
+    dx = ((t * 0.83).sin() * 0.58 + (t * 2.17).sin() * 0.22) * 0.004
+    dy = ((t * 0.97 + 0.61).sin() * 0.48 + (t * 1.67).sin() * 0.19) * 0.004 - 0.0011
+    mandelbrot_center_x = dx - 0.743643887
+    mandelbrot_center_y = dy + 0.131825904
+
+    # family_mix stays in [0.04, 0.22]: larger excursions need a different
+    # camera chart and erase a deep Mandelbrot view's structure.
+    family_mix = ((t * 0.24).sin() * 0.5 + 0.5) * 0.18 + 0.04
+
+    # c = mu/2 - mu^2/4 parameterises the main cardioid; |mu| < 1 keeps the
+    # Julia sets connected rather than dust.
+    mu_x = (t * 0.31).cos() * 0.58
+    mu_y = (t * 0.31).sin() * 0.58
+    mu2_x = mu_x * mu_x - mu_y * mu_y
+    mu2_y = mu_x * mu_y * 2.0
+    julia_x = mu_x * 0.5 - mu2_x * 0.25
+    julia_y = mu_y * 0.5 - mu2_y * 0.25
+
+    # Preserve the target c-plane exactly under the family transform:
+    # (1-mix)*pixel + mix*julia == mandelbrot_pixel.
+    family_scale = family_mix * -1.0 + 1.0
+    center_x = (mandelbrot_center_x - julia_x * family_mix) / family_scale
+    center_y = (mandelbrot_center_y - julia_y * family_mix) / family_scale
+    span = mandelbrot_span / family_scale
     drift = interest_network(unit_x=unit_x, unit_y=unit_y, interest=interest)
-    return quadratic_family(
+    return shade(quadratic_family(
         unit_x=unit_x + drift * 0.004,
         unit_y=unit_y + drift * -0.003,
         center_x=center_x, center_y=center_y, span=span,
         family_mix=family_mix, julia_x=julia_x, julia_y=julia_y,
-    )"""
+    ))"""
 
 
 NETWORK_SOURCE = """
@@ -193,6 +234,36 @@ def _clock_name(api) -> str:
     return next(name for name, body in expressions.items() if body == "t")
 
 
+def _channel_outputs(program) -> dict:
+    """The three colour channels shade() computed, in order.
+
+    A scalar operand is not an attribute: ``x.maximum(0.0)`` records a
+    ``tensor_from_list`` step holding ``(0.0,)`` and then a ``maximum`` whose
+    ``input_ids`` name it. Each channel ends on exactly that clamp, and it is
+    the last thing the kernel does, so the final three are red, green, blue.
+    """
+
+    produced = {step.result_id: step for step in program.steps}
+
+    def clamps_to_zero(step) -> bool:
+        if step.op_name != "maximum" or len(step.input_ids) != 2:
+            return False
+        operand = produced.get(step.input_ids[1])
+        return (
+            operand is not None
+            and operand.op_name == "tensor_from_list"
+            and tuple(operand.attrs.get("values", ())) == (0.0,)
+        )
+
+    markers = [step for step in program.steps if clamps_to_zero(step)]
+    if len(markers) < 3:
+        raise SystemExit(
+            f"expected three channel clamps in the program, found {len(markers)}"
+        )
+    red, green, blue = markers[-3:]
+    return {"red": red.result_id, "green": green.result_id, "blue": blue.result_id}
+
+
 def build(destination: Path) -> Path:
     channel = TelemetryChannel(name="homepage")
     network_module = compile_network_module()
@@ -228,7 +299,7 @@ def build(destination: Path) -> Path:
         adds = [s for s in program.steps if s.op_name == "add"]
         wanted = type(program)(
             version=program.version, feeds=program.feeds, steps=program.steps,
-            outputs={"escape": adds[-1].result_id}, state_in=program.state_in,
+            outputs=_channel_outputs(program), state_in=program.state_in,
             meta=program.meta, extras=program.extras,
         )
         channel.log("selected the escape count", path="aot",
@@ -298,6 +369,8 @@ def build(destination: Path) -> Path:
         feed_expressions=_bind_expressions(module.api),
         build_parameters={
             "iterations (unrolled)": ITERATIONS,
+            "camera": "animated_camera + dream_parameters, in-kernel",
+            "palette": "mandelbrot_jpeg_planes, in-kernel",
             "family": "continuous Mandelbrot <-> Julia, in-kernel",
             "camera": "computed in the module from t via baked sin/cos/exp2",
             "deepest span": "1.6 * 2^-36",

@@ -654,10 +654,43 @@ function renderRaw() {
     .join("\n");
 }
 
+function renderChannels(canvas, note) {
+  // A program returning three outputs has already said what each pixel is.
+  // Copy them; do not interpret them. The ramp below exists for programs
+  // that return one number and leave the looking-at to the caller -- a
+  // program that produced its own channels has answered that question, and
+  // a second opinion from the shell would only corrupt it.
+  const [red, green, blue] = lastOutputs;
+  const count = red.values.length;
+  if (green.values.length !== count || blue.values.length !== count) return false;
+  const d = domain();
+  let w = d.w, h = d.h;
+  if (w * h !== count) { w = Math.round(Math.sqrt(count)) || 1; h = Math.ceil(count / w); }
+  if (w * h !== count) return false;
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return false;
+  const image = ctx.createImageData(w, h);
+  const invert = $("img_invert").checked;
+  for (let i = 0; i < count; i++) {
+    const clamp = (v) => Math.max(0, Math.min(255, Math.round(invert ? 255 - v : v)));
+    image.data[i*4+0] = clamp(red.values[i]);
+    image.data[i*4+1] = clamp(green.values[i]);
+    image.data[i*4+2] = clamp(blue.values[i]);
+    image.data[i*4+3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+  note.textContent = w + "x" + h + ", " + lastOutputs.length +
+    " outputs read as " + red.name + "/" + green.name + "/" + blue.name +
+    " channels, exactly as the program produced them";
+  return true;
+}
+
 function renderImage() {
   const canvas = $("canvas");
   const note = $("imgnote");
   if (!lastOutputs || !lastOutputs.length) { note.textContent = "Run first."; return; }
+  if (lastOutputs.length >= 3 && renderChannels(canvas, note)) return;
   const values = lastOutputs[0].values;
   const d = domain();
   let w = d.w, h = d.h;
