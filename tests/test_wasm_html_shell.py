@@ -266,6 +266,9 @@ def test_graph_phosphor_integrates_profile_pulses_with_decay():
     assert "Math.exp(-age / decay)" in html
     assert "pulseGraphNodes(spec.node_ids, elapsedMs)" in html
     assert 'id="graph-decay"' in html or "graph-decay" in html
+    assert 'id="graph-edges" type="checkbox"' in html
+    assert "showAllEdges || graphSelectedNode !== null" in html
+    assert "Math.atan2(vector[1], vector[0])" in html
 
 
 def test_an_edited_descriptor_does_not_pretend_to_apply():
