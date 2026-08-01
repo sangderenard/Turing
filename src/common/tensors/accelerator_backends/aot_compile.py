@@ -38,6 +38,12 @@ Real Fortran AOT exists, but through a different route: get
 ``sympy_expression=``.  See ``docs/PIPELINE_STAGE_DISAMBIGUATION.md`` for
 how this fits against the tape-walking JIT backends.
 
+``unroll_limit`` bounds which loops ``remove_loops`` may flatten. The
+default of 8 is low for a target that needs a flat program: a loop above
+the limit is retained rather than refused, so the caller gets a program
+that compiles and runs fewer iterations than it asked for. Set it to the
+trip count you expect.
+
 ``source`` must be real ``def`` functions, not a lambda -- and, following
 the one verified working shape (``tests/test_glsl_fused_network.py``'s
 ``affine``/``render_value`` pair), the function whose result you want must
@@ -113,6 +119,7 @@ def compile_ast_aot(
     *,
     backend: str = "c",
     remove_loops: bool = False,
+    unroll_limit: int = 8,
     profiling: bool = False,
     precompile_only: bool = False,
 ) -> AOTCompilation:
@@ -139,7 +146,10 @@ def compile_ast_aot(
     reduce_abstract_tensor_topology(graph)
 
     deployment_type = strategize_glsl_deployment(
-        graph, backend=backend, remove_loops=remove_loops
+        graph,
+        backend=backend,
+        remove_loops=remove_loops,
+        unroll_limit=unroll_limit,
     )
     # shell_language is fixed at "glsl", the one path that actually emits
     # something distinct -- see this module's docstring. It is not derived

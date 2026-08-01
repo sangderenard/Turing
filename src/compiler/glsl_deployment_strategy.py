@@ -7900,12 +7900,26 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
         data["attributes"] = attributes
 
 
+# Above this an unroll is refused rather than attempted. It is a guard
+# against a runaway trip count turning into an unbounded program, not a
+# judgement about what is reasonable: a caller who wants this much detail is
+# spending their own compute, and the emitted program is theirs to hold.
+MAX_UNROLL_LIMIT = 4096
+
+
 def strategize_glsl_deployment(
     graph: Any,
     *,
-    max_nodes_per_dispatch: int = 256,
-    backend: str = "glsl",
-    remove_loops: bool = False,
+    # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
+    # be split into chunks a driver would accept. That is no longer what the
+    # number means now that emission goes SPIR-V -> GLSL, and for a target
+    # that wants one flat program it was actively harmful -- a program past
+    # the bound was split into regions, so a caller asking for a flat
+    # unrolled loop silently got a retained one instead.
+    max_nodes_per_dispatch: int = 65536,
+    backend: str | None = None,
+    remove_loops: bool | None = None,
+    unroll_limit: int | None = None,
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
@@ -7920,7 +7934,37 @@ def strategize_glsl_deployment(
     ``remove_loops`` disables native loop retention, so
     ``evaporate_unrolled_loops`` unrolls every discovered loop into a flat
     instruction sequence instead of a real ``LoopBlock``.
+
+    ``unroll_limit`` is the largest trip count that may be unrolled. It was
+    fixed at 8, which is not a property of any backend -- a target that
+    wants a flat program wants *its* loops flat, whatever their length. A
+    loop above the limit is silently retained instead, which for a caller
+    that needed a flat program means a shorter program that still compiles
+    and quietly computes fewer iterations. Raise it to whatever the target
+    can actually take.
     """
+
+    # Inherit whatever the compilation asked for, then record it so the
+    # function shells planned from subgraphs of this one see the same thing.
+    # Without this a nested function -- which is where a loop usually lives,
+    # since the entrypoint is a thin wrapper -- silently planned with the
+    # defaults, and a caller asking for a flat program got a retained loop.
+    inherited = dict(graph.G.graph.get("loop_settings") or {})
+    backend = inherited.get("backend", "glsl") if backend is None else backend
+    remove_loops = (
+        inherited.get("remove_loops", False) if remove_loops is None
+        else remove_loops
+    )
+    unroll_limit = (
+        inherited.get("unroll_limit", 8) if unroll_limit is None
+        else unroll_limit
+    )
+    unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
+    graph.G.graph["loop_settings"] = {
+        "backend": backend,
+        "remove_loops": bool(remove_loops),
+        "unroll_limit": int(unroll_limit),
+    }
 
     _propagate_callsite_planner_specializations(graph)
     canonical_value_ids = bool(
@@ -7933,6 +7977,7 @@ def strategize_glsl_deployment(
             native_while=not remove_loops,
             dynamic_bounds=not remove_loops,
             kpn=False,
+            unroll_limit=int(unroll_limit),
         )
     )
     discovered_loop_plans = (
@@ -10817,6 +10862,16 @@ class ProcessGraphGLSLDeployment:
             function_graph = extract_clean_process_subgraph(
                 entry.graph,
                 entry.graph.G,
+            )
+            # A function's graph is built independently, not carved out of
+            # the caller's, so it does not inherit the compilation's loop
+            # settings the way an extracted subgraph does. Seeding them here
+            # is what makes unroll_limit/remove_loops mean anything for a
+            # callee -- and the callee is where loops usually live, since the
+            # entrypoint is a thin wrapper by convention.
+            function_graph.G.graph.setdefault(
+                "loop_settings",
+                dict(graph.G.graph.get("loop_settings") or {}),
             )
             function_shell_types[entry.reference.address] = (
                 strategize_glsl_deployment(

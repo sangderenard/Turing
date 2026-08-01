@@ -520,7 +520,13 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
         for name in (numerical_name, control_name, *region_function_names)
     })
     module = emit_module(
-        program_module, name="mandelbrot_fortran_aot", outputs=emit_outputs
+        program_module,
+        # compile_module names the .f90/.dll from the module name, not from
+        # out_path, so this is what actually keys the artifact on disk. It
+        # must carry the specialization or one build overwrites another's
+        # library -- and a loaded DLL then blocks the next link.
+        name=out_path.stem,
+        outputs=emit_outputs,
     )
     if not module.complete:
         raise RuntimeError(
@@ -533,27 +539,40 @@ def _aot_compile_mandelbrot_fortran(count: int, iterations: int, out_path: Path)
     return ctypes.CDLL(str(library_path))
 
 
-def _fortran_artifact_path() -> Path:
+def _fortran_artifact_path(count: int, iterations: int) -> Path:
     """Where the emitted .f90 (and, beside it, the .api.yaml) lives.
 
-    One definition: the compile step and the descriptor lookup must not be
-    able to disagree about the path. Absolute, because compile_module runs
-    the Fortran compiler as a subprocess and a relative cache path is only
-    correct while the working directory happens to be the repository root.
+    Keyed by count and iterations because the emitted program is specialized
+    to both -- extents are compiled into the signature and the iteration
+    bound is a control uniform of this build. A single fixed path let one
+    configuration silently overwrite another's artifact, and left the loaded
+    DLL locked against the next compile.
+
+    Absolute, because compile_module runs the Fortran compiler as a
+    subprocess and a relative cache path is only correct while the working
+    directory happens to be the repository root.
     """
 
     return (
         Path(__file__).resolve().parents[4]
         / ".turing-cache"
-        / "mandelbrot_fortran_aot.f90"
+        / f"mandelbrot_fortran_aot_n{int(count)}_i{int(iterations)}.f90"
     )
 
 
 @lru_cache(maxsize=None)
 def _compiled_fortran_mandelbrot_library(count: int, iterations: int):
-    return _aot_compile_mandelbrot_fortran(
-        count, iterations, _fortran_artifact_path()
-    )
+    out_path = _fortran_artifact_path(count, iterations)
+    library_path = out_path.with_suffix(".dll" if sys.platform == "win32" else ".so")
+    descriptor_path = out_path.with_suffix(".api.yaml")
+    if library_path.is_file() and descriptor_path.is_file():
+        # Reuse the artifact rather than recompiling on every process. The
+        # lru_cache above is per-process only, so without this each run
+        # relinked -- and a library already loaded elsewhere holds the file
+        # open, which fails the link with "Permission denied" rather than
+        # anything that names the real cause.
+        return ctypes.CDLL(str(library_path))
+    return _aot_compile_mandelbrot_fortran(count, iterations, out_path)
 
 
 def run_compiled_fortran_shell(cx: np.ndarray, cy: np.ndarray, iterations: int) -> np.ndarray:
@@ -570,7 +589,9 @@ def run_compiled_fortran_shell(cx: np.ndarray, cy: np.ndarray, iterations: int) 
 
     count = cx.size
     lib = _compiled_fortran_mandelbrot_library(count, iterations)
-    descriptor_path = _fortran_artifact_path().with_suffix(".api.yaml")
+    descriptor_path = _fortran_artifact_path(count, iterations).with_suffix(
+        ".api.yaml"
+    )
     api = yaml.safe_load(descriptor_path.read_text(encoding="utf-8"))
     entry_name = api["entry"]
     entry = next(e for e in api["entry_points"] if e["name"] == entry_name)

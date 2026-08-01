@@ -110,8 +110,10 @@ def test_output_views_are_tabs_over_the_same_numbers():
     assert 'data-view="image"' in html
     assert "<canvas" in html
     assert "toDataURL(\"image/jpeg\"" in html
-    # Geometry is the caller's to state; a run does not know its own shape.
-    assert 'id="img_w"' in html and 'id="img_h"' in html
+    # Geometry is stated once, on the domain, and the image view follows it
+    # -- two places to type a width is two places for them to disagree.
+    assert 'id="dom_w"' in html and 'id="dom_h"' in html
+    assert 'id="img_w"' not in html
 
 
 def test_the_diagnostics_bootstrap_is_a_separate_script():
@@ -197,3 +199,89 @@ def test_an_edited_descriptor_does_not_pretend_to_apply():
     html = shell_for_artifact(_artifact()).html
     assert 'id="applyapi" disabled' in html
     assert "not wired up" in html
+
+
+def test_feeds_can_be_generated_from_the_grid_rather_than_typed():
+    """A kernel's feeds are a function of position. Pasting a quarter of a
+    million numbers into a text field is a workaround, not a control."""
+
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    artifact = _artifact()
+    html = emit_html_shell(
+        artifact.api,
+        source=artifact.source,
+        feed_expressions={"feed0": "-2.2 + 3.0 * x / (w - 1)"},
+        default_width=480,
+        default_height=300,
+    ).html
+
+    assert 'id="mode_feed0"' in html
+    assert "-2.2 + 3.0 * x / (w - 1)" in html
+    # The one with an expression defaults to it; the other stays literal.
+    assert 'id="expr_feed1"' in html
+    assert 'value="480"' in html and 'value="300"' in html
+
+
+def test_compiled_in_parameters_are_shown_but_not_editable():
+    """An unrolled loop count is part of the emitted instructions. Offering
+    it as an input would be a lie -- it needs a recompile."""
+
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    artifact = _artifact()
+    html = emit_html_shell(
+        artifact.api,
+        source=artifact.source,
+        build_parameters={"iterations (unrolled)": 48, "steps": 720},
+    ).html
+
+    assert "iterations (unrolled)" in html and ">48<" in html
+    assert "needs a recompile" in html
+    assert 'id="in_iterations (unrolled)"' not in html
+
+
+def test_every_backend_gets_a_tab_including_the_ones_that_refused():
+    """Which languages a program can reach is a real property of the
+    program. A tab that quietly vanished would hide it."""
+
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    artifact = _artifact()
+    html = emit_html_shell(
+        artifact.api,
+        source=artifact.source,
+        backend_sources=[
+            {"language": "fortran", "title": "Fortran", "source": "module k\nend",
+             "available": True, "reason": "", "highlight": "fortran", "lines": 2},
+            {"language": "spirv", "title": "SPIR-V", "source": "",
+             "available": False, "reason": "no SPIR-V type for dtype 'x'",
+             "highlight": "text", "lines": 0},
+        ],
+    ).html
+
+    assert "What made this" in html
+    assert 'data-lang="fortran"' in html and 'data-lang="spirv"' in html
+    assert "module k" in html
+    # The refusal is shown, with its reason, rather than dropped.
+    assert "no SPIR-V type" in html
+    assert "&middot; n/a" in html
+
+
+def test_inputs_can_be_drawn_from_a_gaussian():
+    html = shell_for_artifact(_artifact()).html
+    assert '<option value="gaussian">' in html
+    assert 'id="mean_feed0"' in html and 'id="sigma_feed0"' in html
+    assert "function gaussian()" in html
+    # Box-Muller keeps its spare rather than discarding half the work.
+    assert "spareNormal" in html
+
+
+def test_the_program_can_be_looped_for_a_steady_state_measurement():
+    """One call measures instantiation and first-touch as much as the
+    kernel; the spread over repeats is what says how fast it is."""
+
+    html = shell_for_artifact(_artifact()).html
+    assert 'id="repeats"' in html
+    assert "median" in html and "Melem/s" in html
+    assert 'log("profile", "steady state over ' in html

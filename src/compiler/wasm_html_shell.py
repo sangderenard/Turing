@@ -147,6 +147,14 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
   padding: .1rem .4rem; border-radius: .25rem; background: var(--soft); margin: .1rem; }
 .filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
 .filters label { cursor: pointer; opacity: .75; }
+.srctabs { display: flex; flex-wrap: wrap; gap: .25rem; margin: .5rem 0; }
+.srctab { padding: .25rem .7rem; border-radius: .3rem; cursor: pointer;
+  font-size: .75rem; font-weight: 600; background: var(--soft);
+  border: 1px solid transparent; font-family: ui-monospace, monospace; }
+.srctab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.srcview[hidden] { display: none; }
+.stat { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .8rem;
+  font-family: ui-monospace, monospace; margin-top: .4rem; }
 .good { color: var(--good); }
 details summary { cursor: pointer; font-weight: 600; font-size: .8rem; opacity: .65;
   text-transform: uppercase; letter-spacing: .04em; }
@@ -261,6 +269,64 @@ function parseNumbers(text) {
   return text.split(/[\s,]+/).filter(s => s.length).map(Number);
 }
 
+// Box-Muller, with the spare kept: two normals come out of one pair of
+// uniforms, and throwing one away doubles the cost for no reason.
+let spareNormal = null;
+function gaussian() {
+  if (spareNormal !== null) {
+    const value = spareNormal;
+    spareNormal = null;
+    return value;
+  }
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  const radius = Math.sqrt(-2 * Math.log(u));
+  const angle = 2 * Math.PI * v;
+  spareNormal = radius * Math.sin(angle);
+  return radius * Math.cos(angle);
+}
+
+function domain() {
+  const w = Math.max(1, Number($("dom_w").value) | 0);
+  const h = Math.max(1, Number($("dom_h").value) | 0);
+  return { w: w, h: h, n: w * h };
+}
+
+// Compiled once per run rather than per element: a 256,000-element feed
+// evaluated through a fresh Function each time is the difference between a
+// responsive page and a hung one.
+function feedValues(param, n, d) {
+  const mode = $("mode_" + param.name).value;
+  if (mode === "values") {
+    return parseNumbers($("in_" + param.name).value);
+  }
+  if (mode === "gaussian") {
+    const mean = Number($("mean_" + param.name).value) || 0;
+    const sigma = Number($("sigma_" + param.name).value);
+    const out = new Float64Array(n);
+    for (let i = 0; i < n; i++) out[i] = mean + (sigma || 0) * gaussian();
+    return out;
+  }
+  const body = $("expr_" + param.name).value;
+  let fn;
+  try {
+    fn = new Function("i", "x", "y", "w", "h", "return (" + body + ");");
+  } catch (err) {
+    throw new Error("feed " + param.name + ": " + err.message);
+  }
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i % d.w, y = (i / d.w) | 0;
+    const value = fn(i, x, y, d.w, d.h);
+    if (!Number.isFinite(value)) {
+      throw new Error("feed " + param.name + " gave " + value + " at i=" + i);
+    }
+    out[i] = value;
+  }
+  return out;
+}
+
 async function run() {
   if (!moduleBytes) { setStatus("No .wasm loaded yet.", "bad"); log("warn", "run with no module"); return; }
   try {
@@ -271,10 +337,17 @@ async function run() {
     const fn = instance.exports[entry.symbol];
     if (!fn) throw new Error("export '" + entry.symbol + "' not found");
 
-    const feeds = inputs.map(p => parseNumbers($("in_" + p.name).value));
-    const count = feeds.length ? Math.min(...feeds.map(f => f.length))
-                               : Number($("in_count").value);
+    const d = domain();
+    const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
+    const feeds = inputs.map(p => feedValues(p, d.n, d));
+    // An expression covers the whole grid; literal values only go as far as
+    // the shortest list supplied.
+    const count = anyExpression
+      ? d.n
+      : (feeds.length ? Math.min(...feeds.map(f => f.length)) : d.n);
     if (!count) throw new Error("no elements to run");
+    log("info", "domain", { width: d.w, height: d.h, elements: count,
+                            generated: anyExpression });
 
     // The caller owns memory, so the layout is decided here: every array
     // gets its own contiguous block, feeds first and then outputs.
@@ -304,9 +377,37 @@ async function run() {
       memoryPages: memory.buffer.byteLength / 65536
     });
     log("progress", "executing", { done: 3, total: 4 });
-    const started = performance.now();
-    fn(...args);
-    const elapsed = performance.now() - started;
+    // Steady state, not one sample. A single call measures instantiation
+    // effects, first-touch of the memory, and whatever the JIT had not done
+    // yet; repeating and reporting the spread is what says how fast the
+    // kernel actually is.
+    const repeats = Math.max(1, Number($("repeats").value) | 0);
+    const timings = [];
+    for (let r = 0; r < repeats; r++) {
+      const t0 = performance.now();
+      fn(...args);
+      timings.push(performance.now() - t0);
+    }
+    timings.sort((a, b) => a - b);
+    const elapsed = timings[timings.length >> 1];
+    const total = timings.reduce((a, b) => a + b, 0);
+    if (repeats > 1) {
+      $("stats").innerHTML =
+        "<span>runs " + repeats + "</span>" +
+        "<span>median " + elapsed.toFixed(3) + " ms</span>" +
+        "<span>min " + timings[0].toFixed(3) + "</span>" +
+        "<span>max " + timings[timings.length - 1].toFixed(3) + "</span>" +
+        "<span>total " + total.toFixed(1) + " ms</span>" +
+        "<span>" + (count * repeats / total / 1000).toFixed(1) + " Melem/s</span>";
+      log("profile", "steady state over " + repeats + " runs", {
+        median_ms: Number(elapsed.toFixed(4)),
+        min_ms: Number(timings[0].toFixed(4)),
+        max_ms: Number(timings[timings.length - 1].toFixed(4)),
+        elements: count
+      });
+    } else {
+      $("stats").innerHTML = "";
+    }
     log("ok", "returned in " + elapsed.toFixed(3) + " ms");
 
     lastOutputs = outputs.map((p, i) => ({
@@ -342,14 +443,18 @@ function renderImage() {
   const note = $("imgnote");
   if (!lastOutputs || !lastOutputs.length) { note.textContent = "Run first."; return; }
   const values = lastOutputs[0].values;
-  let w = Number($("img_w").value) | 0;
-  let h = Number($("img_h").value) | 0;
+  const d = domain();
+  let w = d.w, h = d.h;
+  if (w * h !== values.length) {
+    // The run did not cover the grid (literal feeds, or a short list), so
+    // the stated geometry would lie about the picture.
+    w = 0; h = 0;
+  }
   if (!w || !h) {
     // Default to the squarest rectangle that fits, so a run with no stated
     // geometry still shows something honest rather than nothing.
     w = Math.round(Math.sqrt(values.length)) || 1;
     h = Math.ceil(values.length / w);
-    $("img_w").value = w; $("img_h").value = h;
   }
   const invert = $("img_invert").checked;
   let lo = Infinity, hi = -Infinity;
@@ -420,6 +525,18 @@ function renderGraph() {
     rows;
 }
 
+function wireSourceTabs() {
+  document.querySelectorAll(".srctab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".srctab").forEach(t =>
+        t.setAttribute("aria-selected", String(t === tab)));
+      document.querySelectorAll(".srcview").forEach(v => {
+        v.hidden = v.dataset.lang !== tab.dataset.lang;
+      });
+    });
+  });
+}
+
 function wireTabs() {
   document.querySelectorAll(".tab").forEach(tab => {
     tab.addEventListener("click", () => {
@@ -428,8 +545,17 @@ function wireTabs() {
       renderActiveTab();
     });
   });
-  ["img_w", "img_h", "img_invert"].forEach(id =>
+  ["dom_w", "dom_h", "img_invert"].forEach(id =>
     $(id).addEventListener("change", () => renderActiveTab()));
+  document.querySelectorAll("select[id^='mode_']").forEach(select => {
+    select.addEventListener("change", () => {
+      const name = select.id.slice(5);
+      $("row_values_" + name).hidden = select.value !== "values";
+      $("row_expr_" + name).hidden = select.value !== "expression";
+      $("row_gauss_" + name).hidden = select.value !== "gaussian";
+    });
+    select.dispatchEvent(new Event("change"));
+  });
 }
 
 function wireFilePicker() {
@@ -476,6 +602,7 @@ $("copylog").addEventListener("click", () => {
   pane.appendChild(line);
 });
 wireFilters();
+wireSourceTabs();
 renderGraph();
 
 log("info", "shell ready", {
@@ -524,28 +651,115 @@ def _signature_rows(parameters: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(rows)
 
 
-def _input_rows(parameters: Sequence[Mapping[str, Any]]) -> str:
+def _input_rows(
+    parameters: Sequence[Mapping[str, Any]],
+    feed_expressions: Mapping[str, str] | None = None,
+) -> str:
+    """One row per feed, each able to be literal values or an expression.
+
+    A kernel's feeds are usually a function of position, so an expression is
+    offered alongside literal values: it is evaluated per element with the
+    grid coordinates in scope (``i``, ``x``, ``y``, ``w``, ``h``). Typing a
+    quarter of a million numbers into a text field is not a control surface.
+    """
+
+    expressions = dict(feed_expressions or {})
     feeds = [p for p in parameters if p["role"] == "input"]
     rows = []
-    if not feeds:
-        # A program with no array feeds still needs an element count.
-        rows.append(
-            '<div class="row">'
-            '<div class="name">count</div>'
-            '<div class="grow"><input type="number" id="in_count" value="8" min="1"></div>'
-            "</div>"
-        )
     for parameter in feeds:
         name = str(parameter["name"])
+        expression = expressions.get(name, "i")
+        default_mode = "expression" if name in expressions else "values"
         rows.append(
             '<div class="row">'
             f'<div class="name">{_escape(name)}</div>'
-            f'<div class="grow"><input type="text" id="in_{_escape(name)}" '
-            'value="1, 2, 3, 4" '
+            f'<select id="mode_{_escape(name)}">'
+            f'<option value="values"{"" if default_mode == "values" else ""}>values</option>'
+            f'<option value="expression"{" selected" if default_mode == "expression" else ""}>expression</option>'
+            '<option value="gaussian">gaussian</option>'
+            "</select>"
+            '<div class="grow">'
+            f'<div id="row_values_{_escape(name)}">'
+            f'<input type="text" id="in_{_escape(name)}" value="1, 2, 3, 4" '
             'placeholder="comma or space separated numbers"></div>'
-            "</div>"
+            f'<div id="row_expr_{_escape(name)}" hidden>'
+            f'<input type="text" id="expr_{_escape(name)}" '
+            f'value="{_escape(expression)}" '
+            'placeholder="expression over i, x, y, w, h"></div>'
+            f'<div id="row_gauss_{_escape(name)}" hidden class="imgctl">'
+            f'<label>mean <input type="number" step="any" '
+            f'id="mean_{_escape(name)}" value="0"></label>'
+            f'<label>sigma <input type="number" step="any" '
+            f'id="sigma_{_escape(name)}" value="1"></label></div>'
+            "</div></div>"
+        )
+    if not feeds:
+        rows.append(
+            '<div class="meta">This program takes no array feeds; the domain '
+            "width and height decide how many elements one run covers.</div>"
         )
     return "\n".join(rows)
+
+
+def _source_tabs(sources: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+    """Tabs and panes for every backend this program was emitted through.
+
+    A backend that could not serve the program keeps its tab and says why.
+    Which languages a program can reach is a real property of the program,
+    and a tab that quietly vanished would hide it.
+    """
+
+    if not sources:
+        return "", '<div class="meta">No backend sources were collected.</div>'
+    tabs, views = [], []
+    first_available = next(
+        (s["language"] for s in sources if s.get("available")),
+        sources[0]["language"],
+    )
+    for entry in sources:
+        language = str(entry["language"])
+        selected = "true" if language == first_available else "false"
+        mark = "" if entry.get("available") else " &middot; n/a"
+        lines = entry.get("lines") or 0
+        tabs.append(
+            f'<div class="srctab" data-lang="{_escape(language)}" '
+            f'aria-selected="{selected}">{_escape(str(entry["title"]))}{mark}</div>'
+        )
+        if entry.get("available"):
+            body = (
+                f'<div class="meta">{lines} lines</div>'
+                f"<pre>{_escape(str(entry.get('source') or ''))}</pre>"
+            )
+        else:
+            body = (
+                '<div class="note">This backend did not serve the program: '
+                f"{_escape(str(entry.get('reason') or 'no reason given'))}</div>"
+            )
+        views.append(
+            f'<div class="srcview" data-lang="{_escape(language)}"'
+            f'{"" if language == first_available else " hidden"}>{body}</div>'
+        )
+    return "\n".join(tabs), "\n".join(views)
+
+
+def _build_rows(parameters: Mapping[str, Any]) -> str:
+    """Parameters that were fixed when the program was compiled.
+
+    Shown read-only because they are not inputs at all: an unrolled loop
+    count is part of the emitted instructions, so changing it here would be
+    a lie -- it needs a recompile.
+    """
+
+    if not parameters:
+        return ""
+    rows = "".join(
+        f'<div class="kv"><b>{_escape(str(key))}</b><span>{_escape(str(value))}</span></div>'
+        for key, value in parameters.items()
+    )
+    return (
+        '<div class="meta" style="margin-top:.6rem">Compiled in &mdash; changing '
+        "these needs a recompile, not a re-run.</div>" + rows
+    )
 
 
 def emit_html_shell(
@@ -557,6 +771,11 @@ def emit_html_shell(
     telemetry: Any = None,
     process_graph: Any = None,
     origin_source: str = "",
+    feed_expressions: Mapping[str, str] | None = None,
+    build_parameters: Mapping[str, Any] | None = None,
+    default_width: int = 64,
+    default_height: int = 40,
+    backend_sources: Any = None,
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -643,6 +862,16 @@ def emit_html_shell(
         # A descriptor that cannot render is not a reason to lose the page.
         api_yaml = ""
 
+    build_rows = _build_rows(build_parameters or {})
+
+    if backend_sources is None:
+        source_entries: list[Mapping[str, Any]] = []
+    elif hasattr(backend_sources, "to_mapping"):
+        source_entries = list(backend_sources.to_mapping()["sources"])
+    else:
+        source_entries = list(backend_sources)
+    source_tabs, source_views = _source_tabs(source_entries)
+
     note = entry.get("note")
     note_html = f'<div class="note">{_escape(str(note))}</div>' if note else ""
 
@@ -670,11 +899,26 @@ def emit_html_shell(
   </div>
 
   <div class="panel">
+    <div class="panel-title">Domain</div>
+    <div class="meta">A kernel's feeds are computed over a grid. Width and
+      height set how many elements one run covers, and the image view uses
+      the same numbers.</div>
+    <div class="imgctl">
+      <label>width <input type="number" id="dom_w" min="1" value="{default_width}"></label>
+      <label>height <input type="number" id="dom_h" min="1" value="{default_height}"></label>
+    </div>
+    {build_rows}
+  </div>
+
+  <div class="panel">
     <div class="panel-title">Inputs</div>
     {picker}
-    {_input_rows(parameters)}
+    {_input_rows(parameters, feed_expressions)}
+    <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>
+      <label class="meta">repeat <input type="number" id="repeats" min="1"
+        value="1" style="width:5rem"></label>
       <div class="grow"><div id="status" class="out"></div></div>
     </div>
   </div>
@@ -690,8 +934,6 @@ def emit_html_shell(
     </div>
     <div class="tabview" data-view="image" hidden>
       <div class="imgctl">
-        <label>width <input type="number" id="img_w" min="1" value="0"></label>
-        <label>height <input type="number" id="img_h" min="1" value="0"></label>
         <label><input type="checkbox" id="img_invert"> invert</label>
         <a id="download" download="output.jpg" style="display:none">download .jpg</a>
       </div>
@@ -716,6 +958,18 @@ def emit_html_shell(
     </div>
     <div id="log"></div>
     <div class="row"><button id="copylog">Copy log</button></div>
+  </div>
+
+  <div class="panel">
+    <details open>
+      <summary>What made this</summary>
+      <div class="meta">One ordinary Python function, ingested as an AST,
+        planned once as a ProcessGraph, and lowered through the AOT compiler.
+        Every tab below came out of <em>that one compilation</em> &mdash; not
+        from separate re-implementations kept in step by hand.</div>
+      <div class="srctabs">{source_tabs}</div>
+      {source_views}
+    </details>
   </div>
 
   <div class="panel">
@@ -769,6 +1023,11 @@ def shell_for_artifact(
     telemetry: Any = None,
     process_graph: Any = None,
     origin_source: str = "",
+    feed_expressions: Mapping[str, str] | None = None,
+    build_parameters: Mapping[str, Any] | None = None,
+    default_width: int = 64,
+    default_height: int = 40,
+    backend_sources: Any = None,
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
 
@@ -785,6 +1044,11 @@ def shell_for_artifact(
         telemetry=telemetry,
         process_graph=process_graph,
         origin_source=origin_source,
+        feed_expressions=feed_expressions,
+        build_parameters=build_parameters,
+        default_width=default_width,
+        default_height=default_height,
+        backend_sources=backend_sources,
     )
 
 
