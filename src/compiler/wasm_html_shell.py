@@ -530,12 +530,8 @@ function renderImage() {
     image.data[i*4+3] = 255;
   }
   ctx.putImageData(image, 0, 0);
-  const jpeg = canvas.toDataURL("image/jpeg", 0.92);
-  const link = $("download");
-  link.href = jpeg;
-  link.style.display = "inline";
-  note.textContent = w + "x" + h + ", range " + lo.toPrecision(4) + " to " +
-    hi.toPrecision(4) + ", jpeg " + Math.round((jpeg.length * 3) / 4 / 1024) + " KB";
+  note.textContent = w + "x" + h + ", raw scalar field rendered into RGB canvas pixels, range " +
+    lo.toPrecision(4) + " to " + hi.toPrecision(4);
 }
 
 function renderActiveTab() {
@@ -1025,7 +1021,7 @@ def emit_html_shell(
     <div class="panel-title">Results</div>
     <div class="tabs" role="tablist">
       <div class="tab" data-view="raw" role="tab" aria-selected="true">Raw</div>
-      <div class="tab" data-view="image" role="tab" aria-selected="false">JPEG</div>
+      <div class="tab" data-view="image" role="tab" aria-selected="false">RGB pixels</div>
     </div>
     <div class="tabview" data-view="raw">
       <div id="raw" class="out"></div>
@@ -1033,7 +1029,6 @@ def emit_html_shell(
     <div class="tabview" data-view="image" hidden>
       <div class="imgctl">
         <label><input type="checkbox" id="img_invert"> invert</label>
-        <a id="download" download="output.jpg" style="display:none">download .jpg</a>
       </div>
       <div id="imgnote" class="meta"></div>
       <canvas id="canvas" width="1" height="1"></canvas>
