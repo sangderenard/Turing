@@ -151,6 +151,8 @@ _INTENTIONALLY_NONDIFFERENTIABLE = {
     "logical_and", "logical_or", "logical_xor",
 }
 
+_AUTOGRAD_SOURCE_OPERATIONS = {"tensor_from_list"}
+
 try:  # NumPy is an optional dependency for the repository
     import numpy as np
 except Exception:  # pragma: no cover - tested in environments without numpy
@@ -494,6 +496,8 @@ class GradTape:
             else
             "available"
             if op in BACKWARD_REGISTRY._methods
+            else "source"
+            if op in _AUTOGRAD_SOURCE_OPERATIONS
             else "nondifferentiable"
             if op in _INTENTIONALLY_NONDIFFERENTIABLE
             else "missing"

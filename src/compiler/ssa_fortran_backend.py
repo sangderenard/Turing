@@ -979,18 +979,11 @@ class _FunctionEmitter:
         else:
             call_values = [*instr.args, *ordered_outputs]
             extents = sorted(dimension_extents(call_values).values())
-        # A region subroutine's declared parameters already include the
-        # values it writes, so appending ordered_outputs again passed each
-        # one twice -- "More actual than formal arguments in procedure
-        # call". Outputs are only appended when the callee really does
-        # declare more parameters than the call supplies.
-        arity = self.callee_arity.get(str(callee))
         arguments = [
             *extents,
             *(self._operand(value) for value in instr.args),
+            *(_name(value) for value in ordered_outputs),
         ]
-        if arity is None or arity > len(instr.args):
-            arguments.extend(_name(value) for value in ordered_outputs)
         return [f"    call {callee}({', '.join(arguments)})"]
 
     def _indexed_store(self, instr: Instr) -> list[str] | None:
@@ -1390,6 +1383,12 @@ class _FunctionEmitter:
                 if instr.op not in ("Phi", "phi"):
                     continue
                 incoming = instr.attributes.get("incoming") or ()
+                if not incoming:
+                    blocks = tuple(
+                        instr.attributes.get("incoming_blocks") or ()
+                    )
+                    if len(blocks) == len(instr.args):
+                        incoming = tuple(zip(blocks, instr.args))
                 self._locals[instr.res.id] = instr.res
                 entries = self._phi_targets.setdefault(block.name, [])
                 for predecessor, value in incoming:
@@ -1564,7 +1563,7 @@ class FortranModule:
 
     def write(self, directory: str | Path) -> Path:
         path = Path(directory) / f"{self.name}.f90"
-        path.write_text(self.source, encoding="utf-8")
+        path.write_text(self.source, encoding="utf-8", newline="\n")
         if self.api is not None:
             # Beside the source, same stem: the artifact and its contract
             # travel together or the contract is worthless.
@@ -1628,6 +1627,9 @@ def emit_module(
     from .compiled_program_api import CompiledProgramAPI, describe_fortran_function
 
     def _kind(function_name: str) -> str:
+        function = functions[function_name]
+        if function.metadata.get("control_ir"):
+            return "control"
         if function_name.startswith("numerical_region_"):
             return "region"
         if function_name.endswith("_control"):
@@ -1644,6 +1646,20 @@ def emit_module(
                 "iterates here, and calling the numerical subroutine "
                 "directly runs the loop body once"
             )
+        source_names = {
+            int(value_id): str(source_name)
+            for source_name, value_id in function.metadata.get(
+                "named_outputs", ()
+            )
+        }
+        # These are declared function parameters, not aliases selected by
+        # identity-table ordering. They authoritatively name ABI inputs.
+        source_names.update({
+            int(value_id): str(source_name)
+            for source_name, value_id in function.metadata.get(
+                "parameter_names", ()
+            )
+        })
         entry_points.append(
             describe_fortran_function(
                 function_name,
@@ -1652,6 +1668,7 @@ def emit_module(
                 outputs=named_outputs.get(function_name, ()),
                 kind=kind,
                 note=note,
+                source_names=source_names,
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]

@@ -116,6 +116,11 @@ class AOTCompilation:
     # to find the producers of a loop's carried updates; without them a
     # program whose control shell has regions cannot be lowered.
     region_programs: Mapping[int, Any] = field(default_factory=dict)
+    # Retained by the reduced function ProcessGraph: source name -> complete
+    # canonical value-ID history. ``function_outputs`` selects public names.
+    identity_table: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    function_outputs: tuple[str, ...] = ()
+    function_parameters: tuple[str, ...] = ()
 
 
 def compile_ast_aot(
@@ -128,6 +133,7 @@ def compile_ast_aot(
     unroll_limit: int = 8,
     profiling: bool = False,
     precompile_only: bool = False,
+    python_bindings: Mapping[str, Any] | None = None,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -147,6 +153,11 @@ def compile_ast_aot(
 
     module = ast.parse(source)
     graph = ProcessGraph(materialize_memory=False)
+    # AOT compilation may target a function from a live module.  Its resolved
+    # globals are static closure values, not runtime tensor feeds.  Capturing
+    # them here lets the reducer retain computed constants and imported
+    # references without executing or reinterpreting their source expressions.
+    graph.python_bindings = dict(python_bindings or {})
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
@@ -236,6 +247,19 @@ def compile_ast_aot(
                 getattr(source_shell, "captured_region_programs", {}) or {}
             ).items()
         }
+        source_graph_metadata = source_shell.process_graph.G.graph
+        identity_table = {
+            str(name): tuple(map(int, value_ids))
+            for name, value_ids in (
+                source_graph_metadata.get("identity_table") or {}
+            ).items()
+        }
+        function_outputs = tuple(map(
+            str, source_graph_metadata.get("function_outputs") or ()
+        ))
+        function_parameters = tuple(map(
+            str, source_graph_metadata.get("function_parameters") or ()
+        ))
     finally:
         # Matches the release-in-finally discipline every existing caller of
         # this deployment class already follows (tests/test_glsl_fused_network.py).
@@ -255,6 +279,9 @@ def compile_ast_aot(
         shell=shell,
         map_ir=map_ir,
         region_programs=region_programs,
+        identity_table=identity_table,
+        function_outputs=function_outputs,
+        function_parameters=function_parameters,
     )
 
 

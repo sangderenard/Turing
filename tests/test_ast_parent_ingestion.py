@@ -3,6 +3,9 @@ import contextlib
 import io
 import types
 
+from src.common.tensors.topological_reducer import (
+    reduce_abstract_tensor_topology,
+)
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
 
@@ -50,6 +53,13 @@ class _ConstructedSource:
         return _unrelated_dependency(self.value)
 
 
+class _FieldParameterCollisionSource:
+    symbols = None
+
+    def encode(self, symbols):
+        return symbols + 1
+
+
 def _scoped_dependency_a(value):
     return value + 10
 
@@ -87,6 +97,64 @@ def _definitions(graph, name):
         )
         and data["expr_obj"].name == name
     ]
+
+
+def test_literal_module_constants_are_static_function_bindings():
+    graph = _ingest(
+        "CARD_SIZE = 2000\n\ndef build():\n    return CARD_SIZE\n",
+        {},
+    )
+    (_node_id, data), = _definitions(graph, "build")
+
+    assert data["expr_obj"]._python_bindings["CARD_SIZE"] == 2000
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("build").graph
+    assert function_graph.python_bindings["CARD_SIZE"] == 2000
+
+    direct = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        direct.build_from_ast(ast.parse(
+            "CARD_SIZE = 2000\n\ndef build():\n    return CARD_SIZE\n"
+        ))
+    reduce_abstract_tensor_topology(direct)
+    direct_function = direct.function_table.entry("build").graph
+    assert direct_function.python_bindings["CARD_SIZE"] == 2000
+
+
+def test_class_field_default_does_not_shadow_method_parameter():
+    graph = _ingest(
+        """
+def build(symbols):
+    table = _FieldParameterCollisionSource()
+    return table.encode(symbols)
+""",
+        {"_FieldParameterCollisionSource": _FieldParameterCollisionSource},
+    )
+    reduce_abstract_tensor_topology(graph)
+
+    method = graph.function_table.entry("encode").graph
+    symbol_ids = method.G.graph["identity_table"]["symbols"]
+    assert symbol_ids
+    assert method.G.nodes[symbol_ids[0]]["type"] == "Input"
+    assert not any(
+        data.get("type") == "Constant"
+        and (data.get("attributes") or {}).get("binding_name") == "symbols"
+        for _node_id, data in method.G.nodes(data=True)
+    )
+
+
+def test_imported_callable_is_resolved_in_external_function_table():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse(
+            "from pathlib import Path\n\ndef build(value):\n"
+            "    return Path(value)\n"
+        ))
+    reduce_abstract_tensor_topology(graph)
+
+    entry = graph.external_function_table.entry("Path")
+    assert entry.python_callable is not None
+    assert entry.python_callable("example").name == "example"
 
 
 def test_ingestion_builds_source_parent_as_process_graph_nodes():
@@ -183,6 +251,47 @@ class Thermostat:
     ]
     assert map_ir["permissions"] == ()
     assert all(item["permissions"] == () for item in map_ir["graphs"])
+
+
+def test_annotated_assignments_split_schema_from_runtime_assignment():
+    graph = _ingest(
+        '''
+ModuleAlias: type = int
+
+class Accumulator:
+    scale: float = 2.0
+
+    def apply(self, value: float) -> float:
+        result: float = value * self.scale
+        return result
+''',
+        {},
+    )
+
+    schema = graph.G.graph["map_ir"]["schema"]
+    assert schema["module"]["annotations"][0]["name"] == "ModuleAlias"
+    assert schema["classes"][0]["members"][0]["identity"] == "Accumulator.scale"
+    function = next(
+        item for item in schema["functions"]
+        if item["identity"] == "Accumulator.apply"
+    )
+    assert function["locals"][0]["name"] == "result"
+    assert function["locals"][0]["annotation"] == "float"
+
+    from src.common.tensors.topological_reducer import (
+        reduce_abstract_tensor_topology,
+    )
+
+    reduce_abstract_tensor_topology(graph)
+    apply_graph = graph.function_table.entry("Accumulator.apply").graph
+    assert not any(
+        isinstance(data.get("expr_obj"), ast.AnnAssign)
+        for _node_id, data in apply_graph.G.nodes(data=True)
+    )
+    assert any(
+        isinstance(data.get("expr_obj"), ast.BinOp)
+        for _node_id, data in apply_graph.G.nodes(data=True)
+    )
 
 
 def test_dynamic_attribute_call_does_not_alias_method_by_basename():

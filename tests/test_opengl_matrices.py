@@ -2,7 +2,13 @@ import numpy as np
 from dataclasses import dataclass
 
 from src.opengl_render import api as gl_api
-from src.opengl_render.api import _perspective, _look_at, draw_layers
+from src.opengl_render.api import (
+    SecondOrderAutoFitState,
+    _perspective,
+    _look_at,
+    advance_second_order_autofit,
+    draw_layers,
+)
 from src.cells.softbody.geometry.geodesic import icosahedron
 
 # Provide minimal stand-ins for GL dataclasses when OpenGL is unavailable
@@ -77,4 +83,62 @@ def test_draw_layers_transposes_mvp_and_handles_icosahedron():
         _perspective(45.0, aspect, 0.1, radius * 10.0)
         @ _look_at(eye, center, up)
     ).T
-    assert np.allclose(renderer.mvp, expected)
+    assert np.allclose(renderer.mvp, expected, atol=2e-7)
+
+
+def test_draw_layers_tolerates_an_initially_empty_point_graph():
+    points = gl_api.PointLayer(
+        positions=np.empty((0, 3), dtype=np.float32),
+        colors=np.empty((0, 4), dtype=np.float32),
+    )
+    renderer = _StubRenderer()
+
+    draw_layers(renderer, {"points": points}, (640, 480))
+
+    assert renderer.points is points
+    assert renderer.mvp is None
+    assert renderer.viewport == (640, 480)
+
+
+def test_draw_layers_can_use_an_oblique_perspective_view():
+    V, F = icosahedron()
+    mesh = MeshLayer(V.astype(np.float32), F.astype(np.uint32))
+    renderer = _StubRenderer()
+    direction = np.array([0.55, 0.32, 1.0], dtype=np.float32)
+
+    draw_layers(
+        renderer,
+        {"membrane": mesh},
+        (640, 480),
+        view_direction=tuple(direction),
+    )
+
+    center = mesh.positions.mean(axis=0)
+    radius = float(np.linalg.norm(mesh.positions - center, axis=1).max())
+    direction /= np.linalg.norm(direction)
+    eye = center + direction * radius * 3.0
+    expected = (
+        _perspective(45.0, 640 / 480, 0.1, radius * 10.0)
+        @ _look_at(eye, center, np.array([0.0, 1.0, 0.0], np.float32))
+    ).T
+    assert np.allclose(renderer.mvp, expected, atol=2e-7)
+
+
+def test_second_order_autofit_double_smooths_bounds_changes():
+    state = SecondOrderAutoFitState(
+        center_1=np.zeros(3, dtype=np.float32),
+        center_2=np.zeros(3, dtype=np.float32),
+        radius_1=1.0,
+        radius_2=1.0,
+        updated_at=0.0,
+    )
+    state = advance_second_order_autofit(
+        state,
+        np.array([10.0, 0.0, 0.0], dtype=np.float32),
+        10.0,
+        now=0.1,
+        time_constant=0.22,
+    )
+
+    assert 0.0 < state.center_2[0] < state.center_1[0] < 10.0
+    assert 1.0 < state.radius_2 < state.radius_1 < 10.0

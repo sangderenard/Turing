@@ -55,6 +55,37 @@ def test_with_a_binary_the_page_is_self_contained():
     assert "self-contained" in shell.html
 
 
+def test_published_webgl_shader_graduates_page_to_execution_surface():
+    shell = shell_for_artifact(
+        _artifact(),
+        shader_execution={
+            "url": "source/webgl/webgl.frag.glsl",
+            "language": "webgl2-glsl-es",
+            "stage": "fragment",
+        },
+    )
+    html = shell.html
+
+    assert '<canvas id="shader-surface" tabindex="0"' in html
+    assert 'width: 100%;' in html
+    assert 'height: 100%;' in html
+    assert 'canvas.getContext("webgl2"' in html
+    assert 'fetch(new URL(SHADER.url, document.baseURI)' in html
+    assert "canvas.setPointerCapture(event.pointerId)" in html
+    assert 'canvas.addEventListener("keydown"' in html
+    assert "window.TuringShaderSurface" in html
+
+    # Graduation is a CSS visibility mode: the inspector remains available
+    # in the DOM and the shader canvas is the only visible body content.
+    assert '<body class="shader-execution">' in html
+    assert "body.shader-execution > :not(#shader-surface):not(script)" in html
+    assert "display: none !important" in html
+    assert "Local publisher and gallery" in html
+    assert "Process graph" in html
+    assert 'id="run"' in html
+    assert 'id="canvas"' in html
+
+
 def test_the_emitted_source_travels_with_the_page_for_reading():
     shell = shell_for_artifact(_artifact())
     assert "f64.sub" in shell.html
@@ -120,9 +151,13 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     assert 'const STATIC_GALLERY = [{"slug": "demo"' in html
     assert 'renderGallery(STATIC_GALLERY)' in html
     assert 'const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url)' in html
+    assert "function resourceURLs(path)" in html
+    assert 'const siteIndex = window.location.pathname.indexOf("/site/")' in html
+    assert "add(serverURL(pageDirectory + relative))" in html
+    assert 'add(serverURL("/" + relative))' in html
+    assert "resource not found in any configured location" in html
     assert 'const pagesPrefix = routeIndex >= 0' in html
-    assert 'const BROWSER_PYTHON = null' in html
-    assert "fetch(resourceURL(descriptor.url))" in html
+    assert "fetchResource(descriptor.url)" in html
     assert "const programs = new Map()" in html
     assert "versions.find(item => item.latest) || versions[0]" in html
     assert 'selector.className = "gallery-version"' in html
@@ -373,11 +408,19 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
     ).html
 
     assert "new WebAssembly.Memory" in html
+    assert "window.TuringSharedClassMemory" in html
+    assert "turingStorageReference" in html
+    assert "residentOutputs" in html
+    assert "redirectStorageOffset" in html
+    assert "lastExecutionMs" in html
+    assert "residentValues" in html
+    assert "queueDeploymentProfile" in html
+    assert "requestAnimationFrame" in html
     assert "WebAssembly.instantiate(moduleBinary, imports)" in html
     assert "No live tensor is copied through" in html
     assert "shared-memory slot" in html
     assert "Live deployment schedule:" in html
-    assert "await fetch(resourceURL(spec.url))" in html
+    assert "await fetchResource(spec.url)" in html
     assert "one element per call today" not in html
 
 
@@ -396,7 +439,7 @@ def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():
     assert "site/v2/source/render/fortran/render.f90" in html
     assert "The file is fetched only after this button is clicked" in html
     assert 'button.addEventListener("click", async () =>' in html
-    assert "await fetch(resourceURL(descriptor.url))" in html
+    assert "await fetchResource(descriptor.url)" in html
 
 
 def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
@@ -429,7 +472,7 @@ def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
     assert "<mi>result</mi>" in html
     assert "site/v3/math/render/sympy-process-model.json" in html
     assert "Download exact SymPy model" in html
-    assert "await fetch(resourceURL(MATHEMATICS.url))" in html
+    assert "await fetchResource(MATHEMATICS.url)" in html
     assert "relation 1" not in html
     assert "math-equations" not in html
 

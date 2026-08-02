@@ -194,10 +194,10 @@ def test_emitted_program_fuses_intermediates_into_locals():
         3,
     )
     src = emit_program_source(program)
-    assert src.count("buffer") == 3          # 2 feeds + 1 output, no temporaries
+    assert src.count("buffer") == 1          # one shared arena, no temporary SSBOs
     assert "float s2 = s0 + s1;" in src
     assert "float s3 = exp(s2);" in src
-    assert "outbuf[gid] = s3;" in src
+    assert "arena[u_slot[2] + (gid)] = floatBitsToUint(s3);" in src
 
 
 def test_typed_fused_program_keeps_integer_intermediates_and_bool_output(gl):
@@ -225,27 +225,26 @@ def test_typed_fused_program_keeps_integer_intermediates_and_bool_output(gl):
 
 def test_cat_emitter_maps_arbitrary_rank_output_to_source_buffers():
     src = emit_cat_source(((2, 3, 4), (2, 5, 4)), dim=1)
-    assert src.count("readonly buffer Input") == 2
-    assert "binding = 2) writeonly buffer OutBuf" in src
+    assert src.count("buffer Arena") == 1
     assert "uint inner = gid % uint(4);" in src
     assert "uint axis_index = block % uint(8);" in src
-    assert "input0[source_index]" in src
-    assert "input1[source_index]" in src
+    assert "arena[u_slot[0] + (source_index)]" in src
+    assert "arena[u_slot[1] + (source_index)]" in src
 
 
 def test_stack_emitter_preserves_integer_storage_and_inserted_axis_mapping():
     src = emit_stack_source((2, 3, 4), 3, dim=1, dtype=np.int32)
-    assert src.count("readonly buffer Input") == 3
-    assert "int input0[]" in src
-    assert "int outbuf[]" in src
+    assert src.count("buffer Arena") == 1
+    assert "arena[u_slot[0] + (source_index)]" in src
+    assert "arena[u_slot[3] + (gid)]" in src
     assert "uint inner = gid % uint(12);" in src
     assert "uint source_number = block % uint(3);" in src
 
 
 def test_permute_emitter_maps_output_coordinates_to_input_strides():
     src = emit_permute_source((2, 3, 4), (2, 0, 1), dtype=np.uint32)
-    assert "uint input0[]" in src
-    assert "uint outbuf[]" in src
+    assert "arena[u_slot[0] + (source_index)]" in src
+    assert "arena[u_slot[1] + (gid)]" in src
     assert "coord0 * uint(1)" in src
     assert "coord1 * uint(12)" in src
     assert "coord2 * uint(4)" in src
@@ -253,8 +252,7 @@ def test_permute_emitter_maps_output_coordinates_to_input_strides():
 
 def test_arange_emitter_uses_gid_without_an_input_buffer():
     src = emit_arange_source(3, 2, dtype=np.int32)
-    assert "readonly buffer" not in src
-    assert "binding = 0) writeonly buffer OutBuf" in src
+    assert src.count("buffer Arena") == 1
     assert "int(gid)" in src
     assert "int(3) + int(gid) * int(2)" in src
 
@@ -273,18 +271,19 @@ def test_primitive_emitter_indexes_broadcast_inputs_without_expanding_buffers():
         right_shape=(1, 8),
         out_shape=(8, 8),
     )
-    assert src.count("readonly buffer") == 2
+    assert src.count("buffer Arena") == 1
     assert "lhs_index" in src
     assert "rhs_index" in src
-    assert "lhs[lhs_index]" in src
-    assert "rhs[rhs_index]" in src
+    assert "arena[u_slot[0] + (lhs_index)]" in src
+    assert "arena[u_slot[1] + (rhs_index)]" in src
 
 
 def test_expand_emitter_uses_direct_broadcast_indexing():
     src = emit_expand_source((1, 8), (4, 3, 8), dtype=np.float32)
-    assert src.count("readonly buffer") == 1
+    assert src.count("buffer Arena") == 1
     assert "source_index" in src
-    assert "outbuf[gid] = input0[source_index]" in src
+    assert "arena[u_slot[1] + (gid)]" in src
+    assert "arena[u_slot[0] + (source_index)]" in src
 
 
 def test_matmul_emitter_contains_one_batched_accumulation_kernel():
@@ -294,12 +293,12 @@ def test_matmul_emitter_contains_one_batched_accumulation_kernel():
         left_dtype=np.float32,
         right_dtype=np.float32,
     )
-    assert src.count("readonly buffer") == 2
+    assert src.count("buffer Arena") == 1
     assert "batch_coord0" in src
     assert "shared float left_tile[16][16]" in src
     assert "shared float right_tile[16][16]" in src
     assert "barrier();" in src
-    assert "outbuf[output_index] = total" in src
+    assert "arena[u_slot[2] + (output_index)] = floatBitsToUint(total)" in src
 
 
 def test_topk_emitter_selects_offsets_without_host_sorting():
@@ -308,7 +307,7 @@ def test_topk_emitter_selects_offsets_without_host_sorting():
     )
     assert "uint chosen[3]" in src
     assert "candidate > best" in src
-    assert "offsets[gid]" in src
+    assert "arena[u_slot[1] + (gid)]" in src
     assert "isnan(candidate)" in src
 
 
@@ -320,7 +319,7 @@ def test_repeat_and_reduction_emitters_are_single_dispatch_kernels():
         "sum", (2, 3, 4), dim=1, dtype=np.float32
     )
     assert "for (uint k = uint(0); k < uint(3); ++k)" in reduce_src
-    assert "outbuf[gid] = total" in reduce_src
+    assert "arena[u_slot[1] + (gid)] = floatBitsToUint(total)" in reduce_src
 
 
 def test_cumsum_emitter_assigns_one_bounded_output_per_invocation():
@@ -370,7 +369,8 @@ def test_every_advertised_op_emits():
         dtype = np.int32 if op in integer_ops else np.float32
         src = emit_op_source(op, left_dtype=dtype, right_dtype=dtype)
         assert src.startswith("#version 430")
-        assert "outbuf[gid]" in src
+        assert "arena[u_slot[" in src
+        assert " + (gid)]" in src
 
 
 def test_glsl_ops_are_exactly_the_abstract_tensor_primitive_vocabulary():
@@ -411,15 +411,33 @@ def test_chunk_residency_is_explicit_and_roundtrips(gl):
 
 def test_wrapped_buffer_is_not_deleted_by_release(gl):
     """Interop contract: a host-owned buffer stays the host's to free."""
-    owned = GLChunk.from_numpy(np.ones(8, dtype=np.float32)).to_gpu()
-    wrapper = GLChunk.wrap(owned.buffer_id, (8,))
-    assert wrapper.on_gpu
-    np.testing.assert_allclose(wrapper.to_cpu(), np.ones(8), rtol=RTOL, atol=ATOL)
+    from OpenGL import GL
 
-    wrapper.release()
-    # The original still works because release() did not touch a wrapped buffer.
-    np.testing.assert_allclose(owned.to_cpu(), np.ones(8), rtol=RTOL, atol=ATOL)
-    owned.release()
+    values = np.ones(8, dtype=np.float32)
+    buffer_id = GL.glGenBuffers(1)
+    try:
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, buffer_id)
+        GL.glBufferData(
+            GL.GL_SHADER_STORAGE_BUFFER,
+            values.nbytes,
+            values,
+            GL.GL_STATIC_DRAW,
+        )
+        GL.glBindBuffer(GL.GL_SHADER_STORAGE_BUFFER, 0)
+        wrapper = GLChunk.wrap(buffer_id, (8,))
+        assert wrapper.on_gpu
+        np.testing.assert_allclose(
+            wrapper.to_cpu(), values, rtol=RTOL, atol=ATOL
+        )
+        wrapper.release()
+        # Re-wrapping proves release did not delete the host-owned buffer.
+        survivor = GLChunk.wrap(buffer_id, (8,))
+        np.testing.assert_allclose(
+            survivor.to_cpu(), values, rtol=RTOL, atol=ATOL
+        )
+        survivor.release()
+    finally:
+        GL.glDeleteBuffers(1, [buffer_id])
 
 
 BINARY_CASES = {

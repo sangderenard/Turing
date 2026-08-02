@@ -15,6 +15,7 @@ from src.compiler.loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
     LoopStrategy,
+    _rebuild_graph_edges,
     analyze_shader_loop_reductions,
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
@@ -55,6 +56,29 @@ def _glsl_composer(*, unroll_limit: int = 8) -> LoopComposer:
             unroll_limit=unroll_limit,
         )
     )
+
+
+def test_rebuild_preserves_irreducible_recursion_for_loop_lowering():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.add_node(0, parents=[(2, "carried")], children=[])
+    graph.G.add_node(1, parents=[(0, "body")], children=[])
+    graph.G.add_node(2, parents=[(1, "next")], children=[])
+
+    _rebuild_graph_edges(graph)
+
+    region = graph.G.graph["recursion_table"][0]
+    assert region["kind"] == "irreducible_recursion"
+    assert region["lower_as"] == "while"
+    assert set(region["members"]) == {0, 1, 2}
+    assert set(region["feedback"]) == {
+        (0, 1, "body"),
+        (1, 2, "next"),
+        (2, 0, "carried"),
+    }
+    assert set(graph.levels) == {0, 1, 2}
+    assert len(set(graph.levels.values())) == 1
+    assert graph.G.has_edge(2, 0)
+    assert graph.G.nodes[0]["attributes"]["recursion_region_id"] == 0
 
 
 def test_loop_composer_unrolls_small_static_range():

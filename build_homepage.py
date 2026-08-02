@@ -62,6 +62,7 @@ ITERATIONS = 160
 WASM_REGION_STEPS = 400
 WASM_REGION_STEP_OPTIONS = (200, 400, 800)
 SITE_VERSION = "v3"
+GITHUB_PAGES_ROOT = "https://sangderenard.github.io/nogodsnomasters/"
 WASM_MODULE_DIR = f"site/{SITE_VERSION}/wasm"
 SOURCE_MODULE_DIR = f"site/{SITE_VERSION}/source/render"
 MATH_MODULE_DIR = f"site/{SITE_VERSION}/math/render"
@@ -561,7 +562,7 @@ def build(destination: Path) -> Path:
         backend_sources=source_entries,
         mathematics=mathematics,
         graph_views=graph_views,
-        resource_route="./",
+        resource_route=GITHUB_PAGES_ROOT,
         static_gallery=_static_gallery(destination),
         network_manifest={
             "name": "Mandelbrot future-detail controller",

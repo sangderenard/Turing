@@ -40,7 +40,8 @@ class Tribuffer:
         self.video_buffers = {k: None for k in keys}  # OpenGL buffer handles or wrappers
         # If manager is a LockManagerThread, pass kernel info to its LockGraph
         if manager and hasattr(manager, 'lock_graph'):
-            num_pages = shapes[0] if isinstance(shapes, (list, tuple)) else None
+            first_shape = shapes[0]
+            num_pages = int(first_shape[0]) if isinstance(first_shape, (list, tuple)) else int(first_shape)
             key_shapes = {k: s for k, s in zip(keys, shapes)}
             kernels = kernel_config if kernel_config else None
             # Patch: only set up if not already done
@@ -175,7 +176,8 @@ class GeneralBufferSync:
         # start lock manager
         if manager is None:
             # Pass kernel info to LockGraph
-            num_pages = tribuffer.shapes[0] if isinstance(tribuffer.shapes, (list, tuple)) else None
+            first_shape = tribuffer.shapes[0]
+            num_pages = int(first_shape[0]) if isinstance(first_shape, (list, tuple)) else int(first_shape)
             key_shapes = {k: s for k, s in zip(keys, tribuffer.shapes)}
             kernels = kernel_config if kernel_config else None
             self.manager = LockManagerThread(LockGraph(num_pages=num_pages, key_shapes=key_shapes, kernels=kernels))

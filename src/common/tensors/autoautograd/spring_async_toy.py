@@ -66,6 +66,8 @@ from .residual_store import ResidualStore, Space
 import time
 import threading
 import math
+import ctypes
+import numpy as np
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Optional, Callable
@@ -78,6 +80,46 @@ mcolors = None  # type: ignore
 GL_DYNAMIC_DRAW = GL_ARRAY_BUFFER = GL_DEPTH_TEST = GL_LEQUAL = GL_CULL_FACE = None  # type: ignore
 GL_PROGRAM_POINT_SIZE = GL_COLOR_BUFFER_BIT = GL_DEPTH_BUFFER_BIT = GL_POINTS = GL_LINES = None  # type: ignore
 GL_VERTEX_SHADER = GL_FRAGMENT_SHADER = GL_FLOAT = GL_FALSE = None  # type: ignore
+
+
+def enable_liveviz_gl() -> None:
+    """Load the dependencies used by FluxSpring's own LiveVizGLPoints."""
+
+    global matplotlib, mcolors, pygame, DOUBLEBUF, OPENGL, RESIZABLE
+    global VIDEORESIZE, QUIT, KEYDOWN, K_SPACE, compileProgram, compileShader
+    if globals().get("pygame") is not None and mcolors is not None:
+        return
+    import matplotlib as _matplotlib  # type: ignore
+    from matplotlib import colors as _mcolors  # type: ignore
+    import pygame as _pygame  # type: ignore
+    from pygame.locals import (  # type: ignore
+        DOUBLEBUF as _DOUBLEBUF,
+        OPENGL as _OPENGL,
+        RESIZABLE as _RESIZABLE,
+        VIDEORESIZE as _VIDEORESIZE,
+        QUIT as _QUIT,
+        KEYDOWN as _KEYDOWN,
+        K_SPACE as _K_SPACE,
+    )
+    import OpenGL.GL as _GL  # type: ignore
+    from OpenGL.GL import shaders as _shaders  # type: ignore
+
+    matplotlib = _matplotlib
+    mcolors = _mcolors
+    pygame = _pygame
+    DOUBLEBUF, OPENGL, RESIZABLE = _DOUBLEBUF, _OPENGL, _RESIZABLE
+    VIDEORESIZE, QUIT, KEYDOWN, K_SPACE = (
+        _VIDEORESIZE, _QUIT, _KEYDOWN, _K_SPACE
+    )
+    globals().update({
+        name: getattr(_GL, name)
+        for name in dir(_GL)
+        if not name.startswith("_")
+    })
+    compileProgram = _shaders.compileProgram
+    compileShader = _shaders.compileShader
+    from ..pyopengl_handler import install_pyopengl_handlers
+    install_pyopengl_handlers()
 
 from ..abstraction import AbstractTensor
 from ..filtered_poisson import filtered_poisson
@@ -1174,6 +1216,7 @@ class LiveVizGLPoints:
                  base_point_size: float = 6.0,
                  boundary_scale: float = 1.3,
                  bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06)):
+        enable_liveviz_gl()
         self.sys = sys
         self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
         self.edge_cmap = matplotlib.colormaps.get_cmap(edge_cmap)
@@ -1224,7 +1267,11 @@ class LiveVizGLPoints:
         self._rot_phi = 0.0
         self._rot_dtheta = 0.002
         self._rot_dphi = 0.0015
-    def _upload(self, vbo, arr, cap_attr, usage=GL_DYNAMIC_DRAW):
+    def _upload(self, vbo, arr, cap_attr, usage=None):
+        # GL constants are installed lazily for this optional visualizer, so a
+        # module-definition-time default would permanently capture ``None``.
+        if usage is None:
+            usage = GL_DYNAMIC_DRAW
         t = AbstractTensor.get_tensor(arr)
         nbytes_attr = getattr(t, "nbytes", None)
         nbytes = int(nbytes_attr() if callable(nbytes_attr) else nbytes_attr)
@@ -1236,7 +1283,12 @@ class LiveVizGLPoints:
         # grow (and orphan) only when needed
         if nbytes > cap:
             new_cap = max(int(nbytes * 1.5), 256)
-            glBufferData(GL_ARRAY_BUFFER, new_cap, None, usage)  # allocate/orphan
+            glBufferData(
+                GL_ARRAY_BUFFER,
+                new_cap,
+                np.zeros(new_cap, dtype=np.uint8),
+                usage,
+            )  # allocate/orphan
             setattr(self, cap_attr, new_cap)
 
         glBufferSubData(GL_ARRAY_BUFFER, 0, nbytes, ptr)         # upload bytes
@@ -1388,12 +1440,14 @@ class LiveVizGLPoints:
         # --- existing ctrls & base colormap (KEEP this: learning nodes stay coolwarm) ---
         ctrl_vals = AbstractTensor.get_tensor([nodes[i][1][1] for i in ids])
 
-        vmin = AbstractTensor.min(ctrl_vals)
-        vmax = AbstractTensor.max(ctrl_vals)
-        if vmin > 0.0:
-            vmin = 0.0 - 1e-6
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
+        vmin = float(AbstractTensor.min(ctrl_vals))
+        vmax = float(AbstractTensor.max(ctrl_vals))
+        # TwoSlopeNorm requires the zero center to be strictly bracketed.
+        # A live network can legitimately have all-negative or all-positive
+        # control activation during a frame.
+        scale = max(abs(vmin), abs(vmax), 1.0) * 1e-6
+        vmin = min(vmin, -scale)
+        vmax = max(vmax, scale)
         norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
         C = AbstractTensor.get_tensor(self.node_cmap(norm(ctrl_vals)), dtype="float32")[:, :3]
 
@@ -1435,6 +1489,11 @@ class LiveVizGLPoints:
         is_b = AbstractTensor.get_tensor([int(i) in bset for i in ids], dtype=ids.bool_dtype, like=ids)
         is_b = is_b.to_dtype("bool")
         sizes[is_b] *= self.boundary_scale
+        for idx, nid in enumerate(ids):
+            sizes[idx] *= max(
+                0.12,
+                float(getattr(self.sys.nodes[int(nid)], "visual_growth", 1.0)),
+            )
 
         return P, C, sizes, P  # return P twice; last is for autoscale
 
@@ -1473,7 +1532,7 @@ class LiveVizGLPoints:
             hi = lo + 1e-12
         norm = mcolors.Normalize(vmin=lo, vmax=hi)
         colors = AbstractTensor.get_tensor(self.edge_cmap(norm(U_vals)), dtype="float32")[:, :3]
-        C = AbstractTensor.repeat(colors, 2, axis=0)
+        C = AbstractTensor.repeat(colors, 2, dim=0)
 
         S = AT.full((P.shape[0],), 1.0, dtype=float)
         return P, C, S
@@ -1490,15 +1549,12 @@ class LiveVizGLPoints:
 
         glBindVertexArray(0)
 
-        #PE, CE, SE = self._pack_edges()
-        #self._num_edge_vertices = PE.shape[0]
-
-        # edges
-        #self._upload(self._edge_vbo_pos, PE, "_edge_cap_pos")
-        #self._upload(self._edge_vbo_col, CE, "_edge_cap_col")
-        #self._upload(self._edge_vbo_size, SE, "_edge_cap_size")
-
-        #glBindVertexArray(0)
+        PE, CE, SE = self._pack_edges()
+        self._num_edge_vertices = PE.shape[0]
+        self._upload(self._edge_vbo_pos, PE, "_edge_cap_pos")
+        self._upload(self._edge_vbo_col, CE, "_edge_cap_col")
+        self._upload(self._edge_vbo_size, SE, "_edge_cap_size")
+        glBindVertexArray(0)
 
         # update camera
         self._compute_mvp(P_for_bounds)
@@ -1557,7 +1613,7 @@ class LiveVizGLPoints:
         return M @ T
 
     def _compute_mvp(self, P: AbstractTensor):
-        if P.shape == (0,):
+        if not P.shape or int(P.shape[0]) == 0:
             self._mvp = AbstractTensor.eye(4, dtype=P.float_dtype)
             return
         P = AbstractTensor.nan_to_num(P, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1596,6 +1652,8 @@ class LiveVizGLPoints:
 
     # ---------- public API ----------
     def launch(self, width: int = 960, height: int = 720):
+        enable_liveviz_gl()
+        self._closed = False
         self._w, self._h = int(width), int(height)
         self._create_window()
         self._compile_shaders()
@@ -1675,15 +1733,21 @@ class LiveVizGLPoints:
 
     def step(self, _dt: float = 0.0):
         """Call from your main loop (non-blocking)."""
+        if getattr(self, "_closed", False):
+            return False
         if self._program is None:
             # if user forgot to launch, do it lazily
             self.launch(self._w, self._h)
         self._handle_events()
+        if getattr(self, "_closed", False):
+            return False
         self._update_rotation()
         self._update_buffers()
         self._draw()
+        return True
 
     def close(self):
+        self._closed = True
         try:
             if self._vbo_pos:
                 glDeleteBuffers(1, [self._vbo_pos])

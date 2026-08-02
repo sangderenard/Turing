@@ -415,8 +415,10 @@ class NumPyTensorOperations(AbstractTensor):
         raise NotImplementedError(f"Operator {op} not implemented for NumPy backend.")
 
     def _torch_dtype_to_numpy(self, dtype):
+        if dtype is None:
+            return None
         if torch is None:
-            return dtype
+            return np.dtype(dtype)
         if dtype == torch.float32:
             return np.float32
         if dtype == torch.int64:
@@ -427,7 +429,13 @@ class NumPyTensorOperations(AbstractTensor):
             return np.int32
         if dtype == torch.bool:
             return np.bool_
-        return None
+        # NumPy dtype objects and ordinary dtype strings are already a valid
+        # backend-neutral spelling.  This also preserves the dtype requested
+        # by TensorPool instead of silently allocating its buffers as float64.
+        try:
+            return np.dtype(dtype)
+        except (TypeError, ValueError):
+            return None
 
     def _numpy_dtype_to_torch(self, dtype):
         if torch is None:

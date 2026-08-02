@@ -15,7 +15,13 @@ from .spectral_readout import (
     gather_recent_windows,
     batched_bandpower_from_windows,
 )
-from . import fs_dec, register_param_wheels, ParamWheel
+from . import (
+    ParamWheel,
+    fs_dec,
+    register_param_wheels,
+    required_spiral_len,
+    spiral_slot,
+)
 from .fs_harness import RingHarness, RingBuffer
 from .fs_types import (
     DECSpec,
@@ -50,6 +56,18 @@ logger = logging.getLogger(__name__)
 # Parameters we expose to the whiteboard jobs.  Each slice provided to the
 # job function corresponds to one of these attributes in this order.
 FLUX_PARAM_SCHEMA = ("alpha", "w", "b")
+
+
+def _vectorize_wheel_params_to_1d(wheels: Sequence[ParamWheel]) -> None:
+    """Give scalar parameter slots the vector shape expected by the demo."""
+
+    for wheel in wheels:
+        for index, param in enumerate(wheel.params):
+            tensor = AT.get_tensor(param)
+            wheel.params[index] = (
+                tensor.reshape(1) if getattr(tensor, "ndim", 0) == 0
+                else tensor.reshape(-1)
+            )
 
 
 class TensorRingBuffer:
@@ -377,11 +395,11 @@ def pump_with_loss(
     fft_tick = tick - (spectral_cfg.win_len - 1)
     W, kept = gather_recent_windows(mids, spectral_cfg, ctx.harness)
     if len(kept) == len(mids):
-        
+        bp = batched_bandpower_from_windows(W, spectral_cfg)
         targ_mat = AT.stack([hist_targets[nid] for nid in kept])
         hist_residual = bp - targ_mat
-        
-        ctx.hist_buf.push(hist_residual)
+        hist_residual_summary = hist_residual.mean(0)
+        ctx.hist_buf.push(hist_residual_summary)
 
     if fft_tick >= 0:
         idx = (ctx.out_buf.idx - spectral_cfg.win_len) % spectral_cfg.win_len
@@ -396,7 +414,10 @@ def pump_with_loss(
         spec_float = (
             float(AT.get_tensor(spec_val)) if spec_val is not None else None
         )
-        active_slots = 
+        row_slots = [
+            spiral_slot(fft_tick, row, ctx.bp_queue.slots)
+            for row in range(len(ctx.wheels))
+        ]
         tick_map = ctx.row_slots.setdefault(fft_tick, {})
         for row_idx, slot_idx in enumerate(row_slots):
             tick_map[row_idx] = slot_idx
@@ -579,10 +600,11 @@ def train_routing(
             frame_idx + 1,
             len(noise_frames),
         )
-        for i in range(B):
-            psi[i] = frame_chunks[i]
-        target_out = AT.stack([sine_chunks[i] for i in range(B)]).flatten()
-        psi = pump_with_loss(
+        for k in range(win):
+            for i in range(B):
+                psi[i] = frame_chunks[i][k]
+            target_out = AT.stack([sine_chunks[i][k] for i in range(B)]).flatten()
+            psi = pump_with_loss(
                 ctx,
                 psi,
                 target_out,
@@ -593,25 +615,25 @@ def train_routing(
                 B,
                 tick,
             )
-        mature_tick = tick - (spectral_cfg.win_len - 1)
-        if mature_tick >= 0:
-            mature_slot = mature_tick % ctx.bp_queue.slots
-            row_map = ctx.row_slots.get(mature_tick)
-            res = ctx.bp_queue.process_slot(
+            mature_tick = tick - (spectral_cfg.win_len - 1)
+            if mature_tick >= 0:
+                mature_slot = mature_tick % ctx.bp_queue.slots
+                row_map = ctx.row_slots.get(mature_tick)
+                res = ctx.bp_queue.process_slot(
                     mature_slot,
                     sys=_sys_for_slot(mature_slot, mature_tick),
                     row_slots=row_map,
-                    node_attrs=FLUX_PARAM_SCHEMA,
                 )
-            ctx.row_slots.pop(mature_tick, None)
-            if res is not None:
-                g_src = getattr(res, "grads_per_source_tensor", None)
-                g_par = getattr(res, "param_grads_tensor", None)
-                have_src = (g_src is not None and bool(AT.get_tensor(g_src).any()))
-                have_par = (g_par is not None and bool(AT.get_tensor(g_par).any()))
-                if not (have_src or have_par):
-                    raise RuntimeError("whiteboard op produced no gradients")
-                ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
+                ctx.row_slots.pop(mature_tick, None)
+                if res is not None:
+                    g_src = getattr(res, "grads_per_source_tensor", None)
+                    g_par = getattr(res, "param_grads_tensor", None)
+                    have_src = (g_src is not None and bool(AT.get_tensor(g_src).any()))
+                    have_par = (g_par is not None and bool(AT.get_tensor(g_par).any()))
+                    if not (have_src or have_par):
+                        raise RuntimeError("whiteboard op produced no gradients")
+                    ctx.log_buf.append({"tick": AT.tensor([float(mature_tick)])})
+            tick += 1
 
         W, kept = gather_recent_windows(list(range(B)), spectral_cfg, harness)
         if len(kept) == B:

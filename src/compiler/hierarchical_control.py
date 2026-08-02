@@ -13,6 +13,7 @@ from .control_source import (
     ControlUniform,
     LoopBlock,
     ParallelDeployment,
+    RecursionRegion,
     SequenceBlock,
     StateMachineTick,
     StatementBlock,
@@ -62,9 +63,11 @@ def compose_hierarchical_control(
     all_closure_iterables: list[
         tuple[int, int, str, tuple[int, ...]]
     ] = []
+    all_recursion_regions: list[RecursionRegion] = []
+    next_recursion_region = 0
 
     def compose(closure: PlanClosure) -> ControlProgram:
-        nonlocal next_region
+        nonlocal next_region, next_recursion_region
         closure_id = int(closure.closure_id)
         local = controls[closure_id]
         region_map = {}
@@ -77,6 +80,26 @@ def compose_hierarchical_control(
 
         def value(local_id: int) -> int:
             return values.global_id(closure_id, int(local_id))
+
+        recursion_region_map = {}
+        for region in local.recursion_regions:
+            global_region_id = next_recursion_region
+            next_recursion_region += 1
+            recursion_region_map[int(region.region_id)] = global_region_id
+            edge = lambda item: (value(item[0]), value(item[1]), item[2])
+            all_recursion_regions.append(RecursionRegion(
+                region_id=global_region_id,
+                kind=region.kind,
+                lower_as=region.lower_as,
+                members=tuple(value(member) for member in region.members),
+                control_ir=region.control_ir,
+                control_members=tuple(
+                    value(member) for member in region.control_members
+                ),
+                incoming=tuple(edge(item) for item in region.incoming),
+                outgoing=tuple(edge(item) for item in region.outgoing),
+                feedback=tuple(edge(item) for item in region.feedback),
+            ))
 
         induction_names: dict[str, str] = {}
 
@@ -297,6 +320,13 @@ def compose_hierarchical_control(
                     ),
                     block.parallel_iterations,
                     block.dispatch_shell,
+                    (
+                        None
+                        if block.recursion_region_id is None
+                        else recursion_region_map[
+                            int(block.recursion_region_id)
+                        ]
+                    ),
                 )
             if isinstance(block, StateMachineTick):
                 return StateMachineTick(
@@ -367,13 +397,15 @@ def compose_hierarchical_control(
         if remaining_calls_after:
             root = SequenceBlock((root, *remaining_calls_after))
         return ControlProgram(
-            root,
-            tuple(region_map[region] for region in local.region_indices),
-            (),
-            (),
-            (),
-            (),
-            (),
+            root=root,
+            region_indices=tuple(
+                region_map[region] for region in local.region_indices
+            ),
+            recursion_regions=tuple(
+                region
+                for region in all_recursion_regions
+                if region.region_id in recursion_region_map.values()
+            ),
         )
 
     program = compose(hierarchy)
@@ -419,6 +451,7 @@ def compose_hierarchical_control(
         tuple(dict.fromkeys(all_static_iterables)),
         tuple(dict.fromkeys(all_collections)),
         tuple(dict.fromkeys(all_closure_iterables)),
+        tuple(dict.fromkeys(all_recursion_regions)),
     )
     return HierarchicalControl(program, tuple(region_correlations))
 

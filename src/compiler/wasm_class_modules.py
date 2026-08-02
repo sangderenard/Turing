@@ -497,6 +497,7 @@ def build_embedded_class_graph(
     entrypoint: str,
     embed_binaries: bool = True,
     module_dir: str = "modules",
+    storage_redirects: Mapping[str, str] | None = None,
 ) -> dict:
     """Adapt ``build_manifest`` for a logical program's browser shell.
 
@@ -559,6 +560,17 @@ def build_embedded_class_graph(
             )
         logical_outputs[output_name] = list(producer)
 
+    resolved_redirects = {}
+    for input_name, output_name in dict(storage_redirects or {}).items():
+        if input_name not in logical_inputs:
+            raise ValueError(f"storage redirect names unknown input {input_name!r}")
+        producer = logical_outputs.get(output_name)
+        if producer is None:
+            raise ValueError(f"storage redirect names unknown output {output_name!r}")
+        resolved_redirects[f"in::{input_name}"] = (
+            f"out::{producer[0]}::{producer[1]}"
+        )
+
     from .process_graph_shell import schedule_table
 
     return {
@@ -571,6 +583,7 @@ def build_embedded_class_graph(
         "root_module": root_spec.module_name,
         "root_outputs": root_entry["outputs"],
         "logical_outputs": logical_outputs,
+        "storage_redirects": resolved_redirects,
         "schedule": schedule_table(specs),
         "shared_memory": manifest["shared_memory"],
         "shared_static_bytes": manifest["shared_static_bytes"],

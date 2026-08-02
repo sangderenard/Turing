@@ -950,6 +950,11 @@ class GLChunk:
         """
         if self._released:
             raise RuntimeError("cannot update a released GLChunk")
+        if self._reserved == 0 and self._allocation is not None:
+            raise RuntimeError(
+                "cannot replace a partial GLChunk view; update its owning "
+                "allocation or use an explicit resident-range upload"
+            )
         self._deferred = None
         data = np.ascontiguousarray(np.asarray(array, dtype=self.dtype))
         if data.shape != self._shape:

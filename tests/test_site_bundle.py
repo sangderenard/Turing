@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
+
+import pytest
 
 from src.compiler.site_bundle import (
     BUNDLE_SCHEMA,
+    DEFAULT_WASM_CARD_OPERATIONS,
     DEFAULT_PUBLISH_ROOT,
     TURING_REPOSITORY_ROOT,
+    _shader_execution_descriptor,
     build_program_bundle,
     build_source_inspection_bundle,
     build_source_inspection_page,
@@ -14,10 +19,31 @@ from src.compiler.site_bundle import (
     resolve_publish_root,
     slugify,
 )
+from src.compiler.ssa_fortran_backend import fortran_compiler
 
 
 def test_default_publish_root_is_the_parent_workspace():
     assert DEFAULT_PUBLISH_ROOT == TURING_REPOSITORY_ROOT.parent
+
+
+def test_only_published_browser_shader_graduates_a_bundle_page():
+    desktop_only = [{
+        "language": "glsl",
+        "available": True,
+        "url": "source/glsl/glsl.comp.glsl",
+    }]
+    assert _shader_execution_descriptor(desktop_only) is None
+
+    descriptor = _shader_execution_descriptor(desktop_only + [{
+        "language": "webgl",
+        "available": True,
+        "url": "source/webgl/webgl.frag.glsl",
+    }])
+    assert descriptor == {
+        "url": "source/webgl/webgl.frag.glsl",
+        "language": "webgl2-glsl-es",
+        "stage": "fragment",
+    }
     assert resolve_publish_root(DEFAULT_PUBLISH_ROOT) == DEFAULT_PUBLISH_ROOT
 
 
@@ -105,7 +131,6 @@ def test_ast_inspection_is_published_as_a_standard_gallery_bundle(tmp_path):
     assert "Open generated callable page" in html
     assert 'const RESOURCE_ROUTE = "./"' in html
     assert 'const STATIC_GALLERY = [' in html
-    assert 'const BROWSER_PYTHON = {"script_url": "https://cdn.jsdelivr.net/pyodide/' in html
     assert 'href="callables/inspectioncompiler-encode/index.html"' in html
     assert '"python_source_url": "source/python_source/test_site_bundle.py"' in html
 
@@ -165,6 +190,10 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
     assert "index.html" in paths
     assert "source/python_source/affine.py" in paths
     assert any(path.startswith("wasm/") for path in paths)
+    card_prefix = f"wasm/size-{DEFAULT_WASM_CARD_OPERATIONS}/"
+    assert any(path.startswith(card_prefix) and path.endswith(".wasm") for path in paths)
+    assert card_prefix + "class-inventory.json" in paths
+    assert f'"{DEFAULT_WASM_CARD_OPERATIONS}":' in bundle.page_path.read_text()
     assert bundle.url.startswith("/site/programs/affine-field/versions/v1-")
     assert json.loads(bundle.manifest_path.read_text())["page"]["url"] == bundle.url
 
@@ -178,3 +207,46 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
         include_mathematics=False,
     )
     assert repeated.directory == bundle.directory
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None, reason="no Fortran compiler installed"
+)
+def test_program_bundle_compiles_fortran_and_records_output_fidelity(tmp_path: Path):
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        include_backends=True,
+        include_mathematics=False,
+    )
+
+    fortran_path = bundle.directory / "source/fortran/fortran.f90"
+    api_path = bundle.directory / "source/fortran/fortran.api.yaml"
+    proof_path = bundle.directory / "verification/fortran-fidelity.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+
+    assert fortran_path.is_file()
+    assert api_path.is_file()
+    assert "intent(out)" in fortran_path.read_text(encoding="utf-8")
+    assert proof["schema"] == "turing-fortran-fidelity-v1"
+    assert proof["passed"] is True
+    assert proof["case_count"] == 3
+    assert all(case["passed"] for case in proof["cases"])
+    assert all(
+        output["fortran"] == output["reference"]
+        for case in proof["cases"]
+        for output in case["outputs"]
+    )
+    assert proof["source_sha256"] == hashlib.sha256(
+        fortran_path.read_bytes()
+    ).hexdigest()
+    assert (
+        bundle.directory / "native/fortran" / proof["native_library"]
+    ).is_file()
+    assert bundle.manifest["compiler"]["fortran_verification"] == {
+        "passed": True,
+        "case_count": 3,
+        "source_sha256": proof["source_sha256"],
+        "url": "verification/fortran-fidelity.json",
+    }

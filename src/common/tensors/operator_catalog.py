@@ -250,6 +250,7 @@ HOST_BOUNDARY_OPERATORS = frozenset(
         "avi",
         "jpg",
         "load",
+        "mjpeg_frames",
         "numpy",
         "save",
         "tobytes",

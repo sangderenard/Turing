@@ -17,7 +17,7 @@ inlined definitions without losing the source correlation.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -67,6 +67,21 @@ class ShellReferenceCorrelation:
     source_name: str | None = None
 
 
+@dataclass(frozen=True)
+class ShellRecursionReference:
+    """One shell-local reference to a cached recursive SCC."""
+
+    index: int
+    region_id: int
+    lower_as: str
+    members: tuple[int, ...]
+    control_ir: bool = True
+    control_members: tuple[int, ...] = ()
+    incoming: tuple[tuple[int, int, str], ...] = ()
+    outgoing: tuple[tuple[int, int, str], ...] = ()
+    feedback: tuple[tuple[int, int, str], ...] = ()
+
+
 @dataclass
 class ShellReferenceTables:
     """Ordinary indexed lists installed on one deployment shell."""
@@ -75,6 +90,7 @@ class ShellReferenceTables:
     constants: list[ShellConstantReference]
     memory: list[ShellMemoryReference]
     correlations: list[ShellReferenceCorrelation]
+    recursion: list[ShellRecursionReference] = field(default_factory=list)
 
     def copy(self) -> "ShellReferenceTables":
         return ShellReferenceTables(
@@ -82,6 +98,7 @@ class ShellReferenceTables:
             constants=list(self.constants),
             memory=list(self.memory),
             correlations=list(self.correlations),
+            recursion=list(self.recursion),
         )
 
 
@@ -333,6 +350,17 @@ def _ordered_nodes(graph: Any) -> list[Any]:
         import networkx as nx
 
         return list(nx.lexicographical_topological_sort(graph.G, key=str))
+    except nx.NetworkXUnfeasible:
+        # Retained loop-carried feedback is recorded as an irreducible SCC by
+        # loop_composer.  Reference-table numbering needs a stable view, not
+        # permission to erase that recursion.
+        return sorted(
+            graph.G,
+            key=lambda node_id: (
+                int(graph.levels.get(node_id, 0)),
+                str(node_id),
+            ),
+        )
     except (ImportError, TypeError, ValueError):
         return list(graph.G)
 
@@ -385,7 +413,34 @@ def build_shell_reference_tables(graph: Any) -> ShellReferenceTables:
     constants: list[ShellConstantReference] = []
     memory: list[ShellMemoryReference] = []
     correlations: list[ShellReferenceCorrelation] = []
+    recursion: list[ShellRecursionReference] = []
     function_indices: dict[tuple[str, int | str], int] = {}
+
+    for region_id, record in sorted(
+        (graph.G.graph.get("recursion_table") or {}).items()
+    ):
+        index = len(recursion)
+        recursion.append(ShellRecursionReference(
+            index=index,
+            region_id=int(region_id),
+            lower_as=str(record.get("lower_as", "while")),
+            members=tuple(map(int, record.get("members", ()))),
+            control_ir=bool(record.get("control_ir", True)),
+            control_members=tuple(map(
+                int, record.get("control_members", ())
+            )),
+            incoming=tuple(record.get("incoming", ())),
+            outgoing=tuple(record.get("outgoing", ())),
+            feedback=tuple(record.get("feedback", ())),
+        ))
+        correlations.append(ShellReferenceCorrelation(
+            table="recursion",
+            index=index,
+            graph_node_id=None,
+            source_kind="strongly_connected_component",
+            source_reference=int(region_id),
+            source_name=f"recursion_region_{int(region_id)}",
+        ))
 
     function_table = getattr(graph, "function_table", None)
     if function_table is not None:
@@ -571,6 +626,7 @@ def build_shell_reference_tables(graph: Any) -> ShellReferenceTables:
         constants=constants,
         memory=memory,
         correlations=correlations,
+        recursion=recursion,
     )
 
 
@@ -583,6 +639,7 @@ __all__ = [
     "ShellFunctionReference",
     "ShellMemoryReference",
     "ShellReferenceCorrelation",
+    "ShellRecursionReference",
     "ShellReferenceTables",
     "build_map_dependency_regions",
     "build_class_navigation_table",

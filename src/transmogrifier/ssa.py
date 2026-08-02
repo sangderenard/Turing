@@ -92,11 +92,16 @@ class Function:
     name: str
     args: List[SSAValue]
     blocks: Dict[str, BasicBlock]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class IRModule:
     functions: Dict[str, Function]
     function_table: FunctionTable = field(default_factory=FunctionTable)
+    # Backend-neutral cache of CFG recursion regions.  Keys are function
+    # names; region records identify loop headers, latches, Phi values, and
+    # the ProcessGraph SCC from which each loop was lowered.
+    recursion_table: Dict[str, Dict[int, Any]] = field(default_factory=dict)
 
 # -----------------------------------------------------------------------------
 # Correlator for Language <-> SSA Operation Mappings

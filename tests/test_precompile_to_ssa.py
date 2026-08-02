@@ -7,6 +7,7 @@ from src.compiler.control_source import (
     ControlUniform,
     LoopBlock,
     ParallelDeployment,
+    RecursionRegion,
     SequenceBlock,
     StatementBlock,
 )
@@ -205,6 +206,50 @@ def test_control_region_call_wires_feeds_and_explicit_output_producers():
     assert [item.res.id for item in loads] == [12, 13]
 
 
+def test_control_ssa_returns_declared_region_output_for_shell_binding():
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_3__",)),
+        region_indices=(3,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={3: "numerical_region_3"},
+        region_signatures={3: ((), (12,))},
+        output_value_ids=(12,),
+    )
+
+    assert shortfalls == ()
+    returned = function.blocks["entry"].instrs[-1]
+    assert returned.op == "Ret"
+    assert [value.id for value in returned.args] == [12]
+
+
+def test_control_ssa_resolves_named_output_from_retained_id_history():
+    control = ControlProgram(
+        StatementBlock(("__scheduled_region_3__",)),
+        region_indices=(3,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_callees={3: "numerical_region_3"},
+        region_signatures={3: ((), (7,))},
+        named_output_histories={"count": (4, 7, 8)},
+        value_name_histories={"x": (0,), "count": (4, 7, 8)},
+        parameter_names=("x",),
+    )
+
+    assert shortfalls == ()
+    assert function.metadata["named_outputs"] == (("count", 7),)
+    assert function.metadata["value_names"] == (("count", 7),)
+    assert function.metadata["parameter_names"] == ()
+    assert function.metadata["control_ir"] is True
+    assert [value.id for value in function.blocks["entry"].instrs[-1].args] == [7]
+
+
 def test_loop_collection_binding_is_indexed_store_after_region_publication():
     control = ControlProgram(
         LoopBlock(
@@ -274,6 +319,50 @@ def test_loop_carried_value_is_a_phi_with_the_region_update():
     assert any(
         instruction.res is phis[0].args[1]
         for instruction in function.blocks["loop_body"].instrs
+    )
+
+
+def test_recursion_table_lowers_to_phi_and_llvm_shaped_backedge():
+    region = RecursionRegion(
+        region_id=7,
+        kind="irreducible_recursion",
+        lower_as="while",
+        members=(10, 20),
+        feedback=((20, 10, "carried"),),
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "iteration",
+            "0",
+            "4",
+            "1",
+            StatementBlock(("__scheduled_region_3__",)),
+            carried_aliases=((20, 10),),
+            recursion_region_id=7,
+        ),
+        region_indices=(3,),
+        recursion_regions=(region,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+        region_signatures={3: ((10,), (20,))},
+    )
+
+    assert shortfalls == ()
+    lowered = function.metadata["recursion_table"][7]
+    assert lowered["lower_as"] == "while"
+    loop, = lowered["loops"]
+    assert loop["header"] == "loop_header"
+    assert loop["latch"] == "loop_latch"
+    assert loop["backedge"] == ("loop_latch", "loop_header")
+    assert len(loop["phi_value_ids"]) == 2
+    assert function.blocks["loop_latch"].successors == ["loop_header"]
+    assert all(
+        instruction.attributes.get("recursion_region_id") == 7
+        for instruction in function.blocks["loop_header"].instrs
+        if instruction.op == "Phi"
     )
 
 

@@ -248,22 +248,15 @@ class AbstractTensor:
 
         Non-scalar tensors raise ``TypeError`` mirroring PyTorch/NumPy."""
 
-        try:
-            n = self.numel()
-        except Exception:
-            n = 1
+        shape = tuple(getattr(self, "shape", ()))
+        n = 1
+        for size in shape:
+            n *= int(size)
         if n != 1:
             raise TypeError("Only scalar tensors can be converted to int")
 
         item_fn = getattr(self, "item_")
-        try:
-            import inspect
-            if len(inspect.signature(item_fn).parameters) == 0:
-                value = item_fn()
-            else:
-                value = item_fn(self.data)
-        except Exception:
-            value = item_fn(self.data)
+        value = item_fn()
         return int(value)
     def argwhere(self) -> "AbstractTensor":
         """Return the indices where condition is True. Like np.argwhere, always returns a 2D array of indices."""
@@ -987,6 +980,12 @@ class AbstractTensor:
         if cls is None:
             if like is not None:
                 cls = like.__class__
+            elif isinstance(data, AbstractTensor):
+                # Static helpers such as stack/cat call get_tensor on their
+                # first operand.  Preserve that operand's selected backend;
+                # consulting the process default here silently migrated a
+                # NumPy capture into Nodus halfway through its tape.
+                cls = data.__class__
             else:
                 cls = AbstractTensor.check_or_build_registry()
 

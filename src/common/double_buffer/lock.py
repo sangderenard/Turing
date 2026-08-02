@@ -355,23 +355,18 @@ class LockGraph:
             return info
         # buf:<key> or buf:<key>:p<page>_<region>...
         if name.startswith("buf:"):
-            parts = name.split(":p",1)
-            if len(parts) < 2:
-                print(parts)
-                raise ValueError(f"Invalid node name format: {name}")
-            
-            prospective_key = parts[0].split("buf:",1)
-            if len(prospective_key) < 2:
-                print(prospective_key)
-                raise ValueError(f"Invalid key format in node name: {name}")    
-            info['key'] = prospective_key[1]
-            if len(parts)==2:
-                pg, rest = parts[1].split("_",1)
-                info['page'] = int(pg)
-                # region e.g. d0_0_16_d1_0_16…
-                region = tuple(tuple(map(int,x.split("_")[-2:]))
-                               for x in rest.split("_d") if x)
-                info['region'] = region
+            import re
+            match = re.match(r"^buf:(.+):p([0-9]+)_(.+)$", name)
+            if match is None:
+                info['key'] = name.split("buf:", 1)[1]
+                return info
+            info['key'] = match.group(1)
+            info['page'] = int(match.group(2))
+            rest = match.group(3)
+            # region e.g. d0_0_16_d1_0_16…
+            region = tuple(tuple(map(int,x.split("_")[-2:]))
+                           for x in rest.split("_d") if x)
+            info['region'] = region
         # vertex appended
         if ":vtx_" in name:
             base, coords = name.split(":vtx_",1)

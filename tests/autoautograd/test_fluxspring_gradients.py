@@ -142,7 +142,7 @@ def test_fluxspring_gradients_match_fd_and_accumulate():
     assert g_node_new == pytest.approx(g_node_val, rel=1e-6, abs=1e-6)
 
 
-def test_demo_spec_has_no_gradients():
+def test_demo_spec_routes_gradients_to_connected_parameters():
     bands = [[20, 40], [40, 60]]
     cfg = SpectralCfg(
         enabled=True,
@@ -163,7 +163,7 @@ def test_demo_spec_has_no_gradients():
     loss = ((psi[out_start : out_start + len(bands)]) ** 2).mean()
     params = [spec.edges[0].ctrl.w, spec.nodes[0].ctrl.w, spec.nodes[1].ctrl.w]
     grads = autograd.grad(loss, params, allow_unused=True)
-    assert all(g is None for g in grads)
+    assert any(g is not None for g in grads)
 
 
 def test_register_learnable_params_preserves_gradients():

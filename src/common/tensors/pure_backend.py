@@ -482,10 +482,12 @@ class PurePythonTensorOperations(AbstractTensor):
             for i in range(len(tensors[0]))
         ]
 
-    def get_device_(self, tensor: Any) -> Any:
+    def get_device_(self, tensor: Any = None) -> Any:
         return "cpu_pure_python"
 
-    def get_dtype_(self, tensor: Any) -> Any:
+    def get_dtype_(self, tensor: Any = None) -> Any:
+        if tensor is None:
+            tensor = self.data
         if isinstance(tensor, list):
             if not tensor:
                 return None

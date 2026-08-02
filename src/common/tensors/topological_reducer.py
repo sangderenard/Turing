@@ -1056,6 +1056,11 @@ def _normalize_lexical_values(
                 loop_attributes["loop_target_bindings"] = (
                     loop_target_bindings
                 )
+                loop_attributes["loop_target_initials"] = {
+                    name: before_loop[name]
+                    for name in loop_target_bindings
+                    if name in before_loop
+                }
                 # This pass resolves source/value identities only.  It records
                 # the body value selected by the lexical continuation, but it
                 # must not manufacture a loop latch, exit, collection owner,
@@ -1233,6 +1238,14 @@ def _normalize_lexical_values(
                     "loop_target_bindings"
                 ].items()
                 if target in mapping
+            }
+        if "loop_target_initials" in attributes:
+            attributes["loop_target_initials"] = {
+                name: mapping[initial]
+                for name, initial in attributes[
+                    "loop_target_initials"
+                ].items()
+                if initial in mapping
             }
         if "loop_state_effects" in attributes:
             attributes["loop_state_effects"] = tuple(
@@ -1555,6 +1568,41 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         contextual_requirements
     )
     static_bindings = dict(getattr(graph, "python_bindings", {}) or {})
+    # Parent-source expansion is optional, but literal module constants are
+    # required static bindings in either ingestion mode.  Recover only
+    # assignments outside function/class bodies; locals remain SSA values.
+    scoped_member_ids = {
+        id(member)
+        for _owner_id, owner_data in graph.G.nodes(data=True)
+        for owner in (owner_data.get("expr_obj"),)
+        if isinstance(
+            owner,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        )
+        for member in ast.walk(owner)
+        if member is not owner
+    }
+    for _node_id, node_data in graph.G.nodes(data=True):
+        expression = node_data.get("expr_obj")
+        if id(expression) in scoped_member_ids:
+            continue
+        if isinstance(expression, ast.Assign):
+            targets = expression.targets
+            value_node = expression.value
+        elif isinstance(expression, ast.AnnAssign):
+            targets = (expression.target,)
+            value_node = expression.value
+        else:
+            continue
+        if value_node is None:
+            continue
+        try:
+            literal = ast.literal_eval(value_node)
+        except (TypeError, ValueError, SyntaxError):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                static_bindings[target.id] = literal
     python_package = getattr(graph, "python_package", None)
     for local_name, (
         qualified_name,
@@ -2085,6 +2133,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         }
         function_graph = copy.copy(graph)
         function_graph.G = graph.G.subgraph(included).copy()
+        # The definition may carry literal module constants and source-local
+        # imports beyond the root graph's generic binding set.  Preserve that
+        # exact static environment on the function graph consumed by compiled
+        # shells; otherwise those globals reappear as missing runtime inputs.
+        function_graph.python_bindings = definition_static_bindings
         function_graph.levels = {
             member: level
             for member, level in graph.levels.items()
@@ -2094,6 +2147,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         function_graph.function_table = function_table
         positional_parameters = ()
         keyword_only_parameters = ()
+        variadic_parameters = ()
         if isinstance(
             statement,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
@@ -2108,11 +2162,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             keyword_only_parameters = tuple(
                 argument.arg for argument in statement.args.kwonlyargs
             )
+            variadic_parameters = tuple(
+                argument.arg
+                for argument in (statement.args.vararg, statement.args.kwarg)
+                if argument is not None
+            )
         parameter_names = (
             *positional_parameters,
             *keyword_only_parameters,
+            *variadic_parameters,
         )
         parameter_defaults = {}
+        if isinstance(
+            statement,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+        ):
+            if statement.args.vararg is not None:
+                parameter_defaults[statement.args.vararg.arg] = ()
+            if statement.args.kwarg is not None:
+                parameter_defaults[statement.args.kwarg.arg] = {}
         scalar_parameter_names = set()
         if isinstance(
             statement,
@@ -2290,6 +2358,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if hasattr(statement, "_python_bindings"):
             delattr(statement, "_python_bindings")
         function_table.resolve_graph(reference, function_graph)
+    # External call references and static Python bindings are two views of the
+    # same compile-time environment.  Join them once after every call has been
+    # declared so compiled shells can invoke imported constructors/functions
+    # without a second lookup mechanism.
+    for entry in external_function_table:
+        target = static_bindings.get(entry.name)
+        if callable(target):
+            external_function_table.resolve_callable(entry.reference, target)
     return graph
 
 

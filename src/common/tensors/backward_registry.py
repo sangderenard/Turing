@@ -217,6 +217,34 @@ def index_adjoint(G, source, index):
     input_shape = tuple(source.shape)
     if isinstance(index, AbstractTensor):
         index = index.tolist()
+
+    # ``None``/newaxis is layout-only: it consumes no source axis and inserts
+    # a singleton result axis.  Remove those singleton axes from the incoming
+    # gradient before applying the adjoint of the remaining source index.
+    if isinstance(index, tuple) and any(item is None for item in index):
+        inserted_axes = []
+        output_axis = 0
+        for item in index:
+            if item is None:
+                inserted_axes.append(output_axis)
+                output_axis += 1
+            elif isinstance(item, (int, np.integer)):
+                continue
+            elif item is Ellipsis or isinstance(item, slice):
+                output_axis += 1
+            else:
+                raw = item.tolist() if hasattr(item, "tolist") else item
+                output_axis += max(1, np.asarray(raw).ndim)
+        gradient_shape = list(G.shape)
+        for axis in reversed(inserted_axes):
+            if axis >= len(gradient_shape) or gradient_shape[axis] != 1:
+                raise ValueError(
+                    "newaxis adjoint requires a singleton gradient axis"
+                )
+            gradient_shape.pop(axis)
+        G = G.reshape(tuple(gradient_shape))
+        index = tuple(item for item in index if item is not None)
+
     def _advanced(item):
         return (
             not isinstance(item, (int, np.integer, slice))
@@ -315,6 +343,26 @@ def T(X):
         else:
             X = X.reshape((1, X.shape[0]))
     return X.transpose(-2, -1)
+
+
+def matmul_vjp(g, A, B):
+    """VJP for the existing NumPy-style rank-1/rank-2 matmul operator."""
+
+    a_vector = getattr(A, "ndim", len(getattr(A, "shape", ()))) == 1
+    b_vector = getattr(B, "ndim", len(getattr(B, "shape", ()))) == 1
+    A2 = A.reshape((1, A.shape[0])) if a_vector else A
+    B2 = B.reshape((B.shape[0], 1)) if b_vector else B
+    if a_vector and b_vector:
+        g2 = g.reshape((1, 1))
+    elif a_vector:
+        g2 = g.reshape((*g.shape[:-1], 1, g.shape[-1]))
+    elif b_vector:
+        g2 = g.reshape((*g.shape, 1))
+    else:
+        g2 = g
+    gA = unbroadcast(AbstractTensor.matmul(g2, T(B2)), A2.shape)
+    gB = unbroadcast(AbstractTensor.matmul(T(A2), g2), B2.shape)
+    return gA.reshape(A.shape), gB.reshape(B.shape)
 
 BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
     # ----------------------------------------------------------------------
@@ -766,7 +814,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g=g.reshape((1, *s)) if getattr(g, 'ndim', len(s))==1 else g; gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
+            "body": "return matmul_vjp(g, A, B)"
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",
@@ -1065,7 +1113,7 @@ BACKWARD_RULES: Dict[str, Dict[str, Any]] = {
         },
         "python": {
             "parameters": ["g", "A", "B"],
-            "body": "s=g.shape() if callable(getattr(g,'shape',None)) else g.shape; g=g.reshape((1, *s)) if getattr(g, 'ndim', len(s))==1 else g; gA=unbroadcast(AbstractTensor.matmul(g, T(B)), A.shape); gB=unbroadcast(AbstractTensor.matmul(T(A), g), B.shape); return gA, gB"
+            "body": "return matmul_vjp(g, A, B)"
         },
         "domain": "Inner dims match; batch dims broadcastable.",
         "notes": "Use T() as last-two-dims transpose. Apply unbroadcast to fold batch broadcasting.",

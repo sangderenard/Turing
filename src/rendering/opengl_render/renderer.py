@@ -15,10 +15,10 @@ from OpenGL.GL import (
     glGenVertexArrays, glBindVertexArray,
     glGenBuffers, glBindBuffer, glBufferData, glBufferSubData,
     glEnableVertexAttribArray, glVertexAttribPointer,
-    glGetUniformLocation, glUniformMatrix4fv, glUniform1f, glUniform4fv,
+    glGetUniformLocation, glGetAttribLocation, glUniformMatrix4fv, glUniform1f, glUniform4fv,
     glDrawArrays, glDrawElements, glPolygonMode, glLineWidth,
     glEnable, glDisable, glBlendFunc, glDepthMask, glCullFace, glViewport, glClearColor, glClear,
-    glWindowPos2f, glDrawPixels, glPixelStorei,
+    glWindowPos2f, glDrawPixels, glPixelStorei, glReadPixels, glGetError,
     GL_COMPILE_STATUS, GL_LINK_STATUS,
     GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
     GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
@@ -125,14 +125,14 @@ void main(){
 
 POINT_FS = """
 #version 330 core
-//in vec4 vColor;
+in vec4 vColor;
 out vec4 FragColor;
 void main(){
-    //vec2 uv = gl_PointCoord * 2.0 - 1.0;
-    //float r2 = dot(uv, uv);
-    //if (r2 > 1.0) discard;
-    //float edge = smoothstep(0.7, 1.0, r2);
-    FragColor = vec4(1.0,1.0,1.0,1.0);//vec4(vColor.rgb, vColor.a);// * (1.0 - edge));
+    vec2 uv = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(uv, uv);
+    if (r2 > 1.0) discard;
+    float alpha = vColor.a * (1.0 - smoothstep(0.70, 1.0, r2));
+    FragColor = vec4(vColor.rgb, alpha);
 }
 """
 
@@ -233,7 +233,13 @@ class DebugRenderer:
 class GLRenderer:
     """A minimal scene graph: Mesh → Lines → Points (draw order)."""
 
-    def __init__(self, mvp: Optional[np.ndarray] = None, *, size: Tuple[int, int] = (640, 480)):
+    def __init__(
+        self,
+        mvp: Optional[np.ndarray] = None,
+        *,
+        size: Tuple[int, int] = (640, 480),
+        point_shader_sources: tuple[str, str] | None = None,
+    ):
         """Create a renderer and its backing window.
 
         Parameters
@@ -265,7 +271,9 @@ class GLRenderer:
         # programs
         self.prog_mesh = _link_program(MESH_VS,  MESH_FS)
         self.prog_line = _link_program(LINE_VS,  LINE_FS)
-        self.prog_point= _link_program(POINT_VS, POINT_FS)
+        self._point_shader_sources = point_shader_sources
+        point_vertex, point_fragment = point_shader_sources or (POINT_VS, POINT_FS)
+        self.prog_point = _link_program(point_vertex, point_fragment)
 
         # MVP (4x4 float32, column-major)
         self.mvp = np.identity(4, dtype=np.float32) if mvp is None else np.asarray(mvp, np.float32)
@@ -284,6 +292,11 @@ class GLRenderer:
 
         self._overlay_lines: list[str] = []
         self._font = None
+        import os
+        self._capture_path = os.environ.get("TURING_GL_CAPTURE_PATH")
+        self._capture_after_ms = int(os.environ.get(
+            "TURING_GL_CAPTURE_AFTER_MS", "4000"
+        ))
 
     # ---- Mesh API ----
     def set_mesh(self, layer: MeshLayer):
@@ -358,6 +371,70 @@ class GLRenderer:
     def set_points(self, layer: PointLayer):
         vao = glGenVertexArrays(1); glBindVertexArray(vao)
 
+        # The older particles surface uses a nine-float interleaved ABI. Keep
+        # supporting it for callers that explicitly supply that shader, while
+        # FluxSpring's real LiveViz shader follows the ordinary position/color/
+        # size attribute layout below.
+        particles_abi = (
+            self._point_shader_sources is not None
+            and "in_position" in self._point_shader_sources[0]
+            and "in_radius" in self._point_shader_sources[0]
+        )
+        fluxspring_abi = (
+            self._point_shader_sources is not None
+            and "in vec3 in_pos" in self._point_shader_sources[0]
+            and "in vec3 in_col" in self._point_shader_sources[0]
+            and "in float in_size" in self._point_shader_sources[0]
+        )
+        if particles_abi:
+            pos = layer.positions.astype(np.float32, copy=False)
+            col = (
+                np.ones((pos.shape[0], 4), np.float32)
+                if layer.colors is None
+                else layer.colors.astype(np.float32, copy=False)
+            )
+            size = (
+                np.full((pos.shape[0],), layer.size_px_default, np.float32)
+                if layer.sizes_px is None
+                else layer.sizes_px.astype(np.float32, copy=False)
+            )
+            # This is the original particles.py ABI:
+            # position3, color3, alpha, radius, kinetic-energy.
+            interleaved = np.column_stack((
+                pos,
+                col[:, :3],
+                col[:, 3],
+                size / 20.0,
+                np.zeros((pos.shape[0],), dtype=np.float32),
+            )).astype(np.float32, copy=False)
+            vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
+            glBufferData(GL_ARRAY_BUFFER, interleaved.nbytes, interleaved, GL_DYNAMIC_DRAW)
+            stride = 9 * 4
+            for name, count, offset in (
+                ("in_position", 3, 0),
+                ("in_color", 3, 3 * 4),
+                ("in_alpha", 1, 6 * 4),
+                ("in_radius", 1, 7 * 4),
+                ("in_ke", 1, 8 * 4),
+            ):
+                location = glGetAttribLocation(self.prog_point, name)
+                glEnableVertexAttribArray(location)
+                glVertexAttribPointer(
+                    location, count, GL_FLOAT, GL_FALSE, stride,
+                    ctypes.c_void_p(offset),
+                )
+            glBindVertexArray(0)
+            self._point = dict(
+                vao=vao,
+                vbo=vbo,
+                cbo=None,
+                sbo=None,
+                count=pos.shape[0],
+                alpha=float(layer.alpha),
+                fluxspring=True,
+            )
+            return
+
         # positions
         vbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, vbo)
         pos = layer.positions.astype(np.float32, copy=False)
@@ -370,9 +447,16 @@ class GLRenderer:
         # treated as an error; callers needing visible points must supply their
         # own colors.
         col = np.zeros((pos.shape[0], 4), np.float32) if layer.colors is None else layer.colors.astype(np.float32, copy=False)
+        if fluxspring_abi:
+            # Match LiveVizGLPoints exactly: tightly packed RGB, not the
+            # generic renderer's RGBA attribute. This distinction is visible
+            # on drivers that enforce the shader's vec3 declaration strictly.
+            col = np.ascontiguousarray(col[:, :3], dtype=np.float32)
         cbo = glGenBuffers(1); glBindBuffer(GL_ARRAY_BUFFER, cbo)
         glBufferData(GL_ARRAY_BUFFER, col.nbytes, col, GL_DYNAMIC_DRAW)
-        glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        color_components = 3 if fluxspring_abi else 4
+        color_stride = color_components * 4
+        glEnableVertexAttribArray(1); glVertexAttribPointer(1, color_components, GL_FLOAT, GL_FALSE, color_stride, ctypes.c_void_p(0))
 
         # sizes
         size = (np.full((pos.shape[0],), layer.size_px_default, np.float32) if layer.sizes_px is None
@@ -382,7 +466,17 @@ class GLRenderer:
         glEnableVertexAttribArray(2); glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 4, ctypes.c_void_p(0))
 
         glBindVertexArray(0)
-        self._point = dict(vao=vao, vbo=vbo, cbo=cbo, sbo=sbo, count=pos.shape[0], alpha=float(layer.alpha))
+        self._point = dict(
+            vao=vao,
+            vbo=vbo,
+            cbo=cbo,
+            sbo=sbo,
+            count=pos.shape[0],
+            alpha=float(layer.alpha),
+            fluxspring=self._point_shader_sources is not None,
+            size_min=float(size.min()) if size.size else 0.0,
+            size_max=float(size.max()) if size.size else 0.0,
+        )
 
     def update_points(self, positions: Optional[np.ndarray] = None,
                       colors: Optional[np.ndarray] = None,
@@ -406,6 +500,8 @@ class GLRenderer:
         self.mvp = np.asarray(mvp, dtype=np.float32)
 
     def draw(self, viewport_px: Tuple[int,int]):
+        import pygame
+
         w, h = viewport_px
         glViewport(0, 0, int(w), int(h))
         glClearColor(0.08, 0.08, 0.1, 1.0)
@@ -439,17 +535,49 @@ class GLRenderer:
         # 3) Points (peaks)
         if self._point:
             glDisable(GL_DEPTH_TEST)
-            glDisable(GL_BLEND)
+            glEnable(GL_BLEND)
 
             glUseProgram(self.prog_point)
-            uMVP  = glGetUniformLocation(self.prog_point, "uMVP")
+            fluxspring = bool(self._point.get("fluxspring"))
+            uMVP = glGetUniformLocation(
+                self.prog_point,
+                "u_mvp" if fluxspring else "uMVP",
+            )
             glUniformMatrix4fv(uMVP, 1, GL_FALSE, self.mvp)
+            if fluxspring:
+                uTime = glGetUniformLocation(self.prog_point, "u_time")
+                glUniform1f(uTime, float(pygame.time.get_ticks()))
             glBindVertexArray(self._point["vao"])
             glDrawArrays(GL_POINTS, 0, self._point["count"])
             glBindVertexArray(0)
 
+        if (
+            self._capture_path
+            and pygame.time.get_ticks() >= self._capture_after_ms
+            and self._point
+            and self._point["count"]
+        ):
+            from PIL import Image
+
+            pixels = glReadPixels(
+                0, 0, int(w), int(h), GL_RGBA, GL_UNSIGNED_BYTE
+            )
+            rgba = np.frombuffer(pixels, dtype=np.uint8).reshape(h, w, 4)
+            Image.fromarray(np.flipud(rgba), "RGBA").save(self._capture_path)
+            print(
+                "[fluxspring-capture]",
+                {
+                    "path": self._capture_path,
+                    "points": self._point["count"],
+                    "size_min": self._point.get("size_min"),
+                    "size_max": self._point.get("size_max"),
+                    "gl_error": int(glGetError()),
+                },
+                flush=True,
+            )
+            self._capture_path = None
+
         glUseProgram(0)
-        import pygame
         self._draw_overlay()
         pygame.display.flip()
     # ---- disposal ----

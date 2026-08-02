@@ -110,8 +110,8 @@ def test_full_pipeline_with_tensor_pool():
     results = sink.get_batch(4, timeout=0.1)
     assert len(results) == 1
     r = results[0]
-    # With the current stubbed integrator, y evaluates to zero and gradients collapse to zero.
-    assert float(r.y) == pytest.approx(0.0)
+    # ``sum_k`` is the registered AbstractTensor sum over both source rows.
+    assert float(r.y) == pytest.approx(21.0)
     assert r.grads == (0.0, 0.0)
 
     # Release tensors back to the pool (exercise detach + clear)

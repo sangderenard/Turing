@@ -17,7 +17,63 @@ from ..function_table import ExternalFunctionTable, FunctionTable
 import colorsys
 import random
 import time
+import threading
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ProcessGraphSnapshot:
+    """Immutable-by-convention topology copy taken at one graph revision."""
+
+    revision: int
+    graph: Any
+
+
+class ProcessGraphAccessor:
+    """Lock-aware read access for live compiler/visualization observers."""
+
+    def __init__(self, owner: "ProcessGraph"):
+        self._owner = owner
+
+    def snapshot(self) -> ProcessGraphSnapshot:
+        owner = self._owner
+        with owner._graph_condition:
+            copied = owner.G.copy(as_view=False)
+            for node_id, level in owner.levels.items():
+                if node_id in copied:
+                    copied.nodes[node_id].setdefault("level", level)
+            return ProcessGraphSnapshot(owner._graph_revision, copied)
+
+    def wait_for_change(
+        self,
+        after_revision: int,
+        timeout: float | None = None,
+    ) -> ProcessGraphSnapshot:
+        owner = self._owner
+        with owner._graph_condition:
+            owner._graph_condition.wait_for(
+                lambda: owner._graph_revision > after_revision,
+                timeout=timeout,
+            )
+        return self.snapshot()
+
+    def subscribe(self, callback, *, replay: bool = True):
+        """Receive an exact snapshot after each serialized graph mutation."""
+
+        owner = self._owner
+        with owner._graph_condition:
+            owner._graph_subscribers.append(callback)
+        if replay:
+            callback(self.snapshot())
+
+        def unsubscribe():
+            with owner._graph_condition:
+                if callback in owner._graph_subscribers:
+                    owner._graph_subscribers.remove(callback)
+
+        return unsubscribe
 
 class _RandomFloatQueue(deque):
     """
@@ -208,6 +264,53 @@ def _class_schema_from_ast(definition):
     }
 
 
+def _ast_qualified_name(expression):
+    """Return a dotted source name without importing or executing it."""
+
+    if isinstance(expression, ast.Name):
+        return expression.id
+    if isinstance(expression, ast.Attribute):
+        owner = _ast_qualified_name(expression.value)
+        return f"{owner}.{expression.attr}" if owner else expression.attr
+    return None
+
+
+def _state_machine_schema_from_ast(definition):
+    """Describe an explicitly marked AbstractTensor state-machine class."""
+
+    bases = tuple(
+        name
+        for base in definition.bases
+        if (name := _ast_qualified_name(base)) is not None
+    )
+    marker = next(
+        (
+            name for name in bases
+            if name.rsplit(".", 1)[-1] == "AbstractTensorStateMachine"
+        ),
+        None,
+    )
+    if marker is None:
+        return None
+    methods = tuple(
+        member.name
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    return {
+        "class_name": definition.name,
+        "identity": definition.name,
+        "marker": marker,
+        "bases": bases,
+        "transition_identity": (
+            f"{definition.name}.transition"
+            if "transition" in methods
+            else None
+        ),
+        "ast_node_id": id(definition),
+    }
+
+
 def _map_ir_from_ast(tree):
     """Build the map member that accompanies numeric and control IR.
 
@@ -221,8 +324,118 @@ def _map_ir_from_ast(tree):
         for definition in ast.walk(tree)
         if isinstance(definition, ast.ClassDef)
     )
+    state_machines = tuple(
+        state_machine
+        for definition in ast.walk(tree)
+        if isinstance(definition, ast.ClassDef)
+        if (state_machine := _state_machine_schema_from_ast(definition))
+        is not None
+    )
+    module_annotations = tuple(
+        {
+            "name": statement.target.id,
+            "identity": statement.target.id,
+            "annotation": ast.unparse(statement.annotation),
+            "value": (
+                None if statement.value is None
+                else ast.unparse(statement.value)
+            ),
+            "ast_node_id": id(statement),
+        }
+        for statement in getattr(tree, "body", ())
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+    )
+    class_annotations = tuple(
+        {
+            "class_name": definition.name,
+            "members": tuple(
+                {
+                    "name": statement.target.id,
+                    "identity": f"{definition.name}.{statement.target.id}",
+                    "annotation": ast.unparse(statement.annotation),
+                    "value": (
+                        None if statement.value is None
+                        else ast.unparse(statement.value)
+                    ),
+                    "ast_node_id": id(statement),
+                }
+                for statement in definition.body
+                if isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+            ),
+        }
+        for definition in getattr(tree, "body", ())
+        if isinstance(definition, ast.ClassDef)
+    )
+    function_annotations = tuple(
+        {
+            "identity": (
+                f"{definition.name}.{function.name}"
+                if isinstance(definition, ast.ClassDef)
+                else function.name
+            ),
+            "locals": tuple(
+                {
+                    "name": statement.target.id,
+                    "annotation": ast.unparse(statement.annotation),
+                    "value": (
+                        None if statement.value is None
+                        else ast.unparse(statement.value)
+                    ),
+                    "ast_node_id": id(statement),
+                }
+                for statement in ast.walk(function)
+                if isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+            ),
+        }
+        for definition in getattr(tree, "body", ())
+        for function in (
+            (definition,)
+            if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+            else tuple(
+                member for member in definition.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+            if isinstance(definition, ast.ClassDef)
+            else ()
+        )
+    )
+    schema_roots = tuple(
+        item["ast_node_id"]
+        for item in module_annotations
+    ) + tuple(
+        member["ast_node_id"]
+        for record in class_annotations
+        for member in record["members"]
+    )
+    schema_statements = tuple(
+        statement
+        for statement in getattr(tree, "body", ())
+        if isinstance(statement, ast.AnnAssign)
+    ) + tuple(
+        statement
+        for definition in getattr(tree, "body", ())
+        if isinstance(definition, ast.ClassDef)
+        for statement in definition.body
+        if isinstance(statement, ast.AnnAssign)
+    )
+    schema_node_ids = tuple(dict.fromkeys(
+        id(node)
+        for statement in schema_statements
+        for node in ast.walk(statement)
+    ))
     return {
+        "schema": {
+            "module": {"annotations": module_annotations},
+            "classes": class_annotations,
+            "functions": function_annotations,
+        },
+        "schema_roots": schema_roots,
+        "schema_node_ids": schema_node_ids,
         "objects": objects,
+        "state_machines": state_machines,
         "graphs": tuple(
             {
                 "identity": method["graph_identity"],
@@ -234,6 +447,33 @@ def _map_ir_from_ast(tree):
         ),
         "permissions": (),
     }
+
+
+class _RuntimeAnnAssignNormalizer(ast.NodeTransformer):
+    """Separate local annotation schema from executable assignment logic."""
+
+    def __init__(self):
+        self.function_depth = 0
+
+    def visit_FunctionDef(self, node):
+        self.function_depth += 1
+        try:
+            return self.generic_visit(node)
+        finally:
+            self.function_depth -= 1
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_AnnAssign(self, node):
+        node = self.generic_visit(node)
+        if not self.function_depth:
+            return node
+        if node.value is None:
+            return ast.copy_location(ast.Pass(), node)
+        return ast.copy_location(
+            ast.Assign(targets=[node.target], value=node.value),
+            node,
+        )
 
 
 def _ast_definition_bindings(value):
@@ -295,7 +535,7 @@ def _ast_definition_bindings(value):
 
 
 def _import_ast_bindings(tree, bindings, package=None):
-    """Make imports visible to source discovery without adding runtime calls."""
+    """Make imports and literal module constants visible to source discovery."""
 
     resolved = dict(bindings)
     for statement in ast.walk(tree):
@@ -323,6 +563,33 @@ def _import_ast_bindings(tree, bindings, package=None):
                     )
                 except AttributeError:
                     continue
+    # A literal module assignment is already a fully reduced compiler fact.
+    # Retain it beside imported bindings so function subgraphs can resolve
+    # globals such as chunk sizes without executing module code or fabricating
+    # a runtime input.
+    # Only module assignments are lexical globals.  This helper also receives
+    # discovered FunctionDef and ClassDef nodes; treating their local or class
+    # assignments as globals lets a class field default (for example
+    # ``symbols = None``) shadow a method parameter with the same spelling.
+    module_body = tree.body if isinstance(tree, ast.Module) else ()
+    for statement in module_body:
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+            value_node = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = (statement.target,)
+            value_node = statement.value
+        else:
+            continue
+        if value_node is None:
+            continue
+        try:
+            value = ast.literal_eval(value_node)
+        except (TypeError, ValueError, SyntaxError):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                resolved[target.id] = value
     return resolved
 
 
@@ -745,6 +1012,21 @@ class ProcessGraph:
         self.materialize_memory = materialize_memory
         self.MG = BitTensorMemoryGraph(size=0) if materialize_memory else None
         self.G = self.MG.G if self.MG is not None else nx.DiGraph()
+        self._graph_lock = threading.RLock()
+        self._graph_condition = threading.Condition(self._graph_lock)
+        self._graph_revision = 0
+        self._graph_subscribers = []
+        self._graph_accessor = ProcessGraphAccessor(self)
+        from ...compiler.evolution_metagraph import active_evolution_metagraph
+        self._evolution_metagraph = active_evolution_metagraph()
+        self._evolution_graph = (
+            None
+            if self._evolution_metagraph is None
+            else self._evolution_metagraph.open_graph(
+                "process-graph",
+                "source ingestion",
+            )
+        )
         self.levels = {}
         self.node_map = {}
         # integer level for recombinatorics aggressiveness: 0=no, higher unlock more transforms
@@ -764,6 +1046,67 @@ class ProcessGraph:
             if external_function_table is None
             else external_function_table
         )
+
+    def graph_accessor(self) -> ProcessGraphAccessor:
+        """Return the stable accessor used by live compilation observers."""
+
+        return self._graph_accessor
+
+    def observe_evolution_node(self, node_id, data) -> None:
+        if self._evolution_graph is None:
+            return
+        source_span = data.get("source_span")
+        if not source_span:
+            expression = data.get("expr_obj")
+            if expression is not None and hasattr(expression, "lineno"):
+                source_span = {
+                    "line": getattr(expression, "lineno", None),
+                    "column": getattr(expression, "col_offset", None),
+                    "end_line": getattr(expression, "end_lineno", None),
+                    "end_column": getattr(expression, "end_col_offset", None),
+                }
+        self._evolution_metagraph.component(
+            self._evolution_graph,
+            node_id,
+            label=str(data.get("label") or data.get("op") or node_id),
+            kind=str(data.get("type") or data.get("op") or "operation"),
+            attributes={
+                "source_span": source_span,
+                "schema_version": data.get("schema_version"),
+            },
+        )
+
+    def observe_evolution_edge(self, source, target, role="data") -> None:
+        if self._evolution_graph is None:
+            return
+        from ...compiler.evolution_metagraph import EvolutionComponentRef
+        self._evolution_metagraph.relationship(
+            self._evolution_graph,
+            EvolutionComponentRef(self._evolution_graph.id, str(source)),
+            EvolutionComponentRef(self._evolution_graph.id, str(target)),
+            role=str(role or "data"),
+        )
+
+    @contextmanager
+    def graph_mutation(self):
+        """Serialize a topology mutation and publish one new revision."""
+
+        snapshot = None
+        callbacks = ()
+        with self._graph_condition:
+            yield self.G
+            self._graph_revision += 1
+            self._graph_condition.notify_all()
+            callbacks = tuple(self._graph_subscribers)
+            if callbacks:
+                copied = self.G.copy(as_view=False)
+                for node_id, level in self.levels.items():
+                    if node_id in copied:
+                        copied.nodes[node_id].setdefault("level", level)
+                snapshot = ProcessGraphSnapshot(self._graph_revision, copied)
+        if snapshot is not None:
+            for callback in callbacks:
+                callback(snapshot)
 
     def full_recombinatorics(self, expr, level=1):
         """
@@ -820,7 +1163,9 @@ class ProcessGraph:
 
             
 
-        if nid not in self.G:
+        with self.graph_mutation():
+            if nid in self.G:
+                return nid, True
             node_type = type(node).__name__
             #print(f"Building graph node: type={type(node).__name__}, repr={repr(node)}")
 
@@ -843,40 +1188,38 @@ class ProcessGraph:
                 parents=[],
                 children=[])
             self.node_map[nid] = node
+            self.observe_evolution_node(nid, self.G.nodes[nid])
 
             new_nid = self.deduplicate_node(self.G, nid)
             if new_nid != nid:
                 del self.node_map[nid]
                 return new_nid, True
             return nid, False
-        else:
-            return nid, True  # return nid and flag if already defined
 
     def connect(self, src_id, tgt_id, producer_role, consumer_role, store_id=None):
-        src_label = self.G.nodes[src_id]['label'] if src_id in self.G.nodes else "??"
-        tgt_label = self.G.nodes[tgt_id]['label'] if tgt_id in self.G.nodes else "??"
+        with self.graph_mutation():
+            edge = Edge(
+                id=(src_id, tgt_id, producer_role, consumer_role),
+                operation=None,
+                source=src_id,
+                target=tgt_id,
+                store_id=store_id
+            )
+            if not self.G.has_edge(src_id, tgt_id):
+                self.G.add_edge(src_id, tgt_id, extra=set())
+            if 'extra' not in self.G[src_id][tgt_id]:
+                self.G[src_id][tgt_id]['extra'] = set()
+            self.G[src_id][tgt_id]['extra'].add(edge)
 
-        edge = Edge(
-            id=(src_id, tgt_id, producer_role, consumer_role),
-            operation=None,
-            source=src_id,
-            target=tgt_id,
-            store_id=store_id
-        )
-        if not self.G.has_edge(src_id, tgt_id):
-            self.G.add_edge(src_id, tgt_id, extra=set())
-        if 'extra' not in self.G[src_id][tgt_id]:
-            self.G[src_id][tgt_id]['extra'] = set()
-        self.G[src_id][tgt_id]['extra'].add(edge)
-
-        if 'children' not in self.G.nodes[src_id]:
-            self.G.nodes[src_id]['children'] = []
-        if 'parents' not in self.G.nodes[tgt_id]:
-            self.G.nodes[tgt_id]['parents'] = []
-        if tgt_id not in [p for p, _ in self.G.nodes[src_id]['children']]:
-            self.G.nodes[src_id]['children'].append((tgt_id, producer_role))
-        if src_id not in [p for p, _ in self.G.nodes[tgt_id]['parents']]:
-            self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
+            if 'children' not in self.G.nodes[src_id]:
+                self.G.nodes[src_id]['children'] = []
+            if 'parents' not in self.G.nodes[tgt_id]:
+                self.G.nodes[tgt_id]['parents'] = []
+            if tgt_id not in [p for p, _ in self.G.nodes[src_id]['children']]:
+                self.G.nodes[src_id]['children'].append((tgt_id, producer_role))
+            if src_id not in [p for p, _ in self.G.nodes[tgt_id]['parents']]:
+                self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
+            self.observe_evolution_edge(src_id, tgt_id, consumer_role)
 
     def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None):
         # For each role in spec, use the role_indices and a counter (schema_repeats) to determine which arg to use.
@@ -1066,6 +1409,7 @@ class ProcessGraph:
         self,
         node_or_path,
         *args,
+        semantic=None,
         filename=None,
         resolve_unresolved_parents=False,
         parent_bindings=None,
@@ -1076,7 +1420,8 @@ class ProcessGraph:
         """Import Python source as a structural AST ProcessGraph."""
         import os
 
-        if isinstance(node_or_path, ast.AST):
+        supplied_ast = isinstance(node_or_path, ast.AST)
+        if supplied_ast:
             tree = node_or_path
         elif isinstance(node_or_path, str) and os.path.exists(node_or_path):
             filename = filename or node_or_path
@@ -1111,6 +1456,21 @@ class ProcessGraph:
         # nodes ProcessGraph is about to ingest; do not create a second AST
         # ingestion path or infer process topology from them.
         self.G.graph["map_ir"] = _map_ir_from_ast(tree)
+        from ...compiler.state_machine_ast import plan_marked_state_machines
+        state_machine_plans, state_machine_shortfalls = (
+            plan_marked_state_machines(tree)
+        )
+        self.G.graph["state_machine_controls"] = state_machine_plans
+        self.G.graph["state_machine_control_shortfalls"] = (
+            state_machine_shortfalls
+        )
+        if semantic is None:
+            semantic = not supplied_ast and not resolve_unresolved_parents
+        if semantic:
+            from ...compiler.ast_process_graph import build_semantic_ast
+
+            return build_semantic_ast(self, tree, filename=filename)
+        tree = ast.fix_missing_locations(_RuntimeAnnAssignNormalizer().visit(tree))
 
         if profile_verbose:
             print(
@@ -1184,27 +1544,28 @@ class ProcessGraph:
                 )
                 dom_id = id(domain_node)
                 domain_node.id = dom_id  # ensure domain node has a unique ID
-                self.G.add_node(
-                    store_node_id,
-                    label=store_label,
-                    type="Store",
-                    domain_node=domain_node,
-                    store_id=store_id,
-                    expr_obj=store_label,
-                    parents=[(nid, 'result')],
-                    children=[]
-                )
+                with self.graph_mutation():
+                    self.G.add_node(
+                        store_node_id,
+                        label=store_label,
+                        type="Store",
+                        domain_node=domain_node,
+                        store_id=store_id,
+                        expr_obj=store_label,
+                        parents=[(nid, 'result')],
+                        children=[]
+                    )
 
-                node_data['children'].append((store_node_id, 'result'))
+                    node_data['children'].append((store_node_id, 'result'))
 
-                edge = Edge(
-                    id = (nid, store_node_id, 'output', 'result'),
-                    operation = None,
-                    source = nid,
-                    store_id = store_id,
-                    target = store_node_id,
-                )
-                self.G.add_edge(nid, store_node_id, extra=[edge])
+                    edge = Edge(
+                        id = (nid, store_node_id, 'output', 'result'),
+                        operation = None,
+                        source = nid,
+                        store_id = store_id,
+                        target = store_node_id,
+                    )
+                    self.G.add_edge(nid, store_node_id, extra=[edge])
 
                 current_outputs += 1
 
@@ -1400,41 +1761,42 @@ class ProcessGraph:
                     if result_length is not None
                     else {}
                 )
-                self.G.add_node(
-                    idx,
-                    label=node.op,
-                    type=node.op,
-                    op=node.op,
-                    expr_obj=node,
-                    extra_args={
-                        "kwargs": dict(node.kwargs),
-                        "arg_ids": tuple(node.args),
-                        "out_obj_id": node.out_obj_id,
-                    },
-                    attributes=dict(node.kwargs),
-                    constant=None,
-                    tensor=tensor,
-                    bit_quanta=(
-                        {
-                            "quanta": int(result_length),
-                            "bits_per_quantum": 1,
-                            "pid_domains": (),
-                            "source_nodes": tuple(parent for parent, _ in parents),
-                        }
-                        if result_length is not None
-                        else None
-                    ),
-                    control={"recorded_by": "turing_provenance"},
-                    source_span=None,
-                    input_roles=tuple(role for _, role in parents),
-                    output_roles=("result",),
-                    schema_version=1,
-                    domain_node=domain_node,
-                    store_id=None,
-                    parents=parents,
-                    children=children,
-                )
-                self.node_map[idx] = node
+                with self.graph_mutation():
+                    self.G.add_node(
+                        idx,
+                        label=node.op,
+                        type=node.op,
+                        op=node.op,
+                        expr_obj=node,
+                        extra_args={
+                            "kwargs": dict(node.kwargs),
+                            "arg_ids": tuple(node.args),
+                            "out_obj_id": node.out_obj_id,
+                        },
+                        attributes=dict(node.kwargs),
+                        constant=None,
+                        tensor=tensor,
+                        bit_quanta=(
+                            {
+                                "quanta": int(result_length),
+                                "bits_per_quantum": 1,
+                                "pid_domains": (),
+                                "source_nodes": tuple(parent for parent, _ in parents),
+                            }
+                            if result_length is not None
+                            else None
+                        ),
+                        control={"recorded_by": "turing_provenance"},
+                        source_span=None,
+                        input_roles=tuple(role for _, role in parents),
+                        output_roles=("result",),
+                        schema_version=1,
+                        domain_node=domain_node,
+                        store_id=None,
+                        parents=parents,
+                        children=children,
+                    )
+                    self.node_map[idx] = node
 
             for edge in expr_or_tensor.edges:
                 role = f"arg{edge.arg_pos}"
@@ -1445,7 +1807,8 @@ class ProcessGraph:
                     target=edge.dst_idx,
                     store_id=None,
                 )
-                self.G.add_edge(edge.src_idx, edge.dst_idx, extra=[graph_edge])
+                with self.graph_mutation():
+                    self.G.add_edge(edge.src_idx, edge.dst_idx, extra=[graph_edge])
 
             self.roots = [idx for idx in by_idx if not outgoing[idx]]
             return self
@@ -2089,22 +2452,24 @@ class ProcessGraph:
                 if n in self.G:            # duplicate only if you reused the same expr object
                     continue               # (rare with id(obj) – safe to ignore)
                 meta = G_loc.nodes[n]
-                self.G.add_node(
-                    n,
-                    label    = meta.get('label', ''),
-                    type     = meta.get('type',  ''),
-                    expr_obj = meta.get('expr_obj'),
-                    parents  = set(),
-                    children = set(),
-                )
-                self.node_map[n] = nm_loc.get(n)
-                self.levels[n]   = lvl_loc.get(n, 0)
+                with self.graph_mutation():
+                    self.G.add_node(
+                        n,
+                        label    = meta.get('label', ''),
+                        type     = meta.get('type',  ''),
+                        expr_obj = meta.get('expr_obj'),
+                        parents  = set(),
+                        children = set(),
+                    )
+                    self.node_map[n] = nm_loc.get(n)
+                    self.levels[n]   = lvl_loc.get(n, 0)
 
             for u, v in G_loc.edges:
                 if not self.G.has_edge(u, v):
-                    self.G.add_edge(u, v)
-                    self.G.nodes[u]['children'].add(v)
-                    self.G.nodes[v]['parents'].add(u)
+                    with self.graph_mutation():
+                        self.G.add_edge(u, v)
+                        self.G.nodes[u]['children'].add(v)
+                        self.G.nodes[v]['parents'].add(u)
 
     def group_by_level_and_type(self):
         grouping={}

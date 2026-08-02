@@ -129,11 +129,16 @@ def abstract_mesh_laplace(
         vertex_count,
         value_tensor * 0.0,
     )
+    degenerate_indicator = AbstractTensor.where(
+        valid_triangle,
+        double_area * 0.0,
+        double_area * 0.0 + 1.0,
+    )
     degenerate_contributions = AbstractTensor.cat(
         (
-            1.0 - valid_triangle,
-            1.0 - valid_triangle,
-            1.0 - valid_triangle,
+            degenerate_indicator,
+            degenerate_indicator,
+            degenerate_indicator,
         ),
         dim=0,
     )
@@ -158,8 +163,8 @@ def abstract_mesh_laplace(
     ).to_backend(vertex_tensor)
     valid_vertex = (
         (vertex_area > degeneracy_epsilon)
-        * (degenerate_vertices == 0.0)
-        * (nonmanifold_tensor == 0.0)
+        & (degenerate_vertices == 0.0)
+        & (nonmanifold_tensor == 0.0)
     )
     safe_vertex_area = AbstractTensor.where(
         vertex_area > degeneracy_epsilon,

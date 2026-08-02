@@ -44,6 +44,8 @@ def _infer_node_depths(spec: FluxSpringSpec) -> Dict[int, int]:
         stack.add(n)
         best = 0
         for p in edges_by_dst.get(n, []):
+            if p in stack:
+                continue
             best = max(best, depth(p, stack) + _STAGE_TICKS)
         stack.remove(n)
         memo[n] = best
@@ -53,10 +55,9 @@ def _infer_node_depths(spec: FluxSpringSpec) -> Dict[int, int]:
 
 
 def populate_label_stage_depth(spec: FluxSpringSpec) -> None:
-    """Fill ``_LABEL_STAGE_DEPTH`` based on ``spec`` if empty."""
+    """Refresh label depths for the current independent FluxSpring spec."""
 
-    if _LABEL_STAGE_DEPTH:
-        return
+    _LABEL_STAGE_DEPTH.clear()
     node_depth = _infer_node_depths(spec)
     for n in spec.nodes:
         _LABEL_STAGE_DEPTH[f"node[{n.id}]"] = node_depth.get(n.id, 0)

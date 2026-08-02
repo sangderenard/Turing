@@ -45,6 +45,7 @@ class ThreadedAsciiDiffPrinter:
         self._block_on_full = block_on_full
         self._stop = threading.Event()
         self._printer = cffiPrinter(threaded=True)
+        self._stopped = False
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
         self._thread.start()
 
@@ -58,11 +59,14 @@ class ThreadedAsciiDiffPrinter:
     def wait_until_empty(self) -> None:
         """Block until all queued frames have been processed."""
         self._queue.join()
+        # The renderer's queue is only the first of two queues.  Completion
+        # means the fast-console worker has written the frame too.
+        self._printer.flush()
 
     def _render_loop(self) -> None:
         agent_writer, agent_reader = 0, 1
         logger.debug("Starting render loop")
-        while not self._stop.is_set():
+        while True:
             try:
                 item = self._queue.get(timeout=0.1)
                 logger.debug("Retrieved frame from queue")
@@ -74,16 +78,21 @@ class ThreadedAsciiDiffPrinter:
                 logger.debug("Stop sentinel received")
                 self._queue.task_done()
                 break
-            self._db.write_frame(item, agent_idx=agent_writer)
-            frame = self._db.read_frame(agent_idx=agent_reader)
-            if frame is not None:
-                logger.debug("Sending frame to cffiPrinter: %d chars", len(frame))
-                self._printer.print(frame)
-            self._queue.task_done()
+            try:
+                self._db.write_frame(item, agent_idx=agent_writer)
+                frame = self._db.read_frame(agent_idx=agent_reader)
+                if frame is not None:
+                    logger.debug("Sending frame to cffiPrinter: %d chars", len(frame))
+                    self._printer.print(frame)
+            finally:
+                self._queue.task_done()
         self._printer.flush()
         
     def stop(self) -> None:
         """Signal the rendering thread to terminate and wait for it."""
+        if self._stopped:
+            return
+        self._stopped = True
         self._stop.set()
         # Ensure the sentinel is enqueued even if the queue is full.
         self._queue.put(None, block=True)

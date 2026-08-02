@@ -329,7 +329,6 @@ const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
 const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
 const STATIC_GALLERY = __STATIC_GALLERY__;
-const BROWSER_PYTHON = __BROWSER_PYTHON__;
 const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
@@ -355,24 +354,66 @@ function serverURL(path) {
   return new URL(path, server).href;
 }
 
-function resourceURL(path) {
+function resourceURLs(path) {
   if (!path) throw new Error("resource path is empty");
   if (/^(?:[a-z]+:)?\/\//i.test(path) || path.startsWith("data:") || path.startsWith("blob:")) {
-    return path;
+    return [path];
   }
   const route = RESOURCE_ROUTE.endsWith("/") ? RESOURCE_ROUTE : RESOURCE_ROUTE + "/";
   const relative = String(path).replace(/^\.\//, "").replace(/^\//, "");
-  if (relative.startsWith("site/") && /^https?:$/.test(window.location.protocol)) {
+  const candidates = [];
+  const add = value => {
+    const url = new URL(value, document.baseURI).href;
+    if (!candidates.includes(url)) candidates.push(url);
+  };
+  if (relative.startsWith("site/")) {
     const siteIndex = window.location.pathname.indexOf("/site/");
-    const pagesPrefix = siteIndex >= 0 ? window.location.pathname.slice(0, siteIndex + 1) : "/";
-    return new URL(pagesPrefix + relative, window.location.origin).href;
+    if (siteIndex >= 0) {
+      const repositoryRoot = new URL(window.location.href);
+      repositoryRoot.pathname = window.location.pathname.slice(0, siteIndex + 1);
+      repositoryRoot.search = "";
+      repositoryRoot.hash = "";
+      add(new URL(relative, repositoryRoot));
+    }
   }
   if (route.startsWith("/") && /^https?:$/.test(window.location.protocol)) {
     const routeIndex = window.location.pathname.indexOf(route);
     const pagesPrefix = routeIndex >= 0 ? window.location.pathname.slice(0, routeIndex) : "";
-    return new URL(pagesPrefix + route + relative, window.location.origin).href;
+    add(new URL(pagesPrefix + route + relative, window.location.origin));
+  } else {
+    add(new URL(relative, new URL(route, document.baseURI)));
   }
-  return new URL(relative, new URL(route, document.baseURI)).href;
+  try {
+    const siteIndex = window.location.pathname.indexOf("/site/");
+    if (siteIndex >= 0 && !relative.startsWith("site/")) {
+      const pageDirectory = window.location.pathname.slice(
+        siteIndex, window.location.pathname.lastIndexOf("/") + 1
+      );
+      add(serverURL(pageDirectory + relative));
+    }
+    add(serverURL("/" + relative));
+  } catch (_) {
+    // A malformed optional server address must not break static navigation.
+  }
+  return candidates;
+}
+
+function resourceURL(path) {
+  return resourceURLs(path)[0];
+}
+
+async function fetchResource(path, options) {
+  const failures = [];
+  for (const url of resourceURLs(path)) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+      failures.push(url + " (HTTP " + response.status + ")");
+    } catch (error) {
+      failures.push(url + " (" + error.message + ")");
+    }
+  }
+  throw new Error("resource not found in any configured location: " + failures.join(", "));
 }
 
 function evaluateClassPermission(identity, required, evaluator) {
@@ -634,10 +675,18 @@ class ClassGraphRunner {
     this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
     this.instances = new Map();
     this.runtime = null;
+    this.lastExecutionMs = 0;
     this.fieldOffsets = [];
     this.fieldIndex = new Map(
       (manifest.class_inventory.field_slots || []).map(field => [field.key, field.index])
     );
+    for (const redirect of manifest.class_inventory.storage_redirects || []) {
+      const storageIndex = this.fieldIndex.get(redirect.storage);
+      if (storageIndex === undefined) throw new Error(
+        "storage redirect target is absent from the class inventory: " + redirect.storage
+      );
+      this.fieldIndex.set(redirect.identity, storageIndex);
+    }
     this.layoutCount = 0;
     this.inventoryOffset = 0;
     const staticBytes = Number(manifest.shared_static_bytes || 0);
@@ -647,7 +696,7 @@ class ClassGraphRunner {
   }
 
   async binary(url, label) {
-    const response = await fetch(resourceURL(url));
+    const response = await fetchResource(url);
     if (!response.ok) throw new Error(
       "failed to load " + label + ": HTTP " + response.status
     );
@@ -659,7 +708,7 @@ class ClassGraphRunner {
     markDeploymentNode(spec.name, "downloading");
     let moduleBinary;
     if (spec.url) {
-      const response = await fetch(resourceURL(spec.url));
+      const response = await fetchResource(spec.url);
       if (!response.ok) throw new Error(
         "failed to load method card " + spec.name + ": HTTP " + response.status
       );
@@ -728,11 +777,59 @@ class ClassGraphRunner {
     return this.fieldOffsets[index];
   }
 
-  async run(logicalInputs, count, start = 0, end = null, latch = false) {
+  redirectStorageOffset(identity, offset) {
+    const index = this.fieldIndex.get(identity);
+    if (index === undefined) throw new Error("unknown shared-memory identity " + identity);
+    if (!Number.isInteger(offset) || offset < 0) throw new Error(
+      "shared-memory storage offset must be a non-negative integer"
+    );
+    this.fieldOffsets[index] = offset;
+    if (this.layoutCount > 0) {
+      new Int32Array(this.memory.buffer, this.inventoryOffset + index * 4, 1)[0] = offset;
+    }
+  }
+
+  redirectStorage(identity, storage) {
+    this.redirectStorageOffset(identity, this.offsetForKey(storage));
+  }
+
+  storageReference(identity, count) {
+    this.layout(count);
+    return Object.freeze({
+      turingStorageReference: true,
+      memory: this.memory,
+      identity,
+      offset: this.offsetForKey(identity),
+      count,
+      valueType: this.manifest.modules[0].value_type,
+    });
+  }
+
+  logicalOutputReference(logicalName, count) {
+    const binding = this.manifest.logical_outputs[logicalName];
+    if (!binding) throw new Error("unknown logical output " + logicalName);
+    return this.storageReference("out::" + binding[0] + "::" + binding[1], count);
+  }
+
+  async run(
+    logicalInputs, count, start = 0, end = null, latch = false,
+    residentOutputs = false
+  ) {
     this.layout(count);
     const View = this.manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
     for (const [logicalName, source] of Object.entries(logicalInputs)) {
-      const offset = this.offsetForKey("in::" + logicalName);
+      const identity = "in::" + logicalName;
+      if (source && source.turingStorageReference === true) {
+        if (source.memory !== this.memory) throw new Error(
+          "zero-copy storage references must belong to this shared WebAssembly.Memory"
+        );
+        if (Number(source.count) < count) throw new Error(
+          logicalName + " resident storage is smaller than extent " + count
+        );
+        this.redirectStorageOffset(identity, Number(source.offset));
+        continue;
+      }
+      const offset = this.offsetForKey(identity);
       const target = new View(this.memory.buffer, offset, count);
       if (ArrayBuffer.isView(source) || Array.isArray(source)) {
         if (source.length === 1) target.fill(Number(source[0]));
@@ -761,19 +858,21 @@ class ClassGraphRunner {
         }
       }
     } else {
-      activeMethods.forEach(method => markDeploymentNode(method.module, "running"));
       const started = performance.now();
       coordinate(count, this.inventoryOffset, start, rangeEnd);
       const elapsed = performance.now() - started;
-      activeMethods.forEach(method => markDeploymentNode(
-        method.module, "done", elapsed / Math.max(1, activeMethods.length),
+      this.lastExecutionMs = elapsed;
+      activeMethods.forEach(method => queueDeploymentProfile(
+        method.module, elapsed / Math.max(1, activeMethods.length),
         "coordinator amortized"
       ));
     }
     return outputs.map(parameter => {
       const binding = this.manifest.logical_outputs[parameter.name];
       if (!binding) throw new Error("logical output " + parameter.name + " has no deployment binding");
-      const offset = this.offsetForKey("out::" + binding[0] + "::" + binding[1]);
+      const identity = "out::" + binding[0] + "::" + binding[1];
+      if (residentOutputs) return this.storageReference(identity, count);
+      const offset = this.offsetForKey(identity);
       return new View(this.memory.buffer, offset, count).slice();
     });
   }
@@ -784,7 +883,7 @@ class ContiguousRunner {
   async instance() {
     if (this.runtime) return this.runtime;
     markContiguousState("downloading");
-    const response = await fetch(resourceURL(this.spec.url));
+    const response = await fetchResource(this.spec.url);
     if (!response.ok) throw new Error("failed to load contiguous WASM: HTTP " + response.status);
     const {instance} = await WebAssembly.instantiate(await response.arrayBuffer(), {});
     this.runtime = instance;
@@ -850,6 +949,30 @@ function activeClassGraphRunner() {
   return classGraphRunners.get(key);
 }
 
+window.TuringSharedClassMemory = Object.freeze({
+  redirect(identity, storage) {
+    const runner = activeClassGraphRunner();
+    if (!runner) throw new Error("no active divided-program runner");
+    runner.redirectStorage(identity, storage);
+  },
+  output(logicalName, count) {
+    const runner = activeClassGraphRunner();
+    if (!runner) throw new Error("no active divided-program runner");
+    return runner.logicalOutputReference(logicalName, count);
+  },
+  runResident(logicalInputs, count, start = 0, end = null, latch = false) {
+    const runner = activeClassGraphRunner();
+    if (!runner) throw new Error("no active divided-program runner");
+    return runner.run(logicalInputs, count, start, end, latch, true);
+  },
+});
+
+function residentValues(value) {
+  if (!value || value.turingStorageReference !== true) return value;
+  const View = value.valueType === "f32" ? Float32Array : Float64Array;
+  return new View(value.memory.buffer, value.offset, value.count);
+}
+
 async function computeViaSelectedRunner(feeds, count) {
   const logicalInputs = {};
   const manifest = activeExecutionMode === "staged" ? activeStagedManifest() : CLASS_GRAPH;
@@ -867,7 +990,8 @@ async function computeViaSelectedRunner(feeds, count) {
   if (!runner) throw new Error("choose a punch-card size before running");
   return runner.run(
     logicalInputs, count, 0, null,
-    Boolean($("card-latch") && $("card-latch").checked)
+    Boolean($("card-latch") && $("card-latch").checked),
+    true
   );
 }
 
@@ -932,10 +1056,13 @@ async function runClassGraphMode() {
       const frameStarted = performance.now();
       const t0 = performance.now();
       const result = await computeViaSelectedRunner(activeFeeds, count);
-      timings.push(performance.now() - t0);
+      const wallElapsed = performance.now() - t0;
+      const stagedRunner = activeExecutionMode === "staged"
+        ? activeClassGraphRunner() : null;
+      timings.push(stagedRunner ? stagedRunner.lastExecutionMs : wallElapsed);
       lastOutputs = outputs.map((p, index) => ({
         name: p.name,
-        values: result[index],
+        values: residentValues(result[index]),
       }));
       if (animated) {
         if ((r % 15) === 0) reportTimings(timings, count);
@@ -1537,19 +1664,50 @@ function renderGraph() {
   });
 }
 
-function markDeploymentNode(moduleName, state, elapsedMs, profileScope = "method") {
+const pendingDeploymentProfiles = new Map();
+let deploymentProfileFrame = 0;
+
+function queueDeploymentProfile(moduleName, elapsedMs, profileScope) {
+  const previous = pendingDeploymentProfiles.get(moduleName) || {
+    calls: 0, totalMs: 0, scope: profileScope,
+  };
+  previous.calls += 1;
+  previous.totalMs += elapsedMs;
+  pendingDeploymentProfiles.set(moduleName, previous);
+  if (!deploymentProfileFrame) {
+    deploymentProfileFrame = requestAnimationFrame(() => {
+      deploymentProfileFrame = 0;
+      for (const [name, sample] of pendingDeploymentProfiles) {
+        markDeploymentNode(
+          name, "done", sample.totalMs / sample.calls, sample.scope,
+          sample.calls, sample.totalMs
+        );
+      }
+      pendingDeploymentProfiles.clear();
+    });
+  }
+}
+
+function markDeploymentNode(
+  moduleName, state, elapsedMs, profileScope = "method",
+  callIncrement = 1, depositedElapsedMs = elapsedMs
+) {
   const node = document.querySelector('.deployment-node[data-module="' + CSS.escape(moduleName) + '"]');
   if (!node) return;
   node.dataset.state = state;
   const label = node.querySelector(".node-state");
-  const calls = Number(node.dataset.calls || 0) + (state === "done" ? 1 : 0);
+  const calls = Number(node.dataset.calls || 0) + (
+    state === "done" ? callIncrement : 0
+  );
   if (state === "done") node.dataset.calls = String(calls);
   const timing = elapsedMs === undefined ? "" : " · " + elapsedMs.toFixed(3) + " ms";
   if (label) label.textContent = state + timing + (calls ? " · " + calls + " calls" : "");
   if (state === "done") {
     const deployment = activeStagedManifest();
     const spec = deployment && deployment.modules.find(module => module.name === moduleName);
-    if (spec) pulseGraphNodes(spec.node_ids, elapsedMs, moduleName, profileScope);
+    if (spec) pulseGraphNodes(
+      spec.node_ids, depositedElapsedMs, moduleName, profileScope
+    );
   }
 }
 
@@ -1583,7 +1741,7 @@ function wireSourceTabs() {
       const old = button.textContent;
       button.textContent = "Downloading…";
       try {
-        const response = await fetch(resourceURL(descriptor.url));
+        const response = await fetchResource(descriptor.url);
         if (!response.ok) throw new Error("HTTP " + response.status);
         const blob = await response.blob();
         const href = URL.createObjectURL(blob);
@@ -1609,7 +1767,7 @@ function wireMathematics() {
     const old = button.textContent;
     button.textContent = "Downloading…";
     try {
-      const response = await fetch(resourceURL(MATHEMATICS.url));
+      const response = await fetchResource(MATHEMATICS.url);
       if (!response.ok) throw new Error("HTTP " + response.status);
       const blob = await response.blob();
       const href = URL.createObjectURL(blob);
@@ -1794,58 +1952,11 @@ function wireTabs() {
 }
 
 function decodePythonBytes(value) {
-  if (value instanceof Uint8Array) return value;
   if (!value || value.kind !== "bytes") return null;
   const binary = atob(value.base64 || "");
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
-}
-
-let browserPythonRuntime = null;
-
-async function loadBrowserPython() {
-  if (!BROWSER_PYTHON) throw new Error("browser Python runtime is not configured");
-  if (browserPythonRuntime) return browserPythonRuntime;
-  browserPythonRuntime = (async () => {
-    if (!window.loadPyodide) {
-      await new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = BROWSER_PYTHON.script_url;
-        script.onload = resolve;
-        script.onerror = () => reject(new Error("could not load the browser Python runtime"));
-        document.head.appendChild(script);
-      });
-    }
-    const runtime = await window.loadPyodide({
-      indexURL: BROWSER_PYTHON.index_url,
-    });
-    await runtime.loadPackage("pillow");
-    return runtime;
-  })();
-  return browserPythonRuntime;
-}
-
-async function runBrowserPython(button, arguments) {
-  const runtime = await loadBrowserPython();
-  const response = await fetch(resourceURL(button.dataset.source), {cache: "no-store"});
-  if (!response.ok) throw new Error("source load HTTP " + response.status);
-  runtime.globals.set("__turing_source", await response.text());
-  runtime.globals.set("__turing_callable", button.dataset.identity);
-  runtime.globals.set("__turing_arguments_json", JSON.stringify(arguments));
-  const proxy = await runtime.runPythonAsync(`
-import json
-__turing_namespace = {}
-exec(compile(__turing_source, "<published-source>", "exec"), __turing_namespace)
-__turing_result = __turing_namespace[__turing_callable](**json.loads(__turing_arguments_json))
-__turing_result
-`);
-  try {
-    return proxy && typeof proxy.toJs === "function"
-      ? proxy.toJs({create_proxies: false}) : proxy;
-  } finally {
-    if (proxy && typeof proxy.destroy === "function") proxy.destroy();
-  }
 }
 
 async function runPythonCallable(button) {
@@ -1867,27 +1978,19 @@ async function runPythonCallable(button) {
   status.textContent = "Running " + button.dataset.identity + "…";
   status.className = "python-callable-status out";
   try {
-    let result;
-    try {
-      const response = await fetch(serverURL("/api/run"), {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          source: button.dataset.source,
-          callable: button.dataset.identity,
-          arguments: arguments,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
-      result = payload.result || {};
-    } catch (serverError) {
-      if (!BROWSER_PYTHON) throw serverError;
-      status.textContent = "Local runner unavailable; loading browser Python/WASM…";
-      result = await runBrowserPython(button, arguments);
-    }
-    const items = Array.isArray(result)
-      ? result : (result.kind === "tuple" || result.kind === "list" ? result.items || [] : []);
+    const response = await fetch(serverURL("/api/run"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        source: button.dataset.source,
+        callable: button.dataset.identity,
+        arguments: arguments,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
+    const result = payload.result || {};
+    const items = result.kind === "tuple" || result.kind === "list" ? result.items || [] : [];
     const planes = items.slice(0, 3).map(decodePythonBytes);
     const width = Number(arguments.width || 512);
     const height = Number(arguments.height || 512);
@@ -2098,6 +2201,198 @@ def _escape(text: str) -> str:
     return (
         text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     )
+
+
+_SHADER_EXECUTION_CSS = """
+html, body.shader-execution {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  max-width: none;
+  overflow: hidden;
+  background: #000;
+}
+body.shader-execution > :not(#shader-surface):not(script) {
+  display: none !important;
+}
+body.shader-execution #shader-surface {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  touch-action: none;
+}
+"""
+
+
+_SHADER_EXECUTION_JS = r"""
+const SHADER = __SHADER_EXECUTION__;
+const canvas = document.getElementById("shader-surface");
+const gl = canvas.getContext("webgl2", {
+  alpha: false,
+  antialias: false,
+  depth: false,
+  stencil: false,
+  preserveDrawingBuffer: false,
+});
+const input = {
+  pointer: [0, 0],
+  buttons: 0,
+  wheel: [0, 0],
+  keys: new Set(),
+};
+
+function fail(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  canvas.dataset.error = message;
+  canvas.title = message;
+  console.error("shader execution failed", error);
+}
+
+function capturePointer(event) {
+  canvas.focus({preventScroll: true});
+  input.pointer[0] = event.offsetX;
+  input.pointer[1] = canvas.clientHeight - event.offsetY;
+  input.buttons = event.buttons;
+}
+
+canvas.addEventListener("pointerdown", event => {
+  capturePointer(event);
+  canvas.setPointerCapture(event.pointerId);
+  event.preventDefault();
+});
+canvas.addEventListener("pointermove", capturePointer);
+canvas.addEventListener("pointerup", event => {
+  capturePointer(event);
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  event.preventDefault();
+});
+canvas.addEventListener("pointercancel", event => {
+  input.buttons = 0;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+});
+canvas.addEventListener("wheel", event => {
+  input.wheel[0] += event.deltaX;
+  input.wheel[1] += event.deltaY;
+  event.preventDefault();
+}, {passive: false});
+canvas.addEventListener("keydown", event => {
+  input.keys.add(event.code);
+  event.preventDefault();
+});
+canvas.addEventListener("keyup", event => {
+  input.keys.delete(event.code);
+  event.preventDefault();
+});
+canvas.addEventListener("contextmenu", event => event.preventDefault());
+canvas.focus({preventScroll: true});
+
+function compile(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const report = gl.getShaderInfoLog(shader) || "unknown shader compiler error";
+    gl.deleteShader(shader);
+    throw new Error(report);
+  }
+  return shader;
+}
+
+const vertexSource = `#version 300 es
+precision highp float;
+const vec2 TURING_TRIANGLE[3] = vec2[3](
+  vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)
+);
+void main() {
+  gl_Position = vec4(TURING_TRIANGLE[gl_VertexID], 0.0, 1.0);
+}`;
+
+if (!gl) {
+  fail(new Error("WebGL 2 is required by this execution page"));
+} else {
+  const ready = (async () => {
+    const response = await fetch(new URL(SHADER.url, document.baseURI), {cache: "no-store"});
+    if (!response.ok) throw new Error("shader load failed: HTTP " + response.status);
+    const fragmentSource = await response.text();
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "shader link failed");
+    }
+    gl.useProgram(program);
+
+    const feedNames = [...fragmentSource.matchAll(/uniform\s+sampler2D\s+(turing_feed_\d+)\s*;/g)]
+      .map(match => match[1]);
+    const feeds = feedNames.map((name, index) => {
+      const texture = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0 + index);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.uniform1i(gl.getUniformLocation(program, name), index);
+      return {texture, index, width: 0, height: 0};
+    });
+
+    function uploadFeeds(time) {
+      const width = canvas.width;
+      const height = canvas.height;
+      for (const feed of feeds) {
+        const values = new Float32Array(width * height);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const channel = feed.index % 8;
+            values[y * width + x] = channel === 0 ? x / Math.max(1, width - 1)
+              : channel === 1 ? y / Math.max(1, height - 1)
+              : channel === 2 ? time
+              : channel === 3 ? input.pointer[0] / Math.max(1, canvas.clientWidth)
+              : channel === 4 ? input.pointer[1] / Math.max(1, canvas.clientHeight)
+              : channel === 5 ? input.buttons
+              : channel === 6 ? input.wheel[1]
+              : input.keys.size;
+          }
+        }
+        gl.activeTexture(gl.TEXTURE0 + feed.index);
+        gl.bindTexture(gl.TEXTURE_2D, feed.texture);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, values);
+      }
+    }
+
+    let lastInputSignature = "";
+    function frame(milliseconds) {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      const resized = canvas.width !== width || canvas.height !== height;
+      if (resized) {
+        canvas.width = width;
+        canvas.height = height;
+        gl.viewport(0, 0, width, height);
+      }
+      const time = milliseconds / 1000;
+      const signature = [width, height, ...input.pointer, input.buttons,
+        ...input.wheel, input.keys.size, Math.floor(time * 60)].join(":");
+      if (resized || signature !== lastInputSignature) {
+        uploadFeeds(time);
+        lastInputSignature = signature;
+      }
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    return {canvas, gl, program, input, fragmentSource};
+  })();
+  window.TuringShaderSurface = {canvas, gl, input, ready};
+  ready.catch(fail);
+}
+"""
 
 
 def _map_ir_mapping(map_ir: Any) -> dict[str, Any]:
@@ -2510,7 +2805,7 @@ def emit_html_shell(
     graph_views: Mapping[str, Any] | None = None,
     resource_route: str = "/",
     static_gallery: Sequence[Mapping[str, Any]] | None = None,
-    browser_python_runtime: Mapping[str, str] | None = None,
+    shader_execution: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -2552,6 +2847,28 @@ def emit_html_shell(
     )
     parameters = entry["parameters"]
     shell_name = name or f"{mapping['module']}_shell"
+
+    shader_css = ""
+    shader_canvas = ""
+    shader_script = ""
+    body_class = ""
+    if shader_execution is not None:
+        shader = dict(shader_execution)
+        if not shader.get("url"):
+            raise ValueError("shader execution requires a published shader URL")
+        # Keep the complete inspection document available for tooling and
+        # diagnostics, but graduate its presentation to the WebGL surface.
+        # CSS owns the visibility switch exactly so removing this class is a
+        # sufficient way to inspect the same generated page again.
+        body_class = ' class="shader-execution"'
+        shader_css = _SHADER_EXECUTION_CSS
+        shader_canvas = (
+            '<canvas id="shader-surface" tabindex="0" '
+            'aria-label="WebGL shader execution surface"></canvas>'
+        )
+        shader_script = "<script>" + _SHADER_EXECUTION_JS.replace(
+            "__SHADER_EXECUTION__", json.dumps(shader, default=str)
+        ) + "</script>"
 
     encoded = (
         json.dumps(base64.b64encode(wasm_bytes).decode("ascii"))
@@ -2600,7 +2917,6 @@ def emit_html_shell(
         .replace("__MATHEMATICS__", json.dumps(dict(mathematics or {}), default=str))
         .replace("__RESOURCE_ROUTE__", json.dumps(str(resource_route)))
         .replace("__STATIC_GALLERY__", json.dumps(list(static_gallery or []), default=str))
-        .replace("__BROWSER_PYTHON__", json.dumps(dict(browser_python_runtime), default=str) if browser_python_runtime else "null")
         .replace("__DEFAULT_SERVER_ADDRESS__", json.dumps(str(default_server_address)))
         .replace(
             "__CLASS_GRAPH__",
@@ -2734,9 +3050,10 @@ def emit_html_shell(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_escape(shell_name)}</title>
-<style>{_CSS}</style>
+<style>{_CSS}{shader_css}</style>
 </head>
-<body>
+<body{body_class}>
+  {shader_canvas}
   <div class="title">{_escape(str(mapping["module"]))}</div>
   <div class="sub">{_escape(str(mapping["language"]))} &middot; entry
     <code>{_escape(str(entry["name"]))}</code> &middot;
@@ -2911,6 +3228,7 @@ def emit_html_shell(
 
 <script>{boot_script}</script>
 <script>{script}</script>
+{shader_script}
 </body>
 </html>
 """
@@ -2933,6 +3251,7 @@ def shell_for_artifact(
     network_manifest: Mapping[str, Any] | None = None,
     map_ir: Mapping[str, Any] | None = None,
     resource_route: str = "/",
+    shader_execution: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
@@ -2958,6 +3277,7 @@ def shell_for_artifact(
         mathematics=mathematics,
         map_ir=map_ir,
         resource_route=resource_route,
+        shader_execution=shader_execution,
         default_server_address=default_server_address,
     )
 

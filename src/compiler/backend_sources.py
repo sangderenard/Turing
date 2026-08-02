@@ -37,6 +37,10 @@ class BackendSource:
     reason: str = ""
     # Rough syntax family, so a page can style it without guessing.
     highlight: str = "text"
+    # The in-memory compiler artifact, when the emitter has one.  This is not
+    # serialized into the page; the bundle builder uses it to compile and
+    # verify the exact source that it publishes.
+    artifact: Any = field(default=None, repr=False, compare=False)
 
     @property
     def lines(self) -> int:
@@ -157,7 +161,31 @@ def _ssa_module(lowering: Any, names: Sequence[str]):
     from ..transmogrifier.ssa import IRModule
 
     present = [n for n in names if n in lowering.module.functions]
-    return IRModule({n: lowering.module.functions[n] for n in present}), present
+    return IRModule(
+        {n: lowering.module.functions[n] for n in present},
+        recursion_table={
+            name: dict(lowering.module.recursion_table[name])
+            for name in present
+            if name in lowering.module.recursion_table
+        },
+    ), present
+
+
+def _returned_values(function: Any) -> tuple[Any, ...]:
+    """Return the SSA values carried by the function's return instruction."""
+
+    returns = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op).casefold() == "ret"
+    ]
+    if len(returns) != 1:
+        raise ValueError(
+            f"{function.name} must have exactly one return instruction; "
+            f"found {len(returns)}"
+        )
+    return tuple(returns[0].args)
 
 
 def collect_backend_sources(
@@ -208,6 +236,9 @@ def collect_backend_sources(
             region_programs=aot.region_programs,
             numerical_name=numerical_name,
             control_name=control_name,
+            identity_table=getattr(aot, "identity_table", {}),
+            function_outputs=tuple(getattr(aot, "function_outputs", ())),
+            function_parameters=tuple(getattr(aot, "function_parameters", ())),
         )
         if not lowering.complete:
             failed("SSA lowering incomplete", detail=lowering.shortfall_report()[:400])
@@ -250,13 +281,21 @@ def collect_backend_sources(
                 if n.startswith("numerical_region_")
             ]
             module, present = _ssa_module(lowering, names)
-            emitted = fortran_emit(module, name="kernel_fortran")
+            emitted = fortran_emit(
+                module,
+                name="kernel_fortran",
+                outputs={
+                    function_name: _returned_values(function)
+                    for function_name, function in module.functions.items()
+                },
+            )
             collected.append(BackendSource(
                 language="fortran", title="Fortran",
                 source=emitted.source,
                 available=emitted.complete,
                 reason="" if emitted.complete else emitted.shortfalls[0].format(),
                 highlight="fortran",
+                artifact=emitted,
             ))
             note("Fortran emitted", functions=len(present),
                  complete=emitted.complete)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import numpy as np
 import struct
 import textwrap
 
@@ -62,8 +63,13 @@ def test_program_is_one_abstract_tensor_pipeline():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
 
-    assert called_names == {"mandelbrot_frame_program"}
-    assert "mjpeg_frames" in called_attributes
+    assert called_names == {
+        "encode_jfif_resident",
+        "mandelbrot_frame_program",
+        "range",
+        "tuple",
+    }
+    assert "mjpeg_frames" not in called_attributes
     assert {
         "MJPEGAVIWriter",
         "encode_jfif",
@@ -107,9 +113,16 @@ def test_program_emits_batched_jpeg_packets_without_a_file_boundary():
         )
 
     assert len(packets) == 2
+    encoded = []
+    for octets, byte_count in packets:
+        count = int(np.asarray(byte_count.tolist()).reshape(-1)[0])
+        payload = bytes(
+            np.asarray(octets.tolist(), dtype=np.uint8).reshape(-1)[:count]
+        )
+        encoded.append(payload)
     assert all(
         packet.startswith(b"\xff\xd8") and packet.endswith(b"\xff\xd9")
-        for packet in packets
+        for packet in encoded
     )
     assert frames.shape == (2, height, width, 3)
     assert counts.shape == (2, height, width)

@@ -7,7 +7,10 @@ def _wrap_result(self, result):
     from ..abstraction import AbstractTensor
     if isinstance(result, AbstractTensor):
         return result
-    out = type(self)(track_time=getattr(self, "track_time", False))
+    out = type(self)(
+        track_time=getattr(self, "track_time", False),
+        tape=getattr(self, "_tape", None),
+    )
     out.data = result
     return out
 

@@ -22,6 +22,10 @@ class OpJob:
     job_id: str
     # NEW: used for binning & runner backend scope (must be hashable)
     backend_tag: Optional[Any] = None
+    # Scheduler jobs consume the node's public whiteboard value.  Keep this
+    # explicit so the runtime does not fall back to the spring-specific ``p``
+    # shorthand used by its lower-level private job record.
+    param_schema: Tuple[str, ...] = ("sphere",)
 
 @dataclass(frozen=True)
 class ThreadedOpJob(OpJob):

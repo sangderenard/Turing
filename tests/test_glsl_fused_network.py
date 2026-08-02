@@ -788,9 +788,13 @@ def test_recorded_tensor_constructor_is_a_stage_not_an_external_feed(gl):
 
     assert id(source) in captured.program.feeds
     assert id(scalar_tensor) not in captured.program.feeds
-    assert any(
+    assert not any(
         (stage.extras or {}).get("kernel_kind") == "constant"
         for stage in captured.stages
+    )
+    assert any(
+        step.attrs.get("right_scalar") == 4.0
+        for step in captured.program.steps
     )
     replayed = execute_captured_fused_program(captured, {})["result_0"]
     np.testing.assert_allclose(
@@ -920,7 +924,7 @@ def test_requested_outputs_trim_abandoned_tape_branches(gl):
     }
     assert "slice" not in stage_ops
     assert "sum" not in stage_ops
-    assert "tensor_from_list" in stage_ops
+    assert "tensor_from_list" not in stage_ops
     assert "sum" not in source_text
     np.testing.assert_allclose(replayed.numpy(), kept.numpy())
 

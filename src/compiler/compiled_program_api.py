@@ -63,6 +63,8 @@ class Parameter:
     passing: str  # "value" | "reference"
     shape: tuple[int, ...] = ()
     extent: str | None = None
+    # Stable source/IR name retained beside the ABI-local ``t<ID>`` spelling.
+    source_name: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -77,6 +79,8 @@ class Parameter:
             mapping["shape"] = list(self.shape)
         if self.extent is not None:
             mapping["extent"] = self.extent
+        if self.source_name is not None:
+            mapping["source_name"] = self.source_name
         return mapping
 
 
@@ -151,6 +155,7 @@ def describe_fortran_function(
     outputs: Iterable[SSAValue] = (),
     kind: str = "numerical",
     note: str | None = None,
+    source_names: Mapping[int, str] | None = None,
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -160,6 +165,7 @@ def describe_fortran_function(
     """
 
     parameters: list[Parameter] = []
+    source_names = dict(source_names or {})
     for extent in extent_names:
         parameters.append(
             Parameter(
@@ -187,6 +193,7 @@ def describe_fortran_function(
                 passing="reference" if array else "value",
                 shape=tuple(value.shape or ()),
                 extent=str(extent_names[-1]) if array and extent_names else None,
+                source_name=source_names.get(int(value.id)),
             )
         )
     for value in outputs:
@@ -203,6 +210,7 @@ def describe_fortran_function(
                 passing="reference",
                 shape=tuple(value.shape or ()),
                 extent=str(extent_names[-1]) if extent_names else None,
+                source_name=source_names.get(int(value.id)),
             )
         )
     return EntryPoint(

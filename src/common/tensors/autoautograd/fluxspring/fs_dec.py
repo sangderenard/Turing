@@ -36,8 +36,10 @@ def validate_boundary_of_boundary_AT(spec: FluxSpringSpec, tol: float = 1e-9) ->
 
 # --------- Geometry primitives ---------
 def _edge_indices(spec: FluxSpringSpec):
-    idx_i = AT.get_tensor([e.src for e in spec.edges], dtype=int)
-    idx_j = AT.get_tensor([e.dst for e in spec.edges], dtype=int)
+    # The pooled constructor can inherit a floating buffer; make the index
+    # contract explicit at the operation boundary.
+    idx_i = AT.get_tensor([e.src for e in spec.edges]).astype("int64")
+    idx_j = AT.get_tensor([e.dst for e in spec.edges]).astype("int64")
     return idx_i, idx_j
 
 def edge_vectors_AT(P: AT.Tensor, spec: FluxSpringSpec) -> AT.Tensor:

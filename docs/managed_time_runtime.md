@@ -152,3 +152,12 @@ scientific errors are not monotonic in timestep.
   table ABI; general process-graph and multi-edge deployment remain.
 - Native solver transactions must prove that all persistent state is covered
   by the managed state's checkpoint contract.
+
+## Headless computational-world consumer
+
+The optional computational-world engine is specified in
+`docs/COMPUTATIONAL_NARNIA_ENGINE.md`. It is a subordinate consumer of this
+managed-time boundary, not a second time runtime. In particular, a shell
+"tick lease" only decides whether the world participates in a managed round;
+it cannot create a game, observer, replay, or presentation clock. With no
+lease, the world performs no advancement or live-material harvesting.

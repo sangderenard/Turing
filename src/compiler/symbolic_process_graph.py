@@ -1296,15 +1296,24 @@ def symbolically_reduce_process_graph(
     ingest_sympy_expression(rebuilt, reduced[0])
 
     source_by_name = {}
+    source_name_by_id = {}
     identity_table = graph.G.graph.get("identity_table") or {}
     for name, value_ids in identity_table.items():
         for value_id in value_ids:
             if value_id in graph.G:
                 source_by_name[str(name)] = graph.G.nodes[value_id]
+                source_name_by_id[int(value_id)] = str(name)
     for _node_id, data in rebuilt.G.nodes(data=True):
         if data.get("type") != "Input":
             continue
-        name = str((data.get("attributes") or {}).get("binding_name"))
+        attributes = data.setdefault("attributes", {})
+        name = str(attributes.get("binding_name"))
+        if name.startswith("value_") and name[6:].isdigit():
+            source_name = source_name_by_id.get(int(name[6:]))
+            if source_name is not None:
+                attributes["binding_name"] = source_name
+                data["label"] = source_name
+                name = source_name
         source = source_by_name.get(name)
         if source is not None:
             data["tensor"] = dict(source.get("tensor") or {})

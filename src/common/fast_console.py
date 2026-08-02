@@ -11,6 +11,7 @@ import threading
 import queue
 import logging
 import os
+import sys
 from typing import Optional
 
 
@@ -83,7 +84,10 @@ class cffiPrinter:
             if self._handle == self.ffi.NULL or self._handle == self.ffi.cast("void*", -1):
                 raise OSError("GetStdHandle failed")
             mode = self.ffi.new("unsigned long *")
-            if self.C.GetConsoleMode(self._handle, mode):
+            self._console_output = bool(
+                self.C.GetConsoleMode(self._handle, mode)
+            )
+            if self._console_output:
                 new_mode = mode[0] | 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 if not self.C.SetConsoleMode(self._handle, new_mode):
                     logger.error("SetConsoleMode failed")
@@ -108,6 +112,8 @@ class cffiPrinter:
         self._queue = queue.Queue(maxsize=queue_size) if threaded else None
         self._thread = None
         self._stop_event = threading.Event() if threaded else None
+        self._worker_error = None
+        self._stopped = False
         if threaded:
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
@@ -128,13 +134,21 @@ class cffiPrinter:
 
     def _print_direct(self, s: str) -> None:
         if self._is_windows:
+            if not self._console_output:
+                sys.stdout.write(s)
+                sys.stdout.flush()
+                return
             written = self.ffi.new("unsigned long *")
             if self.mode == "A":
                 b = s.encode("utf-8")
                 n = len(b)
                 ret = self.C.WriteConsoleA(self._handle, b, n, written, self.ffi.NULL)
                 if ret == 0:
-                    raise OSError("WriteConsoleA failed")
+                    # A redirected stdout (pytest capture, a pipe, or a file)
+                    # is not a console handle.  It is still a valid output
+                    # boundary, so write to the inherited descriptor.
+                    sys.stdout.write(s)
+                    sys.stdout.flush()
             else:
                 w = s.encode("utf-16-le")
                 n = len(w) // 2
@@ -146,28 +160,40 @@ class cffiPrinter:
                     self.ffi.NULL,
                 )
                 if ret == 0:
-                    raise OSError("WriteConsoleW failed")
+                    sys.stdout.write(s)
+                    sys.stdout.flush()
         else:
             b = s.encode("utf-8")
             self.C.write(self._fd, b, len(b))
 
     def _worker(self):
-        while not self._stop_event.is_set():
+        while True:
+            s = self._queue.get()
             try:
-                s = self._queue.get(timeout=0.1)
+                if s is None:
+                    return
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug("worker printing %d chars", len(s))
                 self._print_direct(s)
+            except BaseException as error:  # preserve failure without deadlock
+                self._worker_error = error
+            finally:
                 self._queue.task_done()
-            except queue.Empty:
-                continue
 
     def flush(self):
         if self.threaded and self._queue:
             self._queue.join()
+            if self._worker_error is not None:
+                error = self._worker_error
+                self._worker_error = None
+                raise RuntimeError("background console write failed") from error
 
     def stop(self):
-        if self.threaded and self._stop_event:
-            self._stop_event.set()
-            if self._thread:
+        if self.threaded and self._stop_event and not self._stopped:
+            self._stopped = True
+            try:
+                self.flush()
+            finally:
+                self._stop_event.set()
+                self._queue.put(None)
                 self._thread.join()

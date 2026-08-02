@@ -39,22 +39,19 @@ def test_composed_mandelbrot_child_matches_numpy_with_planned_glsl_phases():
             iterations
         )
         deployment.compile_process_graph()
-        try:
-            deployment.capture_fused_programs(feeds)
-        except RuntimeError as error:
-            # The complete recording/JPEG parent is intentionally still
-            # rejected by the truthful completeness gate.  Its fully composed
-            # Mandelbrot child remains installed and is what this test owns.
-            assert "truthful complete GLSL shell" in str(error)
 
     child = next(
         shell
         for shell in _walk_planned_shells(deployment)
         if shell.process_graph.G.graph.get("function_name")
         == "mandelbrot_frame_program"
-        and shell.installed_control_shell is not None
+        and "@callsite-" not in shell.profile_path
     )
     try:
+        # This test owns the composed numerical child.  Capturing the complete
+        # recording/JPEG parent first is both unrelated and intentionally
+        # rejected by its own truthful hierarchical-ABI completeness gate.
+        child.capture_fused_programs(feeds)
         glsl = child.execute_named(feeds)
         installed = child.installed_control_shell
         assert installed.artifact.device_resident

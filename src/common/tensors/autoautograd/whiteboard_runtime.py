@@ -460,10 +460,22 @@ def run_batched_vjp(
         view = NodeAttrView(sys.nodes, union_schema, indices=union_ids).build()
         x_all = view.tensor
         if hasattr(x_all, "requires_grad_"):
-            x_all = x_all.requires_grad_()
+            # Node attributes may belong to the caller's older tape.  This VJP
+            # owns a fresh local tape, so its packed batch must be a local leaf.
+            x_all = AT.get_tensor(
+                x_all.data,
+                cls=type(x_all),
+                tape=autograd.tape,
+                requires_grad=True,
+            )
         logger.debug("run_batched_vjp: x_all=%s", AT.get_tensor(x_all))
         if param_tensor is not None and hasattr(param_tensor, "requires_grad_"):
-            param_tensor = param_tensor.requires_grad_()
+            param_tensor = AT.get_tensor(
+                param_tensor.data,
+                cls=type(param_tensor),
+                tape=autograd.tape,
+                requires_grad=True,
+            )
         probe_params: List[Any] = []
         if probe_enabled:
             probe_params = [x_all]
@@ -483,8 +495,10 @@ def run_batched_vjp(
                 sl = view._attr_slices[a]  # type: ignore[index]
                 part = x_j[..., sl]
                 shape = view._attr_shapes[a]  # type: ignore[index]
-                if hasattr(part, "view") and shape is not None:
-                    part = part.view((part.shape[0],) + shape)
+                if hasattr(part, "reshape") and shape is not None:
+                    # Source-level ``view`` is expressed with the existing
+                    # reshape operator in this graph-facing path.
+                    part = part.reshape((part.shape[0],) + shape)
                 params.append(part)
             params_per_job.append(params)
 
@@ -545,6 +559,17 @@ def run_batched_vjp(
                 vec_args = op_args
                 if meta.dim_params and len(vec_args) > 0 and isinstance(vec_args[0], int):
                     vec_args = (vec_args[0] + 1,) + vec_args[1:]
+                elif (
+                    op_name in {"sum", "prod"}
+                    and not vec_args
+                    and "dim" not in vec_kwargs
+                ):
+                    # The leading dimension was introduced by JobBatcher and
+                    # names jobs, not data.  An unqualified source reduction
+                    # therefore reduces every dimension after it, retaining
+                    # one result per job.
+                    data_dims = tuple(range(1, len(x.shape)))
+                    return x if not data_dims else op(dim=data_dims)
                 return op(*vec_args, **vec_kwargs)
 
             ys = JobBatcher.run_vectorized(jb_jobs, {"fn": _fn, "vectorized_fn": _vec_fn})

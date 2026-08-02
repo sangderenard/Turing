@@ -161,7 +161,7 @@ def test_first_filtered_mandelbrot_avi_region_round_trips_into_compiler():
         )[0]
 
     assert callable(compiled)
-    assert filtered.G.graph["deployment_nodes"] == (28,)
+    assert filtered.G.graph["deployment_nodes"] == (27,)
     assert report.original == report.reduced
     assert any(
         data.get("type") == "Indexed"

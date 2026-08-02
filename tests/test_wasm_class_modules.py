@@ -455,6 +455,27 @@ def test_describe_process_graph_api_collapses_a_value_needed_by_several_chunks()
     assert inputs == ["x"]
 
 
+def test_embedded_graph_can_redirect_a_logical_input_to_output_storage():
+    program = _linear_program(4)
+    program.extras = {"capture_feed_origins": {
+        1: {"binding_name": "x"},
+    }}
+    specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
+    modules = emit_class_modules(
+        specs, link_calls=False, shared_memory=True,
+    )
+
+    manifest = build_embedded_class_graph(
+        specs, modules, program, entrypoint="kernel",
+        storage_redirects={"x": "result"},
+    )
+
+    producer = manifest["logical_outputs"]["result"]
+    assert manifest["storage_redirects"] == {
+        "in::x": f"out::{producer[0]}::{producer[1]}"
+    }
+
+
 def test_describe_process_graph_api_falls_back_to_a_synthetic_name():
     """A hand-built program with no capture_feed_origins extras still gets
     a usable, if less pretty, parameter name -- never a crash."""

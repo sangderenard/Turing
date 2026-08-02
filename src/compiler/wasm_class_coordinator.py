@@ -48,6 +48,14 @@ class ClassFieldSlot:
 
 
 @dataclass(frozen=True)
+class StorageRedirect:
+    """One public storage identity resolved onto another resident slot."""
+
+    identity: str
+    storage: str
+
+
+@dataclass(frozen=True)
 class ClassMethodCard:
     """One method and the field slots bound to its pointer parameters."""
 
@@ -68,6 +76,7 @@ class ClassInventory:
 
     fields: tuple[ClassFieldSlot, ...]
     methods: tuple[ClassMethodCard, ...]
+    storage_redirects: tuple[StorageRedirect, ...] = ()
 
     def to_mapping(self) -> dict:
         return {
@@ -75,6 +84,10 @@ class ClassInventory:
             "field_slots": [
                 {"index": field.index, "key": field.key}
                 for field in self.fields
+            ],
+            "storage_redirects": [
+                {"identity": item.identity, "storage": item.storage}
+                for item in self.storage_redirects
             ],
             "methods": [
                 {
@@ -126,7 +139,35 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
     )
     if len(keys) != len(set(keys)):
         raise ValueError("class inventory field keys must be unique")
-    field_index = {key: index for index, key in enumerate(keys)}
+    redirects = {
+        str(identity): str(storage)
+        for identity, storage in dict(
+            manifest.get("storage_redirects", {}) or {}
+        ).items()
+    }
+    unknown = (set(redirects) | set(redirects.values())) - set(keys)
+    if unknown:
+        raise ValueError(
+            "storage redirects name unknown identities: "
+            + ", ".join(sorted(unknown))
+        )
+
+    def canonical(key: str) -> str:
+        seen = []
+        while key in redirects:
+            if key in seen:
+                raise ValueError("storage redirects contain a cycle")
+            seen.append(key)
+            key = redirects[key]
+        return key
+
+    canonical_keys = tuple(dict.fromkeys(canonical(key) for key in keys))
+    canonical_index = {
+        key: index for index, key in enumerate(canonical_keys)
+    }
+    field_index = {
+        key: canonical_index[canonical(key)] for key in keys
+    }
 
     methods = []
     for index, module in enumerate(modules):
@@ -150,8 +191,15 @@ def build_class_inventory(manifest: Mapping[str, object]) -> ClassInventory:
             output_slots=outputs,
         ))
     return ClassInventory(
-        fields=tuple(ClassFieldSlot(index, key) for index, key in enumerate(keys)),
+        fields=tuple(
+            ClassFieldSlot(index, key) for index, key in enumerate(canonical_keys)
+        ),
         methods=tuple(methods),
+        storage_redirects=tuple(
+            StorageRedirect(identity, canonical(identity))
+            for identity in keys
+            if canonical(identity) != identity
+        ),
     )
 
 
@@ -315,6 +363,7 @@ __all__ = [
     "ClassFieldSlot",
     "ClassInventory",
     "ClassMethodCard",
+    "StorageRedirect",
     "WasmClassCoordinator",
     "build_class_inventory",
     "build_coordinator_control",

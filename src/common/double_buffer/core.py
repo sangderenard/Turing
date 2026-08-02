@@ -254,7 +254,14 @@ class ThreadSafeBuffer:
         self.auto_advance = False  # If True, auto-advance agents on read/write
         self.late_join = late_join
         self.readstates = DoubleBuffer(roll_length=buffer_size, num_agents=len(agent_specs), reference=physics_keys)
-        self.host = Tribuffer(physics_keys, self.shape, dtype, '32', init='zeroes', manager=self.manager)
+        self.host = Tribuffer(
+            physics_keys,
+            [self.shape for _key in physics_keys],
+            dtype,
+            '32',
+            init='zeroes',
+            manager=self.manager,
+        )
         self.mailboxes = {spec.agent_id: [] for spec in agent_specs}
         self.agent_specs = {spec.agent_id: spec for spec in agent_specs}
         self.mailbox_locks = {spec.agent_id: threading.Lock() for spec in agent_specs}

@@ -50,6 +50,10 @@ class LoopBlock:
     parallel_iterations: bool = False
     # A C dispatch shell dissolves the loop into one-iteration shader calls.
     dispatch_shell: str = "glsl"
+    # Stable entry in ControlProgram.recursion_regions.  The CFG/SSA lowerer
+    # uses this to associate the loop header, Phi nodes, and latch backedge
+    # with the ProcessGraph SCC from which this loop was retained.
+    recursion_region_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,21 @@ ControlBlock = (
 
 
 @dataclass(frozen=True)
+class RecursionRegion:
+    """One cached strongly connected ProcessGraph region."""
+
+    region_id: int
+    kind: str
+    lower_as: str
+    members: tuple[int, ...]
+    control_ir: bool = True
+    control_members: tuple[int, ...] = ()
+    incoming: tuple[tuple[int, int, str], ...] = ()
+    outgoing: tuple[tuple[int, int, str], ...] = ()
+    feedback: tuple[tuple[int, int, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class ControlProgram:
     root: ControlBlock
     region_indices: tuple[int, ...] = ()
@@ -138,6 +157,7 @@ class ControlProgram:
     closure_iterable_bindings: tuple[
         tuple[int, int, str, tuple[int, ...]], ...
     ] = ()
+    recursion_regions: tuple[RecursionRegion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -395,6 +415,7 @@ def compose_region_code(
                 block.carried_aliases,
                 block.parallel_iterations,
                 block.dispatch_shell,
+                block.recursion_region_id,
             )
         if isinstance(block, StateMachineTick):
             return StateMachineTick(
@@ -436,6 +457,7 @@ def compose_region_code(
         static_iterable_bindings=program.static_iterable_bindings,
         collection_bindings=program.collection_bindings,
         closure_iterable_bindings=program.closure_iterable_bindings,
+        recursion_regions=program.recursion_regions,
     )
 
 
@@ -495,6 +517,7 @@ def project_control_regions(
                 ),
                 block.parallel_iterations,
                 block.dispatch_shell,
+                block.recursion_region_id,
             )
         if isinstance(block, StateMachineTick):
             cases = tuple(
@@ -529,10 +552,13 @@ def project_control_regions(
     root = project(program.root) or SequenceBlock(())
 
     active_inductions: set[str] = set()
+    active_recursion_regions: set[int] = set()
 
     def gather_inductions(block: ControlBlock) -> None:
         if isinstance(block, LoopBlock):
             active_inductions.add(str(block.induction))
+            if block.recursion_region_id is not None:
+                active_recursion_regions.add(int(block.recursion_region_id))
             gather_inductions(block.body)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
@@ -584,6 +610,11 @@ def project_control_regions(
             for binding in program.closure_iterable_bindings
             if str(binding[2]) in active_inductions
         ),
+        tuple(
+            region
+            for region in program.recursion_regions
+            if region.region_id in active_recursion_regions
+        ),
     )
 
 
@@ -605,6 +636,7 @@ def overlay_scheduled_control(
     static_iterable_bindings = []
     collection_bindings = []
     closure_iterable_bindings = []
+    recursion_regions = []
     controls = tuple(controls)
     controlled_sets = tuple(
         frozenset(control.region_indices) for control in controls
@@ -652,6 +684,7 @@ def overlay_scheduled_control(
                     block.carried_aliases,
                     block.parallel_iterations,
                     block.dispatch_shell,
+                    block.recursion_region_id,
                 ),
                 consumed,
             )
@@ -756,6 +789,7 @@ def overlay_scheduled_control(
         closure_iterable_bindings.extend(
             control.closure_iterable_bindings
         )
+        recursion_regions.extend(control.recursion_regions)
         if index not in maximal:
             continue
         overlap = set(controlled) & covered
@@ -789,6 +823,7 @@ def overlay_scheduled_control(
         closure_iterable_bindings=tuple(
             dict.fromkeys(closure_iterable_bindings)
         ),
+        recursion_regions=tuple(dict.fromkeys(recursion_regions)),
     )
 
 
@@ -939,6 +974,7 @@ __all__ = [
     "CFFICallable",
     "LoopBlock",
     "ParallelDeployment",
+    "RecursionRegion",
     "RegionCode",
     "SequenceBlock",
     "StateMachineTick",

@@ -4,7 +4,7 @@ from src.common.tensors.autoautograd.integration import bridge_v2
 class DummyNode:
     def __init__(self):
         self.p = 0
-        self.param = (0, 0, 0)
+        self.ctrl = (0, 0, 0)
         self.version = 0
 
 

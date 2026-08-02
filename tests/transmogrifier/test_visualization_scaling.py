@@ -1,15 +1,16 @@
-import os
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
-import pygame
 import pytest
 
-from src.cells.cell_consts import Cell
-from src.cells.simulator import Simulator
-from src.cells.simulator_methods.visualization import _LCVisual
 
+def test_scale_updates_with_cell_resize(monkeypatch):
+    # The dummy driver belongs only to this headless visualization test.  A
+    # module-level assignment leaked through pytest collection and disabled
+    # every later OpenGL/GLSL test in the same process.
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    import pygame
+    from src.cells.cell_consts import Cell
+    from src.cells.simulator import Simulator
+    from src.cells.simulator_methods.visualization import _LCVisual
 
-def test_scale_updates_with_cell_resize():
     cells = [
         Cell(stride=10, left=0, right=100, label="A"),
         Cell(stride=10, left=100, right=200, label="B"),

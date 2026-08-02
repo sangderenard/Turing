@@ -44,6 +44,39 @@ def _compile_two_function_specs(chunk_size=2):
     )
 
 
+def test_aot_keeps_annotations_in_maps_and_out_of_runtime_dispatch():
+    source = '''
+ModuleValue: float = 3.0
+
+class Scale:
+    factor: float = 2.0
+
+def kernel(value):
+    result: float = value * 2.0
+    return result
+'''
+    aot = compile_ast_aot(
+        source,
+        "kernel",
+        {"value": np.array([4.0])},
+        precompile_only=True,
+    )
+
+    schema = aot.map_ir["schema"]
+    assert schema["module"]["annotations"][0]["name"] == "ModuleValue"
+    assert schema["classes"][0]["members"][0]["name"] == "factor"
+    function = next(
+        item for item in schema["functions"] if item["identity"] == "kernel"
+    )
+    assert function["locals"][0]["name"] == "result"
+    assert aot.function_outputs == ("result",)
+    assert aot.function_parameters == ("value",)
+    assert aot.identity_table["result"]
+    assert aot.identity_table["result"][-1] == max(
+        aot.identity_table["result"]
+    )
+
+
 def test_schedule_table_is_built_fresh_from_real_compiled_ir():
     """Not a fixture: pulled from compile_ast_aot's own compiled_shell_program,
     cut into chunks, run through the real ProcessGraph/ILPScheduler, same as

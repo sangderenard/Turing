@@ -630,9 +630,14 @@ class BuildLaplace3D:
                 self.local_state_network.update_metric_function(metric_tensor_func)
                 local_state_network = self.local_state_network
             else:
-                logger.debug("Initializing new LocalStateNetwork.")
-                local_state_network = LocalStateNetwork(metric_tensor_func, (N_u, N_v, N_w), DEFAULT_CONFIGURATION)
-            self.local_state_network = local_state_network
+                # The metric function is already the complete deterministic
+                # geometry contract.  A learned LocalStateNetwork is an
+                # optional caller-supplied approximation, not an implicit
+                # replacement for that contract.
+                logger.debug("Using metric tensor function directly.")
+                local_state_network = None
+            if local_state_network is not None:
+                self.local_state_network = local_state_network
             # Move to CPU and convert to numpy for processing
             #logger.debug("Moving metric tensors to CPU and converting to numpy.")
             #g_ij = g_ij.clone().detach().cpu().numpy()  # Shape: (N_u, N_v, N_w, 3, 3)
@@ -649,22 +654,32 @@ class BuildLaplace3D:
         
 
         # 2. Obtain State Outputs
-        state_output = local_state_network(
-            grid_u, grid_v, grid_w,
-            partials=(dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw),
-            additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL,
-                               "lambda_reg": lambda_reg}
-        )
+        state_output = None
+        if local_state_network is None:
+            g_ij, g_inv, det_g = metric_tensor_func(
+                grid_u, grid_v, grid_w,
+                dXdu, dYdu, dZdu,
+                dXdv, dYdv, dZdv,
+                dXdw, dYdw, dZdw,
+            )
+            tension = AbstractTensor.ones_like(det_g)
+            density = AbstractTensor.ones_like(det_g)
+        else:
+            state_output = local_state_network(
+                grid_u, grid_v, grid_w,
+                partials=(dXdu, dYdu, dZdu, dXdv, dYdv, dZdv, dXdw, dYdw, dZdw),
+                additional_params={"default_stencil":INT_LAPLACEBELTRAMI_STENCIL,
+                                   "lambda_reg": lambda_reg}
+            )
 
-        if state_output.dim() == 7:
-            state_output = state_output.squeeze(0)
-        #print(state_output)
-        # 4. Extract Components from Selected Tensor
-        g_ij = state_output[..., 0, :, :]      # Metric tensor
-        g_inv = state_output[..., 1, :, :]     # Inverse metric tensor
-        det_g = state_output[..., 2, 0, 0]     # Determinant of the metric tensor
-        tension = state_output[..., 2, 1, 1]
-        density = state_output[..., 2, 2, 2]
+            if state_output.dim() == 7:
+                state_output = state_output.squeeze(0)
+            # 4. Extract Components from selected learned tensor.
+            g_ij = state_output[..., 0, :, :]
+            g_inv = state_output[..., 1, :, :]
+            det_g = state_output[..., 2, 0, 0]
+            tension = state_output[..., 2, 1, 1]
+            density = state_output[..., 2, 2, 2]
         _label_tensor(g_ij, "laplace_nd.metric.g")
         _label_tensor(g_inv, "laplace_nd.metric.g_inv")
         _label_tensor(det_g, "laplace_nd.metric.det_g")

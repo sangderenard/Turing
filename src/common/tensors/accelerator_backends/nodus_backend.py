@@ -125,6 +125,13 @@ class NodusTensorOperations(NumPyTensorOperations):
         # operations nodus genuinely does not implement reach super(), and
         # each of those is named below rather than reached by an except.
         if canonical == "matmul":
+            # The connected arena ABI exposes matrix-matrix multiplication,
+            # including the rank-1 views normalized below, but not NumPy's
+            # batched matmul contract.  This is an explicit unsupported shape
+            # class, so it belongs to the inherited implementation just like
+            # other operations absent from the arena vocabulary.
+            if np.asarray(left).ndim > 2 or np.asarray(right).ndim > 2:
+                return super()._apply_operator__(op, left, right)
             return self._matmul_via_nodus(_arena(), left, right)
 
         if canonical not in _na.CANONICAL_OPS:
@@ -258,18 +265,32 @@ class NodusTensorOperations(NumPyTensorOperations):
                 f"nodus matmul is f32/f64 only; operands promote to "
                 f"{result_dtype}"
             )
-        if left_array.ndim != 2 or right_array.ndim != 2:
+        if left_array.ndim not in (1, 2) or right_array.ndim not in (1, 2):
             raise NodusUnsupported(
-                "nodus matmul takes two rank-2 tensors; got shapes "
+                "nodus matmul supports rank-1/rank-2 NumPy matmul; got shapes "
                 f"{left_array.shape} and {right_array.shape}"
             )
-        left = self._push(arena, left_array.astype(result_dtype, copy=False))
-        right = self._push(arena, right_array.astype(result_dtype, copy=False))
+        # The core ABI is matrix-matrix only. Rank-1 operands are ABI views of
+        # the same data, not new operators: promote them to a row/column and
+        # remove the corresponding singleton result axis afterward.
+        left_was_vector = left_array.ndim == 1
+        right_was_vector = right_array.ndim == 1
+        left_matrix = left_array.reshape(1, -1) if left_was_vector else left_array
+        right_matrix = right_array.reshape(-1, 1) if right_was_vector else right_array
+        left = self._push(arena, left_matrix.astype(result_dtype, copy=False))
+        right = self._push(arena, right_matrix.astype(result_dtype, copy=False))
         try:
             out = arena.matmul(left, right)
             try:
-                shape = (left_array.shape[0], right_array.shape[1])
-                return self._pull(arena, out, result_dtype, shape)
+                matrix_shape = (left_matrix.shape[0], right_matrix.shape[1])
+                result = self._pull(arena, out, result_dtype, matrix_shape)
+                if left_was_vector and right_was_vector:
+                    return result.reshape(())
+                if left_was_vector:
+                    return result.reshape(matrix_shape[1])
+                if right_was_vector:
+                    return result.reshape(matrix_shape[0])
+                return result
             finally:
                 arena.destroy(out)
         finally:

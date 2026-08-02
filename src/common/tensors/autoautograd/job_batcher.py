@@ -154,6 +154,13 @@ class JobBatcher:
                 batch_kwargs["sub_fn_kwargs"] = sub_fn_kwargs
 
             out = vec_fn(*batch_args, **batch_kwargs)
+            out_shape = getattr(out, "shape", ())
+            if out_shape and int(out_shape[0]) == len(jobs):
+                # AbstractTensor supports indexed batch extraction but does
+                # not register as ``collections.abc.Iterable``.  Preserve the
+                # one-result-per-job contract explicitly instead of wrapping
+                # the complete batched tensor as one result.
+                return [out[index] for index in range(len(jobs))]
             return list(out) if isinstance(out, Iterable) else [out]
 
         # Fallback: run sequentially

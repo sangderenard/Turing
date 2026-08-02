@@ -58,6 +58,7 @@ class BackwardRegistry:
             "index_adjoint": br.index_adjoint,
             "eps": br.eps,
             "T": br.T,
+            "matmul_vjp": br.matmul_vjp,
 
             # optional helper used by 'trace'
             "I_like": getattr(br, "I_like", None),

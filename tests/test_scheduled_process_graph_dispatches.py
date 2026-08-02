@@ -42,6 +42,47 @@ def _add(graph, node_id, op, parents=()):
         graph.G.nodes[parent]["children"].append((node_id, role))
 
 
+def test_recursion_control_projection_still_reduces_numeric_interior():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "input")
+    _add(graph, 2, "add", (1,))
+    _add(graph, 3, "mul", (2,))
+    _add(graph, 4, "LoopResult", (3,))
+    graph.G.add_edge(4, 2, role="carried")
+    graph.G.nodes[2]["parents"].append((4, "carried"))
+    graph.G.nodes[4]["children"].append((2, "carried"))
+    graph.levels = {1: 0, 2: 1, 3: 1, 4: 1}
+
+    plan = reduce_scheduled_shader_regions(
+        graph,
+        (2, 3, 4),
+        control_node_ids=(4,),
+        max_nodes_per_region=8,
+    )
+
+    assert any(set(dispatch.node_ids) == {2, 3} for dispatch in plan.dispatches)
+    assert all(4 not in dispatch.node_ids for dispatch in plan.dispatches)
+
+
+def test_static_python_call_name_collision_is_not_numerical_dispatch():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "sub")
+    graph.G.nodes[1]["attributes"]["static_python_reference"] = "re.sub"
+
+    assert _is_dispatch_metadata_node(graph, 1)
+
+
+def test_canonical_static_tensor_operator_remains_numerical_dispatch():
+    graph = ProcessGraph(materialize_memory=False)
+    _add(graph, 1, "stack")
+    graph.G.nodes[1]["attributes"].update({
+        "static_python_reference": "AbstractTensor.stack",
+        "operator_reference_node": 99,
+    })
+
+    assert not _is_dispatch_metadata_node(graph, 1)
+
+
 def test_schedule_batches_isolated_dependency_columns_as_forward_records():
     graph = ProcessGraph(materialize_memory=False)
     _add(graph, 1, "input")

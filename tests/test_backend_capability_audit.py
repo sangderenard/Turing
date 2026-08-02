@@ -22,7 +22,7 @@ def test_shared_catalog_audit_reports_each_target_without_hiding_gaps():
         "nodus_kernel": True,
         "complete": True,
     }
-    assert not by_name["sin"]["c_native"]
-    assert not by_name["sin"]["glsl"]
+    assert by_name["sin"]["c_native"]
+    assert by_name["sin"]["glsl"]
     assert by_name["sin"]["nodus_kernel"]
     assert not by_name["matmul"]["nodus_kernel"]

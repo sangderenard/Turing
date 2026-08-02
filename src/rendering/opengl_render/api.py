@@ -15,8 +15,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping, Optional, Tuple, Type, Union, TYPE_CHECKING
 from collections import deque
+from dataclasses import dataclass
 import colorsys
 import math
+import time
 import numpy as np
 from src.common.double_buffer import DoubleBuffer
 
@@ -56,6 +58,43 @@ if TYPE_CHECKING:  # for type hints only
     from .renderer import GLRenderer as _GLRenderer_T
 
 RendererFactory = Union[Type["_GLRenderer_T"], Callable[[], "_GLRenderer_T"]]
+
+
+@dataclass
+class SecondOrderAutoFitState:
+    """Two cascaded camera-bound filters (a critically damped two-pole fit)."""
+
+    center_1: np.ndarray
+    center_2: np.ndarray
+    radius_1: float
+    radius_2: float
+    updated_at: float
+
+
+def advance_second_order_autofit(
+    state: SecondOrderAutoFitState | None,
+    target_center: np.ndarray,
+    target_radius: float,
+    *,
+    now: float,
+    time_constant: float = 3.5,
+) -> SecondOrderAutoFitState:
+    """Advance a double-smoothed center/radius without overshoot."""
+
+    center = np.asarray(target_center, dtype=np.float32)
+    radius = max(1.0, float(target_radius))
+    if state is None:
+        return SecondOrderAutoFitState(
+            center.copy(), center.copy(), radius, radius, float(now)
+        )
+    dt = min(0.1, max(0.0, float(now) - state.updated_at))
+    alpha = 1.0 - math.exp(-dt / max(1e-4, float(time_constant)))
+    state.center_1 += alpha * (center - state.center_1)
+    state.center_2 += alpha * (state.center_1 - state.center_2)
+    state.radius_1 += alpha * (radius - state.radius_1)
+    state.radius_2 += alpha * (state.radius_1 - state.radius_2)
+    state.updated_at = float(now)
+    return state
 
 # ---------------------------------------------------------------------------
 # Color utilities
@@ -272,6 +311,8 @@ def draw_layers(
     renderer: "_GLRenderer_T",
     layers: Mapping[str, Union[MeshLayer, LineLayer, PointLayer]],
     viewport: Optional[Tuple[int, int]] = None,
+    *,
+    view_direction: Optional[Tuple[float, float, float]] = None,
 ) -> None:
     """Upload ``layers`` to ``renderer`` and draw a frame.
 
@@ -349,13 +390,32 @@ def draw_layers(
             pos_list.append(lines.positions)
         if isinstance(active_pts, PointLayer):
             pos_list.append(active_pts.positions)
+        pos_list = [positions for positions in pos_list if positions.size]
         if pos_list:
             pts_all = np.concatenate(pos_list, axis=0)
-            center = pts_all.mean(axis=0)
-            radius = float(np.linalg.norm(pts_all - center, axis=1).max())
-            if radius <= 0:
-                radius = 1.0
-            eye = center + np.array([0.0, 0.0, radius * 3.0], dtype=np.float32)
+            target_center = pts_all.mean(axis=0)
+            target_radius = float(
+                np.linalg.norm(pts_all - target_center, axis=1).max()
+            )
+            auto_fit = advance_second_order_autofit(
+                getattr(renderer, "_second_order_autofit", None),
+                target_center,
+                target_radius,
+                now=time.perf_counter(),
+            )
+            renderer._second_order_autofit = auto_fit
+            center = auto_fit.center_2
+            radius = auto_fit.radius_2
+            direction = np.asarray(
+                view_direction or (0.0, 0.0, 1.0),
+                dtype=np.float32,
+            )
+            direction_length = float(np.linalg.norm(direction))
+            if direction_length <= 1e-6:
+                direction = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                direction /= direction_length
+            eye = center + direction * radius * 3.0
             up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
             aspect = float(viewport[0]) / float(viewport[1])
             mvp = _perspective(45.0, aspect, 0.1, radius * 10.0) @ _look_at(eye, center, up)

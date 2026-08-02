@@ -25,3 +25,17 @@ def test_large_tiled_matmul_preserves_forward_and_backward():
         np.asarray(grad_b.tolist()),
         a_host.T @ np.ones((4097, 2)),
     )
+
+
+def test_matrix_vector_matmul_preserves_forward_and_backward():
+    a_host = np.arange(6.0).reshape(2, 3)
+    b_host = np.array([2.0, 3.0, 4.0])
+    a = AbstractTensor.tensor(a_host).requires_grad_()
+    b = AbstractTensor.tensor(b_host).requires_grad_()
+
+    product = a @ b
+    grad_a, grad_b = AbstractTensor.autograd.grad(product.sum(), [a, b])
+
+    assert np.allclose(np.asarray(product.tolist()), a_host @ b_host)
+    assert np.allclose(np.asarray(grad_a.tolist()), np.outer(np.ones(2), b_host))
+    assert np.allclose(np.asarray(grad_b.tolist()), a_host.T @ np.ones(2))

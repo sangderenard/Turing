@@ -392,6 +392,7 @@ def reduce_scheduled_shader_regions(
     partition_keys: Mapping[int, Any] | None = None,
     extra_dependency_edges: Iterable[tuple[int, int]] = (),
     fusible_node_ids: Iterable[int] | None = None,
+    control_node_ids: Iterable[int] = (),
     schedule: str = "asap",
 ) -> ScheduledProcessGraphDispatchPlan:
     """Reduce executable nodes to maximal shader regions by fixed point.
@@ -415,25 +416,43 @@ def reduce_scheduled_shader_regions(
     boundary rather than a planning preference, so it stays alone in its own
     region; the default admits every executable node.
 
+    ``control_node_ids`` are cached recursion/loop-IR nodes.  Fusion removes
+    only edges incident to those nodes from its scheduling projection.  The
+    semantic graph remains unchanged, and numerical nodes inside the same SCC
+    remain executable and reducible.
+
     """
 
     cap = int(max_nodes_per_region)
     if cap < 1:
         raise ValueError("max_nodes_per_region must be positive")
-    if not nx.is_directed_acyclic_graph(graph.G):
+    control_nodes = {
+        int(node_id)
+        for node_id in control_node_ids
+        if int(node_id) in graph.G
+    }
+    planning_graph = graph.G.copy()
+    planning_graph.remove_edges_from(tuple(
+        (left, right)
+        for left, right in planning_graph.edges
+        if left in control_nodes or right in control_nodes
+    ))
+    if not nx.is_directed_acyclic_graph(planning_graph):
         raise ValueError("shader-region reduction requires an acyclic graph")
 
     levels = _planner_levels(graph, fallback_schedule=schedule)
     topological = tuple(
         nx.lexicographical_topological_sort(
-            graph.G, key=lambda node_id: int(node_id)
+            planning_graph, key=lambda node_id: int(node_id)
         )
     )
     order_index = {
         node_id: index for index, node_id in enumerate(topological)
     }
     executable = {
-        node_id for node_id in executable_node_ids if node_id in graph.G
+        node_id
+        for node_id in executable_node_ids
+        if node_id in graph.G and node_id not in control_nodes
     }
     keys = dict(partition_keys or {})
     fusible = (
@@ -441,16 +460,25 @@ def reduce_scheduled_shader_regions(
         if fusible_node_ids is None
         else {node_id for node_id in fusible_node_ids if node_id in executable}
     )
-    graph_edges = set(graph.G.edges)
+    graph_edges = set(planning_graph.edges)
     semantic_edges = graph_edges | {
         (parent, node_id)
         for node_id, data in graph.G.nodes(data=True)
         for parent, _role in data.get("parents", ())
-        if parent in graph.G
+        if (
+            parent in graph.G
+            and parent not in control_nodes
+            and node_id not in control_nodes
+        )
     } | {
         (left, right)
         for left, right in extra_dependency_edges
-        if left in graph.G and right in graph.G
+        if (
+            left in graph.G
+            and right in graph.G
+            and left not in control_nodes
+            and right not in control_nodes
+        )
     }
     semantic_successors: dict[int, set[int]] = {
         node_id: set() for node_id in graph.G

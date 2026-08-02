@@ -42,7 +42,8 @@ from typing import Any, Mapping
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
-BUILDER_VERSION = "site-bundle-v7"
+BUILDER_VERSION = "site-bundle-v11"
+DEFAULT_WASM_CARD_OPERATIONS = 2000
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
 
@@ -52,6 +53,7 @@ _SOURCE_EXTENSIONS = {
     "fortran": "f90",
     "spirv": "spvasm",
     "glsl": "comp.glsl",
+    "webgl": "frag.glsl",
     "wat": "wat",
     "numpy": "py",
     "torch": "py",
@@ -246,10 +248,6 @@ def build_source_inspection_page(
         map_ir=map_ir,
         resource_route=resource_route,
         static_gallery=static_gallery,
-        browser_python_runtime={
-            "script_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js",
-            "index_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/",
-        } if python_source_url else None,
     )
     output = Path(destination).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -778,7 +776,10 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
             relative = Path("source") / language / output_name
             path = directory / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body, encoding="utf-8")
+            # Backend source hashes are verification identities.  Preserve
+            # the emitter's LF bytes even on Windows so the published file is
+            # byte-for-byte the artifact that was compiled and checked.
+            path.write_text(body, encoding="utf-8", newline="\n")
             item.update({
                 "url": relative.as_posix(),
                 "filename": output_name,
@@ -786,6 +787,28 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
             })
         published.append(item)
     return published
+
+
+def _shader_execution_descriptor(
+    published_sources: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Select the browser-native shader which graduates a page to execution."""
+
+    for source in published_sources:
+        if (
+            source.get("language") == "webgl"
+            and source.get("available")
+            and source.get("url")
+        ):
+            return {
+                "url": str(source["url"]),
+                "language": "webgl2-glsl-es",
+                "stage": "fragment",
+            }
+    # Desktop GLSL is deliberately not a fallback. Its SSBO binding/channel
+    # arena needs the dedicated memory handler documented in the GLSL
+    # ingestion layer and cannot be executed by a WebGL canvas.
+    return None
 
 
 def _artifact_inventory(directory: Path) -> list[dict[str, Any]]:
@@ -850,6 +873,15 @@ def build_program_bundle(
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
         from .shell_telemetry import TelemetryChannel, summarize_process_graph
         from .sympy_math_renderer import render_reduced_program_mathematics
+        from .wasm_class_coordinator import (
+            build_class_inventory,
+            emit_wasm_class_coordinator,
+        )
+        from .wasm_class_modules import (
+            build_embedded_class_graph,
+            emit_class_modules,
+            partition_reduced_program,
+        )
         from .wasm_html_shell import emit_html_shell
 
         parameter_names = _entrypoint_parameters(source, contract.entrypoint)
@@ -870,6 +902,7 @@ def build_program_bundle(
                 remove_loops=contract.remove_loops,
                 unroll_limit=contract.unroll_limit,
                 precompile_only=True,
+                python_bindings=globals(),
             )
             program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
             module = emit_wasm_module(
@@ -882,6 +915,61 @@ def build_program_bundle(
         wasm_path = temporary / wasm_relative
         wasm_path.parent.mkdir(parents=True, exist_ok=True)
         wasm_path.write_bytes(module.binary)
+
+        card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
+        specs = partition_reduced_program(
+            program,
+            chunk_size=DEFAULT_WASM_CARD_OPERATIONS,
+            owner_name=contract.entrypoint,
+        )
+        card_modules = emit_class_modules(
+            specs, dtype="float64", link_calls=False, shared_memory=True
+        )
+        incomplete_cards = [
+            card_modules[spec.index]
+            for spec in specs
+            if not card_modules[spec.index].complete
+        ]
+        if incomplete_cards:
+            raise RuntimeError("\n".join(
+                card.shortfall_report() for card in incomplete_cards
+            ))
+        card_manifest = build_embedded_class_graph(
+            specs,
+            card_modules,
+            program,
+            entrypoint=contract.entrypoint,
+            embed_binaries=False,
+            module_dir=card_directory.as_posix(),
+        )
+        inventory = build_class_inventory(card_manifest)
+        coordinator = emit_wasm_class_coordinator(
+            inventory,
+            name=f"{contract.entrypoint}_coordinator_{DEFAULT_WASM_CARD_OPERATIONS}",
+        )
+        card_manifest.update({
+            "region_steps": DEFAULT_WASM_CARD_OPERATIONS,
+            "class_inventory": inventory.to_mapping(),
+            "coordinator": {
+                "name": coordinator.name,
+                "url": (card_directory / f"{coordinator.name}.wasm").as_posix(),
+                "entry": "run_range",
+                "memory_import": {"module": "env", "field": "memory"},
+                "method_count": len(inventory.methods),
+            },
+        })
+        card_output_directory = temporary / card_directory
+        card_output_directory.mkdir(parents=True, exist_ok=True)
+        for spec in specs:
+            (card_output_directory / f"{spec.module_name}.wasm").write_bytes(
+                card_modules[spec.index].binary
+            )
+        (card_output_directory / f"{coordinator.name}.wasm").write_bytes(
+            coordinator.binary
+        )
+        (card_output_directory / "class-inventory.json").write_text(
+            json.dumps(inventory.to_mapping(), indent=2), encoding="utf-8"
+        )
 
         sources = None
         if include_backends:
@@ -897,6 +985,67 @@ def build_program_bundle(
         published_sources = _write_sources(
             temporary, source, Path(source_filename).name, sources
         )
+
+        fortran_verification = None
+        if sources is not None:
+            fortran_source = next(
+                (
+                    item for item in sources.sources
+                    if item.language == "fortran" and item.available
+                ),
+                None,
+            )
+            fortran_artifact = (
+                None if fortran_source is None else fortran_source.artifact
+            )
+            if fortran_artifact is not None:
+                from ..common.tensors.fused_ir import ordered_feed_ids
+                from .fortran_fidelity import verify_fortran_module
+                from .ssa_fortran_backend import fortran_compiler
+
+                source_path = temporary / "source" / "fortran" / "fortran.f90"
+                api_path = source_path.with_suffix(".api.yaml")
+                fortran_artifact.api.write(api_path)
+                if fortran_compiler() is not None:
+                    feed_origins = dict(
+                        (getattr(program, "extras", None) or {}).get(
+                            "capture_feed_origins", {}
+                        )
+                    )
+                    feed_values = {}
+                    for feed_index, feed_id in enumerate(ordered_feed_ids(program)):
+                        origin = feed_origins.get(
+                            feed_id, feed_origins.get(str(feed_id), {})
+                        )
+                        parameter_name = origin.get("binding_name")
+                        if parameter_name not in feeds:
+                            parameter_name = parameter_names[feed_index]
+                        feed_values[feed_id] = feeds[parameter_name]
+                    proof = verify_fortran_module(
+                        fortran_artifact,
+                        program,
+                        feed_values,
+                        temporary / "native" / "fortran",
+                        entrypoint=contract.entrypoint,
+                    )
+                    proof_relative = Path("verification") / "fortran-fidelity.json"
+                    proof_path = temporary / proof_relative
+                    proof_path.parent.mkdir(parents=True, exist_ok=True)
+                    proof_path.write_text(
+                        json.dumps(proof, indent=2, allow_nan=True),
+                        encoding="utf-8",
+                    )
+                    fortran_verification = {
+                        "passed": True,
+                        "case_count": proof["case_count"],
+                        "source_sha256": proof["source_sha256"],
+                        "url": proof_relative.as_posix(),
+                    }
+                else:
+                    fortran_verification = {
+                        "passed": None,
+                        "reason": "no Fortran compiler was available at build time",
+                    }
 
         mathematics = None
         math_error = ""
@@ -939,6 +1088,7 @@ def build_program_bundle(
             "operation_count": len(required_steps(program)),
         }
         route = f"/site/programs/{contract.slug}/versions/{version}/"
+        shader_execution = _shader_execution_descriptor(published_sources)
         shell = emit_html_shell(
             module.api,
             name="index",
@@ -958,12 +1108,13 @@ def build_program_bundle(
             mathematics=mathematics,
             map_ir=aot.map_ir,
             class_graph={
-                "modules": [],
-                "variants": {},
+                **card_manifest,
+                "variants": {str(DEFAULT_WASM_CARD_OPERATIONS): card_manifest},
                 "contiguous": contiguous,
                 "runtime_version": BUILDER_VERSION,
             },
             resource_route=route,
+            shader_execution=shader_execution,
         )
         page_path = shell.write(temporary)
 
@@ -987,7 +1138,12 @@ def build_program_bundle(
                 "builder": BUILDER_VERSION,
             },
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "page": {"path": "index.html", "url": route + "index.html"},
+            "page": {
+                "path": "index.html",
+                "url": route + "index.html",
+                "mode": "shader-execution" if shader_execution else "inspection",
+                "shader": shader_execution,
+            },
             "source": {
                 "path": f"source/python_source/{Path(source_filename).name}",
                 "filename": Path(source_filename).name,
@@ -997,6 +1153,7 @@ def build_program_bundle(
                 "remove_loops": contract.remove_loops,
                 "unroll_limit": contract.unroll_limit,
                 "mathematics_error": math_error,
+                "fortran_verification": fortran_verification,
             },
             "artifacts": _artifact_inventory(temporary),
         }

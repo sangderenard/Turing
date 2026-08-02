@@ -93,6 +93,32 @@ def test_shell_reference_tables_use_dense_monotonic_local_ids():
     )
 
 
+def test_shell_reference_tables_cache_recursion_regions():
+    _graph, record_graph = _reduced_function_graph()
+    record_graph.G.graph["recursion_table"] = {
+        3: {
+            "lower_as": "while",
+            "members": (4, 5),
+            "incoming": ((1, 4, "value"),),
+            "outgoing": ((5, 8, "result"),),
+            "feedback": ((5, 4, "carried"),),
+        }
+    }
+
+    tables = build_shell_reference_tables(record_graph)
+
+    entry, = tables.recursion
+    assert entry.index == 0
+    assert entry.region_id == 3
+    assert entry.lower_as == "while"
+    assert entry.feedback == ((5, 4, "carried"),)
+    assert any(
+        correlation.table == "recursion"
+        and correlation.source_reference == 3
+        for correlation in tables.correlations
+    )
+
+
 def test_glsl_shell_packages_independent_reference_lists():
     module = ast.parse(
         """
@@ -111,11 +137,13 @@ def affine(value):
         assert first.function_references == second.function_references
         assert first.constant_references == second.constant_references
         assert first.memory_references == second.memory_references
+        assert first.recursion_references == second.recursion_references
         assert first.reference_correlations == second.reference_correlations
 
         assert first.function_references is not second.function_references
         assert first.constant_references is not second.constant_references
         assert first.memory_references is not second.memory_references
+        assert first.recursion_references is not second.recursion_references
         assert first.reference_correlations is not second.reference_correlations
     finally:
         first.release()

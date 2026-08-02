@@ -114,7 +114,36 @@ def lower_fused_program_to_ssa(
     *,
     function_name: str = "numerical_precompile",
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
-    """Translate only operations already named by the existing SSA registry."""
+    """Translate only operations already named by the existing SSA registry.
+
+    .. warning::
+
+       **INTERNAL NUMERIC LOWERER -- DO NOT CALL THIS AS A COMPILER ENTRYPOINT.**
+
+       No person-facing workflow and no orchestration, publishing, inspection,
+       or application function may call this lowerer directly.  It accepts an
+       already-precompiled :class:`FusedProgram`, not Python or a general AST.
+       Only the precompiler and tensor-backend boundary may access it.  All
+       other callers must enter through the appropriate precompiler or tensor
+       backend and let that layer supply the numeric program.
+
+       Tests may call this function only to verify the lowerer itself; a test
+       call is not precedent for production use.
+    """
+
+    from .evolution_metagraph import (
+        EvolutionComponentRef,
+        active_evolution_metagraph,
+        record_fused_program_evolution,
+    )
+
+    evolution = active_evolution_metagraph()
+    precompile_evolution = record_fused_program_evolution(program)
+    ssa_evolution = (
+        None
+        if evolution is None
+        else evolution.open_graph("ssa", function_name)
+    )
 
     metadata = program.meta or {}
     values = {
@@ -132,6 +161,26 @@ def lower_fused_program_to_ssa(
     available = set(program.feeds)
     instructions: list[Instr] = []
     shortfalls: list[SSALoweringShortfall] = []
+
+    if evolution is not None and ssa_evolution is not None:
+        for value_id in sorted(program.feeds):
+            sources = (
+                (EvolutionComponentRef(precompile_evolution.id, str(value_id)),)
+                if precompile_evolution is not None else ()
+            )
+            target = evolution.component(
+                ssa_evolution,
+                value_id,
+                label=values[value_id].name(),
+                kind="argument",
+                consumes=sources,
+            )
+            if sources:
+                evolution.handoff(
+                    target,
+                    sources,
+                    transformation="precompile-to-ssa",
+                )
 
     def element_count(value_id: int) -> int:
         meta = metadata.get(value_id)
@@ -240,6 +289,37 @@ def lower_fused_program_to_ssa(
                 attributes=attributes,
             )
         )
+        if evolution is not None and ssa_evolution is not None:
+            sources = (
+                (EvolutionComponentRef(precompile_evolution.id, str(step.result_id)),)
+                if precompile_evolution is not None else ()
+            )
+            target = evolution.component(
+                ssa_evolution,
+                step.result_id,
+                label=str(handler.value),
+                kind="instruction",
+                attributes={"tensor_operation": step.op_name},
+                consumes=sources,
+            )
+            if sources:
+                evolution.handoff(
+                    target,
+                    sources,
+                    transformation="precompile-to-ssa",
+                )
+            for position, value_id in enumerate(step.input_ids):
+                input_ref = EvolutionComponentRef(
+                    ssa_evolution.id,
+                    str(value_id),
+                )
+                if evolution.has_component(input_ref):
+                    evolution.relationship(
+                        ssa_evolution,
+                        input_ref,
+                        target,
+                        role=f"arg{position}",
+                    )
         available.add(step.result_id)
 
     output_values = [
@@ -262,20 +342,21 @@ def lower_fused_program_to_ssa(
             )
         )
     instructions.append(Instr(Handler.Ret.value, output_values, None))
-    return (
-        Function(
-            function_name,
-            arguments,
-            {
-                "entry": BasicBlock(
-                    "entry",
-                    instructions,
-                    [],
-                )
-            },
-        ),
-        tuple(shortfalls),
+    function = Function(
+        function_name,
+        arguments,
+        {
+            "entry": BasicBlock(
+                "entry",
+                instructions,
+                [],
+            )
+        },
     )
+    if evolution is not None and ssa_evolution is not None:
+        evolution.bind_artifact(function, ssa_evolution)
+        evolution.close_graph(ssa_evolution)
+    return function, tuple(shortfalls)
 
 
 class _ControlSSABuilder:
@@ -290,9 +371,37 @@ class _ControlSSABuilder:
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
         region_value_meta: Mapping[int, Meta] | None = None,
+        output_value_ids: tuple[int, ...] = (),
+        named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
+        value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
+        parameter_names: tuple[str, ...] = (),
     ):
+        from .evolution_metagraph import (
+            active_evolution_metagraph,
+            record_control_program_evolution,
+        )
+
         self.program = program
+        self.evolution = active_evolution_metagraph()
+        self.control_evolution = record_control_program_evolution(program)
+        self.ssa_evolution = (
+            None
+            if self.evolution is None
+            else self.evolution.open_graph("ssa", function_name)
+        )
+        self._evolution_source = None
+        self._evolution_instruction = 0
         self.region_value_meta = dict(region_value_meta or {})
+        self.output_value_ids = tuple(map(int, output_value_ids))
+        self.named_output_histories = {
+            str(name): tuple(map(int, history))
+            for name, history in (named_output_histories or {}).items()
+        }
+        self.value_name_histories = {
+            str(name): tuple(map(int, history))
+            for name, history in (value_name_histories or {}).items()
+        }
+        self.parameter_names = tuple(map(str, parameter_names))
         self.function_name = function_name
         self.next_value_id = int(first_value_id)
         self.blocks: dict[str, BasicBlock] = {}
@@ -308,6 +417,22 @@ class _ControlSSABuilder:
         # the surrounding loop without degrading that name to a symbolic
         # host-side load.
         self.local_control_values: dict[str, SSAValue] = {}
+        self.recursion_regions = {
+            int(region.region_id): {
+                "kind": str(region.kind),
+                "lower_as": str(region.lower_as),
+                "control_ir": bool(region.control_ir),
+                "members": tuple(map(int, region.members)),
+                "control_members": tuple(map(
+                    int, region.control_members
+                )),
+                "incoming": tuple(region.incoming),
+                "outgoing": tuple(region.outgoing),
+                "feedback": tuple(region.feedback),
+            }
+            for region in program.recursion_regions
+        }
+        self.ssa_recursion_table: dict[int, dict[str, Any]] = {}
         for uniform in program.uniforms:
             value = SSAValue(
                 int(uniform.value_id),
@@ -494,6 +619,45 @@ class _ControlSSABuilder:
                 attributes=dict(attributes or {}),
             )
         )
+        if self.evolution is not None and self.ssa_evolution is not None:
+            from .evolution_metagraph import EvolutionComponentRef
+
+            local_id = (
+                str(result.id)
+                if result is not None
+                else f"{self.current.name}:{self._evolution_instruction}:{op.value}"
+            )
+            self._evolution_instruction += 1
+            sources = (
+                (self._evolution_source,)
+                if self._evolution_source is not None else ()
+            )
+            target = self.evolution.component(
+                self.ssa_evolution,
+                local_id,
+                label=str(op.value),
+                kind="control-instruction",
+                attributes={"block": self.current.name},
+                consumes=sources,
+            )
+            if sources:
+                self.evolution.handoff(
+                    target,
+                    sources,
+                    transformation="control-ir-to-ssa",
+                )
+            for position, argument in enumerate(args):
+                argument_ref = EvolutionComponentRef(
+                    self.ssa_evolution.id,
+                    str(argument.id),
+                )
+                if self.evolution.has_component(argument_ref):
+                    self.evolution.relationship(
+                        self.ssa_evolution,
+                        argument_ref,
+                        target,
+                        role=f"arg{position}",
+                    )
 
     def branch(self, target: BasicBlock) -> None:
         self.emit(
@@ -562,6 +726,15 @@ class _ControlSSABuilder:
         return value
 
     def lower(self, block: ControlBlock, *, path: str = "root") -> None:
+        previous = self._evolution_source
+        if self.evolution is not None:
+            self._evolution_source = self.evolution.component_for_artifact(block)
+        try:
+            self._lower(block, path=path)
+        finally:
+            self._evolution_source = previous
+
+    def _lower(self, block: ControlBlock, *, path: str = "root") -> None:
         if isinstance(block, SequenceBlock):
             for index, child in enumerate(block.blocks):
                 self.lower(child, path=f"{path}.sequence[{index}]")
@@ -660,6 +833,7 @@ class _ControlSSABuilder:
         raise TypeError(f"unknown control block {type(block).__name__}")
 
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
+        recursion_region_id = loop.recursion_region_id
         preheader = self.current
         start = self.expression_value(
             loop.start,
@@ -720,6 +894,7 @@ class _ControlSSABuilder:
             attributes={
                 "incoming_blocks": (preheader.name, latch.name),
                 "source_name": loop.induction,
+                "recursion_region_id": recursion_region_id,
             },
         )
         for (
@@ -738,6 +913,7 @@ class _ControlSSABuilder:
                     "binding": "loop_carried",
                     "initial_value_id": initial_id,
                     "updated_value_id": updated_id,
+                    "recursion_region_id": recursion_region_id,
                 },
             )
             self.external_values[initial_id] = current_value
@@ -887,6 +1063,25 @@ class _ControlSSABuilder:
             next_induction,
         )
         self.branch(header)
+        if recursion_region_id is not None:
+            source = self.recursion_regions[int(recursion_region_id)]
+            lowered_region = self.ssa_recursion_table.setdefault(
+                int(recursion_region_id),
+                {**source, "function": self.function_name, "loops": []},
+            )
+            lowered_region["loops"].append({
+                "function": self.function_name,
+                "preheader": preheader.name,
+                "header": header.name,
+                "body": body.name,
+                "latch": latch.name,
+                "exit": exit_block.name,
+                "phi_value_ids": (
+                    int(induction.id),
+                    *(int(current.id) for *_prefix, current in carried),
+                ),
+                "backedge": (latch.name, header.name),
+            })
         for target_id, previous in restored_values.items():
             if previous is None:
                 self.external_values.pop(target_id, None)
@@ -936,20 +1131,62 @@ class _ControlSSABuilder:
         self.current = merge
 
     def finish(self) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
+        returned = []
+        named_returns = []
+        returned_ids = set()
+        for name, history in self.named_output_histories.items():
+            value = next((
+                self.external_values[value_id]
+                for value_id in reversed(history)
+                if value_id in self.external_values
+            ), None)
+            if value is None:
+                continue
+            named_returns.append((name, int(value.id)))
+            if value.id not in returned_ids:
+                returned.append(value)
+                returned_ids.add(value.id)
+        for value_id in self.output_value_ids:
+            value = self.external_values.get(value_id)
+            if value is not None and value.id not in returned_ids:
+                returned.append(value)
+                returned_ids.add(value.id)
+        value_names = []
+        for name, history in self.value_name_histories.items():
+            value = next((
+                self.external_values[value_id]
+                for value_id in reversed(history)
+                if value_id in self.external_values
+            ), None)
+            if value is not None:
+                value_names.append((name, int(value.id)))
+        parameter_value_names = tuple(
+            (name, value_id)
+            for name, value_id in value_names
+            if name in self.parameter_names
+        )
         if not self.current.successors and (
             not self.current.instrs
             or self.current.instrs[-1].op
             not in {Handler.Br.value, Handler.CondBr.value, Handler.Ret.value}
         ):
-            self.emit(Handler.Ret, [])
-        return (
-            Function(
+            self.emit(Handler.Ret, returned)
+        function = Function(
                 self.function_name,
                 self.arguments,
                 self.blocks,
-            ),
-            tuple(self.shortfalls),
+                metadata={
+                    "recursion_table": dict(self.ssa_recursion_table),
+                    "named_outputs": tuple(named_returns),
+                    "value_names": tuple(value_names),
+                    "parameter_names": parameter_value_names,
+                    "control_ir": True,
+                },
         )
+        if self.evolution is not None and self.ssa_evolution is not None:
+            self.evolution.bind_artifact(function, self.ssa_evolution)
+            self.evolution.close_graph(self.ssa_evolution)
+        return function, tuple(self.shortfalls)
 
 
 def lower_control_program_to_ssa(
@@ -962,6 +1199,10 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
+    output_value_ids: tuple[int, ...] = (),
+    named_output_histories: Mapping[str, tuple[int, ...]] | None = None,
+    value_name_histories: Mapping[str, tuple[int, ...]] | None = None,
+    parameter_names: tuple[str, ...] = (),
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -970,6 +1211,10 @@ def lower_control_program_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_value_meta=region_value_meta,
+        output_value_ids=output_value_ids,
+        named_output_histories=named_output_histories,
+        value_name_histories=value_name_histories,
+        parameter_names=parameter_names,
     )
     builder.lower(program.root)
     return builder.finish()
@@ -1252,6 +1497,9 @@ def lower_precompile_and_control_to_ssa(
     numerical_name: str = "numerical_precompile",
     control_name: str = "planned_control",
     region_programs: dict[int, Any] | None = None,
+    identity_table: Mapping[str, tuple[int, ...]] | None = None,
+    function_outputs: tuple[str, ...] = (),
+    function_parameters: tuple[str, ...] = (),
 ) -> PrecompileSSALoweringResult:
     validation = validate_precompile_ssa_compatibility(artifact)
     program = getattr(artifact, "program", artifact)
@@ -1321,9 +1569,26 @@ def lower_precompile_and_control_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_value_meta=region_value_meta,
+        output_value_ids=(
+            tuple(map(int, program.outputs.values()))
+            if region_signatures and not function_outputs else ()
+        ),
+        named_output_histories={
+            str(name): tuple(map(int, (identity_table or {}).get(name, ())))
+            for name in function_outputs
+        },
+        value_name_histories=identity_table,
+        parameter_names=function_parameters,
     )
     functions[control_function.name] = control_function
-    module = IRModule(functions)
+    module = IRModule(
+        functions,
+        recursion_table={
+            name: dict(function.metadata.get("recursion_table", {}))
+            for name, function in functions.items()
+            if function.metadata.get("recursion_table")
+        },
+    )
     cycles = (
         *find_ssa_cycles(numerical),
         *find_ssa_cycles(control_function),
@@ -1364,6 +1629,10 @@ def ssa_module_dictionary(module: IRModule) -> dict[str, Any]:
         }
 
     return {
+        "recursion_table": {
+            name: dict(regions)
+            for name, regions in module.recursion_table.items()
+        },
         "functions": {
             name: {
                 "args": [value(argument) for argument in function.args],
@@ -1391,6 +1660,7 @@ def ssa_module_dictionary(module: IRModule) -> dict[str, Any]:
                     }
                     for block_name, block in function.blocks.items()
                 },
+                "metadata": dict(function.metadata),
             }
             for name, function in module.functions.items()
         }

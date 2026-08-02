@@ -212,6 +212,34 @@ def test_control_flow_lowers_phi_into_predecessor_assignments():
     assert source.count("goto") >= 3
 
 
+def test_compact_phi_incoming_blocks_emit_predecessor_assignments():
+    initial = SSAValue(0, "int32")
+    updated = SSAValue(1, "int32")
+    current = SSAValue(2, "int32")
+    function = Function("compact_phi", [], {
+        "entry": BasicBlock("entry", [
+            Instr("const", [], initial, attributes={"constant": 0}),
+            Instr("Br", [], SSAValue(90), attributes={"target": "loop"}),
+        ], ["loop"]),
+        "loop": BasicBlock("loop", [
+            Instr(
+                "Phi", [initial, updated], current,
+                attributes={"incoming_blocks": ("entry", "latch")},
+            ),
+            Instr("Br", [], SSAValue(91), attributes={"target": "latch"}),
+        ], ["latch"]),
+        "latch": BasicBlock("latch", [
+            Instr("add", [current], updated, attributes={"right_scalar": 1}),
+            Instr("Br", [], SSAValue(92), attributes={"target": "loop"}),
+        ], ["loop"]),
+    })
+
+    source = emit_function(function).source
+
+    assert "t2 = t0" in source
+    assert "t2 = t1" in source
+
+
 def test_values_live_across_blocks_are_not_fused_away():
     """Inlining must never move a computation across control flow."""
 

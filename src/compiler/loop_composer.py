@@ -12,7 +12,7 @@ import ast
 import copy
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import networkx as nx
 
@@ -20,6 +20,7 @@ from .control_source import (
     ControlProgram,
     ControlUniform,
     LoopBlock,
+    RecursionRegion,
     SequenceBlock,
     StatementBlock,
     StreamPublishBlock,
@@ -49,6 +50,25 @@ class LoopStrategy(str, Enum):
     NATIVE_SOURCE = "native_source"
     DISPATCH = "dispatch"
     KPN = "kpn"
+
+
+_CONTROL_IR_NODE_TYPES = frozenset({
+    "LoopExit",
+    "LoopStateTransition",
+    "LoopResult",
+    "LoopStatePort",
+    "LoopAggregateResult",
+})
+
+
+def _is_control_ir_node(data: Mapping[str, Any] | dict[str, Any]) -> bool:
+    return (
+        str(data.get("type")) in _CONTROL_IR_NODE_TYPES
+        or isinstance(
+            data.get("expr_obj"),
+            (ast.For, ast.While, ast.comprehension),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -177,6 +197,8 @@ def _rebuild_graph_edges(graph: Any) -> None:
     for node_id in graph.G:
         graph.G.nodes[node_id]["children"] = []
     for node_id, data in graph.G.nodes(data=True):
+        (data.get("attributes") or {}).pop("recursion_region_id", None)
+        (data.get("attributes") or {}).pop("control_ir_owned", None)
         normalized = []
         for parent, role in data.get("parents") or ():
             parent = int(parent)
@@ -186,11 +208,81 @@ def _rebuild_graph_edges(graph: Any) -> None:
             graph.G.add_edge(parent, node_id, role=role)
             graph.G.nodes[parent]["children"].append((node_id, role))
         data["parents"] = normalized
+    try:
+        generations = tuple(nx.topological_generations(graph.G))
+    except nx.NetworkXUnfeasible:
+        # A retained loop deliberately has feedback: its next-iteration value
+        # depends on the body, while the body depends on the loop-carried
+        # input port.  That is irreducible recursion, not an invalid attempt
+        # to schedule the body as straight-line SSA.  Preserve the feedback
+        # edges for SemanticLoop/LoopBlock lowering and topologically order
+        # only the condensation graph, whose nodes are the strongly connected
+        # components of this graph.
+        components = tuple(nx.strongly_connected_components(graph.G))
+        condensed = nx.condensation(graph.G, scc=components)
+        recursive_components = []
+        generations = []
+        for generation in nx.topological_generations(condensed):
+            members = set()
+            for component_id in generation:
+                component_members = frozenset(
+                    int(node_id)
+                    for node_id in condensed.nodes[component_id]["members"]
+                )
+                members.update(component_members)
+                if (
+                    len(component_members) > 1
+                    or any(
+                        graph.G.has_edge(node_id, node_id)
+                        for node_id in component_members
+                    )
+                ):
+                    recursive_components.append(component_members)
+            generations.append(tuple(sorted(members)))
+        recursion_table = {}
+        for component_index, component in enumerate(recursive_components):
+            incoming = []
+            outgoing = []
+            feedback = []
+            for source, target, edge_data in graph.G.edges(data=True):
+                edge = (
+                    int(source),
+                    int(target),
+                    str(edge_data.get("role", "")),
+                )
+                if source in component and target in component:
+                    feedback.append(edge)
+                elif source not in component and target in component:
+                    incoming.append(edge)
+                elif source in component and target not in component:
+                    outgoing.append(edge)
+            recursion_table[component_index] = {
+                "kind": "irreducible_recursion",
+                "lower_as": "while",
+                "control_ir": True,
+                "members": tuple(sorted(component)),
+                "control_members": tuple(sorted(
+                    node_id
+                    for node_id in component
+                    if _is_control_ir_node(graph.G.nodes[node_id])
+                )),
+                "incoming": tuple(sorted(incoming)),
+                "outgoing": tuple(sorted(outgoing)),
+                "feedback": tuple(sorted(feedback)),
+            }
+            for node_id in component:
+                attributes = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                attributes["recursion_region_id"] = component_index
+                if _is_control_ir_node(graph.G.nodes[node_id]):
+                    attributes["control_ir_owned"] = True
+        graph.G.graph["recursion_table"] = recursion_table
+    else:
+        graph.G.graph.pop("recursion_table", None)
     graph.levels = {
         int(node_id): int(level)
-        for level, generation in enumerate(
-            nx.topological_generations(graph.G)
-        )
+        for level, generation in enumerate(generations)
         for node_id in generation
     }
 
@@ -1856,6 +1948,24 @@ def analyze_shader_loop_reductions(
     """
 
     regions = tuple(tuple(nodes) for nodes in region_nodes)
+    recursion_regions = tuple(
+        RecursionRegion(
+            region_id=int(region_id),
+            kind=str(record["kind"]),
+            lower_as=str(record["lower_as"]),
+            members=tuple(map(int, record["members"])),
+            control_ir=bool(record.get("control_ir", True)),
+            control_members=tuple(map(
+                int, record.get("control_members", ())
+            )),
+            incoming=tuple(record.get("incoming", ())),
+            outgoing=tuple(record.get("outgoing", ())),
+            feedback=tuple(record.get("feedback", ())),
+        )
+        for region_id, record in sorted(
+            (graph.G.graph.get("recursion_table") or {}).items()
+        )
+    )
     forbidden = (
         ast.Break,
         ast.Continue,
@@ -1935,6 +2045,15 @@ def analyze_shader_loop_reductions(
 
     for plan in plans:
         loop = plan.loop
+        loop_members = {int(loop.node_id), *map(int, loop.body_nodes)}
+        recursion_region_id = next(
+            (
+                region.region_id
+                for region in recursion_regions
+                if loop_members.intersection(region.members)
+            ),
+            None,
+        )
         # Source spellings are not identities.  Separate lexical loops
         # routinely reuse ``i``, ``item`` or ``packet``; using that spelling as
         # a control key lets projection retain or discard another loop's
@@ -2169,6 +2288,11 @@ def analyze_shader_loop_reductions(
                         and len(loop.target_bindings) == 1
                     )
                     else (),
+                    recursion_regions=tuple(
+                        region
+                        for region in recursion_regions
+                        if region.region_id == recursion_region_id
+                    ),
                     root=LoopBlock(
                         induction=induction_name,
                         start=(
@@ -2310,6 +2434,7 @@ def analyze_shader_loop_reductions(
                         dispatch_shell=(
                             "c" if prefer_c_dispatch else "glsl"
                         ),
+                        recursion_region_id=recursion_region_id,
                     ),
                 )
             ),

@@ -22,12 +22,36 @@ from .fs_dec import (
 # Spectral utilities
 from .spectral_readout import compute_metrics
 from .fs_harness import RingHarness
+from .evolution import (
+    EvolutionEdge,
+    EvolutionNode,
+    FluxSpringFrame,
+    MultiNetworkFluxSpring,
+)
 from typing import Callable, Sequence, Iterable
 import logging
 
 from ...abstraction import AbstractTensor as AT
 
 logger = logging.getLogger(__name__)
+
+
+def spiral_slot(tick: int, row_idx: int, spiral_len: int) -> int:
+    """Map a delayed row at ``tick`` onto the shared parameter-slot ring."""
+
+    if spiral_len <= 0:
+        return 0
+    return int((tick - row_idx) % spiral_len)
+
+
+def required_spiral_len(
+    spec: FluxSpringSpec, extra_delay: int = 0
+) -> int:
+    """Return the spectral history plus any explicitly reserved delay."""
+
+    spectral = getattr(spec, "spectral", None)
+    base = int(getattr(spectral, "win_len", 0))
+    return max(1, base + int(extra_delay))
 
 
 def _tape():
@@ -89,7 +113,7 @@ class ParamWheel:
         slots: int = 2,
         rings: int = 1,
         label: str | None = None,
-        initialization: AT | str = "ones",
+        initialization: AT | str = "base",
     ) -> None:
         self.setter = setter
         self.label = label
@@ -101,7 +125,9 @@ class ParamWheel:
         self._params: list[AT] = []
         base_t = AT.get_tensor(base)
         if isinstance(initialization, str):
-            if initialization == "ones":
+            if initialization == "base":
+                init_val = base_t
+            elif initialization == "ones":
                 init_val = base_t * 0 + 1
             elif initialization == "zeros":
                 init_val = base_t * 0
@@ -118,7 +144,10 @@ class ParamWheel:
             p = init_val.clone() if hasattr(init_val, "clone") else AT.get_tensor(init_val)
             p.requires_grad_(True)
             # Annotate each leaf so whiteboard/debuggers can locate them
-            lbl = f"{label or 'ParamWheel'}[slot={s}]"
+            # Slots are versions of one existing parameter, not independent
+            # organic graph channels. Keep one stable lineage/ProcessGraph
+            # identity across the flat ring.
+            lbl = label or "ParamWheel"
             try:
                 _tape().annotate(p, label=lbl)
             except Exception:
@@ -171,7 +200,11 @@ class ParamWheel:
 
     def apply_slot(self, slot: int, update_fn: Callable[[AT, AT], AT]) -> None:
         p = self._params[int(slot)]
-        g = getattr(p, "_grad", None) or self._grads[int(slot)] or getattr(p, "grad", None)
+        g = getattr(p, "_grad", None)
+        if g is None:
+            g = self._grads[int(slot)]
+        if g is None:
+            g = getattr(p, "grad", None)
         if g is None:
             return
         new_p = update_fn(p, g)
@@ -209,8 +242,10 @@ def register_param_wheels(
     """
 
     if slots is None:
-        slots = spec.spectral.win_len if getattr(spec, "spectral", None) and getattr(spec.spectral, "enabled", False) else max(2, getattr(spec, "stages", 2))
-    rings = 1 + (int(extra_delay) + int(slots) - 1) // int(slots)
+        slots = required_spiral_len(spec, extra_delay) if getattr(spec, "spectral", None) and getattr(spec.spectral, "enabled", False) else max(2, getattr(spec, "stages", 2))
+    # ParamWheel is a flat ring of ordinary SSA-visible parameter versions.
+    # ``rings`` remains a compatibility field, not a second graph/memory model.
+    rings = 1
 
     wheels: list[ParamWheel] = []
     tmp: list[AT] = []

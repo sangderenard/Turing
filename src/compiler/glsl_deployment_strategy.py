@@ -84,6 +84,26 @@ from ..transmogrifier.operator_defs import (
 )
 
 
+def _dependency_order(graph: Any) -> tuple[int, ...]:
+    """Return DAG order, or stable condensation order for retained loops."""
+
+    try:
+        return tuple(nx.lexicographical_topological_sort(
+            graph.G, key=lambda value_id: int(value_id)
+        ))
+    except nx.NetworkXUnfeasible:
+        recursive = graph.G.graph.get("recursion_table")
+        if not recursive or set(graph.levels) != set(graph.G):
+            raise
+        return tuple(sorted(
+            graph.G,
+            key=lambda node_id: (
+                int(graph.levels[node_id]),
+                int(node_id),
+            ),
+        ))
+
+
 _scheduled_capture_backend: ContextVar[str] = ContextVar(
     "scheduled_capture_backend",
     default="glsl",
@@ -1097,11 +1117,7 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
     }
     emitted_regions = set()
     items = []
-    topological_nodes = tuple(
-        nx.lexicographical_topological_sort(
-            graph.G, key=lambda node_id: int(node_id)
-        )
-    )
+    topological_nodes = _dependency_order(graph)
     order_index = {
         int(node_id): index
         for index, node_id in enumerate(topological_nodes)
@@ -3832,14 +3848,21 @@ def _is_ast_metadata_node(graph: Any, node_id: int) -> bool:
 
     data = graph.G.nodes[node_id]
     node_type = data.get("type")
+    map_ir = graph.G.graph.get("map_ir") or {}
     return (
+        node_id in set(map_ir.get("schema_node_ids", ()))
+        or
         node_type in {"str", "NoneType"}
         or isinstance(
             data.get("expr_obj"),
             (
                 ast.Module,
+                ast.ClassDef,
                 ast.FunctionDef,
                 ast.AsyncFunctionDef,
+                ast.Import,
+                ast.ImportFrom,
+                ast.alias,
                 ast.arguments,
                 ast.arg,
                 ast.keyword,
@@ -3877,11 +3900,7 @@ def _inert_routing_nodes(graph: Any) -> frozenset[int]:
     roots = set(getattr(graph, "roots", ()) or ())
     children = _semantic_children(graph)
     inert: set[int] = set()
-    for node_id in reversed(tuple(
-        nx.lexicographical_topological_sort(
-            graph.G, key=lambda value_id: int(value_id)
-        )
-    )):
+    for node_id in reversed(_dependency_order(graph)):
         if node_id in roots:
             continue
         expression = graph.G.nodes[node_id].get("expr_obj")
@@ -3987,10 +4006,46 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         isinstance(expression, ast.Compare)
         and len(expression.ops) > 1
     )
+    python_shape_index = (
+        isinstance(expression, ast.Subscript)
+        and isinstance(expression.value, ast.Attribute)
+        and expression.value.attr == "shape"
+    )
+    # Loop-target initializers are coordinator state setup.  Their values may
+    # use ordinary tensor operations, but emitting them as an independent GPU
+    # region duplicates work before the retained loop owns the binding.
+    loop_target_initializer = any(
+        node_id in set(
+            (candidate.get("attributes") or {})
+            .get("loop_target_initials", {})
+            .values()
+        )
+        for _candidate_id, candidate in graph.G.nodes(data=True)
+        if isinstance(candidate.get("expr_obj"), (ast.For, ast.While))
+    )
     return (
         bool(
             (data.get("attributes") or {}).get(
                 "coordinator_short_circuit"
+            )
+        )
+        or any(
+            (data.get("attributes") or {}).get(name) is not None
+            for name in (
+                "callee_ref",
+                "method_ref",
+                "class_ref",
+            )
+        )
+        or (
+            (data.get("attributes") or {}).get(
+                "static_python_reference"
+            ) is not None
+            and (
+                node_type not in abstract_tensor_funcs
+                or (data.get("attributes") or {}).get(
+                    "operator_reference_node"
+                ) is None
             )
         )
         or
@@ -4073,12 +4128,14 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
         )
         or isinstance(expression, ast.Attribute)
         or python_routing_index
+        or python_shape_index
         or compares_none
         or static_scalar_expression
         or coordinator_accessor
         or coordinator_bit_shift
         or coordinator_boolean_not
         or chained_comparison
+        or loop_target_initializer
         or (
             data.get("type") == "Load"
             and (data.get("attributes") or {}).get("source_type") == "Name"
@@ -4407,11 +4464,7 @@ def _closure_routing_dependencies(
 
     order_index = {
         node_id: index
-        for index, node_id in enumerate(
-            nx.lexicographical_topological_sort(
-                graph.G, key=lambda value_id: int(value_id)
-            )
-        )
+        for index, node_id in enumerate(_dependency_order(graph))
     }
     free_names: dict[int, frozenset[str]] = {}
     edges: set[tuple[int, int]] = set()
@@ -5143,6 +5196,13 @@ def _call_arguments(
     fallback_index = 1 << 30
     for parent, role_value in parents:
         role = str(role_value)
+        if role == "kwargs":
+            keywords.update(dict(values[parent]))
+            continue
+        if role == "args":
+            for value in values[parent]:
+                positional[len(positional)] = value
+            continue
         if role.startswith("kw:"):
             keywords[role[3:]] = values[parent]
             continue
@@ -5153,7 +5213,7 @@ def _call_arguments(
             index = int(role[4:])
         elif role.startswith("arg") and role[3:].isdigit():
             index = int(role[3:])
-        elif role in {"arg", "args"}:
+        elif role == "arg":
             index = len(positional)
         else:
             continue
@@ -6217,7 +6277,13 @@ def _coordinate_scheduled_capture_impl(
                     for parent, role in parents
                     if str(role) == "values"
                 ]
-                result = dict(zip(keys, items))
+                result = {}
+                key_values = iter(keys)
+                for key_expression, item in zip(expression.keys, items):
+                    if key_expression is None:
+                        result.update(dict(item))
+                    else:
+                        result[next(key_values)] = item
             elif (
                 isinstance(expression, ast.Attribute)
                 and node_type != "SetAttr"
@@ -6471,6 +6537,8 @@ def _coordinate_scheduled_capture_impl(
                         ast.LtE: operator.le,
                         ast.Gt: operator.gt,
                         ast.GtE: operator.ge,
+                        ast.In: lambda left, right: left in right,
+                        ast.NotIn: lambda left, right: left not in right,
                     }.get(type(comparison))
                     if comparator is None:
                         raise NotImplementedError(
@@ -6780,6 +6848,44 @@ def _coordinate_scheduled_capture_impl(
                             args,
                             kwargs,
                         )
+                        initializer_ref = (
+                            callee_value.descriptor.get("methods") or {}
+                        ).get("__init__")
+                        if initializer_ref is not None:
+                            nested = shell.function_shells[int(initializer_ref)]
+                            (
+                                receiver_parameter,
+                                positional_parameters,
+                                _,
+                            ) = _method_parameter_layout(
+                                nested.process_graph.G
+                            )
+                            nested_inputs = dict(
+                                zip(positional_parameters, args)
+                            ) | kwargs
+                            if receiver_parameter is not None:
+                                nested_inputs[receiver_parameter] = result
+                            for name, value in (
+                                nested.process_graph.G.graph.get(
+                                    "parameter_defaults", {}
+                                ).items()
+                            ):
+                                nested_inputs.setdefault(name, value)
+                            if capture:
+                                _coordinate_scheduled_capture(
+                                    nested,
+                                    nested_inputs,
+                                    device=device,
+                                    capture=True,
+                                    discovery_session=discovery_session,
+                                )
+                            elif nested.whole_program_compiled:
+                                nested.execute_process_graph(nested_inputs)
+                            else:
+                                nested.coordinate_first_invocation(
+                                    nested_inputs,
+                                    device=device,
+                                )
                     else:
                         nested = (
                             getattr(shell, "callsite_function_shells", {}).get(
@@ -6855,10 +6961,16 @@ def _coordinate_scheduled_capture_impl(
                                 f"parents={parents!r}"
                             )
                         receiver = evaluate_node(receiver_parent)
-                        if isinstance(receiver, _CompiledStructuralObject):
-                            method_ref = receiver.methods.get(
-                                expression.func.attr
+                        if isinstance(
+                            receiver,
+                            (_CompiledStructuralObject, _CompiledStructuralClass),
+                        ):
+                            methods = (
+                                receiver.methods
+                                if isinstance(receiver, _CompiledStructuralObject)
+                                else receiver.descriptor.get("methods") or {}
                             )
+                            method_ref = methods.get(expression.func.attr)
                             if method_ref is None:
                                 raise RuntimeError(
                                     f"compiled class {receiver.class_ref!r} "
@@ -7064,6 +7176,14 @@ def _coordinate_scheduled_capture_impl(
 
                 result = None
                 iterations_completed = 0
+                target_initials = (
+                    (graph.G.nodes[node_id].get("attributes") or {})
+                    .get("loop_target_initials") or {}
+                )
+                for name, binding in loop.target_bindings:
+                    initial = target_initials.get(name)
+                    if initial is not None:
+                        values[binding] = evaluate_node(int(initial))
                 if shell._profiler.verbose:
                     shell._profiler.trace(
                         path=shell.profile_path,
@@ -7117,9 +7237,10 @@ def _coordinate_scheduled_capture_impl(
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    for body_node in nx.lexicographical_topological_sort(
-                        graph.G.subgraph(loop.body_nodes),
-                        key=lambda value_id: int(value_id),
+                    for body_node in (
+                        candidate
+                        for candidate in _dependency_order(graph)
+                        if candidate in set(loop.body_nodes)
                     ):
                         body_region = region_for_node.get(body_node)
                         if is_shader_internal_node(body_node):
@@ -7165,6 +7286,25 @@ def _coordinate_scheduled_capture_impl(
                     if parents
                     else RuntimeError("ProcessGraph bare raise")
                 )
+                if hasattr(exception, "add_note"):
+                    input_state = tuple(
+                        (
+                            int(input_id),
+                            (input_data.get("attributes") or {}).get(
+                                "binding_name",
+                                input_data.get("label"),
+                            ),
+                            _diagnostic_value_summary(values.get(input_id)),
+                        )
+                        for input_id, input_data in graph.G.nodes(data=True)
+                        if input_data.get("type") == "Input"
+                        and input_id in values
+                    )
+                    exception.add_note(
+                        "raised by ProcessGraph "
+                        f"{graph.G.graph.get('function_name', '?')} at node "
+                        f"{node_id}; inputs={input_state!r}"
+                    )
                 raise exception
             elif isinstance(expression, ast.Assert):
                 by_role = {
@@ -7178,6 +7318,8 @@ def _coordinate_scheduled_capture_impl(
                         else None
                     )
                     raise AssertionError(message)
+                result = None
+            elif isinstance(expression, ast.Pass):
                 result = None
             elif node_type == "SetAttr":
                 by_role = {
@@ -7309,6 +7451,14 @@ def _coordinate_scheduled_capture_impl(
                 loop_node = expression_nodes[id(statement)]
                 plan = loop_plans_by_node[loop_node]
                 loop = plan.loop
+                target_initials = (
+                    (graph.G.nodes[loop_node].get("attributes") or {})
+                    .get("loop_target_initials") or {}
+                )
+                for name, binding in loop.target_bindings:
+                    initial = target_initials.get(name)
+                    if initial is not None:
+                        values[binding] = evaluate_node(int(initial))
                 if loop.iterator_kind == "arithmetic_sequence":
                     by_role = {
                         str(role): parent
@@ -7480,6 +7630,22 @@ def _coordinate_scheduled_capture_impl(
         _scheduled_capture_backend.get(),
         device,
     ):
+        # Public array inputs are tensor values even when their first consumer
+        # is structural control (for example a defensive ``isinstance``
+        # guard).  Tensorise under the scheduled backend before control
+        # ownership removes those inputs from the ordinary sweep.
+        for input_id, previous in tuple(values.items()):
+            resident = _tensorize_graph_input(previous, device=device)
+            if resident is previous:
+                continue
+            values[input_id] = resident
+            named = getattr(shell, "_capture_input_names", None)
+            if named is not None and (carried := named.get(id(previous))):
+                named[id(resident)] = carried
+                storage = _capture_storage_identity(resident)
+                if storage is not None:
+                    shell._capture_input_storage[storage] = carried
+
         # Runtime control operands are outputs of the compiled program just as
         # surely as returned tensors are.  A predicate used only by
         # ``if tensor_scalar: raise`` may otherwise remain hidden beneath the
@@ -7497,9 +7663,7 @@ def _coordinate_scheduled_capture_impl(
             for validation in _validation_control_blocks(shell):
                 evaluate_node(int(validation.predicate_value_id))
 
-        for node_id in nx.lexicographical_topological_sort(
-            graph.G, key=lambda value_id: int(value_id)
-        ):
+        for node_id in _dependency_order(graph):
             if node_id in inert_nodes:
                 continue
             if node_id in controlled_nodes:
@@ -7610,6 +7774,12 @@ def _coordinate_scheduled_capture(
             discovery_session=discovery_session,
         )
     except Exception as error:
+        if hasattr(error, "add_note"):
+            error.add_note(
+                "while coordinating ProcessGraph shell "
+                f"{shell.profile_path!r} with inputs="
+                f"{tuple((str(name), _diagnostic_value_summary(value)) for name, value in initial_values.items())!r}"
+            )
         shell._profiler.record_exception(
             error,
             path=shell.profile_path,
@@ -7939,13 +8109,6 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
         name: next(iter(references))
         for name, references in references_by_name.items()
         if len(references) == 1
-        # Name uniqueness is sufficient only for the live, tensor-oriented
-        # aggregate methods whose receiver participates in the shader graph.
-        # Generic/dead control methods (append, validate, finish, to_bytes)
-        # require reachability and receiver-type proof before planning; adding
-        # them by spelling alone creates hierarchy entries for branches that
-        # source specialization has already removed.
-        and name in {"encode_codewords", "lookup"}
     }
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
@@ -8096,11 +8259,10 @@ def strategize_glsl_deployment(
     )
     _resolve_unambiguous_method_references(graph)
     reference_tables = build_shell_reference_tables(graph)
+    ordered_executable_nodes = _dependency_order(graph)
     executable_nodes = tuple(
         node_id
-        for node_id in nx.lexicographical_topological_sort(
-            graph.G, key=lambda value_id: int(value_id)
-        )
+        for node_id in ordered_executable_nodes
         if not _is_dispatch_metadata_node(graph, node_id)
     )
     # Control membership is a semantic partition: numerical work may be
@@ -8115,12 +8277,21 @@ def strategize_glsl_deployment(
     )
     inert_nodes = _inert_routing_nodes(graph)
     closure_edges, closure_outputs = _closure_routing_dependencies(graph)
+    recursion_control_nodes = frozenset(
+        int(node_id)
+        for record in (
+            graph.G.graph.get("recursion_table") or {}
+        ).values()
+        if record.get("control_ir", True)
+        for node_id in record.get("control_members", ())
+    )
     dispatch_plan = reduce_scheduled_shader_regions(
         graph,
         executable_nodes,
         max_nodes_per_region=max_nodes_per_dispatch,
         partition_keys=partition_keys,
         extra_dependency_edges=closure_edges,
+        control_node_ids=recursion_control_nodes,
     )
     executable_dispatch_nodes = tuple(
         dispatch.node_ids
@@ -8247,6 +8418,7 @@ class ProcessGraphGLSLDeployment:
         self.function_references = self.reference_tables.functions
         self.constant_references = self.reference_tables.constants
         self.memory_references = self.reference_tables.memory
+        self.recursion_references = self.reference_tables.recursion
         self.reference_correlations = self.reference_tables.correlations
         self.function_shells = {
             reference: shell_type(**tuning)
@@ -10307,20 +10479,30 @@ class ProcessGraphGLSLDeployment:
             identities = tuple(identity_table.get(public_name, ()))
             if not identities:
                 continue
-            value_id = int(identities[-1])
-            if self.hierarchical_shell_composed:
-                # The artifact is globally namespaced after closure
-                # composition.  Function-output identities in the root
-                # ProcessGraph remain local, exactly like its input
-                # identities, so translate them through the same root value
-                # table before matching a terminal.
-                value_id = int(
+            candidate_values = tuple(
+                int(
                     self.hierarchical_root_value_ids.get(
-                        value_id,
-                        value_id,
+                        int(value_id),
+                        int(value_id),
                     )
                 )
-            terminal_name = terminal_by_value.get(value_id)
+                if self.hierarchical_shell_composed
+                else int(value_id)
+                for value_id in reversed(identities)
+            )
+            # A retained loop can append a structural result port after the
+            # numerical value actually published by the artifact.  Select the
+            # newest identity that is a real terminal instead of discarding
+            # the public name merely because the final structural alias is
+            # not itself a shader slot.
+            terminal_name = next(
+                (
+                    terminal_by_value[value_id]
+                    for value_id in candidate_values
+                    if value_id in terminal_by_value
+                ),
+                None,
+            )
             if terminal_name is not None:
                 inferred_outputs[str(public_name)] = terminal_name
         if not inferred_outputs:
@@ -11031,6 +11213,12 @@ class _CompiledStructuralClass:
             args,
             kwargs,
         )
+
+    def __getattr__(self, name):
+        method_ref = (self.descriptor.get("methods") or {}).get(name)
+        if method_ref is None:
+            raise AttributeError(name)
+        return _CompiledStructuralMethod(self, method_ref)
 
 
 class _GreedyGeneratorStream:

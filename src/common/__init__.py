@@ -25,6 +25,11 @@ from .dt_system.time_runtime import (
     TimeAdvanceReport,
     ManagedTimeRuntime,
 )
+from .abstract_tensor_state_machine import (
+    AbstractTensorStateMachine,
+    TensorStateField,
+    is_abstract_tensor_state_machine,
+)
 
 __all__ = [
     # Planning/result types
@@ -46,4 +51,8 @@ __all__ = [
     "TimeWindowRequest",
     "TimeAdvanceReport",
     "ManagedTimeRuntime",
+    # Class-bound managed state-machine contract
+    "AbstractTensorStateMachine",
+    "TensorStateField",
+    "is_abstract_tensor_state_machine",
 ]

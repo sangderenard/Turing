@@ -76,6 +76,6 @@ def test_hierarchical_plan_is_structural_and_ascii_is_only_a_view():
     )
 
     rendered = render_plan_ascii(plan)
-    assert "closure outer captures=[1]" in rendered
-    assert "closure loop_body captures=[2]" in rendered
+    assert "closure outer id=-1 captures=[1]" in rendered
+    assert "closure loop_body id=-1 captures=[2]" in rendered
     assert "add in=[2,3] out=[4]" in rendered

@@ -74,6 +74,21 @@ def test_inventory_is_a_class_descriptor_not_a_host_schedule():
     assert mapping["methods"][1]["input_slots"] == [1]
 
 
+def test_inventory_redirects_input_identity_to_the_exact_output_slot():
+    specs, _modules, manifest = _deployment()
+    output_key = f"out::{specs[-1].module_name}::result"
+    manifest["storage_redirects"] = {"in::x": output_key}
+
+    inventory = build_class_inventory(manifest)
+    mapping = inventory.to_mapping()
+
+    assert mapping["storage_redirects"] == [{
+        "identity": "in::x", "storage": output_key,
+    }]
+    assert "in::x" not in {field["key"] for field in mapping["field_slots"]}
+    assert inventory.methods[0].input_slots == inventory.methods[-1].output_slots
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_wasm_coordinator_calls_cards_internally_and_honors_latched_ranges(tmp_path):
     specs, modules, manifest = _deployment()
