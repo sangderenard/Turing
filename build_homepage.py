@@ -72,6 +72,34 @@ MATH_MODULE_DIR = f"site/{SITE_VERSION}/math/render"
 ORBIT_CLAMP = 1.0e18
 
 
+def _static_gallery(destination: Path) -> list[dict]:
+    """Read published bundle manifests into GitHub Pages-compatible links."""
+    items: list[dict] = []
+    for path in (destination / "site" / "programs").glob("*/versions/*/bundle.json"):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        program = manifest["program"]
+        artifacts = manifest.get("artifacts", [])
+        items.append({
+            "slug": program["slug"],
+            "title": program["title"],
+            "entrypoint": program.get("entrypoint", "program"),
+            "version": manifest["version"]["id"],
+            "created_at": manifest.get("created_at", ""),
+            "url": manifest["page"]["url"].lstrip("/"),
+            "source": manifest.get("source", {}).get("filename", ""),
+            "artifacts": len(artifacts),
+            "bytes": sum(int(artifact.get("bytes", 0)) for artifact in artifacts),
+            "latest": False,
+        })
+    items.sort(key=lambda item: (item["slug"], item["created_at"]), reverse=True)
+    newest: set[str] = set()
+    for item in items:
+        if item["slug"] not in newest:
+            item["latest"] = True
+            newest.add(item["slug"])
+    return items
+
+
 _SOURCE_EXTENSIONS = {
     "python_source": "py", "ssa": "ssa", "fortran": "f90",
     "spirv": "spvasm", "glsl": "comp.glsl", "wat": "wat",
@@ -533,6 +561,8 @@ def build(destination: Path) -> Path:
         backend_sources=source_entries,
         mathematics=mathematics,
         graph_views=graph_views,
+        resource_route="./",
+        static_gallery=_static_gallery(destination),
         network_manifest={
             "name": "Mandelbrot future-detail controller",
             "module": {"api": network_module.api.to_mapping(), "wasm_base64": base64.b64encode(network_module.binary).decode("ascii")},

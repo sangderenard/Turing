@@ -107,6 +107,7 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     html = emit_html_shell(
         _artifact().api,
         resource_route="/site/programs/demo/versions/v1-abc/",
+        static_gallery=[{"slug": "demo", "url": "site/programs/demo/index.html"}],
     ).html
 
     assert 'id="server-address" value="http://localhost:8787"' in html
@@ -116,6 +117,10 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     assert 'fetch(serverURL("/api/generate")' in html
     assert 'fetch(serverURL("/api/gallery")' in html
     assert 'const RESOURCE_ROUTE = "/site/programs/demo/versions/v1-abc/"' in html
+    assert 'const STATIC_GALLERY = [{"slug": "demo"' in html
+    assert 'renderGallery(STATIC_GALLERY)' in html
+    assert 'const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url)' in html
+    assert 'const pagesPrefix = routeIndex >= 0' in html
     assert "fetch(resourceURL(descriptor.url))" in html
     assert "const programs = new Map()" in html
     assert "versions.find(item => item.latest) || versions[0]" in html

@@ -328,6 +328,7 @@ const MAP_IR = __MAP_IR__;
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
 const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
+const STATIC_GALLERY = __STATIC_GALLERY__;
 const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
@@ -360,8 +361,11 @@ function resourceURL(path) {
   }
   const route = RESOURCE_ROUTE.endsWith("/") ? RESOURCE_ROUTE : RESOURCE_ROUTE + "/";
   const relative = String(path).replace(/^\.\//, "").replace(/^\//, "");
-  const server = serverAddress();
-  if (server) return new URL(route.replace(/^\//, "") + relative, server).href;
+  if (route.startsWith("/") && /^https?:$/.test(window.location.protocol)) {
+    const routeIndex = window.location.pathname.indexOf(route);
+    const pagesPrefix = routeIndex >= 0 ? window.location.pathname.slice(0, routeIndex) : "";
+    return new URL(pagesPrefix + route + relative, window.location.origin).href;
+  }
   return new URL(relative, new URL(route, document.baseURI)).href;
 }
 
@@ -1645,7 +1649,7 @@ function wireExecutionModes() {
   });
 }
 
-function renderGallery(items) {
+function renderGallery(items, fromServer = false) {
   const gallery = $("gallery");
   if (!gallery) return;
   gallery.replaceChildren();
@@ -1665,7 +1669,8 @@ function renderGallery(items) {
     const card = document.createElement("div");
     card.className = "gallery-card";
     const link = document.createElement("a");
-    link.href = serverURL(newest.url);
+    const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url);
+    link.href = itemURL(newest);
     link.textContent = newest.title || newest.slug;
     const version = document.createElement("label");
     version.className = "meta";
@@ -1683,7 +1688,7 @@ function renderGallery(items) {
     const detail = document.createElement("span");
     detail.className = "meta";
     const show = item => {
-      link.href = serverURL(item.url);
+      link.href = itemURL(item);
       detail.textContent = item.artifacts + " artifacts · " + item.bytes + " bytes";
     };
     selector.addEventListener("change", () => {
@@ -1704,12 +1709,13 @@ async function refreshGallery() {
     if (!response.ok) throw new Error("HTTP " + response.status);
     const payload = await response.json();
     const items = payload.items || [];
-    const programCount = renderGallery(items) || 0;
+    const programCount = renderGallery(items, true) || 0;
     if (status) status.textContent = programCount + " program(s) · " +
       items.length + " prepared version(s)";
   } catch (error) {
-    if (status) status.textContent = "Local server unavailable: " + error.message;
-    renderGallery([]);
+    const programCount = renderGallery(STATIC_GALLERY) || 0;
+    if (status) status.textContent = programCount + " static program(s) · " +
+      STATIC_GALLERY.length + " prepared version(s); local server unavailable";
   }
 }
 
@@ -2442,6 +2448,7 @@ def emit_html_shell(
     class_graph: Mapping[str, Any] | None = None,
     graph_views: Mapping[str, Any] | None = None,
     resource_route: str = "/",
+    static_gallery: Sequence[Mapping[str, Any]] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -2530,6 +2537,7 @@ def emit_html_shell(
         ], default=str))
         .replace("__MATHEMATICS__", json.dumps(dict(mathematics or {}), default=str))
         .replace("__RESOURCE_ROUTE__", json.dumps(str(resource_route)))
+        .replace("__STATIC_GALLERY__", json.dumps(list(static_gallery or []), default=str))
         .replace("__DEFAULT_SERVER_ADDRESS__", json.dumps(str(default_server_address)))
         .replace(
             "__CLASS_GRAPH__",
