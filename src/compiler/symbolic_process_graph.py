@@ -51,6 +51,7 @@ SYMPY_PROCESS_GRAPH_TRANSLATIONS: Mapping[object, SympyProcessGraphRule] = (
         sympy.sin: SympyProcessGraphRule("Sin"),
         sympy.cos: SympyProcessGraphRule("Cos"),
         sympy.tan: SympyProcessGraphRule("Tan"),
+        sympy.tanh: SympyProcessGraphRule("Tanh"),
         sympy.exp: SympyProcessGraphRule("Exp"),
         sympy.log: SympyProcessGraphRule("Log"),
         sympy.floor: SympyProcessGraphRule("Floor"),
@@ -155,6 +156,8 @@ _CANONICAL_FUNCTIONS = {
     "cos": sympy.cos,
     "Tan": sympy.tan,
     "tan": sympy.tan,
+    "Tanh": sympy.tanh,
+    "tanh": sympy.tanh,
     "Exp": sympy.exp,
     "exp": sympy.exp,
     "Log": sympy.log,
@@ -169,8 +172,10 @@ _CANONICAL_FUNCTIONS = {
     "ceiling": sympy.ceiling,
     "Min": sympy.Min,
     "min": sympy.Min,
+    "minimum": sympy.Min,
     "Max": sympy.Max,
     "max": sympy.Max,
+    "maximum": sympy.Max,
 }
 
 _LOGICAL_FUNCTIONS = {
@@ -686,7 +691,7 @@ def process_graph_to_sympy_expressions(
     indexed_bases = {
         int(parent_id)
         for _node_id, data in graph.G.nodes(data=True)
-        if str(data.get("op") or data.get("type")) == "Indexed"
+        if str(data.get("op") or data.get("type")) in {"Indexed", "indexed"}
         for parent_id, role in data.get("parents") or ()
         if str(role) == "base"
     }
@@ -716,7 +721,7 @@ def process_graph_to_sympy_expressions(
                 else sympy.Symbol(name)
             )
         elif operation in {
-            "const", "Constant", "Integer", "Float", "Rational"
+            "const", "constant", "Constant", "Integer", "Float", "Rational"
         }:
             value = attributes.get("value", data.get("constant"))
             result = _sympy_literal(value)
@@ -726,7 +731,7 @@ def process_graph_to_sympy_expressions(
                 for values in parents_by_role.values()
                 for _node, value in values
             ]
-            if operation == "Indexed":
+            if operation in {"Indexed", "indexed"}:
                 base = parents_by_role.get("base", ())
                 indices = parents_by_role.get("index", ())
                 if len(base) != 1 or not indices:
@@ -853,6 +858,18 @@ def process_graph_to_sympy_relations(
         ).items()
         for value_id in value_ids
     }
+    indexed_bases = {
+        int(parent_id)
+        for node_id in live_nodes
+        for parent_id, role in (
+            graph.G.nodes[node_id].get("parents") or ()
+        )
+        if str(
+            graph.G.nodes[node_id].get("op")
+            or graph.G.nodes[node_id].get("type")
+        ) in {"Indexed", "indexed"}
+        and str(role) == "base"
+    }
     expressions: dict[int, sympy.Basic] = {}
     inputs: dict[str, sympy.Basic] = {}
     equations: list[sympy.Basic] = []
@@ -908,15 +925,35 @@ def process_graph_to_sympy_relations(
                 or data.get("label")
                 or f"value_{node_id}"
             )
-            value = inputs.setdefault(name, sympy.Symbol(name))
+            value = inputs.setdefault(
+                name,
+                (
+                    sympy.IndexedBase(name)
+                    if node_id in indexed_bases
+                    else sympy.Symbol(name)
+                ),
+            )
             expressions[node_id] = value
             continue
 
         value = sympy.Symbol(f"value_{node_id}")
         expressions[node_id] = value
         rhs: sympy.Basic
-        if operation in {"const", "Constant", "Integer", "Float", "Rational"}:
+        if operation in {
+            "const", "constant", "Constant", "Integer", "Float", "Rational"
+        }:
             rhs = _sympy_literal(attributes.get("value", data.get("constant")))
+        elif operation in {"Indexed", "indexed"}:
+            base = parents_by_role.get("base") or ordered[:1]
+            indices = parents_by_role.get("index") or ordered[1:]
+            if len(base) != 1 or not indices:
+                raise ValueError(
+                    f"Indexed node {node_id} lacks base/index operands"
+                )
+            try:
+                rhs = sympy.Indexed(base[0], *indices)
+            except TypeError:
+                rhs = sympy.Function("getitem")(base[0], *indices)
         elif operation in _IDENTITY_OPERATIONS and len(ordered) == 1:
             rhs = ordered[0]
         elif operation in {"select", "Select", "Phi", "phi", "mu"}:

@@ -182,10 +182,10 @@ From the Turing repository root:
 python build_homepage.py
 ```
 
-Commit `index.html`, `site/v2/`, and the compiler/runtime sources and
-tests that produced them. GitHub Pages serves the repository root, so relative
-module URLs resolve beneath the project page without a special loader or a
-second site.
+Commit `../index.html` and `../site/` in the parent `nogodsnomasters`
+repository. Commit the compiler/runtime sources and tests that produced them
+in Turing. GitHub Pages serves the parent repository root, so relative module
+URLs resolve without a special loader or a duplicated site inside Turing.
 
 ## Deliberately unresolved
 

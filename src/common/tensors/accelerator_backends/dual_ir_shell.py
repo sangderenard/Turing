@@ -1,12 +1,13 @@
-"""The dual IR shell.
+"""The numeric/control shell with its accompanying map IR.
 
 Just the IR object -- not a compiler, not an executor.  ``DualIRShell``
-pairs the two programs the AOT pipeline already produces and already names
+pairs the programs the AOT pipeline already produces and already names
 (``aot_compile.AOTCompilation.compiled_shell_program`` /
 ``.shell_control_program``): the numeric program (``FusedProgram``, a flat
 list of ``OpStep``, no control flow) and the control program
 (``ControlProgram``, the loop/branch shell that references numeric regions
-via ``__scheduled_region_N__`` markers).
+via ``__scheduled_region_N__`` markers). ``map_ir`` carries graph identities,
+object/resource identities, and their declared permissions.
 
 A shell is more than just numeric+control, though: it also carries the
 profiling and logging the instrumented C shell (``profiled_c_shell.py``)
@@ -26,7 +27,7 @@ or execute anything itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Mapping, TYPE_CHECKING, Optional
 
 from ....compiler.control_source import ControlProgram
 from ..fused_ir import FusedProgram
@@ -47,6 +48,7 @@ class DualIRShell:
 
     compiled_shell_program: FusedProgram
     shell_control_program: Optional[ControlProgram] = None
+    map_ir: Optional[Mapping[str, Any]] = None
     name: Optional[str] = None
     profile: Optional[CLaunchProfile] = None
     log_messages: tuple[str, ...] = ()
@@ -95,12 +97,13 @@ def compose_dual_ir_shell(
     """Arrange an already-produced ``AOTCompilation`` (and, optionally, an
     already-produced launch profile) into a ``DualIRShell``.  Reads
     ``aot.compiled_shell_program``/``aot.shell_control_program`` -- the same
-    numeric/control pair ``compile_ast_aot`` already returns -- and does not
+    numeric/control/map members ``compile_ast_aot`` already returns -- and does not
     compile or execute anything itself."""
 
     return DualIRShell(
         compiled_shell_program=aot.compiled_shell_program,
         shell_control_program=aot.shell_control_program,
+        map_ir=getattr(aot, "map_ir", None),
         name=name or aot.entrypoint,
         profile=profile,
         log_messages=log_messages,

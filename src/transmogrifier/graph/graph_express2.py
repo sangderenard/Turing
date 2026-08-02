@@ -143,6 +143,99 @@ def _filter_discovered_definition(definition, module):
     return ast.copy_location(filtered, definition)
 
 
+def _class_schema_from_ast(definition):
+    """Record only class syntax already being ingested by ``ProcessGraph``.
+
+    This is descriptive AST metadata: attributes and direct method definitions
+    with source-derived program identifiers.  It deliberately does not infer
+    execution, data flow, process edges, or a runtime object model.
+    """
+
+    attributes = []
+    seen_attributes = set()
+
+    def add_attribute(name, annotation, storage):
+        if name in seen_attributes:
+            return
+        seen_attributes.add(name)
+        attributes.append({
+            "name": name,
+            "identity": f"{definition.name}.{name}",
+            "storage": storage,
+            "annotation": None if annotation is None else ast.unparse(annotation),
+            "permissions": (),
+        })
+
+    methods = [
+        member
+        for member in definition.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for member in definition.body:
+        if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+            add_attribute(member.target.id, member.annotation, "class")
+        elif isinstance(member, ast.Assign):
+            for target in member.targets:
+                if isinstance(target, ast.Name):
+                    add_attribute(target.id, None, "class")
+    for method in methods:
+        for statement in ast.walk(method):
+            targets = (
+                ((statement.target, statement.annotation),)
+                if isinstance(statement, ast.AnnAssign)
+                else ((target, None) for target in statement.targets)
+                if isinstance(statement, ast.Assign)
+                else ()
+            )
+            for target, annotation in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    add_attribute(target.attr, annotation, "instance")
+    return {
+        "class_name": definition.name,
+        "class_node_id": id(definition),
+        "permissions": (),
+        "attributes": tuple(attributes),
+        "methods": tuple({
+            "name": method.name,
+            "graph_identity": f"{definition.name}.{method.name}",
+            "ast_node_id": id(method),
+            "permissions": (),
+        } for method in methods),
+    }
+
+
+def _map_ir_from_ast(tree):
+    """Build the map member that accompanies numeric and control IR.
+
+    Empty permission tuples are explicit: AST ingestion has found identities
+    but no permission declarations. Policy is not guessed from Python naming
+    conventions or method bodies.
+    """
+
+    objects = tuple(
+        _class_schema_from_ast(definition)
+        for definition in ast.walk(tree)
+        if isinstance(definition, ast.ClassDef)
+    )
+    return {
+        "objects": objects,
+        "graphs": tuple(
+            {
+                "identity": method["graph_identity"],
+                "ast_node_id": method["ast_node_id"],
+                "permissions": method["permissions"],
+            }
+            for object_schema in objects
+            for method in object_schema["methods"]
+        ),
+        "permissions": (),
+    }
+
+
 def _ast_definition_bindings(value):
     """Obtain names needed only while recursively discovering source AST."""
 
@@ -1013,6 +1106,11 @@ class ProcessGraph:
                     profile_verbose=profile_verbose,
                 )
             )
+
+        # Preserve class declarations as schema metadata beside the exact AST
+        # nodes ProcessGraph is about to ingest; do not create a second AST
+        # ingestion path or infer process topology from them.
+        self.G.graph["map_ir"] = _map_ir_from_ast(tree)
 
         if profile_verbose:
             print(

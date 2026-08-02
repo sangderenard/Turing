@@ -212,6 +212,29 @@ _DTYPE_KIND: dict[str, str] = {
 DEFAULT_DTYPE = "float64"
 
 
+def supported_tensor_operations() -> frozenset[str]:
+    """Canonical tensor operations this emitter can spell directly.
+
+    SSA also contains control and memory instructions, but those are not
+    tensor-operator vocabulary.  This view is for target selection and is
+    derived from the emitter tables themselves so it cannot become a second
+    hand-maintained backend list.
+    """
+
+    from ..common.tensors.operator_catalog import (
+        CANONICAL_ABSTRACT_TENSOR_OPERATORS,
+    )
+
+    registered = (
+        frozenset(_BINARY)
+        | frozenset(_UNARY)
+        | frozenset(_REDUCTION)
+        | _SHAPE_ONLY
+        | frozenset({"tensor_from_list", "where"})
+    )
+    return frozenset(registered & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
+
+
 class FortranEmissionError(ValueError):
     """Raised when an SSA construct has no honest Fortran spelling."""
 
@@ -1745,4 +1768,5 @@ __all__ = [
     "emit_function",
     "emit_module",
     "fortran_compiler",
+    "supported_tensor_operations",
 ]

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,249 @@ class ShellReferenceTables:
             memory=list(self.memory),
             correlations=list(self.correlations),
         )
+
+
+@dataclass(frozen=True)
+class MapDependencyRegions:
+    """Function compartments retained for execution and object-map reasons.
+
+    ``runtime`` is the strict call closure of one entrypoint. ``mapped`` is
+    the set of graph-backed methods named by retained class maps. ``retained``
+    is their union, while ``map_only`` keeps non-runtime methods identifiable
+    without pretending they are part of the current execution closure.
+    """
+
+    runtime: tuple[int, ...]
+    mapped: tuple[int, ...]
+    retained: tuple[int, ...]
+    map_only: tuple[int, ...]
+    bindings: tuple[tuple[str, int], ...]
+
+
+PermissionEvaluator = Callable[[str, tuple[str, ...]], bool]
+
+
+@dataclass(frozen=True)
+class ClassNavigationMember:
+    """One dot-addressable class member in the navigation LUT."""
+
+    name: str
+    identity: str
+    kind: str
+    storage: str | None
+    function_reference: int | None
+    permissions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClassNavigationRecord:
+    """One class's static space and method/function-table references."""
+
+    identity: str
+    permissions: tuple[str, ...]
+    members: tuple[ClassNavigationMember, ...]
+    instantiation_functions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ClassNavigationTable:
+    """Lookup table for class construction and ``.`` member navigation."""
+
+    classes: tuple[ClassNavigationRecord, ...]
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "classes": [
+                {
+                    "identity": record.identity,
+                    "permissions": list(record.permissions),
+                    "instantiation_functions": list(
+                        record.instantiation_functions
+                    ),
+                    "members": [
+                        {
+                            "name": member.name,
+                            "identity": member.identity,
+                            "kind": member.kind,
+                            "storage": member.storage,
+                            "function_reference": member.function_reference,
+                            "permissions": list(member.permissions),
+                        }
+                        for member in record.members
+                    ],
+                }
+                for record in self.classes
+            ]
+        }
+
+    def class_record(self, identity: str) -> ClassNavigationRecord:
+        matches = [item for item in self.classes if item.identity == identity]
+        if len(matches) != 1:
+            raise KeyError(f"unknown or ambiguous class identity {identity!r}")
+        return matches[0]
+
+    @staticmethod
+    def _require(
+        evaluator: PermissionEvaluator,
+        identity: str,
+        permissions: tuple[str, ...],
+    ) -> None:
+        if not evaluator(identity, permissions):
+            raise PermissionError(f"access denied to {identity!r}")
+
+    def instantiate(
+        self,
+        class_identity: str,
+        evaluator: PermissionEvaluator,
+    ) -> tuple[int, ...]:
+        """Return the permitted constructor function-table references."""
+
+        record = self.class_record(class_identity)
+        self._require(evaluator, record.identity, record.permissions)
+        constructors = {
+            member.function_reference: member
+            for member in record.members
+            if member.name in {"__new__", "__init__"}
+            and member.function_reference is not None
+        }
+        for reference in record.instantiation_functions:
+            member = constructors[reference]
+            self._require(evaluator, member.identity, member.permissions)
+        return record.instantiation_functions
+
+    def resolve_dot(
+        self,
+        class_identity: str,
+        member_name: str,
+        evaluator: PermissionEvaluator,
+    ) -> ClassNavigationMember:
+        """Resolve ``class_identity.member_name`` after permission checks."""
+
+        record = self.class_record(class_identity)
+        self._require(evaluator, record.identity, record.permissions)
+        matches = [item for item in record.members if item.name == member_name]
+        if len(matches) != 1:
+            raise KeyError(
+                f"unknown or ambiguous member {class_identity}.{member_name}"
+            )
+        member = matches[0]
+        self._require(evaluator, member.identity, member.permissions)
+        return member
+
+
+def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
+    """Bind ingested class-map identities to the existing function table."""
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        raise ValueError("class navigation requires a function table")
+    records = []
+    for object_map in (graph.G.graph.get("map_ir") or {}).get("objects", ()):
+        class_identity = str(object_map["class_name"])
+        members = []
+        for attribute in object_map.get("attributes", ()):
+            members.append(ClassNavigationMember(
+                name=str(attribute["name"]),
+                identity=str(attribute["identity"]),
+                kind="attribute",
+                storage=str(attribute["storage"]),
+                function_reference=None,
+                permissions=tuple(attribute.get("permissions", ())),
+            ))
+        for method in object_map.get("methods", ()):
+            identity = str(method["graph_identity"])
+            try:
+                entry = function_table.entry(identity)
+            except KeyError:
+                reference = None
+            else:
+                reference = (
+                    int(entry.reference.address) if entry.graph is not None else None
+                )
+            members.append(ClassNavigationMember(
+                name=str(method["name"]),
+                identity=identity,
+                kind="method",
+                storage=None,
+                function_reference=reference,
+                permissions=tuple(method.get("permissions", ())),
+            ))
+        names = [member.name for member in members]
+        if len(names) != len(set(names)):
+            raise ValueError(f"class {class_identity!r} has ambiguous member names")
+        constructors = tuple(
+            member.function_reference
+            for constructor_name in ("__new__", "__init__")
+            for member in members
+            if member.name == constructor_name
+            and member.function_reference is not None
+        )
+        records.append(ClassNavigationRecord(
+            identity=class_identity,
+            permissions=tuple(object_map.get("permissions", ())),
+            members=tuple(members),
+            instantiation_functions=constructors,
+        ))
+    identities = [record.identity for record in records]
+    if len(identities) != len(set(identities)):
+        raise ValueError("class navigation contains duplicate class identities")
+    return ClassNavigationTable(tuple(records))
+
+
+def build_map_dependency_regions(graph: Any, entrypoint: str) -> MapDependencyRegions:
+    """Combine strict runtime closure with map-level class retention."""
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        raise ValueError("dependency regions require a function table")
+    try:
+        entry = function_table.entry(entrypoint)
+    except KeyError as exc:
+        raise ValueError(f"unknown dependency entrypoint {entrypoint!r}") from exc
+
+    runtime: set[int] = set()
+    pending = [int(entry.reference.address)]
+    while pending:
+        reference = pending.pop()
+        if reference in runtime:
+            continue
+        runtime.add(reference)
+        function = function_table.entry(reference)
+        function_graph = function.graph
+        if function_graph is None:
+            continue
+        for _node_id, data in function_graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            callee = attributes.get("callee_ref")
+            if callee is None:
+                callee = attributes.get("method_ref")
+            if callee is not None:
+                pending.append(int(callee))
+
+    mapped: set[int] = set()
+    bindings: list[tuple[str, int]] = []
+    map_ir = graph.G.graph.get("map_ir") or {}
+    for mapped_graph in map_ir.get("graphs", ()):
+        identity = mapped_graph.get("identity")
+        if not identity:
+            continue
+        try:
+            mapped_entry = function_table.entry(str(identity))
+        except KeyError:
+            continue
+        if mapped_entry.graph is not None:
+            reference = int(mapped_entry.reference.address)
+            mapped.add(reference)
+            bindings.append((str(identity), reference))
+
+    retained = runtime | mapped
+    return MapDependencyRegions(
+        runtime=tuple(sorted(runtime)),
+        mapped=tuple(sorted(mapped)),
+        retained=tuple(sorted(retained)),
+        map_only=tuple(sorted(mapped - runtime)),
+        bindings=tuple(bindings),
+    )
 
 
 def _ordered_nodes(graph: Any) -> list[Any]:
@@ -332,10 +575,16 @@ def build_shell_reference_tables(graph: Any) -> ShellReferenceTables:
 
 
 __all__ = [
+    "ClassNavigationMember",
+    "ClassNavigationRecord",
+    "ClassNavigationTable",
+    "MapDependencyRegions",
     "ShellConstantReference",
     "ShellFunctionReference",
     "ShellMemoryReference",
     "ShellReferenceCorrelation",
     "ShellReferenceTables",
+    "build_map_dependency_regions",
+    "build_class_navigation_table",
     "build_shell_reference_tables",
 ]

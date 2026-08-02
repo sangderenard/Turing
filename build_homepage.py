@@ -1,6 +1,7 @@
-"""Build the repository's homepage: index.html.
+"""Build the workspace gallery homepage at the parent repository root.
 
     python build_homepage.py
+    python build_homepage.py --destination C:/dev/Powershell
 
 One ordinary Python function is ingested as an AST, planned once as a
 ProcessGraph, lowered through the AOT compiler, and emitted through every
@@ -15,11 +16,12 @@ rather than a number nobody checks.
 The page is a small manifest shell. Versioned staged and contiguous ``.wasm``
 artifacts are fetched only when selected for execution, and versioned language
 sources are fetched only after an explicit Download click. GitHub Pages serves
-the root shell and ``site/v2/`` artifact tree together.
+the coordination-repository root shell and ``site/v3/`` artifact tree together.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import base64
 import contextlib
@@ -48,6 +50,9 @@ from src.compiler.wasm_class_coordinator import (
 )
 from src.compiler.wasm_html_shell import emit_html_shell
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
+
+TURING_ROOT = Path(__file__).resolve().parent
+DEFAULT_PUBLISH_ROOT = TURING_ROOT.parent
 
 # Every iteration is unrolled into the emitted program, so this is the one
 # number that decides how large it gets. The escape test is the break-out:
@@ -341,6 +346,11 @@ def _channel_outputs(program) -> dict:
 
 
 def build(destination: Path) -> Path:
+    destination = destination.resolve()
+    if destination == TURING_ROOT:
+        raise ValueError(
+            "the generated site belongs in the parent workspace root, not Turing"
+        )
     channel = TelemetryChannel(name="homepage")
     network_module = compile_network_module()
     probe = {name: np.zeros(4) for name in (
@@ -620,5 +630,16 @@ def build(destination: Path) -> Path:
     return written
 
 
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--destination",
+        type=Path,
+        default=DEFAULT_PUBLISH_ROOT,
+        help="published-site root (default: parent of the Turing repository)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    build(Path(__file__).resolve().parent)
+    build(_arguments().destination.resolve())

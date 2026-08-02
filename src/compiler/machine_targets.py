@@ -19,18 +19,22 @@ toolchain that may not be installed. ``available()`` reports the second
 without affecting the first, so a target is never quietly skipped for
 lacking a compiler -- ``emit`` still works and says so.
 
-WebAssembly is the first member, and it is deliberately the simplest one:
+WebAssembly was the first member, and it is deliberately the simplest one:
 it consumes ``FusedProgram``, the only intermediary with no control flow,
 which is exactly what makes it a translation rather than a compiler (see
 ``fused_program_wasm_backend`` for why WebAssembly's structured control flow
 makes the SSA route a much larger problem).
+
+The hub also registers desktop GLSL, Fortran-through-SSA, and WebGL 2.  C and
+LLVM are inventoried here but not registered as ``FusedProgram`` printers:
+their current JIT entry points consume captured autograd tapes directly.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 from ..common.tensors.fused_ir import FusedProgram
 
@@ -52,12 +56,36 @@ class TargetCapabilities:
     # Whether the target has native control flow for a loop-bearing program,
     # or only handles the straight-line numeric region.
     control_flow: bool
+    # A closed operation vocabulary when the target has one. ``None`` is for
+    # a target whose acceptance depends on richer IR than an operation name.
+    # Closed sets make unknown operations fail selection instead of appearing
+    # supported merely because they were absent from a blacklist.
+    supported_operations: frozenset[str] | None = None
     # Operations the target cannot express at all. A caller can check this
     # against a program's steps before paying for emission.
     unsupported_operations: frozenset[str] = frozenset()
     # The external tool needed to turn emitted text into a binary, if any.
     assembler: str | None = None
     note: str | None = None
+
+    def supports(self, operations: set[str] | frozenset[str]) -> bool:
+        used = frozenset(operations)
+        if self.supported_operations is not None and not (
+            used <= self.supported_operations
+        ):
+            return False
+        return not bool(used & self.unsupported_operations)
+
+
+@dataclass(frozen=True)
+class BackendOperatorInventory:
+    """Read-only view of the finite list owned by an existing backend."""
+
+    backend: str
+    consumes: str
+    operations: frozenset[str]
+    sources: tuple[str, ...]
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -131,12 +159,79 @@ def targets_for(program: FusedProgram) -> tuple[str, ...]:
     return tuple(
         name
         for name, target in _REGISTRY.items()
-        if not (used & target.capabilities.unsupported_operations)
+        if target.capabilities.supports(used)
     )
 
 
 def emit(program: FusedProgram, target: str, *, name: str = "program") -> TargetArtifact:
     return get_target(target).emit(program, name=name)
+
+
+def operator_inventories() -> tuple[BackendOperatorInventory, ...]:
+    """Inventory C, GLSL, Fortran, LLVM and WebGL without copying their lists."""
+
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+        c_dispatch_operations,
+        covered_operations,
+    )
+    from ..common.tensors.accelerator_backends.glsl_backend import GLSL_OPS
+    from .fused_program_webgl_backend import supported_operations as webgl_ops
+    from .ssa_fortran_backend import supported_tensor_operations
+
+    return (
+        BackendOperatorInventory(
+            backend="c",
+            consumes="captured_tape",
+            operations=c_dispatch_operations(),
+            sources=(
+                "src/common/tensors/accelerator_backends/c_backend.py:"
+                "CAbstractTensor._apply_operator__.binary_codes/unary_codes",
+            ),
+            note="scalar opcode dispatch; structural kernels have separate entry points",
+        ),
+        BackendOperatorInventory(
+            backend="glsl",
+            consumes="fused_program",
+            operations=GLSL_OPS,
+            sources=(
+                "src/common/tensors/accelerator_backends/glsl_backend.py:"
+                "_BINARY/_UNARY/GLSL_OPS",
+            ),
+            note="desktop OpenGL 4.3 compute expression surface",
+        ),
+        BackendOperatorInventory(
+            backend="fortran",
+            consumes="ssa",
+            operations=supported_tensor_operations(),
+            sources=(
+                "src/compiler/ssa_fortran_backend.py:"
+                "_BINARY/_UNARY/_REDUCTION/_SHAPE_ONLY",
+            ),
+            note="tensor operations only; SSA control instructions are additional",
+        ),
+        BackendOperatorInventory(
+            backend="llvm",
+            consumes="captured_tape",
+            operations=covered_operations(),
+            sources=(
+                "src/common/tensors/accelerator_backends/"
+                "c_backend_llvm_ssa.py:TRANSLATIONS",
+            ),
+            note="authored C-kernel to LLVM-SSA correspondences",
+        ),
+        BackendOperatorInventory(
+            backend="webgl",
+            consumes="fused_program",
+            operations=webgl_ops(),
+            sources=(
+                "src/common/tensors/accelerator_backends/glsl_backend.py:"
+                "GLSL_FLOAT_SCALAR_OPS",
+                "src/compiler/fused_program_webgl_backend.py:"
+                "supported_operations",
+            ),
+            note="WebGL 2 fragment-raster ABI; no compute shaders or SSBOs",
+        ),
+    )
 
 
 # --- WebAssembly -----------------------------------------------------------
@@ -146,7 +241,21 @@ class _WasmTarget:
     """WAT text from the flat numeric IR. The hub's first member."""
 
     def __init__(self):
-        from .fused_program_wasm_backend import _NO_WASM_INSTRUCTION
+        from .fused_program_wasm_backend import (
+            _BINARY_INSTRUCTION,
+            _COMPARISON_INSTRUCTION,
+            _LUT_OPS,
+            _NO_WASM_INSTRUCTION,
+            _UNARY_INSTRUCTION,
+        )
+
+        supported = frozenset(
+            set(_BINARY_INSTRUCTION)
+            | set(_COMPARISON_INSTRUCTION)
+            | set(_LUT_OPS)
+            | set(_UNARY_INSTRUCTION)
+            | {"tensor_from_list"}
+        )
 
         self.capabilities = TargetCapabilities(
             name="wasm",
@@ -155,6 +264,7 @@ class _WasmTarget:
             # The only loop it writes is the elementwise walk over the
             # extent; it does not lower a program's own control flow.
             control_flow=False,
+            supported_operations=supported,
             unsupported_operations=frozenset(_NO_WASM_INSTRUCTION),
             assembler="wat2wasm",
             note=(
@@ -198,7 +308,175 @@ class _WasmTarget:
 register_target(_WasmTarget())
 
 
+# --- desktop GLSL compute --------------------------------------------------
+
+
+class _GLSLTarget:
+    def __init__(self):
+        from ..common.tensors.accelerator_backends.glsl_backend import GLSL_OPS
+
+        self.capabilities = TargetCapabilities(
+            name="glsl",
+            consumes="fused_program",
+            emits=".comp.glsl",
+            control_flow=False,
+            supported_operations=GLSL_OPS,
+            assembler="OpenGL 4.3 driver",
+            note="desktop compute shader with std430 SSBO bindings",
+        )
+
+    def available(self) -> bool:
+        from ..common.tensors.accelerator_backends.glsl_backend import (
+            gl_context_info,
+        )
+
+        return gl_context_info() is not None
+
+    def emit(self, program: FusedProgram, *, name: str = "program") -> TargetArtifact:
+        from ..common.tensors.accelerator_backends.glsl_backend import (
+            emit_multi_output_program_source,
+            emit_program_source,
+        )
+        from .compiled_program_api import CompiledProgramAPI, EntryPoint
+
+        try:
+            source = (
+                emit_multi_output_program_source(program)
+                if len(program.outputs) > 1
+                else emit_program_source(program)
+            )
+            shortfalls: tuple[str, ...] = ()
+        except Exception as error:
+            source = ""
+            shortfalls = (f"{type(error).__name__}: {error}",)
+        api = CompiledProgramAPI(
+            module=name,
+            language="glsl",
+            entry="main",
+            entry_points=(EntryPoint("main", "main", "numerical"),),
+            metadata={
+                "execution_model": "compute",
+                "minimum_opengl": "4.3",
+                "storage": "std430 SSBO",
+            },
+        )
+        return TargetArtifact(
+            target="glsl",
+            name=name,
+            source=source,
+            complete=not shortfalls,
+            shortfalls=shortfalls,
+            api=api,
+            extension=".comp.glsl",
+        )
+
+
+# --- Fortran ---------------------------------------------------------------
+
+
+class _FortranTarget:
+    def __init__(self):
+        from .ssa_fortran_backend import supported_tensor_operations
+
+        self.capabilities = TargetCapabilities(
+            name="fortran",
+            consumes="fused_program->ssa",
+            emits=".f90",
+            control_flow=True,
+            supported_operations=supported_tensor_operations(),
+            assembler="gfortran/ifx/ifort/flang/lfortran",
+            note="FusedProgram is first lowered to the shared repository SSA",
+        )
+
+    def available(self) -> bool:
+        from .ssa_fortran_backend import fortran_compiler
+
+        return fortran_compiler() is not None
+
+    def emit(self, program: FusedProgram, *, name: str = "program") -> TargetArtifact:
+        from ..transmogrifier.ssa import IRModule
+        from .precompile_to_ssa import lower_fused_program_to_ssa
+        from .ssa_fortran_backend import emit_module
+
+        function, lowering_shortfalls = lower_fused_program_to_ssa(
+            program, function_name=name,
+        )
+        returns = tuple(
+            instruction.args
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        )
+        output_values = returns[-1] if returns else ()
+        module = emit_module(
+            IRModule({name: function}),
+            name=name,
+            outputs={name: output_values},
+        )
+        shortfalls = tuple(
+            f"{item.domain}:{item.name} at {item.location}: {item.reason}"
+            for item in lowering_shortfalls
+        ) + tuple(item.format() for item in module.shortfalls)
+        return TargetArtifact(
+            target="fortran",
+            name=name,
+            source=module.source,
+            complete=not shortfalls,
+            shortfalls=shortfalls,
+            api=module.api,
+            extension=".f90",
+            module=module,
+        )
+
+
+# --- WebGL 2 ---------------------------------------------------------------
+
+
+class _WebGLTarget:
+    def __init__(self):
+        from .fused_program_webgl_backend import supported_operations
+
+        self.capabilities = TargetCapabilities(
+            name="webgl",
+            consumes="fused_program",
+            emits=".frag.glsl",
+            control_flow=False,
+            supported_operations=supported_operations(),
+            assembler="WebGL 2 browser driver",
+            note=(
+                "fragment-raster target: sampler2D inputs and up to four "
+                "float color-attachment outputs"
+            ),
+        )
+
+    def available(self) -> bool:
+        # Emission has no toolchain dependency. Runtime availability is a
+        # property of the browser/graphics context that receives the artifact.
+        return True
+
+    def emit(self, program: FusedProgram, *, name: str = "program") -> TargetArtifact:
+        from .fused_program_webgl_backend import emit_webgl_fragment_module
+
+        module = emit_webgl_fragment_module(program, name=name)
+        return TargetArtifact(
+            target="webgl",
+            name=name,
+            source=module.source,
+            complete=module.complete,
+            shortfalls=tuple(item.format() for item in module.shortfalls),
+            api=module.api,
+            extension=".frag.glsl",
+            module=module,
+        )
+
+
+register_target(_GLSLTarget())
+register_target(_FortranTarget())
+register_target(_WebGLTarget())
+
+
 __all__ = [
+    "BackendOperatorInventory",
     "MachineTarget",
     "TargetArtifact",
     "TargetCapabilities",
@@ -206,6 +484,7 @@ __all__ = [
     "capabilities",
     "emit",
     "get_target",
+    "operator_inventories",
     "register_target",
     "targets",
     "targets_for",

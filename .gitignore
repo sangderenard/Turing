@@ -34,3 +34,7 @@ standard_graph.jpg
 
 # gfortran module files emitted next to generated sources
 *.mod
+
+# Published gallery output belongs to the parent nogodsnomasters repository.
+/index.html
+/site/

@@ -343,6 +343,32 @@ def collect_backend_sources(
             reason=f"{type(error).__name__}: {error}",
         ))
 
+    # --- WebGL 2 --------------------------------------------------------
+    # WebGL shares GLSL scalar expressions, not desktop compute storage.
+    # Its fragment-raster adapter therefore gets its own source tab and an
+    # honest shortfall when the program needs a non-browser-native layout.
+    try:
+        from .fused_program_webgl_backend import emit_webgl_fragment_module
+
+        emitted = emit_webgl_fragment_module(program, name=numerical_name)
+        collected.append(BackendSource(
+            language="webgl",
+            title="WebGL 2",
+            source=emitted.source,
+            available=emitted.complete,
+            reason=(
+                "" if emitted.complete
+                else emitted.shortfalls[0].format()
+            ),
+            highlight="c",
+        ))
+        note("WebGL emitted", complete=emitted.complete)
+    except Exception as error:
+        collected.append(BackendSource(
+            language="webgl", title="WebGL 2", available=False,
+            reason=f"{type(error).__name__}: {error}",
+        ))
+
     # --- WebAssembly ----------------------------------------------------
     if wasm_source:
         collected.append(BackendSource(

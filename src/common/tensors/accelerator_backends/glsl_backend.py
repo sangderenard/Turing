@@ -143,6 +143,8 @@ __all__ = [
     "dispatch_batch",
     "fuse_elementwise",
     "GLSL_OPS",
+    "GLSL_FLOAT_SCALAR_OPS",
+    "emit_scalar_expression",
     "shader_cache_stats",
     "dispatch_stats",
 ]
@@ -242,6 +244,19 @@ _UNARY: dict[str, str] = {
 
 GLSL_OPS: frozenset[str] = frozenset(_BINARY) | frozenset(_UNARY)
 
+# WebGL 2 has the GLSL ES scalar math used by these entries, but it does not
+# share the desktop compute backend's typed SSBO ABI.  Keep the reusable
+# float-expression surface beside the authoritative expression tables; the
+# WebGL fragment adapter consumes this view instead of copying the operators.
+_NON_FLOAT_SCALAR_OPS = frozenset(
+    {
+        "bitand", "bitor", "bitxor", "shl", "shr", "invert",
+        "int_trunc", "zext", "sext", "fptosi", "fptoui", "sitofp",
+        "uitofp",
+    }
+)
+GLSL_FLOAT_SCALAR_OPS: frozenset[str] = GLSL_OPS - _NON_FLOAT_SCALAR_OPS
+
 _LOCAL_SIZE = 256
 
 _ALIASES = {
@@ -297,6 +312,31 @@ def _expr(
         .replace("$a", left)
         .replace("$b", right)
         .replace("$out", out_type)
+    )
+
+
+def emit_scalar_expression(
+    op: str,
+    left: str,
+    right: str | None = None,
+    *,
+    reverse: bool = False,
+    out_type: str = "float",
+) -> str:
+    """Render one scalar expression from the canonical GLSL op tables.
+
+    This is the deliberately small reuse seam for GLSL-family targets.  It
+    exposes expression spelling, not the desktop compute shader's SSBO,
+    dispatch, or context policy.
+    """
+
+    canonical, prefix_reverse = canonical_op(op)
+    return _expr(
+        canonical,
+        left,
+        right,
+        bool(reverse) ^ prefix_reverse,
+        out_type=out_type,
     )
 
 

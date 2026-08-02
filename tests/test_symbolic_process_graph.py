@@ -240,6 +240,28 @@ def test_boolean_polynomials_and_bit_recombination_are_exact_on_bits():
             assert actual == (left_value ^ right_value)
 
 
+def test_backend_minimum_maximum_and_tanh_have_registered_sympy_semantics():
+    x, y, z = sympy.symbols("x y z")
+    expected = sympy.tanh(sympy.Max(x, sympy.Min(y, z)))
+    graph = ProcessGraph(materialize_memory=False)
+    graph.build_from_expression(expected)
+    operation_aliases = {
+        "Min": "minimum",
+        "Max": "maximum",
+        "Tanh": "tanh",
+    }
+    for _node_id, data in graph.G.nodes(data=True):
+        operation = str(data.get("op"))
+        if operation in operation_aliases:
+            data["op"] = operation_aliases[operation]
+
+    expression, = process_graph_to_sympy_expressions(graph)
+    model = process_graph_to_sympy_relations(graph)
+
+    assert expression == expected
+    assert model.uninterpreted == ()
+
+
 def test_symbolic_transition_unroll_uses_simultaneous_state_updates():
     state, choose_forward = sympy.symbols("state choose_forward")
     unrolled = unroll_symbolic_transition(

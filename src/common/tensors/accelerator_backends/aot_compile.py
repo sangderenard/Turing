@@ -92,6 +92,11 @@ from ....compiler.glsl_deployment_strategy import (
     _walk_planned_shells,
     strategize_glsl_deployment,
 )
+from ....compiler.shell_reference_tables import (
+    build_class_navigation_table,
+    build_map_dependency_regions,
+)
+from ....compiler.precompile_to_ssa import lower_class_navigation_to_ssa
 from ....transmogrifier.graph.graph_express2 import ProcessGraph
 from ..topological_reducer import reduce_abstract_tensor_topology
 from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
@@ -105,6 +110,7 @@ class AOTCompilation:
     shell_control_program: Any
     deployment: Any
     shell: DualIRShell
+    map_ir: Mapping[str, Any] | None = None
     # The numeric program for each ``__scheduled_region_N__`` the control
     # program references. ``lower_precompile_and_control_to_ssa`` needs these
     # to find the producers of a loop's carried updates; without them a
@@ -144,6 +150,29 @@ def compile_ast_aot(
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
+    dependency_regions = build_map_dependency_regions(graph, entrypoint)
+    map_ir = dict(graph.G.graph.get("map_ir") or {})
+    map_ir["dependency_regions"] = {
+        "runtime": dependency_regions.runtime,
+        "mapped": dependency_regions.mapped,
+        "retained": dependency_regions.retained,
+        "map_only": dependency_regions.map_only,
+        "bindings": dependency_regions.bindings,
+    }
+    class_navigation = build_class_navigation_table(graph)
+    map_ir["class_navigation"] = class_navigation
+    navigation_ssa = lower_class_navigation_to_ssa(class_navigation)
+    map_ir["semantic_methods"] = tuple(
+        {
+            "function": function.name,
+            "operations": tuple(dict.fromkeys(
+                instruction.op
+                for instruction in function.blocks["entry"].instrs
+            )),
+        }
+        for function in navigation_ssa.functions.values()
+    )
+    graph.G.graph["map_ir"] = map_ir
 
     deployment_type = strategize_glsl_deployment(
         graph,
@@ -214,6 +243,7 @@ def compile_ast_aot(
     shell = DualIRShell(
         compiled_shell_program=compiled_shell_program,
         shell_control_program=shell_control_program,
+        map_ir=map_ir,
         name=entrypoint,
     )
     return AOTCompilation(
@@ -223,6 +253,7 @@ def compile_ast_aot(
         shell_control_program=shell_control_program,
         deployment=deployment,
         shell=shell,
+        map_ir=map_ir,
         region_programs=region_programs,
     )
 

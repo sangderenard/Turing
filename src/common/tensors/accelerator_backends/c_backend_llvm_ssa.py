@@ -2587,11 +2587,26 @@ def translations_for_operation(operation: str) -> tuple[CBackendLLVMSSA, ...]:
 
 
 def covered_operations() -> frozenset[str]:
+    """Operations with an authored C-kernel/LLVM-SSA correspondence."""
+
     return frozenset(
         operation
         for translation in TRANSLATIONS
         for operation in translation.abstract_tensor_operations
     )
+
+
+def c_dispatch_operations() -> frozenset[str]:
+    """Operations in the real C backend's scalar opcode dictionaries.
+
+    The dictionaries inside ``CAbstractTensor._apply_operator__`` are the
+    source of truth.  Reading them through the existing AST inventory keeps
+    compiler capability reports from importing/initializing the C runtime or
+    maintaining another copy of the finite operator list.
+    """
+
+    binary, unary = _c_backend_operator_codes()
+    return frozenset(binary) | frozenset(unary)
 
 
 def validate_translation_table(
@@ -2636,6 +2651,7 @@ __all__ = [
     "LLVM_SSA_MODULE",
     "PRECOMPILE_INTERNAL_OPERATORS",
     "TRANSLATIONS",
+    "c_dispatch_operations",
     "covered_operations",
     "discover_c_backend_functions",
     "extract_c_function",

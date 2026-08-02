@@ -126,6 +126,22 @@ A model is algebraically complete for a selected live slice when
 `uninterpreted == ()` and all retained loops/effects have been realized or
 given explicit transition relations.
 
+“Uninterpreted” is not a dead-code or importance classification. The node and
+its arguments remain in an explicit equation; SymPy simply treats its function
+head as opaque because Turing has not supplied a valid mathematical rule. This
+is safer than inventing commutative/pure semantics, although genuinely
+stateful operations ultimately need state/event-transition equations rather
+than a generic uninterpreted function.
+
+The generated Mandelbrot homepage previously reported 647 uninterpreted
+operations: 322 `minimum`, 322 `maximum`, and 3 `tanh`. Those were present in
+the SymPy model and had not been reduced away. They were backend spelling gaps,
+so `minimum`/`maximum` aliases and `tanh` are now registered and a regenerated
+homepage model reports them as interpreted mathematics. The JFIF full-program
+model has a different boundary: after registering lowercase constants and
+indexed access, 65 operations remain unresolved (calls, static references,
+attributes, unlowered control, tensor-shape operations, and raises).
+
 ## Example: solve a graph backwards
 
 ```python
@@ -180,13 +196,13 @@ The recorded complete run was:
 | recursively ingested AST module | 5,760 nodes |
 | first reduced encoder | 108 nodes |
 | first direct precompile | 109 instructions; graph becomes 109 nodes |
-| compact SymPy before | 132 operations; `srepr` length 5,802 |
-| compact SymPy after aggressive pass | 132 operations; `srepr` length 5,802; unchanged |
-| complete SymPy program model | 107 equations; 72 uninterpreted operations |
+| compact SymPy before | 132 operations; `srepr` length 5,778 |
+| compact SymPy after aggressive pass | 132 operations; `srepr` length 5,778; unchanged |
+| complete SymPy program model | 107 equations; 65 uninterpreted operations |
 | per-equation aggressive pass | 0 equations changed |
-| reverse-table reconstruction | 138 nodes; zero fallbacks; all 109 modeled nodes mapped |
-| second topology reduction | 138 nodes |
-| final direct precompile | 140 instructions |
+| reverse-table reconstruction | 143 nodes; zero fallbacks; all 109 modeled nodes mapped |
+| second topology reduction | 143 nodes |
+| final direct precompile | 145 instructions; graph becomes 145 nodes |
 
 The larger reconstructed program is the honest result. Mathematical lowering
 exposes comparison/control expressions as additional nodes, while the current

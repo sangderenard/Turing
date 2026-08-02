@@ -72,7 +72,10 @@ def test_no_component_or_third_party_layout_engine_creeps_in():
     # engine or component framework.
     assert "process-graph-grid" in html
     # And no third-party anything: the page must open with no network.
-    assert "http://" not in html and "https://" not in html
+    # The one URL is the explicitly configurable loopback publisher, not a
+    # third-party dependency. The page still carries all of its own UI code.
+    without_local_server = html.replace("http://localhost:8787", "")
+    assert "http://" not in without_local_server and "https://" not in html
     assert "<script src" not in html
 
 
@@ -98,6 +101,134 @@ def test_a_mapping_is_accepted_as_well_as_a_descriptor_object():
     artifact = _artifact()
     shell = emit_html_shell(artifact.api.to_mapping(), source=artifact.source)
     assert "feed0" in shell.html
+
+
+def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
+    html = emit_html_shell(
+        _artifact().api,
+        resource_route="/site/programs/demo/versions/v1-abc/",
+    ).html
+
+    assert 'id="server-address" value="http://localhost:8787"' in html
+    assert 'id="python-source"' in html
+    assert 'id="generate-page"' in html
+    assert 'id="gallery"' in html
+    assert 'fetch(serverURL("/api/generate")' in html
+    assert 'fetch(serverURL("/api/gallery")' in html
+    assert 'const RESOURCE_ROUTE = "/site/programs/demo/versions/v1-abc/"' in html
+    assert "fetch(resourceURL(descriptor.url))" in html
+    assert "const programs = new Map()" in html
+    assert "versions.find(item => item.latest) || versions[0]" in html
+    assert 'selector.className = "gallery-version"' in html
+    assert "program(s) · " in html
+
+
+def test_html_shell_reports_class_lut_and_exposes_semantic_navigation_methods():
+    map_ir = {
+        "class_navigation": {
+            "classes": [{
+                "identity": "Vault",
+                "permissions": ["vault:enter"],
+                "instantiation_functions": [4],
+                "members": [{
+                    "name": "read",
+                    "identity": "Vault.read",
+                    "kind": "method",
+                    "storage": None,
+                    "function_reference": 7,
+                    "permissions": ["vault:read"],
+                }],
+            }],
+        },
+        "semantic_methods": [
+            {"function": "turing.class.resolve_member", "operations": ["Const", "Eq", "And", "LAnd", "Select", "Ret"]},
+        ],
+    }
+
+    html = emit_html_shell(_artifact().api, map_ir=map_ir).html
+
+    assert "Class map and navigation LUT" in html
+    assert 'id="class-map"' in html
+    assert "Vault.read" in html
+    assert "turing.class.resolve_member" in html
+    assert "const MAP_IR =" in html
+    assert "window.TuringClassNavigation" in html
+    assert "resolveClassMember" in html
+    assert "resolveClassInstantiation" in html
+    assert "class navigation requires a permission evaluator" in html
+
+
+def test_callable_run_systems_are_grouped_and_packed_into_hidden_div_tabs():
+    map_ir = {
+        "callable_systems": {
+            "classes": [{
+                "identity": "Curve",
+                "methods": [
+                    {
+                        "identity": "Curve.derive",
+                        "name": "derive",
+                        "signature": "derive(self, iterations: int)",
+                        "parameters": [
+                            {"name": "self", "role": "input", "dtype": "Curve", "passing": "value"},
+                            {"name": "iterations", "role": "input", "dtype": "int", "passing": "value"},
+                        ],
+                        "page_url": "/curve/derive/index.html",
+                        "function_reference": 3,
+                    },
+                    {
+                        "identity": "Curve.trace",
+                        "name": "trace",
+                        "signature": "trace(self, iterations: int)",
+                        "parameters": [],
+                        "page_url": "/curve/trace/index.html",
+                        "function_reference": 4,
+                    },
+                ],
+            }],
+            "file_scope": {
+                "functions": [{
+                    "identity": "helper",
+                    "name": "helper",
+                    "signature": "helper(value)",
+                    "parameters": [],
+                    "page_url": "/helper/index.html",
+                    "function_reference": 5,
+                }],
+                "symbols": [{
+                    "name": "SCALE",
+                    "kind": "binding",
+                    "expression": "SCALE = 2.0",
+                }],
+            },
+            "functions": [{
+                "identity": "helper",
+                "name": "helper",
+                "signature": "helper(value)",
+                "parameters": [],
+                "page_url": "/helper/index.html",
+                "function_reference": 5,
+            }],
+        }
+    }
+
+    html = emit_html_shell(_artifact().api, map_ir=map_ir).html
+
+    assert "Callable run systems" in html
+    assert html.index("file scope") < html.index("class Curve")
+    assert 'class="callable-owner-tab"' in html
+    assert 'class="callable-owner-view" data-callable-owner-view="file-scope"' in html
+    assert 'data-callable-owner-view="class-Curve" hidden' in html
+    assert 'class="callable-tab"' in html
+    assert 'class="callable-tabview" data-callable-view="Curve-trace" hidden' in html
+    assert 'data-callable="Curve.derive"' in html
+    assert 'id="callable-Curve-derive-iterations"' in html
+    assert 'data-callable-view="file-symbols" hidden' in html
+    assert "SCALE = 2.0" in html
+    assert "Open generated callable page" in html
+    assert "function wireCallableTabs()" in html
+    assert "activateOwner" in html
+    assert 'data-class-map-view="raw" hidden' in html
+    assert "function wireClassMapTabs()" in html
 
 
 # --- output views and diagnostics -----------------------------------------
@@ -240,7 +371,7 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
     assert "No live tensor is copied through" in html
     assert "shared-memory slot" in html
     assert "Live deployment schedule:" in html
-    assert "await fetch(spec.url)" in html
+    assert "await fetch(resourceURL(spec.url))" in html
     assert "one element per call today" not in html
 
 
@@ -259,7 +390,7 @@ def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():
     assert "site/v2/source/render/fortran/render.f90" in html
     assert "The file is fetched only after this button is clicked" in html
     assert 'button.addEventListener("click", async () =>' in html
-    assert "await fetch(descriptor.url)" in html
+    assert "await fetch(resourceURL(descriptor.url))" in html
 
 
 def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
@@ -292,7 +423,7 @@ def test_sympy_mathematics_is_rendered_separately_from_lazy_sources():
     assert "<mi>result</mi>" in html
     assert "site/v3/math/render/sympy-process-model.json" in html
     assert "Download exact SymPy model" in html
-    assert "await fetch(MATHEMATICS.url)" in html
+    assert "await fetch(resourceURL(MATHEMATICS.url))" in html
     assert "relation 1" not in html
     assert "math-equations" not in html
 

@@ -151,6 +151,40 @@ def construct(value):
     assert not _definitions(graph, "_unrelated_dependency")
 
 
+def test_actual_ast_ingestion_records_dummy_class_schema_without_process_inference():
+    graph = _ingest(
+        '''
+class Thermostat:
+    manufacturer: str = "Turing"
+
+    def __init__(self, reading: float):
+        self.reading: float = reading
+        self.target = 21.0
+
+    def adjust(self, amount: float) -> float:
+        return self.reading + amount
+''',
+        {},
+    )
+
+    map_ir = graph.G.graph["map_ir"]
+    (schema,) = map_ir["objects"]
+    assert schema["class_name"] == "Thermostat"
+    assert schema["attributes"] == (
+        {"name": "manufacturer", "identity": "Thermostat.manufacturer", "storage": "class", "annotation": "str", "permissions": ()},
+        {"name": "reading", "identity": "Thermostat.reading", "storage": "instance", "annotation": "float", "permissions": ()},
+        {"name": "target", "identity": "Thermostat.target", "storage": "instance", "annotation": None, "permissions": ()},
+    )
+    assert [method["graph_identity"] for method in schema["methods"]] == [
+        "Thermostat.__init__", "Thermostat.adjust",
+    ]
+    assert [item["identity"] for item in map_ir["graphs"]] == [
+        "Thermostat.__init__", "Thermostat.adjust",
+    ]
+    assert map_ir["permissions"] == ()
+    assert all(item["permissions"] == () for item in map_ir["graphs"])
+
+
 def test_dynamic_attribute_call_does_not_alias_method_by_basename():
     graph = _ingest(
         """

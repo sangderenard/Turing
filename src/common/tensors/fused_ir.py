@@ -1,9 +1,18 @@
-"""Lightweight core of the established :mod:`abstract_nn.fused_program` IR.
+"""IR for resolving one bounded numeric segment.
 
-The full builder and runner intentionally live in ``abstract_nn``.  Backend
-lowerers import this module so using the C or GLSL backend does not initialize
-the neural-network stack.  These are the same public IR classes re-exported by
-``abstract_nn.fused_program``; this module is not a second program format.
+``FusedProgram`` is **not the Turing compiler** and is not Turing's model of a
+whole program.  It contains only the data dependencies needed to resolve a
+flat numeric region after the compiler has already decided that the region is
+eligible for numeric fusion.  It has no object identity, class organization,
+control flow, process-graph ownership, map permissions, shell resources, or
+deployment policy.
+
+The full builder and runner intentionally live in ``abstract_nn``.  Numeric
+backend lowerers import this lightweight module so using the C or GLSL backend
+does not initialize the neural-network stack.  These are the same public IR
+classes re-exported by ``abstract_nn.fused_program``; this module is not a
+second program format.  A compiler-managed method or process may contain zero,
+one, or many of these numeric segments.
 """
 
 from __future__ import annotations
@@ -37,7 +46,19 @@ class OpStep:
 
 @dataclass
 class FusedProgram:
-    """Unified program representation for AbstractTensor graphs."""
+    """Dependency-resolved IR for one flat numeric segment.
+
+    Despite the historical name, this object is neither a compiler nor a
+    complete program.  ``feeds`` name values entering the numeric segment,
+    ``steps`` are its linearly ordered tensor operations, and ``outputs`` name
+    values leaving it.  The surrounding ProcessGraph, control IR, object/class
+    map, permissions, method identity, shell, and runtime remain outside this
+    object and must not be inferred from it.
+
+    Backends consume a ``FusedProgram`` only after a larger compilation has
+    selected such a numeric region.  Treating it as the compiler boundary
+    discards the non-numeric structure that Turing is required to retain.
+    """
 
     version: int
     feeds: Set[int]

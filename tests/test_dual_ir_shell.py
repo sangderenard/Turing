@@ -9,7 +9,7 @@ from src.common.tensors.accelerator_backends.profiled_c_shell import (
 )
 
 
-def _aot(entrypoint="f", numeric="numeric-program", control=None):
+def _aot(entrypoint="f", numeric="numeric-program", control=None, map_ir=None):
     return AOTCompilation(
         entrypoint=entrypoint,
         outputs={},
@@ -17,6 +17,7 @@ def _aot(entrypoint="f", numeric="numeric-program", control=None):
         shell_control_program=control,
         deployment=None,
         shell=DualIRShell(compiled_shell_program=numeric, shell_control_program=control),
+        map_ir=map_ir,
     )
 
 
@@ -26,9 +27,19 @@ def test_shell_pairs_the_same_numeric_and_control_the_aot_already_returns():
     assert shell.shell_control_program == "control"
 
 
+def test_shell_carries_map_ir_as_a_distinct_member():
+    map_ir = {"objects": (), "graphs": (), "permissions": ()}
+    shell = compose_dual_ir_shell(_aot(map_ir=map_ir))
+
+    assert shell.compiled_shell_program == "numeric-program"
+    assert shell.shell_control_program is None
+    assert shell.map_ir is map_ir
+
+
 def test_a_bare_shell_has_no_profile_no_log_no_children():
     shell = DualIRShell(compiled_shell_program="numeric")
     assert shell.shell_control_program is None
+    assert shell.map_ir is None
     assert shell.profile is None
     assert shell.log_messages == ()
     assert shell.children == ()

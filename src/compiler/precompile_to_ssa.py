@@ -975,6 +975,237 @@ def lower_control_program_to_ssa(
     return builder.finish()
 
 
+def lower_class_navigation_to_ssa(
+    navigation: Any,
+    *,
+    namespace: str = "turing.class",
+) -> IRModule:
+    """Lower class navigation to ordinary, backend-supported SSA primitives.
+
+    Class/member identities and permission names become deterministic integer
+    LUT indices and permission bits. Lookup is a chain of ``Eq``/``LAnd``/
+    ``Select`` operations; permission checks are ``And`` plus ``Eq``. Missing
+    or denied references are ``-1``. No class-specific opcode is introduced.
+    """
+
+    mapping = (
+        navigation.to_mapping()
+        if hasattr(navigation, "to_mapping")
+        else dict(navigation)
+    )
+
+    classes = tuple(mapping.get("classes", ()))
+    permission_names = sorted({
+        str(permission)
+        for record in classes
+        for permission in (
+            *record.get("permissions", ()),
+            *(
+                permission
+                for member in record.get("members", ())
+                for permission in member.get("permissions", ())
+            ),
+        )
+    })
+    permission_bits = {
+        name: 1 << index for index, name in enumerate(permission_names)
+    }
+
+    def mask(names) -> int:
+        result = 0
+        for name in names:
+            result |= permission_bits[str(name)]
+        return result
+
+    lut_classes = []
+    member_index = 0
+    for class_index, record in enumerate(classes):
+        members = []
+        for local_index, member in enumerate(record.get("members", ())):
+            members.append({
+                **dict(member),
+                "member_index": member_index,
+                "local_slot": local_index,
+                "required_mask": mask(member.get("permissions", ())),
+                "kind_code": 1 if member.get("kind") == "method" else 0,
+                "reference": (
+                    int(member["function_reference"])
+                    if member.get("function_reference") is not None
+                    else local_index
+                ),
+            })
+            member_index += 1
+        lut_classes.append({
+            **dict(record),
+            "class_index": class_index,
+            "required_mask": mask(record.get("permissions", ())),
+            "members": members,
+        })
+    lut = {
+        "classes": lut_classes,
+        "permission_bits": permission_bits,
+    }
+
+    class Builder:
+        def __init__(self, name: str, dtypes: tuple[str, ...]):
+            self.name = name
+            self.args = [SSAValue(i, dtype=dtype) for i, dtype in enumerate(dtypes)]
+            self.next_id = len(self.args)
+            self.instructions: list[Instr] = []
+
+        def emit(self, operation: Handler, args=(), *, dtype="i32", **attributes):
+            result = SSAValue(self.next_id, dtype=dtype)
+            self.next_id += 1
+            self.instructions.append(Instr(
+                operation.value, list(args), result, attributes=attributes,
+            ))
+            return result
+
+        def constant(self, value: int, *, dtype="i32"):
+            return self.emit(Handler.Const, dtype=dtype, value=int(value))
+
+        def finish(self, results: list[SSAValue]):
+            self.instructions.append(Instr(Handler.Ret.value, results, None))
+            return Function(self.name, self.args, {
+                "entry": BasicBlock("entry", self.instructions),
+            })
+
+    lookup = Builder(f"{namespace}.lookup", ("i32",))
+    lookup_result = lookup.constant(-1)
+    for record in lut_classes:
+        class_id = lookup.constant(record["class_index"])
+        matches = lookup.emit(Handler.Eq, (lookup.args[0], class_id), dtype="bool")
+        row = lookup.constant(record["class_index"])
+        lookup_result = lookup.emit(
+            Handler.Select, (matches, row, lookup_result),
+        )
+    lookup_function = lookup.finish([lookup_result])
+
+    permission = Builder(
+        f"{namespace}.evaluate_permission", ("i32", "i32"),
+    )
+    present = permission.emit(Handler.And, permission.args)
+    permitted = permission.emit(
+        Handler.Eq, (present, permission.args[1]), dtype="bool",
+    )
+    permission_function = permission.finish([permitted])
+
+    resolve = Builder(
+        f"{namespace}.resolve_member", ("i32", "i32", "i32"),
+    )
+    resolved_kind = resolve.constant(-1)
+    resolved_reference = resolve.constant(-1)
+    resolved_allowed = resolve.constant(0, dtype="bool")
+    for record in lut_classes:
+        class_id = resolve.constant(record["class_index"])
+        class_match = resolve.emit(
+            Handler.Eq, (resolve.args[0], class_id), dtype="bool",
+        )
+        for member in record["members"]:
+            member_id = resolve.constant(member["member_index"])
+            member_match = resolve.emit(
+                Handler.Eq, (resolve.args[1], member_id), dtype="bool",
+            )
+            identity_match = resolve.emit(
+                Handler.LAnd, (class_match, member_match), dtype="bool",
+            )
+            required = resolve.constant(
+                record["required_mask"] | member["required_mask"]
+            )
+            present = resolve.emit(Handler.And, (resolve.args[2], required))
+            permission_match = resolve.emit(
+                Handler.Eq, (present, required), dtype="bool",
+            )
+            allowed = resolve.emit(
+                Handler.LAnd, (identity_match, permission_match), dtype="bool",
+            )
+            kind = resolve.constant(member["kind_code"])
+            reference = resolve.constant(member["reference"])
+            resolved_kind = resolve.emit(
+                Handler.Select, (allowed, kind, resolved_kind),
+            )
+            resolved_reference = resolve.emit(
+                Handler.Select, (allowed, reference, resolved_reference),
+            )
+            resolved_allowed = resolve.emit(
+                Handler.Select,
+                (identity_match, permission_match, resolved_allowed),
+                dtype="bool",
+            )
+    resolve_function = resolve.finish([
+        resolved_kind, resolved_reference, resolved_allowed,
+    ])
+
+    instantiate = Builder(
+        f"{namespace}.instantiate", ("i32", "i32"),
+    )
+    new_reference = instantiate.constant(-1)
+    init_reference = instantiate.constant(-1)
+    instantiate_allowed = instantiate.constant(0, dtype="bool")
+    for record in lut_classes:
+        class_id = instantiate.constant(record["class_index"])
+        class_match = instantiate.emit(
+            Handler.Eq, (instantiate.args[0], class_id), dtype="bool",
+        )
+        constructors = list(record.get("instantiation_functions", ()))
+        constructor_members = {
+            member["function_reference"]: member
+            for member in record["members"]
+            if member.get("function_reference") is not None
+        }
+        required_mask = record["required_mask"]
+        for reference in constructors:
+            member = constructor_members.get(reference)
+            if member is not None:
+                required_mask |= member["required_mask"]
+        required = instantiate.constant(required_mask)
+        present = instantiate.emit(Handler.And, (instantiate.args[1], required))
+        permission_match = instantiate.emit(
+            Handler.Eq, (present, required), dtype="bool",
+        )
+        allowed = instantiate.emit(
+            Handler.LAnd, (class_match, permission_match), dtype="bool",
+        )
+        new_value = instantiate.constant(next((
+            int(member["function_reference"])
+            for member in record["members"]
+            if member["name"] == "__new__"
+            and member.get("function_reference") is not None
+        ), -1))
+        init_value = instantiate.constant(next((
+            int(member["function_reference"])
+            for member in record["members"]
+            if member["name"] == "__init__"
+            and member.get("function_reference") is not None
+        ), -1))
+        new_reference = instantiate.emit(
+            Handler.Select, (allowed, new_value, new_reference),
+        )
+        init_reference = instantiate.emit(
+            Handler.Select, (allowed, init_value, init_reference),
+        )
+        instantiate_allowed = instantiate.emit(
+            Handler.Select,
+            (class_match, permission_match, instantiate_allowed),
+            dtype="bool",
+        )
+    instantiate_function = instantiate.finish([
+        new_reference, init_reference, instantiate_allowed,
+    ])
+
+    functions = (
+        lookup_function,
+        instantiate_function,
+        resolve_function,
+        permission_function,
+    )
+    for function in functions:
+        function.blocks["entry"].instrs[0].attributes.setdefault(
+            "class_navigation_lut", lut,
+        )
+    return IRModule({function.name: function for function in functions})
+
+
 def find_ssa_cycles(function: Function) -> tuple[SSACycle, ...]:
     graph = nx.DiGraph()
     graph.add_nodes_from(function.blocks)
@@ -1171,6 +1402,7 @@ __all__ = [
     "SSACycle",
     "SSALoweringShortfall",
     "find_ssa_cycles",
+    "lower_class_navigation_to_ssa",
     "lower_control_program_to_ssa",
     "lower_fused_program_to_ssa",
     "lower_precompile_and_control_to_ssa",

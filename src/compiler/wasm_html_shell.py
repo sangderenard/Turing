@@ -15,7 +15,9 @@ Nothing here is specific to any one program. The page is generated from the
 API descriptor (``compiled_program_api.py``), so the controls are whatever
 that program's parameters are: one input row per feed, one result row per
 output, the entry point's name on the button. Compile something else and the
-page reshapes itself.
+page reshapes itself. Structural source pages extend the same contract to all
+callables: outer tabs group classes, inner tabs select methods, and module
+functions follow the class groups without stretching the document vertically.
 
 Deliberately not a layout manager. Layout belongs to a different subrepo, so
 this is plain ``div``s and a little CSS -- a stack of labelled rows, one
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -180,6 +183,43 @@ canvas { max-width: 100%; image-rendering: pixelated; border-radius: .35rem;
 .graph-option { display: inline-flex; align-items: center; gap: .25rem; cursor: pointer; }
 .filters { display: flex; gap: .4rem; margin-bottom: .5rem; font-size: .75rem; }
 .filters label { cursor: pointer; opacity: .75; }
+.server-controls { display: grid; grid-template-columns: minmax(9rem, 1fr) minmax(9rem, 1fr);
+  gap: .55rem .8rem; margin-top: .65rem; }
+.server-controls label { font-size: .75rem; opacity: .78; }
+.server-controls input { min-height: 2.1rem; }
+.server-controls .wide { grid-column: 1 / -1; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: .6rem; margin-top: .7rem; }
+.gallery-card { border: 1px solid var(--line); border-radius: .4rem;
+  padding: .6rem .7rem; background: var(--soft); }
+.gallery-card a { font-weight: 600; }
+.gallery-card .meta { display: block; min-width: 0; margin-top: .2rem; }
+.callable-group { margin-top: 1rem; }
+.callable-group-title { color: var(--accent); font-weight: 700; margin-bottom: .45rem; }
+.callable-tabs { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .55rem; }
+.callable-owner-tabs { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .75rem; }
+.callable-owner-tab { border: 1px solid var(--line); border-radius: .4rem; padding: .4rem .65rem;
+  cursor: pointer; font-weight: 650; user-select: none; }
+.callable-owner-tab[aria-selected="true"] { border-color: var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.callable-owner-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.callable-owner-view { margin-top: .6rem; }
+.class-map-tabs { display: flex; gap: .35rem; margin: .65rem 0; }
+.class-map-tab { border: 1px solid var(--line); border-radius: .35rem; padding: .35rem .6rem;
+  cursor: pointer; user-select: none; }
+.class-map-tab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
+.callable-tab { border: 1px solid var(--line); border-radius: .35rem; padding: .3rem .55rem;
+  color: var(--muted); cursor: pointer; font-size: .82rem; user-select: none; }
+.callable-tab[aria-selected="true"] { color: var(--fg); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel2)); }
+.callable-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.callable-run-system { border: 1px solid var(--line); border-radius: .4rem;
+  padding: .75rem; margin: .55rem 0; background: var(--panel2); }
+.callable-run-system .method-title { font-weight: 650; overflow-wrap: anywhere; }
+.callable-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: .45rem; margin: .6rem 0; }
+.callable-inputs label { color: var(--muted); font-size: .82rem; }
+.callable-inputs input { display: block; width: 100%; margin-top: .2rem; }
 .srctabs { display: flex; flex-wrap: wrap; gap: .25rem; margin: .5rem 0; }
 .srctab { padding: .25rem .7rem; border-radius: .3rem; cursor: pointer;
   font-size: .75rem; font-weight: 600; background: var(--soft);
@@ -284,14 +324,94 @@ const GRAPH = __GRAPH__;
 let GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
+const MAP_IR = __MAP_IR__;
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
+const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
+const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
 const inputs = params.filter(p => p.role === "input");
 const outputs = params.filter(p => p.role === "output");
 const bytes = API.metadata.element_bytes || 8;
 const isF32 = (API.metadata.value_type || "f64") === "f32";
+
+function serverAddress() {
+  const input = document.getElementById("server-address");
+  const value = (input ? input.value : DEFAULT_SERVER_ADDRESS).trim();
+  if (!value) return null;
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("server address must use http or https");
+  }
+  return url;
+}
+
+function serverURL(path) {
+  const server = serverAddress();
+  if (!server) return new URL(path, document.baseURI).href;
+  return new URL(path, server).href;
+}
+
+function resourceURL(path) {
+  if (!path) throw new Error("resource path is empty");
+  if (/^(?:[a-z]+:)?\/\//i.test(path) || path.startsWith("data:") || path.startsWith("blob:")) {
+    return path;
+  }
+  const route = RESOURCE_ROUTE.endsWith("/") ? RESOURCE_ROUTE : RESOURCE_ROUTE + "/";
+  const relative = String(path).replace(/^\.\//, "").replace(/^\//, "");
+  const server = serverAddress();
+  if (server) return new URL(route.replace(/^\//, "") + relative, server).href;
+  return new URL(relative, new URL(route, document.baseURI)).href;
+}
+
+function evaluateClassPermission(identity, required, evaluator) {
+  if (typeof evaluator !== "function") {
+    throw new TypeError("class navigation requires a permission evaluator");
+  }
+  if (!evaluator(identity, required || [])) {
+    throw new Error("access denied to " + identity);
+  }
+}
+
+function resolveClass(classIdentity, evaluator) {
+  const classes = ((MAP_IR.class_navigation || {}).classes || []);
+  const matches = classes.filter(item => item.identity === classIdentity);
+  if (matches.length !== 1) throw new Error(
+    "unknown or ambiguous class identity " + classIdentity
+  );
+  evaluateClassPermission(matches[0].identity, matches[0].permissions, evaluator);
+  return matches[0];
+}
+
+function resolveClassMember(classIdentity, memberName, evaluator) {
+  const record = resolveClass(classIdentity, evaluator);
+  const matches = (record.members || []).filter(item => item.name === memberName);
+  if (matches.length !== 1) throw new Error(
+    "unknown or ambiguous member " + classIdentity + "." + memberName
+  );
+  evaluateClassPermission(matches[0].identity, matches[0].permissions, evaluator);
+  return matches[0];
+}
+
+function resolveClassInstantiation(classIdentity, evaluator) {
+  const record = resolveClass(classIdentity, evaluator);
+  const constructors = new Set(record.instantiation_functions || []);
+  for (const member of record.members || []) {
+    if (constructors.has(member.function_reference)) {
+      evaluateClassPermission(member.identity, member.permissions, evaluator);
+    }
+  }
+  return Array.from(constructors);
+}
+
+window.TuringClassNavigation = Object.freeze({
+  map: MAP_IR,
+  resolveClass,
+  resolveDot: resolveClassMember,
+  instantiate: resolveClassInstantiation,
+  evaluatePermission: evaluateClassPermission
+});
 
 let moduleBytes = null;
 if (WASM_BASE64) {
@@ -517,7 +637,7 @@ class ClassGraphRunner {
   }
 
   async binary(url, label) {
-    const response = await fetch(url);
+    const response = await fetch(resourceURL(url));
     if (!response.ok) throw new Error(
       "failed to load " + label + ": HTTP " + response.status
     );
@@ -529,7 +649,7 @@ class ClassGraphRunner {
     markDeploymentNode(spec.name, "downloading");
     let moduleBinary;
     if (spec.url) {
-      const response = await fetch(spec.url);
+      const response = await fetch(resourceURL(spec.url));
       if (!response.ok) throw new Error(
         "failed to load method card " + spec.name + ": HTTP " + response.status
       );
@@ -654,7 +774,7 @@ class ContiguousRunner {
   async instance() {
     if (this.runtime) return this.runtime;
     markContiguousState("downloading");
-    const response = await fetch(this.spec.url);
+    const response = await fetch(resourceURL(this.spec.url));
     if (!response.ok) throw new Error("failed to load contiguous WASM: HTTP " + response.status);
     const {instance} = await WebAssembly.instantiate(await response.arrayBuffer(), {});
     this.runtime = instance;
@@ -1453,7 +1573,7 @@ function wireSourceTabs() {
       const old = button.textContent;
       button.textContent = "Downloading…";
       try {
-        const response = await fetch(descriptor.url);
+        const response = await fetch(resourceURL(descriptor.url));
         if (!response.ok) throw new Error("HTTP " + response.status);
         const blob = await response.blob();
         const href = URL.createObjectURL(blob);
@@ -1479,7 +1599,7 @@ function wireMathematics() {
     const old = button.textContent;
     button.textContent = "Downloading…";
     try {
-      const response = await fetch(MATHEMATICS.url);
+      const response = await fetch(resourceURL(MATHEMATICS.url));
       if (!response.ok) throw new Error("HTTP " + response.status);
       const blob = await response.blob();
       const href = URL.createObjectURL(blob);
@@ -1525,6 +1645,121 @@ function wireExecutionModes() {
   });
 }
 
+function renderGallery(items) {
+  const gallery = $("gallery");
+  if (!gallery) return;
+  gallery.replaceChildren();
+  if (!items.length) {
+    gallery.textContent = "No versioned program bundles have been prepared yet.";
+    gallery.className = "meta";
+    return;
+  }
+  gallery.className = "gallery";
+  const programs = new Map();
+  for (const item of items) {
+    if (!programs.has(item.slug)) programs.set(item.slug, []);
+    programs.get(item.slug).push(item);
+  }
+  programs.forEach(versions => {
+    const newest = versions.find(item => item.latest) || versions[0];
+    const card = document.createElement("div");
+    card.className = "gallery-card";
+    const link = document.createElement("a");
+    link.href = serverURL(newest.url);
+    link.textContent = newest.title || newest.slug;
+    const version = document.createElement("label");
+    version.className = "meta";
+    version.append((newest.entrypoint || "program") + " · version ");
+    const selector = document.createElement("select");
+    selector.className = "gallery-version";
+    for (const item of versions) {
+      const option = document.createElement("option");
+      option.value = item.url;
+      option.textContent = item.version;
+      option.selected = item === newest;
+      selector.appendChild(option);
+    }
+    version.appendChild(selector);
+    const detail = document.createElement("span");
+    detail.className = "meta";
+    const show = item => {
+      link.href = serverURL(item.url);
+      detail.textContent = item.artifacts + " artifacts · " + item.bytes + " bytes";
+    };
+    selector.addEventListener("change", () => {
+      const selected = versions.find(item => item.url === selector.value) || newest;
+      show(selected);
+    });
+    show(newest);
+    card.append(link, version, detail);
+    gallery.appendChild(card);
+  });
+  return programs.size;
+}
+
+async function refreshGallery() {
+  const status = $("publisher-status");
+  try {
+    const response = await fetch(serverURL("/api/gallery"), {cache: "no-store"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const payload = await response.json();
+    const items = payload.items || [];
+    const programCount = renderGallery(items) || 0;
+    if (status) status.textContent = programCount + " program(s) · " +
+      items.length + " prepared version(s)";
+  } catch (error) {
+    if (status) status.textContent = "Local server unavailable: " + error.message;
+    renderGallery([]);
+  }
+}
+
+function wireLocalPublisher() {
+  const address = $("server-address");
+  if (!address) return;
+  const remembered = localStorage.getItem("turing-server-address");
+  if (remembered) address.value = remembered;
+  address.addEventListener("change", () => {
+    localStorage.setItem("turing-server-address", address.value.trim());
+    refreshGallery();
+  });
+  $("refresh-gallery").addEventListener("click", refreshGallery);
+  $("generate-page").addEventListener("click", async () => {
+    const file = $("python-source").files[0];
+    const status = $("publisher-status");
+    if (!file) {
+      status.textContent = "Choose a Python file first.";
+      return;
+    }
+    const data = new FormData();
+    data.append("source", file, file.name);
+    for (const name of ["entrypoint", "title", "slug", "probes"]) {
+      const value = $("publish-" + name).value.trim();
+      if (value) data.append(name, value);
+    }
+    const button = $("generate-page");
+    button.disabled = true;
+    status.textContent = "Compiling and packaging " + file.name + "…";
+    try {
+      const response = await fetch(serverURL("/api/generate"), {
+        method: "POST", body: data
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
+      status.replaceChildren();
+      const link = document.createElement("a");
+      link.href = serverURL(payload.url);
+      link.textContent = "Open generated page";
+      status.append("Prepared ", link, ".");
+      await refreshGallery();
+    } catch (error) {
+      status.textContent = "Generation failed: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  refreshGallery();
+}
+
 function wireTabs() {
   document.querySelectorAll(".tab").forEach(tab => {
     tab.addEventListener("click", () => {
@@ -1543,6 +1778,151 @@ function wireTabs() {
       $("row_gauss_" + name).hidden = select.value !== "gaussian";
     });
     select.dispatchEvent(new Event("change"));
+  });
+}
+
+function decodePythonBytes(value) {
+  if (!value || value.kind !== "bytes") return null;
+  const binary = atob(value.base64 || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function runPythonCallable(button) {
+  const section = button.closest(".callable-run-system");
+  const status = section.querySelector(".python-callable-status");
+  const canvas = section.querySelector(".python-callable-canvas");
+  const arguments = {};
+  try {
+    section.querySelectorAll(".python-callable-input").forEach(input => {
+      const value = input.value.trim();
+      if (value) arguments[input.dataset.parameter] = JSON.parse(value);
+    });
+  } catch (error) {
+    status.textContent = "Invalid JSON input: " + error.message;
+    status.className = "python-callable-status out bad";
+    return;
+  }
+  button.disabled = true;
+  status.textContent = "Running " + button.dataset.identity + "…";
+  status.className = "python-callable-status out";
+  try {
+    const response = await fetch(serverURL("/api/run"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        source: button.dataset.source,
+        callable: button.dataset.identity,
+        arguments: arguments,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
+    const result = payload.result || {};
+    const items = result.kind === "tuple" || result.kind === "list" ? result.items || [] : [];
+    const planes = items.slice(0, 3).map(decodePythonBytes);
+    const width = Number(arguments.width || 512);
+    const height = Number(arguments.height || 512);
+    if (planes.length === 3 && planes.every(plane => plane && plane.length === width * height)) {
+      canvas.hidden = false;
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      const image = context.createImageData(width, height);
+      for (let i = 0; i < width * height; i++) {
+        image.data[i * 4] = planes[0][i];
+        image.data[i * 4 + 1] = planes[1][i];
+        image.data[i * 4 + 2] = planes[2][i];
+        image.data[i * 4 + 3] = 255;
+      }
+      context.putImageData(image, 0, 0);
+      status.textContent = width + "x" + height + " RGB frame returned by " + button.dataset.identity;
+    } else {
+      canvas.hidden = true;
+      status.textContent = JSON.stringify(result).slice(0, 4000);
+    }
+    status.className = "python-callable-status out good";
+  } catch (error) {
+    status.textContent = error.message;
+    status.className = "python-callable-status out bad";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function wirePythonCallables() {
+  document.querySelectorAll(".python-callable-run").forEach(button => {
+    button.addEventListener("click", () => runPythonCallable(button));
+  });
+}
+
+function wireCallableTabs() {
+  document.querySelectorAll(".panel").forEach(panel => {
+    const ownerTabs = Array.from(panel.querySelectorAll(".callable-owner-tab"));
+    const ownerViews = Array.from(panel.querySelectorAll(".callable-owner-view"));
+    const activateOwner = tab => {
+      const key = tab.dataset.callableOwnerTab;
+      ownerTabs.forEach(item => item.setAttribute(
+        "aria-selected", String(item === tab)
+      ));
+      ownerViews.forEach(view => {
+        view.hidden = view.dataset.callableOwnerView !== key;
+      });
+    };
+    ownerTabs.forEach(tab => {
+      tab.addEventListener("click", () => activateOwner(tab));
+      tab.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activateOwner(tab);
+        }
+      });
+    });
+  });
+  document.querySelectorAll(".callable-group").forEach(group => {
+    const tabs = Array.from(group.querySelectorAll(".callable-tab"));
+    const views = Array.from(group.querySelectorAll(".callable-tabview"));
+    const activate = tab => {
+      const key = tab.dataset.callableTab;
+      tabs.forEach(item => item.setAttribute(
+        "aria-selected", String(item === tab)
+      ));
+      views.forEach(view => {
+        view.hidden = view.dataset.callableView !== key;
+      });
+    };
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => activate(tab));
+      tab.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate(tab);
+        }
+      });
+    });
+  });
+}
+
+function wireClassMapTabs() {
+  document.querySelectorAll(".class-map-tabs").forEach(tablist => {
+    const panel = tablist.closest(".panel");
+    const tabs = Array.from(tablist.querySelectorAll(".class-map-tab"));
+    const views = Array.from(panel.querySelectorAll(".class-map-tabview"));
+    const activate = tab => {
+      const key = tab.dataset.classMapTab;
+      tabs.forEach(item => item.setAttribute("aria-selected", String(item === tab)));
+      views.forEach(view => { view.hidden = view.dataset.classMapView !== key; });
+    };
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => activate(tab));
+      tab.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate(tab);
+        }
+      });
+    });
   });
 }
 
@@ -1582,6 +1962,9 @@ function wireFilePicker() {
 
 wireFilePicker();
 wireTabs();
+wireCallableTabs();
+wirePythonCallables();
+wireClassMapTabs();
 $("run").addEventListener("click", run);
 $("copyapi").addEventListener("click", () => {
   navigator.clipboard.writeText($("apiyaml").value);
@@ -1615,6 +1998,7 @@ wireFilters();
 wireSourceTabs();
 wireMathematics();
 wireExecutionModes();
+wireLocalPublisher();
 renderGraph();
 
 log("info", "shell ready", {
@@ -1647,6 +2031,16 @@ def _escape(text: str) -> str:
     return (
         text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     )
+
+
+def _map_ir_mapping(map_ir: Any) -> dict[str, Any]:
+    if map_ir is None:
+        return {}
+    mapping = dict(map_ir)
+    navigation = mapping.get("class_navigation")
+    if hasattr(navigation, "to_mapping"):
+        mapping["class_navigation"] = navigation.to_mapping()
+    return mapping
 
 
 def _signature_rows(parameters: Sequence[Mapping[str, Any]]) -> str:
@@ -1716,6 +2110,156 @@ def _input_rows(
             "width and height decide how many elements one run covers.</div>"
         )
     return "\n".join(rows)
+
+
+def _callable_systems_panel(map_mapping: Mapping[str, Any]) -> str:
+    """Render one complete run section per method, then module function."""
+
+    systems = dict(map_mapping.get("callable_systems") or {})
+    classes = list(systems.get("classes", ()))
+    file_scope = dict(systems.get("file_scope") or {})
+    functions = list(file_scope.get("functions", systems.get("functions", ())))
+    symbols = list(file_scope.get("symbols", ()))
+    if not classes and not functions and not symbols:
+        return ""
+
+    def run_system(item: Mapping[str, Any]) -> str:
+        identity = str(item.get("identity", item.get("name", "callable")))
+        parameters = list(item.get("parameters", ()))
+        prefix = re.sub(r"[^a-zA-Z0-9_-]+", "-", identity).strip("-") or "callable"
+        inputs = "".join(
+            '<label>' + _escape(str(parameter.get("name", "input")))
+            + '<input class="python-callable-input" data-parameter="'
+            + _escape(str(parameter.get("name", "input")))
+            + '" type="text" id="callable-' + _escape(prefix) + "-"
+            + _escape(str(parameter.get("name", "input")))
+            + '" value="' + _escape(str(parameter.get("default", "")))
+            + '" placeholder="JSON value or numeric sequence"></label>'
+            for parameter in parameters
+        ) or '<div class="meta">This callable declares no inputs.</div>'
+        reference = item.get("function_reference")
+        graph_state = (
+            f"ProcessGraph function reference {reference} retained"
+            if reference is not None
+            else "structural signature retained; no function-table body"
+        )
+        page_url = str(item.get("page_url") or "")
+        page_link = (
+            f'<a class="button" href="{_escape(page_url)}">Open generated callable page</a>'
+            if page_url else '<span class="meta">No separate callable page was requested.</span>'
+        )
+        python_source_url = str(item.get("python_source_url") or "")
+        if python_source_url:
+            run_button = (
+                '<button type="button" class="python-callable-run" data-source="'
+                + _escape(python_source_url) + '" data-identity="' + _escape(identity)
+                + '">Run ' + _escape(identity) + '</button>'
+            )
+            runtime_state = "trusted local Python runtime ready"
+        else:
+            run_button = (
+                '<button type="button" disabled title="No executable artifact has been '
+                'emitted for this callable yet">Run ' + _escape(identity) + '</button>'
+            )
+            runtime_state = "executable backend pending"
+        return (
+            '<section class="callable-run-system" data-callable="' + _escape(identity) + '">'
+            '<div class="method-title"><code>' + _escape(str(item.get("signature") or identity))
+            + '</code></div><div class="callable-inputs">' + inputs + '</div>'
+            '<div class="row">' + run_button
+            + page_link + '<div class="grow meta">' + _escape(graph_state)
+            + '; ' + _escape(runtime_state) + '</div></div>'
+            '<div class="python-callable-status out"></div>'
+            '<canvas class="python-callable-canvas" width="1" height="1" hidden></canvas>'
+            '</section>'
+        )
+
+    def tabbed_group(
+        label: str,
+        items: Sequence[Mapping[str, Any]],
+        scope_symbols: Sequence[Mapping[str, Any]] = (),
+    ) -> str:
+        if not items and not scope_symbols:
+            return (
+                '<div class="callable-group"><div class="callable-group-title">'
+                + _escape(label) + '</div><div class="meta">No explicit methods declared.</div></div>'
+            )
+        tabs = []
+        views = []
+        for index, item in enumerate(items):
+            identity = str(item.get("identity", item.get("name", index)))
+            key = re.sub(r"[^a-zA-Z0-9_-]+", "-", identity).strip("-") or str(index)
+            selected = "true" if index == 0 else "false"
+            hidden = "" if index == 0 else " hidden"
+            tabs.append(
+                '<div class="callable-tab" role="tab" tabindex="0" '
+                f'data-callable-tab="{_escape(key)}" aria-selected="{selected}">'
+                + _escape(str(item.get("name", identity))) + "</div>"
+            )
+            views.append(
+                f'<div class="callable-tabview" data-callable-view="{_escape(key)}"{hidden}>'
+                + run_system(item) + "</div>"
+            )
+        if scope_symbols:
+            selected = "true" if not items else "false"
+            hidden = "" if not items else " hidden"
+            tabs.append(
+                '<div class="callable-tab" role="tab" tabindex="0" '
+                f'data-callable-tab="file-symbols" aria-selected="{selected}">symbols</div>'
+            )
+            symbol_rows = "".join(
+                '<div class="kv"><b>' + _escape(str(symbol.get("name", "symbol")))
+                + '</b><span>' + _escape(str(symbol.get("kind", "binding")))
+                + '</span><span class="meta">' + _escape(str(symbol.get("expression", "")))
+                + '</span></div>'
+                for symbol in scope_symbols
+            )
+            views.append(
+                f'<div class="callable-tabview" data-callable-view="file-symbols"{hidden}>'
+                '<section class="callable-run-system" data-callable="file-symbols">'
+                '<div class="method-title"><code>file symbols</code></div>'
+                '<div class="meta">Global constants, aliases, imports, and symbolic bindings '
+                'retained at module scope.</div>' + symbol_rows + '</section></div>'
+            )
+        return (
+            '<div class="callable-group"><div class="callable-group-title">'
+            + _escape(label) + '</div><div class="callable-tabs" role="tablist">'
+            + "".join(tabs) + "</div>" + "".join(views) + "</div>"
+        )
+
+    owner_groups: list[
+        tuple[str, str, Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]]
+    ] = []
+    if functions or symbols:
+        owner_groups.append(("file scope", "file-scope", functions, symbols))
+    for record in classes:
+        methods = list(record.get("methods", ()))
+        label = "class " + str(record.get("identity", "class"))
+        key = re.sub(r"[^a-zA-Z0-9_-]+", "-", label).strip("-") or "class"
+        owner_groups.append((label, key, methods, ()))
+
+    owner_tabs = []
+    owner_views = []
+    for index, (label, key, items, scope_symbols) in enumerate(owner_groups):
+        selected = "true" if index == 0 else "false"
+        hidden = "" if index == 0 else " hidden"
+        owner_tabs.append(
+            '<div class="callable-owner-tab" role="tab" tabindex="0" '
+            f'data-callable-owner-tab="{_escape(key)}" aria-selected="{selected}">'
+            + _escape(label) + "</div>"
+        )
+        owner_views.append(
+            f'<div class="callable-owner-view" data-callable-owner-view="{_escape(key)}"{hidden}>'
+            + tabbed_group(label, items, scope_symbols) + "</div>"
+        )
+    return (
+        '<div class="panel"><div class="panel-title">Callable run systems</div>'
+        '<div class="meta">File-level functions and symbols are grouped under file scope; '
+        'classes follow in source order. Each callable keeps independent inputs and a '
+        'separately generated inspection page.</div><div class="callable-owner-tabs" '
+        'role="tablist">' + "".join(owner_tabs) + "</div>"
+        + "".join(owner_views) + "</div>"
+    )
 
 
 def _source_tabs(sources: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
@@ -1894,8 +2438,11 @@ def emit_html_shell(
     backend_sources: Any = None,
     mathematics: Mapping[str, Any] | None = None,
     network_manifest: Mapping[str, Any] | None = None,
+    map_ir: Mapping[str, Any] | None = None,
     class_graph: Mapping[str, Any] | None = None,
     graph_views: Mapping[str, Any] | None = None,
+    resource_route: str = "/",
+    default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
 
@@ -1960,12 +2507,14 @@ def emit_html_shell(
     network_mapping.setdefault("name", "No feedback network attached")
     network_mapping.setdefault("routes", [])
     network_routes = {str(route["feed"]): route for route in network_mapping["routes"] if isinstance(route, Mapping) and route.get("feed")}
+    map_mapping = _map_ir_mapping(map_ir)
     script = (
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
         .replace("__GRAPH__", json.dumps(graph_mapping, default=str))
         .replace("__GRAPH_VIEWS__", json.dumps(dict(graph_views or {}), default=str))
         .replace("__NETWORK__", json.dumps(network_mapping, default=str))
+        .replace("__MAP_IR__", json.dumps(map_mapping, default=str))
         .replace("__SOURCE_DOWNLOADS__", json.dumps([
             {
                 "language": str(entry.get("language", "")),
@@ -1980,6 +2529,8 @@ def emit_html_shell(
             if entry.get("url")
         ], default=str))
         .replace("__MATHEMATICS__", json.dumps(dict(mathematics or {}), default=str))
+        .replace("__RESOURCE_ROUTE__", json.dumps(str(resource_route)))
+        .replace("__DEFAULT_SERVER_ADDRESS__", json.dumps(str(default_server_address)))
         .replace(
             "__CLASS_GRAPH__",
             json.dumps(dict(class_graph), default=str) if class_graph else "null",
@@ -1991,7 +2542,11 @@ def emit_html_shell(
     )
 
     external_class_graph = bool(
-        class_graph and any(module.get("url") for module in class_graph.get("modules", ()))
+        class_graph
+        and (
+            any(module.get("url") for module in class_graph.get("modules", ()))
+            or dict(class_graph).get("contiguous", {}).get("url")
+        )
     )
     if external_class_graph:
         banner = (
@@ -2030,6 +2585,30 @@ def emit_html_shell(
 
     build_rows = _build_rows(build_parameters or {})
     mathematics_html = _mathematics_panel(mathematics)
+    callable_systems_html = _callable_systems_panel(map_mapping)
+    class_records = list(
+        dict(map_mapping.get("class_navigation") or {}).get("classes", ())
+    )
+    mapped_graphs = list(map_mapping.get("graphs", ()))
+    class_map_html = (
+        '<div class="panel"><div class="panel-title">Class map and navigation LUT</div>'
+        '<div class="meta">Retained class space, graph/function identities, permissions, '
+        'dependency regions, and SSA class-navigation methods.</div>'
+        '<div class="class-map-tabs" role="tablist">'
+        '<div class="class-map-tab" role="tab" tabindex="0" data-class-map-tab="summary" '
+        'aria-selected="true">Summary</div>'
+        '<div class="class-map-tab" role="tab" tabindex="0" data-class-map-tab="raw" '
+        'aria-selected="false">Raw map IR</div></div>'
+        '<div class="class-map-tabview" data-class-map-view="summary">'
+        f'<div class="stat"><span>{len(class_records)} classes</span>'
+        f'<span>{len(mapped_graphs)} callable graphs</span></div></div>'
+        '<div class="class-map-tabview" data-class-map-view="raw" hidden>'
+        f'<pre id="class-map">{_escape(json.dumps(map_mapping, indent=2, default=str))}</pre></div>'
+        '</div>'
+        if map_mapping
+        else '<div class="panel"><div class="panel-title">Class map and navigation LUT</div>'
+        '<div class="meta">This compilation carries no class-map entries.</div></div>'
+    )
 
     if backend_sources is None:
         source_entries: list[Mapping[str, Any]] = []
@@ -2097,11 +2676,44 @@ def emit_html_shell(
   {note_html}
 
   <div class="panel">
+    <div class="panel-title">Local publisher and gallery</div>
+    <div class="meta">The loopback Go server can compile a trusted Python file,
+      package every generated artifact together, and make the versioned page
+      discoverable from the site tree. Uploaded Python is compiler input and
+      must be treated as trusted local code.</div>
+    <div class="server-controls">
+      <label class="wide">server address
+        <input type="text" id="server-address" value="{_escape(default_server_address)}"
+          spellcheck="false"></label>
+      <label class="wide">Python source
+        <input type="file" id="python-source" accept=".py,text/x-python"></label>
+      <label>entrypoint (optional)
+        <input type="text" id="publish-entrypoint" placeholder="render or kernel"></label>
+      <label>title (optional)
+        <input type="text" id="publish-title" placeholder="Gallery title"></label>
+      <label>slug (optional)
+        <input type="text" id="publish-slug" placeholder="url-name"></label>
+      <label>probe values JSON (optional)
+        <input type="text" id="publish-probes" placeholder='{{"gain": [1.0]}}'></label>
+    </div>
+    <div class="row">
+      <button id="generate-page">Generate page</button>
+      <button id="refresh-gallery">Refresh gallery</button>
+      <div class="grow"><div id="publisher-status" class="out"></div></div>
+    </div>
+    <div id="gallery" class="meta">Looking for prepared pages…</div>
+  </div>
+
+  {callable_systems_html}
+
+  <div class="panel">
     <div class="panel-title">Signature</div>
     {_signature_rows(parameters)}
   </div>
 
   {execution_modes_html}
+
+  {class_map_html}
 
   <div class="panel">
     <div class="panel-title">Domain</div>
@@ -2248,6 +2860,9 @@ def shell_for_artifact(
     backend_sources: Any = None,
     mathematics: Mapping[str, Any] | None = None,
     network_manifest: Mapping[str, Any] | None = None,
+    map_ir: Mapping[str, Any] | None = None,
+    resource_route: str = "/",
+    default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
 
@@ -2270,6 +2885,9 @@ def shell_for_artifact(
         default_height=default_height,
         backend_sources=backend_sources,
         mathematics=mathematics,
+        map_ir=map_ir,
+        resource_route=resource_route,
+        default_server_address=default_server_address,
     )
 
 

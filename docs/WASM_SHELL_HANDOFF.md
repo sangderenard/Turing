@@ -140,8 +140,10 @@ its output was never compared against NumPy. Unverified, not known-bad.
 
 ```
 python -m src.compiler.build_math_cache      # only when epsilon/domains change
-python build_homepage.py                     # writes index.html
+python build_homepage.py                     # writes ../index.html and ../site/v3/
 ```
 
-`index.html` is served from the `nogodsnomasters` repository root. That repo's
-branch is `nogodsnomasters`, not `main` — Pages must point at it.
+`index.html` is written to and served from the parent `nogodsnomasters`
+repository root. The Turing checkout contains the generator, not a second copy
+of the generated site. The parent repo's branch is `nogodsnomasters`, not
+`main` — Pages must point at it.

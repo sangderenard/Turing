@@ -2,6 +2,8 @@ import ast
 import contextlib
 import io
 
+import pytest
+
 from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
@@ -9,6 +11,8 @@ from src.compiler.glsl_deployment_strategy import (
     strategize_glsl_deployment,
 )
 from src.compiler.shell_reference_tables import (
+    build_class_navigation_table,
+    build_map_dependency_regions,
     build_shell_reference_tables,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -116,3 +120,136 @@ def affine(value):
     finally:
         first.release()
         second.release()
+
+
+def test_class_map_and_runtime_dependency_regions_retain_different_method_compartments():
+    module = ast.parse(
+        '''
+class Archive:
+    capacity: int = 16
+
+    def __init__(self):
+        self.value = 0
+
+    def read(self, index):
+        return self.value + index
+
+    def compact(self):
+        self.value = 0
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    map_ir = graph.G.graph["map_ir"]
+    (object_map,) = map_ir["objects"]
+    assert object_map["class_name"] == "Archive"
+    assert [item["identity"] for item in object_map["attributes"]] == [
+        "Archive.capacity", "Archive.value",
+    ]
+    assert [item["identity"] for item in map_ir["graphs"]] == [
+        "Archive.__init__", "Archive.read", "Archive.compact",
+    ]
+
+    regions = build_map_dependency_regions(graph, "Archive.read")
+    references = {
+        entry.qualified_name: int(entry.reference.address)
+        for entry in graph.function_table
+    }
+    assert regions.runtime == (references["Archive.read"],)
+    assert set(regions.mapped) == {
+        references["Archive.__init__"],
+        references["Archive.read"],
+        references["Archive.compact"],
+    }
+    assert set(regions.retained) == set(regions.mapped)
+    assert set(regions.map_only) == {
+        references["Archive.__init__"],
+        references["Archive.compact"],
+    }
+    assert regions.bindings == (
+        ("Archive.__init__", references["Archive.__init__"]),
+        ("Archive.read", references["Archive.read"]),
+        ("Archive.compact", references["Archive.compact"]),
+    )
+
+    # Each method is already an independent graph compartment suitable for
+    # receiving its own method shell; retaining it does not add it to runtime.
+    method_graphs = {
+        name: graph.function_table.entry(name).graph
+        for name in (
+            "Archive.__init__", "Archive.read", "Archive.compact",
+        )
+    }
+    assert len({id(item) for item in method_graphs.values()}) == 3
+    assert all(
+        item.G.graph["method_owner"] == "Archive"
+        for item in method_graphs.values()
+    )
+
+
+def test_class_navigation_lut_resolves_instantiation_and_dot_through_permissions():
+    module = ast.parse(
+        '''
+class Vault:
+    capacity: int = 8
+
+    def __init__(self):
+        self.value = 0
+
+    def read(self):
+        return self.value
+
+    def erase(self):
+        self.value = 0
+'''
+    )
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    object_map = graph.G.graph["map_ir"]["objects"][0]
+    object_map["permissions"] = ("vault:enter",)
+    object_map["attributes"][0]["permissions"] = ("vault:inspect",)
+    method_permissions = {
+        "__init__": ("vault:create",),
+        "read": ("vault:read",),
+        "erase": ("vault:erase",),
+    }
+    for method in object_map["methods"]:
+        method["permissions"] = method_permissions[method["name"]]
+    reduce_abstract_tensor_topology(graph)
+
+    table = build_class_navigation_table(graph)
+    references = {
+        entry.qualified_name: int(entry.reference.address)
+        for entry in graph.function_table
+    }
+
+    def evaluator(grants):
+        granted = frozenset(grants)
+        return lambda _identity, required: set(required) <= granted
+
+    constructors = table.instantiate(
+        "Vault", evaluator({"vault:enter", "vault:create"})
+    )
+    assert constructors == (references["Vault.__init__"],)
+
+    read = table.resolve_dot(
+        "Vault", "read", evaluator({"vault:enter", "vault:read"})
+    )
+    assert read.kind == "method"
+    assert read.function_reference == references["Vault.read"]
+
+    capacity = table.resolve_dot(
+        "Vault", "capacity", evaluator({"vault:enter", "vault:inspect"})
+    )
+    assert capacity.kind == "attribute"
+    assert capacity.storage == "class"
+    assert capacity.function_reference is None
+
+    with pytest.raises(PermissionError, match="Vault.erase"):
+        table.resolve_dot(
+            "Vault", "erase", evaluator({"vault:enter", "vault:read"})
+        )

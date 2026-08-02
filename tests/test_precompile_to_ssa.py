@@ -13,8 +13,14 @@ from src.compiler.control_source import (
 from src.compiler.precompile_to_ssa import (
     find_ssa_cycles,
     lower_control_program_to_ssa,
+    lower_class_navigation_to_ssa,
     lower_fused_program_to_ssa,
     lower_precompile_and_control_to_ssa,
+)
+from src.compiler.shell_reference_tables import (
+    ClassNavigationMember,
+    ClassNavigationRecord,
+    ClassNavigationTable,
 )
 
 
@@ -55,6 +61,45 @@ def test_numerical_tensor_ops_call_real_imported_llvm_algorithms():
         "binary_scalar_double"
     )
     assert function.blocks["entry"].instrs[1].attributes["right_scalar"] == 1.0
+
+
+def test_class_navigation_has_general_ssa_semantic_procedures():
+    navigation = ClassNavigationTable((ClassNavigationRecord(
+        identity="Vault",
+        permissions=("vault:enter",),
+        members=(ClassNavigationMember(
+            name="read",
+            identity="Vault.read",
+            kind="method",
+            storage=None,
+            function_reference=7,
+            permissions=("vault:read",),
+        ),),
+        instantiation_functions=(),
+    ),))
+
+    module = lower_class_navigation_to_ssa(navigation)
+
+    assert set(module.functions) == {
+        "turing.class.lookup",
+        "turing.class.instantiate",
+        "turing.class.resolve_member",
+        "turing.class.evaluate_permission",
+    }
+    operations = {
+        instruction.op
+        for function in module.functions.values()
+        for instruction in function.blocks["entry"].instrs
+    }
+    assert operations <= {"Const", "Eq", "And", "LAnd", "Select", "Ret"}
+    assert {"ClassLookup", "ClassInstantiate", "ResolveMember", "EvaluatePermission"}.isdisjoint(operations)
+    resolve = module.functions["turing.class.resolve_member"]
+    assert resolve.blocks["entry"].instrs[0].attributes[
+        "class_navigation_lut"
+    ]["classes"][0]["members"][0]["function_reference"] == 7
+    assert [value.dtype for value in resolve.blocks["entry"].instrs[-1].args] == [
+        "i32", "i32", "bool",
+    ]
 
 
 def test_numerical_lowering_routes_scatter_through_real_llvm_algorithm():
