@@ -103,6 +103,11 @@ def test_ast_inspection_is_published_as_a_standard_gallery_bundle(tmp_path):
     assert "Callable run systems" in html
     assert 'data-callable="_InspectionCompiler.encode"' in html
     assert "Open generated callable page" in html
+    assert 'const RESOURCE_ROUTE = "./"' in html
+    assert 'const STATIC_GALLERY = [' in html
+    assert 'const BROWSER_PYTHON = {"script_url": "https://cdn.jsdelivr.net/pyodide/' in html
+    assert 'href="callables/inspectioncompiler-encode/index.html"' in html
+    assert '"python_source_url": "source/python_source/test_site_bundle.py"' in html
 
 
 def test_file_scope_precedes_classes_and_lists_outer_symbols(tmp_path):

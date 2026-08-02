@@ -121,6 +121,7 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     assert 'renderGallery(STATIC_GALLERY)' in html
     assert 'const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url)' in html
     assert 'const pagesPrefix = routeIndex >= 0' in html
+    assert 'const BROWSER_PYTHON = null' in html
     assert "fetch(resourceURL(descriptor.url))" in html
     assert "const programs = new Map()" in html
     assert "versions.find(item => item.latest) || versions[0]" in html

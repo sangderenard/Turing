@@ -329,6 +329,7 @@ const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
 const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
 const STATIC_GALLERY = __STATIC_GALLERY__;
+const BROWSER_PYTHON = __BROWSER_PYTHON__;
 const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
@@ -361,6 +362,11 @@ function resourceURL(path) {
   }
   const route = RESOURCE_ROUTE.endsWith("/") ? RESOURCE_ROUTE : RESOURCE_ROUTE + "/";
   const relative = String(path).replace(/^\.\//, "").replace(/^\//, "");
+  if (relative.startsWith("site/") && /^https?:$/.test(window.location.protocol)) {
+    const siteIndex = window.location.pathname.indexOf("/site/");
+    const pagesPrefix = siteIndex >= 0 ? window.location.pathname.slice(0, siteIndex + 1) : "/";
+    return new URL(pagesPrefix + relative, window.location.origin).href;
+  }
   if (route.startsWith("/") && /^https?:$/.test(window.location.protocol)) {
     const routeIndex = window.location.pathname.indexOf(route);
     const pagesPrefix = routeIndex >= 0 ? window.location.pathname.slice(0, routeIndex) : "";
@@ -1788,11 +1794,58 @@ function wireTabs() {
 }
 
 function decodePythonBytes(value) {
+  if (value instanceof Uint8Array) return value;
   if (!value || value.kind !== "bytes") return null;
   const binary = atob(value.base64 || "");
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+let browserPythonRuntime = null;
+
+async function loadBrowserPython() {
+  if (!BROWSER_PYTHON) throw new Error("browser Python runtime is not configured");
+  if (browserPythonRuntime) return browserPythonRuntime;
+  browserPythonRuntime = (async () => {
+    if (!window.loadPyodide) {
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = BROWSER_PYTHON.script_url;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("could not load the browser Python runtime"));
+        document.head.appendChild(script);
+      });
+    }
+    const runtime = await window.loadPyodide({
+      indexURL: BROWSER_PYTHON.index_url,
+    });
+    await runtime.loadPackage("pillow");
+    return runtime;
+  })();
+  return browserPythonRuntime;
+}
+
+async function runBrowserPython(button, arguments) {
+  const runtime = await loadBrowserPython();
+  const response = await fetch(resourceURL(button.dataset.source), {cache: "no-store"});
+  if (!response.ok) throw new Error("source load HTTP " + response.status);
+  runtime.globals.set("__turing_source", await response.text());
+  runtime.globals.set("__turing_callable", button.dataset.identity);
+  runtime.globals.set("__turing_arguments_json", JSON.stringify(arguments));
+  const proxy = await runtime.runPythonAsync(`
+import json
+__turing_namespace = {}
+exec(compile(__turing_source, "<published-source>", "exec"), __turing_namespace)
+__turing_result = __turing_namespace[__turing_callable](**json.loads(__turing_arguments_json))
+__turing_result
+`);
+  try {
+    return proxy && typeof proxy.toJs === "function"
+      ? proxy.toJs({create_proxies: false}) : proxy;
+  } finally {
+    if (proxy && typeof proxy.destroy === "function") proxy.destroy();
+  }
 }
 
 async function runPythonCallable(button) {
@@ -1814,19 +1867,27 @@ async function runPythonCallable(button) {
   status.textContent = "Running " + button.dataset.identity + "…";
   status.className = "python-callable-status out";
   try {
-    const response = await fetch(serverURL("/api/run"), {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        source: button.dataset.source,
-        callable: button.dataset.identity,
-        arguments: arguments,
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
-    const result = payload.result || {};
-    const items = result.kind === "tuple" || result.kind === "list" ? result.items || [] : [];
+    let result;
+    try {
+      const response = await fetch(serverURL("/api/run"), {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          source: button.dataset.source,
+          callable: button.dataset.identity,
+          arguments: arguments,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || "HTTP " + response.status);
+      result = payload.result || {};
+    } catch (serverError) {
+      if (!BROWSER_PYTHON) throw serverError;
+      status.textContent = "Local runner unavailable; loading browser Python/WASM…";
+      result = await runBrowserPython(button, arguments);
+    }
+    const items = Array.isArray(result)
+      ? result : (result.kind === "tuple" || result.kind === "list" ? result.items || [] : []);
     const planes = items.slice(0, 3).map(decodePythonBytes);
     const width = Number(arguments.width || 512);
     const height = Number(arguments.height || 512);
@@ -2449,6 +2510,7 @@ def emit_html_shell(
     graph_views: Mapping[str, Any] | None = None,
     resource_route: str = "/",
     static_gallery: Sequence[Mapping[str, Any]] | None = None,
+    browser_python_runtime: Mapping[str, str] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -2538,6 +2600,7 @@ def emit_html_shell(
         .replace("__MATHEMATICS__", json.dumps(dict(mathematics or {}), default=str))
         .replace("__RESOURCE_ROUTE__", json.dumps(str(resource_route)))
         .replace("__STATIC_GALLERY__", json.dumps(list(static_gallery or []), default=str))
+        .replace("__BROWSER_PYTHON__", json.dumps(dict(browser_python_runtime), default=str) if browser_python_runtime else "null")
         .replace("__DEFAULT_SERVER_ADDRESS__", json.dumps(str(default_server_address)))
         .replace(
             "__CLASS_GRAPH__",

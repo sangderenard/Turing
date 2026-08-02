@@ -42,7 +42,7 @@ from typing import Any, Mapping
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
-BUILDER_VERSION = "site-bundle-v6"
+BUILDER_VERSION = "site-bundle-v7"
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
 
@@ -122,6 +122,35 @@ def resolve_publish_root(destination: str | Path) -> Path:
     return resolved
 
 
+def static_gallery_items(destination: str | Path) -> list[dict[str, Any]]:
+    """Return published manifests as links relative to the website root."""
+    root = resolve_publish_root(destination)
+    items: list[dict[str, Any]] = []
+    for path in (root / "site" / "programs").glob("*/versions/*/bundle.json"):
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        program = manifest["program"]
+        artifacts = manifest.get("artifacts", [])
+        items.append({
+            "slug": program["slug"],
+            "title": program["title"],
+            "entrypoint": program.get("entrypoint", "program"),
+            "version": manifest["version"]["id"],
+            "created_at": manifest.get("created_at", ""),
+            "url": manifest["page"]["url"].lstrip("/"),
+            "source": manifest.get("source", {}).get("filename", ""),
+            "artifacts": len(artifacts),
+            "bytes": sum(int(artifact.get("bytes", 0)) for artifact in artifacts),
+            "latest": False,
+        })
+    items.sort(key=lambda item: (item["slug"], item["created_at"]), reverse=True)
+    newest: set[str] = set()
+    for item in items:
+        if item["slug"] not in newest:
+            item["latest"] = True
+            newest.add(item["slug"])
+    return items
+
+
 def build_source_inspection_page(
     subject: str | Path | type | Any,
     destination: str | Path,
@@ -130,6 +159,7 @@ def build_source_inspection_page(
     resource_route: str = "/",
     callable_systems: Mapping[str, Any] | None = None,
     python_source_url: str = "",
+    static_gallery: list[Mapping[str, Any]] | None = None,
 ) -> Path:
     """Render a file, class, or method with the website's HTML shell."""
 
@@ -215,6 +245,11 @@ def build_source_inspection_page(
         origin_source=source,
         map_ir=map_ir,
         resource_route=resource_route,
+        static_gallery=static_gallery,
+        browser_python_runtime={
+            "script_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js",
+            "index_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/",
+        } if python_source_url else None,
     )
     output = Path(destination).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -444,11 +479,28 @@ def build_source_inspection_bundle(
     temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=versions))
     try:
         route = f"/site/programs/{page_slug}/versions/{version}/"
-        python_source_url = route + "source/python_source/" + source_name
+        created_at = datetime.now(timezone.utc).isoformat()
+        gallery = static_gallery_items(destination)
+        for item in gallery:
+            if item["slug"] == page_slug:
+                item["latest"] = False
+        gallery.insert(0, {
+            "slug": page_slug,
+            "title": page_title,
+            "entrypoint": subject_name,
+            "version": version,
+            "created_at": created_at,
+            "url": (route + "index.html").lstrip("/"),
+            "source": source_name,
+            "artifacts": 0,
+            "bytes": 0,
+            "latest": True,
+        })
+        python_source_url = "source/python_source/" + source_name
         targets = _inspection_callables(source)
         page_urls = {
             target.qualified_name: (
-                route + "callables/" + slugify(target.qualified_name) + "/index.html"
+                "callables/" + slugify(target.qualified_name) + "/index.html"
             )
             for target in targets
         }
@@ -481,11 +533,10 @@ def build_source_inspection_bundle(
                 ),
                 callable_directory,
                 title=target.qualified_name,
-                resource_route=(
-                    route + "callables/" + slugify(target.qualified_name) + "/"
-                ),
+                resource_route="./",
                 callable_systems=target_systems,
-                python_source_url=python_source_url,
+                python_source_url="../../source/python_source/" + source_name,
+                static_gallery=gallery,
             )
             callable_source = callable_directory / "source" / callable_source_name
             callable_source.parent.mkdir(parents=True, exist_ok=True)
@@ -494,9 +545,10 @@ def build_source_inspection_bundle(
             subject,
             temporary,
             title=page_title,
-            resource_route=route,
+            resource_route="./",
             callable_systems=callable_systems,
             python_source_url=python_source_url,
+            static_gallery=gallery,
         )
         source_relative = Path("source") / "python_source" / source_name
         published_source = temporary / source_relative
@@ -516,7 +568,7 @@ def build_source_inspection_bundle(
                 "source_sha256": source_digest,
                 "builder": BUILDER_VERSION + "-ast",
             },
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": created_at,
             "page": {"path": page_path.name, "url": route + page_path.name},
             "source": {
                 "path": source_relative.as_posix(),
