@@ -69,8 +69,16 @@ def columnar_multifluid_rgb_step(
     rest_surface,
     displacement,
     displacement_velocity,
+    entity_x,
+    entity_y,
+    entity_velocity_x,
+    entity_velocity_y,
     managed_time,
     dt,
+    audio_low,
+    audio_mid,
+    audio_high,
+    audio_level,
     ink_red,
     ink_yellow,
     ink_green,
@@ -81,16 +89,71 @@ def columnar_multifluid_rgb_step(
     """One Python-owned managed tick and its three RGB preview planes."""
 
     next_time = managed_time + dt
-    player_x = 5.0 + 3.15 * (next_time * 0.72).sin()
-    player_y = 3.5 + 2.05 * (next_time * 1.07 + 1.5707963267948966).sin()
+    preferred_x = audio_low - audio_high
+    preferred_y = 2.0 * audio_mid - audio_low - audio_high
+    preferred_length = (
+        preferred_x * preferred_x + preferred_y * preferred_y + 1.0e-5
+    ).sqrt()
+    preferred_x = preferred_x / preferred_length
+    preferred_y = preferred_y / preferred_length
+    region_phase = (
+        column_x * 0.61 + column_y * 0.83
+        + (column_x * 0.37 - column_y * 0.29).sin() * 0.72
+    )
+    region_x = region_phase.cos()
+    region_y = region_phase.sin()
+    angular_similarity = region_x * preferred_x + region_y * preferred_y
+    sight_x = column_x - entity_x
+    sight_y = column_y - entity_y
+    sight_distance_squared = sight_x * sight_x + sight_y * sight_y
+    sight_distance = (sight_distance_squared + 0.12).sqrt()
+    visibility = (
+        (-sight_distance_squared / (2.0 * 2.35 * 2.35)).exp()
+        / (sight_distance_squared + 0.18)
+    )
+    signed_visibility = visibility * angular_similarity
+    visibility_total = visibility.sum() + 1.0e-6
+    steering_x = (
+        (sight_x / sight_distance) * signed_visibility
+    ).sum() / visibility_total
+    steering_y = (
+        (sight_y / sight_distance) * signed_visibility
+    ).sum() / visibility_total
+    steering_x = column_x * 0.0 + steering_x
+    steering_y = column_y * 0.0 + steering_y
+    acceleration_x = (
+        1.85 * steering_x + 0.10 * (5.0 - entity_x)
+        - 0.72 * entity_velocity_x
+    )
+    acceleration_y = (
+        1.85 * steering_y + 0.10 * (3.5 - entity_y)
+        - 0.72 * entity_velocity_y
+    )
+    next_entity_velocity_x = entity_velocity_x + acceleration_x * dt
+    next_entity_velocity_y = entity_velocity_y + acceleration_y * dt
+    next_entity_x = (
+        entity_x + next_entity_velocity_x * dt
+    ).maximum(0.65).minimum(9.35)
+    next_entity_y = (
+        entity_y + next_entity_velocity_y * dt
+    ).maximum(0.65).minimum(6.35)
+    player_x = next_entity_x
+    player_y = next_entity_y
+    spectral_size = (
+        0.42 * audio_low + 0.34 * audio_mid
+        + 0.18 * audio_high + 0.35 * audio_level
+    ).maximum(0.0).minimum(1.0)
+    entity_half_extent = 0.32 + 0.30 * spectral_size
     distance_squared = (
         (column_x - player_x) * (column_x - player_x)
         + (column_y - player_y) * (column_y - player_y)
     )
     entity_interior = (
-        (0.52 - (column_x - player_x).abs()).maximum(0.0)
-        .minimum((0.52 - (column_y - player_y).abs()).maximum(0.0))
-        / 0.52
+        (entity_half_extent - (column_x - player_x).abs()).maximum(0.0)
+        .minimum(
+            (entity_half_extent - (column_y - player_y).abs()).maximum(0.0)
+        )
+        / entity_half_extent
     )
     load = (-distance_squared / (2.0 * 1.35 * 1.35)).exp()
     target = -0.42 * load - 0.22 * entity_interior * entity_interior
@@ -175,6 +238,10 @@ def columnar_multifluid_rgb_step(
         blue,
         next_displacement,
         next_velocity,
+        next_entity_x,
+        next_entity_y,
+        next_entity_velocity_x,
+        next_entity_velocity_y,
         next_time,
         next_ink_red,
         next_ink_yellow,

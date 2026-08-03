@@ -9,14 +9,13 @@ import pytest
 
 from src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo import (
     SOURCE,
-    build_demo,
 )
 from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
     project_public_numerical_program,
 )
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
-from src.compiler.site_bundle import discover_source_contract
+from src.compiler.site_bundle import build_program_bundle, discover_source_contract
 
 
 def _feeds(count=8):
@@ -26,8 +25,16 @@ def _feeds(count=8):
         "rest_surface": np.full(count, 1.5),
         "displacement": np.zeros(count),
         "displacement_velocity": np.zeros(count),
+        "entity_x": np.full(count, 5.0),
+        "entity_y": np.full(count, 3.5),
+        "entity_velocity_x": np.full(count, 0.45),
+        "entity_velocity_y": np.full(count, 0.12),
         "managed_time": np.zeros(count),
         "dt": np.full(count, 0.025),
+        "audio_low": np.zeros(count),
+        "audio_mid": np.zeros(count),
+        "audio_high": np.zeros(count),
+        "audio_level": np.zeros(count),
         "ink_red": np.zeros(count),
         "ink_yellow": np.zeros(count),
         "ink_green": np.zeros(count),
@@ -44,6 +51,10 @@ def test_python_page_contract_declares_compiled_state_feedback():
     assert contract.state_feedback == {
         "displacement": "next_displacement",
         "displacement_velocity": "next_velocity",
+        "entity_x": "next_entity_x",
+        "entity_y": "next_entity_y",
+        "entity_velocity_x": "next_entity_velocity_x",
+        "entity_velocity_y": "next_entity_velocity_y",
         "managed_time": "next_time",
         "ink_red": "next_ink_red",
         "ink_yellow": "next_ink_yellow",
@@ -56,7 +67,7 @@ def test_python_page_contract_declares_compiled_state_feedback():
     assert contract.render_fps == 30.0
 
 
-def test_python_rgb_tick_recompiles_to_six_output_wasm():
+def test_python_rgb_tick_recompiles_with_reductions_to_wasm():
     aot = compile_ast_aot(
         SOURCE,
         "columnar_multifluid_rgb_step",
@@ -82,6 +93,10 @@ def test_python_rgb_tick_recompiles_to_six_output_wasm():
         "blue",
         "next_displacement",
         "next_velocity",
+        "next_entity_x",
+        "next_entity_y",
+        "next_entity_velocity_x",
+        "next_entity_velocity_y",
         "next_time",
         "next_ink_red",
         "next_ink_yellow",
@@ -94,7 +109,13 @@ def test_python_rgb_tick_recompiles_to_six_output_wasm():
 
 
 def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
-    bundle = build_demo(tmp_path)
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="columnar_multifluid_web_demo.py",
+        include_backends=False,
+        include_mathematics=False,
+    )
     manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
     html = bundle.page_path.read_text(encoding="utf-8")
 
@@ -102,12 +123,29 @@ def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
     shader = manifest["page"]["shader"]
     assert shader["role"] == "shader-surface"
     assert shader["configuration"] == {
-        "output_texture": {"channels": ["red", "green", "blue"]},
+        "output_feed_bindings": {
+            "turing_feed_0": "red",
+            "turing_feed_1": "green",
+            "turing_feed_2": "blue",
+        },
     }
     assert any(
         "shader-surface" in artifact["path"]
         for artifact in manifest["artifacts"]
     )
+    shader_source = (bundle.directory / shader["url"]).read_text(encoding="utf-8")
+    assert "texture(turing_feed_0, turing_uv).r" in shader_source
+    assert "turing_output_0 = vec4(v_4, v_6, v_8, 1.0);" in shader_source
+    audio = manifest["page"]["audio"]
+    assert audio["managed_time_output"] == "next_time"
+    assert audio["pan_output"] == "next_entity_x"
+    assert (bundle.directory / audio["audio_url"]).read_bytes()[:4] == b"RIFF"
+    features = json.loads(
+        (bundle.directory / audio["features_url"]).read_text(encoding="utf-8")
+    )
+    assert set(features["feeds"]) == {
+        "audio_low", "audio_mid", "audio_high", "audio_level",
+    }
     assert '"state_feedback"' in html
     assert "acceptCompiledState(activeFeeds, result)" in html
     assert "createImageData(w, h)" in html
@@ -115,9 +153,11 @@ def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
     assert "next_displacement" in html
     assert "requestAnimationFrame" in html
     assert '<canvas id="shader-surface" tabindex="0"' in html
-    assert "turing_output_texture" in html
+    assert "output_feed_bindings" in html
     assert "outputFrame()" in html
     assert "uploadOutputTexture()" in html
+    assert "managedDelta / wallDelta" in html
+    assert "createStereoPanner" in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
@@ -158,7 +198,12 @@ const state = {
   column_x: [3.5, 4.5, 5.5, 6.5], column_y: [3.5, 3.5, 3.5, 3.5],
   rest_surface: [1.5, 1.5, 1.5, 1.5], displacement: [0, 0, 0, 0],
   displacement_velocity: [0, 0, 0, 0], managed_time: [0, 0, 0, 0],
+  entity_x: [5, 5, 5, 5], entity_y: [3.5, 3.5, 3.5, 3.5],
+  entity_velocity_x: [0.45, 0.45, 0.45, 0.45],
+  entity_velocity_y: [0.12, 0.12, 0.12, 0.12],
   dt: [0.025, 0.025, 0.025, 0.025],
+  audio_low: [0, 0, 0, 0], audio_mid: [0, 0, 0, 0],
+  audio_high: [0, 0, 0, 0], audio_level: [0, 0, 0, 0],
   ink_red: [0, 0, 0, 0], ink_yellow: [0, 0, 0, 0],
   ink_green: [0, 0, 0, 0], ink_cyan: [0, 0, 0, 0],
   ink_blue: [0, 0, 0, 0], ink_magenta: [0, 0, 0, 0],
@@ -166,6 +211,9 @@ const state = {
 const feedback = {
   displacement: "next_displacement",
   displacement_velocity: "next_velocity",
+  entity_x: "next_entity_x", entity_y: "next_entity_y",
+  entity_velocity_x: "next_entity_velocity_x",
+  entity_velocity_y: "next_entity_velocity_y",
   managed_time: "next_time",
   ink_red: "next_ink_red", ink_yellow: "next_ink_yellow",
   ink_green: "next_ink_green", ink_cyan: "next_ink_cyan",

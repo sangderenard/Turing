@@ -906,6 +906,19 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
+        if step.op_name == "sum":
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "sum",
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
         attrs = dict(step.attrs)
         reverse = prefix_reverse ^ bool(attrs.pop("reverse", False))
@@ -1133,7 +1146,9 @@ def dispatch_region_to_fused_program(
 
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
-        op, _ = canonical_elementwise_op(_operation(graph, node_id))
+        raw_op = _operation(graph, node_id)
+        reduction = raw_op == "sum"
+        op = raw_op if reduction else canonical_elementwise_op(raw_op)[0]
         parents = list(data.get("parents") or ())
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
@@ -1162,8 +1177,13 @@ def dispatch_region_to_fused_program(
                     value_parents.append(parent_id)
             else:
                 value_parents.append(parent_id)
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] = (
+            copy.deepcopy(dict(data.get("attributes") or {}))
+            if reduction else {}
+        )
         if scalar_parent is not None:
+            if reduction:
+                raise ValueError("sum cannot consume a scalar constant operand")
             if len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
             attrs["right_scalar"] = scalar_parent[1]

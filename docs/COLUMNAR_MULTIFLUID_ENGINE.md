@@ -97,7 +97,8 @@ chosen sampling resolution.
 - pressure projection, viscosity, phase change, or material reactions;
 - general contact forces among non-entity voxels inside a player-local domain;
 - releasing/repacking freely moving voxels into different columns;
-- a GLSL storage binding or shader.
+- a desktop-GLSL storage binding for the physics tensors (the browser
+  presentation shader is compiled separately from Python expressions).
 
 The current transfer tensor is an inspectable proposal, not fake completed
 fluid transport. It is already arranged as a shader-friendly
@@ -114,18 +115,34 @@ to a `StateTable`, runs YoungMan on the same surface field, and writes a visual
 report plus a JSON world-state snapshot under
 `build/columnar_multifluid_demo/`.
 
-The browser demo is also authored in Python:
+The browser program is also authored in Python. Its literal `TURING_PAGE`
+contract names both the state-machine entrypoint and a Python presentation
+entrypoint, so it enters the general page-bundle compiler without a
+demo-specific builder. The compiler lowers the former to Wasm and the latter
+through SSA to a packed WebGL fragment shader:
 
-```powershell
-python -m src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo `
-  --destination build/columnar_multifluid_web
+```python
+from pathlib import Path
+
+from src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo import SOURCE
+from src.compiler.site_bundle import build_program_bundle
+
+build_program_bundle(
+    SOURCE,
+    Path("build/columnar_multifluid_web"),
+    source_filename="columnar_multifluid_web_demo.py",
+)
 ```
 
 Its Python source enters the normal AST/ProcessGraph recompiler and is emitted
 as WebAssembly. The compiled transition returns three RGB planes, the next
-spring state and managed time, and six persistent hue-band ink planes. The
-HTML shell only feeds those explicitly named state outputs into the next Wasm
-invocation. When the bundle contains its presentation shader, the shell
-uploads the RGB planes as one texture and stretches it over the viewport. It
-contains no second physics implementation, private time manager, or
-precomputed frames.
+spring/entity state and managed time, and six persistent hue-band ink planes.
+The HTML shell only feeds those explicitly named state outputs into the next
+Wasm invocation. The bundled Python synthesizer produces one AbstractTensor
+sample surface and analyzes it with `AbstractTensor.rfft`; the shell indexes
+those features by compiled managed time. Speaker playback is resampled so its
+playback rate follows managed-time advance per wall-time advance, and the
+entity's compiled x position controls stereo pan. Neither mechanism alters
+`dt`. The generated WebGL shader samples the named RGB output planes and
+stretches them over the viewport; it contains no second physics
+implementation, private time manager, or precomputed visual frames.

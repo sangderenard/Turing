@@ -315,6 +315,127 @@ window.addEventListener("unhandledrejection", (event) => {
 
 """
 
+# Managed-time audio is installed before feed expressions are evaluated.  It
+# observes compiled outputs but never writes ``dt``: the state machine remains
+# the sole time authority, while speaker playbackRate follows managed-time
+# advancement divided by wall-time advancement.
+_AUDIO_RUNTIME_JS = r"""(() => {
+  const CONFIG = __AUDIO_RUNTIME__;
+  if (!CONFIG) return;
+  let context = null;
+  let source = null;
+  let panner = null;
+  let decoded = null;
+  let featureDocument = null;
+  let managedTime = 0;
+  let previousManagedTime = null;
+  let previousWallTime = null;
+  let observedRevision = -1;
+
+  const ready = fetch(
+    new URL(CONFIG.features_url, document.baseURI), {cache: "no-store"}
+  ).then(response => {
+    if (!response.ok) throw new Error("audio features failed: HTTP " + response.status);
+    return response.json();
+  }).then(features => { featureDocument = features; });
+
+  function outputValue(frame, name) {
+    const output = frame && frame.outputs.find(item => item.name === name);
+    return output && output.values && output.values.length ? Number(output.values[0]) : null;
+  }
+
+  async function ensureDecoded() {
+    if (decoded) return decoded;
+    const response = await fetch(new URL(CONFIG.audio_url, document.baseURI), {cache: "no-store"});
+    if (!response.ok) throw new Error("audio load failed: HTTP " + response.status);
+    const bytes = await response.arrayBuffer();
+    context = context || new AudioContext({sampleRate: CONFIG.sample_rate});
+    decoded = await context.decodeAudioData(bytes.slice(0));
+    return decoded;
+  }
+
+  async function start() {
+    const buffer = await ensureDecoded();
+    if (context.state === "suspended") await context.resume();
+    if (source) return;
+    source = context.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    panner = context.createStereoPanner();
+    source.connect(panner).connect(context.destination);
+    source.start(0, ((managedTime % buffer.duration) + buffer.duration) % buffer.duration);
+  }
+
+  function observe() {
+    const runtime = window.TuringWasmRuntime;
+    const frame = runtime && runtime.outputFrame ? runtime.outputFrame() : null;
+    if (frame && frame.revision !== observedRevision) {
+      observedRevision = frame.revision;
+      const nextManagedTime = outputValue(frame, CONFIG.managed_time_output);
+      const wallTime = performance.now() / 1000;
+      if (nextManagedTime !== null) {
+        if (source && previousManagedTime !== null && previousWallTime !== null) {
+          const wallDelta = wallTime - previousWallTime;
+          const managedDelta = nextManagedTime - previousManagedTime;
+          if (wallDelta > 0 && managedDelta >= 0) {
+            source.playbackRate.setTargetAtTime(
+              Math.max(0.0001, managedDelta / wallDelta), context.currentTime, 0.015
+            );
+          }
+        }
+        managedTime = nextManagedTime;
+        previousManagedTime = nextManagedTime;
+        previousWallTime = wallTime;
+      }
+      if (panner && CONFIG.pan_output) {
+        const position = outputValue(frame, CONFIG.pan_output);
+        const range = CONFIG.pan_range || [-1, 1];
+        if (position !== null && range[1] !== range[0]) {
+          const pan = Math.max(-1, Math.min(1,
+            2 * (position - range[0]) / (range[1] - range[0]) - 1
+          ));
+          panner.pan.setTargetAtTime(pan, context.currentTime, 0.02);
+        }
+      }
+    }
+    requestAnimationFrame(observe);
+  }
+
+  window.TuringAudioRuntime = Object.freeze({
+    ready,
+    start,
+    suspend: () => context ? context.suspend() : Promise.resolve(),
+    feature(name) {
+      if (!featureDocument) return 0;
+      const values = featureDocument.feeds[name];
+      if (!values || !values.length) return 0;
+      const position = ((managedTime % featureDocument.duration)
+        + featureDocument.duration) % featureDocument.duration;
+      const frame = position * featureDocument.feature_fps;
+      const lower = Math.floor(frame) % values.length;
+      const upper = (lower + 1) % values.length;
+      const blend = frame - Math.floor(frame);
+      return values[lower] * (1 - blend) + values[upper] * blend;
+    },
+    async outputDevices() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+      return (await navigator.mediaDevices.enumerateDevices())
+        .filter(device => device.kind === "audiooutput");
+    },
+    async selectOutput(deviceId) {
+      context = context || new AudioContext({sampleRate: CONFIG.sample_rate});
+      if (typeof context.setSinkId !== "function") {
+        throw new Error("this browser does not support selecting an audio output");
+      }
+      await context.setSinkId(deviceId);
+    },
+    get managedTime() { return managedTime; },
+  });
+  window.addEventListener("pointerdown", () => start().catch(console.error), {once: true});
+  ready.catch(console.error);
+  requestAnimationFrame(observe);
+})();"""
+
 # The program script proper.
 _JS = r"""const API = __API__;
 const WASM_BASE64 = __WASM__;
@@ -2607,16 +2728,18 @@ if (!gl) {
 
     const feedNames = [...fragmentSource.matchAll(/uniform\s+sampler2D\s+(turing_feed_\d+)\s*;/g)]
       .map(match => match[1]);
+    const outputFeedBindings = configuration.output_feed_bindings || {};
     const feeds = feedNames.map((name, index) => {
       const texture = gl.createTexture();
       gl.activeTexture(gl.TEXTURE0 + index);
       gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      const outputName = outputFeedBindings[name] || null;
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, outputName ? gl.LINEAR : gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, outputName ? gl.LINEAR : gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.uniform1i(gl.getUniformLocation(program, name), index);
-      return {texture, index, width: 0, height: 0};
+      return {texture, index, width: 0, height: 0, outputName, revision: -1};
     });
 
     const domSurfaceEnabled = configuration.dom_surface === true;
@@ -2796,7 +2919,28 @@ if (!gl) {
     function uploadFeeds(time) {
       const width = canvas.width;
       const height = canvas.height;
+      const outputFrame = liaison.wasm && liaison.wasm.outputFrame
+        ? liaison.wasm.outputFrame() : null;
+      const outputsByName = outputFrame
+        ? new Map(outputFrame.outputs.map(item => [item.name, item.values]))
+        : new Map();
       for (const feed of feeds) {
+        if (feed.outputName) {
+          const source = outputsByName.get(feed.outputName);
+          if (!source || !outputFrame || feed.revision === outputFrame.revision) continue;
+          const count = outputFrame.width * outputFrame.height;
+          if (source.length < count) continue;
+          const values = Float32Array.from(source.slice(0, count));
+          gl.activeTexture(gl.TEXTURE0 + feed.index);
+          gl.bindTexture(gl.TEXTURE_2D, feed.texture);
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+          gl.texImage2D(
+            gl.TEXTURE_2D, 0, gl.R32F, outputFrame.width, outputFrame.height,
+            0, gl.RED, gl.FLOAT, values
+          );
+          feed.revision = outputFrame.revision;
+          continue;
+        }
         const values = new Float32Array(width * height);
         for (let y = 0; y < height; y += 1) {
           for (let x = 0; x < width; x += 1) {
@@ -3278,6 +3422,7 @@ def emit_html_shell(
     resource_route: str = "/",
     static_gallery: Sequence[Mapping[str, Any]] | None = None,
     shader_execution: Mapping[str, Any] | None = None,
+    audio_runtime: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -3323,6 +3468,7 @@ def emit_html_shell(
     shader_css = ""
     shader_canvas = ""
     shader_script = ""
+    audio_script = ""
     body_class = ""
     if shader_execution is not None:
         shader = dict(shader_execution)
@@ -3342,6 +3488,10 @@ def emit_html_shell(
         )
         shader_script = "<script>" + _SHADER_EXECUTION_JS.replace(
             "__SHADER_EXECUTION__", json.dumps(shader, default=str)
+        ) + "</script>"
+    if audio_runtime is not None:
+        audio_script = "<script>" + _AUDIO_RUNTIME_JS.replace(
+            "__AUDIO_RUNTIME__", json.dumps(dict(audio_runtime), default=str)
         ) + "</script>"
 
     encoded = (
@@ -3700,6 +3850,7 @@ def emit_html_shell(
     </details>
   </div>
 
+{audio_script}
 <script>{boot_script}</script>
 <script>{script}</script>
 {shader_script}
@@ -3726,6 +3877,7 @@ def shell_for_artifact(
     map_ir: Mapping[str, Any] | None = None,
     resource_route: str = "/",
     shader_execution: Mapping[str, Any] | None = None,
+    audio_runtime: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
@@ -3752,6 +3904,7 @@ def shell_for_artifact(
         map_ir=map_ir,
         resource_route=resource_route,
         shader_execution=shader_execution,
+        audio_runtime=audio_runtime,
         default_server_address=default_server_address,
     )
 

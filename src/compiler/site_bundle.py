@@ -28,6 +28,7 @@ import contextlib
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -80,6 +81,9 @@ class SourceContract:
     state_feedback: Mapping[str, str]
     render_fps: float
     autostart: bool
+    presentation_entrypoint: str | None
+    shader_configuration: Mapping[str, Any]
+    audio_configuration: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,6 +697,24 @@ def discover_source_contract(
             f"{sorted(unknown_state_inputs)!r}"
         )
 
+    presentation_entrypoint = config.get("presentation_entrypoint")
+    if presentation_entrypoint is not None:
+        presentation_entrypoint = str(presentation_entrypoint)
+        presentation = next(
+            (node for node in functions if node.name == presentation_entrypoint), None
+        )
+        if presentation is None:
+            raise ValueError(
+                f"presentation entrypoint {presentation_entrypoint!r} is not a "
+                "top-level function"
+            )
+    shader_config = config.get("shader_configuration", {})
+    if not isinstance(shader_config, dict):
+        raise ValueError("TURING_PAGE['shader_configuration'] must be a mapping")
+    audio_config = config.get("audio", {})
+    if not isinstance(audio_config, dict):
+        raise ValueError("TURING_PAGE['audio'] must be a mapping")
+
     page_title = str(title or config.get("title") or selected.replace("_", " ").title())
     page_slug = slugify(str(slug or config.get("slug") or selected))
     width = int(config.get("width", 64))
@@ -721,6 +743,9 @@ def discover_source_contract(
         state_feedback=dict(state_feedback),
         render_fps=render_fps,
         autostart=bool(config.get("autostart", False)),
+        presentation_entrypoint=presentation_entrypoint,
+        shader_configuration=dict(shader_config),
+        audio_configuration=dict(audio_config),
     )
 
 
@@ -780,6 +805,9 @@ def _content_version(
         "state_feedback": dict(contract.state_feedback),
         "render_fps": contract.render_fps,
         "autostart": contract.autostart,
+        "presentation_entrypoint": contract.presentation_entrypoint,
+        "contract_shader_configuration": dict(contract.shader_configuration),
+        "audio_configuration": dict(contract.audio_configuration),
         "presentation_shader_sha256": (
             hashlib.sha256(presentation_shader.encode("utf-8")).hexdigest()
             if presentation_shader is not None else None
@@ -893,6 +921,56 @@ def _shader_execution_descriptor(
     return None
 
 
+def _write_audio_asset(
+    directory: Path,
+    configuration: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Materialize a trusted Python audio producer into a shell asset contract."""
+
+    if not configuration:
+        return None
+    generator = str(configuration.get("generator", ""))
+    module_name, separator, callable_name = generator.partition(":")
+    if not separator or not module_name or not callable_name:
+        raise ValueError("TURING_PAGE['audio'].generator must be 'module:callable'")
+    arguments = configuration.get("arguments", {})
+    if not isinstance(arguments, Mapping):
+        raise ValueError("TURING_PAGE['audio'].arguments must be a mapping")
+    producer = getattr(importlib.import_module(module_name), callable_name)
+    track = producer(**dict(arguments))
+    wave = track.wave_bytes()
+    features = {
+        str(name): [float(value) for value in values]
+        for name, values in dict(track.feature_feeds).items()
+    }
+    audio_relative = Path("audio") / "managed-time-source.wav"
+    features_relative = Path("audio") / "spectral-features.json"
+    audio_path = directory / audio_relative
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(wave)
+    features_relative_path = directory / features_relative
+    features_relative_path.write_text(
+        json.dumps({
+            "feature_fps": int(track.feature_fps),
+            "duration": float(track.duration),
+            "feeds": features,
+        }, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return {
+        "audio_url": audio_relative.as_posix(),
+        "features_url": features_relative.as_posix(),
+        "sample_rate": int(track.sample_rate),
+        "feature_fps": int(track.feature_fps),
+        "duration": float(track.duration),
+        "managed_time_output": str(
+            configuration.get("managed_time_output", "next_time")
+        ),
+        "pan_output": str(configuration.get("pan_output", "")),
+        "pan_range": list(configuration.get("pan_range", (-1.0, 1.0))),
+    }
+
+
 def _artifact_inventory(directory: Path) -> list[dict[str, Any]]:
     inventory = []
     for path in sorted(item for item in directory.rglob("*") if item.is_file()):
@@ -941,12 +1019,16 @@ def build_program_bundle(
     contract = discover_source_contract(
         source, entrypoint=entrypoint, title=title, slug=slug, probes=probes
     )
+    contract_shader_configuration = {
+        **dict(contract.shader_configuration),
+        **dict(shader_configuration or {}),
+    }
     version, source_digest = _content_version(
         source,
         contract,
         presentation_shader=presentation_shader,
         presentation_document=presentation_document,
-        shader_configuration=shader_configuration,
+        shader_configuration=contract_shader_configuration,
     )
     destination = resolve_publish_root(destination)
     versions = destination / "site" / "programs" / contract.slug / "versions"
@@ -965,6 +1047,7 @@ def build_program_bundle(
         from ..transmogrifier.graph.graph_express2 import ProcessGraph
         from .backend_sources import collect_backend_sources
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
+        from .fused_program_webgl_backend import emit_webgl_fragment_module
         from .shell_telemetry import TelemetryChannel, summarize_process_graph
         from .sympy_math_renderer import render_reduced_program_mathematics
         from .wasm_class_coordinator import (
@@ -1036,6 +1119,58 @@ def build_program_bundle(
                         },
                     ),
                 )
+
+            effective_presentation_shader = presentation_shader
+            effective_shader_configuration = dict(contract_shader_configuration)
+            if contract.presentation_entrypoint is not None:
+                presentation_parameters = _entrypoint_parameters(
+                    source, contract.presentation_entrypoint
+                )
+                presentation_feeds = {
+                    parameter: _probe_value(0.0, contract.probe_size)
+                    for parameter in presentation_parameters
+                }
+                presentation_aot = compile_ast_aot(
+                    source,
+                    contract.presentation_entrypoint,
+                    presentation_feeds,
+                    backend=contract.backend,
+                    remove_loops=contract.remove_loops,
+                    unroll_limit=contract.unroll_limit,
+                    precompile_only=True,
+                    python_bindings=globals(),
+                )
+                presentation_program = project_public_numerical_program(
+                    presentation_aot
+                )
+                presentation_module = emit_webgl_fragment_module(
+                    presentation_program,
+                    name=contract.presentation_entrypoint,
+                    output_layout="rgba",
+                    input_sampling="normalized",
+                )
+                if not presentation_module.complete:
+                    raise RuntimeError(
+                        "WebGL presentation emission shortfalls:\n" + "\n".join(
+                            "- " + item.format()
+                            for item in presentation_module.shortfalls
+                        )
+                    )
+                effective_presentation_shader = presentation_module.source
+                origins = dict(
+                    (getattr(presentation_program, "extras", None) or {}).get(
+                        "capture_feed_origins", {}
+                    )
+                )
+                bindings = {}
+                for item in presentation_module.api.metadata["feed_bindings"]:
+                    value_id = item["value_id"]
+                    origin = origins.get(value_id, origins.get(str(value_id), {}))
+                    input_name = origin.get("binding_name")
+                    if input_name is None and value_id < len(presentation_parameters):
+                        input_name = presentation_parameters[value_id]
+                    bindings[item["uniform"]] = str(input_name)
+                effective_shader_configuration["output_feed_bindings"] = bindings
         if not module.complete:
             raise RuntimeError(module.shortfall_report())
 
@@ -1115,9 +1250,8 @@ def build_program_bundle(
             source,
             Path(source_filename).name,
             sources,
-            presentation_shader=presentation_shader,
+            presentation_shader=effective_presentation_shader,
         )
-        effective_shader_configuration = dict(shader_configuration or {})
         if presentation_document is not None:
             document_relative = (
                 Path("source") / "roles" / "shader-document" / "index.html"
@@ -1240,6 +1374,9 @@ def build_program_bundle(
             (module.api.metadata or {}).get("shell_io"),
             effective_shader_configuration,
         )
+        audio_runtime = _write_audio_asset(
+            temporary, contract.audio_configuration
+        )
         shell = emit_html_shell(
             module.api,
             name="index",
@@ -1266,6 +1403,7 @@ def build_program_bundle(
             },
             resource_route=route,
             shader_execution=shader_execution,
+            audio_runtime=audio_runtime,
         )
         page_path = shell.write(temporary)
 
@@ -1294,6 +1432,7 @@ def build_program_bundle(
                 "url": route + "index.html",
                 "mode": "shader-execution" if shader_execution else "inspection",
                 "shader": shader_execution,
+                "audio": audio_runtime,
             },
             "source": {
                 "path": f"source/python_source/{Path(source_filename).name}",

@@ -230,6 +230,53 @@ def test_a_varying_tensor_constant_runs_from_the_wasm_data_segment(tmp_path):
     assert json.loads(completed.stdout) == [10, 40, 90]
 
 
+@pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node not on PATH"
+)
+def test_whole_tensor_sum_runs_as_a_reduction_then_broadcasts(tmp_path):
+    import json
+    import subprocess
+
+    program = _program(
+        [
+            OpStep(0, "sum", [1], {"axis": None, "keepdim": False}, 2),
+            OpStep(1, "truediv", [1, 2], {}, 3),
+        ],
+        (1,),
+        {"normalized": 3},
+    )
+    module = emit_wasm_module(program, name="sum_then_normalize")
+    assert module.complete, module.shortfall_report()
+    assert "(block $sum_done_0" in module.source
+    module_path = tmp_path / "sum_then_normalize.wasm"
+    module_path.write_bytes(module.binary)
+    script = tmp_path / "run_sum.mjs"
+    script.write_text(
+        """
+        import { readFileSync } from "node:fs";
+        const { instance } = await WebAssembly.instantiate(
+          readFileSync(process.argv[2]), {}
+        );
+        const inputOffset = 0;
+        const outputOffset = 24;
+        new Float64Array(instance.exports.memory.buffer, inputOffset, 3)
+          .set([1, 2, 3]);
+        instance.exports.run(3, inputOffset, outputOffset);
+        console.log(JSON.stringify(Array.from(
+          new Float64Array(instance.exports.memory.buffer, outputOffset, 3)
+        )));
+        """,
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["node", str(script), str(module_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(completed.stdout) == pytest.approx([1 / 6, 2 / 6, 3 / 6])
+
+
 def test_the_catalogue_decides_what_is_reachable():
     """Every function with a table is emittable, and the two lists cannot
     drift: _LUT_OPS is taken from the catalogue rather than written out
