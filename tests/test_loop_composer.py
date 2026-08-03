@@ -17,6 +17,7 @@ from src.compiler.loop_composer import (
     LoopStrategy,
     _rebuild_graph_edges,
     analyze_shader_loop_reductions,
+    bind_control_deployments_to_regions,
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
     planned_collection_bindings,
@@ -31,8 +32,10 @@ from src.compiler.loop_ir import (
 from src.compiler.control_source import (
     ControlTarget,
     LoopBlock,
+    LoopControlBlock,
     SequenceBlock,
     StreamPublishBlock,
+    WhileBlock,
     render_control_program,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
@@ -138,6 +141,72 @@ def test_unroll_strategy_evaporates_to_straight_line_value_graph():
     assert all(graph.G.nodes[value_id]["type"] == "Add"
                for value_id in stack_inputs)
     assert len(set(stack_inputs)) == 3
+
+
+def test_static_mapping_generator_reduction_preserves_destructured_outputs():
+    graph = _function_graph(
+        "def kernel(mapping):\n"
+        "    return any(\n"
+        "        value > 0 for name, value in mapping.items()\n"
+        "    )\n",
+        "kernel",
+    )
+    graph.G.graph["planner_specializations"] = {
+        "mapping": {"quiet": 0, "active": 2},
+    }
+    graph.G.graph["deployment_schedule_preference"] = "asap"
+    composer = _glsl_composer()
+    plans = composer.discover(graph)
+
+    plan, = plans
+    assert plan.loop.target_bindings
+    assert plan.loop.iteration_outputs
+
+    evaporate_unrolled_loops(graph, plans)
+
+    generator_id = next(
+        node_id
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.GeneratorExp)
+    )
+    generator = graph.G.nodes[generator_id]
+    assert generator["attributes"]["materialization_kind"] == (
+        "unrolled_loop"
+    )
+    generated_values = tuple(
+        parent
+        for parent, role in generator["parents"]
+        if str(role).startswith("arg")
+    )
+    assert len(generated_values) == 2
+    assert all(
+        graph.G.nodes[value_id]["type"] == "greater"
+        for value_id in generated_values
+    )
+    assert not any(
+        data.get("label") in {"name", "value"}
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    deployment, = graph.G.graph["control_deployment_regions"]
+    assert deployment.origin == "unrolled_loop"
+    assert deployment.schedule == "independent_lanes"
+    assert deployment.schedule_preference == "asap"
+    assert len(deployment.lanes) == 2
+    for lane in deployment.lanes:
+        assert lane.source_node_ids
+        assert all(
+            (deployment.region_id, lane.index)
+            in graph.G.nodes[value_id]["attributes"][
+                "deployment_memberships"
+            ]
+            for value_id in lane.source_node_ids
+        )
+    mapped, = bind_control_deployments_to_regions(
+        (deployment,),
+        tuple(lane.source_node_ids for lane in deployment.lanes),
+    )
+    assert mapped.schedule_preference == "asap"
+    assert [lane.region_indices for lane in mapped.lanes] == [(0,), (1,)]
 
 
 def test_literal_callsite_specialization_precedes_single_loop_reduction():
@@ -638,4 +707,35 @@ def test_loop_shader_reduction_runs_after_region_compartmentalization():
     assert rendered.startswith(
         f"for (int iteration_{plans[0].loop.node_id} = 0; "
         f"iteration_{plans[0].loop.node_id} < 64;"
+    )
+
+
+def test_while_condition_and_break_become_planner_control_edges():
+    graph = _function_graph(
+        "def kernel(x):\n"
+        "    while x < 8:\n"
+        "        x = x + 1\n"
+        "        if x > 4:\n"
+        "            break\n"
+        "    return x\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+
+    assert plan.loop.break_nodes
+    reduction, = analyze_shader_loop_reductions(
+        graph,
+        (plan,),
+        (plan.loop.condition_nodes, plan.loop.body_nodes),
+    )
+
+    assert reduction.collapsible
+    assert reduction.blockers == ()
+    assert reduction.control_program is not None
+    loop = reduction.control_program.root
+    assert isinstance(loop, WhileBlock)
+    assert loop.predicate_value_id == plan.loop.condition_nodes[0]
+    assert any(
+        isinstance(block, LoopControlBlock) and block.action == "break"
+        for block in loop.body.blocks
     )

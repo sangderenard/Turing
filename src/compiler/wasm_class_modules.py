@@ -48,13 +48,192 @@ chunk is a numbered prerequisite of it.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from ..common.tensors.fused_ir import FusedProgram, ordered_feed_ids
 from .process_graph_fusion import (
     DispatchRegion, dispatch_region_to_fused_program,
     fused_program_to_process_graph,
+    reduce_scheduled_shader_regions,
 )
+
+
+def partition_threaded_wasm_program(
+    program: FusedProgram,
+    *,
+    max_nodes_per_region: int = 64,
+    schedule_preference: str = "alap",
+):
+    """Cut a numerical DAG into vertically fused, parallel Wasm waves.
+
+    This consumes the existing fixed-point ProcessGraph reducer. Each emitted
+    region is therefore a maximal compatible DAG up to the explicit Wasm
+    region cap, including vertical-fusion rewrites; regions at the same
+    dependency level become lanes of one ``ParallelDeployment``.
+    """
+
+    import networkx as nx
+
+    from .control_source import (
+        ControlProgram,
+        ParallelDeployment,
+        SequenceBlock,
+        StatementBlock,
+    )
+    from .fused_program_wasm_backend import required_steps
+
+    preference = str(schedule_preference).lower()
+    if preference not in {"asap", "alap"}:
+        raise ValueError("Wasm thread schedule must be asap or alap")
+    live = required_steps(program)
+    if len(live) <= int(max_nodes_per_region):
+        return None
+    pruned = FusedProgram(
+        version=program.version,
+        feeds=set(program.feeds),
+        steps=list(live),
+        outputs=dict(program.outputs),
+        state_in=program.state_in,
+        meta=program.meta,
+        extras=program.extras,
+    )
+    graph = fused_program_to_process_graph(pruned)
+    executable = {
+        int(step.result_id)
+        for step in live
+        if graph.G.nodes[int(step.result_id)].get("type")
+        not in {"input", "const", "return"}
+    }
+    numerical_graph = graph.G.subgraph(executable)
+    topological = tuple(
+        nx.lexicographical_topological_sort(
+            numerical_graph, key=lambda node_id: int(node_id)
+        )
+    )
+    visited: set[int] = set()
+    columns: list[tuple[int, ...]] = []
+    for start in topological:
+        if int(start) in visited:
+            continue
+        predecessors = tuple(numerical_graph.predecessors(start))
+        if (
+            len(predecessors) == 1
+            and numerical_graph.out_degree(predecessors[0]) == 1
+        ):
+            continue
+        column = [int(start)]
+        current = start
+        while numerical_graph.out_degree(current) == 1:
+            successor = next(iter(numerical_graph.successors(current)))
+            if numerical_graph.in_degree(successor) != 1:
+                break
+            column.append(int(successor))
+            current = successor
+        visited.update(column)
+        columns.append(tuple(column))
+    for node_id in topological:
+        if int(node_id) not in visited:
+            columns.append((int(node_id),))
+    lane_partitions = min(4, max(1, len(columns)))
+    partition_keys = {
+        node_id: column_index % lane_partitions
+        for column_index, column in enumerate(columns)
+        for node_id in column
+    }
+    reduced = reduce_scheduled_shader_regions(
+        graph,
+        executable,
+        max_nodes_per_region=int(max_nodes_per_region),
+        max_bindings_per_region=256,
+        partition_keys=partition_keys,
+        schedule=preference,
+    )
+    if len(reduced.dispatches) < 2:
+        return None
+    region_of = {
+        int(node_id): index
+        for index, dispatch in enumerate(reduced.dispatches)
+        for node_id in dispatch.node_ids
+    }
+    dependency = nx.DiGraph()
+    dependency.add_nodes_from(range(len(reduced.dispatches)))
+    for parent, child in graph.G.edges:
+        left = region_of.get(int(parent))
+        right = region_of.get(int(child))
+        if left is not None and right is not None and left != right:
+            dependency.add_edge(left, right)
+    if not nx.is_directed_acyclic_graph(dependency):
+        raise ValueError("reduced Wasm deployment topology contains a cycle")
+
+    if preference == "asap":
+        waves = [tuple(map(int, wave)) for wave in nx.topological_generations(dependency)]
+    else:
+        levels: dict[int, int] = {}
+        for node in reversed(tuple(nx.topological_sort(dependency))):
+            levels[int(node)] = max(
+                (levels[int(child)] + 1 for child in dependency.successors(node)),
+                default=0,
+            )
+        waves = [
+            tuple(sorted(node for node, value in levels.items() if value == level))
+            for level in sorted(set(levels.values()), reverse=True)
+        ]
+    if not any(len(wave) > 1 for wave in waves):
+        return None
+
+    origins = dict((program.extras or {}).get("capture_feed_origins", {}) or {})
+    region_programs: dict[int, FusedProgram] = {}
+    for index, dispatch in enumerate(reduced.dispatches):
+        boundary = _boundary_region(
+            graph, tuple(map(int, dispatch.node_ids)), tuple(graph.G.nodes)
+        )
+        member = dispatch_region_to_fused_program(graph, boundary)
+        member.extras = {
+            **dict(member.extras or {}),
+            "capture_feed_origins": {
+                value_id: origins[value_id]
+                for value_id in member.feeds
+                if value_id in origins
+            },
+            "wasm_vertical_fusion": tuple(dispatch.rewrite_history),
+        }
+        region_programs[index] = member
+
+    blocks = []
+    for wave in waves:
+        lanes = tuple(
+            StatementBlock((f"__scheduled_region_{index}__",))
+            for index in wave
+        )
+        blocks.append(
+            lanes[0]
+            if len(lanes) == 1
+            else ParallelDeployment(lanes, preference)
+        )
+    control = ControlProgram(
+        SequenceBlock(tuple(blocks)),
+        region_indices=tuple(
+            index for wave in waves for index in wave
+        ),
+    )
+    summary = {
+        "abi": "turing.wasm-vertical-fusion.v1",
+        "source_operations": len(live),
+        "regions": len(reduced.dispatches),
+        "waves": len(waves),
+        "parallel_waves": sum(len(wave) > 1 for wave in waves),
+        "max_wave_width": max(map(len, waves)),
+        "lane_partitions": lane_partitions,
+        "region_sizes": [len(dispatch.node_ids) for dispatch in reduced.dispatches],
+        "vertical_fused_regions": sum(
+            "vertical-fusion" in dispatch.rewrite_history
+            for dispatch in reduced.dispatches
+        ),
+        "rewrite_history": [
+            list(dispatch.rewrite_history) for dispatch in reduced.dispatches
+        ],
+    }
+    return control, region_programs, summary
 
 
 @dataclass(frozen=True)
@@ -91,6 +270,147 @@ class ClassModuleSpec:
     @property
     def module_name(self) -> str:
         return f"{self.name}__{self.index}"
+
+
+def emit_control_region_modules(
+    control,
+    region_programs: Mapping[int, FusedProgram],
+    *,
+    owner_name: str,
+    module_dir: str,
+    dtype: str = "float64",
+) -> tuple[dict[int, object], dict]:
+    """Emit planner regions without flattening their controlling program.
+
+    Each ``ControlProgram`` region remains one callable WebAssembly kernel.
+    Values crossing region boundaries are assigned shared-memory identities;
+    the companion control coordinator invokes these exact kernels according
+    to the planner-owned loop/state-machine structure.
+    """
+
+    from .fused_program_wasm_backend import (
+        emit_wasm_module,
+        program_feed_order,
+    )
+    from .wasm_binary import WasmImport
+
+    ordered_regions = tuple(dict.fromkeys(map(int, control.region_indices)))
+    missing = set(ordered_regions) - set(map(int, region_programs))
+    if missing:
+        raise ValueError(
+            "control references missing WebAssembly regions: "
+            + ", ".join(map(str, sorted(missing)))
+        )
+    programs = {
+        region: getattr(region_programs[region], "program", region_programs[region])
+        for region in ordered_regions
+    }
+    producer: dict[int, tuple[str, str]] = {}
+    module_names = {
+        region: f"{owner_name}_region_{region}" for region in ordered_regions
+    }
+    for region, program in programs.items():
+        for output_name, value_id in program.outputs.items():
+            producer[int(value_id)] = (
+                module_names[region], str(output_name)
+            )
+
+    modules = {}
+    entries = []
+    edges = []
+    logical_inputs: dict[str, list[tuple[str, str]]] = {}
+    value_bindings: dict[int, str] = {
+        value_id: f"out::{module_name}::{output_name}"
+        for value_id, (module_name, output_name) in producer.items()
+    }
+    static_offset = 0
+    for region in ordered_regions:
+        program = programs[region]
+        module_name = module_names[region]
+        module = emit_wasm_module(
+            program,
+            name=module_name,
+            dtype=dtype,
+            imports=(WasmImport(
+                module="env",
+                field="memory",
+                kind="memory",
+                memory_pages=1,
+            ),),
+            static_data_offset=static_offset,
+        )
+        if not module.complete:
+            raise RuntimeError(module.shortfall_report())
+        modules[region] = module
+        api_entry = module.api.entry_points[0]
+        inputs = [
+            parameter.name for parameter in api_entry.parameters
+            if parameter.role == "input"
+        ]
+        outputs = [
+            parameter.name for parameter in api_entry.parameters
+            if parameter.role == "output"
+        ]
+        feed_ids = tuple(map(int, program_feed_order(program)))
+        if len(feed_ids) != len(inputs):
+            raise ValueError(
+                f"region {region} WebAssembly feed ABI is inconsistent"
+            )
+        origins = dict((program.extras or {}).get("capture_feed_origins", {}))
+        for value_id, input_name in zip(feed_ids, inputs):
+            source = producer.get(value_id)
+            if source is not None:
+                edges.append({
+                    "from": {
+                        "module": source[0], "output": source[1]
+                    },
+                    "to": {
+                        "module": module_name, "input": input_name
+                    },
+                })
+                continue
+            origin = origins.get(value_id, origins.get(str(value_id), {}))
+            logical_name = str(
+                origin.get("binding_name") or f"input_{value_id}"
+            )
+            logical_inputs.setdefault(logical_name, []).append(
+                (module_name, input_name)
+            )
+            value_bindings.setdefault(value_id, f"in::{logical_name}")
+        entries.append({
+            "name": module_name,
+            "url": f"{module_dir}/{module_name}.wasm",
+            "entry": module.api.entry,
+            "inputs": inputs,
+            "outputs": outputs,
+            "value_type": module.api.metadata.get("value_type", "f64"),
+            "element_bytes": module.api.metadata.get("element_bytes", 8),
+            "memory_export": module.api.metadata.get("memory_export", "memory"),
+            "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
+            "static_data_offset": module.api.metadata.get("static_data_offset", 0),
+            "shared_memory_import": module.api.metadata.get(
+                "shared_memory_import", {"module": "env", "field": "memory"}
+            ),
+            "operation_count": len(program.steps),
+            "node_ids": [int(step.result_id) for step in program.steps],
+            "is_root": False,
+            "region_index": region,
+        })
+        static_offset = max(
+            static_offset,
+            int(module.api.metadata.get("reserved_bytes", 0)),
+        )
+    return modules, {
+        "modules": entries,
+        "edges": edges,
+        "logical_inputs": logical_inputs,
+        "shared_memory": True,
+        "shared_static_bytes": static_offset,
+        "control_regions": list(ordered_regions),
+        "value_bindings": {
+            str(value_id): key for value_id, key in value_bindings.items()
+        },
+    }
 
 
 def _boundary_region(
@@ -877,6 +1197,7 @@ __all__ = [
     "build_module_process_graph",
     "describe_process_graph_api",
     "emit_class_modules",
+    "emit_control_region_modules",
     "partition_reduced_program",
     "schedule_module_levels",
 ]

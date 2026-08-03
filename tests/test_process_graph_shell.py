@@ -4,7 +4,10 @@ segmented by partition_reduced_program (see wasm_class_modules.py)."""
 import numpy as np
 import pytest
 
-from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
+from src.common.tensors.accelerator_backends.aot_compile import (
+    compile_ast_aot,
+    project_public_numerical_program,
+)
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.process_graph_shell import emit_process_graph_shell, schedule_table
 from src.compiler.wasm_class_modules import partition_reduced_program
@@ -75,6 +78,60 @@ def kernel(value):
     assert aot.identity_table["result"][-1] == max(
         aot.identity_table["result"]
     )
+
+
+def test_aot_records_and_validates_the_requested_bake_mode():
+    source = (
+        "def helper(x):\n"
+        "    return x * 2.0\n"
+        "\n"
+        "def kernel(x):\n"
+        "    return helper(x)\n"
+    )
+    one_shot = compile_ast_aot(
+        source,
+        "kernel",
+        {"x": np.array([3.0])},
+        precompile_only=True,
+        bake_mode="one-shot",
+        schedule_preference="ASAP",
+    )
+
+    assert one_shot.bake_mode == "one_shot"
+    assert one_shot.schedule_preference == "asap"
+    with pytest.raises(ValueError, match="one_shot.*whole_program"):
+        compile_ast_aot(
+            source,
+            "kernel",
+            {"x": np.array([3.0])},
+            precompile_only=True,
+            bake_mode="partial",
+        )
+
+
+def test_configured_parameter_constants_apply_before_graph_reduction():
+    source = "def kernel(x, gain):\n    return x * gain\n"
+    aot = compile_ast_aot(
+        source,
+        "kernel",
+        {"x": np.array([3.0]), "gain": np.array([99.0])},
+        precompile_only=True,
+        constant_map={"gain": 2.0},
+    )
+    program = project_public_numerical_program(aot)
+
+    assert aot.program_record_mode == "configured"
+    assert aot.constant_map == {"gain": 2.0}
+    assert len(program.feeds) == 1
+    assert any(step.attrs.get("right_scalar") == 2.0 for step in program.steps)
+    with pytest.raises(ValueError, match="asap.*alap"):
+        compile_ast_aot(
+            source,
+            "kernel",
+            {"x": np.array([3.0])},
+            precompile_only=True,
+            schedule_preference="middle",
+        )
 
 
 def test_schedule_table_is_built_fresh_from_real_compiled_ir():

@@ -113,11 +113,33 @@ def extract_clean_process_subgraph(
 ) -> ProcessGraph:
     """Copy an induced subgraph without obligations to excluded nodes."""
 
+    def isolate_metadata(value):
+        """Copy mutable metadata containers without cloning semantic objects."""
+
+        if isinstance(value, dict):
+            return {
+                isolate_metadata(key): isolate_metadata(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [isolate_metadata(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(isolate_metadata(item) for item in value)
+        if isinstance(value, set):
+            return {isolate_metadata(item) for item in value}
+        if isinstance(value, frozenset):
+            return frozenset(isolate_metadata(item) for item in value)
+        return value
+
     included = set(node_ids)
     extracted = copy.copy(graph)
     extracted.G = graph.G.subgraph(included).copy()
+    extracted.G.graph = isolate_metadata(dict(graph.G.graph))
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
+        for key, value in tuple(data.items()):
+            if key != "expr_obj":
+                data[key] = isolate_metadata(value)
         data["parents"] = [
             (parent, role)
             for parent, role in data.get("parents", ())
@@ -906,6 +928,19 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
+        if step.op_name == "sum":
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "sum",
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
         attrs = dict(step.attrs)
         reverse = prefix_reverse ^ bool(attrs.pop("reverse", False))
@@ -1133,7 +1168,9 @@ def dispatch_region_to_fused_program(
 
     for node_id in region.node_ids:
         data = graph.G.nodes[node_id]
-        op, _ = canonical_elementwise_op(_operation(graph, node_id))
+        raw_op = _operation(graph, node_id)
+        reduction = raw_op == "sum"
+        op = raw_op if reduction else canonical_elementwise_op(raw_op)[0]
         parents = list(data.get("parents") or ())
         value_parents: list[int] = []
         scalar_parent: tuple[int, Any] | None = None
@@ -1162,8 +1199,13 @@ def dispatch_region_to_fused_program(
                     value_parents.append(parent_id)
             else:
                 value_parents.append(parent_id)
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] = (
+            copy.deepcopy(dict(data.get("attributes") or {}))
+            if reduction else {}
+        )
         if scalar_parent is not None:
+            if reduction:
+                raise ValueError("sum cannot consume a scalar constant operand")
             if len(value_parents) != 1:
                 raise ValueError(f"{op} has an invalid scalar operand layout")
             attrs["right_scalar"] = scalar_parent[1]

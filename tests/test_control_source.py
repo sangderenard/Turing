@@ -2,11 +2,13 @@ from src.compiler.control_source import (
     ControlProgram,
     ControlTarget,
     LoopBlock,
+    LoopControlBlock,
     ParallelDeployment,
     RegionCode,
     SequenceBlock,
     StateMachineTick,
     StatementBlock,
+    WhileBlock,
     render_control_program,
     render_c_shell,
     project_control_regions,
@@ -60,6 +62,30 @@ def test_state_machine_tick_is_one_transition_without_polling():
     assert rendered.startswith("switch (state) {")
     assert "while" not in rendered
     assert "case READY:" in rendered
+
+
+def test_switch_default_and_condition_loop_render_without_host_protocol():
+    tick = StateMachineTick(
+        state="mode",
+        cases=(("1", StatementBlock(("work();",))),),
+        default=StatementBlock(("idle();",)),
+    )
+    loop = WhileBlock(
+        predicate_value_id=7,
+        condition=StatementBlock(("refresh_predicate();",)),
+        body=SequenceBlock((
+            tick,
+            LoopControlBlock("break", predicate_value_id=8),
+        )),
+    )
+
+    rendered = render_control_program(ControlProgram(loop), ControlTarget.C)
+
+    assert rendered.count("refresh_predicate();") == 2
+    assert "while (value_7) {" in rendered
+    assert "default:" in rendered
+    assert "if (value_8) {" in rendered
+    assert "break;" in rendered
 
 
 def test_parallel_lanes_share_one_compiled_source_without_host_execution():

@@ -7,6 +7,13 @@ GLSL, as WebAssembly, and as plain NumPy or PyTorch -- all from the same
 compilation, not from six re-implementations that have to be kept in step by
 hand.
 
+The per-backend artifacts handled here are internal projections of a Python
+compilation that has already passed through AST and ProcessGraph ingestion.
+This module is not a collection of compiler entrypoints.  In particular, a
+backend accepting a normalized numerical ``FusedProgram`` does not mean the
+Python recompiler accepts only numerical functions; it means this late stage
+is emitting the numerical regions selected by the complete compilation.
+
 Everything here starts from the AOT compilation
 (``aot_compile.compile_ast_aot`` -> ``lower_precompile_and_control_to_ssa``).
 That is the shared stage: the SSA module is what the language backends
@@ -41,6 +48,10 @@ class BackendSource:
     # serialized into the page; the bundle builder uses it to compile and
     # verify the exact source that it publishes.
     artifact: Any = field(default=None, repr=False, compare=False)
+    # Deployment role is separate from source language.  A browser shader is
+    # only allowed to take over the generated page when the bundle explicitly
+    # publishes it as the shader surface.
+    role: str = ""
 
     @property
     def lines(self) -> int:
@@ -65,6 +76,7 @@ class BackendSourceSet:
                     "reason": s.reason,
                     "highlight": s.highlight,
                     "lines": s.lines,
+                    **({"role": s.role} if s.role else {}),
                 }
                 for s in self.sources
             ]
@@ -150,10 +162,25 @@ def normalized_program(program: Any) -> Any:
     from .fused_program_wasm_backend import required_steps
 
     live = required_steps(folded)
+    live_value_ids = set(folded.feeds) | {
+        int(step.result_id) for step in live
+    }
     return FusedProgram(
         version=folded.version, feeds=set(folded.feeds), steps=live,
         outputs=dict(folded.outputs), state_in=folded.state_in,
-        meta=folded.meta, extras=folded.extras,
+        # Dead-step pruning must prune its type records too.  Keeping metadata
+        # for removed values makes an otherwise valid public projection fail
+        # the shared precompile validator as an orphaned-value artifact.
+        meta=(
+            None
+            if folded.meta is None
+            else {
+                value_id: entry
+                for value_id, entry in folded.meta.items()
+                if int(value_id) in live_value_ids
+            }
+        ),
+        extras=folded.extras,
     )
 
 
@@ -197,11 +224,15 @@ def collect_backend_sources(
     wasm_source: str = "",
     program: Any = None,
 ) -> BackendSourceSet:
-    """Emit ``aot`` through every backend that will take it.
+    """Emit internal products of ``aot`` through every backend that takes them.
 
     ``aot`` is an ``AOTCompilation`` from a ``precompile_only=True`` run, so
     the numeric and control IR are backend-agnostic at this point and no
     backend has been privileged by getting there first.
+
+    This function is downstream of the Python compiler frontend.  The local
+    ``program`` variable below is only its normalized numerical member, not a
+    replacement input language and not the application's compilation path.
     """
 
     def note(message: str, **detail: Any) -> None:
@@ -217,6 +248,9 @@ def collect_backend_sources(
     # ones nothing reads. Dead-step pruning cannot remove those -- they are
     # outputs -- so a caller that knows which result it actually wants says
     # so, and the rest becomes prunable.
+    # INTERNAL NUMERICAL MEMBER: Python AST ingestion and control/map planning
+    # have already happened.  Do not move this extraction outward into an
+    # application entrypoint or describe it as the Python compiler's scope.
     raw = program if program is not None else getattr(
         aot.compiled_shell_program, "program", aot.compiled_shell_program
     )
@@ -230,8 +264,13 @@ def collect_backend_sources(
     try:
         from .precompile_to_ssa import lower_precompile_and_control_to_ssa
 
+        # ``program`` may be the public projection selected by the bundle
+        # (rather than every value observed during capture).  Lower that
+        # exact compiled tick projection so SSA-backed targets publish the same ABI
+        # as Wasm and the Python reference.  The control and region programs
+        # remain those planned by the original AOT compilation below.
         lowering = lower_precompile_and_control_to_ssa(
-            aot.compiled_shell_program,
+            program,
             aot.shell_control_program,
             region_programs=aot.region_programs,
             numerical_name=numerical_name,
@@ -400,6 +439,7 @@ def collect_backend_sources(
                 else emitted.shortfalls[0].format()
             ),
             highlight="c",
+            role="shader-surface",
         ))
         note("WebGL emitted", complete=emitted.complete)
     except Exception as error:

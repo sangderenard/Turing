@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Dict, Callable, Union
 from enum import Enum
 from .function_table import FunctionTable
+from ..compiler.deployment_frame import DeploymentFrame, DeploymentJoin
 
 # -----------------------------------------------------------------------------
 # Core SSA Data Structures
@@ -94,6 +95,58 @@ class Function:
     blocks: Dict[str, BasicBlock]
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+
+@dataclass(frozen=True)
+class SSADeploymentLane:
+    """One independently schedulable lane retained after SSA lowering."""
+
+    index: int
+    instruction_sites: tuple[tuple[str, int], ...] = ()
+    callees: tuple[str, ...] = ()
+    source_region_indices: tuple[int, ...] = ()
+    source_value_ids: tuple[int, ...] = ()
+    source_node_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class SSADeploymentRegion:
+    """Backend-neutral proof that an SSA subgraph may deploy in parallel.
+
+    This is a scheduling permission, not a selected GPU/API backend.  A later
+    deployment pass can bind the region to GLSL, CUDA, SIMD, threads, or keep
+    the recorded linear schedule without changing program semantics.
+    """
+
+    region_id: int
+    function: str
+    kind: str
+    schedule: str
+    schedule_preference: str = "alap"
+    lanes: tuple[SSADeploymentLane, ...] = ()
+    iteration_space: tuple[str, str, str] | None = None
+    carried_aliases: tuple[tuple[int, int], ...] = ()
+    recursion_region_id: int | None = None
+    origin: str = "control_ir"
+    source_loop_node_id: int | None = None
+    scale: int = 1
+    join: DeploymentJoin = DeploymentJoin()
+    deploy_site: tuple[str, int] | None = None
+    join_site: tuple[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        preference = str(self.schedule_preference).lower()
+        if preference not in {"asap", "alap"}:
+            raise ValueError(
+                "deployment schedule preference must be 'asap' or 'alap'"
+            )
+        object.__setattr__(self, "schedule_preference", preference)
+        DeploymentFrame(self.region_id, self.scale, self.join)
+
+    @property
+    def frame(self) -> DeploymentFrame:
+        return DeploymentFrame(self.region_id, self.scale, self.join)
+
+
 @dataclass
 class IRModule:
     functions: Dict[str, Function]
@@ -102,6 +155,19 @@ class IRModule:
     # names; region records identify loop headers, latches, Phi values, and
     # the ProcessGraph SCC from which each loop was lowered.
     recursion_table: Dict[str, Dict[int, Any]] = field(default_factory=dict)
+    # Parallel-candidate regions survive lowering beside the ordinary CFG.
+    # The SSA instruction stream remains a valid serial fallback.
+    deployment_table: Dict[str, tuple[SSADeploymentRegion, ...]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        if not self.deployment_table:
+            self.deployment_table = {
+                name: tuple(function.metadata.get("deployment_regions", ()))
+                for name, function in self.functions.items()
+                if function.metadata.get("deployment_regions")
+            }
 
 # -----------------------------------------------------------------------------
 # Correlator for Language <-> SSA Operation Mappings

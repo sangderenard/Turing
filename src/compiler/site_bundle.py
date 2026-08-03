@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import ast
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
+import importlib
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -42,8 +45,10 @@ from typing import Any, Mapping
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
-BUILDER_VERSION = "site-bundle-v11"
+BUILDER_VERSION = "site-bundle-v18"
 DEFAULT_WASM_CARD_OPERATIONS = 2000
+PROGRAM_BAKE_MODES = frozenset({"one_shot", "whole_program"})
+PROGRAM_SCHEDULE_PREFERENCES = frozenset({"asap", "alap"})
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
 
@@ -60,6 +65,54 @@ _SOURCE_EXTENSIONS = {
     "abstract_tensor": "py",
 }
 
+# A published bundle is a product of both authored source and the compiler
+# implementation which lowered it.  Keep this list on the actual bundle path:
+# unrelated repository work must not churn immutable URLs, while a change to
+# any stage capable of changing the emitted ABI/control/module bytes must.
+_BUNDLE_COMPILER_IMPLEMENTATION_FILES = (
+    Path(__file__),
+    Path(__file__).with_name("backend_sources.py"),
+    Path(__file__).with_name("fused_program_wasm_backend.py"),
+    Path(__file__).with_name("glsl_deployment_strategy.py"),
+    Path(__file__).with_name("loop_composer.py"),
+    Path(__file__).with_name("precompile_to_ssa.py"),
+    Path(__file__).with_name("process_graph_fusion.py"),
+    Path(__file__).with_name("wasm_class_coordinator.py"),
+    Path(__file__).with_name("wasm_class_modules.py"),
+    Path(__file__).with_name("wasm_html_shell.py"),
+    Path(__file__).parents[1] / "common" / "tensors" / "abstraction.py",
+    Path(__file__).parents[1] / "common" / "tensors" / "topological_reducer.py",
+    Path(__file__).parents[1] / "common" / "tensors"
+    / "accelerator_backends" / "aot_compile.py",
+    Path(__file__).parents[1] / "common" / "tensors"
+    / "accelerator_backends" / "c_primitive_program.py",
+    Path(__file__).parents[1] / "transmogrifier" / "graph"
+    / "graph_deep_compiler.py",
+    Path(__file__).parents[1] / "transmogrifier" / "graph"
+    / "graph_express2.py",
+    Path(__file__).parents[1] / "transmogrifier" / "operator_defs.py",
+)
+
+
+@lru_cache(maxsize=1)
+def _bundle_compiler_digest() -> str:
+    """Fingerprint code that can change a generated program bundle."""
+
+    digest = hashlib.sha256()
+    for path in _BUNDLE_COMPILER_IMPLEMENTATION_FILES:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"bundle compiler implementation file is missing: {resolved}"
+            )
+        digest.update(resolved.relative_to(TURING_REPOSITORY_ROOT).as_posix().encode(
+            "utf-8"
+        ))
+        digest.update(b"\0")
+        digest.update(resolved.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class SourceContract:
@@ -74,8 +127,17 @@ class SourceContract:
     height: int
     probe_size: int
     backend: str
+    bake_mode: str
+    schedule_preference: str
     remove_loops: bool
     unroll_limit: int
+    state_feedback: Mapping[str, str]
+    render_fps: float
+    autostart: bool
+    presentation_entrypoint: str | None
+    shader_configuration: Mapping[str, Any]
+    audio_configuration: Mapping[str, Any]
+    constant_map: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,6 +688,8 @@ def discover_source_contract(
     title: str | None = None,
     slug: str | None = None,
     probes: Mapping[str, Any] | None = None,
+    bake_mode: str | None = None,
+    schedule_preference: str | None = None,
 ) -> SourceContract:
     """Inspect a Python module and select its page contract.
 
@@ -662,6 +726,23 @@ def discover_source_contract(
     if unknown:
         raise ValueError(f"probe values name unknown parameters: {sorted(unknown)!r}")
 
+    constant_map = config.get("constants", config.get("constant_map", {}))
+    if not isinstance(constant_map, dict):
+        raise ValueError("TURING_PAGE['constants'] must be a mapping")
+    unknown_constants = set(constant_map) - set(parameters)
+    if unknown_constants:
+        raise ValueError(
+            "configured constants name unknown parameters: "
+            f"{sorted(unknown_constants)!r}"
+        )
+    for name, value in constant_map.items():
+        try:
+            ast.literal_eval(ast.parse(repr(value), mode="eval").body)
+        except (SyntaxError, ValueError, TypeError) as error:
+            raise ValueError(
+                f"configured constant {name!r} must be a Python literal"
+            ) from error
+
     expressions = config.get("feed_expressions", {})
     if not isinstance(expressions, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
@@ -674,16 +755,70 @@ def discover_source_contract(
             f"feed expressions name unknown parameters: {sorted(unknown_expressions)!r}"
         )
 
+    state_feedback = config.get("state_feedback", {})
+    if not isinstance(state_feedback, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in state_feedback.items()
+    ):
+        raise ValueError(
+            "TURING_PAGE['state_feedback'] must map input names to output names"
+        )
+    unknown_state_inputs = set(state_feedback) - set(parameters)
+    if unknown_state_inputs:
+        raise ValueError(
+            "state feedback names unknown input parameters: "
+            f"{sorted(unknown_state_inputs)!r}"
+        )
+
+    presentation_entrypoint = config.get("presentation_entrypoint")
+    if presentation_entrypoint is not None:
+        presentation_entrypoint = str(presentation_entrypoint)
+        presentation = next(
+            (node for node in functions if node.name == presentation_entrypoint), None
+        )
+        if presentation is None:
+            raise ValueError(
+                f"presentation entrypoint {presentation_entrypoint!r} is not a "
+                "top-level function"
+            )
+    shader_config = config.get("shader_configuration", {})
+    if not isinstance(shader_config, dict):
+        raise ValueError("TURING_PAGE['shader_configuration'] must be a mapping")
+    audio_config = config.get("audio", {})
+    if not isinstance(audio_config, dict):
+        raise ValueError("TURING_PAGE['audio'] must be a mapping")
+
     page_title = str(title or config.get("title") or selected.replace("_", " ").title())
     page_slug = slugify(str(slug or config.get("slug") or selected))
     width = int(config.get("width", 64))
     height = int(config.get("height", 40))
     probe_size = int(config.get("probe_size", 4))
     unroll_limit = int(config.get("unroll_limit", 4096))
+    selected_bake_mode = str(
+        bake_mode if bake_mode is not None
+        else config.get("bake_mode", "whole_program")
+    ).strip().lower().replace("-", "_")
+    selected_schedule_preference = str(
+        schedule_preference if schedule_preference is not None
+        else config.get("schedule_preference", "alap")
+    ).strip().lower()
+    render_fps = float(config.get("render_fps", 30.0))
     if min(width, height, probe_size) < 1:
         raise ValueError("width, height, and probe_size must be positive")
     if unroll_limit < 0:
         raise ValueError("unroll_limit must be non-negative")
+    if selected_bake_mode not in PROGRAM_BAKE_MODES:
+        raise ValueError(
+            "TURING_PAGE['bake_mode'] must be 'one_shot' or "
+            f"'whole_program', not {selected_bake_mode!r}"
+        )
+    if selected_schedule_preference not in PROGRAM_SCHEDULE_PREFERENCES:
+        raise ValueError(
+            "TURING_PAGE['schedule_preference'] must be 'asap' or "
+            f"'alap', not {selected_schedule_preference!r}"
+        )
+    if not math.isfinite(render_fps) or render_fps <= 0.0:
+        raise ValueError("render_fps must be finite and positive")
     return SourceContract(
         entrypoint=str(selected),
         title=page_title,
@@ -694,8 +829,17 @@ def discover_source_contract(
         height=height,
         probe_size=probe_size,
         backend=str(config.get("backend", "c")),
+        bake_mode=selected_bake_mode,
+        schedule_preference=selected_schedule_preference,
         remove_loops=bool(config.get("remove_loops", True)),
         unroll_limit=unroll_limit,
+        state_feedback=dict(state_feedback),
+        render_fps=render_fps,
+        autostart=bool(config.get("autostart", False)),
+        presentation_entrypoint=presentation_entrypoint,
+        shader_configuration=dict(shader_config),
+        audio_configuration=dict(audio_config),
+        constant_map=dict(constant_map),
     )
 
 
@@ -734,17 +878,43 @@ def _entrypoint_parameters(source: str, entrypoint: str) -> tuple[str, ...]:
     )
 
 
-def _content_version(source: str, contract: SourceContract) -> tuple[str, str]:
+def _content_version(
+    source: str,
+    contract: SourceContract,
+    *,
+    presentation_shader: str | None = None,
+    presentation_document: str | None = None,
+    shader_configuration: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
     source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     identity = {
         "builder": BUILDER_VERSION,
+        "compiler_implementation_sha256": _bundle_compiler_digest(),
         "source_sha256": source_digest,
         "entrypoint": contract.entrypoint,
         "feeds": contract.feeds,
         "feed_expressions": contract.feed_expressions,
         "backend": contract.backend,
+        "bake_mode": contract.bake_mode,
+        "schedule_preference": contract.schedule_preference,
         "remove_loops": contract.remove_loops,
         "unroll_limit": contract.unroll_limit,
+        "state_feedback": dict(contract.state_feedback),
+        "render_fps": contract.render_fps,
+        "autostart": contract.autostart,
+        "presentation_entrypoint": contract.presentation_entrypoint,
+        "contract_shader_configuration": dict(contract.shader_configuration),
+        "audio_configuration": dict(contract.audio_configuration),
+        "constant_map": dict(contract.constant_map),
+        "presentation_shader_sha256": (
+            hashlib.sha256(presentation_shader.encode("utf-8")).hexdigest()
+            if presentation_shader is not None else None
+        ),
+        "presentation_document_sha256": (
+            hashlib.sha256(presentation_document.encode("utf-8")).hexdigest()
+            if presentation_document is not None else None
+        ),
+        "shader_configuration": dict(shader_configuration or {}),
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -752,7 +922,14 @@ def _content_version(source: str, contract: SourceContract) -> tuple[str, str]:
     return f"v{BUNDLE_LAYOUT_VERSION}-{digest[:16]}", source_digest
 
 
-def _write_sources(directory: Path, source: str, filename: str, sources: Any) -> list[dict[str, Any]]:
+def _write_sources(
+    directory: Path,
+    source: str,
+    filename: str,
+    sources: Any,
+    *,
+    presentation_shader: str | None = None,
+) -> list[dict[str, Any]]:
     entries = [{
         "language": "python_source",
         "title": "Original Python",
@@ -763,6 +940,18 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
         "lines": source.count("\n") + 1,
         "filename": Path(filename).name,
     }]
+    if presentation_shader is not None:
+        entries.append({
+            "language": "webgl",
+            "title": "WebGL presentation shader",
+            "source": presentation_shader,
+            "available": True,
+            "reason": "",
+            "highlight": "c",
+            "lines": presentation_shader.count("\n") + 1,
+            "filename": "surface.frag.glsl",
+            "role": "shader-surface",
+        })
     if sources is not None:
         entries.extend(sources.to_mapping()["sources"])
     published: list[dict[str, Any]] = []
@@ -773,7 +962,12 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
             language = str(item["language"])
             extension = _SOURCE_EXTENSIONS.get(language, "txt")
             output_name = str(item.get("filename") or f"{language}.{extension}")
-            relative = Path("source") / language / output_name
+            role = str(item.get("role") or "")
+            relative = (
+                Path("source") / "roles" / role / output_name
+                if role == "shader-surface"
+                else Path("source") / language / output_name
+            )
             path = directory / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             # Backend source hashes are verification identities.  Preserve
@@ -791,24 +985,88 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
 
 def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
+    shell_io: Mapping[str, Any] | None = None,
+    configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Select the browser-native shader which graduates a page to execution."""
+    """Select the explicitly-role-marked browser presentation shader."""
 
     for source in published_sources:
         if (
             source.get("language") == "webgl"
+            and source.get("role") == "shader-surface"
             and source.get("available")
             and source.get("url")
         ):
-            return {
+            descriptor = {
                 "url": str(source["url"]),
                 "language": "webgl2-glsl-es",
                 "stage": "fragment",
+                "role": "shader-surface",
+                "autostart": True,
+                "execution": {
+                    "continuous": True,
+                    "prefer_contiguous": True,
+                },
             }
+            if shell_io:
+                descriptor["io"] = dict(shell_io)
+            if configuration:
+                descriptor["configuration"] = dict(configuration)
+            return descriptor
     # Desktop GLSL is deliberately not a fallback. Its SSBO binding/channel
     # arena needs the dedicated memory handler documented in the GLSL
     # ingestion layer and cannot be executed by a WebGL canvas.
     return None
+
+
+def _write_audio_asset(
+    directory: Path,
+    configuration: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Materialize a trusted Python audio producer into a shell asset contract."""
+
+    if not configuration:
+        return None
+    generator = str(configuration.get("generator", ""))
+    module_name, separator, callable_name = generator.partition(":")
+    if not separator or not module_name or not callable_name:
+        raise ValueError("TURING_PAGE['audio'].generator must be 'module:callable'")
+    arguments = configuration.get("arguments", {})
+    if not isinstance(arguments, Mapping):
+        raise ValueError("TURING_PAGE['audio'].arguments must be a mapping")
+    producer = getattr(importlib.import_module(module_name), callable_name)
+    track = producer(**dict(arguments))
+    wave = track.wave_bytes()
+    features = {
+        str(name): [float(value) for value in values]
+        for name, values in dict(track.feature_feeds).items()
+    }
+    audio_relative = Path("audio") / "managed-time-source.wav"
+    features_relative = Path("audio") / "spectral-features.json"
+    audio_path = directory / audio_relative
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(wave)
+    features_relative_path = directory / features_relative
+    features_relative_path.write_text(
+        json.dumps({
+            "feature_fps": int(track.feature_fps),
+            "duration": float(track.duration),
+            "feeds": features,
+        }, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return {
+        "audio_url": audio_relative.as_posix(),
+        "features_url": features_relative.as_posix(),
+        "sample_rate": int(track.sample_rate),
+        "feature_fps": int(track.feature_fps),
+        "duration": float(track.duration),
+        "managed_time_output": str(
+            configuration.get("managed_time_output", "next_time")
+        ),
+        "pan_output": str(configuration.get("pan_output", "")),
+        "pan_range": list(configuration.get("pan_range", (-1.0, 1.0))),
+    }
 
 
 def _artifact_inventory(directory: Path) -> list[dict[str, Any]]:
@@ -849,14 +1107,35 @@ def build_program_bundle(
     probes: Mapping[str, Any] | None = None,
     include_backends: bool = True,
     include_mathematics: bool = True,
+    presentation_shader: str | None = None,
+    presentation_document: str | None = None,
+    shader_configuration: Mapping[str, Any] | None = None,
+    bake_mode: str | None = None,
+    schedule_preference: str | None = None,
 ) -> ProgramBundle:
     """Compile source and atomically publish its complete versioned bundle."""
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     contract = discover_source_contract(
-        source, entrypoint=entrypoint, title=title, slug=slug, probes=probes
+        source,
+        entrypoint=entrypoint,
+        title=title,
+        slug=slug,
+        probes=probes,
+        bake_mode=bake_mode,
+        schedule_preference=schedule_preference,
     )
-    version, source_digest = _content_version(source, contract)
+    contract_shader_configuration = {
+        **dict(contract.shader_configuration),
+        **dict(shader_configuration or {}),
+    }
+    version, source_digest = _content_version(
+        source,
+        contract,
+        presentation_shader=presentation_shader,
+        presentation_document=presentation_document,
+        shader_configuration=contract_shader_configuration,
+    )
     destination = resolve_publish_root(destination)
     versions = destination / "site" / "programs" / contract.slug / "versions"
     final_directory = versions / version
@@ -866,21 +1145,29 @@ def build_program_bundle(
     temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=versions))
     compile_log = io.StringIO()
     try:
-        from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
+        from ..common.tensors.accelerator_backends.aot_compile import (
+            compile_ast_aot,
+            project_public_numerical_program,
+        )
         from ..common.tensors.topological_reducer import reduce_abstract_tensor_topology
         from ..transmogrifier.graph.graph_express2 import ProcessGraph
         from .backend_sources import collect_backend_sources
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
+        from .fused_program_webgl_backend import emit_webgl_fragment_module
         from .shell_telemetry import TelemetryChannel, summarize_process_graph
         from .sympy_math_renderer import render_reduced_program_mathematics
         from .wasm_class_coordinator import (
+            build_browser_thread_plan,
             build_class_inventory,
             emit_wasm_class_coordinator,
+            emit_wasm_control_coordinator,
         )
         from .wasm_class_modules import (
             build_embedded_class_graph,
             emit_class_modules,
+            emit_control_region_modules,
             partition_reduced_program,
+            partition_threaded_wasm_program,
         )
         from .wasm_html_shell import emit_html_shell
 
@@ -903,50 +1190,277 @@ def build_program_bundle(
                 unroll_limit=contract.unroll_limit,
                 precompile_only=True,
                 python_bindings=globals(),
+                bake_mode=contract.bake_mode,
+                schedule_preference=contract.schedule_preference,
+                constant_map=contract.constant_map,
             )
-            program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
+            if (
+                contract.bake_mode == "whole_program"
+                and aot.control_shortfalls
+            ):
+                details = "; ".join(
+                    f"{item['function']} loop {item['loop_node_id']}: "
+                    + ", ".join(item["blockers"])
+                    for item in aot.control_shortfalls
+                )
+                raise RuntimeError(
+                    "WebAssembly whole-program bake refused an incomplete "
+                    "control lowering; emitting the discovery-time numerical "
+                    f"trace would not be the source program ({details})"
+                )
+            # This extraction is deliberately late in compilation.  ``aot``
+            # already represents Python AST -> ProcessGraph -> planned
+            # control/map/numerical compilation.  ``program`` is only the
+            # internal numerical member required by this particular Wasm
+            # emitter; it is not the source compiler, an application API, or
+            # evidence that the Python recompiler is numerics-only.
+            program = project_public_numerical_program(aot)
             module = emit_wasm_module(
                 program, name=contract.entrypoint, dtype="float64"
             )
+            if contract.state_feedback:
+                entry = module.api.entry_points[0]
+                input_names = {
+                    item.name for item in entry.parameters if item.role == "input"
+                }
+                output_names = {
+                    item.name for item in entry.parameters if item.role == "output"
+                }
+                missing_inputs = set(contract.state_feedback) - input_names
+                missing_outputs = set(contract.state_feedback.values()) - output_names
+                if missing_inputs or missing_outputs:
+                    raise ValueError(
+                        "compiled state feedback does not match the Python ABI; "
+                        f"missing inputs={sorted(missing_inputs)!r}; "
+                        f"missing outputs={sorted(missing_outputs)!r}"
+                    )
+                module = replace(
+                    module,
+                    api=replace(
+                        module.api,
+                        metadata={
+                            **dict(module.api.metadata),
+                            "state_feedback": dict(contract.state_feedback),
+                            "render_fps": float(contract.render_fps),
+                            "autostart": bool(contract.autostart),
+                        },
+                    ),
+                )
+
+            effective_presentation_shader = presentation_shader
+            effective_shader_configuration = dict(contract_shader_configuration)
+            if contract.presentation_entrypoint is not None:
+                presentation_parameters = _entrypoint_parameters(
+                    source, contract.presentation_entrypoint
+                )
+                presentation_feeds = {
+                    parameter: _probe_value(0.0, contract.probe_size)
+                    for parameter in presentation_parameters
+                }
+                presentation_aot = compile_ast_aot(
+                    source,
+                    contract.presentation_entrypoint,
+                    presentation_feeds,
+                    backend=contract.backend,
+                    remove_loops=contract.remove_loops,
+                    unroll_limit=contract.unroll_limit,
+                    precompile_only=True,
+                    python_bindings=globals(),
+                    bake_mode=contract.bake_mode,
+                    schedule_preference=contract.schedule_preference,
+                )
+                presentation_program = project_public_numerical_program(
+                    presentation_aot
+                )
+                presentation_module = emit_webgl_fragment_module(
+                    presentation_program,
+                    name=contract.presentation_entrypoint,
+                    output_layout="rgba",
+                    input_sampling="normalized",
+                )
+                if not presentation_module.complete:
+                    raise RuntimeError(
+                        "WebGL presentation emission shortfalls:\n" + "\n".join(
+                            "- " + item.format()
+                            for item in presentation_module.shortfalls
+                        )
+                    )
+                effective_presentation_shader = presentation_module.source
+                origins = dict(
+                    (getattr(presentation_program, "extras", None) or {}).get(
+                        "capture_feed_origins", {}
+                    )
+                )
+                bindings = {}
+                for item in presentation_module.api.metadata["feed_bindings"]:
+                    value_id = item["value_id"]
+                    origin = origins.get(value_id, origins.get(str(value_id), {}))
+                    input_name = origin.get("binding_name")
+                    if input_name is None and value_id < len(presentation_parameters):
+                        input_name = presentation_parameters[value_id]
+                    bindings[item["uniform"]] = str(input_name)
+                effective_shader_configuration["output_feed_bindings"] = bindings
         if not module.complete:
             raise RuntimeError(module.shortfall_report())
 
-        wasm_relative = Path("wasm") / f"{module.name}.wasm"
-        wasm_path = temporary / wasm_relative
-        wasm_path.parent.mkdir(parents=True, exist_ok=True)
-        wasm_path.write_bytes(module.binary)
-
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
-        specs = partition_reduced_program(
-            program,
-            chunk_size=DEFAULT_WASM_CARD_OPERATIONS,
-            owner_name=contract.entrypoint,
+        real_control = (
+            aot.shell_control_program
+            if contract.bake_mode == "whole_program"
+            and aot.shell_control_program is not None
+            and aot.shell_control_program.region_indices
+            and aot.region_programs
+            else None
         )
-        card_modules = emit_class_modules(
-            specs, dtype="float64", link_calls=False, shared_memory=True
-        )
-        incomplete_cards = [
-            card_modules[spec.index]
-            for spec in specs
-            if not card_modules[spec.index].complete
-        ]
-        if incomplete_cards:
-            raise RuntimeError("\n".join(
-                card.shortfall_report() for card in incomplete_cards
-            ))
-        card_manifest = build_embedded_class_graph(
-            specs,
-            card_modules,
-            program,
-            entrypoint=contract.entrypoint,
-            embed_binaries=False,
-            module_dir=card_directory.as_posix(),
-        )
-        inventory = build_class_inventory(card_manifest)
-        coordinator = emit_wasm_class_coordinator(
-            inventory,
-            name=f"{contract.entrypoint}_coordinator_{DEFAULT_WASM_CARD_OPERATIONS}",
-        )
+        effective_region_programs = dict(aot.region_programs)
+        thread_topology = None
+        if real_control is not None and len(real_control.region_indices) == 1:
+            source_region = int(real_control.region_indices[0])
+            source_program = effective_region_programs.get(source_region)
+            if source_program is not None:
+                threaded = partition_threaded_wasm_program(
+                    # The public projection above has already collapsed
+                    # byte-for-byte duplicate observational definitions and
+                    # restored the exact source output contract. The raw
+                    # capture intentionally retains those observations and is
+                    # therefore not a valid partition input.
+                    program,
+                    max_nodes_per_region=64,
+                    schedule_preference=contract.schedule_preference,
+                )
+                if threaded is not None:
+                    real_control, effective_region_programs, thread_topology = threaded
+        if real_control is not None:
+            card_modules, card_manifest = emit_control_region_modules(
+                real_control,
+                effective_region_programs,
+                owner_name=contract.entrypoint,
+                module_dir=card_directory.as_posix(),
+                dtype="float64",
+            )
+            producer = {
+                int(value_id): (
+                    entry["name"], str(output_name)
+                )
+                for region, region_program in effective_region_programs.items()
+                if int(region) in card_modules
+                for entry in card_manifest["modules"]
+                if int(entry["region_index"]) == int(region)
+                for output_name, value_id in getattr(
+                    region_program, "program", region_program
+                ).outputs.items()
+            }
+            logical_outputs = {}
+            for output_name in aot.function_outputs:
+                identities = tuple(aot.identity_table.get(output_name, ()))
+                binding = next(
+                    (
+                        producer[int(value_id)]
+                        for value_id in reversed(identities)
+                        if int(value_id) in producer
+                    ),
+                    None,
+                )
+                if binding is not None:
+                    logical_outputs[str(output_name)] = list(binding)
+            if not logical_outputs:
+                for entry in reversed(card_manifest["modules"]):
+                    for output_name in entry["outputs"]:
+                        logical_outputs.setdefault(
+                            str(output_name), [entry["name"], output_name]
+                        )
+            card_manifest["logical_outputs"] = logical_outputs
+            inventory = build_class_inventory(card_manifest)
+            field_slots_by_key = {
+                field.key: int(field.index) for field in inventory.fields
+            }
+            control_value_slots = {
+                int(value_id): field_slots_by_key[key]
+                for value_id, key in card_manifest.get(
+                    "value_bindings", {}
+                ).items()
+                if key in field_slots_by_key
+            }
+            region_methods = {
+                int(entry["region_index"]): int(method.index)
+                for entry, method in zip(
+                    card_manifest["modules"], inventory.methods
+                )
+            }
+            coordinator = emit_wasm_control_coordinator(
+                inventory,
+                real_control,
+                region_methods=region_methods,
+                value_slots=control_value_slots,
+                region_signatures={
+                    int(region): (
+                        tuple(sorted(map(int, region_program.feeds))),
+                        tuple(map(int, region_program.outputs.values())),
+                    )
+                    for region, region_program in effective_region_programs.items()
+                },
+                name=(
+                    f"{contract.entrypoint}_control_"
+                    f"{DEFAULT_WASM_CARD_OPERATIONS}"
+                ),
+            )
+            specs = ()
+            contiguous = None
+            thread_plan = build_browser_thread_plan(
+                real_control, region_methods
+            )
+        else:
+            specs = partition_reduced_program(
+                program,
+                chunk_size=DEFAULT_WASM_CARD_OPERATIONS,
+                owner_name=contract.entrypoint,
+            )
+            card_modules = emit_class_modules(
+                specs, dtype="float64", link_calls=False, shared_memory=True
+            )
+            incomplete_cards = [
+                card_modules[spec.index]
+                for spec in specs
+                if not card_modules[spec.index].complete
+            ]
+            if incomplete_cards:
+                raise RuntimeError("\n".join(
+                    card.shortfall_report() for card in incomplete_cards
+                ))
+            card_manifest = build_embedded_class_graph(
+                specs,
+                card_modules,
+                program,
+                entrypoint=contract.entrypoint,
+                embed_binaries=False,
+                module_dir=card_directory.as_posix(),
+            )
+            inventory = build_class_inventory(card_manifest)
+            coordinator = emit_wasm_class_coordinator(
+                inventory,
+                name=(
+                    f"{contract.entrypoint}_coordinator_"
+                    f"{DEFAULT_WASM_CARD_OPERATIONS}"
+                ),
+            )
+            thread_plan = None
+            wasm_relative = Path("wasm") / f"{module.name}.wasm"
+            wasm_path = temporary / wasm_relative
+            wasm_path.parent.mkdir(parents=True, exist_ok=True)
+            wasm_path.write_bytes(module.binary)
+            entry = module.api.entry_points[0]
+            contiguous = {
+                "name": module.name,
+                "url": wasm_relative.as_posix(),
+                "entry": module.api.entry,
+                "inputs": [item.name for item in entry.parameters if item.role == "input"],
+                "outputs": [item.name for item in entry.parameters if item.role == "output"],
+                "value_type": module.api.metadata.get("value_type", "f64"),
+                "element_bytes": module.api.metadata.get("element_bytes", 8),
+                "memory_export": module.api.metadata.get("memory_export", "memory"),
+                "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
+                "operation_count": len(required_steps(program)),
+            }
         card_manifest.update({
             "region_steps": DEFAULT_WASM_CARD_OPERATIONS,
             "class_inventory": inventory.to_mapping(),
@@ -956,17 +1470,39 @@ def build_program_bundle(
                 "entry": "run_range",
                 "memory_import": {"module": "env", "field": "memory"},
                 "method_count": len(inventory.methods),
+                "supports_ranges": real_control is None,
             },
+            "thread_deployment": thread_plan,
+            "thread_topology": thread_topology,
         })
         card_output_directory = temporary / card_directory
         card_output_directory.mkdir(parents=True, exist_ok=True)
-        for spec in specs:
-            (card_output_directory / f"{spec.module_name}.wasm").write_bytes(
-                card_modules[spec.index].binary
-            )
+        if real_control is not None:
+            for region, region_module in card_modules.items():
+                entry = next(
+                    item for item in card_manifest["modules"]
+                    if int(item["region_index"]) == int(region)
+                )
+                (card_output_directory / f"{entry['name']}.wasm").write_bytes(
+                    region_module.binary
+                )
+        else:
+            for spec in specs:
+                (card_output_directory / f"{spec.module_name}.wasm").write_bytes(
+                    card_modules[spec.index].binary
+                )
         (card_output_directory / f"{coordinator.name}.wasm").write_bytes(
             coordinator.binary
         )
+        if real_control is not None:
+            # Publish the whole-program control kernel at the conventional
+            # Wasm root as well. It imports the region kernels listed by the
+            # class manifest; it is not the old flattened numerical module.
+            wasm_root = temporary / "wasm"
+            wasm_root.mkdir(parents=True, exist_ok=True)
+            (wasm_root / f"{coordinator.name}.wasm").write_bytes(
+                coordinator.binary
+            )
         (card_output_directory / "class-inventory.json").write_text(
             json.dumps(inventory.to_mapping(), indent=2), encoding="utf-8"
         )
@@ -979,12 +1515,34 @@ def build_program_bundle(
                     numerical_name=contract.entrypoint,
                     control_name=f"{contract.entrypoint}_control",
                     channel=channel,
-                    wasm_source=module.source,
+                    wasm_source=(
+                        coordinator.wat
+                        if real_control is not None
+                        else module.source
+                    ),
                     program=program,
                 )
         published_sources = _write_sources(
-            temporary, source, Path(source_filename).name, sources
+            temporary,
+            source,
+            Path(source_filename).name,
+            sources,
+            presentation_shader=effective_presentation_shader,
         )
+        if presentation_document is not None:
+            document_relative = (
+                Path("source") / "roles" / "shader-document" / "index.html"
+            )
+            document_path = temporary / document_relative
+            document_path.parent.mkdir(parents=True, exist_ok=True)
+            document_path.write_text(
+                presentation_document,
+                encoding="utf-8",
+                newline="\n",
+            )
+            effective_shader_configuration["document_url"] = (
+                document_relative.as_posix()
+            )
 
         fortran_verification = None
         if sources is not None:
@@ -1074,21 +1632,15 @@ def build_program_bundle(
             except Exception as error:  # page generation survives optional projection refusal
                 math_error = f"{type(error).__name__}: {error}"
 
-        entry = module.api.entry_points[0]
-        contiguous = {
-            "name": module.name,
-            "url": wasm_relative.as_posix(),
-            "entry": module.api.entry,
-            "inputs": [item.name for item in entry.parameters if item.role == "input"],
-            "outputs": [item.name for item in entry.parameters if item.role == "output"],
-            "value_type": module.api.metadata.get("value_type", "f64"),
-            "element_bytes": module.api.metadata.get("element_bytes", 8),
-            "memory_export": module.api.metadata.get("memory_export", "memory"),
-            "reserved_bytes": module.api.metadata.get("reserved_bytes", 0),
-            "operation_count": len(required_steps(program)),
-        }
         route = f"/site/programs/{contract.slug}/versions/{version}/"
-        shader_execution = _shader_execution_descriptor(published_sources)
+        shader_execution = _shader_execution_descriptor(
+            published_sources,
+            (module.api.metadata or {}).get("shell_io"),
+            effective_shader_configuration,
+        )
+        audio_runtime = _write_audio_asset(
+            temporary, contract.audio_configuration
+        )
         shell = emit_html_shell(
             module.api,
             name="index",
@@ -1115,6 +1667,7 @@ def build_program_bundle(
             },
             resource_route=route,
             shader_execution=shader_execution,
+            audio_runtime=audio_runtime,
         )
         page_path = shell.write(temporary)
 
@@ -1143,6 +1696,7 @@ def build_program_bundle(
                 "url": route + "index.html",
                 "mode": "shader-execution" if shader_execution else "inspection",
                 "shader": shader_execution,
+                "audio": audio_runtime,
             },
             "source": {
                 "path": f"source/python_source/{Path(source_filename).name}",
@@ -1150,8 +1704,13 @@ def build_program_bundle(
             },
             "compiler": {
                 "backend": contract.backend,
+                "bake_mode": contract.bake_mode,
+                "schedule_preference": contract.schedule_preference,
+                "program_record_mode": aot.program_record_mode,
+                "constant_map": dict(aot.constant_map),
                 "remove_loops": contract.remove_loops,
                 "unroll_limit": contract.unroll_limit,
+                "implementation_sha256": _bundle_compiler_digest(),
                 "mathematics_error": math_error,
                 "fortran_verification": fortran_verification,
             },

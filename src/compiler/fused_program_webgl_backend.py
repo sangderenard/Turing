@@ -93,6 +93,9 @@ def _api(
     name: str,
     feed_ids: tuple[int, ...],
     outputs: Mapping[str, int],
+    *,
+    output_layout: str,
+    input_sampling: str,
 ) -> CompiledProgramAPI:
     return CompiledProgramAPI(
         module=name,
@@ -113,16 +116,29 @@ def _api(
             "execution_model": "fragment-raster",
             "glsl_version": "300 es",
             "input_storage": "sampler2D red channel",
-            "output_storage": "one vec4 draw buffer per output; scalar is red channel",
-            "required_draw_buffers": len(outputs),
-            "required_extension": "EXT_color_buffer_float",
+            "input_sampling": input_sampling,
+            "output_storage": (
+                "one RGBA presentation color"
+                if output_layout == "rgba"
+                else "one vec4 draw buffer per output; scalar is red channel"
+            ),
+            "output_layout": output_layout,
+            "required_draw_buffers": 1 if output_layout == "rgba" else len(outputs),
+            "required_extension": (
+                None if output_layout == "rgba" else "EXT_color_buffer_float"
+            ),
             "feed_bindings": [
                 {"value_id": value_id, "uniform": f"turing_feed_{value_id}"}
                 for value_id in feed_ids
             ],
             "outputs": [
-                {"name": output_name, "value_id": value_id, "location": 0}
-                for output_name, value_id in outputs.items()
+                {
+                    "name": output_name,
+                    "value_id": value_id,
+                    "location": 0 if output_layout == "rgba" else index,
+                    "channel": "rgba"[index] if output_layout == "rgba" else "r",
+                }
+                for index, (output_name, value_id) in enumerate(outputs.items())
             ],
             "vertex_shader": FULLSCREEN_VERTEX_SHADER,
         },
@@ -133,20 +149,38 @@ def emit_webgl_fragment_module(
     program: FusedProgram,
     *,
     name: str = "program",
+    output_layout: str = "draw-buffers",
+    input_sampling: str = "texel",
 ) -> WebGLFragmentModule:
     """Lower one straight-line, elementwise program to GLSL ES 3.00."""
+
+    if output_layout not in {"draw-buffers", "rgba"}:
+        raise ValueError("output_layout must be 'draw-buffers' or 'rgba'")
+    if input_sampling not in {"texel", "normalized"}:
+        raise ValueError("input_sampling must be 'texel' or 'normalized'")
 
     feed_ids = tuple(ordered_feed_ids(program))
     shortfalls: list[WebGLShortfall] = []
     names = {value_id: f"v_{value_id}" for value_id in feed_ids}
-    body = [
-        "    ivec2 turing_coordinate = ivec2(gl_FragCoord.xy);",
-        *(
-            f"    float {names[value_id]} = texelFetch("
-            f"turing_feed_{value_id}, turing_coordinate, 0).r;"
-            for value_id in feed_ids
-        ),
-    ]
+    if input_sampling == "normalized":
+        body = [
+            "    vec2 turing_uv = gl_FragCoord.xy / max(turing_resolution, vec2(1.0));",
+            "    turing_uv.y = 1.0 - turing_uv.y;",
+            *(
+                f"    float {names[value_id]} = texture("
+                f"turing_feed_{value_id}, turing_uv).r;"
+                for value_id in feed_ids
+            ),
+        ]
+    else:
+        body = [
+            "    ivec2 turing_coordinate = ivec2(gl_FragCoord.xy);",
+            *(
+                f"    float {names[value_id]} = texelFetch("
+                f"turing_feed_{value_id}, turing_coordinate, 0).r;"
+                for value_id in feed_ids
+            ),
+        ]
 
     for step in program.steps:
         result = f"v_{step.result_id}"
@@ -250,23 +284,38 @@ def emit_webgl_fragment_module(
             ))
         output_expressions.append(output)
 
+    if output_layout == "rgba":
+        packed = list(output_expressions[:4])
+        while len(packed) < 3:
+            packed.append("0.0")
+        if len(packed) < 4:
+            packed.append("1.0")
+        output_declarations = ["layout(location = 0) out vec4 turing_output_0;"]
+        output_assignments = [
+            "    turing_output_0 = vec4(" + ", ".join(packed) + ");"
+        ]
+    else:
+        output_declarations = [
+            f"layout(location = {index}) out vec4 turing_output_{index};"
+            for index in range(len(program.outputs))
+        ]
+        output_assignments = [
+            f"    turing_output_{index} = vec4({output}, 0.0, 0.0, 1.0);"
+            for index, output in enumerate(output_expressions)
+        ]
+
     source = "\n".join((
         "#version 300 es",
         "precision highp float;",
         "precision highp int;",
         "",
+        *(("uniform vec2 turing_resolution;",) if input_sampling == "normalized" else ()),
         *(f"uniform sampler2D turing_feed_{value_id};" for value_id in feed_ids),
-        *(
-            f"layout(location = {index}) out vec4 turing_output_{index};"
-            for index in range(len(program.outputs))
-        ),
+        *output_declarations,
         "",
         "void main() {",
         *body,
-        *(
-            f"    turing_output_{index} = vec4({output}, 0.0, 0.0, 1.0);"
-            for index, output in enumerate(output_expressions)
-        ),
+        *output_assignments,
         "}",
         "",
     ))
@@ -274,7 +323,13 @@ def emit_webgl_fragment_module(
         name=name,
         source=source,
         shortfalls=tuple(shortfalls),
-        api=_api(name, feed_ids, program.outputs),
+        api=_api(
+            name,
+            feed_ids,
+            program.outputs,
+            output_layout=output_layout,
+            input_sampling=input_sampling,
+        ),
     )
 
 

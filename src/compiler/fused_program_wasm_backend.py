@@ -1,6 +1,18 @@
 """Emit WebAssembly -- both the readable text and the runnable binary -- from
 a ``FusedProgram``.
 
+.. warning::
+
+   **INTERNAL BACKEND SUBMECHANISM -- NOT THE PYTHON COMPILER ENTRYPOINT.**
+
+   This module receives one numerical artifact only after Python AST
+   ingestion, ProcessGraph construction, control/map planning, specialization,
+   and numerical-region extraction have already occurred.  Its
+   ``FusedProgram`` input cannot be used to infer the language understood by
+   the Python recompiler.  Application and publishing code must enter through
+   the Python source compiler and let that pipeline invoke this emitter for
+   the numerical pieces it selects.
+
 Why this IR and not SSA or Fortran: WebAssembly has no ``goto``. Its control
 flow is structured (``block``/``loop``/``br``), so lowering an arbitrary SSA
 control-flow graph needs a relooper -- a real algorithm, not a translation.
@@ -225,6 +237,33 @@ def required_steps(program: FusedProgram) -> list[OpStep]:
     return [step for step in program.steps if step.result_id in required]
 
 
+def _flat_sum_steps(live: Sequence[OpStep]) -> tuple[OpStep, ...]:
+    """Validate and return whole-tensor ``sum`` reductions in dependency order.
+
+    SSA already names and specifies this operator.  The Wasm backend merely
+    supplies its storage/control implementation: one counted pass accumulates
+    the input tensor into a scalar local, which subsequent elementwise steps
+    naturally broadcast.  Axis reductions need shape/stride information and
+    remain explicit shortfalls until that memory contract reaches this IR.
+    """
+
+    return tuple(step for step in live if step.op_name == "sum")
+
+
+def _sum_dependencies(step: OpStep, live: Sequence[OpStep]) -> tuple[OpStep, ...]:
+    producers = {candidate.result_id: candidate for candidate in live}
+    required: set[int] = set()
+    stack = list(step.input_ids)
+    while stack:
+        value_id = stack.pop()
+        producer = producers.get(value_id)
+        if producer is None or producer.result_id in required:
+            continue
+        required.add(producer.result_id)
+        stack.extend(producer.input_ids)
+    return tuple(candidate for candidate in live if candidate.result_id in required)
+
+
 def _constant_scalar(step: OpStep) -> float | None:
     """The scalar a ``tensor_from_list`` step contributes, if it is one.
 
@@ -267,7 +306,14 @@ def emit_wasm_module(
     imports: Sequence[object] = (),
     static_data_offset: int = 0,
 ) -> WasmModule:
-    """Lower one elementwise ``FusedProgram`` to a WAT module.
+    """Lower one internal elementwise ``FusedProgram`` to a WAT module.
+
+    This is a backend emission primitive, not a source compiler.  A direct
+    call is appropriate for backend tests and for compiler stages that already
+    own a ``FusedProgram``.  It is not an application workflow and says
+    nothing about whether the Python frontend can represent classes, control
+    flow, state machines, or other source constructs; those were handled
+    before this function is reached.
 
     The emitted function is ``(count, feed0, feed1, ..., out0, ...)`` where
     every argument after ``count`` is a byte offset into the exported memory.
@@ -310,38 +356,87 @@ def emit_wasm_module(
             "      i32.add",
         ]
 
-    # Feeds are read once per iteration into locals, so a value used by more
-    # than one step is loaded once rather than re-read from memory.
+    # Allocate stable locals before emitting either reduction or output passes.
     for index, feed_id in enumerate(feed_ids):
         local = f"$v{len(names)}"
         names[feed_id] = local
         locals_declared.append(f"(local {local} {value_type})")
-        # The same label the signature declares -- emitting $feed{index}
-        # here while the header says $unit_x produces WAT that does not
-        # refer to its own parameters.
-        body.extend(element_address("$" + labels[index]))
-        body.append(f"      {load}")
-        body.append(f"      local.set {local}")
-
     for step in live:
         local = f"$v{len(names)}"
-        locals_declared.append(f"(local {local} {value_type})")
-        instructions = _step_instructions(
-            step,
-            names,
-            value_type,
-            element_bytes,
-            static_data["constants"],
-            shortfalls,
-        )
-        if instructions is None:
-            # Still bind a name so later steps referring to this result do
-            # not also fail; the module is incomplete either way.
-            names[step.result_id] = local
-            continue
-        body.extend(instructions)
-        body.append(f"      local.set {local}")
         names[step.result_id] = local
+        locals_declared.append(f"(local {local} {value_type})")
+
+    sums = _flat_sum_steps(live)
+    for step in sums:
+        if step.attrs.get("axis") is not None or bool(step.attrs.get("keepdim", False)):
+            shortfalls.append(WasmShortfall(
+                step.step_id,
+                step.op_name,
+                "axis/keepdim reduction needs tensor shape and stride metadata",
+            ))
+
+    def load_feeds(target: list[str]) -> None:
+        # Feeds are read once per iteration into locals, so a value used by
+        # more than one step is loaded once rather than re-read from memory.
+        for index, feed_id in enumerate(feed_ids):
+            target.extend(element_address("$" + labels[index]))
+            target.append(f"      {load}")
+            target.append(f"      local.set {names[feed_id]}")
+
+    def evaluate_steps(target: list[str], steps: Sequence[OpStep]) -> None:
+        for candidate in steps:
+            if candidate.op_name == "sum":
+                continue
+            instructions = _step_instructions(
+                candidate,
+                names,
+                value_type,
+                element_bytes,
+                static_data["constants"],
+                shortfalls,
+            )
+            if instructions is None:
+                continue
+            target.extend(instructions)
+            target.append(f"      local.set {names[candidate.result_id]}")
+
+    reduction_passes: list[str] = []
+    for reduction_index, step in enumerate(sums):
+        dependencies = _sum_dependencies(step, live)
+        source = names.get(step.input_ids[0]) if step.input_ids else None
+        if source is None:
+            shortfalls.append(WasmShortfall(
+                step.step_id, step.op_name, "reduction operand was never produced",
+            ))
+            continue
+        reduction_passes.extend((
+            "    i32.const 0",
+            "    local.set $i",
+            f"    (block $sum_done_{reduction_index}",
+            f"      (loop $sum_body_{reduction_index}",
+            "        local.get $i",
+            "        local.get $count",
+            "        i32.ge_s",
+            f"        br_if $sum_done_{reduction_index}",
+        ))
+        load_feeds(reduction_passes)
+        evaluate_steps(reduction_passes, dependencies)
+        reduction_passes.extend((
+            f"      local.get {names[step.result_id]}",
+            f"      local.get {source}",
+            f"      {value_type}.add",
+            f"      local.set {names[step.result_id]}",
+            "        local.get $i",
+            "        i32.const 1",
+            "        i32.add",
+            "        local.set $i",
+            f"        br $sum_body_{reduction_index}",
+            "      )",
+            "    )",
+        ))
+
+    load_feeds(body)
+    evaluate_steps(body, live)
 
     for index, output_id in enumerate(output_ids):
         target = names.get(output_id)
@@ -372,6 +467,9 @@ def emit_wasm_module(
         memory_declaration,
         f"  (func (export \"{function_name}\") {parameter_text}",
         *(f"    {declaration}" for declaration in locals_declared),
+        *reduction_passes,
+        "    i32.const 0",
+        "    local.set $i",
         "    (block $done",
         "      (loop $body",
         "        ;; while i < count",
@@ -560,6 +658,10 @@ def _assemble(
 
     index_local = builder.declare_local("i32")
     locals_for: dict[int, int] = {}
+    for feed_id in feed_ids:
+        locals_for[feed_id] = builder.declare_local(value_type)
+    for step in live:
+        locals_for[step.result_id] = builder.declare_local(value_type)
 
     def element_address(pointer_param: int) -> None:
         builder.local_get(pointer_param)
@@ -568,6 +670,92 @@ def _assemble(
         builder.raw(0x6C)  # i32.mul
         builder.raw(0x6A)  # i32.add
 
+    def load_feeds() -> None:
+        for feed_id in feed_ids:
+            element_address(feed_params[feed_id])
+            builder.load()
+            builder.local_set(locals_for[feed_id])
+
+    def evaluate_steps(steps: Sequence[OpStep]) -> None:
+        for step in steps:
+            if step.op_name == "sum":
+                continue
+            local = locals_for[step.result_id]
+            constant = _constant_scalar(step)
+            if constant is not None:
+                builder.value_const(constant)
+                builder.local_set(local)
+                continue
+            if step.op_name == "tensor_from_list":
+                entry = tables["constants"][step.result_id]
+                builder.i32_const(entry["base"])
+                builder.local_get(index_local)
+                builder.i32_const(element_bytes)
+                builder.raw(0x6C)  # i32.mul
+                builder.raw(0x6A)  # i32.add
+                builder.load()
+                builder.local_set(local)
+                continue
+            left = locals_for[step.input_ids[0]]
+
+            def push_right() -> None:
+                if len(step.input_ids) == 2:
+                    builder.local_get(locals_for[step.input_ids[1]])
+                else:
+                    builder.value_const(float(step.attrs["right_scalar"]))
+
+            if step.op_name in _LUT_OPS:
+                entry = tables["entries"][step.op_name]
+                _emit_lut(
+                    builder, left, step.op_name, entry["base"], entry["intervals"],
+                    entry["lower"], entry["upper"], entry["periodic"],
+                )
+            elif step.op_name in ELEMENTWISE_UNARY:
+                builder.local_get(left)
+                builder.op(_UNARY_INSTRUCTION[step.op_name])
+            elif step.attrs.get("reverse", False):
+                push_right()
+                builder.local_get(left)
+            else:
+                builder.local_get(left)
+                push_right()
+
+            if step.op_name in ELEMENTWISE_BINARY:
+                instruction = _BINARY_INSTRUCTION.get(step.op_name)
+                if instruction is not None:
+                    builder.op(instruction)
+                else:
+                    builder.op(_COMPARISON_INSTRUCTION[step.op_name])
+                    builder.op("convert_i32_u")
+            builder.local_set(local)
+
+    # Each SSA sum gets an explicit whole-tensor pass. Its scalar local is
+    # then consumed by later tensor expressions as a broadcast value.
+    for reduction in _flat_sum_steps(live):
+        builder.i32_const(0)
+        builder.local_set(index_local)
+        builder.block()
+        builder.loop()
+        builder.local_get(index_local)
+        builder.local_get(count_param)
+        builder.raw(0x4E)  # i32.ge_s
+        builder.br_if(1)
+        load_feeds()
+        evaluate_steps(_sum_dependencies(reduction, live))
+        builder.local_get(locals_for[reduction.result_id])
+        builder.local_get(locals_for[reduction.input_ids[0]])
+        builder.op("add")
+        builder.local_set(locals_for[reduction.result_id])
+        builder.local_get(index_local)
+        builder.i32_const(1)
+        builder.raw(0x6A)
+        builder.local_set(index_local)
+        builder.br(0)
+        builder.end()
+        builder.end()
+
+    builder.i32_const(0)
+    builder.local_set(index_local)
     # block { loop { if i >= count break; ...; i += 1; continue } }
     builder.block()
     builder.loop()
@@ -575,68 +763,8 @@ def _assemble(
     builder.local_get(count_param)
     builder.raw(0x4E)  # i32.ge_s
     builder.br_if(1)  # out of the enclosing block
-
-    for feed_id in feed_ids:
-        local = builder.declare_local(value_type)
-        locals_for[feed_id] = local
-        element_address(feed_params[feed_id])
-        builder.load()
-        builder.local_set(local)
-
-    for step in live:
-        local = builder.declare_local(value_type)
-        constant = _constant_scalar(step)
-        if constant is not None:
-            builder.value_const(constant)
-            locals_for[step.result_id] = local
-            builder.local_set(local)
-            continue
-        if step.op_name == "tensor_from_list":
-            entry = tables["constants"][step.result_id]
-            builder.i32_const(entry["base"])
-            builder.local_get(index_local)
-            builder.i32_const(element_bytes)
-            builder.raw(0x6C)  # i32.mul
-            builder.raw(0x6A)  # i32.add
-            builder.load()
-            locals_for[step.result_id] = local
-            builder.local_set(local)
-            continue
-        left = locals_for[step.input_ids[0]]
-
-        def push_right() -> None:
-            if len(step.input_ids) == 2:
-                builder.local_get(locals_for[step.input_ids[1]])
-            else:
-                builder.value_const(float(step.attrs["right_scalar"]))
-
-        if step.op_name in _LUT_OPS:
-            entry = tables["entries"][step.op_name]
-            _emit_lut(
-                builder, left, step.op_name, entry["base"], entry["intervals"],
-                entry["lower"], entry["upper"], entry["periodic"],
-            )
-        elif step.op_name in ELEMENTWISE_UNARY:
-            builder.local_get(left)
-            builder.op(_UNARY_INSTRUCTION[step.op_name])
-        elif step.attrs.get("reverse", False):
-            push_right()
-            builder.local_get(left)
-        else:
-            builder.local_get(left)
-            push_right()
-
-        if step.op_name in ELEMENTWISE_BINARY:
-            instruction = _BINARY_INSTRUCTION.get(step.op_name)
-            if instruction is not None:
-                builder.op(instruction)
-            else:
-                builder.op(_COMPARISON_INSTRUCTION[step.op_name])
-                # A comparison yields i32; convert so the result carries the
-                # operand's own type, as every other backend reports it.
-                builder.op("convert_i32_u")
-        locals_for[step.result_id] = local
-        builder.local_set(local)
+    load_feeds()
+    evaluate_steps(live)
 
     for slot, output_id in enumerate(output_ids):
         element_address(output_params[slot])

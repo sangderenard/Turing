@@ -1,0 +1,2108 @@
+schema: turing-compiled-program-api-v1
+module: kernel_fortran
+language: fortran
+entry: columnar_multifluid_rgb_step
+metadata:
+  dtype: float64
+  shell_io:
+    requirements:
+      schema: turing-shell-io-requirements
+      version: 1
+      requests:
+      - capability: display_double_buffer
+        optional: false
+        attributes:
+          height: 176
+          pixel_format: rgb_f64_planar
+          title: "Managed Columnar Multifluid World \u2014 native Fortran"
+          width: 256
+      bindings:
+      - resource: display.red
+        entry_point: columnar_multifluid_rgb_step
+        parameter: t1393
+      - resource: display.green
+        entry_point: columnar_multifluid_rgb_step
+        parameter: t1397
+      - resource: display.blue
+        entry_point: columnar_multifluid_rgb_step
+        parameter: t1401
+      options: []
+    abi:
+      schema: turing-shell-io-abi
+      version: 1
+      input_events:
+        header_bytes: 16
+        record_bytes: 32
+        header_fields:
+        - capacity
+        - read_index
+        - write_index
+        - dropped
+      file_requests:
+        header_bytes: 16
+        record_bytes: 32
+        header_fields:
+        - capacity
+        - read_index
+        - write_index
+        - dropped
+      file_completions:
+        header_bytes: 16
+        record_bytes: 32
+        header_fields:
+        - capacity
+        - read_index
+        - write_index
+        - dropped
+      display:
+        pixel_format: rgba8
+        descriptor_fields:
+        - width
+        - height
+        - stride_bytes
+        - front_offset
+        - back_offset
+        - generation
+        optional: true
+      files:
+        request_record_bytes: 32
+        completion_record_bytes: 32
+        operations:
+        - open
+        - create
+        - read
+        - write
+        - close
+        - stat
+        span_fields:
+        - memory_offset
+        - byte_length
+      records:
+        input_event_i32:
+        - kind
+        - code
+        - value
+        - x
+        - y
+        - buttons
+        - modifiers
+        - timestamp_ms
+        file_request_i32:
+        - operation
+        - request_id
+        - handle
+        - file_offset_low
+        - file_offset_high
+        - memory_offset
+        - byte_length
+        - flags
+        file_completion_i32:
+        - operation
+        - request_id
+        - handle
+        - status
+        - bytes_transferred
+        - size_low
+        - size_high
+        - flags
+entry_points:
+- name: columnar_multifluid_rgb_step_numerical
+  symbol: columnar_multifluid_rgb_step_numerical
+  kind: numerical
+  parameters:
+  - name: extent_1
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: extent_16
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: t0
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: managed_time
+  - name: t1
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: dt
+  - name: t2
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_low
+  - name: t3
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_high
+  - name: t4
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_mid
+  - name: t5
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_x
+  - name: t6
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_y
+  - name: t7
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_red
+  - name: t8
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_yellow
+  - name: t9
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_green
+  - name: t10
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_cyan
+  - name: t11
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_blue
+  - name: t12
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_magenta
+  - name: t13
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_cargo
+  - name: t14
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_cargo
+  - name: t15
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_cargo
+  - name: t16
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: food_store
+  - name: t17
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_x
+  - name: t18
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_y
+  - name: t19
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_x
+  - name: t20
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_y
+  - name: t21
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_x
+  - name: t22
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_y
+  - name: t23
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_x
+  - name: t24
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_y
+  - name: t25
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_x
+  - name: t26
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_y
+  - name: t27
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_x
+  - name: t28
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_y
+  - name: t29
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_level
+  - name: t30
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: nest_food
+  - name: t31
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: filter_reservoir
+  - name: t32
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement
+  - name: t33
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement_velocity
+  - name: t34
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: rest_surface
+  - name: t1393
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: red
+  - name: t1397
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: green
+  - name: t1401
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: blue
+  - name: t976
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_displacement
+  - name: t974
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_velocity
+  - name: t301
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_x
+  - name: t309
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_y
+  - name: t291
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_velocity_x
+  - name: t293
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_velocity_y
+  - name: t457
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_x
+  - name: t465
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_y
+  - name: t447
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_velocity_x
+  - name: t449
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_velocity_y
+  - name: t603
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_x
+  - name: t611
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_y
+  - name: t593
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_velocity_x
+  - name: t595
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_velocity_y
+  - name: t875
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_cargo
+  - name: t884
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_cargo
+  - name: t893
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_cargo
+  - name: t942
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_food_store
+  - name: t949
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_nest_food
+  - name: t1228
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_filter_reservoir
+  - name: t35
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_time
+  - name: t1215
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_red
+  - name: t1216
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_yellow
+  - name: t1217
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_green
+  - name: t1218
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_cyan
+  - name: t1219
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_blue
+  - name: t1220
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_magenta
+- name: columnar_multifluid_rgb_step
+  symbol: columnar_multifluid_rgb_step
+  kind: control
+  parameters:
+  - name: extent_1
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: extent_16
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: t0
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: managed_time
+  - name: t1
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: dt
+  - name: t2
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_low
+  - name: t3
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_high
+  - name: t4
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_mid
+  - name: t5
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_x
+  - name: t6
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_y
+  - name: t7
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_red
+  - name: t8
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_yellow
+  - name: t9
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_green
+  - name: t10
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_cyan
+  - name: t11
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_blue
+  - name: t12
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_magenta
+  - name: t13
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_cargo
+  - name: t14
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_cargo
+  - name: t15
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_cargo
+  - name: t16
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: food_store
+  - name: t17
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_x
+  - name: t18
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_y
+  - name: t19
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_x
+  - name: t20
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_y
+  - name: t21
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_x
+  - name: t22
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_y
+  - name: t23
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_x
+  - name: t24
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_y
+  - name: t25
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_x
+  - name: t26
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_y
+  - name: t27
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_x
+  - name: t28
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_y
+  - name: t29
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_level
+  - name: t30
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: nest_food
+  - name: t31
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: filter_reservoir
+  - name: t32
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement
+  - name: t33
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement_velocity
+  - name: t34
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: rest_surface
+  - name: t1393
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: red
+  - name: t1397
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: green
+  - name: t1401
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: blue
+  - name: t976
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_displacement
+  - name: t974
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_velocity
+  - name: t301
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_x
+  - name: t309
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_y
+  - name: t291
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_velocity_x
+  - name: t293
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_velocity_y
+  - name: t457
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_x
+  - name: t465
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_y
+  - name: t447
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_velocity_x
+  - name: t449
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_velocity_y
+  - name: t603
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_x
+  - name: t611
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_y
+  - name: t593
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_velocity_x
+  - name: t595
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_velocity_y
+  - name: t875
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_cargo
+  - name: t884
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_b_cargo
+  - name: t893
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_entity_c_cargo
+  - name: t942
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_food_store
+  - name: t949
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_nest_food
+  - name: t1228
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_filter_reservoir
+  - name: t35
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_time
+  - name: t1215
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_red
+  - name: t1216
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_yellow
+  - name: t1217
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_green
+  - name: t1218
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_cyan
+  - name: t1219
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_blue
+  - name: t1220
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: next_ink_magenta
+  note: 'call this one: a program whose control shell has a loop iterates here, and
+    calling the numerical subroutine directly runs the loop body once'
+- name: numerical_region_0
+  symbol: numerical_region_0
+  kind: region
+  parameters:
+  - name: extent_1
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: extent_16
+    role: extent
+    dtype: int32
+    c_type: int32_t
+    ctypes: c_int32
+    passing: value
+  - name: t0
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: managed_time
+  - name: t1
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: dt
+  - name: t2
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_low
+  - name: t3
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_high
+  - name: t4
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_mid
+  - name: t5
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_x
+  - name: t6
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: column_y
+  - name: t7
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_red
+  - name: t8
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_yellow
+  - name: t9
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_green
+  - name: t10
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_cyan
+  - name: t11
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_blue
+  - name: t12
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: ink_magenta
+  - name: t13
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_cargo
+  - name: t14
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_cargo
+  - name: t15
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_cargo
+  - name: t16
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: food_store
+  - name: t17
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_x
+  - name: t18
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_y
+  - name: t19
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_x
+  - name: t20
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_y
+  - name: t21
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_x
+  - name: t22
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_y
+  - name: t23
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_x
+  - name: t24
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_velocity_y
+  - name: t25
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_x
+  - name: t26
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_b_velocity_y
+  - name: t27
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_x
+  - name: t28
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: entity_c_velocity_y
+  - name: t29
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: audio_level
+  - name: t30
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: nest_food
+  - name: t31
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: filter_reservoir
+  - name: t32
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement
+  - name: t33
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: displacement_velocity
+  - name: t34
+    role: input
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: rest_surface
+  - name: t35
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_35
+  - name: t291
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_291
+  - name: t293
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_293
+  - name: t447
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_447
+  - name: t449
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_449
+  - name: t593
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_593
+  - name: t595
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_595
+  - name: t301
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_301
+  - name: t309
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_309
+  - name: t457
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_457
+  - name: t465
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_465
+  - name: t603
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_603
+  - name: t611
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_611
+  - name: t1215
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1215
+  - name: t1216
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1216
+  - name: t1217
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1217
+  - name: t1218
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1218
+  - name: t1219
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1219
+  - name: t1220
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1220
+  - name: t949
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_949
+  - name: t875
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_875
+  - name: t884
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_884
+  - name: t893
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_893
+  - name: t974
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_974
+  - name: t976
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_976
+  - name: t942
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_942
+  - name: t1228
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1228
+  - name: t1393
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1393
+  - name: t1401
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1401
+  - name: t1397
+    role: output
+    dtype: float64
+    c_type: double
+    ctypes: c_double
+    passing: reference
+    shape:
+    - 16
+    extent: extent_16
+    source_name: value_1397

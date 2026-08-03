@@ -39,11 +39,32 @@ def test_only_published_browser_shader_graduates_a_bundle_page():
         "available": True,
         "url": "source/webgl/webgl.frag.glsl",
     }])
+    assert descriptor is None
+
+    descriptor = _shader_execution_descriptor(desktop_only + [{
+        "language": "webgl",
+        "role": "shader-surface",
+        "available": True,
+        "url": "source/roles/shader-surface/webgl.frag.glsl",
+    }])
     assert descriptor == {
-        "url": "source/webgl/webgl.frag.glsl",
+        "url": "source/roles/shader-surface/webgl.frag.glsl",
         "language": "webgl2-glsl-es",
         "stage": "fragment",
+        "role": "shader-surface",
+        "autostart": True,
+        "execution": {
+            "continuous": True,
+            "prefer_contiguous": True,
+        },
     }
+    io = {"requirements": {"requests": [{"capability": "pointer"}]}}
+    assert _shader_execution_descriptor(desktop_only + [{
+        "language": "webgl",
+        "role": "shader-surface",
+        "available": True,
+        "url": "surface.frag.glsl",
+    }], io)["io"] == io
     assert resolve_publish_root(DEFAULT_PUBLISH_ROOT) == DEFAULT_PUBLISH_ROOT
 
 
@@ -88,7 +109,36 @@ def test_literal_source_contract_is_inspected_without_importing_source():
     assert contract.slug == "affine-field"
     assert contract.feeds["gain"]["values"] == [2.0] * 4
     assert contract.feed_expressions == {"x": "x / max(1, w - 1)"}
+    assert contract.bake_mode == "whole_program"
+    assert contract.schedule_preference == "alap"
+    assert contract.constant_map == {}
     assert (contract.width, contract.height) == (16, 8)
+
+
+def test_configured_constant_map_is_validated_before_compilation():
+    configured = SOURCE.replace(
+        '"width": 16,', '"constants": {"gain": 2.0},\n    "width": 16,'
+    )
+    contract = discover_source_contract(configured)
+
+    assert contract.constant_map == {"gain": 2.0}
+    with pytest.raises(ValueError, match="unknown parameters"):
+        discover_source_contract(configured.replace("gain\": 2.0", "missing\": 2.0"))
+
+
+def test_bake_mode_override_is_explicit_and_validated():
+    contract = discover_source_contract(
+        SOURCE,
+        bake_mode="one-shot",
+        schedule_preference="ASAP",
+    )
+
+    assert contract.bake_mode == "one_shot"
+    assert contract.schedule_preference == "asap"
+    with pytest.raises(ValueError, match="one_shot.*whole_program"):
+        discover_source_contract(SOURCE, bake_mode="numeric-ish")
+    with pytest.raises(ValueError, match="asap.*alap"):
+        discover_source_contract(SOURCE, schedule_preference="whenever")
 
 
 def test_website_builder_accepts_a_compiler_class_without_embedding_wasm(tmp_path):
@@ -194,6 +244,11 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
     assert any(path.startswith(card_prefix) and path.endswith(".wasm") for path in paths)
     assert card_prefix + "class-inventory.json" in paths
     assert f'"{DEFAULT_WASM_CARD_OPERATIONS}":' in bundle.page_path.read_text()
+    html = bundle.page_path.read_text(encoding="utf-8")
+    assert '"supports_ranges": false' in html
+    assert '"contiguous": null' in html
+    assert bundle.manifest["compiler"]["bake_mode"] == "whole_program"
+    assert bundle.manifest["compiler"]["schedule_preference"] == "alap"
     assert bundle.url.startswith("/site/programs/affine-field/versions/v1-")
     assert json.loads(bundle.manifest_path.read_text())["page"]["url"] == bundle.url
 
@@ -207,6 +262,30 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
         include_mathematics=False,
     )
     assert repeated.directory == bundle.directory
+
+
+def test_one_shot_bundle_packages_the_discovery_numeric_trace(tmp_path: Path):
+    whole = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        include_backends=False,
+        include_mathematics=False,
+    )
+    one_shot = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        include_backends=False,
+        include_mathematics=False,
+        bake_mode="one_shot",
+    )
+
+    assert one_shot.directory != whole.directory
+    assert one_shot.manifest["compiler"]["bake_mode"] == "one_shot"
+    html = one_shot.page_path.read_text(encoding="utf-8")
+    assert '"supports_ranges": true' in html
+    assert '"contiguous": {' in html
 
 
 @pytest.mark.skipif(

@@ -838,8 +838,7 @@ def test_explicit_long_conversion_lowers_after_layout_stage(gl):
     replayed = execute_captured_fused_program(captured, {})["result"]
 
     assert any(
-        step.op_name == "add"
-        and step.attrs.get("right_scalar") == 0
+        step.op_name == "fptosi"
         and stage.meta[step.result_id].dtype == str(result.dtype)
         for stage in captured.execution_programs
         for step in stage.steps

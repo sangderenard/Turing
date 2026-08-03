@@ -11,10 +11,26 @@ from .discrete_fluid_engine import BathDiscreteFluidEngine
 from .voxel_fluid_engine import VoxelFluidEngine
 from .hybrid_fluid_engine import HybridFluidEngine
 from .softbody_engine import SoftbodyEngineWrapper
+from .columnar_multifluid_engine import (
+    ColumnarMultifluidConfig,
+    ColumnarMultifluidEngine,
+    ColumnarMultifluidSnapshot,
+    ColumnarMultifluidState,
+    ColumnarSurfaceField,
+    ColumnarSurfacePrimitives,
+    advance_columnar_surface_spring,
+)
 
 __all__ = [
     "BathDiscreteFluidEngine",
     "VoxelFluidEngine",
     "HybridFluidEngine",
     "SoftbodyEngineWrapper",
+    "ColumnarMultifluidConfig",
+    "ColumnarMultifluidEngine",
+    "ColumnarMultifluidSnapshot",
+    "ColumnarMultifluidState",
+    "ColumnarSurfaceField",
+    "ColumnarSurfacePrimitives",
+    "advance_columnar_surface_spring",
 ]

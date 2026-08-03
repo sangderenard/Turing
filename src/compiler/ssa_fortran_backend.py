@@ -1432,7 +1432,23 @@ class _FunctionEmitter:
         def dims(value: SSAValue) -> str:
             return ", ".join(dim_extents[int(size)] for size in value.shape)
 
-        extent_names = sorted(dim_extents.values())
+        # A caller must expose every extent its emitted callees require, even
+        # when that size exists only in a callee-local temporary.  Whole-field
+        # reductions are the common case: the region has an extent-one scalar
+        # result, while the control wrapper otherwise sees only the public
+        # field extent.  The call already passes the callee's declared extent
+        # list, so omitting it from this wrapper's own ABI produces an
+        # undeclared ``extent_1`` identifier in otherwise valid Fortran.
+        called_extent_names = {
+            extent
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op in ("Call", "call")
+            for extent in self.callee_extents.get(
+                str(instr.attributes.get("callee") or ""), ()
+            )
+        }
+        extent_names = sorted(set(dim_extents.values()) | called_extent_names)
         self.extent_names = tuple(extent_names)
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
@@ -1612,6 +1628,10 @@ def emit_module(
         )
         for function_name, function in functions.items()
     )
+    emitted_extents = {
+        function_name: subroutine.extent_names
+        for function_name, subroutine in zip(functions, subroutines)
+    }
     lines = [
         f"module {name}",
         "  use, intrinsic :: iso_c_binding",
@@ -1664,7 +1684,11 @@ def emit_module(
             describe_fortran_function(
                 function_name,
                 function,
-                extent_names=callee_extents.get(function_name, ()),
+                # Use the final second-pass signature. A caller can acquire
+                # transitive extent arguments from a callee even when its
+                # own values do not have that shape; the discarded first
+                # pass deliberately cannot see those call requirements.
+                extent_names=emitted_extents.get(function_name, ()),
                 outputs=named_outputs.get(function_name, ()),
                 kind=kind,
                 note=note,

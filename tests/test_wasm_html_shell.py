@@ -1,3 +1,7 @@
+import base64
+from pathlib import Path
+import subprocess
+
 import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
@@ -62,6 +66,9 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
             "url": "source/webgl/webgl.frag.glsl",
             "language": "webgl2-glsl-es",
             "stage": "fragment",
+            "role": "shader-surface",
+            "autostart": True,
+            "execution": {"continuous": True, "prefer_contiguous": True},
         },
     )
     html = shell.html
@@ -74,12 +81,30 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert "canvas.setPointerCapture(event.pointerId)" in html
     assert 'canvas.addEventListener("keydown"' in html
     assert "window.TuringShaderSurface" in html
+    assert "window.TuringShaderLiaison" in html
+    assert "window.TuringWasmRuntime" in html
+    assert "outputFrame()" in html
+    assert "uploadOutputTexture()" in html
+    assert "wasm: window.TuringWasmRuntime || null" in html
+    assert "start({continuous = true, preferContiguous = true} = {})" in html
+    assert "preferContiguous && contiguousRunner" in html
+    assert "liaison.wasm.start({" in html
 
-    # Graduation is a CSS visibility mode: the inspector remains available
-    # in the DOM and the shader canvas is the only visible body content.
+    # The opaque shader overlays the inspector without display:none, because
+    # the browser must still calculate the hidden document's real layout.
     assert '<body class="shader-execution">' in html
-    assert "body.shader-execution > :not(#shader-surface):not(script)" in html
-    assert "display: none !important" in html
+    assert "position: fixed" in html
+    assert "z-index: 2147483647" in html
+    assert "display: none !important" not in html
+    assert 'schema: "turing-dom-layout"' in html
+    assert "element.getBoundingClientRect()" in html
+    assert "view.getComputedStyle(element)" in html
+    assert "new Float32Array(elements.length * 8)" in html
+    assert "await settledLayout(document)" in html
+    assert "async loadHTML(source" in html
+    assert "async loadFile(file)" in html
+    assert 'canvas.addEventListener("drop"' in html
+    assert "snapshot.viewport.height - (element.y + element.height * 0.5)" in html
     assert "Local publisher and gallery" in html
     assert "Process graph" in html
     assert 'id="run"' in html
@@ -152,6 +177,7 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     assert 'renderGallery(STATIC_GALLERY)' in html
     assert 'const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url)' in html
     assert "function resourceURLs(path)" in html
+    assert "add(relative);" in html
     assert 'const siteIndex = window.location.pathname.indexOf("/site/")' in html
     assert "add(serverURL(pageDirectory + relative))" in html
     assert 'add(serverURL("/" + relative))' in html
@@ -422,6 +448,113 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
     assert "Live deployment schedule:" in html
     assert "await fetchResource(spec.url)" in html
     assert "one element per call today" not in html
+
+
+def test_parallel_wasm_plan_uses_aligned_bounded_worker_tiles_and_join():
+    from src.compiler.wasm_html_shell import emit_html_shell
+
+    artifact = _artifact()
+    class_graph = {
+        "modules": [{
+            "name": "lane_0", "wasm_base64": "AGFzbQEAAAA=",
+            "entry": "kernel", "inputs": ["x"], "outputs": ["y"],
+            "value_type": "f64", "element_bytes": 8,
+            "shared_memory_import": {"module": "env", "field": "memory"},
+        }],
+        "edges": [], "logical_inputs": {"feed0": [["lane_0", "x"]]},
+        "logical_outputs": {"result": ["lane_0", "y"]},
+        "shared_memory": True, "shared_static_bytes": 0,
+        "class_inventory": {
+            "field_slots": [{"index": 0, "key": "in::feed0"},
+                            {"index": 1, "key": "out::lane_0::y"}],
+            "storage_redirects": [],
+            "methods": [{"index": 0, "module": "lane_0", "entry": "kernel",
+                         "input_slots": [0], "output_slots": [1]}],
+        },
+        "coordinator": {"entry": "run_range", "method_count": 1},
+        "thread_deployment": {
+            "abi": "turing.wasm-thread-deployment.v1",
+            "tile_alignment": 8, "tiles_per_worker": 2,
+            "root": {"kind": "deploy", "scale": 1,
+                     "join": {"mode": "barrier"},
+                     "lanes": [{"kind": "call", "method": 0}]},
+        },
+    }
+    html = emit_html_shell(artifact.api, class_graph=class_graph).html
+
+    assert "navigator.hardwareConcurrency" in html
+    assert "Math.min(taskCount, 8" in html
+    assert "tile_alignment" in html
+    assert "new Worker(this.tileWorkerURL)" in html
+    assert "await Promise.all" in html
+    assert "Join: all WebAssembly tiles committed" in html
+    assert "replaying serial Wasm schedule" in html
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe").exists(),
+    reason="Chrome is unavailable",
+)
+def test_wasm_tile_worker_executes_kernel_and_crosses_join_in_browser(tmp_path):
+    from src.compiler.fused_program_wasm_backend import emit_wasm_module
+    from src.compiler.wasm_binary import WasmImport
+    from src.compiler.wasm_html_shell import _JS
+
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2)],
+        outputs={"result": 2},
+    )
+    module = emit_wasm_module(
+        program,
+        name="tile_kernel",
+        imports=(WasmImport(
+            module="env", field="memory", kind="memory", memory_pages=1,
+        ),),
+    )
+    worker_function = _JS.split(
+        "function wasmTileWorkerSource() {", 1
+    )[1].split("class ClassGraphRunner", 1)[0]
+    worker_function = "function wasmTileWorkerSource() {" + worker_function
+    encoded = base64.b64encode(module.binary).decode("ascii")
+    page = f"""<!doctype html><body>WAIT<script>
+{worker_function}
+const manifest = {{
+  modules: [{{name: "lane", entry: "tile_kernel", value_type: "f64",
+    element_bytes: 8, wasm_base64: "{encoded}",
+    shared_memory_import: {{module: "env", field: "memory"}}}}],
+  shared_static_bytes: 0
+}};
+const inventory = {{field_slots: [{{index:0}}, {{index:1}}], methods: [{{
+  index: 0, module: "lane", entry: "tile_kernel",
+  input_slots: [0], output_slots: [1]
+}}]}};
+const url = URL.createObjectURL(new Blob([wasmTileWorkerSource()], {{type:"text/javascript"}}));
+const worker = new Worker(url);
+worker.onmessage = event => {{
+  const values = Array.from(event.data.outputs[1] || []);
+  document.body.textContent = !event.data.error && JSON.stringify(values) === "[2,4,6]"
+    ? "PASS JOIN [2,4,6]" : "FAIL " + JSON.stringify(event.data);
+  worker.terminate();
+}};
+worker.postMessage({{manifest, inventory, methodIds:[0], count:3,
+  fields:[new Float64Array([1,2,3]), new Float64Array(3)]}});
+</script></body>"""
+    page_path = tmp_path / "worker.html"
+    page_path.write_text(page, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "--headless=new", "--disable-gpu", "--no-sandbox",
+            "--virtual-time-budget=5000", "--dump-dom", page_path.as_uri(),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    assert "PASS JOIN [2,4,6]" in completed.stdout
 
 
 def test_versioned_sources_are_not_embedded_or_fetched_before_a_click():

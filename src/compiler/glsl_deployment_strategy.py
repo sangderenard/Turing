@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import copy
 import gc
 import operator
 import time
@@ -11,6 +12,7 @@ import traceback
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
@@ -36,7 +38,9 @@ from .hierarchical_plan import (
 from .loop_composer import (
     LoopBackendCapabilities,
     LoopComposer,
+    _destructure_loop_target,
     analyze_shader_loop_reductions,
+    bind_control_deployments_to_regions,
     evaporate_unrolled_loops,
     materialize_retained_loop_ports,
 )
@@ -1355,11 +1359,21 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
         def validation_values(block) -> None:
             from .control_source import (
                 CallBlock,
+                LoopControlBlock,
                 LoopBlock,
                 ParallelDeployment,
                 SequenceBlock,
                 StateMachineTick,
+                WhileBlock,
             )
+
+            def expression_values(expression):
+                if expression is None:
+                    return
+                if expression.value_id is not None:
+                    control_values.add(int(expression.value_id))
+                for operand in expression.operands:
+                    expression_values(operand)
 
             if isinstance(block, ValidationBlock):
                 control_values.add(int(block.predicate_value_id))
@@ -1374,9 +1388,20 @@ def _build_shell_hierarchy_plan(shell: Any) -> PlanClosure:
                     validation_values(child)
             elif isinstance(block, LoopBlock):
                 validation_values(block.body)
+            elif isinstance(block, WhileBlock):
+                control_values.add(int(block.predicate_value_id))
+                expression_values(block.predicate_expression)
+                validation_values(block.condition)
+                validation_values(block.body)
+            elif isinstance(block, LoopControlBlock):
+                if block.predicate_value_id is not None:
+                    control_values.add(int(block.predicate_value_id))
+                expression_values(block.predicate_expression)
             elif isinstance(block, StateMachineTick):
                 for _value, body in block.cases:
                     validation_values(body)
+                if block.default is not None:
+                    validation_values(block.default)
             elif isinstance(block, ParallelDeployment):
                 for lane in block.lanes:
                     validation_values(lane)
@@ -1419,10 +1444,12 @@ def _refresh_hierarchy_control_captures(
 
     from .control_source import (
         CallBlock,
+        LoopControlBlock,
         LoopBlock,
         ParallelDeployment,
         SequenceBlock,
         StateMachineTick,
+        WhileBlock,
     )
 
     values: set[int] = set()
@@ -1459,6 +1486,13 @@ def _refresh_hierarchy_control_captures(
         )
 
         def visit(block) -> None:
+            def expression_values(expression):
+                if expression is None:
+                    return
+                if expression.value_id is not None:
+                    values.add(int(expression.value_id))
+                for operand in expression.operands:
+                    expression_values(operand)
             if isinstance(block, ValidationBlock):
                 values.add(int(block.predicate_value_id))
             elif isinstance(block, StreamPublishBlock):
@@ -1472,9 +1506,20 @@ def _refresh_hierarchy_control_captures(
                     visit(child)
             elif isinstance(block, LoopBlock):
                 visit(block.body)
+            elif isinstance(block, WhileBlock):
+                values.add(int(block.predicate_value_id))
+                expression_values(block.predicate_expression)
+                visit(block.condition)
+                visit(block.body)
+            elif isinstance(block, LoopControlBlock):
+                if block.predicate_value_id is not None:
+                    values.add(int(block.predicate_value_id))
+                expression_values(block.predicate_expression)
             elif isinstance(block, StateMachineTick):
                 for _case, body in block.cases:
                     visit(body)
+                if block.default is not None:
+                    visit(block.default)
             elif isinstance(block, ParallelDeployment):
                 for lane in block.lanes:
                     visit(lane)
@@ -3090,9 +3135,11 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         def fix_aggregate_loop_bounds(block):
             from .control_source import (
                 CallBlock,
+                LoopControlBlock,
                 LoopBlock,
                 ParallelDeployment,
                 StateMachineTick,
+                WhileBlock,
             )
 
             if isinstance(block, LoopBlock):
@@ -3119,7 +3166,20 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                     block.carried_aliases,
                     block.parallel_iterations,
                     block.dispatch_shell,
+                    block.recursion_region_id,
+                    block.schedule_preference,
                 )
+            if isinstance(block, WhileBlock):
+                return WhileBlock(
+                    block.predicate_value_id,
+                    fix_aggregate_loop_bounds(block.condition),
+                    fix_aggregate_loop_bounds(block.body),
+                    block.carried_aliases,
+                    block.recursion_region_id,
+                    block.predicate_expression,
+                )
+            if isinstance(block, LoopControlBlock):
+                return block
             if isinstance(block, SequenceBlock):
                 return SequenceBlock(tuple(
                     fix_aggregate_loop_bounds(child)
@@ -3132,12 +3192,17 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                         (case, fix_aggregate_loop_bounds(body))
                         for case, body in block.cases
                     ),
+                    None if block.default is None
+                    else fix_aggregate_loop_bounds(block.default),
                 )
             if isinstance(block, ParallelDeployment):
-                return ParallelDeployment(tuple(
-                    fix_aggregate_loop_bounds(lane)
-                    for lane in block.lanes
-                ))
+                return ParallelDeployment(
+                    tuple(
+                        fix_aggregate_loop_bounds(lane)
+                        for lane in block.lanes
+                    ),
+                    block.schedule_preference,
+                )
             if isinstance(block, CallBlock):
                 return CallBlock(
                     block.callsite_id,
@@ -3149,12 +3214,10 @@ def _build_hierarchical_glsl_artifact(shell: Any):
 
         program = hierarchical.program
         hierarchical = type(hierarchical)(
-            ControlProgram(
-                fix_aggregate_loop_bounds(program.root),
-                program.region_indices,
-                program.uniforms,
-                program.value_aliases,
-                tuple(
+            replace(
+                program,
+                root=fix_aggregate_loop_bounds(program.root),
+                iterable_bindings=tuple(
                     binding
                     for binding in program.iterable_bindings
                     if (
@@ -3163,9 +3226,9 @@ def _build_hierarchical_glsl_artifact(shell: Any):
                         str(binding[2]),
                     ) not in aggregate_resident_bindings
                 ),
-                program.static_iterable_bindings,
-                program.collection_bindings,
-                tuple(dict.fromkeys(expanded_bindings)),
+                closure_iterable_bindings=tuple(
+                    dict.fromkeys(expanded_bindings)
+                ),
             ),
             hierarchical.region_correlations,
         )
@@ -3370,6 +3433,8 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         ),
         hierarchical.region_correlations,
     )
+    shell.hierarchical_control_program = hierarchical.program
+    shell.hierarchical_captured_region_programs = dict(captured_regions)
     if set(captured_regions) != set(
         hierarchical.program.region_indices
     ):
@@ -3695,6 +3760,12 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         for global_id, details in shell.hierarchical_endpoint_details.items()
     }
     try:
+        # Retain the target-neutral whole-program form alongside the optional
+        # GLSL artifact. AOT consumers (notably WebAssembly) need the same
+        # hierarchy and region identities without reverse-engineering shader
+        # source or selecting one nested shell as a surrogate root.
+        shell.hierarchical_control_program = hierarchical.program
+        shell.hierarchical_captured_region_programs = dict(captured_regions)
         artifact = build_control_shader_artifact(
             hierarchical.program,
             captured_regions,
@@ -4149,6 +4220,7 @@ def _dispatch_subgraph(
     *,
     required_outputs: frozenset[int] = frozenset(),
     inert_nodes: frozenset[int] = frozenset(),
+    schedule_preference: str = "asap",
 ) -> Any:
     """Return the planned dispatch as an independent ProcessGraph subgraph.
 
@@ -4277,12 +4349,20 @@ def _dispatch_subgraph(
     # its reconstructed internal dependencies.  The source schedule guided
     # legal region formation; this local schedule governs emitted instruction
     # order inside the resulting shader.
+    schedule_preference = str(schedule_preference).lower()
+    if schedule_preference not in {"asap", "alap"}:
+        raise ValueError(
+            "dispatch schedule preference must be 'asap' or 'alap'"
+        )
     computed_levels = subgraph.compute_levels(
-        method="asap",
+        method=schedule_preference,
         order="dependency",
     )
     if computed_levels is not None:
         subgraph.levels = computed_levels
+    subgraph.G.graph["compartment_schedule_preference"] = (
+        schedule_preference
+    )
     subgraph.G.graph["compartment_schedule"] = tuple(
         (
             level,
@@ -5188,10 +5268,12 @@ def _call_arguments(
     parents: tuple[tuple[int, str], ...],
     values: dict[int, Any],
     static_arguments: dict[str, Any] | None = None,
+    graph: Any | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Reconstruct positional and keyword arguments from ProcessGraph roles."""
 
     positional: dict[int, Any] = {}
+    starred: set[int] = set()
     keywords: dict[str, Any] = {}
     fallback_index = 1 << 30
     for parent, role_value in parents:
@@ -5218,13 +5300,28 @@ def _call_arguments(
         else:
             continue
         positional[index] = values[parent]
+        if (
+            graph is not None
+            and parent in graph.G
+            and isinstance(
+                graph.G.nodes[parent].get("expr_obj"), ast.Starred
+            )
+        ):
+            starred.add(index)
         fallback_index += 1
     for role, value in (static_arguments or {}).items():
         if role.startswith("kw:"):
             keywords[role[3:]] = value
         elif (index := _positional_argument_index(role)) is not None:
             positional[index] = value
-    return [positional[index] for index in sorted(positional)], keywords
+    arguments = []
+    for index in sorted(positional):
+        value = positional[index]
+        if index in starred:
+            arguments.extend(value)
+        else:
+            arguments.append(value)
+    return arguments, keywords
 
 
 def _static_python_value(bindings: dict[str, Any], path: str) -> Any:
@@ -5395,6 +5492,11 @@ def _coordinate_scheduled_capture_impl(
                 *expression.body,
                 *expression.orelse,
             )
+        elif isinstance(expression, ast.IfExp):
+            controlled_statements = (
+                expression.body,
+                expression.orelse,
+            )
         elif isinstance(expression, ast.Try):
             controlled_statements = (
                 *expression.body,
@@ -5436,6 +5538,18 @@ def _coordinate_scheduled_capture_impl(
             )
     loop_plans_by_node = {
         plan.loop.node_id: plan for plan in shell.loop_plans
+    }
+    nested_body_nodes_by_loop = {
+        int(owner.loop.node_id): frozenset(
+            int(body_node)
+            for nested in shell.loop_plans
+            if (
+                int(nested.loop.node_id) != int(owner.loop.node_id)
+                and int(nested.loop.node_id) in owner.loop.body_nodes
+            )
+            for body_node in nested.loop.body_nodes
+        )
+        for owner in shell.loop_plans
     }
     comprehension_owner_by_binding: dict[int, int] = {}
     comprehension_owner_by_generator: dict[int, int] = {}
@@ -6168,6 +6282,28 @@ def _coordinate_scheduled_capture_impl(
                 },
             )
 
+    class _LoopBreakSignal(Exception):
+        pass
+
+    class _LoopContinueSignal(Exception):
+        pass
+
+    def evaluate_static_expression(expression: ast.AST) -> Any:
+        if isinstance(expression, ast.Constant):
+            return expression.value
+        if isinstance(expression, ast.Name):
+            if expression.id in shell.static_python_bindings:
+                return shell.static_python_bindings[expression.id]
+            defaults = graph.G.graph.get("parameter_defaults") or {}
+            if expression.id in defaults:
+                return defaults[expression.id]
+        if isinstance(expression, ast.Attribute):
+            return getattr(
+                evaluate_static_expression(expression.value),
+                expression.attr,
+            )
+        raise KeyError(ast.unparse(expression))
+
     def evaluate_node(node_id: int) -> Any:
         if node_id in values:
             return values[node_id]
@@ -6243,11 +6379,40 @@ def _coordinate_scheduled_capture_impl(
                 result = _constant_value(data)
             elif node_type in {"LoopExit", "LoopResult"}:
                 by_role = {str(role): parent for parent, role in parents}
-                evaluate_node(by_role["control"])
-                result = evaluate_node(by_role["value"])
+                control_id = int(by_role["control"])
+                evaluate_node(control_id)
+                if attributes.get("result_kind") == "carried":
+                    binding_name = str(attributes.get("binding_name", ""))
+                    carried_initial = next(
+                        (
+                            int(initial)
+                            for name, initial, _updated in (
+                                loop_plans_by_node[control_id]
+                                .loop.carried_bindings
+                            )
+                            if str(name) == binding_name
+                        ),
+                        None,
+                    )
+                    result = (
+                        evaluate_node(carried_initial)
+                        if carried_initial is not None
+                        else evaluate_node(by_role["value"])
+                    )
+                else:
+                    result = evaluate_node(by_role["value"])
             elif node_type in {"LoopStateTransition", "LoopStatePort"}:
                 by_role = {str(role): parent for parent, role in parents}
-                evaluate_node(by_role["effect"])
+                # Retained-loop effects execute as members of the loop body.
+                # A state port is only a publication boundary for the state
+                # after that control has completed; replaying the effect here
+                # both applies it twice and attempts to read loop-local target
+                # bindings after their owning loop has gone out of scope.
+                loop_id = (attributes or {}).get("loop_id")
+                if loop_id is not None:
+                    evaluate_node(int(loop_id))
+                elif node_type == "LoopStateTransition":
+                    evaluate_node(by_role["effect"])
                 result = evaluate_node(by_role["state"])
             elif node_type == "LoopAggregateResult":
                 result = tuple(
@@ -6394,7 +6559,12 @@ def _coordinate_scheduled_capture_impl(
                 in {"unrolled_loop", "retained_loop_aggregate"}
                 and isinstance(
                     expression,
-                    (ast.ListComp, ast.SetComp, ast.DictComp),
+                    (
+                        ast.ListComp,
+                        ast.SetComp,
+                        ast.DictComp,
+                        ast.GeneratorExp,
+                    ),
                 )
             ):
                 materialized = [
@@ -6406,6 +6576,12 @@ def _coordinate_scheduled_capture_impl(
                     result = set(materialized)
                 elif isinstance(expression, ast.DictComp):
                     result = dict(materialized)
+                elif isinstance(expression, ast.GeneratorExp):
+                    # Keep a replayable finite sequence during discovery.
+                    # Consumers such as any/all/sum and starred calls preserve
+                    # their Python argument semantics without re-entering the
+                    # evaporated generator control node.
+                    result = tuple(materialized)
                 else:
                     result = materialized
             elif isinstance(
@@ -6464,13 +6640,18 @@ def _coordinate_scheduled_capture_impl(
                     iterator = iter(iterable)
                     for item in iterator:
                         targets = loop.target_bindings
-                        items = (
-                            tuple(item)
-                            if len(targets) > 1
-                            else (item,)
-                        )
+                        items_by_name = dict(_destructure_loop_target(
+                            generator_expression.generators[index].target,
+                            item,
+                        ))
                         invalidated = set()
-                        assignments = tuple(zip(targets, items))
+                        assignments = tuple(
+                            (
+                                (name, binding),
+                                items_by_name[str(name)],
+                            )
+                            for name, binding in targets
+                        )
                         for (_name, binding), _value in assignments:
                             invalidated.update(
                                 nx.descendants(graph.G, binding)
@@ -6522,10 +6703,25 @@ def _coordinate_scheduled_capture_impl(
                     )
                 result = evaluate_node(owner)
             elif isinstance(expression, ast.Compare):
-                operands = [
-                    evaluate_node(parent)
-                    for parent, _role in parents
-                ]
+                by_role = {
+                    str(role): int(parent) for parent, role in parents
+                }
+                source_operands = (
+                    expression.left,
+                    *expression.comparators,
+                )
+                operands = []
+                for index, source_operand in enumerate(source_operands):
+                    role = "lhs" if index == 0 else "rhs"
+                    parent = by_role.get(role)
+                    if parent is not None and (
+                        index == 0 or len(expression.ops) == 1
+                    ):
+                        operands.append(evaluate_node(parent))
+                    else:
+                        operands.append(
+                            evaluate_static_expression(source_operand)
+                        )
                 result = True
                 for index, comparison in enumerate(expression.ops):
                     comparator = {
@@ -6616,6 +6812,7 @@ def _coordinate_scheduled_capture_impl(
                     parents,
                     values,
                     static_arguments,
+                    graph,
                 )
                 external_ref = attributes.get("external_callee_ref")
                 callee_ref = attributes.get("callee_ref")
@@ -6826,6 +7023,29 @@ def _coordinate_scheduled_capture_impl(
                         if str(role) == "callee"
                     )
                     callee_value = evaluate_node(callee_parent)
+                    if callable(callee_value) and not isinstance(
+                        callee_value,
+                        (
+                            _CompiledStructuralClass,
+                            _CompiledStructuralMethod,
+                        ),
+                    ):
+                        if not capture:
+                            raise RuntimeError(
+                                "an uncaptured runtime callable reached "
+                                f"compiled coordinator execution at node {node_id}"
+                            )
+                        # A callback parameter is an invocation boundary, not
+                        # a name-based function-table reference.  During the
+                        # one authorized discovery pass, invoke the supplied
+                        # callable under the active AbstractTensor backend so
+                        # its canonical tensor work is appended to the same
+                        # program tape.  Installed execution may never fall
+                        # back to the Python callable: its work must already
+                        # have been absorbed by this capture.
+                        result = callee_value(*args, **kwargs)
+                        values[node_id] = result
+                        return result
                     if not isinstance(
                         callee_value,
                         (
@@ -7206,12 +7426,16 @@ def _coordinate_scheduled_capture_impl(
                         except StopIteration:
                             break
                         targets = loop.target_bindings
-                        items = (
-                            tuple(item)
-                            if len(targets) > 1
-                            else (item,)
+                        items_by_name = dict(_destructure_loop_target(
+                            expression.target, item
+                        ))
+                        target_assignments = tuple(
+                            (
+                                (name, binding),
+                                items_by_name[str(name)],
+                            )
+                            for name, binding in targets
                         )
-                        target_assignments = tuple(zip(targets, items))
                     else:
                         target_assignments = ()
                         test_parent = next(
@@ -7237,19 +7461,34 @@ def _coordinate_scheduled_capture_impl(
                         (),
                     ):
                         completed_regions.discard(region_index)
-                    for body_node in (
-                        candidate
-                        for candidate in _dependency_order(graph)
-                        if candidate in set(loop.body_nodes)
-                    ):
-                        body_region = region_for_node.get(body_node)
-                        if is_shader_internal_node(body_node):
-                            evaluate_region(body_region)
-                        else:
-                            result = evaluate_node(body_node)
+                    loop_signal = None
+                    try:
+                        for body_node in (
+                            candidate
+                            for candidate in _dependency_order(graph)
+                            if (
+                                candidate in set(loop.body_nodes)
+                                and candidate not in nested_body_nodes_by_loop[
+                                    int(node_id)
+                                ]
+                            )
+                        ):
+                            body_region = region_for_node.get(body_node)
+                            if is_shader_internal_node(body_node):
+                                evaluate_region(body_region)
+                            else:
+                                result = evaluate_node(body_node)
+                    except _LoopBreakSignal:
+                        loop_signal = "break"
+                    except _LoopContinueSignal:
+                        loop_signal = "continue"
                     for _name, initial, updated in loop.carried_bindings:
                         values[initial] = evaluate_node(updated)
                     iterations_completed += 1
+                    if loop_signal == "break":
+                        break
+                    if loop_signal == "continue":
+                        continue
                     if shell._profiler.verbose:
                         shell._profiler.trace(
                             path=shell.profile_path,
@@ -7321,6 +7560,10 @@ def _coordinate_scheduled_capture_impl(
                 result = None
             elif isinstance(expression, ast.Pass):
                 result = None
+            elif isinstance(expression, ast.Break):
+                raise _LoopBreakSignal()
+            elif isinstance(expression, ast.Continue):
+                raise _LoopContinueSignal()
             elif node_type == "SetAttr":
                 by_role = {
                     str(role): parent for parent, role in parents
@@ -7489,15 +7732,16 @@ def _coordinate_scheduled_capture_impl(
                 else:
                     iterator = iter(evaluate_node(loop.iterable_node))
                 for item in iterator:
-                    items = (
-                        tuple(item)
-                        if len(loop.target_bindings) > 1
-                        else (item,)
-                    )
-                    assignments = tuple(zip(
-                        loop.target_bindings,
-                        items,
+                    items_by_name = dict(_destructure_loop_target(
+                        statement.target, item
                     ))
+                    assignments = tuple(
+                        (
+                            (name, binding),
+                            items_by_name[str(name)],
+                        )
+                        for name, binding in loop.target_bindings
+                    )
                     for dependent in loop_invalidated_nodes[loop_node]:
                         values.pop(dependent, None)
                     for (_name, binding), bound_value in assignments:
@@ -8000,6 +8244,125 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             )[parameter] = first
 
 
+def propagate_bound_planner_specializations(
+    graph: Any,
+    entrypoint: str,
+    bindings: Mapping[str, Any],
+) -> None:
+    """Carry safe structural feed values through the linked call graph.
+
+    This is planning metadata, not constant folding of numerical tensors.
+    Only syntax that reads an already-supplied object without invoking
+    arbitrary user code is resolved: names, public attributes, subscripts,
+    literal containers, and standard structural views such as ``items``.
+    """
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    reference = function_table.reference(entrypoint)
+    if reference is None:
+        return
+
+    def resolve(node: ast.AST, environment: Mapping[str, Any]) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in environment:
+            return environment[node.id]
+        if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):
+            return getattr(resolve(node.value, environment), node.attr)
+        if isinstance(node, ast.Subscript):
+            return resolve(node.value, environment)[
+                resolve(node.slice, environment)
+            ]
+        if isinstance(node, ast.Tuple):
+            return tuple(resolve(item, environment) for item in node.elts)
+        if isinstance(node, ast.List):
+            return [resolve(item, environment) for item in node.elts]
+        if isinstance(node, ast.Dict):
+            return {
+                resolve(key, environment): resolve(value, environment)
+                for key, value in zip(node.keys, node.values)
+            }
+        if isinstance(node, ast.Call):
+            args = [resolve(argument, environment) for argument in node.args]
+            if isinstance(node.func, ast.Name) and node.func.id in {
+                "tuple", "list", "range", "enumerate", "zip"
+            }:
+                return {
+                    "tuple": tuple, "list": list, "range": range,
+                    "enumerate": enumerate, "zip": zip,
+                }[node.func.id](*args)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"items", "keys", "values"}
+                and not node.keywords
+                and not args
+            ):
+                owner = resolve(node.func.value, environment)
+                if isinstance(owner, Mapping):
+                    return getattr(owner, node.func.attr)()
+        raise ValueError("expression is not a safe structural binding")
+
+    entry = function_table.entry(reference.address).graph
+    if entry is None:
+        return
+    queue: list[tuple[Any, dict[str, Any]]] = [(entry, dict(bindings))]
+    visited: set[tuple[int, tuple[str, ...]]] = set()
+    while queue:
+        current, environment = queue.pop(0)
+        key = (id(current), tuple(sorted(environment)))
+        if key in visited:
+            continue
+        visited.add(key)
+        current.G.graph.setdefault("planner_specializations", {}).update(
+            environment
+        )
+        for _node_id, data in current.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            callee_reference = attributes.get(
+                "callee_ref", attributes.get("method_ref")
+            )
+            expression = data.get("expr_obj")
+            if callee_reference is None or not isinstance(expression, ast.Call):
+                continue
+            try:
+                callee = function_table.entry(int(callee_reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            if callee is None:
+                continue
+            receiver, positional, _all = _method_parameter_layout(callee.G)
+            resolved: dict[str, Any] = {}
+            if receiver is not None and isinstance(expression.func, ast.Attribute):
+                try:
+                    resolved[receiver] = resolve(
+                        expression.func.value, environment
+                    )
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    pass
+            for position, argument in enumerate(expression.args):
+                if position >= len(positional):
+                    break
+                try:
+                    resolved[positional[position]] = resolve(
+                        argument, environment
+                    )
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+            for keyword in expression.keywords:
+                if keyword.arg is None:
+                    continue
+                try:
+                    resolved[str(keyword.arg)] = resolve(
+                        keyword.value, environment
+                    )
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+            if resolved:
+                queue.append((callee, resolved))
+
+
 _CALLSITE_SHELL_TYPE_CACHE: dict[tuple[object, ...], type] = {}
 
 
@@ -8152,6 +8515,7 @@ def strategize_glsl_deployment(
     backend: str | None = None,
     remove_loops: bool | None = None,
     unroll_limit: int | None = None,
+    schedule_preference: str | None = None,
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
@@ -8191,12 +8555,23 @@ def strategize_glsl_deployment(
         inherited.get("unroll_limit", 8) if unroll_limit is None
         else unroll_limit
     )
+    schedule_preference = (
+        inherited.get("schedule_preference", "alap")
+        if schedule_preference is None else schedule_preference
+    )
+    schedule_preference = str(schedule_preference).lower()
+    if schedule_preference not in {"asap", "alap"}:
+        raise ValueError(
+            "deployment schedule preference must be 'asap' or 'alap'"
+        )
     unroll_limit = max(1, min(int(unroll_limit), MAX_UNROLL_LIMIT))
     graph.G.graph["loop_settings"] = {
         "backend": backend,
         "remove_loops": bool(remove_loops),
         "unroll_limit": int(unroll_limit),
+        "schedule_preference": schedule_preference,
     }
+    graph.G.graph["deployment_schedule_preference"] = schedule_preference
 
     _propagate_callsite_planner_specializations(graph)
     canonical_value_ids = bool(
@@ -8297,14 +8672,34 @@ def strategize_glsl_deployment(
         dispatch.node_ids
         for dispatch in dispatch_plan.dispatches
     )
+    control_deployment_regions = bind_control_deployments_to_regions(
+        graph.G.graph.get("control_deployment_regions", ()),
+        executable_dispatch_nodes,
+    )
+    deployment_region_preferences: dict[int, str] = {}
+    for deployment in control_deployment_regions:
+        for lane in deployment.lanes:
+            for region_index in lane.region_indices:
+                previous = deployment_region_preferences.setdefault(
+                    int(region_index), deployment.schedule_preference
+                )
+                if previous != deployment.schedule_preference:
+                    raise ValueError(
+                        "scheduled region has conflicting deployment "
+                        f"preferences: region={region_index}, "
+                        f"preferences={(previous, deployment.schedule_preference)!r}"
+                    )
     dispatch_subgraphs = tuple(
         _dispatch_subgraph(
             graph,
             node_ids,
             required_outputs=closure_outputs,
             inert_nodes=inert_nodes,
+            schedule_preference=deployment_region_preferences.get(
+                region_index, "asap"
+            ),
         )
-        for node_ids in executable_dispatch_nodes
+        for region_index, node_ids in enumerate(executable_dispatch_nodes)
         if node_ids
     )
     for subgraph, dispatch in zip(
@@ -8358,6 +8753,7 @@ class ProcessGraphGLSLDeployment:
     loop_plans = __loop_plans__
     loop_region_indices = __loop_region_indices__
     loop_shader_reductions = __loop_shader_reductions__
+    control_deployment_regions = __control_deployment_regions__
     process_graph_boundary = __process_graph_boundary__
     python_callable = staticmethod(__python_callable__)
     dispatch_subgraphs = __dispatch_subgraphs__
@@ -8529,6 +8925,8 @@ class ProcessGraphGLSLDeployment:
         self.composed_shell_artifact = None
         self.composed_shell_specialized_values = {}
         self.shell_control_program = None
+        self.hierarchical_control_program = None
+        self.hierarchical_captured_region_programs = {}
         self.hierarchical_shell_composed = False
         self.hierarchical_root_value_ids = {}
         self.hierarchical_private_value_ids = {}
@@ -10215,8 +10613,11 @@ class ProcessGraphGLSLDeployment:
         all_loops_lowered = all(
             not reduction.region_indices
             or (
-                reduction.collapsible
-                and reduction.control_program is not None
+                reduction.control_program is not None
+                and (
+                    not emit_glsl
+                    or reduction.collapsible
+                )
             )
             for reduction in self.loop_shader_reductions
         )
@@ -10240,24 +10641,28 @@ class ProcessGraphGLSLDeployment:
                         retained_value_ids=retained_value_ids,
                     )
                     for reduction in self.loop_shader_reductions
-                    if reduction.collapsible
-                    and reduction.control_program is not None
+                    if reduction.control_program is not None
+                    and (
+                        not emit_glsl
+                        or reduction.collapsible
+                    )
                 ),
+            )
+            shell_control = replace(
+                shell_control,
+                deployment_regions=tuple(dict.fromkeys((
+                    *shell_control.deployment_regions,
+                    *self.control_deployment_regions,
+                ))),
             )
             validations = _validation_control_blocks(self)
             if validations:
-                shell_control = ControlProgram(
-                    SequenceBlock((
+                shell_control = replace(
+                    shell_control,
+                    root=SequenceBlock((
                         shell_control.root,
                         *validations,
                     )),
-                    shell_control.region_indices,
-                    shell_control.uniforms,
-                    shell_control.value_aliases,
-                    shell_control.iterable_bindings,
-                    shell_control.static_iterable_bindings,
-                    shell_control.collection_bindings,
-                    shell_control.closure_iterable_bindings,
                 )
             shell_control = project_control_regions(
                 shell_control,
@@ -10265,11 +10670,9 @@ class ProcessGraphGLSLDeployment:
                 retained_value_ids=retained_value_ids,
             )
             if self.compiled_process_graph_aliases:
-                shell_control = ControlProgram(
-                    shell_control.root,
-                    shell_control.region_indices,
-                    shell_control.uniforms,
-                    tuple(dict.fromkeys((
+                shell_control = replace(
+                    shell_control,
+                    value_aliases=tuple(dict.fromkeys((
                         *shell_control.value_aliases,
                         *(
                             (int(alias), int(owner))
@@ -10277,10 +10680,6 @@ class ProcessGraphGLSLDeployment:
                             self.compiled_process_graph_aliases.items()
                         ),
                     ))),
-                    shell_control.iterable_bindings,
-                    shell_control.static_iterable_bindings,
-                    shell_control.collection_bindings,
-                    shell_control.closure_iterable_bindings,
                 )
             self.shell_control_program = shell_control
             self._profiler.trace(
@@ -11003,6 +11402,7 @@ class ProcessGraphGLSLDeployment:
         if node_id in executable_node_ids
     }
     namespace = {
+        "replace": replace,
         "__process_graph__": graph,
         "__external_function_table__": getattr(
             graph,
@@ -11015,6 +11415,7 @@ class ProcessGraphGLSLDeployment:
         "__dispatch_plan__": dispatch_plan,
         "__loop_plans__": loop_plans,
         "__loop_shader_reductions__": loop_shader_reductions,
+        "__control_deployment_regions__": control_deployment_regions,
         "__loop_region_indices__": loop_region_indices,
         "__process_graph_boundary__": process_graph_boundary,
         "__python_callable__": python_callable,
@@ -11166,7 +11567,13 @@ class _CompiledStructuralObject:
         self.class_ref = str(class_ref)
         self.methods = dict(descriptor.get("methods") or {})
         fields = tuple(descriptor.get("fields") or ())
-        self.state = dict(zip(fields, args))
+        defaults = descriptor.get("field_defaults") or {}
+        self.state = {
+            field: copy.deepcopy(defaults[field])
+            for field in fields
+            if field in defaults
+        }
+        self.state.update(zip(fields, args))
         self.state.update(kwargs)
         for field in fields:
             self.state.setdefault(field, None)
