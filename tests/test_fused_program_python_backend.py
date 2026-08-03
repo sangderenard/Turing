@@ -158,3 +158,27 @@ def test_numpy_dialect_evaluates_captured_whole_field_sum():
 
     assert "np.sum(field, axis=None, keepdims=False)" in compiled.source
     assert compiled.callable(np.asarray([1.0, 2.0, 3.5])) == pytest.approx(6.5)
+
+
+def test_numpy_dialect_uses_existing_floor_operator_spelling():
+    program = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[
+            OpStep(
+                step_id=0,
+                op_name="floor",
+                input_ids=[1],
+                attrs={},
+                result_id=2,
+            ),
+        ],
+        outputs={"result": 2},
+    )
+    compiled = compile_single_region_python(program, {1: "field"}, dialect="numpy")
+
+    assert "np.floor(field)" in compiled.source
+    assert np.allclose(
+        compiled.callable(np.asarray([-1.2, 0.0, 2.8])),
+        [-2.0, 0.0, 2.0],
+    )

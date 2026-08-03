@@ -349,6 +349,41 @@ def compile_ast_aot(
         # Matches the release-in-finally discipline every existing caller of
         # this deployment class already follows (tests/test_glsl_fused_network.py).
         deployment.release()
+    # Captured control regions are intentionally thin numerical graphs, but
+    # their external feed identities still belong to the enclosing Python
+    # function.  Carry that provenance onto every region so backends that
+    # publish the regions directly can expose the source ABI instead of
+    # inventing positional ``input_N`` names.
+    named_feed_ids = {
+        int(history[0]): name
+        for name in function_parameters
+        if (history := tuple(identity_table.get(name, ())))
+    }
+    region_programs = {
+        index: FusedProgram(
+            version=program.version,
+            feeds=set(program.feeds),
+            steps=list(program.steps),
+            outputs=dict(program.outputs),
+            state_in=None if program.state_in is None else set(program.state_in),
+            meta=None if program.meta is None else dict(program.meta),
+            extras={
+                **dict(program.extras or {}),
+                "capture_feed_origins": {
+                    **dict(
+                        (program.extras or {}).get("capture_feed_origins", {})
+                        or {}
+                    ),
+                    **{
+                        value_id: {"binding_name": name}
+                        for value_id, name in named_feed_ids.items()
+                        if value_id in program.feeds
+                    },
+                },
+            },
+        )
+        for index, program in region_programs.items()
+    }
     shell = DualIRShell(
         compiled_shell_program=compiled_shell_program,
         shell_control_program=shell_control_program,

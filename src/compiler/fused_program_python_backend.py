@@ -116,7 +116,7 @@ _NAMED_FUNCTIONS = frozenset(
     {
         "abs", "sqrt", "exp", "log", "sin", "cos", "tan",
         "asin", "acos", "atan", "sinh", "cosh", "tanh",
-        "asinh", "acosh", "atanh", "sign",
+        "asinh", "acosh", "atanh", "sign", "floor",
         "isfinite", "isnan", "isinf", "logical_not",
         "maximum", "minimum",
     }

@@ -102,6 +102,9 @@ try {
     return {
       error: liaison.canvas.dataset.error || null,
       revision: liaison.wasm ? liaison.wasm.outputFrame().revision : -1,
+      running: liaison.wasm ? liaison.wasm.running : false,
+      status: document.getElementById("status")?.textContent || "",
+      outputCount: liaison.wasm ? liaison.wasm.outputFrame().outputs.length : 0,
       width: liaison.canvas.width,
       height: liaison.canvas.height,
       center: Array.from(pixel),

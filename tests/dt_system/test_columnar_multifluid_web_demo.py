@@ -56,6 +56,12 @@ def _feeds(count=8):
         "entity_c_y": np.full(count, 2.8),
         "entity_c_velocity_x": np.full(count, 0.18),
         "entity_c_velocity_y": np.full(count, -0.38),
+        "entity_cargo": np.zeros(count),
+        "entity_b_cargo": np.zeros(count),
+        "entity_c_cargo": np.zeros(count),
+        "food_store": np.zeros(count),
+        "nest_food": np.zeros(count),
+        "filter_reservoir": np.zeros(count),
         "managed_time": np.zeros(count),
         "dt": np.full(count, 0.025),
         "audio_low": np.zeros(count),
@@ -90,6 +96,12 @@ def test_python_page_contract_declares_compiled_state_feedback():
         "entity_c_y": "next_entity_c_y",
         "entity_c_velocity_x": "next_entity_c_velocity_x",
         "entity_c_velocity_y": "next_entity_c_velocity_y",
+        "entity_cargo": "next_entity_cargo",
+        "entity_b_cargo": "next_entity_b_cargo",
+        "entity_c_cargo": "next_entity_c_cargo",
+        "food_store": "next_food_store",
+        "nest_food": "next_nest_food",
+        "filter_reservoir": "next_filter_reservoir",
         "managed_time": "next_time",
         "ink_red": "next_ink_red",
         "ink_yellow": "next_ink_yellow",
@@ -148,6 +160,12 @@ def test_python_rgb_tick_recompiles_with_reductions_to_wasm():
         "next_entity_c_y",
         "next_entity_c_velocity_x",
         "next_entity_c_velocity_y",
+        "next_entity_cargo",
+        "next_entity_b_cargo",
+        "next_entity_c_cargo",
+        "next_food_store",
+        "next_nest_food",
+        "next_filter_reservoir",
         "next_time",
         "next_ink_red",
         "next_ink_yellow",
@@ -250,6 +268,12 @@ def test_native_fortran_bundle_has_all_tick_outputs_and_no_shader(tmp_path):
         "next_entity_c_y",
         "next_entity_c_velocity_x",
         "next_entity_c_velocity_y",
+        "next_entity_cargo",
+        "next_entity_b_cargo",
+        "next_entity_c_cargo",
+        "next_food_store",
+        "next_nest_food",
+        "next_filter_reservoir",
         "next_time",
         "next_ink_red",
         "next_ink_yellow",
@@ -334,7 +358,7 @@ const names = [...inputNames, ...outputNames];
 const offsets = names.map((_, index) => reserved + index * count * 8);
 const memory = instance.exports.memory;
 const state = {
-  column_x: [3.5, 4.5, 5.5, 6.5], column_y: [3.5, 3.5, 3.5, 3.5],
+  column_x: [2.6, 5.1, 7.5, 1.15], column_y: [2, 4.8, 2.8, 5.75],
   rest_surface: [1.5, 1.5, 1.5, 1.5], displacement: [0, 0, 0, 0],
   displacement_velocity: [0, 0, 0, 0], managed_time: [0, 0, 0, 0],
   entity_x: [2.6, 2.6, 2.6, 2.6], entity_y: [2, 2, 2, 2],
@@ -346,10 +370,13 @@ const state = {
   entity_c_x: [7.5, 7.5, 7.5, 7.5], entity_c_y: [2.8, 2.8, 2.8, 2.8],
   entity_c_velocity_x: [0.18, 0.18, 0.18, 0.18],
   entity_c_velocity_y: [-0.38, -0.38, -0.38, -0.38],
+  entity_cargo: [0, 0, 0, 0], entity_b_cargo: [0.8, 0.8, 0.8, 0.8],
+  entity_c_cargo: [0, 0, 0, 0], food_store: [0.7, 0.7, 0.7, 0],
+  nest_food: [0, 0, 0, 0], filter_reservoir: [0, 0, 0, 0],
   dt: [0.025, 0.025, 0.025, 0.025],
   audio_low: [0, 0, 0, 0], audio_mid: [0, 0, 0, 0],
   audio_high: [0, 0, 0, 0], audio_level: [0, 0, 0, 0],
-  ink_red: [0, 0, 0, 0], ink_yellow: [0, 0, 0, 0],
+  ink_red: [0, 0, 0, 1], ink_yellow: [0, 0, 0, 0],
   ink_green: [0, 0, 0, 0], ink_cyan: [0, 0, 0, 0],
   ink_blue: [0, 0, 0, 0], ink_magenta: [0, 0, 0, 0],
 };
@@ -365,6 +392,11 @@ const feedback = {
   entity_c_x: "next_entity_c_x", entity_c_y: "next_entity_c_y",
   entity_c_velocity_x: "next_entity_c_velocity_x",
   entity_c_velocity_y: "next_entity_c_velocity_y",
+  entity_cargo: "next_entity_cargo",
+  entity_b_cargo: "next_entity_b_cargo",
+  entity_c_cargo: "next_entity_c_cargo",
+  food_store: "next_food_store", nest_food: "next_nest_food",
+  filter_reservoir: "next_filter_reservoir",
   managed_time: "next_time",
   ink_red: "next_ink_red", ink_yellow: "next_ink_yellow",
   ink_green: "next_ink_green", ink_cyan: "next_ink_cyan",
@@ -407,6 +439,11 @@ console.log(JSON.stringify(reports));
         assert min(second[channel]) >= 0.0
         assert max(second[channel]) <= 255.0
     assert max(second["next_ink_red"]) > 0.0
+    assert max(second["next_entity_cargo"]) > 0.0
+    assert max(second["next_entity_c_cargo"]) > 0.0
+    assert max(second["next_nest_food"]) > 0.0
+    assert max(second["next_filter_reservoir"]) > 0.0
+    assert min(second["next_food_store"][:3]) < 0.7
     for entity in ("entity", "entity_b", "entity_c"):
         travel = max(
             abs(second[f"next_{entity}_x"][0] - first[f"next_{entity}_x"][0]),
