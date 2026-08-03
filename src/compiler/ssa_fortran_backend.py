@@ -1432,7 +1432,23 @@ class _FunctionEmitter:
         def dims(value: SSAValue) -> str:
             return ", ".join(dim_extents[int(size)] for size in value.shape)
 
-        extent_names = sorted(dim_extents.values())
+        # A caller must expose every extent its emitted callees require, even
+        # when that size exists only in a callee-local temporary.  Whole-field
+        # reductions are the common case: the region has an extent-one scalar
+        # result, while the control wrapper otherwise sees only the public
+        # field extent.  The call already passes the callee's declared extent
+        # list, so omitting it from this wrapper's own ABI produces an
+        # undeclared ``extent_1`` identifier in otherwise valid Fortran.
+        called_extent_names = {
+            extent
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op in ("Call", "call")
+            for extent in self.callee_extents.get(
+                str(instr.attributes.get("callee") or ""), ()
+            )
+        }
+        extent_names = sorted(set(dim_extents.values()) | called_extent_names)
         self.extent_names = tuple(extent_names)
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)

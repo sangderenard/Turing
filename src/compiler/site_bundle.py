@@ -44,7 +44,7 @@ from typing import Any, Mapping
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
-BUILDER_VERSION = "site-bundle-v16"
+BUILDER_VERSION = "site-bundle-v17"
 DEFAULT_WASM_CARD_OPERATIONS = 2000
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent

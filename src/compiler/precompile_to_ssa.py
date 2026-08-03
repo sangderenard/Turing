@@ -342,6 +342,22 @@ def lower_fused_program_to_ssa(
             )
         )
     instructions.append(Instr(Handler.Ret.value, output_values, None))
+    feed_origins = dict(
+        (getattr(program, "extras", None) or {}).get(
+            "capture_feed_origins", {}
+        )
+    )
+    parameter_names = tuple(
+        (
+            str(
+                feed_origins.get(
+                    value.id, feed_origins.get(str(value.id), {})
+                ).get("binding_name", f"t{value.id}")
+            ),
+            int(value.id),
+        )
+        for value in arguments
+    )
     function = Function(
         function_name,
         arguments,
@@ -351,6 +367,14 @@ def lower_fused_program_to_ssa(
                 instructions,
                 [],
             )
+        },
+        metadata={
+            "named_outputs": tuple(
+                (str(name), int(value_id))
+                for name, value_id in program.outputs.items()
+                if value_id in available
+            ),
+            "parameter_names": parameter_names,
         },
     )
     if evolution is not None and ssa_evolution is not None:

@@ -152,7 +152,34 @@ def _call(dialect: Dialect, function: str, args: list[str]) -> str:
 
 def _step_expression(dialect: Dialect, step: OpStep, names: dict[int, str]) -> str:
     op = step.op_name
+    if op == "tensor_from_list":
+        if "values" not in step.attrs:
+            raise PythonLoweringShortfall("tensor_from_list has no values")
+        values = repr(step.attrs["values"])
+        if dialect is NUMPY:
+            return f"np.asarray({values})"
+        if dialect is TORCH:
+            return f"torch.tensor({values})"
+        if dialect is ABSTRACT_TENSOR:
+            return f"AbstractTensor.tensor({values})"
+        raise PythonLoweringShortfall(
+            f"tensor_from_list has no {dialect.name} spelling registered"
+        )
     a = names[step.input_ids[0]]
+    if op == "sum":
+        axis = step.attrs.get("axis")
+        keepdim = bool(step.attrs.get("keepdim", False))
+        if dialect is NUMPY:
+            return f"np.sum({a}, axis={axis!r}, keepdims={keepdim!r})"
+        if dialect is TORCH:
+            if axis is None:
+                return f"torch.sum({a})"
+            return f"torch.sum({a}, dim={axis!r}, keepdim={keepdim!r})"
+        if dialect is ABSTRACT_TENSOR:
+            return f"{a}.sum(dim={axis!r}, keepdim={keepdim!r})"
+        raise PythonLoweringShortfall(
+            f"sum has no {dialect.name} spelling registered"
+        )
     if op in ELEMENTWISE_UNARY:
         args = [a]
     elif op in ELEMENTWISE_BINARY:

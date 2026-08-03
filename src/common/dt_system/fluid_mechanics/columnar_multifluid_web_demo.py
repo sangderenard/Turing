@@ -16,7 +16,7 @@ def columnar_multifluid_present(red, green, blue):
     return display_red, display_green, display_blue
 
 
-_PAGE = "TURING_PAGE = " + repr({
+_PAGE_CONFIG = {
     "entrypoint": "columnar_multifluid_rgb_step",
     "presentation_entrypoint": "columnar_multifluid_present",
     "title": "Managed Columnar Multifluid World",
@@ -99,7 +99,10 @@ _PAGE = "TURING_PAGE = " + repr({
         "pan_output": "next_entity_x",
         "pan_range": [0.0, 10.0],
     },
-})
+}
+
+
+_PAGE = "TURING_PAGE = " + repr(_PAGE_CONFIG)
 
 
 SOURCE = "\n\n".join((
@@ -109,4 +112,22 @@ SOURCE = "\n\n".join((
 ))
 
 
-__all__ = ["SOURCE", "columnar_multifluid_present"]
+# Native/offline build of the identical authored tick.  Omitting the
+# presentation entrypoint is intentional: this contract publishes the Python,
+# SSA and generated Fortran plus its native fidelity proof, but no WebGL
+# shader surface.  It is the backend-independent reference artifact while the
+# browser presentation path is being qualified.
+_FORTRAN_PAGE_CONFIG = {
+    **_PAGE_CONFIG,
+    "title": "Managed Columnar Multifluid World — Native Fortran",
+    "slug": "managed-columnar-multifluid-world-fortran",
+}
+_FORTRAN_PAGE_CONFIG.pop("presentation_entrypoint", None)
+_FORTRAN_PAGE = "TURING_PAGE = " + repr(_FORTRAN_PAGE_CONFIG)
+FORTRAN_SOURCE = "\n\n".join((
+    _FORTRAN_PAGE,
+    inspect.getsource(columnar_multifluid_rgb_step),
+))
+
+
+__all__ = ["FORTRAN_SOURCE", "SOURCE", "columnar_multifluid_present"]

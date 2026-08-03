@@ -2734,10 +2734,18 @@ if (!gl) {
       gl.activeTexture(gl.TEXTURE0 + index);
       gl.bindTexture(gl.TEXTURE_2D, texture);
       const outputName = outputFeedBindings[name] || null;
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, outputName ? gl.LINEAR : gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, outputName ? gl.LINEAR : gl.NEAREST);
+      // R32F sampling is core in WebGL 2, but LINEAR filtering of float
+      // textures requires OES_texture_float_linear.  Generated presentation
+      // feeds must work without that optional extension, so retain the core
+      // NEAREST contract.  The full-screen surface still stretches them.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0,
+        gl.RED, gl.FLOAT, new Float32Array([0])
+      );
       gl.uniform1i(gl.getUniformLocation(program, name), index);
       return {texture, index, width: 0, height: 0, outputName, revision: -1};
     });

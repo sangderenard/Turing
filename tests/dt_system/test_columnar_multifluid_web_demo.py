@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import functools
+import http.server
+from pathlib import Path
 import shutil
+import socketserver
 import subprocess
+import threading
 
 import numpy as np
 import pytest
 
 from src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo import (
+    FORTRAN_SOURCE,
     SOURCE,
 )
 from src.common.tensors.accelerator_backends.aot_compile import (
@@ -16,6 +22,19 @@ from src.common.tensors.accelerator_backends.aot_compile import (
 )
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
 from src.compiler.site_bundle import build_program_bundle, discover_source_contract
+from src.compiler.ssa_fortran_backend import fortran_compiler
+
+
+def _chrome_executable():
+    candidates = (
+        shutil.which("chrome"),
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("msedge"),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    )
+    return next((item for item in candidates if item and Path(item).is_file()), None)
 
 
 def _feeds(count=8):
@@ -65,6 +84,14 @@ def test_python_page_contract_declares_compiled_state_feedback():
     }
     assert contract.autostart
     assert contract.render_fps == 30.0
+
+
+def test_native_fortran_contract_is_an_inspection_bundle_without_a_shader():
+    contract = discover_source_contract(FORTRAN_SOURCE)
+
+    assert contract.slug == "managed-columnar-multifluid-world-fortran"
+    assert contract.presentation_entrypoint is None
+    assert contract.entrypoint == "columnar_multifluid_rgb_step"
 
 
 def test_python_rgb_tick_recompiles_with_reductions_to_wasm():
@@ -158,6 +185,86 @@ def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
     assert "uploadOutputTexture()" in html
     assert "managedDelta / wallDelta" in html
     assert "createStereoPanner" in html
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None, reason="no Fortran compiler installed"
+)
+def test_native_fortran_bundle_has_all_tick_outputs_and_no_shader(tmp_path):
+    bundle = build_program_bundle(
+        FORTRAN_SOURCE,
+        tmp_path,
+        source_filename="columnar_multifluid_fortran_demo.py",
+        include_backends=True,
+        include_mathematics=False,
+    )
+    manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    proof = json.loads(
+        (bundle.directory / "verification/fortran-fidelity.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["page"]["mode"] == "inspection"
+    assert manifest["page"]["shader"] is None
+    assert proof["passed"] is True
+    assert [item["name"] for item in proof["cases"][0]["outputs"]] == [
+        "red",
+        "green",
+        "blue",
+        "next_displacement",
+        "next_velocity",
+        "next_entity_x",
+        "next_entity_y",
+        "next_entity_velocity_x",
+        "next_entity_velocity_y",
+        "next_time",
+        "next_ink_red",
+        "next_ink_yellow",
+        "next_ink_green",
+        "next_ink_cyan",
+        "next_ink_blue",
+        "next_ink_magenta",
+    ]
+
+
+@pytest.mark.skipif(
+    shutil.which("node") is None or _chrome_executable() is None,
+    reason="Node.js and a Chromium browser are required",
+)
+def test_compiler_generated_webgl_presents_non_black_wasm_output(tmp_path):
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="columnar_multifluid_web_demo.py",
+        include_backends=False,
+        include_mathematics=False,
+    )
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler,
+        directory=str(tmp_path),
+    )
+    with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        relative = bundle.page_path.relative_to(tmp_path).as_posix()
+        url = f"http://127.0.0.1:{server.server_address[1]}/{relative}"
+        probe = Path(__file__).parents[1] / "browser_webgl_probe.mjs"
+        completed = subprocess.run(
+            ["node", str(probe), str(_chrome_executable()), url],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        server.shutdown()
+
+    result = json.loads(completed.stdout)
+    assert result["error"] is None
+    assert result["revision"] >= 1
+    assert result["glError"] == 0
+    assert result["center"][3] == 255
+    assert sum(result["center"][:3]) > 0
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")

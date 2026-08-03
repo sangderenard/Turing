@@ -162,10 +162,25 @@ def normalized_program(program: Any) -> Any:
     from .fused_program_wasm_backend import required_steps
 
     live = required_steps(folded)
+    live_value_ids = set(folded.feeds) | {
+        int(step.result_id) for step in live
+    }
     return FusedProgram(
         version=folded.version, feeds=set(folded.feeds), steps=live,
         outputs=dict(folded.outputs), state_in=folded.state_in,
-        meta=folded.meta, extras=folded.extras,
+        # Dead-step pruning must prune its type records too.  Keeping metadata
+        # for removed values makes an otherwise valid public projection fail
+        # the shared precompile validator as an orphaned-value artifact.
+        meta=(
+            None
+            if folded.meta is None
+            else {
+                value_id: entry
+                for value_id, entry in folded.meta.items()
+                if int(value_id) in live_value_ids
+            }
+        ),
+        extras=folded.extras,
     )
 
 
@@ -249,8 +264,13 @@ def collect_backend_sources(
     try:
         from .precompile_to_ssa import lower_precompile_and_control_to_ssa
 
+        # ``program`` may be the public projection selected by the bundle
+        # (rather than every value observed during capture).  Lower that
+        # exact compiled tick projection so SSA-backed targets publish the same ABI
+        # as Wasm and the Python reference.  The control and region programs
+        # remain those planned by the original AOT compilation below.
         lowering = lower_precompile_and_control_to_ssa(
-            aot.compiled_shell_program,
+            program,
             aot.shell_control_program,
             region_programs=aot.region_programs,
             numerical_name=numerical_name,
