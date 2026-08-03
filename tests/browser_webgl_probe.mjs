@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import {spawn} from "node:child_process";
 
-const [chrome, pageURL] = process.argv.slice(2);
+const [chrome, pageURL, screenshotPath, minimumRevisionText] = process.argv.slice(2);
+const minimumRevision = Math.max(1, Number(minimumRevisionText || 1));
 if (!chrome || !pageURL) {
   throw new Error("usage: node browser_webgl_probe.mjs <chrome> <page-url>");
 }
@@ -86,7 +87,7 @@ try {
     const liaison = window.TuringShaderLiaison;
     if (!liaison) throw new Error("shader liaison was not installed");
     await liaison.ready;
-    while ((!liaison.wasm || liaison.wasm.outputFrame().revision < 1) &&
+    while ((!liaison.wasm || liaison.wasm.outputFrame().revision < ${minimumRevision}) &&
            performance.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 20));
     }
@@ -114,6 +115,13 @@ try {
   });
   if (evaluated.exceptionDetails) {
     throw new Error(evaluated.exceptionDetails.text || "page evaluation failed");
+  }
+  if (screenshotPath) {
+    const screenshot = await request("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+    });
+    await fs.writeFile(screenshotPath, Buffer.from(screenshot.data, "base64"));
   }
   process.stdout.write(JSON.stringify(evaluated.result.value));
 } finally {

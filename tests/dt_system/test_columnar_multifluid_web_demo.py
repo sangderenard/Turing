@@ -44,10 +44,18 @@ def _feeds(count=8):
         "rest_surface": np.full(count, 1.5),
         "displacement": np.zeros(count),
         "displacement_velocity": np.zeros(count),
-        "entity_x": np.full(count, 5.0),
-        "entity_y": np.full(count, 3.5),
-        "entity_velocity_x": np.full(count, 0.45),
-        "entity_velocity_y": np.full(count, 0.12),
+        "entity_x": np.full(count, 2.6),
+        "entity_y": np.full(count, 2.0),
+        "entity_velocity_x": np.full(count, 0.42),
+        "entity_velocity_y": np.full(count, 0.16),
+        "entity_b_x": np.full(count, 5.1),
+        "entity_b_y": np.full(count, 4.8),
+        "entity_b_velocity_x": np.full(count, -0.34),
+        "entity_b_velocity_y": np.full(count, 0.27),
+        "entity_c_x": np.full(count, 7.5),
+        "entity_c_y": np.full(count, 2.8),
+        "entity_c_velocity_x": np.full(count, 0.18),
+        "entity_c_velocity_y": np.full(count, -0.38),
         "managed_time": np.zeros(count),
         "dt": np.full(count, 0.025),
         "audio_low": np.zeros(count),
@@ -74,6 +82,14 @@ def test_python_page_contract_declares_compiled_state_feedback():
         "entity_y": "next_entity_y",
         "entity_velocity_x": "next_entity_velocity_x",
         "entity_velocity_y": "next_entity_velocity_y",
+        "entity_b_x": "next_entity_b_x",
+        "entity_b_y": "next_entity_b_y",
+        "entity_b_velocity_x": "next_entity_b_velocity_x",
+        "entity_b_velocity_y": "next_entity_b_velocity_y",
+        "entity_c_x": "next_entity_c_x",
+        "entity_c_y": "next_entity_c_y",
+        "entity_c_velocity_x": "next_entity_c_velocity_x",
+        "entity_c_velocity_y": "next_entity_c_velocity_y",
         "managed_time": "next_time",
         "ink_red": "next_ink_red",
         "ink_yellow": "next_ink_yellow",
@@ -124,6 +140,14 @@ def test_python_rgb_tick_recompiles_with_reductions_to_wasm():
         "next_entity_y",
         "next_entity_velocity_x",
         "next_entity_velocity_y",
+        "next_entity_b_x",
+        "next_entity_b_y",
+        "next_entity_b_velocity_x",
+        "next_entity_b_velocity_y",
+        "next_entity_c_x",
+        "next_entity_c_y",
+        "next_entity_c_velocity_x",
+        "next_entity_c_velocity_y",
         "next_time",
         "next_ink_red",
         "next_ink_yellow",
@@ -218,6 +242,14 @@ def test_native_fortran_bundle_has_all_tick_outputs_and_no_shader(tmp_path):
         "next_entity_y",
         "next_entity_velocity_x",
         "next_entity_velocity_y",
+        "next_entity_b_x",
+        "next_entity_b_y",
+        "next_entity_b_velocity_x",
+        "next_entity_b_velocity_y",
+        "next_entity_c_x",
+        "next_entity_c_y",
+        "next_entity_c_velocity_x",
+        "next_entity_c_velocity_y",
         "next_time",
         "next_ink_red",
         "next_ink_yellow",
@@ -305,9 +337,15 @@ const state = {
   column_x: [3.5, 4.5, 5.5, 6.5], column_y: [3.5, 3.5, 3.5, 3.5],
   rest_surface: [1.5, 1.5, 1.5, 1.5], displacement: [0, 0, 0, 0],
   displacement_velocity: [0, 0, 0, 0], managed_time: [0, 0, 0, 0],
-  entity_x: [5, 5, 5, 5], entity_y: [3.5, 3.5, 3.5, 3.5],
-  entity_velocity_x: [0.45, 0.45, 0.45, 0.45],
-  entity_velocity_y: [0.12, 0.12, 0.12, 0.12],
+  entity_x: [2.6, 2.6, 2.6, 2.6], entity_y: [2, 2, 2, 2],
+  entity_velocity_x: [0.42, 0.42, 0.42, 0.42],
+  entity_velocity_y: [0.16, 0.16, 0.16, 0.16],
+  entity_b_x: [5.1, 5.1, 5.1, 5.1], entity_b_y: [4.8, 4.8, 4.8, 4.8],
+  entity_b_velocity_x: [-0.34, -0.34, -0.34, -0.34],
+  entity_b_velocity_y: [0.27, 0.27, 0.27, 0.27],
+  entity_c_x: [7.5, 7.5, 7.5, 7.5], entity_c_y: [2.8, 2.8, 2.8, 2.8],
+  entity_c_velocity_x: [0.18, 0.18, 0.18, 0.18],
+  entity_c_velocity_y: [-0.38, -0.38, -0.38, -0.38],
   dt: [0.025, 0.025, 0.025, 0.025],
   audio_low: [0, 0, 0, 0], audio_mid: [0, 0, 0, 0],
   audio_high: [0, 0, 0, 0], audio_level: [0, 0, 0, 0],
@@ -321,13 +359,19 @@ const feedback = {
   entity_x: "next_entity_x", entity_y: "next_entity_y",
   entity_velocity_x: "next_entity_velocity_x",
   entity_velocity_y: "next_entity_velocity_y",
+  entity_b_x: "next_entity_b_x", entity_b_y: "next_entity_b_y",
+  entity_b_velocity_x: "next_entity_b_velocity_x",
+  entity_b_velocity_y: "next_entity_b_velocity_y",
+  entity_c_x: "next_entity_c_x", entity_c_y: "next_entity_c_y",
+  entity_c_velocity_x: "next_entity_c_velocity_x",
+  entity_c_velocity_y: "next_entity_c_velocity_y",
   managed_time: "next_time",
   ink_red: "next_ink_red", ink_yellow: "next_ink_yellow",
   ink_green: "next_ink_green", ink_cyan: "next_ink_cyan",
   ink_blue: "next_ink_blue", ink_magenta: "next_ink_magenta",
 };
 const reports = [];
-for (let tick = 0; tick < 2; tick += 1) {
+for (let tick = 0; tick < 48; tick += 1) {
   inputNames.forEach((name, index) =>
     new Float64Array(memory.buffer, offsets[index], count).set(state[name]));
   instance.exports.run(count, ...offsets);
@@ -350,10 +394,11 @@ console.log(JSON.stringify(reports));
         capture_output=True,
         text=True,
     )
-    first, second = json.loads(completed.stdout)
+    reports = json.loads(completed.stdout)
+    first, second = reports[0], reports[-1]
 
     assert first["next_time"] == pytest.approx([0.025] * 4)
-    assert second["next_time"] == pytest.approx([0.05] * 4)
+    assert second["next_time"] == pytest.approx([1.2] * 4)
     assert min(first["next_displacement"]) < 0.0
     assert second["next_displacement"] != pytest.approx(
         first["next_displacement"]
@@ -362,3 +407,9 @@ console.log(JSON.stringify(reports));
         assert min(second[channel]) >= 0.0
         assert max(second[channel]) <= 255.0
     assert max(second["next_ink_red"]) > 0.0
+    for entity in ("entity", "entity_b", "entity_c"):
+        travel = max(
+            abs(second[f"next_{entity}_x"][0] - first[f"next_{entity}_x"][0]),
+            abs(second[f"next_{entity}_y"][0] - first[f"next_{entity}_y"][0]),
+        )
+        assert travel > 0.08

@@ -73,6 +73,14 @@ def columnar_multifluid_rgb_step(
     entity_y,
     entity_velocity_x,
     entity_velocity_y,
+    entity_b_x,
+    entity_b_y,
+    entity_b_velocity_x,
+    entity_b_velocity_y,
+    entity_c_x,
+    entity_c_y,
+    entity_c_velocity_x,
+    entity_c_velocity_y,
     managed_time,
     dt,
     audio_low,
@@ -103,31 +111,55 @@ def columnar_multifluid_rgb_step(
     region_x = region_phase.cos()
     region_y = region_phase.sin()
     angular_similarity = region_x * preferred_x + region_y * preferred_y
+    # Three ants deposit paired bands and follow the preceding ant's bands.
+    # This cyclic colony rule is intentionally local and incomplete: trails,
+    # repulsion and exploration decide the emergent path instead of a scripted
+    # destination or the much slower display hue cycle.
+    trail_a = ink_red + ink_yellow
+    trail_b = ink_green + ink_cyan
+    trail_c = ink_blue + ink_magenta
+
     sight_x = column_x - entity_x
     sight_y = column_y - entity_y
     sight_distance_squared = sight_x * sight_x + sight_y * sight_y
-    sight_distance = (sight_distance_squared + 0.12).sqrt()
+    sight_distance = (sight_distance_squared + 0.08).sqrt()
     visibility = (
-        (-sight_distance_squared / (2.0 * 2.35 * 2.35)).exp()
-        / (sight_distance_squared + 0.18)
+        (-sight_distance_squared / (2.0 * 1.55 * 1.55)).exp()
+        / (sight_distance_squared + 0.14)
     )
-    signed_visibility = visibility * angular_similarity
+    signed_visibility = visibility * (
+        1.35 * trail_c - 0.30 * trail_a + 0.18 * angular_similarity
+    )
     visibility_total = visibility.sum() + 1.0e-6
-    steering_x = (
-        (sight_x / sight_distance) * signed_visibility
-    ).sum() / visibility_total
-    steering_y = (
-        (sight_y / sight_distance) * signed_visibility
-    ).sum() / visibility_total
-    steering_x = column_x * 0.0 + steering_x
-    steering_y = column_y * 0.0 + steering_y
+    steering_x = ((sight_x / sight_distance) * signed_visibility).sum()
+    steering_x = column_x * 0.0 + steering_x / visibility_total
+    steering_y = ((sight_y / sight_distance) * signed_visibility).sum()
+    steering_y = column_y * 0.0 + steering_y / visibility_total
+    separation_ab_x = entity_x - entity_b_x
+    separation_ab_y = entity_y - entity_b_y
+    separation_ac_x = entity_x - entity_c_x
+    separation_ac_y = entity_y - entity_c_y
+    separation_ab = (
+        separation_ab_x * separation_ab_x
+        + separation_ab_y * separation_ab_y + 0.18
+    )
+    separation_ac = (
+        separation_ac_x * separation_ac_x
+        + separation_ac_y * separation_ac_y + 0.18
+    )
     acceleration_x = (
-        1.85 * steering_x + 0.10 * (5.0 - entity_x)
-        - 0.72 * entity_velocity_x
+        2.35 * steering_x
+        + 0.58 * (next_time * 1.71 + 0.20).cos()
+        + 0.30 * separation_ab_x / separation_ab
+        + 0.30 * separation_ac_x / separation_ac
+        + 0.08 * (5.0 - entity_x) - 0.54 * entity_velocity_x
     )
     acceleration_y = (
-        1.85 * steering_y + 0.10 * (3.5 - entity_y)
-        - 0.72 * entity_velocity_y
+        2.35 * steering_y
+        + 0.58 * (next_time * 1.37 + 1.10).sin()
+        + 0.30 * separation_ab_y / separation_ab
+        + 0.30 * separation_ac_y / separation_ac
+        + 0.08 * (3.5 - entity_y) - 0.54 * entity_velocity_y
     )
     next_entity_velocity_x = entity_velocity_x + acceleration_x * dt
     next_entity_velocity_y = entity_velocity_y + acceleration_y * dt
@@ -137,25 +169,137 @@ def columnar_multifluid_rgb_step(
     next_entity_y = (
         entity_y + next_entity_velocity_y * dt
     ).maximum(0.65).minimum(6.35)
-    player_x = next_entity_x
-    player_y = next_entity_y
+
+    sight_b_x = column_x - entity_b_x
+    sight_b_y = column_y - entity_b_y
+    sight_b_distance_squared = sight_b_x * sight_b_x + sight_b_y * sight_b_y
+    sight_b_distance = (sight_b_distance_squared + 0.08).sqrt()
+    visibility_b = (
+        (-sight_b_distance_squared / (2.0 * 1.55 * 1.55)).exp()
+        / (sight_b_distance_squared + 0.14)
+    )
+    signed_visibility_b = visibility_b * (
+        1.35 * trail_a - 0.30 * trail_b
+        + 0.18 * (region_y * preferred_x - region_x * preferred_y)
+    )
+    visibility_b_total = visibility_b.sum() + 1.0e-6
+    steering_b_x = ((sight_b_x / sight_b_distance) * signed_visibility_b).sum()
+    steering_b_x = column_x * 0.0 + steering_b_x / visibility_b_total
+    steering_b_y = ((sight_b_y / sight_b_distance) * signed_visibility_b).sum()
+    steering_b_y = column_y * 0.0 + steering_b_y / visibility_b_total
+    separation_bc_x = entity_b_x - entity_c_x
+    separation_bc_y = entity_b_y - entity_c_y
+    separation_bc = (
+        separation_bc_x * separation_bc_x
+        + separation_bc_y * separation_bc_y + 0.18
+    )
+    acceleration_b_x = (
+        2.35 * steering_b_x
+        + 0.58 * (next_time * 1.63 + 2.30).cos()
+        - 0.30 * separation_ab_x / separation_ab
+        + 0.30 * separation_bc_x / separation_bc
+        + 0.08 * (5.0 - entity_b_x) - 0.54 * entity_b_velocity_x
+    )
+    acceleration_b_y = (
+        2.35 * steering_b_y
+        + 0.58 * (next_time * 1.43 + 2.80).sin()
+        - 0.30 * separation_ab_y / separation_ab
+        + 0.30 * separation_bc_y / separation_bc
+        + 0.08 * (3.5 - entity_b_y) - 0.54 * entity_b_velocity_y
+    )
+    next_entity_b_velocity_x = entity_b_velocity_x + acceleration_b_x * dt
+    next_entity_b_velocity_y = entity_b_velocity_y + acceleration_b_y * dt
+    next_entity_b_x = (
+        entity_b_x + next_entity_b_velocity_x * dt
+    ).maximum(0.65).minimum(9.35)
+    next_entity_b_y = (
+        entity_b_y + next_entity_b_velocity_y * dt
+    ).maximum(0.65).minimum(6.35)
+
+    sight_c_x = column_x - entity_c_x
+    sight_c_y = column_y - entity_c_y
+    sight_c_distance_squared = sight_c_x * sight_c_x + sight_c_y * sight_c_y
+    sight_c_distance = (sight_c_distance_squared + 0.08).sqrt()
+    visibility_c = (
+        (-sight_c_distance_squared / (2.0 * 1.55 * 1.55)).exp()
+        / (sight_c_distance_squared + 0.14)
+    )
+    signed_visibility_c = visibility_c * (
+        1.35 * trail_b - 0.30 * trail_c
+        - 0.18 * angular_similarity
+    )
+    visibility_c_total = visibility_c.sum() + 1.0e-6
+    steering_c_x = ((sight_c_x / sight_c_distance) * signed_visibility_c).sum()
+    steering_c_x = column_x * 0.0 + steering_c_x / visibility_c_total
+    steering_c_y = ((sight_c_y / sight_c_distance) * signed_visibility_c).sum()
+    steering_c_y = column_y * 0.0 + steering_c_y / visibility_c_total
+    acceleration_c_x = (
+        2.35 * steering_c_x
+        + 0.58 * (next_time * 1.79 + 4.20).cos()
+        - 0.30 * separation_ac_x / separation_ac
+        - 0.30 * separation_bc_x / separation_bc
+        + 0.08 * (5.0 - entity_c_x) - 0.54 * entity_c_velocity_x
+    )
+    acceleration_c_y = (
+        2.35 * steering_c_y
+        + 0.58 * (next_time * 1.31 + 5.00).sin()
+        - 0.30 * separation_ac_y / separation_ac
+        - 0.30 * separation_bc_y / separation_bc
+        + 0.08 * (3.5 - entity_c_y) - 0.54 * entity_c_velocity_y
+    )
+    next_entity_c_velocity_x = entity_c_velocity_x + acceleration_c_x * dt
+    next_entity_c_velocity_y = entity_c_velocity_y + acceleration_c_y * dt
+    next_entity_c_x = (
+        entity_c_x + next_entity_c_velocity_x * dt
+    ).maximum(0.65).minimum(9.35)
+    next_entity_c_y = (
+        entity_c_y + next_entity_c_velocity_y * dt
+    ).maximum(0.65).minimum(6.35)
+
     spectral_size = (
         0.42 * audio_low + 0.34 * audio_mid
         + 0.18 * audio_high + 0.35 * audio_level
     ).maximum(0.0).minimum(1.0)
-    entity_half_extent = 0.32 + 0.30 * spectral_size
-    distance_squared = (
-        (column_x - player_x) * (column_x - player_x)
-        + (column_y - player_y) * (column_y - player_y)
+    entity_half_extent = 0.18 + 0.12 * spectral_size
+    distance_a_squared = (
+        (column_x - next_entity_x) * (column_x - next_entity_x)
+        + (column_y - next_entity_y) * (column_y - next_entity_y)
     )
-    entity_interior = (
-        (entity_half_extent - (column_x - player_x).abs()).maximum(0.0)
+    distance_b_squared = (
+        (column_x - next_entity_b_x) * (column_x - next_entity_b_x)
+        + (column_y - next_entity_b_y) * (column_y - next_entity_b_y)
+    )
+    distance_c_squared = (
+        (column_x - next_entity_c_x) * (column_x - next_entity_c_x)
+        + (column_y - next_entity_c_y) * (column_y - next_entity_c_y)
+    )
+    entity_a_interior = (
+        (entity_half_extent - (column_x - next_entity_x).abs()).maximum(0.0)
         .minimum(
-            (entity_half_extent - (column_y - player_y).abs()).maximum(0.0)
+            (entity_half_extent - (column_y - next_entity_y).abs()).maximum(0.0)
         )
         / entity_half_extent
     )
-    load = (-distance_squared / (2.0 * 1.35 * 1.35)).exp()
+    entity_b_interior = (
+        (entity_half_extent - (column_x - next_entity_b_x).abs()).maximum(0.0)
+        .minimum(
+            (entity_half_extent - (column_y - next_entity_b_y).abs()).maximum(0.0)
+        )
+        / entity_half_extent
+    )
+    entity_c_interior = (
+        (entity_half_extent - (column_x - next_entity_c_x).abs()).maximum(0.0)
+        .minimum(
+            (entity_half_extent - (column_y - next_entity_c_y).abs()).maximum(0.0)
+        )
+        / entity_half_extent
+    )
+    entity_interior = entity_a_interior.maximum(entity_b_interior)
+    entity_interior = entity_interior.maximum(entity_c_interior)
+    load_a = (-distance_a_squared / (2.0 * 0.78 * 0.78)).exp()
+    load_b = (-distance_b_squared / (2.0 * 0.78 * 0.78)).exp()
+    load_c = (-distance_c_squared / (2.0 * 0.78 * 0.78)).exp()
+    load = (load_a + load_b + load_c).minimum(1.0)
     target = -0.42 * load - 0.22 * entity_interior * entity_interior
     acceleration = (
         20.0 * (target - displacement) - 8.0 * displacement_velocity
@@ -178,38 +322,37 @@ def columnar_multifluid_rgb_step(
         232.0 + 16.0 * height + 15.0 * compression + 20.0 * load
     ).maximum(0.0).minimum(255.0)
 
-    hue = next_time * 0.42
-    source_red = (-distance_squared / (2.0 * 0.44 * 0.44)).exp()
-    source_yellow = (-distance_squared / (2.0 * 0.48 * 0.48)).exp()
-    source_green = (-distance_squared / (2.0 * 0.52 * 0.52)).exp()
-    source_cyan = (-distance_squared / (2.0 * 0.56 * 0.56)).exp()
-    source_blue = (-distance_squared / (2.0 * 0.60 * 0.60)).exp()
-    source_magenta = (-distance_squared / (2.0 * 0.64 * 0.64)).exp()
-    weight_red = hue.cos().maximum(0.0)
-    weight_yellow = (hue - 1.0471975511965976).cos().maximum(0.0)
-    weight_green = (hue - 2.0943951023931953).cos().maximum(0.0)
-    weight_cyan = (hue - 3.141592653589793).cos().maximum(0.0)
-    weight_blue = (hue - 4.1887902047863905).cos().maximum(0.0)
-    weight_magenta = (hue - 5.235987755982989).cos().maximum(0.0)
+    # Paired fields are the ants' pheromone vocabulary.  The narrow band is
+    # the fresh trail and the wider companion is its smoothly overlapping
+    # halo; unequal evaporation leaves useful gradients behind moving ants.
+    source_red = (-distance_a_squared / (2.0 * 0.24 * 0.24)).exp()
+    source_yellow = (-distance_a_squared / (2.0 * 0.38 * 0.38)).exp()
+    source_green = (-distance_b_squared / (2.0 * 0.24 * 0.24)).exp()
+    source_cyan = (-distance_b_squared / (2.0 * 0.38 * 0.38)).exp()
+    source_blue = (-distance_c_squared / (2.0 * 0.24 * 0.24)).exp()
+    source_magenta = (-distance_c_squared / (2.0 * 0.38 * 0.38)).exp()
+    pulse_a = 0.78 + 0.22 * (next_time * 2.11).sin()
+    pulse_b = 0.78 + 0.22 * (next_time * 1.91 + 2.1).sin()
+    pulse_c = 0.78 + 0.22 * (next_time * 2.27 + 4.2).sin()
     next_ink_red = (
-        ink_red * (-0.050 * dt).exp() + 2.8 * dt * source_red * weight_red
+        ink_red * (-0.095 * dt).exp() + 3.2 * dt * source_red * pulse_a
     ).minimum(1.0)
     next_ink_yellow = (
-        ink_yellow * (-0.054 * dt).exp()
-        + 2.8 * dt * source_yellow * weight_yellow
+        ink_yellow * (-0.072 * dt).exp()
+        + 2.2 * dt * source_yellow * pulse_a
     ).minimum(1.0)
     next_ink_green = (
-        ink_green * (-0.058 * dt).exp() + 2.8 * dt * source_green * weight_green
+        ink_green * (-0.095 * dt).exp() + 3.2 * dt * source_green * pulse_b
     ).minimum(1.0)
     next_ink_cyan = (
-        ink_cyan * (-0.062 * dt).exp() + 2.8 * dt * source_cyan * weight_cyan
+        ink_cyan * (-0.072 * dt).exp() + 2.2 * dt * source_cyan * pulse_b
     ).minimum(1.0)
     next_ink_blue = (
-        ink_blue * (-0.066 * dt).exp() + 2.8 * dt * source_blue * weight_blue
+        ink_blue * (-0.095 * dt).exp() + 3.2 * dt * source_blue * pulse_c
     ).minimum(1.0)
     next_ink_magenta = (
-        ink_magenta * (-0.070 * dt).exp()
-        + 2.8 * dt * source_magenta * weight_magenta
+        ink_magenta * (-0.072 * dt).exp()
+        + 2.2 * dt * source_magenta * pulse_c
     ).minimum(1.0)
     ink_total = (
         next_ink_red + next_ink_yellow + next_ink_green
@@ -242,6 +385,14 @@ def columnar_multifluid_rgb_step(
         next_entity_y,
         next_entity_velocity_x,
         next_entity_velocity_y,
+        next_entity_b_x,
+        next_entity_b_y,
+        next_entity_b_velocity_x,
+        next_entity_b_velocity_y,
+        next_entity_c_x,
+        next_entity_c_y,
+        next_entity_c_velocity_x,
+        next_entity_c_velocity_y,
         next_time,
         next_ink_red,
         next_ink_yellow,
