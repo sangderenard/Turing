@@ -80,7 +80,7 @@ def _feeds(count=8):
 def test_python_page_contract_declares_compiled_state_feedback():
     contract = discover_source_contract(SOURCE)
 
-    assert (contract.width, contract.height) == (768, 536)
+    assert (contract.width, contract.height) == (256, 176)
     assert contract.entrypoint == "columnar_multifluid_rgb_step"
     assert contract.state_feedback == {
         "displacement": "next_displacement",
