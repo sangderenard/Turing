@@ -184,6 +184,53 @@ def test_bind_c_arrays_are_explicit_shape_over_a_passed_extent():
     assert "allocatable" not in source
 
 
+def test_api_describes_transitive_callee_extents_from_final_signature():
+    field = SSAValue(0, "float64", (4,))
+    scalar_temporary = SSAValue(1, "float64", (1,))
+    result = SSAValue(2, "float64", (4,))
+    callee = Function("region", [field], {
+        "entry": BasicBlock("entry", [
+            Instr("sum", [field], scalar_temporary),
+            Instr("add", [field], result, attributes={"right_scalar": 1.0}),
+            Instr("Ret", [], SSAValue(90)),
+        ]),
+    })
+
+    aggregate = SSAValue(10, "aggregate")
+    address = SSAValue(11, "pointer")
+    public_result = SSAValue(12, "float64", (4,))
+    caller = Function("whole_program", [field], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [field], aggregate,
+                attributes={
+                    "callee": "region",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [aggregate], address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [address], public_result),
+            Instr("Ret", [], SSAValue(91)),
+        ]),
+    })
+
+    module = emit_module(
+        IRModule({"region": callee, "whole_program": caller}),
+        outputs={"region": [result], "whole_program": [public_result]},
+    )
+    control_api = module.api.entry_point("whole_program")
+
+    assert [
+        parameter.name
+        for parameter in control_api.parameters
+        if parameter.role == "extent"
+    ] == ["extent_1", "extent_4"]
+    assert "subroutine whole_program(extent_1, extent_4" in module.source
+
+
 def test_unreferenced_block_labels_are_not_emitted():
     """A label nothing branches to is a warning and pure noise."""
 

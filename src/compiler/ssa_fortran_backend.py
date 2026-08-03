@@ -1628,6 +1628,10 @@ def emit_module(
         )
         for function_name, function in functions.items()
     )
+    emitted_extents = {
+        function_name: subroutine.extent_names
+        for function_name, subroutine in zip(functions, subroutines)
+    }
     lines = [
         f"module {name}",
         "  use, intrinsic :: iso_c_binding",
@@ -1680,7 +1684,11 @@ def emit_module(
             describe_fortran_function(
                 function_name,
                 function,
-                extent_names=callee_extents.get(function_name, ()),
+                # Use the final second-pass signature. A caller can acquire
+                # transitive extent arguments from a callee even when its
+                # own values do not have that shape; the discarded first
+                # pass deliberately cannot see those call requirements.
+                extent_names=emitted_extents.get(function_name, ()),
                 outputs=named_outputs.get(function_name, ()),
                 kind=kind,
                 note=note,
