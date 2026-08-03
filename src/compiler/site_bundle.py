@@ -40,7 +40,9 @@ import re
 import shutil
 import tempfile
 import textwrap
-from typing import Any, Mapping
+import threading
+import time
+from typing import Any, Callable, Mapping
 
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
@@ -51,6 +53,11 @@ PROGRAM_BAKE_MODES = frozenset({"one_shot", "whole_program"})
 PROGRAM_SCHEDULE_PREFERENCES = frozenset({"asap", "alap"})
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
+
+# The default whole-screen passthrough every published page compiles,
+# unconditionally, whether or not it is ever used -- see the compile step
+# in ``build_program_bundle`` for why.
+_PASSTHROUGH_SOURCE = "def turing_passthrough(red, green, blue):\n    return red, green, blue\n"
 
 _SOURCE_EXTENSIONS = {
     "python_source": "py",
@@ -665,20 +672,68 @@ def slugify(value: str) -> str:
     return slug[:80].rstrip("-")
 
 
-def _literal_page_config(module: ast.Module) -> dict[str, Any]:
+def _with_heartbeat(
+    progress: "Callable[[str], None] | None",
+    label: str,
+    call: "Callable[[], Any]",
+    *,
+    interval: float = 1.0,
+) -> Any:
+    """Run one call that cannot itself be subdivided (a single C-level
+    ``ast.parse``/``ast.literal_eval`` invocation) while a background
+    thread keeps emitting proof of life on its own timer. There is no real
+    sub-step to report from inside a call like that -- this does not
+    invent one -- it only makes silence during it distinguishable from a
+    hang by continuing to report elapsed time until the call returns.
+    """
+
+    if progress is None:
+        return call()
+    started = time.monotonic()
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(interval):
+            progress(f"{label}: still running ({time.monotonic() - started:.1f}s elapsed)")
+
+    heartbeat = threading.Thread(target=_beat, daemon=True)
+    heartbeat.start()
+    try:
+        return call()
+    finally:
+        stop.set()
+        heartbeat.join()
+        progress(f"{label}: finished ({time.monotonic() - started:.1f}s total)")
+
+
+def _literal_page_config(
+    module: ast.Module,
+    progress: "Callable[[str], None] | None" = None,
+) -> dict[str, Any]:
+    if progress is not None:
+        progress(f"scanning {len(module.body)} top-level statements for TURING_PAGE")
     for statement in module.body:
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
         if not any(isinstance(target, ast.Name) and target.id == "TURING_PAGE" for target in targets):
             continue
+        if progress is not None:
+            progress("found TURING_PAGE assignment; literal_eval-ing its value")
         try:
-            value = ast.literal_eval(statement.value)
+            value = _with_heartbeat(
+                progress, "TURING_PAGE literal_eval",
+                lambda: ast.literal_eval(statement.value),
+            )
         except (TypeError, ValueError) as error:
             raise ValueError("TURING_PAGE must be a literal dictionary") from error
         if not isinstance(value, dict):
             raise ValueError("TURING_PAGE must be a literal dictionary")
+        if progress is not None:
+            progress(f"TURING_PAGE literal_eval complete: {len(value)} top-level keys")
         return value
+    if progress is not None:
+        progress("no TURING_PAGE assignment found")
     return {}
 
 
@@ -691,6 +746,7 @@ def discover_source_contract(
     probes: Mapping[str, Any] | None = None,
     bake_mode: str | None = None,
     schedule_preference: str | None = None,
+    progress: "Callable[[str], None] | None" = None,
 ) -> SourceContract:
     """Inspect a Python module and select its page contract.
 
@@ -698,8 +754,8 @@ def discover_source_contract(
     arguments override it.  No source code is imported or executed here.
     """
 
-    module = ast.parse(source)
-    config = _literal_page_config(module)
+    module = _with_heartbeat(progress, "ast.parse", lambda: ast.parse(source))
+    config = _literal_page_config(module, progress)
     functions = [node for node in module.body if isinstance(node, ast.FunctionDef)]
     public = [node for node in functions if not node.name.startswith("_")]
     if not public:
@@ -736,13 +792,23 @@ def discover_source_contract(
             "configured constants name unknown parameters: "
             f"{sorted(unknown_constants)!r}"
         )
+    if progress is not None:
+        progress(f"validating {len(constant_map)} configured constants as literals")
     for name, value in constant_map.items():
+        if progress is not None:
+            size = len(value) if isinstance(value, (list, tuple, dict, set)) else 1
+            progress(f"validating constant {name!r} ({size} element(s))")
         try:
-            ast.literal_eval(ast.parse(repr(value), mode="eval").body)
+            _with_heartbeat(
+                progress, f"validating constant {name!r}",
+                lambda value=value: ast.literal_eval(ast.parse(repr(value), mode="eval").body),
+            )
         except (SyntaxError, ValueError, TypeError) as error:
             raise ValueError(
                 f"configured constant {name!r} must be a Python literal"
             ) from error
+        if progress is not None:
+            progress(f"constant {name!r} validated")
 
     expressions = config.get("feed_expressions", {})
     if not isinstance(expressions, dict) or not all(
@@ -1120,10 +1186,34 @@ def build_program_bundle(
     shader_configuration: Mapping[str, Any] | None = None,
     bake_mode: str | None = None,
     schedule_preference: str | None = None,
+    progress_sink: Callable[[Any], None] | None = None,
 ) -> ProgramBundle:
-    """Compile source and atomically publish its complete versioned bundle."""
+    """Compile source and atomically publish its complete versioned bundle.
+
+    ``progress_sink``, if given, is subscribed to the same
+    ``shell_telemetry.TelemetryChannel`` that is baked into the published
+    page (``emit_html_shell(telemetry=...)``): every record this function
+    emits while compiling reaches the sink immediately, live, as well as
+    ending up in the page's own console log the next time it is opened. A
+    caller that wants terminal visibility during the build passes a
+    printing sink; a caller that doesn't care can leave it ``None`` and the
+    records still travel with the page.
+    """
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    # The channel is created before contract discovery, not after, on
+    # purpose: parsing and ``ast.literal_eval``-ing a source file whose
+    # ``TURING_PAGE`` bakes in large literal tensor constants (a
+    # fixed-size grid's worth of floats, spelled out as source text) is
+    # not instant, and it used to be the one compile stage with no
+    # progress record at all -- the silent gap ran out before anyone
+    # watching could tell the difference between "compiling" and "hung."
+    from .shell_telemetry import TelemetryChannel
+
+    channel = TelemetryChannel(name="program:pending")
+    if progress_sink is not None:
+        channel.subscribe(progress_sink)
+    channel.log(f"parsing source ({len(source)} bytes)", path="contract")
     contract = discover_source_contract(
         source,
         entrypoint=entrypoint,
@@ -1132,6 +1222,12 @@ def build_program_bundle(
         probes=probes,
         bake_mode=bake_mode,
         schedule_preference=schedule_preference,
+        progress=lambda message: channel.log(message, path="contract"),
+    )
+    channel.name = f"program:{contract.slug}"
+    channel.log(
+        f"discovered contract for {contract.entrypoint!r}",
+        path="contract", slug=contract.slug,
     )
     contract_shader_configuration = {
         **dict(contract.shader_configuration),
@@ -1162,7 +1258,7 @@ def build_program_bundle(
         from .backend_sources import collect_backend_sources
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
         from .fused_program_webgl_backend import emit_webgl_fragment_module
-        from .shell_telemetry import TelemetryChannel, summarize_process_graph
+        from .shell_telemetry import summarize_process_graph
         from .sympy_math_renderer import render_reduced_program_mathematics
         from .wasm_class_coordinator import (
             build_browser_thread_plan,
@@ -1185,25 +1281,26 @@ def build_program_bundle(
             name: _probe_value(contract.feeds.get(name), contract.probe_size)
             for name in parameter_names
         }
-        channel = TelemetryChannel(name=f"program:{contract.slug}")
         with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
-            graph = ProcessGraph(materialize_memory=False)
-            graph.build_from_ast(ast.parse(source))
-            reduce_abstract_tensor_topology(graph)
-            aot = compile_ast_aot(
-                source,
-                contract.entrypoint,
-                feeds,
-                backend=contract.backend,
-                remove_loops=contract.remove_loops,
-                unroll_limit=contract.unroll_limit,
-                precompile_only=True,
-                python_bindings=globals(),
-                bake_mode=contract.bake_mode,
-                schedule_preference=contract.schedule_preference,
-                constant_map=contract.constant_map,
-                mutable_parameters=contract.mutable_parameters,
-            )
+            with channel.timed("build process graph", path="process_graph"):
+                graph = ProcessGraph(materialize_memory=False)
+                graph.build_from_ast(ast.parse(source))
+                reduce_abstract_tensor_topology(graph)
+            with channel.timed("AOT compile", path="aot", entrypoint=contract.entrypoint):
+                aot = compile_ast_aot(
+                    source,
+                    contract.entrypoint,
+                    feeds,
+                    backend=contract.backend,
+                    remove_loops=contract.remove_loops,
+                    unroll_limit=contract.unroll_limit,
+                    precompile_only=True,
+                    python_bindings=globals(),
+                    bake_mode=contract.bake_mode,
+                    schedule_preference=contract.schedule_preference,
+                    constant_map=contract.constant_map,
+                    mutable_parameters=contract.mutable_parameters,
+                )
             if (
                 contract.bake_mode == "whole_program"
                 and aot.control_shortfalls
@@ -1225,9 +1322,11 @@ def build_program_bundle(
             # emitter; it is not the source compiler, an application API, or
             # evidence that the Python recompiler is numerics-only.
             program = project_public_numerical_program(aot)
+            channel.log("emitting wasm module", path="wasm", entrypoint=contract.entrypoint)
             module = emit_wasm_module(
                 program, name=contract.entrypoint, dtype="float64"
             )
+            channel.log("wasm module emitted", path="wasm", operations=len(required_steps(program)))
             if contract.state_feedback:
                 entry = module.api.entry_points[0]
                 input_names = {
@@ -1260,11 +1359,27 @@ def build_program_bundle(
             effective_presentation_shader = presentation_shader
             effective_shader_configuration = dict(contract_shader_configuration)
             if contract.presentation_entrypoint is not None:
+                channel.log(
+                    "compiling presentation shader", path="presentation",
+                    entrypoint=contract.presentation_entrypoint,
+                )
                 presentation_parameters = _entrypoint_parameters(
                     source, contract.presentation_entrypoint
                 )
+                # Mirror the main entrypoint's own feed derivation exactly
+                # (``feeds = {name: _probe_value(contract.feeds.get(name), ...)}``
+                # above): a presentation parameter that is also named in
+                # ``TURING_PAGE["feeds"]`` gets that configured value/array,
+                # not a blanket per-pixel probe. Without this, a presentation
+                # entrypoint could never be handed a real fixed-size array
+                # (e.g. one row per tracked element) -- every parameter would
+                # be forced to the same uniform probe shape, which is what
+                # made a hand-authored GLSL loop look like the only way to
+                # reach per-element data from this compile path.
                 presentation_feeds = {
-                    parameter: _probe_value(0.0, contract.probe_size)
+                    parameter: _probe_value(
+                        contract.feeds.get(parameter, 0.0), contract.probe_size
+                    )
                     for parameter in presentation_parameters
                 }
                 presentation_aot = compile_ast_aot(
@@ -1296,6 +1411,7 @@ def build_program_bundle(
                         )
                     )
                 effective_presentation_shader = presentation_module.source
+                channel.log("presentation shader compiled", path="presentation")
                 origins = dict(
                     (getattr(presentation_program, "extras", None) or {}).get(
                         "capture_feed_origins", {}
@@ -1313,7 +1429,60 @@ def build_program_bundle(
         if not module.complete:
             raise RuntimeError(module.shortfall_report())
 
+        # A trivial identity shader (display red/green/blue as-is) compiled
+        # for every page, unconditionally -- not because this page needs it,
+        # but so the shell always has *some* auto-compiled whole-screen
+        # passthrough surface on hand for anything that wants one later,
+        # without waiting on a page author to remember to declare one. Never
+        # autostarted; a page's own presentation_entrypoint (if any) is what
+        # actually runs by default.
+        channel.log("compiling default passthrough shader", path="passthrough")
+        passthrough_feeds = {
+            name: _probe_value(0.0, contract.probe_size)
+            for name in ("red", "green", "blue")
+        }
+        passthrough_aot = compile_ast_aot(
+            _PASSTHROUGH_SOURCE,
+            "turing_passthrough",
+            passthrough_feeds,
+            backend=contract.backend,
+            remove_loops=True,
+            unroll_limit=contract.unroll_limit,
+            precompile_only=True,
+            python_bindings=globals(),
+        )
+        passthrough_program = project_public_numerical_program(passthrough_aot)
+        passthrough_module = emit_webgl_fragment_module(
+            passthrough_program, name="turing_passthrough",
+            output_layout="rgba", input_sampling="normalized",
+        )
+        passthrough_descriptor: dict[str, Any] | None = None
+        if passthrough_module.complete:
+            passthrough_relative = Path("source") / "webgl" / "passthrough.frag.glsl"
+            passthrough_path = temporary / passthrough_relative
+            passthrough_path.parent.mkdir(parents=True, exist_ok=True)
+            passthrough_path.write_text(passthrough_module.source, encoding="utf-8")
+            passthrough_descriptor = {
+                "url": passthrough_relative.as_posix(),
+                "language": "webgl2-glsl-es",
+                "role": "passthrough-surface",
+                "inputs": ["red", "green", "blue"],
+                "autostart": False,
+                "note": (
+                    "Always-available whole-screen identity shader. Not used "
+                    "by this page's default presentation; present for "
+                    "anything that wants a plain texture passthrough."
+                ),
+            }
+            channel.log("default passthrough shader compiled", path="passthrough")
+        else:
+            channel.error(
+                "default passthrough shader had shortfalls", path="passthrough",
+                shortfalls=[item.format() for item in passthrough_module.shortfalls],
+            )
+
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
+        channel.log("partitioning program into wasm regions", path="regions")
         real_control = (
             aot.shell_control_program
             if contract.bake_mode == "whole_program"
@@ -1328,6 +1497,7 @@ def build_program_bundle(
             source_region = int(real_control.region_indices[0])
             source_program = effective_region_programs.get(source_region)
             if source_program is not None:
+                channel.log("attempting threaded wasm partition", path="regions")
                 threaded = partition_threaded_wasm_program(
                     # The public projection above has already collapsed
                     # byte-for-byte duplicate observational definitions and
@@ -1340,7 +1510,17 @@ def build_program_bundle(
                 )
                 if threaded is not None:
                     real_control, effective_region_programs, thread_topology = threaded
+                    channel.log(
+                        "threaded partition found", path="regions",
+                        waves=len(thread_topology.get("rewrite_history", ())) if thread_topology else 0,
+                    )
+                else:
+                    channel.log("threaded partition unavailable, staying single-region", path="regions")
         if real_control is not None:
+            channel.log(
+                "emitting control region modules", path="regions",
+                regions=len(real_control.region_indices),
+            )
             card_modules, card_manifest = emit_control_region_modules(
                 real_control,
                 effective_region_programs,
@@ -1348,6 +1528,7 @@ def build_program_bundle(
                 module_dir=card_directory.as_posix(),
                 dtype="float64",
             )
+            channel.log("control region modules emitted", path="regions", modules=len(card_modules))
             producer = {
                 int(value_id): (
                     entry["name"], str(output_name)
@@ -1380,7 +1561,9 @@ def build_program_bundle(
                             str(output_name), [entry["name"], output_name]
                         )
             card_manifest["logical_outputs"] = logical_outputs
+            channel.log("building class inventory", path="regions")
             inventory = build_class_inventory(card_manifest)
+            channel.log("class inventory built", path="regions", methods=len(inventory.methods))
             field_slots_by_key = {
                 field.key: int(field.index) for field in inventory.fields
             }
@@ -1397,6 +1580,7 @@ def build_program_bundle(
                     card_manifest["modules"], inventory.methods
                 )
             }
+            channel.log("emitting wasm control coordinator", path="regions")
             coordinator = emit_wasm_control_coordinator(
                 inventory,
                 real_control,
@@ -1414,8 +1598,10 @@ def build_program_bundle(
                     f"{DEFAULT_WASM_CARD_OPERATIONS}"
                 ),
             )
+            channel.log("wasm control coordinator emitted", path="regions")
             specs = ()
             contiguous = None
+            channel.log("building browser thread plan", path="regions")
             thread_plan = build_browser_thread_plan(
                 real_control,
                 region_methods,
@@ -1424,15 +1610,19 @@ def build_program_bundle(
                     for region, region_program in effective_region_programs.items()
                 },
             )
+            channel.log("browser thread plan built", path="regions")
         else:
+            channel.log("partitioning reduced program (no parallel regions)", path="regions")
             specs = partition_reduced_program(
                 program,
                 chunk_size=DEFAULT_WASM_CARD_OPERATIONS,
                 owner_name=contract.entrypoint,
             )
+            channel.log("emitting class modules", path="regions", chunks=len(specs))
             card_modules = emit_class_modules(
                 specs, dtype="float64", link_calls=False, shared_memory=True
             )
+            channel.log("class modules emitted", path="regions")
             incomplete_cards = [
                 card_modules[spec.index]
                 for spec in specs
@@ -1442,6 +1632,7 @@ def build_program_bundle(
                 raise RuntimeError("\n".join(
                     card.shortfall_report() for card in incomplete_cards
                 ))
+            channel.log("building embedded class graph", path="regions")
             card_manifest = build_embedded_class_graph(
                 specs,
                 card_modules,
@@ -1450,7 +1641,9 @@ def build_program_bundle(
                 embed_binaries=False,
                 module_dir=card_directory.as_posix(),
             )
+            channel.log("building class inventory", path="regions")
             inventory = build_class_inventory(card_manifest)
+            channel.log("emitting wasm class coordinator", path="regions")
             coordinator = emit_wasm_class_coordinator(
                 inventory,
                 name=(
@@ -1458,6 +1651,7 @@ def build_program_bundle(
                     f"{DEFAULT_WASM_CARD_OPERATIONS}"
                 ),
             )
+            channel.log("wasm class coordinator emitted", path="regions")
             thread_plan = None
             wasm_relative = Path("wasm") / f"{module.name}.wasm"
             wasm_path = temporary / wasm_relative
@@ -1521,9 +1715,14 @@ def build_program_bundle(
         (card_output_directory / "class-inventory.json").write_text(
             json.dumps(inventory.to_mapping(), indent=2), encoding="utf-8"
         )
+        channel.log(
+            "wasm regions emitted", path="regions",
+            regions=len(inventory.methods), parallel=thread_topology is not None,
+        )
 
         sources = None
         if include_backends:
+            channel.log("collecting backend sources", path="sources")
             with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
                 sources = collect_backend_sources(
                     aot,
@@ -1537,6 +1736,11 @@ def build_program_bundle(
                     ),
                     program=program,
                 )
+            channel.log(
+                "backend sources collected", path="sources",
+                languages=len(sources.sources) if sources is not None else 0,
+            )
+        channel.log("writing sources to bundle directory", path="sources")
         published_sources = _write_sources(
             temporary,
             source,
@@ -1579,6 +1783,7 @@ def build_program_bundle(
                 source_path = temporary / "source" / "fortran" / "fortran.f90"
                 api_path = source_path.with_suffix(".api.yaml")
                 fortran_artifact.api.write(api_path)
+                channel.log("checking for a fortran compiler", path="fortran")
                 if fortran_compiler() is not None:
                     feed_origins = dict(
                         (getattr(program, "extras", None) or {}).get(
@@ -1594,12 +1799,17 @@ def build_program_bundle(
                         if parameter_name not in feeds:
                             parameter_name = parameter_names[feed_index]
                         feed_values[feed_id] = feeds[parameter_name]
+                    channel.log("compiling and verifying native fortran module", path="fortran")
                     proof = verify_fortran_module(
                         fortran_artifact,
                         program,
                         feed_values,
                         temporary / "native" / "fortran",
                         entrypoint=contract.entrypoint,
+                    )
+                    channel.log(
+                        "fortran verification finished", path="fortran",
+                        case_count=proof["case_count"],
                     )
                     proof_relative = Path("verification") / "fortran-fidelity.json"
                     proof_path = temporary / proof_relative
@@ -1623,6 +1833,7 @@ def build_program_bundle(
         mathematics = None
         math_error = ""
         if include_mathematics:
+            channel.log("rendering sympy mathematics model", path="mathematics")
             try:
                 document = render_reduced_program_mathematics(
                     program,
@@ -1644,18 +1855,23 @@ def build_program_bundle(
                     "filename": relative.name,
                     "bytes": path.stat().st_size,
                 })
+                channel.log("sympy mathematics model rendered", path="mathematics")
             except Exception as error:  # page generation survives optional projection refusal
                 math_error = f"{type(error).__name__}: {error}"
+                channel.error(f"sympy mathematics model failed: {math_error}", path="mathematics")
 
         route = f"/site/programs/{contract.slug}/versions/{version}/"
+        channel.log("building shader execution descriptor", path="shader")
         shader_execution = _shader_execution_descriptor(
             published_sources,
             (module.api.metadata or {}).get("shell_io"),
             effective_shader_configuration,
         )
+        channel.log("writing audio asset", path="audio")
         audio_runtime = _write_audio_asset(
             temporary, contract.audio_configuration
         )
+        channel.log("rendering html shell", path="shell")
         shell = emit_html_shell(
             module.api,
             name="index",
@@ -1683,8 +1899,11 @@ def build_program_bundle(
             resource_route=route,
             shader_execution=shader_execution,
             audio_runtime=audio_runtime,
+            passthrough_shader=passthrough_descriptor,
         )
+        channel.log("html shell rendered, writing page to disk", path="shell")
         page_path = shell.write(temporary)
+        channel.log("page written", path="shell", page=str(page_path))
 
         log_text = compile_log.getvalue().strip()
         if log_text:
@@ -1736,12 +1955,15 @@ def build_program_bundle(
         manifest_path = temporary / "bundle.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         if final_directory.exists():
+            channel.log("identical version already published", path="bundle", version=version)
             existing = load_program_bundle(final_directory)
             shutil.rmtree(temporary)
             return existing
         temporary.replace(final_directory)
+        channel.log("bundle published", path="bundle", version=version, route=route)
         return load_program_bundle(final_directory)
-    except Exception:
+    except Exception as error:
+        channel.exception(error, path="bundle", phase="build_program_bundle")
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 

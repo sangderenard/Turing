@@ -4107,6 +4107,7 @@ def emit_html_shell(
     static_gallery: Sequence[Mapping[str, Any]] | None = None,
     shader_execution: Mapping[str, Any] | None = None,
     audio_runtime: Mapping[str, Any] | None = None,
+    passthrough_shader: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate a launchable page for one compiled program.
@@ -4177,6 +4178,18 @@ def emit_html_shell(
         audio_script = "<script>" + _AUDIO_RUNTIME_JS.replace(
             "__AUDIO_RUNTIME__", json.dumps(dict(audio_runtime), default=str)
         ) + "</script>"
+
+    # Present on every page regardless of whether this page's own
+    # presentation uses it -- a standing, always-compiled whole-screen
+    # identity shader that anything on the page can reach for later. It is
+    # never instantiated here; nothing subscribes to it by default.
+    passthrough_script = ""
+    if passthrough_shader is not None:
+        passthrough_script = (
+            "<script>window.TuringPassthroughShader = "
+            + json.dumps(dict(passthrough_shader), default=str)
+            + ";</script>"
+        )
 
     encoded = (
         json.dumps(base64.b64encode(wasm_bytes).decode("ascii"))
@@ -4552,6 +4565,7 @@ def emit_html_shell(
 <script>{boot_script}</script>
 <script>{script}</script>
 {shader_script}
+{passthrough_script}
 <script>{_TRANSCRIPT_JS}</script>
 </body>
 </html>
@@ -4577,6 +4591,7 @@ def shell_for_artifact(
     resource_route: str = "/",
     shader_execution: Mapping[str, Any] | None = None,
     audio_runtime: Mapping[str, Any] | None = None,
+    passthrough_shader: Mapping[str, Any] | None = None,
     default_server_address: str = "http://localhost:8787",
 ) -> HtmlShell:
     """Generate the page straight from a ``machine_targets.TargetArtifact``."""
@@ -4604,6 +4619,7 @@ def shell_for_artifact(
         resource_route=resource_route,
         shader_execution=shader_execution,
         audio_runtime=audio_runtime,
+        passthrough_shader=passthrough_shader,
         default_server_address=default_server_address,
     )
 

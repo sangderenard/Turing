@@ -340,3 +340,34 @@ def test_program_bundle_compiles_fortran_and_records_output_fidelity(tmp_path: P
         "source_sha256": proof["source_sha256"],
         "url": "verification/fortran-fidelity.json",
     }
+
+
+def test_progress_sink_receives_live_build_records_that_also_reach_the_page(tmp_path: Path):
+    """The telemetry channel used to be created and never written to, so a
+    published page always showed an empty build log. build_program_bundle
+    must both call a live progress_sink as it compiles and still bake the
+    same records into the page's own console log."""
+
+    seen = []
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        include_backends=False,
+        include_mathematics=False,
+        progress_sink=seen.append,
+    )
+
+    kinds_and_paths = {(record.kind, record.path) for record in seen}
+    assert ("log", "contract") in kinds_and_paths
+    assert ("profile", "process_graph") in kinds_and_paths
+    assert ("profile", "aot") in kinds_and_paths
+    assert ("log", "wasm") in kinds_and_paths
+    # "bundle published" is necessarily emitted after the page HTML is
+    # already serialized -- a page cannot describe its own publish event --
+    # so it is only observable live, not baked into this page's own log.
+    assert ("log", "bundle") in kinds_and_paths
+
+    html = bundle.page_path.read_text(encoding="utf-8")
+    assert "AOT compile" in html
+    assert "wasm module emitted" in html
