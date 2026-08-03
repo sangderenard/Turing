@@ -1763,17 +1763,11 @@ class AbstractTensor:
     def to_dtype(self, dtype: str = "float") -> "AbstractTensor":
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
         result.data = self.to_dtype_(dtype)
-        source_kind = getattr(
-            getattr(getattr(self, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        target_kind = getattr(
-            getattr(getattr(result, "data", None), "dtype", None),
-            "kind",
-            None,
-        )
-        if target_kind == source_kind:
+        source_dtype = getattr(getattr(self, "data", None), "dtype", None)
+        target_dtype = getattr(getattr(result, "data", None), "dtype", None)
+        source_kind = getattr(source_dtype, "kind", None)
+        target_kind = getattr(target_dtype, "kind", None)
+        if source_dtype == target_dtype:
             operation = "reshape"
             params = {"shape": tuple(result.shape)}
         elif target_kind == "b":

@@ -2443,6 +2443,8 @@ def compose_control_shader(
                     == selected_c_dispatch_induction
                     else "glsl"
                 ),
+                block.recursion_region_id,
+                block.schedule_preference,
             )
             if (
                 device_resident
@@ -2464,9 +2466,13 @@ def compose_control_shader(
                 ),
             )
         if isinstance(block, ParallelDeployment):
-            return ParallelDeployment(tuple(
-                substitute(lane, parallel_scope) for lane in block.lanes
-            ))
+            return ParallelDeployment(
+                tuple(
+                    substitute(lane, parallel_scope)
+                    for lane in block.lanes
+                ),
+                block.schedule_preference,
+            )
         if isinstance(block, CallBlock):
             return CallBlock(
                 block.callsite_id,

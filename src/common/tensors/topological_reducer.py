@@ -176,6 +176,23 @@ def _normalize_lexical_values(
             *statement.args.kwonlyargs,
         )
     }
+    exception_local_names = {
+        target.id
+        for handler in (
+            node
+            for node in ast.walk(statement)
+            if isinstance(node, ast.ExceptHandler)
+        )
+        for body_node in handler.body
+        for assignment in ast.walk(body_node)
+        if isinstance(assignment, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (
+            (*assignment.targets,)
+            if isinstance(assignment, ast.Assign)
+            else (assignment.target,)
+        )
+        if isinstance(target, ast.Name)
+    }
     for body_statement in statement.body:
         if not isinstance(body_statement, ast.Return):
             continue
@@ -417,6 +434,7 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 if (
                     producer_id is None
+                    and expression.id not in parameter_names
                     and static_value is not None
                     and isinstance(
                         static_value,
@@ -436,6 +454,7 @@ def _normalize_lexical_values(
                     )
                 if (
                     producer_id is None
+                    and expression.id not in parameter_names
                     and expression.id in static_bindings
                     and is_static_literal(static_value)
                 ):
@@ -451,6 +470,8 @@ def _normalize_lexical_values(
                         binding_kind=(
                             "parameter"
                             if expression.id in parameter_names
+                            else "exception"
+                            if expression.id in exception_local_names
                             else "external"
                         ),
                     )
@@ -489,6 +510,12 @@ def _normalize_lexical_values(
                         value,
                         f"{receiver.path}.{expression.attr}",
                     )
+            elif isinstance(receiver, int) and id(expression) in graph.G:
+                _replace_inputs(
+                    graph,
+                    id(expression),
+                    ((receiver, "value"),),
+                )
 
         if isinstance(expression, ast.Call):
             callee = resolve_expression(expression.func)
@@ -703,7 +730,9 @@ def _normalize_lexical_values(
             if isinstance(value, _StaticPythonReference):
                 raise TypeError(
                     "a static Python reference cannot be stored as a runtime "
-                    "object attribute"
+                    f"object attribute in {statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}, "
+                    f"value={value.path}"
                 )
             receiver = resolve_expression(target.value)
             if not isinstance(receiver, int) or not isinstance(value, int):
@@ -718,6 +747,17 @@ def _normalize_lexical_values(
                 raise RuntimeError(
                     "attribute assignment target disappeared before SetAttr "
                     "lowering"
+                )
+            # In ``object.field += value`` the Attribute node is the read
+            # feeding the AugAssign result.  Reusing that same node as the
+            # write would create ``Attribute -> AugAssign -> SetAttr`` while
+            # SetAttr is still the Attribute node: an artificial dataflow
+            # cycle.  Keep the read and write as distinct program events.
+            if node_id == value or nx.has_path(graph.G, node_id, value):
+                node_id = new_node(
+                    "SetAttr",
+                    f"setattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
                 )
             node_data = graph.G.nodes[node_id]
             node_data["type"] = "SetAttr"
@@ -775,6 +815,8 @@ def _normalize_lexical_values(
                         binding_kind=(
                             "parameter"
                             if body_statement.target.id in parameter_names
+                            else "exception"
+                            if body_statement.target.id in exception_local_names
                             else "external"
                         ),
                     )
@@ -1000,10 +1042,17 @@ def _normalize_lexical_values(
                     for nested in body_statement.body
                     for member in ast.walk(nested)
                 }
+                direct_loop_target_names = (
+                    set(loop_target_names(body_statement.target))
+                    if isinstance(body_statement, ast.For)
+                    else set()
+                )
                 current_loop_bindings = {
                     name: value_id
                     for name, value_id in environment.items()
                     if (
+                        name in direct_loop_target_names
+                        and
                         (
                             graph.G.nodes[value_id].get("attributes") or {}
                         ).get("binding_kind") == "loop"
@@ -1131,6 +1180,27 @@ def _normalize_lexical_values(
             returned_values.append(value)
     if returned_values:
         graph.roots = list(dict.fromkeys(returned_values))
+
+    # A source-linked unbound method can arrive with its receiver Name absent
+    # from the owned subgraph even though the Attribute load itself is owned.
+    # Restore the ordinary parameter edge before lexical Name cleanup; an
+    # Attribute without its receiver is not a valid structural operation.
+    for node_id, data in list(graph.G.nodes(data=True)):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Attribute)
+            and not data.get("parents")
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id in parameter_names
+        ):
+            continue
+        receiver = environment.get(expression.value.id)
+        if receiver is None:
+            receiver = input_value(
+                expression.value.id,
+                binding_kind="parameter",
+            )
+        _replace_inputs(graph, node_id, ((receiver, "value"),))
 
     # Any surviving lexical occurrence is either unused syntax or an unresolved
     # source label.  It is not executable work in the reduced value graph.
@@ -1635,6 +1705,32 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     for builtin_name, value in vars(builtins).items():
         static_bindings.setdefault(builtin_name, value)
     graph.python_bindings = static_bindings
+    function_parameters_by_address = {}
+    for function_node_id, reference in function_nodes.items():
+        definition = graph.G.nodes[function_node_id].get("expr_obj")
+        if not isinstance(
+            definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+        ):
+            continue
+        function_parameters_by_address[reference.address] = {
+            argument.arg
+            for argument in (
+                *definition.args.posonlyargs,
+                *definition.args.args,
+                *definition.args.kwonlyargs,
+                *(
+                    (definition.args.vararg,)
+                    if definition.args.vararg is not None
+                    else ()
+                ),
+                *(
+                    (definition.args.kwarg,)
+                    if definition.args.kwarg is not None
+                    else ()
+                ),
+            )
+        }
 
     for _node_id, data in graph.G.nodes(data=True):
         source_type = data.get("type")
@@ -1819,8 +1915,30 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             if isinstance(expression.func, ast.Name):
                 callee_name = expression.func.id
-                reference = function_table.reference(callee_name)
-                if reference is None and callee_name in import_bindings:
+                owner = call_owners.get(node_id)
+                callee_is_parameter = (
+                    owner is not None
+                    and callee_name in function_parameters_by_address.get(
+                        owner.address,
+                        (),
+                    )
+                )
+                if callee_is_parameter:
+                    attributes = data.setdefault("attributes", {})
+                    attributes.pop("callee_ref", None)
+                    attributes.pop("external_callee_ref", None)
+                    call_inputs.insert(
+                        0,
+                        (id(expression.func), "callee"),
+                    )
+                    reference = None
+                else:
+                    reference = function_table.reference(callee_name)
+                if (
+                    not callee_is_parameter
+                    and reference is None
+                    and callee_name in import_bindings
+                ):
                     (
                         qualified_name,
                         imported_name,
@@ -1840,11 +1958,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     data.setdefault("attributes", {})[
                         "external_callee_ref"
                     ] = external_reference.address
-                elif reference is not None:
+                elif (
+                    not callee_is_parameter
+                    and reference is not None
+                ):
                     data.setdefault("attributes", {})[
                         "callee_ref"
                     ] = reference.address
-                else:
+                elif not callee_is_parameter:
                     call_inputs.insert(
                         0,
                         (id(expression.func), "callee"),

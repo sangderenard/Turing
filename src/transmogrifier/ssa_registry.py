@@ -68,6 +68,8 @@ class Handler(Enum):
     CondBr        = "CondBr"
     Ret           = "Ret"
     Call          = "Call"
+    Deploy        = "Deploy"
+    Join          = "Join"
 
     # Misc
     Select        = "Select"
@@ -96,6 +98,8 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'imaginaryunit':       Handler.Const,
     'true':                Handler.Const,
     'false':               Handler.Const,
+    'deploy':              Handler.Deploy,
+    'join':                Handler.Join,
 
     # Arithmetic
     'add':                 Handler.Add,

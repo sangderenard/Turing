@@ -174,6 +174,37 @@ def test_first_filtered_mandelbrot_avi_region_round_trips_into_compiler():
     )
 
 
+def test_deep_compiler_preserves_string_literal_for_tensor_dtype():
+    from src.transmogrifier.graph.graph_deep_compiler import GraphDeepCompiler
+    from src.transmogrifier.operator_defs import (
+        abstract_tensor_funcs,
+        abstract_tensor_sigs,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.clear()
+    graph.G.add_node(
+        1, type="Constant", label="int64", parents=[], constant="int64"
+    )
+    graph.G.add_node(
+        2, type="Store", label="result", parents=[(1, "value")]
+    )
+    graph.G.add_edge(1, 2)
+    graph.levels = {1: 0, 2: 1}
+    compiler = GraphDeepCompiler(
+        graph,
+        dict(abstract_tensor_funcs),
+        abstract_tensor_sigs,
+    )
+    compiled = compiler.build_function()
+
+    result, = compiled()
+
+    assert "b'int64'" not in compiler._code
+    assert "'int64'" in compiler._code
+    assert result == "int64"
+
+
 def test_branch_phi_projects_as_an_exact_piecewise_expression():
     module = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):

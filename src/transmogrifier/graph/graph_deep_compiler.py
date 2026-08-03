@@ -338,8 +338,6 @@ class GraphDeepCompiler:
                 # as a runtime symbol in the compiled shell.
                 if isinstance(literal, enum.IntEnum):
                     literal = int(literal)
-                if isinstance(literal, str):
-                    literal = literal.encode("utf-8")
                 if not _is_emittable_literal(literal):
                     raise TypeError(
                         f"{ntype} node {nid} has unsupported literal type "

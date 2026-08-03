@@ -623,7 +623,9 @@ _CAPTURED_NATIVE_KERNELS = {
     "any": "reduce",
     "all": "reduce",
     "empty": "fill",
+    "empty_like": "fill",
     "full": "fill",
+    "full_like": "fill",
     "gather": "index_select",
     "permute": "permute",
     "repeat": "repeat",
@@ -633,7 +635,9 @@ _CAPTURED_NATIVE_KERNELS = {
     "tensor_from_list": "constant",
     "where": "where",
     "ones": "fill",
+    "ones_like": "fill",
     "zeros": "fill",
+    "zeros_like": "fill",
 }
 
 _CAPTURED_CAST_OPERATIONS = frozenset({
@@ -646,6 +650,54 @@ _CAPTURED_CAST_OPERATIONS = frozenset({
     "long_cast",
     "to_dtype",
 })
+
+_CAPTURED_COMPOSITE_OPERATIONS = frozenset({
+    "clamp",
+    "clamp_min",
+    "clamp_max",
+})
+
+
+def _captured_dtype_kind(value: Any) -> str | None:
+    """Return NumPy's dtype-kind code for a captured tensor value."""
+
+    storage = getattr(value, "data", value)
+    dtype = getattr(storage, "dtype", getattr(value, "dtype", None))
+    kind = getattr(dtype, "kind", None)
+    if kind is not None:
+        return str(kind)
+    name = str(dtype).rsplit(".", 1)[-1].lower()
+    if "bool" in name:
+        return "b"
+    if "float" in name or "double" in name or "half" in name:
+        return "f"
+    if name.startswith("uint"):
+        return "u"
+    if name.startswith("int") or name.startswith("long"):
+        return "i"
+    return None
+
+
+def _canonical_captured_cast(source: Any, result: Any) -> tuple[str, dict[str, Any]]:
+    """Use the established AbstractTensor conversion vocabulary."""
+
+    source_kind = _captured_dtype_kind(source)
+    target_kind = _captured_dtype_kind(result)
+    if source_kind is None or target_kind is None:
+        raise TypeError(
+            "captured dtype conversion requires recognizable source and "
+            f"result dtypes; source={getattr(source, 'dtype', None)!r}, "
+            f"result={getattr(result, 'dtype', None)!r}"
+        )
+    if target_kind == source_kind:
+        return "add", {"right_scalar": 0}
+    if target_kind == "b":
+        return "not_equal", {"right_scalar": 0}
+    if target_kind == "f":
+        return ("uitofp" if source_kind in {"u", "b"} else "sitofp"), {}
+    if target_kind == "u":
+        return ("fptoui" if source_kind == "f" else "zext"), {}
+    return ("fptosi" if source_kind == "f" else "sext"), {}
 
 
 def _captured_meta(value: Any) -> Meta:
@@ -689,19 +741,59 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
     lowered_operation = operation
 
+    if operation in _CAPTURED_COMPOSITE_OPERATIONS:
+        if len(input_ids) != 1:
+            raise ValueError(
+                f"captured {operation!r} requires one tensor input"
+            )
+        lower_bound = attrs.get("min", attrs.get("min_val"))
+        upper_bound = attrs.get("max", attrs.get("max_val"))
+        if operation == "clamp_min" and lower_bound is None:
+            lower_bound = attrs.get("value")
+        if operation == "clamp_max" and upper_bound is None:
+            upper_bound = attrs.get("value")
+        specifications = []
+        if lower_bound is not None:
+            specifications.append(("maximum", lower_bound))
+        if upper_bound is not None:
+            specifications.append(("minimum", upper_bound))
+        if not specifications:
+            specifications.append(("add", 0))
+        steps = []
+        previous_id = input_ids[0]
+        for index, (op_name, scalar) in enumerate(specifications):
+            output_id = (
+                result_id
+                if index == len(specifications) - 1
+                else -(result_id + index + 1)
+            )
+            metadata[output_id] = metadata[result_id]
+            steps.append(OpStep(
+                step_id=index,
+                op_name=op_name,
+                input_ids=[previous_id],
+                attrs={"right_scalar": scalar},
+                result_id=output_id,
+            ))
+            previous_id = output_id
+        program = FusedProgram(
+            version=1,
+            feeds=set(feeds),
+            steps=steps,
+            outputs={"result_0": result_id},
+            meta=metadata,
+            extras={"kernel_kind": None},
+        )
+        return CapturedFusedProgram(program, feeds)
+
     if operation in _CAPTURED_CAST_OPERATIONS:
         if len(input_ids) != 1:
             raise ValueError(
                 f"captured dtype conversion {operation!r} requires one "
                 "tensor input"
             )
-        # This is the lowering of an explicit AbstractTensor conversion, not
-        # compiler-invented promotion.  A typed arena read followed by a typed
-        # arena write performs the requested conversion; adding numerical zero
-        # gives the shared elementwise emitter its existing identity primitive
-        # while result metadata remains the tensor API's chosen dtype.
-        lowered_operation = "add"
-        attrs = {"right_scalar": 0}
+        source = node.ctx["inputs"][0]
+        lowered_operation, attrs = _canonical_captured_cast(source, result)
         kernel_kind = None
 
     if operation == "rmatmul":
@@ -720,8 +812,11 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
         attrs["shape"] = tuple(result.shape)
         attrs["fill_value"] = {
             "empty": 0,
+            "empty_like": 0,
             "zeros": 0,
+            "zeros_like": 0,
             "ones": 1,
+            "ones_like": 1,
         }.get(operation, attrs.get("fill_value"))
     if kernel_kind == "constant":
         attrs["shape"] = tuple(result.shape)
@@ -955,6 +1050,7 @@ def compile_recorded_fused_tape(
     if len(nodes) == 1 and (
         operations[0] in _CAPTURED_NATIVE_KERNELS
         or operations[0] in _CAPTURED_CAST_OPERATIONS
+        or operations[0] in _CAPTURED_COMPOSITE_OPERATIONS
         or operations[0] == "slice"
     ):
         node = nodes[0]
@@ -1227,6 +1323,7 @@ def compile_recorded_fused_tape(
             if (
                 operation not in _CAPTURED_NATIVE_KERNELS
                 and operation not in _CAPTURED_CAST_OPERATIONS
+                and operation not in _CAPTURED_COMPOSITE_OPERATIONS
                 and operation not in {
                     "slice",
                     "clone",

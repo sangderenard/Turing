@@ -172,6 +172,21 @@ def test_one_element_tensor_remains_the_input_to_a_unary_cast():
     assert step.input_ids == [id(runtime_tensor)]
 
 
+def test_isolated_explicit_cast_retains_canonical_conversion_operation():
+    with autograd.forward_capture() as tape:
+        runtime_tensor = NumPyTensorOperations.tensor(
+            np.asarray([3], dtype=np.int32)
+        )
+        result = runtime_tensor.astype("int64")
+
+    captured = compile_recorded_fused_tape(tape, outputs={"result": result})
+    step = captured.execution_programs[-1].steps[-1]
+
+    assert step.op_name == "sext"
+    assert step.input_ids == [id(runtime_tensor)]
+    assert captured.program.meta[id(result)].dtype == "int64"
+
+
 def test_requested_empty_tensor_output_may_pass_through_a_recorded_region():
     empty = NumPyTensorOperations.tensor(
         np.asarray([], dtype=np.float32)

@@ -41,8 +41,12 @@ def test_first_class_python_spring_kernel_matches_legacy_hooke_direction():
 
 
 def test_first_class_python_spring_kernel_uses_existing_backend_surfaces():
-    # Compile the same function the live state machine calls. There is no
-    # shadow DSL kernel and no invented SSA operation in this qualification.
+    # Backend qualification deliberately isolates one numerical region.  This
+    # is not the public compiler workflow and must not be read as evidence that
+    # applications need to decompose Python into hand-selected kernels.  The
+    # actual compiler enters through Python AST/ProcessGraph; this test merely
+    # proves that a late internal region reaches the existing backend tables.
+    # There is no shadow DSL kernel and no invented SSA operation here.
     source = inspect.getsource(bound_spring_stretch_force)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
         io.StringIO()

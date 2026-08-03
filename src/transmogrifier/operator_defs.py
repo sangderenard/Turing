@@ -107,6 +107,18 @@ array_sig = {
 # Operation name -> signature mapping
 # -------------------------------------------------
 operator_signatures = {
+    # Structural concurrency framing. Deploy and Join do not perform numeric
+    # work; a Join reduction names an existing operator in its metadata.
+    'Deploy': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
+    'Join': {
+        'min_inputs': 0, 'max_inputs': None,
+        'min_outputs': 0, 'max_outputs': None,
+        'concurrency': None, 'allows_inplace': False,
+    },
     'Add': sig_binary_elementwise,
     'Mul': sig_binary_elementwise,
     'Pow': sig_binary_elementwise,
@@ -346,6 +358,8 @@ def matrixelement_op(role_map):
 default_funcs['MatrixElement'] = matrixelement_op
 # --- role schemas -----------------------------------------------------------
 role_schemas = {
+            'Deploy': {'up': {'domain': 'many'}, 'down': {'lanes': 'many'}},
+            'Join': {'up': {'lanes': 'many'}, 'down': {'result': 'many'}},
             'IndexedBase': {'up':{'shape':1}, 'down':{}},
             'Indexed': {'up':{'base':1, 'index':'many'},'down':{}},
             'Idx': {'up':{'limits': 'many'}, 'down':{}},
@@ -706,8 +720,18 @@ def _abstract_tensor_maximum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor maximum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "maximum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return max(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.maximum(operand)
     return result
 
@@ -716,8 +740,18 @@ def _abstract_tensor_minimum(*values):
     operands = _abstract_tensor_values(*values)
     if not operands:
         raise ValueError("AbstractTensor minimum requires an operand")
-    result = operands[0]
-    for operand in operands[1:]:
+    tensor_index = next(
+        (
+            index
+            for index, operand in enumerate(operands)
+            if callable(getattr(operand, "minimum", None))
+        ),
+        None,
+    )
+    if tensor_index is None:
+        return min(operands)
+    result = operands.pop(tensor_index)
+    for operand in operands:
         result = result.minimum(operand)
     return result
 
