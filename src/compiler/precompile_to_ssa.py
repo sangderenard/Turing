@@ -11,7 +11,9 @@ import networkx as nx
 from .control_source import (
     CallBlock,
     ControlBlock,
+    ControlExpression,
     ControlProgram,
+    LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
     SequenceBlock,
@@ -19,7 +21,9 @@ from .control_source import (
     StatementBlock,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
 )
+from .deployment_frame import DeploymentJoin
 from .precompile_ssa_validator import (
     PrecompileSSAValidationResult,
     ssa_handler_for_precompile,
@@ -38,6 +42,8 @@ from ..transmogrifier.ssa import (
     Function,
     IRModule,
     Instr,
+    SSADeploymentLane,
+    SSADeploymentRegion,
     SSAValue,
 )
 from ..transmogrifier.ssa_registry import Handler
@@ -441,6 +447,41 @@ class _ControlSSABuilder:
         # the surrounding loop without degrading that name to a symbolic
         # host-side load.
         self.local_control_values: dict[str, SSAValue] = {}
+        self.loop_targets: list[tuple[BasicBlock, BasicBlock]] = []
+        self.deployment_records: list[dict[str, Any]] = [
+            {
+                "region_id": int(region.region_id),
+                "kind": str(region.kind),
+                "schedule": str(region.schedule),
+                "schedule_preference": str(region.schedule_preference),
+                "lane_count": len(region.lanes),
+                "iteration_space": region.iteration_space,
+                "carried_aliases": tuple(region.carried_aliases),
+                "recursion_region_id": region.recursion_region_id,
+                "origin": str(region.origin),
+                "source_loop_node_id": region.source_loop_node_id,
+                "scale": int(region.scale),
+                "join": region.join,
+                "declared_lanes": tuple(region.lanes),
+            }
+            for region in program.deployment_regions
+        ]
+        deployment_ids = [
+            int(record["region_id"]) for record in self.deployment_records
+        ]
+        if len(deployment_ids) != len(set(deployment_ids)):
+            raise ValueError("control deployment region IDs must be unique")
+        self.next_deployment_id = max(deployment_ids, default=-1) + 1
+        self.declared_region_memberships: dict[
+            int, list[tuple[int, int]]
+        ] = {}
+        for record in self.deployment_records:
+            for lane in record["declared_lanes"]:
+                for region_index in lane.region_indices:
+                    self.declared_region_memberships.setdefault(
+                        int(region_index), []
+                    ).append((int(record["region_id"]), int(lane.index)))
+        self.active_deployments: list[tuple[int, int]] = []
         self.recursion_regions = {
             int(region.region_id): {
                 "kind": str(region.kind),
@@ -635,12 +676,18 @@ class _ControlSSABuilder:
         *,
         attributes: dict[str, Any] | None = None,
     ) -> None:
+        resolved_attributes = dict(attributes or {})
+        if self.active_deployments:
+            resolved_attributes.setdefault(
+                "deployment_memberships",
+                tuple(self.active_deployments),
+            )
         self.current.instrs.append(
             Instr(
                 op.value,
                 args,
                 result,
-                attributes=dict(attributes or {}),
+                attributes=resolved_attributes,
             )
         )
         if self.evolution is not None and self.ssa_evolution is not None:
@@ -683,6 +730,24 @@ class _ControlSSABuilder:
                         role=f"arg{position}",
                     )
 
+    def emit_deployment_boundary(
+        self, op: Handler, record: dict[str, Any]
+    ) -> tuple[str, int]:
+        """Emit a structural frame marker; it performs no numeric work."""
+        site = (self.current.name, len(self.current.instrs))
+        join = record["join"]
+        self.emit(op, [], attributes={
+            "deployment_frame": True,
+            "region_id": int(record["region_id"]),
+            "scale": int(record.get("scale", 1)),
+            "join_mode": join.mode.value,
+            "reduction_operator": join.reduction_operator,
+            "allow_reassociation": bool(join.allow_reassociation),
+            "schedule_preference": str(record["schedule_preference"]),
+        })
+        record["deploy_site" if op is Handler.Deploy else "join_site"] = site
+        return site
+
     def branch(self, target: BasicBlock) -> None:
         self.emit(
             Handler.Br,
@@ -713,7 +778,10 @@ class _ControlSSABuilder:
         *,
         location: str,
     ) -> SSAValue:
-        spelling = str(expression)
+        spelling = str(expression).strip()
+        value_match = re.fullmatch(r"value_(\d+)", spelling)
+        if value_match is not None:
+            return self.external_value(int(value_match.group(1)))
         uniform = self.uniform_values.get(spelling)
         if uniform is not None:
             return uniform
@@ -749,6 +817,76 @@ class _ControlSSABuilder:
         )
         return value
 
+    def lower_control_expression(
+        self,
+        expression: ControlExpression,
+        *,
+        result_override: SSAValue | None = None,
+    ) -> SSAValue:
+        if expression.op == "value":
+            return self.external_value(int(expression.value_id))
+        if expression.op == "const":
+            result = result_override or self.fresh_value(
+                dtype="bool" if isinstance(expression.literal, bool) else None
+            )
+            self.emit(
+                Handler.Const, [], result,
+                attributes={"value": expression.literal},
+            )
+            return result
+        operand_values = [
+            self.lower_control_expression(operand)
+            for operand in expression.operands
+        ]
+        if expression.op in {"float", "int", "bool"}:
+            return operand_values[0]
+        if expression.op == "item":
+            source = operand_values[0]
+            if not source.shape:
+                return source
+            index = self.constant_value(0)
+            address = self.fresh_value(dtype="ptr")
+            self.emit(
+                Handler.GetElementPtr, [source, index], address,
+                attributes={"binding": "control_scalar_item"},
+            )
+            result = result_override or self.fresh_value(dtype=source.dtype)
+            self.emit(
+                Handler.Load, [address], result,
+                attributes={"binding": "control_scalar_item"},
+            )
+            return result
+        handlers = {
+            "add": Handler.Add, "sub": Handler.Sub,
+            "mul": Handler.Mul, "div": Handler.Div,
+            "neg": Handler.Neg,
+            "lt": Handler.Lt, "le": Handler.Le,
+            "gt": Handler.Gt, "ge": Handler.Ge,
+            "eq": Handler.Eq, "ne": Handler.Ne,
+            "and": Handler.LAnd, "or": Handler.LOr,
+            "not": Handler.LNot,
+        }
+        handler = handlers.get(expression.op)
+        if handler is None:
+            raise ValueError(
+                f"unsupported control expression {expression.op!r}"
+            )
+        result = result_override or self.fresh_value(
+            dtype=(
+                "bool" if expression.op in {
+                    "lt", "le", "gt", "ge", "eq", "ne",
+                    "and", "or", "not",
+                } else operand_values[0].dtype
+            )
+        )
+        self.emit(handler, operand_values, result, attributes={
+            "binding": "control_expression",
+            "source_value_id": expression.value_id,
+        })
+        if expression.value_id is not None:
+            self.external_values[int(expression.value_id)] = result
+        return result
+
     def lower(self, block: ControlBlock, *, path: str = "root") -> None:
         previous = self._evolution_source
         if self.evolution is not None:
@@ -769,10 +907,18 @@ class _ControlSSABuilder:
                 location = f"{path}.statement[{index}]"
                 if match is not None:
                     region_index = int(match.group(1))
-                    self.emit_region_call(
-                        region_index,
-                        location=location,
+                    memberships = self.declared_region_memberships.get(
+                        region_index, ()
                     )
+                    self.active_deployments.extend(memberships)
+                    try:
+                        self.emit_region_call(
+                            region_index,
+                            location=location,
+                        )
+                    finally:
+                        if memberships:
+                            del self.active_deployments[-len(memberships):]
                 else:
                     self.emit(
                         Handler.Call,
@@ -793,6 +939,33 @@ class _ControlSSABuilder:
             return
         if isinstance(block, LoopBlock):
             self.lower_loop(block, path=path)
+            return
+        if isinstance(block, WhileBlock):
+            self.lower_while(block, path=path)
+            return
+        if isinstance(block, LoopControlBlock):
+            if not self.loop_targets:
+                raise ValueError(f"{block.action} appears outside a loop")
+            latch, exit_block = self.loop_targets[-1]
+            target = exit_block if block.action == "break" else latch
+            if block.predicate_value_id is None:
+                self.branch(target)
+                self.current = self.new_block("unreachable_loop_control")
+            else:
+                fallthrough = self.new_block("loop_control_next")
+                predicate = (
+                    self.lower_control_expression(block.predicate_expression)
+                    if block.predicate_expression is not None
+                    else self.external_value(
+                        block.predicate_value_id, dtype="bool"
+                    )
+                )
+                self.conditional_branch(
+                    predicate,
+                    target if block.expect_true else fallthrough,
+                    fallthrough if block.expect_true else target,
+                )
+                self.current = fallthrough
             return
         if isinstance(block, CallBlock):
             # Hierarchy planning has already unified the bound value IDs.
@@ -848,16 +1021,57 @@ class _ControlSSABuilder:
             self.lower_state_machine(block, path=path)
             return
         if isinstance(block, ParallelDeployment):
-            # The lanes are independent.  A linear SSA listing is a valid
-            # schedule of that partial order; a target may re-parallelize it
-            # from the retained lane structure before this final lowering.
+            deployment_id = self.next_deployment_id
+            self.next_deployment_id += 1
+            record = {
+                "region_id": deployment_id,
+                "kind": "parallel_candidate",
+                "schedule": "independent_lanes",
+                "schedule_preference": block.schedule_preference,
+                "lane_count": len(block.lanes),
+                "iteration_space": None,
+                "carried_aliases": (),
+                "recursion_region_id": None,
+                "origin": "parallel_block",
+                "source_loop_node_id": None,
+                "scale": 1,
+                "join": DeploymentJoin(),
+                "declared_lanes": (),
+            }
+            self.deployment_records.append(record)
+            self.emit_deployment_boundary(Handler.Deploy, record)
             for index, lane in enumerate(block.lanes):
-                self.lower(lane, path=f"{path}.lane[{index}]")
+                self.active_deployments.append((deployment_id, index))
+                try:
+                    self.lower(lane, path=f"{path}.lane[{index}]")
+                finally:
+                    self.active_deployments.pop()
+            self.emit_deployment_boundary(Handler.Join, record)
             return
         raise TypeError(f"unknown control block {type(block).__name__}")
 
     def lower_loop(self, loop: LoopBlock, *, path: str) -> None:
         recursion_region_id = loop.recursion_region_id
+        deployment_id = None
+        if loop.parallel_iterations:
+            deployment_id = self.next_deployment_id
+            self.next_deployment_id += 1
+            record = {
+                "region_id": deployment_id,
+                "kind": "parallel_candidate",
+                "schedule": "independent_iterations",
+                "schedule_preference": loop.schedule_preference,
+                "lane_count": 1,
+                "iteration_space": (loop.start, loop.stop, loop.step),
+                "carried_aliases": tuple(loop.carried_aliases),
+                "recursion_region_id": recursion_region_id,
+                "origin": "retained_loop",
+                "source_loop_node_id": None,
+                "scale": 1,
+                "join": DeploymentJoin(),
+                "declared_lanes": (),
+            }
+            self.deployment_records.append(record)
         preheader = self.current
         start = self.expression_value(
             loop.start,
@@ -906,6 +1120,8 @@ class _ControlSSABuilder:
         latch = self.new_block("loop_latch")
         exit_block = self.new_block("loop_exit")
         self.current = preheader
+        if deployment_id is not None:
+            self.emit_deployment_boundary(Handler.Deploy, record)
         self.branch(header)
 
         induction = self.fresh_value(dtype="int")
@@ -946,6 +1162,12 @@ class _ControlSSABuilder:
         self.conditional_branch(condition, body, exit_block)
 
         self.current = body
+        self.loop_targets.append((latch, exit_block))
+        if deployment_id is not None:
+            # Lane zero is the SSA template for every independent iteration;
+            # the iteration space above tells a deployment pass how to fan it
+            # out.  The ordinary CFG remains the serial fallback.
+            self.active_deployments.append((deployment_id, 0))
         previous_induction = self.local_control_values.get(loop.induction)
         self.local_control_values[loop.induction] = induction
         restored_values: dict[int, SSAValue | None] = {}
@@ -1022,7 +1244,10 @@ class _ControlSSABuilder:
                     "induction": loop.induction,
                 },
             )
-        self.lower(loop.body, path=f"{path}.body")
+        try:
+            self.lower(loop.body, path=f"{path}.body")
+        finally:
+            self.loop_targets.pop()
         produced_results = {
             id(instruction.res)
             for basic_block in self.blocks.values()
@@ -1077,6 +1302,8 @@ class _ControlSSABuilder:
                     "source_value_id": int(source_id),
                 },
             )
+        if deployment_id is not None:
+            self.active_deployments.pop()
         if not self.current.successors:
             self.branch(latch)
 
@@ -1121,6 +1348,131 @@ class _ControlSSABuilder:
             self.external_values[initial_id] = current
             self.external_values[updated_id] = current
         self.current = exit_block
+        if deployment_id is not None:
+            self.emit_deployment_boundary(Handler.Join, record)
+
+    def lower_while(self, loop: WhileBlock, *, path: str) -> None:
+        recursion_region_id = loop.recursion_region_id
+        self.lower(loop.condition, path=f"{path}.condition.initial")
+        preheader = self.current
+        initial_predicate = (
+            self.lower_control_expression(loop.predicate_expression)
+            if loop.predicate_expression is not None
+            else self.external_value(loop.predicate_value_id, dtype="bool")
+        )
+        next_predicate = self.fresh_value(dtype="bool")
+
+        carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
+        for updated_id, initial_id in loop.carried_aliases:
+            updated_id = int(updated_id)
+            initial_id = int(initial_id)
+            initial_value = self.external_value(initial_id)
+            updated_value = SSAValue(
+                updated_id,
+                dtype=initial_value.dtype,
+                shape=initial_value.shape,
+            )
+            current_value = self.fresh_value(
+                dtype=initial_value.dtype,
+                shape=initial_value.shape,
+            )
+            self.external_values[updated_id] = updated_value
+            carried.append((
+                updated_id, initial_id, initial_value,
+                updated_value, current_value,
+            ))
+
+        header = self.new_block("while_header")
+        body = self.new_block("while_body")
+        latch = self.new_block("while_latch")
+        exit_block = self.new_block("while_exit")
+        self.current = preheader
+        self.branch(header)
+
+        self.current = header
+        current_predicate = self.fresh_value(dtype="bool")
+        self.emit(
+            Handler.Phi,
+            [initial_predicate, next_predicate],
+            current_predicate,
+            attributes={
+                "incoming_blocks": (preheader.name, latch.name),
+                "binding": "while_condition",
+                "source_value_id": int(loop.predicate_value_id),
+                "recursion_region_id": recursion_region_id,
+            },
+        )
+        self.external_values[int(loop.predicate_value_id)] = current_predicate
+        for updated_id, initial_id, initial, updated, current in carried:
+            self.emit(
+                Handler.Phi,
+                [initial, updated],
+                current,
+                attributes={
+                    "incoming_blocks": (preheader.name, latch.name),
+                    "binding": "loop_carried",
+                    "initial_value_id": initial_id,
+                    "updated_value_id": updated_id,
+                    "recursion_region_id": recursion_region_id,
+                },
+            )
+            self.external_values[initial_id] = current
+        self.conditional_branch(current_predicate, body, exit_block)
+
+        self.current = body
+        self.loop_targets.append((latch, exit_block))
+        try:
+            self.lower(loop.body, path=f"{path}.body")
+        finally:
+            self.loop_targets.pop()
+        if not self.current.successors:
+            self.branch(latch)
+
+        self.current = latch
+        self.external_values[int(loop.predicate_value_id)] = next_predicate
+        self.lower(loop.condition, path=f"{path}.condition.latch")
+        if loop.predicate_expression is not None:
+            self.lower_control_expression(
+                loop.predicate_expression,
+                result_override=next_predicate,
+            )
+        if not any(
+            instruction.res is next_predicate
+            for instruction in self.current.instrs
+        ):
+            self.shortfalls.append(SSALoweringShortfall(
+                "control",
+                "while_condition",
+                f"{path}.condition",
+                f"predicate value {loop.predicate_value_id} has no producer",
+            ))
+        if not self.current.successors:
+            self.branch(header)
+
+        if recursion_region_id is not None:
+            source = self.recursion_regions[int(recursion_region_id)]
+            lowered = self.ssa_recursion_table.setdefault(
+                int(recursion_region_id),
+                {**source, "function": self.function_name, "loops": []},
+            )
+            lowered["loops"].append({
+                "function": self.function_name,
+                "header": header.name,
+                "body": body.name,
+                "latch": latch.name,
+                "exit": exit_block.name,
+                "phi_value_ids": (
+                    int(current_predicate.id),
+                    *(int(current.id) for *_prefix, current in carried),
+                ),
+                "backedge": (latch.name, header.name),
+                "domain": "condition",
+            })
+        for updated_id, initial_id, _initial, _updated, current in carried:
+            self.external_values[initial_id] = current
+            self.external_values[updated_id] = current
+        self.external_values[int(loop.predicate_value_id)] = current_predicate
+        self.current = exit_block
 
     def lower_state_machine(
         self,
@@ -1150,6 +1502,8 @@ class _ControlSSABuilder:
             if not self.current.successors:
                 self.branch(merge)
             self.current = otherwise
+        if tick.default is not None:
+            self.lower(tick.default, path=f"{path}.default")
         if not self.current.successors:
             self.branch(merge)
         self.current = merge
@@ -1189,6 +1543,82 @@ class _ControlSSABuilder:
             for name, value_id in value_names
             if name in self.parameter_names
         )
+        deployment_regions = []
+        for record in self.deployment_records:
+            declared_lanes = {
+                int(lane.index): lane
+                for lane in record.get("declared_lanes", ())
+            }
+            lane_sites: dict[int, list[tuple[str, int]]] = {
+                index: [] for index in range(int(record["lane_count"]))
+            }
+            lane_callees: dict[int, list[str]] = {
+                index: [] for index in lane_sites
+            }
+            lane_regions: dict[int, list[int]] = {
+                index: [] for index in lane_sites
+            }
+            for block_name, basic_block in self.blocks.items():
+                for instruction_index, instruction in enumerate(
+                    basic_block.instrs
+                ):
+                    memberships = tuple(
+                        instruction.attributes.get(
+                            "deployment_memberships", ()
+                        )
+                    )
+                    for region_id, lane_index in memberships:
+                        if int(region_id) != int(record["region_id"]):
+                            continue
+                        lane_index = int(lane_index)
+                        lane_sites[lane_index].append(
+                            (block_name, instruction_index)
+                        )
+                        callee = instruction.attributes.get("callee")
+                        if callee is not None:
+                            lane_callees[lane_index].append(str(callee))
+                        source_region = instruction.attributes.get(
+                            "region_index"
+                        )
+                        if source_region is not None:
+                            lane_regions[lane_index].append(
+                                int(source_region)
+                            )
+            deployment_regions.append(SSADeploymentRegion(
+                region_id=int(record["region_id"]),
+                function=self.function_name,
+                kind=str(record["kind"]),
+                schedule=str(record["schedule"]),
+                schedule_preference=str(record["schedule_preference"]),
+                lanes=tuple(
+                    SSADeploymentLane(
+                        index=index,
+                        instruction_sites=tuple(lane_sites[index]),
+                        callees=tuple(dict.fromkeys(lane_callees[index])),
+                        source_region_indices=tuple(dict.fromkeys(
+                            lane_regions[index]
+                        )),
+                        source_value_ids=tuple(
+                            declared_lanes[index].value_ids
+                            if index in declared_lanes else ()
+                        ),
+                        source_node_ids=tuple(
+                            declared_lanes[index].source_node_ids
+                            if index in declared_lanes else ()
+                        ),
+                    )
+                    for index in sorted(lane_sites)
+                ),
+                iteration_space=record["iteration_space"],
+                carried_aliases=tuple(record["carried_aliases"]),
+                recursion_region_id=record["recursion_region_id"],
+                origin=str(record["origin"]),
+                source_loop_node_id=record["source_loop_node_id"],
+                scale=int(record.get("scale", 1)),
+                join=record["join"],
+                deploy_site=record.get("deploy_site"),
+                join_site=record.get("join_site"),
+            ))
         if not self.current.successors and (
             not self.current.instrs
             or self.current.instrs[-1].op
@@ -1205,6 +1635,7 @@ class _ControlSSABuilder:
                     "value_names": tuple(value_names),
                     "parameter_names": parameter_value_names,
                     "control_ir": True,
+                    "deployment_regions": tuple(deployment_regions),
                 },
         )
         if self.evolution is not None and self.ssa_evolution is not None:

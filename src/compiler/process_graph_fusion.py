@@ -113,11 +113,33 @@ def extract_clean_process_subgraph(
 ) -> ProcessGraph:
     """Copy an induced subgraph without obligations to excluded nodes."""
 
+    def isolate_metadata(value):
+        """Copy mutable metadata containers without cloning semantic objects."""
+
+        if isinstance(value, dict):
+            return {
+                isolate_metadata(key): isolate_metadata(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [isolate_metadata(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(isolate_metadata(item) for item in value)
+        if isinstance(value, set):
+            return {isolate_metadata(item) for item in value}
+        if isinstance(value, frozenset):
+            return frozenset(isolate_metadata(item) for item in value)
+        return value
+
     included = set(node_ids)
     extracted = copy.copy(graph)
     extracted.G = graph.G.subgraph(included).copy()
+    extracted.G.graph = isolate_metadata(dict(graph.G.graph))
     for node_id in extracted.G:
         data = extracted.G.nodes[node_id]
+        for key, value in tuple(data.items()):
+            if key != "expr_obj":
+                data[key] = isolate_metadata(value)
         data["parents"] = [
             (parent, role)
             for parent, role in data.get("parents", ())

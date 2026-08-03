@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.control_source import (
+    ControlDeploymentLane,
+    ControlDeploymentRegion,
     CallBlock,
     ControlProgram,
     ControlUniform,
     LoopBlock,
+    LoopControlBlock,
     ParallelDeployment,
     RecursionRegion,
     SequenceBlock,
     StatementBlock,
+    StateMachineTick,
+    WhileBlock,
 )
 from src.compiler.precompile_to_ssa import (
     find_ssa_cycles,
@@ -23,6 +28,7 @@ from src.compiler.shell_reference_tables import (
     ClassNavigationRecord,
     ClassNavigationTable,
 )
+from src.transmogrifier.ssa import IRModule
 
 
 def _program(*steps):
@@ -398,3 +404,149 @@ def test_callblock_evaporates_and_parallel_lanes_linearize_without_fake_call():
         "numerical_region_1",
         "numerical_region_2",
     ]
+    assert [instruction.op for instruction in function.blocks["entry"].instrs][
+        :1
+    ] == ["Deploy"]
+    assert function.blocks["entry"].instrs[-2].op == "Join"
+    deployment, = function.metadata["deployment_regions"]
+    assert deployment.schedule == "independent_lanes"
+    assert deployment.deploy_site == ("entry", 0)
+    assert deployment.join_site == (
+        "entry",
+        next(
+            index
+            for index, instruction in enumerate(
+                function.blocks["entry"].instrs
+            )
+            if instruction.op == "Join"
+        ),
+    )
+    assert [lane.callees for lane in deployment.lanes] == [
+        ("numerical_region_1",),
+        ("numerical_region_2",),
+    ]
+    assert [lane.source_region_indices for lane in deployment.lanes] == [
+        (1,),
+        (2,),
+    ]
+    module = IRModule({function.name: function})
+    assert module.deployment_table[function.name] == (deployment,)
+
+
+def test_parallel_loop_retains_iteration_deployment_region_in_ssa():
+    control = ControlProgram(
+        LoopBlock(
+            "iteration",
+            "0",
+            "8",
+            "1",
+            StatementBlock(("__scheduled_region_7__",)),
+            parallel_iterations=True,
+        ),
+        region_indices=(7,),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        first_value_id=100,
+    )
+
+    assert shortfalls == ()
+    deployment, = function.metadata["deployment_regions"]
+    assert deployment.schedule == "independent_iterations"
+    assert deployment.iteration_space == ("0", "8", "1")
+    assert deployment.lanes[0].source_region_indices == (7,)
+    call = next(
+        instruction
+        for instruction in function.blocks["loop_body"].instrs
+        if instruction.op == "Call"
+    )
+    assert call.attributes["deployment_memberships"] == ((0, 0),)
+
+
+def test_control_deployment_table_maps_scheduled_subgraphs_into_ssa():
+    control = ControlProgram(
+        SequenceBlock((
+            StatementBlock(("__scheduled_region_3__",)),
+            StatementBlock(("__scheduled_region_4__",)),
+        )),
+        region_indices=(3, 4),
+        deployment_regions=(ControlDeploymentRegion(
+            region_id=12,
+            kind="parallel_candidate",
+            schedule="independent_lanes",
+            schedule_preference="asap",
+            lanes=(
+                ControlDeploymentLane(
+                    0, (3,), (30,), (300, 301)
+                ),
+                ControlDeploymentLane(
+                    1, (4,), (40,), (400, 401)
+                ),
+            ),
+            origin="unrolled_loop",
+            source_loop_node_id=22,
+        ),),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(control)
+
+    assert shortfalls == ()
+    deployment, = function.metadata["deployment_regions"]
+    assert deployment.region_id == 12
+    assert deployment.origin == "unrolled_loop"
+    assert deployment.schedule_preference == "asap"
+    assert deployment.source_loop_node_id == 22
+    assert deployment.lanes[0].instruction_sites == (("entry", 0),)
+    assert deployment.lanes[0].source_region_indices == (3,)
+    assert deployment.lanes[0].source_value_ids == (30,)
+    assert deployment.lanes[0].source_node_ids == (300, 301)
+    assert deployment.lanes[1].instruction_sites == (("entry", 1),)
+    assert [
+        instruction.attributes["deployment_memberships"]
+        for instruction in function.blocks["entry"].instrs[:2]
+    ] == [((12, 0),), ((12, 1),)]
+
+
+def test_condition_loop_break_and_switch_default_lower_to_cfg_ssa():
+    control = ControlProgram(
+        WhileBlock(
+            predicate_value_id=10,
+            condition=StatementBlock(("__scheduled_region_0__",)),
+            body=SequenceBlock((
+                StatementBlock(("__scheduled_region_1__",)),
+                StateMachineTick(
+                    state="value_20",
+                    cases=(("1", LoopControlBlock("continue")),),
+                    default=LoopControlBlock("break", predicate_value_id=11),
+                ),
+            )),
+            recursion_region_id=4,
+        ),
+        region_indices=(0, 1),
+        recursion_regions=(RecursionRegion(
+            4, "cycle", "while", (10, 11, 20)
+        ),),
+    )
+
+    function, shortfalls = lower_control_program_to_ssa(
+        control,
+        region_signatures={
+            0: ((), (10,)),
+            1: ((10,), (11, 20)),
+        },
+    )
+
+    assert shortfalls == ()
+    assert function.blocks["while_header"].successors == [
+        "while_body", "while_exit"
+    ]
+    assert function.blocks["while_latch"].successors == ["while_header"]
+    assert any(
+        instruction.op == "Phi"
+        and instruction.attributes.get("binding") == "while_condition"
+        for instruction in function.blocks["while_header"].instrs
+    )
+    assert function.metadata["recursion_table"][4]["loops"][0][
+        "domain"
+    ] == "condition"

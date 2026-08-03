@@ -7,9 +7,11 @@ coordinator after planning has selected a compiled target.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping
+
+from .deployment_frame import DeploymentFrame, DeploymentJoin
 
 
 class ControlTarget(str, Enum):
@@ -35,6 +37,16 @@ class SequenceBlock:
 
 
 @dataclass(frozen=True)
+class ControlExpression:
+    """Typed scalar expression evaluated by the compiled control backend."""
+
+    op: str
+    operands: tuple["ControlExpression", ...] = ()
+    value_id: int | None = None
+    literal: bool | int | float | None = None
+
+
+@dataclass(frozen=True)
 class LoopBlock:
     induction: str
     start: str
@@ -54,6 +66,51 @@ class LoopBlock:
     # uses this to associate the loop header, Phi nodes, and latch backedge
     # with the ProcessGraph SCC from which this loop was retained.
     recursion_region_id: int | None = None
+    schedule_preference: str = "alap"
+
+    def __post_init__(self) -> None:
+        preference = str(self.schedule_preference).lower()
+        if preference not in {"asap", "alap"}:
+            raise ValueError(
+                "loop schedule preference must be 'asap' or 'alap'"
+            )
+        object.__setattr__(self, "schedule_preference", preference)
+
+
+@dataclass(frozen=True)
+class WhileBlock:
+    """Condition-controlled loop with an explicitly scheduled predicate.
+
+    ``condition`` is run before the first test and again at the latch.  This
+    lets a numerical region compute the predicate without smuggling Python
+    evaluation into a compiled shell.  The predicate itself remains an
+    ordinary resident value shared by every backend.
+    """
+
+    predicate_value_id: int
+    condition: "ControlBlock"
+    body: "ControlBlock"
+    carried_aliases: tuple[tuple[int, int], ...] = ()
+    recursion_region_id: int | None = None
+    predicate_expression: ControlExpression | None = None
+
+
+@dataclass(frozen=True)
+class LoopControlBlock:
+    """A planner-owned ``break`` or ``continue`` edge.
+
+    When ``predicate_value_id`` is absent the edge is unconditional.  A
+    conditional edge branches only when the resident predicate is true.
+    """
+
+    action: str
+    predicate_value_id: int | None = None
+    expect_true: bool = True
+    predicate_expression: ControlExpression | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in {"break", "continue"}:
+            raise ValueError("loop control action must be break or continue")
 
 
 @dataclass(frozen=True)
@@ -62,6 +119,7 @@ class StateMachineTick:
 
     state: str
     cases: tuple[tuple[str, "ControlBlock"], ...]
+    default: "ControlBlock | None" = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +127,67 @@ class ParallelDeployment:
     """Independent scheduled lanes available to one backend deployment."""
 
     lanes: tuple["ControlBlock", ...]
+    schedule_preference: str = "alap"
+
+    def __post_init__(self) -> None:
+        preference = str(self.schedule_preference).lower()
+        if preference not in {"asap", "alap"}:
+            raise ValueError(
+                "parallel schedule preference must be 'asap' or 'alap'"
+            )
+        object.__setattr__(self, "schedule_preference", preference)
+
+
+@dataclass(frozen=True)
+class ControlDeploymentLane:
+    """One proven-independent lane in a backend-neutral deployment region."""
+
+    index: int
+    region_indices: tuple[int, ...] = ()
+    value_ids: tuple[int, ...] = ()
+    source_node_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ControlDeploymentRegion:
+    """Durable parallelism evidence beside the lexical Control IR.
+
+    The record grants a later deployment pass permission to schedule the
+    listed lanes concurrently.  It deliberately does not select GLSL, SIMD,
+    threads, or any other backend, and the lexical control tree remains the
+    serial fallback.
+    """
+
+    region_id: int
+    kind: str
+    schedule: str
+    schedule_preference: str = "alap"
+    lanes: tuple[ControlDeploymentLane, ...] = ()
+    iteration_space: tuple[str, str, str] | None = None
+    carried_aliases: tuple[tuple[int, int], ...] = ()
+    recursion_region_id: int | None = None
+    origin: str = "control_ir"
+    source_loop_node_id: int | None = None
+    scale: int = 1
+    join: DeploymentJoin = DeploymentJoin()
+
+    def __post_init__(self) -> None:
+        preference = str(self.schedule_preference).lower()
+        if preference not in {"asap", "alap"}:
+            raise ValueError(
+                "deployment schedule preference must be 'asap' or 'alap'"
+            )
+        object.__setattr__(self, "schedule_preference", preference)
+        indices = tuple(int(lane.index) for lane in self.lanes)
+        if indices != tuple(range(len(self.lanes))):
+            raise ValueError(
+                "deployment lane indices must be contiguous from zero"
+            )
+        DeploymentFrame(self.region_id, self.scale, self.join)
+
+    @property
+    def frame(self) -> DeploymentFrame:
+        return DeploymentFrame(self.region_id, self.scale, self.join)
 
 
 @dataclass(frozen=True)
@@ -111,6 +230,8 @@ ControlBlock = (
     StatementBlock
     | SequenceBlock
     | LoopBlock
+    | WhileBlock
+    | LoopControlBlock
     | StateMachineTick
     | ParallelDeployment
     | CallBlock
@@ -158,6 +279,10 @@ class ControlProgram:
         tuple[int, int, str, tuple[int, ...]], ...
     ] = ()
     recursion_regions: tuple[RecursionRegion, ...] = ()
+    # Scheduling permissions survive independently of source syntax.  This
+    # is where an evaporated/unrolled loop can condense instead of becoming
+    # indistinguishable straight-line work.
+    deployment_regions: tuple[ControlDeploymentRegion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -232,6 +357,64 @@ def _render_loop(block: LoopBlock, target: ControlTarget) -> tuple[str, ...]:
     )
 
 
+def _predicate_spelling(value_id: int, target: ControlTarget) -> str:
+    value = f"value_{int(value_id)}"
+    return f"bool({value})" if target is ControlTarget.PYTHON else value
+
+
+def _render_expression(
+    expression: ControlExpression,
+    target: ControlTarget,
+) -> str:
+    if expression.op == "value":
+        return f"value_{int(expression.value_id)}"
+    if expression.op == "const":
+        return repr(expression.literal).lower() if target is not ControlTarget.PYTHON else repr(expression.literal)
+    if expression.op in {"item", "float", "int", "bool"}:
+        return _render_expression(expression.operands[0], target)
+    unary = {"not": "!", "neg": "-"}
+    if expression.op in unary:
+        token = "not " if target is ControlTarget.PYTHON and expression.op == "not" else unary[expression.op]
+        return f"({token}{_render_expression(expression.operands[0], target)})"
+    binary = {
+        "add": "+", "sub": "-", "mul": "*", "div": "/",
+        "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
+        "eq": "==", "ne": "!=",
+        "and": "and" if target is ControlTarget.PYTHON else "&&",
+        "or": "or" if target is ControlTarget.PYTHON else "||",
+    }[expression.op]
+    return f"({_render_expression(expression.operands[0], target)} {binary} {_render_expression(expression.operands[1], target)})"
+
+
+def _render_while(block: WhileBlock, target: ControlTarget) -> tuple[str, ...]:
+    condition = render_control_block(block.condition, target)
+    body = render_control_block(block.body, target)
+    predicate = (
+        _render_expression(block.predicate_expression, target)
+        if block.predicate_expression is not None
+        else _predicate_spelling(block.predicate_value_id, target)
+    )
+    if target is ControlTarget.PYTHON:
+        return (
+            *condition,
+            f"while {predicate}:",
+            *_indent((*body, *condition)),
+        )
+    if target is ControlTarget.FORTRAN:
+        return (
+            *condition,
+            f"do while ({predicate})",
+            *_indent((*body, *condition)),
+            "end do",
+        )
+    return (
+        *condition,
+        f"while ({predicate}) {{",
+        *_indent((*body, *condition)),
+        "}",
+    )
+
+
 def _render_tick(
     block: StateMachineTick,
     target: ControlTarget,
@@ -242,18 +425,28 @@ def _render_tick(
             keyword = "if" if index == 0 else "elif"
             lines.append(f"{keyword} {block.state} == {value}:")
             lines.extend(_indent(render_control_block(body, target)))
+        if block.default is not None:
+            lines.append("else:")
+            lines.extend(_indent(render_control_block(block.default, target)))
         return tuple(lines)
     if target is ControlTarget.FORTRAN:
         lines = [f"select case ({block.state})"]
         for value, body in block.cases:
             lines.append(f"case ({value})")
             lines.extend(_indent(render_control_block(body, target)))
+        if block.default is not None:
+            lines.append("case default")
+            lines.extend(_indent(render_control_block(block.default, target)))
         lines.append("end select")
         return tuple(lines)
     lines = [f"switch ({block.state}) {{"]
     for value, body in block.cases:
         lines.append(f"    case {value}:")
         lines.extend(_indent(render_control_block(body, target), 8))
+        lines.append("        break;")
+    if block.default is not None:
+        lines.append("    default:")
+        lines.extend(_indent(render_control_block(block.default, target), 8))
         lines.append("        break;")
     lines.append("}")
     return tuple(lines)
@@ -275,6 +468,32 @@ def render_control_block(
         )
     if isinstance(block, LoopBlock):
         return _render_loop(block, target)
+    if isinstance(block, WhileBlock):
+        return _render_while(block, target)
+    if isinstance(block, LoopControlBlock):
+        statement = (
+            f"{block.action}"
+            if target in {ControlTarget.PYTHON, ControlTarget.FORTRAN}
+            else f"{block.action};"
+        )
+        if block.predicate_value_id is None:
+            return (statement,)
+        predicate = (
+            _render_expression(block.predicate_expression, target)
+            if block.predicate_expression is not None
+            else _predicate_spelling(block.predicate_value_id, target)
+        )
+        if not block.expect_true:
+            predicate = (
+                f"not {predicate}"
+                if target is ControlTarget.PYTHON
+                else f"!({predicate})"
+            )
+        if target is ControlTarget.PYTHON:
+            return (f"if {predicate}:", f"    {statement}")
+        if target is ControlTarget.FORTRAN:
+            return (f"if ({predicate}) then", f"    {statement}", "end if")
+        return (f"if ({predicate}) {{", f"    {statement}", "}")
     if isinstance(block, StateMachineTick):
         return _render_tick(block, target)
     if isinstance(block, ParallelDeployment):
@@ -416,14 +635,30 @@ def compose_region_code(
                 block.parallel_iterations,
                 block.dispatch_shell,
                 block.recursion_region_id,
+                block.schedule_preference,
             )
+        if isinstance(block, WhileBlock):
+            return WhileBlock(
+                block.predicate_value_id,
+                substitute(block.condition),
+                substitute(block.body),
+                block.carried_aliases,
+                block.recursion_region_id,
+                block.predicate_expression,
+            )
+        if isinstance(block, LoopControlBlock):
+            return block
         if isinstance(block, StateMachineTick):
             return StateMachineTick(
                 block.state,
                 tuple((value, substitute(body)) for value, body in block.cases),
+                None if block.default is None else substitute(block.default),
             )
         if isinstance(block, ParallelDeployment):
-            return ParallelDeployment(tuple(substitute(lane) for lane in block.lanes))
+            return ParallelDeployment(
+                tuple(substitute(lane) for lane in block.lanes),
+                block.schedule_preference,
+            )
         if isinstance(block, CallBlock):
             return CallBlock(
                 block.callsite_id,
@@ -458,6 +693,7 @@ def compose_region_code(
         collection_bindings=program.collection_bindings,
         closure_iterable_bindings=program.closure_iterable_bindings,
         recursion_regions=program.recursion_regions,
+        deployment_regions=program.deployment_regions,
     )
 
 
@@ -518,21 +754,62 @@ def project_control_regions(
                 block.parallel_iterations,
                 block.dispatch_shell,
                 block.recursion_region_id,
+                block.schedule_preference,
             )
+        if isinstance(block, WhileBlock):
+            condition = project(block.condition)
+            body = project(block.body)
+            if body is None or (
+                condition is None and block.predicate_expression is None
+            ):
+                return None
+            return WhileBlock(
+                block.predicate_value_id,
+                condition or SequenceBlock(()),
+                body,
+                tuple(
+                    (updated, initial)
+                    for updated, initial in block.carried_aliases
+                    if retained_values is None
+                    or (
+                        int(updated) in retained_values
+                        and int(initial) in retained_values
+                    )
+                ),
+                block.recursion_region_id,
+                block.predicate_expression,
+            )
+        if isinstance(block, LoopControlBlock):
+            if (
+                block.predicate_value_id is not None
+                and retained_values is not None
+                and int(block.predicate_value_id) not in retained_values
+            ):
+                return None
+            return block
         if isinstance(block, StateMachineTick):
             cases = tuple(
                 (value, projected)
                 for value, body in block.cases
                 if (projected := project(body)) is not None
             )
-            return StateMachineTick(block.state, cases) if cases else None
+            default = (
+                None if block.default is None else project(block.default)
+            )
+            return (
+                StateMachineTick(block.state, cases, default)
+                if cases or default is not None else None
+            )
         if isinstance(block, ParallelDeployment):
             lanes = tuple(
                 projected
                 for lane in block.lanes
                 if (projected := project(lane)) is not None
             )
-            return ParallelDeployment(lanes) if lanes else None
+            return (
+                ParallelDeployment(lanes, block.schedule_preference)
+                if lanes else None
+            )
         if isinstance(block, CallBlock):
             callee = project(block.callee)
             if callee is None:
@@ -560,12 +837,19 @@ def project_control_regions(
             if block.recursion_region_id is not None:
                 active_recursion_regions.add(int(block.recursion_region_id))
             gather_inductions(block.body)
+        elif isinstance(block, WhileBlock):
+            if block.recursion_region_id is not None:
+                active_recursion_regions.add(int(block.recursion_region_id))
+            gather_inductions(block.condition)
+            gather_inductions(block.body)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
                 gather_inductions(child)
         elif isinstance(block, StateMachineTick):
             for _value, body in block.cases:
                 gather_inductions(body)
+            if block.default is not None:
+                gather_inductions(block.default)
         elif isinstance(block, ParallelDeployment):
             for lane in block.lanes:
                 gather_inductions(lane)
@@ -573,6 +857,47 @@ def project_control_regions(
             gather_inductions(block.callee)
 
     gather_inductions(root)
+    projected_deployments = []
+    for deployment in program.deployment_regions:
+        lanes = tuple(
+            replace(
+                lane,
+                region_indices=tuple(
+                    index
+                    for index in lane.region_indices
+                    if int(index) in retained
+                ),
+                value_ids=tuple(
+                    value_id
+                    for value_id in lane.value_ids
+                    if retained_values is None
+                    or int(value_id) in retained_values
+                ),
+            )
+            for lane in deployment.lanes
+        )
+        lanes = tuple(
+            projected_lane
+            for source_lane, projected_lane in zip(
+                deployment.lanes, lanes
+            )
+            if (
+                projected_lane.region_indices
+                or (
+                    not source_lane.region_indices
+                    and (
+                        projected_lane.value_ids
+                        or projected_lane.source_node_ids
+                    )
+                )
+            )
+        )
+        lanes = tuple(
+            replace(lane, index=index)
+            for index, lane in enumerate(lanes)
+        )
+        if lanes:
+            projected_deployments.append(replace(deployment, lanes=lanes))
     return ControlProgram(
         root,
         tuple(
@@ -615,6 +940,7 @@ def project_control_regions(
             for region in program.recursion_regions
             if region.region_id in active_recursion_regions
         ),
+        tuple(projected_deployments),
     )
 
 
@@ -637,6 +963,7 @@ def overlay_scheduled_control(
     collection_bindings = []
     closure_iterable_bindings = []
     recursion_regions = []
+    deployment_regions = []
     controls = tuple(controls)
     controlled_sets = tuple(
         frozenset(control.region_indices) for control in controls
@@ -685,9 +1012,30 @@ def overlay_scheduled_control(
                     block.parallel_iterations,
                     block.dispatch_shell,
                     block.recursion_region_id,
+                    block.schedule_preference,
                 ),
                 consumed,
             )
+        if isinstance(block, WhileBlock):
+            condition, condition_consumed = embed(
+                block.condition, nested_root, nested_regions
+            )
+            body, body_consumed = embed(
+                block.body, nested_root, nested_regions
+            )
+            return (
+                WhileBlock(
+                    block.predicate_value_id,
+                    condition or SequenceBlock(()),
+                    body or SequenceBlock(()),
+                    block.carried_aliases,
+                    block.recursion_region_id,
+                    block.predicate_expression,
+                ),
+                condition_consumed or body_consumed,
+            )
+        if isinstance(block, LoopControlBlock):
+            return block, False
         if isinstance(block, StateMachineTick):
             cases = []
             consumed_any = False
@@ -697,7 +1045,17 @@ def overlay_scheduled_control(
                 )
                 cases.append((value, projected or SequenceBlock(())))
                 consumed_any |= consumed
-            return StateMachineTick(block.state, tuple(cases)), consumed_any
+            default = None
+            if block.default is not None:
+                default, consumed = embed(
+                    block.default, nested_root, nested_regions
+                )
+                default = default or SequenceBlock(())
+                consumed_any |= consumed
+            return (
+                StateMachineTick(block.state, tuple(cases), default),
+                consumed_any,
+            )
         if isinstance(block, ParallelDeployment):
             lanes = []
             consumed_any = False
@@ -707,7 +1065,10 @@ def overlay_scheduled_control(
                 )
                 lanes.append(projected or SequenceBlock(()))
                 consumed_any |= consumed
-            return ParallelDeployment(tuple(lanes)), consumed_any
+            return (
+                ParallelDeployment(tuple(lanes), block.schedule_preference),
+                consumed_any,
+            )
         if isinstance(block, CallBlock):
             callee, consumed = embed(
                 block.callee, nested_root, nested_regions
@@ -790,6 +1151,11 @@ def overlay_scheduled_control(
             control.closure_iterable_bindings
         )
         recursion_regions.extend(control.recursion_regions)
+        deployment_base = len(deployment_regions)
+        deployment_regions.extend(
+            replace(region, region_id=deployment_base + offset)
+            for offset, region in enumerate(control.deployment_regions)
+        )
         if index not in maximal:
             continue
         overlap = set(controlled) & covered
@@ -824,6 +1190,7 @@ def overlay_scheduled_control(
             dict.fromkeys(closure_iterable_bindings)
         ),
         recursion_regions=tuple(dict.fromkeys(recursion_regions)),
+        deployment_regions=tuple(deployment_regions),
     )
 
 
@@ -966,6 +1333,9 @@ def compile_cffi_shell(
 
 __all__ = [
     "ControlBlock",
+    "ControlDeploymentLane",
+    "ControlDeploymentRegion",
+    "ControlExpression",
     "CallBlock",
     "ValidationBlock",
     "ControlProgram",
@@ -973,6 +1343,7 @@ __all__ = [
     "ControlUniform",
     "CFFICallable",
     "LoopBlock",
+    "LoopControlBlock",
     "ParallelDeployment",
     "RecursionRegion",
     "RegionCode",
@@ -980,6 +1351,7 @@ __all__ = [
     "StateMachineTick",
     "StatementBlock",
     "StreamPublishBlock",
+    "WhileBlock",
     "compile_cffi_shell",
     "compile_python_shell",
     "compose_region_code",

@@ -121,6 +121,7 @@ _OPCODES: dict[str, dict[str, int]] = {
 OP_BLOCK = 0x02
 OP_LOOP = 0x03
 OP_IF = 0x04
+OP_ELSE = 0x05
 OP_END = 0x0B
 OP_BR = 0x0C
 OP_BR_IF = 0x0D
@@ -128,6 +129,8 @@ OP_CALL = 0x10
 OP_LOCAL_GET = 0x20
 OP_LOCAL_SET = 0x21
 OP_I32_CONST = 0x41
+OP_I32_EQZ = 0x45
+OP_I32_EQ = 0x46
 OP_I32_LT_S = 0x48
 OP_I32_LE_S = 0x4C
 OP_I32_ADD = 0x6A
@@ -268,6 +271,10 @@ class CodeBuilder:
 
     def if_(self, block_type: int = EMPTY_BLOCK) -> "CodeBuilder":
         self.code += bytes([OP_IF, block_type])
+        return self
+
+    def else_(self) -> "CodeBuilder":
+        self.code += bytes([OP_ELSE])
         return self
 
     def br(self, depth: int) -> "CodeBuilder":

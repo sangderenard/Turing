@@ -93,12 +93,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import inspect
 import io
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from ....compiler.glsl_deployment_strategy import (
     _walk_planned_shells,
+    propagate_bound_planner_specializations,
     strategize_glsl_deployment,
 )
 from ....compiler.shell_reference_tables import (
@@ -107,9 +109,68 @@ from ....compiler.shell_reference_tables import (
 )
 from ....compiler.precompile_to_ssa import lower_class_navigation_to_ssa
 from ....transmogrifier.graph.graph_express2 import ProcessGraph
+from ..abstraction import AbstractTensor
 from ..topological_reducer import reduce_abstract_tensor_topology
 from ..fused_ir import FusedProgram
 from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
+
+
+AOT_BAKE_MODES = frozenset({"one_shot", "whole_program"})
+AOT_SCHEDULE_PREFERENCES = frozenset({"asap", "alap"})
+
+
+def normalize_aot_bake_mode(value: str) -> str:
+    """Validate the public choice between trace and retained-control baking."""
+
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode not in AOT_BAKE_MODES:
+        raise ValueError(
+            "bake_mode must be 'one_shot' or 'whole_program', "
+            f"not {value!r}"
+        )
+    return mode
+
+
+def normalize_aot_schedule_preference(value: str) -> str:
+    """Validate the pinned placement preference used by every deployment."""
+
+    preference = str(value).strip().lower()
+    if preference not in AOT_SCHEDULE_PREFERENCES:
+        raise ValueError(
+            "schedule_preference must be 'asap' or 'alap', "
+            f"not {value!r}"
+        )
+    return preference
+
+
+def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
+    """Keep the source linker above the established tensor-op boundary.
+
+    ``AbstractTensor`` methods are the compiler's numerical vocabulary.  If
+    dependency discovery recursively ingests their Python dispatch wrappers,
+    an ordinary ``AT.tensor`` call expands into backend selection, autograd,
+    and tape object construction instead of remaining the tensor operation
+    the reducer already knows how to lower.
+    """
+
+    target = value.__func__ if inspect.ismethod(value) else value
+    owner = str(getattr(target, "__qualname__", "")).split(".", 1)[0]
+    module = str(getattr(target, "__module__", ""))
+    if not module.startswith("src."):
+        return False
+    if module.endswith(".debug"):
+        return False
+    for name in dir(AbstractTensor):
+        candidate = getattr(AbstractTensor, name, None)
+        candidate = (
+            candidate.__func__ if inspect.ismethod(candidate) else candidate
+        )
+        if target is candidate:
+            return False
+    return not (
+        owner == "AbstractTensor"
+        and module == "src.common.tensors.abstraction"
+    )
 
 
 @dataclass(frozen=True)
@@ -134,6 +195,81 @@ class AOTCompilation:
     identity_table: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     function_outputs: tuple[str, ...] = ()
     function_parameters: tuple[str, ...] = ()
+    # Planner-owned control that could not be represented by the exported
+    # ControlProgram.  A whole-program backend must reject these rather than
+    # silently baking the numerical trace observed during discovery.
+    control_shortfalls: tuple[Mapping[str, Any], ...] = ()
+    # ``one_shot`` packages the numerical trace produced by the discovery
+    # execution. ``whole_program`` requires consumers to retain the planned
+    # ControlProgram and its real region kernels.
+    bake_mode: str = "whole_program"
+    schedule_preference: str = "alap"
+    # The full source record remains authoritative. A configured record fixes
+    # selected public parameters to literals before ProcessGraph reduction.
+    program_record_mode: str = "full"
+    constant_map: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _apply_parameter_constant_map(
+    module: ast.Module,
+    entrypoint: str,
+    constant_map: Mapping[str, Any],
+) -> ast.Module:
+    """Replace configured parameter reads before topology reduction."""
+
+    if not constant_map:
+        return module
+    function = next(
+        (
+            node for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == entrypoint
+        ),
+        None,
+    )
+    if function is None:
+        raise ValueError(f"configured entrypoint {entrypoint!r} is absent")
+    parameters = {
+        argument.arg
+        for argument in (
+            *function.args.posonlyargs,
+            *function.args.args,
+            *function.args.kwonlyargs,
+        )
+    }
+    unknown = set(map(str, constant_map)) - parameters
+    if unknown:
+        raise ValueError(
+            "configured constants name unknown parameters: "
+            + ", ".join(sorted(unknown))
+        )
+    replacements: dict[str, ast.expr] = {}
+    normalized: dict[str, Any] = {}
+    for name, value in constant_map.items():
+        try:
+            expression = ast.parse(repr(value), mode="eval").body
+            literal = ast.literal_eval(expression)
+        except (SyntaxError, ValueError, TypeError) as error:
+            raise ValueError(
+                f"configured constant {name!r} must be a Python literal"
+            ) from error
+        replacements[str(name)] = expression
+        normalized[str(name)] = literal
+
+    class ReplaceConfiguredReads(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id in replacements:
+                return ast.copy_location(
+                    ast.fix_missing_locations(
+                        ast.parse(repr(normalized[node.id]), mode="eval").body
+                    ),
+                    node,
+                )
+            return node
+
+    ReplaceConfiguredReads().visit(function)
+    ast.fix_missing_locations(module)
+    return module
 
 
 def project_public_numerical_program(compilation: AOTCompilation) -> Any:
@@ -219,6 +355,9 @@ def compile_ast_aot(
     profiling: bool = False,
     precompile_only: bool = False,
     python_bindings: Mapping[str, Any] | None = None,
+    bake_mode: str = "whole_program",
+    schedule_preference: str = "alap",
+    constant_map: Mapping[str, Any] | None = None,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -236,7 +375,14 @@ def compile_ast_aot(
     ``DualIRShell`` describing the same numeric/control pair.
     """
 
-    module = ast.parse(source)
+    bake_mode = normalize_aot_bake_mode(bake_mode)
+    schedule_preference = normalize_aot_schedule_preference(
+        schedule_preference
+    )
+    constant_map = dict(constant_map or {})
+    module = _apply_parameter_constant_map(
+        ast.parse(source), entrypoint, constant_map
+    )
     graph = ProcessGraph(materialize_memory=False)
     # AOT compilation may target a function from a live module.  Its resolved
     # globals are static closure values, not runtime tensor feeds.  Capturing
@@ -244,8 +390,15 @@ def compile_ast_aot(
     # references without executing or reinterpreting their source expressions.
     graph.python_bindings = dict(python_bindings or {})
     with contextlib.redirect_stdout(io.StringIO()):
-        graph.build_from_ast(module)
+        graph.build_from_ast(
+            module,
+            resolve_unresolved_parents=True,
+            parent_include=_source_dependency_is_not_tensor_primitive,
+        )
     reduce_abstract_tensor_topology(graph)
+    propagate_bound_planner_specializations(
+        graph, entrypoint, feeds
+    )
     dependency_regions = build_map_dependency_regions(graph, entrypoint)
     map_ir = dict(graph.G.graph.get("map_ir") or {})
     map_ir["dependency_regions"] = {
@@ -275,6 +428,7 @@ def compile_ast_aot(
         backend=backend,
         remove_loops=remove_loops,
         unroll_limit=unroll_limit,
+        schedule_preference=schedule_preference,
     )
     # shell_language is fixed at "glsl", the one path that actually emits
     # something distinct -- see this module's docstring. It is not derived
@@ -324,17 +478,72 @@ def compile_ast_aot(
                 if control is not None and control.region_indices:
                     source_shell = candidate
                     break
+        control_shortfalls = tuple(
+            {
+                "function": str(
+                    candidate.process_graph.G.graph.get("function_name")
+                    or "?"
+                ),
+                "loop_node_id": int(reduction.loop_node_id),
+                "source_type": type(
+                    candidate.process_graph.G.nodes[
+                        int(reduction.loop_node_id)
+                    ].get("expr_obj")
+                ).__name__,
+                "condition_nodes": tuple(
+                    int(parent)
+                    for parent, role in (
+                        candidate.process_graph.G.nodes[
+                            int(reduction.loop_node_id)
+                        ].get("parents") or ()
+                    )
+                    if str(role) in {"test", "ifs"}
+                ),
+                "blockers": tuple(map(str, reduction.blockers)),
+                "captured_regions": tuple(
+                    int(key if not isinstance(key, tuple) else key[-2])
+                    for key in (
+                        candidate.captured_region_programs or {}
+                    )
+                ),
+            }
+            for candidate in _walk_planned_shells(deployment)
+            if candidate.captured_region_programs
+            for reduction in candidate.loop_shader_reductions
+            if reduction.region_indices
+            and reduction.control_program is None
+        )
+        hierarchical_control = getattr(
+            function_shell, "hierarchical_control_program", None
+        )
+        hierarchical_regions = getattr(
+            function_shell,
+            "hierarchical_captured_region_programs",
+            {},
+        )
+        if hierarchical_control is not None and hierarchical_regions:
+            source_shell = function_shell
+            shell_control_program = hierarchical_control
+            selected_regions = hierarchical_regions
+        else:
+            shell_control_program = source_shell.shell_control_program
+            selected_regions = getattr(
+                source_shell, "captured_region_programs", {}
+            ) or {}
         compiled_shell_program = source_shell.compiled_shell_program
-        shell_control_program = source_shell.shell_control_program
         region_programs = {
             int(index): getattr(program, "program", program)
-            for index, program in (
-                getattr(source_shell, "captured_region_programs", {}) or {}
-            ).items()
+            for index, program in selected_regions.items()
         }
         source_graph_metadata = source_shell.process_graph.G.graph
+        root_value_ids = dict(
+            getattr(source_shell, "hierarchical_root_value_ids", {}) or {}
+        )
         identity_table = {
-            str(name): tuple(map(int, value_ids))
+            str(name): tuple(
+                int(root_value_ids.get(int(value_id), int(value_id)))
+                for value_id in value_ids
+            )
             for name, value_ids in (
                 source_graph_metadata.get("identity_table") or {}
             ).items()
@@ -402,11 +611,20 @@ def compile_ast_aot(
         identity_table=identity_table,
         function_outputs=function_outputs,
         function_parameters=function_parameters,
+        control_shortfalls=control_shortfalls,
+        bake_mode=bake_mode,
+        schedule_preference=schedule_preference,
+        program_record_mode=("configured" if constant_map else "full"),
+        constant_map=constant_map,
     )
 
 
 __all__ = [
+    "AOT_BAKE_MODES",
+    "AOT_SCHEDULE_PREFERENCES",
     "AOTCompilation",
     "compile_ast_aot",
+    "normalize_aot_bake_mode",
+    "normalize_aot_schedule_preference",
     "project_public_numerical_program",
 ]

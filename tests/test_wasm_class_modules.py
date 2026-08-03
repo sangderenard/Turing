@@ -12,7 +12,8 @@ from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
-    partition_reduced_program, schedule_module_levels,
+    partition_reduced_program, partition_threaded_wasm_program,
+    schedule_module_levels,
 )
 
 
@@ -55,6 +56,37 @@ def test_a_larger_program_is_cut_into_contiguous_chunks():
     # Dependency order: earliest chunk first, root (owner) last.
     assert specs[-1].is_root
     assert all(not s.is_root for s in specs[:-1])
+
+
+def test_thread_partition_vertically_fuses_before_parallel_waves():
+    program = FusedProgram(
+        version=1,
+        feeds={1, 2},
+        steps=[
+            OpStep(0, "mul", [1], {"right_scalar": 2.0}, 10),
+            OpStep(1, "add", [10], {"right_scalar": 1.0}, 11),
+            OpStep(2, "mul", [2], {"right_scalar": 3.0}, 20),
+            OpStep(3, "add", [20], {"right_scalar": 1.0}, 21),
+            OpStep(4, "add", [11, 21], {}, 30),
+            OpStep(5, "mul", [30], {"right_scalar": 0.5}, 31),
+        ],
+        outputs={"result": 31},
+    )
+
+    partitioned = partition_threaded_wasm_program(
+        program, max_nodes_per_region=2, schedule_preference="asap"
+    )
+
+    control, regions, summary = partitioned
+    assert summary["source_operations"] == 6
+    assert summary["vertical_fused_regions"] >= 1
+    assert summary["parallel_waves"] >= 1
+    assert max(summary["region_sizes"]) <= 2
+    assert set(control.region_indices) == set(regions)
+    assert any(
+        "vertical-fusion" in history
+        for history in summary["rewrite_history"]
+    )
 
 
 def test_each_chunk_declares_only_the_values_it_actually_needs():

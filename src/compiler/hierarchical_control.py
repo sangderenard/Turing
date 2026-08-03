@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Mapping
 
 from .control_source import (
     CallBlock,
     ControlBlock,
+    ControlExpression,
     ControlProgram,
     ControlUniform,
+    LoopControlBlock,
     LoopBlock,
     ParallelDeployment,
     RecursionRegion,
@@ -19,6 +21,7 @@ from .control_source import (
     StatementBlock,
     StreamPublishBlock,
     ValidationBlock,
+    WhileBlock,
 )
 from .hierarchical_plan import (
     HierarchyValueTable,
@@ -64,10 +67,13 @@ def compose_hierarchical_control(
         tuple[int, int, str, tuple[int, ...]]
     ] = []
     all_recursion_regions: list[RecursionRegion] = []
+    all_deployment_regions = []
     next_recursion_region = 0
+    next_deployment_region = 0
 
     def compose(closure: PlanClosure) -> ControlProgram:
         nonlocal next_region, next_recursion_region
+        nonlocal next_deployment_region
         closure_id = int(closure.closure_id)
         local = controls[closure_id]
         region_map = {}
@@ -99,6 +105,35 @@ def compose_hierarchical_control(
                 incoming=tuple(edge(item) for item in region.incoming),
                 outgoing=tuple(edge(item) for item in region.outgoing),
                 feedback=tuple(edge(item) for item in region.feedback),
+            ))
+
+        for deployment in local.deployment_regions:
+            global_deployment_id = next_deployment_region
+            next_deployment_region += 1
+            all_deployment_regions.append(replace(
+                deployment,
+                region_id=global_deployment_id,
+                lanes=tuple(
+                    replace(
+                        lane,
+                        region_indices=tuple(
+                            region_map[int(region_index)]
+                            for region_index in lane.region_indices
+                            if int(region_index) in region_map
+                        ),
+                        value_ids=tuple(
+                            value(value_id) for value_id in lane.value_ids
+                        ),
+                    )
+                    for lane in deployment.lanes
+                ),
+                recursion_region_id=(
+                    None
+                    if deployment.recursion_region_id is None
+                    else recursion_region_map[
+                        int(deployment.recursion_region_id)
+                    ]
+                ),
             ))
 
         induction_names: dict[str, str] = {}
@@ -277,6 +312,19 @@ def compose_hierarchical_control(
 
         def rewrite(block: ControlBlock) -> ControlBlock:
             nonlocal remaining_calls_after
+            def rewrite_expression(expression):
+                if expression is None:
+                    return None
+                return ControlExpression(
+                    expression.op,
+                    tuple(
+                        rewrite_expression(operand)
+                        for operand in expression.operands
+                    ),
+                    None if expression.value_id is None
+                    else value(expression.value_id),
+                    expression.literal,
+                )
             if isinstance(block, StatementBlock):
                 local_region = _region_marker(block)
                 if local_region is None:
@@ -327,6 +375,30 @@ def compose_hierarchical_control(
                             int(block.recursion_region_id)
                         ]
                     ),
+                    block.schedule_preference,
+                )
+            if isinstance(block, WhileBlock):
+                return WhileBlock(
+                    value(block.predicate_value_id),
+                    rewrite(block.condition),
+                    rewrite(block.body),
+                    tuple(
+                        (value(updated), value(initial))
+                        for updated, initial in block.carried_aliases
+                    ),
+                    (
+                        None if block.recursion_region_id is None
+                        else recursion_region_map[int(block.recursion_region_id)]
+                    ),
+                    rewrite_expression(block.predicate_expression),
+                )
+            if isinstance(block, LoopControlBlock):
+                return LoopControlBlock(
+                    block.action,
+                    None if block.predicate_value_id is None
+                    else value(block.predicate_value_id),
+                    block.expect_true,
+                    rewrite_expression(block.predicate_expression),
                 )
             if isinstance(block, StateMachineTick):
                 return StateMachineTick(
@@ -335,11 +407,13 @@ def compose_hierarchical_control(
                         (rename_control_text(case), rewrite(body))
                         for case, body in block.cases
                     ),
+                    None if block.default is None else rewrite(block.default),
                 )
             if isinstance(block, ParallelDeployment):
-                return ParallelDeployment(tuple(
-                    rewrite(lane) for lane in block.lanes
-                ))
+                return ParallelDeployment(
+                    tuple(rewrite(lane) for lane in block.lanes),
+                    block.schedule_preference,
+                )
             if isinstance(block, CallBlock):
                 return CallBlock(
                     block.callsite_id,
@@ -424,9 +498,17 @@ def compose_hierarchical_control(
         if isinstance(block, LoopBlock):
             collect_regions(block.body)
             return
+        if isinstance(block, WhileBlock):
+            collect_regions(block.condition)
+            collect_regions(block.body)
+            return
+        if isinstance(block, LoopControlBlock):
+            return
         if isinstance(block, StateMachineTick):
             for _case, body in block.cases:
                 collect_regions(body)
+            if block.default is not None:
+                collect_regions(block.default)
             return
         if isinstance(block, ParallelDeployment):
             for lane in block.lanes:
@@ -442,16 +524,21 @@ def compose_hierarchical_control(
         raise TypeError(type(block).__name__)
 
     collect_regions(program.root)
-    program = ControlProgram(
-        program.root,
-        tuple(ordered_regions),
-        tuple(dict.fromkeys(all_uniforms)),
-        tuple(dict.fromkeys(all_aliases)),
-        tuple(dict.fromkeys(all_iterables)),
-        tuple(dict.fromkeys(all_static_iterables)),
-        tuple(dict.fromkeys(all_collections)),
-        tuple(dict.fromkeys(all_closure_iterables)),
-        tuple(dict.fromkeys(all_recursion_regions)),
+    program = replace(
+        program,
+        region_indices=tuple(ordered_regions),
+        uniforms=tuple(dict.fromkeys(all_uniforms)),
+        value_aliases=tuple(dict.fromkeys(all_aliases)),
+        iterable_bindings=tuple(dict.fromkeys(all_iterables)),
+        static_iterable_bindings=tuple(
+            dict.fromkeys(all_static_iterables)
+        ),
+        collection_bindings=tuple(dict.fromkeys(all_collections)),
+        closure_iterable_bindings=tuple(
+            dict.fromkeys(all_closure_iterables)
+        ),
+        recursion_regions=tuple(dict.fromkeys(all_recursion_regions)),
+        deployment_regions=tuple(all_deployment_regions),
     )
     return HierarchicalControl(program, tuple(region_correlations))
 

@@ -823,6 +823,67 @@ let running = false;
 // the class instance (memory + field-slot table + method inventory), then
 // calls one translated WASM coordinator. Card-to-card calls stay in WASM.
 // No live tensor is copied through JavaScript at a seam.
+function wasmTileWorkerSource() {
+  return `self.onmessage = async event => {
+    try {
+      const {manifest, inventory, methodIds, count, fields} = event.data;
+      const specs = new Map(manifest.modules.map(spec => [spec.name, spec]));
+      const cards = new Map((inventory.methods || []).map(card => [card.index, card]));
+      const elementBytes = Number(manifest.modules[0].element_bytes || 8);
+      const View = manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+      const fieldCount = (inventory.field_slots || []).length;
+      let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
+      const inventoryOffset = cursor;
+      cursor += fieldCount * 4;
+      cursor = Math.ceil(cursor / elementBytes) * elementBytes;
+      const offsets = Array.from({length: fieldCount}, () => {
+        const offset = cursor; cursor += count * elementBytes; return offset;
+      });
+      const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
+      new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
+      for (const [indexText, values] of Object.entries(fields)) {
+        const index = Number(indexText);
+        new View(memory.buffer, offsets[index], count).set(values);
+      }
+      const outputSlots = new Set();
+      for (const methodId of methodIds) {
+        const card = cards.get(methodId);
+        if (!card) throw new Error("unknown deployment method " + methodId);
+        const spec = specs.get(card.module);
+        if (!spec) throw new Error("missing deployment module " + card.module);
+        let bytes;
+        if (spec.url) {
+          const response = await fetch(spec.absolute_url || spec.url);
+          if (!response.ok) throw new Error("worker fetch failed: HTTP " + response.status);
+          bytes = await response.arrayBuffer();
+        } else if (spec.wasm_base64) {
+          const raw = atob(spec.wasm_base64);
+          const decoded = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) decoded[i] = raw.charCodeAt(i);
+          bytes = decoded;
+        } else throw new Error("deployment module has no bytes");
+        const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
+        const imports = {};
+        imports[memoryImport.module] = {[memoryImport.field]: memory};
+        const {instance} = await WebAssembly.instantiate(bytes, imports);
+        const args = [...card.input_slots, ...card.output_slots].map(slot => offsets[slot]);
+        instance.exports[card.entry](count, ...args);
+        card.output_slots.forEach(slot => outputSlots.add(slot));
+      }
+      const outputs = {};
+      const transfer = [];
+      for (const slot of outputSlots) {
+        const values = new View(memory.buffer, offsets[slot], count).slice();
+        outputs[slot] = values;
+        transfer.push(values.buffer);
+      }
+      self.postMessage({outputs}, transfer);
+    } catch (error) {
+      self.postMessage({error: String(error && (error.stack || error.message || error))});
+    }
+  };`;
+}
+
 class ClassGraphRunner {
   constructor(manifest) {
     if (!manifest.shared_memory) throw new Error(
@@ -846,10 +907,180 @@ class ClassGraphRunner {
     }
     this.layoutCount = 0;
     this.inventoryOffset = 0;
+    this.tileWorkerURL = null;
     const staticBytes = Number(manifest.shared_static_bytes || 0);
     this.memory = new WebAssembly.Memory({
       initial: Math.max(1, Math.ceil(staticBytes / 65536))
     });
+  }
+
+  callsInDeploymentNode(node) {
+    if (node.kind === "call") return [Number(node.method)];
+    if (node.kind === "sequence") return node.children.flatMap(
+      child => this.callsInDeploymentNode(child)
+    );
+    throw new Error("worker lane contains unsupported " + node.kind + " node");
+  }
+
+  tileRanges(count, workerCount) {
+    const contract = this.manifest.thread_deployment || {};
+    const alignment = Math.max(1, Number(contract.tile_alignment || 8));
+    const desired = Math.max(1, workerCount * Number(contract.tiles_per_worker || 2));
+    const tile = Math.max(
+      alignment,
+      Math.ceil(Math.ceil(count / desired) / alignment) * alignment
+    );
+    const ranges = [];
+    for (let start = 0; start < count; start += tile) {
+      ranges.push([start, Math.min(count, start + tile)]);
+    }
+    return ranges;
+  }
+
+  workerCount(taskCount) {
+    const hardware = Math.max(1, Number(navigator.hardwareConcurrency || 2));
+    return Math.max(1, Math.min(taskCount, 8, Math.max(1, hardware - 1)));
+  }
+
+  async runTileTask(methodIds, start, end, View) {
+    if (!this.tileWorkerURL) {
+      this.tileWorkerURL = URL.createObjectURL(new Blob(
+        [wasmTileWorkerSource()], {type: "text/javascript"}
+      ));
+    }
+    const count = end - start;
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    const cards = new Map((this.manifest.class_inventory.methods || []).map(
+      card => [Number(card.index), card]
+    ));
+    const touchedSlots = new Set();
+    for (const methodId of methodIds) {
+      const card = cards.get(Number(methodId));
+      [...card.input_slots, ...card.output_slots].forEach(
+        slot => touchedSlots.add(Number(slot))
+      );
+    }
+    const fields = {};
+    for (const slot of touchedSlots) {
+      fields[slot] = new View(
+        this.memory.buffer,
+        this.fieldOffsets[slot] + start * elementBytes,
+        count,
+      ).slice();
+    }
+    const manifest = {
+      ...this.manifest,
+      modules: this.manifest.modules.map(spec => ({
+        ...spec,
+        absolute_url: spec.url ? new URL(spec.url, document.baseURI).href : null,
+      })),
+    };
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(this.tileWorkerURL);
+      worker.onmessage = event => {
+        worker.terminate();
+        if (event.data.error) reject(new Error(event.data.error));
+        else resolve({start, end, outputs: event.data.outputs});
+      };
+      worker.onerror = event => {
+        worker.terminate();
+        reject(new Error(event.message || "WebAssembly tile worker failed"));
+      };
+      worker.postMessage({
+        manifest,
+        inventory: this.manifest.class_inventory,
+        methodIds,
+        count,
+        fields,
+      });
+    });
+  }
+
+  async executeDeploymentNodeSerial(node, count) {
+    if (node.kind === "call") {
+      const method = (this.manifest.class_inventory.methods || []).find(
+        candidate => Number(candidate.index) === Number(node.method)
+      );
+      const spec = this.modulesByName.get(method.module);
+      const instance = this.instances.get(method.module);
+      const args = [...method.input_slots, ...method.output_slots].map(
+        slot => this.fieldOffsets[slot]
+      );
+      instance.exports[method.entry](count, ...args);
+      return;
+    }
+    const children = node.kind === "deploy" ? node.lanes : node.children;
+    for (const child of children) await this.executeDeploymentNodeSerial(child, count);
+  }
+
+  async executeDeploy(node, count, View) {
+    const laneCalls = node.lanes.map(lane => this.callsInDeploymentNode(lane));
+    const methods = new Map((this.manifest.class_inventory.methods || []).map(
+      method => [Number(method.index), method]
+    ));
+    const written = new Set();
+    for (const calls of laneCalls) for (const methodId of calls) {
+      for (const slot of methods.get(methodId).output_slots) {
+        if (written.has(slot)) {
+          log("warn", "parallel lanes share an output slot; using serial fallback", {slot});
+          return this.executeDeploymentNodeSerial(node, count);
+        }
+        written.add(slot);
+      }
+    }
+    if (typeof Worker === "undefined" || count < 2) {
+      return this.executeDeploymentNodeSerial(node, count);
+    }
+    const provisionalWorkers = this.workerCount(Math.max(1, laneCalls.length * 2));
+    const ranges = this.tileRanges(count, provisionalWorkers);
+    const tasks = laneCalls.flatMap(methodIds => ranges.map(
+      ([start, end]) => ({methodIds, start, end})
+    ));
+    const limit = this.workerCount(tasks.length);
+    log("progress", "Deploy: dispatching WebAssembly tiles", {
+      done: 0, total: tasks.length, workers: limit, tiles: ranges.length,
+      lanes: laneCalls.length, join: node.join.mode
+    });
+    const completed = [];
+    try {
+      for (let cursor = 0; cursor < tasks.length; cursor += limit) {
+        const batch = tasks.slice(cursor, cursor + limit);
+        completed.push(...await Promise.all(batch.map(task =>
+          this.runTileTask(task.methodIds, task.start, task.end, View)
+        )));
+        setProgress(completed.length, tasks.length, "Join: awaiting WebAssembly tiles");
+      }
+    } catch (error) {
+      log("warn", "thread deployment failed; replaying serial Wasm schedule", {
+        error: String(error)
+      });
+      return this.executeDeploymentNodeSerial(node, count);
+    }
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    for (const result of completed) {
+      for (const [slotText, values] of Object.entries(result.outputs)) {
+        const slot = Number(slotText);
+        new View(
+          this.memory.buffer,
+          this.fieldOffsets[slot] + result.start * elementBytes,
+          result.end - result.start,
+        ).set(values);
+      }
+    }
+    log("ok", "Join: all WebAssembly tiles committed", {
+      tiles: completed.length, workers: limit
+    });
+  }
+
+  async executeDeploymentNode(node, count, View) {
+    if (node.kind === "deploy") return this.executeDeploy(node, count, View);
+    if (node.kind === "sequence") {
+      for (const child of node.children) {
+        await this.executeDeploymentNode(child, count, View);
+      }
+      return;
+    }
+    return this.executeDeploymentNodeSerial(node, count);
   }
 
   async binary(url, label) {
@@ -874,6 +1105,12 @@ class ClassGraphRunner {
       const raw = atob(spec.wasm_base64);
       moduleBinary = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+    } else if (this.manifest.thread_deployment) {
+      const started = performance.now();
+      await this.executeDeploymentNode(
+        this.manifest.thread_deployment.root, count, View
+      );
+      this.lastExecutionMs = performance.now() - started;
     } else {
       throw new Error("method card " + spec.name + " has no URL or bytes");
     }
@@ -998,12 +1235,15 @@ class ClassGraphRunner {
     }
     const runtime = await this.ensureRuntime();
     const methodCount = Number(this.manifest.coordinator.method_count);
-    const rangeEnd = end === null ? methodCount : Math.min(methodCount, end);
+    const supportsRanges = this.manifest.coordinator.supports_ranges !== false;
+    const rangeStart = supportsRanges ? start : 0;
+    const rangeEnd = supportsRanges && end !== null
+      ? Math.min(methodCount, end) : methodCount;
     const activeMethods = (this.manifest.class_inventory.methods || []).filter(
-      method => method.index >= start && method.index < rangeEnd
+      method => method.index >= rangeStart && method.index < rangeEnd
     );
     const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
-    if (latch) {
+    if (latch && supportsRanges) {
       for (let index = 0; index < activeMethods.length && running; index++) {
         const method = activeMethods[index];
         markDeploymentNode(method.module, "running");
@@ -1016,7 +1256,7 @@ class ClassGraphRunner {
       }
     } else {
       const started = performance.now();
-      coordinate(count, this.inventoryOffset, start, rangeEnd);
+      coordinate(count, this.inventoryOffset, rangeStart, rangeEnd);
       const elapsed = performance.now() - started;
       this.lastExecutionMs = elapsed;
       activeMethods.forEach(method => queueDeploymentProfile(
