@@ -36,6 +36,7 @@ class EvolutionComponent:
     label: str
     kind: str
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    token_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,38 @@ class EvolutionSnapshot:
 
 
 Subscriber = Callable[[EvolutionEvent], None]
+
+
+class TokenPathAtlas:
+    """Stable integer identities for structural and vocabulary token paths.
+
+    Text labels remain diagnostics. Equality and cross-representation lineage
+    use the returned integer identity, while the retained path explains which
+    namespace/token composition produced it.
+    """
+
+    def __init__(self) -> None:
+        self._paths: list[tuple[int, ...]] = []
+        self._index: dict[tuple[int, ...], int] = {}
+
+    def consume(self, path: Iterable[int]) -> int:
+        encoded = tuple(int(token) for token in path)
+        token = self._index.get(encoded)
+        if token is not None:
+            return token
+        token = len(self._paths)
+        self._paths.append(encoded)
+        self._index[encoded] = token
+        return token
+
+    def path(self, token: int) -> tuple[int, ...]:
+        return self._paths[int(token)]
+
+    def snapshot(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(self._paths)
+
+    def __len__(self) -> int:
+        return len(self._paths)
 
 
 class EvolutionMetaGraph:
@@ -142,6 +175,7 @@ class EvolutionMetaGraph:
         kind: str,
         attributes: Mapping[str, Any] | None = None,
         consumes: Iterable[EvolutionComponentRef] = (),
+        token_id: int | None = None,
     ) -> EvolutionComponentRef:
         ref = EvolutionComponentRef(graph.id, str(local_id))
         record = EvolutionComponent(
@@ -149,6 +183,7 @@ class EvolutionMetaGraph:
             str(label),
             str(kind),
             dict(attributes or {}),
+            None if token_id is None else int(token_id),
         )
         with self._lock:
             previous = self._components.get(ref)
@@ -170,13 +205,21 @@ class EvolutionMetaGraph:
         target: EvolutionComponentRef,
         *,
         role: str = "data",
+        role_token_id: int | None = None,
     ) -> EvolutionEvent:
         return self._publish(
             "component-link",
             graph=graph,
             component=target,
             sources=(source,),
-            detail={"role": str(role)},
+            detail={
+                "role": str(role),
+                **(
+                    {}
+                    if role_token_id is None
+                    else {"role_token_id": int(role_token_id)}
+                ),
+            },
         )
 
     def handoff(
@@ -217,6 +260,39 @@ class EvolutionMetaGraph:
                 tuple(self._components.values()),
                 tuple(self._events),
             )
+
+    def to_token_multidigraph(self):
+        """Project all component and lineage events without collapsing edges."""
+
+        import networkx as nx
+
+        snapshot = self.snapshot()
+        graph = nx.MultiDiGraph()
+        graph_refs = {item.id: item for item in snapshot.graphs}
+        for component in snapshot.components:
+            owner = graph_refs.get(component.ref.graph_id)
+            graph.add_node(
+                (component.ref.graph_id, component.ref.local_id),
+                token_id=component.token_id,
+                diagnostic=component.label,
+                kind=component.kind,
+                stage=None if owner is None else owner.stage,
+                **dict(component.attributes),
+            )
+        for event in snapshot.events:
+            if event.component is None or not event.sources:
+                continue
+            target = (event.component.graph_id, event.component.local_id)
+            for position, source in enumerate(event.sources):
+                graph.add_edge(
+                    (source.graph_id, source.local_id),
+                    target,
+                    key=(event.sequence, position),
+                    event=event.kind,
+                    sequence=event.sequence,
+                    **dict(event.detail),
+                )
+        return graph
 
 
 _ACTIVE_EVOLUTION: ContextVar[EvolutionMetaGraph | None] = ContextVar(
@@ -345,6 +421,7 @@ __all__ = [
     "EvolutionGraphRef",
     "EvolutionMetaGraph",
     "EvolutionSnapshot",
+    "TokenPathAtlas",
     "active_evolution_metagraph",
     "record_evolution",
     "record_fused_program_evolution",

@@ -72,6 +72,9 @@ class ReelGraphics:
         self.head_gap = 30
         self.head_anim = 0.0
         self.head_anim_speed = 4.0
+        self.position_driven = False
+        self.pending_motion = 0.0
+        self.motor_position = 0.0
         self.left = Reel(self.left_center, self.spool_radius, self.max_radius, self.left_tape)
         self.right = Reel(self.right_center, self.spool_radius, self.max_radius, self.right_tape)
 
@@ -87,7 +90,10 @@ class ReelGraphics:
 
     def update(self, dt):
         moved = 0.0
-        if self.playing and self.left_tape > 0:
+        if self.position_driven:
+            moved = self.pending_motion
+            self.pending_motion = 0.0
+        elif self.playing and self.left_tape > 0:
             moved = self.tape_speed * dt
             self.left_tape = max(0.0, self.left_tape - moved)
             self.right_tape = min(self.total_tape, self.right_tape + moved)
@@ -101,8 +107,9 @@ class ReelGraphics:
             self.right_tape = self.total_tape - self.left_tape
         self.left.tape_length = self.left_tape
         self.right.tape_length = self.right_tape
-        self.left_radius = self.left.update(dt, moved if (self.playing or self.recording or self.seeking) else 0.0, self.total_tape)
-        self.right_radius = self.right.update(dt, moved if (self.playing or self.recording or self.seeking) else 0.0, self.total_tape)
+        linear_speed = moved / dt if dt > 0.0 else 0.0
+        self.left_radius = self.left.update(dt, linear_speed, self.total_tape)
+        self.right_radius = self.right.update(dt, linear_speed, self.total_tape)
         # Head animation
         head_down = self.playing or self.recording
         if head_down:
@@ -134,5 +141,10 @@ class ReelGraphics:
         # Status text
         font = pygame.font.SysFont(None, 24)
         status = "PLAY" if self.playing else "REC" if self.recording else "SEEK" if self.seeking else "STOP"
-        text = font.render(f"{status} | Tape: {self.left_tape:.1f} / {self.total_tape}", True, (255,255,255))
+        text = font.render(
+            f"{status} | Tape: {self.left_tape:.1f} / {self.total_tape} "
+            f"| Head: {self.motor_position:.4f} in",
+            True,
+            (255,255,255),
+        )
         surface.blit(text, (self.rect.left + 10, self.rect.top + 10))

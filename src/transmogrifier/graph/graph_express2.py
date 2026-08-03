@@ -1772,8 +1772,10 @@ class ProcessGraph:
                             "kwargs": dict(node.kwargs),
                             "arg_ids": tuple(node.args),
                             "out_obj_id": node.out_obj_id,
+                            "metadata": dict(node.metadata),
                         },
                         attributes=dict(node.kwargs),
+                        metadata=dict(node.metadata),
                         constant=None,
                         tensor=tensor,
                         bit_quanta=(
