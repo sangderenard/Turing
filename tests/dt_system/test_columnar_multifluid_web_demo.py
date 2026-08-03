@@ -10,7 +10,6 @@ import pytest
 from src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo import (
     SOURCE,
     build_demo,
-    build_pages,
 )
 from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
@@ -119,23 +118,6 @@ def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
     assert "turing_output_texture" in html
     assert "outputFrame()" in html
     assert "uploadOutputTexture()" in html
-
-
-def test_pages_build_has_stable_root_entrypoint(tmp_path):
-    bundle = build_pages(tmp_path)
-    deployment = json.loads(
-        (tmp_path / "deployment.json").read_text(encoding="utf-8")
-    )
-
-    assert (tmp_path / "index.html").exists()
-    assert (tmp_path / ".nojekyll").exists()
-    assert deployment["entrypoint"] == bundle.page_path.relative_to(
-        tmp_path
-    ).as_posix()
-    assert deployment["version"] == bundle.manifest["version"]["id"]
-    assert deployment["entrypoint"] in (
-        tmp_path / "index.html"
-    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")

@@ -121,13 +121,6 @@ python -m src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo `
   --destination build/columnar_multifluid_web
 ```
 
-For a complete GitHub Pages artifact with a stable top-level entrypoint:
-
-```powershell
-python -m src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo `
-  --pages --destination _site
-```
-
 Its Python source enters the normal AST/ProcessGraph recompiler and is emitted
 as WebAssembly. The compiled transition returns three RGB planes, the next
 spring state and managed time, and six persistent hue-band ink planes. The

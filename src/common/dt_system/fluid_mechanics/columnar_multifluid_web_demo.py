@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import inspect
-import json
 from pathlib import Path
 
 from .columnar_multifluid_kernels import columnar_multifluid_rgb_step
@@ -107,47 +106,6 @@ def build_demo(destination: Path):
     )
 
 
-def build_pages(destination: Path):
-    """Build the demo plus a stable top-level GitHub Pages entrypoint."""
-
-    destination = destination.resolve()
-    destination.mkdir(parents=True, exist_ok=True)
-    bundle = build_demo(destination)
-    relative_page = bundle.page_path.relative_to(destination).as_posix()
-    landing = f'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="0;url={relative_page}">
-<title>Managed Columnar Multifluid World</title>
-</head>
-<body>
-<p>Opening the <a href="{relative_page}">managed columnar multifluid world</a>.</p>
-<script>location.replace(new URL({json.dumps(relative_page)}, document.baseURI));</script>
-</body>
-</html>
-'''
-    (destination / "index.html").write_text(
-        landing, encoding="utf-8", newline="\n"
-    )
-    (destination / ".nojekyll").write_text("", encoding="utf-8")
-    (destination / "deployment.json").write_text(
-        json.dumps(
-            {
-                "schema": "turing-pages-deployment-v1",
-                "program": "managed-columnar-multifluid-world",
-                "entrypoint": relative_page,
-                "version": bundle.manifest["version"]["id"],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-        newline="\n",
-    )
-    return bundle
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -155,21 +113,13 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(__file__).resolve().parents[5],
     )
-    parser.add_argument(
-        "--pages",
-        action="store_true",
-        help="also write a stable top-level GitHub Pages entrypoint",
-    )
     arguments = parser.parse_args(argv)
-    builder = build_pages if arguments.pages else build_demo
-    bundle = builder(arguments.destination.resolve())
+    bundle = build_demo(arguments.destination.resolve())
     print(bundle.page_path)
     return 0
 
 
-__all__ = [
-    "PRESENTATION_SHADER", "SOURCE", "build_demo", "build_pages", "main"
-]
+__all__ = ["PRESENTATION_SHADER", "SOURCE", "build_demo", "main"]
 
 
 if __name__ == "__main__":
