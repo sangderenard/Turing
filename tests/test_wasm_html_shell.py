@@ -324,10 +324,12 @@ def test_output_views_are_tabs_over_the_same_numbers():
 def test_the_diagnostics_bootstrap_is_a_separate_script():
     """A handler defined inside the program script cannot catch that
     script's own parse error -- nothing in it has run yet. Two script tags
-    is what makes a dead shell announce itself instead of looking inert."""
+    is what makes a dead shell announce itself instead of looking inert.
+    (A third, later tag drives the always-present text transcript and is
+    independent of this boot/program pair.)"""
 
     html = shell_for_artifact(_artifact()).html
-    assert html.count("<script>") == 2
+    assert html.count("<script>") == 3
     boot, program = html.split("<script>")[1], html.split("<script>")[2]
     assert 'addEventListener("error"' in boot
     assert "const API =" in program
@@ -817,3 +819,63 @@ def test_feedback_network_contract_is_executable():
     assert "candidate_offsets" in html
     assert "feedbackState.speed" in html
     assert "WebAssembly.instantiate(bytes" in html
+
+
+def test_transcript_is_present_and_linked_regardless_of_shader_or_graph():
+    """The plain-text transcript is not gated behind the shader body class or
+    a supplied process graph -- a bare inspection page still gets one, and a
+    reader following raw HTML (no JS, no canvas) can reach every node."""
+
+    html = emit_html_shell(_artifact().api).html
+    assert 'id="program-transcript"' in html
+    assert 'class="shader-execution"' not in html
+    assert '?node=graph-index' in html
+    assert '?node=log' in html
+    assert '?node=network' in html
+    assert '?node=shader' in html
+    assert "No shader execution surface attached" in html
+
+
+def test_transcript_graph_nodes_link_to_their_parents():
+    """The process graph's own parent edges are the navigable structure --
+    each node section links every parent by the same ?node= scheme."""
+
+    graph = {
+        "nodes": 2,
+        "edges": 1,
+        "truncated": False,
+        "histogram": {"add": 1, "sub": 1},
+        "table": [
+            {"id": 1, "type": "sub", "label": "left - right", "parents": []},
+            {"id": 2, "type": "add", "label": "abs(...) + 1", "parents": [1]},
+        ],
+    }
+    html = emit_html_shell(_artifact().api, process_graph=graph).html
+    assert 'data-node="graph-1"' in html
+    assert 'data-node="graph-2"' in html
+    assert '<a href="?node=graph-1">' in html
+    assert '<a href="?node=graph-1">node 1 (sub)</a>' in html
+
+
+def test_transcript_telemetry_renders_as_readable_log_text():
+    """Build-time telemetry records show up as plain list text in the
+    transcript, not only as JSON handed to the diagnostics script."""
+
+    telemetry = {
+        "records": [
+            {"kind": "log", "message": "compiled entry", "path": "backend_sources"},
+            {"kind": "error", "message": "boom", "path": ""},
+        ]
+    }
+    html = emit_html_shell(_artifact().api, telemetry=telemetry).html
+    assert "[log] compiled entry (backend_sources)" in html
+    assert "[error] boom" in html
+
+
+def test_transcript_survives_with_no_optional_data_at_all():
+    """Every input the transcript reads is optional; omitting all of them
+    must still produce a coherent, non-crashing transcript."""
+
+    html = emit_html_shell(_artifact().api).html
+    assert 'id="program-transcript"' in html
+    assert "No feedback network attached" in html

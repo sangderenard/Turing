@@ -280,6 +280,7 @@ function log(kind, message, detail) {
     pane.appendChild(line);
     pane.scrollTop = pane.scrollHeight;
   }
+  window.dispatchEvent(new CustomEvent("turing-telemetry", { detail: entry }));
   return entry;
 }
 
@@ -313,6 +314,85 @@ window.addEventListener("unhandledrejection", (event) => {
     ? event.reason.message : event.reason));
 });
 
+"""
+
+# A static, always-present textual rendering of the same data this shell
+# already collects (process graph, telemetry, network/shader manifests,
+# class navigation) -- not a second engine, just a second view a
+# non-visual client can read. It sits at the very back of the stacking
+# context so a sighted visitor keeps seeing the shader/inspection page
+# until they actually follow one of its links.
+_TRANSCRIPT_CSS = """
+#program-transcript {
+  position: fixed;
+  inset: 0;
+  z-index: -2147483648;
+  overflow: auto;
+  margin: 0;
+  padding: 1.5rem;
+  max-width: none;
+  background: Canvas;
+  color: CanvasText;
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#program-transcript .transcript-inner { max-width: 60rem; margin: 0 auto; }
+#program-transcript h2 { font-size: 1.05rem; margin: 1.6rem 0 .5rem; }
+#program-transcript h2:first-child { margin-top: 0; }
+#program-transcript ul { padding-left: 1.2rem; }
+#program-transcript li { margin: .15rem 0; }
+#program-transcript a { color: var(--accent, #3b82f6); }
+body.transcript-active #shader-surface,
+body.transcript-active #shader-layout-document,
+body.transcript-active > .title,
+body.transcript-active > .sub,
+body.transcript-active > #fatal,
+body.transcript-active > .note,
+body.transcript-active > .panel {
+  display: none;
+}
+body.transcript-active #program-transcript {
+  z-index: 2147483646;
+}
+"""
+
+_TRANSCRIPT_JS = r"""(() => {
+  const root = document.getElementById("program-transcript");
+  if (!root) return;
+  function currentNode() {
+    return new URLSearchParams(location.search).get("node");
+  }
+  function focusNode(id) {
+    if (!id) return;
+    const el = root.querySelector('[data-node="' + CSS.escape(id) + '"]');
+    if (el) el.scrollIntoView({ block: "start" });
+  }
+  function activate(id) {
+    document.body.classList.add("transcript-active");
+    focusNode(id);
+  }
+  const initial = currentNode();
+  if (initial) activate(initial);
+  root.addEventListener("click", (event) => {
+    const link = event.target.closest("a[href]");
+    if (!link) return;
+    const url = new URL(link.getAttribute("href"), location.href);
+    if (url.pathname !== location.pathname) return;
+    event.preventDefault();
+    const node = url.searchParams.get("node");
+    history.pushState({ node }, "", url.search || location.pathname);
+    activate(node);
+  });
+  window.addEventListener("popstate", () => activate(currentNode()));
+  window.addEventListener("turing-telemetry", (event) => {
+    const list = root.querySelector('[data-node="log"] ul');
+    if (!list || !event.detail) return;
+    const record = event.detail;
+    const item = document.createElement("li");
+    item.textContent = "[" + record.kind + "] " + record.message +
+      (record.path ? " (" + record.path + ")" : "");
+    list.appendChild(item);
+  });
+})();
 """
 
 # Managed-time audio is installed before feed expressions are evaluated.  It
@@ -3826,6 +3906,184 @@ def _mathematics_panel(mathematics: Mapping[str, Any] | None) -> str:
   </div>"""
 
 
+def _transcript_section(node_id: str, title: str, body_html: str) -> str:
+    return (
+        f'<section data-node="{_escape(node_id)}">'
+        f"<h2>{_escape(title)}</h2>{body_html}</section>"
+    )
+
+
+def _transcript_list(items: Sequence[str]) -> str:
+    if not items:
+        return "<p>None.</p>"
+    return "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
+
+
+def _render_transcript(
+    *,
+    mapping: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    parameters: Sequence[Mapping[str, Any]],
+    graph_mapping: Mapping[str, Any],
+    telemetry_mapping: Mapping[str, Any],
+    network_mapping: Mapping[str, Any],
+    map_mapping: Mapping[str, Any],
+    shader_execution: Mapping[str, Any] | None,
+    backend_sources: Any,
+    origin_source: str,
+    build_parameters: Mapping[str, Any] | None,
+) -> str:
+    """A static, fully-linked textual transcript of what this page already knows.
+
+    Every fact here already exists as a Python value passed into
+    :func:`emit_html_shell` for the canvas/JS presentation; this renders the
+    same facts as literal HTML text and real ``?node=`` links instead of
+    JSON handed only to a script. Nothing is computed here that the compiler
+    did not already compute -- see ``docs/WASM_SHELL_HANDOFF.md``'s "one
+    ingested program" rule.
+    """
+
+    sections: list[str] = []
+
+    param_items = [
+        f'<code>{_escape(str(p.get("name", "")))}</code> '
+        f'<span>({_escape(str(p.get("dtype", "")))})</span>'
+        for p in parameters
+    ]
+    root_body = (
+        f'<p><b>{_escape(str(mapping.get("module", "")))}</b> &middot; '
+        f'{_escape(str(mapping.get("language", "")))} &middot; entry '
+        f'<code>{_escape(str(entry.get("name", "")))}</code></p>'
+        f"<p>Parameters:</p>{_transcript_list(param_items)}"
+        f'<p><a href="?node=graph-index">Process graph</a> &middot; '
+        f'<a href="?node=log">Build and run log</a> &middot; '
+        f'<a href="?node=network">Feedback network</a> &middot; '
+        f'<a href="?node=shader">Shader execution</a> &middot; '
+        f'<a href="?node=classes">Classes and callables</a> &middot; '
+        f'<a href="?node=sources">Sources</a></p>'
+    )
+    sections.append(_transcript_section("root", "Program", root_body))
+
+    table = list(graph_mapping.get("table") or ())
+    histogram = dict(graph_mapping.get("histogram") or {})
+    index_body = (
+        f'<p>{graph_mapping.get("nodes", 0)} nodes, '
+        f'{graph_mapping.get("edges", 0)} edges'
+        f'{" (truncated)" if graph_mapping.get("truncated") else ""}.</p>'
+        + _transcript_list(
+            [f"{_escape(kind)}: {count}" for kind, count in histogram.items()]
+        )
+        + _transcript_list(
+            [
+                f'<a href="?node=graph-{_escape(str(row.get("id")))}">'
+                f'node {_escape(str(row.get("id")))} '
+                f'({_escape(str(row.get("type")))})</a>'
+                for row in table
+            ]
+        )
+    )
+    sections.append(_transcript_section("graph-index", "Process graph", index_body))
+    for row in table:
+        node_id = str(row.get("id"))
+        parents = list(row.get("parents") or ())
+        node_body = (
+            f'<p>type <code>{_escape(str(row.get("type")))}</code></p>'
+            f'<p>{_escape(str(row.get("label") or ""))}</p>'
+            "<p>Parents:</p>"
+            + _transcript_list(
+                [
+                    f'<a href="?node=graph-{_escape(str(p))}">node {_escape(str(p))}</a>'
+                    for p in parents
+                ]
+            )
+            + f'<p><a href="?node=graph-index">Back to graph index</a></p>'
+        )
+        sections.append(
+            _transcript_section(f"graph-{node_id}", f"Node {node_id}", node_body)
+        )
+
+    log_items = [
+        f'[{_escape(str(record.get("kind")))}] {_escape(str(record.get("message")))}'
+        + (
+            f' ({_escape(str(record.get("path")))})'
+            if record.get("path")
+            else ""
+        )
+        for record in telemetry_mapping.get("records") or ()
+    ]
+    sections.append(
+        _transcript_section(
+            "log", "Build and run log", f'<ul>{"".join(f"<li>{i}</li>" for i in log_items)}</ul>'
+        )
+    )
+
+    routes = list(network_mapping.get("routes") or ())
+    network_body = (
+        f'<p>{_escape(str(network_mapping.get("name", "")))}</p>'
+        + _transcript_list(
+            [
+                f'feed <code>{_escape(str(route.get("feed", "")))}</code>'
+                for route in routes
+                if isinstance(route, Mapping)
+            ]
+        )
+    )
+    sections.append(_transcript_section("network", "Feedback network", network_body))
+
+    if shader_execution:
+        shader_body = (
+            f'<p>role <code>{_escape(str(shader_execution.get("role", "")))}</code> '
+            f'&middot; stage <code>{_escape(str(shader_execution.get("stage", "")))}</code></p>'
+            f'<p>Published at <code>{_escape(str(shader_execution.get("url", "")))}</code></p>'
+        )
+    else:
+        shader_body = "<p>No shader execution surface attached to this page.</p>"
+    sections.append(_transcript_section("shader", "Shader execution", shader_body))
+
+    class_nav = dict(map_mapping.get("class_navigation") or {})
+    callables = list(map_mapping.get("callable_systems") or ())
+    classes_body = _transcript_list(
+        [_escape(str(name)) for name in class_nav.get("classes", ())]
+    ) + _transcript_list(
+        [
+            f'<a href="?node=class-{_escape(str(c.get("identity", "")))}">'
+            f'{_escape(str(c.get("name", "")))}</a> '
+            f'<code>{_escape(str(c.get("signature", "")))}</code>'
+            for c in callables
+            if isinstance(c, Mapping)
+        ]
+    )
+    sections.append(_transcript_section("classes", "Classes and callables", classes_body))
+
+    if hasattr(backend_sources, "to_mapping"):
+        source_entries = list(backend_sources.to_mapping()["sources"])
+    else:
+        source_entries = list(backend_sources or [])
+    sources_body = _transcript_list(
+        [
+            f'{_escape(str(s.get("language", "")))} &middot; '
+            f'{_escape(str(s.get("filename", "")))}'
+            for s in source_entries
+            if isinstance(s, Mapping)
+        ]
+    ) + (
+        f"<p>Original source: {len(origin_source.splitlines())} lines.</p>"
+        if origin_source
+        else ""
+    )
+    if build_parameters:
+        sources_body += "<p>Compiled-in parameters:</p>" + _transcript_list(
+            [f"{_escape(str(k))} = {_escape(str(v))}" for k, v in build_parameters.items()]
+        )
+    sections.append(_transcript_section("sources", "Sources", sources_body))
+
+    return (
+        '<div id="program-transcript" role="document" '
+        'aria-label="Plain-text transcript of this compiled program">'
+        '<div class="transcript-inner">' + "".join(sections) + "</div></div>"
+    )
+
+
 def emit_html_shell(
     api: Any,
     *,
@@ -3944,6 +4202,19 @@ def emit_html_shell(
     network_mapping.setdefault("routes", [])
     network_routes = {str(route["feed"]): route for route in network_mapping["routes"] if isinstance(route, Mapping) and route.get("feed")}
     map_mapping = _map_ir_mapping(map_ir)
+    transcript_html = _render_transcript(
+        mapping=mapping,
+        entry=entry,
+        parameters=parameters,
+        graph_mapping=graph_mapping,
+        telemetry_mapping=telemetry_mapping,
+        network_mapping=network_mapping,
+        map_mapping=map_mapping,
+        shader_execution=shader_execution,
+        backend_sources=backend_sources,
+        origin_source=origin_source,
+        build_parameters=build_parameters,
+    )
     script = (
         _JS.replace("__API__", json.dumps(mapping))
         .replace("__WASM__", encoded)
@@ -4100,9 +4371,10 @@ def emit_html_shell(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_escape(shell_name)}</title>
-<style>{_CSS}{shader_css}</style>
+<style>{_CSS}{shader_css}{_TRANSCRIPT_CSS}</style>
 </head>
 <body{body_class}>
+  {transcript_html}
   {shader_canvas}
   <div class="title">{_escape(str(mapping["module"]))}</div>
   <div class="sub">{_escape(str(mapping["language"]))} &middot; entry
@@ -4280,6 +4552,7 @@ def emit_html_shell(
 <script>{boot_script}</script>
 <script>{script}</script>
 {shader_script}
+<script>{_TRANSCRIPT_JS}</script>
 </body>
 </html>
 """
