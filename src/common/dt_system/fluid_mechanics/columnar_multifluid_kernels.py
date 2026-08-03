@@ -127,6 +127,9 @@ def columnar_multifluid_rgb_step(
     cargo_a = entity_cargo.maximum(0.0).minimum(1.0)
     cargo_b = entity_b_cargo.maximum(0.0).minimum(1.0)
     cargo_c = entity_c_cargo.maximum(0.0).minimum(1.0)
+    foraging_a = 1.0 - cargo_a
+    foraging_b = 1.0 - cargo_b
+    foraging_c = 1.0 - cargo_c
     nest_x = 5.0
     nest_y = 3.45
 
@@ -157,15 +160,14 @@ def columnar_multifluid_rgb_step(
         / (sight_distance_squared + 0.14)
     )
     signed_visibility = visibility * (
-        1.20 * (1.0 - cargo_a) * trail_c
-        - 0.30 * trail_a + 1.65 * (1.0 - cargo_a) * growing_food
+        1.20 * foraging_a * trail_c
+        - 0.30 * trail_a + 1.65 * foraging_a * growing_food
         + 0.18 * angular_similarity
     )
     visibility_total = visibility.sum() + 1.0e-6
-    steering_x = ((sight_x / sight_distance) * signed_visibility).sum()
-    steering_x = column_x * 0.0 + steering_x / visibility_total
-    steering_y = ((sight_y / sight_distance) * signed_visibility).sum()
-    steering_y = column_y * 0.0 + steering_y / visibility_total
+    steering_weight = signed_visibility / (sight_distance * visibility_total)
+    steering_x = column_x * 0.0 + (sight_x * steering_weight).sum()
+    steering_y = column_y * 0.0 + (sight_y * steering_weight).sum()
     separation_ab_x = entity_x - entity_b_x
     separation_ab_y = entity_y - entity_b_y
     separation_ac_x = entity_x - entity_c_x
@@ -215,15 +217,16 @@ def columnar_multifluid_rgb_step(
         / (sight_b_distance_squared + 0.14)
     )
     signed_visibility_b = visibility_b * (
-        1.20 * (1.0 - cargo_b) * trail_a - 0.30 * trail_b
-        + 1.65 * (1.0 - cargo_b) * growing_food
+        1.20 * foraging_b * trail_a - 0.30 * trail_b
+        + 1.65 * foraging_b * growing_food
         + 0.18 * (region_y * preferred_x - region_x * preferred_y)
     )
     visibility_b_total = visibility_b.sum() + 1.0e-6
-    steering_b_x = ((sight_b_x / sight_b_distance) * signed_visibility_b).sum()
-    steering_b_x = column_x * 0.0 + steering_b_x / visibility_b_total
-    steering_b_y = ((sight_b_y / sight_b_distance) * signed_visibility_b).sum()
-    steering_b_y = column_y * 0.0 + steering_b_y / visibility_b_total
+    steering_b_weight = (
+        signed_visibility_b / (sight_b_distance * visibility_b_total)
+    )
+    steering_b_x = column_x * 0.0 + (sight_b_x * steering_b_weight).sum()
+    steering_b_y = column_y * 0.0 + (sight_b_y * steering_b_weight).sum()
     separation_bc_x = entity_b_x - entity_c_x
     separation_bc_y = entity_b_y - entity_c_y
     separation_bc = (
@@ -267,15 +270,16 @@ def columnar_multifluid_rgb_step(
         / (sight_c_distance_squared + 0.14)
     )
     signed_visibility_c = visibility_c * (
-        1.20 * (1.0 - cargo_c) * trail_b - 0.30 * trail_c
-        + 1.65 * (1.0 - cargo_c) * growing_food
+        1.20 * foraging_c * trail_b - 0.30 * trail_c
+        + 1.65 * foraging_c * growing_food
         - 0.18 * angular_similarity
     )
     visibility_c_total = visibility_c.sum() + 1.0e-6
-    steering_c_x = ((sight_c_x / sight_c_distance) * signed_visibility_c).sum()
-    steering_c_x = column_x * 0.0 + steering_c_x / visibility_c_total
-    steering_c_y = ((sight_c_y / sight_c_distance) * signed_visibility_c).sum()
-    steering_c_y = column_y * 0.0 + steering_c_y / visibility_c_total
+    steering_c_weight = (
+        signed_visibility_c / (sight_c_distance * visibility_c_total)
+    )
+    steering_c_x = column_x * 0.0 + (sight_c_x * steering_c_weight).sum()
+    steering_c_y = column_y * 0.0 + (sight_c_y * steering_c_weight).sum()
     nest_c_x = nest_x - entity_c_x
     nest_c_y = nest_y - entity_c_y
     nest_c_length = (nest_c_x * nest_c_x + nest_c_y * nest_c_y + 0.08).sqrt()
@@ -358,9 +362,9 @@ def columnar_multifluid_rgb_step(
     food_near_b = food_near_b / (pickup_b_kernel.sum() + 1.0e-6)
     food_near_c = (growing_food * pickup_c_kernel).sum()
     food_near_c = food_near_c / (pickup_c_kernel.sum() + 1.0e-6)
-    pickup_a = (1.0 - cargo_a) * food_near_a.minimum(0.7) * 1.35
-    pickup_b = (1.0 - cargo_b) * food_near_b.minimum(0.7) * 1.35
-    pickup_c = (1.0 - cargo_c) * food_near_c.minimum(0.7) * 1.35
+    pickup_a = foraging_a * food_near_a.minimum(0.7) * 1.35
+    pickup_b = foraging_b * food_near_b.minimum(0.7) * 1.35
+    pickup_c = foraging_c * food_near_c.minimum(0.7) * 1.35
 
     nest_distance_a = (
         (next_entity_x - nest_x) * (next_entity_x - nest_x)
@@ -395,14 +399,11 @@ def columnar_multifluid_rgb_step(
         + pickup_c_kernel * pickup_c
     )
 
-    drain_distance = (
-        (column_x - 1.15) * (column_x - 1.15)
-        + (column_y - 5.75) * (column_y - 5.75)
-    )
-    return_distance = (
-        (column_x - 8.85) * (column_x - 8.85)
-        + (column_y - 5.75) * (column_y - 5.75)
-    )
+    drain_x = column_x - 1.15
+    utility_y = column_y - 5.75
+    return_x = column_x - 8.85
+    drain_distance = drain_x * drain_x + utility_y * utility_y
+    return_distance = return_x * return_x + utility_y * utility_y
     drain_mask = (-drain_distance / (2.0 * 0.48 * 0.48)).exp()
     return_mask = (-return_distance / (2.0 * 0.58 * 0.58)).exp()
     next_food_store = (
@@ -449,25 +450,27 @@ def columnar_multifluid_rgb_step(
     pulse_a = 0.78 + 0.22 * (next_time * 2.11).sin()
     pulse_b = 0.78 + 0.22 * (next_time * 1.91 + 2.1).sin()
     pulse_c = 0.78 + 0.22 * (next_time * 2.27 + 4.2).sin()
+    core_decay = (-0.095 * dt).exp()
+    halo_decay = (-0.072 * dt).exp()
+    core_gain = 3.2 * dt
+    halo_gain = 2.2 * dt
     next_ink_red = (
-        ink_red * (-0.095 * dt).exp() + 3.2 * dt * source_red * pulse_a
+        ink_red * core_decay + core_gain * source_red * pulse_a
     ).minimum(1.0)
     next_ink_yellow = (
-        ink_yellow * (-0.072 * dt).exp()
-        + 2.2 * dt * source_yellow * pulse_a
+        ink_yellow * halo_decay + halo_gain * source_yellow * pulse_a
     ).minimum(1.0)
     next_ink_green = (
-        ink_green * (-0.095 * dt).exp() + 3.2 * dt * source_green * pulse_b
+        ink_green * core_decay + core_gain * source_green * pulse_b
     ).minimum(1.0)
     next_ink_cyan = (
-        ink_cyan * (-0.072 * dt).exp() + 2.2 * dt * source_cyan * pulse_b
+        ink_cyan * halo_decay + halo_gain * source_cyan * pulse_b
     ).minimum(1.0)
     next_ink_blue = (
-        ink_blue * (-0.095 * dt).exp() + 3.2 * dt * source_blue * pulse_c
+        ink_blue * core_decay + core_gain * source_blue * pulse_c
     ).minimum(1.0)
     next_ink_magenta = (
-        ink_magenta * (-0.072 * dt).exp()
-        + 2.2 * dt * source_magenta * pulse_c
+        ink_magenta * halo_decay + halo_gain * source_magenta * pulse_c
     ).minimum(1.0)
     drain_fraction = (0.12 * dt * drain_mask).minimum(0.08)
     drainable_material = (
@@ -478,12 +481,13 @@ def columnar_multifluid_rgb_step(
     drained_material = (
         0.12 * dt * drained_material / (drain_mask.sum() + 1.0e-6)
     )
-    next_ink_red = next_ink_red * (1.0 - drain_fraction)
-    next_ink_yellow = next_ink_yellow * (1.0 - drain_fraction)
-    next_ink_green = next_ink_green * (1.0 - drain_fraction)
-    next_ink_cyan = next_ink_cyan * (1.0 - drain_fraction)
-    next_ink_blue = next_ink_blue * (1.0 - drain_fraction)
-    next_ink_magenta = next_ink_magenta * (1.0 - drain_fraction)
+    drain_retention = 1.0 - drain_fraction
+    next_ink_red = next_ink_red * drain_retention
+    next_ink_yellow = next_ink_yellow * drain_retention
+    next_ink_green = next_ink_green * drain_retention
+    next_ink_cyan = next_ink_cyan * drain_retention
+    next_ink_blue = next_ink_blue * drain_retention
+    next_ink_magenta = next_ink_magenta * drain_retention
     clean_emission = 0.30 * dt * clean_release
     next_filter_reservoir = (
         filter_reservoir + drained_material - clean_emission
@@ -502,43 +506,51 @@ def columnar_multifluid_rgb_step(
     ink_color_blue = 255.0 * (
         next_ink_cyan + next_ink_blue + next_ink_magenta
     ) / ink_total
-    red = base_red * (1.0 - ink_alpha) + ink_color_red * ink_alpha
-    green = base_green * (1.0 - ink_alpha) + ink_color_green * ink_alpha
-    blue = base_blue * (1.0 - ink_alpha) + ink_color_blue * ink_alpha
+    ink_retention = 1.0 - ink_alpha
+    red = base_red * ink_retention + ink_color_red * ink_alpha
+    green = base_green * ink_retention + ink_color_green * ink_alpha
+    blue = base_blue * ink_retention + ink_color_blue * ink_alpha
 
     food_alpha = next_food_store.minimum(0.76)
-    red = red * (1.0 - food_alpha) + 226.0 * food_alpha
-    green = green * (1.0 - food_alpha) + 181.0 * food_alpha
-    blue = blue * (1.0 - food_alpha) + 62.0 * food_alpha
+    food_retention = 1.0 - food_alpha
+    red = red * food_retention + 226.0 * food_alpha
+    green = green * food_retention + 181.0 * food_alpha
+    blue = blue * food_retention + 62.0 * food_alpha
+    nest_field_x = column_x - nest_x
+    nest_field_y = column_y - nest_y
     nest_field_distance = (
-        (column_x - nest_x) * (column_x - nest_x)
-        + (column_y - nest_y) * (column_y - nest_y)
+        nest_field_x * nest_field_x + nest_field_y * nest_field_y
     )
     nest_body = (-nest_field_distance / (2.0 * 0.34 * 0.34)).exp()
     nest_glow = next_nest_food.minimum(1.0)
     nest_red = 102.0 + 58.0 * nest_glow
     nest_green = 72.0 + 42.0 * nest_glow
     nest_blue = 48.0 + 24.0 * nest_glow
-    red = red * (1.0 - nest_body) + nest_red * nest_body
-    green = green * (1.0 - nest_body) + nest_green * nest_body
-    blue = blue * (1.0 - nest_body) + nest_blue * nest_body
+    nest_retention = 1.0 - nest_body
+    red = red * nest_retention + nest_red * nest_body
+    green = green * nest_retention + nest_green * nest_body
+    blue = blue * nest_retention + nest_blue * nest_body
 
     clean_alpha = (return_mask * clean_release).minimum(0.60)
-    red = red * (1.0 - clean_alpha) + 218.0 * clean_alpha
-    green = green * (1.0 - clean_alpha) + 249.0 * clean_alpha
-    blue = blue * (1.0 - clean_alpha) + 255.0 * clean_alpha
+    clean_retention = 1.0 - clean_alpha
+    red = red * clean_retention + 218.0 * clean_alpha
+    green = green * clean_retention + 249.0 * clean_alpha
+    blue = blue * clean_retention + 255.0 * clean_alpha
     drain_body = (-drain_distance / (2.0 * 0.23 * 0.23)).exp()
     return_body = (-return_distance / (2.0 * 0.23 * 0.23)).exp()
-    red = red * (1.0 - drain_body) + 53.0 * drain_body
-    green = green * (1.0 - drain_body) + 83.0 * drain_body
-    blue = blue * (1.0 - drain_body) + 103.0 * drain_body
-    red = red * (1.0 - return_body) + 205.0 * return_body
-    green = green * (1.0 - return_body) + 245.0 * return_body
-    blue = blue * (1.0 - return_body) + 252.0 * return_body
+    drain_body_retention = 1.0 - drain_body
+    return_body_retention = 1.0 - return_body
+    red = red * drain_body_retention + 53.0 * drain_body
+    green = green * drain_body_retention + 83.0 * drain_body
+    blue = blue * drain_body_retention + 103.0 * drain_body
+    red = red * return_body_retention + 205.0 * return_body
+    green = green * return_body_retention + 245.0 * return_body
+    blue = blue * return_body_retention + 252.0 * return_body
     entity_glow = entity_interior * entity_interior
-    red = red * (1.0 - entity_glow) + 245.0 * entity_glow
-    green = green * (1.0 - entity_glow) + 252.0 * entity_glow
-    blue = blue * (1.0 - entity_glow) + 255.0 * entity_glow
+    entity_retention = 1.0 - entity_glow
+    red = red * entity_retention + 245.0 * entity_glow
+    green = green * entity_retention + 252.0 * entity_glow
+    blue = blue * entity_retention + 255.0 * entity_glow
     return (
         red,
         green,

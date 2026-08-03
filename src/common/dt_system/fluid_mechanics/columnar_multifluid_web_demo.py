@@ -21,8 +21,8 @@ _PAGE_CONFIG = {
     "presentation_entrypoint": "columnar_multifluid_present",
     "title": "Managed Columnar Multifluid World",
     "slug": "managed-columnar-multifluid-world",
-    "width": 384,
-    "height": 268,
+    "width": 768,
+    "height": 536,
     "probe_size": 16,
     "feeds": {
         "column_x": 0.5,
