@@ -32,6 +32,7 @@ Python.
 - player path origins for managed-time sinusoidal motion;
 - column rest heights plus spring displacement and displacement velocity;
 - column surface, material-mass, and mean-velocity summaries;
+- six independently diffusing hue-band ink liquids;
 - dense directional material-transfer proposals;
 - managed time and state-machine phase.
 
@@ -62,11 +63,15 @@ for all per-voxel numeric work:
 3. find the nearest player voxel for every occupied voxel in one distance
    broadcast and assign local physics domains inside the capture radius;
 4. apply gravity and integrate centroids in one tensor expression;
+   material inside an entity's unit-voxel interior also receives a smooth
+   outward rejection force;
 5. constrain column-domain `x/y` to their centroids and project `z` against
    the displaced packed unit-slot supports;
 6. reduce column material mass and mean velocity;
 7. gather four-neighbor surfaces and produce dense material-transfer flux
    proposals weighted by material mobility.
+8. inject the managed-time hue into six named liquid channels and diffuse each
+   channel through the same four-neighbor stencil with its own coefficient.
 
 Topology initialization and YoungMan's tetrahedron case table remain ordinary
 Python/NumPy control. They do not perform serial per-voxel physics.
@@ -90,7 +95,7 @@ chosen sampling resolution.
 
 - applying transfer proposals with a conservative scatter/compaction pass;
 - pressure projection, viscosity, phase change, or material reactions;
-- contact forces among voxels inside a player-local domain;
+- general contact forces among non-entity voxels inside a player-local domain;
 - releasing/repacking freely moving voxels into different columns;
 - a GLSL storage binding or shader.
 
@@ -116,10 +121,18 @@ python -m src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo `
   --destination build/columnar_multifluid_web
 ```
 
+For a complete GitHub Pages artifact with a stable top-level entrypoint:
+
+```powershell
+python -m src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo `
+  --pages --destination _site
+```
+
 Its Python source enters the normal AST/ProcessGraph recompiler and is emitted
-as WebAssembly. The compiled transition returns three RGB planes followed by
-its next displacement, spring-velocity, and managed-time tensors. The HTML
-shell only copies those explicitly named state outputs into the next Wasm
-invocation and paints the RGB planes with `ImageData`. It contains no second
-physics implementation, no private time manager, no precomputed frames, and
-no presentation shader.
+as WebAssembly. The compiled transition returns three RGB planes, the next
+spring state and managed time, and six persistent hue-band ink planes. The
+HTML shell only feeds those explicitly named state outputs into the next Wasm
+invocation. When the bundle contains its presentation shader, the shell
+uploads the RGB planes as one texture and stretches it over the viewport. It
+contains no second physics implementation, private time manager, or
+precomputed frames.

@@ -10,6 +10,7 @@ import pytest
 from src.common.dt_system.fluid_mechanics.columnar_multifluid_web_demo import (
     SOURCE,
     build_demo,
+    build_pages,
 )
 from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
@@ -28,6 +29,12 @@ def _feeds(count=8):
         "displacement_velocity": np.zeros(count),
         "managed_time": np.zeros(count),
         "dt": np.full(count, 0.025),
+        "ink_red": np.zeros(count),
+        "ink_yellow": np.zeros(count),
+        "ink_green": np.zeros(count),
+        "ink_cyan": np.zeros(count),
+        "ink_blue": np.zeros(count),
+        "ink_magenta": np.zeros(count),
     }
 
 
@@ -39,6 +46,12 @@ def test_python_page_contract_declares_compiled_state_feedback():
         "displacement": "next_displacement",
         "displacement_velocity": "next_velocity",
         "managed_time": "next_time",
+        "ink_red": "next_ink_red",
+        "ink_yellow": "next_ink_yellow",
+        "ink_green": "next_ink_green",
+        "ink_cyan": "next_ink_cyan",
+        "ink_blue": "next_ink_blue",
+        "ink_magenta": "next_ink_magenta",
     }
     assert contract.autostart
     assert contract.render_fps == 30.0
@@ -71,6 +84,12 @@ def test_python_rgb_tick_recompiles_to_six_output_wasm():
         "next_displacement",
         "next_velocity",
         "next_time",
+        "next_ink_red",
+        "next_ink_yellow",
+        "next_ink_green",
+        "next_ink_cyan",
+        "next_ink_blue",
+        "next_ink_magenta",
     ]
     assert module.binary[:4] == b"\x00asm"
 
@@ -100,6 +119,23 @@ def test_bundle_graduates_rgb_preview_to_full_viewport_shader(tmp_path):
     assert "turing_output_texture" in html
     assert "outputFrame()" in html
     assert "uploadOutputTexture()" in html
+
+
+def test_pages_build_has_stable_root_entrypoint(tmp_path):
+    bundle = build_pages(tmp_path)
+    deployment = json.loads(
+        (tmp_path / "deployment.json").read_text(encoding="utf-8")
+    )
+
+    assert (tmp_path / "index.html").exists()
+    assert (tmp_path / ".nojekyll").exists()
+    assert deployment["entrypoint"] == bundle.page_path.relative_to(
+        tmp_path
+    ).as_posix()
+    assert deployment["version"] == bundle.manifest["version"]["id"]
+    assert deployment["entrypoint"] in (
+        tmp_path / "index.html"
+    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
@@ -141,11 +177,17 @@ const state = {
   rest_surface: [1.5, 1.5, 1.5, 1.5], displacement: [0, 0, 0, 0],
   displacement_velocity: [0, 0, 0, 0], managed_time: [0, 0, 0, 0],
   dt: [0.025, 0.025, 0.025, 0.025],
+  ink_red: [0, 0, 0, 0], ink_yellow: [0, 0, 0, 0],
+  ink_green: [0, 0, 0, 0], ink_cyan: [0, 0, 0, 0],
+  ink_blue: [0, 0, 0, 0], ink_magenta: [0, 0, 0, 0],
 };
 const feedback = {
   displacement: "next_displacement",
   displacement_velocity: "next_velocity",
   managed_time: "next_time",
+  ink_red: "next_ink_red", ink_yellow: "next_ink_yellow",
+  ink_green: "next_ink_green", ink_cyan: "next_ink_cyan",
+  ink_blue: "next_ink_blue", ink_magenta: "next_ink_magenta",
 };
 const reports = [];
 for (let tick = 0; tick < 2; tick += 1) {
@@ -182,3 +224,4 @@ console.log(JSON.stringify(reports));
     for channel in ("red", "green", "blue"):
         assert min(second[channel]) >= 0.0
         assert max(second[channel]) <= 255.0
+    assert max(second["next_ink_red"]) > 0.0

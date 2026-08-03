@@ -55,6 +55,7 @@ def test_columnar_engine_is_first_class_state_machine_with_unit_voxel_storage():
     assert state.voxel_occupied.shape == (2, 3, 2, 4)
     assert state.voxel_centroid.shape == (2, 3, 2, 4, 3)
     assert state.voxel_material_fraction.shape == (2, 3, 2, 4, 4)
+    assert state.column_ink_fraction.shape == (2, 3, 2, 6)
     assert state.voxel_material_fraction.sum().item() == pytest.approx(
         state.voxel_occupied.to_dtype("float32").sum().item()
     )
@@ -124,6 +125,7 @@ def test_managed_tick_moves_player_sinusoidally_and_loads_spring_sheet():
     assert metrics.advanced_dt == pytest.approx(0.025)
     assert not np.allclose(after, before)
     assert displacement.min() < 0.0
+    assert np.asarray(state.column_ink_fraction.tolist()).max() > 0.0
     assert np.count_nonzero(displacement) > 1
     assert np.asarray(state.column_surface_z.tolist()) == pytest.approx(
         np.asarray(state.column_rest_surface_z.tolist()) + displacement
@@ -151,6 +153,46 @@ def test_column_stencil_proposes_only_mobile_downhill_material_flux():
     assert flux[..., 0].max() == 0.0
     assert flux[..., 2].max() > 0.0
     assert flux[..., 3].max() == 0.0
+
+
+def test_entity_voxel_rejects_matter_from_its_interior():
+    state, config = _state()
+    player_index = state.place_player(0, 1, 0, 0, 3, config)
+    flat = state.voxel_centroid.reshape((-1, 3))
+    other_index = player_index + 1
+    player = flat[player_index].reshape((1, 3))
+    state.voxel_centroid = AbstractTensor.scatter(
+        flat,
+        AbstractTensor.tensor([other_index], dtype="int64"),
+        player + AbstractTensor.tensor([[0.18, 0.0, 0.0]])
+        - flat[other_index].reshape((1, 3)),
+        dim=0,
+    ).reshape(state.voxel_centroid.shape)
+    acceleration = np.asarray(
+        ColumnarMultifluidEngine(state, config)
+        ._entity_rejection_acceleration(state).tolist()
+    ).reshape(-1, 3)
+
+    assert acceleration[other_index, 0] > 0.0
+    assert acceleration[other_index, 1] == pytest.approx(0.0)
+    assert np.linalg.norm(acceleration[player_index]) == pytest.approx(0.0)
+
+
+def test_hue_bands_are_independent_diffusing_liquid_channels():
+    config = _config(tile_shape=(3, 1), slots_per_column=2)
+    state = ColumnarMultifluidState.regular(((0, 0),), config)
+    ink = np.zeros((1, 3, 1, config.ink_band_count), dtype=np.float32)
+    ink[0, 1, 0, :] = 1.0
+    state.column_ink_fraction = AbstractTensor.tensor(ink)
+    engine = ColumnarMultifluidEngine(state, config)
+
+    engine._advance_ink(state, 0.1)
+    advanced = np.asarray(state.column_ink_fraction.tolist())
+
+    assert np.all(advanced >= 0.0)
+    assert np.all(advanced <= 1.0)
+    assert np.all(advanced[0, 0, 0, :] > 0.0)
+    assert len(np.unique(np.round(advanced[0, 0, 0, :], 7))) > 1
 
 
 def test_youngman_extracts_the_same_bulk_column_and_player_surface_field():
@@ -188,3 +230,6 @@ def test_publish_committed_exposes_centroid_as_world_reference():
 
     assert table.get("columnar_world", "voxels", "centroid") is state.voxel_centroid
     assert table.get("columnar_world", "managed", "time") is state.managed_time
+    assert table.get(
+        "columnar_world", "columns", "ink_fraction"
+    ) is state.column_ink_fraction

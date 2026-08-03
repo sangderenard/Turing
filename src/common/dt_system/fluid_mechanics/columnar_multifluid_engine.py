@@ -49,6 +49,18 @@ class ColumnarMultifluidConfig:
     surface_spring_coupling: float = 4.0
     surface_load_depth: float = 0.42
     surface_load_radius: float = 1.35
+    entity_interior_half_extent: float = 0.55
+    entity_rejection_stiffness: float = 34.0
+    ink_band_names: tuple[str, ...] = (
+        "red", "yellow", "green", "cyan", "blue", "magenta"
+    )
+    ink_band_diffusivity: tuple[float, ...] = (
+        0.11, 0.15, 0.19, 0.23, 0.27, 0.31
+    )
+    ink_injection_rate: float = 2.8
+    ink_decay_rate: float = 0.055
+    ink_injection_radius: float = 0.62
+    ink_hue_angular_velocity: float = 0.42
     player_path_amplitude: tuple[float, float, float] = (0.75, 0.5, 0.08)
     player_path_angular_frequency: tuple[float, float, float] = (0.7, 1.1, 1.7)
 
@@ -69,6 +81,9 @@ class ColumnarMultifluidConfig:
             "surface_smoothing", "surface_spring_stiffness",
             "surface_spring_damping", "surface_spring_coupling",
             "surface_load_depth", "surface_load_radius",
+            "entity_interior_half_extent", "entity_rejection_stiffness",
+            "ink_injection_rate", "ink_decay_rate", "ink_injection_radius",
+            "ink_hue_angular_velocity",
         ):
             if not math.isfinite(float(getattr(self, name))):
                 raise ValueError(f"columnar {name} must be finite")
@@ -90,6 +105,27 @@ class ColumnarMultifluidConfig:
             raise ValueError("surface load depth cannot be negative")
         if float(self.surface_load_radius) <= 0.0:
             raise ValueError("surface load radius must be positive")
+        if float(self.entity_interior_half_extent) <= 0.0:
+            raise ValueError("entity interior half extent must be positive")
+        if float(self.entity_rejection_stiffness) < 0.0:
+            raise ValueError("entity rejection stiffness cannot be negative")
+        if not self.ink_band_names or len(set(self.ink_band_names)) != len(
+            self.ink_band_names
+        ):
+            raise ValueError("ink band names must be unique and non-empty")
+        if len(self.ink_band_diffusivity) != len(self.ink_band_names):
+            raise ValueError("one diffusivity is required per ink liquid")
+        if any(
+            not math.isfinite(float(value)) or float(value) < 0.0
+            for value in self.ink_band_diffusivity
+        ):
+            raise ValueError("ink diffusivities must be finite and non-negative")
+        if float(self.ink_injection_rate) < 0.0:
+            raise ValueError("ink injection rate cannot be negative")
+        if float(self.ink_decay_rate) < 0.0:
+            raise ValueError("ink decay rate cannot be negative")
+        if float(self.ink_injection_radius) <= 0.0:
+            raise ValueError("ink injection radius must be positive")
         for name in ("player_path_amplitude", "player_path_angular_frequency"):
             values = tuple(float(value) for value in getattr(self, name))
             if len(values) != 3 or any(not math.isfinite(value) for value in values):
@@ -98,6 +134,10 @@ class ColumnarMultifluidConfig:
     @property
     def material_count(self) -> int:
         return len(self.material_names)
+
+    @property
+    def ink_band_count(self) -> int:
+        return len(self.ink_band_names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +175,7 @@ class ColumnarMultifluidState:
     column_surface_z: AbstractTensor
     column_material_mass: AbstractTensor
     column_mean_velocity: AbstractTensor
+    column_ink_fraction: AbstractTensor
     transfer_flux: AbstractTensor
     managed_time: AbstractTensor
     phase: AbstractTensor
@@ -245,6 +286,10 @@ class ColumnarMultifluidState:
             column_mean_velocity=AbstractTensor.zeros(
                 (tile_count, width, height, 3), dtype="float32"
             ),
+            column_ink_fraction=AbstractTensor.zeros(
+                (tile_count, width, height, config.ink_band_count),
+                dtype="float32",
+            ),
             transfer_flux=AbstractTensor.zeros(
                 (column_count, 4, materials), dtype="float32"
             ),
@@ -297,6 +342,9 @@ class ColumnarMultifluidState:
             "column_surface_z": (tiles, width, height),
             "column_material_mass": (tiles, width, height, materials),
             "column_mean_velocity": (tiles, width, height, 3),
+            "column_ink_fraction": (
+                tiles, width, height, config.ink_band_count
+            ),
             "transfer_flux": (columns, 4, materials),
             "managed_time": (1,),
             "phase": (1,),
@@ -377,6 +425,9 @@ class ColumnarMultifluidState:
             self.column_rest_surface_z
         )
         self.column_surface_z = self.column_rest_surface_z.clone()
+        self.column_ink_fraction = AbstractTensor.zeros_like(
+            self.column_ink_fraction
+        )
         self.validate(config)
 
     def place_player(
@@ -551,6 +602,7 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
         TensorStateField("column_displacement_velocity", ("T", "X", "Y"), "float32", scope="columnar_world"),
         TensorStateField("column_surface_z", ("T", "X", "Y"), "float32", scope="columnar_world"),
         TensorStateField("column_material_mass", ("T", "X", "Y", "M"), "float32", scope="columnar_world"),
+        TensorStateField("column_ink_fraction", ("T", "X", "Y", "H"), "float32", scope="columnar_world"),
         TensorStateField("transfer_flux", ("C", 4, "M"), "float32", scope="columnar_world"),
         TensorStateField("managed_time", (1,), "float64", scope="columnar_world"),
         TensorStateField("phase", (1,), "int32", scope="columnar_world"),
@@ -667,6 +719,99 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
             state.column_rest_surface_z + state.column_displacement
         )
 
+    def _entity_rejection_acceleration(
+        self, state: ColumnarMultifluidState
+    ) -> AbstractTensor:
+        """Push matter out of every entity's unit-voxel interior in bulk."""
+
+        shape = tuple(state.voxel_velocity.shape)
+        if int(state.player_voxel_index.shape[0]) == 0:
+            return AbstractTensor.zeros(shape, dtype="float32")
+        flat_centroid = state.voxel_centroid.reshape((-1, 3))
+        players = flat_centroid.index_select(0, state.player_voxel_index)
+        delta = flat_centroid.reshape((-1, 1, 3)) - players.reshape((1, -1, 3))
+        cube_distance = delta.abs().max(dim=-1)
+        penetration = (
+            float(self.config.entity_interior_half_extent) - cube_distance
+        ).maximum(0.0)
+        distance = ((delta * delta).sum(dim=-1) + 1.0e-8).sqrt()
+        strength = (
+            penetration * float(self.config.entity_rejection_stiffness)
+            / distance
+        )
+        acceleration = (
+            delta * strength.reshape((*strength.shape, 1))
+        ).sum(dim=1)
+        dynamic = (
+            state.voxel_occupied.reshape((-1,))
+            & ~state.voxel_is_player.reshape((-1,))
+        ).reshape((-1, 1)).expand(tuple(acceleration.shape))
+        return AbstractTensor.where(dynamic, acceleration, 0.0).reshape(shape)
+
+    def _advance_ink(
+        self, state: ColumnarMultifluidState, dt: float
+    ) -> None:
+        """Inject and diffuse independent hue-band liquid channels."""
+
+        config = self.config
+        bands = int(config.ink_band_count)
+        flat_ink = state.column_ink_fraction.reshape((-1, bands))
+        neighbors = state.column_neighbor_index
+        valid = neighbors >= 0
+        safe = AbstractTensor.where(valid, neighbors, 0).reshape((-1,))
+        gathered = flat_ink.index_select(0, safe).reshape((-1, 4, bands))
+        valid_lanes = valid.reshape((-1, 4, 1)).expand(tuple(gathered.shape))
+        neighbor_sum = AbstractTensor.where(valid_lanes, gathered, 0.0).sum(dim=1)
+        neighbor_count = valid.to_dtype("float32").sum(
+            dim=1, keepdim=True
+        ).expand(tuple(flat_ink.shape))
+        neighbor_mean = neighbor_sum / AbstractTensor.where(
+            neighbor_count > 0.0, neighbor_count, 1.0
+        )
+        diffusivity = _tensor(config.ink_band_diffusivity, "float32").reshape(
+            (1, bands)
+        )
+        diffusion = diffusivity * (neighbor_mean - flat_ink)
+
+        source = AbstractTensor.zeros((int(flat_ink.shape[0]), 1), dtype="float32")
+        if int(state.player_voxel_index.shape[0]):
+            players = state.voxel_centroid.reshape((-1, 3)).index_select(
+                0, state.player_voxel_index
+            )
+            delta = (
+                state.column_centroid.reshape((-1, 1, 2))
+                - players[:, :2].reshape((1, -1, 2))
+            )
+            distance_squared = (delta * delta).sum(dim=-1)
+            radius = float(config.ink_injection_radius)
+            source = (-distance_squared / (2.0 * radius * radius)).exp().max(
+                dim=-1
+            ).reshape((-1, 1))
+        phase = (
+            AbstractTensor.arange(bands, dtype="float32")
+            * (2.0 * math.pi / bands)
+        ).reshape((1, bands))
+        hue = (
+            (float(state.managed_time.item()) + float(dt))
+            * float(config.ink_hue_angular_velocity)
+        )
+        band_weight = (hue - phase).cos().maximum(0.0)
+        band_weight = band_weight * band_weight
+        band_weight = band_weight / AbstractTensor.where(
+            band_weight.sum(dim=-1, keepdim=True) > 0.0,
+            band_weight.sum(dim=-1, keepdim=True),
+            1.0,
+        )
+        injection = (
+            source * band_weight * float(config.ink_injection_rate)
+        )
+        next_ink = flat_ink + float(dt) * (
+            diffusion + injection - float(config.ink_decay_rate) * flat_ink
+        )
+        state.column_ink_fraction = next_ink.maximum(0.0).minimum(1.0).reshape(
+            state.column_ink_fraction.shape
+        )
+
     def _refresh_column_stencils(self, state: ColumnarMultifluidState) -> None:
         config = self.config
         grid = state.voxel_occupied & (state.voxel_physics_domain == 0)
@@ -732,6 +877,7 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
         state.validate(self.config)
         self._advance_prescribed_players(state, dt)
         self._advance_surface_spring(state, dt)
+        self._advance_ink(state, dt)
         state.voxel_physics_domain = self._player_domains(state)
         occupied = state.voxel_occupied
         grid = occupied & (state.voxel_physics_domain == 0)
@@ -745,7 +891,10 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
         gravity = _tensor((0.0, 0.0, float(self.config.gravity)), "float32").reshape(
             (1, 1, 1, 1, 3)
         )
-        velocity = state.voxel_velocity + dynamic_lane * gravity * float(dt)
+        rejection = self._entity_rejection_acceleration(state)
+        velocity = state.voxel_velocity + dynamic_lane * (
+            gravity + rejection
+        ) * float(dt)
         predicted = AbstractTensor.where(
             player_lane,
             state.voxel_centroid,
@@ -922,6 +1071,10 @@ class ColumnarMultifluidEngine(AbstractTensorStateMachine):
         )
         state_table.set(
             "columnar_world", "columns", "transfer_flux", state.transfer_flux
+        )
+        state_table.set(
+            "columnar_world", "columns", "ink_fraction",
+            state.column_ink_fraction,
         )
         state_table.set(
             "columnar_world", "managed", "time", state.managed_time

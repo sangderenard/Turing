@@ -71,6 +71,12 @@ def columnar_multifluid_rgb_step(
     displacement_velocity,
     managed_time,
     dt,
+    ink_red,
+    ink_yellow,
+    ink_green,
+    ink_cyan,
+    ink_blue,
+    ink_magenta,
 ):
     """One Python-owned managed tick and its three RGB preview planes."""
 
@@ -81,8 +87,13 @@ def columnar_multifluid_rgb_step(
         (column_x - player_x) * (column_x - player_x)
         + (column_y - player_y) * (column_y - player_y)
     )
+    entity_interior = (
+        (0.52 - (column_x - player_x).abs()).maximum(0.0)
+        .minimum((0.52 - (column_y - player_y).abs()).maximum(0.0))
+        / 0.52
+    )
     load = (-distance_squared / (2.0 * 1.35 * 1.35)).exp()
-    target = -0.42 * load
+    target = -0.42 * load - 0.22 * entity_interior * entity_interior
     acceleration = (
         20.0 * (target - displacement) - 8.0 * displacement_velocity
     )
@@ -93,16 +104,71 @@ def columnar_multifluid_rgb_step(
     compression = (-next_displacement / 0.42).maximum(0.0).minimum(1.0)
     motion = next_velocity.abs().minimum(1.0)
 
-    red = (
+    base_red = (
         186.0 + 27.0 * height - 34.0 * compression + 54.0 * load
     ).maximum(0.0).minimum(255.0)
-    green = (
+    base_green = (
         220.0 + 18.0 * height - 21.0 * compression + 30.0 * load
         + 8.0 * motion
     ).maximum(0.0).minimum(255.0)
-    blue = (
+    base_blue = (
         232.0 + 16.0 * height + 15.0 * compression + 20.0 * load
     ).maximum(0.0).minimum(255.0)
+
+    hue = next_time * 0.42
+    source_red = (-distance_squared / (2.0 * 0.44 * 0.44)).exp()
+    source_yellow = (-distance_squared / (2.0 * 0.48 * 0.48)).exp()
+    source_green = (-distance_squared / (2.0 * 0.52 * 0.52)).exp()
+    source_cyan = (-distance_squared / (2.0 * 0.56 * 0.56)).exp()
+    source_blue = (-distance_squared / (2.0 * 0.60 * 0.60)).exp()
+    source_magenta = (-distance_squared / (2.0 * 0.64 * 0.64)).exp()
+    weight_red = hue.cos().maximum(0.0)
+    weight_yellow = (hue - 1.0471975511965976).cos().maximum(0.0)
+    weight_green = (hue - 2.0943951023931953).cos().maximum(0.0)
+    weight_cyan = (hue - 3.141592653589793).cos().maximum(0.0)
+    weight_blue = (hue - 4.1887902047863905).cos().maximum(0.0)
+    weight_magenta = (hue - 5.235987755982989).cos().maximum(0.0)
+    next_ink_red = (
+        ink_red * (-0.050 * dt).exp() + 2.8 * dt * source_red * weight_red
+    ).minimum(1.0)
+    next_ink_yellow = (
+        ink_yellow * (-0.054 * dt).exp()
+        + 2.8 * dt * source_yellow * weight_yellow
+    ).minimum(1.0)
+    next_ink_green = (
+        ink_green * (-0.058 * dt).exp() + 2.8 * dt * source_green * weight_green
+    ).minimum(1.0)
+    next_ink_cyan = (
+        ink_cyan * (-0.062 * dt).exp() + 2.8 * dt * source_cyan * weight_cyan
+    ).minimum(1.0)
+    next_ink_blue = (
+        ink_blue * (-0.066 * dt).exp() + 2.8 * dt * source_blue * weight_blue
+    ).minimum(1.0)
+    next_ink_magenta = (
+        ink_magenta * (-0.070 * dt).exp()
+        + 2.8 * dt * source_magenta * weight_magenta
+    ).minimum(1.0)
+    ink_total = (
+        next_ink_red + next_ink_yellow + next_ink_green
+        + next_ink_cyan + next_ink_blue + next_ink_magenta
+    ).maximum(1.0e-6)
+    ink_alpha = ink_total.minimum(0.88)
+    ink_color_red = 255.0 * (
+        next_ink_red + next_ink_yellow + next_ink_magenta
+    ) / ink_total
+    ink_color_green = 255.0 * (
+        next_ink_yellow + next_ink_green + next_ink_cyan
+    ) / ink_total
+    ink_color_blue = 255.0 * (
+        next_ink_cyan + next_ink_blue + next_ink_magenta
+    ) / ink_total
+    red = base_red * (1.0 - ink_alpha) + ink_color_red * ink_alpha
+    green = base_green * (1.0 - ink_alpha) + ink_color_green * ink_alpha
+    blue = base_blue * (1.0 - ink_alpha) + ink_color_blue * ink_alpha
+    entity_glow = entity_interior * entity_interior
+    red = red * (1.0 - entity_glow) + 245.0 * entity_glow
+    green = green * (1.0 - entity_glow) + 252.0 * entity_glow
+    blue = blue * (1.0 - entity_glow) + 255.0 * entity_glow
     return (
         red,
         green,
@@ -110,6 +176,12 @@ def columnar_multifluid_rgb_step(
         next_displacement,
         next_velocity,
         next_time,
+        next_ink_red,
+        next_ink_yellow,
+        next_ink_green,
+        next_ink_cyan,
+        next_ink_blue,
+        next_ink_magenta,
     )
 
 
