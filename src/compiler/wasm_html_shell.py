@@ -2620,6 +2620,21 @@ if (!gl) {
     });
 
     const domSurfaceEnabled = configuration.dom_surface === true;
+    const domIO = configuration.dom_io || {
+      inputs: {
+        position_x: "position_x", position_y: "position_y",
+        velocity_x: "velocity_x", velocity_y: "velocity_y",
+        anchor_x: "anchor_x", anchor_y: "anchor_y",
+        extent_x: "extent_x", extent_y: "extent_y",
+        pointer_x: "pointer_x", pointer_y: "pointer_y",
+        pointer_buttons: "pointer_buttons", button_latch: "button_latch",
+        score: "score", window_dt: "window_dt",
+      },
+      outputs: {
+        position_x: 0, position_y: 1, velocity_x: 2, velocity_y: 3,
+        button_latch: 4, score: 5, activity: 6,
+      },
+    };
     const domTextureLocation = gl.getUniformLocation(program, "turing_dom_state");
     const domCountLocation = gl.getUniformLocation(program, "turing_dom_count");
     const resolutionLocation = gl.getUniformLocation(program, "turing_resolution");
@@ -2703,7 +2718,7 @@ if (!gl) {
 
     let surfaceState = null;
     function initializeSurfaceState(snapshot) {
-      const elements = snapshot.elements.slice(0, 256);
+      const elements = snapshot.elements.slice(0, configuration.max_elements || 256);
       const values = key => new Float64Array(elements.map(element => element[key]));
       const extentX = values("width");
       const extentY = values("height");
@@ -2727,6 +2742,8 @@ if (!gl) {
         velocityX: new Float64Array(elements.length),
         velocityY: new Float64Array(elements.length),
         activity: new Float64Array(elements.length),
+        buttonLatch: new Float64Array(elements.length),
+        score: new Float64Array(elements.length),
         lastMilliseconds: null,
       };
       return surfaceState;
@@ -2736,12 +2753,14 @@ if (!gl) {
       if (!domTexture) return;
       const count = state.elements.length;
       const packed = new Float32Array(Math.max(1, count) * 12);
+      const scaleX = canvas.width / Math.max(canvas.clientWidth, 1);
+      const scaleY = canvas.height / Math.max(canvas.clientHeight, 1);
       state.elements.forEach((element, index) => {
         const color = cssColor(element.background);
         const base = index * 12;
         packed.set([
-          state.positionX[index], state.positionY[index],
-          state.extentX[index] * 0.5, state.extentY[index] * 0.5,
+          state.positionX[index] * scaleX, state.positionY[index] * scaleY,
+          state.extentX[index] * 0.5 * scaleX, state.extentY[index] * 0.5 * scaleY,
           element.z_index + index * 0.025, state.activity[index],
           element.border_radius, element.interactive ? 1 : 0,
           color[0], color[1], color[2], color[3],
@@ -2774,22 +2793,29 @@ if (!gl) {
         : Math.min(1 / 20, Math.max(1 / 240, (milliseconds - state.lastMilliseconds) / 1000));
       state.lastMilliseconds = milliseconds;
       const fill = value => new Float64Array(count).fill(value);
-      const result = await liaison.wasm.run({
-        position_x: state.positionX,
-        position_y: state.positionY,
-        velocity_x: state.velocityX,
-        velocity_y: state.velocityY,
-        anchor_x: state.anchorX,
-        anchor_y: state.anchorY,
-        extent_x: state.extentX,
-        extent_y: state.extentY,
-        pointer_x: fill(input.pointer[0]),
-        pointer_y: fill(canvas.clientHeight - input.pointer[1]),
-        pointer_buttons: fill(input.buttons),
-        dt: fill(elapsed),
-      }, count);
-      [state.positionX, state.positionY, state.velocityX,
-        state.velocityY, state.activity] = result;
+      const authoredInputs = {};
+      authoredInputs[domIO.inputs.position_x] = state.positionX;
+      authoredInputs[domIO.inputs.position_y] = state.positionY;
+      authoredInputs[domIO.inputs.velocity_x] = state.velocityX;
+      authoredInputs[domIO.inputs.velocity_y] = state.velocityY;
+      authoredInputs[domIO.inputs.anchor_x] = state.anchorX;
+      authoredInputs[domIO.inputs.anchor_y] = state.anchorY;
+      authoredInputs[domIO.inputs.extent_x] = state.extentX;
+      authoredInputs[domIO.inputs.extent_y] = state.extentY;
+      authoredInputs[domIO.inputs.pointer_x] = fill(input.pointer[0]);
+      authoredInputs[domIO.inputs.pointer_y] = fill(input.pointer[1]);
+      authoredInputs[domIO.inputs.pointer_buttons] = fill(input.buttons);
+      authoredInputs[domIO.inputs.button_latch] = state.buttonLatch;
+      authoredInputs[domIO.inputs.score] = state.score;
+      authoredInputs[domIO.inputs.window_dt] = fill(elapsed);
+      const result = await liaison.wasm.run(authoredInputs, count);
+      state.positionX = result[domIO.outputs.position_x];
+      state.positionY = result[domIO.outputs.position_y];
+      state.velocityX = result[domIO.outputs.velocity_x];
+      state.velocityY = result[domIO.outputs.velocity_y];
+      state.buttonLatch = result[domIO.outputs.button_latch];
+      state.score = result[domIO.outputs.score];
+      state.activity = result[domIO.outputs.activity];
       uploadDomState(state);
     }
 
@@ -2834,7 +2860,7 @@ if (!gl) {
       if (pointerLocation !== null) gl.uniform2f(
         pointerLocation,
         input.pointer[0] * ratio,
-        (canvas.clientHeight - input.pointer[1]) * ratio,
+        input.pointer[1] * ratio,
       );
       if (timeLocation !== null) gl.uniform1f(timeLocation, time);
       if (domSurfaceEnabled) await advanceDomSurface(milliseconds);
