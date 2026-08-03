@@ -336,6 +336,36 @@ const inputs = params.filter(p => p.role === "input");
 const outputs = params.filter(p => p.role === "output");
 const bytes = API.metadata.element_bytes || 8;
 const isF32 = (API.metadata.value_type || "f64") === "f32";
+// A stateful Python program names which returned arrays become inputs to its
+// next admitted tick.  The shell only transports those arrays; transition
+// math and managed-time evolution remain in the compiled Python program.
+const STATE_FEEDBACK = (API.metadata || {}).state_feedback || {};
+const STATE_FEEDBACK_PAIRS = Object.entries(STATE_FEEDBACK);
+const HAS_STATE_FEEDBACK = STATE_FEEDBACK_PAIRS.length > 0;
+
+function refreshNonStateFeeds(activeFeeds, count, d, frameIndex) {
+  return inputs.map((p, index) =>
+    Object.prototype.hasOwnProperty.call(STATE_FEEDBACK, p.name)
+      ? activeFeeds[index]
+      : feedValues(p, count, d, frameIndex)
+  );
+}
+
+function acceptCompiledState(activeFeeds, result) {
+  for (const [inputName, outputName] of STATE_FEEDBACK_PAIRS) {
+    const inputIndex = inputs.findIndex(item => item.name === inputName);
+    const outputIndex = outputs.findIndex(item => item.name === outputName);
+    if (inputIndex < 0 || outputIndex < 0) {
+      throw new Error(
+        "state feedback ABI mismatch: " + inputName + " <- " + outputName
+      );
+    }
+    const values = residentValues(result[outputIndex]);
+    activeFeeds[inputIndex] = values.slice
+      ? values.slice()
+      : new (isF32 ? Float32Array : Float64Array)(values);
+  }
+}
 
 function serverAddress() {
   const input = document.getElementById("server-address");
@@ -366,6 +396,12 @@ function resourceURLs(path) {
     const url = new URL(value, document.baseURI).href;
     if (!candidates.includes(url)) candidates.push(url);
   };
+  // The generated page and its artifacts are published together.  This is
+  // the correct first location for a file opened from the Go server, a
+  // repository-prefixed GitHub Pages URL, and a versioned bundle page.
+  // A file:// fetch may be rejected by the browser, in which case the
+  // configured loopback-server candidates below remain available.
+  add(relative);
   if (relative.startsWith("site/")) {
     const siteIndex = window.location.pathname.indexOf("/site/");
     if (siteIndex >= 0) {
@@ -967,6 +1003,52 @@ window.TuringSharedClassMemory = Object.freeze({
   },
 });
 
+// Stable bridge for presentation layers.  A shader surface may ask the page
+// runtime to execute its bundled companion Wasm without reaching into the
+// inspector controls or owning WebAssembly instantiation itself.
+window.TuringWasmRuntime = Object.freeze({
+  api: API,
+  io: (API.metadata || {}).shell_io || null,
+  sharedMemory: window.TuringSharedClassMemory,
+  get running() { return running; },
+  outputFrame() {
+    const dimensions = domain();
+    return {
+      revision: outputRevision,
+      width: dimensions.w,
+      height: dimensions.h,
+      outputs: (lastOutputs || []).map(item => ({
+        name: item.name,
+        values: item.values,
+      })),
+    };
+  },
+  start({continuous = true, preferContiguous = true} = {}) {
+    if (running) return Promise.resolve();
+    if (continuous && $("repeats")) $("repeats").value = "0";
+    if (CLASS_GRAPH && !activeExecutionMode) {
+      const preferred = preferContiguous && contiguousRunner
+        ? document.querySelector('.execution-mode[data-mode="contiguous"]')
+        : null;
+      const choice = preferred || document.querySelector(".execution-mode");
+      if (!choice) return Promise.reject(new Error("no WebAssembly deployment is published"));
+      choice.click();
+    }
+    return run();
+  },
+  async run(logicalInputs, count) {
+    if (contiguousRunner) return contiguousRunner.run(logicalInputs, count);
+    const variants = CLASS_GRAPH && CLASS_GRAPH.variants
+      ? Object.keys(CLASS_GRAPH.variants) : [];
+    if (variants.length) {
+      activeExecutionMode = "staged";
+      activeRegionSize = Number(variants[0]);
+      return activeClassGraphRunner().run(logicalInputs, count, 0, null, false, true);
+    }
+    throw new Error("this page has no liaison-compatible WebAssembly runner");
+  },
+});
+
 function residentValues(value) {
   if (!value || value.turingStorageReference !== true) return value;
   const View = value.valueType === "f32" ? Float32Array : Float64Array;
@@ -1014,7 +1096,12 @@ async function runClassGraphMode() {
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
     const anyNetwork = inputs.some(p => $("mode_" + p.name).value === "network");
-    const renderFps = Math.max(1, Number((NETWORK.feedback || {}).render_fps) || 24);
+    const renderFps = Math.max(
+      1,
+      Number((API.metadata || {}).render_fps)
+        || Number((NETWORK.feedback || {}).render_fps)
+        || 24
+    );
     const feedbackTicks = Math.max(
       1,
       Math.round((Number((NETWORK.feedback || {}).fps) || 120) / renderFps)
@@ -1031,7 +1118,7 @@ async function runClassGraphMode() {
     const repeats = Math.max(0, Number($("repeats").value) | 0);
     const continuous = repeats === 0;
     const animated = (continuous || repeats > 1) &&
-      (anyExpression || anyGaussian || anyNetwork);
+      (anyExpression || anyGaussian || anyNetwork || HAS_STATE_FEEDBACK);
     const timings = [];
     if (animated) {
       document.querySelectorAll(".tab").forEach(tab =>
@@ -1050,7 +1137,7 @@ async function runClassGraphMode() {
       if (r > 0 && animated) {
         frameIndex = r;
         await advanceFeedback(feedbackTicks);
-        activeFeeds = inputs.map(p => feedValues(p, count, d, frameIndex));
+        activeFeeds = refreshNonStateFeeds(activeFeeds, count, d, frameIndex);
         applyFeedbackFeed(activeFeeds, count);
       }
       const frameStarted = performance.now();
@@ -1060,10 +1147,11 @@ async function runClassGraphMode() {
       const stagedRunner = activeExecutionMode === "staged"
         ? activeClassGraphRunner() : null;
       timings.push(stagedRunner ? stagedRunner.lastExecutionMs : wallElapsed);
-      lastOutputs = outputs.map((p, index) => ({
+      publishOutputs(outputs.map((p, index) => ({
         name: p.name,
         values: residentValues(result[index]),
-      }));
+      })));
+      acceptCompiledState(activeFeeds, result);
       if (animated) {
         if ((r % 15) === 0) reportTimings(timings, count);
         renderActiveTab();
@@ -1121,7 +1209,12 @@ async function run() {
     const anyExpression = inputs.some(p => $("mode_" + p.name).value === "expression");
     const anyGaussian = inputs.some(p => $("mode_" + p.name).value === "gaussian");
     const anyNetwork = inputs.some(p => $("mode_" + p.name).value === "network");
-    const renderFps = Math.max(1, Number((NETWORK.feedback || {}).render_fps) || 24);
+    const renderFps = Math.max(
+      1,
+      Number((API.metadata || {}).render_fps)
+        || Number((NETWORK.feedback || {}).render_fps)
+        || 24
+    );
     const feedbackTicks = Math.max(1, Math.round((Number((NETWORK.feedback || {}).fps) || 120) / renderFps));
     await advanceFeedback(feedbackTicks);
     const feeds = inputs.map(p => feedValues(p, d.n, d, frameIndex));
@@ -1180,7 +1273,8 @@ async function run() {
     // A routed network is a time-varying source too.  Without this term a page
     // set entirely to network feeds runs its first frame but never reaches the
     // redraw/yield path below.
-    const animated = (continuous || repeats > 1) && (anyExpression || anyGaussian || anyNetwork);
+    const animated = (continuous || repeats > 1) &&
+      (anyExpression || anyGaussian || anyNetwork || HAS_STATE_FEEDBACK);
     if (animated) {
       document.querySelectorAll(".tab").forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.view === "image")));
       renderActiveTab();
@@ -1191,7 +1285,9 @@ async function run() {
       if (r > 0 && animated) {
         frameIndex = r;
         await advanceFeedback(feedbackTicks);
-        const refreshed = inputs.map(p => feedValues(p, count, d, frameIndex));
+        const refreshed = refreshNonStateFeeds(
+          activeFeeds, count, d, frameIndex
+        );
         applyFeedbackFeed(refreshed, count);
         activeFeeds = refreshed;
         inputs.forEach((p, i) => {
@@ -1206,10 +1302,14 @@ async function run() {
       if (animated) {
         // Read this frame out and paint it before the next one starts,
         // otherwise the loop finishes and only the last frame is ever seen.
-        lastOutputs = outputs.map((p, i) => ({
+        publishOutputs(outputs.map((p, i) => ({
           name: p.name,
           values: new View(memory.buffer, offsets[inputs.length + i], count)
-        }));
+        })));
+        acceptCompiledState(
+          activeFeeds,
+          lastOutputs.map(item => item.values)
+        );
         if ((r % 15) === 0) reportTimings(timings, count);
         // The redraw is synchronous and inside the computation loop: the
         // loop calls it directly and does not continue until it has
@@ -1245,10 +1345,10 @@ async function run() {
     }
     log("ok", "returned in " + elapsed.toFixed(3) + " ms");
 
-    lastOutputs = outputs.map((p, i) => ({
+    publishOutputs(outputs.map((p, i) => ({
       name: p.name,
       values: new View(memory.buffer, offsets[inputs.length + i], count)
-    }));
+    })));
     log("progress", "reading outputs", { done: 4, total: 4 });
     renderActiveTab();
     renderNetworkStats(feeds);
@@ -1269,6 +1369,12 @@ async function run() {
 // program. "raw" is the numbers; "image" reads the same buffer as a picture.
 
 let lastOutputs = null;
+let outputRevision = 0;
+
+function publishOutputs(nextOutputs) {
+  lastOutputs = nextOutputs;
+  outputRevision += 1;
+}
 
 function renderWebGLPalette(canvas, values, w, h, lo, span, invert) {
   // Resizing a canvas clears its WebGL drawing buffer and state.  Do it before
@@ -2179,6 +2285,12 @@ log("info", "shell ready", {
 });
 if (moduleBytes) setStatus("module embedded, ready", "good");
 else if (CLASS_GRAPH) setStatus("Choose Mono or a punch-card size; no runtime artifact is loaded.", "good");
+if ((API.metadata || {}).autostart && (moduleBytes || CLASS_GRAPH)) {
+  requestAnimationFrame(() => {
+    window.TuringWasmRuntime.start({continuous: true, preferContiguous: true})
+      .catch(error => setStatus(String(error), "bad"));
+  });
+}
 """
 
 
@@ -2213,16 +2325,24 @@ html, body.shader-execution {
   overflow: hidden;
   background: #000;
 }
-body.shader-execution > :not(#shader-surface):not(script) {
-  display: none !important;
-}
 body.shader-execution #shader-surface {
   display: block;
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
   width: 100%;
   height: 100%;
   border: 0;
   outline: 0;
   touch-action: none;
+}
+body.shader-execution #shader-layout-document {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
 }
 """
 
@@ -2242,6 +2362,144 @@ const input = {
   buttons: 0,
   wheel: [0, 0],
   keys: new Set(),
+};
+
+function elementIdentity(element, index) {
+  if (element.id) return "#" + element.id;
+  const explicit = element.getAttribute("data-turing-identity");
+  if (explicit) return explicit;
+  const parts = [];
+  for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+    const siblings = node.parentElement
+      ? Array.from(node.parentElement.children).filter(item => item.tagName === node.tagName)
+      : [];
+    const ordinal = siblings.length > 1 ? ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")" : "";
+    parts.unshift(node.tagName.toLowerCase() + ordinal);
+  }
+  return parts.join(">") || "element-" + index;
+}
+
+function layoutSnapshot(targetDocument = document) {
+  const view = targetDocument.defaultView || window;
+  const excluded = new Set(["SCRIPT", "STYLE", "LINK", "META", "TITLE", "BASE"]);
+  const nodes = Array.from(targetDocument.body
+    ? targetDocument.body.querySelectorAll("*") : []
+  ).filter(element => !excluded.has(element.tagName) && element.id !== "shader-surface");
+  const indexOf = new Map(nodes.map((element, index) => [element, index]));
+  const measured = nodes.map((element, index) => {
+    const rect = element.getBoundingClientRect();
+    const style = view.getComputedStyle(element);
+    return {
+      index,
+      identity: elementIdentity(element, index),
+      parent: indexOf.has(element.parentElement) ? indexOf.get(element.parentElement) : -1,
+      tag: element.tagName.toLowerCase(),
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      z_index: Number.isFinite(Number(style.zIndex)) ? Number(style.zIndex) : 0,
+      opacity: Number(style.opacity) || 0,
+      border_radius: parseFloat(style.borderTopLeftRadius) || 0,
+      background: style.backgroundColor,
+      color: style.color,
+      interactive: element.matches("a,button,input,select,textarea,[tabindex]"),
+    };
+  }).filter(element => element.width > 0 && element.height > 0);
+  const retained = new Map(measured.map((element, index) => [element.index, index]));
+  const elements = measured.map((element, index) => ({
+    ...element,
+    index,
+    parent: retained.has(element.parent) ? retained.get(element.parent) : -1,
+  }));
+  const packed = new Float32Array(elements.length * 8);
+  elements.forEach((element, index) => packed.set([
+    element.x, element.y, element.width, element.height,
+    element.z_index, element.opacity, element.border_radius,
+    element.interactive ? 1 : 0,
+  ], index * 8));
+  return {
+    schema: "turing-dom-layout",
+    version: 1,
+    viewport: {
+      width: targetDocument.documentElement.clientWidth,
+      height: targetDocument.documentElement.clientHeight,
+      device_pixel_ratio: view.devicePixelRatio || 1,
+    },
+    stride: 8,
+    fields: ["x", "y", "width", "height", "z_index", "opacity", "border_radius", "interactive"],
+    elements,
+    packed,
+  };
+}
+
+async function settledLayout(targetDocument) {
+  if (targetDocument.fonts && targetDocument.fonts.ready) {
+    await targetDocument.fonts.ready.catch(() => {});
+  }
+  const images = Array.from(targetDocument.images || []);
+  await Promise.all(images.map(item => item.decode ? item.decode().catch(() => {}) : Promise.resolve()));
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  return layoutSnapshot(targetDocument);
+}
+
+function htmlWithBase(source, baseURL) {
+  const parsed = new DOMParser().parseFromString(String(source), "text/html");
+  let base = parsed.head.querySelector("base");
+  if (!base) {
+    base = parsed.createElement("base");
+    parsed.head.prepend(base);
+  }
+  base.href = baseURL;
+  return "<!doctype html>\n" + parsed.documentElement.outerHTML;
+}
+
+const domLayout = {
+  frame: null,
+  latest: null,
+  listeners: new Set(),
+  snapshot(targetDocument = document) {
+    this.latest = layoutSnapshot(targetDocument);
+    this.listeners.forEach(listener => listener(this.latest));
+    return this.latest;
+  },
+  subscribe(listener) {
+    this.listeners.add(listener);
+    if (this.latest) listener(this.latest);
+    return () => this.listeners.delete(listener);
+  },
+  async loadHTML(source, {baseURL = document.baseURI} = {}) {
+    if (!this.frame) {
+      this.frame = document.createElement("iframe");
+      this.frame.id = "shader-layout-document";
+      this.frame.setAttribute("aria-hidden", "true");
+      this.frame.setAttribute("sandbox", "allow-same-origin");
+      document.body.insertBefore(this.frame, canvas);
+    }
+    const loaded = new Promise(resolve => this.frame.addEventListener("load", resolve, {once: true}));
+    this.frame.srcdoc = htmlWithBase(source, baseURL);
+    await loaded;
+    const snapshot = await settledLayout(this.frame.contentDocument);
+    this.latest = snapshot;
+    this.listeners.forEach(listener => listener(snapshot));
+    return snapshot;
+  },
+  async loadFile(file) {
+    if (!file || !/html?/i.test(file.type || file.name || "")) {
+      throw new Error("shader layout input must be an HTML file");
+    }
+    return this.loadHTML(await file.text(), {baseURL: document.baseURI});
+  },
+};
+const liaison = {
+  role: SHADER.role,
+  canvas,
+  gl,
+  input,
+  io: SHADER.io || (window.TuringWasmRuntime && window.TuringWasmRuntime.io) || null,
+  wasm: window.TuringWasmRuntime || null,
+  dom: domLayout,
+  ready: null,
 };
 
 function fail(error) {
@@ -2287,6 +2545,12 @@ canvas.addEventListener("keyup", event => {
   event.preventDefault();
 });
 canvas.addEventListener("contextmenu", event => event.preventDefault());
+canvas.addEventListener("dragover", event => event.preventDefault());
+canvas.addEventListener("drop", event => {
+  event.preventDefault();
+  const file = event.dataTransfer && event.dataTransfer.files[0];
+  if (file) domLayout.loadFile(file).catch(fail);
+});
 canvas.focus({preventScroll: true});
 
 function compile(type, source) {
@@ -2325,6 +2589,21 @@ if (!gl) {
       throw new Error(gl.getProgramInfoLog(program) || "shader link failed");
     }
     gl.useProgram(program);
+    const configuration = SHADER.configuration || {};
+    if (configuration.document_url) {
+      const documentResponse = await fetch(
+        new URL(configuration.document_url, document.baseURI),
+        {cache: "no-store"},
+      );
+      if (!documentResponse.ok) {
+        throw new Error("shader document load failed: HTTP " + documentResponse.status);
+      }
+      await domLayout.loadHTML(await documentResponse.text(), {
+        baseURL: new URL(configuration.document_url, document.baseURI).href,
+      });
+    } else {
+      domLayout.latest = await settledLayout(document);
+    }
 
     const feedNames = [...fragmentSource.matchAll(/uniform\s+sampler2D\s+(turing_feed_\d+)\s*;/g)]
       .map(match => match[1]);
@@ -2339,6 +2618,180 @@ if (!gl) {
       gl.uniform1i(gl.getUniformLocation(program, name), index);
       return {texture, index, width: 0, height: 0};
     });
+
+    const domSurfaceEnabled = configuration.dom_surface === true;
+    const domTextureLocation = gl.getUniformLocation(program, "turing_dom_state");
+    const domCountLocation = gl.getUniformLocation(program, "turing_dom_count");
+    const resolutionLocation = gl.getUniformLocation(program, "turing_resolution");
+    const pointerLocation = gl.getUniformLocation(program, "turing_pointer");
+    const timeLocation = gl.getUniformLocation(program, "turing_time");
+    const domTexture = domTextureLocation === null ? null : gl.createTexture();
+    const domTextureUnit = feeds.length;
+    if (domTexture) {
+      gl.activeTexture(gl.TEXTURE0 + domTextureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, domTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.uniform1i(domTextureLocation, domTextureUnit);
+    }
+
+    // A presentation shader may consume the latest logical RGB frame emitted
+    // by its companion Wasm program.  This is deliberately a display liaison:
+    // computation remains in Wasm and the shader only samples the published
+    // output texture across its full-screen triangle.
+    const outputTextureConfiguration = configuration.output_texture || null;
+    const outputTextureLocation = gl.getUniformLocation(
+      program, "turing_output_texture"
+    );
+    const outputTextureUnit = feeds.length + (domTexture ? 1 : 0);
+    const outputTexture = outputTextureConfiguration && outputTextureLocation !== null
+      ? gl.createTexture() : null;
+    let outputTextureRevision = -1;
+    if (outputTexture) {
+      gl.activeTexture(gl.TEXTURE0 + outputTextureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, outputTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
+        gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255])
+      );
+      gl.uniform1i(outputTextureLocation, outputTextureUnit);
+    }
+
+    function uploadOutputTexture() {
+      if (!outputTexture || !liaison.wasm || !liaison.wasm.outputFrame) return;
+      const frame = liaison.wasm.outputFrame();
+      if (!frame || frame.revision === outputTextureRevision || !frame.outputs.length) return;
+      const channelNames = Array.isArray(outputTextureConfiguration.channels)
+        ? outputTextureConfiguration.channels : ["red", "green", "blue"];
+      const byName = new Map(frame.outputs.map(item => [item.name, item.values]));
+      const channels = channelNames.slice(0, 3).map(name => byName.get(name));
+      if (channels.length !== 3 || channels.some(values => !values)) return;
+      const count = frame.width * frame.height;
+      if (channels.some(values => values.length < count)) return;
+      const pixels = new Uint8Array(count * 4);
+      for (let index = 0; index < count; index += 1) {
+        const base = index * 4;
+        pixels[base] = Math.max(0, Math.min(255, Math.round(channels[0][index])));
+        pixels[base + 1] = Math.max(0, Math.min(255, Math.round(channels[1][index])));
+        pixels[base + 2] = Math.max(0, Math.min(255, Math.round(channels[2][index])));
+        pixels[base + 3] = 255;
+      }
+      gl.activeTexture(gl.TEXTURE0 + outputTextureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, outputTexture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA, frame.width, frame.height, 0,
+        gl.RGBA, gl.UNSIGNED_BYTE, pixels
+      );
+      outputTextureRevision = frame.revision;
+    }
+
+    function cssColor(value) {
+      const components = String(value || "").match(/[\d.]+/g) || [];
+      return [0.16, 0.34, 0.64, 1.0].map((fallback, index) =>
+        components[index] === undefined
+          ? fallback
+          : Number(components[index]) / (index < 3 ? 255 : 1)
+      );
+    }
+
+    let surfaceState = null;
+    function initializeSurfaceState(snapshot) {
+      const elements = snapshot.elements.slice(0, 256);
+      const values = key => new Float64Array(elements.map(element => element[key]));
+      const extentX = values("width");
+      const extentY = values("height");
+      const anchorX = new Float64Array(elements.map(element => element.x + element.width * 0.5));
+      // DOM rectangles are top-origin; WebGL fragment coordinates are
+      // bottom-origin.  Normalize once at the liaison boundary so physics,
+      // pointer hit testing, and shader geometry all share one coordinate
+      // system.
+      const anchorY = new Float64Array(elements.map(element =>
+        snapshot.viewport.height - (element.y + element.height * 0.5)
+      ));
+      surfaceState = {
+        snapshot,
+        elements,
+        anchorX,
+        anchorY,
+        extentX,
+        extentY,
+        positionX: anchorX.slice(),
+        positionY: anchorY.slice(),
+        velocityX: new Float64Array(elements.length),
+        velocityY: new Float64Array(elements.length),
+        activity: new Float64Array(elements.length),
+        lastMilliseconds: null,
+      };
+      return surfaceState;
+    }
+
+    function uploadDomState(state) {
+      if (!domTexture) return;
+      const count = state.elements.length;
+      const packed = new Float32Array(Math.max(1, count) * 12);
+      state.elements.forEach((element, index) => {
+        const color = cssColor(element.background);
+        const base = index * 12;
+        packed.set([
+          state.positionX[index], state.positionY[index],
+          state.extentX[index] * 0.5, state.extentY[index] * 0.5,
+          element.z_index + index * 0.025, state.activity[index],
+          element.border_radius, element.interactive ? 1 : 0,
+          color[0], color[1], color[2], color[3],
+        ], base);
+      });
+      gl.activeTexture(gl.TEXTURE0 + domTextureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, domTexture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA32F, 3, Math.max(1, count), 0,
+        gl.RGBA, gl.FLOAT, packed
+      );
+      if (domCountLocation !== null) gl.uniform1i(domCountLocation, count);
+    }
+
+    async function advanceDomSurface(milliseconds) {
+      const snapshot = domLayout.latest;
+      if (!snapshot) return;
+      if (!surfaceState || surfaceState.snapshot !== snapshot) {
+        initializeSurfaceState(snapshot);
+      }
+      const state = surfaceState;
+      const count = state.elements.length;
+      if (!count || !liaison.wasm) {
+        uploadDomState(state);
+        return;
+      }
+      const elapsed = state.lastMilliseconds === null
+        ? 1 / 60
+        : Math.min(1 / 20, Math.max(1 / 240, (milliseconds - state.lastMilliseconds) / 1000));
+      state.lastMilliseconds = milliseconds;
+      const fill = value => new Float64Array(count).fill(value);
+      const result = await liaison.wasm.run({
+        position_x: state.positionX,
+        position_y: state.positionY,
+        velocity_x: state.velocityX,
+        velocity_y: state.velocityY,
+        anchor_x: state.anchorX,
+        anchor_y: state.anchorY,
+        extent_x: state.extentX,
+        extent_y: state.extentY,
+        pointer_x: fill(input.pointer[0]),
+        pointer_y: fill(canvas.clientHeight - input.pointer[1]),
+        pointer_buttons: fill(input.buttons),
+        dt: fill(elapsed),
+      }, count);
+      [state.positionX, state.positionY, state.velocityX,
+        state.velocityY, state.activity] = result;
+      uploadDomState(state);
+    }
 
     function uploadFeeds(time) {
       const width = canvas.width;
@@ -2366,7 +2819,7 @@ if (!gl) {
     }
 
     let lastInputSignature = "";
-    function frame(milliseconds) {
+    async function frame(milliseconds) {
       const ratio = Math.max(1, window.devicePixelRatio || 1);
       const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
       const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
@@ -2377,6 +2830,15 @@ if (!gl) {
         gl.viewport(0, 0, width, height);
       }
       const time = milliseconds / 1000;
+      if (resolutionLocation !== null) gl.uniform2f(resolutionLocation, width, height);
+      if (pointerLocation !== null) gl.uniform2f(
+        pointerLocation,
+        input.pointer[0] * ratio,
+        (canvas.clientHeight - input.pointer[1]) * ratio,
+      );
+      if (timeLocation !== null) gl.uniform1f(timeLocation, time);
+      if (domSurfaceEnabled) await advanceDomSurface(milliseconds);
+      uploadOutputTexture();
       const signature = [width, height, ...input.pointer, input.buttons,
         ...input.wheel, input.keys.size, Math.floor(time * 60)].join(":");
       if (resized || signature !== lastInputSignature) {
@@ -2384,12 +2846,22 @@ if (!gl) {
         lastInputSignature = signature;
       }
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      requestAnimationFrame(frame);
+      requestAnimationFrame(value => frame(value).catch(fail));
     }
-    requestAnimationFrame(frame);
+    requestAnimationFrame(value => frame(value).catch(fail));
+    if (!domSurfaceEnabled && SHADER.autostart !== false && liaison.wasm) {
+      const execution = SHADER.execution || {};
+      liaison.wasm.start({
+        continuous: execution.continuous !== false,
+        preferContiguous: execution.prefer_contiguous !== false,
+      }).catch(fail);
+    }
     return {canvas, gl, program, input, fragmentSource};
   })();
-  window.TuringShaderSurface = {canvas, gl, input, ready};
+  liaison.ready = ready;
+  window.TuringShaderLiaison = liaison;
+  // Compatibility name for callers of the first shader-surface probe.
+  window.TuringShaderSurface = liaison;
   ready.catch(fail);
 }
 """
@@ -2856,6 +3328,8 @@ def emit_html_shell(
         shader = dict(shader_execution)
         if not shader.get("url"):
             raise ValueError("shader execution requires a published shader URL")
+        if shader.get("role") != "shader-surface":
+            raise ValueError("shader execution requires the shader-surface role")
         # Keep the complete inspection document available for tooling and
         # diagnostics, but graduate its presentation to the WebGL surface.
         # CSS owns the visibility switch exactly so removing this class is a

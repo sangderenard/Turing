@@ -62,6 +62,9 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
             "url": "source/webgl/webgl.frag.glsl",
             "language": "webgl2-glsl-es",
             "stage": "fragment",
+            "role": "shader-surface",
+            "autostart": True,
+            "execution": {"continuous": True, "prefer_contiguous": True},
         },
     )
     html = shell.html
@@ -74,12 +77,30 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert "canvas.setPointerCapture(event.pointerId)" in html
     assert 'canvas.addEventListener("keydown"' in html
     assert "window.TuringShaderSurface" in html
+    assert "window.TuringShaderLiaison" in html
+    assert "window.TuringWasmRuntime" in html
+    assert "outputFrame()" in html
+    assert "uploadOutputTexture()" in html
+    assert "wasm: window.TuringWasmRuntime || null" in html
+    assert "start({continuous = true, preferContiguous = true} = {})" in html
+    assert "preferContiguous && contiguousRunner" in html
+    assert "liaison.wasm.start({" in html
 
-    # Graduation is a CSS visibility mode: the inspector remains available
-    # in the DOM and the shader canvas is the only visible body content.
+    # The opaque shader overlays the inspector without display:none, because
+    # the browser must still calculate the hidden document's real layout.
     assert '<body class="shader-execution">' in html
-    assert "body.shader-execution > :not(#shader-surface):not(script)" in html
-    assert "display: none !important" in html
+    assert "position: fixed" in html
+    assert "z-index: 2147483647" in html
+    assert "display: none !important" not in html
+    assert 'schema: "turing-dom-layout"' in html
+    assert "element.getBoundingClientRect()" in html
+    assert "view.getComputedStyle(element)" in html
+    assert "new Float32Array(elements.length * 8)" in html
+    assert "await settledLayout(document)" in html
+    assert "async loadHTML(source" in html
+    assert "async loadFile(file)" in html
+    assert 'canvas.addEventListener("drop"' in html
+    assert "snapshot.viewport.height - (element.y + element.height * 0.5)" in html
     assert "Local publisher and gallery" in html
     assert "Process graph" in html
     assert 'id="run"' in html
@@ -152,6 +173,7 @@ def test_local_publisher_uses_configurable_server_and_bundle_resource_route():
     assert 'renderGallery(STATIC_GALLERY)' in html
     assert 'const itemURL = item => fromServer ? serverURL(item.url) : resourceURL(item.url)' in html
     assert "function resourceURLs(path)" in html
+    assert "add(relative);" in html
     assert 'const siteIndex = window.location.pathname.indexOf("/site/")' in html
     assert "add(serverURL(pageDirectory + relative))" in html
     assert 'add(serverURL("/" + relative))' in html

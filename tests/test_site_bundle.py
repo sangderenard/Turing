@@ -39,11 +39,32 @@ def test_only_published_browser_shader_graduates_a_bundle_page():
         "available": True,
         "url": "source/webgl/webgl.frag.glsl",
     }])
+    assert descriptor is None
+
+    descriptor = _shader_execution_descriptor(desktop_only + [{
+        "language": "webgl",
+        "role": "shader-surface",
+        "available": True,
+        "url": "source/roles/shader-surface/webgl.frag.glsl",
+    }])
     assert descriptor == {
-        "url": "source/webgl/webgl.frag.glsl",
+        "url": "source/roles/shader-surface/webgl.frag.glsl",
         "language": "webgl2-glsl-es",
         "stage": "fragment",
+        "role": "shader-surface",
+        "autostart": True,
+        "execution": {
+            "continuous": True,
+            "prefer_contiguous": True,
+        },
     }
+    io = {"requirements": {"requests": [{"capability": "pointer"}]}}
+    assert _shader_execution_descriptor(desktop_only + [{
+        "language": "webgl",
+        "role": "shader-surface",
+        "available": True,
+        "url": "surface.frag.glsl",
+    }], io)["io"] == io
     assert resolve_publish_root(DEFAULT_PUBLISH_ROOT) == DEFAULT_PUBLISH_ROOT
 
 

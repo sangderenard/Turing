@@ -8,6 +8,7 @@ from .algorithm import (
     compile_grid_domain,
     extract_isosurface,
     metric_sample_tags,
+    tetrahedra_from_axes,
     tetrahedra_from_grid_domain,
 )
 from .spline import (
@@ -45,5 +46,6 @@ __all__ = [
     "extract_isosurface",
     "metric_sample_tags",
     "simplex_multi_indices",
+    "tetrahedra_from_axes",
     "tetrahedra_from_grid_domain",
 ]

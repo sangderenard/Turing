@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import ast
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -42,7 +43,7 @@ from typing import Any, Mapping
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
 BUNDLE_LAYOUT_VERSION = 1
-BUILDER_VERSION = "site-bundle-v11"
+BUILDER_VERSION = "site-bundle-v16"
 DEFAULT_WASM_CARD_OPERATIONS = 2000
 TURING_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
@@ -76,6 +77,9 @@ class SourceContract:
     backend: str
     remove_loops: bool
     unroll_limit: int
+    state_feedback: Mapping[str, str]
+    render_fps: float
+    autostart: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -674,16 +678,34 @@ def discover_source_contract(
             f"feed expressions name unknown parameters: {sorted(unknown_expressions)!r}"
         )
 
+    state_feedback = config.get("state_feedback", {})
+    if not isinstance(state_feedback, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in state_feedback.items()
+    ):
+        raise ValueError(
+            "TURING_PAGE['state_feedback'] must map input names to output names"
+        )
+    unknown_state_inputs = set(state_feedback) - set(parameters)
+    if unknown_state_inputs:
+        raise ValueError(
+            "state feedback names unknown input parameters: "
+            f"{sorted(unknown_state_inputs)!r}"
+        )
+
     page_title = str(title or config.get("title") or selected.replace("_", " ").title())
     page_slug = slugify(str(slug or config.get("slug") or selected))
     width = int(config.get("width", 64))
     height = int(config.get("height", 40))
     probe_size = int(config.get("probe_size", 4))
     unroll_limit = int(config.get("unroll_limit", 4096))
+    render_fps = float(config.get("render_fps", 30.0))
     if min(width, height, probe_size) < 1:
         raise ValueError("width, height, and probe_size must be positive")
     if unroll_limit < 0:
         raise ValueError("unroll_limit must be non-negative")
+    if not math.isfinite(render_fps) or render_fps <= 0.0:
+        raise ValueError("render_fps must be finite and positive")
     return SourceContract(
         entrypoint=str(selected),
         title=page_title,
@@ -696,6 +718,9 @@ def discover_source_contract(
         backend=str(config.get("backend", "c")),
         remove_loops=bool(config.get("remove_loops", True)),
         unroll_limit=unroll_limit,
+        state_feedback=dict(state_feedback),
+        render_fps=render_fps,
+        autostart=bool(config.get("autostart", False)),
     )
 
 
@@ -734,7 +759,14 @@ def _entrypoint_parameters(source: str, entrypoint: str) -> tuple[str, ...]:
     )
 
 
-def _content_version(source: str, contract: SourceContract) -> tuple[str, str]:
+def _content_version(
+    source: str,
+    contract: SourceContract,
+    *,
+    presentation_shader: str | None = None,
+    presentation_document: str | None = None,
+    shader_configuration: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
     source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     identity = {
         "builder": BUILDER_VERSION,
@@ -745,6 +777,18 @@ def _content_version(source: str, contract: SourceContract) -> tuple[str, str]:
         "backend": contract.backend,
         "remove_loops": contract.remove_loops,
         "unroll_limit": contract.unroll_limit,
+        "state_feedback": dict(contract.state_feedback),
+        "render_fps": contract.render_fps,
+        "autostart": contract.autostart,
+        "presentation_shader_sha256": (
+            hashlib.sha256(presentation_shader.encode("utf-8")).hexdigest()
+            if presentation_shader is not None else None
+        ),
+        "presentation_document_sha256": (
+            hashlib.sha256(presentation_document.encode("utf-8")).hexdigest()
+            if presentation_document is not None else None
+        ),
+        "shader_configuration": dict(shader_configuration or {}),
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -752,7 +796,14 @@ def _content_version(source: str, contract: SourceContract) -> tuple[str, str]:
     return f"v{BUNDLE_LAYOUT_VERSION}-{digest[:16]}", source_digest
 
 
-def _write_sources(directory: Path, source: str, filename: str, sources: Any) -> list[dict[str, Any]]:
+def _write_sources(
+    directory: Path,
+    source: str,
+    filename: str,
+    sources: Any,
+    *,
+    presentation_shader: str | None = None,
+) -> list[dict[str, Any]]:
     entries = [{
         "language": "python_source",
         "title": "Original Python",
@@ -763,6 +814,18 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
         "lines": source.count("\n") + 1,
         "filename": Path(filename).name,
     }]
+    if presentation_shader is not None:
+        entries.append({
+            "language": "webgl",
+            "title": "WebGL presentation shader",
+            "source": presentation_shader,
+            "available": True,
+            "reason": "",
+            "highlight": "c",
+            "lines": presentation_shader.count("\n") + 1,
+            "filename": "surface.frag.glsl",
+            "role": "shader-surface",
+        })
     if sources is not None:
         entries.extend(sources.to_mapping()["sources"])
     published: list[dict[str, Any]] = []
@@ -773,7 +836,12 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
             language = str(item["language"])
             extension = _SOURCE_EXTENSIONS.get(language, "txt")
             output_name = str(item.get("filename") or f"{language}.{extension}")
-            relative = Path("source") / language / output_name
+            role = str(item.get("role") or "")
+            relative = (
+                Path("source") / "roles" / role / output_name
+                if role == "shader-surface"
+                else Path("source") / language / output_name
+            )
             path = directory / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             # Backend source hashes are verification identities.  Preserve
@@ -791,20 +859,34 @@ def _write_sources(directory: Path, source: str, filename: str, sources: Any) ->
 
 def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
+    shell_io: Mapping[str, Any] | None = None,
+    configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Select the browser-native shader which graduates a page to execution."""
+    """Select the explicitly-role-marked browser presentation shader."""
 
     for source in published_sources:
         if (
             source.get("language") == "webgl"
+            and source.get("role") == "shader-surface"
             and source.get("available")
             and source.get("url")
         ):
-            return {
+            descriptor = {
                 "url": str(source["url"]),
                 "language": "webgl2-glsl-es",
                 "stage": "fragment",
+                "role": "shader-surface",
+                "autostart": True,
+                "execution": {
+                    "continuous": True,
+                    "prefer_contiguous": True,
+                },
             }
+            if shell_io:
+                descriptor["io"] = dict(shell_io)
+            if configuration:
+                descriptor["configuration"] = dict(configuration)
+            return descriptor
     # Desktop GLSL is deliberately not a fallback. Its SSBO binding/channel
     # arena needs the dedicated memory handler documented in the GLSL
     # ingestion layer and cannot be executed by a WebGL canvas.
@@ -849,6 +931,9 @@ def build_program_bundle(
     probes: Mapping[str, Any] | None = None,
     include_backends: bool = True,
     include_mathematics: bool = True,
+    presentation_shader: str | None = None,
+    presentation_document: str | None = None,
+    shader_configuration: Mapping[str, Any] | None = None,
 ) -> ProgramBundle:
     """Compile source and atomically publish its complete versioned bundle."""
 
@@ -856,7 +941,13 @@ def build_program_bundle(
     contract = discover_source_contract(
         source, entrypoint=entrypoint, title=title, slug=slug, probes=probes
     )
-    version, source_digest = _content_version(source, contract)
+    version, source_digest = _content_version(
+        source,
+        contract,
+        presentation_shader=presentation_shader,
+        presentation_document=presentation_document,
+        shader_configuration=shader_configuration,
+    )
     destination = resolve_publish_root(destination)
     versions = destination / "site" / "programs" / contract.slug / "versions"
     final_directory = versions / version
@@ -866,7 +957,10 @@ def build_program_bundle(
     temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=versions))
     compile_log = io.StringIO()
     try:
-        from ..common.tensors.accelerator_backends.aot_compile import compile_ast_aot
+        from ..common.tensors.accelerator_backends.aot_compile import (
+            compile_ast_aot,
+            project_public_numerical_program,
+        )
         from ..common.tensors.topological_reducer import reduce_abstract_tensor_topology
         from ..transmogrifier.graph.graph_express2 import ProcessGraph
         from .backend_sources import collect_backend_sources
@@ -904,10 +998,44 @@ def build_program_bundle(
                 precompile_only=True,
                 python_bindings=globals(),
             )
-            program = getattr(aot.compiled_shell_program, "program", aot.compiled_shell_program)
+            # This extraction is deliberately late in compilation.  ``aot``
+            # already represents Python AST -> ProcessGraph -> planned
+            # control/map/numerical compilation.  ``program`` is only the
+            # internal numerical member required by this particular Wasm
+            # emitter; it is not the source compiler, an application API, or
+            # evidence that the Python recompiler is numerics-only.
+            program = project_public_numerical_program(aot)
             module = emit_wasm_module(
                 program, name=contract.entrypoint, dtype="float64"
             )
+            if contract.state_feedback:
+                entry = module.api.entry_points[0]
+                input_names = {
+                    item.name for item in entry.parameters if item.role == "input"
+                }
+                output_names = {
+                    item.name for item in entry.parameters if item.role == "output"
+                }
+                missing_inputs = set(contract.state_feedback) - input_names
+                missing_outputs = set(contract.state_feedback.values()) - output_names
+                if missing_inputs or missing_outputs:
+                    raise ValueError(
+                        "compiled state feedback does not match the Python ABI; "
+                        f"missing inputs={sorted(missing_inputs)!r}; "
+                        f"missing outputs={sorted(missing_outputs)!r}"
+                    )
+                module = replace(
+                    module,
+                    api=replace(
+                        module.api,
+                        metadata={
+                            **dict(module.api.metadata),
+                            "state_feedback": dict(contract.state_feedback),
+                            "render_fps": float(contract.render_fps),
+                            "autostart": bool(contract.autostart),
+                        },
+                    ),
+                )
         if not module.complete:
             raise RuntimeError(module.shortfall_report())
 
@@ -983,8 +1111,27 @@ def build_program_bundle(
                     program=program,
                 )
         published_sources = _write_sources(
-            temporary, source, Path(source_filename).name, sources
+            temporary,
+            source,
+            Path(source_filename).name,
+            sources,
+            presentation_shader=presentation_shader,
         )
+        effective_shader_configuration = dict(shader_configuration or {})
+        if presentation_document is not None:
+            document_relative = (
+                Path("source") / "roles" / "shader-document" / "index.html"
+            )
+            document_path = temporary / document_relative
+            document_path.parent.mkdir(parents=True, exist_ok=True)
+            document_path.write_text(
+                presentation_document,
+                encoding="utf-8",
+                newline="\n",
+            )
+            effective_shader_configuration["document_url"] = (
+                document_relative.as_posix()
+            )
 
         fortran_verification = None
         if sources is not None:
@@ -1088,7 +1235,11 @@ def build_program_bundle(
             "operation_count": len(required_steps(program)),
         }
         route = f"/site/programs/{contract.slug}/versions/{version}/"
-        shader_execution = _shader_execution_descriptor(published_sources)
+        shader_execution = _shader_execution_descriptor(
+            published_sources,
+            (module.api.metadata or {}).get("shell_io"),
+            effective_shader_configuration,
+        )
         shell = emit_html_shell(
             module.api,
             name="index",

@@ -2,6 +2,15 @@
 that wants to compile a real Python function ahead-of-time through the
 precompiler, instead of walking a captured tape.
 
+This module is a Python compiler frontend.  Its input contract is Python
+source plus an entrypoint; the ``FusedProgram`` objects exposed on the result
+are internal products made *after* AST ingestion, ProcessGraph construction,
+control planning, and specialization.  They are not an alternate application
+entrypoint and must not be mistaken for the scope of Python the compiler
+understands.  Consumers compiling an application enter here (or through a
+higher-level source/bundle compiler), never by manufacturing a numerical
+``FusedProgram`` and calling a backend emitter directly.
+
 This is the real, existing pipeline -- not a new one:
 
     ast.parse(source)
@@ -99,6 +108,7 @@ from ....compiler.shell_reference_tables import (
 from ....compiler.precompile_to_ssa import lower_class_navigation_to_ssa
 from ....transmogrifier.graph.graph_express2 import ProcessGraph
 from ..topological_reducer import reduce_abstract_tensor_topology
+from ..fused_ir import FusedProgram
 from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
 
 
@@ -106,6 +116,9 @@ from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
 class AOTCompilation:
     entrypoint: str
     outputs: Mapping[str, Any]
+    # INTERNAL COMPILATION PRODUCT.  This is exposed so later compiler stages
+    # can assemble control/numeric SSA and emit targets.  Its flat numerical
+    # shape does not describe or limit the Python source accepted above it.
     compiled_shell_program: Any
     shell_control_program: Any
     deployment: Any
@@ -121,6 +134,78 @@ class AOTCompilation:
     identity_table: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     function_outputs: tuple[str, ...] = ()
     function_parameters: tuple[str, ...] = ()
+
+
+def project_public_numerical_program(compilation: AOTCompilation) -> Any:
+    """Project one numeric region through the retained source identity map.
+
+    Discovery regions may retain values needed by surrounding control and
+    therefore expose more numeric terminals than the source function returns.
+    Backend APIs must describe the public function, not those compiler-private
+    boundaries. When one region contains every declared public output, select
+    and name those values from ``function_outputs``/``identity_table`` and
+    restore source parameter names on its feeds.
+
+    Multi-region/control programs remain unchanged; their public ABI is
+    assembled by the SSA/control path rather than fabricated by flattening.
+    """
+
+    outputs = {
+        name: int(compilation.identity_table[name][-1])
+        for name in compilation.function_outputs
+        if compilation.identity_table.get(name)
+    }
+    fallback = getattr(
+        compilation.compiled_shell_program,
+        "program",
+        compilation.compiled_shell_program,
+    )
+    if not outputs or len(outputs) != len(compilation.function_outputs):
+        return fallback
+
+    candidates = [*compilation.region_programs.values(), fallback]
+    selected = []
+    for candidate in candidates:
+        available = {
+            *map(int, candidate.feeds),
+            *(int(step.result_id) for step in candidate.steps),
+            *map(int, candidate.outputs.values()),
+        }
+        if set(outputs.values()) <= available:
+            selected.append(candidate)
+    if len(selected) != 1:
+        return fallback
+
+    program = selected[0]
+    # Region assembly can encounter the same captured literal through more
+    # than one returned expression.  Both references deliberately retain the
+    # same identity, so collapse only byte-for-byte-equivalent definitions;
+    # a differing redefinition remains visible to downstream validation.
+    steps = []
+    definitions: dict[int, Any] = {}
+    for step in program.steps:
+        result_id = int(step.result_id)
+        previous = definitions.get(result_id)
+        if previous is not None and previous == step:
+            continue
+        definitions[result_id] = step
+        steps.append(step)
+    extras = dict(program.extras or {})
+    origins = dict(extras.get("capture_feed_origins", {}) or {})
+    for name in compilation.function_parameters:
+        history = tuple(compilation.identity_table.get(name, ()))
+        if history and int(history[0]) in program.feeds:
+            origins[int(history[0])] = {"binding_name": name}
+    extras["capture_feed_origins"] = origins
+    return FusedProgram(
+        version=program.version,
+        feeds=set(program.feeds),
+        steps=steps,
+        outputs=outputs,
+        state_in=None if program.state_in is None else set(program.state_in),
+        meta=None if program.meta is None else dict(program.meta),
+        extras=extras,
+    )
 
 
 def compile_ast_aot(
@@ -285,4 +370,8 @@ def compile_ast_aot(
     )
 
 
-__all__ = ["AOTCompilation", "compile_ast_aot"]
+__all__ = [
+    "AOTCompilation",
+    "compile_ast_aot",
+    "project_public_numerical_program",
+]
