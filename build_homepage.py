@@ -34,7 +34,6 @@ import numpy as np
 from src.common.tensors.accelerator_backends.aot_compile import compile_ast_aot
 from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
 from src.compiler.backend_sources import collect_backend_sources
-from src.compiler.dom_shader_demo import build_demo as build_dom_shader_demo
 from src.compiler.fused_program_wasm_backend import emit_wasm_module, required_steps
 from src.compiler.shell_telemetry import TelemetryChannel, summarize_process_graph
 from src.compiler.sympy_math_renderer import render_reduced_program_mathematics
@@ -381,10 +380,6 @@ def build(destination: Path) -> Path:
         raise ValueError(
             "the generated site belongs in the parent workspace root, not Turing"
         )
-    # Publish presentation programs before the homepage snapshots its gallery.
-    # The demo itself still enters through the ordinary source bundle compiler;
-    # this is publication ordering, not a second compilation path.
-    dom_shader_bundle = build_dom_shader_demo(destination)
     channel = TelemetryChannel(name="homepage")
     network_module = compile_network_module()
     probe = {name: np.zeros(4) for name in (
@@ -662,7 +657,6 @@ def build(destination: Path) -> Path:
         print(f"  {entry.title:16} {state} {entry.lines:6} lines"
               f"  {entry.reason[:60]}")
     print(f"wrote {written} ({written.stat().st_size // 1024} KB)")
-    print(f"wrote DOM shader demo to {dom_shader_bundle.page_path}")
     print(f"wrote {len(deployments)} coordinated class variants and one contiguous module to {region_directory}")
     return written
 

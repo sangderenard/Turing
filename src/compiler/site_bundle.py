@@ -80,9 +80,6 @@ class SourceContract:
     state_feedback: Mapping[str, str]
     render_fps: float
     autostart: bool
-    presentation_shader: str | None
-    presentation_document: str | None
-    shader_configuration: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,16 +693,6 @@ def discover_source_contract(
             f"{sorted(unknown_state_inputs)!r}"
         )
 
-    embedded_shader = config.get("presentation_shader")
-    if embedded_shader is not None and not isinstance(embedded_shader, str):
-        raise ValueError("TURING_PAGE['presentation_shader'] must be a string")
-    embedded_document = config.get("presentation_document")
-    if embedded_document is not None and not isinstance(embedded_document, str):
-        raise ValueError("TURING_PAGE['presentation_document'] must be a string")
-    embedded_shader_configuration = config.get("shader_configuration", {})
-    if not isinstance(embedded_shader_configuration, dict):
-        raise ValueError("TURING_PAGE['shader_configuration'] must be a mapping")
-
     page_title = str(title or config.get("title") or selected.replace("_", " ").title())
     page_slug = slugify(str(slug or config.get("slug") or selected))
     width = int(config.get("width", 64))
@@ -734,9 +721,6 @@ def discover_source_contract(
         state_feedback=dict(state_feedback),
         render_fps=render_fps,
         autostart=bool(config.get("autostart", False)),
-        presentation_shader=embedded_shader,
-        presentation_document=embedded_document,
-        shader_configuration=dict(embedded_shader_configuration),
     )
 
 
@@ -957,12 +941,6 @@ def build_program_bundle(
     contract = discover_source_contract(
         source, entrypoint=entrypoint, title=title, slug=slug, probes=probes
     )
-    if presentation_shader is None:
-        presentation_shader = contract.presentation_shader
-    if presentation_document is None:
-        presentation_document = contract.presentation_document
-    if shader_configuration is None:
-        shader_configuration = contract.shader_configuration
     version, source_digest = _content_version(
         source,
         contract,
