@@ -12,7 +12,8 @@ from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
-    partition_reduced_program, partition_threaded_wasm_program,
+    fused_program_extent_effect, partition_reduced_program,
+    partition_threaded_wasm_program,
     schedule_module_levels,
 )
 
@@ -87,6 +88,19 @@ def test_thread_partition_vertically_fuses_before_parallel_waves():
         "vertical-fusion" in history
         for history in summary["rewrite_history"]
     )
+
+
+def test_extent_effect_marks_whole_invocation_reductions_collective():
+    pointwise = _linear_program(3)
+    collective = FusedProgram(
+        version=1,
+        feeds={1},
+        steps=[OpStep(0, "sum", [1], {}, 2)],
+        outputs={"result": 2},
+    )
+
+    assert fused_program_extent_effect(pointwise) == "pointwise"
+    assert fused_program_extent_effect(collective) == "collective"
 
 
 def test_each_chunk_declares_only_the_values_it_actually_needs():

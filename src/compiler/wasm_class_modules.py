@@ -58,6 +58,27 @@ from .process_graph_fusion import (
 )
 
 
+# These operations change an invocation-wide tensor extent into shared state.
+# Element tiling may only cross them with an explicit partial-reduction Join;
+# silently evaluating them once per tile changes one world into many worlds.
+COLLECTIVE_FUSED_OPERATIONS = frozenset({
+    "sum", "mean", "prod", "min", "max", "any", "all", "argmin", "argmax",
+})
+
+
+def fused_program_extent_effect(program: FusedProgram) -> str:
+    """Classify whether a fused program is safe to split by element extent."""
+
+    program = getattr(program, "program", program)
+    for step in program.steps:
+        if (
+            str(step.op_name) in COLLECTIVE_FUSED_OPERATIONS
+            or "reduce_op" in dict(step.attrs or {})
+        ):
+            return "collective"
+    return "pointwise"
+
+
 def partition_threaded_wasm_program(
     program: FusedProgram,
     *,
@@ -229,6 +250,11 @@ def partition_threaded_wasm_program(
             "vertical-fusion" in dispatch.rewrite_history
             for dispatch in reduced.dispatches
         ),
+        "extent_effect": fused_program_extent_effect(pruned),
+        "collective_regions": [
+            index for index, member in region_programs.items()
+            if fused_program_extent_effect(member) == "collective"
+        ],
         "rewrite_history": [
             list(dispatch.rewrite_history) for dispatch in reduced.dispatches
         ],
@@ -392,6 +418,7 @@ def emit_control_region_modules(
                 "shared_memory_import", {"module": "env", "field": "memory"}
             ),
             "operation_count": len(program.steps),
+            "extent_effect": fused_program_extent_effect(program),
             "node_ids": [int(step.result_id) for step in program.steps],
             "is_root": False,
             "region_index": region,
@@ -1199,5 +1226,6 @@ __all__ = [
     "emit_class_modules",
     "emit_control_region_modules",
     "partition_reduced_program",
+    "fused_program_extent_effect",
     "schedule_module_levels",
 ]

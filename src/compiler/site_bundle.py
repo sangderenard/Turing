@@ -138,6 +138,7 @@ class SourceContract:
     shader_configuration: Mapping[str, Any]
     audio_configuration: Mapping[str, Any]
     constant_map: Mapping[str, Any]
+    mutable_parameters: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,6 +813,12 @@ def discover_source_contract(
             "TURING_PAGE['bake_mode'] must be 'one_shot' or "
             f"'whole_program', not {selected_bake_mode!r}"
         )
+    forbidden_constants = set(constant_map) & set(state_feedback)
+    if forbidden_constants:
+        raise ValueError(
+            "state-feedback parameters are mutable and cannot be configured "
+            "as constants: " + ", ".join(sorted(forbidden_constants))
+        )
     if selected_schedule_preference not in PROGRAM_SCHEDULE_PREFERENCES:
         raise ValueError(
             "TURING_PAGE['schedule_preference'] must be 'asap' or "
@@ -840,6 +847,7 @@ def discover_source_contract(
         shader_configuration=dict(shader_config),
         audio_configuration=dict(audio_config),
         constant_map=dict(constant_map),
+        mutable_parameters=tuple(state_feedback),
     )
 
 
@@ -1166,6 +1174,7 @@ def build_program_bundle(
             build_embedded_class_graph,
             emit_class_modules,
             emit_control_region_modules,
+            fused_program_extent_effect,
             partition_reduced_program,
             partition_threaded_wasm_program,
         )
@@ -1193,6 +1202,7 @@ def build_program_bundle(
                 bake_mode=contract.bake_mode,
                 schedule_preference=contract.schedule_preference,
                 constant_map=contract.constant_map,
+                mutable_parameters=contract.mutable_parameters,
             )
             if (
                 contract.bake_mode == "whole_program"
@@ -1407,7 +1417,12 @@ def build_program_bundle(
             specs = ()
             contiguous = None
             thread_plan = build_browser_thread_plan(
-                real_control, region_methods
+                real_control,
+                region_methods,
+                region_extent_effects={
+                    int(region): fused_program_extent_effect(region_program)
+                    for region, region_program in effective_region_programs.items()
+                },
             )
         else:
             specs = partition_reduced_program(
@@ -1708,6 +1723,8 @@ def build_program_bundle(
                 "schedule_preference": contract.schedule_preference,
                 "program_record_mode": aot.program_record_mode,
                 "constant_map": dict(aot.constant_map),
+                "mutable_parameters": list(aot.mutable_parameters),
+                "thread_topology": thread_topology,
                 "remove_loops": contract.remove_loops,
                 "unroll_limit": contract.unroll_limit,
                 "implementation_sha256": _bundle_compiler_digest(),

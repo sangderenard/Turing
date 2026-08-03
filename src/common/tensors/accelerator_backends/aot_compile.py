@@ -208,12 +208,14 @@ class AOTCompilation:
     # selected public parameters to literals before ProcessGraph reduction.
     program_record_mode: str = "full"
     constant_map: Mapping[str, Any] = field(default_factory=dict)
+    mutable_parameters: tuple[str, ...] = ()
 
 
 def _apply_parameter_constant_map(
     module: ast.Module,
     entrypoint: str,
     constant_map: Mapping[str, Any],
+    mutable_parameters: tuple[str, ...] = (),
 ) -> ast.Module:
     """Replace configured parameter reads before topology reduction."""
 
@@ -242,6 +244,12 @@ def _apply_parameter_constant_map(
         raise ValueError(
             "configured constants name unknown parameters: "
             + ", ".join(sorted(unknown))
+        )
+    forbidden = set(map(str, constant_map)) & set(map(str, mutable_parameters))
+    if forbidden:
+        raise ValueError(
+            "configured constants cannot freeze mutable parameters: "
+            + ", ".join(sorted(forbidden))
         )
     replacements: dict[str, ast.expr] = {}
     normalized: dict[str, Any] = {}
@@ -358,6 +366,7 @@ def compile_ast_aot(
     bake_mode: str = "whole_program",
     schedule_preference: str = "alap",
     constant_map: Mapping[str, Any] | None = None,
+    mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -380,8 +389,9 @@ def compile_ast_aot(
         schedule_preference
     )
     constant_map = dict(constant_map or {})
+    mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
     module = _apply_parameter_constant_map(
-        ast.parse(source), entrypoint, constant_map
+        ast.parse(source), entrypoint, constant_map, mutable_parameters
     )
     graph = ProcessGraph(materialize_memory=False)
     # AOT compilation may target a function from a live module.  Its resolved
@@ -616,6 +626,7 @@ def compile_ast_aot(
         schedule_preference=schedule_preference,
         program_record_mode=("configured" if constant_map else "full"),
         constant_map=constant_map,
+        mutable_parameters=mutable_parameters,
     )
 
 

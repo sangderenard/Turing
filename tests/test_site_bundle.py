@@ -126,6 +126,17 @@ def test_configured_constant_map_is_validated_before_compilation():
         discover_source_contract(configured.replace("gain\": 2.0", "missing\": 2.0"))
 
 
+def test_state_feedback_parameters_cannot_be_declared_static():
+    configured = SOURCE.replace(
+        '"width": 16,',
+        '"state_feedback": {"gain": "result"},\n'
+        '    "constants": {"gain": 2.0},\n    "width": 16,',
+    )
+
+    with pytest.raises(ValueError, match="mutable.*cannot.*constants"):
+        discover_source_contract(configured)
+
+
 def test_bake_mode_override_is_explicit_and_validated():
     contract = discover_source_contract(
         SOURCE,

@@ -824,62 +824,83 @@ let running = false;
 // calls one translated WASM coordinator. Card-to-card calls stay in WASM.
 // No live tensor is copied through JavaScript at a seam.
 function wasmTileWorkerSource() {
-  return `self.onmessage = async event => {
+  return `const contexts = new Map();
+  let configuredManifest = null;
+  let configuredInventory = null;
+  let configuredModules = null;
+
+  async function contextFor(count) {
+    if (contexts.has(count)) return contexts.get(count);
+    const manifest = configuredManifest;
+    const inventory = configuredInventory;
+    const elementBytes = Number(manifest.modules[0].element_bytes || 8);
+    const View = manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
+    const fieldCount = (inventory.field_slots || []).length;
+    let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
+    const inventoryOffset = cursor;
+    cursor += fieldCount * 4;
+    cursor = Math.ceil(cursor / elementBytes) * elementBytes;
+    const offsets = Array.from({length: fieldCount}, () => {
+      const offset = cursor; cursor += count * elementBytes; return offset;
+    });
+    const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
+    new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
+    const context = {memory, offsets, View, instances: new Map()};
+    contexts.set(count, context);
+    return context;
+  }
+
+  self.onmessage = async event => {
     try {
-      const {manifest, inventory, methodIds, count, fields} = event.data;
+      if (event.data.type === "configure") {
+        configuredManifest = event.data.manifest;
+        configuredInventory = event.data.inventory;
+        configuredModules = new Map(event.data.compiledModules);
+        contexts.clear();
+        self.postMessage({type: "configured"});
+        return;
+      }
+      const {taskId, methodIds, count, fields, resultSlots} = event.data;
+      const manifest = configuredManifest;
+      const inventory = configuredInventory;
+      if (!manifest || !inventory) throw new Error("tile worker is not configured");
       const specs = new Map(manifest.modules.map(spec => [spec.name, spec]));
       const cards = new Map((inventory.methods || []).map(card => [card.index, card]));
-      const elementBytes = Number(manifest.modules[0].element_bytes || 8);
-      const View = manifest.modules[0].value_type === "f32" ? Float32Array : Float64Array;
-      const fieldCount = (inventory.field_slots || []).length;
-      let cursor = Math.ceil(Number(manifest.shared_static_bytes || 0) / 4) * 4;
-      const inventoryOffset = cursor;
-      cursor += fieldCount * 4;
-      cursor = Math.ceil(cursor / elementBytes) * elementBytes;
-      const offsets = Array.from({length: fieldCount}, () => {
-        const offset = cursor; cursor += count * elementBytes; return offset;
-      });
-      const memory = new WebAssembly.Memory({initial: Math.max(1, Math.ceil(cursor / 65536))});
-      new Int32Array(memory.buffer, inventoryOffset, fieldCount).set(offsets);
+      const context = await contextFor(count);
+      const {memory, offsets, View, instances} = context;
       for (const [indexText, values] of Object.entries(fields)) {
         const index = Number(indexText);
         new View(memory.buffer, offsets[index], count).set(values);
       }
-      const outputSlots = new Set();
       for (const methodId of methodIds) {
         const card = cards.get(methodId);
         if (!card) throw new Error("unknown deployment method " + methodId);
         const spec = specs.get(card.module);
         if (!spec) throw new Error("missing deployment module " + card.module);
-        let bytes;
-        if (spec.url) {
-          const response = await fetch(spec.absolute_url || spec.url);
-          if (!response.ok) throw new Error("worker fetch failed: HTTP " + response.status);
-          bytes = await response.arrayBuffer();
-        } else if (spec.wasm_base64) {
-          const raw = atob(spec.wasm_base64);
-          const decoded = new Uint8Array(raw.length);
-          for (let i = 0; i < raw.length; i++) decoded[i] = raw.charCodeAt(i);
-          bytes = decoded;
-        } else throw new Error("deployment module has no bytes");
-        const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
-        const imports = {};
-        imports[memoryImport.module] = {[memoryImport.field]: memory};
-        const {instance} = await WebAssembly.instantiate(bytes, imports);
+        let instance = instances.get(spec.name);
+        if (!instance) {
+          const compiled = configuredModules.get(spec.name);
+          if (!compiled) throw new Error("deployment module was not precompiled: " + spec.name);
+          const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
+          const imports = {};
+          imports[memoryImport.module] = {[memoryImport.field]: memory};
+          instance = await WebAssembly.instantiate(compiled, imports);
+          instances.set(spec.name, instance);
+        }
         const args = [...card.input_slots, ...card.output_slots].map(slot => offsets[slot]);
         instance.exports[card.entry](count, ...args);
-        card.output_slots.forEach(slot => outputSlots.add(slot));
       }
       const outputs = {};
       const transfer = [];
-      for (const slot of outputSlots) {
+      for (const slot of resultSlots) {
         const values = new View(memory.buffer, offsets[slot], count).slice();
         outputs[slot] = values;
         transfer.push(values.buffer);
       }
-      self.postMessage({outputs}, transfer);
+      self.postMessage({taskId, outputs}, transfer);
     } catch (error) {
-      self.postMessage({error: String(error && (error.stack || error.message || error))});
+      self.postMessage({taskId: event.data.taskId,
+        error: String(error && (error.stack || error.message || error))});
     }
   };`;
 }
@@ -908,6 +929,11 @@ class ClassGraphRunner {
     this.layoutCount = 0;
     this.inventoryOffset = 0;
     this.tileWorkerURL = null;
+    this.tileWorkers = [];
+    this.tileModulesPromise = null;
+    this.nextTileTaskId = 1;
+    this.threadingEnabled = new URLSearchParams(location.search).get("wasmThreads") !== "0";
+    this.collectiveNoticeShown = false;
     const staticBytes = Number(manifest.shared_static_bytes || 0);
     this.memory = new WebAssembly.Memory({
       initial: Math.max(1, Math.ceil(staticBytes / 65536))
@@ -920,6 +946,12 @@ class ClassGraphRunner {
       child => this.callsInDeploymentNode(child)
     );
     throw new Error("worker lane contains unsupported " + node.kind + " node");
+  }
+
+  callsInDeploymentSchedule(node) {
+    if (node.kind === "call") return [Number(node.method)];
+    const children = node.kind === "deploy" ? node.lanes : node.children;
+    return children.flatMap(child => this.callsInDeploymentSchedule(child));
   }
 
   tileRanges(count, workerCount) {
@@ -942,31 +974,17 @@ class ClassGraphRunner {
     return Math.max(1, Math.min(taskCount, 8, Math.max(1, hardware - 1)));
   }
 
-  async runTileTask(methodIds, start, end, View) {
+  threadingEligible() {
+    const contract = this.manifest.thread_deployment || {};
+    return contract.extent_effect !== "collective" &&
+      contract.extent_effect !== "global-state";
+  }
+
+  async ensureTileWorkers(count) {
     if (!this.tileWorkerURL) {
       this.tileWorkerURL = URL.createObjectURL(new Blob(
         [wasmTileWorkerSource()], {type: "text/javascript"}
       ));
-    }
-    const count = end - start;
-    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
-    const cards = new Map((this.manifest.class_inventory.methods || []).map(
-      card => [Number(card.index), card]
-    ));
-    const touchedSlots = new Set();
-    for (const methodId of methodIds) {
-      const card = cards.get(Number(methodId));
-      [...card.input_slots, ...card.output_slots].forEach(
-        slot => touchedSlots.add(Number(slot))
-      );
-    }
-    const fields = {};
-    for (const slot of touchedSlots) {
-      fields[slot] = new View(
-        this.memory.buffer,
-        this.fieldOffsets[slot] + start * elementBytes,
-        count,
-      ).slice();
     }
     const manifest = {
       ...this.manifest,
@@ -975,23 +993,68 @@ class ClassGraphRunner {
         absolute_url: spec.url ? new URL(spec.url, document.baseURI).href : null,
       })),
     };
-    return new Promise((resolve, reject) => {
+    if (!this.tileModulesPromise) {
+      this.tileModulesPromise = Promise.all(manifest.modules.map(async spec => {
+        let bytes;
+        if (spec.url) {
+          const response = await fetchResource(spec.absolute_url || spec.url);
+          if (!response.ok) throw new Error(
+            "tile module fetch failed: HTTP " + response.status + " for " + spec.name
+          );
+          bytes = await response.arrayBuffer();
+        } else if (spec.wasm_base64) {
+          const raw = atob(spec.wasm_base64);
+          const decoded = new Uint8Array(raw.length);
+          for (let index = 0; index < raw.length; index++) {
+            decoded[index] = raw.charCodeAt(index);
+          }
+          bytes = decoded;
+        } else throw new Error("deployment module has no bytes: " + spec.name);
+        return [spec.name, await WebAssembly.compile(bytes)];
+      }));
+    }
+    const compiledModules = await this.tileModulesPromise;
+    while (this.tileWorkers.length < count) {
       const worker = new Worker(this.tileWorkerURL);
+      const ready = new Promise((resolve, reject) => {
+        worker.onmessage = event => event.data.type === "configured" && resolve();
+        worker.onerror = event => reject(new Error(
+          event.message || "WebAssembly tile worker failed during configuration"
+        ));
+      });
+      worker.postMessage({
+        type: "configure", manifest, inventory: this.manifest.class_inventory,
+        compiledModules,
+      });
+      this.tileWorkers.push({worker, ready});
+    }
+    await Promise.all(this.tileWorkers.slice(0, count).map(item => item.ready));
+  }
+
+  async runTileTask(methodIds, start, end, View, workerIndex, inputSlots, resultSlots) {
+    const count = end - start;
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    const fields = {};
+    for (const slot of inputSlots) {
+      fields[slot] = new View(
+        this.memory.buffer,
+        this.fieldOffsets[slot] + start * elementBytes,
+        count,
+      ).slice();
+    }
+    const taskId = this.nextTileTaskId++;
+    const worker = this.tileWorkers[workerIndex].worker;
+    return new Promise((resolve, reject) => {
       worker.onmessage = event => {
-        worker.terminate();
+        if (Number(event.data.taskId) !== taskId) return;
         if (event.data.error) reject(new Error(event.data.error));
         else resolve({start, end, outputs: event.data.outputs});
       };
       worker.onerror = event => {
-        worker.terminate();
         reject(new Error(event.message || "WebAssembly tile worker failed"));
       };
       worker.postMessage({
-        manifest,
-        inventory: this.manifest.class_inventory,
-        methodIds,
-        count,
-        fields,
+        type: "run", taskId, methodIds, count, fields, resultSlots,
       });
     });
   }
@@ -1041,12 +1104,27 @@ class ClassGraphRunner {
       done: 0, total: tasks.length, workers: limit, tiles: ranges.length,
       lanes: laneCalls.length, join: node.join.mode
     });
+    const producedSlots = new Set();
+    for (const calls of laneCalls) for (const methodId of calls) {
+      for (const slot of methods.get(methodId).output_slots) producedSlots.add(Number(slot));
+    }
+    const inputSlots = new Set();
+    for (const calls of laneCalls) for (const methodId of calls) {
+      for (const slot of methods.get(methodId).input_slots) {
+        if (!producedSlots.has(Number(slot))) inputSlots.add(Number(slot));
+      }
+    }
+    const resultSlots = [...producedSlots];
+    await this.ensureTileWorkers(limit);
     const completed = [];
     try {
       for (let cursor = 0; cursor < tasks.length; cursor += limit) {
         const batch = tasks.slice(cursor, cursor + limit);
-        completed.push(...await Promise.all(batch.map(task =>
-          this.runTileTask(task.methodIds, task.start, task.end, View)
+        completed.push(...await Promise.all(batch.map((task, index) =>
+          this.runTileTask(
+            task.methodIds, task.start, task.end, View, index,
+            inputSlots, resultSlots
+          )
         )));
         setProgress(completed.length, tasks.length, "Join: awaiting WebAssembly tiles");
       }
@@ -1069,6 +1147,71 @@ class ClassGraphRunner {
     }
     log("ok", "Join: all WebAssembly tiles committed", {
       tiles: completed.length, workers: limit
+    });
+  }
+
+  async executeThreadDeployment(root, count, View) {
+    // Each tile owns a complete vertical slice of the scheduled graph. This
+    // keeps producer/consumer chains inside one worker and crosses one Join
+    // barrier for the whole tick instead of copying fields at every wave.
+    const methodIds = this.callsInDeploymentSchedule(root);
+    const methods = new Map((this.manifest.class_inventory.methods || []).map(
+      method => [Number(method.index), method]
+    ));
+    const producedSlots = new Set();
+    for (const methodId of methodIds) {
+      for (const slot of methods.get(methodId).output_slots) producedSlots.add(Number(slot));
+    }
+    const inputSlots = new Set();
+    for (const methodId of methodIds) {
+      for (const slot of methods.get(methodId).input_slots) {
+        if (!producedSlots.has(Number(slot))) inputSlots.add(Number(slot));
+      }
+    }
+    const resultSlots = new Set();
+    for (const binding of Object.values(this.manifest.logical_outputs || {})) {
+      const slot = this.fieldIndex.get("out::" + binding[0] + "::" + binding[1]);
+      if (slot !== undefined) resultSlots.add(Number(slot));
+    }
+    const desiredWorkers = this.workerCount(Math.max(1, Math.ceil(count / 8)));
+    const ranges = this.tileRanges(count, desiredWorkers);
+    const limit = this.workerCount(ranges.length);
+    await this.ensureTileWorkers(limit);
+    log("progress", "Deploy: dispatching vertically fused WebAssembly tiles", {
+      done: 0, total: ranges.length, workers: limit,
+      operations: methodIds.length, join: "barrier"
+    });
+    const completed = [];
+    try {
+      for (let cursor = 0; cursor < ranges.length; cursor += limit) {
+        const batch = ranges.slice(cursor, cursor + limit);
+        completed.push(...await Promise.all(batch.map(([start, end], index) =>
+          this.runTileTask(
+            methodIds, start, end, View, index, inputSlots, resultSlots
+          )
+        )));
+        setProgress(completed.length, ranges.length, "Join: awaiting fused WebAssembly tiles");
+      }
+    } catch (error) {
+      log("warn", "thread deployment failed; replaying serial Wasm schedule", {
+        error: String(error)
+      });
+      await Promise.all(this.manifest.modules.map(spec => this.instantiateCard(spec)));
+      return this.executeDeploymentNodeSerial(root, count);
+    }
+    const elementBytes = Number(this.manifest.modules[0].element_bytes || 8);
+    for (const result of completed) {
+      for (const [slotText, values] of Object.entries(result.outputs)) {
+        const slot = Number(slotText);
+        new View(
+          this.memory.buffer,
+          this.fieldOffsets[slot] + result.start * elementBytes,
+          result.end - result.start,
+        ).set(values);
+      }
+    }
+    log("ok", "Join: vertically fused WebAssembly tiles committed", {
+      tiles: completed.length, workers: limit, operations: methodIds.length
     });
   }
 
@@ -1105,12 +1248,6 @@ class ClassGraphRunner {
       const raw = atob(spec.wasm_base64);
       moduleBinary = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
-    } else if (this.manifest.thread_deployment) {
-      const started = performance.now();
-      await this.executeDeploymentNode(
-        this.manifest.thread_deployment.root, count, View
-      );
-      this.lastExecutionMs = performance.now() - started;
     } else {
       throw new Error("method card " + spec.name + " has no URL or bytes");
     }
@@ -1233,7 +1370,6 @@ class ClassGraphRunner {
         target.fill(Number(source));
       }
     }
-    const runtime = await this.ensureRuntime();
     const methodCount = Number(this.manifest.coordinator.method_count);
     const supportsRanges = this.manifest.coordinator.supports_ranges !== false;
     const rangeStart = supportsRanges ? start : 0;
@@ -1242,8 +1378,26 @@ class ClassGraphRunner {
     const activeMethods = (this.manifest.class_inventory.methods || []).filter(
       method => method.index >= rangeStart && method.index < rangeEnd
     );
-    const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
-    if (latch && supportsRanges) {
+    if (this.threadingEnabled && this.manifest.thread_deployment &&
+        !this.threadingEligible() && !this.collectiveNoticeShown) {
+      this.collectiveNoticeShown = true;
+      log("info", "whole-extent Wasm coordinator retained", {
+        reason: "deployment contains collective/global-state operations",
+        collectiveMethods: this.manifest.thread_deployment.collective_methods || []
+      });
+    }
+    if (this.threadingEnabled && this.manifest.thread_deployment &&
+        this.threadingEligible() && !latch &&
+        rangeStart === 0 && rangeEnd === methodCount) {
+      const started = performance.now();
+      await this.executeThreadDeployment(
+        this.manifest.thread_deployment.root, count, View
+      );
+      this.lastExecutionMs = performance.now() - started;
+    } else {
+      const runtime = await this.ensureRuntime();
+      const coordinate = runtime.exports[this.manifest.coordinator.entry || "run_range"];
+      if (latch && supportsRanges) {
       for (let index = 0; index < activeMethods.length && running; index++) {
         const method = activeMethods[index];
         markDeploymentNode(method.module, "running");
@@ -1254,15 +1408,16 @@ class ClassGraphRunner {
           await waitForCardLatch(index + 1, activeMethods.length);
         }
       }
-    } else {
-      const started = performance.now();
-      coordinate(count, this.inventoryOffset, rangeStart, rangeEnd);
-      const elapsed = performance.now() - started;
-      this.lastExecutionMs = elapsed;
-      activeMethods.forEach(method => queueDeploymentProfile(
-        method.module, elapsed / Math.max(1, activeMethods.length),
-        "coordinator amortized"
-      ));
+      } else {
+        const started = performance.now();
+        coordinate(count, this.inventoryOffset, rangeStart, rangeEnd);
+        const elapsed = performance.now() - started;
+        this.lastExecutionMs = elapsed;
+        activeMethods.forEach(method => queueDeploymentProfile(
+          method.module, elapsed / Math.max(1, activeMethods.length),
+          "coordinator amortized"
+        ));
+      }
     }
     return outputs.map(parameter => {
       const binding = this.manifest.logical_outputs[parameter.name];
@@ -1345,6 +1500,29 @@ function activeClassGraphRunner() {
   }
   return classGraphRunners.get(key);
 }
+
+window.TuringWasmThreads = Object.freeze({
+  get enabled() {
+    const runner = activeClassGraphRunner();
+    return runner ? runner.threadingEnabled : null;
+  },
+  setEnabled(enabled) {
+    const runner = activeClassGraphRunner();
+    if (!runner) throw new Error("no active divided-program runner");
+    runner.threadingEnabled = Boolean(enabled);
+  },
+  profile() {
+    const runner = activeClassGraphRunner();
+    return runner ? {
+      enabled: runner.threadingEnabled,
+      eligible: runner.threadingEligible(),
+      extentEffect: (runner.manifest.thread_deployment || {}).extent_effect || null,
+      lastExecutionMs: runner.lastExecutionMs,
+      workers: runner.tileWorkers.length,
+      topology: runner.manifest.thread_topology || null,
+    } : null;
+  },
+});
 
 window.TuringSharedClassMemory = Object.freeze({
   redirect(identity, storage) {

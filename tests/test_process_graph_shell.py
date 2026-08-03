@@ -124,6 +124,15 @@ def test_configured_parameter_constants_apply_before_graph_reduction():
     assert aot.constant_map == {"gain": 2.0}
     assert len(program.feeds) == 1
     assert any(step.attrs.get("right_scalar") == 2.0 for step in program.steps)
+    with pytest.raises(ValueError, match="cannot freeze mutable parameters"):
+        compile_ast_aot(
+            source,
+            "kernel",
+            {"x": np.array([3.0]), "gain": np.array([99.0])},
+            precompile_only=True,
+            constant_map={"gain": 2.0},
+            mutable_parameters=("gain",),
+        )
     with pytest.raises(ValueError, match="asap.*alap"):
         compile_ast_aot(
             source,

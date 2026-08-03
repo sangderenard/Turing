@@ -486,6 +486,11 @@ def test_parallel_wasm_plan_uses_aligned_bounded_worker_tiles_and_join():
     assert "Math.min(taskCount, 8" in html
     assert "tile_alignment" in html
     assert "new Worker(this.tileWorkerURL)" in html
+    assert "executeThreadDeployment" in html
+    assert "vertically fused WebAssembly tiles" in html
+    assert "window.TuringWasmThreads" in html
+    assert 'contract.extent_effect !== "collective"' in html
+    assert "whole-extent Wasm coordinator retained" in html
     assert "await Promise.all" in html
     assert "Join: all WebAssembly tiles committed" in html
     assert "replaying serial Wasm schedule" in html
@@ -533,13 +538,22 @@ const inventory = {{field_slots: [{{index:0}}, {{index:1}}], methods: [{{
 const url = URL.createObjectURL(new Blob([wasmTileWorkerSource()], {{type:"text/javascript"}}));
 const worker = new Worker(url);
 worker.onmessage = event => {{
+  if (event.data.type === "configured") {{
+    worker.postMessage({{type:"run", taskId:1, methodIds:[0], count:3,
+      fields:{{0:new Float64Array([1,2,3])}}, resultSlots:[1]}});
+    return;
+  }}
   const values = Array.from(event.data.outputs[1] || []);
   document.body.textContent = !event.data.error && JSON.stringify(values) === "[2,4,6]"
     ? "PASS JOIN [2,4,6]" : "FAIL " + JSON.stringify(event.data);
   worker.terminate();
 }};
-worker.postMessage({{manifest, inventory, methodIds:[0], count:3,
-  fields:[new Float64Array([1,2,3]), new Float64Array(3)]}});
+const raw = atob("{encoded}");
+const bytes = new Uint8Array(raw.length);
+for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+WebAssembly.compile(bytes).then(compiled => worker.postMessage({{
+  type:"configure", manifest, inventory, compiledModules:[["lane", compiled]]
+}}));
 </script></body>"""
     page_path = tmp_path / "worker.html"
     page_path.write_text(page, encoding="utf-8")

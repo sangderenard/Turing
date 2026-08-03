@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 
 from .columnar_multifluid_kernels import columnar_multifluid_rgb_step
 
@@ -142,6 +143,40 @@ _PAGE_CONFIG = {
         "pan_range": [0.0, 10.0],
     },
 }
+
+# This particular published artifact is a fully configured/static compile:
+# every public entrypoint parameter is replaced by the supplied feed literal
+# before ProcessGraph construction and reduction.  Keep the assignment beside
+# the complete feed table so adding a new parameter cannot silently leave it
+# dynamic.  Other callers of the Python kernel remain free to compile a full
+# or partially configured record.
+_PAGE_CONFIG["constants"] = {
+    name: value
+    for name, value in _PAGE_CONFIG["feeds"].items()
+    if name not in _PAGE_CONFIG["state_feedback"]
+}
+_STATIC_WIDTH = int(_PAGE_CONFIG["width"])
+_STATIC_HEIGHT = int(_PAGE_CONFIG["height"])
+_PAGE_CONFIG["constants"].update({
+    "column_x": [
+        (x + 0.5) * 10.0 / _STATIC_WIDTH
+        for y in range(_STATIC_HEIGHT)
+        for x in range(_STATIC_WIDTH)
+    ],
+    "column_y": [
+        (y + 0.5) * 7.0 / _STATIC_HEIGHT
+        for y in range(_STATIC_HEIGHT)
+        for x in range(_STATIC_WIDTH)
+    ],
+    "rest_surface": [
+        1.15 + 3.1 * math.exp(-16.0 * (
+            ((x + 0.5) / _STATIC_WIDTH - 0.62) ** 2
+            + ((y + 0.5) / _STATIC_HEIGHT - 0.52) ** 2
+        ))
+        for y in range(_STATIC_HEIGHT)
+        for x in range(_STATIC_WIDTH)
+    ],
+})
 
 
 _PAGE = "TURING_PAGE = " + repr(_PAGE_CONFIG)

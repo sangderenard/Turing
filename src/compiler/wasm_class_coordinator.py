@@ -64,13 +64,17 @@ def _scheduled_region(block: StatementBlock) -> int | None:
 def build_browser_thread_plan(
     control: ControlProgram,
     region_methods: Mapping[int, int],
+    *,
+    region_extent_effects: Mapping[int, str] | None = None,
 ) -> dict | None:
     """Project lexical parallel tags into a browser deployment plan.
 
     The Wasm binary remains the serial semantic reference.  This optional
-    plan lets the browser run proven-independent lanes on Web Workers, split
-    into aligned element tiles, and await the matching Join barrier. Control
-    forms whose ordering cannot be represented exactly are left to the Wasm
+    plan lets the browser run proven-independent lanes on Web Workers and
+    await the matching Join barrier. Element tiling is separately guarded by
+    compiler-authored extent effects: a collective region must remain on the
+    whole invocation until a partial-reduction Join exists. Control forms
+    whose ordering cannot be represented exactly are left to the Wasm
     coordinator by returning ``None``.
     """
 
@@ -188,10 +192,32 @@ def build_browser_thread_plan(
             children.append(deploy)
             index += len(members)
         plan = {"kind": "sequence", "children": children}
+    extent_effects = {
+        int(region): str(effect)
+        for region, effect in (region_extent_effects or {}).items()
+    }
+    invalid_effects = set(extent_effects.values()) - {
+        "pointwise", "collective", "global-state",
+    }
+    if invalid_effects:
+        raise ValueError(
+            "unknown WebAssembly extent effects: "
+            + ", ".join(sorted(invalid_effects))
+        )
+    collective_methods = sorted({
+        int(region_methods[region])
+        for region, effect in extent_effects.items()
+        if effect in {"collective", "global-state"}
+        and region in region_methods
+    })
     return {
         "abi": "turing.wasm-thread-deployment.v1",
         "tile_alignment": 8,
         "tiles_per_worker": 2,
+        "extent_effect": (
+            "collective" if collective_methods else "pointwise"
+        ),
+        "collective_methods": collective_methods,
         "root": plan,
     }
 
