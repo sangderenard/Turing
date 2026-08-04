@@ -23,7 +23,7 @@ from src.compiler.loop_composer import (
     planned_collection_bindings,
 )
 from src.compiler.glsl_deployment_strategy import (
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from src.compiler.loop_ir import (
     IterableAccess,
@@ -223,7 +223,7 @@ def test_literal_callsite_specialization_precedes_single_loop_reduction():
         ))
     reduce_abstract_tensor_topology(module)
 
-    deployment = strategize_glsl_deployment(module)
+    deployment = strategize_shell_deployment(module)
     child = next(
         shell
         for shell in deployment.function_shell_types.values()

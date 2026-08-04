@@ -28,6 +28,12 @@ makes the SSA route a much larger problem).
 The hub also registers desktop GLSL, Fortran-through-SSA, and WebGL 2.  C and
 LLVM are inventoried here but not registered as ``FusedProgram`` printers:
 their current JIT entry points consume captured autograd tapes directly.
+
+WebGL 2 is registered but deprecated (``TargetCapabilities.deprecated``):
+its fragment-raster ABI predates browser compute shaders.  ``get_target``
+and ``emit`` redirect plain ``"webgl"`` lookups to ``"webgpu"`` unless the
+caller passes ``allow_deprecated=True``. ``"webgpu"`` emits WGSL compute
+shaders from the shared SSA and records its launch shape in API metadata.
 """
 
 from __future__ import annotations
@@ -56,6 +62,10 @@ class TargetCapabilities:
     # Whether the target has native control flow for a loop-bearing program,
     # or only handles the straight-line numeric region.
     control_flow: bool
+    # Whether the target can execute rank-bearing tensor operations directly.
+    # A non-native target (rank-1 ABI like WASM's run(count, ...)) needs every
+    # tensor op unrolled to scalar form before the graph is flattened.
+    tensor_native: bool = True
     # A closed operation vocabulary when the target has one. ``None`` is for
     # a target whose acceptance depends on richer IR than an operation name.
     # Closed sets make unknown operations fail selection instead of appearing
@@ -67,6 +77,18 @@ class TargetCapabilities:
     # The external tool needed to turn emitted text into a binary, if any.
     assembler: str | None = None
     note: str | None = None
+    # Which pipeline stage (shader_stages.STAGES key) this target's emitted
+    # text runs as, for targets that are a real GPU shading language.
+    # ``None`` for targets with no stage concept at all (Fortran, WASM, C).
+    stage: str | None = None
+    # A deprecated target is still registered and still emits when asked
+    # explicitly (``allow_deprecated=True``), but a caller who names it
+    # without that override gets redirected to ``redirect_to`` instead.
+    # This is data, like everything else on this dataclass, so deprecating
+    # a target is a registration change, not a call-site hunt.
+    deprecated: bool = False
+    deprecated_reason: str | None = None
+    redirect_to: str | None = None
 
     def supports(self, operations: set[str] | frozenset[str]) -> bool:
         used = frozenset(operations)
@@ -140,11 +162,31 @@ def capabilities() -> tuple[TargetCapabilities, ...]:
     return tuple(t.capabilities for t in _REGISTRY.values())
 
 
-def get_target(name: str) -> MachineTarget:
+def get_target(name: str, *, allow_deprecated: bool = False) -> MachineTarget:
+    """Look up a registered target, honoring deprecation redirects.
+
+    A target marked ``deprecated`` on its capabilities is not removed from
+    the registry -- a caller can still reach it with
+    ``allow_deprecated=True`` -- but the default lookup silently hands back
+    ``redirect_to`` instead, so new call sites land on the replacement
+    without every existing caller needing to know a redirect happened.
+    """
+
     target = _REGISTRY.get(name)
     if target is None:
         raise KeyError(
             f"unknown machine target {name!r}; one of {sorted(_REGISTRY)}"
+        )
+    if target.capabilities.deprecated and not allow_deprecated:
+        redirect_name = target.capabilities.redirect_to
+        redirected = _REGISTRY.get(redirect_name) if redirect_name else None
+        if redirected is not None:
+            return redirected
+        raise TargetUnavailable(
+            f"target {name!r} is deprecated "
+            f"({target.capabilities.deprecated_reason or 'no reason given'}) "
+            "and has no available replacement registered; pass "
+            "allow_deprecated=True to use it anyway"
         )
     return target
 
@@ -163,8 +205,16 @@ def targets_for(program: FusedProgram) -> tuple[str, ...]:
     )
 
 
-def emit(program: FusedProgram, target: str, *, name: str = "program") -> TargetArtifact:
-    return get_target(target).emit(program, name=name)
+def emit(
+    program: FusedProgram,
+    target: str,
+    *,
+    name: str = "program",
+    allow_deprecated: bool = False,
+) -> TargetArtifact:
+    return get_target(target, allow_deprecated=allow_deprecated).emit(
+        program, name=name
+    )
 
 
 def operator_inventories() -> tuple[BackendOperatorInventory, ...]:
@@ -177,6 +227,7 @@ def operator_inventories() -> tuple[BackendOperatorInventory, ...]:
     from ..common.tensors.accelerator_backends.glsl_backend import GLSL_OPS
     from .fused_program_webgl_backend import supported_operations as webgl_ops
     from .ssa_fortran_backend import supported_tensor_operations
+    from .ssa_webgpu_backend import supported_tensor_operations as webgpu_ops
 
     return (
         BackendOperatorInventory(
@@ -229,7 +280,21 @@ def operator_inventories() -> tuple[BackendOperatorInventory, ...]:
                 "src/compiler/fused_program_webgl_backend.py:"
                 "supported_operations",
             ),
-            note="WebGL 2 fragment-raster ABI; no compute shaders or SSBOs",
+            note=(
+                "WebGL 2 fragment-raster ABI; no compute shaders or SSBOs. "
+                "Deprecated -- get_target/emit redirect to webgpu unless "
+                "called with allow_deprecated=True."
+            ),
+        ),
+        BackendOperatorInventory(
+            backend="webgpu",
+            consumes="fused_program",
+            operations=webgpu_ops(),
+            sources=(
+                "src/compiler/ssa_webgpu_backend.py:"
+                "_BINARY/_UNARY/_REDUCTION/_SHAPE_ONLY",
+            ),
+            note="WebGPU compute shader emitted directly from shared SSA",
         ),
     )
 
@@ -264,6 +329,9 @@ class _WasmTarget:
             # The only loop it writes is the elementwise walk over the
             # extent; it does not lower a program's own control flow.
             control_flow=False,
+            # Rank-1 run(count, ...) ABI: tensor ops must be unrolled to scalar
+            # form at ProcessGraph intake, before flattening.
+            tensor_native=False,
             supported_operations=supported,
             unsupported_operations=frozenset(_NO_WASM_INSTRUCTION),
             assembler="wat2wasm",
@@ -323,6 +391,7 @@ class _GLSLTarget:
             supported_operations=GLSL_OPS,
             assembler="OpenGL 4.3 driver",
             note="desktop compute shader with std430 SSBO bindings",
+            stage="compute",
         )
 
     def available(self) -> bool:
@@ -447,6 +516,18 @@ class _WebGLTarget:
                 "fragment-raster target: sampler2D inputs and up to four "
                 "float color-attachment outputs"
             ),
+            deprecated=True,
+            deprecated_reason=(
+                "WebGL 2's fragment-raster ABI (no compute shaders, no "
+                "SSBOs, values smuggled through sampler2D/color attachments) "
+                "is a workaround for a browser that had no compute path. "
+                "WebGPU has one. New callers should target webgpu; webgl "
+                "stays registered and fully functional for callers that "
+                "pass allow_deprecated=True, since browsers without WebGPU "
+                "support still exist."
+            ),
+            redirect_to="webgpu",
+            stage="fragment",
         )
 
     def available(self) -> bool:
@@ -470,9 +551,73 @@ class _WebGLTarget:
         )
 
 
+# --- WebGPU compute ---------------------------------------------------------
+
+
+class _WebGPUTarget:
+    """WGSL compute text from a FusedProgram lowered through shared SSA."""
+
+    def __init__(self):
+        from .ssa_webgpu_backend import supported_tensor_operations
+
+        self.capabilities = TargetCapabilities(
+            name="webgpu",
+            consumes="fused_program->ssa",
+            emits=".wgsl",
+            control_flow=True,
+            supported_operations=supported_tensor_operations(),
+            unsupported_operations=frozenset(),
+            assembler="WebGPU browser driver",
+            note="FusedProgram is lowered to shared SSA and emitted as WGSL compute",
+            stage="compute",
+        )
+
+    def available(self) -> bool:
+        return True
+
+    def emit(self, program: FusedProgram, *, name: str = "program") -> TargetArtifact:
+        from ..transmogrifier.ssa import IRModule
+        from .precompile_to_ssa import lower_fused_program_to_ssa
+        from .ssa_webgpu_backend import emit_module
+
+        function, lowering_shortfalls = lower_fused_program_to_ssa(
+            program, function_name=name,
+        )
+        returns = tuple(
+            instruction.args
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in {"Ret", "ret", "Return", "return"}
+        )
+        output_values = returns[-1] if returns else ()
+        count = max(
+            (int(size) for value in function.args for size in value.shape),
+            default=1,
+        )
+        module = emit_module(
+            IRModule({name: function}), name=name,
+            outputs={name: output_values}, count=count,
+        )
+        shortfalls = tuple(
+            f"{item.domain}:{item.name} at {item.location}: {item.reason}"
+            for item in lowering_shortfalls
+        ) + tuple(item.format() for item in module.shortfalls)
+        return TargetArtifact(
+            target="webgpu",
+            name=name,
+            source=module.source,
+            complete=not shortfalls,
+            shortfalls=shortfalls,
+            api=module.api,
+            extension=".wgsl",
+            module=module,
+        )
+
+
 register_target(_GLSLTarget())
 register_target(_FortranTarget())
 register_target(_WebGLTarget())
+register_target(_WebGPUTarget())
 
 
 __all__ = [

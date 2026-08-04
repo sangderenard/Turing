@@ -77,7 +77,7 @@ def test_published_webgl_shader_graduates_page_to_execution_surface():
     assert 'width: 100%;' in html
     assert 'height: 100%;' in html
     assert 'canvas.getContext("webgl2"' in html
-    assert 'fetch(new URL(SHADER.url, document.baseURI)' in html
+    assert 'fetch(new URL(activeCandidate.url, document.baseURI)' in html
     assert "canvas.setPointerCapture(event.pointerId)" in html
     assert 'canvas.addEventListener("keydown"' in html
     assert "window.TuringShaderSurface" in html

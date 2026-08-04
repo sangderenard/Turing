@@ -41,12 +41,13 @@ def test_only_published_browser_shader_graduates_a_bundle_page():
     }])
     assert descriptor is None
 
-    descriptor = _shader_execution_descriptor(desktop_only + [{
+    webgl_only = desktop_only + [{
         "language": "webgl",
         "role": "shader-surface",
         "available": True,
         "url": "source/roles/shader-surface/webgl.frag.glsl",
-    }])
+    }]
+    descriptor = _shader_execution_descriptor(webgl_only)
     assert descriptor == {
         "url": "source/roles/shader-surface/webgl.frag.glsl",
         "language": "webgl2-glsl-es",
@@ -57,6 +58,12 @@ def test_only_published_browser_shader_graduates_a_bundle_page():
             "continuous": True,
             "prefer_contiguous": True,
         },
+        "candidates": [{
+            "url": "source/roles/shader-surface/webgl.frag.glsl",
+            "language": "webgl2-glsl-es",
+            "stage": "fragment",
+            "role": "shader-surface",
+        }],
     }
     io = {"requirements": {"requests": [{"capability": "pointer"}]}}
     assert _shader_execution_descriptor(desktop_only + [{
@@ -66,6 +73,38 @@ def test_only_published_browser_shader_graduates_a_bundle_page():
         "url": "surface.frag.glsl",
     }], io)["io"] == io
     assert resolve_publish_root(DEFAULT_PUBLISH_ROOT) == DEFAULT_PUBLISH_ROOT
+
+
+def test_webgpu_candidate_takes_priority_and_canvas2d_is_the_last_resort():
+    sources = [
+        {
+            "language": "webgpu",
+            "role": "shader-surface",
+            "available": True,
+            "url": "source/roles/shader-surface/program.compute.wgsl",
+        },
+        {
+            "language": "webgl",
+            "role": "shader-surface",
+            "available": True,
+            "url": "source/roles/shader-surface/program.frag.glsl",
+        },
+    ]
+    io = {"requirements": {"requests": [{"capability": "pointer"}]}}
+    descriptor = _shader_execution_descriptor(sources, io)
+
+    assert descriptor["language"] == "wgsl"
+    assert descriptor["url"] == "source/roles/shader-surface/program.compute.wgsl"
+    languages = [item["language"] for item in descriptor["candidates"]]
+    assert languages == ["wgsl", "webgl2-glsl-es", "canvas2d"]
+    assert descriptor["candidates"][-1]["url"] is None
+
+    # No shell_io means the canvas2d last resort has nothing to paint, so it
+    # is withheld rather than offered as a candidate with nothing to show.
+    without_io = _shader_execution_descriptor(sources)
+    assert [item["language"] for item in without_io["candidates"]] == [
+        "wgsl", "webgl2-glsl-es",
+    ]
 
 
 def test_gallery_refuses_to_publish_into_the_turing_source_repository():
@@ -244,6 +283,16 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
     )
 
     assert bundle.manifest["schema"] == BUNDLE_SCHEMA
+    assert "origin" not in bundle.manifest  # origin is program-level, not per-version
+    origin_path = bundle.directory.parent.parent / "origin.json"
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    assert origin["entrypoint"] == "kernel"
+    assert origin["slug"] == "affine-field"
+    assert origin["source"] == SOURCE
+    assert origin["probes"]["gain"] == {"values": [2.0] * 4}
+    assert origin["include_backends"] is False
+    assert origin["include_mathematics"] is False
+    assert origin["backend_targets"] is None
     assert bundle.page_path.is_file()
     assert (bundle.directory / "source/python_source/affine.py").is_file()
     assert list((bundle.directory / "wasm").glob("*.wasm"))
@@ -273,6 +322,120 @@ def test_program_bundle_owns_page_source_wasm_manifest_and_inventory(tmp_path: P
         include_mathematics=False,
     )
     assert repeated.directory == bundle.directory
+
+
+def test_force_new_version_appends_instead_of_reusing(tmp_path: Path):
+    import re
+
+    first = build_program_bundle(
+        SOURCE, tmp_path, source_filename="affine.py",
+        include_backends=False, include_mathematics=False,
+    )
+    forced = build_program_bundle(
+        SOURCE, tmp_path, source_filename="affine.py",
+        include_backends=False, include_mathematics=False,
+        force_new_version=True,
+    )
+    forced_again = build_program_bundle(
+        SOURCE, tmp_path, source_filename="affine.py",
+        include_backends=False, include_mathematics=False,
+        force_new_version=True,
+    )
+
+    assert first.directory != forced.directory != forced_again.directory
+    versions_dir = first.directory.parent
+    assert first.directory.parent == forced.directory.parent  # same program
+    match = re.match(r"^v(\d+)\.(\d{3})-(\d{8})-([0-9a-f]{16})$", forced.directory.name)
+    assert match, forced.directory.name
+    next_match = re.match(r"^v(\d+)\.(\d{3})-", forced_again.directory.name)
+    assert next_match
+    assert int(next_match.group(2)) == int(match.group(2)) + 1
+
+    # A plain (non-forced) build still gets today's idempotent lookup and
+    # does not add yet another version.
+    plain_again = build_program_bundle(
+        SOURCE, tmp_path, source_filename="affine.py",
+        include_backends=False, include_mathematics=False,
+    )
+    assert plain_again.directory == first.directory
+    assert len(list(versions_dir.iterdir())) == 3
+
+
+def test_backend_targets_restricts_published_source_tabs(tmp_path: Path):
+    bundle = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        backend_targets=("glsl",),
+    )
+
+    languages = {
+        item["language"] for item in bundle.manifest["page"].get("shader", {}) or {}
+    }
+    html = bundle.page_path.read_text(encoding="utf-8")
+    assert '"language": "glsl"' in html
+    assert '"language": "webgl"' not in html
+    assert '"language": "fortran"' not in html
+
+    region_capabilities = bundle.manifest["compiler"]["region_target_capabilities"]
+    assert region_capabilities
+    assert all(isinstance(item, list) for item in region_capabilities.values())
+
+    # A different backend_targets selection over the identical source must
+    # not silently reuse the first build's directory/tabs.
+    narrower = build_program_bundle(
+        SOURCE,
+        tmp_path,
+        source_filename="affine.py",
+        backend_targets=("fortran",),
+    )
+    assert narrower.directory != bundle.directory
+    narrower_html = narrower.page_path.read_text(encoding="utf-8")
+    assert '"language": "fortran"' in narrower_html
+    assert '"language": "glsl"' not in narrower_html
+
+
+RGB_SOURCE = """
+TURING_PAGE = {
+    "title": "RGB Passthrough",
+    "slug": "rgb-passthrough",
+    "width": 4,
+    "height": 4,
+}
+
+def kernel(input_red, input_green, input_blue):
+    red = input_red + 0.0
+    green = input_green + 0.0
+    blue = input_blue + 0.0
+    return red, green, blue
+"""
+
+
+def test_default_passthrough_becomes_shader_surface_with_a_webgpu_candidate(tmp_path: Path):
+    bundle = build_program_bundle(
+        RGB_SOURCE,
+        tmp_path,
+        source_filename="rgb.py",
+        include_backends=False,
+        include_mathematics=False,
+    )
+
+    manifest = json.loads(bundle.manifest_path.read_text())
+    shader = manifest["page"]["shader"]
+    assert manifest["page"]["mode"] == "shader-execution"
+    languages = [item["language"] for item in shader["candidates"]]
+    assert languages[0] == "wgsl"
+    assert "webgl2-glsl-es" in languages
+
+    wgsl_path = bundle.directory / shader["candidates"][0]["url"]
+    assert wgsl_path.is_file()
+    wgsl_source = wgsl_path.read_text(encoding="utf-8")
+    assert "@compute @workgroup_size(" in wgsl_source
+    assert wgsl_source.count("var<storage, read_write>") == 3
+
+    html = bundle.page_path.read_text(encoding="utf-8")
+    assert '"language": "wgsl"' in html
+    assert "window.TuringPassthroughShader" in html
 
 
 def test_one_shot_bundle_packages_the_discovery_numeric_trace(tmp_path: Path):

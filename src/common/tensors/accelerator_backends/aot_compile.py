@@ -16,14 +16,19 @@ This is the real, existing pipeline -- not a new one:
     ast.parse(source)
     -> ProcessGraph.build_from_ast          (transmogrifier/graph/graph_express2.py)
     -> reduce_abstract_tensor_topology       (common/tensors/topological_reducer.py)
-    -> strategize_glsl_deployment(backend=)  (compiler/glsl_deployment_strategy.py)
+    -> strategize_shell_deployment(backend=) (compiler/glsl_deployment_strategy.py)
     -> deployment.compile_process_graph()
     -> deployment.capture_fused_programs(feeds)
     -> deployment.execute_named(feeds)
 
-``strategize_glsl_deployment``'s name is historical, and ``shell_language``
-is a real, validated constructor argument -- but as of this writing only
-``"glsl"`` has an actual distinct emission path.  ``emit_glsl`` (the flag
+``strategize_shell_deployment`` (renamed from ``strategize_glsl_deployment``,
+which named the function after the one backend it happened to be written
+against instead of what it does) is the compilation choke point: every
+backend -- c, python, glsl, fortran, webgl, webgpu -- funnels its
+ProcessGraph through this one control-planning stage before any
+backend-specific emission diverges.  ``shell_language`` is a real, validated
+constructor argument -- but as of this writing only ``"glsl"`` has an actual
+distinct emission path.  ``emit_glsl`` (the flag
 that decides whether GLSL source is produced) is gated purely by
 ``precompile_only`` inside ``capture_fused_programs``, never by
 ``shell_language``; ``shell_language`` itself is read in exactly one other
@@ -89,19 +94,18 @@ is a restriction of the loop-carried binding analysis, not of Python: the
 two forms are the same computation.
 """
 
-from __future__ import annotations
-
 import ast
 import contextlib
 import inspect
 import io
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from collections.abc import Iterable
+from typing import Any, Callable, Mapping
 
 from ....compiler.glsl_deployment_strategy import (
     _walk_planned_shells,
     propagate_bound_planner_specializations,
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from ....compiler.shell_reference_tables import (
     build_class_navigation_table,
@@ -367,6 +371,8 @@ def compile_ast_aot(
     schedule_preference: str = "alap",
     constant_map: Mapping[str, Any] | None = None,
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
+    retain: Any = (),
+    progress: "Callable[[str], None] | None" = None,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -384,31 +390,47 @@ def compile_ast_aot(
     ``DualIRShell`` describing the same numeric/control pair.
     """
 
+    def _report(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
     bake_mode = normalize_aot_bake_mode(bake_mode)
     schedule_preference = normalize_aot_schedule_preference(
         schedule_preference
     )
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
+    _report("aot: applying constant map")
     module = _apply_parameter_constant_map(
         ast.parse(source), entrypoint, constant_map, mutable_parameters
     )
+    # This graph is a second, independent ProcessGraph build -- the caller
+    # (site_bundle.build_program_bundle) already built and reduced one of
+    # its own moments ago for telemetry/summarize_process_graph. They are
+    # not the same object and this does not reuse that work; real, currently
+    # unavoidable duplicate compute, not just an unlogged phase.
     graph = ProcessGraph(materialize_memory=False)
     # AOT compilation may target a function from a live module.  Its resolved
     # globals are static closure values, not runtime tensor feeds.  Capturing
     # them here lets the reducer retain computed constants and imported
     # references without executing or reinterpreting their source expressions.
     graph.python_bindings = dict(python_bindings or {})
+    _report("aot: building process graph (second, independent build)")
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(
             module,
             resolve_unresolved_parents=True,
             parent_include=_source_dependency_is_not_tensor_primitive,
+            retain=retain,
+            progress=_report,
         )
+    _report("aot: reducing abstract tensor topology")
     reduce_abstract_tensor_topology(graph)
+    _report("aot: propagating bound planner specializations")
     propagate_bound_planner_specializations(
         graph, entrypoint, feeds
     )
+    _report("aot: building map dependency regions")
     dependency_regions = build_map_dependency_regions(graph, entrypoint)
     map_ir = dict(graph.G.graph.get("map_ir") or {})
     map_ir["dependency_regions"] = {
@@ -418,6 +440,7 @@ def compile_ast_aot(
         "map_only": dependency_regions.map_only,
         "bindings": dependency_regions.bindings,
     }
+    _report("aot: building class navigation table")
     class_navigation = build_class_navigation_table(graph)
     map_ir["class_navigation"] = class_navigation
     navigation_ssa = lower_class_navigation_to_ssa(class_navigation)
@@ -433,7 +456,8 @@ def compile_ast_aot(
     )
     graph.G.graph["map_ir"] = map_ir
 
-    deployment_type = strategize_glsl_deployment(
+    _report("aot: strategizing glsl deployment (scheduling/planning pass)")
+    deployment_type = strategize_shell_deployment(
         graph,
         backend=backend,
         remove_loops=remove_loops,
@@ -445,6 +469,7 @@ def compile_ast_aot(
     # from backend= any more; there is no shell "kind" left to pick.
     deployment = deployment_type(profiling=profiling, shell_language="glsl")
     try:
+        _report("aot: compile_process_graph (usually the largest phase)")
         deployment.compile_process_graph()
         reference = graph.function_table.reference(entrypoint)
         if reference is None:
@@ -457,6 +482,7 @@ def compile_ast_aot(
         # module's DualIRShell.
         function_shell = deployment.function_shells.get(reference.address, deployment)
         feeds = dict(feeds)
+        _report("aot: capturing fused programs")
         function_shell.capture_fused_programs(
             feeds, precompile_only=precompile_only
         )
@@ -568,6 +594,7 @@ def compile_ast_aot(
         # Matches the release-in-finally discipline every existing caller of
         # this deployment class already follows (tests/test_glsl_fused_network.py).
         deployment.release()
+    _report("aot: rebuilding region program feed provenance")
     # Captured control regions are intentionally thin numerical graphs, but
     # their external feed identities still belong to the enclosing Python
     # function.  Carry that provenance onto every region so backends that

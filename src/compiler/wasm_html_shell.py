@@ -2969,13 +2969,27 @@ body.shader-execution #shader-layout-document {
 _SHADER_EXECUTION_JS = r"""
 const SHADER = __SHADER_EXECUTION__;
 const canvas = document.getElementById("shader-surface");
-const gl = canvas.getContext("webgl2", {
+// Priority: WebGPU compute (real dispatch, no draw-buffer cap) -> WebGL 2
+// fragment-raster (the only path older browsers have) -> plain 2D canvas
+// (no GPU shading language at all, see the canvas2d branch below). A
+// canvas commits to one context type for the rest of its lifetime the
+// first time getContext() succeeds with a specific type, so this pick has
+// to happen before any getContext() call is made, not by trying one and
+// falling back afterward.
+const shaderCandidates = (SHADER.candidates && SHADER.candidates.length)
+  ? SHADER.candidates : [SHADER];
+const activeCandidate =
+  shaderCandidates.find(candidate => candidate.language === "wgsl" && "gpu" in navigator) ||
+  shaderCandidates.find(candidate => candidate.language === "webgl2-glsl-es") ||
+  shaderCandidates.find(candidate => candidate.language === "canvas2d") ||
+  shaderCandidates[0];
+const gl = activeCandidate.language === "webgl2-glsl-es" ? canvas.getContext("webgl2", {
   alpha: false,
   antialias: false,
   depth: false,
   stencil: false,
   preserveDrawingBuffer: false,
-});
+}) : null;
 const input = {
   pointer: [0, 0],
   buttons: 0,
@@ -3193,11 +3207,13 @@ void main() {
   gl_Position = vec4(TURING_TRIANGLE[gl_VertexID], 0.0, 1.0);
 }`;
 
+let ready;
+if (activeCandidate.language === "webgl2-glsl-es") {
 if (!gl) {
   fail(new Error("WebGL 2 is required by this execution page"));
 } else {
-  const ready = (async () => {
-    const response = await fetch(new URL(SHADER.url, document.baseURI), {cache: "no-store"});
+  ready = (async () => {
+    const response = await fetch(new URL(activeCandidate.url, document.baseURI), {cache: "no-store"});
     if (!response.ok) throw new Error("shader load failed: HTTP " + response.status);
     const fragmentSource = await response.text();
     const program = gl.createProgram();
@@ -3508,6 +3524,237 @@ if (!gl) {
     }
     return {canvas, gl, program, input, fragmentSource};
   })();
+}
+} else if (activeCandidate.language === "wgsl") {
+  ready = (async () => {
+    if (!("gpu" in navigator)) {
+      throw new Error("WebGPU is not available in this browser");
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("no WebGPU adapter is available");
+    const device = await adapter.requestDevice();
+    const response = await fetch(new URL(activeCandidate.url, document.baseURI), {cache: "no-store"});
+    if (!response.ok) throw new Error("shader load failed: HTTP " + response.status);
+    const computeSource = await response.text();
+    const computeModule = device.createShaderModule({code: computeSource});
+
+    // Bindings are discovered from the emitted WGSL text itself, the same
+    // way the WebGL branch above discovers its sampler2D feed uniforms by
+    // scanning the fetched fragment source -- ssa_webgpu_backend.py's
+    // WGSLModule.io_layout is not threaded through the published
+    // descriptor JSON, so this mirrors the existing established pattern
+    // instead of widening that contract for a first version.
+    const bindingPattern = /@group\(0\)\s+@binding\((\d+)\)\s+var<storage,\s*(read|read_write)>\s+(\w+)\s*:\s*array<(f32|i32|u32)>;/g;
+    const bindings = [...computeSource.matchAll(bindingPattern)].map(match => ({
+      index: Number(match[1]), access: match[2], name: match[3], dtype: match[4],
+    }));
+    const feedBindings = bindings.filter(binding => binding.access === "read");
+    const outputBindings = bindings.filter(binding => binding.access === "read_write");
+    if (!outputBindings.length) throw new Error("compute shader declares no output binding");
+    const workgroupMatch = computeSource.match(/@workgroup_size\((\d+),\s*(\d+),\s*(\d+)\)/);
+    const workgroupSizeX = workgroupMatch ? Number(workgroupMatch[1]) : 32;
+
+    const context = canvas.getContext("webgpu");
+    if (!context) throw new Error("failed to acquire a webgpu canvas context");
+    const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({device, format: presentationFormat, alphaMode: "opaque"});
+
+    const computePipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {module: computeModule, entryPoint: "main"},
+    });
+
+    // Fixed presentation stage, authored here rather than compiler-emitted
+    // -- analogous to FULLSCREEN_VERTEX_SHADER for the WebGL branch above.
+    // Reads the compute pass's first output buffer as a grayscale field;
+    // this is a first-light default, not a claim about what the program
+    // means visually.
+    const presentationModule = device.createShaderModule({code: `
+struct Dims { width: u32, height: u32 };
+@group(0) @binding(0) var<uniform> turing_dims: Dims;
+@group(0) @binding(1) var<storage, read> turing_present: array<f32>;
+
+struct VertexOut { @builtin(position) position: vec4<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+  var positions = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+  );
+  var out: VertexOut;
+  out.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs(vertexOut: VertexOut) -> @location(0) vec4<f32> {
+  let x = u32(vertexOut.position.x);
+  let y = u32(vertexOut.position.y);
+  if (x >= turing_dims.width || y >= turing_dims.height) {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+  }
+  let index = y * turing_dims.width + x;
+  let value = turing_present[index];
+  return vec4<f32>(value, value, value, 1.0);
+}
+`});
+    const presentationPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: {module: presentationModule, entryPoint: "vs"},
+      fragment: {module: presentationModule, entryPoint: "fs", targets: [{format: presentationFormat}]},
+      primitive: {topology: "triangle-list"},
+    });
+    const dimsBuffer = device.createBuffer({
+      size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    let elementCount = 0;
+    let feedBuffers = [];
+    let outputBuffer = null;
+    let computeBindGroup = null;
+    let presentationBindGroup = null;
+
+    function ensureBuffers(width, height) {
+      const count = width * height;
+      if (count === elementCount && computeBindGroup) return;
+      feedBuffers.forEach(buffer => buffer.destroy());
+      if (outputBuffer) outputBuffer.destroy();
+      const byteLength = Math.max(4, count * 4);
+      feedBuffers = feedBindings.map(() => device.createBuffer({
+        size: byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      }));
+      outputBuffer = device.createBuffer({
+        size: byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      computeBindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+          ...feedBindings.map((binding, index) => ({binding: binding.index, resource: {buffer: feedBuffers[index]}})),
+          {binding: outputBindings[0].index, resource: {buffer: outputBuffer}},
+        ],
+      });
+      presentationBindGroup = device.createBindGroup({
+        layout: presentationPipeline.getBindGroupLayout(0),
+        entries: [
+          {binding: 0, resource: {buffer: dimsBuffer}},
+          {binding: 1, resource: {buffer: outputBuffer}},
+        ],
+      });
+      device.queue.writeBuffer(dimsBuffer, 0, new Uint32Array([width, height]));
+      elementCount = count;
+    }
+
+    function writeFeeds(time) {
+      feedBindings.forEach((binding, index) => {
+        const values = new Float32Array(Math.max(1, elementCount));
+        for (let i = 0; i < elementCount; i += 1) {
+          const channel = index % 4;
+          values[i] = channel === 0 ? i / Math.max(1, elementCount - 1)
+            : channel === 1 ? time
+            : channel === 2 ? input.pointer[0]
+            : input.pointer[1];
+        }
+        device.queue.writeBuffer(feedBuffers[index], 0, values);
+      });
+    }
+
+    async function frame(milliseconds) {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      ensureBuffers(width, height);
+      writeFeeds(milliseconds / 1000);
+
+      const encoder = device.createCommandEncoder();
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(computePipeline);
+      computePass.setBindGroup(0, computeBindGroup);
+      const workgroups = Math.max(1, Math.min(65535, Math.ceil(elementCount / workgroupSizeX)));
+      computePass.dispatchWorkgroups(workgroups);
+      computePass.end();
+
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: context.getCurrentTexture().createView(),
+          clearValue: {r: 0, g: 0, b: 0, a: 1},
+          loadOp: "clear",
+          storeOp: "store",
+        }],
+      });
+      renderPass.setPipeline(presentationPipeline);
+      renderPass.setBindGroup(0, presentationBindGroup);
+      renderPass.draw(3);
+      renderPass.end();
+      device.queue.submit([encoder.finish()]);
+      requestAnimationFrame(value => frame(value).catch(fail));
+    }
+
+    domLayout.latest = await settledLayout(document);
+    requestAnimationFrame(value => frame(value).catch(fail));
+    if (SHADER.autostart !== false && liaison.wasm) {
+      const execution = SHADER.execution || {};
+      liaison.wasm.start({
+        continuous: execution.continuous !== false,
+        preferContiguous: execution.prefer_contiguous !== false,
+      }).catch(fail);
+    }
+    return {canvas, device, context, input};
+  })();
+} else {
+  // Plain 2D canvas, no shader compilation of any kind: paint the WASM
+  // numeric output's named channels straight to pixels. Always available,
+  // the last-resort tier when neither WebGPU nor WebGL 2 can run.
+  ready = (async () => {
+    const context2d = canvas.getContext("2d");
+    if (!context2d) throw new Error("2D canvas context is unavailable");
+    const configuration = SHADER.configuration || {};
+    const channelNames = Array.isArray(configuration.channels)
+      ? configuration.channels : ["red", "green", "blue"];
+    domLayout.latest = await settledLayout(document);
+
+    function paint() {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const frame = liaison.wasm && liaison.wasm.outputFrame ? liaison.wasm.outputFrame() : null;
+      if (frame && frame.outputs.length) {
+        const byName = new Map(frame.outputs.map(item => [item.name, item.values]));
+        const channels = channelNames.slice(0, 3).map(name => byName.get(name));
+        const count = frame.width * frame.height;
+        if (channels.length === 3 && channels.every(values => values && values.length >= count)) {
+          const pixels = new Uint8ClampedArray(count * 4);
+          for (let index = 0; index < count; index += 1) {
+            const base = index * 4;
+            pixels[base] = Math.max(0, Math.min(255, Math.round(channels[0][index])));
+            pixels[base + 1] = Math.max(0, Math.min(255, Math.round(channels[1][index])));
+            pixels[base + 2] = Math.max(0, Math.min(255, Math.round(channels[2][index])));
+            pixels[base + 3] = 255;
+          }
+          context2d.putImageData(new ImageData(pixels, frame.width, frame.height), 0, 0);
+        }
+      }
+      requestAnimationFrame(paint);
+    }
+    requestAnimationFrame(paint);
+    if (SHADER.autostart !== false && liaison.wasm) {
+      const execution = SHADER.execution || {};
+      liaison.wasm.start({
+        continuous: execution.continuous !== false,
+        preferContiguous: execution.prefer_contiguous !== false,
+      }).catch(fail);
+    }
+    return {canvas, context2d, input};
+  })();
+}
+if (ready) {
   liaison.ready = ready;
   window.TuringShaderLiaison = liaison;
   // Compatibility name for callers of the first shader-surface probe.
@@ -4169,7 +4416,7 @@ def emit_html_shell(
         shader_css = _SHADER_EXECUTION_CSS
         shader_canvas = (
             '<canvas id="shader-surface" tabindex="0" '
-            'aria-label="WebGL shader execution surface"></canvas>'
+            'aria-label="shader execution surface"></canvas>'
         )
         shader_script = "<script>" + _SHADER_EXECUTION_JS.replace(
             "__SHADER_EXECUTION__", json.dumps(shader, default=str)

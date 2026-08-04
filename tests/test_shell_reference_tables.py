@@ -8,7 +8,7 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from src.compiler.shell_reference_tables import (
     build_class_navigation_table,
@@ -130,7 +130,7 @@ def affine(value):
     with contextlib.redirect_stdout(io.StringIO()):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
-    shell_type = strategize_glsl_deployment(graph)
+    shell_type = strategize_shell_deployment(graph)
     first = shell_type()
     second = shell_type()
     try:

@@ -421,17 +421,27 @@ def collect_backend_sources(
             reason=f"{type(error).__name__}: {error}",
         ))
 
-    # --- WebGL 2 --------------------------------------------------------
+    # --- WebGL 2 (deprecated -- see machine_targets._WebGLTarget) -------
     # WebGL shares GLSL scalar expressions, not desktop compute storage.
     # Its fragment-raster adapter therefore gets its own source tab and an
     # honest shortfall when the program needs a non-browser-native layout.
+    #
+    # machine_targets.get_target("webgl") redirects new Python callers to
+    # "webgpu" (deprecated=True, redirect_to="webgpu"). This bundle builder
+    # is a deliberate exception -- it keeps emitting real WebGL 2 with
+    # role="shader-surface" alongside webgpu's, because published pages need
+    # a working fallback for browsers without WebGPU support. The published
+    # JS runtime picks whichever candidate its own feature detection
+    # supports (see wasm_html_shell.py's priority order: webgpu -> webgl ->
+    # plain canvas), so both stay real, not just one placeholder plus a
+    # deprecated afterthought.
     try:
         from .fused_program_webgl_backend import emit_webgl_fragment_module
 
         emitted = emit_webgl_fragment_module(program, name=numerical_name)
         collected.append(BackendSource(
             language="webgl",
-            title="WebGL 2",
+            title="WebGL 2 (deprecated)",
             source=emitted.source,
             available=emitted.complete,
             reason=(
@@ -444,7 +454,67 @@ def collect_backend_sources(
         note("WebGL emitted", complete=emitted.complete)
     except Exception as error:
         collected.append(BackendSource(
-            language="webgl", title="WebGL 2", available=False,
+            language="webgl", title="WebGL 2 (deprecated)", available=False,
+            reason=f"{type(error).__name__}: {error}",
+        ))
+
+    # --- WebGPU (compute) ------------------------------------------------
+    # Registered in machine_targets as webgl's replacement
+    # (machine_targets._WebGPUTarget, backed by ssa_webgpu_backend.py).
+    # Carries role="shader-surface" alongside webgl's: site_bundle.py's
+    # _shader_execution_descriptor tries candidates in priority order
+    # (webgpu -> webgl -> canvas), so both are legitimate shader-surface
+    # candidates here; which one a published page actually runs is a
+    # runtime feature-detection choice made in the browser, not a
+    # build-time one made here.
+    try:
+        from .precompile_to_ssa import lower_fused_program_to_ssa
+        from .ssa_webgpu_backend import emit_module as emit_webgpu_module
+        from ..transmogrifier.ssa import IRModule
+
+        function, lowering_shortfalls = lower_fused_program_to_ssa(
+            program, function_name=numerical_name,
+        )
+        returned = next(
+            (
+                instruction.args
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret", "Return", "return"}
+            ),
+            (),
+        )
+        count = max(
+            (int(size) for value in function.args for size in value.shape),
+            default=1,
+        )
+        emitted = emit_webgpu_module(
+            IRModule({numerical_name: function}),
+            name=numerical_name,
+            outputs={numerical_name: returned},
+            count=count,
+        )
+        complete = not lowering_shortfalls and emitted.complete
+        reason = ""
+        if lowering_shortfalls:
+            item = lowering_shortfalls[0]
+            reason = f"{item.domain}:{item.name} at {item.location}: {item.reason}"
+        elif not emitted.complete:
+            reason = emitted.shortfalls[0].format()
+        collected.append(BackendSource(
+            language="webgpu",
+            title="WebGPU (compute)",
+            source=emitted.source,
+            available=complete,
+            reason=reason,
+            highlight="rust",
+            role="shader-surface",
+            artifact=emitted,
+        ))
+        note("WebGPU emitted", complete=complete)
+    except Exception as error:
+        collected.append(BackendSource(
+            language="webgpu", title="WebGPU (compute)", available=False,
             reason=f"{type(error).__name__}: {error}",
         ))
 

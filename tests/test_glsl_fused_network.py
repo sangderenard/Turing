@@ -45,7 +45,7 @@ from src.compiler.glsl_deployment_strategy import (
     _capture_feed_aliases,
     _tensorize_graph_input,
     _unique_runtime_feed_aliases,
-    strategize_glsl_deployment,
+    strategize_shell_deployment,
 )
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 
@@ -1145,7 +1145,7 @@ def test_glsl_deployment_accepts_ephemeral_vertical_programs(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         legacy_fused_network=True,
     )
     program = _program(
@@ -1173,7 +1173,7 @@ def test_composed_control_is_default_and_legacy_network_is_explicit(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     program = _program(
         [0],
         [("mul", 1, [0], {"right_scalar": 4.0})],
@@ -1197,7 +1197,7 @@ def test_glsl_deployment_shell_owns_named_and_fifo_execution(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         input_slots=2,
         output_slots=2,
         legacy_fused_network=True,
@@ -1254,7 +1254,7 @@ def test_glsl_deployment_installs_compiled_tapes(gl):
         parents=[],
         children=[],
     )
-    deployment = strategize_glsl_deployment(graph)(
+    deployment = strategize_shell_deployment(graph)(
         legacy_fused_network=True,
     )
     program = _program(
@@ -1332,7 +1332,7 @@ def test_glsl_deployment_rejects_per_region_tape_capture(gl):
     )
     graph.compute_levels(method="asap", order="dependency")
 
-    deployment = strategize_glsl_deployment(
+    deployment = strategize_shell_deployment(
         graph,
         max_nodes_per_dispatch=1,
     )(legacy_fused_network=True)
@@ -1391,7 +1391,7 @@ def test_glsl_deployment_coordinates_structural_result_around_numeric_region(gl)
     graph.roots = [3]
     graph.compute_levels(method="asap", order="dependency")
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     values = np.arange(16, dtype=np.float32)
     deployment.compile_process_graph()
     try:
@@ -1449,7 +1449,7 @@ def test_precompile_only_observes_numerics_without_glsl_compilation(
         raise AssertionError("precompile-only discovery compiled GLSL")
 
     monkeypatch.setattr(glsl_backend, "_compile", reject_glsl_compile)
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         deployment.capture_fused_programs(
@@ -1483,7 +1483,7 @@ def render_value(x):
         for entry in graph.function_table
         if entry.graph is not None
     }
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
 
     assert set(deployment_type.function_shell_types) == set(expected)
     deployment = deployment_type(
@@ -1551,7 +1551,7 @@ def render(x):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         render_ref = graph.function_table.reference("render")
@@ -1603,7 +1603,7 @@ def render(x):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment = strategize_glsl_deployment(graph)()
+    deployment = strategize_shell_deployment(graph)()
     try:
         deployment.compile_process_graph()
         render_ref = graph.function_table.reference("render")
@@ -1652,7 +1652,7 @@ def recurrent(x, iterations):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
     deployment = deployment_type(
         profiling=True,
         verbose_profile=True,
@@ -1724,7 +1724,7 @@ def collect(x, iterations):
         graph.build_from_ast(module)
     reduce_abstract_tensor_topology(graph)
 
-    deployment_type = strategize_glsl_deployment(graph)
+    deployment_type = strategize_shell_deployment(graph)
     reference = graph.function_table.reference("collect")
     assert reference is not None
     shell_type = deployment_type.function_shell_types[reference.address]

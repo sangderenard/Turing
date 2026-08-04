@@ -1,4 +1,14 @@
-"""GLSL deployment-strategy stage for ProcessGraphs."""
+"""Deployment-strategy stage for ProcessGraphs.
+
+Despite the module's filename, ``strategize_shell_deployment`` (formerly
+``strategize_glsl_deployment``) is not GLSL-specific: it is the single
+compilation choke point every backend passes through -- c, python, glsl,
+fortran-via-precompile_only, webgl, and (once registered) webgpu all
+funnel through this one control-planning stage before diverging into
+backend-specific emission later in the pipeline. See
+``accelerator_backends/aot_compile.py`` for the full pipeline this stage
+sits in.
+"""
 
 from __future__ import annotations
 
@@ -8446,7 +8456,7 @@ def _callsite_specialized_shell_type(
     specialized.G.graph.setdefault(
         "planner_specializations", {}
     ).update(specializations)
-    planned = strategize_glsl_deployment(
+    planned = strategize_shell_deployment(
         specialized,
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
         _function_table_stack=(id(function_table),),
@@ -8502,7 +8512,7 @@ def _resolve_unambiguous_method_references(graph: Any) -> None:
 MAX_UNROLL_LIMIT = 4096
 
 
-def strategize_glsl_deployment(
+def strategize_shell_deployment(
     graph: Any,
     *,
     # Was 256, which was a GLSL dispatch-sizing constraint: a shader had to
@@ -8519,6 +8529,11 @@ def strategize_glsl_deployment(
     _function_table_stack: tuple[int, ...] = (),
 ) -> type:
     """Build a stateful shell around the graph's flat dispatch schedule.
+
+    This is the compilation choke point: every backend -- c, python, glsl,
+    fortran, webgl, webgpu -- funnels its ProcessGraph through this one
+    control-planning stage before any backend-specific emission happens.
+    The name is generic on purpose; nothing below is GLSL-specific.
 
     ``backend`` only tags the loop-composition capability profile below --
     it does not change GLSL emission, which stays gated behind
@@ -11543,7 +11558,7 @@ class ProcessGraphGLSLDeployment:
                 dict(graph.G.graph.get("loop_settings") or {}),
             )
             function_shell_types[entry.reference.address] = (
-                strategize_glsl_deployment(
+                strategize_shell_deployment(
                     function_graph,
                     max_nodes_per_dispatch=max_nodes_per_dispatch,
                     _function_table_stack=nested_stack,
@@ -11556,7 +11571,7 @@ class ProcessGraphGLSLDeployment:
 __all__ = [
     "DeploymentErrorBuffer",
     "DeploymentProfiler",
-    "strategize_glsl_deployment",
+    "strategize_shell_deployment",
 ]
 class _CompiledStructuralObject:
     """Shell-owned state whose methods are compiled function subgraphs."""

@@ -42,7 +42,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 
 BUNDLE_SCHEMA = "turing-program-bundle-v1"
@@ -57,7 +57,18 @@ DEFAULT_PUBLISH_ROOT = TURING_REPOSITORY_ROOT.parent
 # The default whole-screen passthrough every published page compiles,
 # unconditionally, whether or not it is ever used -- see the compile step
 # in ``build_program_bundle`` for why.
-_PASSTHROUGH_SOURCE = "def turing_passthrough(red, green, blue):\n    return red, green, blue\n"
+#
+# The ``+ 0.0`` is load-bearing, not decoration: a bare ``return red, green,
+# blue`` traces zero operations (AbstractTensor capture only records
+# computed steps), so ``project_public_numerical_program`` finds no output
+# to name and every backend reports "no outputs" as a shortfall -- this
+# passthrough has never actually compiled without it. The no-op arithmetic
+# forces one real captured step per output, same visual result, and is what
+# makes ``passthrough_module.complete`` (and its WebGPU sibling) ever True.
+_PASSTHROUGH_SOURCE = (
+    "def turing_passthrough(red, green, blue):\n"
+    "    return red + 0.0, green + 0.0, blue + 0.0\n"
+)
 
 _SOURCE_EXTENSIONS = {
     "python_source": "py",
@@ -66,6 +77,7 @@ _SOURCE_EXTENSIONS = {
     "spirv": "spvasm",
     "glsl": "comp.glsl",
     "webgl": "frag.glsl",
+    "webgpu": "compute.wgsl",
     "wat": "wat",
     "numpy": "py",
     "torch": "py",
@@ -84,6 +96,10 @@ _BUNDLE_COMPILER_IMPLEMENTATION_FILES = (
     Path(__file__).with_name("loop_composer.py"),
     Path(__file__).with_name("precompile_to_ssa.py"),
     Path(__file__).with_name("process_graph_fusion.py"),
+    Path(__file__).with_name("ssa_webgpu_backend.py"),
+    Path(__file__).with_name("shader_stages.py"),
+    Path(__file__).with_name("fused_program_webgl_backend.py"),
+    Path(__file__).with_name("machine_targets.py"),
     Path(__file__).with_name("wasm_class_coordinator.py"),
     Path(__file__).with_name("wasm_class_modules.py"),
     Path(__file__).with_name("wasm_html_shell.py"),
@@ -959,6 +975,8 @@ def _content_version(
     presentation_shader: str | None = None,
     presentation_document: str | None = None,
     shader_configuration: Mapping[str, Any] | None = None,
+    include_backends: bool = True,
+    backend_targets: Sequence[str] | None = None,
 ) -> tuple[str, str]:
     source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     identity = {
@@ -989,11 +1007,51 @@ def _content_version(
             if presentation_document is not None else None
         ),
         "shader_configuration": dict(shader_configuration or {}),
+        # Different backend selections produce different published source
+        # tabs from the same compilation, so they need different content
+        # versions too -- otherwise a second build with a narrower
+        # backend_targets list would silently reuse the first build's
+        # directory (and its wider set of tabs) instead of actually
+        # reflecting the request.
+        "include_backends": include_backends,
+        "backend_targets": sorted(str(item).lower() for item in backend_targets or ()),
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return f"v{BUNDLE_LAYOUT_VERSION}-{digest[:16]}", source_digest
+    return f"v{BUNDLE_LAYOUT_VERSION}-{digest[:16]}", source_digest, digest[:16]
+
+
+_COMPILER_VERSION_NUMBER = int(re.search(r"(\d+)$", BUILDER_VERSION).group(1))
+_SEQUENTIAL_VERSION_PATTERN = re.compile(
+    rf"^v{_COMPILER_VERSION_NUMBER}\.(\d{{3}})-"
+)
+
+
+def _next_sequential_version(versions_dir: Path, content_hash16: str) -> str:
+    """A fresh, never-reused version name for --full-style forced rebuilds.
+
+    Format: ``v<compiler version>.<iteration>-<date>-<content hash>``. The
+    compiler-version number comes from ``BUILDER_VERSION`` (the same value
+    every bundle already records under ``compiler.implementation_sha256``'s
+    neighbor fields); the iteration counter is scoped to that compiler
+    version and resets when it changes, so "how many times has this program
+    been rebuilt under the current compiler" is legible directly from the
+    version name. Unlike the default content-addressed version (same input
+    -> same directory, see ``_content_version``), this always produces a
+    new, previously-unused name -- deliberately: a forced rebuild is asking
+    for an additional version on record, not a lookup.
+    """
+
+    highest = 0
+    if versions_dir.is_dir():
+        for entry in versions_dir.iterdir():
+            match = _SEQUENTIAL_VERSION_PATTERN.match(entry.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    iteration = highest + 1
+    date_stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"v{_COMPILER_VERSION_NUMBER}.{iteration:03d}-{date_stamp}-{content_hash16}"
 
 
 def _write_sources(
@@ -1003,6 +1061,7 @@ def _write_sources(
     sources: Any,
     *,
     presentation_shader: str | None = None,
+    presentation_shader_wgsl: str | None = None,
 ) -> list[dict[str, Any]]:
     entries = [{
         "language": "python_source",
@@ -1014,6 +1073,18 @@ def _write_sources(
         "lines": source.count("\n") + 1,
         "filename": Path(filename).name,
     }]
+    if presentation_shader_wgsl is not None:
+        entries.append({
+            "language": "webgpu",
+            "title": "WebGPU presentation shader",
+            "source": presentation_shader_wgsl,
+            "available": True,
+            "reason": "",
+            "highlight": "rust",
+            "lines": presentation_shader_wgsl.count("\n") + 1,
+            "filename": "surface.compute.wgsl",
+            "role": "shader-surface",
+        })
     if presentation_shader is not None:
         entries.append({
             "language": "webgl",
@@ -1057,40 +1128,165 @@ def _write_sources(
     return published
 
 
+# Priority order for the published page's live execution surface: WebGPU
+# compute first (real dispatch, no draw-buffer cap), WebGL 2 fragment-raster
+# second (the only path older browsers have), plain 2D canvas last (needs no
+# GPU shading language at all -- just paints the WASM numeric output, see
+# wasm_html_shell.py's canvas2d branch). Which one a page actually runs is a
+# runtime feature-detection choice in the browser (navigator.gpu, then a
+# webgl2 context, then always-available 2D); this only decides which
+# candidates exist to choose from and in what order.
+_SHADER_SURFACE_LANGUAGES: tuple[tuple[str, str, str], ...] = (
+    ("webgpu", "wgsl", "compute"),
+    ("webgl", "webgl2-glsl-es", "fragment"),
+)
+
+
 def _shader_execution_descriptor(
     published_sources: list[dict[str, Any]],
     shell_io: Mapping[str, Any] | None = None,
     configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Select the explicitly-role-marked browser presentation shader."""
+    """Build the priority-ordered list of shader-surface candidates.
 
-    for source in published_sources:
-        if (
-            source.get("language") == "webgl"
-            and source.get("role") == "shader-surface"
-            and source.get("available")
-            and source.get("url")
-        ):
-            descriptor = {
-                "url": str(source["url"]),
-                "language": "webgl2-glsl-es",
-                "stage": "fragment",
-                "role": "shader-surface",
-                "autostart": True,
-                "execution": {
-                    "continuous": True,
-                    "prefer_contiguous": True,
-                },
-            }
-            if shell_io:
-                descriptor["io"] = dict(shell_io)
-            if configuration:
-                descriptor["configuration"] = dict(configuration)
-            return descriptor
-    # Desktop GLSL is deliberately not a fallback. Its SSBO binding/channel
-    # arena needs the dedicated memory handler documented in the GLSL
-    # ingestion layer and cannot be executed by a WebGL canvas.
-    return None
+    The returned mapping's top level still describes the highest-priority
+    candidate (``url``/``language``/``stage``/``role``) for existing readers
+    (the manifest, the HTML shell's inspection panel); ``candidates`` adds
+    the full ordered list, including a GPU-free ``canvas2d`` entry that
+    needs no published source at all, so the page always has *something* to
+    fall back to.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    by_language = {
+        str(source.get("language")): source for source in published_sources
+        if source.get("role") == "shader-surface" and source.get("available")
+        and source.get("url")
+    }
+    for source_language, wire_language, stage in _SHADER_SURFACE_LANGUAGES:
+        source = by_language.get(source_language)
+        if source is None:
+            continue
+        candidates.append({
+            "url": str(source["url"]),
+            "language": wire_language,
+            "stage": stage,
+            "role": "shader-surface",
+        })
+    if not candidates:
+        # Desktop GLSL is deliberately never a candidate here. Its SSBO
+        # binding/channel arena needs the dedicated memory handler
+        # documented in the GLSL ingestion layer and cannot be executed by
+        # a browser canvas of any kind. No compiled shader source at all
+        # means no shader-execution page, same as before this function grew
+        # a candidate list -- a bare 2D-canvas fallback is only offered
+        # below as a *last resort after* a real candidate, never as the
+        # sole reason to switch a page into execution mode.
+        return None
+    # Always-available last resort once at least one real shader source
+    # exists: paint the WASM numeric output straight to a 2D canvas, no
+    # shader compilation of any kind. wasm_html_shell.py's runtime tries
+    # this only if every GPU-backed candidate above it fails to acquire a
+    # context.
+    if shell_io:
+        candidates.append({
+            "url": None,
+            "language": "canvas2d",
+            "stage": "none",
+            "role": "shader-surface",
+        })
+    descriptor = dict(candidates[0])
+    descriptor["autostart"] = True
+    descriptor["execution"] = {"continuous": True, "prefer_contiguous": True}
+    descriptor["candidates"] = candidates
+    if shell_io:
+        descriptor["io"] = dict(shell_io)
+    if configuration:
+        descriptor["configuration"] = dict(configuration)
+    return descriptor
+
+
+def _write_program_origin(
+    destination: Path,
+    contract: SourceContract,
+    source: str,
+    source_filename: str,
+    *,
+    backend_targets: Sequence[str] | None,
+    include_backends: bool,
+    include_mathematics: bool,
+) -> Path:
+    """Record how to rebuild this *program* from scratch, program-scoped.
+
+    One file per slug (``site/programs/<slug>/origin.json``), not one per
+    version -- a program's origin (its source, entrypoint, probes, backend
+    selection) is a property of the program, not of any single compiled
+    snapshot, and a program can carry many versions under one origin. The
+    full source text is embedded directly rather than referencing a
+    version's published copy, so regeneration is self-contained even when a
+    program has zero, one, or many versions on disk: there is exactly one
+    place to look, independent of which version (if any) is newest.
+    Overwritten on every build with the same slug, so it always reflects
+    the most recent recipe used for that program.
+    """
+
+    origin_path = destination / "site" / "programs" / contract.slug / "origin.json"
+    origin_path.parent.mkdir(parents=True, exist_ok=True)
+    origin = {
+        "slug": contract.slug,
+        "title": contract.title,
+        "entrypoint": contract.entrypoint,
+        "source": source,
+        "source_filename": Path(source_filename).name,
+        "probes": contract.feeds,
+        "backend_targets": (
+            sorted(str(item).lower() for item in backend_targets)
+            if backend_targets else None
+        ),
+        "include_backends": include_backends,
+        "include_mathematics": include_mathematics,
+        "bake_mode": contract.bake_mode,
+        "schedule_preference": contract.schedule_preference,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    origin_path.write_text(json.dumps(origin, indent=2), encoding="utf-8")
+    return origin_path
+
+
+def _region_target_capabilities(
+    region_programs: Mapping[int, Any],
+) -> dict[str, list[str]]:
+    """Which registered ``machine_targets`` entries can serve each region.
+
+    Reports capability (``machine_targets.targets_for``), not a chosen
+    assignment -- there is no planner here deciding which target a region
+    should actually run on, only data about which ones honestly could.
+    """
+
+    from . import machine_targets
+
+    return {
+        str(region_index): sorted(machine_targets.targets_for(region_program))
+        for region_index, region_program in region_programs.items()
+    }
+
+
+def _passthrough_candidates(
+    *descriptors: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Same top-level-plus-candidates shape as ``_shader_execution_descriptor``,
+    for the always-compiled passthrough shader. Never autostarted; nothing
+    subscribes to it by default (see ``passthrough_script`` in
+    ``wasm_html_shell.py``), so this only needs to expose every language a
+    caller could reach for, webgpu first.
+    """
+
+    candidates = [item for item in descriptors if item is not None]
+    if not candidates:
+        return None
+    result = dict(candidates[0])
+    result["candidates"] = candidates
+    return result
 
 
 def _write_audio_asset(
@@ -1180,6 +1376,7 @@ def build_program_bundle(
     slug: str | None = None,
     probes: Mapping[str, Any] | None = None,
     include_backends: bool = True,
+    backend_targets: Sequence[str] | None = None,
     include_mathematics: bool = True,
     presentation_shader: str | None = None,
     presentation_document: str | None = None,
@@ -1187,8 +1384,17 @@ def build_program_bundle(
     bake_mode: str | None = None,
     schedule_preference: str | None = None,
     progress_sink: Callable[[Any], None] | None = None,
+    force_new_version: bool = False,
 ) -> ProgramBundle:
     """Compile source and atomically publish its complete versioned bundle.
+
+    ``force_new_version``, if True, skips the default content-addressed
+    idempotency (same source + config -> same directory, see
+    ``_content_version``) and instead always publishes an additional,
+    previously-unused version under this program's ``versions/`` directory
+    (see ``_next_sequential_version``) -- what ``publish_bundles.py --full``
+    wants: process the origin again into one more version on record, not a
+    lookup that might just hand back what's already there.
 
     ``progress_sink``, if given, is subscribed to the same
     ``shell_telemetry.TelemetryChannel`` that is baked into the published
@@ -1198,6 +1404,16 @@ def build_program_bundle(
     caller that wants terminal visibility during the build passes a
     printing sink; a caller that doesn't care can leave it ``None`` and the
     records still travel with the page.
+
+    ``backend_targets``, if given, restricts the published source tabs to
+    those languages (e.g. ``("glsl", "webgpu")``) rather than every backend
+    ``collect_backend_sources`` can serve. Matched case-insensitively against
+    each source's ``language``; the original Python source tab is always
+    kept regardless. Ignored when ``include_backends`` is False (there is
+    nothing to restrict). Unmatched names are silently inert rather than an
+    error -- a target list that includes a backend this program can't reach
+    (say, ``webgl`` for a bitwise-only kernel) is a normal, expected outcome,
+    not a caller mistake.
     """
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -1233,18 +1449,27 @@ def build_program_bundle(
         **dict(contract.shader_configuration),
         **dict(shader_configuration or {}),
     }
-    version, source_digest = _content_version(
+    version, source_digest, content_hash16 = _content_version(
         source,
         contract,
         presentation_shader=presentation_shader,
         presentation_document=presentation_document,
         shader_configuration=contract_shader_configuration,
+        include_backends=include_backends,
+        backend_targets=backend_targets,
     )
     destination = resolve_publish_root(destination)
     versions = destination / "site" / "programs" / contract.slug / "versions"
-    final_directory = versions / version
-    if final_directory.is_dir() and (final_directory / "bundle.json").is_file():
-        return load_program_bundle(final_directory)
+    if force_new_version:
+        version = _next_sequential_version(versions, content_hash16)
+        final_directory = versions / version
+        # No idempotency shortcut here on purpose -- _next_sequential_version
+        # never hands back a name already on disk, so there is nothing to
+        # look up, only a new version to publish.
+    else:
+        final_directory = versions / version
+        if final_directory.is_dir() and (final_directory / "bundle.json").is_file():
+            return load_program_bundle(final_directory)
     versions.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=versions))
     compile_log = io.StringIO()
@@ -1255,7 +1480,7 @@ def build_program_bundle(
         )
         from ..common.tensors.topological_reducer import reduce_abstract_tensor_topology
         from ..transmogrifier.graph.graph_express2 import ProcessGraph
-        from .backend_sources import collect_backend_sources
+        from .backend_sources import BackendSourceSet, collect_backend_sources
         from .fused_program_wasm_backend import emit_wasm_module, required_steps
         from .fused_program_webgl_backend import emit_webgl_fragment_module
         from .shell_telemetry import summarize_process_graph
@@ -1282,11 +1507,32 @@ def build_program_bundle(
             for name in parameter_names
         }
         with contextlib.redirect_stdout(compile_log), contextlib.redirect_stderr(compile_log):
+            # ``channel.timed(...)`` only emits a record when the block
+            # finishes (success or failure) -- it never announces that it
+            # started, which made a slow block look identical to nothing
+            # having happened yet. An explicit "starting" log plus a
+            # heartbeat on the one genuinely long, opaque call (AOT compile
+            # can run for minutes with no sub-step to report) closes that
+            # gap the same way ast.parse's heartbeat did.
+            channel.log("build process graph starting", path="process_graph")
             with channel.timed("build process graph", path="process_graph"):
                 graph = ProcessGraph(materialize_memory=False)
-                graph.build_from_ast(ast.parse(source))
+                channel.log("process_graph: build_from_ast starting", path="process_graph")
+                graph.build_from_ast(
+                    ast.parse(source),
+                    resolve_unresolved_parents=True,
+                    progress=lambda message: channel.log(message, path="process_graph"),
+                )
+                channel.log("process_graph: build_from_ast finished", path="process_graph")
+                channel.log("process_graph: reduce_abstract_tensor_topology starting", path="process_graph")
                 reduce_abstract_tensor_topology(graph)
+                channel.log("process_graph: reduce_abstract_tensor_topology finished", path="process_graph")
+            channel.log(
+                "AOT compile starting", path="aot",
+                entrypoint=contract.entrypoint,
+            )
             with channel.timed("AOT compile", path="aot", entrypoint=contract.entrypoint):
+                channel.log("AOT compile starting", path="aot", entrypoint=contract.entrypoint)
                 aot = compile_ast_aot(
                     source,
                     contract.entrypoint,
@@ -1300,7 +1546,9 @@ def build_program_bundle(
                     schedule_preference=contract.schedule_preference,
                     constant_map=contract.constant_map,
                     mutable_parameters=contract.mutable_parameters,
+                    progress=lambda message: channel.log(message, path="aot"),
                 )
+                channel.log("AOT compile finished", path="aot", entrypoint=contract.entrypoint)
             if (
                 contract.bake_mode == "whole_program"
                 and aot.control_shortfalls
@@ -1357,6 +1605,12 @@ def build_program_bundle(
                 )
 
             effective_presentation_shader = presentation_shader
+            # No WebGPU analog for the hand-authored ``presentation_shader``
+            # passthrough parameter -- that path publishes raw, caller-supplied
+            # GLSL text (demo scripts that author their own shader), not
+            # something this compiler emits, so there's nothing here to lower
+            # to WGSL. Only the compiler-generated paths below get one.
+            effective_presentation_shader_wgsl: str | None = None
             effective_shader_configuration = dict(contract_shader_configuration)
             if contract.presentation_entrypoint is not None:
                 channel.log(
@@ -1393,6 +1647,7 @@ def build_program_bundle(
                     python_bindings=globals(),
                     bake_mode=contract.bake_mode,
                     schedule_preference=contract.schedule_preference,
+                    progress=lambda message: channel.log(message, path="presentation"),
                 )
                 presentation_program = project_public_numerical_program(
                     presentation_aot
@@ -1437,8 +1692,14 @@ def build_program_bundle(
         # autostarted; a page's own presentation_entrypoint (if any) is what
         # actually runs by default.
         channel.log("compiling default passthrough shader", path="passthrough")
+        # float32, not _probe_value's default float64: this is a display-only
+        # identity map, precision is irrelevant, and WebGPU core has no f64 at
+        # all -- ssa_webgpu_backend.py reports float64 as a real shortfall
+        # (correctly, for a program that actually needs the precision), which
+        # would otherwise make the always-available passthrough's WebGPU
+        # sibling permanently incomplete for no reason that matters here.
         passthrough_feeds = {
-            name: _probe_value(0.0, contract.probe_size)
+            name: _probe_value(0.0, contract.probe_size).astype("float32")
             for name in ("red", "green", "blue")
         }
         passthrough_aot = compile_ast_aot(
@@ -1456,7 +1717,52 @@ def build_program_bundle(
             passthrough_program, name="turing_passthrough",
             output_layout="rgba", input_sampling="normalized",
         )
+        # Same identity program, compiled through the WebGPU compute path too
+        # -- ssa_webgpu_backend.py's compute+present JS runtime is what a
+        # published page actually prefers (see _shader_execution_descriptor's
+        # webgpu-first priority order), so the always-available passthrough
+        # needs a real WGSL sibling, not just the WebGL one.
+        passthrough_wgsl_module = None
+        try:
+            from .precompile_to_ssa import lower_fused_program_to_ssa as _lower_passthrough
+            from .ssa_webgpu_backend import emit_module as _emit_passthrough_wgsl
+            from ..transmogrifier.ssa import IRModule as _PassthroughIRModule
+
+            passthrough_function, passthrough_lowering_shortfalls = _lower_passthrough(
+                passthrough_program, function_name="turing_passthrough",
+            )
+            if not passthrough_lowering_shortfalls:
+                passthrough_returned = next(
+                    (
+                        instruction.args
+                        for block in passthrough_function.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op in {"Ret", "ret", "Return", "return"}
+                    ),
+                    (),
+                )
+                passthrough_count = max(
+                    (
+                        int(size)
+                        for value in passthrough_function.args
+                        for size in value.shape
+                    ),
+                    default=1,
+                )
+                passthrough_wgsl_module = _emit_passthrough_wgsl(
+                    _PassthroughIRModule({"turing_passthrough": passthrough_function}),
+                    name="turing_passthrough",
+                    outputs={"turing_passthrough": passthrough_returned},
+                    count=passthrough_count,
+                )
+        except Exception as error:
+            channel.error(
+                f"default WebGPU passthrough shader raised: "
+                f"{type(error).__name__}: {error}",
+                path="passthrough",
+            )
         passthrough_descriptor: dict[str, Any] | None = None
+        passthrough_wgsl_descriptor: dict[str, Any] | None = None
         if passthrough_module.complete:
             passthrough_relative = Path("source") / "webgl" / "passthrough.frag.glsl"
             passthrough_path = temporary / passthrough_relative
@@ -1480,6 +1786,65 @@ def build_program_bundle(
                 "default passthrough shader had shortfalls", path="passthrough",
                 shortfalls=[item.format() for item in passthrough_module.shortfalls],
             )
+        if passthrough_wgsl_module is not None and passthrough_wgsl_module.complete:
+            passthrough_wgsl_relative = Path("source") / "webgpu" / "passthrough.compute.wgsl"
+            passthrough_wgsl_path = temporary / passthrough_wgsl_relative
+            passthrough_wgsl_path.parent.mkdir(parents=True, exist_ok=True)
+            passthrough_wgsl_path.write_text(passthrough_wgsl_module.source, encoding="utf-8")
+            passthrough_wgsl_descriptor = {
+                "url": passthrough_wgsl_relative.as_posix(),
+                "language": "wgsl",
+                "role": "passthrough-surface",
+                "inputs": ["red", "green", "blue"],
+                "autostart": False,
+                "note": (
+                    "Always-available whole-screen identity shader, WebGPU "
+                    "compute variant. Not used by this page's default "
+                    "presentation; present for anything that wants a plain "
+                    "texture passthrough."
+                ),
+            }
+            channel.log("default WebGPU passthrough shader compiled", path="passthrough")
+        elif passthrough_wgsl_module is not None:
+            channel.error(
+                "default WebGPU passthrough shader had shortfalls", path="passthrough",
+                shortfalls=[item.format() for item in passthrough_wgsl_module.shortfalls],
+            )
+
+        # "Shader support" is mandatory, not an opt-in a page author has to
+        # remember: if no presentation_entrypoint was authored, and the main
+        # entrypoint itself already names outputs red/green/blue, the always
+        # -compiled passthrough becomes this page's active presentation --
+        # tensor math stays entirely in the (unrestricted) WASM kernel, and
+        # nothing but a trivial per-pixel display ever has to be expressed
+        # as WebGL-safe scalar code. A page author never authors a shader
+        # function unless they want something other than plain display.
+        if (
+            contract.presentation_entrypoint is None
+            and passthrough_module.complete
+            and effective_presentation_shader is None
+        ):
+            output_names = {
+                item.name
+                for item in module.api.entry_points[0].parameters
+                if item.role == "output"
+            }
+            if {"red", "green", "blue"} <= output_names:
+                channel.log(
+                    "no presentation_entrypoint authored; using the default "
+                    "passthrough as this page's shader support",
+                    path="presentation",
+                )
+                effective_presentation_shader = passthrough_module.source
+                if passthrough_wgsl_module is not None and passthrough_wgsl_module.complete:
+                    effective_presentation_shader_wgsl = passthrough_wgsl_module.source
+                effective_shader_configuration["output_feed_bindings"] = {
+                    item["uniform"]: name
+                    for item, name in zip(
+                        passthrough_module.api.metadata["feed_bindings"],
+                        ("red", "green", "blue"),
+                    )
+                }
 
         card_directory = Path("wasm") / f"size-{DEFAULT_WASM_CARD_OPERATIONS}"
         channel.log("partitioning program into wasm regions", path="regions")
@@ -1736,6 +2101,16 @@ def build_program_bundle(
                     ),
                     program=program,
                 )
+            if backend_targets:
+                wanted = {str(item).lower() for item in backend_targets}
+                sources = BackendSourceSet(tuple(
+                    item for item in sources.sources
+                    if item.language.lower() in wanted
+                ))
+                channel.log(
+                    "restricted to requested backend targets", path="sources",
+                    targets=sorted(wanted), kept=len(sources.sources),
+                )
             channel.log(
                 "backend sources collected", path="sources",
                 languages=len(sources.sources) if sources is not None else 0,
@@ -1747,6 +2122,7 @@ def build_program_bundle(
             Path(source_filename).name,
             sources,
             presentation_shader=effective_presentation_shader,
+            presentation_shader_wgsl=effective_presentation_shader_wgsl,
         )
         if presentation_document is not None:
             document_relative = (
@@ -1830,6 +2206,66 @@ def build_program_bundle(
                         "reason": "no Fortran compiler was available at build time",
                     }
 
+        # Run the exact WebAssembly the bundle ships against the same NumPy
+        # rendering the Fortran path uses -- the numpy source published under
+        # this bundle's own backend tab.  Exported-memory numeric modules only;
+        # imported-memory region modules are driven by the control path.
+        wasm_verification = None
+        if module.binary is not None and not (
+            module.api.metadata or {}
+        ).get("shared_memory_import"):
+            from ..common.tensors.fused_ir import ordered_feed_ids
+            from .wasm_fidelity import node_runtime, verify_wasm_module
+
+            channel.log("checking for a node runtime", path="wasm")
+            if node_runtime() is not None:
+                feed_origins = dict(
+                    (getattr(program, "extras", None) or {}).get(
+                        "capture_feed_origins", {}
+                    )
+                )
+                feed_values = {}
+                for feed_index, feed_id in enumerate(ordered_feed_ids(program)):
+                    origin = feed_origins.get(
+                        feed_id, feed_origins.get(str(feed_id), {})
+                    )
+                    parameter_name = origin.get("binding_name")
+                    if parameter_name not in feeds:
+                        parameter_name = parameter_names[feed_index]
+                    feed_values[feed_id] = feeds[parameter_name]
+                channel.log(
+                    "running emitted wasm against the numpy reference", path="wasm"
+                )
+                proof = verify_wasm_module(
+                    module,
+                    program,
+                    feed_values,
+                    temporary / "native" / "wasm",
+                    entrypoint=contract.entrypoint,
+                )
+                channel.log(
+                    "wasm verification finished", path="wasm",
+                    case_count=proof["case_count"],
+                )
+                proof_relative = Path("verification") / "wasm-fidelity.json"
+                proof_path = temporary / proof_relative
+                proof_path.parent.mkdir(parents=True, exist_ok=True)
+                proof_path.write_text(
+                    json.dumps(proof, indent=2, allow_nan=True),
+                    encoding="utf-8",
+                )
+                wasm_verification = {
+                    "passed": True,
+                    "case_count": proof["case_count"],
+                    "binary_sha256": proof["binary_sha256"],
+                    "url": proof_relative.as_posix(),
+                }
+            else:
+                wasm_verification = {
+                    "passed": None,
+                    "reason": "no node runtime was available at build time",
+                }
+
         mathematics = None
         math_error = ""
         if include_mathematics:
@@ -1899,7 +2335,9 @@ def build_program_bundle(
             resource_route=route,
             shader_execution=shader_execution,
             audio_runtime=audio_runtime,
-            passthrough_shader=passthrough_descriptor,
+            passthrough_shader=_passthrough_candidates(
+                passthrough_wgsl_descriptor, passthrough_descriptor,
+            ),
         )
         channel.log("html shell rendered, writing page to disk", path="shell")
         page_path = shell.write(temporary)
@@ -1930,6 +2368,19 @@ def build_program_bundle(
                 "url": route + "index.html",
                 "mode": "shader-execution" if shader_execution else "inspection",
                 "shader": shader_execution,
+                # "shader support" is the mandatory pairing this page always
+                # has: a compiled WASM numeric program (tensor math,
+                # unrestricted) plus a thin GLSL presentation of its named
+                # outputs -- the passthrough by default, an authored
+                # presentation_entrypoint only when a page wants something
+                # other than plain display. "shader" is kept for existing
+                # readers; "shader_support" is the concept to check going
+                # forward, since it is never null once the numeric program
+                # names red/green/blue outputs.
+                "shader_support": {
+                    "numeric": {"entrypoint": contract.entrypoint},
+                    "presentation": shader_execution,
+                },
                 "audio": audio_runtime,
             },
             "source": {
@@ -1949,11 +2400,27 @@ def build_program_bundle(
                 "implementation_sha256": _bundle_compiler_digest(),
                 "mathematics_error": math_error,
                 "fortran_verification": fortran_verification,
+                "wasm_verification": wasm_verification,
+                # Per-subgraph *capability*, not an assignment: which
+                # registered machine_targets entries could serve each region
+                # as-is, keyed by region index. This is the raw material a
+                # distributed-dispatch planner needs (which client capability
+                # profiles could even accept a given region's binary) -- it
+                # is not that planner. Nothing here picks one target per
+                # region; that decision doesn't exist yet.
+                "region_target_capabilities": _region_target_capabilities(
+                    effective_region_programs
+                ),
             },
             "artifacts": _artifact_inventory(temporary),
         }
         manifest_path = temporary / "bundle.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _write_program_origin(
+            destination, contract, source, source_filename,
+            backend_targets=backend_targets, include_backends=include_backends,
+            include_mathematics=include_mathematics,
+        )
         if final_directory.exists():
             channel.log("identical version already published", path="bundle", version=version)
             existing = load_program_bundle(final_directory)
