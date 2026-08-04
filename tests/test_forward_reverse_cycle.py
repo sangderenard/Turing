@@ -90,6 +90,13 @@ def test_fused_cycle_emits_complete_fortran():
     assert "proposed_parameter" in str(artifact.program.outputs)
 
 
+def test_retained_nonlinear_output_blocks_false_matmul_replacement():
+    analysis = _capture().analyze_matmul_replacement()
+
+    assert not analysis.fully_replaceable
+    assert any(piece.operation == "mul" for piece in analysis.local_blockers)
+
+
 @pytest.mark.skipif(fortran_compiler() is None, reason="no Fortran compiler installed")
 def test_compiled_fortran_cycle_matches_python(tmp_path):
     capture = _capture()

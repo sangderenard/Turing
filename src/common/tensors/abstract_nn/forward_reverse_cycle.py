@@ -299,6 +299,18 @@ class ForwardReverseCycleCapture:
         }
         return ForwardReverseCycleResult(forward_outputs, proposed, incidentals)
 
+    def analyze_matmul_replacement(self, **options):
+        """Test whether this captured forward graph is one affine matmul."""
+
+        from ....compiler.affine_matmul_solver import analyze_affine_replacement
+
+        return analyze_affine_replacement(
+            self.forward_program,
+            self.feed_values,
+            variable_feed_ids=self.parameter_ids.values(),
+            **options,
+        )
+
     def emit_fortran(self, *, name: str = "forward_reverse_cycle") -> "FortranCycleArtifact":
         if not self.correction.fortran_fusible:
             raise ValueError(
