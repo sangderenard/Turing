@@ -3223,6 +3223,8 @@ const liaison = {
   role: SHADER.role,
   canvas,
   gl,
+  context: gl,
+  candidate: activeCandidate,
   input,
   io: SHADER.io || (window.TuringWasmRuntime && window.TuringWasmRuntime.io) || null,
   wasm: window.TuringWasmRuntime || null,
@@ -3303,7 +3305,32 @@ void main() {
 }`;
 
 let ready;
-if (activeCandidate.language === "webgl2-glsl-es") {
+if (SHADER.display_ownership === "program-interior") {
+  ready = (async () => {
+    const interior = SHADER.interior || null;
+    if (!interior || !interior.controller_source || !interior.controller_entry) {
+      throw new Error("interior display ownership requires a controller source and entrypoint");
+    }
+    if (SHADER.context === "webgl2" && !gl) {
+      throw new Error("the interior program promised WebGL2 presentation but no context is available");
+    }
+    // The shell stops here: it owns allocation of the canvas/context and the
+    // input liaison, but it does not compile a display shader, create a frame
+    // loop, or interpret visual outputs. The authored interior controller
+    // receives the complete context and assumes presentation ownership.
+    const install = new Function(
+      "liaison", "interior",
+      interior.controller_source
+        + "\nreturn " + interior.controller_entry + "(liaison, interior);"
+    );
+    const claimed = await install(liaison, interior);
+    if (!claimed || claimed.ownsDisplay !== true) {
+      throw new Error("interior display controller did not confirm presentation ownership");
+    }
+    canvas.dataset.displayOwner = interior.owner || "program-interior";
+    return claimed;
+  })();
+} else if (activeCandidate.language === "webgl2-glsl-es") {
 if (!gl) {
   fail(new Error("WebGL 2 is required by this execution page"));
 } else {
@@ -4499,10 +4526,17 @@ def emit_html_shell(
     body_class = ""
     if shader_execution is not None:
         shader = dict(shader_execution)
-        if not shader.get("url"):
+        interior_display = shader.get("display_ownership") == "program-interior"
+        if not shader.get("url") and not interior_display:
             raise ValueError("shader execution requires a published shader URL")
         if shader.get("role") != "shader-surface":
             raise ValueError("shader execution requires the shader-surface role")
+        if interior_display:
+            interior = shader.get("interior")
+            if not isinstance(interior, Mapping):
+                raise ValueError("interior display ownership requires an interior contract")
+            if not interior.get("controller_source") or not interior.get("controller_entry"):
+                raise ValueError("interior display ownership requires a controller source and entrypoint")
         # Keep the complete inspection document available for tooling and
         # diagnostics, but graduate its presentation to the WebGL surface.
         # CSS owns the visibility switch exactly so removing this class is a
