@@ -123,7 +123,7 @@ language = javascript
 encoding = utf-8
 inputs = gpu_active
 outputs = indicator_state
-entry = updateGPUIndicator
+entry = installTuringDisplay
 role = display-controller
 @end*/
 function updateGPUIndicator(active, block) {
