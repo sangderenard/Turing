@@ -8,6 +8,13 @@ pytest_run_times.log
 env
 /build/
 
+# Generated diagnostics and render captures are local artifacts. Reference
+# images intentionally kept under src/rendering/ascii_diff remain tracked.
+*.log
+/*.png
+/*.jpg
+/src/common/tensors/abstract_nn/*lossxor.png
+
 # Agent scratch artifacts: probe drivers, captured run logs, and rendered
 # media produced while debugging.  These are session output, not sources.
 .codex-*

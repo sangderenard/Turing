@@ -955,6 +955,21 @@ class PERuntimeFunction:
 
 
 @dataclass(frozen=True, slots=True)
+class PEImportSymbol:
+    """One PE import-address-table slot and its stable external identity."""
+
+    library: str
+    name: str | None
+    ordinal: int | None
+    iat_rva: int
+
+    @property
+    def display_name(self) -> str:
+        symbol = self.name if self.name is not None else f"ordinal:{self.ordinal}"
+        return f"{self.library}!{symbol}"
+
+
+@dataclass(frozen=True, slots=True)
 class PEImage:
     machine: PEMachine
     pe32_plus: bool
@@ -964,6 +979,7 @@ class PEImage:
     entrypoint_section_index: int
     sections: tuple[PESection, ...]
     runtime_functions: tuple[PERuntimeFunction, ...]
+    imports: tuple[PEImportSymbol, ...]
     encoded: bytes
 
     @property
@@ -1140,6 +1156,12 @@ def parse_pe_image(
         )
     exception_rva = 0
     exception_size = 0
+    import_rva = 0
+    import_size = 0
+    if visible_directories > 1:
+        import_entry = directory_table_offset + 1 * 8
+        import_rva = _u32(data, import_entry, "PE import-directory RVA")
+        import_size = _u32(data, import_entry + 4, "PE import-directory size")
     if visible_directories > 3:
         exception_entry = directory_table_offset + 3 * 8
         exception_rva = _u32(data, exception_entry, "PE exception-directory RVA")
@@ -1237,6 +1259,76 @@ def parse_pe_image(
                 )
             runtime_functions.append(PERuntimeFunction(begin_rva, end_rva, unwind_rva))
 
+    def file_offset_for_import_rva(rva: int, label: str) -> int:
+        matches = [section.file_offset_for_rva(rva) for section in sections]
+        offsets = [offset for offset in matches if offset is not None]
+        if len(offsets) != 1:
+            raise BinaryFormatError(f"{label} RVA {rva:#x} does not map uniquely to file bytes")
+        return offsets[0]
+
+    def import_ascii(rva: int, label: str) -> str:
+        offset = file_offset_for_import_rva(rva, label)
+        end = data.find(b"\x00", offset, min(len(data), offset + 4096))
+        if end < 0:
+            raise BinaryFormatError(f"unterminated {label} string at RVA {rva:#x}")
+        try:
+            return data[offset:end].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise BinaryFormatError(f"non-ASCII {label} string at RVA {rva:#x}") from error
+
+    imports: list[PEImportSymbol] = []
+    if import_rva or import_size:
+        if not import_rva or not import_size:
+            raise BinaryFormatError("PE import directory has only one nonzero field")
+        import_offset = file_offset_for_import_rva(import_rva, "import directory")
+        import_end = import_offset + import_size
+        _need(data, import_offset, import_size, "PE import directory")
+        descriptor_offset = import_offset
+        descriptor_count = 0
+        pointer_size = 8 if pe32_plus else 4
+        ordinal_mask = 1 << (pointer_size * 8 - 1)
+        while descriptor_offset + 20 <= import_end:
+            fields = tuple(_u32(data, descriptor_offset + index * 4, "PE import descriptor") for index in range(5))
+            if not any(fields):
+                break
+            original_thunk_rva, _, _, library_name_rva, first_thunk_rva = fields
+            if not library_name_rva or not first_thunk_rva:
+                raise BinaryFormatError("PE import descriptor lacks library name or first thunk")
+            library = import_ascii(library_name_rva, "import library")
+            lookup_rva = original_thunk_rva or first_thunk_rva
+            for symbol_index in range(65536):
+                thunk_rva = lookup_rva + symbol_index * pointer_size
+                thunk_offset = file_offset_for_import_rva(thunk_rva, "import lookup thunk")
+                thunk = (
+                    _u64(data, thunk_offset, "PE64 import lookup thunk")
+                    if pe32_plus else _u32(data, thunk_offset, "PE32 import lookup thunk")
+                )
+                if thunk == 0:
+                    break
+                if thunk & ordinal_mask:
+                    name = None
+                    ordinal = thunk & 0xFFFF
+                else:
+                    name_rva = thunk & (ordinal_mask - 1)
+                    name_offset = file_offset_for_import_rva(name_rva, "import hint/name")
+                    _need(data, name_offset, 2, "PE import hint")
+                    name = import_ascii(name_rva + 2, "import symbol")
+                    ordinal = None
+                imports.append(PEImportSymbol(
+                    library=library,
+                    name=name,
+                    ordinal=ordinal,
+                    iat_rva=first_thunk_rva + symbol_index * pointer_size,
+                ))
+            else:
+                raise BinaryFormatError("PE import thunk table exceeds 65536 symbols")
+            descriptor_count += 1
+            if descriptor_count > 4096:
+                raise BinaryFormatError("PE import directory exceeds 4096 descriptors")
+            descriptor_offset += 20
+        else:
+            raise BinaryFormatError("PE import directory has no terminating descriptor")
+
     image = PEImage(
         machine=machine,
         pe32_plus=pe32_plus,
@@ -1246,6 +1338,7 @@ def parse_pe_image(
         entrypoint_section_index=entry_index,
         sections=tuple(sections),
         runtime_functions=tuple(runtime_functions),
+        imports=tuple(imports),
         encoded=data,
     )
     executable = tuple(section for section in sections if section.executable)
@@ -1363,6 +1456,7 @@ __all__ = [
     "ImmediateOperand",
     "MachineSemanticToken",
     "PEMachine",
+    "PEImportSymbol",
     "PERuntimeFunction",
     "PESection",
     "PESectionFlag",

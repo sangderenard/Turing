@@ -28,10 +28,11 @@ def build_machine_register_shader(*, workgroup_size: int = 64) -> MachineRegiste
     if not 1 <= workgroup_size <= 256:
         raise ValueError("WebGPU workgroup size must be in [1, 256]")
     register_count = len(MACHINE_DISPLAY_REGISTERS)
-    source = f"""// turing.machine-register-display.v1
-struct DisplayUniforms {{ core_count: u32, history_position: u32, register_stride_cells: u32, cache_block_count: u32 }};
+    source = f"""// turing.machine-register-display.v2
+// Binding 0 is the complete TMSNAP01 observation buffer, not a register-only copy.
+struct DisplayUniforms {{ history_position: u32, cache_block_count: u32, _pad0: u32, _pad1: u32 }};
 struct CacheBlock {{ byte_offset: u32, byte_capacity: u32, occupied_bytes: u32, address_low: u32 }};
-@group(0) @binding(0) var<storage, read> register_words: array<vec2<u32>>;
+@group(0) @binding(0) var<storage, read> state_snapshot: array<u32>;
 @group(0) @binding(1) var<storage, read_write> cells: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> display: DisplayUniforms;
 @group(0) @binding(3) var<storage, read> cache_blocks: array<CacheBlock>;
@@ -40,16 +41,20 @@ struct CacheBlock {{ byte_offset: u32, byte_capacity: u32, occupied_bytes: u32, 
 @compute @workgroup_size({workgroup_size})
 fn update_machine_registers(@builtin(global_invocation_id) gid: vec3<u32>) {{
   let index = gid.x;
-  let count = display.core_count * {register_count}u;
+  let core_count = state_snapshot[10u];
+  let snapshot_register_count = state_snapshot[11u];
+  let register_stride_words = state_snapshot[12u] / 4u;
+  let register_base_words = state_snapshot[13u] / 4u;
+  let count = core_count * snapshot_register_count;
   if (index >= count) {{ return; }}
-  let core_index = index / {register_count}u;
-  let register_index = index % {register_count}u;
-  let physical_index = core_index * display.register_stride_cells + register_index;
-  let words = register_words[physical_index];
+  let core_index = index / snapshot_register_count;
+  let register_index = index % snapshot_register_count;
+  let physical_index = register_base_words + core_index * register_stride_words + register_index * 2u;
+  let words = vec2<u32>(state_snapshot[physical_index], state_snapshot[physical_index + 1u]);
   let nonzero = select(0.0, 1.0, (words.x | words.y) != 0u);
   let high_energy = log2(1.0 + f32(words.y)) / 32.0;
   let low_energy = log2(1.0 + f32(words.x)) / 32.0;
-  let scan = f32((register_index + display.history_position) % {register_count}u) / f32({register_count});
+  let scan = f32((register_index + state_snapshot[4u]) % {register_count}u) / f32({register_count});
   cells[index] = vec4<f32>(0.12 + low_energy, 0.15 + high_energy, 0.25 + 0.65 * scan, 0.35 + 0.65 * nonzero);
 }}
 

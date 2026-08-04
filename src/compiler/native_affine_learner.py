@@ -775,6 +775,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--compile-only", action="store_true")
     arguments = parser.parse_args(argv)
     if not arguments.console:
+        # A source exposing the process-graph contract belongs to the shared
+        # compiler pipeline, not the legacy hand-emitted affine demonstration.
+        # Keep the historical CLI useful while making the implementation an
+        # ordinary forward/reverse IR -> SSA -> Fortran/C-shell compilation.
+        from .native_sorting_process_learner import (
+            compile_sorting_process_window,
+            load_sorting_process_problem,
+        )
+        try:
+            load_sorting_process_problem(arguments.python_file)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        else:
+            process_artifact = compile_sorting_process_window(
+                arguments.python_file,
+                arguments.output,
+                batch_size=arguments.train_samples,
+            )
+            print(process_artifact.executable_path)
+            if not arguments.compile_only:
+                process_artifact.run(frames=arguments.frames)
+            return 0
         artifact = compile_learning_window(
             arguments.python_file,
             arguments.output,

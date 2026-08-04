@@ -457,6 +457,7 @@ def run_precompiled_graph(
     size: tuple[int, int] = (1100, 760),
     fps: int = 60,
     release_hz: float = 6.0,
+    shader_sources: tuple[str, str] | None = None,
 ) -> None:
     """Open the reusable OpenGL graph surface for any supported IR package."""
 
@@ -498,6 +499,7 @@ def run_precompiled_graph(
                         node_cmap="coolwarm",
                         edge_cmap="coolwarm",
                         base_point_size=10.0,
+                        shader_sources=shader_sources,
                     )
                     visualizer.launch(*size)
                 else:

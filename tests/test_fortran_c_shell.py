@@ -13,6 +13,9 @@ from src.compiler.compiled_program_api import (
 from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
 from src.compiler.fortran_c_shell import emit_fortran_c_shell_source
 from src.compiler.ssa_fortran_backend import FortranModule, fortran_compiler
+from src.compiler.shell_io import (
+    ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
+)
 
 
 @pytest.mark.skipif(
@@ -75,6 +78,9 @@ end module affine_fortran
     assert payload["frames"] == 2
     assert payload["outputs"]["y"] == {"first": 7.0, "sum": 168.0}
     assert payload["shell_ns_total"] > 0
+    c_source = artifact.c_source_path.read_text(encoding="utf-8")
+    assert "slots[0] = slots[1]" in c_source
+    assert "memcpy(slots[0], slots[1]" not in c_source
 
 
 @pytest.mark.skipif(
@@ -199,3 +205,93 @@ def test_generated_c_shell_uses_win32_rgb_blit_from_shared_io_contract():
     assert "SDL" not in source
     assert "pygame" not in source
     assert "turing_display_present(" in source
+    assert "#include <stdbool.h>" in source
+
+
+def test_generated_c_shell_reads_declared_file_port_into_bound_abi_parameters():
+    parameters = (
+        Parameter(
+            "subject_bytes", "input", "u8", "uint8_t", "c_uint8",
+            "reference", (16,), None, "binary_bytes",
+        ),
+        Parameter(
+            "subject_length", "input", "i64", "int64_t", "c_int64",
+            "value", source_name="binary_length",
+        ),
+    )
+    api = attach_shell_io(CompiledProgramAPI(
+        "machine", "fortran", "load_subject",
+        (EntryPoint("load_subject", "load_subject", "control", parameters),),
+    ), ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject-binary", "file", "input", entry_point="load_subject",
+            fields={"data": "binary_bytes", "length": "binary_length"},
+            attributes={"maximum_bytes": 16},
+        ),),
+    ))
+    module = FortranModule("machine", "", api=api)
+
+    source = emit_fortran_c_shell_source(module)
+
+    assert 'turing_argument_value(argc, argv, "--file-subject-binary")' in source
+    assert "turing_read_file(" in source
+    assert "(uint8_t *)slots[0], 16" in source
+    assert "*((int64_t *)slots[1]) = (int64_t)loaded_bytes" in source
+    assert "short initial state at binary_bytes" not in source
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_native_c_file_handler_runs_fortran_with_exact_bytes_and_length(tmp_path):
+    source = """
+module file_subject_fortran
+  use, intrinsic :: iso_c_binding
+  implicit none
+contains
+  subroutine inspect_subject(subject_bytes, subject_length, result) &
+      bind(C, name="inspect_subject")
+    integer(c_int8_t), intent(in) :: subject_bytes(16)
+    integer(c_int64_t), value :: subject_length
+    integer(c_int64_t), intent(out) :: result
+    result = int(subject_bytes(1), c_int64_t) + subject_length
+  end subroutine inspect_subject
+end module file_subject_fortran
+"""
+    parameters = (
+        Parameter(
+            "subject_bytes", "input", "u8", "uint8_t", "c_uint8",
+            "reference", (16,), None, "binary_bytes",
+        ),
+        Parameter(
+            "subject_length", "input", "i64", "int64_t", "c_int64",
+            "value", source_name="binary_length",
+        ),
+        Parameter(
+            "result", "output", "i64", "int64_t", "c_int64",
+            "reference", source_name="result",
+        ),
+    )
+    api = attach_shell_io(CompiledProgramAPI(
+        "file_subject_fortran", "fortran", "inspect_subject",
+        (EntryPoint("inspect_subject", "inspect_subject", "control", parameters),),
+    ), ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject-binary", "file", "input", entry_point="inspect_subject",
+            fields={"data": "binary_bytes", "length": "binary_length"},
+            attributes={"maximum_bytes": 16},
+        ),),
+    ))
+    module = FortranModule("file_subject_fortran", source, api=api)
+    subject = tmp_path / "subject.exe"
+    subject.write_bytes(b"MZ\x00\xff")
+
+    artifact = compile_fortran_module_c_shell(
+        module, {}, tmp_path / "build", name="file_subject_native",
+    )
+    payload = json.loads(artifact.run(files={"subject-binary": subject}).stdout)
+
+    assert payload["outputs"]["result"] == {"first": 81.0, "sum": 81.0}

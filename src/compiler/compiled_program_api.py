@@ -32,6 +32,8 @@ SCHEMA = "turing-compiled-program-api-v1"
 # Python caller needs. Both are recorded because a caller in another language
 # needs the first and cannot use the second.
 _C_TYPES: dict[str, tuple[str, str]] = {
+    "uint8": ("uint8_t", "c_uint8"),
+    "u8": ("uint8_t", "c_uint8"),
     "float": ("float", "c_float"),
     "float32": ("float", "c_float"),
     "f32": ("float", "c_float"),

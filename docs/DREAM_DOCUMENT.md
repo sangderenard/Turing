@@ -107,3 +107,14 @@ Emit that launchable shell with:
 python -m src.compiler.dream_document examples/reversible_chip_simulator.dream \
   --emit-shell build/reversible_chip_live.html
 ```
+
+The simulator document's Python arena contains the binary-machine program and
+shell-tick controls. Its subject bytes remain runtime machine input rather than
+cards. The HTML liaison exposes `machineSnapshots`, a newest-generation bus for
+complete `TMSNAP01` buffers, plus an optional compiled `machineProgram` host.
+The interior display subscribes to that bus, uploads the real register banks
+and an RGBA8 subject framebuffer when present, and does not manufacture colored
+placeholder textures. The compiled descriptor declares `subject-binary` as a
+file system port whose byte and length fields bind `load_subject`. HTML renders
+that port as a file picker and exposes it through `TuringSystemPorts`; the
+compiled program registers its handler without requiring a Python interpreter.

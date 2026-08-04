@@ -1215,7 +1215,8 @@ class LiveVizGLPoints:
                  edge_cmap: str = "coolwarm",
                  base_point_size: float = 6.0,
                  boundary_scale: float = 1.3,
-                 bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06)):
+                 bg_color: Tuple[float, float, float] = (0.04, 0.04, 0.06),
+                 shader_sources: Tuple[str, str] | None = None):
         enable_liveviz_gl()
         self.sys = sys
         self.node_cmap = matplotlib.colormaps.get_cmap(node_cmap)
@@ -1237,6 +1238,7 @@ class LiveVizGLPoints:
         }
         self.boundary_scale = float(boundary_scale)
         self.bg_color = bg_color
+        self.shader_sources = shader_sources
 
         # runtime / GL state
         self._win = None
@@ -1363,6 +1365,8 @@ class LiveVizGLPoints:
         }
         """
 
+        if self.shader_sources is not None:
+            vsrc, fsrc = self.shader_sources
         self._program = compileProgram(
             compileShader(vsrc, GL_VERTEX_SHADER),
             compileShader(fsrc, GL_FRAGMENT_SHADER)

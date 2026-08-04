@@ -94,6 +94,6 @@ def test_machine_register_shader_accepts_lossless_64_bit_word_pairs():
 
     assert artifact.register_names == MACHINE_DISPLAY_REGISTERS
     assert len(artifact.register_names) == 20
-    assert "array<vec2<u32>>" in artifact.source
+    assert "state_snapshot: array<u32>" in artifact.source
+    assert "register_base_words = state_snapshot[13u] / 4u" in artifact.source
     assert "@compute @workgroup_size(128)" in artifact.source
-

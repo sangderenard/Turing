@@ -35,6 +35,30 @@ class MachineExecutionStatus(IntEnum):
     BLOCKED_CONTROL = 3
     TRAPPED = 4
     STEP_LIMIT = 5
+    WAITING_EXTERNAL = 6
+
+
+@dataclass(frozen=True, slots=True)
+class MachineExternalReference:
+    """A symbolic guest-binary target installed into an import slot."""
+
+    reference_id: int
+    target_address: int
+    domain: str
+    library: str
+    symbol: str
+
+
+@dataclass(frozen=True, slots=True)
+class MachineExternalCallRequest:
+    """A deterministic system-port request retained in reversible state."""
+
+    request_id: int
+    reference: MachineExternalReference
+    instruction_address: int
+    return_address: int
+    arguments: tuple[int, int, int, int]
+    stack_pointer: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +70,7 @@ class MachineExecutionState:
         default_factory=lambda: MappingProxyType({}),
     )
     call_stack: tuple[int, ...] = ()
+    external_requests: tuple[MachineExternalCallRequest, ...] = ()
     steps: int = 0
 
     REGISTER_NAMES: ClassVar[tuple[str, ...]] = (
@@ -94,6 +119,7 @@ class MachineExecutionResult:
 MachineEffectHandler = Callable[[MachineExecutionState, Any], MachineExecutionState]
 MachinePredicateHandler = Callable[[MachineExecutionState, Any], bool]
 MachineIndirectTargetHandler = Callable[[MachineExecutionState, Any], int]
+MachineExternalTargetResolver = Callable[[int], MachineExternalReference | None]
 
 
 class MachineExecutionOrchestrator:
@@ -106,11 +132,13 @@ class MachineExecutionOrchestrator:
         effect_handlers: Mapping[int, MachineEffectHandler] | None = None,
         predicate_handler: MachinePredicateHandler | None = None,
         indirect_target_handler: MachineIndirectTargetHandler | None = None,
+        external_target_resolver: MachineExternalTargetResolver | None = None,
     ) -> None:
         self.program = program
         self.effect_handlers = MappingProxyType(dict(effect_handlers or {}))
         self.predicate_handler = predicate_handler
         self.indirect_target_handler = indirect_target_handler
+        self.external_target_resolver = external_target_resolver
         instructions: dict[int, Any] = {}
         for record in program.functions:
             for instruction in record.report.instructions:
@@ -152,10 +180,12 @@ class MachineExecutionOrchestrator:
                     MachineExecutionStatus.HALTED, advanced,
                     "returned from the outermost emulated frame", instruction=instruction,
                 )
+            handler = self.effect_handlers.get(int(semantic))
+            handled = handler(advanced, instruction) if handler is not None else advanced
             return MachineExecutionResult(
                 MachineExecutionStatus.RUNNING,
                 replace(
-                    advanced,
+                    handled,
                     pc=state.call_stack[-1],
                     call_stack=state.call_stack[:-1],
                 ),
@@ -195,10 +225,12 @@ class MachineExecutionOrchestrator:
                     "direct call target needs an emulated or host-bound implementation",
                     int(semantic), instruction,
                 )
+            handler = self.effect_handlers.get(int(semantic))
+            handled = handler(advanced, instruction) if handler is not None else advanced
             return MachineExecutionResult(
                 MachineExecutionStatus.RUNNING,
                 replace(
-                    advanced,
+                    handled,
                     pc=target,
                     call_stack=(*state.call_stack, next_pc),
                 ),
@@ -220,9 +252,45 @@ class MachineExecutionOrchestrator:
                 if semantic is MachineSemanticToken.INDIRECT_CALL
                 else state.call_stack
             )
+            handler = self.effect_handlers.get(int(semantic))
+            handled = handler(advanced, instruction) if handler is not None else advanced
+            reference = (
+                self.external_target_resolver(int(target))
+                if self.external_target_resolver is not None else None
+            )
+            if reference is not None:
+                return_address = (
+                    next_pc
+                    if semantic is MachineSemanticToken.INDIRECT_CALL
+                    else (state.call_stack[-1] if state.call_stack else next_pc)
+                )
+                request = MachineExternalCallRequest(
+                    request_id=handled.steps,
+                    reference=reference,
+                    instruction_address=instruction.address,
+                    return_address=return_address,
+                    arguments=(
+                        state.registers[1], state.registers[2],
+                        state.registers[8], state.registers[9],
+                    ),
+                    stack_pointer=handled.registers[4],
+                )
+                waiting = replace(
+                    handled,
+                    pc=int(target),
+                    call_stack=stack,
+                    external_requests=(*handled.external_requests, request),
+                )
+                return MachineExecutionResult(
+                    MachineExecutionStatus.WAITING_EXTERNAL,
+                    waiting,
+                    f"waiting for guest external reference {reference.library}!{reference.symbol}",
+                    int(semantic),
+                    instruction,
+                )
             return MachineExecutionResult(
                 MachineExecutionStatus.RUNNING,
-                replace(advanced, pc=int(target), call_stack=stack),
+                replace(handled, pc=int(target), call_stack=stack),
                 instruction=instruction,
             )
         if semantic in {
@@ -315,6 +383,10 @@ class ReversibleMachineExecutor:
         return self._position
 
     @property
+    def history_length(self) -> int:
+        return len(self._states)
+
+    @property
     def edges(self) -> tuple[MachineExecutionEdge, ...]:
         return tuple(self._edges)
 
@@ -335,6 +407,19 @@ class ReversibleMachineExecutor:
             raise IndexError("machine executor is already at its initial state")
         self._position -= 1
         return self.state
+
+    def commit_external_completion(self, state: MachineExecutionState) -> MachineExecutionState:
+        """Journal a shell-supplied completion as a reversible graph edge."""
+
+        source = self.state
+        del self._states[self._position + 1:]
+        del self._edges[self._position:]
+        self._states.append(state)
+        self._edges.append(MachineExecutionEdge(
+            source, state, MachineExecutionStatus.RUNNING, None,
+        ))
+        self._position += 1
+        return state
 
     def seek_history(self, position: int) -> MachineExecutionState:
         if not 0 <= position < len(self._states):
@@ -426,6 +511,9 @@ def orchestrate_machine_program(
 __all__ = [
     "MachineEffectHandler",
     "MachineExecutionOrchestrator",
+    "MachineExternalCallRequest",
+    "MachineExternalReference",
+    "MachineExternalTargetResolver",
     "MachineExecutionEdge",
     "MachineExecutionResult",
     "MachineExecutionState",

@@ -539,6 +539,10 @@ def python_exec_handler(namespace: dict[str, Any] | None = None):
 def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program"):
     """Build the standard shell with presentation owned by the document."""
 
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+    from .shell_io import (
+        ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
+    )
     from .wasm_html_shell import emit_html_shell
 
     handoff = document.display_handoff()
@@ -546,15 +550,24 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
         raise DreamDocumentError(
             "HTML shell emission requires a fragment block promising interior display ownership"
         )
-    api = {
-        "module": name,
-        "language": "dream-document",
-        "entry": "dream_main",
-        "entry_points": [{
-            "name": "dream_main", "symbol": "dream_main",
-            "kind": "control", "parameters": [],
-        }],
-        "metadata": {
+    api = CompiledProgramAPI(
+        module=name,
+        language="dream-document",
+        entry="dream_main",
+        entry_points=(
+            EntryPoint("dream_main", "dream_main", "control"),
+            EntryPoint("load_subject", "load_subject", "control", (
+                Parameter(
+                    "subject_bytes", "input", "u8", "uint8_t", "c_uint8",
+                    "reference", source_name="binary_bytes",
+                ),
+                Parameter(
+                    "subject_length", "input", "i64", "int64_t", "c_int64",
+                    "value", source_name="binary_length",
+                ),
+            )),
+        ),
+        metadata={
             "document_schema": document.schema,
             "display_ownership": "program-interior",
             "deployment_regions": [
@@ -568,7 +581,19 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
                 for region in document.lower_to_ssa().deployment_regions
             ],
         },
-    }
+    )
+    api = attach_shell_io(api, ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject-binary", "file", "input",
+            entry_point="load_subject",
+            fields={"data": "binary_bytes", "length": "binary_length"},
+            attributes={
+                "accept": ".exe,.dll,application/vnd.microsoft.portable-executable,application/octet-stream",
+                "purpose": "machine-subject",
+            },
+        ),),
+    ))
     source = "\n\n".join(
         f"/* dream block: {block.identity} ({block.language}:{block.stage or 'host'}) */\n{block.payload}"
         for block in document.blocks

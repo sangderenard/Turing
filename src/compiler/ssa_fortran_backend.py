@@ -233,7 +233,10 @@ def supported_tensor_operations() -> frozenset[str]:
         | frozenset(_UNARY)
         | frozenset(_REDUCTION)
         | _SHAPE_ONLY
-        | frozenset({"tensor_from_list", "where"})
+        | frozenset({
+            "tensor_from_list", "where", "fill", "zeros", "zeros_like",
+            "empty", "empty_like", "ones", "ones_like", "full", "full_like",
+        })
     )
     return frozenset(registered & CANONICAL_ABSTRACT_TENSOR_OPERATORS)
 
@@ -449,7 +452,8 @@ class _FunctionEmitter:
         # Values emitted as part of a multi-instruction group (a region call,
         # an indexed store) rather than one at a time.
         self._consumed: set[int] = set()
-        self._address_producers: dict[int, tuple[SSAValue, SSAValue]] = {}
+        self._address_producers: dict[int, tuple[SSAValue, tuple[SSAValue, ...]]] = {}
+        self._mutated_arrays: set[int] = set()
         self._producers: dict[int, Instr] = {}
         # Collection value id -> the induction that indexes it.
         self._collections: dict[int, SSAValue] = {}
@@ -622,9 +626,18 @@ class _FunctionEmitter:
                 return args[0]
             return _broadcast(args[0], source_shape, target_shape)
 
-        if operation in ("zeros", "full"):
-            # A scalar broadcasts across a whole array on assignment.
-            fill = attributes.get("fill_value", 0)
+        if operation in {
+            "Fill", "fill", "zeros", "zeros_like", "empty", "empty_like",
+            "ones", "ones_like", "full", "full_like",
+        }:
+            # Handler.Fill is the compiler's backend-neutral span operation.
+            # The result storage is already declared (or supplied by the
+            # caller when it is public), so initialization is one scalar
+            # whole-array assignment, never an element constructor.
+            default = 1 if operation in {"ones", "ones_like"} else 0
+            fill = attributes.get("fill_value", attributes.get("value", default))
+            if fill is None:
+                return None
             if instr.res.dtype in ("float64", "float32", "double"):
                 fill = float(fill)
             return _literal(fill)
@@ -895,6 +908,52 @@ class _FunctionEmitter:
             )
         return converted
 
+    def _coerce_to_result(
+        self,
+        instr: Instr,
+        value: SSAValue,
+        expression: str,
+    ) -> str:
+        """Convert one expression to the instruction result's scalar kind.
+
+        Fortran's ``merge`` requires its true and false sources to have the
+        same type and kind.  The tensor IR follows numpy promotion rules, so
+        a ``where`` may quite correctly select between an integer and a real,
+        or between a logical and a number.  Apply that promotion to each
+        branch before spelling the intrinsic.
+        """
+
+        result_dtype = str(getattr(instr.res, "dtype", None) or self.dtype)
+        target_logical = result_dtype in ("bool", "logical")
+        source_logical = self._is_logical(value)
+        if target_logical:
+            if source_logical:
+                return expression
+            source_dtype = str(getattr(value, "dtype", None) or self.dtype)
+            zero = (
+                "0_c_int64_t" if source_dtype.endswith("int64")
+                else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
+                else "0.0_c_double"
+            )
+            return f"({expression} /= {zero})"
+        if source_logical:
+            numeric = _UNARY["bool_to_float64"].format(expression)
+            return (
+                numeric
+                if result_dtype not in _INTEGER_DTYPES
+                else f"int({numeric}, c_int64_t)"
+            )
+        source_dtype = str(getattr(value, "dtype", None) or self.dtype)
+        source_real = source_dtype not in _INTEGER_DTYPES
+        target_real = result_dtype not in _INTEGER_DTYPES
+        if source_real == target_real:
+            return expression
+        return (
+            f"real({expression}, c_double)"
+            if target_real
+            else f"int({expression}, c_int64_t)"
+        )
+
     def _conform(self, instr: Instr, args: list[str]) -> list[str] | None:
         """Make an elementwise op's operands conform to its result shape.
 
@@ -1032,17 +1091,20 @@ class _FunctionEmitter:
         the pair collapses into one assignment.
         """
 
-        if instr.op != "Store" or len(instr.args) != 2:
+        if instr.op not in ("Store", "store") or len(instr.args) != 2:
             return None
         source, address = instr.args
         producer = self._address_producers.get(address.id)
         if producer is None:
             return None
-        collection, position = producer
+        collection, positions = producer
         self._consumed.add(address.id)
         # SSA induction values are 0-based; Fortran subscripts start at 1.
+        subscripts = ", ".join(
+            f"{self._operand(position)} + 1" for position in positions
+        )
         return [
-            f"    {self._operand(collection)}({self._operand(position)} + 1)"
+            f"    {self._operand(collection)}({subscripts})"
             f" = {self._operand(source)}"
         ]
 
@@ -1051,21 +1113,32 @@ class _FunctionEmitter:
 
         for block in self.function.blocks.values():
             for instr in block.instrs:
-                if instr.op != "GetElementPtr" or instr.res is None:
+                if instr.op not in ("GetElementPtr", "getelementptr") or instr.res is None:
                     continue
-                if instr.attributes.get("binding") != "collection_publication":
+                # Aggregate result extraction is handled by _region_call and
+                # carries its index as metadata. Ordinary tensor addressing
+                # carries the collection followed by one index per rank.
+                if len(instr.args) < 2:
                     continue
-                if len(instr.args) != 2:
-                    continue
-                self._address_producers[instr.res.id] = (
-                    instr.args[0],
-                    instr.args[1],
-                )
-                # A collection is written once per iteration, so it holds one
-                # element per trip: it is a member of the enclosing object,
-                # not a local, and nothing else in the program declares its
-                # extent.
-                self._collections[instr.args[0].id] = instr.args[1]
+                collection = instr.args[0]
+                positions = tuple(instr.args[1:])
+                self._address_producers[instr.res.id] = (collection, positions)
+                if instr.attributes.get("binding") == "collection_publication":
+                    # A collection is written once per iteration, so it holds
+                    # one element per trip and its extent comes from the loop.
+                    self._collections[collection.id] = positions[0]
+
+        stored_addresses = {
+            instr.args[1].id
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op in ("Store", "store") and len(instr.args) == 2
+        }
+        self._mutated_arrays = {
+            collection.id
+            for address_id, (collection, _positions) in self._address_producers.items()
+            if address_id in stored_addresses
+        }
 
     def _collection_extent(self, induction: SSAValue) -> str | None:
         """The trip count governing a collection, as a Fortran expression.
@@ -1220,6 +1293,15 @@ class _FunctionEmitter:
                 return _literal(instr.attributes["value"])
             return _literal(constant)
 
+        if op in ("Load", "load") and len(instr.args) == 1:
+            producer = self._address_producers.get(instr.args[0].id)
+            if producer is not None:
+                collection, positions = producer
+                subscripts = ", ".join(
+                    f"{self._operand(position)} + 1" for position in positions
+                )
+                return f"{self._operand(collection)}({subscripts})"
+
         structural = self._structural(instr, args, op)
         if structural is not None:
             return structural
@@ -1266,7 +1348,21 @@ class _FunctionEmitter:
                 args = self._numeric(instr, args)
             return _UNARY[op].format(*args)
         if op in ("Select", "where") and len(args) == 3:
-            return f"merge({args[1]}, {args[2]}, {args[0]})"
+            conformed = self._conform(instr, args)
+            if conformed is None:
+                return None
+            args = conformed
+            mask = args[0]
+            if not self._is_logical(instr.args[0]):
+                mask_dtype = str(getattr(instr.args[0], "dtype", "")).casefold()
+                zero = "0_c_int64_t" if mask_dtype.endswith("int64") else (
+                    "0_c_int32_t" if mask_dtype.endswith(("int32", "int"))
+                    else "0.0_c_double"
+                )
+                mask = f"({mask} /= {zero})"
+            true_value = self._coerce_to_result(instr, instr.args[1], args[1])
+            false_value = self._coerce_to_result(instr, instr.args[2], args[2])
+            return f"merge({true_value}, {false_value}, {mask})"
         return None
 
     # -- statement emission ------------------------------------------------
@@ -1508,6 +1604,11 @@ class _FunctionEmitter:
                         f"    {kind}, intent(inout) :: {_name(argument)}({extent})"
                     )
                     continue
+            if argument.id in self._mutated_arrays and _is_array(argument):
+                declarations.append(
+                    f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                )
+                continue
             if _is_array(argument):
                 declarations.append(
                     f"    {kind}, intent(in) :: {_name(argument)}({dims(argument)})"

@@ -534,7 +534,16 @@ const STATIC_GALLERY = __STATIC_GALLERY__;
 const DEFAULT_SERVER_ADDRESS = __DEFAULT_SERVER_ADDRESS__;
 const entry = API.entry_points.find(e => e.name === API.entry) || API.entry_points[0];
 const params = entry.parameters;
-const inputs = params.filter(p => p.role === "input");
+const SHELL_IO = (API.metadata || {}).shell_io || null;
+const SYSTEM_PORTS = SHELL_IO && SHELL_IO.requirements
+  ? (SHELL_IO.requirements.system_ports || []) : [];
+const SYSTEM_FIELDS = new Map();
+for (const port of SYSTEM_PORTS) {
+  for (const field of port.fields || []) {
+    SYSTEM_FIELDS.set(field.parameter, {port, field: field.name});
+  }
+}
+const inputs = params.filter(p => p.role === "input" && !SYSTEM_FIELDS.has(p.name));
 const outputs = params.filter(p => p.role === "output");
 const bytes = API.metadata.element_bytes || 8;
 const isF32 = (API.metadata.value_type || "f64") === "f32";
@@ -544,6 +553,70 @@ const isF32 = (API.metadata.value_type || "f64") === "f32";
 const STATE_FEEDBACK = (API.metadata || {}).state_feedback || {};
 const STATE_FEEDBACK_PAIRS = Object.entries(STATE_FEEDBACK);
 const HAS_STATE_FEEDBACK = STATE_FEEDBACK_PAIRS.length > 0;
+
+// Named system ports carry non-numerical shell resources outside the ordinary
+// elementwise feed UI. Files are byte-exact. Web external references are
+// intentionally limited to other registered Turing bundles.
+const systemPorts = {
+  descriptors: new Map(SYSTEM_PORTS.map(port => [port.name, port])),
+  files: new Map(),
+  bundles: new Map(),
+  fileHandlers: new Map(),
+  listeners: new Map(),
+  descriptor(name) {
+    const descriptor = this.descriptors.get(name);
+    if (!descriptor) throw new Error("unknown system port " + name);
+    return descriptor;
+  },
+  subscribe(name, listener) {
+    this.descriptor(name);
+    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
+    this.listeners.get(name).add(listener);
+    return () => this.listeners.get(name).delete(listener);
+  },
+  registerFileHandler(name, handler) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "file") throw new Error(name + " is not a file port");
+    this.fileHandlers.set(name, handler);
+  },
+  async publishFile(name, file) {
+    const descriptor = this.descriptor(name);
+    if (descriptor.kind !== "file") throw new Error(name + " is not a file port");
+    const bytes = file instanceof Uint8Array
+      ? file : new Uint8Array(await file.arrayBuffer());
+    const value = Object.freeze({
+      name: file.name || name,
+      type: file.type || "application/octet-stream",
+      lastModified: Number(file.lastModified || 0),
+      bytes,
+    });
+    this.files.set(name, value);
+    const handler = this.fileHandlers.get(name);
+    if (handler) await handler(value);
+    for (const listener of this.listeners.get(name) || []) listener(value);
+    return value;
+  },
+  registerBundle(identity, descriptor) {
+    if (!identity || !descriptor) throw new Error("bundle registration needs identity and descriptor");
+    this.bundles.set(String(identity), descriptor);
+  },
+  resolveBundle(name) {
+    const port = this.descriptor(name);
+    if (port.kind !== "external_reference" || port.external_domain !== "bundle") {
+      throw new Error(name + " is not a web bundle-reference port");
+    }
+    const identity = String((port.attributes || {}).bundle || "");
+    const resolved = this.bundles.get(identity);
+    if (!resolved && !port.optional) throw new Error("required bundle is not registered: " + identity);
+    return resolved || null;
+  },
+};
+for (const port of SYSTEM_PORTS) {
+  if (port.kind === "external_reference" && port.external_domain !== "bundle") {
+    throw new Error("HTML shells accept external references only to Turing bundles");
+  }
+}
+window.TuringSystemPorts = systemPorts;
 
 function refreshNonStateFeeds(activeFeeds, count, d, frameIndex) {
   return inputs.map((p, index) =>
@@ -2950,7 +3023,35 @@ function wireFilePicker() {
   });
 }
 
+function wireSystemPorts() {
+  document.querySelectorAll("input[data-system-file-port]").forEach(input => {
+    input.addEventListener("change", async event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      const port = event.target.dataset.systemFilePort;
+      try {
+        const value = await systemPorts.publishFile(port, file);
+        const status = document.querySelector('[data-system-port-status="' + CSS.escape(port) + '"]');
+        if (status) status.textContent = value.name + " · " + value.bytes.byteLength + " bytes";
+        setStatus("loaded " + value.name + " for " + port, "good");
+      } catch (error) {
+        setStatus(String(error), "bad");
+      }
+    });
+  });
+  const runtime = window.TuringMachineProgram || window.TuringMachineRuntime || null;
+  if (runtime && typeof runtime.bindSystemPorts === "function") {
+    runtime.bindSystemPorts(systemPorts);
+  } else if (runtime && typeof runtime.loadBinary === "function") {
+    const filePorts = SYSTEM_PORTS.filter(port => port.kind === "file" && port.direction === "input");
+    if (filePorts.length === 1) {
+      systemPorts.registerFileHandler(filePorts[0].name, value => runtime.loadBinary(value.bytes));
+    }
+  }
+}
+
 wireFilePicker();
+wireSystemPorts();
 wireTabs();
 wireCallableTabs();
 wirePythonCallables();
@@ -3219,6 +3320,35 @@ const domLayout = {
     return this.loadHTML(await file.text(), {baseURL: document.baseURI});
   },
 };
+// The compiled machine runtime publishes complete TMSNAP01 generations here.
+// Presentation observes the newest flip; it never clocks or blocks execution.
+const machineSnapshots = {
+  generation: 0,
+  current: null,
+  listeners: new Set(),
+  publish(value) {
+    const bytes = value instanceof Uint8Array
+      ? value
+      : new Uint8Array(value && value.buffer ? value.buffer : value);
+    if (bytes.byteLength < 76) throw new Error("machine snapshot is shorter than its header");
+    const magic = String.fromCharCode(...bytes.subarray(0, 8));
+    if (magic !== "TMSNAP01") throw new Error("machine snapshot has an unknown ABI");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const generation = Number(view.getBigUint64(16, true));
+    if (generation <= this.generation) return false;
+    this.generation = generation;
+    this.current = bytes;
+    this.listeners.forEach(listener => listener(bytes, generation));
+    return true;
+  },
+  latest() { return this.current; },
+  subscribe(listener) {
+    this.listeners.add(listener);
+    if (this.current) listener(this.current, this.generation);
+    return () => this.listeners.delete(listener);
+  },
+};
+window.TuringMachineSnapshots = machineSnapshots;
 const liaison = {
   role: SHADER.role,
   canvas,
@@ -3229,6 +3359,9 @@ const liaison = {
   io: SHADER.io || (window.TuringWasmRuntime && window.TuringWasmRuntime.io) || null,
   wasm: window.TuringWasmRuntime || null,
   dom: domLayout,
+  machineSnapshots,
+  systemPorts: window.TuringSystemPorts || null,
+  machineProgram: window.TuringMachineProgram || window.TuringMachineRuntime || null,
   ready: null,
 };
 
@@ -3279,7 +3412,20 @@ canvas.addEventListener("dragover", event => event.preventDefault());
 canvas.addEventListener("drop", event => {
   event.preventDefault();
   const file = event.dataTransfer && event.dataTransfer.files[0];
-  if (file) domLayout.loadFile(file).catch(fail);
+  if (!file) return;
+  if (/html?/i.test(file.type || file.name || "")) {
+    domLayout.loadFile(file).catch(fail);
+  } else if (liaison.systemPorts) {
+    const filePorts = Array.from(liaison.systemPorts.descriptors.values())
+      .filter(port => port.kind === "file" && port.direction === "input");
+    if (filePorts.length !== 1) {
+      fail(new Error("binary drop requires exactly one input file system port"));
+      return;
+    }
+    liaison.systemPorts.publishFile(filePorts[0].name, file).catch(fail);
+  } else {
+    fail(new Error("this build has no compiled file system port"));
+  }
 });
 canvas.focus({preventScroll: true});
 
@@ -3915,6 +4061,7 @@ def _input_rows(
     parameters: Sequence[Mapping[str, Any]],
     feed_expressions: Mapping[str, str] | None = None,
     network_routes: Mapping[str, Mapping[str, Any]] | None = None,
+    shell_io: Mapping[str, Any] | None = None,
 ) -> str:
     """One row per feed, each able to be literal values or an expression.
 
@@ -3926,7 +4073,16 @@ def _input_rows(
 
     expressions = dict(feed_expressions or {})
     routes = dict(network_routes or {})
-    feeds = [p for p in parameters if p["role"] == "input"]
+    requirements = dict((shell_io or {}).get("requirements") or {})
+    system_parameters = {
+        str(field.get("parameter"))
+        for port in requirements.get("system_ports", ())
+        for field in port.get("fields", ())
+    }
+    feeds = [
+        p for p in parameters
+        if p["role"] == "input" and str(p["name"]) not in system_parameters
+    ]
     rows = []
     for parameter in feeds:
         name = str(parameter["name"])
@@ -3962,6 +4118,39 @@ def _input_rows(
             '<div class="meta">This program takes no array feeds; the domain '
             "width and height decide how many elements one run covers.</div>"
         )
+    return "\n".join(rows)
+
+
+def _system_port_rows(shell_io: Mapping[str, Any] | None) -> str:
+    requirements = dict((shell_io or {}).get("requirements") or {})
+    ports = list(requirements.get("system_ports", ()))
+    rows = []
+    for port in ports:
+        name = str(port.get("name", "system-port"))
+        kind = str(port.get("kind", ""))
+        if kind == "file":
+            attributes = dict(port.get("attributes") or {})
+            accept = str(attributes.get("accept", "application/octet-stream"))
+            required = "" if port.get("optional") else " required"
+            rows.append(
+                '<div class="row system-port" data-system-port="' + _escape(name) + '">'
+                '<div class="name">' + _escape(name) + '</div>'
+                '<div class="grow"><input type="file" data-system-file-port="'
+                + _escape(name) + '" accept="' + _escape(accept) + '"' + required + '>'
+                '<div class="meta" data-system-port-status="' + _escape(name)
+                + '">awaiting file · byte-exact shell port</div></div></div>'
+            )
+        elif kind == "external_reference":
+            domain = str(port.get("external_domain", ""))
+            attributes = dict(port.get("attributes") or {})
+            bundle = str(attributes.get("bundle", "unbound bundle"))
+            export = str(attributes.get("export", "default"))
+            rows.append(
+                '<div class="row system-port" data-system-port="' + _escape(name) + '">'
+                '<div class="name">' + _escape(name) + '</div><div class="meta grow">'
+                + _escape(domain + " · " + bundle + " :: " + export)
+                + '</div></div>'
+            )
     return "\n".join(rows)
 
 
@@ -4517,6 +4706,15 @@ def emit_html_shell(
         mapping["entry_points"][0],
     )
     parameters = entry["parameters"]
+    shell_io_mapping = dict((mapping.get("metadata") or {}).get("shell_io") or {})
+    for port in dict(shell_io_mapping.get("requirements") or {}).get("system_ports", ()):
+        if (
+            port.get("kind") == "external_reference"
+            and port.get("external_domain") != "bundle"
+        ):
+            raise ValueError(
+                "HTML shells accept external references only to Turing bundles"
+            )
     shell_name = name or f"{mapping['module']}_shell"
 
     shader_css = ""
@@ -4835,7 +5033,8 @@ def emit_html_shell(
   <div class="panel">
     <div class="panel-title">Inputs</div>
     {picker}
-    {_input_rows(parameters, feed_expressions, network_routes)}
+    {_system_port_rows(shell_io_mapping)}
+    {_input_rows(parameters, feed_expressions, network_routes, shell_io_mapping)}
     <div id="stats" class="stat"></div>
     <div class="row">
       <button id="run"{disabled}>Run {_escape(str(entry["name"]))}</button>

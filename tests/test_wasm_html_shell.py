@@ -7,6 +7,10 @@ import pytest
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.machine_targets import emit
 from src.compiler.wasm_html_shell import emit_html_shell, shell_for_artifact
+from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+from src.compiler.shell_io import (
+    ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
+)
 
 
 def _artifact(name="demo"):
@@ -57,6 +61,49 @@ def test_with_a_binary_the_page_is_self_contained():
     assert 'id="picker"' not in shell.html
     assert "AGFzbQEAAAA=" in shell.html  # base64 of the header above
     assert "self-contained" in shell.html
+
+
+def _file_port_api(*, domain=None):
+    parameters = (
+        Parameter("t4", "input", "u8", "uint8_t", "c_uint8", "reference", source_name="subject_bytes"),
+        Parameter("t5", "input", "i64", "int64_t", "c_int64", "value", source_name="subject_length"),
+    )
+    requests = [ShellIORequest.create("files")]
+    ports = [SystemPort.create(
+        "subject", "file", "input", entry_point="load_subject",
+        fields={"data": "subject_bytes", "length": "subject_length"},
+        attributes={"accept": ".exe,.dll"},
+    )]
+    if domain is not None:
+        requests.append(ShellIORequest.create(
+            "bundle_references" if domain == "bundle" else "host_references"
+        ))
+        ports.append(SystemPort.create(
+            "decoder", "external_reference", "call",
+            external_domain=domain,
+            attributes={"bundle": "decoder-bundle", "export": "decode"},
+        ))
+    return attach_shell_io(CompiledProgramAPI(
+        "machine", "wasm", "load_subject",
+        (EntryPoint("load_subject", "load_subject", "control", parameters),),
+    ), ShellIOManifest(tuple(requests), system_ports=tuple(ports)))
+
+
+def test_html_renders_file_system_port_instead_of_numeric_parameter_fields():
+    html = emit_html_shell(_file_port_api(domain="bundle")).html
+
+    assert 'data-system-file-port="subject"' in html
+    assert 'accept=".exe,.dll"' in html
+    assert 'id="in_t4"' not in html
+    assert 'id="in_t5"' not in html
+    assert "window.TuringSystemPorts = systemPorts" in html
+    assert "publishFile(name, file)" in html
+    assert "bundle · decoder-bundle :: decode" in html
+
+
+def test_html_rejects_host_system_external_reference_ports():
+    with pytest.raises(ValueError, match="only to Turing bundles"):
+        emit_html_shell(_file_port_api(domain="host_system"))
 
 
 def test_published_webgl_shader_graduates_page_to_execution_surface():

@@ -103,9 +103,18 @@ class PrecompileSSALoweringResult:
 
 
 def _ssa_value(value_id: int, meta: Meta | None) -> SSAValue:
+    dtype = None if meta is None else meta.dtype
+    if dtype is not None:
+        dtype = str(dtype)
+    if dtype is not None and "." in dtype:
+        # Capturing through Torch records qualified spellings such as
+        # ``torch.bool``. SSA and every compiled ABI use canonical dtype
+        # names; allowing the frontend backend's module prefix to escape here
+        # makes the Fortran declaration and C sidecar disagree.
+        dtype = dtype.rsplit(".", 1)[-1]
     return SSAValue(
         int(value_id),
-        dtype=None if meta is None else meta.dtype,
+        dtype=dtype,
         shape=(
             ()
             if meta is None or meta.shape is None

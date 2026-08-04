@@ -944,6 +944,36 @@ def fused_program_to_process_graph(program: FusedProgram) -> ProcessGraph:
                 ),
             )
             continue
+        if step.op_name in {"reshape", "broadcast_to"}:
+            add_node(
+                step.result_id,
+                _node_payload(
+                    step.op_name,
+                    parents=tuple(
+                        (value_id, "operand") for value_id in step.input_ids
+                    ),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
+        if step.op_name == "where":
+            if len(step.input_ids) != 3:
+                raise ValueError(
+                    f"where step {step.step_id} needs condition, true, and false inputs"
+                )
+            add_node(
+                step.result_id,
+                _node_payload(
+                    "where",
+                    parents=tuple(zip(
+                        step.input_ids, ("condition", "true", "false")
+                    )),
+                    attributes=copy.deepcopy(dict(step.attrs)),
+                    meta=metadata.get(step.result_id),
+                ),
+            )
+            continue
         op, prefix_reverse = canonical_elementwise_op(step.op_name)
         attrs = dict(step.attrs)
         reverse = prefix_reverse ^ bool(attrs.pop("reverse", False))

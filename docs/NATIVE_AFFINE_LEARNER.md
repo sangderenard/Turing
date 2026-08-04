@@ -12,12 +12,19 @@ Build and run the included eight-value sorting problem:
 python -m src.compiler.native_affine_learner examples/learnable_sort.py
 ```
 
+`learnable_sort.py` now exposes `build_process_problem()`, so this historical
+command dispatches to the shared compiler process described in
+`NATIVE_SORTING_PROCESS_LEARNER.md`. It captures the sorting network's forward
+Graph IR, derives its reverse graph, schedules both with the renderer, lowers
+the regions to SSA, and emits the native Fortran/C-shell runnable. It does not
+use the legacy hand-written affine Fortran generator below.
+
 The window runs continuously until it is closed. Its left panel is the fixed
 reference/oracle stick-and-ball graph. Its right panel is the changing affine
 neural graph: live coefficients are colored sticks and inputs/outputs are
 balls. Bottom bands show held-out loss, exactness, and relative operation cost.
 
-The callable form is:
+The callable form for legacy files that expose only `build_benchmark()` is:
 
 ```python
 from src.compiler.native_affine_learner import compile_learning_window

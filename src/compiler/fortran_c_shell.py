@@ -23,6 +23,8 @@ from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 
 
 _NUMPY_DTYPES = {
+    "uint8": np.dtype("uint8"),
+    "u8": np.dtype("uint8"),
     "bool": np.dtype("bool"),
     "logical": np.dtype("bool"),
     "float": np.dtype("float32"),
@@ -54,6 +56,7 @@ class FortranCShellExecutable:
         self,
         *,
         frames: int = 1,
+        files: Mapping[str, str | Path] | None = None,
         capture_output: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         if frames < 0:
@@ -66,8 +69,11 @@ class FortranCShellExecutable:
                 + os.pathsep
                 + environment.get("PATH", "")
             )
+        arguments = [str(self.executable_path), str(frames)]
+        for name, path in sorted(dict(files or {}).items()):
+            arguments.extend(("--file-" + _identifier(name).replace("_", "-"), str(Path(path).resolve())))
         return subprocess.run(
-            [str(self.executable_path), str(frames)],
+            arguments,
             cwd=str(self.directory),
             env=environment,
             capture_output=capture_output,
@@ -177,6 +183,47 @@ def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
     }
 
 
+def _system_file_configurations(module: Any, entry: Any) -> tuple[dict[str, Any], ...]:
+    metadata = dict(getattr(module.api, "metadata", {}) or {})
+    requirements = dict((metadata.get("shell_io") or {}).get("requirements") or {})
+    parameters = {parameter.name: parameter for parameter in entry.parameters}
+    configurations = []
+    for port in requirements.get("system_ports", ()):
+        if port.get("kind") != "file" or port.get("direction") not in {
+            "input", "bidirectional",
+        }:
+            continue
+        if str(port.get("entry_point")) != str(entry.name):
+            continue
+        fields = {
+            str(field.get("name")): str(field.get("parameter"))
+            for field in port.get("fields", ())
+        }
+        if set(fields) < {"data", "length"}:
+            raise ValueError(f"native file port {port.get('name')!r} lacks data/length fields")
+        data = parameters.get(fields["data"])
+        length = parameters.get(fields["length"])
+        if data is None or length is None:
+            raise ValueError(f"native file port {port.get('name')!r} has unknown parameters")
+        if str(data.c_type) != "uint8_t" or data.passing != "reference":
+            raise ValueError("native file data parameter must be a uint8 reference")
+        if str(length.c_type) not in {"int32_t", "int64_t"}:
+            raise ValueError("native file length parameter must be int32 or int64")
+        attributes = dict(port.get("attributes") or {})
+        capacity = int(attributes.get("maximum_bytes", _element_count(data, _extent_values(entry, None))))
+        if capacity < 1:
+            raise ValueError("native input file capacity must be positive")
+        configurations.append({
+            "name": str(port["name"]),
+            "flag": "--file-" + _identifier(str(port["name"])).replace("_", "-"),
+            "data": data,
+            "length": length,
+            "capacity": capacity,
+            "optional": bool(port.get("optional")),
+        })
+    return tuple(configurations)
+
+
 def emit_fortran_c_shell_source(
     module: Any,
     *,
@@ -210,6 +257,12 @@ def emit_fortran_c_shell_source(
         parameter.name: index for index, parameter in enumerate(values)
     }
     display = _display_configuration(module, entry)
+    file_ports = _system_file_configurations(module, entry)
+    system_parameters = {
+        parameter.name
+        for port in file_ports
+        for parameter in (port["data"], port["length"])
+    }
     if display is not None:
         expected_pixels = int(display["width"]) * int(display["height"])
         for parameter_name in display["channels"]:
@@ -257,12 +310,13 @@ def emit_fortran_c_shell_source(
     input_read_lines = []
     for index, parameter in enumerate(values):
         c_type = str(parameter.c_type)
-        count = _element_count(parameter, extents)
+        file_port = next((port for port in file_ports if port["data"].name == parameter.name), None)
+        count = int(file_port["capacity"]) if file_port else _element_count(parameter, extents)
         allocation_lines.extend((
             f"    slots[{index}] = calloc({count}, sizeof({c_type}));",
             f"    if (!slots[{index}]) return 3;",
         ))
-        if parameter.role == "input":
+        if parameter.role == "input" and parameter.name not in system_parameters:
             input_read_lines.extend((
                 f"    if (fread(slots[{index}], sizeof({c_type}), {count}, state) "
                 f"!= {count}) {{",
@@ -271,7 +325,26 @@ def emit_fortran_c_shell_source(
                 "    }",
             ))
 
+    file_load_lines = []
+    for port in file_ports:
+        data_slot = slot_by_parameter[port["data"].name]
+        length_slot = slot_by_parameter[port["length"].name]
+        variable = _identifier("file_" + port["name"])
+        file_load_lines.extend((
+            f"    const char *{variable} = turing_argument_value(argc, argv, {_c_string(port['flag'])});",
+            *(
+                (f"    if ({variable} == NULL) {{ fprintf(stderr, \"missing {port['flag']}\\n\"); return 8; }}",)
+                if not port["optional"] else ()
+            ),
+            f"    if ({variable} != NULL) {{",
+            "        size_t loaded_bytes = 0;",
+            f"        if (!turing_read_file({variable}, (uint8_t *)slots[{data_slot}], {port['capacity']}, &loaded_bytes)) return 9;",
+            f"        *(({port['length'].c_type} *)slots[{length_slot}]) = ({port['length'].c_type})loaded_bytes;",
+            "    }",
+        ))
+
     feedback_lines = []
+    feedback_finalize_lines = []
     for input_name, output_name in feedback.items():
         input_slot = slot_by_name[input_name]
         output_slot = slot_by_name[output_name]
@@ -286,10 +359,16 @@ def emit_fortran_c_shell_source(
                 f"state feedback {input_name!r}->{output_name!r} has "
                 "incompatible storage"
             )
-        feedback_lines.append(
-            f"        memcpy(slots[{input_slot}], slots[{output_slot}], "
-            f"{_element_count(input_parameter, extents)} * sizeof({input_parameter.c_type}));"
+        swap = (
+            f"{{ void *feedback_arena = slots[{input_slot}]; "
+            f"slots[{input_slot}] = slots[{output_slot}]; "
+            f"slots[{output_slot}] = feedback_arena; }}"
         )
+        feedback_lines.append(f"        {swap}")
+        # After the last frame the latest value is in the input address. Swap
+        # once more so the public output name still denotes the final result
+        # for serialization and caller inspection.
+        feedback_finalize_lines.append(f"    {swap}")
 
     output_lines = []
     output_write_lines = []
@@ -465,10 +544,41 @@ static void turing_display_close(void) {
     source = "\n".join((
         _C_SOURCE,
         "",
+        "#include <stdbool.h>",
         "#include <stdio.h>",
         "#include <stdlib.h>",
         "#include <string.h>",
         "",
+        *(r'''static const char *turing_argument_value(int argc, char **argv, const char *flag) {
+    int index;
+    for (index = 2; index + 1 < argc; ++index) {
+        if (strcmp(argv[index], flag) == 0) return argv[index + 1];
+    }
+    return NULL;
+}
+
+static int turing_read_file(
+    const char *path, uint8_t *destination, size_t capacity, size_t *length
+) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    if (file == NULL) { perror(path); return 0; }
+    if (fseek(file, 0, SEEK_END) != 0 || (size = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file); return 0;
+    }
+    if ((unsigned long long)size > (unsigned long long)capacity) {
+        fprintf(stderr, "input file exceeds compiled port capacity: %s\n", path);
+        fclose(file); return 0;
+    }
+    if (fread(destination, 1, (size_t)size, file) != (size_t)size) {
+        fclose(file); return 0;
+    }
+    fclose(file);
+    *length = (size_t)size;
+    return 1;
+}
+''' if file_ports else "",),
         display_source,
         f"extern void {entry.symbol}({', '.join(prototype_arguments)});",
         "",
@@ -489,6 +599,7 @@ static void turing_display_close(void) {
         "    if (frames < 0) return 2;",
         "    if (!state) { perror(\"initial state\"); return 2; }",
         *allocation_lines,
+        *file_load_lines,
         *input_read_lines,
         "    fclose(state);",
         *display_open_lines,
@@ -497,10 +608,11 @@ static void turing_display_close(void) {
         *display_message_lines,
         "        if (turing_profiled_launch_ex(turing_fortran_compute, slots,",
         "                &profile, &stats, NULL, NULL, 3) != 1) return 5;",
-        *feedback_lines,
         *display_present_lines,
+        *feedback_lines,
         "    }",
         *display_close_lines,
+        *feedback_finalize_lines,
         "    printf(\"{\\\"status\\\":%d,\\\"frames\\\":%d,\\\"shell_ns_total\\\":%llu,\\\"outputs\\\":{\",",
         "           profile.status, frame, stats.shell_ns_total);",
         *output_lines,
@@ -542,9 +654,16 @@ def compile_fortran_module_c_shell(
     extents = _extent_values(entry, extent_overrides)
     values = tuple(item for item in entry.parameters if item.role != "extent")
     input_parameters = tuple(item for item in values if item.role == "input")
+    file_ports = _system_file_configurations(module, entry)
+    system_parameters = {
+        parameter.name
+        for port in file_ports
+        for parameter in (port["data"], port["length"])
+    }
     missing = {
         _source_name(parameter)
         for parameter in input_parameters
+        if parameter.name not in system_parameters
         if _source_name(parameter) not in inputs
     }
     if missing:
@@ -552,6 +671,8 @@ def compile_fortran_module_c_shell(
 
     state_bytes = bytearray()
     for parameter in input_parameters:
+        if parameter.name in system_parameters:
+            continue
         source_name = _source_name(parameter)
         dtype = _NUMPY_DTYPES.get(str(parameter.dtype).casefold())
         if dtype is None:

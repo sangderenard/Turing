@@ -99,8 +99,8 @@ def test_execution_clock_drops_runaway_time_instead_of_catching_up_forever():
 def test_shader_has_separate_register_and_cache_update_kernels():
     source = build_machine_register_shader().source
 
-    assert "array<vec2<u32>>" in source
-    assert "core_index * display.register_stride_cells" in source
+    assert "state_snapshot: array<u32>" in source
+    assert "core_index * register_stride_words" in source
     assert "fn update_machine_registers" in source
     assert "fn update_program_cache" in source
     assert "occupied_bytes" in source

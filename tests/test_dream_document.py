@@ -95,6 +95,10 @@ def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
 
     complete = emit_dream_html_shell(document, name="chip").html
     assert '"display_ownership": "program-interior"' in complete
+    assert "TuringMachineSnapshots" in complete
+    assert "machineSnapshots.subscribe(uploadSnapshot)" in complete
+    assert "BinaryMachineProgram.load_pe" in complete
+    assert "systemPorts.publishFile" in complete
     assert '"kind": "device_dispatch"' in complete
     assert "installTuringDisplay" in complete
 
@@ -143,9 +147,10 @@ def test_trusted_python_blocks_share_the_simulator_arena():
         shader_deployer=lambda block: block.stage,
     )
 
-    assert namespace["chip_state"]["cycle"] == 1
-    assert namespace["register_layout"].core_stride == 256
-    assert records[1].result == 1
+    assert namespace["machine_program"] is None
+    assert set(namespace["machine_controls"]) == {"load_binary", "tick", "set_speed"}
+    assert namespace["published_generation"] == 0
+    assert records[1].result == 0
 
 
 def test_unframed_source_and_bad_hash_fail_before_any_language_parser():
@@ -164,7 +169,7 @@ def test_reference_cli_runs_card_order_and_reports_gpu_activity(capsys):
 
     assert "GPU ACTIVE | register-light-compute" in output
     assert "GPU IDLE | chip-present-fragment" in output
-    assert "head-step: python -> 1" in output
+    assert "head-step: python -> 0" in output
 
 
 def test_cli_emits_launchable_interior_owned_shell(tmp_path, capsys):

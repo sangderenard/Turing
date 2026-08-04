@@ -2,20 +2,39 @@
 id = chip-setup
 language = python
 encoding = utf-8
-outputs = chip_state, register_layout
+outputs = machine_program, machine_controls
 entry = main
 @end*/
-from src.compiler.machine_chip_layout import build_register_bank_layout
+from src.compiler.binary_machine_program import BinaryMachineProgram
+from src.compiler.machine_state_buffer import MachineRunDirection
 
-register_layout = build_register_bank_layout(4, base_offset=0x2000)
-chip_state = {
-    "cycle": 0,
-    "direction": 1,
-    "gpu_active": False,
-    "register_words": [0] * (register_layout.byte_size // 4),
-    "cache_occupancy": [0.15, 0.42, 0.78, 1.0],
+machine_program = None
+
+def load_subject(binary_bytes, **runtime_options):
+    global machine_program
+    machine_program = BinaryMachineProgram.load_pe(
+        binary_bytes,
+        maximum_file_size=runtime_options.pop("maximum_file_size", 256 * 1024 * 1024),
+        **runtime_options,
+    )
+    machine_program.set_direction(MachineRunDirection.FORWARD)
+    return machine_program
+
+def tick_machine(elapsed_seconds):
+    if machine_program is None:
+        return 0
+    return machine_program.tick(elapsed_seconds)
+
+def set_machine_speed(transitions_per_second):
+    if machine_program is not None:
+        machine_program.set_speed(transitions_per_second)
+
+machine_controls = {
+    "load_binary": load_subject,
+    "tick": tick_machine,
+    "set_speed": set_machine_speed,
 }
-result = chip_state
+result = machine_controls
 /*@turing.end*/
 
 /*@turing.parallel.v1
@@ -28,17 +47,14 @@ join = frame-barrier
 id = head-step
 language = python
 encoding = utf-8
-inputs = chip_state
-outputs = chip_state
+inputs = machine_program, shell_tick_seconds
+outputs = published_generation
 parallel-group = chip-frame
 entry = step
 @end*/
-chip_state["cycle"] += chip_state["direction"]
-if chip_state["cycle"] >= 4096:
-    chip_state["direction"] = -1
-elif chip_state["cycle"] <= 0:
-    chip_state["direction"] = 1
-result = chip_state["cycle"]
+elapsed = float(globals().get("shell_tick_seconds", 0.0))
+published_generation = tick_machine(elapsed)
+result = published_generation
 /*@turing.end*/
 
 /*@turing.shader.v1
@@ -46,7 +62,7 @@ id = register-light-compute
 language = glsl
 encoding = utf-8
 stage = compute
-inputs = register_words, display_uniforms
+inputs = machine_state_snapshot
 outputs = register_cells
 abi = turing.shader-component.v1
 local-size = 64
@@ -55,29 +71,34 @@ parallel-group = chip-frame
 #version 430
 layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) readonly buffer RegisterWords {
-    uvec2 register_words[];
+layout(std430, binding = 0) readonly buffer MachineStateSnapshot {
+    uint state_words[];
 };
 layout(std430, binding = 1) writeonly buffer RegisterCells {
     vec4 register_cells[];
 };
-layout(location = 0) uniform uint core_count;
-layout(location = 1) uniform uint register_stride_cells;
-layout(location = 2) uniform uint generation;
-
 const uint REGISTER_COUNT = 20u;
+const uint HEADER_CORE_COUNT = 10u;
+const uint HEADER_REGISTER_COUNT = 11u;
+const uint HEADER_REGISTER_STRIDE = 12u;
+const uint HEADER_REGISTER_OFFSET = 13u;
+const uint HEADER_GENERATION_LOW = 4u;
 
 void main() {
     uint logical_index = gl_GlobalInvocationID.x;
-    if (logical_index >= core_count * REGISTER_COUNT) return;
-    uint core_index = logical_index / REGISTER_COUNT;
-    uint register_index = logical_index % REGISTER_COUNT;
-    uint physical_index = core_index * register_stride_cells + register_index;
-    uvec2 words = register_words[physical_index];
+    uint core_count = state_words[HEADER_CORE_COUNT];
+    uint register_count = state_words[HEADER_REGISTER_COUNT];
+    if (logical_index >= core_count * register_count) return;
+    uint core_index = logical_index / register_count;
+    uint register_index = logical_index % register_count;
+    uint stride_words = state_words[HEADER_REGISTER_STRIDE] / 4u;
+    uint base_words = state_words[HEADER_REGISTER_OFFSET] / 4u;
+    uint physical_index = base_words + core_index * stride_words + register_index * 2u;
+    uvec2 words = uvec2(state_words[physical_index], state_words[physical_index + 1u]);
     float occupied = float((words.x | words.y) != 0u);
     float low_energy = log2(1.0 + float(words.x)) / 32.0;
     float high_energy = log2(1.0 + float(words.y)) / 32.0;
-    float scan = float((register_index + generation) % REGISTER_COUNT) / float(REGISTER_COUNT);
+    float scan = float((register_index + state_words[HEADER_GENERATION_LOW]) % REGISTER_COUNT) / float(REGISTER_COUNT);
     register_cells[logical_index] = vec4(
         0.08 + low_energy,
         0.14 + high_energy,
@@ -103,14 +124,27 @@ context = webgl2
 precision highp float;
 in vec2 uv;
 out vec4 display_color;
-uniform sampler2D register_cells;
-uniform sampler2D cache_cells;
+uniform highp usampler2D register_words;
+uniform sampler2D subject_output;
+uniform vec2 machine_shape;
+uniform float subject_available;
 uniform float gpu_active;
 
 void main() {
-    vec3 registers = texture(register_cells, uv).rgb;
-    vec3 cache = texture(cache_cells, uv).rgb;
-    vec3 chip = mix(cache, registers, step(0.48, uv.y));
+    vec3 chip = vec3(0.015, 0.02, 0.03);
+    if (uv.y >= 0.50 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
+        vec2 machine_uv = vec2(uv.x, (uv.y - 0.50) * 2.0);
+        ivec2 cell = ivec2(clamp(floor(machine_uv * machine_shape), vec2(0.0), machine_shape - 1.0));
+        uvec2 words = texelFetch(register_words, cell, 0).rg;
+        float low_energy = log2(1.0 + float(words.x)) / 32.0;
+        float high_energy = log2(1.0 + float(words.y)) / 32.0;
+        float occupied = float((words.x | words.y) != 0u);
+        vec2 grid = fract(machine_uv * machine_shape);
+        float border = step(0.04, grid.x) * step(0.04, grid.y);
+        chip = border * vec3(0.08 + low_energy, 0.14 + high_energy, 0.25 + 0.7 * occupied);
+    } else if (uv.y < 0.50 && subject_available > 0.5) {
+        chip = texture(subject_output, vec2(uv.x, uv.y * 2.0)).rgb;
+    }
     vec3 gpu_lamp = mix(vec3(0.08, 0.10, 0.12), vec3(0.15, 1.0, 0.42), gpu_active);
     float lamp = 1.0 - smoothstep(0.025, 0.04, distance(uv, vec2(0.94, 0.06)));
     display_color = vec4(mix(chip, gpu_lamp, lamp), 1.0);
@@ -170,22 +204,64 @@ function installTuringDisplay(liaison, interior) {
   gl.useProgram(program);
   gl.bindVertexArray(gl.createVertexArray());
 
-  function texture(unit, uniform, rgba) {
+  function texture(unit, uniform) {
     const resource = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0 + unit);
     gl.bindTexture(gl.TEXTURE_2D, resource);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(rgba)
-    );
     gl.uniform1i(gl.getUniformLocation(program, uniform), unit);
     return resource;
   }
-  texture(0, "register_cells", [25, 150, 255, 255]);
-  texture(1, "cache_cells", [255, 85, 35, 255]);
+  const registerTexture = texture(0, "register_words");
+  const subjectTexture = texture(1, "subject_output");
+  const shapeLocation = gl.getUniformLocation(program, "machine_shape");
+  const subjectLocation = gl.getUniformLocation(program, "subject_available");
   const activeLocation = gl.getUniformLocation(program, "gpu_active");
+  let gpuActive = 0;
+  let subjectAvailable = 0;
+
+  function uploadSnapshot(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const coreCount = view.getUint32(40, true);
+    const registerCount = view.getUint32(44, true);
+    const registerStride = view.getUint32(48, true);
+    const registerOffset = view.getUint32(52, true);
+    const packed = new Uint32Array(coreCount * registerCount * 2);
+    for (let core = 0; core < coreCount; core++) {
+      const source = registerOffset + core * registerStride;
+      packed.set(new Uint32Array(
+        bytes.buffer, bytes.byteOffset + source, registerCount * 2
+      ), core * registerCount * 2);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, registerTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, registerCount, coreCount, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, packed);
+    if (shapeLocation !== null) gl.uniform2f(shapeLocation, registerCount, coreCount);
+
+    subjectAvailable = 0;
+    const descriptorOffset = view.getUint32(60, true);
+    const outputCount = view.getUint32(64, true);
+    for (let index = 0; index < outputCount; index++) {
+      const descriptor = descriptorOffset + index * 64;
+      const kind = view.getUint32(descriptor, true);
+      const format = view.getUint32(descriptor + 4, true);
+      const width = view.getUint32(descriptor + 8, true);
+      const height = view.getUint32(descriptor + 12, true);
+      const offset = Number(view.getBigUint64(descriptor + 24, true));
+      const length = Number(view.getBigUint64(descriptor + 32, true));
+      if (kind === 3 && format === 3 && width * height * 4 <= length) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, subjectTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+          new Uint8Array(bytes.buffer, bytes.byteOffset + offset, width * height * 4));
+        subjectAvailable = 1;
+        break;
+      }
+    }
+    gpuActive = 1;
+  }
+  const unsubscribe = liaison.machineSnapshots.subscribe(uploadSnapshot);
 
   function frame() {
     const ratio = Math.max(1, window.devicePixelRatio || 1);
@@ -196,12 +272,14 @@ function installTuringDisplay(liaison, interior) {
       liaison.canvas.height = height;
       gl.viewport(0, 0, width, height);
     }
-    liaison.canvas.dataset.gpuActive = "true";
-    if (activeLocation !== null) gl.uniform1f(activeLocation, 1.0);
+    liaison.canvas.dataset.gpuActive = gpuActive ? "true" : "false";
+    if (subjectLocation !== null) gl.uniform1f(subjectLocation, subjectAvailable);
+    if (activeLocation !== null) gl.uniform1f(activeLocation, gpuActive);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gpuActive = 0;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
-  return {program, ownsDisplay: true};
+  return {program, ownsDisplay: true, unsubscribe};
 }
 /*@turing.end*/

@@ -184,6 +184,82 @@ def test_bind_c_arrays_are_explicit_shape_over_a_passed_extent():
     assert "allocatable" not in source
 
 
+def test_fill_initializes_a_large_predeclared_span_without_array_literals():
+    span = SSAValue(20, "float64", (70_000,))
+    function = Function("zero_span", [], {
+        "entry": BasicBlock("entry", [
+            Instr("Fill", [], span, attributes={"fill_value": 0.0}),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[span]).source
+
+    assert "intent(out) :: t20(extent_70000)" in source
+    assert "t20 = 0.0_c_double" in source
+    assert "[" not in source
+    assert "allocatable" not in source
+
+
+def test_generic_index_addresses_lower_to_fortran_loads_and_stores():
+    arena = SSAValue(20, "float64", (3, 4))
+    row = SSAValue(21, "int32")
+    column = SSAValue(22, "int32")
+    value = SSAValue(23, "float64")
+    address = SSAValue(24, "pointer")
+    stored = SSAValue(25, "void")
+    loaded = SSAValue(26, "float64")
+    function = Function("indexed_arena", [arena, row, column, value], {
+        "entry": BasicBlock("entry", [
+            Instr("GetElementPtr", [arena, row, column], address),
+            Instr("Store", [value, address], stored),
+            Instr("Load", [address], loaded),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[loaded]).source
+
+    assert "intent(inout) :: t20(extent_3, extent_4)" in source
+    assert "t20(t21 + 1, t22 + 1) = t23" in source
+    assert "t26 = t20(t21 + 1, t22 + 1)" in source
+    assert "UNSUPPORTED" not in source
+
+
+def test_numeric_where_mask_and_scalar_branch_are_conformed_for_fortran():
+    mask = SSAValue(20, "float64", (4,))
+    when_true = SSAValue(21, "float64", (4,))
+    when_false = SSAValue(22, "float64", (1,))
+    result = SSAValue(23, "float64", (4,))
+    function = Function("numeric_where", [mask, when_true, when_false], {
+        "entry": BasicBlock("entry", [
+            Instr("where", [mask, when_true, when_false], result),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[result]).source
+
+    assert "merge(t21, t22(1), (t20 /= 0.0_c_double))" in source
+
+
+def test_where_promotes_mixed_branch_kinds_to_the_result_dtype():
+    mask = SSAValue(30, "bool", (4,))
+    integers = SSAValue(31, "int64", (1,))
+    reals = SSAValue(32, "float64", (1,))
+    result = SSAValue(33, "float64", (4,))
+    function = Function("promoted_where", [mask, integers, reals], {
+        "entry": BasicBlock("entry", [
+            Instr("where", [mask, integers, reals], result),
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    source = emit_function(function, outputs=[result]).source
+
+    assert "merge(real(t31(1), c_double), t32(1), t30)" in source
+
+
 def test_api_describes_transitive_callee_extents_from_final_signature():
     field = SSAValue(0, "float64", (4,))
     scalar_temporary = SSAValue(1, "float64", (1,))

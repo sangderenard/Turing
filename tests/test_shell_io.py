@@ -9,6 +9,8 @@ from src.compiler.shell_io import (
     ShellIOManifest,
     ShellIORequest,
     ShellOption,
+    ExternalReferenceDomain,
+    SystemPort,
     attach_shell_io,
     plan_shell_stack,
 )
@@ -63,6 +65,11 @@ def test_shared_abi_has_event_file_and_optional_double_buffer_mailboxes():
     assert mapping["records"]["input_event_i32"][:3] == [
         "kind", "code", "value",
     ]
+    assert mapping["external_references"]["web_domain"] == "bundle"
+    assert mapping["external_references"]["operations"] == [
+        "resolve", "call", "release",
+    ]
+    assert mapping["records"]["external_request_i32"][2] == "reference_id"
 
 
 def test_shell_io_travels_in_the_existing_compiled_api_descriptor():
@@ -120,3 +127,55 @@ def test_attaching_io_resolves_source_name_to_fortran_abi_parameter():
     assert attached["metadata"]["shell_io"]["requirements"]["bindings"] == [{
         "resource": "display.back", "entry_point": "frame", "parameter": "t77",
     }]
+
+
+def test_file_parameter_port_resolves_data_and_length_through_compiled_api():
+    parameters = (
+        Parameter("t4", "input", "u8", "uint8_t", "c_uint8", "reference", source_name="binary_bytes"),
+        Parameter("t5", "input", "i64", "int64_t", "c_int64", "value", source_name="binary_length"),
+    )
+    api = CompiledProgramAPI(
+        "machine", "wasm", "load_subject",
+        (EntryPoint("load_subject", "load_subject", "control", parameters),),
+    )
+    manifest = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        system_ports=(SystemPort.create(
+            "subject", "file", "input", entry_point="load_subject",
+            fields={"data": "binary_bytes", "length": "binary_length"},
+            attributes={"accept": ".exe,.dll,application/octet-stream"},
+        ),),
+    )
+
+    attached = attach_shell_io(api, manifest).to_mapping()
+    port = attached["metadata"]["shell_io"]["requirements"]["system_ports"][0]
+
+    assert port["kind"] == "file"
+    assert port["fields"] == [
+        {"name": "data", "parameter": "t4"},
+        {"name": "length", "parameter": "t5"},
+    ]
+
+
+def test_web_bundle_references_are_distinct_from_native_host_references():
+    web_manifest = ShellIOManifest(
+        (ShellIORequest.create("bundle_references"),),
+        system_ports=(SystemPort.create(
+            "decoder", "external_reference", "call",
+            external_domain=ExternalReferenceDomain.BUNDLE,
+            attributes={"bundle": "machine-decoder", "export": "decode"},
+        ),),
+    )
+    assert plan_shell_stack("wasm", web_manifest, (WEB_JAVASCRIPT_SHELL,)).outer_kind == "web_page"
+
+    host_manifest = ShellIOManifest(
+        (ShellIORequest.create("host_references"),),
+        system_ports=(SystemPort.create(
+            "kernel32", "external_reference", "call",
+            external_domain=ExternalReferenceDomain.HOST_SYSTEM,
+            attributes={"library": "kernel32", "symbol": "ReadFile"},
+        ),),
+    )
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("wasm", host_manifest, (WEB_JAVASCRIPT_SHELL,))
+    assert plan_shell_stack("fortran", host_manifest, (NATIVE_PROCESS_SHELL,)).outer_kind == "native_process"
