@@ -111,6 +111,11 @@ PRECOMPILE_TO_SSA: dict[str, Handler] = {
     "matmul": Handler.MatMul,
     "neg": Handler.Neg,
     "abs": Handler.Abs,
+    # Shape operations remain canonical tensor calls in SSA. Backends such as
+    # Fortran spell them as native array expressions from the preserved attrs.
+    "reshape": Handler.Call,
+    "view": Handler.Call,
+    "broadcast_to": Handler.Call,
     "bitand": Handler.And,
     "bitor": Handler.Or,
     "bitxor": Handler.Xor,

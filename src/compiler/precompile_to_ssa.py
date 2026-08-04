@@ -276,6 +276,8 @@ def lower_fused_program_to_ssa(
             )
             continue
         attributes = dict(step.attrs)
+        if handler is Handler.Call:
+            attributes.setdefault("tensor_operation", step.op_name)
         if algorithm is not None:
             attributes.update({
                 "callee": algorithm,

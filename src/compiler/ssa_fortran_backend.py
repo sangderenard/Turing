@@ -187,7 +187,10 @@ _COMPARISON = frozenset(
 # Operations that rearrange values without computing new ones, so the type of
 # the result is the type of what went in.
 _SHAPE_ONLY = frozenset(
-    {"slice", "reshape", "view", "permute", "stack", "concat", "scatter"}
+    {
+        "slice", "reshape", "view", "broadcast_to", "permute", "stack",
+        "concat", "scatter",
+    }
 )
 
 _REAL_OPERAND = frozenset(
@@ -341,6 +344,15 @@ def _broadcast(
         expanding.append(position)
     if not expanding:
         return None
+
+    # A one-element array is semantically a scalar broadcast. SUM is the
+    # legal Fortran scalarisation for an arbitrary array expression; unlike
+    # appending ``(1)`` it also works when the producer was inlined.
+    if shape and _element_count(shape) == 1:
+        result = f"sum({expression})"
+        for position, target in enumerate(result_shape):
+            result = f"spread({result}, dim={position + 1}, ncopies={int(target)})"
+        return result
 
     # Only the operand's *own* extent-one dimensions need indexing away.
     # The dimensions alignment prepended do not exist on it, and SPREAD
@@ -538,17 +550,28 @@ class _FunctionEmitter:
         shape = instr.res.shape
         rank = len(shape)
 
-        if operation in _REDUCTION and "dim" in attributes and len(args) == 1:
+        reduction_axis = attributes.get("dim", attributes.get("axis"))
+        if (
+            operation in _REDUCTION
+            and reduction_axis is not None
+            and len(args) == 1
+        ):
             # Fortran reduces along one dimension natively. Arrays are
             # declared in SSA dimension order, so the axis needs no
             # translation; sum(a, dim=k) drops that dimension, and keepdim
             # asks for it back as an extent of one.
             source_rank = len(instr.args[0].shape)
-            axis = (int(attributes["dim"]) % source_rank) + 1
+            if isinstance(reduction_axis, (tuple, list)):
+                if len(reduction_axis) != 1:
+                    return None
+                reduction_axis = reduction_axis[0]
+            axis = (int(reduction_axis) % source_rank) + 1
             reduced = _REDUCTION[operation].format(
                 f"{args[0]}, dim={axis}"
             )
             if len(shape) == source_rank:
+                if source_rank == 1:
+                    return f"[{reduced}]"
                 extents = ", ".join(str(int(size)) for size in shape)
                 return f"reshape({reduced}, [{extents}])"
             return reduced
@@ -568,6 +591,13 @@ class _FunctionEmitter:
             source = args[0]
             source_shape = tuple(instr.args[0].shape)
             source_rank = len(source_shape)
+            if rank == 0:
+                if source_rank == 0:
+                    return source
+                indices = ", ".join("1" for _ in source_shape)
+                return f"{source}({indices})"
+            if source_rank == 0:
+                source = f"[{source}]"
             if source_rank > 1:
                 reversed_extents = ", ".join(
                     str(int(size)) for size in reversed(source_shape)
@@ -584,6 +614,13 @@ class _FunctionEmitter:
             extents = ", ".join(str(int(size)) for size in shape)
             order = ", ".join(str(value) for value in range(rank, 0, -1))
             return f"reshape({source}, [{extents}], order=[{order}])"
+
+        if operation == "broadcast_to" and len(args) == 1:
+            source_shape = tuple(instr.args[0].shape)
+            target_shape = tuple(shape)
+            if source_shape == target_shape:
+                return args[0]
+            return _broadcast(args[0], source_shape, target_shape)
 
         if operation in ("zeros", "full"):
             # A scalar broadcasts across a whole array on assignment.

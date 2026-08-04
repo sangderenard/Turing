@@ -23,7 +23,7 @@ def test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy():
     }
     assert len(inventories["c"].operations) == 40
     assert len(inventories["glsl"].operations) == 56
-    assert len(inventories["fortran"].operations) == 57
+    assert len(inventories["fortran"].operations) == 58
     assert len(inventories["llvm"].operations) == 70
     assert len(inventories["webgl"].operations) == 44
     assert inventories["webgpu"].operations
