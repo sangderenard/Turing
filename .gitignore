@@ -6,6 +6,7 @@ pytest_run_times.log
 .turing-cache/
 .vs
 env
+/build/
 
 # Agent scratch artifacts: probe drivers, captured run logs, and rendered
 # media produced while debugging.  These are session output, not sources.
