@@ -373,6 +373,25 @@ def _msvcrt_time(file_time: int) -> ExternalCapabilityHandler:
     return handler
 
 
+def _msvcrt_srand(request, state):
+    return MachineExternalCallCompletion(
+        request.request_id,
+        system_writes=(MachineExternalStateWrite(
+            "msvcrt.rand_state", request.arguments[0] & 0xFFFFFFFF,
+        ),),
+    )
+
+
+def _msvcrt_rand(request, state):
+    seed = int(state.system_state.get("msvcrt.rand_state", 1)) & 0xFFFFFFFF
+    seed = (seed * 214013 + 2531011) & 0xFFFFFFFF
+    return MachineExternalCallCompletion(
+        request.request_id,
+        result=(seed >> 16) & 0x7FFF,
+        system_writes=(MachineExternalStateWrite("msvcrt.rand_state", seed),),
+    )
+
+
 def _heap_alloc(request, state):
     heap, flags, size = request.arguments[:3]
     if heap != 0x300 or size > 256 * 1024 * 1024:
@@ -649,6 +668,8 @@ def deterministic_windows_bootstrap_port(
             "memcmp": _msvcrt_memcmp,
             "_get_osfhandle": _get_osfhandle,
             "time": _msvcrt_time(file_time),
+            "srand": _msvcrt_srand,
+            "rand": _msvcrt_rand,
         },
         "api-ms-win-core-errorhandling-l1-1-0.dll": {
             "SetUnhandledExceptionFilter": _set_unhandled_exception_filter,

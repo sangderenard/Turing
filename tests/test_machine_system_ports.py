@@ -252,6 +252,27 @@ def test_crt_time_uses_virtual_file_time_epoch():
     assert completion.memory_writes[0].data == (42).to_bytes(8, "little")
 
 
+def test_crt_random_state_is_explicit_and_replayable():
+    port = deterministic_windows_bootstrap_port()
+    srand_request = MachineExternalCallRequest(
+        28, MachineExternalReference(22, 0, "guest-binary", "msvcrt.dll", "srand"),
+        0, 0, (7, 0, 0, 0), 0,
+    )
+    seeded = port.handle(srand_request, MachineExecutionState(pc=0))
+    assert seeded is not None
+    state = MachineExecutionState(
+        pc=0,
+        system_state={item.key: item.value for item in seeded.system_writes},
+    )
+    rand_request = MachineExternalCallRequest(
+        29, MachineExternalReference(23, 0, "guest-binary", "msvcrt.dll", "rand"),
+        0, 0, (0, 0, 0, 0), 0,
+    )
+    first = port.handle(rand_request, state)
+    replay = port.handle(rand_request, state)
+    assert first == replay
+
+
 def test_registry_policy_is_empty_and_never_reads_host_registry():
     port = deterministic_windows_bootstrap_port()
     request = MachineExternalCallRequest(
