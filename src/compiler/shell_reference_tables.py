@@ -322,9 +322,19 @@ def build_map_dependency_regions(graph: Any, entrypoint: str) -> MapDependencyRe
     mapped: set[int] = set()
     bindings: list[tuple[str, int]] = []
     map_ir = graph.G.graph.get("map_ir") or {}
+    selected_classes = (
+        set(map(str, map_ir["selected_class_identities"]))
+        if "selected_class_identities" in map_ir
+        else None
+    )
     for mapped_graph in map_ir.get("graphs", ()):
         identity = mapped_graph.get("identity")
         if not identity:
+            continue
+        if (
+            selected_classes is not None
+            and str(identity).rsplit(".", 1)[0] not in selected_classes
+        ):
             continue
         try:
             mapped_entry = function_table.entry(str(identity))

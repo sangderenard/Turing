@@ -1,0 +1,83 @@
+{
+  "abi": "turing.class-memory-inventory.v1",
+  "field_slots": [
+    {
+      "index": 0,
+      "key": "in::managed_time"
+    },
+    {
+      "index": 1,
+      "key": "in::dt"
+    },
+    {
+      "index": 2,
+      "key": "in::column_x"
+    },
+    {
+      "index": 3,
+      "key": "in::column_y"
+    },
+    {
+      "index": 4,
+      "key": "in::displacement"
+    },
+    {
+      "index": 5,
+      "key": "in::displacement_velocity"
+    },
+    {
+      "index": 6,
+      "key": "in::rest_surface"
+    },
+    {
+      "index": 7,
+      "key": "out::columnar_multifluid_rgb_step__0::next_time"
+    },
+    {
+      "index": 8,
+      "key": "out::columnar_multifluid_rgb_step__0::next_velocity"
+    },
+    {
+      "index": 9,
+      "key": "out::columnar_multifluid_rgb_step__0::next_displacement"
+    },
+    {
+      "index": 10,
+      "key": "out::columnar_multifluid_rgb_step__0::red"
+    },
+    {
+      "index": 11,
+      "key": "out::columnar_multifluid_rgb_step__0::blue"
+    },
+    {
+      "index": 12,
+      "key": "out::columnar_multifluid_rgb_step__0::green"
+    }
+  ],
+  "storage_redirects": [],
+  "methods": [
+    {
+      "index": 0,
+      "module": "columnar_multifluid_rgb_step__0",
+      "entry": "run",
+      "input_slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "output_slots": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "parameter_count": 14
+    }
+  ]
+}

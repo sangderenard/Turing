@@ -1270,6 +1270,18 @@ def _normalize_lexical_values(
     ordered_graph = nx.DiGraph()
     ordered_graph.graph.update(relabeled.graph)
     ordered_graph.graph["canonical_value_ids"] = True
+    map_ir = dict(ordered_graph.graph.get("map_ir") or {})
+    map_ir["schema_node_ids"] = tuple(
+        mapping[node_id]
+        for node_id in map_ir.get("schema_node_ids", ())
+        if node_id in mapping
+    )
+    map_ir["schema_roots"] = tuple(
+        mapping[node_id]
+        for node_id in map_ir.get("schema_roots", ())
+        if node_id in mapping
+    )
+    ordered_graph.graph["map_ir"] = map_ir
     for value_id in range(len(mapping)):
         ordered_graph.add_node(value_id, **relabeled.nodes[value_id])
     ordered_graph.add_edges_from(relabeled.edges(data=True))

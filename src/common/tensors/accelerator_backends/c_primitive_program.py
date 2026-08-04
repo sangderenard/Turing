@@ -620,6 +620,7 @@ _CAPTURED_NATIVE_KERNELS = {
     "max": "reduce",
     "mean": "reduce",
     "min": "reduce",
+    "prod": "reduce",
     "any": "reduce",
     "all": "reduce",
     "empty": "fill",

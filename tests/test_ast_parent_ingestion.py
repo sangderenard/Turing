@@ -99,6 +99,40 @@ def _definitions(graph, name):
     ]
 
 
+def test_profile_verbose_emits_per_item_ast_and_graph_logs(capsys):
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"_source_helper": _source_helper}
+    graph.build_from_ast(
+        ast.parse(
+            "def root(value):\n"
+            "    return _source_helper(value)\n"
+        ),
+        resolve_unresolved_parents=True,
+        profile_verbose=True,
+    )
+    captured = capsys.readouterr().out
+
+    assert "[ast-parent]" in captured
+    assert "[graph-build" in captured
+
+
+def test_progress_callback_emits_graph_build_logs_without_profile_verbose():
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"_source_helper": _source_helper}
+    messages = []
+    graph.build_from_ast(
+        ast.parse(
+            "def root(value):\n"
+            "    return _source_helper(value)\n"
+        ),
+        resolve_unresolved_parents=True,
+        progress=messages.append,
+    )
+
+    assert any("[ast-parent]" in message for message in messages)
+    assert any("[graph-build" in message for message in messages)
+
+
 def test_literal_module_constants_are_static_function_bindings():
     graph = _ingest(
         "CARD_SIZE = 2000\n\ndef build():\n    return CARD_SIZE\n",

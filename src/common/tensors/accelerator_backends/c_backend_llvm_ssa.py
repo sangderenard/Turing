@@ -153,6 +153,7 @@ declare double @llvm.trunc.f64(double)
 declare double @llvm.floor.f64(double)
 declare double @llvm.ceil.f64(double)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 declare double @pow(double, double)
 declare double @exp(double)
 declare double @log(double)
@@ -1974,6 +1975,21 @@ def _flatten_host_values(value: Any):
         yield value
 
 
+# Span-memory initialisation constructors and their implicit fill scalar.
+# ``None`` requires an explicit ``fill_value`` parameter (``full``/``fill``).
+_TAPE_FILL_DEFAULTS: Mapping[str, float | None] = {
+    "fill": None,
+    "zeros": 0.0,
+    "zeros_like": 0.0,
+    "empty": 0.0,
+    "empty_like": 0.0,
+    "ones": 1.0,
+    "ones_like": 1.0,
+    "full": None,
+    "full_like": None,
+}
+
+
 def lower_abstract_tensor_tape_to_llvm_ssa(
     tape: Any,
     outputs: Mapping[str, Any] | Any,
@@ -2116,13 +2132,35 @@ def lower_abstract_tensor_tape_to_llvm_ssa(
         destination = pointers[result_id]
         result_count = _element_count(result)
 
-        if operation in {"full", "zeros"} and "fill_double" in translated_symbols:
+        if operation in _TAPE_FILL_DEFAULTS and "fill_double" in translated_symbols:
             parameters = dict(node.ctx.get("params") or {})
-            fill_value = 0.0 if operation == "zeros" else parameters["fill_value"]
-            entry.append(
-                f"  call void @fill_double(ptr {destination}, "
-                f"double {_llvm_double(fill_value)}, i32 {result_count})"
+            default_value = _TAPE_FILL_DEFAULTS[operation]
+            fill_value = parameters.get(
+                "fill_value", parameters.get("value", default_value)
             )
+            if fill_value is None:
+                shortfalls.append(
+                    TapeLLVMShortfall(
+                        result_id,
+                        operation,
+                        "span initialisation requires an explicit fill_value",
+                    )
+                )
+                continue
+            fill_value = float(fill_value)
+            if fill_value == 0.0:
+                # Zero-fill is the calloc case: a bytewise memset is the
+                # definite lowering for zero-initialised span memory.
+                byte_count = result_count * 8
+                entry.append(
+                    f"  call void @llvm.memset.p0.i64(ptr {destination}, i8 0, "
+                    f"i64 {byte_count}, i1 false)"
+                )
+            else:
+                entry.append(
+                    f"  call void @fill_double(ptr {destination}, "
+                    f"double {_llvm_double(fill_value)}, i32 {result_count})"
+                )
             continue
 
         if operation == "arange" and "create_arange" in translated_symbols:

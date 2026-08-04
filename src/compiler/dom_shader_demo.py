@@ -2,9 +2,14 @@
 
 The ingested source owns event response, persistent state transition,
 BoundSpring motion, managed-time admission/rollback, render attributes, and
-the ray-box presentation math itself. Nothing here is hand-authored GLSL --
-``elastic_dom_present`` is an ordinary Python function compiled by the same
-autocompiler as everything else in this repository.
+the ray-box presentation math -- all in one WASM-compiled function.
+Presentation is a full per-pixel image computed with ordinary tensor
+broadcasting and reductions, which are unrestricted in WASM; the page's
+displayed shader is the standing default passthrough (see
+``_PASSTHROUGH_SOURCE`` in ``site_bundle.py``), which the bundler attaches
+automatically once this function names outputs ``red``/``green``/``blue``.
+Nothing here is hand-authored GLSL, and nothing here is a second,
+hand-split "presentation entrypoint" either -- one function, one compile.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ footer { margin-top: 24px; padding: 18px 22px; border-radius: 18px; background: 
 <main>
 <article data-turing-identity="layout-card"><h2>Measured layout</h2><p>The browser supplies only final rectangles and events.</p></article>
 <article data-turing-identity="wasm-card"><h2>Resident physics</h2><p>Bound springs and managed time execute in WebAssembly.</p></article>
-<article data-turing-identity="shader-card"><h2>Ray-cast depth</h2><p>One shader intersects and lights projected boxes.</p></article>
+<article data-turing-identity="shader-card"><h2>Ray-cast depth</h2><p>The same compiled program ray-marches its own state.</p></article>
 </main><footer data-turing-identity="footer">Drop an HTML file to replace the hidden document.</footer>
 </body></html>'''
 
@@ -76,16 +81,13 @@ _MANAGED_CANDIDATE = '''
     step_dt = admitted * remaining_time.minimum(stable_dt) + (1.0 - admitted) * candidate_dt * 0.5
 '''
 
-_ELEMENT_COUNT = 256
-
-# ``elem_index`` is a compile-time-fixed [0, 1, ..., 255] array -- it is the
-# per-slot loop counter the original GLSL ``for`` loop carried implicitly.
-# ``elem_valid`` starts as all-ones; the real per-frame count arrives through
-# ``dom_count`` and masks it, exactly like the original ``index >=
-# turing_dom_count: break``.
-_ELEMENT_INDEX = list(float(i) for i in range(_ELEMENT_COUNT))
-_ZEROS = [0.0] * _ELEMENT_COUNT
-_ONES = [1.0] * _ELEMENT_COUNT
+_CANVAS_WIDTH = 480.0
+_CANVAS_HEIGHT = 320.0
+_CANVAS_PIXELS = int(_CANVAS_WIDTH * _CANVAS_HEIGHT)
+# A representative-shaped probe: the compiler bakes array length in as part
+# of the program's shape, so this needs to be the real pixel count, not a
+# placeholder -- exactly like the fluid-sim demo's column_x/column_y probes.
+_PIXEL_ZEROS = [0.0] * _CANVAS_PIXELS
 
 
 SOURCE = (
@@ -94,8 +96,8 @@ SOURCE = (
         "entrypoint": "elastic_dom_page",
         "title": "Elastic DOM Surface",
         "slug": "elastic-dom-surface",
-        "width": 960,
-        "height": 640,
+        "width": int(_CANVAS_WIDTH),
+        "height": int(_CANVAS_HEIGHT),
         "probe_size": 4,
         "feeds": {
             "position_x": {"values": [90.0, 260.0, 430.0, 600.0]},
@@ -108,6 +110,22 @@ SOURCE = (
             "pointer_x": 0.0, "pointer_y": 0.0,
             "pointer_buttons": 0.0, "button_latch": 0.0,
             "score": 0.0, "window_dt": 1.0 / 60.0,
+            # Per-pixel feeds (one value per output pixel, not per element)
+            # -- the same feed_expressions mechanism the fluid-sim demo uses
+            # for its column grid, evaluated by JS from the implicit
+            # per-pixel x/y/w/h/t.
+            "ndc_x": {"values": list(_PIXEL_ZEROS)},
+            "ndc_y": {"values": list(_PIXEL_ZEROS)},
+            "aspect": {"values": list(_PIXEL_ZEROS)},
+            "pixel_time": {"values": list(_PIXEL_ZEROS)},
+            # Per-element constants: one tint per tracked DOM element and a
+            # fixed z-separation so elements don't shear into each other
+            # (widened from the original hand-written shader's 0.006/index
+            # to 0.03/index worth of separation).
+            "tint_r": {"values": [0.44, 0.37, 0.18, 0.44]},
+            "tint_g": {"values": [0.62, 0.24, 0.43, 0.62]},
+            "tint_b": {"values": [0.86, 0.56, 0.47, 0.86]},
+            "depth_bias": {"values": [0.0, 0.03, 0.06, 0.09]},
         },
         "backend": "c", "remove_loops": True,
         "state_feedback": {
@@ -116,54 +134,12 @@ SOURCE = (
             "button_latch": "next_button_latch", "score": "next_score",
         },
         "render_fps": 60.0, "autostart": True,
-        "presentation_entrypoint": "elastic_dom_present",
         "presentation_document": DEMO_DOCUMENT,
-        "feeds_presentation": {
-            "ndc_x": "(x / max(w - 1.0, 1.0)) * 2.0 - 1.0",
-            "ndc_y": "(y / max(h - 1.0, 1.0)) * 2.0 - 1.0",
+        "feed_expressions": {
+            "ndc_x": "(x / Math.max(w - 1.0, 1.0)) * 2.0 - 1.0",
+            "ndc_y": "(y / Math.max(h - 1.0, 1.0)) * 2.0 - 1.0",
             "aspect": "w / Math.max(h, 1.0)",
-            "time": "t",
-            "elem_geom_x": {"values": [90.0, 260.0, 430.0, 600.0] + _ZEROS[4:]},
-            "elem_geom_y": {"values": [90.0, 150.0, 230.0, 320.0] + _ZEROS[4:]},
-            "elem_geom_hw": {"values": [140.0, 150.0, 160.0, 180.0] + _ZEROS[4:]},
-            "elem_geom_hh": {"values": [48.0, 64.0, 72.0, 84.0] + _ZEROS[4:]},
-            "elem_material_x": {"values": _ZEROS},
-            "elem_material_y": {"values": _ZEROS},
-            "elem_tint_r": {"values": [0.44, 0.37, 0.18, 0.44] + _ZEROS[4:]},
-            "elem_tint_g": {"values": [0.62, 0.24, 0.43, 0.62] + _ZEROS[4:]},
-            "elem_tint_b": {"values": [0.86, 0.56, 0.47, 0.86] + _ZEROS[4:]},
-            "elem_index": {"values": list(_ELEMENT_INDEX)},
-            "dom_count": 4.0,
-        },
-        "shader_configuration": {
-            "dom_surface": True,
-            "max_elements": _ELEMENT_COUNT,
-            "dom_io": {
-                "inputs": {
-                    "position_x": "position_x", "position_y": "position_y",
-                    "velocity_x": "velocity_x", "velocity_y": "velocity_y",
-                    "anchor_x": "anchor_x", "anchor_y": "anchor_y",
-                    "extent_x": "extent_x", "extent_y": "extent_y",
-                    "pointer_x": "pointer_x", "pointer_y": "pointer_y",
-                    "pointer_buttons": "pointer_buttons",
-                    "button_latch": "button_latch", "score": "score",
-                    "window_dt": "window_dt",
-                },
-                "outputs": {
-                    "position_x": 0, "position_y": 1,
-                    "velocity_x": 2, "velocity_y": 3,
-                    "button_latch": 4, "score": 5, "activity": 6,
-                    "rejected_steps": 7, "advanced_time": 8,
-                    "remaining_time": 9,
-                },
-                "presentation_elements": {
-                    "geom_x": "elem_geom_x", "geom_y": "elem_geom_y",
-                    "geom_hw": "elem_geom_hw", "geom_hh": "elem_geom_hh",
-                    "material_x": "elem_material_x", "material_y": "elem_material_y",
-                    "tint_r": "elem_tint_r", "tint_g": "elem_tint_g",
-                    "tint_b": "elem_tint_b", "count": "dom_count",
-                },
-            },
+            "pixel_time": "t",
         },
     })
     + '''
@@ -172,6 +148,8 @@ def elastic_dom_page(
     position_x, position_y, velocity_x, velocity_y,
     anchor_x, anchor_y, extent_x, extent_y,
     pointer_x, pointer_y, pointer_buttons, button_latch, score, window_dt,
+    ndc_x, ndc_y, aspect, pixel_time,
+    tint_r, tint_g, tint_b, depth_bias,
 ):
     half_x = extent_x * 0.5
     half_y = extent_y * 0.5
@@ -200,84 +178,92 @@ def elastic_dom_page(
     next_score = score + pressed
     activity = (hovered * 0.2 + pressed * 0.65 + (velocity_x * velocity_x + velocity_y * velocity_y) * 0.00002).minimum(1.0)
     advanced_time = window_dt - remaining_time
-    return (
-        next_position_x, next_position_y, next_velocity_x, next_velocity_y,
-        next_button_latch, next_score, activity, rejected_steps,
-        advanced_time, remaining_time,
-    )
 
+    # --- Presentation: ray-box intersection and Blinn-Phong shading,
+    # folded into the same compiled program. This is a genuine reduction
+    # (nearest-of-N-elements per pixel), which only WASM tensor math can
+    # express -- a WebGL fragment shader compiled straight from Python
+    # cannot do a loop or a reduction, only flat per-fragment scalar
+    # arithmetic. So the whole image is computed here, once, as ordinary
+    # array broadcasting: per-pixel values (ndc_x et al, one value per
+    # output pixel) against per-element values (position_x et al, one
+    # value per tracked DOM element) via reshape-to-broadcast, exactly the
+    # same (-1, 1) / (1, -1) pattern already proven in
+    # ``advance_columnar_surface_spring_local`` above. The result is
+    # reduced back to one row per pixel with a masked minimum (nearest
+    # valid hit) and a masked sum (that hit's own color) instead of a
+    # loop with an early ``break``.
+    pixel_ndc_x = ndc_x.reshape((-1, 1))
+    pixel_ndc_y = ndc_y.reshape((-1, 1))
+    pixel_aspect = aspect.reshape((-1, 1))
+    pixel_time_col = pixel_time.reshape((-1, 1))
 
-def elastic_dom_present(
-    ndc_x, ndc_y, aspect, time,
-    elem_geom_x, elem_geom_y, elem_geom_hw, elem_geom_hh,
-    elem_material_x, elem_material_y,
-    elem_tint_r, elem_tint_g, elem_tint_b,
-    elem_index, dom_count,
-):
-    """The ray-box intersection and Blinn-Phong shading the original
-    hand-written GLSL performed with a ``for`` loop and an early ``break``.
-    There is no loop here: every element's candidate hit and shading is
-    computed for all elements at once (elementwise array math), and the
-    nearest valid hit is picked with a masked minimum/masked sum instead of
-    a running ``nearest`` variable and a ``break``."""
+    elem_position_x = next_position_x.reshape((1, -1))
+    elem_position_y = next_position_y.reshape((1, -1))
+    elem_half_x = half_x.reshape((1, -1))
+    elem_half_y = half_y.reshape((1, -1))
+    elem_tint_r = tint_r.reshape((1, -1))
+    elem_tint_g = tint_g.reshape((1, -1))
+    elem_tint_b = tint_b.reshape((1, -1))
+    elem_depth_bias = depth_bias.reshape((1, -1))
 
     ray_origin_x = 0.0
     ray_origin_y = 0.0
     ray_origin_z = 8.5
 
-    ray_dir_x = ndc_x * aspect
-    ray_dir_y = ndc_y
-    ray_dir_z = ndc_x * 0.0 - 2.15
+    ray_dir_x = pixel_ndc_x * pixel_aspect
+    ray_dir_y = pixel_ndc_y
+    ray_dir_z = pixel_ndc_x * 0.0 - 2.15
     ray_len = (ray_dir_x * ray_dir_x + ray_dir_y * ray_dir_y + ray_dir_z * ray_dir_z + 0.000001).sqrt()
     ray_dir_x = ray_dir_x / ray_len
     ray_dir_y = ray_dir_y / ray_len
     ray_dir_z = ray_dir_z / ray_len
 
-    light_x = 3.8 * (time * 0.19).cos()
-    light_y = time * 0.0 + 4.6
-    light_z = 5.5 + 0.7 * (time * 0.13).sin()
+    light_x = 3.8 * (pixel_time_col * 0.19).cos()
+    light_y = pixel_time_col * 0.0 + 4.6
+    light_z = 5.5 + 0.7 * (pixel_time_col * 0.13).sin()
 
-    center_x = ndc_x * 0.0 + elem_geom_x * aspect * 4.0
-    center_y = ndc_x * 0.0 + elem_geom_y * 4.0
-    center_z = ndc_x * 0.0 - 0.12 * elem_material_x - elem_index * 0.03
+    norm_center_x = elem_position_x / __WIDTH__ * 2.0 - 1.0
+    norm_center_y = elem_position_y / __HEIGHT__ * 2.0 - 1.0
+    norm_half_x = elem_half_x / __WIDTH__ * 2.0
+    norm_half_y = elem_half_y / __HEIGHT__ * 2.0
 
-    half_x = (elem_geom_hw * aspect * 4.0).maximum(0.018) + ndc_x * 0.0
-    half_y = (elem_geom_hh * 4.0).maximum(0.018) + ndc_x * 0.0
-    glow = elem_material_y.minimum(1.0)
-    half_z = (0.10 + 0.025 * glow) + ndc_x * 0.0
-
-    valid = (elem_index < dom_count)
+    center_x = pixel_ndc_x * 0.0 + norm_center_x * pixel_aspect * 4.0
+    center_y = pixel_ndc_x * 0.0 + norm_center_y * 4.0
+    center_z = pixel_ndc_x * 0.0 - elem_depth_bias
+    box_half_x = (norm_half_x * pixel_aspect * 4.0).maximum(0.018) + pixel_ndc_x * 0.0
+    box_half_y = (norm_half_y * 4.0).maximum(0.018) + pixel_ndc_x * 0.0
+    box_half_z = 0.12 + pixel_ndc_x * 0.0
 
     inv_dir_x = 1.0 / ray_dir_x
     inv_dir_y = 1.0 / ray_dir_y
     inv_dir_z = 1.0 / ray_dir_z
 
-    first_x = (center_x - half_x - ray_origin_x) * inv_dir_x
-    second_x = (center_x + half_x - ray_origin_x) * inv_dir_x
+    first_x = (center_x - box_half_x - ray_origin_x) * inv_dir_x
+    second_x = (center_x + box_half_x - ray_origin_x) * inv_dir_x
     near_x = first_x.minimum(second_x)
     far_x = first_x.maximum(second_x)
 
-    first_y = (center_y - half_y - ray_origin_y) * inv_dir_y
-    second_y = (center_y + half_y - ray_origin_y) * inv_dir_y
+    first_y = (center_y - box_half_y - ray_origin_y) * inv_dir_y
+    second_y = (center_y + box_half_y - ray_origin_y) * inv_dir_y
     near_y = first_y.minimum(second_y)
     far_y = first_y.maximum(second_y)
 
-    first_z = (center_z - half_z - ray_origin_z) * inv_dir_z
-    second_z = (center_z + half_z - ray_origin_z) * inv_dir_z
+    first_z = (center_z - box_half_z - ray_origin_z) * inv_dir_z
+    second_z = (center_z + box_half_z - ray_origin_z) * inv_dir_z
     near_z = first_z.minimum(second_z)
     far_z = first_z.maximum(second_z)
 
     near_distance = near_x.maximum(near_y).maximum(near_z)
     far_distance = far_x.minimum(far_y).minimum(far_z)
 
-    hit_ok = (far_distance >= near_distance.maximum(0.0)) * valid
+    hit_ok = (far_distance >= near_distance.maximum(0.0))
     hit_distance = (near_distance > 0.0) * near_distance + (near_distance <= 0.0) * far_distance
 
     big = 1.0e20
     effective_distance = hit_ok * hit_distance + (1.0 - hit_ok) * big
     nearest = effective_distance.min(dim=-1, keepdim=True)
     winner = (effective_distance <= nearest) * hit_ok
-    winner_count = winner.sum(dim=-1, keepdim=True) + 0.000001
 
     point_x = ray_origin_x + ray_dir_x * hit_distance
     point_y = ray_origin_y + ray_dir_y * hit_distance
@@ -287,9 +273,9 @@ def elastic_dom_present(
     surface_y = point_y - center_y
     surface_z = point_z - center_z
 
-    face_x = (surface_x.abs() - half_x).abs()
-    face_y = (surface_y.abs() - half_y).abs()
-    face_z = (surface_z.abs() - half_z).abs()
+    face_x = (surface_x.abs() - box_half_x).abs()
+    face_y = (surface_y.abs() - box_half_y).abs()
+    face_z = (surface_z.abs() - box_half_z).abs()
 
     is_x = (face_x < face_y) * (face_x < face_z)
     is_y = (face_y < face_z) * (1.0 - is_x)
@@ -334,14 +320,15 @@ def elastic_dom_present(
 
     attenuation = 1.0 / (1.0 + 0.035 * light_dist2)
 
-    surface_r = elem_tint_r * (0.13 + 1.15 * diffuse * attenuation) + 1.00 * specular * attenuation * 0.9 + elem_tint_r * glow * 0.08
-    surface_g = elem_tint_g * (0.13 + 1.15 * diffuse * attenuation) + 0.91 * specular * attenuation * 0.9 + elem_tint_g * glow * 0.08
-    surface_b = elem_tint_b * (0.13 + 1.15 * diffuse * attenuation) + 0.75 * specular * attenuation * 0.9 + elem_tint_b * glow * 0.08
+    surface_r = elem_tint_r * (0.13 + 1.15 * diffuse * attenuation) + 1.00 * specular * attenuation * 0.9
+    surface_g = elem_tint_g * (0.13 + 1.15 * diffuse * attenuation) + 0.91 * specular * attenuation * 0.9
+    surface_b = elem_tint_b * (0.13 + 1.15 * diffuse * attenuation) + 0.75 * specular * attenuation * 0.9
 
+    winner_count = winner.sum(dim=-1) + 0.000001
     any_hit = (winner.sum(dim=-1) > 0.0)
-    picked_r = (winner * surface_r).sum(dim=-1) / winner_count.sum(dim=-1)
-    picked_g = (winner * surface_g).sum(dim=-1) / winner_count.sum(dim=-1)
-    picked_b = (winner * surface_b).sum(dim=-1) / winner_count.sum(dim=-1)
+    picked_r = (winner * surface_r).sum(dim=-1) / winner_count
+    picked_g = (winner * surface_g).sum(dim=-1) / winner_count
+    picked_b = (winner * surface_b).sum(dim=-1) / winner_count
 
     background_r = ndc_x * 0.0 + 0.008
     background_g = ndc_x * 0.0 + 0.012
@@ -351,11 +338,16 @@ def elastic_dom_present(
     color_g = any_hit * picked_g + (1.0 - any_hit) * background_g
     color_b = any_hit * picked_b + (1.0 - any_hit) * background_b
 
-    display_red = color_r.maximum(0.0) ** (1.0 / 2.2)
-    display_green = color_g.maximum(0.0) ** (1.0 / 2.2)
-    display_blue = color_b.maximum(0.0) ** (1.0 / 2.2)
-    return (display_red, display_green, display_blue)
-'''
+    red = color_r.maximum(0.0).reshape((-1,)) ** (1.0 / 2.2)
+    green = color_g.maximum(0.0).reshape((-1,)) ** (1.0 / 2.2)
+    blue = color_b.maximum(0.0).reshape((-1,)) ** (1.0 / 2.2)
+
+    return (
+        next_position_x, next_position_y, next_velocity_x, next_velocity_y,
+        next_button_latch, next_score, activity, rejected_steps,
+        advanced_time, remaining_time, red, green, blue,
+    )
+'''.replace("__WIDTH__", repr(_CANVAS_WIDTH)).replace("__HEIGHT__", repr(_CANVAS_HEIGHT))
 )
 
 

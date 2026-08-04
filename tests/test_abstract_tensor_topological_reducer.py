@@ -39,6 +39,39 @@ def kernel(x):
             assert data["type"] == original_type
 
 
+def test_annotated_assignments_use_one_ingestion_operator_in_classes_and_functions():
+    graph = ProcessGraph(materialize_memory=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(ast.parse(
+            """
+class Example:
+    class_value: float = 1.0
+
+    def method(self, value):
+        local_value: float = value
+        return local_value
+"""
+        ))
+
+    assert not any(
+        isinstance(data.get("expr_obj"), ast.AnnAssign)
+        for _node_id, data in graph.G.nodes(data=True)
+    )
+    assignments = [
+        data
+        for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Assign)
+    ]
+    assert len(assignments) == 2
+
+    reduce_abstract_tensor_topology(graph)
+
+    assert all(data["type"] == "Store" for data in assignments)
+    assert graph.G.graph["map_ir"]["schema"]["classes"][0][
+        "members"
+    ][0]["annotation"] == "float"
+
+
 def test_expr_wrapper_is_removed_without_removing_its_interior():
     graph = ProcessGraph(materialize_memory=False)
     with contextlib.redirect_stdout(io.StringIO()):

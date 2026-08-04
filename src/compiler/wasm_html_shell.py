@@ -526,6 +526,7 @@ let GRAPH_VIEWS = __GRAPH_VIEWS__;
 const NETWORK = __NETWORK__;
 const CLASS_GRAPH = __CLASS_GRAPH__;
 const MAP_IR = __MAP_IR__;
+const CARD_GRAPH = MAP_IR.card_graph || {cards: [], connections: [], paths: {}};
 const SOURCE_DOWNLOADS = __SOURCE_DOWNLOADS__;
 const MATHEMATICS = __MATHEMATICS__;
 const RESOURCE_ROUTE = __RESOURCE_ROUTE__;
@@ -693,6 +694,40 @@ function resolveClassInstantiation(classIdentity, evaluator) {
   return Array.from(constructors);
 }
 
+class CardGraphReadHead {
+  constructor(graph = CARD_GRAPH) {
+    this.graph = graph;
+    this.cards = new Map((graph.cards || []).map(card => [card.id, card]));
+    this.outgoing = new Map();
+    for (const connection of graph.connections || []) {
+      if (!this.outgoing.has(connection.from)) this.outgoing.set(connection.from, []);
+      this.outgoing.get(connection.from).push(connection);
+    }
+  }
+
+  card(identity) {
+    const card = this.cards.get(identity);
+    if (!card) throw new Error("unknown punch card " + identity);
+    return card;
+  }
+
+  connectionsFrom(identity, kind = null) {
+    return (this.outgoing.get(identity) || []).filter(
+      connection => kind === null || connection.kind === kind
+    );
+  }
+
+  async traverse(path = "linear", visit, maximumCards = 100000) {
+    if (typeof visit !== "function") throw new TypeError("card traversal requires a visitor");
+    const identities = (this.graph.paths || {})[path];
+    if (!Array.isArray(identities)) throw new Error("unknown card path " + path);
+    if (identities.length > maximumCards) throw new Error("card traversal limit exceeded");
+    for (let index = 0; index < identities.length; index++) {
+      await visit(this.card(identities[index]), index, identities.length);
+    }
+  }
+}
+
 window.TuringClassNavigation = Object.freeze({
   map: MAP_IR,
   resolveClass,
@@ -700,9 +735,17 @@ window.TuringClassNavigation = Object.freeze({
   instantiate: resolveClassInstantiation,
   evaluatePermission: evaluateClassPermission
 });
+window.TuringCardGraph = Object.freeze({
+  graph: CARD_GRAPH,
+  createReadHead: () => new CardGraphReadHead(CARD_GRAPH),
+});
 
 let moduleBytes = null;
 if (WASM_BASE64) {
+// Compiled modules contain no arena address and can be cached globally.
+// Instances cannot: imported memory binds them to one outer coordinator.
+const PUNCH_CARD_MODULE_CACHE = new Map();
+
   const raw = atob(WASM_BASE64);
   moduleBytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) moduleBytes[i] = raw.charCodeAt(i);
@@ -991,6 +1034,7 @@ class ClassGraphRunner {
       "segmented manifest does not declare the shared-memory ABI"
     );
     this.manifest = manifest;
+    this.cardGraph = CARD_GRAPH;
     this.modulesByName = new Map(manifest.modules.map(m => [m.name, m]));
     this.instances = new Map();
     this.runtime = null;
@@ -1144,11 +1188,11 @@ class ClassGraphRunner {
       const method = (this.manifest.class_inventory.methods || []).find(
         candidate => Number(candidate.index) === Number(node.method)
       );
+      if (!method) throw new Error("unknown deployment method " + node.method);
       const spec = this.modulesByName.get(method.module);
-      const instance = this.instances.get(method.module);
-      const args = [...method.input_slots, ...method.output_slots].map(
-        slot => this.fieldOffsets[slot]
-      );
+      if (!spec) throw new Error("missing deployment module " + method.module);
+      const instance = await this.instantiateCard(spec);
+      const args = this.rebindCardAliases(method);
       instance.exports[method.entry](count, ...args);
       return;
     }
@@ -1317,24 +1361,39 @@ class ClassGraphRunner {
   async instantiateCard(spec) {
     if (this.instances.has(spec.name)) return this.instances.get(spec.name);
     markDeploymentNode(spec.name, "downloading");
-    let moduleBinary;
-    if (spec.url) {
-      const response = await fetchResource(spec.url);
-      if (!response.ok) throw new Error(
-        "failed to load method card " + spec.name + ": HTTP " + response.status
-      );
-      moduleBinary = await response.arrayBuffer();
-    } else if (spec.wasm_base64) {
-      const raw = atob(spec.wasm_base64);
-      moduleBinary = new Uint8Array(raw.length);
-      for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
-    } else {
-      throw new Error("method card " + spec.name + " has no URL or bytes");
+    const cacheKey = spec.cache_key || spec.url || (spec.name + "::" + (spec.wasm_base64 || ""));
+    let compiled = PUNCH_CARD_MODULE_CACHE.get(cacheKey);
+    if (!compiled) {
+      compiled = (async () => {
+        let moduleBinary;
+        if (spec.url) {
+          const response = await fetchResource(spec.url);
+          if (!response.ok) throw new Error(
+            "failed to load method card " + spec.name + ": HTTP " + response.status
+          );
+          moduleBinary = await response.arrayBuffer();
+        } else if (spec.wasm_base64) {
+          const raw = atob(spec.wasm_base64);
+          moduleBinary = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) moduleBinary[i] = raw.charCodeAt(i);
+        } else {
+          throw new Error("method card " + spec.name + " has no URL or bytes");
+        }
+        return WebAssembly.compile(moduleBinary);
+      })();
+      PUNCH_CARD_MODULE_CACHE.set(cacheKey, compiled);
     }
     const memoryImport = spec.shared_memory_import || {module: "env", field: "memory"};
     const imports = {};
     imports[memoryImport.module] = {[memoryImport.field]: this.memory};
-    const { instance } = await WebAssembly.instantiate(moduleBinary, imports);
+    let module;
+    try {
+      module = await compiled;
+    } catch (error) {
+      PUNCH_CARD_MODULE_CACHE.delete(cacheKey);
+      throw error;
+    }
+    const instance = await WebAssembly.instantiate(module, imports);
     this.instances.set(spec.name, instance);
     markDeploymentNode(spec.name, "ready");
     return instance;
@@ -1383,6 +1442,37 @@ class ClassGraphRunner {
   }
 
   offsetForKey(key) {
+
+  rebindCardAliases(method) {
+    const slots = [...method.input_slots, ...method.output_slots].map(Number);
+    const table = new Int32Array(
+      this.memory.buffer, this.inventoryOffset,
+      (this.manifest.class_inventory.field_slots || []).length
+    );
+    // Always rewrite: a cached card may be entered through a different graph
+    // edge, and a previous traversal's address must never survive the seam.
+    for (const slot of slots) table[slot] = this.fieldOffsets[slot];
+    return slots.map(slot => table[slot]);
+  }
+
+  async executeReadHeadRange(count, activeMethods, latch) {
+    for (let index = 0; index < activeMethods.length && (!latch || running); index++) {
+      const method = activeMethods[index];
+      const spec = this.modulesByName.get(method.module);
+      if (!spec) throw new Error("inventory method module not found: " + method.module);
+      const instance = await this.instantiateCard(spec);
+      const args = this.rebindCardAliases(method);
+      markDeploymentNode(method.module, "running");
+      const started = performance.now();
+      instance.exports[method.entry](count, ...args);
+      const elapsed = performance.now() - started;
+      queueDeploymentProfile(method.module, elapsed, "lazy read head");
+      markDeploymentNode(method.module, "done", elapsed, "lazy read head");
+      if (latch && index + 1 < activeMethods.length && running) {
+        await waitForCardLatch(index + 1, activeMethods.length);
+      }
+    }
+  }
     const index = this.fieldIndex.get(key);
     if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
     return this.fieldOffsets[index];
@@ -1466,7 +1556,12 @@ class ClassGraphRunner {
         collectiveMethods: this.manifest.thread_deployment.collective_methods || []
       });
     }
-    if (this.threadingEnabled && this.manifest.thread_deployment &&
+    const cardPolicy = (this.cardGraph || {}).address_policy || {};
+    if (cardPolicy.execution === "read-head") {
+      const started = performance.now();
+      await this.executeReadHeadRange(count, activeMethods, latch);
+      this.lastExecutionMs = performance.now() - started;
+    } else if (this.threadingEnabled && this.manifest.thread_deployment &&
         this.threadingEligible() && !latch &&
         rangeStart === 0 && rangeEnd === methodCount) {
       const started = performance.now();
@@ -4462,6 +4557,9 @@ def emit_html_shell(
     network_mapping.setdefault("routes", [])
     network_routes = {str(route["feed"]): route for route in network_mapping["routes"] if isinstance(route, Mapping) and route.get("feed")}
     map_mapping = _map_ir_mapping(map_ir)
+    from .card_graph import build_card_graph
+
+    map_mapping.setdefault("card_graph", build_card_graph(map_mapping, class_graph))
     transcript_html = _render_transcript(
         mapping=mapping,
         entry=entry,

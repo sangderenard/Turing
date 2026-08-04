@@ -61,7 +61,10 @@ from ..common.tensors.fused_ir import (
     OpStep,
     flatten_tensor_constant,
     ordered_feed_ids,
+    resolve_view_source,
     uniform_tensor_constant,
+    unroll_feed_axis_reductions,
+    view_offset_stride,
 )
 
 
@@ -128,11 +131,12 @@ _COMPARISON_INSTRUCTION = {
 # Genuinely out of reach: no instruction, and no table either. tan has poles
 # inside any interval worth covering, so no bounded table describes it -- a
 # program wanting it should divide sin by cos and decide for itself what
-# happens near the pole. The rest are shape or predicate operations rather
-# than functions of one float.
+# happens near the pole. mod/floordiv await an integer-remainder lowering;
+# the predicates return a boolean mask this elementwise float pass does not
+# model yet. (sign and pow ARE lowered -- see _step_instructions / _assemble.)
 _NO_WASM_INSTRUCTION = {
-    "pow", "mod", "floordiv", "tan",
-    "sign", "isfinite", "isnan", "isinf", "logical_not",
+    "mod", "floordiv", "tan",
+    "isfinite", "isnan", "isinf", "logical_not",
 }
 # Reachable through a baked table rather than an instruction. Taken from
 # the catalogue itself so the two cannot drift apart: adding a function to
@@ -264,6 +268,273 @@ def _sum_dependencies(step: OpStep, live: Sequence[OpStep]) -> tuple[OpStep, ...
     return tuple(candidate for candidate in live if candidate.result_id in required)
 
 
+# One axis reduction folds a trailing axis away. The accumulator starts at the
+# identity and each grid element is combined with the value-type instruction
+# named here; ``mean`` uses the ``sum`` fold and divides by K afterwards.
+_REDUCE_FOLD: dict[str, tuple[str, float]] = {
+    "sum": ("add", 0.0),
+    "mean": ("add", 0.0),
+    "prod": ("mul", 1.0),
+    "min": ("min", float("inf")),
+    "amin": ("min", float("inf")),
+    "max": ("max", float("-inf")),
+    "amax": ("max", float("-inf")),
+}
+
+
+def _shape_product(shape: Any) -> int | None:
+    if shape is None:
+        return None
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return total
+
+
+@dataclass(frozen=True)
+class _AxisReductionPlan:
+    """How to iterate a program whose outputs survive a trailing-axis reduce.
+
+    An axis reduction is a rank change (N*K -> N) the flat ``run(count, ...)``
+    model cannot express directly.  It is lowered as a nested walk: the outer
+    loop iterates the surviving extent N -- the independent, per-output lane,
+    exactly as parallel as an elementwise pass -- and an inner counted loop of
+    K accumulates the reduced axis.  Keeping N as the outer lane is deliberate:
+    a materialised pre-reduction segment stays parallel over N, so it can still
+    be scored as a parallel deployment region downstream; only the K fold is
+    serial.  ``ok`` is False when the program contains an axis reduction this
+    backend cannot yet express (the reasons are recorded as shortfalls).
+    """
+
+    ok: bool
+    axis_extent: int
+    reductions: tuple[OpStep, ...]
+    reduce_op: dict[int, str]
+    inner_dependencies: dict[int, tuple[OpStep, ...]]
+    pre_steps: tuple[OpStep, ...]
+    post_steps: tuple[OpStep, ...]
+    value_class: dict[int, str]
+    feed_class: dict[int, str]
+    grid_output_steps: tuple[OpStep, ...]
+
+
+def _plan_axis_reductions(
+    program: FusedProgram,
+    live: Sequence[OpStep],
+    feed_ids: Sequence[int],
+    shortfalls: list[WasmShortfall],
+) -> _AxisReductionPlan | None:
+    """Classify one reduction program, or return None when it has no axis reduce.
+
+    Shared by both emitters so the WAT and binary forms cannot disagree about
+    which values are grid/row/kaxis/scalar or which steps run in the inner
+    fold.  Records a shortfall (and returns an ``ok=False`` plan) for every
+    reduction shape this backend cannot express, so emission fails loudly
+    rather than returning a plausible wrong number.
+    """
+
+    reductions = tuple(
+        step for step in live if step.attrs.get("axis") is not None
+    )
+    if not reductions:
+        return None
+
+    def fail(step_id: int, op: str, reason: str) -> _AxisReductionPlan:
+        shortfalls.append(WasmShortfall(step_id, op, reason))
+        return _AxisReductionPlan(
+            ok=False, axis_extent=0, reductions=reductions, reduce_op={},
+            inner_dependencies={}, pre_steps=(), post_steps=(),
+            value_class={}, feed_class={}, grid_output_steps=(),
+        )
+
+    meta = program.meta or {}
+    whole_sums = tuple(
+        step for step in live
+        if step.op_name == "sum" and step.attrs.get("axis") is None
+    )
+    if whole_sums:
+        return fail(
+            reductions[0].step_id, "reduce",
+            "whole-tensor and axis reductions in one program are not lowered "
+            "together",
+        )
+
+    extents_n: set[int] = set()
+    extents_k: set[int] = set()
+    reduce_op: dict[int, str] = {}
+    for step in reductions:
+        if not step.input_ids:
+            return fail(step.step_id, step.op_name, "reduction has no operand")
+        entry = meta.get(step.input_ids[0])
+        shape = tuple(entry.shape) if entry is not None and entry.shape is not None else None
+        if shape is None:
+            return fail(
+                step.step_id, step.op_name,
+                "axis reduction input has no shape metadata",
+            )
+        axis = int(step.attrs["axis"])
+        norm = axis if axis >= 0 else len(shape) + axis
+        if norm != len(shape) - 1:
+            return fail(
+                step.step_id, step.op_name,
+                f"only trailing-axis (axis=-1) reduction is lowered; got "
+                f"axis={axis} on shape {shape}",
+            )
+        k = int(shape[-1])
+        total = _shape_product(shape) or 0
+        op = str(step.attrs.get("reduce_op") or step.op_name)
+        if op not in _REDUCE_FOLD:
+            return fail(
+                step.step_id, step.op_name,
+                f"reduce_op {op!r} has no WebAssembly accumulator",
+            )
+        reduce_op[step.result_id] = op
+        extents_k.add(k)
+        extents_n.add(total // k if k else 0)
+
+    if len(extents_k) != 1 or len(extents_n) != 1:
+        return fail(
+            reductions[0].step_id, "reduce",
+            f"mixed reduction extents N={sorted(extents_n)} K={sorted(extents_k)} "
+            "are not lowered in one program",
+        )
+    outer_n = next(iter(extents_n))
+    axis_k = next(iter(extents_k))
+    if outer_n == axis_k:
+        return fail(
+            reductions[0].step_id, "reduce",
+            f"ambiguous reduction where N == K == {outer_n}; broadcasting "
+            "cannot be classified by extent alone",
+        )
+
+    def classify(value_id: int) -> str:
+        entry = meta.get(value_id)
+        product = _shape_product(entry.shape) if entry is not None else None
+        if product is None:
+            return "unknown"
+        if product == outer_n * axis_k:
+            return "grid"
+        if product == outer_n:
+            return "row"
+        if product == axis_k:
+            return "kaxis"
+        if product == 1:
+            return "scalar"
+        return "other"
+
+    value_class: dict[int, str] = {}
+    for value_id in feed_ids:
+        value_class[value_id] = classify(value_id)
+    for step in live:
+        value_class[step.result_id] = classify(step.result_id)
+
+    reduction_results = {step.result_id for step in reductions}
+    producers = {step.result_id: step for step in live}
+
+    def depends_on_reduction(step: OpStep) -> bool:
+        seen: set[int] = set()
+        stack = list(step.input_ids)
+        while stack:
+            value_id = stack.pop()
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+            if value_id in reduction_results:
+                return True
+            producer = producers.get(value_id)
+            if producer is not None:
+                stack.extend(producer.input_ids)
+        return False
+
+    feed_class: dict[int, str] = {}
+    for value_id in feed_ids:
+        klass = value_class.get(value_id, "unknown")
+        if klass == "grid":
+            return fail(
+                -1, "feed",
+                f"feed {value_id} is grid-shaped (N*K); the count-based ABI "
+                "cannot size it yet",
+            )
+        if klass in ("other", "unknown"):
+            return fail(
+                -1, "feed",
+                f"feed {value_id} has a shape that is not row/kaxis/scalar "
+                "relative to the reduction extents",
+            )
+        feed_class[value_id] = klass
+
+    pre_steps: list[OpStep] = []
+    post_steps: list[OpStep] = []
+    inner_dependencies: dict[int, tuple[OpStep, ...]] = {}
+    for step in live:
+        if step.result_id in reduction_results:
+            continue
+        klass = value_class.get(step.result_id, "unknown")
+        if klass in ("grid", "kaxis"):
+            # Inner-scope steps are emitted per reduction, in the fold loop.
+            # A grid/kaxis value may depend on an earlier reduction's row
+            # result (e.g. mask = dist <= dist.min(axis)): that reduction is
+            # emitted first and its result stays live in the outer scope, so a
+            # later reduction's inner loop can read it as a per-row scalar.
+            continue
+        if klass == "other" or klass == "unknown":
+            return fail(
+                step.step_id, step.op_name,
+                f"value {step.result_id} has an unclassifiable shape relative "
+                "to the reduction extents",
+            )
+        if depends_on_reduction(step):
+            post_steps.append(step)
+        else:
+            pre_steps.append(step)
+
+    for step in reductions:
+        deps = _sum_dependencies(step, live)
+        inner = tuple(
+            dep for dep in deps
+            if dep.result_id not in reduction_results
+            and value_class.get(dep.result_id) in ("grid", "kaxis")
+        )
+        inner_dependencies[step.result_id] = inner
+
+    # Grid/kaxis outputs need their own K-walk to be written at every (i, k).
+    # Gather the grid/kaxis steps that feed them (row/scalar ancestors are
+    # already computed once in the outer scope, so recursion stops there).
+    grid_output_ids = [
+        output_id for output_id in program.outputs.values()
+        if value_class.get(output_id) in ("grid", "kaxis")
+    ]
+    grid_needed: set[int] = set()
+    grid_stack = list(grid_output_ids)
+    while grid_stack:
+        value_id = grid_stack.pop()
+        if value_id in grid_needed:
+            continue
+        if value_class.get(value_id) not in ("grid", "kaxis"):
+            continue
+        producer = producers.get(value_id)
+        if producer is None:
+            continue
+        grid_needed.add(value_id)
+        grid_stack.extend(producer.input_ids)
+    grid_output_steps = tuple(
+        step for step in live if step.result_id in grid_needed
+    )
+
+    return _AxisReductionPlan(
+        ok=True,
+        axis_extent=axis_k,
+        reductions=reductions,
+        reduce_op=reduce_op,
+        inner_dependencies=inner_dependencies,
+        pre_steps=tuple(pre_steps),
+        post_steps=tuple(post_steps),
+        value_class=value_class,
+        feed_class=feed_class,
+        grid_output_steps=grid_output_steps,
+    )
+
+
 def _constant_scalar(step: OpStep) -> float | None:
     """The scalar a ``tensor_from_list`` step contributes, if it is one.
 
@@ -297,6 +568,169 @@ def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str
     return resolved
 
 
+def _emit_reduction_body_wat(
+    body: list[str],
+    plan: _AxisReductionPlan,
+    names: Mapping[int, str],
+    feed_label: Mapping[int, str],
+    feed_ids: Sequence[int],
+    value_type: str,
+    load: str,
+    store: str,
+    element_bytes: int,
+    static_data: Mapping[str, Any],
+    shortfalls: list[WasmShortfall],
+    output_ids: Sequence[int],
+) -> None:
+    """Append the nested reduction body for one axis-reduction program.
+
+    Runs inside the outer ``loop $body`` (which owns ``$i`` over N).  Row and
+    scalar feeds are read once per ``$i``; each reduction then runs an inner
+    ``$k`` loop over K that reads kaxis feeds/constants and folds the reduced
+    axis.  Post-reduction elementwise steps close out the iteration.
+    """
+
+    axis_k = plan.axis_extent
+
+    def index_lines(klass: str) -> list[str]:
+        if klass == "grid":
+            return [
+                "local.get $i", f"i32.const {axis_k}", "i32.mul",
+                "local.get $k", "i32.add",
+            ]
+        if klass == "kaxis":
+            return ["local.get $k"]
+        if klass == "row":
+            return ["local.get $i"]
+        return ["i32.const 0"]
+
+    def emit_load(pointer_expr: str, klass: str, destination: str) -> None:
+        body.append(f"      {pointer_expr}")
+        for line in index_lines(klass):
+            body.append(f"      {line}")
+        body.append(f"      i32.const {element_bytes}")
+        body.append("      i32.mul")
+        body.append("      i32.add")
+        body.append(f"      {load}")
+        body.append(f"      local.set {destination}")
+
+    def emit_feed(feed_id: int) -> None:
+        emit_load(
+            f"local.get {feed_label[feed_id]}",
+            plan.feed_class[feed_id],
+            names[feed_id],
+        )
+
+    def emit_step(step: OpStep) -> None:
+        constant = _constant_scalar(step)
+        if step.op_name == "tensor_from_list" and constant is None:
+            entry = static_data["constants"].get(step.result_id)
+            if entry is None:
+                shortfalls.append(WasmShortfall(
+                    step.step_id, step.op_name, "array constant was not baked",
+                ))
+                return
+            emit_load(
+                f"i32.const {entry['base']}",
+                plan.value_class.get(step.result_id, "row"),
+                names[step.result_id],
+            )
+            return
+        instructions = _step_instructions(
+            step, names, value_type, element_bytes,
+            static_data["constants"], shortfalls,
+        )
+        if instructions is None:
+            return
+        body.extend(instructions)
+        body.append(f"      local.set {names[step.result_id]}")
+
+    # Row/scalar feeds: read once for this $i, stable across every inner loop.
+    for feed_id in feed_ids:
+        if plan.feed_class[feed_id] in ("row", "scalar"):
+            emit_feed(feed_id)
+    for step in plan.pre_steps:
+        emit_step(step)
+
+    grid_slots = [
+        (output_id, slot, plan.value_class.get(output_id))
+        for slot, output_id in enumerate(output_ids)
+        if plan.value_class.get(output_id) in ("grid", "kaxis")
+    ]
+    for region_index, reduction in enumerate(plan.reductions):
+        op = plan.reduce_op[reduction.result_id]
+        fold, identity = _REDUCE_FOLD[op]
+        accumulator = names[reduction.result_id]
+        body.append(f"      {value_type}.const {identity!r}")
+        body.append(f"      local.set {accumulator}")
+        body.append("      i32.const 0")
+        body.append("      local.set $k")
+        body.append(f"      (block $rdone_{region_index}")
+        body.append(f"        (loop $rbody_{region_index}")
+        body.append("          local.get $k")
+        body.append(f"          i32.const {axis_k}")
+        body.append("          i32.ge_s")
+        body.append(f"          br_if $rdone_{region_index}")
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] == "kaxis":
+                emit_feed(feed_id)
+        for step in plan.inner_dependencies[reduction.result_id]:
+            emit_step(step)
+        body.append(f"          local.get {accumulator}")
+        body.append(f"          local.get {names[reduction.input_ids[0]]}")
+        body.append(f"          {value_type}.{fold}")
+        body.append(f"          local.set {accumulator}")
+        body.append("          local.get $k")
+        body.append("          i32.const 1")
+        body.append("          i32.add")
+        body.append("          local.set $k")
+        body.append(f"          br $rbody_{region_index}")
+        body.append("        )")
+        body.append("      )")
+        if op == "mean":
+            body.append(f"      local.get {accumulator}")
+            body.append(f"      {value_type}.const {float(axis_k)!r}")
+            body.append(f"      {value_type}.div")
+            body.append(f"      local.set {accumulator}")
+
+    for step in plan.post_steps:
+        emit_step(step)
+
+    # Grid/kaxis outputs get their own K-walk: they are full N*K tensors, so
+    # each is written at every (i, k) cell.  Independent of the folds above --
+    # an output that feeds no reduction is still materialised here.
+    if grid_slots:
+        body.append("      i32.const 0")
+        body.append("      local.set $k")
+        body.append("      (block $gdone")
+        body.append("        (loop $gbody")
+        body.append("          local.get $k")
+        body.append(f"          i32.const {axis_k}")
+        body.append("          i32.ge_s")
+        body.append("          br_if $gdone")
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] == "kaxis":
+                emit_feed(feed_id)
+        for step in plan.grid_output_steps:
+            emit_step(step)
+        for output_id, slot, klass in grid_slots:
+            body.append(f"          local.get $out{slot}")
+            for line in index_lines(klass):
+                body.append(f"          {line}")
+            body.append(f"          i32.const {element_bytes}")
+            body.append("          i32.mul")
+            body.append("          i32.add")
+            body.append(f"          local.get {names[output_id]}")
+            body.append(f"          {store}")
+        body.append("          local.get $k")
+        body.append("          i32.const 1")
+        body.append("          i32.add")
+        body.append("          local.set $k")
+        body.append("          br $gbody")
+        body.append("        )")
+        body.append("      )")
+
+
 def emit_wasm_module(
     program: FusedProgram,
     *,
@@ -325,6 +759,12 @@ def emit_wasm_module(
     caller (``build_homepage.py`` included) is unaffected.
     """
 
+    # A trailing-axis reduction over a genuine feed buffer (not one
+    # composed in-program from lower-rank operands) has no memory contract
+    # under the flat run(count, ...) ABI otherwise; unroll it into an
+    # elementwise fold over K strided views of that same buffer first, so
+    # the rest of this emitter never has to special-case it.
+    program = unroll_feed_axis_reductions(program)
     value_type, element_bytes, load, store = _value_type(program, dtype)
     shortfalls: list[WasmShortfall] = []
     live = required_steps(program)
@@ -336,9 +776,19 @@ def emit_wasm_module(
     feed_ids = program_feed_order(program)
     output_ids = list(program.outputs.values())
     names: dict[int, str] = {}
-    labels = feed_names(program, feed_ids)
+    # A view feed (Meta.source_id set) reads another feed's buffer under its
+    # own offset/stride and must not get a second byte-offset parameter for
+    # the same memory; parameters are allocated per unique buffer owner.
+    parameter_feed_ids: list[int] = []
+    seen_sources: set[int] = set()
+    for feed_id in feed_ids:
+        source_id = resolve_view_source(program.meta, feed_id)
+        if source_id not in seen_sources:
+            seen_sources.add(source_id)
+            parameter_feed_ids.append(source_id)
+    labels = feed_names(program, parameter_feed_ids)
     parameters: list[str] = ["$count"]
-    for index, feed_id in enumerate(feed_ids):
+    for index, feed_id in enumerate(parameter_feed_ids):
         parameters.append("$" + labels[index])
     for index, _ in enumerate(output_ids):
         parameters.append(f"$out{index}")
@@ -346,7 +796,7 @@ def emit_wasm_module(
     body: list[str] = []
     locals_declared: list[str] = ["(local $i i32)", "(local $addr i32)"]
 
-    def element_address(pointer: str) -> list[str]:
+    def direct_element_address(pointer: str) -> list[str]:
         # addr = pointer + i * element_bytes
         return [
             f"      local.get {pointer}",
@@ -355,6 +805,27 @@ def emit_wasm_module(
             "      i32.mul",
             "      i32.add",
         ]
+
+    def element_address(feed_id: int) -> list[str]:
+        # addr = source_pointer + offset*bytes + i * stride*bytes
+        # The offset/stride descriptor is the IR's memory manager
+        # (fused_ir.Meta); default (0, 1) reproduces a plain contiguous read.
+        source_id = resolve_view_source(program.meta, feed_id)
+        offset, stride = view_offset_stride(program.meta, feed_id)
+        instructions = [f"      local.get {feed_label[source_id]}"]
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            instructions.extend([
+                f"      i32.const {byte_offset}",
+                "      i32.add",
+            ])
+        instructions.extend([
+            "      local.get $i",
+            f"      i32.const {stride * element_bytes}",
+            "      i32.mul",
+            "      i32.add",
+        ])
+        return instructions
 
     # Allocate stable locals before emitting either reduction or output passes.
     for index, feed_id in enumerate(feed_ids):
@@ -366,20 +837,22 @@ def emit_wasm_module(
         names[step.result_id] = local
         locals_declared.append(f"(local {local} {value_type})")
 
-    sums = _flat_sum_steps(live)
-    for step in sums:
-        if step.attrs.get("axis") is not None or bool(step.attrs.get("keepdim", False)):
-            shortfalls.append(WasmShortfall(
-                step.step_id,
-                step.op_name,
-                "axis/keepdim reduction needs tensor shape and stride metadata",
-            ))
+    sums = tuple(
+        step for step in _flat_sum_steps(live) if step.attrs.get("axis") is None
+    )
+    plan = _plan_axis_reductions(program, live, feed_ids, shortfalls)
+    if plan is not None:
+        locals_declared.append("(local $k i32)")
+
+    feed_label = {
+        feed_id: "$" + labels[index] for index, feed_id in enumerate(parameter_feed_ids)
+    }
 
     def load_feeds(target: list[str]) -> None:
         # Feeds are read once per iteration into locals, so a value used by
         # more than one step is loaded once rather than re-read from memory.
-        for index, feed_id in enumerate(feed_ids):
-            target.extend(element_address("$" + labels[index]))
+        for feed_id in feed_ids:
+            target.extend(element_address(feed_id))
             target.append(f"      {load}")
             target.append(f"      local.set {names[feed_id]}")
 
@@ -401,53 +874,68 @@ def emit_wasm_module(
             target.append(f"      local.set {names[candidate.result_id]}")
 
     reduction_passes: list[str] = []
-    for reduction_index, step in enumerate(sums):
-        dependencies = _sum_dependencies(step, live)
-        source = names.get(step.input_ids[0]) if step.input_ids else None
-        if source is None:
-            shortfalls.append(WasmShortfall(
-                step.step_id, step.op_name, "reduction operand was never produced",
+    if plan is not None and plan.ok:
+        # Nested walk: outer loop iterates N (added by the assembly below),
+        # each reduction runs an inner counted loop over K.
+        _emit_reduction_body_wat(
+            body, plan, names, feed_label, feed_ids, value_type,
+            load, store, element_bytes, static_data, shortfalls, output_ids,
+        )
+    elif plan is not None:
+        # Unsupported axis reduction: the plan already recorded a shortfall, so
+        # no binary is built. The illustrative text body is left empty.
+        pass
+    else:
+        for reduction_index, step in enumerate(sums):
+            dependencies = _sum_dependencies(step, live)
+            source = names.get(step.input_ids[0]) if step.input_ids else None
+            if source is None:
+                shortfalls.append(WasmShortfall(
+                    step.step_id, step.op_name, "reduction operand was never produced",
+                ))
+                continue
+            reduction_passes.extend((
+                "    i32.const 0",
+                "    local.set $i",
+                f"    (block $sum_done_{reduction_index}",
+                f"      (loop $sum_body_{reduction_index}",
+                "        local.get $i",
+                "        local.get $count",
+                "        i32.ge_s",
+                f"        br_if $sum_done_{reduction_index}",
             ))
-            continue
-        reduction_passes.extend((
-            "    i32.const 0",
-            "    local.set $i",
-            f"    (block $sum_done_{reduction_index}",
-            f"      (loop $sum_body_{reduction_index}",
-            "        local.get $i",
-            "        local.get $count",
-            "        i32.ge_s",
-            f"        br_if $sum_done_{reduction_index}",
-        ))
-        load_feeds(reduction_passes)
-        evaluate_steps(reduction_passes, dependencies)
-        reduction_passes.extend((
-            f"      local.get {names[step.result_id]}",
-            f"      local.get {source}",
-            f"      {value_type}.add",
-            f"      local.set {names[step.result_id]}",
-            "        local.get $i",
-            "        i32.const 1",
-            "        i32.add",
-            "        local.set $i",
-            f"        br $sum_body_{reduction_index}",
-            "      )",
-            "    )",
-        ))
+            load_feeds(reduction_passes)
+            evaluate_steps(reduction_passes, dependencies)
+            reduction_passes.extend((
+                f"      local.get {names[step.result_id]}",
+                f"      local.get {source}",
+                f"      {value_type}.add",
+                f"      local.set {names[step.result_id]}",
+                "        local.get $i",
+                "        i32.const 1",
+                "        i32.add",
+                "        local.set $i",
+                f"        br $sum_body_{reduction_index}",
+                "      )",
+                "    )",
+            ))
 
-    load_feeds(body)
-    evaluate_steps(body, live)
+        load_feeds(body)
+        evaluate_steps(body, live)
 
-    for index, output_id in enumerate(output_ids):
-        target = names.get(output_id)
-        if target is None:
-            shortfalls.append(
-                WasmShortfall(-1, "output", f"value {output_id} is never produced")
-            )
-            continue
-        body.extend(element_address(f"$out{index}"))
-        body.append(f"      local.get {target}")
-        body.append(f"      {store}")
+    if plan is None or plan.ok:
+        for index, output_id in enumerate(output_ids):
+            if plan is not None and plan.value_class.get(output_id) in ("grid", "kaxis"):
+                continue  # written by the grid K-walk in the reduction body
+            target = names.get(output_id)
+            if target is None:
+                shortfalls.append(
+                    WasmShortfall(-1, "output", f"value {output_id} is never produced")
+                )
+                continue
+            body.extend(direct_element_address(f"$out{index}"))
+            body.append(f"      local.get {target}")
+            body.append(f"      {store}")
 
     parameter_text = " ".join(f"(param {p} i32)" for p in parameters)
     memory_import = next(
@@ -492,14 +980,14 @@ def emit_wasm_module(
     source = "\n".join(lines)
 
     reserved = static_data["reserved_bytes"]
-    api = _describe(name, function_name, feed_ids, output_ids, value_type,
+    api = _describe(name, function_name, parameter_feed_ids, output_ids, value_type,
                     element_bytes, reserved,
                     static_data_offset=static_data_offset,
                     shared_memory_import=(
                         {"module": memory_import.module, "field": memory_import.field}
                         if memory_import is not None else None
                     ),
-                    input_names=feed_names(program, feed_ids),
+                    input_names=labels,
                     output_names=list(program.outputs.keys()))
     binary = None
     if not shortfalls:
@@ -560,6 +1048,31 @@ def _step_instructions(
             WasmShortfall(step.step_id, op, "operand was never produced")
         )
         return None
+
+    if op == "sign":
+        # sign(x) = (x>0) - (x<0): exact, using the comparison opcodes WASM has.
+        return [
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.gt",
+            f"      {value_type}.convert_i32_u",
+            f"      local.get {left}",
+            f"      {value_type}.const 0.0",
+            f"      {value_type}.lt",
+            f"      {value_type}.convert_i32_u",
+            f"      {value_type}.sub",
+        ]
+
+    if op == "pow":
+        if step.attrs.get("reverse", False):
+            shortfalls.append(WasmShortfall(
+                step.step_id, "pow",
+                "reverse pow (base on the right) is not lowered yet"))
+            return None
+        # pow(x, y) = exp(y*log(x)); the binary composes the baked exp/log
+        # tables. Text names the step rather than inlining it, like any LUT op.
+        return [f"      ;; pow via exp(y*log(x)) baked tables (see the .wasm)",
+                f"      local.get {left}"]
 
     if op in _LUT_OPS:
         # The binary carries the table and the interpolation; the text form
@@ -641,7 +1154,10 @@ def _assemble(
     from .wasm_binary import CodeBuilder, build_module
 
     live = required_steps(program)
-    lut_ops = sorted({step.op_name for step in live} & _LUT_OPS)
+    lut_ops = {step.op_name for step in live} & _LUT_OPS
+    if any(step.op_name == "pow" for step in live):
+        lut_ops |= {"exp", "log"}
+    lut_ops = sorted(lut_ops)
     if lut_ops and value_type != "f64":
         raise WasmEmissionError(
             f"{lut_ops} is only baked for f64; an f32 table would need its "
@@ -653,8 +1169,19 @@ def _assemble(
     parameter_count = 1 + len(feed_ids) + len(output_ids)
     builder = CodeBuilder(value_type=value_type, parameter_count=parameter_count)
     count_param = 0
-    feed_params = {feed_id: 1 + i for i, feed_id in enumerate(feed_ids)}
-    output_params = [1 + len(feed_ids) + i for i in range(len(output_ids))]
+    # A view feed (Meta.source_id set) reads another feed's buffer under its
+    # own offset/stride and must not get a second byte-offset parameter for
+    # the same memory; parameters are allocated per unique buffer owner, same
+    # as the WAT lowering above.
+    parameter_feed_ids: list[int] = []
+    seen_sources: set[int] = set()
+    for feed_id in feed_ids:
+        source_id = resolve_view_source(program.meta, feed_id)
+        if source_id not in seen_sources:
+            seen_sources.add(source_id)
+            parameter_feed_ids.append(source_id)
+    feed_params = {feed_id: 1 + i for i, feed_id in enumerate(parameter_feed_ids)}
+    output_params = [1 + len(parameter_feed_ids) + i for i in range(len(output_ids))]
 
     index_local = builder.declare_local("i32")
     locals_for: dict[int, int] = {}
@@ -663,16 +1190,29 @@ def _assemble(
     for step in live:
         locals_for[step.result_id] = builder.declare_local(value_type)
 
-    def element_address(pointer_param: int) -> None:
+    def direct_element_address(pointer_param: int) -> None:
         builder.local_get(pointer_param)
         builder.local_get(index_local)
         builder.i32_const(element_bytes)
         builder.raw(0x6C)  # i32.mul
         builder.raw(0x6A)  # i32.add
 
+    def element_address(feed_id: int) -> None:
+        source_id = resolve_view_source(program.meta, feed_id)
+        offset, stride = view_offset_stride(program.meta, feed_id)
+        builder.local_get(feed_params[source_id])
+        byte_offset = offset * element_bytes
+        if byte_offset:
+            builder.i32_const(byte_offset)
+            builder.raw(0x6A)  # i32.add
+        builder.local_get(index_local)
+        builder.i32_const(stride * element_bytes)
+        builder.raw(0x6C)  # i32.mul
+        builder.raw(0x6A)  # i32.add
+
     def load_feeds() -> None:
         for feed_id in feed_ids:
-            element_address(feed_params[feed_id])
+            element_address(feed_id)
             builder.load()
             builder.local_set(locals_for[feed_id])
 
@@ -680,54 +1220,237 @@ def _assemble(
         for step in steps:
             if step.op_name == "sum":
                 continue
-            local = locals_for[step.result_id]
-            constant = _constant_scalar(step)
-            if constant is not None:
-                builder.value_const(constant)
-                builder.local_set(local)
-                continue
-            if step.op_name == "tensor_from_list":
-                entry = tables["constants"][step.result_id]
-                builder.i32_const(entry["base"])
+            emit_step(step, push_index_flat)
+
+    def push_index_flat() -> None:
+        builder.local_get(index_local)
+
+    def emit_step(step: OpStep, push_index) -> None:
+        local = locals_for[step.result_id]
+        constant = _constant_scalar(step)
+        if constant is not None:
+            builder.value_const(constant)
+            builder.local_set(local)
+            return
+        if step.op_name == "tensor_from_list":
+            entry = tables["constants"][step.result_id]
+            builder.i32_const(entry["base"])
+            push_index()
+            builder.i32_const(element_bytes)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            builder.load()
+            builder.local_set(local)
+            return
+        left = locals_for[step.input_ids[0]]
+
+        def push_right() -> None:
+            if len(step.input_ids) == 2:
+                builder.local_get(locals_for[step.input_ids[1]])
+            else:
+                builder.value_const(float(step.attrs["right_scalar"]))
+
+        if step.op_name == "sign":
+            # sign(x) = (x>0) - (x<0): exact, no table.
+            builder.local_get(left)
+            builder.value_const(0.0)
+            builder.op("gt")
+            builder.op("convert_i32_u")
+            builder.local_get(left)
+            builder.value_const(0.0)
+            builder.op("lt")
+            builder.op("convert_i32_u")
+            builder.op("sub")
+            builder.local_set(local)
+            return
+
+        if step.op_name == "pow":
+            # pow(x, y) = exp(y * log(x)), composing the baked tables.
+            log_entry = tables["entries"]["log"]
+            exp_entry = tables["entries"]["exp"]
+            product = builder.declare_local(value_type)
+            _emit_lut(
+                builder, left, "log", log_entry["base"],
+                log_entry["intervals"], log_entry["lower"],
+                log_entry["upper"], log_entry["periodic"],
+            )
+            push_right()
+            builder.op("mul")
+            builder.local_set(product)
+            _emit_lut(
+                builder, product, "exp", exp_entry["base"],
+                exp_entry["intervals"], exp_entry["lower"],
+                exp_entry["upper"], exp_entry["periodic"],
+            )
+            builder.local_set(local)
+            return
+
+        if step.op_name in _LUT_OPS:
+            entry = tables["entries"][step.op_name]
+            _emit_lut(
+                builder, left, step.op_name, entry["base"], entry["intervals"],
+                entry["lower"], entry["upper"], entry["periodic"],
+            )
+        elif step.op_name in ELEMENTWISE_UNARY:
+            builder.local_get(left)
+            builder.op(_UNARY_INSTRUCTION[step.op_name])
+        elif step.attrs.get("reverse", False):
+            push_right()
+            builder.local_get(left)
+        else:
+            builder.local_get(left)
+            push_right()
+
+        if step.op_name in ELEMENTWISE_BINARY:
+            instruction = _BINARY_INSTRUCTION.get(step.op_name)
+            if instruction is not None:
+                builder.op(instruction)
+            else:
+                builder.op(_COMPARISON_INSTRUCTION[step.op_name])
+                builder.op("convert_i32_u")
+        builder.local_set(local)
+
+    plan = _plan_axis_reductions(program, live, feed_ids, [])
+    if plan is not None and plan.ok:
+        k_local = builder.declare_local("i32")
+        axis_k = plan.axis_extent
+
+        def push_class_index(klass: str) -> None:
+            if klass == "grid":
                 builder.local_get(index_local)
+                builder.i32_const(axis_k)
+                builder.raw(0x6C)  # i32.mul
+                builder.local_get(k_local)
+                builder.raw(0x6A)  # i32.add
+            elif klass == "kaxis":
+                builder.local_get(k_local)
+            elif klass == "row":
+                builder.local_get(index_local)
+            else:
+                builder.i32_const(0)
+
+        def load_feed_class(feed_id: int) -> None:
+            builder.local_get(feed_params[feed_id])
+            push_class_index(plan.feed_class[feed_id])
+            builder.i32_const(element_bytes)
+            builder.raw(0x6C)  # i32.mul
+            builder.raw(0x6A)  # i32.add
+            builder.load()
+            builder.local_set(locals_for[feed_id])
+
+        def emit_reduction_step(step: OpStep) -> None:
+            klass = plan.value_class.get(step.result_id, "row")
+            emit_step(step, lambda: push_class_index(klass))
+
+        builder.i32_const(0)
+        builder.local_set(index_local)
+        builder.block()
+        builder.loop()
+        builder.local_get(index_local)
+        builder.local_get(count_param)
+        builder.raw(0x4E)  # i32.ge_s
+        builder.br_if(1)
+        for feed_id in feed_ids:
+            if plan.feed_class[feed_id] in ("row", "scalar"):
+                load_feed_class(feed_id)
+        for step in plan.pre_steps:
+            emit_reduction_step(step)
+        grid_slots = [
+            (output_id, slot, plan.value_class.get(output_id))
+            for slot, output_id in enumerate(output_ids)
+            if plan.value_class.get(output_id) in ("grid", "kaxis")
+        ]
+        for reduction in plan.reductions:
+            op = plan.reduce_op[reduction.result_id]
+            fold, identity = _REDUCE_FOLD[op]
+            accumulator = locals_for[reduction.result_id]
+            builder.value_const(identity)
+            builder.local_set(accumulator)
+            builder.i32_const(0)
+            builder.local_set(k_local)
+            builder.block()
+            builder.loop()
+            builder.local_get(k_local)
+            builder.i32_const(axis_k)
+            builder.raw(0x4E)  # i32.ge_s
+            builder.br_if(1)
+            for feed_id in feed_ids:
+                if plan.feed_class[feed_id] == "kaxis":
+                    load_feed_class(feed_id)
+            for step in plan.inner_dependencies[reduction.result_id]:
+                emit_reduction_step(step)
+            builder.local_get(accumulator)
+            builder.local_get(locals_for[reduction.input_ids[0]])
+            builder.op(fold)
+            builder.local_set(accumulator)
+            builder.local_get(k_local)
+            builder.i32_const(1)
+            builder.raw(0x6A)  # i32.add
+            builder.local_set(k_local)
+            builder.br(0)
+            builder.end()  # loop
+            builder.end()  # block
+            if op == "mean":
+                builder.local_get(accumulator)
+                builder.value_const(float(axis_k))
+                builder.op("div")
+                builder.local_set(accumulator)
+        for step in plan.post_steps:
+            emit_reduction_step(step)
+        if grid_slots:
+            builder.i32_const(0)
+            builder.local_set(k_local)
+            builder.block()
+            builder.loop()
+            builder.local_get(k_local)
+            builder.i32_const(axis_k)
+            builder.raw(0x4E)  # i32.ge_s
+            builder.br_if(1)
+            for feed_id in feed_ids:
+                if plan.feed_class[feed_id] == "kaxis":
+                    load_feed_class(feed_id)
+            for step in plan.grid_output_steps:
+                emit_reduction_step(step)
+            for output_id, slot, klass in grid_slots:
+                builder.local_get(output_params[slot])
+                push_class_index(klass)
                 builder.i32_const(element_bytes)
                 builder.raw(0x6C)  # i32.mul
                 builder.raw(0x6A)  # i32.add
-                builder.load()
-                builder.local_set(local)
-                continue
-            left = locals_for[step.input_ids[0]]
+                builder.local_get(locals_for[output_id])
+                builder.store()
+            builder.local_get(k_local)
+            builder.i32_const(1)
+            builder.raw(0x6A)  # i32.add
+            builder.local_set(k_local)
+            builder.br(0)
+            builder.end()  # loop
+            builder.end()  # block
+        for slot, output_id in enumerate(output_ids):
+            if plan.value_class.get(output_id) in ("grid", "kaxis"):
+                continue  # written by the grid K-walk above
+            direct_element_address(output_params[slot])
+            builder.local_get(locals_for[output_id])
+            builder.store()
+        builder.local_get(index_local)
+        builder.i32_const(1)
+        builder.raw(0x6A)  # i32.add
+        builder.local_set(index_local)
+        builder.br(0)
+        builder.end()  # loop
+        builder.end()  # block
 
-            def push_right() -> None:
-                if len(step.input_ids) == 2:
-                    builder.local_get(locals_for[step.input_ids[1]])
-                else:
-                    builder.value_const(float(step.attrs["right_scalar"]))
-
-            if step.op_name in _LUT_OPS:
-                entry = tables["entries"][step.op_name]
-                _emit_lut(
-                    builder, left, step.op_name, entry["base"], entry["intervals"],
-                    entry["lower"], entry["upper"], entry["periodic"],
-                )
-            elif step.op_name in ELEMENTWISE_UNARY:
-                builder.local_get(left)
-                builder.op(_UNARY_INSTRUCTION[step.op_name])
-            elif step.attrs.get("reverse", False):
-                push_right()
-                builder.local_get(left)
-            else:
-                builder.local_get(left)
-                push_right()
-
-            if step.op_name in ELEMENTWISE_BINARY:
-                instruction = _BINARY_INSTRUCTION.get(step.op_name)
-                if instruction is not None:
-                    builder.op(instruction)
-                else:
-                    builder.op(_COMPARISON_INSTRUCTION[step.op_name])
-                    builder.op("convert_i32_u")
-            builder.local_set(local)
+        data = tables["data"]
+        pages = max(1, (reserved_bytes + 65535) // 65536 + 1)
+        return build_module(
+            function_name=function_name,
+            parameter_types=["i32"] * parameter_count,
+            body=builder,
+            memory_pages=pages,
+            data=data,
+            data_offset=int(tables.get("data_offset", 0)),
+            imports=imports,
+        )
 
     # Each SSA sum gets an explicit whole-tensor pass. Its scalar local is
     # then consumed by later tensor expressions as a broadcast value.
@@ -767,7 +1490,7 @@ def _assemble(
     evaluate_steps(live)
 
     for slot, output_id in enumerate(output_ids):
-        element_address(output_params[slot])
+        direct_element_address(output_params[slot])
         builder.local_get(locals_for[output_id])
         builder.store()
 
@@ -934,7 +1657,11 @@ def plan_static_data(
 
     import struct as _struct
 
-    tables = plan_tables(sorted({step.op_name for step in steps} & _LUT_OPS))
+    lut_ops = {step.op_name for step in steps} & _LUT_OPS
+    if any(step.op_name == "pow" for step in steps):
+        # pow composes exp and log tables even though it is not itself tabulated.
+        lut_ops |= {"exp", "log"}
+    tables = plan_tables(sorted(lut_ops))
     for entry in tables["entries"].values():
         entry["base"] += data_offset
     payload = bytearray(tables["data"])

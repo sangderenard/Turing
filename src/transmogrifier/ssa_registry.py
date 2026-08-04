@@ -50,6 +50,7 @@ class Handler(Enum):
     Load          = "Load"
     Store         = "Store"
     Alloca        = "Alloca"
+    Fill          = "Fill"          # span-memory initialisation; zero-fill == calloc
     GetElementPtr = "GetElementPtr"
 
     # Casts & Conversions
@@ -143,6 +144,17 @@ sympy_ssa_name_map: Dict[str, Handler] = {
     'load':                Handler.Load,
     'store':               Handler.Store,
     'alloca':              Handler.Alloca,
+    # Span-memory initialisation collapses the construction constructors onto a
+    # single Fill operation. Zero-fill (``zeros``/``empty``) is the calloc case.
+    'fill':                Handler.Fill,
+    'zeros':               Handler.Fill,
+    'zeros_like':          Handler.Fill,
+    'ones':                Handler.Fill,
+    'ones_like':           Handler.Fill,
+    'full':                Handler.Fill,
+    'full_like':           Handler.Fill,
+    'empty':               Handler.Fill,
+    'empty_like':          Handler.Fill,
     'getelementptr':       Handler.GetElementPtr,
     'idx':                 Handler.GetElementPtr,
     'indexed':             Handler.Load,
@@ -437,6 +449,19 @@ ast_ssa_equivalents: Dict[Handler, tuple[str, ...]] = {
         'slice',
         'extslice',
         'index',
+    ),
+
+    # Span-memory initialisation. Tensor construction constructors collapse onto
+    # a single Fill operation whose zero-fill spelling is the calloc case.
+    Handler.Fill: (
+        'call:zeros',
+        'call:zeros_like',
+        'call:ones',
+        'call:ones_like',
+        'call:full',
+        'call:full_like',
+        'call:empty',
+        'call:empty_like',
     ),
 
     # Type expressions collapse to the existing conversion operators. Generic

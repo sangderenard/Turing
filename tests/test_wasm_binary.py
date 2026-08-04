@@ -292,9 +292,12 @@ def test_the_catalogue_decides_what_is_reachable():
     # Nothing is both reachable and refused.
     assert not (_LUT_OPS & _NO_WASM_INSTRUCTION)
     # What stays refused is refused for a reason, not for want of a table:
-    # tan has poles, and the rest are predicates or shape operations rather
-    # than functions of one float.
-    assert {"tan", "pow", "mod", "sign", "isnan"} <= _NO_WASM_INSTRUCTION
+    # tan has poles, mod/floordiv await an integer-remainder lowering, and the
+    # rest are predicates or shape operations rather than functions of one
+    # float. sign and pow ARE lowered (see _step_instructions / _assemble)
+    # and so are deliberately absent from this refusal set.
+    assert {"tan", "mod", "isnan"} <= _NO_WASM_INSTRUCTION
+    assert not ({"sign", "pow"} & _NO_WASM_INSTRUCTION)
 
 
 def test_feed_order_follows_the_program_not_the_id_allocator():

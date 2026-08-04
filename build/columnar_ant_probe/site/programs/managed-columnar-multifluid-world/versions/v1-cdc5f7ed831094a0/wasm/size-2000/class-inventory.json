@@ -1,0 +1,283 @@
+{
+  "abi": "turing.class-memory-inventory.v1",
+  "field_slots": [
+    {
+      "index": 0,
+      "key": "in::managed_time"
+    },
+    {
+      "index": 1,
+      "key": "in::dt"
+    },
+    {
+      "index": 2,
+      "key": "in::audio_low"
+    },
+    {
+      "index": 3,
+      "key": "in::audio_high"
+    },
+    {
+      "index": 4,
+      "key": "in::audio_mid"
+    },
+    {
+      "index": 5,
+      "key": "in::column_x"
+    },
+    {
+      "index": 6,
+      "key": "in::column_y"
+    },
+    {
+      "index": 7,
+      "key": "in::ink_red"
+    },
+    {
+      "index": 8,
+      "key": "in::ink_yellow"
+    },
+    {
+      "index": 9,
+      "key": "in::ink_green"
+    },
+    {
+      "index": 10,
+      "key": "in::ink_cyan"
+    },
+    {
+      "index": 11,
+      "key": "in::ink_blue"
+    },
+    {
+      "index": 12,
+      "key": "in::ink_magenta"
+    },
+    {
+      "index": 13,
+      "key": "in::entity_x"
+    },
+    {
+      "index": 14,
+      "key": "in::entity_y"
+    },
+    {
+      "index": 15,
+      "key": "in::entity_b_x"
+    },
+    {
+      "index": 16,
+      "key": "in::entity_b_y"
+    },
+    {
+      "index": 17,
+      "key": "in::entity_c_x"
+    },
+    {
+      "index": 18,
+      "key": "in::entity_c_y"
+    },
+    {
+      "index": 19,
+      "key": "in::entity_velocity_x"
+    },
+    {
+      "index": 20,
+      "key": "in::entity_velocity_y"
+    },
+    {
+      "index": 21,
+      "key": "in::entity_b_velocity_x"
+    },
+    {
+      "index": 22,
+      "key": "in::entity_b_velocity_y"
+    },
+    {
+      "index": 23,
+      "key": "in::entity_c_velocity_x"
+    },
+    {
+      "index": 24,
+      "key": "in::entity_c_velocity_y"
+    },
+    {
+      "index": 25,
+      "key": "in::audio_level"
+    },
+    {
+      "index": 26,
+      "key": "in::displacement"
+    },
+    {
+      "index": 27,
+      "key": "in::displacement_velocity"
+    },
+    {
+      "index": 28,
+      "key": "in::rest_surface"
+    },
+    {
+      "index": 29,
+      "key": "out::columnar_multifluid_rgb_step__0::next_time"
+    },
+    {
+      "index": 30,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_velocity_x"
+    },
+    {
+      "index": 31,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_velocity_y"
+    },
+    {
+      "index": 32,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_x"
+    },
+    {
+      "index": 33,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_y"
+    },
+    {
+      "index": 34,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_b_velocity_x"
+    },
+    {
+      "index": 35,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_b_velocity_y"
+    },
+    {
+      "index": 36,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_b_x"
+    },
+    {
+      "index": 37,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_b_y"
+    },
+    {
+      "index": 38,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_c_velocity_x"
+    },
+    {
+      "index": 39,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_c_velocity_y"
+    },
+    {
+      "index": 40,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_c_x"
+    },
+    {
+      "index": 41,
+      "key": "out::columnar_multifluid_rgb_step__0::next_entity_c_y"
+    },
+    {
+      "index": 42,
+      "key": "out::columnar_multifluid_rgb_step__0::next_velocity"
+    },
+    {
+      "index": 43,
+      "key": "out::columnar_multifluid_rgb_step__0::next_displacement"
+    },
+    {
+      "index": 44,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_red"
+    },
+    {
+      "index": 45,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_yellow"
+    },
+    {
+      "index": 46,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_green"
+    },
+    {
+      "index": 47,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_cyan"
+    },
+    {
+      "index": 48,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_blue"
+    },
+    {
+      "index": 49,
+      "key": "out::columnar_multifluid_rgb_step__0::next_ink_magenta"
+    },
+    {
+      "index": 50,
+      "key": "out::columnar_multifluid_rgb_step__0::red"
+    },
+    {
+      "index": 51,
+      "key": "out::columnar_multifluid_rgb_step__0::green"
+    },
+    {
+      "index": 52,
+      "key": "out::columnar_multifluid_rgb_step__0::blue"
+    }
+  ],
+  "storage_redirects": [],
+  "methods": [
+    {
+      "index": 0,
+      "module": "columnar_multifluid_rgb_step__0",
+      "entry": "run",
+      "input_slots": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28
+      ],
+      "output_slots": [
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52
+      ],
+      "parameter_count": 54
+    }
+  ]
+}

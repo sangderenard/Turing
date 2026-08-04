@@ -14,6 +14,11 @@ from ..solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
 from ..operator_defs import default_funcs, operator_signatures, role_schemas
 from ..ilpscheduler import ILPScheduler
 from ..function_table import ExternalFunctionTable, FunctionTable
+from .node_special_cases import (
+    interpret_special_case,
+    dissolve_spans,
+    tensor_operation_name,
+)
 import colorsys
 import random
 import time
@@ -222,11 +227,11 @@ def _class_schema_from_ast(definition):
             "permissions": (),
         })
 
-    methods = [
-        member
-        for member in definition.body
-        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+    methods_by_name = {}
+    for member in definition.body:
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods_by_name[member.name] = member
+    methods = list(methods_by_name.values())
     for member in definition.body:
         if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
             add_attribute(member.target.id, member.annotation, "class")
@@ -450,24 +455,10 @@ def _map_ir_from_ast(tree):
 
 
 class _RuntimeAnnAssignNormalizer(ast.NodeTransformer):
-    """Separate local annotation schema from executable assignment logic."""
-
-    def __init__(self):
-        self.function_depth = 0
-
-    def visit_FunctionDef(self, node):
-        self.function_depth += 1
-        try:
-            return self.generic_visit(node)
-        finally:
-            self.function_depth -= 1
-
-    visit_AsyncFunctionDef = visit_FunctionDef
+    """Translate annotation syntax to the ordinary assignment operator."""
 
     def visit_AnnAssign(self, node):
         node = self.generic_visit(node)
-        if not self.function_depth:
-            return node
         if node.value is None:
             return ast.copy_location(ast.Pass(), node)
         return ast.copy_location(
@@ -593,6 +584,68 @@ def _import_ast_bindings(tree, bindings, package=None):
     return resolved
 
 
+def _heat_escape(level: int) -> str:
+    """An ANSI truecolor escape that gets warmer and brighter every level
+    the upward search climbs -- cool blue at the first pass, through
+    yellow, to hot white the deeper it has to go looking for a definition
+    this ``while True:`` loop was never given a constant bound to stop at."""
+
+    t = max(0.0, min(level / 8.0, 1.0))
+    if t < 0.5:
+        u = t / 0.5
+        r, g, b = int(70 + u * 185), int(120 + u * 135), int(220 - u * 170)
+    else:
+        u = (t - 0.5) / 0.5
+        r, g, b = 255, int(255 - u * 55) if u < 1 else 255, int(50 + u * 205)
+    return f"\x1b[1m\x1b[38;2;{r};{g};{b}m"
+
+
+_HEAT_RESET = "\x1b[0m"
+
+
+def _depth_escape(depth: int) -> str:
+    """The downward counterpart to ``_heat_escape``: green through cyan to
+    violet, deepening (not brightening) the further this descends into a
+    just-discovered definition's own nested functions/classes. Cool/violet
+    for descent, warm/bright for the upward search -- the two are never
+    mistakable for each other even color-blind, because they also use
+    different marker glyphs (``v`` vs ``!``)."""
+
+    t = max(0.0, min(depth / 6.0, 1.0))
+    if t < 0.5:
+        u = t / 0.5
+        r, g, b = int(60 + u * 20), int(190 - u * 10), int(110 + u * 110)
+    else:
+        u = (t - 0.5) / 0.5
+        r, g, b = int(80 + u * 120), int(180 - u * 130), int(220 + u * 15)
+    return f"\x1b[1m\x1b[38;2;{r};{g};{b}m"
+
+
+def _safe_repr(value, *, max_length=180):
+    if value is None:
+        return "None"
+    try:
+        text = repr(value)
+    except Exception as exc:
+        return f"<repr-error {exc!r}>"
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def _walk_definitions_with_depth(node, depth=1):
+    """Yield ``(member, depth)`` for every nested FunctionDef/AsyncFunctionDef
+    /ClassDef inside ``node``, depth-first, unlike ``ast.walk`` which gives
+    no depth at all. Depth 1 is a direct child definition of ``node``."""
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield child, depth
+            yield from _walk_definitions_with_depth(child, depth + 1)
+        else:
+            yield from _walk_definitions_with_depth(child, depth)
+
+
 def _expand_unresolved_ast_parents(
     tree,
     bindings,
@@ -600,12 +653,21 @@ def _expand_unresolved_ast_parents(
     package=None,
     include=None,
     profile_verbose=False,
+    progress=None,
 ):
     """Discover missing source definitions and return AST parent links.
 
     The returned definitions are ordinary AST objects.  They are subsequently
     ingested by ``ProcessGraph.build_graph``; no callable is installed in a
     function table or deferred to runtime.
+
+    ``progress``, if given, is called once per node discovered by the
+    upward search with one already-colored, already-``!``-decorated line.
+    The color and exclamation count both scale with ``pass_index`` -- this
+    loop is a genuine ``while True:``, not bounded by any constant depth,
+    and each additional pass means the search climbed one level further
+    looking for a source definition that was not where the previous pass
+    expected it.
     """
 
     if isinstance(tree, ast.Module):
@@ -613,6 +675,12 @@ def _expand_unresolved_ast_parents(
     else:
         module = ast.Module(body=[tree], type_ignores=[])
         ast.fix_missing_locations(module)
+
+    def emit(message):
+        if profile_verbose:
+            print(message, flush=True)
+        if progress is not None:
+            progress(message)
 
     root_bindings = _import_ast_bindings(module, bindings, package=package)
     # Resolution context belongs to the definition containing a call.  Never
@@ -701,9 +769,18 @@ def _expand_unresolved_ast_parents(
                     node.func.value,
                     call_bindings,
                 )
+            emit(
+                f"[ast-parent] call line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')} "
+                f"resolving {call_name or '<unknown>'} -> {identity[1]} "
+                f"source={_safe_repr(getattr(node.func, 'id', None) or getattr(node.func, 'attr', None) or getattr(node.func, 'name', None))}"
+            )
             source_definition = _source_ast_definition(source_target)
             if source_definition is None:
                 unavailable_identities.add(identity)
+                emit(
+                    f"[ast-parent] unresolved source for {identity[1]} "
+                    f"reason=source_unavailable"
+                )
                 continue
             process_graph_boundary = getattr(
                 source_target,
@@ -727,18 +804,37 @@ def _expand_unresolved_ast_parents(
             )
 
             module.body.append(source_definition)
-            new_definitions = [
-                member
-                for member in ast.walk(source_definition)
-                if isinstance(
-                    member,
-                    (
-                        ast.FunctionDef,
-                        ast.AsyncFunctionDef,
-                        ast.ClassDef,
-                    ),
+            emit(
+                f"[ast-parent] discovered definition {getattr(source_definition, 'name', identity)!r} "
+                f"from {identity[1]} pass={pass_index} "
+                f"kind={type(source_definition).__name__} line={getattr(source_definition, 'lineno', '?')}"
+            )
+            if progress is not None:
+                bang = "!" * min(pass_index, 12)
+                progress(
+                    f"{_heat_escape(pass_index)}[upward search L{pass_index}]{bang} "
+                    f"found {getattr(source_definition, 'name', identity)!r} "
+                    f"(unbounded -- no constant depth limit){bang}{_HEAT_RESET}"
                 )
-            ]
+            # ``source_definition`` itself is included first, matching what
+            # ``ast.walk(source_definition)`` used to yield before this loop
+            # tracked depth -- it is the node the upward search just found,
+            # already logged above, not a downward descent in its own right.
+            new_definitions = [source_definition]
+            for member, member_depth in _walk_definitions_with_depth(source_definition):
+                new_definitions.append(member)
+                emit(
+                    f"[ast-parent] nested {type(member).__name__} {getattr(member, 'name', '?')!r} "
+                    f"depth={member_depth} inside {getattr(source_definition, 'name', identity)!r} "
+                    f"line={getattr(member, 'lineno', '?')}"
+                )
+                if progress is not None:
+                    arrows = "v" * min(member_depth, 12)
+                    progress(
+                        f"{_depth_escape(member_depth)}[downward descent D{member_depth}]{arrows} "
+                        f"found {getattr(member, 'name', '?')!r} nested inside "
+                        f"{getattr(source_definition, 'name', identity)!r}{arrows}{_HEAT_RESET}"
+                    )
             definitions.extend(new_definitions)
             for new_definition in new_definitions:
                 definitions_by_name.setdefault(
@@ -819,6 +915,9 @@ def _expand_unresolved_ast_parents(
             if len(candidates) == 1:
                 definition = candidates[0]
         if definition is not None and definition is not call:
+            emit(
+                f"[ast-parent] linked parent {getattr(definition, 'name', '?')!r} -> call line={getattr(call, 'lineno', '?')}"
+            )
             parent_links.append((definition, call))
             continue
         if isinstance(call.func, ast.Name):
@@ -842,6 +941,9 @@ def _expand_unresolved_ast_parents(
             reason = "source_unavailable"
         else:
             reason = "missing_source_parent"
+        emit(
+            f"[ast-parent] unresolved call {unresolved_name!r} line={getattr(call, 'lineno', '?')} reason={reason}"
+        )
         unresolved_calls.append(
             {
                 "name": unresolved_name,
@@ -1029,6 +1131,9 @@ class ProcessGraph:
         )
         self.levels = {}
         self.node_map = {}
+        self._graph_profile_verbose = False
+        self._graph_build_counter = 0
+        self._graph_progress = None
         # integer level for recombinatorics aggressiveness: 0=no, higher unlock more transforms
         self.recombinatorics_level = recombinatorics_level
         self.expand_complex = expand_complex
@@ -1046,6 +1151,59 @@ class ProcessGraph:
             if external_function_table is None
             else external_function_table
         )
+
+    def _safe_repr(self, value, *, max_length=180):
+        return _safe_repr(value, max_length=max_length)
+
+    def _node_debug_summary(self, node):
+        if isinstance(node, ast.AST):
+            parts = []
+            if hasattr(node, "lineno") and getattr(node, "lineno", None) is not None:
+                parts.append(f"line={node.lineno}")
+            if hasattr(node, "col_offset") and getattr(node, "col_offset", None) is not None:
+                parts.append(f"col={node.col_offset}")
+            if isinstance(node, ast.Constant):
+                parts.append(f"value={self._safe_repr(node.value)}")
+            elif isinstance(node, ast.Name):
+                parts.append(f"id={node.id}")
+            elif isinstance(node, ast.Attribute):
+                parts.append(f"attr={node.attr}")
+            elif isinstance(node, ast.Call):
+                func_kind = type(node.func).__name__
+                parts.append(f"func={func_kind}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                parts.append(f"body={len(node.body)}")
+            if hasattr(node, "name") and getattr(node, "name", None) not in {None, ""}:
+                parts.append(f"name={node.name}")
+            if hasattr(node, "value") and not isinstance(node.value, ast.AST):
+                parts.append(f"value={self._safe_repr(node.value)}")
+            if hasattr(node, "arg") and getattr(node, "arg", None) not in {None, ""}:
+                parts.append(f"arg={node.arg}")
+            if hasattr(node, "id") and getattr(node, "id", None) not in {None, ""}:
+                parts.append(f"id={node.id}")
+            return " | ".join(parts) if parts else type(node).__name__
+
+        parts = []
+        for attr in ("name", "id", "arg", "value", "label"):
+            candidate = getattr(node, attr, None)
+            if candidate is None:
+                continue
+            if isinstance(candidate, (str, int, float, bool)) or candidate is None:
+                parts.append(f"{attr}={self._safe_repr(candidate)}")
+            elif not isinstance(candidate, (list, tuple, dict, set)):
+                parts.append(f"{attr}={self._safe_repr(candidate)}")
+        if not parts:
+            parts.append(self._safe_repr(node))
+        return " | ".join(parts)
+
+    def _emit_graph_build_log(self, message: str, *, progress=None) -> None:
+        """Emit verbose compiler progress for each ingested AST item."""
+
+        if self._graph_profile_verbose:
+            print(message, flush=True)
+        sink = progress if progress is not None else self._graph_progress
+        if sink is not None:
+            sink(message)
 
     def graph_accessor(self) -> ProcessGraphAccessor:
         """Return the stable accessor used by live compilation observers."""
@@ -1221,30 +1379,58 @@ class ProcessGraph:
                 self.G.nodes[tgt_id]['parents'].append((src_id, consumer_role))
             self.observe_evolution_edge(src_id, tgt_id, consumer_role)
 
-    def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None):
+    def _recurse_spec(self, nid, args, spec, direction, store_id=None, schema_repeats=None, role_indices=None, progress=None):
         # For each role in spec, use the role_indices and a counter (schema_repeats) to determine which arg to use.
-        
+
         if os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower() in {
             "1", "true", "yes", "on",
         }:
             print(spec.items())
-        
+
         for role, param in spec.items():
             if param == 1:
-                idx = role_indices[role][ schema_repeats.get(role, 0) ]
+                idx = role_indices[role][schema_repeats.get(role, 0)]
                 schema_repeats[role] = schema_repeats.get(role, 0) + 1
                 if direction == 'down':
-                    self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                    self.build_graph(
+                        args[idx],
+                        producer_id=nid,
+                        producer_role=role,
+                        consumer_role=f"arg{idx}",
+                        store_id=store_id,
+                        progress=progress,
+                    )
                 else:
-                    self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                    self.build_graph(
+                        args[idx],
+                        consumer_id=nid,
+                        producer_role="output",
+                        consumer_role=role,
+                        store_id=store_id,
+                        progress=progress,
+                    )
             elif param == 'many':
                 indices = role_indices[role]
                 # Use all remaining indices for this role.
                 for idx in indices[schema_repeats.get(role, 0):]:
                     if direction == 'down':
-                        self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            producer_id=nid,
+                            producer_role=role,
+                            consumer_role=f"arg{idx}",
+                            store_id=store_id,
+                            progress=progress,
+                        )
                     else:
-                        self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            consumer_id=nid,
+                            producer_role="output",
+                            consumer_role=role,
+                            store_id=store_id,
+                            progress=progress,
+                        )
                 schema_repeats[role] = len(indices)
             elif isinstance(param, tuple):
                 num = param[1] if len(param) == 2 else param[0]
@@ -1253,16 +1439,47 @@ class ProcessGraph:
                     idx = indices[schema_repeats.get(role, 0)]
                     schema_repeats[role] = schema_repeats.get(role, 0) + 1
                     if direction == 'down':
-                        self.build_graph(args[idx], producer_id=nid, producer_role=role, consumer_role=f"arg{idx}", store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            producer_id=nid,
+                            producer_role=role,
+                            consumer_role=f"arg{idx}",
+                            store_id=store_id,
+                            progress=progress,
+                        )
                     else:
-                        self.build_graph(args[idx], consumer_id=nid, producer_role="output", consumer_role=role, store_id=store_id)
+                        self.build_graph(
+                            args[idx],
+                            consumer_id=nid,
+                            producer_role="output",
+                            consumer_role=role,
+                            store_id=store_id,
+                            progress=progress,
+                        )
         # ...existing code...
 
-    def build_graph(self, node, producer_id=None, consumer_id=None, producer_role=None, consumer_role=None, store_id=None):
+    def build_graph(self, node, producer_id=None, consumer_id=None, producer_role=None, consumer_role=None, store_id=None, progress=None):
         if not self.domain_shape:
             self.domain_shape = (1,)
 
+        self._graph_build_counter += 1
         nid, already_defined = self.ensure_node(node, store_id)
+        node_type = type(node).__name__
+        location = ""
+        if isinstance(node, ast.AST):
+            location = (
+                f" line={getattr(node, 'lineno', '?')} col={getattr(node, 'col_offset', '?')}"
+            )
+        if hasattr(node, "name") and getattr(node, "name", None) not in {None, ""}:
+            location += f" name={node.name}"
+        detail = self._node_debug_summary(node)
+        self._emit_graph_build_log(
+            f"[graph-build #{self._graph_build_counter}] {node_type}{location} "
+            f"nid={nid} already_defined={already_defined} "
+            f"producer={producer_role or '-'} consumer={consumer_role or '-'} "
+            f"details={detail}",
+            progress=progress,
+        )
         if already_defined:
             # just hook up to parents or consumers and exit
             if producer_id is not None:
@@ -1271,7 +1488,40 @@ class ProcessGraph:
                 self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
             return nid
 
-        node_type = type(node).__name__
+        # Both the AST and SymPy front ends converge here (dispatch is on
+        # ``type(node).__name__``).  A span dissolved at the ingestion seam
+        # arrives carrying its resolved decision on ``_special_case``;
+        # anything else is classified now by the same switch.
+        special = getattr(node, "_special_case", None)
+        if special is None:
+            special = interpret_special_case(node)
+        if special is not None:
+            data = self.G.nodes[nid]
+            data["type"] = special.type
+            data["op"] = special.type
+            data["attributes"] = special.attributes
+            data["extra_args"] = special.attributes
+            data["constant"] = special.constant
+            if producer_id is not None:
+                self.connect(producer_id, nid, producer_role, consumer_role, store_id)
+            if consumer_id is not None:
+                self.connect(nid, consumer_id, producer_role, consumer_role, store_id)
+            if producer_id is None and consumer_id is None:
+                self.roots.append(nid)
+            return nid
+
+        # A call whose callee names an authoritative tensor operation is
+        # flagged here, without collapsing it, so a downstream off-tensor
+        # target can find and unroll reductions before serialization.
+        tensor_op = tensor_operation_name(node)
+        if tensor_op is not None:
+            data = self.G.nodes[nid]
+            attributes = data.get("attributes")
+            if attributes is None:
+                attributes = {}
+                data["attributes"] = attributes
+            attributes["tensor"] = tensor_op
+
         schema = self.role_schemas.get(node_type, None)
         # Graph ingestion can visit thousands of nodes.  Dumping every Python
         # object here is neither shell profiling nor progress reporting: the
@@ -1336,11 +1586,11 @@ class ProcessGraph:
             if graph_build_verbose:
                 print(f"[build_graph] Node {nid} ({node_type}) has schema: {schema}")
             # Pass along repeat_counter and role_indices to _recurse_spec.
-            self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
-            self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices)
+            self._recurse_spec(nid, args, schema.get('up', {}), direction='up', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
+            self._recurse_spec(nid, args, schema.get('down', {}), direction='down', store_id=store_id, schema_repeats=repeat_counter, role_indices=role_indices, progress=progress)
         else:
             for idx, arg in enumerate(args):
-                self.build_graph(arg, consumer_id=nid, producer_role="output", consumer_role=f'arg{idx}', store_id=store_id)
+                self.build_graph(arg, consumer_id=nid, producer_role="output", consumer_role=f'arg{idx}', store_id=store_id, progress=progress)
 
         # now that we've fully resolved, connect this node in the context given
         if producer_id is not None:
@@ -1414,7 +1664,9 @@ class ProcessGraph:
         resolve_unresolved_parents=False,
         parent_bindings=None,
         parent_include=None,
+        retain=(),
         profile_verbose=False,
+        progress=None,
         **kwargs,
     ):
         """Import Python source as a structural AST ProcessGraph."""
@@ -1437,8 +1689,47 @@ class ProcessGraph:
                 "build_from_ast expects an AST node, a filename, or a source string"
             )
 
+        retained = () if retain is None else (
+            (retain,) if inspect.isclass(retain) else tuple(retain)
+        )
+        retained_identities = []
+        existing_classes = {
+            definition.name
+            for definition in getattr(tree, "body", ())
+            if isinstance(definition, ast.ClassDef)
+        }
+        for retained_class in retained:
+            if not inspect.isclass(retained_class):
+                raise TypeError(
+                    "retain expects a class object or an iterable of class objects"
+                )
+            identity = retained_class.__name__
+            retained_identities.append(identity)
+            if identity in existing_classes:
+                continue
+            definition = _source_ast_definition(retained_class)
+            if not isinstance(definition, ast.ClassDef):
+                raise ValueError(
+                    f"cannot ingest retained class {retained_class!r}: "
+                    "source is unavailable"
+                )
+            tree.body.append(definition)
+            existing_classes.add(identity)
+
+        # Dissolve recognised spans at the seam -- before parent-expansion, IR
+        # mapping, state-machine planning, and the normalizer each walk the
+        # tree -- so a repr-expanded feed array is collapsed exactly once and
+        # never seen expanded again by any downstream pass.
+        tree = dissolve_spans(tree)
+
         parent_links = ()
         unresolved_calls = ()
+        self._graph_profile_verbose = bool(profile_verbose) or bool(
+            os.environ.get("TURING_GRAPH_BUILD_VERBOSE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._graph_progress = progress
+        self._graph_build_counter = 0
         if resolve_unresolved_parents:
             bindings = dict(getattr(self, "python_bindings", {}) or {})
             bindings.update(parent_bindings or {})
@@ -1449,6 +1740,7 @@ class ProcessGraph:
                     package=getattr(self, "python_package", None),
                     include=parent_include,
                     profile_verbose=profile_verbose,
+                    progress=progress,
                 )
             )
 
@@ -1456,6 +1748,10 @@ class ProcessGraph:
         # nodes ProcessGraph is about to ingest; do not create a second AST
         # ingestion path or infer process topology from them.
         self.G.graph["map_ir"] = _map_ir_from_ast(tree)
+        if retained_identities:
+            self.G.graph["map_ir"]["selected_class_identities"] = tuple(
+                dict.fromkeys(retained_identities)
+            )
         from ...compiler.state_machine_ast import plan_marked_state_machines
         state_machine_plans, state_machine_shortfalls = (
             plan_marked_state_machines(tree)
@@ -1480,7 +1776,7 @@ class ProcessGraph:
                 flush=True,
             )
             build_started = time.perf_counter()
-        root = self.build_graph(tree, *args, **kwargs)
+        root = self.build_graph(tree, *args, progress=progress, **kwargs)
         if profile_verbose:
             print(
                 "[ast-build-profile] complete build_graph "

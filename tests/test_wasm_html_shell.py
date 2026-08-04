@@ -444,7 +444,8 @@ def test_segmented_shell_keeps_one_public_api_and_runs_full_arrays():
     assert "residentValues" in html
     assert "queueDeploymentProfile" in html
     assert "requestAnimationFrame" in html
-    assert "WebAssembly.instantiate(moduleBinary, imports)" in html
+    assert "WebAssembly.compile(moduleBinary)" in html
+    assert "WebAssembly.instantiate(module, imports)" in html
     assert "No live tensor is copied through" in html
     assert "shared-memory slot" in html
     assert "Live deployment schedule:" in html

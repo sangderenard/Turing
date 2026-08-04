@@ -8,6 +8,7 @@ from src.common.tensors.accelerator_backends.aot_compile import (
     compile_ast_aot,
     project_public_numerical_program,
 )
+from src.common.tensors.abstraction import AbstractTensor
 from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler.process_graph_shell import emit_process_graph_shell, schedule_table
 from src.compiler.wasm_class_modules import partition_reduced_program
@@ -78,6 +79,41 @@ def kernel(value):
     assert aot.identity_table["result"][-1] == max(
         aot.identity_table["result"]
     )
+
+
+def test_aot_ingests_and_retains_the_abstract_tensor_class_object():
+    source = (
+        "def helper(value):\n"
+        "    return value * 2.0\n"
+        "\n"
+        "def kernel(value):\n"
+        "    return helper(value)\n"
+    )
+
+    aot = compile_ast_aot(
+        source,
+        "kernel",
+        {"value": np.array([4.0])},
+        precompile_only=True,
+        retain=AbstractTensor,
+    )
+
+    abstract_tensor_map = next(
+        item
+        for item in aot.map_ir["objects"]
+        if item["class_name"] == "AbstractTensor"
+    )
+    assert len(abstract_tensor_map["methods"]) > 100
+    assert {
+        "AbstractTensor.tensor",
+        "AbstractTensor.reshape",
+        "AbstractTensor.sum",
+    } <= {
+        identity
+        for identity, _reference in aot.map_ir["dependency_regions"][
+            "bindings"
+        ]
+    }
 
 
 def test_aot_records_and_validates_the_requested_bake_mode():
