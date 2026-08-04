@@ -607,9 +607,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(document.card_graph(), indent=2, sort_keys=True))
         return 0
     if arguments.emit_shell is not None:
-        output = emit_dream_html_shell(
+        artifact = emit_dream_html_shell(
             document, name=arguments.document.stem,
-        ).write(arguments.emit_shell)
+        )
+        output = arguments.emit_shell
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(artifact.html, encoding="utf-8")
         print(output)
         return 0
 
