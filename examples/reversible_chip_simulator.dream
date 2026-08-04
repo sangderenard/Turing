@@ -1,0 +1,207 @@
+/*@turing.segment.v1
+id = chip-setup
+language = python
+encoding = utf-8
+outputs = chip_state, register_layout
+entry = main
+@end*/
+from src.compiler.machine_chip_layout import build_register_bank_layout
+
+register_layout = build_register_bank_layout(4, base_offset=0x2000)
+chip_state = {
+    "cycle": 0,
+    "direction": 1,
+    "gpu_active": False,
+    "register_words": [0] * (register_layout.byte_size // 4),
+    "cache_occupancy": [0.15, 0.42, 0.78, 1.0],
+}
+result = chip_state
+/*@turing.end*/
+
+/*@turing.parallel.v1
+id = chip-frame
+members = head-step, register-light-compute
+join = frame-barrier
+@end*/
+
+/*@turing.segment.v1
+id = head-step
+language = python
+encoding = utf-8
+inputs = chip_state
+outputs = chip_state
+parallel-group = chip-frame
+entry = step
+@end*/
+chip_state["cycle"] += chip_state["direction"]
+if chip_state["cycle"] >= 4096:
+    chip_state["direction"] = -1
+elif chip_state["cycle"] <= 0:
+    chip_state["direction"] = 1
+result = chip_state["cycle"]
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = register-light-compute
+language = glsl
+encoding = utf-8
+stage = compute
+inputs = register_words, display_uniforms
+outputs = register_cells
+abi = turing.shader-component.v1
+local-size = 64
+parallel-group = chip-frame
+@end*/
+#version 430
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer RegisterWords {
+    uvec2 register_words[];
+};
+layout(std430, binding = 1) writeonly buffer RegisterCells {
+    vec4 register_cells[];
+};
+layout(location = 0) uniform uint core_count;
+layout(location = 1) uniform uint register_stride_cells;
+layout(location = 2) uniform uint generation;
+
+const uint REGISTER_COUNT = 20u;
+
+void main() {
+    uint logical_index = gl_GlobalInvocationID.x;
+    if (logical_index >= core_count * REGISTER_COUNT) return;
+    uint core_index = logical_index / REGISTER_COUNT;
+    uint register_index = logical_index % REGISTER_COUNT;
+    uint physical_index = core_index * register_stride_cells + register_index;
+    uvec2 words = register_words[physical_index];
+    float occupied = float((words.x | words.y) != 0u);
+    float low_energy = log2(1.0 + float(words.x)) / 32.0;
+    float high_energy = log2(1.0 + float(words.y)) / 32.0;
+    float scan = float((register_index + generation) % REGISTER_COUNT) / float(REGISTER_COUNT);
+    register_cells[logical_index] = vec4(
+        0.08 + low_energy,
+        0.14 + high_energy,
+        0.22 + 0.72 * scan,
+        0.30 + 0.70 * occupied
+    );
+}
+/*@turing.end*/
+
+/*@turing.shader.v1
+id = chip-present-fragment
+language = glsl
+encoding = utf-8
+stage = fragment
+inputs = register_cells, cache_cells
+outputs = display_color
+abi = turing.shader-component.v1
+entry = main
+display-owner = program-interior
+context = webgl2
+@end*/
+#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 display_color;
+uniform sampler2D register_cells;
+uniform sampler2D cache_cells;
+uniform float gpu_active;
+
+void main() {
+    vec3 registers = texture(register_cells, uv).rgb;
+    vec3 cache = texture(cache_cells, uv).rgb;
+    vec3 chip = mix(cache, registers, step(0.48, uv.y));
+    vec3 gpu_lamp = mix(vec3(0.08, 0.10, 0.12), vec3(0.15, 1.0, 0.42), gpu_active);
+    float lamp = 1.0 - smoothstep(0.025, 0.04, distance(uv, vec2(0.94, 0.06)));
+    display_color = vec4(mix(chip, gpu_lamp, lamp), 1.0);
+}
+/*@turing.end*/
+
+/*@turing.segment.v1
+id = gpu-indicator-ui
+language = javascript
+encoding = utf-8
+inputs = gpu_active
+outputs = indicator_state
+entry = updateGPUIndicator
+role = display-controller
+@end*/
+function updateGPUIndicator(active, block) {
+  const indicator = document.querySelector("[data-turing-gpu-active]");
+  if (!indicator) return;
+  indicator.dataset.active = active ? "true" : "false";
+  indicator.textContent = active
+    ? "GPU ACTIVE · " + block.identity
+    : "GPU IDLE";
+}
+
+function installTuringDisplay(liaison, interior) {
+  const gl = liaison.context;
+  if (!gl) throw new Error("the interior display requires a WebGL2 context");
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || "interior shader compile failed");
+    }
+    return shader;
+  }
+
+  const vertexSource = `#version 300 es
+  precision highp float;
+  const vec2 positions[3] = vec2[3](
+    vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)
+  );
+  out vec2 uv;
+  void main() {
+    vec2 position = positions[gl_VertexID];
+    uv = position * 0.5 + 0.5;
+    gl_Position = vec4(position, 0.0, 1.0);
+  }`;
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, interior.fragment_source));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "interior display link failed");
+  }
+  gl.useProgram(program);
+  gl.bindVertexArray(gl.createVertexArray());
+
+  function texture(unit, uniform, rgba) {
+    const resource = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, resource);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(rgba)
+    );
+    gl.uniform1i(gl.getUniformLocation(program, uniform), unit);
+    return resource;
+  }
+  texture(0, "register_cells", [25, 150, 255, 255]);
+  texture(1, "cache_cells", [255, 85, 35, 255]);
+  const activeLocation = gl.getUniformLocation(program, "gpu_active");
+
+  function frame() {
+    const ratio = Math.max(1, window.devicePixelRatio || 1);
+    const width = Math.max(1, Math.round(liaison.canvas.clientWidth * ratio));
+    const height = Math.max(1, Math.round(liaison.canvas.clientHeight * ratio));
+    if (liaison.canvas.width !== width || liaison.canvas.height !== height) {
+      liaison.canvas.width = width;
+      liaison.canvas.height = height;
+      gl.viewport(0, 0, width, height);
+    }
+    liaison.canvas.dataset.gpuActive = "true";
+    if (activeLocation !== null) gl.uniform1f(activeLocation, 1.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  return {program, ownsDisplay: true};
+}
+/*@turing.end*/
