@@ -143,6 +143,30 @@ def test_unroll_strategy_evaporates_to_straight_line_value_graph():
     assert len(set(stack_inputs)) == 3
 
 
+def test_evaporation_ignores_stale_ids_from_retained_loop_plan():
+    graph = _function_graph(
+        "def kernel(x, keep_running):\n"
+        "    for index in range(2):\n"
+        "        x = x + index\n"
+        "    while keep_running:\n"
+        "        x = x + 1\n"
+        "    return x\n",
+        "kernel",
+    )
+    composer = _glsl_composer()
+    plans = composer.discover(graph)
+    unrolled = [plan for plan in plans if plan.strategy is LoopStrategy.UNROLL]
+    retained = [plan for plan in plans if plan.strategy is not LoopStrategy.UNROLL]
+    assert unrolled and retained
+    stale_id = int(retained[0].loop.node_id)
+    graph.G.remove_node(stale_id)
+
+    evaporated = evaporate_unrolled_loops(graph, plans)
+
+    assert evaporated
+    assert stale_id not in graph.G
+
+
 def test_static_mapping_generator_reduction_preserves_destructured_outputs():
     graph = _function_graph(
         "def kernel(mapping):\n"

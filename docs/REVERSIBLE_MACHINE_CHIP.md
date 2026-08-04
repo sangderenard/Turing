@@ -6,17 +6,49 @@ executor and its WebGPU display.
 
 ## Register banks
 
-Each core owns one fixed 256-byte-aligned bank. The bank begins with twenty
-contiguous 64-bit cells:
+Each core owns one fixed 256-byte-aligned bank. The current AMD64 bank occupies
+512 bytes and contains fifty-four contiguous 64-bit cells:
 
 ```text
-RAX RCX RDX RBX RSP RBP RSI RDI R8 ... R15 RIP RFLAGS STEPS CALL_DEPTH
+RAX ... R15 RIP RFLAGS FS_BASE GS_BASE XMM0_LO XMM0_HI ... XMM15_LO XMM15_HI STEPS CALL_DEPTH
 ```
 
 Each cell is exactly eight contiguous bytes, exposed to WebGPU as adjacent
 little-endian low/high `u32` words. Core `n` begins at
-`register_base + n * 256`. The remaining 96 bytes are bank padding reserved for
+`register_base + n * 512`. The remaining 80 bytes are bank padding reserved for
 future architectural registers; no following core can overlap them.
+
+## Reversible AMD64 state
+
+The default machine program maps PE headers and sections at their preferred
+image base, creates a zeroed 1 MiB stack, and installs minimal PEB/TEB pages.
+The stack begins with Windows x64 entry alignment and a sentinel return address.
+General registers obey 8/16-bit preservation and 32-bit upper-half clearing;
+memory is sparse, byte-addressed, little-endian, page-backed, and copy-on-write.
+Unmapped access becomes a structured machine trap. FS and GS overrides add the
+visible segment bases before memory access; in particular, byte `0x65` selects
+the TEB-backed GS base.
+
+Integer move, address, add/subtract, compare/test, logical, shift/rotate,
+extend, stack, conditional, and atomic compare/exchange families currently
+produce immutable successor states. Calls update both the architectural stack
+and a reversible validation stack. Returning backward restores both without
+executing a guessed inverse operation.
+
+## Guest external calls
+
+The PE loader catalogues import descriptors and every IAT slot by DLL and
+symbol. It replaces file-time thunk RVAs with stable synthetic guest-external
+addresses. An indirect call to one of those addresses pushes its real return
+address and then pauses with `WAITING_EXTERNAL`; the request records the exact
+reference, Windows x64 register arguments, stack pointer, and return address.
+
+A completion can update `RAX` and apply bounded writes only to already mapped
+guest memory. The completion itself is a journal edge, so reversing across it
+restores the pending request and all pre-call state. The supplied deterministic
+Windows bootstrap port is an exact capability allowlist, not Win32 passthrough.
+Unknown functions remain pending for a shell policy to approve, capture, or
+emulate.
 
 ## Program cache
 
@@ -56,3 +88,10 @@ journal retains the timeline.
 bytes through the existing PE machine decompiler and constructs the executor,
 clock, virtual cores, device buffers, and observation slots. Subject code does
 not enter the emulator application's card or SSA representation.
+
+As of the `cmd.exe` execution probe, the actual system binary advances through
+PE validation and security-cookie setup and captures imports including time,
+process/thread identity, tick count, module-handle lookup, and CRT setup. The
+frontier is intentionally moved only by implementing coherent semantic or
+capability families; unsupported behavior remains visible rather than being
+silently approximated.

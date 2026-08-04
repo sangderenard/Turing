@@ -741,6 +741,49 @@ class Accumulator:
     )
 
 
+def test_static_class_attribute_update_uses_reference_and_latest_ssa_value():
+    class Counter:
+        value = 0
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"Counter": Counter}
+    module = ast.parse(
+        """
+def increment():
+    Counter.value += 1
+    return Counter.value
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("increment").graph
+
+    reference_id, reference = next(
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "StaticReference"
+    )
+    set_attr_id, set_attr = next(
+        (node_id, data)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "SetAttr"
+    )
+    updated_value = next(
+        parent
+        for parent, role in set_attr["parents"]
+        if role == "value"
+    )
+
+    assert reference["attributes"]["static_python_reference"] == "Counter"
+    assert (reference_id, "object") in set_attr["parents"]
+    assert set_attr["attributes"]["attribute"] == "value"
+    assert function_graph.G.graph["identity_table"]["result_0"] == (
+        updated_value,
+    )
+    assert set_attr_id != updated_value
+
+
 def test_try_value_survives_when_every_exception_handler_terminates():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

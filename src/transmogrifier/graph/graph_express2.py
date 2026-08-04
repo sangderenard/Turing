@@ -4,6 +4,7 @@ import numpy as np
 import ast
 import importlib
 import inspect
+import math
 import os
 import textwrap
 from typing import Any
@@ -255,8 +256,15 @@ def _class_schema_from_ast(definition):
                     and target.value.id == "self"
                 ):
                     add_attribute(target.attr, annotation, "instance")
+    source_identity = getattr(definition, "_python_source_identity", None)
+    class_identity = (
+        ".".join(part for part in source_identity if part)
+        if source_identity is not None
+        else definition.name
+    )
     return {
         "class_name": definition.name,
+        "class_identity": class_identity,
         "class_node_id": id(definition),
         "permissions": (),
         "attributes": tuple(attributes),
@@ -802,6 +810,12 @@ def _expand_unresolved_ast_parents(
                 source_definition,
                 module,
             )
+            # The AST node's short ``name`` is insufficient once an unbounded
+            # closure contains same-named definitions from different modules.
+            # Preserve the exact live Python identity used to discover it;
+            # later map/function tables can qualify without retaining the
+            # callable itself.
+            source_definition._python_source_identity = identity
 
             module.body.append(source_definition)
             emit(
@@ -1872,23 +1886,49 @@ class ProcessGraph:
                 # Gather all incoming edges
                 incoming_edges = self.G.in_edges(nid, data=True)
                 index_symbols = []
+                numeric_indices = []
                 for src, tgt, data in incoming_edges:
                     if src in self.G.nodes:
                         src_node = self.G.nodes[src]
                         src_type = src_node['type']
                         if src_type in ('Symbol', 'Input', 'Var'):
                             dynamic = True
-                        
-                        index_symbols.append((src_node['label'], src_type))
+                        label = src_node['label']
+                        index_symbols.append((label, src_type))
+                        candidate = src_node.get('constant')
+                        if candidate is None:
+                            candidate = (src_node.get('attributes') or {}).get(
+                                'value'
+                            )
+                        if candidate is None and isinstance(
+                            src_node.get('expr_obj'), ast.Constant
+                        ):
+                            candidate = src_node['expr_obj'].value
+                        if candidate is None:
+                            candidate = label
+                        try:
+                            numeric = float(candidate)
+                        except (TypeError, ValueError, OverflowError):
+                            dynamic = True
+                        else:
+                            if not math.isfinite(numeric) or not numeric.is_integer():
+                                dynamic = True
+                            numeric_indices.append(numeric)
                 self.G.nodes[nid]['index_symbols'] = index_symbols
-                if not dynamic:
+                if not index_symbols:
+                    self.G.nodes[nid]['domain_shape'] = ()
+                elif not dynamic and len(numeric_indices) == len(index_symbols):
                     # If all indices are static, we can set a fixed domain shape
-                    # we just need the extents per dimension
-                    extents = [0] * len(index_symbols[0])  # default to 1 for
-                    for idx, (label, _) in enumerate(index_symbols):
-                        extents[idx] = (0, 0)
-                        extents[idx] = min(float(label), extents[idx][0]), max(float(label), extents[idx][1])
-                    domain_shape = tuple(extent[1] - extent[0] + 1 for extent in extents)
+                    # from zero through each integral coordinate.  Every
+                    # incoming index is one axis, not one row in a two-column
+                    # ``(label, type)`` table.
+                    extents = [
+                        (min(value, 0.0), max(value, 0.0))
+                        for value in numeric_indices
+                    ]
+                    domain_shape = tuple(
+                        int(extent[1] - extent[0] + 1) for extent in extents
+                    )
                     self.G.nodes[nid]['domain_shape'] = domain_shape
                 else:
                     # If dynamic, we cannot set a fixed shape, but we can track the symbols

@@ -19,6 +19,11 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..common.tensors.accelerator_backends.profiled_c_shell import _C_SOURCE
+from .fortran_toolchain import (
+    aggressive_c_flags,
+    aggressive_fortran_flags,
+    standalone_fortran_link_flags,
+)
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
 
 
@@ -61,21 +66,13 @@ class FortranCShellExecutable:
     ) -> subprocess.CompletedProcess[str]:
         if frames < 0:
             raise ValueError("native C shell frame count cannot be negative")
-        environment = dict(os.environ)
-        compiler = fortran_compiler()
-        if compiler is not None:
-            environment["PATH"] = (
-                str(Path(compiler).parent)
-                + os.pathsep
-                + environment.get("PATH", "")
-            )
         arguments = [str(self.executable_path), str(frames)]
         for name, path in sorted(dict(files or {}).items()):
             arguments.extend(("--file-" + _identifier(name).replace("_", "-"), str(Path(path).resolve())))
         return subprocess.run(
             arguments,
             cwd=str(self.directory),
-            env=environment,
+            env=dict(os.environ),
             capture_output=capture_output,
             text=True,
             check=True,
@@ -180,6 +177,7 @@ def _display_configuration(module: Any, entry: Any) -> dict[str, Any] | None:
         "height": height,
         "title": str(attributes.get("title", "Turing native display")),
         "channels": tuple(channels),
+        "frame_delay_ms": max(0, int(attributes.get("frame_delay_ms", 0))),
     }
 
 
@@ -539,6 +537,10 @@ static void turing_display_close(void) {
             f"            (const double *)slots[{blue_slot}]);",
             "        turing_display_messages();",
         ]
+        if int(display["frame_delay_ms"]) > 0:
+            display_present_lines.append(
+                f"        Sleep({int(display['frame_delay_ms'])});"
+            )
         display_close_lines = ["    turing_display_close();"]
 
     source = "\n".join((
@@ -549,6 +551,42 @@ static void turing_display_close(void) {
         "#include <stdlib.h>",
         "#include <string.h>",
         "",
+        r'''#if defined(_WIN32)
+/* GCC 16's MinGW static libgfortran uses the POSIX strndup entry point, while
+ * the Windows CRT does not export it. Keep the standalone runtime archive
+ * resolvable without introducing another redistributable DLL. */
+char *strndup(const char *source, size_t maximum) {
+    size_t length = 0;
+    char *copy;
+    while (length < maximum && source[length] != '\0') ++length;
+    copy = (char *)malloc(length + 1);
+    if (copy == NULL) return NULL;
+    memcpy(copy, source, length);
+    copy[length] = '\0';
+    return copy;
+}
+#endif
+''',
+        r'''static FILE *turing_open_artifact(
+    const char *executable, const char *filename, const char *mode
+) {
+    char path[4096];
+    const char *slash = strrchr(executable, '/');
+    const char *backslash = strrchr(executable, '\\');
+    const char *separator = slash;
+    size_t directory_length;
+    if (backslash != NULL && (separator == NULL || backslash > separator)) {
+        separator = backslash;
+    }
+    if (separator == NULL) return fopen(filename, mode);
+    directory_length = (size_t)(separator - executable + 1);
+    if (directory_length + strlen(filename) + 1 > sizeof(path)) return NULL;
+    memcpy(path, executable, directory_length);
+    strcpy(path + directory_length, filename);
+    return fopen(path, mode);
+}
+''',
+
         *(r'''static const char *turing_argument_value(int argc, char **argv, const char *flag) {
     int index;
     for (index = 2; index + 1 < argc; ++index) {
@@ -595,7 +633,7 @@ static int turing_read_file(
         "    TuringLaunchProfile profile = {0};",
         "    TuringLaunchStats stats = {0};",
         "    int frame;",
-        f"    FILE *state = fopen({_c_string(initial_state_filename)}, \"rb\");",
+        f"    FILE *state = turing_open_artifact(argv[0], {_c_string(initial_state_filename)}, \"rb\");",
         "    if (frames < 0) return 2;",
         "    if (!state) { perror(\"initial state\"); return 2; }",
         *allocation_lines,
@@ -617,7 +655,7 @@ static int turing_read_file(
         "           profile.status, frame, stats.shell_ns_total);",
         *output_lines,
         "    printf(\"}}\\n\");",
-        f"    {{ FILE *outputs_file = fopen({_c_string(final_outputs_filename)}, \"wb\");",
+        f"    {{ FILE *outputs_file = turing_open_artifact(argv[0], {_c_string(final_outputs_filename)}, \"wb\");",
         "      if (!outputs_file) { perror(\"final outputs\"); return 6; }",
         *output_write_lines,
         "      fclose(outputs_file); }",
@@ -638,6 +676,7 @@ def compile_fortran_module_c_shell(
     state_feedback: Mapping[str, str] | None = None,
     extent_overrides: Mapping[str, int] | None = None,
     name: str = "turing_fortran_c_shell",
+    standalone: bool = True,
 ) -> FortranCShellExecutable:
     """Compile generated Fortran plus the generic profiled C main."""
 
@@ -714,11 +753,21 @@ def compile_fortran_module_c_shell(
     environment["PATH"] = (
         str(Path(compiler).parent) + os.pathsep + environment.get("PATH", "")
     )
+    fortran_flags = aggressive_fortran_flags(compiler)
+    c_flags = aggressive_c_flags(compiler)
+    try:
+        link_flags = (
+            standalone_fortran_link_flags(compiler)
+            if standalone else ("-flto",)
+        )
+    except ValueError as error:
+        raise FortranEmissionError(str(error)) from error
     commands = (
-        [compiler, "-O3", "-c", str(fortran_path), "-o", str(fortran_object)],
-        [gcc, "-O3", "-std=c11", "-c", str(c_path), "-o", str(c_object)],
+        [compiler, *fortran_flags, "-c", str(fortran_path), "-o", str(fortran_object)],
+        [gcc, *c_flags, "-std=c11", "-c", str(c_path), "-o", str(c_object)],
         [
             compiler, str(c_object), str(fortran_object), "-o", str(executable),
+            *link_flags,
             *(
                 ["-mwindows", "-lgdi32", "-luser32"]
                 if _display_configuration(module, entry) else []

@@ -74,6 +74,7 @@ class MachineFunctionGraphRecord:
     runtime_function: PERuntimeFunction
     report: "MachineFunctionDecodeReport"
     component: EvolutionComponentRef
+    discovered_leaf: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,12 +424,16 @@ def raise_pe_to_token_multigraph(
     proven_bytes = 0
     proven_instructions = 0
     proven_functions = 0
+    active_functions: dict[int, tuple[PERuntimeFunction, bool]] = {
+        function.begin_rva: (function, False)
+        for function in image.runtime_functions
+    }
     entry_offsets: dict[int, set[int]] = {
         function.begin_rva: {0} for function in image.runtime_functions
     }
     reports: dict[int, MachineFunctionDecodeReport] = {}
     while True:
-        for runtime_function in image.runtime_functions:
+        for runtime_function, _ in active_functions.values():
             file_offset = image.file_offset_for_rva(runtime_function.begin_rva)
             if file_offset is None:
                 continue
@@ -448,7 +453,21 @@ def raise_pe_to_token_multigraph(
                     target_rva = operand.target_address - image.image_base
                     owner = image.runtime_function_for_rva(target_rva)
                     if owner is None:
-                        continue
+                        gap = next((
+                            (begin_rva, end_rva)
+                            for _, begin_rva, end_rva in unclassified_ranges
+                            if begin_rva <= target_rva < end_rva
+                        ), None)
+                        if gap is None:
+                            continue
+                        begin_rva, end_rva = gap
+                        owner_row = active_functions.get(begin_rva)
+                        if owner_row is None:
+                            owner = PERuntimeFunction(begin_rva, end_rva, 0)
+                            active_functions[begin_rva] = (owner, True)
+                            entry_offsets[begin_rva] = set()
+                        else:
+                            owner = owner_row[0]
                     target_offset = target_rva - owner.begin_rva
                     owner_seeds = entry_offsets[owner.begin_rva]
                     if target_offset not in owner_seeds:
@@ -456,7 +475,8 @@ def raise_pe_to_token_multigraph(
                         added_seed = True
         if not added_seed:
             break
-    for index, runtime_function in enumerate(image.runtime_functions):
+    function_rows = tuple(active_functions.values())
+    for index, (runtime_function, discovered_leaf) in enumerate(function_rows):
         file_offset = image.file_offset_for_rva(runtime_function.begin_rva)
         if file_offset is None:
             continue
@@ -473,6 +493,7 @@ def raise_pe_to_token_multigraph(
                 "begin_rva": int(runtime_function.begin_rva),
                 "end_rva": int(runtime_function.end_rva),
                 "unwind_info_rva": int(runtime_function.unwind_info_rva),
+                "discovered_leaf": bool(discovered_leaf),
                 "file_offset": int(file_offset),
                 "complete": bool(report.complete),
             },
@@ -618,11 +639,14 @@ def raise_pe_to_token_multigraph(
             )
         evolution.bind_artifact(report, function_graph)
         evolution.close_graph(function_graph)
-        records.append(MachineFunctionGraphRecord(runtime_function, report, component))
-        proven_bytes += report.decoded_bytes
-        proven_instructions += len(report.instructions)
-        if report.complete:
-            proven_functions += 1
+        records.append(MachineFunctionGraphRecord(
+            runtime_function, report, component, discovered_leaf,
+        ))
+        if not discovered_leaf:
+            proven_bytes += report.decoded_bytes
+            proven_instructions += len(report.instructions)
+            if report.complete:
+                proven_functions += 1
 
     internal_call_token = tokens.consume((
         int(MachineGraphNamespace.RELATION),
@@ -642,15 +666,16 @@ def raise_pe_to_token_multigraph(
                         role="internal-call", role_token_id=internal_call_token,
                     )
     evolution.close_graph(program_graph)
-    failed_functions = len(records) - proven_functions
+    runtime_records = tuple(record for record in records if not record.discovered_leaf)
+    failed_functions = len(runtime_records) - proven_functions
     runtime_described_bytes = sum(
-        record.runtime_function.end_rva - record.runtime_function.begin_rva
-        for record in records
+        function.end_rva - function.begin_rva
+        for function in image.runtime_functions
     )
     unclassified_bytes = sum(end - begin for _, begin, end in unclassified_ranges)
     unreached_runtime_bytes = sum(
         end - begin
-        for record in records
+        for record in runtime_records
         for begin, end in record.report.unreached_ranges
     )
     return MachineProgramGraph(
@@ -662,7 +687,7 @@ def raise_pe_to_token_multigraph(
             file_size=pe_statistics.file_size,
             executable_section_count=pe_statistics.executable_section_count,
             executable_raw_bytes=pe_statistics.executable_raw_bytes,
-            runtime_function_count=len(records),
+            runtime_function_count=len(image.runtime_functions),
             runtime_described_code_bytes=runtime_described_bytes,
             unclassified_executable_bytes=unclassified_bytes,
             unreached_runtime_bytes=unreached_runtime_bytes,

@@ -168,6 +168,7 @@ def _normalize_lexical_values(
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
     static_constant_nodes: dict[str, int] = {}
+    static_attribute_values: dict[tuple[int, str], int] = {}
     parameter_names = {
         argument.arg
         for argument in (
@@ -492,6 +493,11 @@ def _normalize_lexical_values(
             else:
                 receiver = resolve_expression(expression.value)
             if isinstance(receiver, _StaticPythonReference):
+                attribute_key = (id(receiver.value), expression.attr)
+                assigned_value = static_attribute_values.get(attribute_key)
+                if assigned_value is not None:
+                    _redirect_value(graph, id(expression), assigned_value)
+                    return assigned_value
                 try:
                     value = getattr(receiver.value, expression.attr)
                 except AttributeError:
@@ -735,6 +741,11 @@ def _normalize_lexical_values(
                     f"value={value.path}"
                 )
             receiver = resolve_expression(target.value)
+            static_receiver = (
+                receiver if isinstance(receiver, _StaticPythonReference) else None
+            )
+            if static_receiver is not None:
+                receiver = static_reference_node(static_receiver)
             if not isinstance(receiver, int) or not isinstance(value, int):
                 raise TypeError(
                     "attribute assignment requires resolved object and value "
@@ -744,9 +755,13 @@ def _normalize_lexical_values(
                 )
             node_id = id(target)
             if node_id not in graph.G:
-                raise RuntimeError(
-                    "attribute assignment target disappeared before SetAttr "
-                    "lowering"
+                # Resolving a compile-time receiver's literal attribute read
+                # redirects and removes the source Attribute wrapper.  The
+                # subsequent write is still a distinct runtime effect.
+                node_id = new_node(
+                    "SetAttr",
+                    f"setattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
                 )
             # In ``object.field += value`` the Attribute node is the read
             # feeding the AugAssign result.  Reusing that same node as the
@@ -771,6 +786,10 @@ def _normalize_lexical_values(
                     (value, "value"),
                 ),
             )
+            if static_receiver is not None:
+                static_attribute_values[
+                    (id(static_receiver.value), target.attr)
+                ] = value
             return
         if isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, _StaticPythonReference):

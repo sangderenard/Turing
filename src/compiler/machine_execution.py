@@ -22,6 +22,9 @@ from .machine_reference_vocabulary import (
 )
 
 
+MASK64 = (1 << 64) - 1
+
+
 class MachineOrchestrationMode(IntEnum):
     INSPECT = 0
     DECODE = 1
@@ -59,6 +62,7 @@ class MachineExternalCallRequest:
     return_address: int
     arguments: tuple[int, int, int, int]
     stack_pointer: int
+    stack_arguments: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,22 +79,51 @@ class MachineExternalMemoryWrite:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineExternalStateWrite:
+    """One reversible key/value mutation of the virtual system environment."""
+
+    key: str
+    value: int
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            raise ValueError("external state-write key cannot be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class MachineExternalResolution:
+    """A symbolic export requested by a capability-approved resolver."""
+
+    library: str
+    symbol: str
+
+
+@dataclass(frozen=True, slots=True)
 class MachineExternalCallCompletion:
     """The complete deterministic result of one captured host interaction."""
 
     request_id: int
     result: int = 0
     memory_writes: tuple[MachineExternalMemoryWrite, ...] = ()
+    system_writes: tuple[MachineExternalStateWrite, ...] = ()
+    guest_calls: tuple[int, ...] = ()
+    resolution: MachineExternalResolution | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class MachineExecutionState:
     pc: int
     registers: tuple[int, ...] = (0,) * 16
+    vector_registers: tuple[int, ...] = (0,) * 16
     flags: int = 0
     memory: Mapping[int, int] = field(
         default_factory=lambda: MappingProxyType({}),
     )
+    system_state: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+    fs_base: int = 0
+    gs_base: int = 0
     call_stack: tuple[int, ...] = ()
     external_requests: tuple[MachineExternalCallRequest, ...] = ()
     steps: int = 0
@@ -115,9 +148,26 @@ class MachineExecutionState:
         values.update({
             "rip": int(self.pc),
             "rflags": int(self.flags),
+            "fs_base": int(self.fs_base),
+            "gs_base": int(self.gs_base),
             "steps": int(self.steps),
             "call_depth": len(self.call_stack),
         })
+        vector_values = {
+            name: value
+            for index, value in enumerate(self.vector_registers)
+            for name, value in (
+                (f"xmm{index}_lo", int(value) & MASK64),
+                (f"xmm{index}_hi", (int(value) >> 64) & MASK64),
+            )
+        }
+        # Keep XMM halves together and before execution counters in the
+        # physical register bank.
+        counters = {
+            key: values.pop(key) for key in ("steps", "call_depth")
+        }
+        values.update(vector_values)
+        values.update(counters)
         return MappingProxyType(values)
 
     def packed_register_words(self) -> tuple[tuple[int, int], ...]:
@@ -142,6 +192,15 @@ MachineEffectHandler = Callable[[MachineExecutionState, Any], MachineExecutionSt
 MachinePredicateHandler = Callable[[MachineExecutionState, Any], bool]
 MachineIndirectTargetHandler = Callable[[MachineExecutionState, Any], int]
 MachineExternalTargetResolver = Callable[[int], MachineExternalReference | None]
+
+
+@dataclass(frozen=True, slots=True)
+class MachineDispatchPlan:
+    """Runtime-proven code targets discovered through a data-driven dispatch."""
+
+    targets: tuple[int, ...]
+    installed_addresses: tuple[int, ...]
+    failure_reasons: tuple[str, ...] = ()
 
 
 class MachineExecutionOrchestrator:
@@ -170,6 +229,62 @@ class MachineExecutionOrchestrator:
                         f"conflicting decoded instructions at {instruction.address:#x}"
                     )
         self.instructions = MappingProxyType(instructions)
+        self.dispatch_plans: list[MachineDispatchPlan] = []
+
+    def install_dispatch_targets(self, targets: Sequence[int]) -> MachineDispatchPlan:
+        """Decode validated executable targets surfaced by a runtime plan."""
+
+        from .machine_program_graph import decode_reachable_region
+        from .machine_reference_vocabulary import X86ReferenceDecoder
+
+        image = self.program.image
+        merged = dict(self.instructions)
+        installed: set[int] = set()
+        failures: list[str] = []
+        normalized = tuple(dict.fromkeys(int(target) for target in targets))
+        for target in normalized:
+            if target in merged:
+                continue
+            rva = target - image.image_base
+            section = image.section_for_rva(rva)
+            if section is None or not section.executable:
+                failures.append(
+                    f"dispatch target {target:#x} is not in an executable PE section"
+                )
+                continue
+            owner = image.runtime_function_for_rva(rva)
+            if owner is not None:
+                begin_rva, end_rva = owner.begin_rva, owner.end_rva
+            else:
+                begin_rva = section.virtual_address
+                end_rva = section.virtual_address + section.raw_size
+            file_offset = image.file_offset_for_rva(begin_rva)
+            if file_offset is None:
+                failures.append(f"dispatch target {target:#x} has no file-backed code")
+                continue
+            report = decode_reachable_region(
+                X86ReferenceDecoder(),
+                image.encoded[file_offset:file_offset + end_rva - begin_rva],
+                base_address=image.image_base + begin_rva,
+                entry_offsets=(rva - begin_rva,),
+            )
+            failures.extend(
+                f"{failure.address:#x}: {failure.reason}"
+                for failure in report.failures
+            )
+            for instruction in report.instructions:
+                previous = merged.setdefault(instruction.address, instruction)
+                if previous != instruction:
+                    raise ValueError(
+                        f"dispatch decoding conflicts at {instruction.address:#x}"
+                    )
+                installed.add(instruction.address)
+        self.instructions = MappingProxyType(merged)
+        plan = MachineDispatchPlan(
+            normalized, tuple(sorted(installed)), tuple(failures),
+        )
+        self.dispatch_plans.append(plan)
+        return plan
 
     def initial_state(self) -> MachineExecutionState:
         return MachineExecutionState(
@@ -183,6 +298,24 @@ class MachineExecutionOrchestrator:
             for operand in instruction.operands
             if isinstance(operand, RelativeAddressOperand)
         ), None)
+
+    @staticmethod
+    def _stack_arguments(state: MachineExecutionState, count: int = 8) -> tuple[int, ...]:
+        values: list[int] = []
+        # At an external callee entry: return address, 32-byte home space,
+        # then argument five. Stop at the first unmapped word.
+        begin = state.registers[4] + 0x28
+        for argument in range(count):
+            address = begin + argument * 8
+            try:
+                value = int.from_bytes(
+                    bytes(state.memory[address + index] for index in range(8)),
+                    "little",
+                )
+            except KeyError:
+                break
+            values.append(value)
+        return tuple(values)
 
     def step(self, state: MachineExecutionState) -> MachineExecutionResult:
         instruction = self.instructions.get(state.pc)
@@ -296,6 +429,7 @@ class MachineExecutionOrchestrator:
                         state.registers[8], state.registers[9],
                     ),
                     stack_pointer=handled.registers[4],
+                    stack_arguments=self._stack_arguments(handled),
                 )
                 waiting = replace(
                     handled,
@@ -334,7 +468,16 @@ class MachineExecutionOrchestrator:
                 f"no emulation handler for semantic token {int(semantic)} ({semantic.name})",
                 int(semantic), instruction,
             )
-        handled = handler(advanced, instruction)
+        try:
+            handled = handler(advanced, instruction)
+        except (ArithmeticError, KeyError, ValueError) as error:
+            return MachineExecutionResult(
+                MachineExecutionStatus.TRAPPED,
+                state,
+                f"machine effect trapped at {instruction.address:#x}: {error}",
+                int(semantic),
+                instruction,
+            )
         return MachineExecutionResult(
             MachineExecutionStatus.RUNNING,
             handled,
@@ -536,12 +679,15 @@ __all__ = [
     "MachineExternalCallRequest",
     "MachineExternalCallCompletion",
     "MachineExternalMemoryWrite",
+    "MachineExternalStateWrite",
     "MachineExternalReference",
+    "MachineExternalResolution",
     "MachineExternalTargetResolver",
     "MachineExecutionEdge",
     "MachineExecutionResult",
     "MachineExecutionState",
     "MachineExecutionStatus",
+    "MachineDispatchPlan",
     "MachineVirtualMulticore",
     "MachineIndirectTargetHandler",
     "MachineOrchestrationMode",

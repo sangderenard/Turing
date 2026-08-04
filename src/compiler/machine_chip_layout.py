@@ -68,7 +68,11 @@ def build_register_bank_layout(
         raise ValueError("register-bank base must be non-negative and 8-byte aligned")
     names = (
         *MachineExecutionState.REGISTER_NAMES,
-        "rip", "rflags", "steps", "call_depth",
+        "rip", "rflags", "fs_base", "gs_base",
+        *(name for index in range(16) for name in (
+            f"xmm{index}_lo", f"xmm{index}_hi",
+        )),
+        "steps", "call_depth",
     )
     stride = _align(len(names) * 8, bank_alignment)
     cells = tuple(

@@ -26,6 +26,7 @@ from .machine_reference_vocabulary import (
     MachineSemanticToken,
     RegisterOperand,
     RelativeAddressOperand,
+    VectorRegisterOperand,
     X86HighByteRegister,
 )
 
@@ -122,6 +123,13 @@ def _sign_extend(value: int, source_width: int, target_width: int) -> int:
 
 def effective_address(state: MachineExecutionState, instruction, operand: EffectiveAddressOperand) -> int:
     base = instruction.address + len(instruction.encoded) if operand.rip_relative else 0
+    # Architectural segment override bytes are authoritative even where a
+    # historical decoder token name calls 0x65 "FS"; AMD64 defines 0x64 as FS
+    # and 0x65 as GS.
+    if 0x64 in instruction.legacy_prefixes:
+        base += state.fs_base
+    if 0x65 in instruction.legacy_prefixes:
+        base += state.gs_base
     if operand.base is not None:
         base += state.registers[int(operand.base)]
     if operand.index is not None:
@@ -134,6 +142,13 @@ def _data_width(instruction, operand_index: int) -> int:
     if isinstance(operand, (RegisterOperand, HighByteRegisterOperand)):
         return operand.width
     name = instruction.token.name
+    if isinstance(operand, VectorRegisterOperand):
+        match = re.search(r"(?:XMMM|RM|M)(128|64|32)(?:_|$)", name)
+        return int(match.group(1)) if match else operand.width
+    if isinstance(operand, EffectiveAddressOperand):
+        memory_widths = re.findall(r"(?:RM|M)(128|64|32|16|8)(?:_|$)", name)
+        if memory_widths:
+            return int(memory_widths[-1])
     match = re.search(r"(?:RM|R|M)(128|64|32|16|8)(?:_|$)", name)
     if match:
         return int(match.group(1))
@@ -149,6 +164,8 @@ def read_operand(state: MachineExecutionState, instruction, operand_index: int, 
         return state.registers[int(operand.register)] & _mask(operand.width)
     if isinstance(operand, HighByteRegisterOperand):
         return (state.registers[int(operand.register)] >> 8) & 0xFF
+    if isinstance(operand, VectorRegisterOperand):
+        return state.vector_registers[int(operand.register)] & _mask(target_width)
     if isinstance(operand, ImmediateOperand):
         if operand.signed:
             return _sign_extend(operand.value, operand.width, target_width)
@@ -182,6 +199,14 @@ def write_operand(state: MachineExecutionState, instruction, operand_index: int,
         index = int(operand.register)
         registers[index] = (registers[index] & ~(0xFF << 8)) | ((value & 0xFF) << 8)
         return replace(state, registers=tuple(registers))
+    if isinstance(operand, VectorRegisterOperand):
+        vectors = list(state.vector_registers)
+        old = vectors[int(operand.register)]
+        vectors[int(operand.register)] = (
+            value if target_width == 128
+            else (old & ~_mask(target_width)) | value
+        )
+        return replace(state, vector_registers=tuple(vectors))
     if isinstance(operand, EffectiveAddressOperand):
         memory = _as_memory(state.memory).write_unsigned(
             effective_address(state, instruction, operand), target_width, value,
@@ -245,6 +270,22 @@ def _binary_handler(kind: str, *, write: bool = True):
     return handler
 
 
+def _subtract_with_borrow(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    left = read_operand(state, instruction, 0, width=width)
+    right = read_operand(state, instruction, 1, width=width)
+    borrowed = int(bool(state.flags & (1 << CF)))
+    effective_right = right + borrowed
+    raw = left - effective_right
+    flags = _arithmetic_flags(
+        state.flags, left, effective_right, raw, width, subtract=True,
+    )
+    flags = _set_flag(flags, CF, left < effective_right)
+    return write_operand(
+        replace(state, flags=flags), instruction, 0, raw, width=width,
+    )
+
+
 def _move(state: MachineExecutionState, instruction) -> MachineExecutionState:
     width = _data_width(instruction, 0)
     return write_operand(state, instruction, 0, read_operand(state, instruction, 1, width=width), width=width)
@@ -288,6 +329,139 @@ def _incdec(delta: int):
         flags = _set_flag(flags, CF, bool(state.flags & (1 << CF)))
         return write_operand(replace(state, flags=flags), instruction, 0, raw, width=width)
     return handler
+
+
+def _shift(kind: str):
+    def handler(state: MachineExecutionState, instruction) -> MachineExecutionState:
+        width = _data_width(instruction, 0)
+        value = read_operand(state, instruction, 0, width=width)
+        count = read_operand(state, instruction, 1, width=8)
+        count &= 0x3F if width == 64 else 0x1F
+        if count == 0:
+            return state
+        mask = _mask(width)
+        if kind == "left":
+            result = (value << count) & mask
+            carry = bool((value >> (width - count)) & 1) if count <= width else False
+        elif kind == "right":
+            result = value >> count if count < width else 0
+            carry = bool((value >> (count - 1)) & 1) if count <= width else False
+        else:
+            signed_value = value - (1 << width) if value & (1 << (width - 1)) else value
+            result = (signed_value >> count) & mask
+            carry = bool((value >> (count - 1)) & 1) if count <= width else bool(value >> (width - 1))
+        flags = _logical_flags(state.flags, result, width)
+        flags = _set_flag(flags, CF, carry)
+        if count == 1:
+            if kind == "left":
+                overflow = bool(result & (1 << (width - 1))) != carry
+            elif kind == "right":
+                overflow = bool(value & (1 << (width - 1)))
+            else:
+                overflow = False
+            flags = _set_flag(flags, OF, overflow)
+        else:
+            flags = _set_flag(flags, OF, bool(state.flags & (1 << OF)))
+        return write_operand(replace(state, flags=flags), instruction, 0, result, width=width)
+    return handler
+
+
+def _rotate(kind: str):
+    def handler(state: MachineExecutionState, instruction) -> MachineExecutionState:
+        width = _data_width(instruction, 0)
+        value = read_operand(state, instruction, 0, width=width)
+        count = read_operand(state, instruction, 1, width=8) % width
+        if count == 0:
+            return state
+        mask = _mask(width)
+        if kind == "left":
+            result = ((value << count) | (value >> (width - count))) & mask
+            carry = bool(result & 1)
+            overflow = bool(result & (1 << (width - 1))) != carry
+        else:
+            result = ((value >> count) | (value << (width - count))) & mask
+            carry = bool(result & (1 << (width - 1)))
+            overflow = bool((result ^ (result << 1)) & (1 << (width - 1)))
+        flags = _set_flag(state.flags, CF, carry)
+        if count == 1:
+            flags = _set_flag(flags, OF, overflow)
+        return write_operand(replace(state, flags=flags), instruction, 0, result, width=width)
+    return handler
+
+
+def _negate(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    value = read_operand(state, instruction, 0, width=width)
+    raw = -value
+    flags = _arithmetic_flags(state.flags, 0, value, raw, width, subtract=True)
+    flags = _set_flag(flags, CF, value != 0)
+    return write_operand(replace(state, flags=flags), instruction, 0, raw, width=width)
+
+
+def _not(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    return write_operand(
+        state, instruction, 0,
+        ~read_operand(state, instruction, 0, width=width), width=width,
+    )
+
+
+def _compare_exchange(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    destination = read_operand(state, instruction, 0, width=width)
+    source = read_operand(state, instruction, 1, width=width)
+    accumulator = state.registers[0] & _mask(width)
+    flags = _arithmetic_flags(
+        state.flags, accumulator, destination,
+        accumulator - destination, width, subtract=True,
+    )
+    flagged = replace(state, flags=flags)
+    if accumulator == destination:
+        return write_operand(flagged, instruction, 0, source, width=width)
+    registers = list(flagged.registers)
+    if width == 64:
+        registers[0] = destination
+    elif width == 32:
+        registers[0] = destination  # zero extends
+    else:
+        registers[0] = (registers[0] & ~_mask(width)) | destination
+    return replace(flagged, registers=tuple(registers))
+
+
+def _exchange(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    left = read_operand(state, instruction, 0, width=width)
+    right = read_operand(state, instruction, 1, width=width)
+    result = write_operand(state, instruction, 0, right, width=width)
+    return write_operand(result, instruction, 1, left, width=width)
+
+
+def _exchange_add(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    left = read_operand(state, instruction, 0, width=width)
+    right = read_operand(state, instruction, 1, width=width)
+    raw = left + right
+    flags = _arithmetic_flags(state.flags, left, right, raw, width, subtract=False)
+    result = write_operand(replace(state, flags=flags), instruction, 0, raw, width=width)
+    return write_operand(result, instruction, 1, left, width=width)
+
+
+def _vector_xor(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    return write_operand(
+        state, instruction, 0,
+        read_operand(state, instruction, 0, width=width)
+        ^ read_operand(state, instruction, 1, width=width),
+        width=width,
+    )
+
+
+def _vector_shift_right_logical(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    value = read_operand(state, instruction, 0, width=width)
+    byte_count = read_operand(state, instruction, 1, width=8)
+    result = value >> min(byte_count * 8, width)
+    return write_operand(state, instruction, 0, result, width=width)
 
 
 def _extend(signed: bool):
@@ -369,6 +543,21 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.STACK_POP: _pop,
         MachineSemanticToken.INTEGER_INCREMENT: _incdec(1),
         MachineSemanticToken.INTEGER_DECREMENT: _incdec(-1),
+        MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW: _subtract_with_borrow,
+        MachineSemanticToken.INTEGER_NEGATE: _negate,
+        MachineSemanticToken.BITWISE_NOT: _not,
+        MachineSemanticToken.SHIFT_LEFT: _shift("left"),
+        MachineSemanticToken.SHIFT_RIGHT_LOGICAL: _shift("right"),
+        MachineSemanticToken.SHIFT_RIGHT_ARITHMETIC: _shift("arithmetic"),
+        MachineSemanticToken.ROTATE_LEFT: _rotate("left"),
+        MachineSemanticToken.ROTATE_RIGHT: _rotate("right"),
+        MachineSemanticToken.ATOMIC_COMPARE_EXCHANGE: _compare_exchange,
+        MachineSemanticToken.ATOMIC_EXCHANGE_ADD: _exchange_add,
+        MachineSemanticToken.ATOMIC_ADD: _binary_handler("add"),
+        MachineSemanticToken.EXCHANGE: _exchange,
+        MachineSemanticToken.VECTOR_XOR: _vector_xor,
+        MachineSemanticToken.VECTOR_MOVE: _move,
+        MachineSemanticToken.VECTOR_SHIFT_RIGHT_LOGICAL: _vector_shift_right_logical,
         MachineSemanticToken.SIGN_EXTEND: _extend(True),
         MachineSemanticToken.ZERO_EXTEND: _extend(False),
         MachineSemanticToken.NO_OPERATION: _noop,
@@ -394,7 +583,7 @@ def build_external_references(program) -> tuple[MachineExternalReference, ...]:
     )
 
 
-def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, external_references=()) -> MachineExecutionState:
+def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, teb_base: int = 0x00007FFE00000000, peb_base: int = 0x00007FFD00000000, system_arena_base: int = 0x00007FFC00000000, system_arena_size: int = 1024 * 1024, external_references=()) -> MachineExecutionState:
     """Map a preferred-base PE image and a zeroed, ABI-aligned guest stack."""
 
     image = program.image
@@ -421,6 +610,13 @@ def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000,
             reference.target_address,
         )
     memory = memory.map_zeroes(stack_top - stack_size, stack_size)
+    memory = memory.map_zeroes(teb_base, 4096)
+    memory = memory.map_zeroes(peb_base, 4096)
+    memory = memory.map_zeroes(system_arena_base, system_arena_size)
+    # Minimal deterministic x64 Windows process/thread environment.  Fields
+    # outside this declared page stay unmapped and therefore trap visibly.
+    memory = memory.write_unsigned(teb_base + 0x30, 64, teb_base)
+    memory = memory.write_unsigned(teb_base + 0x60, 64, peb_base)
     rsp = stack_top - 8
     memory = memory.write_unsigned(rsp, 64, 0)
     registers = [0] * 16
@@ -429,6 +625,12 @@ def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000,
         pc=image.image_base + image.entrypoint_rva,
         registers=tuple(registers),
         memory=memory,
+        system_state=MappingProxyType({
+            "windows.system_arena_base": system_arena_base,
+            "windows.system_arena_limit": system_arena_base + system_arena_size,
+            "windows.system_arena_cursor": system_arena_base,
+        }),
+        gs_base=teb_base,
     )
 
 
@@ -449,7 +651,6 @@ def complete_external_call_state(
         raise RuntimeError("external completion does not match the reversible call stack")
     registers = list(state.registers)
     registers[0] = int(completion.result) & MASK64
-    registers[4] = (registers[4] + 8) & MASK64
     memory = _as_memory(state.memory)
     for effect in completion.memory_writes:
         # ``map_bytes`` intentionally requires the destination page to exist
@@ -458,16 +659,40 @@ def complete_external_call_state(
         for index in range(len(effect.data)):
             memory[effect.address + index]
         memory = memory.map_bytes(effect.address, effect.data)
+    system_state = dict(state.system_state)
+    for effect in completion.system_writes:
+        system_state[effect.key] = int(effect.value) & MASK64
+    pending = tuple(
+        item for item in state.external_requests
+        if item.request_id != completion.request_id
+    )
+    guest_calls = tuple(int(address) & MASK64 for address in completion.guest_calls)
+    if guest_calls:
+        # The original caller return is already at [RSP]. Push the remaining
+        # callbacks in reverse order so ordinary RET semantics visit each and
+        # finally consume that original return.
+        memory = _as_memory(memory)
+        for address in reversed(guest_calls[1:]):
+            registers[4] = (registers[4] - 8) & MASK64
+            memory = memory.write_unsigned(registers[4], 64, address)
+        return replace(
+            state,
+            pc=guest_calls[0],
+            registers=tuple(registers),
+            memory=memory,
+            system_state=MappingProxyType(system_state),
+            call_stack=(*state.call_stack, *reversed(guest_calls[1:])),
+            external_requests=pending,
+        )
+    registers[4] = (registers[4] + 8) & MASK64
     return replace(
         state,
         pc=request.return_address,
         registers=tuple(registers),
         memory=memory,
+        system_state=MappingProxyType(system_state),
         call_stack=state.call_stack[:-1],
-        external_requests=tuple(
-            item for item in state.external_requests
-                if item.request_id != completion.request_id
-        ),
+        external_requests=pending,
     )
 
 

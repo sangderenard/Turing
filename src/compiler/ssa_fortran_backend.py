@@ -1882,7 +1882,8 @@ def compile_module(
     module: FortranModule,
     *,
     directory: str | Path | None = None,
-    extra_flags: Sequence[str] = ("-O3", "-march=native", "-funroll-loops"),
+    extra_flags: Sequence[str] | None = None,
+    standalone: bool = True,
 ) -> Path:
     """Compile a generated module to a shared library.
 
@@ -1898,20 +1899,32 @@ def compile_module(
         )
     import os
     import sys
+    from .fortran_toolchain import (
+        aggressive_fortran_flags,
+        standalone_fortran_link_flags,
+    )
 
     workdir = Path(directory or tempfile.mkdtemp(prefix="turing_fortran_"))
     workdir.mkdir(parents=True, exist_ok=True)
     source = module.write(workdir)
     suffix = ".dll" if sys.platform == "win32" else ".so"
     library = workdir / f"{module.name}{suffix}"
+    compile_flags = tuple(extra_flags or aggressive_fortran_flags(compiler))
+    try:
+        link_flags = (
+            standalone_fortran_link_flags(compiler) if standalone else ()
+        )
+    except ValueError as error:
+        raise FortranEmissionError(str(error)) from error
     command = [
         compiler,
         "-shared",
         *(() if sys.platform == "win32" else ("-fPIC",)),
-        *extra_flags,
+        *compile_flags,
         str(source),
         "-o",
         str(library),
+        *link_flags,
     ]
 
     # gfortran spawns f951, which loads libgmp/libmpfr from the toolchain's own

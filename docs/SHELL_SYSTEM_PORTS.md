@@ -53,6 +53,15 @@ physical `turing-shell-io-abi` supplies external request/completion rings with
 payloads are offset/length spans in program-owned memory, allowing asynchronous
 JavaScript/Wasm and native hosts to share one record layout.
 
+For a loaded PE, imports become `guest_binary` references with stable numeric
+IDs and synthetic target addresses. Calls pause as typed external requests.
+Shell completions return a scalar result plus an effect list; effects may write
+only existing guest mappings. Both request and completion are retained in the
+reversible machine graph. `CapabilityGatedExternalPort` dispatches by exact,
+case-insensitive `(library, symbol)` identity and has no catch-all host-call
+path. The deterministic Windows bootstrap policy supplies caller-selected
+virtual time, process/thread IDs, counters, and the main module handle.
+
 ## Safety rules
 
 - A required port must have a matching requested shell capability.

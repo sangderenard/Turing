@@ -982,6 +982,10 @@ def evaporate_unrolled_loops(
                 if effect.loop_result_id is not None:
                     live.add(int(effect.loop_result_id))
                 live.update(map(int, effect.argument_value_ids))
+        # Loop plans are snapshots taken before evaporation rewrites the
+        # graph.  A sibling/nested rewrite can legitimately remove IDs still
+        # named by a retained plan; only live graph nodes may seed ancestry.
+        live.intersection_update(int(node_id) for node_id in graph.G)
         for root in tuple(live):
             live.update(int(node_id) for node_id in nx.ancestors(graph.G, root))
         graph.G.remove_nodes_from(

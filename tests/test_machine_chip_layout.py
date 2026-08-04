@@ -44,14 +44,14 @@ def _machine(core_count=2):
 def test_every_register_is_an_individual_contiguous_u64_cell_on_each_core():
     layout = build_register_bank_layout(2, base_offset=0x2000)
 
-    assert layout.core_stride == 256
-    assert layout.byte_size == 512
+    assert layout.core_stride == 512
+    assert layout.byte_size == 1024
     for core in range(2):
         cells = [layout.cell(core, name) for name in layout.register_names]
         assert all(cell.word_offsets[1] - cell.word_offsets[0] == 4 for cell in cells)
         assert [cell.byte_offset for cell in cells] == list(range(
-            0x2000 + core * 256,
-            0x2000 + core * 256 + len(cells) * 8,
+            0x2000 + core * 512,
+            0x2000 + core * 512 + len(cells) * 8,
             8,
         ))
 

@@ -23,7 +23,9 @@ def test_existing_backend_operator_lists_are_exposed_without_a_fifth_copy():
     }
     assert len(inventories["c"].operations) == 40
     assert len(inventories["glsl"].operations) == 56
-    assert len(inventories["fortran"].operations) == 58
+    # Includes the shared span constructors (fill/zeros/ones/full and their
+    # like variants) now lowered by the Fortran backend.
+    assert len(inventories["fortran"].operations) == 65
     assert len(inventories["llvm"].operations) == 70
     assert len(inventories["webgl"].operations) == 44
     assert inventories["webgpu"].operations

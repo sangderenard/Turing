@@ -146,3 +146,24 @@ entity's compiled x position controls stereo pan. Neither mechanism alters
 `dt`. The generated WebGL shader samples the named RGB output planes and
 stretches them over the viewport; it contains no second physics
 implementation, private time manager, or precomputed visual frames.
+
+### Native Fortran display isolation
+
+The same Python-authored tick can be compiled into the common native
+Fortran/C-shell display without the browser bundle. This diagnostic keeps all
+45,056-element terrain, state, and audio planes in caller-owned arenas rather
+than baking large constants:
+
+```powershell
+# First prove the Fortran + Win32 RGB shell with a cheap gradient.
+python -m src.compiler.native_fortran_display probe --frames 300
+
+# Then compile and run the real 256 x 176 columnar tick through the same shell.
+python -m src.compiler.native_fortran_display columnar --frames 300
+```
+
+Use `--compile-only` to separate compiler/antivirus activity from execution.
+Generated executables find `initial-state.bin` beside themselves, so they also
+work when launched outside their build directory. On the reference Windows
+machine one full columnar frame takes about 0.2 seconds; a blank interval much
+longer than that is not expected simulation latency.

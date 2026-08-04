@@ -17,6 +17,7 @@ inlined definitions without losing the source correlation.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -215,12 +216,38 @@ class ClassNavigationTable:
         class_identity: str,
         member_name: str,
         evaluator: PermissionEvaluator,
+        *,
+        receiver_kind: str = "instance",
     ) -> ClassNavigationMember:
         """Resolve ``class_identity.member_name`` after permission checks."""
 
         record = self.class_record(class_identity)
         self._require(evaluator, record.identity, record.permissions)
         matches = [item for item in record.members if item.name == member_name]
+        if len(matches) > 1 and receiver_kind == "instance":
+            # A plain Python method is a non-data descriptor.  An instance
+            # field of the same name therefore shadows it after assignment
+            # (a common adapter pattern: ``self.nodes = ...`` alongside a
+            # class-level ``nodes`` method).  Keep both navigation records so
+            # class-level inspection remains possible, but resolve ordinary
+            # object dots with Python's instance precedence.
+            instance_fields = [
+                item
+                for item in matches
+                if item.kind == "attribute" and item.storage == "instance"
+            ]
+            if len(instance_fields) == 1:
+                matches = instance_fields
+        elif len(matches) > 1 and receiver_kind == "class":
+            matches = [
+                item
+                for item in matches
+                if not (item.kind == "attribute" and item.storage == "instance")
+            ]
+        elif receiver_kind not in {"instance", "class"}:
+            raise ValueError(
+                "receiver_kind must be either 'instance' or 'class'"
+            )
         if len(matches) != 1:
             raise KeyError(
                 f"unknown or ambiguous member {class_identity}.{member_name}"
@@ -238,7 +265,9 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
         raise ValueError("class navigation requires a function table")
     records = []
     for object_map in (graph.G.graph.get("map_ir") or {}).get("objects", ()):
-        class_identity = str(object_map["class_name"])
+        class_identity = str(
+            object_map.get("class_identity", object_map["class_name"])
+        )
         members = []
         for attribute in object_map.get("attributes", ()):
             members.append(ClassNavigationMember(
@@ -267,9 +296,13 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
                 function_reference=reference,
                 permissions=tuple(method.get("permissions", ())),
             ))
-        names = [member.name for member in members]
-        if len(names) != len(set(names)):
-            raise ValueError(f"class {class_identity!r} has ambiguous member names")
+        member_slots = [
+            (member.name, member.kind, member.storage) for member in members
+        ]
+        if len(member_slots) != len(set(member_slots)):
+            raise ValueError(
+                f"class {class_identity!r} has duplicate member slots"
+            )
         constructors = tuple(
             member.function_reference
             for constructor_name in ("__new__", "__init__")
@@ -285,7 +318,17 @@ def build_class_navigation_table(graph: Any) -> ClassNavigationTable:
         ))
     identities = [record.identity for record in records]
     if len(identities) != len(set(identities)):
-        raise ValueError("class navigation contains duplicate class identities")
+        duplicates = tuple(
+            sorted(
+                identity
+                for identity, count in Counter(identities).items()
+                if count > 1
+            )
+        )
+        raise ValueError(
+            "class navigation contains duplicate class identities: "
+            f"{duplicates!r}"
+        )
     return ClassNavigationTable(tuple(records))
 
 

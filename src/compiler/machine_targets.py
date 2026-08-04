@@ -479,7 +479,10 @@ class _FortranTarget:
         output_values = returns[-1] if returns else ()
         module = emit_module(
             IRModule({name: function}),
-            name=name,
+            # A Fortran module and a procedure contained by that module may
+            # not share an identifier. Keep the public procedure/ABI name and
+            # give only the enclosing compilation unit a distinct suffix.
+            name=f"{name}_fortran",
             outputs={name: output_values},
         )
         shortfalls = tuple(

@@ -7,7 +7,7 @@ bytes remain in the register-aware machine pipeline and never become cards.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from .machine_chip_layout import (
@@ -26,8 +26,10 @@ from .machine_execution import (
     MachineExternalCallCompletion,
     MachineExternalMemoryWrite,
     MachineExternalReference,
+    MachineDispatchPlan,
 )
 from .amd64_machine_semantics import (
+    EXTERNAL_TARGET_BASE,
     build_external_references,
     build_initial_machine_state,
     complete_external_call_state,
@@ -44,6 +46,7 @@ from .machine_state_buffer import (
     MachineSnapshotTripleBuffer,
     SubjectOutputBuffer,
 )
+from .machine_system_ports import CapabilityGatedExternalPort
 
 
 class SubjectDeviceBuffers:
@@ -72,6 +75,8 @@ class BinaryMachineProgram:
     clock: ExternalMachineClock
     devices: SubjectDeviceBuffers
     external_references: tuple[MachineExternalReference, ...]
+    external_reference_targets: dict[int, MachineExternalReference]
+    dispatch_plans: list[MachineDispatchPlan]
 
     @classmethod
     def from_program(
@@ -145,6 +150,8 @@ class BinaryMachineProgram:
             ),
             devices=devices,
             external_references=external_references,
+            external_reference_targets=references_by_target,
+            dispatch_plans=[],
         )
 
     @classmethod
@@ -204,6 +211,84 @@ class BinaryMachineProgram:
         )
         core.commit_external_completion(completed)
         return completed
+
+    def service_external_requests(
+        self,
+        port: CapabilityGatedExternalPort,
+        *,
+        core_index: int = 0,
+    ) -> int:
+        """Apply every currently serviceable request through an allowlisted port."""
+
+        serviced = 0
+        while True:
+            pending = self.pending_external_requests(core_index)
+            if not pending:
+                return serviced
+            request = pending[0]
+            completion = port.handle(request, self.machine.cores[core_index].state)
+            if completion is None:
+                return serviced
+            if completion.request_id != request.request_id:
+                raise ValueError("external port returned a mismatched request id")
+            if completion.resolution is not None:
+                reference = self.register_external_reference(
+                    completion.resolution.library,
+                    completion.resolution.symbol,
+                )
+                completion = replace(
+                    completion,
+                    result=reference.target_address,
+                    resolution=None,
+                )
+            core = self.machine.cores[core_index]
+            unknown_calls = tuple(
+                address for address in completion.guest_calls
+                if address not in core.executor.instructions
+            )
+            if unknown_calls:
+                plan = core.executor.install_dispatch_targets(unknown_calls)
+                self.dispatch_plans.append(plan)
+                still_unknown = tuple(
+                    address for address in unknown_calls
+                    if address not in core.executor.instructions
+                )
+                if still_unknown:
+                    details = "; ".join(plan.failure_reasons)
+                    raise ValueError(
+                        "external port requested unprovable guest callbacks: "
+                        + ", ".join(f"{address:#x}" for address in still_unknown)
+                        + (f" ({details})" if details else "")
+                    )
+            core.commit_external_completion(
+                complete_external_call_state(core.state, completion),
+            )
+            serviced += 1
+
+    def register_external_reference(
+        self,
+        library: str,
+        symbol: str,
+    ) -> MachineExternalReference:
+        """Intern a dynamically resolved export in the guest target namespace."""
+
+        for reference in self.external_references:
+            if (
+                reference.library.casefold() == library.casefold()
+                and reference.symbol.casefold() == symbol.casefold()
+            ):
+                return reference
+        reference_id = len(self.external_references) + 1
+        reference = MachineExternalReference(
+            reference_id=reference_id,
+            target_address=EXTERNAL_TARGET_BASE + (reference_id - 1) * 16,
+            domain="guest-binary",
+            library=library,
+            symbol=symbol,
+        )
+        self.external_references = (*self.external_references, reference)
+        self.external_reference_targets[reference.target_address] = reference
+        return reference
 
 
 __all__ = ["BinaryMachineProgram", "SubjectDeviceBuffers"]
