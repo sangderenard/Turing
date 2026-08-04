@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from .binary_structure_graph import (
     BinaryStructureGraph,
@@ -47,6 +47,39 @@ class MachineExecutionState:
     )
     call_stack: tuple[int, ...] = ()
     steps: int = 0
+
+    REGISTER_NAMES: ClassVar[tuple[str, ...]] = (
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    )
+
+    def register_contents(self) -> Mapping[str, int]:
+        """Expose the complete architectural register surface by name."""
+
+        if len(self.registers) != len(self.REGISTER_NAMES):
+            raise ValueError(
+                f"machine state has {len(self.registers)} registers; "
+                f"expected {len(self.REGISTER_NAMES)}"
+            )
+        values = {
+            name: int(value)
+            for name, value in zip(self.REGISTER_NAMES, self.registers)
+        }
+        values.update({
+            "rip": int(self.pc),
+            "rflags": int(self.flags),
+            "steps": int(self.steps),
+            "call_depth": len(self.call_stack),
+        })
+        return MappingProxyType(values)
+
+    def packed_register_words(self) -> tuple[tuple[int, int], ...]:
+        """Return lossless low/high u32 words for the WebGPU display ABI."""
+
+        return tuple(
+            (value & 0xFFFFFFFF, (value >> 32) & 0xFFFFFFFF)
+            for value in self.register_contents().values()
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +273,130 @@ class MachineExecutionOrchestrator:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineExecutionEdge:
+    """One retained edge in the reversible execution graph."""
+
+    source: MachineExecutionState
+    target: MachineExecutionState
+    status: MachineExecutionStatus
+    instruction: Any | None = None
+
+
+@dataclass(slots=True)
+class ReversibleMachineExecutor:
+    """Exact bidirectional journal around the real machine executor.
+
+    Forward movement invokes :class:`MachineExecutionOrchestrator`; backward
+    movement restores the complete prior machine state, including memory and
+    control stack. Rewinding and executing again creates a new graph branch by
+    discarding only the abandoned future of this journal. ``fork`` preserves
+    both alternatives as independently runnable execution threads.
+    """
+
+    executor: MachineExecutionOrchestrator
+    _states: list[MachineExecutionState]
+    _edges: list[MachineExecutionEdge]
+    _position: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        executor: MachineExecutionOrchestrator,
+        state: MachineExecutionState | None = None,
+    ) -> "ReversibleMachineExecutor":
+        return cls(executor, [state or executor.initial_state()], [])
+
+    @property
+    def state(self) -> MachineExecutionState:
+        return self._states[self._position]
+
+    @property
+    def position(self) -> int:
+        return self._position
+
+    @property
+    def edges(self) -> tuple[MachineExecutionEdge, ...]:
+        return tuple(self._edges)
+
+    def step_forward(self) -> MachineExecutionResult:
+        source = self.state
+        result = self.executor.step(source)
+        del self._states[self._position + 1:]
+        del self._edges[self._position:]
+        self._states.append(result.state)
+        self._edges.append(MachineExecutionEdge(
+            source, result.state, result.status, result.instruction,
+        ))
+        self._position += 1
+        return result
+
+    def step_backward(self) -> MachineExecutionState:
+        if self._position == 0:
+            raise IndexError("machine executor is already at its initial state")
+        self._position -= 1
+        return self.state
+
+    def seek_history(self, position: int) -> MachineExecutionState:
+        if not 0 <= position < len(self._states):
+            raise IndexError("machine execution history position is out of range")
+        self._position = int(position)
+        return self.state
+
+    def fork(self) -> "ReversibleMachineExecutor":
+        return ReversibleMachineExecutor(
+            self.executor,
+            list(self._states[:self._position + 1]),
+            list(self._edges[:self._position]),
+            self._position,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MachineVirtualMulticore:
+    """A group of independently reversible binary-execution heads."""
+
+    cores: tuple[ReversibleMachineExecutor, ...]
+
+    @classmethod
+    def create(
+        cls,
+        executor: MachineExecutionOrchestrator,
+        *,
+        core_count: int,
+        initial_states: Sequence[MachineExecutionState] | None = None,
+    ) -> "MachineVirtualMulticore":
+        if core_count <= 0:
+            raise ValueError("virtual multicore requires at least one core")
+        states = tuple(initial_states or ())
+        if states and len(states) != core_count:
+            raise ValueError("initial_states must contain one state per core")
+        return cls(tuple(
+            ReversibleMachineExecutor.create(
+                executor, states[index] if states else None,
+            )
+            for index in range(core_count)
+        ))
+
+    def cycle_forward(self) -> tuple[MachineExecutionResult, ...]:
+        """Advance every execution head once across the virtual core barrier."""
+
+        return tuple(core.step_forward() for core in self.cores)
+
+    def cycle_backward(self) -> tuple[MachineExecutionState, ...]:
+        """Restore every execution head one cycle across the same barrier."""
+
+        if any(core.position == 0 for core in self.cores):
+            raise IndexError("at least one virtual core is already at initial state")
+        return tuple(core.step_backward() for core in self.cores)
+
+    def register_contents(self) -> tuple[Mapping[str, int], ...]:
+        return tuple(core.state.register_contents() for core in self.cores)
+
+    def packed_register_words(self) -> tuple[tuple[tuple[int, int], ...], ...]:
+        return tuple(core.state.packed_register_words() for core in self.cores)
+
+
+@dataclass(frozen=True, slots=True)
 class MachineOrchestrationResult:
     mode: MachineOrchestrationMode
     program: Any
@@ -269,12 +426,15 @@ def orchestrate_machine_program(
 __all__ = [
     "MachineEffectHandler",
     "MachineExecutionOrchestrator",
+    "MachineExecutionEdge",
     "MachineExecutionResult",
     "MachineExecutionState",
     "MachineExecutionStatus",
+    "MachineVirtualMulticore",
     "MachineIndirectTargetHandler",
     "MachineOrchestrationMode",
     "MachineOrchestrationResult",
     "MachinePredicateHandler",
+    "ReversibleMachineExecutor",
     "orchestrate_machine_program",
 ]

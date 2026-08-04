@@ -38,6 +38,7 @@ from .machine_reference_vocabulary import (
 from .x86_tensor_read_head import (
     EncodingFlag,
     PrefixAction,
+    ReadHeadDirection,
     ReadFailure,
     ReadPhase,
     ReadStatus,
@@ -45,6 +46,7 @@ from .x86_tensor_read_head import (
     X86ReadBatch,
     X86ReadHeadConfig,
     X86ReadHeadState,
+    X86ReversibleReadHead,
     X86TensorReadHead,
     controlled_x86_64_read_head_config,
 )
@@ -1371,6 +1373,7 @@ __all__ = [
     "PEImage",
     "RegisterOperand",
     "PrefixAction",
+    "ReadHeadDirection",
     "ReadFailure",
     "ReadPhase",
     "ReadStatus",
@@ -1384,6 +1387,7 @@ __all__ = [
     "X86ReadBatch",
     "X86ReadHeadConfig",
     "X86ReadHeadState",
+    "X86ReversibleReadHead",
     "X86ReferenceDecoder",
     "X86Register",
     "X86TensorReadHead",
