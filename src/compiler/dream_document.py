@@ -536,6 +536,53 @@ def python_exec_handler(namespace: dict[str, Any] | None = None):
     return execute
 
 
+def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program"):
+    """Build the standard shell with presentation owned by the document."""
+
+    from .wasm_html_shell import emit_html_shell
+
+    handoff = document.display_handoff()
+    if handoff is None:
+        raise DreamDocumentError(
+            "HTML shell emission requires a fragment block promising interior display ownership"
+        )
+    api = {
+        "module": name,
+        "language": "dream-document",
+        "entry": "dream_main",
+        "entry_points": [{
+            "name": "dream_main", "symbol": "dream_main",
+            "kind": "control", "parameters": [],
+        }],
+        "metadata": {
+            "document_schema": document.schema,
+            "display_ownership": "program-interior",
+            "deployment_regions": [
+                {
+                    "region_id": region.region_id,
+                    "kind": region.kind,
+                    "schedule": region.schedule,
+                    "lanes": len(region.lanes),
+                    "join": region.join.mode.value,
+                }
+                for region in document.lower_to_ssa().deployment_regions
+            ],
+        },
+    }
+    source = "\n\n".join(
+        f"/* dream block: {block.identity} ({block.language}:{block.stage or 'host'}) */\n{block.payload}"
+        for block in document.blocks
+    )
+    return emit_html_shell(
+        api,
+        source=source,
+        origin_source=source,
+        map_ir={"card_graph": document.card_graph()},
+        shader_execution=handoff.to_shader_execution(),
+        name=f"{name}_shell",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Inspect or reference-run one dream document through its card graph."""
 
@@ -550,10 +597,20 @@ def main(argv: list[str] | None = None) -> int:
         "--run-reference", action="store_true",
         help="execute trusted Python and simulate in-place shader deployment",
     )
+    mode.add_argument(
+        "--emit-shell", type=Path, metavar="HTML",
+        help="write a launchable shell that hands its context to the interior display",
+    )
     arguments = parser.parse_args(argv)
     document = load_dream_document(arguments.document)
     if arguments.inspect:
         print(json.dumps(document.card_graph(), indent=2, sort_keys=True))
+        return 0
+    if arguments.emit_shell is not None:
+        output = emit_dream_html_shell(
+            document, name=arguments.document.stem,
+        ).write(arguments.emit_shell)
+        print(output)
         return 0
 
     namespace: dict[str, Any] = {}
@@ -595,7 +652,7 @@ __all__ = [
     "DreamDisplayHandoff", "DreamExecutionRecord", "DreamParallelDeployment",
     "DreamRuntime", "DreamSSALowering",
     "load_dream_document", "parse_dream_document", "python_exec_handler",
-    "main",
+    "emit_dream_html_shell", "main",
 ]
 
 

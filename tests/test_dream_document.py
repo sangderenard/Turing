@@ -6,6 +6,7 @@ import pytest
 from src.compiler.dream_document import (
     DreamDocumentError,
     DreamRuntime,
+    emit_dream_html_shell,
     load_dream_document,
     parse_dream_document,
     python_exec_handler,
@@ -92,6 +93,11 @@ def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
     assert "installTuringDisplay" in html
     assert 'canvas.dataset.displayOwner = interior.owner' in html
 
+    complete = emit_dream_html_shell(document, name="chip").html
+    assert '"display_ownership": "program-interior"' in complete
+    assert '"kind": "device_dispatch"' in complete
+    assert "installTuringDisplay" in complete
+
 
 def test_parallel_blocks_really_overlap_without_a_runtime_state_lock():
     document = load_dream_document(DOCUMENT)
@@ -159,3 +165,14 @@ def test_reference_cli_runs_card_order_and_reports_gpu_activity(capsys):
     assert "GPU ACTIVE | register-light-compute" in output
     assert "GPU IDLE | chip-present-fragment" in output
     assert "head-step: python -> 1" in output
+
+
+def test_cli_emits_launchable_interior_owned_shell(tmp_path, capsys):
+    output = tmp_path / "chip.html"
+    assert main([str(DOCUMENT), "--emit-shell", str(output)]) == 0
+    html = output.read_text(encoding="utf-8")
+
+    assert '<canvas id="shader-surface"' in html
+    assert "installTuringDisplay" in html
+    assert "program-interior" in html
+    assert str(output) in capsys.readouterr().out
