@@ -68,6 +68,7 @@ class WebGLFragmentModule:
     api: CompiledProgramAPI
     vertex_source: str = FULLSCREEN_VERTEX_SHADER
     io_layout: Any = None
+    component_abi: Any = None
 
     @property
     def complete(self) -> bool:
@@ -333,18 +334,37 @@ def emit_webgl_fragment_module(
             for index, output_id in enumerate(program.outputs.values())
         ),
     )
+    from .shader_component_abi import component_abi_from_layout
+    component_abi = component_abi_from_layout(
+        name,
+        "glsl-es-300",
+        io_layout,
+        decorations={
+            "execution_model": "fragment-raster",
+            "sentinel_policy": "validate-before-draw/publish-after-draw",
+        },
+    )
+    api = _api(
+        name,
+        feed_ids,
+        program.outputs,
+        output_layout=output_layout,
+        input_sampling=input_sampling,
+    )
+    api = CompiledProgramAPI(
+        module=api.module,
+        language=api.language,
+        entry=api.entry,
+        entry_points=api.entry_points,
+        metadata={**dict(api.metadata), "component_abi": component_abi.to_mapping()},
+    )
     return WebGLFragmentModule(
         name=name,
         source=source,
         shortfalls=tuple(shortfalls),
-        api=_api(
-            name,
-            feed_ids,
-            program.outputs,
-            output_layout=output_layout,
-            input_sampling=input_sampling,
-        ),
+        api=api,
         io_layout=io_layout,
+        component_abi=component_abi,
     )
 
 

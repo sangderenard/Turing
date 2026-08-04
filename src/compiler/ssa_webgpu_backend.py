@@ -148,6 +148,7 @@ class WGSLModule:
     api: Any
     launch_plan: WGSLLaunchPlan
     io_layout: Any = None
+    component_abi: Any = None
 
     def write(self, directory: str | Path) -> Path:
         path = Path(directory) / f"{self.name}.wgsl"
@@ -594,6 +595,17 @@ def emit_module(
     io_layout = ShaderIOLayout(
         COMPUTE.name, feeds=tuple(feed_bindings), outputs=tuple(output_bindings),
     )
+    from .shader_component_abi import component_abi_from_layout
+    component_abi = component_abi_from_layout(
+        name,
+        "wgsl",
+        io_layout,
+        decorations={
+            "execution_model": "compute",
+            "workgroup_size": launch_plan.workgroup_size,
+            "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
+        },
+    )
     helpers: list[str] = []
     for callee, returns in callees.items():
         helper = functions[callee]
@@ -671,10 +683,12 @@ def emit_module(
             "io_layout": io_layout.to_mapping(),
             "feed_bindings": [item.to_mapping() for item in feed_bindings],
             "outputs": [item.to_mapping() for item in output_bindings],
+            "component_abi": component_abi.to_mapping(),
         },
     )
     return WGSLModule(
-        name, source, not shortfalls, tuple(shortfalls), api, launch_plan, io_layout,
+        name, source, not shortfalls, tuple(shortfalls), api, launch_plan,
+        io_layout, component_abi,
     )
 
 
