@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Callable, ClassVar, Iterable, Mapping
 
 from ..common.tensors import AbstractTensor
 
@@ -55,6 +55,11 @@ class ReadHeadExecutionMode(IntEnum):
     DECODE = 0
     TRACE = 1
     EMULATE = 2
+
+
+class ReadHeadDirection(IntEnum):
+    BACKWARD = -1
+    FORWARD = 1
 
 
 class PrefixAction(IntEnum):
@@ -432,6 +437,36 @@ class X86ReadHeadState:
     field_multiplier: AbstractTensor
     field_remaining: AbstractTensor
     field_width: AbstractTensor
+
+    REGISTER_NAMES: ClassVar[tuple[str, ...]] = (
+        "cursor", "instruction_start", "phase", "status", "failure",
+        "token", "opcode_map", "opcode", "rex", "rex_present",
+        "legacy_prefixes", "modrm", "sib", "displacement", "immediate",
+        "relative_target", "field_accumulator", "field_multiplier",
+        "field_remaining", "field_width",
+    )
+
+    def register_tensor(self) -> AbstractTensor:
+        """Return every mutable head register as ``(cores, registers)``.
+
+        This is the stable observation ABI for debuggers and shader-backed
+        displays.  It deliberately remains an AbstractTensor operation so a
+        captured read-head graph can publish register state without a host
+        round trip.
+        """
+
+        return AbstractTensor.stack(
+            [getattr(self, name) for name in self.REGISTER_NAMES], dim=1,
+        )
+
+    def register_contents(self) -> tuple[dict[str, int], ...]:
+        """Materialize named per-core values for host-side examination."""
+
+        rows = self.register_tensor().tolist()
+        return tuple(
+            {name: int(value) for name, value in zip(self.REGISTER_NAMES, row)}
+            for row in rows
+        )
 
     @classmethod
     def initial(cls, batch: X86ReadBatch) -> "X86ReadHeadState":
@@ -1027,6 +1062,97 @@ class X86TensorReadHead:
         return _select((threshold > 0) & (value >= threshold), value - modulus, value)
 
 
+@dataclass(slots=True)
+class X86ReversibleReadHead:
+    """Journaled virtual multicore around the pure tensor transition kernel.
+
+    One batch lane is one independently advancing core.  Forward cycles apply
+    the same tensor kernel to every core concurrently.  Backward cycles restore
+    the exact prior immutable state, including partial instruction fields; no
+    attempt is made to guess an algebraic inverse for a lossy decoder step.
+
+    Rewinding and then moving forward truncates the abandoned future, giving
+    callers an explicit branch point suitable for graph inspection or forking.
+    The retained tensor states keep the forward computational graph intact.
+    """
+
+    head: X86TensorReadHead
+    batch: X86PreparedReadBatch
+    _history: list[X86ReadHeadState]
+    _position: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        head: X86TensorReadHead,
+        batch: X86ReadBatch | X86PreparedReadBatch,
+    ) -> "X86ReversibleReadHead":
+        prepared = batch.prepare() if isinstance(batch, X86ReadBatch) else batch
+        initial = X86ReadHeadState.initial(prepared)  # type: ignore[arg-type]
+        return cls(head=head, batch=prepared, _history=[initial])
+
+    @property
+    def state(self) -> X86ReadHeadState:
+        return self._history[self._position]
+
+    @property
+    def core_count(self) -> int:
+        return int(self.batch.octets.shape[0])
+
+    @property
+    def history_position(self) -> int:
+        return self._position
+
+    @property
+    def history_length(self) -> int:
+        return len(self._history)
+
+    def _append(self, state: X86ReadHeadState) -> X86ReadHeadState:
+        del self._history[self._position + 1:]
+        self._history.append(state)
+        self._position += 1
+        return state
+
+    def transition(self, direction: ReadHeadDirection = ReadHeadDirection.FORWARD) -> X86ReadHeadState:
+        """Move one reversible microstep in the requested direction."""
+
+        if direction is ReadHeadDirection.BACKWARD:
+            if self._position == 0:
+                raise IndexError("read head is already at the beginning of history")
+            self._position -= 1
+            return self.state
+        if direction is not ReadHeadDirection.FORWARD:
+            raise ValueError(f"unsupported read-head direction {direction!r}")
+        return self._append(self.head.transition(self.batch, self.state))
+
+    def acknowledge(self) -> X86ReadHeadState:
+        """Journal acknowledgement as its own reversible state change."""
+
+        return self._append(self.head.acknowledge(self.state))
+
+    def seek_history(self, position: int) -> X86ReadHeadState:
+        """Move to an already-recorded examination point without recomputing."""
+
+        if not 0 <= position < len(self._history):
+            raise IndexError("read-head history position is out of range")
+        self._position = int(position)
+        return self.state
+
+    def fork(self) -> "X86ReversibleReadHead":
+        """Create an independent execution thread at the current state."""
+
+        return X86ReversibleReadHead(
+            self.head, self.batch, list(self._history[:self._position + 1]),
+            self._position,
+        )
+
+    def register_tensor(self) -> AbstractTensor:
+        return self.state.register_tensor()
+
+    def register_contents(self) -> tuple[dict[str, int], ...]:
+        return self.state.register_contents()
+
+
 def controlled_x86_64_read_head_config(
     *,
     like: AbstractTensor | None = None,
@@ -1174,6 +1300,7 @@ __all__ = [
     "PrefixAction",
     "ReadFailure",
     "ReadHeadExecutionMode",
+    "ReadHeadDirection",
     "ReadPhase",
     "ReadStatus",
     "X86EncodingRow",
@@ -1183,6 +1310,7 @@ __all__ = [
     "X86ReadHeadProfile",
     "X86ReadHeadState",
     "X86ReadHeadRunResult",
+    "X86ReversibleReadHead",
     "X86TensorReadHead",
     "controlled_x86_64_read_head_config",
 ]
