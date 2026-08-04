@@ -62,6 +62,28 @@ class MachineExternalCallRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class MachineExternalMemoryWrite:
+    """One capability-approved guest-memory effect returned by a shell."""
+
+    address: int
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if self.address < 0:
+            raise ValueError("external memory-write address cannot be negative")
+        object.__setattr__(self, "data", bytes(self.data))
+
+
+@dataclass(frozen=True, slots=True)
+class MachineExternalCallCompletion:
+    """The complete deterministic result of one captured host interaction."""
+
+    request_id: int
+    result: int = 0
+    memory_writes: tuple[MachineExternalMemoryWrite, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class MachineExecutionState:
     pc: int
     registers: tuple[int, ...] = (0,) * 16
@@ -512,6 +534,8 @@ __all__ = [
     "MachineEffectHandler",
     "MachineExecutionOrchestrator",
     "MachineExternalCallRequest",
+    "MachineExternalCallCompletion",
+    "MachineExternalMemoryWrite",
     "MachineExternalReference",
     "MachineExternalTargetResolver",
     "MachineExecutionEdge",

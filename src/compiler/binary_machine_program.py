@@ -23,6 +23,8 @@ from .machine_execution import (
     MachinePredicateHandler,
     MachineVirtualMulticore,
     MachineExternalCallRequest,
+    MachineExternalCallCompletion,
+    MachineExternalMemoryWrite,
     MachineExternalReference,
 )
 from .amd64_machine_semantics import (
@@ -179,6 +181,7 @@ class BinaryMachineProgram:
         request_id: int,
         *,
         result: int = 0,
+        memory_writes: Sequence[MachineExternalMemoryWrite] = (),
         core_index: int = 0,
     ):
         """Apply a shell completion and retain it in reversible history."""
@@ -192,7 +195,12 @@ class BinaryMachineProgram:
         if len(matches) != 1:
             raise KeyError(f"external request {request_id} is not pending on core {core_index}")
         completed = complete_external_call_state(
-            state, request_id, result=result,
+            state,
+            MachineExternalCallCompletion(
+                request_id=int(request_id),
+                result=int(result),
+                memory_writes=tuple(memory_writes),
+            ),
         )
         core.commit_external_completion(completed)
         return completed

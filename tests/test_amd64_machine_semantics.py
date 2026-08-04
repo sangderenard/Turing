@@ -14,6 +14,8 @@ from src.compiler.machine_execution import (
     MachineExecutionState,
     MachineExecutionStatus,
     MachineExternalReference,
+    MachineExternalCallCompletion,
+    MachineExternalMemoryWrite,
     ReversibleMachineExecutor,
 )
 from src.compiler.machine_reference_vocabulary import (
@@ -170,9 +172,17 @@ def test_external_import_call_pauses_as_request_and_completion_is_reversible():
     assert request.arguments[:2] == (11, 22)
     assert waiting.state.memory.read_unsigned(0x7FF8, 64) == 0x1002
 
-    completed = complete_external_call_state(waiting.state, request.request_id, result=73)
+    completed = complete_external_call_state(
+        waiting.state,
+        MachineExternalCallCompletion(
+            request.request_id,
+            result=73,
+            memory_writes=(MachineExternalMemoryWrite(0x7000, b"ok"),),
+        ),
+    )
     core.commit_external_completion(completed)
     assert core.state.pc == 0x1002
     assert core.state.registers[0] == 73
     assert core.state.registers[4] == 0x8000
+    assert bytes((core.state.memory[0x7000], core.state.memory[0x7001])) == b"ok"
     assert core.step_backward() == waiting.state

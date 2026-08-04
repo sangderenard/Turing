@@ -16,6 +16,7 @@ import re
 
 from .machine_execution import (
     MachineExecutionState,
+    MachineExternalCallCompletion,
     MachineExternalReference,
 )
 from .machine_reference_vocabulary import (
@@ -433,32 +434,39 @@ def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000,
 
 def complete_external_call_state(
     state: MachineExecutionState,
-    request_id: int,
-    *,
-    result: int = 0,
+    completion: MachineExternalCallCompletion,
 ) -> MachineExecutionState:
     """Return from one captured external call without bypassing guest state."""
 
     matches = tuple(
         request for request in state.external_requests
-        if request.request_id == int(request_id)
+        if request.request_id == int(completion.request_id)
     )
     if len(matches) != 1:
-        raise KeyError(f"external request {request_id} is not pending")
+        raise KeyError(f"external request {completion.request_id} is not pending")
     request = matches[0]
     if not state.call_stack or state.call_stack[-1] != request.return_address:
         raise RuntimeError("external completion does not match the reversible call stack")
     registers = list(state.registers)
-    registers[0] = int(result) & MASK64
+    registers[0] = int(completion.result) & MASK64
     registers[4] = (registers[4] + 8) & MASK64
+    memory = _as_memory(state.memory)
+    for effect in completion.memory_writes:
+        # ``map_bytes`` intentionally requires the destination page to exist
+        # conceptually; verify every byte first so a host cannot manufacture a
+        # new guest mapping by returning an effect.
+        for index in range(len(effect.data)):
+            memory[effect.address + index]
+        memory = memory.map_bytes(effect.address, effect.data)
     return replace(
         state,
         pc=request.return_address,
         registers=tuple(registers),
+        memory=memory,
         call_stack=state.call_stack[:-1],
         external_requests=tuple(
             item for item in state.external_requests
-            if item.request_id != request.request_id
+                if item.request_id != completion.request_id
         ),
     )
 
