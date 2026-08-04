@@ -1,9 +1,10 @@
 # Native Fortran affine learner
 
 `src.compiler.native_affine_learner` turns a trusted Python benchmark file into
-a standalone Fortran executable. Python supplies exact examples at build time;
-the resulting binary performs optimization, pruning, verification, terminal
-visualization, and model export without Python or Pygame at runtime.
+a native `bind(C)` Fortran learning kernel hosted by the common C shell. Python
+supplies exact examples at build time; the resulting binary performs
+optimization, pruning, verification, and RGB visualization without Python or
+Pygame at runtime.
 
 Build and run the included eight-value sorting problem:
 
@@ -11,18 +12,31 @@ Build and run the included eight-value sorting problem:
 python -m src.compiler.native_affine_learner examples/learnable_sort.py
 ```
 
+The window runs continuously until it is closed. Its left panel is the fixed
+reference/oracle stick-and-ball graph. Its right panel is the changing affine
+neural graph: live coefficients are colored sticks and inputs/outputs are
+balls. Bottom bands show held-out loss, exactness, and relative operation cost.
+
 The callable form is:
 
 ```python
-from src.compiler.native_affine_learner import compile_learning_visualizer
+from src.compiler.native_affine_learner import compile_learning_window
 
-learner = compile_learning_visualizer(
+learner = compile_learning_window(
     "examples/learnable_sort.py",
     "build/native-affine-learner",
 )
-learner.run()                 # live native visualization
-learner.run(epochs=10_000)    # run a longer native experiment
+learner.run()                 # continuous native window; close it to stop
+learner.run(frames=600)       # bounded run for automation
 ```
+
+The compilation contract deliberately separates parameters:
+
+- **Locked:** exact training/validation pairs, dimensions, and reference cost.
+- **Open and fed back:** matrix weights, bias, and epoch.
+- **Open controls:** learning rate and pruning pressure.
+
+Use `--console` to build the earlier standalone ANSI Fortran visualizer instead.
 
 The Python file must define:
 

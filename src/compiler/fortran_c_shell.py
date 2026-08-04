@@ -50,9 +50,14 @@ class FortranCShellExecutable:
     final_outputs_path: Path
     entrypoint: str
 
-    def run(self, *, frames: int = 1) -> subprocess.CompletedProcess[str]:
-        if frames < 1:
-            raise ValueError("native C shell needs at least one frame")
+    def run(
+        self,
+        *,
+        frames: int = 1,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if frames < 0:
+            raise ValueError("native C shell frame count cannot be negative")
         environment = dict(os.environ)
         compiler = fortran_compiler()
         if compiler is not None:
@@ -65,7 +70,7 @@ class FortranCShellExecutable:
             [str(self.executable_path), str(frames)],
             cwd=str(self.directory),
             env=environment,
-            capture_output=True,
+            capture_output=capture_output,
             text=True,
             check=True,
         )

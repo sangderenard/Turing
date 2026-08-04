@@ -21,6 +21,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .ssa_fortran_backend import FortranEmissionError, fortran_compiler
+from .compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
+from .fortran_c_shell import FortranCShellExecutable, compile_fortran_module_c_shell
+from .ssa_fortran_backend import FortranModule
 
 
 def _identifier(value: str) -> str:
@@ -339,6 +342,346 @@ end program {_identifier(problem.name)}_affine_learner
 '''
 
 
+def _value_parameter(name: str, role: str, size: int = 1) -> Parameter:
+    return Parameter(
+        name, role, "float64", "double", "c_double", "reference",
+        () if size == 1 else (int(size),), None, name,
+    )
+
+
+def emit_learning_window_module(
+    problem: LearningProblem,
+    *,
+    width: int = 720,
+    height: int = 480,
+) -> FortranModule:
+    """Emit one stateful learning frame plus RGB stick-and-ball diagrams."""
+
+    if width < 480 or height < 320:
+        raise ValueError("learning window must be at least 480 by 320")
+    n_in = problem.input_dimension
+    n_out = problem.output_dimension
+    n_weight = n_in * n_out
+    pixels = width * height
+    module_name = _identifier(problem.name) + "_learning_window"
+    source = f'''module {module_name}
+  use, intrinsic :: iso_c_binding
+  use, intrinsic :: iso_fortran_env, only: real64
+  implicit none
+  integer, parameter :: n_in={n_in}, n_out={n_out}, n_weight={n_weight}
+  integer, parameter :: n_train={len(problem.train_inputs)}, n_valid={len(problem.validation_inputs)}
+  integer, parameter :: screen_w={width}, screen_h={height}, n_pixels={pixels}
+  integer, parameter :: reference_ops={problem.reference_operations}
+  real(c_double), parameter :: train_x(n_in,n_train) = reshape([ &
+{_fortran_values(problem.train_inputs)} &
+  ], [n_in,n_train])
+  real(c_double), parameter :: train_y(n_out,n_train) = reshape([ &
+{_fortran_values(problem.train_targets)} &
+  ], [n_out,n_train])
+  real(c_double), parameter :: valid_x(n_in,n_valid) = reshape([ &
+{_fortran_values(problem.validation_inputs)} &
+  ], [n_in,n_valid])
+  real(c_double), parameter :: valid_y(n_out,n_valid) = reshape([ &
+{_fortran_values(problem.validation_targets)} &
+  ], [n_out,n_valid])
+contains
+  subroutine learning_frame(weight_in, bias_in, epoch_in, learning_rate, pruning_pressure, &
+      weight_out, bias_out, epoch_out, metrics, red, green, blue) &
+      bind(C, name="learning_frame")
+    real(c_double), intent(in) :: weight_in(n_weight), bias_in(n_out)
+    real(c_double), intent(in) :: epoch_in, learning_rate, pruning_pressure
+    real(c_double), intent(out) :: weight_out(n_weight), bias_out(n_out), epoch_out
+    real(c_double), intent(out) :: metrics(4), red(n_pixels), green(n_pixels), blue(n_pixels)
+    real(c_double) :: w(n_out,n_in), b(n_out), dw(n_out,n_in), db(n_out)
+    real(c_double) :: prediction(n_out), error(n_out), loss, threshold
+    integer :: sample, row, col, active, exact_count, budget
+
+    w = reshape(weight_in, [n_out,n_in])
+    b = bias_in
+    dw = 0.0_c_double
+    db = 0.0_c_double
+    do sample = 1, n_train
+      prediction = matmul(w, train_x(:,sample)) + b
+      error = prediction - train_y(:,sample)
+      db = db + error
+      do row = 1, n_out
+        do col = 1, n_in
+          dw(row,col) = dw(row,col) + error(row)*train_x(col,sample)
+        end do
+      end do
+    end do
+    w = w - learning_rate * 2.0_c_double * dw / real(n_train*n_out,c_double)
+    b = b - learning_rate * 2.0_c_double * db / real(n_train*n_out,c_double)
+    threshold = pruning_pressure * max(1.0_c_double,maxval(abs(w)))
+    where (abs(w) < threshold) w = 0.0_c_double
+    budget = max(0,reference_ops-n_out-1)
+    budget = max(budget,n_weight-int(real(n_weight-budget,c_double)* &
+      min(1.0_c_double,(epoch_in+1.0_c_double)/1200.0_c_double)))
+    call prune_to_budget(w,budget)
+    call verify(w,b,loss,exact_count)
+    active = count(abs(w) > 0.0_c_double)
+    weight_out = reshape(w,[n_weight])
+    bias_out = b
+    epoch_out = epoch_in + 1.0_c_double
+    metrics = [loss,real(exact_count,c_double)/real(n_valid,c_double), &
+      real(active+n_out,c_double)/real(reference_ops,c_double),epoch_out]
+    call render(w,b,metrics,red,green,blue)
+  end subroutine learning_frame
+
+  subroutine verify(w,b,loss,exact_count)
+    real(c_double), intent(in) :: w(n_out,n_in), b(n_out)
+    real(c_double), intent(out) :: loss
+    integer, intent(out) :: exact_count
+    real(c_double) :: p(n_out), e(n_out)
+    integer :: j
+    loss = 0.0_c_double
+    exact_count = 0
+    do j = 1,n_valid
+      p = matmul(w,valid_x(:,j))+b
+      e = p-valid_y(:,j)
+      loss = loss+sum(e*e)
+      if (maxval(abs(e)) <= 1.0e-8_c_double) exact_count=exact_count+1
+    end do
+    loss = loss/real(n_valid*n_out,c_double)
+  end subroutine verify
+
+  subroutine prune_to_budget(w,budget)
+    real(c_double), intent(inout) :: w(n_out,n_in)
+    integer, intent(in) :: budget
+    real(c_double) :: smallest
+    do while (count(abs(w)>0.0_c_double)>budget)
+      smallest=minval(abs(w),mask=abs(w)>0.0_c_double)
+      where(abs(w)<=smallest) w=0.0_c_double
+    end do
+  end subroutine prune_to_budget
+
+  subroutine render(w,b,metrics,r,g,bl)
+    real(c_double), intent(in) :: w(n_out,n_in),b(n_out),metrics(4)
+    real(c_double), intent(out) :: r(n_pixels),g(n_pixels),bl(n_pixels)
+    real(c_double) :: magnitude, ceiling, p(n_out), pulse
+    integer :: x,y,i,j,x0,y0,x1,y1,bar_end
+    do y=0,screen_h-1
+      do x=0,screen_w-1
+        i=1+x+y*screen_w
+        r(i)=8.0_c_double+10.0_c_double*real(y,c_double)/real(screen_h,c_double)
+        g(i)=12.0_c_double+8.0_c_double*real(y,c_double)/real(screen_h,c_double)
+        bl(i)=24.0_c_double+18.0_c_double*real(y,c_double)/real(screen_h,c_double)
+        if (mod(x,24)==0 .or. mod(y,24)==0) then
+          r(i)=r(i)+4.0_c_double; g(i)=g(i)+4.0_c_double; bl(i)=bl(i)+6.0_c_double
+        end if
+      end do
+    end do
+    call rect(r,g,bl,18,18,screen_w/2-10,screen_h-92,14.0_c_double,22.0_c_double,39.0_c_double)
+    call rect(r,g,bl,screen_w/2+10,18,screen_w-18,screen_h-92,14.0_c_double,22.0_c_double,39.0_c_double)
+    ! Reference/oracle: layered crossed sticks with fixed gold balls.
+    do i=1,n_in
+      y0=42+(i-1)*(screen_h-150)/max(1,n_in-1)
+      call ball(r,g,bl,44,y0,6,255.0_c_double,190.0_c_double,70.0_c_double)
+      call draw_line(r,g,bl,50,y0,screen_w/4, &
+        42+(mod(i*3-1,n_out))*(screen_h-150)/max(1,n_out-1), &
+        105.0_c_double,78.0_c_double,36.0_c_double)
+    end do
+    do i=1,n_out
+      y1=42+(i-1)*(screen_h-150)/max(1,n_out-1)
+      call draw_line(r,g,bl,screen_w/4,y1,screen_w/2-40,y1, &
+        160.0_c_double,105.0_c_double,42.0_c_double)
+      call ball(r,g,bl,screen_w/2-34,y1,6,255.0_c_double,205.0_c_double,85.0_c_double)
+    end do
+    ! Neural candidate: only live coefficients are sticks.
+    ceiling=max(maxval(abs(w)),tiny(1.0_c_double))
+    do j=1,n_in
+      y0=42+(j-1)*(screen_h-150)/max(1,n_in-1)
+      call ball(r,g,bl,screen_w/2+42,y0,6,90.0_c_double,220.0_c_double,255.0_c_double)
+      do i=1,n_out
+        if (abs(w(i,j))>0.0_c_double) then
+          y1=42+(i-1)*(screen_h-150)/max(1,n_out-1)
+          magnitude=abs(w(i,j))/ceiling
+          if (w(i,j)>=0.0_c_double) then
+            call draw_line(r,g,bl,screen_w/2+48,y0,screen_w-48,y1, &
+              40.0_c_double,90.0_c_double+150.0_c_double*magnitude,255.0_c_double)
+          else
+            call draw_line(r,g,bl,screen_w/2+48,y0,screen_w-48,y1, &
+              255.0_c_double,70.0_c_double+100.0_c_double*magnitude,75.0_c_double)
+          end if
+        end if
+      end do
+    end do
+    do i=1,n_out
+      y1=42+(i-1)*(screen_h-150)/max(1,n_out-1)
+      call ball(r,g,bl,screen_w-42,y1,6,120.0_c_double,245.0_c_double,210.0_c_double)
+    end do
+    ! Bottom telemetry: loss (pink), exactness (green), cost/reference (cyan).
+    call rect(r,g,bl,24,screen_h-70,screen_w-24,screen_h-58,35.0_c_double,35.0_c_double,52.0_c_double)
+    bar_end=24+int(real(screen_w-48,c_double)*max(0.0_c_double,min(1.0_c_double,1.0_c_double-sqrt(metrics(1)))))
+    call rect(r,g,bl,24,screen_h-70,bar_end,screen_h-58,244.0_c_double,90.0_c_double,155.0_c_double)
+    call rect(r,g,bl,24,screen_h-48,screen_w-24,screen_h-38,35.0_c_double,35.0_c_double,52.0_c_double)
+    bar_end=24+int(real(screen_w-48,c_double)*metrics(2))
+    call rect(r,g,bl,24,screen_h-48,bar_end,screen_h-38,80.0_c_double,235.0_c_double,135.0_c_double)
+    call rect(r,g,bl,24,screen_h-28,screen_w-24,screen_h-18,35.0_c_double,35.0_c_double,52.0_c_double)
+    bar_end=24+int(real(screen_w-48,c_double)*min(1.0_c_double,1.0_c_double/max(metrics(3),tiny(1.0_c_double))))
+    call rect(r,g,bl,24,screen_h-28,bar_end,screen_h-18,75.0_c_double,200.0_c_double,245.0_c_double)
+    pulse=0.5_c_double+0.5_c_double*sin(metrics(4)*0.08_c_double)
+    call ball(r,g,bl,screen_w/2,screen_h-83,5,255.0_c_double*pulse,190.0_c_double,80.0_c_double)
+  end subroutine render
+
+  subroutine rect(r,g,b,x0,y0,x1,y1,rv,gv,bv)
+    real(c_double), intent(inout) :: r(n_pixels),g(n_pixels),b(n_pixels)
+    integer,intent(in)::x0,y0,x1,y1
+    real(c_double),intent(in)::rv,gv,bv
+    integer::x,y,k
+    do y=max(0,y0),min(screen_h-1,y1); do x=max(0,x0),min(screen_w-1,x1)
+      k=1+x+y*screen_w; r(k)=rv; g(k)=gv; b(k)=bv
+    end do; end do
+  end subroutine rect
+
+  subroutine ball(r,g,b,cx,cy,radius,rv,gv,bv)
+    real(c_double), intent(inout) :: r(n_pixels),g(n_pixels),b(n_pixels)
+    integer,intent(in)::cx,cy,radius
+    real(c_double),intent(in)::rv,gv,bv
+    integer::x,y,k
+    do y=max(0,cy-radius),min(screen_h-1,cy+radius)
+      do x=max(0,cx-radius),min(screen_w-1,cx+radius)
+        if ((x-cx)**2+(y-cy)**2<=radius**2) then
+          k=1+x+y*screen_w; r(k)=rv; g(k)=gv; b(k)=bv
+        end if
+      end do
+    end do
+  end subroutine ball
+
+  subroutine draw_line(r,g,b,xa,ya,xb,yb,rv,gv,bv)
+    real(c_double), intent(inout) :: r(n_pixels),g(n_pixels),b(n_pixels)
+    integer,intent(in)::xa,ya,xb,yb
+    real(c_double),intent(in)::rv,gv,bv
+    integer::steps,s,x,y,k
+    steps=max(abs(xb-xa),abs(yb-ya))
+    do s=0,steps
+      x=xa+(xb-xa)*s/max(1,steps); y=ya+(yb-ya)*s/max(1,steps)
+      if(x>=0 .and. x<screen_w .and. y>=0 .and. y<screen_h) then
+        k=1+x+y*screen_w; r(k)=rv; g(k)=gv; b(k)=bv
+      end if
+    end do
+  end subroutine draw_line
+end module {module_name}
+'''
+    parameters = (
+        _value_parameter("weight_in", "input", n_weight),
+        _value_parameter("bias_in", "input", n_out),
+        _value_parameter("epoch_in", "input"),
+        _value_parameter("learning_rate", "input"),
+        _value_parameter("pruning_pressure", "input"),
+        _value_parameter("weight_out", "output", n_weight),
+        _value_parameter("bias_out", "output", n_out),
+        _value_parameter("epoch_out", "output"),
+        _value_parameter("metrics", "output", 4),
+        _value_parameter("red", "output", pixels),
+        _value_parameter("green", "output", pixels),
+        _value_parameter("blue", "output", pixels),
+    )
+    feedback = {
+        "weight_in": "weight_out",
+        "bias_in": "bias_out",
+        "epoch_in": "epoch_out",
+    }
+    shell_io = {
+        "requirements": {
+            "requests": [{
+                "capability": "display_double_buffer",
+                "optional": False,
+                "attributes": {
+                    "pixel_format": "rgb_f64_planar",
+                    "width": width,
+                    "height": height,
+                    "title": f"Turing: {problem.name} — reference / learned affine graph",
+                },
+            }],
+            "bindings": [
+                {"resource": f"display.{channel}", "entry_point": "learning_frame", "parameter": channel}
+                for channel in ("red", "green", "blue")
+            ],
+            "options": [],
+        },
+        "abi": {},
+    }
+    api = CompiledProgramAPI(
+        module=module_name,
+        language="fortran",
+        entry="learning_frame",
+        entry_points=(EntryPoint(
+            name="learning_frame",
+            symbol="learning_frame",
+            kind="control",
+            parameters=parameters,
+            note="One native learning and visualization frame; shell feedback owns mutable state.",
+        ),),
+        metadata={
+            "shell_io": shell_io,
+            "state_feedback": feedback,
+            "parameter_policy": {
+                "open": ["weight_in", "bias_in", "epoch_in", "learning_rate", "pruning_pressure"],
+                "locked": ["train_x", "train_y", "valid_x", "valid_y", "dimensions", "reference_ops"],
+            },
+        },
+    )
+    return FortranModule(module_name, source, api=api)
+
+
+@dataclass(frozen=True)
+class NativeAffineLearningWindow:
+    problem: LearningProblem
+    executable: FortranCShellExecutable
+
+    @property
+    def executable_path(self) -> Path:
+        return self.executable.executable_path
+
+    @property
+    def directory(self) -> Path:
+        return self.executable.directory
+
+    def run(self, *, frames: int = 0, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+        """Run continuously by default; closing the native window ends it."""
+
+        return self.executable.run(frames=frames, capture_output=capture_output)
+
+    __call__ = run
+
+
+def compile_learning_window(
+    python_file: str | Path,
+    output_directory: str | Path,
+    *,
+    seed: int = 7,
+    train_samples: int = 512,
+    validation_samples: int = 256,
+    width: int = 720,
+    height: int = 480,
+    learning_rate: float = 0.12,
+    pruning_pressure: float = 1.0e-3,
+) -> NativeAffineLearningWindow:
+    """Compile the continuous Fortran learner in the shared native C display shell."""
+
+    problem = load_learning_problem(
+        python_file, seed=seed, train_samples=train_samples,
+        validation_samples=validation_samples,
+    )
+    module = emit_learning_window_module(problem, width=width, height=height)
+    feedback = dict(module.api.metadata["state_feedback"])
+    artifact = compile_fortran_module_c_shell(
+        module,
+        {
+            "weight_in": np.zeros(problem.input_dimension*problem.output_dimension),
+            "bias_in": np.mean(problem.train_targets, axis=0),
+            "epoch_in": np.asarray(0.0),
+            "learning_rate": np.asarray(float(learning_rate)),
+            "pruning_pressure": np.asarray(float(pruning_pressure)),
+        },
+        output_directory,
+        state_feedback=feedback,
+        name=_identifier(problem.name) + "_learning_window",
+    )
+    return NativeAffineLearningWindow(problem, artifact)
+
+
 @dataclass(frozen=True)
 class NativeAffineLearner:
     problem: LearningProblem
@@ -427,8 +770,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train-samples", type=int, default=512)
     parser.add_argument("--validation-samples", type=int, default=256)
     parser.add_argument("--display-every", type=int, default=20)
+    parser.add_argument("--frames", type=int, default=0, help="window frames; zero runs until closed")
+    parser.add_argument("--console", action="store_true", help="use the ANSI-only Fortran host")
     parser.add_argument("--compile-only", action="store_true")
     arguments = parser.parse_args(argv)
+    if not arguments.console:
+        artifact = compile_learning_window(
+            arguments.python_file,
+            arguments.output,
+            train_samples=arguments.train_samples,
+            validation_samples=arguments.validation_samples,
+        )
+        print(artifact.executable_path)
+        if not arguments.compile_only:
+            artifact.run(frames=arguments.frames)
+        return 0
     artifact = compile_learning_visualizer(
         arguments.python_file,
         arguments.output,
@@ -450,8 +806,11 @@ if __name__ == "__main__":
 __all__ = [
     "LearningProblem",
     "NativeAffineLearner",
+    "NativeAffineLearningWindow",
+    "compile_learning_window",
     "compile_learning_visualizer",
     "emit_learning_fortran",
+    "emit_learning_window_module",
     "load_learning_problem",
     "main",
 ]
