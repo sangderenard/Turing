@@ -56,3 +56,10 @@ nested call structure. `validate_hierarchical_component_plan` consumes its
 explicit argument and result bindings and proves that each endpoint maps to
 exactly one canonical component port. It never rediscovers relationships from
 source names, observed values, or generated shader text.
+
+Presentation is an ownership edge in the shell ABI. When a component promises
+`display_ownership = program-interior`, the shell may allocate and hand over
+the requested graphics context but must not install its own presentation
+pipeline. The interior controller confirms the transfer explicitly; absence
+of that confirmation is a runtime error rather than an implicit fallback that
+would create two owners of one canvas.
