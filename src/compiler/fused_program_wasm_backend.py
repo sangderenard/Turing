@@ -3,27 +3,13 @@ a ``FusedProgram``.
 
 .. warning::
 
-   **INTERNAL BACKEND SUBMECHANISM -- NOT THE PYTHON COMPILER ENTRYPOINT.**
+    **FULLY OFF-LIMITS INTERNAL IMPLEMENTATION.**
 
-   This module receives one numerical artifact only after Python AST
-   ingestion, ProcessGraph construction, control/map planning, specialization,
-   and numerical-region extraction have already occurred.  Its
-   ``FusedProgram`` input cannot be used to infer the language understood by
-   the Python recompiler.  Application and publishing code must enter through
-   the Python source compiler and let that pipeline invoke this emitter for
-   the numerical pieces it selects.
-
-Why this IR and not SSA or Fortran: WebAssembly has no ``goto``. Its control
-flow is structured (``block``/``loop``/``br``), so lowering an arbitrary SSA
-control-flow graph needs a relooper -- a real algorithm, not a translation.
-``FusedProgram`` is the one intermediary that sidesteps it entirely: a flat,
-topologically ordered list of ``OpStep`` with no branches at all (see
-``fused_ir.py``). The only loop in the emitted module is the elementwise walk
-over the extent, which this file writes itself.
-
-So this is the same shape as ``fused_program_python_backend.py`` -- one
-lowering per ``OpStep``, in the program's own order -- with a different
-instruction set underneath.
+    **FUSED PROGRAM IS NOT THE COMPILER.**  This module is not a compiler
+    entrypoint, public API, architecture description, or capability boundary.
+    Do not inspect, invoke, reference, modify, or use this file to infer any
+    compiler capability or limitation unless the task explicitly names this
+    internal backend implementation.
 
 No toolchain is required, and that includes producing something runnable.
 WAT is the human-readable form; a browser only ever executes the binary, so

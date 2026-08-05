@@ -643,13 +643,14 @@ contains the Dream source, the PE-generator source, and a project-authored
 executes a NOP, and then reaches RET. No Windows system executable is copied
 into the repository.
 
-The static page embeds two full `TMSNAP01` generations produced by the real
-executor. Its standard forward, backward, pause, single-step, and speed controls
-therefore operate as a finite reversible replay on GitHub Pages. With the
-Python owner running, the same shell uses `/snapshot`, `/control`, `/subject`,
-and `/input` for unrestricted tape execution and admitted system activity.
-Static arbitrary-binary loading remains intentionally unavailable until the
-machine owner is lowered into a browser runtime.
+The static page embeds one full `TMSNAP01` generation per transition through
+the first halt, wait, or blocked boundary, subject to the publisher's declared
+transition cap. Its standard forward, backward, pause, single-step, and speed
+controls therefore operate as an exact finite reversible replay on GitHub
+Pages. With the Python owner running, the same shell uses `/snapshot`,
+`/control`, `/subject`, and `/input` for unrestricted tape execution and
+admitted system activity. Static arbitrary-binary loading remains intentionally
+unavailable until the machine owner is lowered into a browser runtime.
 
 The bundle also publishes the real entry-block recompilation product beneath
 `machine/recompiled-entry/`: `block.wasm`, its WAT, packed architectural state,
@@ -661,10 +662,10 @@ proves three decoded instructions (`MOV`, `ADD`, and `NOP`) beginning at
 `0x140001000`; the following outermost RET is honestly recorded as an
 interpreter-lifecycle shortfall, so the bundle does not mislabel the block
 complete. For a register-only safe prefix, the browser projects every
-authenticated journal checkpoint into `TMSNAP01`, replaces the finite
-transport's forward frames with those computed states, and reverses to the
-original snapshot. The deterministic `?recompiled-step=3` probe visibly leaves
-RAX at 43, advances RIP to `0x14000100c`, sets architectural steps to three,
-and reports three flips. Journals with memory effects remain fail-closed on
-retained frames until browser memory, device commit, and capability dispatch
-are implemented.
+authenticated journal checkpoint into `TMSNAP01`, replaces only the matching
+prefix of the finite transport, and preserves the interpreter-produced tape
+after the first unsupported or system-owned boundary. The deterministic
+`?recompiled-step=3` probe visibly leaves RAX at 43, advances RIP to
+`0x14000100c`, sets architectural steps to three, and reports three flips.
+Journals with memory effects remain fail-closed on retained tape frames until
+browser memory commit is implemented.

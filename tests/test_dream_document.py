@@ -5,6 +5,7 @@ from threading import Barrier
 import pytest
 
 from src.compiler.dream_document import (
+    DREAM_LANGUAGE_TRANSLATIONS,
     DreamDocumentError,
     DreamRuntime,
     embed_machine_snapshot,
@@ -72,6 +73,68 @@ def test_dream_deployments_survive_as_catalogued_ssa_dispatch_regions():
     assert lowered.module.functions["dream_main"].metadata["deployment_regions"] == regions
 
 
+def test_every_dream_section_has_a_graph_and_explicit_language_dispatch():
+    compilations = load_dream_document(DOCUMENT).compile_sections()
+
+    assert [compilation.route for compilation in compilations] == [
+        "ast", "ast", "glsl-ssa", "glsl-ssa", "javascript-ast",
+    ]
+    assert [compilation.block for compilation in compilations] == [
+        "chip-setup", "head-step", "register-light-compute",
+        "chip-present-fragment", "gpu-indicator-ui",
+    ]
+    assert all(compilation.graph["nodes"] for compilation in compilations)
+    assert compilations[0].translation_table == "ProcessGraph.build_from_ast"
+    assert [
+        function["qualified_name"]
+        for function in compilations[0].graph["functions"]
+    ] == ["load_subject", "tick_machine", "set_machine_speed"]
+    assert all(
+        function["state"] == "resolved" and function["graph"]["nodes"]
+        for function in compilations[0].graph["functions"]
+    )
+    assert compilations[0].shortfalls == (
+        "process-graph-aot has no executable Dream shell artifact",
+    )
+    assert compilations[2].translation_table == "GLSL_*_TO_SSA"
+    assert any(
+        node["type"] == "SSAInstruction"
+        for node in compilations[2].graph["nodes"]
+    )
+    assert any("GLSL_" in shortfall for shortfall in compilations[2].shortfalls)
+    assert compilations[2].execution_target == "shader-device"
+    assert compilations[2].executable is True
+    assert DREAM_LANGUAGE_TRANSLATIONS["javascript"].execution_target == (
+        "browser-javascript"
+    )
+    assert compilations[4].translation_table == "acorn.parse"
+    assert compilations[4].executable is True
+    assert compilations[4].shortfalls == ()
+    assert {node["id"] for node in compilations[4].graph["nodes"]} == {
+        "updateGPUIndicator", "installTuringDisplay",
+    }
+    assert set(compilations[4].graph["roots"]) == {
+        "updateGPUIndicator", "installTuringDisplay",
+    }
+
+
+def test_unknown_dream_language_uses_source_graph_with_visible_shortfall():
+    document = parse_dream_document(
+        "/*@turing.segment.v1\nid=foreign\nlanguage=java\n@end*/\n"
+        "class Main {}\n/*@turing.end*/"
+    )
+
+    compilation, = document.compile_sections()
+
+    assert compilation.route == "source"
+    assert compilation.execution_target == "source-string-interpreter"
+    assert compilation.executable is False
+    assert compilation.shortfalls == (
+        "source-string-interpreter has no executable Dream shell artifact",
+    )
+    assert compilation.graph["nodes"][1]["text"] == "class Main {}"
+
+
 def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
     document = load_dream_document(DOCUMENT)
     handoff = document.display_handoff()
@@ -106,6 +169,9 @@ def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
     assert "BinaryMachineProgram.load_pe" in complete
     assert "systemPorts.publishFile" in complete
     assert '"kind": "device_dispatch"' in complete
+    assert '"section_compilations"' in complete
+    assert '"section_graphs"' in complete
+    assert "process-graph-aot has no executable Dream shell artifact" in complete
     assert "installTuringDisplay" in complete
     assert 'kind === 2 && format === 2' in complete
     assert 'new TextDecoder("utf-8"' in complete
@@ -246,7 +312,8 @@ def test_machine_wasm_bootstrap_authenticates_the_browser_journal():
     assert "journal provenance witness disagrees" in embedded.html
     assert "TuringRecompiledMachineBlock" in embedded.html
     assert "recompiledMachineProjection" in embedded.html
-    assert "api.localReplay.replaceFrames(projected)" in embedded.html
+    assert "api.localReplay.copyFrames()" in embedded.html
+    assert "retained.slice(projected.length)" in embedded.html
     assert 'get("recompiled-step") || 0' in embedded.html
     assert "Math.min(requestedSteps, projected.length - 1)" in embedded.html
     assert "index < boundedSteps" in embedded.html

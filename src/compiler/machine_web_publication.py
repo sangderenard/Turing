@@ -29,6 +29,7 @@ def build_machine_web_publication(
     subject: bytes,
     subject_path: str,
     subject_metadata: Mapping[str, Any] | None = None,
+    maximum_replay_transitions: int = 4096,
 ) -> MachineWebPublication:
     """Project one machine's entry block through the shared static shell ABI.
 
@@ -46,14 +47,25 @@ def build_machine_web_publication(
         recompiled, core.state, subject_sha256=subject_digest,
     )
 
+    if maximum_replay_transitions <= 0:
+        raise ValueError("machine web replay transition limit must be positive")
+
     machine.runner.tick(0)
     initial = machine.snapshots.copy_latest()
     replay_frames = [] if initial is None else [initial]
     machine.runner.set_direction(MachineRunDirection.FORWARD)
-    machine.runner.tick(1)
-    advanced = machine.snapshots.copy_latest()
-    if advanced is not None:
-        replay_frames.append(advanced)
+    replay_complete = False
+    for _transition in range(maximum_replay_transitions):
+        completed = machine.runner.tick(1)
+        if completed:
+            advanced = machine.snapshots.copy_latest()
+            if advanced is not None:
+                replay_frames.append(advanced)
+        if machine.runner.direction is MachineRunDirection.PAUSED:
+            replay_complete = True
+            break
+        if not completed:
+            break
     machine.runner.set_direction(MachineRunDirection.PAUSED)
 
     published = embed_machine_snapshot_replay(shell, replay_frames)
@@ -85,6 +97,8 @@ def build_machine_web_publication(
         "memory_page_bytes": 4096,
         "static_preview": initial is not None,
         "static_replay_frames": len(replay_frames),
+        "static_replay_complete": replay_complete,
+        "static_replay_transition_limit": maximum_replay_transitions,
         "published_subject": published_subject,
         "recompiled_machine_block": {
             **dict(block.descriptor),

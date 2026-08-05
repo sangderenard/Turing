@@ -8,10 +8,13 @@ ordinary or shader blocks without embedding synchronization in their source.
 
 from __future__ import annotations
 
+import ast
 import base64
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha256
+import io
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -30,6 +33,314 @@ _CLOSE = b"/*@turing.end*/"
 
 class DreamDocumentError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class DreamLanguageTranslation:
+    route: str
+    translation_table: str
+    execution_target: str
+    executable: bool
+
+
+DREAM_LANGUAGE_TRANSLATIONS: Mapping[str, DreamLanguageTranslation] = (
+    MappingProxyType({
+        "python": DreamLanguageTranslation(
+            "ast", "ProcessGraph.build_from_ast", "process-graph-aot", False,
+        ),
+        "sympy": DreamLanguageTranslation(
+            "sympy", "SYMPY_PROCESS_GRAPH_TRANSLATIONS", "symbolic-process-graph", False,
+        ),
+        "javascript": DreamLanguageTranslation(
+            "javascript-ast", "acorn.parse", "browser-javascript", True,
+        ),
+        "glsl": DreamLanguageTranslation(
+            "glsl-ssa", "GLSL_*_TO_SSA", "shader-device", True,
+        ),
+        "wgsl": DreamLanguageTranslation(
+            "source", "DREAM_SOURCE_LANGUAGE_TRANSLATIONS", "shader-device", True,
+        ),
+    })
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DreamSectionCompilation:
+    block: str
+    language: str
+    route: str
+    translation_table: str
+    execution_target: str
+    executable: bool
+    graph: Mapping[str, Any]
+    shortfalls: tuple[str, ...] = ()
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "block": self.block,
+            "language": self.language,
+            "route": self.route,
+            "translation_table": self.translation_table,
+            "execution_target": self.execution_target,
+            "executable": self.executable,
+            "graph": dict(self.graph),
+            "shortfalls": list(self.shortfalls),
+        }
+
+
+def _json_graph_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {"bytes_base64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_graph_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_graph_value(item) for item in value]
+    return repr(value)
+
+
+def _process_graph_mapping(graph: Any, *, route: str) -> dict[str, Any]:
+    def graph_body(subject: Any) -> dict[str, Any]:
+        return {
+            "nodes": [
+                {
+                    "id": str(node_id),
+                    **{
+                        key: _json_graph_value(value)
+                        for key, value in data.items()
+                        if key not in {"expr_obj", "tensor"}
+                    },
+                }
+                for node_id, data in subject.G.nodes(data=True)
+            ],
+            "edges": [
+                {"from": str(source), "to": str(target)}
+                for source, target in subject.G.edges()
+            ],
+            "roots": [str(root) for root in subject.roots],
+        }
+
+    body = graph_body(graph)
+    return {
+        "schema": "turing.dream-section-graph.v1",
+        "route": route,
+        **body,
+        "functions": [
+            {
+                "reference": entry.reference.address,
+                "name": entry.name,
+                "qualified_name": entry.qualified_name,
+                "state": entry.state.value,
+                "recursive": entry.recursive,
+                "graph": (
+                    None if entry.graph is None else graph_body(entry.graph)
+                ),
+            }
+            for entry in graph.function_table
+        ],
+    }
+
+
+def _ssa_module_graph_mapping(module: Any, *, route: str) -> dict[str, Any]:
+    nodes = []
+    edges = []
+    roots = []
+    for function_name, function in module.functions.items():
+        function_id = f"function:{function_name}"
+        roots.append(function_id)
+        nodes.append({
+            "id": function_id,
+            "type": "Function",
+            "name": function_name,
+        })
+        value_nodes: set[str] = set()
+
+        def add_value(value: Any) -> str:
+            value_id = f"{function_id}:value:{value.id}"
+            if value_id not in value_nodes:
+                value_nodes.add(value_id)
+                nodes.append({
+                    "id": value_id,
+                    "type": "SSAValue",
+                    "dtype": value.dtype,
+                    "shape": list(value.shape),
+                    "device": value.device,
+                })
+            return value_id
+
+        for argument in function.args:
+            value_id = add_value(argument)
+            edges.append({"from": function_id, "to": value_id, "role": "argument"})
+        for block_name, basic_block in function.blocks.items():
+            for index, instruction in enumerate(basic_block.instrs):
+                instruction_id = f"{function_id}:{block_name}:instruction:{index}"
+                nodes.append({
+                    "id": instruction_id,
+                    "type": "SSAInstruction",
+                    "op": instruction.op,
+                    "attributes": _json_graph_value(instruction.attributes),
+                    "source_span": _json_graph_value(instruction.source_span),
+                })
+                edges.append({
+                    "from": function_id,
+                    "to": instruction_id,
+                    "role": "contains",
+                })
+                for argument_index, argument in enumerate(instruction.args):
+                    edges.append({
+                        "from": add_value(argument),
+                        "to": instruction_id,
+                        "role": f"argument:{argument_index}",
+                    })
+                if instruction.res is not None:
+                    edges.append({
+                        "from": instruction_id,
+                        "to": add_value(instruction.res),
+                        "role": "result",
+                    })
+    return {
+        "schema": "turing.dream-section-graph.v1",
+        "route": route,
+        "nodes": nodes,
+        "edges": edges,
+        "roots": roots,
+    }
+
+
+def _source_section_graph(block: "DreamBlock") -> dict[str, Any]:
+    lines = block.payload.splitlines()
+    nodes = [{
+        "id": "section",
+        "type": "SourceSection",
+        "language": block.language,
+    }]
+    edges = []
+    previous: str | None = None
+    for number, text in enumerate(lines, 1):
+        identity = f"line:{number}"
+        nodes.append({
+            "id": identity,
+            "type": "SourceLine",
+            "line": number,
+            "text": text,
+        })
+        edges.append({"from": "section", "to": identity, "role": "contains"})
+        if previous is not None:
+            edges.append({"from": previous, "to": identity, "role": "next"})
+        previous = identity
+    return {
+        "schema": "turing.dream-section-graph.v1",
+        "route": "source",
+        "nodes": nodes,
+        "edges": edges,
+        "roots": ["section"],
+    }
+
+
+_JS_AST_PARSER = Path(__file__).resolve().parent / "vendor" / "js_ast_parse.js"
+
+_JS_TOP_LEVEL_DECLARATION_ID_KEY = {
+    "FunctionDeclaration": "id",
+    "ClassDeclaration": "id",
+}
+
+
+def _run_javascript_ast_parser(source: str) -> dict[str, Any]:
+    import json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["node", str(_JS_AST_PARSER)],
+            input=source.encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+        )
+    except FileNotFoundError as error:
+        raise DreamDocumentError(
+            "javascript Dream sections require a `node` executable on PATH "
+            "to build their AST dependency graph"
+        ) from error
+    if result.returncode != 0:
+        raise DreamDocumentError(
+            "javascript source failed to parse: "
+            f"{result.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return json.loads(result.stdout.decode("utf-8"))
+
+
+def _js_top_level_declarations(
+    program_body: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    declarations: dict[str, dict[str, Any]] = {}
+    for statement in program_body:
+        node_type = statement.get("type")
+        id_key = _JS_TOP_LEVEL_DECLARATION_ID_KEY.get(node_type)
+        if id_key is not None:
+            identifier = statement.get(id_key) or {}
+            name = identifier.get("name")
+            if name:
+                declarations[name] = statement
+        elif node_type == "VariableDeclaration":
+            for declarator in statement.get("declarations", ()):
+                target = declarator.get("id") or {}
+                if target.get("type") == "Identifier" and target.get("name"):
+                    declarations[target["name"]] = statement
+    return declarations
+
+
+def _js_collect_identifier_references(
+    node: Any, names: set[str], found: set[str],
+) -> None:
+    if isinstance(node, dict):
+        if node.get("type") == "Identifier" and node.get("name") in names:
+            found.add(node["name"])
+        for key, value in node.items():
+            if key in {"start", "end", "type", "name"}:
+                continue
+            _js_collect_identifier_references(value, names, found)
+    elif isinstance(node, list):
+        for item in node:
+            _js_collect_identifier_references(item, names, found)
+
+
+def _javascript_dependency_graph(source: str, *, identity: str) -> Any:
+    """Build a top-level declaration dependency graph from a JS AST.
+
+    Each module-level function/class/variable declaration becomes a node;
+    an edge records that one declaration's body references another
+    declaration's name. This mirrors the Python `ast` route's use of
+    `ProcessGraph` as the shared graph representation the rest of the
+    Dream compiler pipeline already knows how to lower and schedule.
+    """
+
+    from ..transmogrifier.graph.graph_express2 import ProcessGraph
+
+    program = _run_javascript_ast_parser(source)
+    declarations = _js_top_level_declarations(program.get("body", []))
+
+    graph = ProcessGraph(materialize_memory=False)
+    for name, statement in declarations.items():
+        graph.G.add_node(
+            name,
+            type=statement.get("type"),
+            language="javascript",
+            block=identity,
+        )
+    other_names = set(declarations)
+    for name, statement in declarations.items():
+        referenced: set[str] = set()
+        _js_collect_identifier_references(
+            statement, other_names - {name}, referenced,
+        )
+        for target in referenced:
+            graph.G.add_edge(name, target, role="depends-on")
+    graph.roots = list(declarations)
+    return graph
 
 
 def _header(raw: bytes) -> dict[str, str]:
@@ -163,6 +474,75 @@ class DreamDocument:
             for block in self.blocks
         }
         return graph
+
+    def compile_sections(self) -> tuple[DreamSectionCompilation, ...]:
+        """Graph every block and select its declared language route."""
+
+        from ..transmogrifier.graph.graph_express2 import ProcessGraph
+
+        compiled = []
+        for block in self.blocks:
+            translation = DREAM_LANGUAGE_TRANSLATIONS.get(block.language)
+            if translation is None:
+                translation = DreamLanguageTranslation(
+                    "source", "DREAM_SOURCE_LANGUAGE_TRANSLATIONS",
+                    "source-string-interpreter", False,
+                )
+            shortfalls = []
+            if translation.route == "ast":
+                from ..common.tensors.topological_reducer import (
+                    reduce_abstract_tensor_topology,
+                )
+
+                graph = ProcessGraph(materialize_memory=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    graph.build_from_ast(ast.parse(
+                        block.payload, filename=f"<dream:{block.identity}>",
+                    ))
+                    reduce_abstract_tensor_topology(graph)
+                mapping = _process_graph_mapping(graph, route="ast")
+            elif translation.route == "sympy":
+                import sympy
+                from .symbolic_process_graph import ingest_sympy_expression
+
+                graph = ProcessGraph(materialize_memory=False)
+                ingest_sympy_expression(
+                    graph, sympy.sympify(block.payload, evaluate=False), strict=True,
+                )
+                mapping = _process_graph_mapping(graph, route="sympy")
+            elif translation.route == "glsl-ssa":
+                from .glsl_source_ingestion import lower_glsl_source_to_ssa
+
+                lowering = lower_glsl_source_to_ssa(
+                    block.payload,
+                    function_name=f"dream_block_{block.identity.replace('-', '_')}",
+                )
+                mapping = _ssa_module_graph_mapping(
+                    lowering.module, route="glsl-ssa",
+                )
+                shortfalls.extend(item.format() for item in lowering.shortfalls)
+            elif translation.route == "javascript-ast":
+                graph = _javascript_dependency_graph(
+                    block.payload, identity=block.identity,
+                )
+                mapping = _process_graph_mapping(graph, route="javascript-ast")
+            else:
+                mapping = _source_section_graph(block)
+            if not translation.executable:
+                shortfalls.append(
+                    f"{translation.execution_target} has no executable Dream shell artifact"
+                )
+            compiled.append(DreamSectionCompilation(
+                block=block.identity,
+                language=block.language,
+                route=translation.route,
+                translation_table=translation.translation_table,
+                execution_target=translation.execution_target,
+                executable=translation.executable,
+                graph=MappingProxyType(mapping),
+                shortfalls=tuple(shortfalls),
+            ))
+        return tuple(compiled)
 
     def lower_to_ssa(self) -> "DreamSSALowering":
         """Lower block calls and every dispatch frame into repository SSA."""
@@ -551,6 +931,7 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
         raise DreamDocumentError(
             "HTML shell emission requires a fragment block promising interior display ownership"
         )
+    section_compilations = document.compile_sections()
     api = CompiledProgramAPI(
         module=name,
         language="dream-document",
@@ -571,6 +952,14 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
         metadata={
             "document_schema": document.schema,
             "display_ownership": "program-interior",
+            "section_compilations": [
+                {
+                    key: value
+                    for key, value in compilation.to_mapping().items()
+                    if key != "graph"
+                }
+                for compilation in section_compilations
+            ],
             "deployment_regions": [
                 {
                     "region_id": region.region_id,
@@ -603,7 +992,13 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
         api,
         source=source,
         origin_source=source,
-        map_ir={"card_graph": document.card_graph()},
+        map_ir={
+            "card_graph": document.card_graph(),
+            "section_graphs": {
+                compilation.block: dict(compilation.graph)
+                for compilation in section_compilations
+            },
+        },
         shader_execution=handoff.to_shader_execution(),
         name=f"{name}_shell",
     )
@@ -710,6 +1105,7 @@ document.addEventListener("DOMContentLoaded", () => {{
   api.localReplay = {{
     get frames() {{ return frames.length; }},
     get index() {{ return index; }},
+        copyFrames() {{ return frames.map(frame => frame.slice()); }},
     replaceFrames(nextFrames) {{
       if (!Array.isArray(nextFrames) || !nextFrames.length) {{
         throw new Error("embedded replay replacement requires at least one frame");
@@ -835,7 +1231,11 @@ document.addEventListener("DOMContentLoaded", async () => {{
         );
         projected.push(frame);
       }}
-      api.localReplay.replaceFrames(projected);
+            const retained = api.localReplay.copyFrames();
+            api.localReplay.replaceFrames([
+                ...projected,
+                ...retained.slice(projected.length),
+            ]);
       status.recompiledMachineProjection = "ready";
       const requestedSteps = Number(
         new URLSearchParams(location.search).get("recompiled-step") || 0,

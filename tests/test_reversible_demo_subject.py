@@ -70,7 +70,10 @@ def test_common_machine_web_publication_owns_preview_assets_and_shell_contract()
         "isa": "AMD64",
     }
     assert runtime["recompiled_machine_block"]["covered_operation_count"] == 3
-    assert runtime["static_replay_frames"] == 2
+    assert runtime["static_replay_frames"] == 5
+    assert runtime["static_replay_complete"] is True
     assert runtime["system_ports"]["machine_control"] == "/control"
     assert "TuringRecompiledMachineBlock" in publication.html
     assert "turing-embedded-machine-replay" in publication.html
+    assert "copyFrames()" in publication.html
+    assert "retained.slice(projected.length)" in publication.html
