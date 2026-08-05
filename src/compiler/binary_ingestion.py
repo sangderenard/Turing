@@ -865,6 +865,7 @@ X86_SSA_EQUIVALENCE_TABLE: tuple[BinaryEquivalence, ...] = (
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.CMOVL_R32_RM32), "0f 4c /r", MachineSemanticToken.CONDITIONAL_MOVE.name, BinaryLayer.REPOSITORY_SSA, (Handler.Select.value,), "32-bit signed-less move", "requires SF and OF"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.XOR_RM32_R32), "31 /r", MachineSemanticToken.BITWISE_XOR.name, BinaryLayer.REPOSITORY_SSA, (Handler.Xor.value,), "32-bit destination XOR", "writes flags"),
     BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.SHL_RM64_CL), "REX.W d3 /4", MachineSemanticToken.SHIFT_LEFT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Shl.value,), "64-bit shift by CL", "count is masked and flags are written"),
+    BinaryEquivalence(BinaryLayer.ISA_ENCODING, int(X86InstructionToken.NOT_RM8), "f6 /2", MachineSemanticToken.BITWISE_NOT.name, BinaryLayer.REPOSITORY_SSA, (Handler.Not.value,), "8-bit complement", "does not write flags; legacy high-byte registers remain distinct"),
 )
 
 
@@ -970,8 +971,60 @@ class PEImportSymbol:
 
 
 @dataclass(frozen=True, slots=True)
+class PEDelayImportSymbol:
+    """One delayed IAT slot lowered into the deterministic link plan."""
+
+    library: str
+    name: str | None
+    ordinal: int | None
+    iat_rva: int
+    module_handle_rva: int
+
+    @property
+    def display_name(self) -> str:
+        symbol = self.name if self.name is not None else f"ordinal:{self.ordinal}"
+        return f"{self.library}!{symbol}"
+
+
+@dataclass(frozen=True, slots=True)
+class PEBaseRelocation:
+    """One loader relocation expressed against the image RVA namespace."""
+
+    type: int
+    rva: int
+
+
+@dataclass(frozen=True, slots=True)
+class PEExportSymbol:
+    """One named or ordinal PE export, including a possible forwarder."""
+
+    name: str | None
+    ordinal: int
+    rva: int | None
+    forwarder: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.name if self.name is not None else f"ordinal:{self.ordinal}"
+
+
+@dataclass(frozen=True, slots=True)
+class PETLSDirectory:
+    """Bounded initial-thread TLS template and process-attach callbacks."""
+
+    raw_data_start_rva: int
+    raw_data_end_rva: int
+    index_rva: int
+    callbacks: tuple[int, ...]
+    zero_fill_size: int
+    characteristics: int
+    template: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class PEImage:
     machine: PEMachine
+    coff_characteristics: int
     pe32_plus: bool
     image_base: int
     entrypoint_rva: int
@@ -980,11 +1033,20 @@ class PEImage:
     sections: tuple[PESection, ...]
     runtime_functions: tuple[PERuntimeFunction, ...]
     imports: tuple[PEImportSymbol, ...]
+    delay_imports: tuple[PEDelayImportSymbol, ...]
+    export_name: str | None
+    exports: tuple[PEExportSymbol, ...]
+    base_relocations: tuple[PEBaseRelocation, ...]
+    tls_directory: PETLSDirectory | None
     encoded: bytes
 
     @property
     def entrypoint_section(self) -> PESection:
         return self.sections[self.entrypoint_section_index]
+
+    @property
+    def is_dll(self) -> bool:
+        return bool(self.coff_characteristics & 0x2000)
 
     def section_for_rva(self, rva: int) -> PESection | None:
         matches = tuple(section for section in self.sections if section.contains_rva(rva))
@@ -999,6 +1061,26 @@ class PEImage:
             function for function in self.runtime_functions if function.contains_rva(rva)
         )
         return matches[0] if len(matches) == 1 else None
+
+    def export_by_name(self, name: str) -> PEExportSymbol | None:
+        """Resolve a case-sensitive PE export name without host loading."""
+
+        matches = tuple(item for item in self.exports if item.name == str(name))
+        if len(matches) > 1:
+            destinations = {(item.rva, item.forwarder) for item in matches}
+            if len(destinations) > 1:
+                raise BinaryFormatError(f"conflicting PE export name {name!r}")
+        return matches[0] if matches else None
+
+    def export_by_ordinal(self, ordinal: int) -> PEExportSymbol | None:
+        """Resolve an ordinal while allowing aliases with one destination."""
+
+        matches = tuple(item for item in self.exports if item.ordinal == int(ordinal))
+        if len(matches) > 1:
+            destinations = {(item.rva, item.forwarder) for item in matches}
+            if len(destinations) > 1:
+                raise BinaryFormatError(f"conflicting PE export ordinal {ordinal}")
+        return matches[0] if matches else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1120,6 +1202,7 @@ def parse_pe_image(
             f"PE section count {section_count} is outside [1, {section_limit}]"
         )
     optional_size = _u16(data, coff + 16, "COFF optional-header size")
+    coff_characteristics = _u16(data, coff + 18, "COFF characteristics")
     optional = coff + 20
     _need(data, optional, optional_size, "PE optional header")
     if optional_size < 64:
@@ -1156,8 +1239,20 @@ def parse_pe_image(
         )
     exception_rva = 0
     exception_size = 0
+    export_rva = 0
+    export_size = 0
     import_rva = 0
     import_size = 0
+    relocation_rva = 0
+    relocation_size = 0
+    delay_import_rva = 0
+    delay_import_size = 0
+    tls_rva = 0
+    tls_size = 0
+    if visible_directories > 0:
+        export_entry = directory_table_offset
+        export_rva = _u32(data, export_entry, "PE export-directory RVA")
+        export_size = _u32(data, export_entry + 4, "PE export-directory size")
     if visible_directories > 1:
         import_entry = directory_table_offset + 1 * 8
         import_rva = _u32(data, import_entry, "PE import-directory RVA")
@@ -1166,6 +1261,20 @@ def parse_pe_image(
         exception_entry = directory_table_offset + 3 * 8
         exception_rva = _u32(data, exception_entry, "PE exception-directory RVA")
         exception_size = _u32(data, exception_entry + 4, "PE exception-directory size")
+    if visible_directories > 5:
+        relocation_entry = directory_table_offset + 5 * 8
+        relocation_rva = _u32(data, relocation_entry, "PE relocation-directory RVA")
+        relocation_size = _u32(
+            data, relocation_entry + 4, "PE relocation-directory size",
+        )
+    if visible_directories > 9:
+        tls_entry = directory_table_offset + 9 * 8
+        tls_rva = _u32(data, tls_entry, "PE TLS-directory RVA")
+        tls_size = _u32(data, tls_entry + 4, "PE TLS-directory size")
+    if visible_directories > 13:
+        delay_entry = directory_table_offset + 13 * 8
+        delay_import_rva = _u32(data, delay_entry, "PE delay-import RVA")
+        delay_import_size = _u32(data, delay_entry + 4, "PE delay-import size")
 
     section_table = optional + optional_size
     _need(data, section_table, section_count * 40, "PE section table")
@@ -1276,6 +1385,191 @@ def parse_pe_image(
         except UnicodeDecodeError as error:
             raise BinaryFormatError(f"non-ASCII {label} string at RVA {rva:#x}") from error
 
+    tls_directory: PETLSDirectory | None = None
+    if tls_rva or tls_size:
+        if not tls_rva or not tls_size:
+            raise BinaryFormatError("PE TLS directory has only one nonzero field")
+        structure_size = 40 if pe32_plus else 24
+        if tls_size < structure_size:
+            raise BinaryFormatError("PE TLS directory is smaller than its structure")
+        tls_offset = file_offset_for_import_rva(tls_rva, "TLS directory")
+        tls_section = next(
+            section for section in sections
+            if section.file_offset_for_rva(tls_rva) == tls_offset
+        )
+        if tls_offset + tls_size > tls_section.raw_end:
+            raise BinaryFormatError("PE TLS directory crosses its raw section boundary")
+        _need(data, tls_offset, structure_size, "PE TLS directory")
+        if pe32_plus:
+            start_va = _u64(data, tls_offset, "PE TLS raw-data start VA")
+            end_va = _u64(data, tls_offset + 8, "PE TLS raw-data end VA")
+            index_va = _u64(data, tls_offset + 16, "PE TLS index VA")
+            callbacks_va = _u64(data, tls_offset + 24, "PE TLS callbacks VA")
+            zero_fill = _u32(data, tls_offset + 32, "PE TLS zero-fill size")
+            characteristics = _u32(data, tls_offset + 36, "PE TLS characteristics")
+            pointer_size = 8
+        else:
+            start_va = _u32(data, tls_offset, "PE TLS raw-data start VA")
+            end_va = _u32(data, tls_offset + 4, "PE TLS raw-data end VA")
+            index_va = _u32(data, tls_offset + 8, "PE TLS index VA")
+            callbacks_va = _u32(data, tls_offset + 12, "PE TLS callbacks VA")
+            zero_fill = _u32(data, tls_offset + 16, "PE TLS zero-fill size")
+            characteristics = _u32(data, tls_offset + 20, "PE TLS characteristics")
+            pointer_size = 4
+
+        def tls_va_to_rva(value: int, label: str, *, allow_zero: bool = False) -> int:
+            if not value and allow_zero:
+                return 0
+            if value < image_base:
+                raise BinaryFormatError(f"{label} {value:#x} precedes image base")
+            result = value - image_base
+            if result >= 1 << 32:
+                raise BinaryFormatError(f"{label} {value:#x} exceeds the image RVA namespace")
+            return result
+
+        if bool(start_va) != bool(end_va):
+            raise BinaryFormatError("PE TLS raw-data range has only one nonzero endpoint")
+        start_rva = tls_va_to_rva(start_va, "PE TLS raw-data start", allow_zero=True)
+        end_rva = tls_va_to_rva(end_va, "PE TLS raw-data end", allow_zero=True)
+        if end_rva < start_rva:
+            raise BinaryFormatError("PE TLS raw-data range is reversed")
+        template_size = end_rva - start_rva
+        if template_size + zero_fill > 64 * 1024 * 1024:
+            raise BinaryFormatError("PE TLS initial allocation exceeds 64 MiB")
+        if template_size:
+            template_offset = file_offset_for_import_rva(start_rva, "TLS template")
+            template_section = next(
+                section for section in sections
+                if section.file_offset_for_rva(start_rva) == template_offset
+            )
+            if template_offset + template_size > template_section.raw_end:
+                raise BinaryFormatError("PE TLS template crosses its raw section boundary")
+            _need(data, template_offset, template_size, "PE TLS template")
+            template = data[template_offset:template_offset + template_size]
+        else:
+            template = b""
+        index_rva = tls_va_to_rva(index_va, "PE TLS index")
+        if not any(section.contains_rva(index_rva) for section in sections):
+            raise BinaryFormatError("PE TLS index is not mapped")
+        callbacks: list[int] = []
+        callbacks_rva = tls_va_to_rva(
+            callbacks_va, "PE TLS callback array", allow_zero=True,
+        )
+        if callbacks_rva:
+            for callback_index in range(4096):
+                pointer_rva = callbacks_rva + callback_index * pointer_size
+                pointer_offset = file_offset_for_import_rva(
+                    pointer_rva, "TLS callback pointer",
+                )
+                callback_va = (
+                    _u64(data, pointer_offset, "PE64 TLS callback")
+                    if pe32_plus else _u32(data, pointer_offset, "PE32 TLS callback")
+                )
+                if not callback_va:
+                    break
+                callback_rva = tls_va_to_rva(callback_va, "PE TLS callback")
+                section = next((
+                    item for item in sections
+                    if item.executable and item.contains_rva(callback_rva)
+                ), None)
+                if section is None:
+                    raise BinaryFormatError(
+                        f"PE TLS callback RVA {callback_rva:#x} is not executable"
+                    )
+                callbacks.append(callback_rva)
+            else:
+                raise BinaryFormatError("PE TLS callback table exceeds 4096 entries")
+        tls_directory = PETLSDirectory(
+            start_rva, end_rva, index_rva, tuple(callbacks),
+            zero_fill, characteristics, bytes(template),
+        )
+
+    export_name: str | None = None
+    exports: list[PEExportSymbol] = []
+    if export_rva or export_size:
+        if not export_rva or not export_size:
+            raise BinaryFormatError("PE export directory has only one nonzero field")
+        if export_size < 40:
+            raise BinaryFormatError("PE export directory is smaller than its header")
+        export_offset = file_offset_for_import_rva(export_rva, "export directory")
+        export_end = export_offset + export_size
+        export_section = next(
+            section for section in sections
+            if section.file_offset_for_rva(export_rva) == export_offset
+        )
+        if export_end > export_section.raw_end:
+            raise BinaryFormatError("PE export directory crosses its raw section boundary")
+        _need(data, export_offset, export_size, "PE export directory")
+        export_name_rva = _u32(data, export_offset + 12, "PE export module name")
+        ordinal_base = _u32(data, export_offset + 16, "PE export ordinal base")
+        function_count = _u32(data, export_offset + 20, "PE export function count")
+        name_count = _u32(data, export_offset + 24, "PE export name count")
+        function_table_rva = _u32(data, export_offset + 28, "PE export address table")
+        name_table_rva = _u32(data, export_offset + 32, "PE export name table")
+        ordinal_table_rva = _u32(data, export_offset + 36, "PE export ordinal table")
+        if function_count > 65536 or name_count > 65536:
+            raise BinaryFormatError("PE export table exceeds 65536 entries")
+        if name_count > function_count:
+            raise BinaryFormatError("PE export name count exceeds function count")
+        export_name = import_ascii(export_name_rva, "export module name")
+        function_table = (
+            file_offset_for_import_rva(function_table_rva, "export address table")
+            if function_count else 0
+        )
+        name_table = (
+            file_offset_for_import_rva(name_table_rva, "export name pointer table")
+            if name_count else 0
+        )
+        ordinal_table = (
+            file_offset_for_import_rva(ordinal_table_rva, "export ordinal table")
+            if name_count else 0
+        )
+        _need(data, function_table, function_count * 4, "PE export address table")
+        _need(data, name_table, name_count * 4, "PE export name pointer table")
+        _need(data, ordinal_table, name_count * 2, "PE export ordinal table")
+        names_by_index: dict[int, list[str]] = {}
+        for name_index in range(name_count):
+            ordinal_index = _u16(
+                data, ordinal_table + name_index * 2, "PE export ordinal index",
+            )
+            if ordinal_index >= function_count:
+                raise BinaryFormatError(
+                    f"PE export ordinal index {ordinal_index} exceeds function table"
+                )
+            symbol_name_rva = _u32(
+                data, name_table + name_index * 4, "PE export symbol name RVA",
+            )
+            names_by_index.setdefault(ordinal_index, []).append(
+                import_ascii(symbol_name_rva, "export symbol name")
+            )
+        export_rva_end = export_rva + export_size
+        for function_index in range(function_count):
+            function_rva = _u32(
+                data, function_table + function_index * 4, "PE export function RVA",
+            )
+            if not function_rva:
+                continue
+            if export_rva <= function_rva < export_rva_end:
+                forwarder = import_ascii(function_rva, "export forwarder")
+                target_rva = None
+            else:
+                if not any(section.contains_rva(function_rva) for section in sections):
+                    raise BinaryFormatError(
+                        f"PE export target RVA {function_rva:#x} is not mapped"
+                    )
+                forwarder = None
+                target_rva = function_rva
+            names = names_by_index.get(function_index, [None])
+            exports.extend(
+                PEExportSymbol(
+                    name=name,
+                    ordinal=ordinal_base + function_index,
+                    rva=target_rva,
+                    forwarder=forwarder,
+                )
+                for name in names
+            )
+
     imports: list[PEImportSymbol] = []
     if import_rva or import_size:
         if not import_rva or not import_size:
@@ -1329,8 +1623,142 @@ def parse_pe_image(
         else:
             raise BinaryFormatError("PE import directory has no terminating descriptor")
 
+    delay_imports: list[PEDelayImportSymbol] = []
+    if delay_import_rva or delay_import_size:
+        if not delay_import_rva or not delay_import_size:
+            raise BinaryFormatError("PE delay-import directory has only one nonzero field")
+        delay_offset = file_offset_for_import_rva(
+            delay_import_rva, "delay-import directory",
+        )
+        delay_end = delay_offset + delay_import_size
+        delay_section = next(
+            section for section in sections
+            if section.file_offset_for_rva(delay_import_rva) == delay_offset
+        )
+        if delay_end > delay_section.raw_end:
+            raise BinaryFormatError("PE delay-import directory crosses its raw section boundary")
+        _need(data, delay_offset, delay_import_size, "PE delay-import directory")
+        descriptor_offset = delay_offset
+        descriptor_count = 0
+        pointer_size = 8 if pe32_plus else 4
+        ordinal_mask = 1 << (pointer_size * 8 - 1)
+        while descriptor_offset + 32 <= delay_end:
+            fields = tuple(
+                _u32(data, descriptor_offset + index * 4, "PE delay-import descriptor")
+                for index in range(8)
+            )
+            if not any(fields):
+                break
+            attributes, name_value, module_handle_value, iat_value, int_value, _, _, _ = fields
+            if attributes & ~1:
+                raise BinaryFormatError(
+                    f"unsupported PE delay-import attributes {attributes:#x}"
+                )
+
+            def delay_rva(value: int, label: str) -> int:
+                if not value:
+                    return 0
+                result = value if attributes & 1 else value - image_base
+                if result <= 0 or result >= 1 << 32:
+                    raise BinaryFormatError(f"invalid {label} {value:#x}")
+                return result
+
+            library_name_rva = delay_rva(name_value, "delay-import library RVA")
+            module_handle_rva = delay_rva(
+                module_handle_value, "delay-import module-handle RVA",
+            )
+            first_thunk_rva = delay_rva(iat_value, "delay-import IAT RVA")
+            lookup_rva = delay_rva(int_value, "delay-import name table RVA")
+            if not library_name_rva or not first_thunk_rva or not lookup_rva:
+                raise BinaryFormatError(
+                    "PE delay-import descriptor lacks library, IAT, or name table"
+                )
+            library = import_ascii(library_name_rva, "delay-import library")
+            for symbol_index in range(65536):
+                thunk_rva = lookup_rva + symbol_index * pointer_size
+                thunk_offset = file_offset_for_import_rva(
+                    thunk_rva, "delay-import lookup thunk",
+                )
+                thunk = (
+                    _u64(data, thunk_offset, "PE64 delay-import lookup thunk")
+                    if pe32_plus else _u32(data, thunk_offset, "PE32 delay-import lookup thunk")
+                )
+                if thunk == 0:
+                    break
+                if thunk & ordinal_mask:
+                    name = None
+                    ordinal = thunk & 0xFFFF
+                else:
+                    name_rva = thunk & (ordinal_mask - 1)
+                    name_offset = file_offset_for_import_rva(
+                        name_rva, "delay-import hint/name",
+                    )
+                    _need(data, name_offset, 2, "PE delay-import hint")
+                    name = import_ascii(name_rva + 2, "delay-import symbol")
+                    ordinal = None
+                delay_imports.append(PEDelayImportSymbol(
+                    library, name, ordinal,
+                    first_thunk_rva + symbol_index * pointer_size,
+                    module_handle_rva,
+                ))
+            else:
+                raise BinaryFormatError("PE delay-import table exceeds 65536 symbols")
+            descriptor_count += 1
+            if descriptor_count > 4096:
+                raise BinaryFormatError("PE delay-import directory exceeds 4096 descriptors")
+            descriptor_offset += 32
+        else:
+            raise BinaryFormatError("PE delay-import directory has no terminating descriptor")
+
+    base_relocations: list[PEBaseRelocation] = []
+    if relocation_rva or relocation_size:
+        if not relocation_rva or not relocation_size:
+            raise BinaryFormatError("PE relocation directory has only one nonzero field")
+        relocation_offset = file_offset_for_import_rva(
+            relocation_rva, "base relocation directory",
+        )
+        relocation_end = relocation_offset + relocation_size
+        relocation_section = next(
+            section for section in sections
+            if section.file_offset_for_rva(relocation_rva) == relocation_offset
+        )
+        if relocation_end > relocation_section.raw_end:
+            raise BinaryFormatError(
+                "PE base relocation directory crosses its raw section boundary"
+            )
+        _need(data, relocation_offset, relocation_size, "PE base relocation directory")
+        cursor = relocation_offset
+        while cursor < relocation_end:
+            _need(data, cursor, 8, "PE base relocation block")
+            page_rva = _u32(data, cursor, "PE base relocation page RVA")
+            block_size = _u32(data, cursor + 4, "PE base relocation block size")
+            if block_size < 8 or block_size % 2:
+                raise BinaryFormatError(
+                    f"invalid PE base relocation block size {block_size}"
+                )
+            if block_size > relocation_end - cursor:
+                raise BinaryFormatError("PE base relocation block exceeds its directory")
+            for entry_offset in range(cursor + 8, cursor + block_size, 2):
+                entry = _u16(data, entry_offset, "PE base relocation entry")
+                relocation_type = entry >> 12
+                if relocation_type == 0:  # IMAGE_REL_BASED_ABSOLUTE padding
+                    continue
+                target_rva = page_rva + (entry & 0x0FFF)
+                if not any(section.contains_rva(target_rva) for section in sections):
+                    raise BinaryFormatError(
+                        f"PE base relocation target RVA {target_rva:#x} is not mapped"
+                    )
+                base_relocations.append(PEBaseRelocation(
+                    type=relocation_type,
+                    rva=target_rva,
+                ))
+            cursor += block_size
+        if cursor != relocation_end:
+            raise BinaryFormatError("PE base relocation directory is not block aligned")
+
     image = PEImage(
         machine=machine,
+        coff_characteristics=coff_characteristics,
         pe32_plus=pe32_plus,
         image_base=image_base,
         entrypoint_rva=entrypoint_rva,
@@ -1339,6 +1767,11 @@ def parse_pe_image(
         sections=tuple(sections),
         runtime_functions=tuple(runtime_functions),
         imports=tuple(imports),
+        delay_imports=tuple(delay_imports),
+        export_name=export_name,
+        exports=tuple(exports),
+        base_relocations=tuple(base_relocations),
+        tls_directory=tls_directory,
         encoded=data,
     )
     executable = tuple(section for section in sections if section.executable)
@@ -1455,12 +1888,16 @@ __all__ = [
     "EffectiveAddressOperand",
     "ImmediateOperand",
     "MachineSemanticToken",
+    "PEBaseRelocation",
+    "PEDelayImportSymbol",
+    "PEExportSymbol",
     "PEMachine",
     "PEImportSymbol",
     "PERuntimeFunction",
     "PESection",
     "PESectionFlag",
     "PEStatistics",
+    "PETLSDirectory",
     "PEToSSAResult",
     "PEVocabularyToken",
     "PE_EQUIVALENCE_TABLE",

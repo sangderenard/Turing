@@ -70,6 +70,26 @@ def test_numerical_tensor_ops_call_real_imported_llvm_algorithms():
     assert function.blocks["entry"].instrs[1].attributes["right_scalar"] == 1.0
 
 
+def test_native_fortran_ops_keep_mean_and_span_fill_in_ssa():
+    program = _program(
+        OpStep(0, "mean", [0], {}, 1),
+        OpStep(1, "zeros_like", [0], {}, 2),
+        OpStep(2, "add", [1, 2], {}, 3),
+    )
+
+    function, shortfalls = lower_fused_program_to_ssa(program)
+
+    assert shortfalls == ()
+    instructions = function.blocks["entry"].instrs
+    assert [instruction.op for instruction in instructions] == [
+        "Call",
+        "Fill",
+        "Call",
+        "Ret",
+    ]
+    assert instructions[0].attributes["tensor_operation"] == "mean"
+
+
 def test_class_navigation_has_general_ssa_semantic_procedures():
     navigation = ClassNavigationTable((ClassNavigationRecord(
         identity="Vault",

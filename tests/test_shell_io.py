@@ -11,6 +11,8 @@ from src.compiler.shell_io import (
     ShellOption,
     ExternalReferenceDomain,
     SystemPort,
+    VirtualFileSystemContract,
+    VirtualMount,
     attach_shell_io,
     plan_shell_stack,
 )
@@ -179,3 +181,38 @@ def test_web_bundle_references_are_distinct_from_native_host_references():
     with pytest.raises(ValueError, match="no shell stack"):
         plan_shell_stack("wasm", host_manifest, (WEB_JAVASCRIPT_SHELL,))
     assert plan_shell_stack("fortran", host_manifest, (NATIVE_PROCESS_SHELL,)).outer_kind == "native_process"
+
+
+def test_virtual_filesystem_mounts_are_shell_specific_and_serialized():
+    web = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create("/programs", "bundle", source="program-bundle"),
+        )),
+    )
+    stack = plan_shell_stack("wasm", web, (WEB_JAVASCRIPT_SHELL,))
+    assert stack.outer_kind == "web_page"
+    mapping = web.to_mapping()["virtual_filesystem"]
+    assert mapping["current_directory"] == "/"
+    assert mapping["mounts"][1]["kind"] == "bundle"
+
+    native_only = ShellIOManifest(
+        (ShellIORequest.create("files"),),
+        virtual_filesystem=VirtualFileSystemContract(mounts=(
+            VirtualMount.create("/", "memory", access="read_write"),
+            VirtualMount.create("/host", "host_directory", source="C:\\sandbox"),
+        )),
+    )
+    with pytest.raises(ValueError, match="no shell stack"):
+        plan_shell_stack("wasm", native_only, (WEB_JAVASCRIPT_SHELL,))
+    assert plan_shell_stack(
+        "fortran", native_only, (NATIVE_PROCESS_SHELL,),
+    ).outer_kind == "native_process"
+
+
+def test_file_broker_declares_namespace_and_journal_operations():
+    files = ShellIOABI().to_mapping()["files"]
+    assert files["namespace"] == "utf8-posix-absolute"
+    assert files["effects"] == "ordered-journal"
+    assert {"list", "rename", "chdir", "flush"} <= set(files["operations"])

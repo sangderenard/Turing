@@ -1161,9 +1161,32 @@ def materialize_retained_loop_ports(
         if attributes.get("loop_ports_materialized"):
             materialized_plans.append(plan)
             continue
+        recursion_region_id = attributes.get("recursion_region_id")
+        region_nodes = (
+            tuple(
+                int(node_id)
+                for node_id, data in graph.G.nodes(data=True)
+                if (
+                    recursion_region_id is not None
+                    and (data.get("attributes") or {}).get(
+                        "recursion_region_id"
+                    ) == recursion_region_id
+                )
+            )
+            if recursion_region_id is not None
+            else ()
+        )
+        carried_update_cone = {
+            int(ancestor)
+            for _name, _initial, updated in loop.carried_bindings
+            if int(updated) in graph.G
+            for ancestor in nx.ancestors(graph.G, int(updated))
+        }
         owned_nodes = frozenset((
             int(loop.node_id),
             *map(int, loop.body_nodes),
+            *region_nodes,
+            *carried_update_cone,
             *(int(effect.effect_node_id) for effect in loop.state_effects),
         ))
 
@@ -1622,11 +1645,10 @@ class LoopComposer:
             for candidate, node_data in graph.G.nodes(data=True)
             if node_data.get("expr_obj") is not None
         }
-        def graph_node_for_ast(member: ast.AST) -> int | None:
-            direct = expression_nodes.get(id(member))
-            if direct is not None:
-                return int(direct)
-            signature = (
+        signature_nodes: dict[tuple[Any, ...], int] | None = None
+
+        def ast_signature(member: ast.AST) -> tuple[Any, ...]:
+            return (
                 type(member),
                 getattr(member, "lineno", None),
                 getattr(member, "col_offset", None),
@@ -1634,22 +1656,24 @@ class LoopComposer:
                 getattr(member, "end_col_offset", None),
                 ast.dump(member, include_attributes=False),
             )
-            matches = []
-            for candidate, node_data in graph.G.nodes(data=True):
-                candidate_expression = node_data.get("expr_obj")
-                if not isinstance(candidate_expression, ast.AST):
-                    continue
-                candidate_signature = (
-                    type(candidate_expression),
-                    getattr(candidate_expression, "lineno", None),
-                    getattr(candidate_expression, "col_offset", None),
-                    getattr(candidate_expression, "end_lineno", None),
-                    getattr(candidate_expression, "end_col_offset", None),
-                    ast.dump(candidate_expression, include_attributes=False),
-                )
-                if candidate_signature == signature:
-                    matches.append(int(candidate))
-            return min(matches) if matches else None
+
+        def graph_node_for_ast(member: ast.AST) -> int | None:
+            nonlocal signature_nodes
+            direct = expression_nodes.get(id(member))
+            if direct is not None:
+                return int(direct)
+            if signature_nodes is None:
+                signature_nodes = {}
+                for candidate, node_data in graph.G.nodes(data=True):
+                    candidate_expression = node_data.get("expr_obj")
+                    if not isinstance(candidate_expression, ast.AST):
+                        continue
+                    signature = ast_signature(candidate_expression)
+                    signature_nodes[signature] = min(
+                        int(candidate),
+                        signature_nodes.get(signature, int(candidate)),
+                    )
+            return signature_nodes.get(ast_signature(member))
 
         loop_controls: list[tuple[str, int, int | None, bool]] = []
 

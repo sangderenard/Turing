@@ -14,7 +14,7 @@ Example
 """
 from __future__ import annotations
 
-import enum, textwrap, inspect, hashlib, types
+import builtins, enum, textwrap, inspect, hashlib, types
 from typing import Any, Callable, Dict, List, Tuple
 
 import networkx as nx
@@ -438,6 +438,33 @@ class GraphDeepCompiler:
                     f"{observe(nid, tuple(parent for parent, role in role_parents if role not in {'func', 'callee'}), f'{callee_expression}({arguments})')}"
                 )
                 continue
+            elif ntype == "DelAttr":
+                receiver = next(
+                    parent for parent, role in role_parents if role == "object"
+                )
+                attribute = (node.get("attributes") or {})["attribute"]
+                env["_delattr"] = delattr
+                lines.append(
+                    f"{indent}{lhs} = _delattr(v{receiver}, {attribute!r})"
+                )
+                continue
+            elif ntype == "DelItem":
+                base = next(
+                    parent for parent, role in role_parents if role == "base"
+                )
+                indices = [
+                    parent for parent, role in role_parents if role == "index"
+                ]
+                index_expression = (
+                    f"v{indices[0]}"
+                    if len(indices) == 1
+                    else "(" + ", ".join(f"v{index}" for index in indices) + ")"
+                )
+                env["_delitem"] = lambda container, index: container.__delitem__(index)
+                lines.append(
+                    f"{indent}{lhs} = _delitem(v{base}, {index_expression})"
+                )
+                continue
             else:
                 # operator
                 fn = self.op_table.get(ntype)
@@ -457,13 +484,68 @@ class GraphDeepCompiler:
                     for parent, role in role_parents
                     if not str(role).startswith("kw:")
                 ]
-                if keyword_parents:
+                static_call_arguments = dict(
+                    (node.get("attributes") or {}).get(
+                        "static_call_arguments", {}
+                    )
+                )
+                static_call_values = dict(
+                    (node.get("attributes") or {}).get(
+                        "static_call_values", {}
+                    )
+                )
+                keyword_parents = [
+                    (parent, name)
+                    for parent, name in keyword_parents
+                    if f"kw:{name}" not in static_call_arguments
+                ]
+                static_positional = []
+                static_keywords = []
+                for role, reference in sorted(
+                    static_call_arguments.items(),
+                    key=lambda item: (
+                        0 if str(item[0]).startswith("arg:") else 1,
+                        str(item[0]),
+                    ),
+                ):
+                    parts = str(reference).split(".")
+                    direct_static_value = role in static_call_values
+                    value = static_call_values.get(role)
+                    if value is None:
+                        value = getattr(builtins, parts[0], None)
+                    if value is None:
+                        value = dict(
+                            self.pg.G.graph.get(
+                                "static_python_values", {}
+                            ) or {}
+                        ).get(str(reference))
+                    if value is None:
+                        value = dict(
+                            getattr(self.pg, "python_bindings", {}) or {}
+                        ).get(parts[0])
+                    if value is None:
+                        raise KeyError(
+                            "numerical ProcessGraph static call argument "
+                            f"{reference!r} has no retained Python binding"
+                        )
+                    if not direct_static_value:
+                        for part in parts[1:]:
+                            value = getattr(value, part)
+                    name = f"static_{nid}_{len(env)}"
+                    env[name] = value
+                    if str(role).startswith("kw:"):
+                        static_keywords.append(f"{str(role)[3:]}={name}")
+                    else:
+                        static_positional.append(name)
+                if keyword_parents or static_call_arguments:
                     args = ", ".join((
                         *(f"v{parent}" for parent in positional_parents),
+                        *static_positional,
                         *(
                             f"{name}=v{parent}"
                             for parent, name in keyword_parents
                         ),
+                        *static_keywords,
                     ))
                 elif sig.get("min_inputs",None) is None and sig.get("max_inputs",None) is None and sig.get("min_outputs",None) is None and sig.get("max_outputs",None) is None:
                     args = f"[{', '.join(f'v{pid}' for pid,_ in node['parents'])}]"

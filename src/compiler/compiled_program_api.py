@@ -186,7 +186,11 @@ def describe_fortran_function(
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
-                role="output" if value.id in output_ids else "input",
+                # An SSA value that is both an argument and a result is one
+                # preallocated Fortran intent(inout) arena.  Keep it an input
+                # in the shell contract so its initial contents are loaded;
+                # feedback/output aliases refer to the same resident slot.
+                role="input",
                 dtype=str(value.dtype or "float64"),
                 c_type=c_type,
                 ctypes_name=ctypes_name,

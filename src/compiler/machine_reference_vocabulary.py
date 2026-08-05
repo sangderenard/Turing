@@ -310,6 +310,7 @@ class X86InstructionToken(IntEnum):
     CMOVL_R32_RM32 = 216
     XOR_RM32_R32 = 217
     SHL_RM64_CL = 218
+    NOT_RM8 = 219
 
 
 class MachineSemanticToken(IntEnum):
@@ -1927,6 +1928,29 @@ def _decode_neg_rm8_operands(
     return (decoded.rm,), decoded.next_offset
 
 
+def _decode_not_rm8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    _need(region, offset, 1, address)
+    modrm = int(region[offset])
+    extension = (modrm >> 3) & 0x7
+    if extension != 2:
+        raise VocabularyDecodeError(
+            f"{address:#x}: opcode F6 requires ModRM /2 for NOT, received /{extension}"
+        )
+    decoded = _decode_modrm(region, offset, address, rex, register_width=8)
+    if isinstance(decoded.rm, RegisterOperand):
+        low = modrm & 0x7
+        if rex is None and low >= 4:
+            raise VocabularyDecodeError(
+                f"{address:#x}: legacy high-byte register needs a distinct register token"
+            )
+    return (decoded.rm,), decoded.next_offset
+
+
 def _decode_inc_rm64_operands(
     region: memoryview,
     offset: int,
@@ -2313,6 +2337,14 @@ X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
         b"\xf6",
         _decode_neg_rm8_operands,
         modrm_extension=3,
+        allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.NOT_RM8,
+        MachineSemanticToken.BITWISE_NOT,
+        b"\xf6",
+        _decode_not_rm8_operands,
+        modrm_extension=2,
         allow_rex=True,
     ),
     InstructionSpec(

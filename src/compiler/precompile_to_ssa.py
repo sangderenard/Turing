@@ -584,15 +584,11 @@ class _ControlSSABuilder:
         value = self.external_values.get(value_id)
         if value is not None:
             if value in self.arguments:
-                self.shortfalls.append(
-                    SSALoweringShortfall(
-                        "control",
-                        "producer_identity",
-                        self.current.name,
-                        f"value {value_id} is both a control argument and "
-                        "a scheduled-region result",
-                    )
-                )
+                # A preallocated arena is commonly both the initial value
+                # entering control and the destination published by a later
+                # region.  SSA versions the write; it is not an identity
+                # conflict.  The source value ID stays in accounting so the
+                # public arena-address policy can rotate the two versions.
                 value = self.fresh_value(dtype=dtype)
                 value.accounting["source_value_id"] = value_id
                 self.external_values[value_id] = value

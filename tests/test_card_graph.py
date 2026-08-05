@@ -100,3 +100,6 @@ def test_html_shell_embeds_card_graph_and_runtime_read_head():
     assert "PUNCH_CARD_MODULE_CACHE" in html
     assert "rebindCardAliases" in html
     assert "a previous traversal's address must never survive" in html
+    offset_method = html.index("offsetForKey(key) {")
+    alias_method = html.index("rebindCardAliases(method) {")
+    assert offset_method < html.index("return this.fieldOffsets[index];", offset_method) < alias_method

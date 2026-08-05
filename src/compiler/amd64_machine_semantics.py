@@ -15,6 +15,8 @@ from types import MappingProxyType
 import re
 
 from .machine_execution import (
+    MACHINE_LOADER_CALLBACK_RETURN,
+    MACHINE_TERMINATION_RETURN,
     MachineExecutionState,
     MachineExternalCallCompletion,
     MachineExternalReference,
@@ -464,6 +466,80 @@ def _vector_shift_right_logical(state: MachineExecutionState, instruction) -> Ma
     return write_operand(state, instruction, 0, result, width=width)
 
 
+def _multiply_unsigned(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    width = _data_width(instruction, 0)
+    source = read_operand(state, instruction, 0, width=width)
+    accumulator = state.registers[0] & _mask(width)
+    product = accumulator * source
+    low = product & _mask(width)
+    high = (product >> width) & _mask(width)
+    registers = list(state.registers)
+    if width == 64:
+        registers[0], registers[2] = low, high
+    elif width == 32:
+        registers[0], registers[2] = low, high
+    else:
+        registers[0] = (registers[0] & ~_mask(width)) | low
+        registers[2] = (registers[2] & ~_mask(width)) | high
+    flags = _set_flag(state.flags, CF, high != 0)
+    flags = _set_flag(flags, OF, high != 0)
+    return replace(state, registers=tuple(registers), flags=flags)
+
+
+def _sign_extend_accumulator(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    """Implement the implicit accumulator forms CDQE and CQO."""
+
+    registers = list(state.registers)
+    if instruction.token.name == "CDQE":
+        registers[0] = _sign_extend(registers[0] & 0xFFFFFFFF, 32, 64)
+    elif instruction.token.name == "CQO":
+        registers[2] = MASK64 if registers[0] & (1 << 63) else 0
+    else:
+        raise ValueError(
+            f"unsupported accumulator sign-extension form {instruction.token.name}"
+        )
+    return replace(state, registers=tuple(registers))
+
+
+def _divide(signed: bool):
+    """Divide the implicit RDX:RAX dividend by the decoded operand."""
+
+    def handler(state: MachineExecutionState, instruction) -> MachineExecutionState:
+        width = _data_width(instruction, 0)
+        if width not in (32, 64):
+            raise ValueError(f"unsupported divide width {width}")
+        mask = _mask(width)
+        divisor_bits = read_operand(state, instruction, 0, width=width)
+        if divisor_bits == 0:
+            raise ZeroDivisionError("AMD64 divide error: zero divisor")
+        low = state.registers[0] & mask
+        high = state.registers[2] & mask
+        dividend_bits = (high << width) | low
+        if signed:
+            dividend_width = width * 2
+            dividend = dividend_bits - (1 << dividend_width) \
+                if dividend_bits & (1 << (dividend_width - 1)) else dividend_bits
+            divisor = divisor_bits - (1 << width) \
+                if divisor_bits & (1 << (width - 1)) else divisor_bits
+            quotient = abs(dividend) // abs(divisor)
+            if (dividend < 0) != (divisor < 0):
+                quotient = -quotient
+            remainder = dividend - quotient * divisor
+            if not -(1 << (width - 1)) <= quotient < (1 << (width - 1)):
+                raise OverflowError("AMD64 divide error: signed quotient overflow")
+        else:
+            quotient, remainder = divmod(dividend_bits, divisor_bits)
+            if quotient > mask:
+                raise OverflowError("AMD64 divide error: unsigned quotient overflow")
+        registers = list(state.registers)
+        # Both 32-bit destinations zero-extend in long mode.
+        registers[0] = quotient & mask
+        registers[2] = remainder & mask
+        return replace(state, registers=tuple(registers))
+
+    return handler
+
+
 def _extend(signed: bool):
     def handler(state: MachineExecutionState, instruction) -> MachineExecutionState:
         source_width = _data_width(instruction, 1)
@@ -526,6 +602,97 @@ def _return_stack_effect(state: MachineExecutionState, instruction) -> MachineEx
     return replace(state, registers=tuple(registers))
 
 
+def _string_store(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    count = state.registers[1]
+    destination = state.registers[7]
+    value = state.registers[0] & 0xFFFF
+    direction = -2 if state.flags & (1 << 10) else 2
+    memory = _as_memory(state.memory)
+    if count > len(memory) // 2:
+        raise ValueError("REP STOSW count exceeds mapped guest memory")
+    for index in range(count):
+        address = (destination + index * direction) & MASK64
+        memory.read_unsigned(address, 16)
+        memory = memory.write_unsigned(address, 16, value)
+    registers = list(state.registers)
+    registers[1] = 0
+    registers[7] = (destination + count * direction) & MASK64
+    return replace(state, registers=tuple(registers), memory=memory)
+
+
+def _string_move(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    count = state.registers[1]
+    destination, source = state.registers[7], state.registers[6]
+    direction = -8 if state.flags & (1 << 10) else 8
+    memory = _as_memory(state.memory)
+    if count > len(memory) // 8:
+        raise ValueError("REP MOVSQ count exceeds mapped guest memory")
+    for index in range(count):
+        source_address = (source + index * direction) & MASK64
+        destination_address = (destination + index * direction) & MASK64
+        value = memory.read_unsigned(source_address, 64)
+        memory.read_unsigned(destination_address, 64)
+        memory = memory.write_unsigned(destination_address, 64, value)
+    registers = list(state.registers)
+    registers[1] = 0
+    registers[6] = (source + count * direction) & MASK64
+    registers[7] = (destination + count * direction) & MASK64
+    return replace(state, registers=tuple(registers), memory=memory)
+
+
+def _string_compare(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    destination = state.registers[7]
+    memory_value = _as_memory(state.memory).read_unsigned(destination, 8)
+    accumulator = state.registers[0] & 0xFF
+    result = accumulator - memory_value
+    flags = _arithmetic_flags(
+        state.flags, accumulator, memory_value, result, 8, subtract=True,
+    )
+    direction = -1 if state.flags & (1 << 10) else 1
+    registers = list(state.registers)
+    registers[7] = (destination + direction) & MASK64
+    return replace(state, registers=tuple(registers), flags=flags)
+
+
+def _bit_test(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    destination, source = instruction.operands[:2]
+    width = _data_width(instruction, 0)
+    raw_index = read_operand(state, instruction, 1)
+    memory = _as_memory(state.memory)
+    address = None
+    if isinstance(destination, EffectiveAddressOperand):
+        address = effective_address(state, instruction, destination)
+        if isinstance(source, RegisterOperand):
+            source_width = source.width
+            signed_index = raw_index
+            if signed_index & (1 << (source_width - 1)):
+                signed_index -= 1 << source_width
+            address = (address + (signed_index // width) * (width // 8)) & MASK64
+            bit = signed_index % width
+        else:
+            bit = raw_index % width
+        value = memory.read_unsigned(address, width)
+    else:
+        bit = raw_index % width
+        value = read_operand(state, instruction, 0, width=width)
+    flags = _set_flag(state.flags, CF, bool(value & (1 << bit)))
+    name = instruction.token.name
+    if name.startswith("BTS_"):
+        updated = value | (1 << bit)
+    elif name.startswith("BTR_"):
+        updated = value & ~(1 << bit)
+    elif name.startswith("BTC_"):
+        updated = value ^ (1 << bit)
+    else:
+        return replace(state, flags=flags)
+    if address is not None:
+        memory = memory.write_unsigned(address, width, updated)
+        return replace(state, memory=memory, flags=flags)
+    return replace(
+        write_operand(state, instruction, 0, updated, width=width), flags=flags,
+    )
+
+
 def default_effect_handlers() -> Mapping[int, object]:
     handlers = {
         MachineSemanticToken.EFFECTIVE_ADDRESS: _lea,
@@ -558,7 +725,11 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.VECTOR_XOR: _vector_xor,
         MachineSemanticToken.VECTOR_MOVE: _move,
         MachineSemanticToken.VECTOR_SHIFT_RIGHT_LOGICAL: _vector_shift_right_logical,
+        MachineSemanticToken.INTEGER_MULTIPLY_UNSIGNED: _multiply_unsigned,
+        MachineSemanticToken.INTEGER_DIVIDE: _divide(False),
+        MachineSemanticToken.INTEGER_DIVIDE_SIGNED: _divide(True),
         MachineSemanticToken.SIGN_EXTEND: _extend(True),
+        MachineSemanticToken.SIGN_EXTEND_ACCUMULATOR: _sign_extend_accumulator,
         MachineSemanticToken.ZERO_EXTEND: _extend(False),
         MachineSemanticToken.NO_OPERATION: _noop,
         MachineSemanticToken.CONDITIONAL_MOVE: _conditional_move,
@@ -566,6 +737,12 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.DIRECT_RELATIVE_CALL: _call_stack_effect,
         MachineSemanticToken.INDIRECT_CALL: _call_stack_effect,
         MachineSemanticToken.RETURN: _return_stack_effect,
+        MachineSemanticToken.STRING_STORE: _string_store,
+        MachineSemanticToken.STRING_MOVE: _string_move,
+        MachineSemanticToken.STRING_COMPARE: _string_compare,
+        MachineSemanticToken.BIT_TEST: _bit_test,
+        MachineSemanticToken.BIT_TEST_RESET: _bit_test,
+        MachineSemanticToken.BIT_TEST_COMPLEMENT: _bit_test,
     }
     return MappingProxyType({int(token): handler for token, handler in handlers.items()})
 
@@ -579,35 +756,162 @@ def build_external_references(program) -> tuple[MachineExternalReference, ...]:
             library=symbol.library,
             symbol=symbol.name if symbol.name is not None else f"ordinal:{symbol.ordinal}",
         )
-        for index, symbol in enumerate(getattr(program.image, "imports", ()))
+        for index, symbol in enumerate((
+            *getattr(program.image, "imports", ()),
+            *getattr(program.image, "delay_imports", ()),
+        ))
     )
 
 
-def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, teb_base: int = 0x00007FFE00000000, peb_base: int = 0x00007FFD00000000, system_arena_base: int = 0x00007FFC00000000, system_arena_size: int = 1024 * 1024, external_references=()) -> MachineExecutionState:
-    """Map a preferred-base PE image and a zeroed, ABI-aligned guest stack."""
+def map_pe_image(
+    memory: PagedByteMemory,
+    image,
+    *,
+    load_address: int | None = None,
+) -> tuple[PagedByteMemory, int, int]:
+    """Map one bounded PE image and apply its loader relocations."""
 
-    image = program.image
-    memory = PagedByteMemory.empty()
+    preferred_base = int(image.image_base)
+    runtime_base = preferred_base if load_address is None else int(load_address)
+    if runtime_base < 0 or runtime_base >= 1 << 64:
+        raise ValueError("PE load address must fit an unsigned 64-bit address")
+    load_bias = runtime_base - preferred_base
     sections = tuple(getattr(image, "sections", ()))
     encoded = bytes(getattr(image, "encoded", b""))
     if encoded:
         header_size = min((section.raw_offset for section in sections), default=len(encoded))
-        memory = memory.map_bytes(image.image_base, encoded[:header_size])
+        memory = memory.map_bytes(runtime_base, encoded[:header_size])
         for section in sections:
             raw = encoded[section.raw_offset:section.raw_offset + section.raw_size]
             span = max(section.virtual_size, section.raw_size)
-            memory = memory.map_zeroes(image.image_base + section.virtual_address, span)
-            memory = memory.map_bytes(image.image_base + section.virtual_address, raw)
-    imports = tuple(getattr(image, "imports", ()))
+            memory = memory.map_zeroes(runtime_base + section.virtual_address, span)
+            memory = memory.map_bytes(runtime_base + section.virtual_address, raw)
+    relocations = tuple(getattr(image, "base_relocations", ()))
+    if load_bias and not relocations:
+        raise ValueError(
+            f"PE image cannot move from {preferred_base:#x} to {runtime_base:#x}: "
+            "no base relocation records"
+        )
+    for relocation in relocations:
+        if not load_bias:
+            break
+        relocation_type = int(relocation.type)
+        if relocation_type == 10 and bool(getattr(image, "pe32_plus", True)):
+            width = 64  # IMAGE_REL_BASED_DIR64
+        elif relocation_type == 3 and not bool(getattr(image, "pe32_plus", True)):
+            width = 32  # IMAGE_REL_BASED_HIGHLOW
+        else:
+            raise ValueError(
+                f"unsupported PE base relocation type {relocation_type} "
+                f"at RVA {int(relocation.rva):#x}"
+            )
+        address = runtime_base + int(relocation.rva)
+        original = memory.read_unsigned(address, width)
+        memory = memory.write_unsigned(address, width, original + load_bias)
+    return memory, runtime_base, len(relocations) if load_bias else 0
+
+
+def _pe_reserved_span(image, runtime_base: int) -> tuple[int, int]:
+    header_size = min(
+        (int(section.raw_offset) for section in getattr(image, "sections", ())),
+        default=len(getattr(image, "encoded", b"")),
+    )
+    image_size = max(
+        (int(section.virtual_address) + max(
+            int(section.virtual_size), int(section.raw_size),
+        ) for section in getattr(image, "sections", ())),
+        default=header_size,
+    )
+    return int(runtime_base), int(runtime_base) + max(header_size, image_size)
+
+
+def build_initial_machine_state(program, *, load_address: int | None = None, additional_images=(), import_targets=None, module_handle_targets=None, stack_top: int = 0x00007FFF00000000, stack_size: int = 1024 * 1024, teb_base: int = 0x00007FFE00000000, peb_base: int = 0x00007FFD00000000, system_arena_base: int = 0x00007FFC00000000, system_arena_size: int = 1024 * 1024, external_references=(), virtual_filesystem=None, environment_state=None) -> MachineExecutionState:
+    """Map a linked PE image set plus a zeroed, ABI-aligned guest stack."""
+
+    image = program.image
+    memory, runtime_base, applied_relocations = map_pe_image(
+        PagedByteMemory.empty(), image, load_address=load_address,
+    )
+    preferred_base = int(image.image_base)
+    load_bias = runtime_base - preferred_base
+    relocations = tuple(getattr(image, "base_relocations", ()))
+    mapped_images = [(image, runtime_base)]
+    for linked_image, linked_base in additional_images:
+        memory, actual_base, _count = map_pe_image(
+            memory, linked_image, load_address=int(linked_base),
+        )
+        mapped_images.append((linked_image, actual_base))
+    reserved_ranges = [
+        (*_pe_reserved_span(mapped_image, base), f"PE image at {base:#x}")
+        for mapped_image, base in mapped_images
+    ]
+    reserved_ranges.extend((
+        (stack_top - stack_size, stack_top, "guest stack"),
+        (teb_base, teb_base + 4096, "guest TEB"),
+        (peb_base, peb_base + 4096, "guest PEB"),
+        (
+            system_arena_base,
+            system_arena_base + system_arena_size,
+            "guest system arena",
+        ),
+    ))
+    for left, right in zip(sorted(reserved_ranges), sorted(reserved_ranges)[1:]):
+        if left[1] > right[0]:
+            raise ValueError(
+                f"mapped address ranges overlap: {left[2]} and {right[2]}"
+            )
+    imports = (
+        *getattr(image, "imports", ()),
+        *getattr(image, "delay_imports", ()),
+    )
     references = tuple(external_references)
-    if len(imports) != len(references):
-        if imports or references:
-            raise ValueError("each PE import requires exactly one external reference")
-    for symbol, reference in zip(imports, references):
+    if import_targets is None:
+        if len(imports) != len(references):
+            if imports or references:
+                raise ValueError("each PE import requires exactly one external reference")
+        active_targets = {
+            (runtime_base, int(symbol.iat_rva)): int(reference.target_address)
+            for symbol, reference in zip(imports, references)
+        }
+    else:
+        active_targets = {
+            (int(base), int(rva)): int(target)
+            for (base, rva), target in import_targets.items()
+        }
+    expected_slots = {
+        (base, int(symbol.iat_rva))
+        for mapped_image, base in mapped_images
+        for symbol in (
+            *getattr(mapped_image, "imports", ()),
+            *getattr(mapped_image, "delay_imports", ()),
+        )
+    }
+    if set(active_targets) != expected_slots:
+        missing = expected_slots - set(active_targets)
+        unexpected = set(active_targets) - expected_slots
+        raise ValueError(
+            f"linked PE import target plan mismatch: {len(missing)} missing, "
+            f"{len(unexpected)} unexpected"
+        )
+    for mapped_image, base in mapped_images:
+        for symbol in (
+            *getattr(mapped_image, "imports", ()),
+            *getattr(mapped_image, "delay_imports", ()),
+        ):
+            memory = memory.write_unsigned(
+                base + symbol.iat_rva,
+                64 if mapped_image.pe32_plus else 32,
+                active_targets[(base, int(symbol.iat_rva))],
+            )
+    for (base, rva), target in (module_handle_targets or {}).items():
+        owner_image = next(
+            mapped_image for mapped_image, mapped_base in mapped_images
+            if int(mapped_base) == int(base)
+        )
         memory = memory.write_unsigned(
-            image.image_base + symbol.iat_rva,
-            64 if image.pe32_plus else 32,
-            reference.target_address,
+            int(base) + int(rva),
+            64 if owner_image.pe32_plus else 32,
+            int(target),
         )
     memory = memory.map_zeroes(stack_top - stack_size, stack_size)
     memory = memory.map_zeroes(teb_base, 4096)
@@ -617,20 +921,108 @@ def build_initial_machine_state(program, *, stack_top: int = 0x00007FFF00000000,
     # outside this declared page stay unmapped and therefore trap visibly.
     memory = memory.write_unsigned(teb_base + 0x30, 64, teb_base)
     memory = memory.write_unsigned(teb_base + 0x60, 64, peb_base)
+    loader_order = (*mapped_images[1:], mapped_images[0])
+    tls_images = tuple(
+        (mapped_image, base, mapped_image.tls_directory)
+        for mapped_image, base in loader_order
+        if getattr(mapped_image, "tls_directory", None) is not None
+    )
+    arena_cursor = int(system_arena_base)
+    tls_vector = 0
+    tls_records: list[tuple[int, int, object]] = []
+    if tls_images:
+        arena_cursor = (arena_cursor + 15) & ~15
+        tls_vector = arena_cursor
+        arena_cursor += len(tls_images) * 8
+        memory = memory.write_unsigned(teb_base + 0x58, 64, tls_vector)
+        for tls_index, (mapped_image, base, tls) in enumerate(tls_images):
+            arena_cursor = (arena_cursor + 15) & ~15
+            tls_base = arena_cursor
+            allocation_size = max(1, len(tls.template) + int(tls.zero_fill_size))
+            arena_cursor += allocation_size
+            if arena_cursor > system_arena_base + system_arena_size:
+                raise ValueError("PE TLS allocations exceed the guest system arena")
+            memory = memory.map_zeroes(tls_base, allocation_size)
+            memory = memory.map_bytes(tls_base, tls.template)
+            memory = memory.write_unsigned(tls_vector + tls_index * 8, 64, tls_base)
+            # AddressOfIndex names a DWORD even in PE32+ images.
+            memory = memory.write_unsigned(base + int(tls.index_rva), 32, tls_index)
+            tls_records.append((tls_index, tls_base, tls))
+
     rsp = stack_top - 8
     memory = memory.write_unsigned(rsp, 64, 0)
     registers = [0] * 16
     registers[4] = rsp
+    system_state = {
+        "windows.system_arena_base": system_arena_base,
+        "windows.system_arena_limit": system_arena_base + system_arena_size,
+        "windows.system_arena_cursor": arena_cursor,
+        "windows.loader.preferred_image_base": preferred_base,
+        "windows.loader.image_base": runtime_base,
+        "windows.loader.load_bias": load_bias,
+        "windows.loader.base_relocation_catalog_count": len(relocations),
+        "windows.loader.base_relocation_count": applied_relocations,
+        "windows.loader.module_count": len(mapped_images),
+        "windows.loader.tls_module_count": len(tls_records),
+        "windows.loader.tls_vector": tls_vector,
+    }
+    for tls_index, tls_base, _tls in tls_records:
+        system_state[f"windows.loader.tls.{tls_index}.base"] = tls_base
+        system_state[f"windows.loader.tls.{tls_index}.size"] = max(
+            1, len(_tls.template) + int(_tls.zero_fill_size),
+        )
+    startup_calls: list[tuple[int, int, int, int]] = []
+    tls_callback_count = 0
+    for mapped_image, base in loader_order:
+        tls = getattr(mapped_image, "tls_directory", None)
+        for callback_rva in (() if tls is None else tls.callbacks):
+            # address, module base, kind (1=TLS), requires-success
+            startup_calls.append((base + int(callback_rva), base, 1, 0))
+            tls_callback_count += 1
+        if mapped_image is not image and bool(getattr(mapped_image, "is_dll", False)):
+            entry_rva = int(getattr(mapped_image, "entrypoint_rva", 0))
+            if entry_rva:
+                # DllMain returns BOOL and false aborts process attach.
+                startup_calls.append((base + entry_rva, base, 2, 1))
+    entrypoint = runtime_base + image.entrypoint_rva
+    system_state["windows.loader.entrypoint"] = entrypoint
+    system_state["windows.loader.tls_callback_count"] = tls_callback_count
+    system_state["windows.loader.tls_callback_index"] = 0
+    system_state["windows.loader.startup_call_count"] = len(startup_calls)
+    system_state["windows.loader.startup_call_index"] = 0
+    system_state["windows.loader.startup_direction"] = 1
+    system_state["windows.loader.completion_action"] = 0
+    system_state["windows.loader.startup_reason"] = 1  # DLL_PROCESS_ATTACH
+    for call_index, (target, module_base, kind, requires_success) in enumerate(startup_calls):
+        prefix = f"windows.loader.startup_call.{call_index}"
+        system_state[f"{prefix}.address"] = target
+        system_state[f"{prefix}.module_base"] = module_base
+        system_state[f"{prefix}.kind"] = kind
+        system_state[f"{prefix}.requires_success"] = requires_success
+    call_stack = ()
+    pc = entrypoint
+    if startup_calls:
+        pc, module_base, _kind, _requires_success = startup_calls[0]
+        registers[1] = module_base
+        registers[2] = 1  # DLL_PROCESS_ATTACH
+        registers[8] = 0
+        registers[4] -= 8
+        memory = memory.write_unsigned(
+            registers[4], 64, MACHINE_LOADER_CALLBACK_RETURN,
+        )
+        call_stack = (MACHINE_LOADER_CALLBACK_RETURN,)
+    else:
+        system_state["windows.loader.tls_callbacks_complete"] = 1
+        system_state["windows.loader.startup_calls_complete"] = 1
     return MachineExecutionState(
-        pc=image.image_base + image.entrypoint_rva,
+        pc=pc,
         registers=tuple(registers),
         memory=memory,
-        system_state=MappingProxyType({
-            "windows.system_arena_base": system_arena_base,
-            "windows.system_arena_limit": system_arena_base + system_arena_size,
-            "windows.system_arena_cursor": system_arena_base,
-        }),
+        system_state=MappingProxyType(system_state),
+        virtual_filesystem=virtual_filesystem,
+        environment_state=MappingProxyType(dict(environment_state or {})),
         gs_base=teb_base,
+        call_stack=call_stack,
     )
 
 
@@ -651,6 +1043,12 @@ def complete_external_call_state(
         raise RuntimeError("external completion does not match the reversible call stack")
     registers = list(state.registers)
     registers[0] = int(completion.result) & MASK64
+    written_registers: set[int] = set()
+    for effect in completion.register_writes:
+        if effect.register in written_registers:
+            raise ValueError("external completion writes one register more than once")
+        written_registers.add(effect.register)
+        registers[effect.register] = int(effect.value) & MASK64
     memory = _as_memory(state.memory)
     for effect in completion.memory_writes:
         # ``map_bytes`` intentionally requires the destination page to exist
@@ -662,6 +1060,28 @@ def complete_external_call_state(
     system_state = dict(state.system_state)
     for effect in completion.system_writes:
         system_state[effect.key] = int(effect.value) & MASK64
+    virtual_filesystem = state.virtual_filesystem
+    if completion.filesystem_effects:
+        if virtual_filesystem is None:
+            raise RuntimeError("external completion requires an installed virtual filesystem")
+        for effect in completion.filesystem_effects:
+            virtual_filesystem = virtual_filesystem.apply(effect)
+    environment_state = dict(state.environment_state)
+    for effect in completion.environment_writes:
+        existing = next((key for key in environment_state if key.casefold() == effect.key.casefold()), None)
+        if existing is not None:
+            del environment_state[existing]
+        if effect.value is not None:
+            environment_state[effect.key] = effect.value
+    text_state = dict(state.text_state)
+    for effect in completion.text_writes:
+        text_state[effect.key] = effect.value
+    device_state = dict(state.device_state)
+    device_generations = dict(state.device_generations)
+    for effect in completion.device_writes:
+        previous = device_state.get(effect.device, b"") if effect.append else b""
+        device_state[effect.device] = previous + effect.data
+        device_generations[effect.device] = device_generations.get(effect.device, 0) + 1
     pending = tuple(
         item for item in state.external_requests
         if item.request_id != completion.request_id
@@ -672,6 +1092,12 @@ def complete_external_call_state(
         # callbacks in reverse order so ordinary RET semantics visit each and
         # finally consume that original return.
         memory = _as_memory(memory)
+        base_stack = state.call_stack
+        if completion.terminate:
+            memory = memory.write_unsigned(
+                registers[4], 64, MACHINE_TERMINATION_RETURN,
+            )
+            base_stack = (*state.call_stack[:-1], MACHINE_TERMINATION_RETURN)
         for address in reversed(guest_calls[1:]):
             registers[4] = (registers[4] - 8) & MASK64
             memory = memory.write_unsigned(registers[4], 64, address)
@@ -681,8 +1107,18 @@ def complete_external_call_state(
             registers=tuple(registers),
             memory=memory,
             system_state=MappingProxyType(system_state),
-            call_stack=(*state.call_stack, *reversed(guest_calls[1:])),
+            virtual_filesystem=virtual_filesystem,
+            environment_state=MappingProxyType(environment_state),
+            text_state=MappingProxyType(text_state),
+            device_state=MappingProxyType(device_state),
+            device_generations=MappingProxyType(device_generations),
+            call_stack=(*base_stack, *reversed(guest_calls[1:])),
             external_requests=pending,
+            termination_requested=completion.terminate or state.termination_requested,
+            exit_code=(
+                int(completion.exit_code) & 0xFFFFFFFF
+                if completion.terminate else state.exit_code
+            ),
         )
     registers[4] = (registers[4] + 8) & MASK64
     return replace(
@@ -691,8 +1127,19 @@ def complete_external_call_state(
         registers=tuple(registers),
         memory=memory,
         system_state=MappingProxyType(system_state),
+        virtual_filesystem=virtual_filesystem,
+        environment_state=MappingProxyType(environment_state),
+        text_state=MappingProxyType(text_state),
+        device_state=MappingProxyType(device_state),
+        device_generations=MappingProxyType(device_generations),
         call_stack=state.call_stack[:-1],
         external_requests=pending,
+        termination_requested=False if completion.terminate else state.termination_requested,
+        halted=completion.terminate or state.halted,
+        exit_code=(
+            int(completion.exit_code) & 0xFFFFFFFF
+            if completion.terminate else state.exit_code
+        ),
     )
 
 

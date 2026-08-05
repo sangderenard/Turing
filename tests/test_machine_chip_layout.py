@@ -104,3 +104,4 @@ def test_shader_has_separate_register_and_cache_update_kernels():
     assert "fn update_machine_registers" in source
     assert "fn update_program_cache" in source
     assert "occupied_bytes" in source
+    assert "core_status_base_words = state_snapshot[14u] / 4u" in source

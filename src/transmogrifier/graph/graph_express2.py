@@ -6,7 +6,9 @@ import importlib
 import inspect
 import math
 import os
+import pickle
 import textwrap
+import types
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 from ...compiler.bitops import BitTensorMemoryGraph
@@ -1165,6 +1167,81 @@ class ProcessGraph:
             if external_function_table is None
             else external_function_table
         )
+
+    def __getstate__(self):
+        """Serialize compiler state without live synchronization observers."""
+
+        state = dict(self.__dict__)
+        serialized_bindings = {}
+        for name, value in (state.get("python_bindings") or {}).items():
+            if isinstance(value, types.ModuleType):
+                serialized_bindings[name] = ("module", value.__name__)
+                continue
+            module = getattr(value, "__module__", None)
+            qualname = getattr(value, "__qualname__", None)
+            if module and qualname and "<locals>" not in str(qualname):
+                serialized_bindings[name] = (
+                    "qualified",
+                    str(module),
+                    str(qualname),
+                )
+                continue
+            try:
+                serialized_bindings[name] = (
+                    "pickle",
+                    pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL),
+                )
+            except Exception:
+                # Live interpreter state (ContextVar, locks, active contexts)
+                # and local closures are not compiler state and are resolved
+                # again from imported source bindings when needed.  CPython's
+                # pickle reports local functions as AttributeError rather
+                # than PicklingError, so every ordinary serialization failure
+                # means this binding is not checkpointable.
+                continue
+        state["python_bindings"] = serialized_bindings
+        for name in (
+            "_graph_lock",
+            "_graph_condition",
+            "_graph_accessor",
+            "_graph_subscribers",
+            "_evolution_metagraph",
+            "_evolution_graph",
+            "_graph_progress",
+        ):
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        """Restore a checkpoint as an independent live ProcessGraph."""
+
+        self.__dict__.update(state)
+        restored_bindings = {}
+        for name, descriptor in (
+            self.__dict__.get("python_bindings") or {}
+        ).items():
+            try:
+                if descriptor[0] == "module":
+                    value = importlib.import_module(descriptor[1])
+                elif descriptor[0] == "qualified":
+                    value = importlib.import_module(descriptor[1])
+                    for part in descriptor[2].split("."):
+                        value = getattr(value, part)
+                elif descriptor[0] == "pickle":
+                    value = pickle.loads(descriptor[1])
+                else:
+                    continue
+            except (ImportError, AttributeError, TypeError, ValueError):
+                continue
+            restored_bindings[name] = value
+        self.python_bindings = restored_bindings
+        self._graph_lock = threading.RLock()
+        self._graph_condition = threading.Condition(self._graph_lock)
+        self._graph_subscribers = []
+        self._graph_accessor = ProcessGraphAccessor(self)
+        self._evolution_metagraph = None
+        self._evolution_graph = None
+        self._graph_progress = None
 
     def _safe_repr(self, value, *, max_length=180):
         return _safe_repr(value, max_length=max_length)

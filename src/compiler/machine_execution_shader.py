@@ -9,7 +9,9 @@ from .machine_execution import MachineExecutionState
 
 MACHINE_DISPLAY_REGISTERS = (
     *MachineExecutionState.REGISTER_NAMES,
-    "rip", "rflags", "steps", "call_depth",
+    "rip", "rflags", "fs_base", "gs_base",
+    *(name for index in range(16) for name in (f"xmm{index}_lo", f"xmm{index}_hi")),
+    "steps", "call_depth",
 )
 
 
@@ -45,6 +47,7 @@ fn update_machine_registers(@builtin(global_invocation_id) gid: vec3<u32>) {{
   let snapshot_register_count = state_snapshot[11u];
   let register_stride_words = state_snapshot[12u] / 4u;
   let register_base_words = state_snapshot[13u] / 4u;
+  let core_status_base_words = state_snapshot[14u] / 4u;
   let count = core_count * snapshot_register_count;
   if (index >= count) {{ return; }}
   let core_index = index / snapshot_register_count;
@@ -55,7 +58,16 @@ fn update_machine_registers(@builtin(global_invocation_id) gid: vec3<u32>) {{
   let high_energy = log2(1.0 + f32(words.y)) / 32.0;
   let low_energy = log2(1.0 + f32(words.x)) / 32.0;
   let scan = f32((register_index + state_snapshot[4u]) % {register_count}u) / f32({register_count});
-  cells[index] = vec4<f32>(0.12 + low_energy, 0.15 + high_energy, 0.25 + 0.65 * scan, 0.35 + 0.65 * nonzero);
+  let base_color = vec4<f32>(0.12 + low_energy, 0.15 + high_energy, 0.25 + 0.65 * scan, 0.35 + 0.65 * nonzero);
+  let annotation = state_snapshot[core_status_base_words + core_index * 8u + 7u];
+  let flag_color = vec4<f32>(
+    f32(annotation & 255u) / 255.0,
+    f32((annotation >> 8u) & 255u) / 255.0,
+    f32((annotation >> 16u) & 255u) / 255.0,
+    f32((annotation >> 24u) & 255u) / 255.0
+  );
+  let flagged_rip = annotation != 0u && register_index == 16u;
+  cells[index] = select(base_color, mix(base_color, flag_color, flag_color.a), flagged_rip);
 }}
 
 @compute @workgroup_size({workgroup_size})

@@ -21,7 +21,7 @@ from math import floor
 import struct
 from threading import Event, Thread
 from types import MappingProxyType
-from typing import Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .machine_chip_layout import RegisterBankLayout, pack_register_banks
 from .machine_execution import (
@@ -115,6 +115,84 @@ class SubjectOutputBuffer:
     def __post_init__(self) -> None:
         if min(self.width, self.height, self.channels, self.row_stride, self.generation) < 0:
             raise ValueError("subject-output dimensions and generation cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineSnapshotCoreView:
+    state: object
+    position: int
+    history_length: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineSnapshotMulticoreView:
+    cores: tuple[_MachineSnapshotCoreView, ...]
+
+
+def machine_state_outputs(state) -> tuple[SubjectOutputBuffer, ...]:
+    """Project reversible device state into the language-neutral output ABI."""
+
+    outputs = []
+    console = state.device_state.get("console.output")
+    if console is not None:
+        outputs.append(SubjectOutputBuffer(
+            SubjectOutputKind.TERMINAL, SubjectOutputFormat.UTF8,
+            bytes(console),
+            generation=state.device_generations.get("console.output", 0),
+        ))
+    for name, data in state.device_state.items():
+        if name == "console.output":
+            continue
+        outputs.append(SubjectOutputBuffer(
+            SubjectOutputKind.BYTES, SubjectOutputFormat.RAW_U8,
+            bytes(data), generation=state.device_generations.get(name, 0),
+        ))
+    return tuple(outputs)
+
+
+def build_machine_state_snapshot(
+    states,
+    *,
+    positions: Sequence[int] | None = None,
+    direction: MachineRunDirection = MachineRunDirection.PAUSED,
+    transitions: int = 0,
+    annotation_colors: Sequence[int] | None = None,
+    maximum_outputs: int = 4,
+    maximum_output_bytes: int = 4 * 1024 * 1024,
+) -> bytes:
+    """Serialize retained tape states without reconstructing their subject PE."""
+
+    from .machine_chip_layout import build_register_bank_layout
+
+    active_states = tuple(states)
+    if not active_states:
+        raise ValueError("a machine snapshot needs at least one retained core state")
+    active_positions = tuple(positions or (0 for _item in active_states))
+    colors = tuple(annotation_colors or (0 for _item in active_states))
+    if len(active_positions) != len(active_states) or len(colors) != len(active_states):
+        raise ValueError("snapshot positions/colors must match retained core states")
+    machine = _MachineSnapshotMulticoreView(tuple(
+        _MachineSnapshotCoreView(state, int(position))
+        for state, position in zip(active_states, active_positions)
+    ))
+    registers = build_register_bank_layout(len(active_states))
+    layout = MachineSnapshotLayout.build(
+        registers, core_count=len(active_states),
+        maximum_outputs=maximum_outputs,
+        maximum_output_bytes=maximum_output_bytes,
+    )
+    snapshots = MachineSnapshotTripleBuffer(layout, registers)
+    snapshots.core_annotation_provider = (
+        lambda core, _position: int(colors[core])
+    )
+    outputs = machine_state_outputs(active_states[0])[:maximum_outputs]
+    snapshots.publish(
+        machine, direction=direction, transitions=int(transitions), outputs=outputs,
+    )
+    snapshot = snapshots.copy_latest()
+    if snapshot is None:  # pragma: no cover - publish above establishes it
+        raise RuntimeError("machine snapshot publication failed")
+    return snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +314,7 @@ class MachineSnapshotView:
             "pc": values[0], "history_position": values[1],
             "history_length": values[2], "status": values[3],
             "steps": values[4],
+            "annotation_rgba8": values[5],
         })
 
     def output_descriptor(self, index: int) -> SubjectOutputDescriptor:
@@ -262,13 +341,20 @@ class MachineSnapshotView:
 class MachineSnapshotTripleBuffer:
     """Three preallocated snapshot slots with a non-blocking SPSC flip."""
 
-    def __init__(self, layout: MachineSnapshotLayout, registers: RegisterBankLayout) -> None:
+    def __init__(
+        self,
+        layout: MachineSnapshotLayout,
+        registers: RegisterBankLayout,
+        *,
+        core_annotation_provider: Callable[[int, int], int] | None = None,
+    ) -> None:
         self.layout = layout
         self.registers = registers
         self._slots = tuple(bytearray(layout.byte_size) for _ in range(3))
         self._publication: tuple[int, int] = (0, -1)
         self._reader_index = -1
         self._next_slot = 0
+        self.core_annotation_provider = core_annotation_provider
 
     @property
     def publication(self) -> tuple[int, int]:
@@ -320,7 +406,9 @@ class MachineSnapshotTripleBuffer:
                 core.history_length,
                 int(statuses.get(index, MachineExecutionStatus.RUNNING)),
                 core.state.steps,
-                0,
+                0 if self.core_annotation_provider is None else int(
+                    self.core_annotation_provider(index, core.position)
+                ) & 0xFFFFFFFF,
             )
 
         payload_cursor = self.layout.output_payload_offset
@@ -372,6 +460,7 @@ class MachineSnapshotTripleBuffer:
 
 
 SubjectOutputProvider = Callable[[], Sequence[SubjectOutputBuffer]]
+MachineTransitionObserver = Callable[[MachineVirtualMulticore, str], None]
 
 
 class FreeRunningMachineRunner:
@@ -384,6 +473,8 @@ class FreeRunningMachineRunner:
         *,
         transitions_per_publication: int = 256,
         output_provider: SubjectOutputProvider | None = None,
+        transition_observer: MachineTransitionObserver | None = None,
+        compiled_dispatcher: Any | None = None,
     ) -> None:
         if transitions_per_publication <= 0:
             raise ValueError("transitions_per_publication must be positive")
@@ -391,6 +482,8 @@ class FreeRunningMachineRunner:
         self.snapshots = snapshots
         self.transitions_per_publication = int(transitions_per_publication)
         self.output_provider = output_provider or (lambda: ())
+        self.transition_observer = transition_observer
+        self.compiled_dispatcher = compiled_dispatcher
         self._direction = MachineRunDirection.PAUSED
         self._stop = Event()
         self._thread: Thread | None = None
@@ -446,13 +539,36 @@ class FreeRunningMachineRunner:
         if direction is MachineRunDirection.PAUSED:
             return 0
         completed = 0
-        for _ in range(limit):
+        while completed < limit:
             if self._direction is not direction:
                 break
             if direction is MachineRunDirection.FORWARD:
-                self._last_results = self.machine.cycle_forward()
-                self._transitions += 1
-                completed += 1
+                if len(self.machine.cores) == 1:
+                    observer = (
+                        None if self.transition_observer is None else
+                        lambda: self.transition_observer(self.machine, "forward")
+                    )
+                    results = (
+                        None if self.compiled_dispatcher is None else
+                        self.compiled_dispatcher.execute(
+                            self.machine.cores[0], limit - completed,
+                            transition_observer=observer,
+                        )
+                    )
+                    if results is None:
+                        results = self.machine.cores[0].step_block_forward(
+                            limit - completed,
+                            transition_observer=observer,
+                        )
+                    self._last_results = (results[-1],)
+                    advanced = len(results)
+                else:
+                    self._last_results = self.machine.cycle_forward()
+                    if self.transition_observer is not None:
+                        self.transition_observer(self.machine, "forward")
+                    advanced = 1
+                self._transitions += advanced
+                completed += advanced
                 if any(
                     result.status is not MachineExecutionStatus.RUNNING
                     for result in self._last_results
@@ -465,6 +581,8 @@ class FreeRunningMachineRunner:
                 except IndexError:
                     self._direction = MachineRunDirection.PAUSED
                     break
+                if self.transition_observer is not None:
+                    self.transition_observer(self.machine, "backward")
                 self._last_results = ()
                 self._transitions += 1
                 completed += 1

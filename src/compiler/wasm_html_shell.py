@@ -537,6 +537,8 @@ const params = entry.parameters;
 const SHELL_IO = (API.metadata || {}).shell_io || null;
 const SYSTEM_PORTS = SHELL_IO && SHELL_IO.requirements
   ? (SHELL_IO.requirements.system_ports || []) : [];
+const VIRTUAL_FILESYSTEM = SHELL_IO && SHELL_IO.requirements
+  ? (SHELL_IO.requirements.virtual_filesystem || null) : null;
 const SYSTEM_FIELDS = new Map();
 for (const port of SYSTEM_PORTS) {
   for (const field of port.fields || []) {
@@ -563,6 +565,43 @@ const systemPorts = {
   bundles: new Map(),
   fileHandlers: new Map(),
   listeners: new Map(),
+  virtualFiles: new Map(),
+  virtualFilesystem: VIRTUAL_FILESYSTEM,
+  normalizeVirtualPath(path) {
+    const raw = String(path || ".").replaceAll(String.fromCharCode(92), "/");
+    const cwd = (this.virtualFilesystem || {}).current_directory || "/";
+    const absolute = raw.startsWith("/") ? raw : cwd.replace(/\/$/, "") + "/" + raw;
+    const parts = [];
+    for (const part of absolute.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") parts.pop(); else parts.push(part);
+    }
+    return "/" + parts.join("/");
+  },
+  virtualMount(path) {
+    if (!this.virtualFilesystem) throw new Error("no virtual filesystem was declared");
+    const normalized = this.normalizeVirtualPath(path);
+    const mounts = (this.virtualFilesystem.mounts || []).filter(mount =>
+      normalized === mount.path || normalized.startsWith(mount.path.replace(/\/$/, "") + "/")
+    ).sort((a, b) => b.path.length - a.path.length);
+    if (!mounts.length) throw new Error("path is outside declared virtual mounts: " + normalized);
+    return mounts[0];
+  },
+  readVirtualFile(path) {
+    const normalized = this.normalizeVirtualPath(path);
+    this.virtualMount(normalized);
+    const value = this.virtualFiles.get(normalized);
+    if (!value) throw new Error("virtual file does not exist: " + normalized);
+    return value.slice();
+  },
+  writeVirtualFile(path, bytes) {
+    const normalized = this.normalizeVirtualPath(path);
+    const mount = this.virtualMount(normalized);
+    if (mount.access !== "read_write") throw new Error("virtual mount is read-only: " + mount.path);
+    const value = bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(bytes);
+    this.virtualFiles.set(normalized, value);
+    return value;
+  },
   descriptor(name) {
     const descriptor = this.descriptors.get(name);
     if (!descriptor) throw new Error("unknown system port " + name);
@@ -614,6 +653,11 @@ const systemPorts = {
 for (const port of SYSTEM_PORTS) {
   if (port.kind === "external_reference" && port.external_domain !== "bundle") {
     throw new Error("HTML shells accept external references only to Turing bundles");
+  }
+}
+for (const mount of (VIRTUAL_FILESYSTEM || {}).mounts || []) {
+  if (mount.kind === "host_directory") {
+    throw new Error("HTML shells cannot materialize host-directory mounts");
   }
 }
 window.TuringSystemPorts = systemPorts;
@@ -1515,6 +1559,10 @@ class ClassGraphRunner {
   }
 
   offsetForKey(key) {
+    const index = this.fieldIndex.get(key);
+    if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
+    return this.fieldOffsets[index];
+  }
 
   rebindCardAliases(method) {
     const slots = [...method.input_slots, ...method.output_slots].map(Number);
@@ -1545,10 +1593,6 @@ class ClassGraphRunner {
         await waitForCardLatch(index + 1, activeMethods.length);
       }
     }
-  }
-    const index = this.fieldIndex.get(key);
-    if (index === undefined) throw new Error("unknown shared-memory slot / class field " + key);
-    return this.fieldOffsets[index];
   }
 
   redirectStorageOffset(identity, offset) {
@@ -3326,6 +3370,7 @@ const machineSnapshots = {
   generation: 0,
   current: null,
   listeners: new Set(),
+  transport: null,
   publish(value) {
     const bytes = value instanceof Uint8Array
       ? value
@@ -3346,6 +3391,64 @@ const machineSnapshots = {
     this.listeners.add(listener);
     if (this.current) listener(this.current, this.generation);
     return () => this.listeners.delete(listener);
+  },
+  connect(endpoint = "/snapshot", options = {}) {
+    this.disconnect();
+    const controller = new AbortController();
+    const transport = {
+      endpoint: String(endpoint),
+      inputEndpoint: String(options.inputEndpoint || "/input"),
+      interval: Math.max(4, Number(options.interval || 16)),
+      controller,
+      running: true,
+      error: null,
+    };
+    this.transport = transport;
+    document.dispatchEvent(new CustomEvent("turing-machine-transport", {
+      detail: {connected: true, endpoint: transport.endpoint},
+    }));
+    const poll = async () => {
+      while (transport.running && !controller.signal.aborted) {
+        try {
+          const separator = transport.endpoint.includes("?") ? "&" : "?";
+          const response = await fetch(
+            transport.endpoint + separator + "after=" + this.generation,
+            {cache: "no-store", signal: controller.signal},
+          );
+          if (response.status === 200) this.publish(new Uint8Array(await response.arrayBuffer()));
+          else if (response.status !== 204) throw new Error(
+            "machine snapshot stream returned HTTP " + response.status
+          );
+          transport.error = null;
+        } catch (error) {
+          if (controller.signal.aborted) break;
+          transport.error = error;
+        }
+        await new Promise(resolve => setTimeout(resolve, transport.interval));
+      }
+    };
+    transport.done = poll();
+    return transport;
+  },
+  disconnect() {
+    const transport = this.transport;
+    if (!transport) return;
+    transport.running = false;
+    transport.controller.abort();
+    this.transport = null;
+    document.dispatchEvent(new CustomEvent("turing-machine-transport", {
+      detail: {connected: false},
+    }));
+  },
+  async sendTerminalInput(value) {
+    if (!this.transport) throw new Error("machine snapshot transport is not connected");
+    const bytes = value instanceof Uint8Array
+      ? value : new TextEncoder().encode(String(value));
+    const response = await fetch(this.transport.inputEndpoint, {
+      method: "POST", body: bytes, cache: "no-store",
+      headers: {"Content-Type": "application/octet-stream"},
+    });
+    if (!response.ok) throw new Error("terminal input returned HTTP " + response.status);
   },
 };
 window.TuringMachineSnapshots = machineSnapshots;

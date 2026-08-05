@@ -1770,6 +1770,12 @@ TRANSLATIONS = (
         "existing-axis tensor concatenation",
     ),
     CBackendLLVMSSA(
+        "pad_double_nd",
+        "pad_double_nd",
+        ("pad",),
+        "arbitrary-rank tensor padding",
+    ),
+    CBackendLLVMSSA(
         "slice_copy_double",
         "slice_copy_double",
         ("slice",),
@@ -1778,13 +1784,13 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "index_select_double",
         "index_select_double",
-        ("slice",),
+        ("slice", "gather"),
         "single-axis indexed selection",
     ),
     CBackendLLVMSSA(
         "index_assign_double",
         "index_assign_double",
-        ("scatter",),
+        ("scatter", "index_set"),
         "arbitrary-rank indexed mutation",
     ),
     CBackendLLVMSSA(

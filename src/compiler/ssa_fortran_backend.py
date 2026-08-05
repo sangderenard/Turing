@@ -132,6 +132,9 @@ _UNARY: dict[str, str] = {
     "atanh": "atanh({0})",
     "trunc": "aint({0})",
     "copy": "{0}",
+    "isnan": "ieee_is_nan({0})",
+    "isfinite": "ieee_is_finite({0})",
+    "isinf": "(.not. ieee_is_finite({0}) .and. .not. ieee_is_nan({0}))",
     # Every other backend in the torture matrix reports a comparison as a
     # plain 0.0/1.0 double, not a native boolean -- callers compare outputs
     # with assert_allclose, not a boolean buffer.  Match that at the
@@ -171,7 +174,9 @@ _LOGICAL_UNARY = frozenset({"LNot", "Not", "logical_not", "bool_to_float64"})
 # Of those, the ones that also *produce* LOGICAL. bool_to_float64 is the
 # conversion itself: it consumes a mask and yields a number, so treating its
 # result as logical would convert what was just converted.
-_LOGICAL_RESULT_UNARY = frozenset({"LNot", "Not", "logical_not"})
+_LOGICAL_RESULT_UNARY = frozenset(
+    {"LNot", "Not", "logical_not", "isnan", "isfinite", "isinf"}
+)
 
 # Comparisons yield LOGICAL; everything else here yields a number.
 _COMPARISON = frozenset(
@@ -188,8 +193,8 @@ _COMPARISON = frozenset(
 # the result is the type of what went in.
 _SHAPE_ONLY = frozenset(
     {
-        "slice", "reshape", "view", "broadcast_to", "permute", "stack",
-        "concat", "scatter",
+        "slice", "reshape", "view", "broadcast_to", "permute", "pad", "stack",
+        "concat", "gather", "scatter", "index_set",
     }
 )
 
@@ -379,7 +384,12 @@ def _broadcast(
     return result
 
 
-def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
+def _array_literal(
+    values: Sequence[Any],
+    shape: tuple[int, ...],
+    *,
+    dtype: str = DEFAULT_DTYPE,
+) -> str:
     """A Fortran array constructor for an SSA array constant.
 
     Fortran expresses this natively: ``[a, b, c]`` is an array constructor,
@@ -392,7 +402,14 @@ def _array_literal(values: Sequence[Any], shape: tuple[int, ...]) -> str:
 
     elements = tuple(values)
     if not elements:
-        raise FortranEmissionError("cannot express an empty array constant")
+        kind = _DTYPE_KIND.get(dtype or DEFAULT_DTYPE)
+        if kind is None:
+            raise FortranEmissionError(f"no Fortran kind for dtype {dtype!r}")
+        constructor = f"[{kind} ::]"
+        if len(shape) <= 1:
+            return constructor
+        extents = ", ".join(str(int(size)) for size in shape)
+        return f"reshape({constructor}, [{extents}])"
     if len(set(elements)) == 1:
         return _literal(elements[0])
     constructor = "[" + ", ".join(_literal(element) for element in elements) + "]"
@@ -431,12 +448,21 @@ class _FunctionEmitter:
         outputs: Sequence[SSAValue] = (),
         callee_extents: Mapping[str, Sequence[str]] | None = None,
         callee_arity: Mapping[str, int] | None = None,
+        callee_inout_pairs: Mapping[
+            str, Sequence[tuple[int, int]]
+        ] | None = None,
     ):
         self.function = function
         self.dtype = dtype
         self.outputs = tuple(outputs)
         self.callee_extents = dict(callee_extents or {})
         self.callee_arity = dict(callee_arity or {})
+        self.callee_inout_pairs = {
+            str(name): tuple(pairs)
+            for name, pairs in (callee_inout_pairs or {}).items()
+        }
+        self._value_types: dict[int, SSAValue] = {}
+        self._infer_control_value_types()
         self.shortfalls: list[FortranShortfall] = []
         self._branch_targets: set[str] = set()
         # Single-use temporaries are substituted into their consumer so one SSA
@@ -457,6 +483,114 @@ class _FunctionEmitter:
         self._producers: dict[int, Instr] = {}
         # Collection value id -> the induction that indexes it.
         self._collections: dict[int, SSAValue] = {}
+
+    def _prefer_value_type(self, value: SSAValue) -> bool:
+        """Retain the richest known type for one SSA identity."""
+
+        current = self._value_types.get(int(value.id))
+        if current is None or (
+            not tuple(current.shape) and tuple(value.shape)
+        ):
+            self._value_types[int(value.id)] = value
+            return True
+        return False
+
+    def _typed(self, value: SSAValue) -> SSAValue:
+        return self._value_types.get(int(value.id), value)
+
+    def _infer_control_value_types(self) -> None:
+        """Propagate resident arena rank through aggregate calls and Phis."""
+
+        for value in (*self.function.args, *self.outputs):
+            self._prefer_value_type(value)
+        for block in self.function.blocks.values():
+            for instr in block.instrs:
+                for value in instr.args:
+                    self._prefer_value_type(value)
+                if instr.res is not None:
+                    self._prefer_value_type(instr.res)
+
+        # A region result paired with an input denotes that input's arena.
+        for block in self.function.blocks.values():
+            calls: dict[int, tuple[str, Sequence[SSAValue]]] = {}
+            addresses: dict[int, tuple[str, Sequence[SSAValue], int]] = {}
+            for instr in block.instrs:
+                if (
+                    instr.op in ("Call", "call")
+                    and instr.res is not None
+                    and instr.attributes.get("result_convention")
+                    == "ssa.aggregate"
+                ):
+                    calls[instr.res.id] = (
+                        str(instr.attributes.get("callee") or ""),
+                        instr.args,
+                    )
+                elif (
+                    instr.op == "GetElementPtr"
+                    and instr.res is not None
+                    and instr.args
+                    and instr.args[0].id in calls
+                ):
+                    position = instr.attributes.get("aggregate_index")
+                    if position is not None:
+                        callee, arguments = calls[instr.args[0].id]
+                        addresses[instr.res.id] = (
+                            callee,
+                            arguments,
+                            int(position),
+                        )
+                elif (
+                    instr.op in ("Load", "load")
+                    and instr.res is not None
+                    and instr.args
+                    and instr.args[0].id in addresses
+                ):
+                    callee, arguments, output_index = addresses[
+                        instr.args[0].id
+                    ]
+                    for input_index, paired_output in self.callee_inout_pairs.get(
+                        callee, ()
+                    ):
+                        if (
+                            int(paired_output) == output_index
+                            and int(input_index) < len(arguments)
+                        ):
+                            source = self._typed(arguments[int(input_index)])
+                            self._value_types[instr.res.id] = SSAValue(
+                                instr.res.id,
+                                source.dtype,
+                                tuple(source.shape),
+                                source.device,
+                                dict(source.accounting),
+                            )
+
+        # Loop-carried values can form Phi chains, so settle to a fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for block in self.function.blocks.values():
+                for instr in block.instrs:
+                    if instr.op not in ("Phi", "phi") or instr.res is None:
+                        continue
+                    candidates = [self._typed(value) for value in instr.args]
+                    candidates.extend(
+                        self._typed(value)
+                        for _, value in (instr.attributes.get("incoming") or ())
+                    )
+                    shaped = next(
+                        (value for value in candidates if tuple(value.shape)),
+                        None,
+                    )
+                    if shaped is None or tuple(self._typed(instr.res).shape):
+                        continue
+                    self._value_types[instr.res.id] = SSAValue(
+                        instr.res.id,
+                        shaped.dtype,
+                        tuple(shaped.shape),
+                        shaped.device,
+                        dict(shaped.accounting),
+                    )
+                    changed = True
 
     # -- expression construction ------------------------------------------
     def _operand(self, value: SSAValue) -> str:
@@ -512,7 +646,9 @@ class _FunctionEmitter:
         operation = (
             consumer.attributes.get("tensor_operation") or consumer.op
         )
-        if operation in ("slice", "scatter", "cumsum"):
+        if operation in (
+            "slice", "gather", "scatter", "index_set", "pad", "cumsum"
+        ):
             return True
         if consumer.res is None:
             return False
@@ -984,14 +1120,40 @@ class _FunctionEmitter:
                 continue
             count = _element_count(shape)
             if count == result_count:
-                # Same elements, different rank: restate the shape. Both
-                # sides are already in this emitter's dimension order, so
-                # this is a pure re-description, not a reordering.
+                # Same elements, different rank: preserve the recorded
+                # row-major walk while restating the shape. A plain Fortran
+                # RESHAPE consumes and fills in column-major order; that
+                # silently transposes/chops non-square reshape -> permute ->
+                # flatten programs. Reverse the source traversal first, then
+                # make the destination's last dimension vary fastest, exactly
+                # as the explicit reshape structural lowering does above.
                 if not result_shape:
                     conformed.append(f"{expression}({', '.join(['1'] * len(shape))})")
                     continue
+                source = expression
+                if len(shape) > 1:
+                    source_extents = ", ".join(
+                        str(int(size)) for size in reversed(shape)
+                    )
+                    source_order = ", ".join(
+                        str(value) for value in range(len(shape), 0, -1)
+                    )
+                    source = (
+                        f"reshape({source}, [{source_extents}], "
+                        f"order=[{source_order}])"
+                    )
                 extents = ", ".join(str(int(size)) for size in result_shape)
-                conformed.append(f"reshape({expression}, [{extents}])")
+                if len(result_shape) > 1:
+                    result_order = ", ".join(
+                        str(value)
+                        for value in range(len(result_shape), 0, -1)
+                    )
+                    conformed.append(
+                        f"reshape({source}, [{extents}], "
+                        f"order=[{result_order}])"
+                    )
+                else:
+                    conformed.append(f"reshape({source}, [{extents}])")
                 continue
             if count == 1:
                 # A one-element array acting as a scalar: index it, so
@@ -1060,7 +1222,7 @@ class _FunctionEmitter:
 
         ordered_outputs = [outputs[key] for key in sorted(outputs)]
         for value in ordered_outputs:
-            self._locals[value.id] = value
+            self._locals[value.id] = self._typed(value)
         for value in consumed:
             self._consumed.add(value.id)
 
@@ -1075,12 +1237,34 @@ class _FunctionEmitter:
         else:
             call_values = [*instr.args, *ordered_outputs]
             extents = sorted(dimension_extents(call_values).values())
+        input_arguments = [self._operand(value) for value in instr.args]
+        output_arguments = [_name(value) for value in ordered_outputs]
+        prelude = []
+        aliased_output_indices = set()
+        for input_index, output_index in self.callee_inout_pairs.get(
+            str(callee), ()
+        ):
+            if (
+                input_index >= len(input_arguments)
+                or output_index >= len(output_arguments)
+            ):
+                return None
+            output_argument = output_arguments[output_index]
+            prelude.append(
+                f"    {output_argument} = {input_arguments[input_index]}"
+            )
+            input_arguments[input_index] = output_argument
+            aliased_output_indices.add(int(output_index))
         arguments = [
             *extents,
-            *(self._operand(value) for value in instr.args),
-            *(_name(value) for value in ordered_outputs),
+            *input_arguments,
+            *(
+                argument
+                for index, argument in enumerate(output_arguments)
+                if index not in aliased_output_indices
+            ),
         ]
-        return [f"    call {callee}({', '.join(arguments)})"]
+        return [*prelude, f"    call {callee}({', '.join(arguments)})"]
 
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
@@ -1184,9 +1368,121 @@ class _FunctionEmitter:
         batched = self._batched_matmul(instr, operation)
         if batched is not None:
             return batched
-        if operation not in ("cumsum", "scatter", "stack", "concat"):
+        if operation not in (
+            "cumsum", "gather", "scatter", "index_set", "pad", "stack", "concat"
+        ):
             return None
         target = _name(instr.res)
+
+        if operation == "pad":
+            if len(instr.args) != 1:
+                return None
+            source = self._operand(instr.args[0])
+            source_shape = tuple(int(value) for value in instr.args[0].shape)
+            rank = len(source_shape)
+            pad = instr.attributes.get("pad", 0)
+            if isinstance(pad, int):
+                widths = [(int(pad), int(pad))] * rank
+            elif (
+                isinstance(pad, (tuple, list))
+                and len(pad) == rank
+                and all(
+                    isinstance(pair, (tuple, list)) and len(pair) == 2
+                    for pair in pad
+                )
+            ):
+                widths = [tuple(map(int, pair)) for pair in pad]
+            elif isinstance(pad, (tuple, list)) and len(pad) % 2 == 0:
+                widths = [(0, 0)] * (rank - len(pad) // 2)
+                widths.extend(
+                    (int(pad[-2 * (axis + 1)]), int(pad[-2 * (axis + 1) + 1]))
+                    for axis in range(len(pad) // 2)
+                )
+            else:
+                return None
+            mode = str(instr.attributes.get("mode", "constant"))
+            if mode == "constant":
+                value = _literal(instr.attributes.get("value", 0.0))
+                sections = [
+                    f"{left + 1}:{left + extent}"
+                    for extent, (left, _right) in zip(source_shape, widths)
+                ]
+                return [
+                    f"    {target} = {value}",
+                    f"    {target}({', '.join(sections)}) = {source}",
+                ]
+            if mode != "edge":
+                return None
+            indices = [self._loop_variable() for _ in range(rank)]
+            statements = []
+            indent = "    "
+            for index, extent, (left, right) in zip(
+                indices, source_shape, widths
+            ):
+                statements.append(
+                    f"{indent}do {index} = 1, {left + extent + right}"
+                )
+                indent += "  "
+            source_indices = [
+                f"min(max({index} - {left}, 1), {extent})"
+                for index, extent, (left, _right) in zip(
+                    indices, source_shape, widths
+                )
+            ]
+            statements.append(
+                f"{indent}{target}({', '.join(indices)}) = "
+                f"{source}({', '.join(source_indices)})"
+            )
+            for _index in reversed(indices):
+                indent = indent[:-2]
+                statements.append(f"{indent}end do")
+            return statements
+
+        if operation == "gather":
+            if len(instr.args) != 2 or len(instr.res.shape) != 1:
+                return None
+            source, indices = (self._operand(arg) for arg in instr.args)
+            return [f"    {target} = {source}({indices} + 1)"]
+
+        if operation == "index_set":
+            if len(instr.args) != 2:
+                return None
+            base = self._operand(instr.args[0])
+            value = self._operand(instr.args[1])
+            rank = len(instr.res.shape)
+            index = instr.attributes.get("slices")
+            items = list(index) if isinstance(index, tuple) else [index]
+            items.extend([slice(None)] * (rank - len(items)))
+            if len(items) != rank:
+                return None
+            subscripts = []
+            for axis, item in enumerate(items):
+                extent = int(instr.res.shape[axis])
+                if isinstance(item, int):
+                    normalized = item + extent if item < 0 else item
+                    subscripts.append(str(normalized + 1))
+                elif isinstance(item, slice):
+                    start, stop, step = item.indices(extent)
+                    if step > 0:
+                        subscripts.append(
+                            f"{start + 1}:{stop}"
+                            + ("" if step == 1 else f":{step}")
+                        )
+                    else:
+                        # Python's stop is exclusive; for a descending
+                        # Fortran triplet its inclusive endpoint is stop+2 in
+                        # one-based coordinates.
+                        subscripts.append(
+                            f"{start + 1}:{stop + 2}:{step}"
+                        )
+                else:
+                    return None
+            if _element_count(tuple(instr.args[1].shape)) == 1:
+                value = f"sum({value})"
+            return [
+                f"    {target} = {base}",
+                f"    {target}({', '.join(subscripts)}) = {value}",
+            ]
 
         if operation == "concat":
             # Concatenation writes each source into its own run of the joined
@@ -1282,7 +1578,9 @@ class _FunctionEmitter:
                 # yielded None and reported "cannot express literal None",
                 # which named the missing key rather than the real content.
                 return _array_literal(
-                    instr.attributes["values"], instr.res.shape
+                    instr.attributes["values"],
+                    instr.res.shape,
+                    dtype=instr.res.dtype or self.dtype,
                 )
             if constant is None and instr.attributes.get("value") is not None:
                 # Control-flow scalars (loop bounds, strides) are recorded
@@ -1344,7 +1642,7 @@ class _FunctionEmitter:
             # wrap what was already wrapped.
             return template.format(*args)
         if op in _UNARY and len(args) == 1:
-            if op not in _LOGICAL_UNARY:
+            if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
             return _UNARY[op].format(*args)
         if op in ("Select", "where") and len(args) == 3:
@@ -1429,7 +1727,7 @@ class _FunctionEmitter:
 
             statements = self._statements(instr)
             if statements is not None:
-                self._locals[instr.res.id] = instr.res
+                self._locals[instr.res.id] = self._typed(instr.res)
                 body.extend(statements)
                 continue
 
@@ -1437,7 +1735,10 @@ class _FunctionEmitter:
             if expression is None:
                 self.shortfalls.append(
                     FortranShortfall(
-                        instr.op,
+                        str(
+                            instr.attributes.get("tensor_operation")
+                            or instr.op
+                        ),
                         block.name,
                         "no Fortran intrinsic or expression is registered",
                     )
@@ -1447,7 +1748,7 @@ class _FunctionEmitter:
             if self._may_inline(instr, block):
                 self._inlined[instr.res.id] = expression
                 continue
-            self._locals[instr.res.id] = instr.res
+            self._locals[instr.res.id] = self._typed(instr.res)
             if (
                 self._instruction_is_logical(instr)
                 and str(instr.res.dtype or self.dtype)
@@ -1522,7 +1823,7 @@ class _FunctionEmitter:
                     )
                     if len(blocks) == len(instr.args):
                         incoming = tuple(zip(blocks, instr.args))
-                self._locals[instr.res.id] = instr.res
+                self._locals[instr.res.id] = self._typed(instr.res)
                 entries = self._phi_targets.setdefault(block.name, [])
                 for predecessor, value in incoming:
                     entries.append((str(predecessor), instr.res, value))
@@ -1555,8 +1856,8 @@ class _FunctionEmitter:
         # or -- worse -- silently declares mismatched-size arrays under one
         # extent, which compiles cleanly and corrupts memory at runtime.
         all_values = (
-            *self.function.args,
-            *self.outputs,
+            *(self._typed(value) for value in self.function.args),
+            *(self._typed(value) for value in self.outputs),
             *self._locals.values(),
         )
         arrays_present = any(_is_array(value) for value in all_values)
@@ -1583,9 +1884,15 @@ class _FunctionEmitter:
         }
         extent_names = sorted(set(dim_extents.values()) | called_extent_names)
         self.extent_names = tuple(extent_names)
+        argument_ids = {argument.id for argument in self.function.args}
+        output_ids = {value.id for value in self.outputs}
         arguments = list(extent_names)
         arguments.extend(_name(a) for a in self.function.args)
-        arguments.extend(_name(value) for value in self.outputs)
+        arguments.extend(
+            _name(value)
+            for value in self.outputs
+            if value.id not in argument_ids
+        )
 
         declarations: list[str] = [
             f"    integer(c_int), intent(in), value :: {extent}"
@@ -1593,6 +1900,16 @@ class _FunctionEmitter:
         ]
         for argument in self.function.args:
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
+            if argument.id in output_ids:
+                if _is_array(argument):
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}({dims(argument)})"
+                    )
+                else:
+                    declarations.append(
+                        f"    {kind}, intent(inout) :: {_name(argument)}"
+                    )
+                continue
             if argument.id in self._collections:
                 # A collection accumulates one element per iteration and is
                 # read back by the caller, so it is neither a scalar nor
@@ -1618,6 +1935,8 @@ class _FunctionEmitter:
                     f"    {kind}, intent(in), value :: {_name(argument)}"
                 )
         for value in self.outputs:
+            if value.id in argument_ids:
+                continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             if _is_array(value):
                 declarations.append(
@@ -1652,6 +1971,7 @@ class _FunctionEmitter:
         lines = [
             f"  subroutine {name}({', '.join(arguments)}) bind(C, name=\"{name}\")",
             "    use, intrinsic :: iso_c_binding",
+            "    use, intrinsic :: ieee_arithmetic",
             "    implicit none",
             *declarations,
             "",
@@ -1673,6 +1993,9 @@ def emit_function(
     outputs: Sequence[SSAValue] = (),
     callee_extents: Mapping[str, Sequence[str]] | None = None,
     callee_arity: Mapping[str, int] | None = None,
+    callee_inout_pairs: Mapping[
+        str, Sequence[tuple[int, int]]
+    ] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -1691,6 +2014,7 @@ def emit_function(
         outputs=outputs,
         callee_extents=callee_extents,
         callee_arity=callee_arity,
+        callee_inout_pairs=callee_inout_pairs,
     ).emit()
 
 
@@ -1756,6 +2080,17 @@ def emit_module(
         function_name: len(function.args)
         for function_name, function in functions.items()
     }
+    callee_inout_pairs = {
+        function_name: tuple(
+            (input_index, output_index)
+            for input_index, argument in enumerate(function.args)
+            for output_index, output in enumerate(
+                named_outputs.get(function_name, ())
+            )
+            if int(argument.id) == int(output.id)
+        )
+        for function_name, function in functions.items()
+    }
     subroutines = tuple(
         emit_function(
             function,
@@ -1763,6 +2098,7 @@ def emit_module(
             outputs=named_outputs.get(function_name, ()),
             callee_extents=callee_extents,
             callee_arity=callee_arity,
+            callee_inout_pairs=callee_inout_pairs,
         )
         for function_name, function in functions.items()
     )
@@ -1773,6 +2109,7 @@ def emit_module(
     lines = [
         f"module {name}",
         "  use, intrinsic :: iso_c_binding",
+        "  use, intrinsic :: ieee_arithmetic",
         "  implicit none",
         "contains",
         "",

@@ -520,6 +520,13 @@ def compile_elementwise_tape(
         input_ids: list[int]
         if op in ELEMENTWISE_UNARY and len(inputs) == 1:
             input_ids = [lower(inputs[0])]
+        elif (
+            op in ELEMENTWISE_BINARY
+            and len(inputs) == 1
+            and "right_scalar" in (node.ctx.get("params") or {})
+        ):
+            input_ids = [lower(inputs[0])]
+            attrs["right_scalar"] = node.ctx["params"]["right_scalar"]
         elif op in ELEMENTWISE_BINARY and len(inputs) == 2:
             left, right = inputs
             if not is_scalar(left) and not is_scalar(right):
@@ -534,7 +541,11 @@ def compile_elementwise_tape(
             else:
                 raise ValueError(f"{op} has an unsupported operand layout")
         else:
-            raise ValueError(f"{op} has an unsupported operand layout")
+            raise ValueError(
+                f"{op} has an unsupported operand layout; "
+                f"inputs={tuple((type(item).__name__, getattr(item, 'shape', None), is_scalar(item)) for item in inputs)!r}; "
+                f"params={node.ctx.get('params')!r}"
+            )
         steps.append(
             OpStep(
                 step_id=len(steps),
@@ -628,6 +639,8 @@ _CAPTURED_NATIVE_KERNELS = {
     "full": "fill",
     "full_like": "fill",
     "gather": "index_select",
+    "pad": "pad",
+    "index_set": "index_set",
     "permute": "permute",
     "repeat": "repeat",
     "scatter": "scatter",
@@ -741,6 +754,94 @@ def _compile_single_native_node(node, operation: str) -> CapturedFusedProgram:
     attrs = dict(node.ctx.get("params") or {})
     kernel_kind = _CAPTURED_NATIVE_KERNELS.get(operation, operation)
     lowered_operation = operation
+
+    if operation == "index_set":
+        index = attrs.pop("idx", None)
+        if index is None:
+            raise ValueError("captured indexed assignment has no index")
+        if isinstance(index, tuple) and len(index) == 1:
+            index = index[0]
+        index_storage = (
+            index
+            if isinstance(index, np.ndarray)
+            else getattr(index, "data", index)
+        )
+        index_array = np.asarray(index_storage)
+        if index_array.dtype.kind == "b":
+            if tuple(index_array.shape) != tuple(result.shape):
+                raise ValueError(
+                    "boolean indexed assignment requires a mask matching "
+                    f"the destination shape; mask={index_array.shape!r}, "
+                    f"destination={tuple(result.shape)!r}"
+                )
+            if len(input_ids) != 2:
+                raise ValueError(
+                    "captured boolean indexed assignment requires destination "
+                    "and value tensor inputs"
+                )
+            mask_id = id(index_storage)
+            feeds[mask_id] = index_storage
+            metadata[mask_id] = _captured_meta(index_storage)
+            destination_id, value_id = input_ids
+            value_meta = metadata[value_id]
+            steps: list[OpStep] = []
+            if tuple(value_meta.shape or ()) != tuple(result.shape):
+                broadcast_id = -max(
+                    1,
+                    result_id,
+                    destination_id,
+                    value_id,
+                    mask_id,
+                )
+                metadata[broadcast_id] = metadata[result_id]
+                steps.append(OpStep(
+                    step_id=0,
+                    op_name="broadcast_to",
+                    input_ids=[value_id],
+                    attrs={"shape": tuple(result.shape)},
+                    result_id=broadcast_id,
+                ))
+                value_id = broadcast_id
+            steps.append(OpStep(
+                step_id=len(steps),
+                op_name="where",
+                input_ids=[mask_id, value_id, destination_id],
+                attrs={},
+                result_id=result_id,
+            ))
+            return CapturedFusedProgram(
+                FusedProgram(
+                    version=1,
+                    feeds=set(feeds),
+                    steps=steps,
+                    outputs={"result_0": result_id},
+                    meta=metadata,
+                    extras={"kernel_kind": "where"},
+                ),
+                feeds,
+            )
+        if len(input_ids) != 2:
+            raise ValueError(
+                "captured basic indexed assignment requires destination and "
+                "value tensor inputs"
+            )
+        return CapturedFusedProgram(
+            FusedProgram(
+                version=1,
+                feeds=set(feeds),
+                steps=[OpStep(
+                    step_id=0,
+                    op_name="index_set",
+                    input_ids=input_ids,
+                    attrs={"slices": index},
+                    result_id=result_id,
+                )],
+                outputs={"result_0": result_id},
+                meta=metadata,
+                extras={"kernel_kind": "index_set"},
+            ),
+            feeds,
+        )
 
     if operation in _CAPTURED_COMPOSITE_OPERATIONS:
         if len(input_ids) != 1:
@@ -1097,6 +1198,143 @@ def compile_recorded_fused_tape(
             ]
             if len(active) > 1:
                 source_shape = tuple(node.ctx["inputs"][0].shape)
+                index_tensors = tuple(
+                    (node.ctx.get("params") or {}).get(
+                        "index_tensors", ()
+                    )
+                )
+                if (
+                    len(index_tensors) == len(active)
+                    and all(
+                        hasattr(item, "shape") and hasattr(item, "dtype")
+                        for item in index_tensors
+                    )
+                ):
+                    source_id = step.input_ids[0]
+                    used_ids = {
+                        source_id,
+                        step.result_id,
+                        *(id(item) for item in index_tensors),
+                    }
+                    next_temp = -max(1, *(abs(value) for value in used_ids))
+
+                    def temporary(meta):
+                        nonlocal next_temp
+                        while next_temp in used_ids:
+                            next_temp -= 1
+                        value_id = next_temp
+                        used_ids.add(value_id)
+                        next_temp -= 1
+                        program.meta[value_id] = meta
+                        return value_id
+
+                    flat_source_id = temporary(Meta(
+                        (int(prod(source_shape)),),
+                        program.meta[source_id].dtype,
+                        program.meta[source_id].device,
+                    ))
+                    advanced_steps = [OpStep(
+                        step_id=0,
+                        op_name="reshape",
+                        input_ids=[source_id],
+                        attrs={"shape": (int(prod(source_shape)),)},
+                        result_id=flat_source_id,
+                    )]
+                    flat_index_id = None
+                    for (axis, _item), index_tensor in zip(
+                        active, index_tensors
+                    ):
+                        index_id = id(index_tensor)
+                        captured.feeds[index_id] = index_tensor
+                        program.feeds.add(index_id)
+                        program.meta[index_id] = _captured_meta(index_tensor)
+                        stride = int(prod(source_shape[axis + 1:]))
+                        term_id = index_id
+                        if stride != 1:
+                            term_id = temporary(program.meta[index_id])
+                            advanced_steps.append(OpStep(
+                                step_id=len(advanced_steps),
+                                op_name="mul",
+                                input_ids=[index_id],
+                                attrs={"right_scalar": stride},
+                                result_id=term_id,
+                            ))
+                        if flat_index_id is None:
+                            flat_index_id = term_id
+                        else:
+                            combined_id = temporary(program.meta[index_id])
+                            advanced_steps.append(OpStep(
+                                step_id=len(advanced_steps),
+                                op_name="add",
+                                input_ids=[flat_index_id, term_id],
+                                attrs={},
+                                result_id=combined_id,
+                            ))
+                            flat_index_id = combined_id
+                    advanced_steps.append(OpStep(
+                        step_id=len(advanced_steps),
+                        op_name="gather",
+                        input_ids=[flat_source_id, flat_index_id],
+                        attrs={"dim": 0},
+                        result_id=step.result_id,
+                    ))
+                    program.steps = advanced_steps
+                    program.extras["kernel_kind"] = "advanced_gather"
+                    program.extras["synthetic_result_ids"] = tuple(
+                        int(value_id)
+                        for value_id in used_ids
+                        if int(value_id) < 0
+                    )
+                    return captured
+                if all(isinstance(item, slice) for _axis, item in active):
+                    source_id = step.input_ids[0]
+                    current_id = source_id
+                    current_shape = list(source_shape)
+                    used_ids = {source_id, step.result_id}
+                    next_temp = -max(1, *(abs(value) for value in used_ids))
+                    span_steps = []
+                    synthetic_ids = []
+                    for position, (axis, item) in enumerate(active):
+                        start, stop, stride = item.indices(
+                            current_shape[axis]
+                        )
+                        count = len(range(start, stop, stride))
+                        next_shape = list(current_shape)
+                        next_shape[axis] = count
+                        output_id = step.result_id
+                        if position != len(active) - 1:
+                            while next_temp in used_ids:
+                                next_temp -= 1
+                            output_id = next_temp
+                            used_ids.add(output_id)
+                            synthetic_ids.append(output_id)
+                            next_temp -= 1
+                            program.meta[output_id] = Meta(
+                                tuple(next_shape),
+                                program.meta[source_id].dtype,
+                                program.meta[source_id].device,
+                            )
+                        span_steps.append(OpStep(
+                            step_id=len(span_steps),
+                            op_name="slice",
+                            input_ids=[current_id],
+                            attrs={
+                                "slice_kind": "axis",
+                                "dim": axis,
+                                "start": start,
+                                "step": stride,
+                                "count": count,
+                            },
+                            result_id=output_id,
+                        ))
+                        current_id = output_id
+                        current_shape = next_shape
+                    program.steps = span_steps
+                    program.extras["kernel_kind"] = "multi_axis_span"
+                    program.extras["synthetic_result_ids"] = tuple(
+                        synthetic_ids
+                    )
+                    return captured
                 last_axis = active[-1][0]
                 prefix = items[:last_axis + 1]
                 if not all(isinstance(item, int) for item in prefix):
@@ -1396,10 +1634,16 @@ def compile_recorded_fused_tape(
 
     # Values produced by an earlier stage are routed on-device and are not
     # external roots of the complete captured program.
+    in_place_feeds = {
+        step.result_id
+        for stage in stages
+        for step in stage.steps
+        if step.result_id in step.input_ids
+    }
     external_feeds = {
         value_id: value
         for value_id, value in stage_feeds.items()
-        if value_id not in produced
+        if value_id not in produced or value_id in in_place_feeds
     }
     external_feeds.update(
         (id(value), value) for value in passthrough_outputs.values()
@@ -1415,7 +1659,10 @@ def compile_recorded_fused_tape(
         id(value)
         for node in nodes
         for value in node.ctx.get("inputs", ())
-        if id(value) in produced_ids
+        if (
+            id(value) in produced_ids
+            and id(value) != id(node.ctx["result"])
+        )
     }
     if requested_outputs is None:
         terminal_ids = [

@@ -48,6 +48,78 @@ class ExternalReferenceDomain(str, Enum):
     GUEST_BINARY = "guest_binary"
 
 
+class VirtualMountKind(str, Enum):
+    """Storage supplied beneath a shell-owned virtual path."""
+
+    MEMORY = "memory"
+    BUNDLE = "bundle"
+    HOST_DIRECTORY = "host_directory"
+
+
+class VirtualMountAccess(str, Enum):
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+
+
+@dataclass(frozen=True)
+class VirtualMount:
+    """One explicit mapping into the program's otherwise private namespace."""
+
+    path: str
+    kind: VirtualMountKind
+    access: VirtualMountAccess = VirtualMountAccess.READ_ONLY
+    source: str | None = None
+
+    @classmethod
+    def create(
+        cls, path: str, kind: VirtualMountKind | str, *,
+        access: VirtualMountAccess | str = VirtualMountAccess.READ_ONLY,
+        source: str | None = None,
+    ) -> "VirtualMount":
+        return cls(str(path), VirtualMountKind(kind), VirtualMountAccess(access), source)
+
+    def __post_init__(self) -> None:
+        if not self.path or not self.path.startswith("/"):
+            raise ValueError("virtual mount paths must be absolute")
+        if self.path != "/" and self.path.endswith("/"):
+            raise ValueError("virtual mount paths must not have a trailing slash")
+        if self.kind is not VirtualMountKind.MEMORY and not self.source:
+            raise ValueError(f"{self.kind.value} mounts require a source")
+
+    def to_mapping(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "path": self.path, "kind": self.kind.value, "access": self.access.value,
+        }
+        if self.source is not None:
+            result["source"] = self.source
+        return result
+
+
+@dataclass(frozen=True)
+class VirtualFileSystemContract:
+    """Logical filesystem presented to a program by its enclosing shell."""
+
+    current_directory: str = "/"
+    mounts: tuple[VirtualMount, ...] = (VirtualMount("/", VirtualMountKind.MEMORY, VirtualMountAccess.READ_WRITE),)
+
+    def __post_init__(self) -> None:
+        if not self.current_directory.startswith("/"):
+            raise ValueError("virtual current directory must be absolute")
+        paths = [mount.path.casefold() for mount in self.mounts]
+        if len(paths) != len(set(paths)):
+            raise ValueError("virtual filesystem contains duplicate mount paths")
+        if not any(path == "/" for path in paths):
+            raise ValueError("virtual filesystem requires a root mount")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": "turing-virtual-filesystem",
+            "version": 1,
+            "current_directory": self.current_directory,
+            "mounts": [mount.to_mapping() for mount in self.mounts],
+        }
+
+
 @dataclass(frozen=True)
 class SystemPortField:
     """Map one semantic system-port field to a compiled API parameter."""
@@ -215,6 +287,7 @@ class ShellIOManifest:
     bindings: tuple[ShellIOBinding, ...] = ()
     options: tuple[ShellOption, ...] = ()
     system_ports: tuple[SystemPort, ...] = ()
+    virtual_filesystem: VirtualFileSystemContract | None = None
 
     def __post_init__(self) -> None:
         kinds = [request.capability for request in self.requests]
@@ -232,6 +305,8 @@ class ShellIOManifest:
         if len(port_names) != len(set(port_names)):
             raise ValueError("shell IO manifest contains duplicate system ports")
         requested = set(kinds)
+        if self.virtual_filesystem is not None and ShellIOCapability.FILES not in requested:
+            raise ValueError("virtual filesystem requires the files shell capability")
         unsupported = [
             port.name for port in self.system_ports
             if port.capability not in requested and not port.optional
@@ -255,7 +330,7 @@ class ShellIOManifest:
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": "turing-shell-io-requirements",
             "version": 1,
             "requests": [
@@ -270,6 +345,9 @@ class ShellIOManifest:
             "options": [option.to_mapping() for option in self.options],
             "system_ports": [port.to_mapping() for port in self.system_ports],
         }
+        if self.virtual_filesystem is not None:
+            result["virtual_filesystem"] = self.virtual_filesystem.to_mapping()
+        return result
 
     def specialize_options(self, values: Mapping[str, Any]) -> "ShellIOManifest":
         """Return the manifest with compile-time option defaults recorded."""
@@ -319,9 +397,12 @@ class FileBrokerABI:
     completion_record_bytes: int = 32
     operations: tuple[str, ...] = (
         "open", "create", "read", "write", "close", "stat",
+        "list", "mkdir", "remove", "rename", "getcwd", "chdir", "flush",
     )
     # Paths and payloads are offset/length spans in the artifact's memory.
     span_fields: tuple[str, ...] = ("memory_offset", "byte_length")
+    namespace: str = "utf8-posix-absolute"
+    effects: str = "ordered-journal"
 
 
 @dataclass(frozen=True)
@@ -394,6 +475,8 @@ class ShellIOABI:
                 "completion_record_bytes": self.files.completion_record_bytes,
                 "operations": list(self.files.operations),
                 "span_fields": list(self.files.span_fields),
+                "namespace": self.files.namespace,
+                "effects": self.files.effects,
             },
             "external_references": {
                 "request_record_bytes": self.external_references.request_record_bytes,
@@ -475,6 +558,7 @@ def resolve_shell_io_bindings(api: Any, manifest: ShellIOManifest) -> ShellIOMan
         system_ports=tuple(
             _resolve_system_port(api, port) for port in manifest.system_ports
         ),
+        virtual_filesystem=manifest.virtual_filesystem,
     )
 
 
@@ -512,6 +596,7 @@ class ShellProfile:
     exposes: str
     provides: frozenset[ShellIOCapability] = frozenset()
     cost: int = 1
+    mount_kinds: frozenset[VirtualMountKind] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -550,6 +635,19 @@ def plan_shell_stack(
         queue = deque(sorted(queue, key=lambda item: item[0]))
         cost, (kind, provided), wrappers = queue.popleft()
         if required <= provided:
+            requested_mounts = {
+                mount.kind for mount in (
+                    manifest.virtual_filesystem.mounts
+                    if manifest.virtual_filesystem is not None else ()
+                )
+            }
+            available_mounts = frozenset().union(*(
+                wrapper.mount_kinds for wrapper in wrappers
+            )) if wrappers else frozenset()
+            if not requested_mounts <= available_mounts:
+                # This state satisfies capabilities but not the requested
+                # namespace backing; keep searching for another wrapper.
+                continue
             return ShellStack(
                 str(artifact_kind),
                 wrappers,
@@ -584,6 +682,7 @@ WEB_JAVASCRIPT_SHELL = ShellProfile(
         ShellIOCapability.BUNDLE_REFERENCES,
     }),
     cost=1,
+    mount_kinds=frozenset({VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE}),
 )
 
 NATIVE_PROCESS_SHELL = ShellProfile(
@@ -598,6 +697,10 @@ NATIVE_PROCESS_SHELL = ShellProfile(
         ShellIOCapability.HOST_REFERENCES,
     }),
     cost=1,
+    mount_kinds=frozenset({
+        VirtualMountKind.MEMORY, VirtualMountKind.BUNDLE,
+        VirtualMountKind.HOST_DIRECTORY,
+    }),
 )
 
 
@@ -620,6 +723,10 @@ __all__ = [
     "SystemPortDirection",
     "SystemPortField",
     "SystemPortKind",
+    "VirtualFileSystemContract",
+    "VirtualMount",
+    "VirtualMountAccess",
+    "VirtualMountKind",
     "WEB_JAVASCRIPT_SHELL",
     "attach_shell_io",
     "plan_shell_stack",

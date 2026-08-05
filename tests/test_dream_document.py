@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 from threading import Barrier
 
@@ -6,13 +7,15 @@ import pytest
 from src.compiler.dream_document import (
     DreamDocumentError,
     DreamRuntime,
+    embed_machine_snapshot,
+    embed_machine_snapshot_stream,
     emit_dream_html_shell,
     load_dream_document,
     parse_dream_document,
     python_exec_handler,
     main,
 )
-from src.compiler.wasm_html_shell import emit_html_shell
+from src.compiler.wasm_html_shell import HtmlShell, emit_html_shell
 
 
 DOCUMENT = Path(__file__).parents[1] / "examples" / "reversible_chip_simulator.dream"
@@ -75,6 +78,7 @@ def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
     assert handoff.context == "webgl2"
     assert "void main()" in handoff.fragment_source
     assert handoff.controller_entry == "installTuringDisplay"
+    assert "terminalForm.dataset.turingTerminalInput" in handoff.controller_source
 
     api = {
         "module": "dream-chip", "language": "dream", "entry": "run",
@@ -101,6 +105,12 @@ def test_shell_hands_context_to_interior_display_owner_without_compiling_it():
     assert "systemPorts.publishFile" in complete
     assert '"kind": "device_dispatch"' in complete
     assert "installTuringDisplay" in complete
+    assert 'kind === 2 && format === 2' in complete
+    assert 'new TextDecoder("utf-8"' in complete
+    assert "uploadTerminal" in complete
+    assert "turingRegisterHud" in complete
+    assert "Contiguous virtual register contents" in complete
+    assert "value.toString(16).padStart(16" in complete
 
 
 def test_parallel_blocks_really_overlap_without_a_runtime_state_lock():
@@ -181,3 +191,34 @@ def test_cli_emits_launchable_interior_owned_shell(tmp_path, capsys):
     assert "installTuringDisplay" in html
     assert "program-interior" in html
     assert str(output) in capsys.readouterr().out
+
+
+def test_machine_snapshot_can_boot_inside_generated_shell():
+    artifact = HtmlShell("chip", "<html><body>chip</body></html>", False)
+    snapshot = b"TMSNAP01" + bytes(68)
+
+    embedded = embed_machine_snapshot(artifact, snapshot)
+
+    assert embedded.name == artifact.name
+    assert 'id="turing-embedded-machine-snapshot"' in embedded.html
+    assert "TuringMachineSnapshots.publish(snapshot)" in embedded.html
+    assert base64.b64encode(snapshot).decode("ascii") in embedded.html
+
+
+def test_machine_snapshot_embedding_rejects_unframed_state():
+    artifact = HtmlShell("chip", "<html><body></body></html>", False)
+    with pytest.raises(ValueError, match="TMSNAP01"):
+        embed_machine_snapshot(artifact, b"not-a-snapshot")
+
+
+def test_live_machine_snapshot_stream_boots_same_origin_transport():
+    artifact = HtmlShell("chip", "<html><body></body></html>", False)
+
+    embedded = embed_machine_snapshot_stream(
+        artifact, snapshot_endpoint="/state", input_endpoint="/terminal",
+        interval_milliseconds=8,
+    )
+
+    assert 'id="turing-live-machine-snapshot"' in embedded.html
+    assert 'TuringMachineSnapshots.connect("/state"' in embedded.html
+    assert 'inputEndpoint: "/terminal", interval: 8' in embedded.html

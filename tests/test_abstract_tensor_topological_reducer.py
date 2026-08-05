@@ -784,6 +784,77 @@ def increment():
     assert set_attr_id != updated_value
 
 
+def test_scope_declarations_do_not_become_runtime_operators():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+shared = 0
+
+def outer(value):
+    captured = value
+
+    def update():
+        nonlocal captured
+        global shared
+        captured += 1
+        shared = captured
+        return captured
+
+    return update()
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("update").graph
+
+    for candidate in (graph, function_graph):
+        assert not any(
+            data.get("type") in {"Nonlocal", "Global"}
+            for _node_id, data in candidate.G.nodes(data=True)
+        )
+
+
+def test_delete_lowers_names_away_and_preserves_object_effects():
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def discard(mapping, key, owner, temporary):
+    del temporary
+    del mapping[key]
+    del owner.cached
+    return mapping
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("discard").graph
+
+    for candidate in (graph, function_graph):
+        assert not any(
+            data.get("type") == "Delete"
+            for _node_id, data in candidate.G.nodes(data=True)
+        )
+
+    del_item = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "DelItem"
+    )
+    del_attr = next(
+        data
+        for _node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "DelAttr"
+    )
+    assert {role for _parent, role in del_item["parents"]} == {
+        "base",
+        "index",
+    }
+    assert {role for _parent, role in del_attr["parents"]} == {"object"}
+    assert del_attr["attributes"]["attribute"] == "cached"
+
+
 def test_try_value_survives_when_every_exception_handler_terminates():
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(

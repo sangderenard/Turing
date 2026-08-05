@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import sympy
 
 from src.common.tensors.accelerator_backends.glsl_fused_network import (
     GLSLFusedProgramNetwork,
@@ -40,6 +41,7 @@ from src.common.tensors.topological_reducer import (
     reduce_abstract_tensor_topology,
 )
 from src.compiler.glsl_deployment_strategy import (
+    _diagnostic_value_summary,
     _observe_process_graph_node,
     _planned_capture_context,
     _capture_feed_aliases,
@@ -78,6 +80,22 @@ def test_dtype_descriptor_remains_structural_graph_metadata():
     dtype = np.dtype("float32")
 
     assert _tensorize_graph_input(dtype, device=None) is dtype
+
+
+def test_module_exporting_shape_function_remains_structural():
+    assert callable(sympy.shape)
+    assert _tensorize_graph_input(sympy, device=None) is sympy
+    assert _diagnostic_value_summary(sympy).startswith("module:")
+
+
+def test_shape_only_nested_domain_object_is_not_tensorized():
+    class DomainValue:
+        shape = (1,)
+        tolist = list
+
+    owner = SimpleNamespace(field=DomainValue())
+
+    assert _tensorize_graph_input(owner, device=None) is owner
 
 
 def test_installed_control_shell_executes_loop_in_one_dispatch(gl):

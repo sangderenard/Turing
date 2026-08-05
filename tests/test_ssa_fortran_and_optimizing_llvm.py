@@ -138,6 +138,71 @@ def test_elementwise_ssa_emits_whole_array_fortran():
     assert "t2 = sum(t5)" in source
 
 
+def test_empty_array_constant_has_a_typed_fortran_constructor():
+    empty = SSAValue(0, "float64", (0, 3))
+    function = Function(
+        "empty_constant",
+        [],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr("Const", [], empty, attributes={"values": ()}),
+                    Instr("Ret", [], SSAValue(1)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: [empty]},
+    )
+
+    assert module.complete, [shortfall.format() for shortfall in module.shortfalls]
+    assert "reshape([real(c_double) ::], [0, 3])" in module.source
+
+
+def test_ieee_classification_ops_emit_logical_fortran_expressions():
+    value = SSAValue(0, "float64", (4,))
+    isnan = SSAValue(1, "bool", (4,))
+    isfinite = SSAValue(2, "bool", (4,))
+    function = Function(
+        "classify",
+        [value],
+        {
+            "entry": BasicBlock(
+                "entry",
+                [
+                    Instr(
+                        "Call",
+                        [value],
+                        isnan,
+                        attributes={"tensor_operation": "isnan"},
+                    ),
+                    Instr(
+                        "Call",
+                        [value],
+                        isfinite,
+                        attributes={"tensor_operation": "isfinite"},
+                    ),
+                    Instr("Ret", [], SSAValue(3)),
+                ],
+            )
+        },
+    )
+
+    module = emit_module(
+        IRModule({function.name: function}),
+        outputs={function.name: [isnan, isfinite]},
+    )
+
+    assert module.complete, [shortfall.format() for shortfall in module.shortfalls]
+    assert "use, intrinsic :: ieee_arithmetic" in module.source
+    assert "ieee_is_nan(t0)" in module.source
+    assert "ieee_is_finite(t0)" in module.source
+
+
 def test_single_use_temporaries_are_fused_into_one_expression():
     """One SSA chain must become one array statement, not one per step.
 
@@ -199,6 +264,75 @@ def test_fill_initializes_a_large_predeclared_span_without_array_literals():
     assert "t20 = 0.0_c_double" in source
     assert "[" not in source
     assert "allocatable" not in source
+
+
+def test_argument_output_alias_emits_one_inout_fortran_arena():
+    arena = SSAValue(20, "float64", (4,))
+    function = Function("advance", [arena], {
+        "entry": BasicBlock("entry", [
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+
+    module = emit_module(
+        IRModule({"advance": function}),
+        outputs={"advance": [arena]},
+    )
+    source = module.source
+    entry = module.api.entry_point("advance")
+
+    assert "subroutine advance(extent_4, t20)" in source
+    assert "intent(inout) :: t20(extent_4)" in source
+    assert source.count(":: t20(extent_4)") == 1
+    assert [parameter.role for parameter in entry.parameters] == [
+        "extent",
+        "input",
+    ]
+
+
+def test_inout_region_load_and_phi_retain_resident_arena_rank():
+    arena = SSAValue(20, "float64", (4,))
+    region = Function("advance", [arena], {
+        "entry": BasicBlock("entry", [
+            Instr("Ret", [], SSAValue(99)),
+        ]),
+    })
+    aggregate = SSAValue(10, "aggregate")
+    address = SSAValue(11, "pointer")
+    rank_lost_load = SSAValue(12, "float64")
+    rank_lost_phi = SSAValue(13, "float64")
+    caller_arena = SSAValue(1, "float64", (4,))
+    caller = Function("cycle", [caller_arena], {
+        "entry": BasicBlock("entry", [
+            Instr(
+                "Call", [caller_arena], aggregate,
+                attributes={
+                    "callee": "advance",
+                    "result_convention": "ssa.aggregate",
+                },
+            ),
+            Instr(
+                "GetElementPtr", [aggregate], address,
+                attributes={"aggregate_index": 0},
+            ),
+            Instr("Load", [address], rank_lost_load),
+            Instr(
+                "Phi", [rank_lost_load], rank_lost_phi,
+                attributes={"incoming": (("entry", rank_lost_load),)},
+            ),
+            Instr("Ret", [], SSAValue(100)),
+        ]),
+    })
+
+    source = emit_module(
+        IRModule({"advance": region, "cycle": caller}),
+        outputs={"advance": [arena]},
+    ).source
+
+    assert "real(c_double) :: t12(extent_4)" in source
+    assert "real(c_double) :: t13(extent_4)" in source
+    assert "t12 = t1" in source
+    assert "call advance(extent_4, t12)" in source
 
 
 def test_generic_index_addresses_lower_to_fortran_loads_and_stores():

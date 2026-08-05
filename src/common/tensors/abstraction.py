@@ -1128,10 +1128,20 @@ class AbstractTensor:
         result.data = self.log_softmax_(dim)
         return result
 
-    def pad(self, pad: Tuple[int, ...] = (0, 0), value: float = 0) -> "AbstractTensor":
+    def pad(
+        self,
+        pad: Tuple[int, ...] = (0, 0),
+        value: float = 0,
+        mode: str = "constant",
+    ) -> "AbstractTensor":
+        finalize = AbstractTensor._pre_autograd(
+            "pad",
+            [self],
+            params={"pad": pad, "value": value, "mode": mode},
+        )
         result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.pad_(pad, value)
-        return result
+        result.data = self.pad_(pad, value, mode=mode)
+        return finalize(result)
 
     # --- 2D spatial helpers -------------------------------------------------
     def pad2d(self, pad: Tuple[int, int, int, int], value: float = 0.0) -> "AbstractTensor":
@@ -1873,6 +1883,11 @@ class AbstractTensor:
         - Interpolation uses NumPy's traditional "linear" scheme with
           rank = p/100 * (N-1).
         """
+        # Several public call sites intentionally use the class-style form
+        # ``AbstractTensor.percentile(sequence, n)``.  Normalize that first
+        # operand just as the rest of the high-level tensor API does, while
+        # leaving ordinary instance calls unchanged.
+        self = AbstractTensor.get_tensor(self)
         # Parse percentile and behaviour flags
         try:
             p = float(n)
@@ -2499,8 +2514,19 @@ class AbstractTensor:
         # ---- prefer backend-specific get_item_ if available ----
         # Try to locate the ops/backend object (name may vary in your codebase)
 
+        index_tensors = (
+            tuple(item for item in idx if isinstance(item, AbstractTensor))
+            if isinstance(idx, tuple)
+            else (idx,) if isinstance(idx, AbstractTensor)
+            else ()
+        )
         finalize = AbstractTensor._pre_autograd(
-            "slice", [self], params={"slices": index}
+            "slice",
+            [self],
+            params={
+                "slices": index,
+                "index_tensors": index_tensors,
+            },
         )
 
         if hasattr(self, "get_item_"):

@@ -113,8 +113,20 @@ shell-tick controls. Its subject bytes remain runtime machine input rather than
 cards. The HTML liaison exposes `machineSnapshots`, a newest-generation bus for
 complete `TMSNAP01` buffers, plus an optional compiled `machineProgram` host.
 The interior display subscribes to that bus, uploads the real register banks
-and an RGBA8 subject framebuffer when present, and does not manufacture colored
-placeholder textures. The compiled descriptor declares `subject-binary` as a
+and either an RGBA8 subject framebuffer or UTF-8 terminal when present, and
+does not manufacture colored placeholder textures. The compiled descriptor declares `subject-binary` as a
 file system port whose byte and length fields bind `load_subject`. HTML renders
 that port as a file picker and exposes it through `TuringSystemPorts`; the
 compiled program registers its handler without requiring a Python interpreter.
+
+An existing system tape can seed the page with a real cold-resumed observation:
+
+```text
+python -m src.compiler.dream_document examples/reversible_chip_simulator.dream \
+  --emit-shell build/reversible_chip_state.html --machine-tape cmd-machine.tape.jsonl
+```
+
+The emitter validates tape dependencies while rebuilding the executor, then
+embeds and publishes its newest `TMSNAP01` buffer on page load. This makes a
+self-contained examination artifact. It does not claim that the browser can
+continue the guest until a compiled machine-program host is attached.

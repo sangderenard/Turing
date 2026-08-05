@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 import importlib
 import logging
 import types
@@ -152,6 +152,7 @@ def _normalize_lexical_values(
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
     static_bindings: dict[str, Any],
     function_table: FunctionTable,
+    lexical_function_bindings: dict[str, Any] | None = None,
 ) -> None:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -164,9 +165,11 @@ def _normalize_lexical_values(
     graph = function_graph
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
+    deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     loop_target_bindings_by_ast: dict[int, int] = {}
     static_reference_nodes: dict[tuple[int, str], int] = {}
+    first_class_function_nodes: dict[int, int] = {}
     static_constant_nodes: dict[str, int] = {}
     static_attribute_values: dict[tuple[int, str], int] = {}
     parameter_names = {
@@ -194,6 +197,37 @@ def _normalize_lexical_values(
         )
         if isinstance(target, ast.Name)
     }
+    scalar_loop_target_ast_ids: set[int] = set()
+
+    def target_name_nodes(target: ast.AST) -> tuple[ast.Name, ...]:
+        if isinstance(target, ast.Name):
+            return (target,)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return tuple(
+                name
+                for element in target.elts
+                for name in target_name_nodes(element)
+            )
+        return ()
+
+    for loop in ast.walk(statement):
+        if not (
+            isinstance(loop, ast.For)
+            and isinstance(loop.iter, ast.Call)
+            and isinstance(loop.iter.func, ast.Name)
+        ):
+            continue
+        if loop.iter.func.id == "range":
+            scalar_loop_target_ast_ids.update(
+                id(name) for name in target_name_nodes(loop.target)
+            )
+        elif loop.iter.func.id == "enumerate":
+            if isinstance(loop.target, (ast.Tuple, ast.List)) and loop.target.elts:
+                scalar_loop_target_ast_ids.update(
+                    id(name)
+                    for name in target_name_nodes(loop.target.elts[0])
+                )
+    scalar_loop_binding_ids: set[int] = set()
     for body_statement in statement.body:
         if not isinstance(body_statement, ast.Return):
             continue
@@ -303,9 +337,33 @@ def _normalize_lexical_values(
         class_descriptor = graph.G.graph.get("class_table", {}).get(
             target_name
         )
+        if class_descriptor is not None and is_dataclass(target):
+            # Imported dataclasses enter the function table as structural
+            # class references, but their defining ClassDef belongs to a
+            # different source unit.  Recover the constructor schema here so
+            # omitted literal defaults (for example SuperstepPlan.eps) remain
+            # compiler facts instead of disappearing into Python reflection
+            # at execution time.
+            dataclass_fields = tuple(fields(target))
+            class_descriptor["fields"] = tuple(
+                field.name for field in dataclass_fields
+            )
+            defaults = dict(class_descriptor.get("field_defaults") or {})
+            for field in dataclass_fields:
+                if field.default is not MISSING and is_static_literal(
+                    field.default
+                ):
+                    defaults[field.name] = copy.deepcopy(field.default)
+            class_descriptor["field_defaults"] = defaults
         function_reference = (
             function_table.reference(target_name) if target_name else None
         )
+        if getattr(target, "__self__", None) is not None:
+            # A bound runtime/builtin method is identified by both callable
+            # and receiver.  Linking it to an unrelated source method by the
+            # final spelling alone (for example ContextVar.get versus a
+            # user class's get) discards the receiver and is never valid.
+            function_reference = None
         attributes = {
             "static_python_reference": reference.path,
             "reference_kind": (
@@ -330,6 +388,25 @@ def _normalize_lexical_values(
         static_reference_nodes[key] = node_id
         return node_id
 
+    def first_class_function_node(name: str, reference: Any) -> int:
+        """Represent a source function used as data by its table address."""
+
+        address = int(reference.address)
+        existing = first_class_function_nodes.get(address)
+        if existing is not None:
+            return existing
+        node_id = new_node(
+            "StaticReference",
+            name,
+            attributes={
+                "function_ref": address,
+                "first_class_function_ref": address,
+                "reference_kind": "function_subgraph",
+            },
+        )
+        first_class_function_nodes[address] = node_id
+        return node_id
+
     def bind_loop_target(target: ast.AST) -> None:
         if isinstance(target, ast.Name):
             target_identity = id(target)
@@ -345,6 +422,8 @@ def _normalize_lexical_values(
                 )
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
+            if target_identity in scalar_loop_target_ast_ids:
+                scalar_loop_binding_ids.add(value)
             environment[target.id] = value
             _remove_node(graph, id(target))
             return
@@ -433,6 +512,20 @@ def _normalize_lexical_values(
                     return static_reference
                 producer_id = environment.get(expression.id)
                 static_value = static_bindings.get(expression.id)
+                function_reference = (
+                    (lexical_function_bindings or {}).get(expression.id)
+                    or function_table.reference(expression.id)
+                )
+                if (
+                    producer_id is None
+                    and expression.id not in parameter_names
+                    and function_reference is not None
+                ):
+                    _remove_node(graph, node_id)
+                    return first_class_function_node(
+                        expression.id,
+                        function_reference,
+                    )
                 if (
                     producer_id is None
                     and expression.id not in parameter_names
@@ -483,6 +576,7 @@ def _normalize_lexical_values(
             if (
                 isinstance(expression.value, ast.Name)
                 and expression.value.id not in environment
+                and expression.value.id not in parameter_names
                 and expression.value.id in static_bindings
             ):
                 _remove_node(graph, id(expression.value))
@@ -581,14 +675,136 @@ def _normalize_lexical_values(
                     resolved = resolve_expression(argument)
                     if isinstance(resolved, _StaticPythonReference):
                         static_arguments[f"arg:{index}"] = resolved.path
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[f"arg:{index}"] = resolved.value
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[resolved.path] = resolved.value
+                    elif (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        role = f"arg:{index}"
+                        if not graph.G.has_edge(resolved, node_id):
+                            graph.G.add_edge(resolved, node_id, role=role)
+                        children = graph.G.nodes[resolved].setdefault(
+                            "children", []
+                        )
+                        if (node_id, role) not in children:
+                            children.append((node_id, role))
+                        parents = graph.G.nodes[node_id].setdefault(
+                            "parents", []
+                        )
+                        if (resolved, role) not in parents:
+                            parents.append((resolved, role))
                 for keyword in expression.keywords:
                     if keyword.arg is None:
                         continue
                     resolved = resolve_expression(keyword.value)
                     if isinstance(resolved, _StaticPythonReference):
                         static_arguments[f"kw:{keyword.arg}"] = resolved.path
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[f"kw:{keyword.arg}"] = resolved.value
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[resolved.path] = resolved.value
+                    elif (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        role = f"kw:{keyword.arg}"
+                        if not graph.G.has_edge(resolved, node_id):
+                            graph.G.add_edge(resolved, node_id, role=role)
+                        children = graph.G.nodes[resolved].setdefault(
+                            "children", []
+                        )
+                        if (node_id, role) not in children:
+                            children.append((node_id, role))
+                        parents = graph.G.nodes[node_id].setdefault(
+                            "parents", []
+                        )
+                        if (resolved, role) not in parents:
+                            parents.append((resolved, role))
                 if static_arguments:
                     attributes["static_call_arguments"] = static_arguments
+
+            # A source-defined function may itself be a positional/keyword
+            # value (callbacks, policies, hooks).  Its original Name node was
+            # intentionally removed, so reconnect the compiler-owned static
+            # reference to the call with the argument's real role.
+            if node_id in graph.G:
+                attributes = graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )
+                static_arguments = dict(
+                    attributes.get("static_call_arguments") or {}
+                )
+                for role, argument in (
+                    *tuple(
+                        (f"arg:{index}", argument)
+                        for index, argument in enumerate(expression.args)
+                    ),
+                    *tuple(
+                        (f"kw:{keyword.arg}", keyword.value)
+                        for keyword in expression.keywords
+                        if keyword.arg is not None
+                    ),
+                ):
+                    if (
+                        isinstance(argument, ast.Name)
+                        and isinstance(
+                            getattr(builtins, argument.id, None), type
+                        )
+                    ):
+                        static_arguments[role] = argument.id
+                        attributes.setdefault(
+                            "static_call_values", {}
+                        )[role] = getattr(builtins, argument.id)
+                        graph.G.graph.setdefault(
+                            "static_python_values", {}
+                        )[argument.id] = getattr(builtins, argument.id)
+                if static_arguments:
+                    attributes["static_call_arguments"] = static_arguments
+                for role, argument in (
+                    *tuple(
+                        (f"arg:{index}", argument)
+                        for index, argument in enumerate(expression.args)
+                    ),
+                    *tuple(
+                        (f"kw:{keyword.arg}", keyword.value)
+                        for keyword in expression.keywords
+                        if keyword.arg is not None
+                    ),
+                ):
+                    resolved = resolve_expression(argument)
+                    if not (
+                        isinstance(resolved, int)
+                        and resolved in graph.G
+                        and (graph.G.nodes[resolved].get("attributes") or {}).get(
+                            "first_class_function_ref"
+                        ) is not None
+                    ):
+                        continue
+                    if not graph.G.has_edge(resolved, node_id):
+                        graph.G.add_edge(resolved, node_id, role=role)
+                    children = graph.G.nodes[resolved].setdefault(
+                        "children", []
+                    )
+                    if (node_id, role) not in children:
+                        children.append((node_id, role))
+                    parents = graph.G.nodes[node_id].setdefault(
+                        "parents", []
+                    )
+                    if (resolved, role) not in parents:
+                        parents.append((resolved, role))
 
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
@@ -722,6 +938,7 @@ def _normalize_lexical_values(
         if value is None:
             return
         if isinstance(target, ast.Name):
+            deleted_names.discard(target.id)
             if isinstance(value, _StaticPythonReference):
                 environment.pop(target.id, None)
                 static_environment[target.id] = value
@@ -791,6 +1008,54 @@ def _normalize_lexical_values(
                     (id(static_receiver.value), target.attr)
                 ] = value
             return
+        if isinstance(target, ast.Subscript):
+            if isinstance(value, _StaticPythonReference):
+                raise TypeError(
+                    "a static Python reference cannot be assigned through "
+                    "a runtime tensor index"
+                )
+            base = resolve_expression(target.value)
+            index_expressions = (
+                tuple(target.slice.elts)
+                if isinstance(target.slice, ast.Tuple)
+                else (target.slice,)
+            )
+            indices = tuple(
+                resolve_expression(index) for index in index_expressions
+            )
+            if not isinstance(base, int) or not isinstance(value, int) or not all(
+                isinstance(index, int) for index in indices
+            ):
+                raise TypeError(
+                    "indexed assignment requires resolved tensor, index, "
+                    f"and value nodes in {statement.name}"
+                )
+            node_id = id(target)
+            if (
+                node_id not in graph.G
+                or node_id == base
+                or node_id == value
+                or nx.has_path(graph.G, node_id, value)
+            ):
+                node_id = new_node("IndexedStore", "indexed_store")
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "IndexedStore"
+            node_data["op"] = "IndexedStore"
+            node_data.setdefault("attributes", {})[
+                "source_type"
+            ] = "SubscriptStore"
+            _replace_inputs(
+                graph,
+                node_id,
+                (
+                    (base, "base"),
+                    *((index, "index") for index in indices),
+                    (value, "value"),
+                ),
+            )
+            if isinstance(target.value, ast.Name):
+                bind_target(target.value, node_id)
+            return
         if isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, _StaticPythonReference):
                 raise TypeError(
@@ -813,7 +1078,94 @@ def _normalize_lexical_values(
                 )
                 bind_target(element, projected_id)
 
+    def delete_target(target: ast.AST) -> int | None:
+        """Lower one Python deletion target to its explicit state effect."""
+
+        if isinstance(target, ast.Name):
+            environment.pop(target.id, None)
+            static_environment.pop(target.id, None)
+            deleted_names.add(target.id)
+            _remove_node(graph, id(target))
+            return None
+        if isinstance(target, ast.Attribute):
+            receiver = resolve_expression(target.value)
+            if isinstance(receiver, _StaticPythonReference):
+                receiver = static_reference_node(receiver)
+            if not isinstance(receiver, int):
+                raise TypeError(
+                    "attribute deletion requires a resolved object node in "
+                    f"{statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}, "
+                    f"receiver={receiver!r}"
+                )
+            node_id = id(target)
+            if node_id not in graph.G:
+                node_id = new_node(
+                    "DelAttr",
+                    f"delattr[{target.attr}]",
+                    attributes={"attribute": target.attr},
+                )
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "DelAttr"
+            node_data["op"] = "delattr"
+            node_data.setdefault("attributes", {})["attribute"] = target.attr
+            _replace_inputs(graph, node_id, ((receiver, "object"),))
+            return node_id
+        if isinstance(target, ast.Subscript):
+            base = resolve_expression(target.value)
+            indices = (
+                tuple(target.slice.elts)
+                if isinstance(target.slice, ast.Tuple)
+                else (target.slice,)
+            )
+            resolved_indices = tuple(resolve_expression(index) for index in indices)
+            if not isinstance(base, int) or not all(
+                isinstance(index, int) for index in resolved_indices
+            ):
+                raise TypeError(
+                    "indexed deletion requires resolved container and index "
+                    f"nodes in {statement.name}: "
+                    f"target={ast.dump(target, include_attributes=False)}"
+                )
+            node_id = id(target)
+            if node_id not in graph.G:
+                node_id = new_node("DelItem", "delitem")
+            node_data = graph.G.nodes[node_id]
+            node_data["type"] = "DelItem"
+            node_data["op"] = "delitem"
+            node_data.setdefault("attributes", {})["source_type"] = "Subscript"
+            _replace_inputs(
+                graph,
+                node_id,
+                (
+                    (base, "base"),
+                    *((index, "index") for index in resolved_indices),
+                ),
+            )
+            return node_id
+        if isinstance(target, (ast.Tuple, ast.List)):
+            effects = [delete_target(element) for element in target.elts]
+            return next((effect for effect in reversed(effects) if effect is not None), None)
+        raise TypeError(
+            "unsupported Python deletion target: "
+            f"{ast.dump(target, include_attributes=False)}"
+        )
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
+        if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
+            # Scope declarations affect name binding while parsing; they are
+            # not runtime operations and must never reach an execution
+            # backend as operator nodes.  The reducer's lexical environments
+            # and explicit Input/SetAttr effects carry the resulting values.
+            _remove_node(graph, id(body_statement))
+            return None
+        if isinstance(body_statement, ast.Delete):
+            effects = [delete_target(target) for target in body_statement.targets]
+            _remove_node(graph, id(body_statement))
+            return next(
+                (effect for effect in reversed(effects) if effect is not None),
+                None,
+            )
         if isinstance(body_statement, (ast.Assign, ast.AnnAssign)):
             value = resolve_expression(body_statement.value)
             targets = (
@@ -826,6 +1178,7 @@ def _normalize_lexical_values(
             _remove_node(graph, id(body_statement))
             return value
         if isinstance(body_statement, ast.AugAssign):
+            arena_mask = None
             if isinstance(body_statement.target, ast.Name):
                 current = environment.get(body_statement.target.id)
                 if current is None:
@@ -839,6 +1192,54 @@ def _normalize_lexical_values(
                             else "external"
                         ),
                     )
+            elif (
+                isinstance(body_statement.target, ast.Subscript)
+                and not all(
+                    isinstance(item, ast.Slice)
+                    or (
+                        isinstance(item, ast.Constant)
+                        and (
+                            isinstance(item.value, int)
+                            or item.value is Ellipsis
+                        )
+                    )
+                    or (
+                        isinstance(item, ast.Name)
+                        and environment.get(item.id)
+                        in scalar_loop_binding_ids
+                    )
+                    for item in (
+                        tuple(body_statement.target.slice.elts)
+                        if isinstance(body_statement.target.slice, ast.Tuple)
+                        else (body_statement.target.slice,)
+                    )
+                )
+            ):
+                # Keep aligned boolean-mask updates arena-shaped.  Evaluating
+                # ``field[mask] += rhs[mask]`` literally creates two compact,
+                # data-dependent vectors and then requires a scatter.  The
+                # equivalent functional form
+                # ``field = where(mask, field + rhs, field)`` retains the
+                # preallocated grid shape through every compiler stage.
+                current = resolve_expression(body_statement.target.value)
+                arena_mask = resolve_expression(
+                    body_statement.target.slice
+                )
+                target_slice = ast.dump(
+                    body_statement.target.slice,
+                    include_attributes=False,
+                )
+                for candidate in ast.walk(body_statement.value):
+                    if not isinstance(candidate, ast.Subscript):
+                        continue
+                    if ast.dump(
+                        candidate.slice,
+                        include_attributes=False,
+                    ) != target_slice:
+                        continue
+                    aligned = resolve_expression(candidate.value)
+                    if isinstance(aligned, int):
+                        _redirect_value(graph, id(candidate), aligned)
             else:
                 current = resolve_expression(body_statement.target)
             if current is not None:
@@ -851,6 +1252,22 @@ def _normalize_lexical_values(
             node_id = id(body_statement)
             if current is None or node_id not in graph.G:
                 return None
+            if isinstance(arena_mask, int):
+                where_id = new_node(
+                    "where",
+                    "where",
+                    attributes={
+                        "source_type": "MaskedAugAssign",
+                        "arena_shaped": True,
+                    },
+                    parents=(
+                        (arena_mask, "condition"),
+                        (node_id, "true"),
+                        (current, "false"),
+                    ),
+                )
+                bind_target(body_statement.target.value, where_id)
+                return where_id
             bind_target(body_statement.target, node_id)
             return node_id
         if isinstance(body_statement, ast.Return):
@@ -874,11 +1291,23 @@ def _normalize_lexical_values(
                         str(output_names[index]), []
                     ).append(value)
             if len(expressions) == 1:
-                return resolved[0] if resolved else None
+                value = resolved[0] if resolved else None
+                if value is not None:
+                    graph.G.graph.setdefault(
+                        "return_value_nodes",
+                        {},
+                    )[id(body_statement)] = value
+                return value
             # Preserve the structural tuple/list node for callers that consume
             # it as one Python-shaped value while the output identities above
             # expose each semantic result directly to compiled call binding.
-            return resolve_expression(returned)
+            value = resolve_expression(returned)
+            if value is not None:
+                graph.G.graph.setdefault(
+                    "return_value_nodes",
+                    {},
+                )[id(body_statement)] = value
+            return value
         if isinstance(body_statement, (ast.With, ast.AsyncWith)):
             static_contexts = []
             for item in body_statement.items:
@@ -929,13 +1358,15 @@ def _normalize_lexical_values(
             body_environment = dict(before)
             environment.clear()
             environment.update(body_environment)
+            body_result = None
             for nested in body_statement.body:
-                reduce_statement(nested)
+                body_result = reduce_statement(nested)
             body_environment = dict(environment)
             environment.clear()
             environment.update(before)
+            else_result = None
             for nested in body_statement.orelse:
-                reduce_statement(nested)
+                else_result = reduce_statement(nested)
             else_environment = dict(environment)
             environment.clear()
             environment.update(before)
@@ -963,6 +1394,46 @@ def _normalize_lexical_values(
                             (else_value, "orelse"),
                         ),
                     )
+            def terminal_branch(statements: list[ast.stmt]) -> bool:
+                if not statements:
+                    return False
+                terminal = statements[-1]
+                return isinstance(terminal, (ast.Return, ast.Raise)) or (
+                    isinstance(terminal, ast.If)
+                    and id(terminal) in graph.G
+                    and bool(
+                        (graph.G.nodes[id(terminal)].get("attributes") or {}).get(
+                            "terminal_return_merge"
+                        )
+                    )
+                )
+
+            if (
+                isinstance(test_value, int)
+                and isinstance(body_result, int)
+                and isinstance(else_result, int)
+                and terminal_branch(body_statement.body)
+                and terminal_branch(body_statement.orelse)
+                and id(body_statement) in graph.G
+            ):
+                _replace_inputs(
+                    graph,
+                    id(body_statement),
+                    (
+                        (test_value, "test"),
+                        (body_result, "body"),
+                        (else_result, "orelse"),
+                    ),
+                )
+                graph.G.nodes[id(body_statement)].setdefault(
+                    "attributes", {}
+                ).update({
+                    "terminal_return_merge": True,
+                    "terminal_return_values": (
+                        int(body_result),
+                        int(else_result),
+                    ),
+                })
             return id(body_statement)
         if isinstance(body_statement, ast.Try):
             before = dict(environment)
@@ -1348,6 +1819,12 @@ def _normalize_lexical_values(
                 ].items()
                 if initial in mapping
             }
+        if "terminal_return_values" in attributes:
+            attributes["terminal_return_values"] = tuple(
+                mapping[value_id]
+                for value_id in attributes["terminal_return_values"]
+                if value_id in mapping
+            )
         if "loop_state_effects" in attributes:
             attributes["loop_state_effects"] = tuple(
                 {
@@ -1410,6 +1887,23 @@ def _normalize_lexical_values(
             if child_id in mapping
         ]
 
+    terminal_merges = [
+        int(node_id)
+        for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("terminal_return_merge")
+    ]
+    for merge_id in terminal_merges:
+        branch_values = set(
+            (graph.G.nodes[merge_id].get("attributes") or {}).get(
+                "terminal_return_values", ()
+            )
+        )
+        if branch_values and branch_values.issubset(graph.roots):
+            graph.roots = [
+                root for root in graph.roots if root not in branch_values
+            ]
+            graph.roots.append(merge_id)
+
 
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
     """Apply existing ProcessGraph names to the three structural AST nodes."""
@@ -1432,8 +1926,63 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     call_owners: dict[int, Any] = {}
     method_owners: dict[int, str] = {}
     class_definitions: dict[str, ast.ClassDef] = {}
+    lexical_parent_by_function: dict[int, int] = {}
+    function_definitions = {
+        int(node_id): node_data.get("expr_obj")
+        for node_id, node_data in graph.G.nodes(data=True)
+        if isinstance(
+            node_data.get("expr_obj"),
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
+        )
+    }
+
+    class _DirectNestedFunctionVisitor(ast.NodeVisitor):
+        def __init__(self, owner_id: int):
+            self.owner_id = int(owner_id)
+
+        def visit_FunctionDef(self, node):
+            lexical_parent_by_function[id(node)] = self.owner_id
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            lexical_parent_by_function[id(node)] = self.owner_id
+
+        def visit_ClassDef(self, node):
+            return None
+
+    for owner_id, definition in function_definitions.items():
+        if not isinstance(
+            definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        visitor = _DirectNestedFunctionVisitor(owner_id)
+        for body_member in definition.body:
+            visitor.visit(body_member)
     for _node_id, node_data in graph.G.nodes(data=True):
         class_definition = node_data.get("expr_obj")
+        if isinstance(
+            class_definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            source_identity = getattr(
+                class_definition,
+                "_python_source_identity",
+                None,
+            )
+            qualified = (
+                str(source_identity[1])
+                if (
+                    isinstance(source_identity, tuple)
+                    and len(source_identity) == 2
+                )
+                else ""
+            )
+            parts = tuple(
+                part for part in qualified.split(".") if part != "<locals>"
+            )
+            if "<locals>" not in qualified and len(parts) >= 2:
+                method_owners[id(class_definition)] = parts[-2]
         if not isinstance(class_definition, ast.ClassDef):
             continue
         class_definitions[class_definition.name] = class_definition
@@ -1484,11 +2033,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
         )
         owner_name = method_owners.get(node_id)
-        qualified_name = (
-            f"{owner_name}.{function_name}"
-            if owner_name is not None
-            else function_name
-        )
+
+        def lexical_qualified_name(definition_id: int) -> str:
+            definition = function_definitions[definition_id]
+            identity = getattr(definition, "_python_source_identity", None)
+            if isinstance(identity, tuple) and len(identity) == 2:
+                module_name, python_qualified = map(str, identity)
+                return ".".join(
+                    part
+                    for part in (module_name, python_qualified)
+                    if part
+                )
+            parent_id = lexical_parent_by_function.get(definition_id)
+            if parent_id is not None:
+                return (
+                    f"{lexical_qualified_name(parent_id)}.<locals>."
+                    f"{getattr(definition, 'name', function_name)}"
+                )
+            method_owner = method_owners.get(definition_id)
+            return (
+                f"{method_owner}.{getattr(definition, 'name', function_name)}"
+                if method_owner is not None
+                else str(getattr(definition, "name", function_name))
+            )
+
+        qualified_name = lexical_qualified_name(node_id)
         reference = function_table.declare(
             function_name,
             qualified_name=qualified_name,
@@ -1599,6 +2168,29 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             "field_defaults": class_field_defaults(definition),
         }
         for class_name, definition in class_definitions.items()
+    }
+    for function_node_id, owner_name in method_owners.items():
+        reference = function_nodes.get(function_node_id)
+        if reference is None:
+            continue
+        descriptor = graph.G.graph["class_table"].setdefault(
+            owner_name,
+            {"methods": {}, "fields": (), "field_defaults": {}},
+        )
+        function_definition = graph.G.nodes[function_node_id].get(
+            "expr_obj"
+        )
+        if isinstance(
+            function_definition,
+            (ast.FunctionDef, ast.AsyncFunctionDef),
+        ):
+            descriptor["methods"][function_definition.name] = int(
+                reference.address
+            )
+    method_owner_by_reference = {
+        int(reference.address): method_owners.get(function_node_id)
+        for function_node_id, reference in function_nodes.items()
+        if method_owners.get(function_node_id) is not None
     }
 
     contextual_requirements = list(
@@ -1762,6 +2354,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ),
             )
         }
+    lexical_functions_by_owner: dict[int, dict[str, Any]] = {}
+    for child_id, parent_id in lexical_parent_by_function.items():
+        child_reference = function_nodes.get(child_id)
+        parent_reference = function_nodes.get(parent_id)
+        child_definition = function_definitions.get(child_id)
+        if (
+            child_reference is None
+            or parent_reference is None
+            or not isinstance(
+                child_definition,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+        ):
+            continue
+        lexical_functions_by_owner.setdefault(
+            int(parent_reference.address), {}
+        )[child_definition.name] = child_reference
 
     for _node_id, data in graph.G.nodes(data=True):
         source_type = data.get("type")
@@ -1774,6 +2383,37 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
 
     for node_id, data in list(graph.G.nodes(data=True)):
         expression = data.get("expr_obj")
+        if isinstance(expression, (ast.Nonlocal, ast.Global)):
+            # Root whole-graph deployment regions are formed from this graph,
+            # not only from the normalized per-function copies below.  Scope
+            # declarations are compile-time syntax in both representations.
+            _remove_node(graph, node_id)
+            continue
+        if isinstance(expression, ast.Delete):
+            # The target nodes carry the executable deletion effects.  The
+            # statement wrapper is ordering syntax, not an operator.
+            _remove_node(graph, node_id)
+            continue
+        if (
+            isinstance(expression, ast.Name)
+            and isinstance(expression.ctx, ast.Del)
+        ):
+            # Deleting a lexical binding has no object-level runtime effect.
+            _remove_node(graph, node_id)
+            continue
+        if (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.ctx, ast.Del)
+        ):
+            data["type"] = "DelAttr"
+            data["op"] = "delattr"
+            data.setdefault("attributes", {})["attribute"] = expression.attr
+            _replace_inputs(
+                graph,
+                node_id,
+                ((id(expression.value), "object"),),
+            )
+            continue
         if isinstance(expression, ast.Constant):
             data["type"] = "Constant"
             data["op"] = "const"
@@ -1862,8 +2502,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if isinstance(expression.slice, ast.Tuple)
                 else (expression.slice,)
             )
-            data["type"] = "Indexed"
-            data["op"] = "Indexed"
+            deleting = isinstance(expression.ctx, ast.Del)
+            data["type"] = "DelItem" if deleting else "Indexed"
+            data["op"] = "delitem" if deleting else "Indexed"
             data.setdefault("attributes", {})["source_type"] = "Subscript"
             _replace_inputs(
                 graph,
@@ -1903,6 +2544,28 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data["type"] = operation
             data["op"] = operation
             data.setdefault("attributes", {})["source_type"] = "Call"
+            receiver_name = (
+                expression.func.value.id
+                if isinstance(expression.func.value, ast.Name)
+                else None
+            )
+            call_owner = call_owners.get(node_id)
+            lexical_class = (
+                method_owner_by_reference.get(int(call_owner.address))
+                if call_owner is not None
+                else None
+            )
+            if receiver_name in {"self", "cls"} and lexical_class is not None:
+                method_reference = (
+                    graph.G.graph.get("class_table", {})
+                    .get(lexical_class, {})
+                    .get("methods", {})
+                    .get(expression.func.attr)
+                )
+                if method_reference is not None:
+                    data.setdefault("attributes", {})["method_ref"] = int(
+                        method_reference
+                    )
             _replace_inputs(
                 graph,
                 node_id,
@@ -2210,6 +2873,32 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             for value in function_return_values.get(node_id, ())
             if value in graph.G
         ]
+        terminal_merges = [
+            int(member)
+            for member in graph.G
+            if (
+                (graph.G.nodes[member].get("attributes") or {}).get(
+                    "terminal_return_merge"
+                )
+                and set(
+                    (graph.G.nodes[member].get("attributes") or {}).get(
+                        "terminal_return_values", ()
+                    )
+                ).issubset(return_values)
+            )
+        ]
+        if terminal_merges:
+            merged_values = {
+                int(value)
+                for member in terminal_merges
+                for value in (
+                    graph.G.nodes[member].get("attributes") or {}
+                ).get("terminal_return_values", ())
+            }
+            return_values = [
+                value for value in return_values if value not in merged_values
+            ]
+            return_values.extend(terminal_merges)
         statement = graph.G.nodes[node_id].get("expr_obj")
         definition_static_bindings = dict(
             getattr(statement, "_python_bindings", static_bindings)
@@ -2482,6 +3171,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             normalization_statement,
             definition_static_bindings,
             function_table,
+            lexical_functions_by_owner.get(int(reference.address), {}),
         )
         generator_yields = tuple(
             node_id

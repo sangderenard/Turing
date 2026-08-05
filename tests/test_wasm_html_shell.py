@@ -927,3 +927,20 @@ def test_transcript_survives_with_no_optional_data_at_all():
     html = emit_html_shell(_artifact().api).html
     assert 'id="program-transcript"' in html
     assert "No feedback network attached" in html
+
+
+def test_machine_snapshot_liaison_has_bounded_live_transport_and_input_port():
+    html = emit_html_shell(
+        _artifact().api,
+        shader_execution={
+            "url": "display.frag.glsl", "language": "webgl2-glsl-es",
+            "stage": "fragment", "role": "shader-surface",
+        },
+    ).html
+
+    assert 'connect(endpoint = "/snapshot", options = {})' in html
+    assert '"after=" + this.generation' in html
+    assert 'cache: "no-store"' in html
+    assert "this.disconnect();" in html
+    assert "async sendTerminalInput(value)" in html
+    assert 'String(options.inputEndpoint || "/input")' in html

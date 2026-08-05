@@ -9,12 +9,14 @@ the ordinary AST/Control/SSA pipeline emitted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 from typing import Any, Mapping
+from typing import Callable
 
 import numpy as np
 
@@ -799,8 +801,339 @@ def compile_fortran_module_c_shell(
     )
 
 
+def compile_ast_fortran_c_shell(
+    source: str,
+    entrypoint: str,
+    feeds: Mapping[str, Any],
+    directory: str | Path,
+    *,
+    python_bindings: Mapping[str, Any] | None = None,
+    output_names: tuple[str, ...] | list[str] | None = None,
+    state_feedback: Mapping[str, str] | None = None,
+    display: Mapping[str, Any] | None = None,
+    name: str | None = None,
+    standalone: bool = True,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: bool | str | Path = False,
+) -> FortranCShellExecutable:
+    """Compile Python AST through the registered Fortran target and C shell.
+
+    This is the application-neutral native entrypoint.  It accepts authored
+    Python, runs the ordinary ProcessGraph/AOT compiler, projects that
+    compiler's public numerical program, and only then selects Fortran.
+    Dotted aggregate feed names such as ``state.u`` are resolved from the
+    caller's object without flattening or copying its arena in Python source.
+    """
+
+    from ..common.tensors.accelerator_backends.aot_compile import (
+        compile_ast_aot,
+        project_public_numerical_program,
+    )
+    from .machine_targets import get_target
+    from .shell_io import (
+        ShellIOBinding,
+        ShellIOCapability,
+        ShellIOManifest,
+        ShellIORequest,
+        attach_shell_io,
+    )
+
+    compilation = compile_ast_aot(
+        source,
+        entrypoint,
+        dict(feeds),
+        backend="c",
+        precompile_only=True,
+        bake_mode="whole_program",
+        python_bindings=dict(python_bindings or {}),
+        progress=progress,
+        checkpoint=checkpoint,
+    )
+    hierarchical_outputs = dict(compilation.public_output_value_ids)
+    hierarchical_inputs = dict(compilation.public_input_value_ids)
+    if output_names is not None and hierarchical_outputs:
+        names = tuple(map(str, output_names))
+        if set(hierarchical_outputs) <= set(names):
+            pass
+        elif len(names) != len(hierarchical_outputs):
+            raise ValueError(
+                f"received {len(names)} output names for "
+                f"{len(hierarchical_outputs)} hierarchical outputs"
+            )
+        else:
+            hierarchical_outputs = {
+                output_name: value_id
+                for output_name, value_id in zip(
+                    names, hierarchical_outputs.values()
+                )
+            }
+
+    artifact_name = str(name or entrypoint)
+    module = None
+    if hierarchical_outputs and compilation.region_programs:
+        from ..transmogrifier.ssa import IRModule
+        from .precompile_to_ssa import lower_precompile_and_control_to_ssa
+        from .precompile_ssa_validator import (
+            validate_precompile_ssa_compatibility,
+        )
+        from .ssa_fortran_backend import emit_module
+
+        identity_table = {
+            **dict(compilation.identity_table),
+            **{
+                source_name: (int(value_id),)
+                for source_name, value_id in hierarchical_inputs.items()
+            },
+            **{
+                source_name: (int(value_id),)
+                for source_name, value_id in hierarchical_outputs.items()
+            },
+        }
+        numerical_seed = next(
+            (
+                candidate
+                for candidate in compilation.region_programs.values()
+                if validate_precompile_ssa_compatibility(
+                    candidate
+                ).valid_precompile
+            ),
+            None,
+        )
+        if numerical_seed is None:
+            raise FortranEmissionError(
+                "hierarchical AST program has no structurally valid "
+                "numerical region"
+            )
+        lowering = lower_precompile_and_control_to_ssa(
+            numerical_seed,
+            compilation.shell_control_program,
+            region_programs=dict(compilation.region_programs),
+            numerical_name=f"{artifact_name}_discovery",
+            control_name=artifact_name,
+            identity_table=identity_table,
+            function_outputs=tuple(hierarchical_outputs),
+            function_parameters=tuple(hierarchical_inputs),
+        )
+        if lowering.shortfalls or not lowering.validation.valid_precompile:
+            raise FortranEmissionError(
+                lowering.shortfall_report()
+                + f"; format_issues={lowering.validation.format_issues!r}"
+            )
+        functions = {
+            function_name: function
+            for function_name, function in lowering.module.functions.items()
+            if function_name == artifact_name
+            or function_name.startswith("numerical_region_")
+        }
+
+        def returned_values(function: Any) -> tuple[Any, ...]:
+            returns = tuple(
+                instruction.args
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"Ret", "ret", "Return", "return"}
+            )
+            return tuple(returns[-1]) if returns else ()
+
+        module = emit_module(
+            IRModule(functions),
+            name=f"{artifact_name}_fortran",
+            outputs={
+                function_name: returned_values(function)
+                for function_name, function in functions.items()
+            },
+        )
+        if not module.complete:
+            raise FortranEmissionError(
+                "Fortran target could not emit hierarchical AST program: "
+                + "; ".join(item.format() for item in module.shortfalls)
+            )
+
+    program = project_public_numerical_program(compilation)
+    if module is None and output_names is not None:
+        names = tuple(map(str, output_names))
+        if len(names) != len(program.outputs):
+            metadata = program.meta or {}
+            output_summary = tuple(
+                (
+                    output_name,
+                    tuple(getattr(metadata.get(value_id), "shape", ()) or ()),
+                )
+                for output_name, value_id in program.outputs.items()
+            )
+            declared = {
+                output_name: tuple(
+                    compilation.identity_table.get(output_name, ())
+                )
+                for output_name in compilation.function_outputs
+            }
+            available = {
+                *map(int, program.feeds),
+                *(int(step.result_id) for step in program.steps),
+                *map(int, program.outputs.values()),
+            }
+            raise ValueError(
+                f"received {len(names)} output names for "
+                f"{len(program.outputs)} compiled outputs; "
+                f"declared={declared!r}; "
+                f"declared_available={{{', '.join(f'{key!r}: {tuple(value in available for value in values)!r}' for key, values in declared.items())}}}; "
+                f"first={output_summary[:16]!r}; last={output_summary[-16:]!r}"
+            )
+        program = replace(
+            program,
+            outputs={
+                output_name: value_id
+                for output_name, value_id in zip(
+                    names, program.outputs.values()
+                )
+            },
+        )
+    if module is None:
+        emitted = get_target("fortran").emit(program, name=artifact_name)
+        if not emitted.complete or emitted.module is None:
+            raise FortranEmissionError(
+                "Fortran target could not emit compiled AST program: "
+                + "; ".join(emitted.shortfalls)
+            )
+        module = emitted.module
+    if display is not None:
+        options = dict(display)
+        channels = tuple(
+            map(str, options.pop("channels", ("red", "green", "blue")))
+        )
+        if channels != ("red", "green", "blue"):
+            raise ValueError(
+                "native rgb_f64_planar display requires red, green, blue"
+            )
+        manifest = ShellIOManifest(
+            requests=(ShellIORequest.create(
+                ShellIOCapability.DISPLAY,
+                attributes={
+                    "pixel_format": "rgb_f64_planar",
+                    **options,
+                },
+            ),),
+            bindings=tuple(
+                ShellIOBinding(
+                    f"display.{channel}", artifact_name, channel
+                )
+                for channel in channels
+            ),
+        )
+        module = replace(module, api=attach_shell_io(module.api, manifest))
+
+    def resolve_source_name(source_name: str) -> Any:
+        if source_name in feeds:
+            return feeds[source_name]
+        root, *attributes = source_name.split(".")
+        if root not in feeds:
+            raise KeyError(source_name)
+        value = feeds[root]
+        for attribute in attributes:
+            value = getattr(value, attribute)
+        return value
+
+    native_inputs: dict[str, Any] = {}
+    public_input_names_by_id = {
+        int(value_id): str(source_name)
+        for source_name, value_id in (
+            compilation.public_input_value_ids or {}
+        ).items()
+    }
+
+    def resolve_compiled_value(value_id: int) -> Any:
+        visited = set()
+        current = int(value_id)
+        while current not in visited:
+            visited.add(current)
+            if current in compilation.region_feed_values:
+                return compilation.region_feed_values[current]
+            source_name = public_input_names_by_id.get(current)
+            if source_name is not None:
+                return resolve_source_name(source_name)
+            alias = compilation.hierarchical_value_aliases.get(current)
+            if alias is None:
+                break
+            current = int(alias)
+        raise KeyError(value_id)
+
+    entry = module.api.entry_point(artifact_name)
+    for parameter in entry.parameters:
+        if parameter.role != "input":
+            continue
+        source_name = str(parameter.source_name or parameter.name)
+        try:
+            native_inputs[source_name] = resolve_source_name(source_name)
+        except (AttributeError, KeyError) as error:
+            if parameter.name.startswith("t"):
+                try:
+                    value_id = int(parameter.name[1:])
+                except ValueError:
+                    value_id = -1
+                try:
+                    native_inputs[source_name] = resolve_compiled_value(
+                        value_id
+                    )
+                except (AttributeError, KeyError):
+                    pass
+                else:
+                    continue
+            raise ValueError(
+                f"compiled input {source_name!r} ({parameter.shape!r}) "
+                "has no value in feeds or the captured region cache; "
+                f"endpoint={compilation.hierarchical_value_diagnostics.get(value_id)!r}"
+            ) from error
+    resolved_feedback = dict(state_feedback or {})
+    abi_source_names = {
+        str(parameter.source_name or parameter.name)
+        for parameter in entry.parameters
+        if parameter.role != "extent"
+    }
+
+    def canonical_hierarchy_value(value_id: int) -> int:
+        visited = set()
+        current = int(value_id)
+        while current not in visited:
+            visited.add(current)
+            alias = compilation.hierarchical_value_aliases.get(current)
+            if alias is None:
+                return current
+            current = int(alias)
+        return current
+
+    for input_name, output_name in tuple(resolved_feedback.items()):
+        if output_name in abi_source_names or input_name not in abi_source_names:
+            continue
+        input_id = compilation.public_input_value_ids.get(input_name)
+        output_id = compilation.public_output_value_ids.get(output_name)
+        if output_id is None:
+            history = tuple(compilation.identity_table.get(output_name, ()))
+            output_id = history[-1] if history else None
+        if (
+            input_id is not None
+            and output_id is not None
+            and canonical_hierarchy_value(int(input_id))
+            == canonical_hierarchy_value(int(output_id))
+        ):
+            # The declared function output is the same preallocated arena as
+            # its input.  Fortran correctly publishes one inout ABI parameter
+            # rather than allocating a copy-only output.  Point feedback at
+            # that shared slot so the C shell preserves the alias contract.
+            resolved_feedback[input_name] = input_name
+    return compile_fortran_module_c_shell(
+        module,
+        native_inputs,
+        directory,
+        entrypoint=artifact_name,
+        state_feedback=resolved_feedback,
+        name=artifact_name,
+        standalone=standalone,
+    )
+
+
 __all__ = [
     "FortranCShellExecutable",
     "compile_fortran_module_c_shell",
+    "compile_ast_fortran_c_shell",
     "emit_fortran_c_shell_source",
 ]

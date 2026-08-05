@@ -5,17 +5,78 @@ import json
 import numpy as np
 import pytest
 
+from src.common.tensors.abstraction import AbstractTensor
 from src.compiler.compiled_program_api import (
     CompiledProgramAPI,
     EntryPoint,
     Parameter,
 )
-from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+from src.compiler.fortran_c_shell import (
+    compile_ast_fortran_c_shell,
+    compile_fortran_module_c_shell,
+)
 from src.compiler.fortran_c_shell import emit_fortran_c_shell_source
 from src.compiler.ssa_fortran_backend import FortranModule, fortran_compiler
 from src.compiler.shell_io import (
     ShellIOManifest, ShellIORequest, SystemPort, attach_shell_io,
 )
+
+
+class _ArenaState:
+    def __init__(self):
+        self.values = np.arange(4.0)
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_ast_c_shell_resolves_and_rotates_dotted_object_arenas(tmp_path):
+    artifact = compile_ast_fortran_c_shell(
+        "def frame(state):\n"
+        "    state.values += 1.0\n"
+        "    return state.values\n",
+        "frame",
+        {"state": _ArenaState()},
+        tmp_path,
+        output_names=("values_out",),
+        state_feedback={"state.values": "values_out"},
+    )
+
+    payload = json.loads(artifact.run(frames=2).stdout)
+
+    assert payload["outputs"]["values_out"] == {
+        "first": 2.0,
+        "sum": 14.0,
+    }
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None,
+    reason="no Fortran compiler installed",
+)
+def test_ast_c_shell_uses_captured_early_return_identity(tmp_path):
+    artifact = compile_ast_fortran_c_shell(
+        "def restore(value, ref):\n"
+        "    if isinstance(ref, AbstractTensor):\n"
+        "        return value\n"
+        "    return float(value.item())\n"
+        "\n"
+        "def frame(dt):\n"
+        "    return restore(dt * 2.0, dt)\n",
+        "frame",
+        {"dt": np.asarray([0.05], dtype=np.float64)},
+        tmp_path,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        output_names=("value_out",),
+    )
+
+    payload = json.loads(artifact.run().stdout)
+
+    assert payload["outputs"]["value_out"] == {
+        "first": pytest.approx(0.1),
+        "sum": pytest.approx(0.1),
+    }
 
 
 @pytest.mark.skipif(

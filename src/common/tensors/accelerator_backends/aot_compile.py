@@ -98,11 +98,15 @@ import ast
 import contextlib
 import inspect
 import io
+import types
+from pathlib import Path
 from dataclasses import dataclass, field
 from collections.abc import Iterable
 from typing import Any, Callable, Mapping
 
 from ....compiler.glsl_deployment_strategy import (
+    _build_hierarchical_glsl_artifact,
+    _control_partition_keys,
     _walk_planned_shells,
     propagate_bound_planner_specializations,
     strategize_shell_deployment,
@@ -114,9 +118,13 @@ from ....compiler.shell_reference_tables import (
 from ....compiler.precompile_to_ssa import lower_class_navigation_to_ssa
 from ....transmogrifier.graph.graph_express2 import ProcessGraph
 from ..abstraction import AbstractTensor
-from ..topological_reducer import reduce_abstract_tensor_topology
+from ..topological_reducer import (
+    _normalize_lexical_values,
+    reduce_abstract_tensor_topology,
+)
 from ..fused_ir import FusedProgram
 from .dual_ir_shell import DualIRShell, compose_dual_ir_shell
+from .aot_checkpoint import AOTCheckpointStore, callable_digest
 
 
 AOT_BAKE_MODES = frozenset({"one_shot", "whole_program"})
@@ -177,6 +185,51 @@ def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
     )
 
 
+def _expand_python_static_bindings(
+    bindings: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve referenced globals of supplied functions and classes."""
+
+    expanded = dict(bindings or {})
+    queue = list(expanded.values())
+    visited: set[int] = set()
+    while queue:
+        value = queue.pop()
+        if id(value) in visited:
+            continue
+        visited.add(id(value))
+        targets = (
+            tuple(vars(value).values())
+            if inspect.isclass(value)
+            else (value.__func__ if inspect.ismethod(value) else value,)
+        )
+        for target in targets:
+            code = getattr(target, "__code__", None)
+            namespace = getattr(target, "__globals__", None)
+            if code is None or not isinstance(namespace, dict):
+                continue
+            pending_codes = [code]
+            seen_codes: set[int] = set()
+            while pending_codes:
+                nested_code = pending_codes.pop()
+                if id(nested_code) in seen_codes:
+                    continue
+                seen_codes.add(id(nested_code))
+                pending_codes.extend(
+                    constant
+                    for constant in nested_code.co_consts
+                    if isinstance(constant, types.CodeType)
+                )
+                for name in nested_code.co_names:
+                    if name not in namespace:
+                        continue
+                    dependency = namespace[name]
+                    if name not in expanded:
+                        expanded[name] = dependency
+                        queue.append(dependency)
+    return expanded
+
+
 @dataclass(frozen=True)
 class AOTCompilation:
     entrypoint: str
@@ -194,11 +247,24 @@ class AOTCompilation:
     # to find the producers of a loop's carried updates; without them a
     # program whose control shell has regions cannot be lowered.
     region_programs: Mapping[int, Any] = field(default_factory=dict)
+    region_feed_values: Mapping[int, Any] = field(default_factory=dict)
     # Retained by the reduced function ProcessGraph: source name -> complete
     # canonical value-ID history. ``function_outputs`` selects public names.
     identity_table: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     function_outputs: tuple[str, ...] = ()
     function_parameters: tuple[str, ...] = ()
+    # Global value identities authored by hierarchical composition.  These
+    # bridge source names (including aggregate paths such as ``state.u``) to
+    # the captured region/control namespace; local ProcessGraph node IDs are
+    # not interchangeable with these values.
+    public_input_value_ids: Mapping[str, int] = field(default_factory=dict)
+    public_output_value_ids: Mapping[str, int] = field(default_factory=dict)
+    hierarchical_value_diagnostics: Mapping[int, Any] = field(
+        default_factory=dict
+    )
+    hierarchical_value_aliases: Mapping[int, int] = field(
+        default_factory=dict
+    )
     # Planner-owned control that could not be represented by the exported
     # ControlProgram.  A whole-program backend must reject these rather than
     # silently baking the numerical trace observed during discovery.
@@ -373,6 +439,8 @@ def compile_ast_aot(
     mutable_parameters: tuple[str, ...] | list[str] | set[str] = (),
     retain: Any = (),
     progress: "Callable[[str], None] | None" = None,
+    checkpoint: bool | str | Path = False,
+    resume: bool = True,
 ) -> AOTCompilation:
     """Compile ``entrypoint`` in ``source`` ahead-of-time and execute it once.
 
@@ -400,77 +468,240 @@ def compile_ast_aot(
     )
     constant_map = dict(constant_map or {})
     mutable_parameters = tuple(dict.fromkeys(map(str, mutable_parameters)))
-    _report("aot: applying constant map")
-    module = _apply_parameter_constant_map(
-        ast.parse(source), entrypoint, constant_map, mutable_parameters
+    expanded_python_bindings = _expand_python_static_bindings(
+        python_bindings
     )
+    checkpoint_store = None
+    frontend_implementation = callable_digest(
+        ProcessGraph.build_from_ast,
+        reduce_abstract_tensor_topology,
+        _normalize_lexical_values,
+        propagate_bound_planner_specializations,
+        build_map_dependency_regions,
+        build_class_navigation_table,
+    )
+    source_graph_implementation = callable_digest(
+        ProcessGraph.build_from_ast,
+        _apply_parameter_constant_map,
+    )
+    # A compiled plan contains the frontend's resolved call identities and
+    # reduced topology, not merely the scheduler's output.  Any frontend IR
+    # change must therefore invalidate the downstream plan checkpoint; a
+    # capture/coordinator-only change may continue to reuse it.
+    planning_implementation = callable_digest(
+        strategize_shell_deployment,
+        _control_partition_keys,
+        frontend_implementation,
+    )
+    if checkpoint:
+        binding_values = tuple(
+            value
+            for _name, value in sorted(
+                (python_bindings or {}).items(), key=lambda pair: str(pair[0])
+            )
+            if callable(value)
+        )
+        checkpoint_store = AOTCheckpointStore(
+            {
+                "source": source,
+                "entrypoint": entrypoint,
+                "feeds": dict(feeds),
+                "backend": backend,
+                "remove_loops": bool(remove_loops),
+                "unroll_limit": int(unroll_limit),
+                "bake_mode": bake_mode,
+                "schedule_preference": schedule_preference,
+                "constant_map": constant_map,
+                "mutable_parameters": mutable_parameters,
+                "retain": retain,
+                "python_binding_sources": callable_digest(*binding_values),
+            },
+            None if checkpoint is True else checkpoint,
+        )
+
+    deployment = None
+    if checkpoint_store is not None and resume:
+        _report("aot: loading compiled-plan checkpoint")
+        deployment = checkpoint_store.load(
+            "compiled_plan",
+            planning_implementation,
+        )
+        if deployment is not None:
+            _report("aot: resumed compiled-plan checkpoint")
+            graph = deployment.process_graph
+            map_ir = dict(graph.G.graph.get("map_ir") or {})
+        else:
+            _report(
+                "aot: compiled-plan checkpoint unavailable "
+                f"({checkpoint_store.last_load_status})"
+            )
+
+    graph = None if deployment is None else graph
+    frontend_ready = graph is not None
+    if deployment is None and checkpoint_store is not None and resume:
+        _report("aot: loading frontend checkpoint")
+        graph = checkpoint_store.load(
+            "frontend",
+            frontend_implementation,
+        )
+        if graph is not None:
+            _report("aot: resumed frontend checkpoint")
+            map_ir = dict(graph.G.graph.get("map_ir") or {})
+            frontend_ready = True
+        else:
+            _report(
+                "aot: frontend checkpoint unavailable "
+                f"({checkpoint_store.last_load_status})"
+            )
+
+    if graph is None and checkpoint_store is not None and resume:
+        _report("aot: loading source-graph checkpoint")
+        graph = checkpoint_store.load(
+            "source_graph",
+            source_graph_implementation,
+        )
+        if graph is not None:
+            _report("aot: resumed source-graph checkpoint")
+        else:
+            _report(
+                "aot: source-graph checkpoint unavailable "
+                f"({checkpoint_store.last_load_status})"
+            )
+
+    if graph is None:
+        _report("aot: applying constant map")
+        module = _apply_parameter_constant_map(
+            ast.parse(source), entrypoint, constant_map, mutable_parameters
+        )
     # This graph is a second, independent ProcessGraph build -- the caller
     # (site_bundle.build_program_bundle) already built and reduced one of
     # its own moments ago for telemetry/summarize_process_graph. They are
     # not the same object and this does not reuse that work; real, currently
     # unavoidable duplicate compute, not just an unlogged phase.
-    graph = ProcessGraph(materialize_memory=False)
+        graph = ProcessGraph(materialize_memory=False)
     # AOT compilation may target a function from a live module.  Its resolved
     # globals are static closure values, not runtime tensor feeds.  Capturing
     # them here lets the reducer retain computed constants and imported
     # references without executing or reinterpreting their source expressions.
-    graph.python_bindings = dict(python_bindings or {})
-    _report("aot: building process graph (second, independent build)")
-    with contextlib.redirect_stdout(io.StringIO()):
-        graph.build_from_ast(
-            module,
-            resolve_unresolved_parents=True,
-            parent_include=_source_dependency_is_not_tensor_primitive,
-            retain=retain,
-            progress=_report,
-        )
-    _report("aot: reducing abstract tensor topology")
-    reduce_abstract_tensor_topology(graph)
-    _report("aot: propagating bound planner specializations")
-    propagate_bound_planner_specializations(
-        graph, entrypoint, feeds
-    )
-    _report("aot: building map dependency regions")
-    dependency_regions = build_map_dependency_regions(graph, entrypoint)
-    map_ir = dict(graph.G.graph.get("map_ir") or {})
-    map_ir["dependency_regions"] = {
-        "runtime": dependency_regions.runtime,
-        "mapped": dependency_regions.mapped,
-        "retained": dependency_regions.retained,
-        "map_only": dependency_regions.map_only,
-        "bindings": dependency_regions.bindings,
-    }
-    _report("aot: building class navigation table")
-    class_navigation = build_class_navigation_table(graph)
-    map_ir["class_navigation"] = class_navigation
-    navigation_ssa = lower_class_navigation_to_ssa(class_navigation)
-    map_ir["semantic_methods"] = tuple(
-        {
-            "function": function.name,
-            "operations": tuple(dict.fromkeys(
-                instruction.op
-                for instruction in function.blocks["entry"].instrs
-            )),
-        }
-        for function in navigation_ssa.functions.values()
-    )
-    graph.G.graph["map_ir"] = map_ir
+        graph.python_bindings = dict(expanded_python_bindings)
+        _report("aot: building process graph (second, independent build)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph.build_from_ast(
+                module,
+                resolve_unresolved_parents=True,
+                parent_include=_source_dependency_is_not_tensor_primitive,
+                retain=retain,
+                progress=_report,
+            )
+        if checkpoint_store is not None:
+            _report("aot: saving source-graph checkpoint")
+            try:
+                checkpoint_store.store(
+                    "source_graph",
+                    source_graph_implementation,
+                    graph,
+                )
+            except Exception as error:
+                _report(
+                    "aot: source-graph checkpoint skipped "
+                    f"({type(error).__name__}: {error})"
+                )
 
-    _report("aot: strategizing glsl deployment (scheduling/planning pass)")
-    deployment_type = strategize_shell_deployment(
-        graph,
-        backend=backend,
-        remove_loops=remove_loops,
-        unroll_limit=unroll_limit,
-        schedule_preference=schedule_preference,
-    )
+    if not frontend_ready:
+        _report("aot: reducing abstract tensor topology")
+        reduce_abstract_tensor_topology(graph)
+        _report("aot: propagating bound planner specializations")
+        propagate_bound_planner_specializations(
+            graph, entrypoint, feeds
+        )
+        _report("aot: building map dependency regions")
+        dependency_regions = build_map_dependency_regions(graph, entrypoint)
+        map_ir = dict(graph.G.graph.get("map_ir") or {})
+        map_ir["dependency_regions"] = {
+            "runtime": dependency_regions.runtime,
+            "mapped": dependency_regions.mapped,
+            "retained": dependency_regions.retained,
+            "map_only": dependency_regions.map_only,
+            "bindings": dependency_regions.bindings,
+        }
+        _report("aot: building class navigation table")
+        class_navigation = build_class_navigation_table(graph)
+        map_ir["class_navigation"] = class_navigation
+        navigation_ssa = lower_class_navigation_to_ssa(class_navigation)
+        map_ir["semantic_methods"] = tuple(
+            {
+                "function": function.name,
+                "operations": tuple(dict.fromkeys(
+                    instruction.op
+                    for instruction in function.blocks["entry"].instrs
+                )),
+            }
+            for function in navigation_ssa.functions.values()
+        )
+        graph.G.graph["map_ir"] = map_ir
+        if checkpoint_store is not None:
+            _report("aot: saving frontend checkpoint")
+            try:
+                checkpoint_store.store(
+                    "frontend",
+                    frontend_implementation,
+                    graph,
+                )
+            except Exception as error:
+                _report(
+                    "aot: frontend checkpoint skipped "
+                    f"({type(error).__name__}: {error})"
+                )
+
+    if deployment is None:
+        _report("aot: strategizing glsl deployment (scheduling/planning pass)")
+        deployment_type = strategize_shell_deployment(
+            graph,
+            backend=backend,
+            remove_loops=remove_loops,
+            unroll_limit=unroll_limit,
+            schedule_preference=schedule_preference,
+        )
     # shell_language is fixed at "glsl", the one path that actually emits
     # something distinct -- see this module's docstring. It is not derived
     # from backend= any more; there is no shell "kind" left to pick.
-    deployment = deployment_type(profiling=profiling, shell_language="glsl")
+        deployment = deployment_type(profiling=profiling, shell_language="glsl")
     try:
-        _report("aot: compile_process_graph (usually the largest phase)")
-        deployment.compile_process_graph()
+        planned_shells = tuple(_walk_planned_shells(deployment))
+        for planned_shell in planned_shells:
+            planned_shell.static_python_bindings = {
+                **expanded_python_bindings,
+                **planned_shell.static_python_bindings,
+            }
+        if not getattr(deployment, "whole_program_compiled", False):
+            _report("aot: compile_process_graph (usually the largest phase)")
+            deployment.compile_process_graph()
+            if checkpoint_store is not None:
+                _report("aot: saving compiled-plan checkpoint")
+                saved_static_bindings = []
+                try:
+                    for planned_shell in planned_shells:
+                        if "static_python_bindings" not in planned_shell.__dict__:
+                            continue
+                        saved_static_bindings.append((
+                            planned_shell,
+                            planned_shell.__dict__.pop(
+                                "static_python_bindings"
+                            ),
+                        ))
+                    checkpoint_store.store(
+                        "compiled_plan",
+                        planning_implementation,
+                        deployment,
+                    )
+                except Exception as error:
+                    _report(
+                        "aot: compiled-plan checkpoint skipped "
+                        f"({type(error).__name__}: {error})"
+                    )
+                finally:
+                    for planned_shell, bindings in saved_static_bindings:
+                        planned_shell.static_python_bindings = bindings
         reference = graph.function_table.reference(entrypoint)
         if reference is None:
             raise ValueError(
@@ -486,6 +717,46 @@ def compile_ast_aot(
         function_shell.capture_fused_programs(
             feeds, precompile_only=precompile_only
         )
+        # Planning composes once before this explicit AOT capture has filled
+        # every local region.  Recompose bottom-up now that the numerical
+        # programs exist; otherwise callers see local regions but an empty
+        # hierarchy and cannot link nested methods/loops into a whole program.
+        for planned_shell in tuple(dict.fromkeys((
+            function_shell,
+            deployment,
+        ))):
+            if not getattr(planned_shell, "callsite_function_shells", None):
+                continue
+            try:
+                hierarchical_artifact = _build_hierarchical_glsl_artifact(
+                    planned_shell
+                )
+            except Exception as error:
+                if not (
+                    getattr(
+                        planned_shell,
+                        "hierarchical_control_program",
+                        None,
+                    )
+                    and getattr(
+                        planned_shell,
+                        "hierarchical_captured_region_programs",
+                        {},
+                    )
+                ):
+                    _report(
+                        "aot: hierarchy recomposition skipped "
+                        f"({type(error).__name__}: {str(error)[:320]})"
+                    )
+                    continue
+                _report(
+                    "aot: optional GLSL hierarchy emission skipped "
+                    f"({type(error).__name__}: {str(error)[:320]})"
+                )
+                hierarchical_artifact = None
+            if hierarchical_artifact is not None:
+                planned_shell.composed_shell_artifact = hierarchical_artifact
+                planned_shell.hierarchical_shell_composed = True
         if precompile_only:
             # No GLSL was emitted, so there is nothing to execute here; the
             # caller wants the backend-agnostic FusedProgram/ControlProgram
@@ -549,16 +820,86 @@ def compile_ast_aot(
             if reduction.region_indices
             and reduction.control_program is None
         )
+        entry_output_names = tuple(map(
+            str,
+            function_shell.process_graph.G.graph.get("function_outputs")
+            or (),
+        ))
+        hierarchy_candidates = tuple(dict.fromkeys((
+            function_shell,
+            deployment,
+            *_walk_planned_shells(deployment),
+        )))
+        _report(
+            "aot: hierarchy candidates "
+            + repr(tuple(
+                (
+                    candidate.process_graph.G.graph.get("function_name"),
+                    len(getattr(
+                        candidate,
+                        "hierarchical_captured_region_programs",
+                        {},
+                    ) or {}),
+                    tuple((
+                        getattr(
+                            getattr(candidate, "composed_shell_artifact", None),
+                            "terminal_outputs",
+                            {},
+                        )
+                        or getattr(
+                            candidate,
+                            "hierarchical_terminal_outputs",
+                            {},
+                        )
+                        or {}
+                    ).keys()),
+                    getattr(candidate, "hierarchical_compose_failure", None),
+                )
+                for candidate in hierarchy_candidates
+                if getattr(
+                    candidate,
+                    "hierarchical_captured_region_programs",
+                    {},
+                )
+                or getattr(candidate, "hierarchical_compose_failure", None)
+            ))
+        )
+        hierarchy_owner = max(
+            hierarchy_candidates,
+            key=lambda candidate: (
+                len(
+                    set(entry_output_names)
+                    & set(
+                        getattr(
+                            getattr(candidate, "composed_shell_artifact", None),
+                            "terminal_outputs",
+                            {},
+                        )
+                        or getattr(
+                            candidate,
+                            "hierarchical_terminal_outputs",
+                            {},
+                        )
+                        or {}
+                    )
+                ),
+                bool(getattr(
+                    candidate,
+                    "hierarchical_captured_region_programs",
+                    {},
+                )),
+            ),
+        )
         hierarchical_control = getattr(
-            function_shell, "hierarchical_control_program", None
+            hierarchy_owner, "hierarchical_control_program", None
         )
         hierarchical_regions = getattr(
-            function_shell,
+            hierarchy_owner,
             "hierarchical_captured_region_programs",
             {},
         )
         if hierarchical_control is not None and hierarchical_regions:
-            source_shell = function_shell
+            source_shell = hierarchy_owner
             shell_control_program = hierarchical_control
             selected_regions = hierarchical_regions
         else:
@@ -566,14 +907,80 @@ def compile_ast_aot(
             selected_regions = getattr(
                 source_shell, "captured_region_programs", {}
             ) or {}
-        compiled_shell_program = source_shell.compiled_shell_program
+        # A nested shell may own the retained loop/control regions, but it is
+        # never the public numerical function the caller requested.  Keeping
+        # these coupled replaced an entrypoint such as ``page`` with the
+        # first nested loop owner (for example ``_project``), exporting that
+        # method's hundreds of internal terminals instead of ``page``'s
+        # declared returns.  Control ownership and public ABI ownership are
+        # independent: regions may come from ``source_shell`` while the
+        # numerical program and source names remain on ``function_shell``.
+        compiled_shell_program = function_shell.compiled_shell_program
         region_programs = {
             int(index): getattr(program, "program", program)
             for index, program in selected_regions.items()
         }
-        source_graph_metadata = source_shell.process_graph.G.graph
+        region_feed_values = {
+            int(value_id): value
+            for captured in selected_regions.values()
+            for value_id, value in (
+                getattr(captured, "feeds", {}) or {}
+            ).items()
+        }
+        capture_feed_values = dict(region_feed_values)
+        for candidate in _walk_planned_shells(deployment):
+            captured_programs = (
+                *(
+                    getattr(candidate, "captured_region_programs", {})
+                    or {}
+                ).values(),
+                *(
+                    getattr(
+                        candidate,
+                        "hierarchical_captured_region_programs",
+                        {},
+                    )
+                    or {}
+                ).values(),
+            )
+            whole_captured = getattr(
+                candidate, "compiled_shell_program", None
+            )
+            if whole_captured is not None:
+                captured_programs = (*captured_programs, whole_captured)
+            for captured in captured_programs:
+                capture_feed_values.update({
+                    int(value_id): value
+                    for value_id, value in (
+                        getattr(captured, "feeds", {}) or {}
+                    ).items()
+                })
+        for global_id, capture_id in dict(
+            getattr(
+                hierarchy_owner,
+                "hierarchical_capture_value_ids",
+                {},
+            )
+            or {}
+        ).items():
+            if int(capture_id) in capture_feed_values:
+                region_feed_values[int(global_id)] = (
+                    capture_feed_values[int(capture_id)]
+                )
+        region_feed_values.update({
+            int(value_id): value
+            for value_id, value in dict(
+                getattr(
+                    hierarchy_owner,
+                    "hierarchical_specialized_values",
+                    {},
+                )
+                or {}
+            ).items()
+        })
+        source_graph_metadata = function_shell.process_graph.G.graph
         root_value_ids = dict(
-            getattr(source_shell, "hierarchical_root_value_ids", {}) or {}
+            getattr(function_shell, "hierarchical_root_value_ids", {}) or {}
         )
         identity_table = {
             str(name): tuple(
@@ -590,6 +997,59 @@ def compile_ast_aot(
         function_parameters = tuple(map(
             str, source_graph_metadata.get("function_parameters") or ()
         ))
+        composed_artifact = getattr(
+            hierarchy_owner, "composed_shell_artifact", None
+        )
+        composed_outputs = dict(
+            getattr(composed_artifact, "terminal_outputs", {})
+            or getattr(
+                hierarchy_owner,
+                "hierarchical_terminal_outputs",
+                {},
+            )
+            or {}
+        )
+        public_output_value_ids = {
+            name: int(composed_outputs[name])
+            for name in function_outputs
+            if name in composed_outputs
+        }
+        public_input_value_ids = dict(
+            getattr(hierarchy_owner, "hierarchical_root_field_value_ids", {})
+            or {}
+        )
+        hierarchical_value_diagnostics = dict(
+            getattr(
+                hierarchy_owner,
+                "hierarchical_endpoint_details",
+                {},
+            )
+            or {}
+        )
+        hierarchical_value_aliases = dict(
+            getattr(
+                hierarchy_owner,
+                "hierarchical_value_aliases",
+                {},
+            )
+            or {}
+        )
+        for local_id, global_id in dict(
+            getattr(hierarchy_owner, "hierarchical_root_value_ids", {}) or {}
+        ).items():
+            if int(local_id) not in hierarchy_owner.process_graph.G:
+                continue
+            data = hierarchy_owner.process_graph.G.nodes[int(local_id)]
+            attributes = data.get("attributes") or {}
+            if (
+                data.get("type") == "Input"
+                and attributes.get("binding_kind") == "parameter"
+            ):
+                name = attributes.get("binding_name") or data.get("label")
+                if name is not None:
+                    public_input_value_ids.setdefault(
+                        str(name), int(global_id)
+                    )
     finally:
         # Matches the release-in-finally discipline every existing caller of
         # this deployment class already follows (tests/test_glsl_fused_network.py).
@@ -645,9 +1105,14 @@ def compile_ast_aot(
         shell=shell,
         map_ir=map_ir,
         region_programs=region_programs,
+        region_feed_values=region_feed_values,
         identity_table=identity_table,
         function_outputs=function_outputs,
         function_parameters=function_parameters,
+        public_input_value_ids=public_input_value_ids,
+        public_output_value_ids=public_output_value_ids,
+        hierarchical_value_diagnostics=hierarchical_value_diagnostics,
+        hierarchical_value_aliases=hierarchical_value_aliases,
         control_shortfalls=control_shortfalls,
         bake_mode=bake_mode,
         schedule_preference=schedule_preference,

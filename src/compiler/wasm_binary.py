@@ -90,10 +90,11 @@ def _name(text: str) -> bytes:
 # --- value types and opcodes ----------------------------------------------
 
 I32 = 0x7F
+I64 = 0x7E
 F32 = 0x7D
 F64 = 0x7C
 
-_VALUE_TYPE = {"i32": I32, "f32": F32, "f64": F64}
+_VALUE_TYPE = {"i32": I32, "i64": I64, "f32": F32, "f64": F64}
 
 # Opcodes, per value type. Only the ones a fused elementwise program reaches.
 _OPCODES: dict[str, dict[str, int]] = {
@@ -126,9 +127,11 @@ OP_END = 0x0B
 OP_BR = 0x0C
 OP_BR_IF = 0x0D
 OP_CALL = 0x10
+OP_SELECT = 0x1B
 OP_LOCAL_GET = 0x20
 OP_LOCAL_SET = 0x21
 OP_I32_CONST = 0x41
+OP_I64_CONST = 0x42
 OP_I32_EQZ = 0x45
 OP_I32_EQ = 0x46
 OP_I32_LT_S = 0x48
@@ -136,7 +139,31 @@ OP_I32_LE_S = 0x4C
 OP_I32_ADD = 0x6A
 OP_I32_MUL = 0x6C
 OP_I32_AND = 0x71
+OP_I32_OR = 0x72
+OP_I32_XOR = 0x73
 OP_I32_LOAD = 0x28
+OP_I64_LOAD = 0x29
+OP_I64_LOAD8_U = 0x31
+OP_I64_LOAD16_U = 0x33
+OP_I64_LOAD32_U = 0x35
+OP_I64_STORE = 0x37
+OP_I64_STORE8 = 0x3C
+OP_I64_STORE16 = 0x3D
+OP_I64_STORE32 = 0x3E
+OP_I64_ADD = 0x7C
+OP_I64_SUB = 0x7D
+OP_I64_MUL = 0x7E
+OP_I64_AND = 0x83
+OP_I64_OR = 0x84
+OP_I64_XOR = 0x85
+OP_I64_SHL = 0x86
+OP_I64_SHR_S = 0x87
+OP_I64_SHR_U = 0x88
+OP_I64_ROTL = 0x89
+OP_I64_EQZ = 0x50
+OP_I64_LT_U = 0x54
+OP_I64_POPCNT = 0x7B
+OP_I64_EXTEND_I32_U = 0xAD
 OP_I32_GE_S = 0x4E
 OP_I32_TRUNC_F64_S = 0xAA
 OP_F64_CONVERT_I32_S = 0xB7
@@ -214,6 +241,10 @@ class CodeBuilder:
         self.code += bytes([OP_I32_CONST]) + sleb(value)
         return self
 
+    def i64_const(self, value: int) -> "CodeBuilder":
+        self.code += bytes([OP_I64_CONST]) + sleb(value)
+        return self
+
     def value_const(self, value: float) -> "CodeBuilder":
         opcode = self.opcodes["const"]
         packed = (
@@ -250,6 +281,30 @@ class CodeBuilder:
         """Load an ``i32`` regardless of the numerical kernel value type."""
 
         self.code += bytes([OP_I32_LOAD]) + uleb(align) + uleb(offset)
+        return self
+
+    def i64_load(self, *, align: int = 3, offset: int = 0) -> "CodeBuilder":
+        self.code += bytes([OP_I64_LOAD]) + uleb(align) + uleb(offset)
+        return self
+
+    def i64_load_width(self, width: int, *, offset: int = 0) -> "CodeBuilder":
+        opcode, alignment = {
+            8: (OP_I64_LOAD8_U, 0), 16: (OP_I64_LOAD16_U, 1),
+            32: (OP_I64_LOAD32_U, 2), 64: (OP_I64_LOAD, 3),
+        }[int(width)]
+        self.code += bytes([opcode]) + uleb(alignment) + uleb(offset)
+        return self
+
+    def i64_store(self, *, align: int = 3, offset: int = 0) -> "CodeBuilder":
+        self.code += bytes([OP_I64_STORE]) + uleb(align) + uleb(offset)
+        return self
+
+    def i64_store_width(self, width: int, *, offset: int = 0) -> "CodeBuilder":
+        opcode, alignment = {
+            8: (OP_I64_STORE8, 0), 16: (OP_I64_STORE16, 1),
+            32: (OP_I64_STORE32, 2), 64: (OP_I64_STORE, 3),
+        }[int(width)]
+        self.code += bytes([opcode]) + uleb(alignment) + uleb(offset)
         return self
 
     def store(self, *, align: int | None = None, offset: int = 0) -> "CodeBuilder":
@@ -437,6 +492,26 @@ __all__ = [
     "F32",
     "F64",
     "I32",
+    "I64",
+    "OP_I32_ADD",
+    "OP_I32_AND",
+    "OP_I32_OR",
+    "OP_I32_XOR",
+    "OP_I64_ADD",
+    "OP_I64_AND",
+    "OP_I64_EQZ",
+    "OP_I64_EXTEND_I32_U",
+    "OP_I64_LT_U",
+    "OP_I64_MUL",
+    "OP_I64_OR",
+    "OP_I64_POPCNT",
+    "OP_I64_SHL",
+    "OP_I64_SHR_S",
+    "OP_I64_SHR_U",
+    "OP_I64_ROTL",
+    "OP_I64_SUB",
+    "OP_I64_XOR",
+    "OP_SELECT",
     "WasmImport",
     "build_module",
     "sleb",

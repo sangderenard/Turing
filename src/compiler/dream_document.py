@@ -8,6 +8,7 @@ ordinary or shader blocks without embedding synchronization in their source.
 
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -608,6 +609,76 @@ def emit_dream_html_shell(document: DreamDocument, *, name: str = "dream_program
     )
 
 
+def embed_machine_snapshot(artifact, snapshot: bytes):
+    """Publish one validated machine snapshot when a generated page opens."""
+
+    from .wasm_html_shell import HtmlShell
+
+    payload = bytes(snapshot)
+    if payload[:8] != b"TMSNAP01":
+        raise ValueError("embedded machine state is not a TMSNAP01 snapshot")
+    encoded = base64.b64encode(payload).decode("ascii")
+    bootstrap = f"""
+<script id="turing-embedded-machine-snapshot">
+document.addEventListener("DOMContentLoaded", () => {{
+  const encoded = "{encoded}";
+  const raw = atob(encoded);
+  const snapshot = Uint8Array.from(raw, character => character.charCodeAt(0));
+  if (!window.TuringMachineSnapshots?.publish) {{
+    throw new Error("the interior display did not install TuringMachineSnapshots");
+  }}
+  window.TuringMachineSnapshots.publish(snapshot);
+}});
+</script>
+"""
+    if "</body>" not in artifact.html:
+        raise ValueError("generated HTML shell has no body terminator")
+    return HtmlShell(
+        artifact.name,
+        artifact.html.replace("</body>", bootstrap + "</body>", 1),
+        artifact.embedded,
+    )
+
+
+def embed_machine_snapshot_stream(
+    artifact,
+    *,
+    snapshot_endpoint: str = "/snapshot",
+    input_endpoint: str = "/input",
+    interval_milliseconds: int = 16,
+):
+    """Connect a generated interior display to its same-origin native host."""
+
+    import json
+
+    from .wasm_html_shell import HtmlShell
+
+    interval = int(interval_milliseconds)
+    if interval < 4:
+        raise ValueError("machine snapshot polling interval must be at least 4 ms")
+    snapshot_json = json.dumps(str(snapshot_endpoint))
+    input_json = json.dumps(str(input_endpoint))
+    bootstrap = f"""
+<script id="turing-live-machine-snapshot">
+document.addEventListener("DOMContentLoaded", () => {{
+  if (!window.TuringMachineSnapshots?.connect) {{
+    throw new Error("the interior display did not install TuringMachineSnapshots");
+  }}
+  window.TuringMachineSnapshots.connect({snapshot_json}, {{
+    inputEndpoint: {input_json}, interval: {interval}
+  }});
+}});
+</script>
+"""
+    if "</body>" not in artifact.html:
+        raise ValueError("generated HTML shell has no body terminator")
+    return HtmlShell(
+        artifact.name,
+        artifact.html.replace("</body>", bootstrap + "</body>", 1),
+        artifact.embedded,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Inspect or reference-run one dream document through its card graph."""
 
@@ -626,7 +697,13 @@ def main(argv: list[str] | None = None) -> int:
         "--emit-shell", type=Path, metavar="HTML",
         help="write a launchable shell that hands its context to the interior display",
     )
+    parser.add_argument(
+        "--machine-tape", type=Path, metavar="TAPE",
+        help="embed the tape's latest dependency-validated TMSNAP01 state",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.machine_tape is not None and arguments.emit_shell is None:
+        parser.error("--machine-tape requires --emit-shell")
     document = load_dream_document(arguments.document)
     if arguments.inspect:
         print(json.dumps(document.card_graph(), indent=2, sort_keys=True))
@@ -635,6 +712,29 @@ def main(argv: list[str] | None = None) -> int:
         artifact = emit_dream_html_shell(
             document, name=arguments.document.stem,
         )
+        if arguments.machine_tape is not None:
+            from .machine_state_buffer import build_machine_state_snapshot
+            if arguments.machine_tape.is_dir():
+                from .machine_tape_segments import SegmentedMachineTapeStore
+
+                tape = SegmentedMachineTapeStore(arguments.machine_tape)
+            else:
+                from .machine_system_tape import MachineSystemTape
+
+                tape = MachineSystemTape.read(arguments.machine_tape)
+            states = []
+            positions = []
+            colors = []
+            for core in range(tape.core_count):
+                sequence = tape.latest_sequence(core)
+                states.append(tape.resume_state(core, sequence=sequence))
+                positions.append(int(tape.record(sequence)["position"]))
+                colors.append(tape.annotation_color_rgba8(sequence, core=core))
+            snapshot = build_machine_state_snapshot(
+                states, positions=positions, annotation_colors=colors,
+                maximum_output_bytes=1024 * 1024,
+            )
+            artifact = embed_machine_snapshot(artifact, snapshot)
         output = arguments.emit_shell
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(artifact.html, encoding="utf-8")
@@ -680,7 +780,8 @@ __all__ = [
     "DreamDisplayHandoff", "DreamExecutionRecord", "DreamParallelDeployment",
     "DreamRuntime", "DreamSSALowering",
     "load_dream_document", "parse_dream_document", "python_exec_handler",
-    "emit_dream_html_shell", "main",
+    "emit_dream_html_shell", "embed_machine_snapshot",
+    "embed_machine_snapshot_stream", "main",
 ]
 
 
