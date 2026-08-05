@@ -25,7 +25,7 @@ left unforwarded so the caller's normal not-serviceable path applies.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .machine_execution import (
     MachineExecutionState, MachineExternalCallCompletion,
@@ -143,6 +143,11 @@ class TapeForwardingExternalPort:
     tape: MachineSystemTape
     live: CapabilityGatedExternalPort | None = None
     core: int = 0
+    # Mutated (not reassigned) by handle() so a frozen instance can still
+    # report, after the fact, which requests it resolved from the tape
+    # rather than the live port -- the provenance a caller like
+    # machine_web_publication.py needs to report honestly in its manifest.
+    forwarded_request_ids: list[int] = field(default_factory=list)
 
     def handle(
         self, request: MachineExternalCallRequest, state: MachineExecutionState,
@@ -151,7 +156,10 @@ class TapeForwardingExternalPort:
             completion = self.live.handle(request, state)
             if completion is not None:
                 return completion
-        return find_recorded_completion(self.tape, request, core=self.core)
+        completion = find_recorded_completion(self.tape, request, core=self.core)
+        if completion is not None:
+            self.forwarded_request_ids.append(request.request_id)
+        return completion
 
     def supports(self, request: MachineExternalCallRequest) -> bool:
         if self.live is not None and self.live.supports(request):
