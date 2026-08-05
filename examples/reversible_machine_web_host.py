@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -16,13 +15,10 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from src.compiler.binary_machine_program import BinaryMachineProgram
 from src.compiler.dream_document import (
-    embed_machine_wasm_block_bootstrap,
-    embed_machine_snapshot_replay,
     embed_machine_snapshot_stream,
     emit_dream_html_shell,
     load_dream_document,
 )
-from src.compiler.machine_block_web_bundle import build_machine_block_web_bundle
 from src.compiler.machine_snapshot_host import (
     LiveMachineSnapshotController,
     MachineControlQueue,
@@ -32,7 +28,7 @@ from src.compiler.machine_snapshot_host import (
     build_machine_snapshot_server,
     serve_machine_snapshot_host,
 )
-from src.compiler.machine_state_buffer import MachineRunDirection
+from src.compiler.machine_web_publication import build_machine_web_publication
 from src.compiler.machine_system_ports import deterministic_windows_bootstrap_port
 from src.compiler.site_bundle import publish_prebuilt_program_bundle
 from src.compiler.shell_io import VirtualFileSystemContract, VirtualMount
@@ -146,80 +142,37 @@ def main(argv: list[str] | None = None) -> int:
         preview_machine = _new_machine_bytes(
             demo_subject, environment, options.machine_backend,
         )
-        preview_core = preview_machine.machine.cores[0]
-        recompiled = preview_core.executor.recompile_block_wasm(
-            preview_core.state.pc, preview_core.state, strict=False,
-        )
-        block_web = build_machine_block_web_bundle(
-            recompiled, preview_core.state,
-            subject_sha256=sha256(demo_subject).hexdigest(),
-        )
-        preview_machine.runner.tick(0)
-        preview = preview_machine.snapshots.copy_latest()
-        replay_frames = [] if preview is None else [preview]
-        preview_machine.runner.set_direction(MachineRunDirection.FORWARD)
-        preview_machine.runner.tick(1)
-        advanced = preview_machine.snapshots.copy_latest()
-        if advanced is not None:
-            replay_frames.append(advanced)
-        published_artifact = embed_machine_snapshot_replay(artifact, replay_frames)
-        published_artifact = embed_machine_wasm_block_bootstrap(
-            published_artifact, block_web.descriptor,
-        )
-        published_html = "\n".join(
-            line.rstrip() for line in published_artifact.html.splitlines()
-        )
-        if published_artifact.html.endswith(("\n", "\r")):
-            published_html += "\n"
         fixture_source = Path(__file__).with_name("reversible_demo_subject.py")
-        bundle = publish_prebuilt_program_bundle(
-            destination=options.publish_bundle,
-            slug="reversible-binary-machine",
-            title="Reversible Binary Machine",
-            entrypoint="load_subject",
-            html=published_html,
-            source_filename=f"dream/{options.document.name}",
-            source=options.document.read_bytes(),
-            artifacts={
-                f"source/python_source/{fixture_source.name}": fixture_source.read_bytes(),
-                "subject/reversible-demo-amd64.pe": demo_subject,
-                **block_web.assets,
-            },
-            runtime={
-            "schema": "turing.reversible-machine-runtime.v1",
-            "document_digest": sha256(options.document.read_bytes()).hexdigest(),
-            "shell_digest": sha256(published_html.encode("utf-8")).hexdigest(),
-            "display_owner": "program-interior",
-            "system_ports": {
-                "subject": "/subject", "terminal_input": "/input",
-                "machine_control": "/control", "snapshots": "/snapshot",
-            },
-            "controls": [
-                "pause", "forward", "backward", "step_forward", "step_backward", "speed",
-            ],
-            "snapshot_abi": "TMSNAP01",
-            "memory_page_bytes": 4096,
-            "static_preview": preview is not None,
-            "static_replay_frames": len(replay_frames),
-            "published_subject": {
-                "path": "subject/reversible-demo-amd64.pe",
-                "format": "PE32+", "isa": "AMD64",
-                "sha256": sha256(demo_subject).hexdigest(),
-                "entry_code_hex": DEMO_ENTRY_CODE.hex(),
-                "license": "project-authored fixture",
-            },
-            "recompiled_machine_block": {
-                **dict(block_web.descriptor),
-                "complete": bool(block_web.plan["complete"]),
-                "covered_operation_count": int(
-                    block_web.plan["covered_operation_count"]
-                ),
-                "shortfalls": list(block_web.plan["shortfalls"]),
-            },
-            },
-            refresh_gallery=True,
-        )
-        preview_machine.close()
+        document_source = options.document.read_bytes()
+        try:
+            publication = build_machine_web_publication(
+                artifact, preview_machine,
+                document_source=document_source,
+                subject=demo_subject,
+                subject_path="subject/reversible-demo-amd64.pe",
+                subject_metadata={
+                    "format": "PE32+", "isa": "AMD64",
+                    "entry_code_hex": DEMO_ENTRY_CODE.hex(),
+                    "license": "project-authored fixture",
+                },
+            )
+            bundle = publish_prebuilt_program_bundle(
+                destination=options.publish_bundle,
+                slug="reversible-binary-machine",
+                title="Reversible Binary Machine",
+                entrypoint="load_subject",
+                html=publication.html,
+                source_filename=f"dream/{options.document.name}",
+                source=document_source,
+                artifacts={
+                    f"source/python_source/{fixture_source.name}": fixture_source.read_bytes(),
+                    **publication.assets,
+                },
+                runtime=publication.runtime,
+                refresh_gallery=True,
+            )
+        finally:
+            preview_machine.close()
         print(f"published HTML shell bundle: {bundle.directory.resolve()}", flush=True)
         print(f"public route: {bundle.url}", flush=True)
         if options.publish_only:

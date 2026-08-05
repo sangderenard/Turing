@@ -632,7 +632,12 @@ python examples/reversible_machine_web_host.py `
 
 `publish_prebuilt_program_bundle` owns content addressing, atomic version
 creation, artifact SHA-256 inventory, the `turing-program-bundle-v1` manifest,
-and refresh of the root shell's static gallery. The current public version
+and refresh of the root shell's static gallery. Before that final generic write,
+`build_machine_web_publication` now owns the reusable machine-specific path:
+entry-block recompilation, retained snapshots, journal projection bootstrap,
+subject/block assets, system ports, controls, and runtime metadata. The demo
+script only chooses its authored subject and generator-source attachment. The
+current public version
 contains the Dream source, the PE-generator source, and a project-authored
 2,048-byte PE32+ AMD64 subject whose entry computes `RAX = 42`, increments it,
 executes a NOP, and then reaches RET. No Windows system executable is copied

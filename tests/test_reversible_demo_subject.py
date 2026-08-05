@@ -1,6 +1,10 @@
+from hashlib import sha256
+
 from examples.reversible_demo_subject import DEMO_ENTRY_CODE, build_reversible_demo_subject
 from examples.reversible_machine_web_host import _new_machine_bytes
 from src.compiler.machine_state_buffer import MachineRunDirection
+from src.compiler.machine_web_publication import build_machine_web_publication
+from src.compiler.wasm_html_shell import HtmlShell
 
 
 def test_demo_subject_recompiles_and_reverses_a_multi_instruction_prefix():
@@ -39,3 +43,34 @@ def test_demo_subject_recompiles_and_reverses_a_multi_instruction_prefix():
         assert core.state.steps == 0
     finally:
         machine.close()
+
+
+def test_common_machine_web_publication_owns_preview_assets_and_shell_contract():
+    subject = build_reversible_demo_subject()
+    machine = _new_machine_bytes(subject, {}, "translated")
+    try:
+        publication = build_machine_web_publication(
+            HtmlShell("chip", "<html><body></body></html>", False),
+            machine,
+            document_source=b"dream source",
+            subject=subject,
+            subject_path="subject/demo.pe",
+            subject_metadata={"format": "PE32+", "isa": "AMD64"},
+        )
+    finally:
+        machine.close()
+
+    runtime = publication.runtime
+    assert publication.assets["subject/demo.pe"] == subject
+    assert publication.assets["machine/recompiled-entry/block.wasm"].startswith(b"\0asm")
+    assert runtime["published_subject"] == {
+        "path": "subject/demo.pe",
+        "sha256": sha256(subject).hexdigest(),
+        "format": "PE32+",
+        "isa": "AMD64",
+    }
+    assert runtime["recompiled_machine_block"]["covered_operation_count"] == 3
+    assert runtime["static_replay_frames"] == 2
+    assert runtime["system_ports"]["machine_control"] == "/control"
+    assert "TuringRecompiledMachineBlock" in publication.html
+    assert "turing-embedded-machine-replay" in publication.html
