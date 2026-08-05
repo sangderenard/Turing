@@ -9,11 +9,10 @@ identified request (same reference library/symbol and same arguments) was
 already serviced, and derives a completion from the exact recorded state
 delta -- provenance-bound to that specific prior interaction, never guessed.
 
-Scope: only the ``result`` register (rax) and byte-level ``memory_writes``
-are reconstructed -- the same narrow completion shape
-machine_system_ports.py's own simplest handlers (``_return_value``,
-``_write_u64``) already produce. This module does not attempt to generically
-diff every MachineExecutionState effect domain (filesystem, registry,
+Scope: only registers (rax as ``result``, every other changed register as
+an explicit ``register_writes`` entry) and byte-level ``memory_writes`` are
+reconstructed. This module does not attempt to generically diff every
+MachineExecutionState effect domain (filesystem, registry, virtual memory,
 environment, device, thread spawns, ...); reconstructing those from a raw
 state diff without knowing which effect produced them would risk silently
 fabricating an effect this module cannot verify, which
@@ -21,6 +20,16 @@ CMD_BINARY_EXECUTOR_COMPILATION_HANDOFF.md explicitly forbids ("Never
 fabricate success to keep the prompt moving"). A request whose recorded
 completion touched any of those wider domains is not matched here; it is
 left unforwarded so the caller's normal not-serviceable path applies.
+
+``call_stack`` is deliberately excluded from that check: for an ordinary
+completion (no ``guest_calls``/``control_transfer``, which is all this
+module ever reconstructs) amd64_machine_semantics.complete_external_call_state
+always pops exactly one frame -- ``call_stack=state.call_stack[:-1]`` -- as a
+mechanical consequence of the request's own ``return_address``, not
+something the completion's fields choose. That pop happens identically
+whether the completion came from a live handler or this module, so it is
+not a "domain this module reconstructed" and checking it here would only
+reject completions this module can already replay correctly.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from dataclasses import dataclass, field
 from .machine_execution import (
     MachineExecutionState, MachineExternalCallCompletion,
     MachineExternalCallRequest, MachineExternalMemoryWrite,
+    MachineExternalRegisterWrite,
 )
 from .machine_system_ports import CapabilityGatedExternalPort
 from .machine_system_tape import MachineSystemTape
@@ -49,7 +59,7 @@ def _request_identity(
 
 
 def _is_narrow_completion(before: MachineExecutionState, after: MachineExecutionState) -> bool:
-    """Only forward completions whose recorded effect was rax + memory."""
+    """Only forward completions whose recorded effect was registers + memory."""
 
     return (
         before.virtual_filesystem == after.virtual_filesystem
@@ -58,11 +68,19 @@ def _is_narrow_completion(before: MachineExecutionState, after: MachineExecution
         and before.environment_state == after.environment_state
         and before.text_state == after.text_state
         and before.device_state == after.device_state
-        and before.call_stack == after.call_stack
         and before.system_state == after.system_state
-        and before.registers[1:] == after.registers[1:]
         and before.halted == after.halted
         and before.termination_requested == after.termination_requested
+    )
+
+
+def _changed_register_writes(
+    before: MachineExecutionState, after: MachineExecutionState,
+) -> tuple[MachineExternalRegisterWrite, ...]:
+    return tuple(
+        MachineExternalRegisterWrite(index, after.registers[index])
+        for index in range(1, len(after.registers))
+        if before.registers[index] != after.registers[index]
     )
 
 
@@ -98,8 +116,8 @@ def find_recorded_completion(
     """Find one prior tape record whose request matches ``request``'s identity.
 
     Returns ``None`` when no matching record exists, or when the matching
-    record's recorded effect is wider than the narrow rax+memory shape this
-    module reconstructs.
+    record's recorded effect is wider than the narrow registers+memory shape
+    this module reconstructs.
     """
 
     identity = _request_identity(request)
@@ -125,6 +143,7 @@ def find_recorded_completion(
         return MachineExternalCallCompletion(
             request_id=request.request_id,
             result=int(after_state.registers[_RAX]),
+            register_writes=_changed_register_writes(before_state, after_state),
             memory_writes=_changed_memory_writes(before_state, after_state),
         )
     return None

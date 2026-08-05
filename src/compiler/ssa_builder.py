@@ -19,6 +19,19 @@ def process_graph_to_ssa_instrs(pg: ProcessGraph, schedule: str = "alap") -> Lis
     Loop analysis is intentionally omitted – ProcessGraphs are expected to be
     acyclic once scheduled. Cyclic behaviour must be resolved prior to invoking
     this helper.
+
+    NOT the compiler entrypoint for a general Python function. This reads
+    whatever ``op``/``label`` a node already carries (falling back to the
+    raw ``expr_obj``'s Python type name, or worse, the object itself, if
+    neither is set) -- it does not resolve control flow, attribute access,
+    or free names itself. Feeding it a ProcessGraph built by
+    graph_express2.ProcessGraph.build_from_ast() without first running the
+    real pipeline's control/region/binding passes silently emits degenerate
+    instructions (``op`` holding a literal ``<ast.Name object at 0x...>``)
+    for anything past straight-line scalar expressions, without raising.
+    For real Python-function compilation use
+    src.common.tensors.accelerator_backends.aot_compile.compile_ast_aot,
+    which drives this same underlying machinery correctly.
     """
 
     # Run the embedded scheduler. ``compute_levels`` populates ``pg.levels`` and

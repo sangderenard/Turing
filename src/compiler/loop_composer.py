@@ -770,30 +770,43 @@ def evaporate_unrolled_loops(
             )))
 
         for _name, _initial, updated in carried_bindings:
-            final_value = last_mapping.get(int(updated))
-            if final_value is not None:
-                _replace_parent_value(
-                    graph,
-                    next(
-                        (
-                            int(node_id)
-                            for node_id, data in graph.G.nodes(data=True)
-                            if data.get("type") == "LoopExit"
-                            and (
-                                data.get("attributes") or {}
-                            ).get("binding_name") == _name
-                            and any(
-                                int(parent) == int(loop.node_id)
-                                and str(role) == "control"
-                                for parent, role in (
-                                    data.get("parents") or ()
-                                )
+            # ``last_mapping`` only gets assigned inside the per-iteration
+            # loop above (line ~765). A loop whose traced iterable is empty
+            # never enters that loop, so ``last_mapping`` stays the {}
+            # this block was seeded with and every carried binding's
+            # "updated" value looks unavailable. That is not a genuine
+            # unavailability: zero iterations means the carried value never
+            # changed, so its correct final value is simply its pre-loop
+            # ``_initial`` binding. Falling through to "skip the redirect"
+            # instead left every downstream consumer (for example a value
+            # only used inside a sibling ``if`` branch's separately
+            # extracted region) pointed at a node this same function then
+            # deletes as part of the evaporated loop body, surfacing much
+            # later as "missing ProcessGraph input" with no loop plan left
+            # to explain it.
+            final_value = last_mapping.get(int(updated), int(_initial))
+            _replace_parent_value(
+                graph,
+                next(
+                    (
+                        int(node_id)
+                        for node_id, data in graph.G.nodes(data=True)
+                        if data.get("type") == "LoopExit"
+                        and (
+                            data.get("attributes") or {}
+                        ).get("binding_name") == _name
+                        and any(
+                            int(parent) == int(loop.node_id)
+                            and str(role) == "control"
+                            for parent, role in (
+                                data.get("parents") or ()
                             )
-                        ),
-                        int(updated),
+                        )
                     ),
-                    (int(final_value),),
-                )
+                    int(updated),
+                ),
+                (int(final_value),),
+            )
         for collection_id, values in publications.items():
             if values:
                 _replace_parent_value(

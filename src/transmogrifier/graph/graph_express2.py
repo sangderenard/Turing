@@ -1760,7 +1760,28 @@ class ProcessGraph:
         progress=None,
         **kwargs,
     ):
-        """Import Python source as a structural AST ProcessGraph."""
+        """Import Python source as a structural AST ProcessGraph.
+
+        NOT the compiler entrypoint. This is one frontend step -- it builds
+        the raw structural graph and nothing past it: no global/free-name
+        binding, no control/region splitting (if/for/raise/comprehensions
+        stay unresolved AST-node placeholders), no scheduling. Calling this
+        directly and then handing the result to
+        transmogrifier.ssa_builder.process_graph_to_ssa_instrs will "succeed"
+        (no exception) while silently emitting garbage ops for anything
+        beyond straight-line scalar expressions -- verified by trying it on
+        a real function from amd64_machine_semantics.py, which produced
+        Instr(op='<ast.Name object at 0x...>', args=[]) for most nodes.
+
+        For real compilation of a Python function -- including control flow
+        -- use
+        src.common.tensors.accelerator_backends.aot_compile.compile_ast_aot,
+        which calls this method internally as one step of a real pipeline
+        (global/free-name binding via ``python_bindings``, control/region
+        splitting through control_source.ControlProgram, scheduling). Pass
+        ``precompile_only=True`` to plan without requiring an installed
+        runtime.
+        """
         import os
 
         supplied_ast = isinstance(node_or_path, ast.AST)
