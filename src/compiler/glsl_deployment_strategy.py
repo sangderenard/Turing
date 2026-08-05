@@ -8732,8 +8732,28 @@ def _coordinate_scheduled_capture_impl(
                                     result = AbstractTensor.tensor(result)
                                 result = getattr(result, method_name)(operand)
                         else:
+                            call_args = args
+                            if (
+                                reference == "next"
+                                and call_args
+                                and isinstance(call_args[0], (list, tuple))
+                            ):
+                                # A GeneratorExp/comprehension argument is
+                                # traced as an already-materialized list here
+                                # (this simulator has no lazy generator
+                                # value), but the real builtin `next()` --
+                                # reached as a static host call because it
+                                # has no compiled lowering -- requires an
+                                # actual iterator, not a list, and raises
+                                # TypeError otherwise. `next(genexpr, default)`
+                                # is an ordinary, common idiom (used by
+                                # MachineExecutionOrchestrator._relative_target,
+                                # among others); wrap the materialized
+                                # sequence in iter() so it behaves exactly
+                                # like the real generator would have.
+                                call_args = (iter(call_args[0]), *call_args[1:])
                             try:
-                                result = callable_value(*args, **kwargs)
+                                result = callable_value(*call_args, **kwargs)
                             except Exception as error:
                                 if hasattr(error, "add_note"):
                                     error.add_note(
@@ -8743,7 +8763,7 @@ def _coordinate_scheduled_capture_impl(
                                         f"reference={reference!r}; "
                                         f"call={ast.dump(expression, include_attributes=False)!r}; "
                                         f"callable={_diagnostic_value_summary(callable_value)!r}; "
-                                        f"args={tuple(_diagnostic_value_summary(value) for value in args)!r}; "
+                                        f"args={tuple(_diagnostic_value_summary(value) for value in call_args)!r}; "
                                         f"kwargs={{{', '.join(f'{name!r}: {_diagnostic_value_summary(value)!r}' for name, value in kwargs.items())}}}"
                                     )
                                 raise

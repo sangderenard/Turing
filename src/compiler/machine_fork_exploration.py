@@ -19,8 +19,10 @@ directly to the fall-through or jump target -- the exact same two
 ``CONDITIONAL_RELATIVE_JUMP`` handling already produces for whichever one
 ``predicate_handler`` would have picked. Forking both is just "take both."
 
-Head scheduling is DFS/BFS mixed: newly forked heads are pushed onto a
-double-ended queue; ``dfs_bias`` controls whether each pick pops from the
+Head scheduling is DFS/BFS mixed: newly forked heads are appended to a
+plain list (no ``collections.deque`` -- everything in this module has to
+pass through the same compiler as the machine it drives, and a deque has
+no proven lowering there); ``dfs_bias`` controls whether each pick pops from the
 end just pushed to (depth-first: keep driving the most recently forked
 world deeper) or the far end (breadth-first: cycle through every live
 world before returning to any one of them). 1.0 is pure DFS, 0.0 is pure
@@ -32,7 +34,6 @@ between every instruction; concurrent stepping would race that.
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, replace
 import random
 from typing import Callable
@@ -81,7 +82,7 @@ def explore_forking_paths(
     ``forest.provenance_graph()`` if the whole tree shape is needed.
     """
 
-    pending: deque[int] = deque([int(root_head_id)])
+    pending: list[int] = [int(root_head_id)]
     terminal: list[int] = []
     forks_made = 0
 
@@ -89,7 +90,7 @@ def explore_forking_paths(
         if random_source() < policy.dfs_bias:
             head_id = pending.pop()
         else:
-            head_id = pending.popleft()
+            head_id = pending.pop(0)
         head = forest.heads.get(head_id)
         if head is None or head.status is not MachinePathHeadStatus.ACTIVE:
             continue

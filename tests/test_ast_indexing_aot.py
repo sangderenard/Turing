@@ -533,3 +533,30 @@ def test_object_array_field_keeps_its_dotted_public_feed_origin():
     assert {
         record.get("binding_name") for record in origins.values()
     } == {"state.values"}
+
+
+def test_next_with_generator_expression_and_default_compiles_and_runs():
+    # next(genexpr, default) is an ordinary, common idiom -- used for
+    # example by MachineExecutionOrchestrator._relative_target
+    # (machine_execution.py) -- but this compiler's structural simulator
+    # always materializes a GeneratorExp into a concrete list rather than
+    # a lazy iterator. When the call to next() itself falls through to
+    # being executed as a real "static Python host call" (next() has no
+    # compiled lowering), it used to receive that materialized list
+    # directly, and the real next() builtin raises
+    # "TypeError: 'list' object is not an iterator" on a list. Found via
+    # exactly this pattern failing to compile in
+    # src/compiler/machine_fork_exploration.py.
+    source = """
+def first_positive(values):
+    return next((value for value in values if value > 0), -1)
+"""
+    # precompile_only=True traces and plans but does not execute (outputs
+    # stays empty); the regression this guards against was a compile-time
+    # TypeError from the structural simulator itself, raised well before
+    # any real execution would happen. Not raising is the test.
+    hit = _compile(source, "first_positive", {"values": (-3, -2, 5, 7)})
+    assert hit.control_shortfalls == ()
+
+    miss = _compile(source, "first_positive", {"values": (-3, -2, -1)})
+    assert miss.control_shortfalls == ()
