@@ -175,6 +175,18 @@ def ingest_javascript_expression(
                 handler.name, handler.name, handler.name,
                 [(operand, "operand")],
             )
+        if kind == "ConditionalExpression":
+            condition = lower(expr["test"])
+            if_true = lower(expr["consequent"])
+            if_false = lower(expr["alternate"])
+            return make_node(
+                "Select", "Select", "Select",
+                [
+                    (condition, "condition"),
+                    (if_true, "if_true"),
+                    (if_false, "if_false"),
+                ],
+            )
         if kind == "CallExpression":
             callee_spelling = _callee_spelling(expr.get("callee"))
             canonical = JAVASCRIPT_DIRECT_CALLS.get(callee_spelling)
@@ -263,6 +275,11 @@ def javascript_source_from_graph(graph: Any, node_id: int) -> str:
     except KeyError as error:
         raise ValueError(f"cannot render node type {node_type!r} to javascript") from error
     by_role = {role: parent for parent, role in data["parents"]}
+    if handler is Handler.Select:
+        condition = javascript_source_from_graph(graph, by_role["condition"])
+        if_true = javascript_source_from_graph(graph, by_role["if_true"])
+        if_false = javascript_source_from_graph(graph, by_role["if_false"])
+        return f"({condition} ? {if_true} : {if_false})"
     if handler in SSA_TO_JAVASCRIPT_UNARY:
         rendered = javascript_source_from_graph(graph, by_role["operand"])
         return f"{SSA_TO_JAVASCRIPT_UNARY[handler]}({rendered})"

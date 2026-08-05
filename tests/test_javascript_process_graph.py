@@ -46,6 +46,7 @@ def test_operator_tables_are_invertible_and_share_the_ssa_handler_vocabulary():
     "!flag",
     "a === b",
     "a && b || c",
+    "a ? b : c",
 ])
 def test_from_javascript_produces_canonical_handler_nodes(source):
     expression = _parse_expression(source)
@@ -65,6 +66,7 @@ def test_from_javascript_produces_canonical_handler_nodes(source):
     "!flag",
     "a === b",
     "Math.sqrt(a)",
+    "a ? b : c",
 ])
 def test_from_javascript_lowers_through_the_real_aot_ssa_pipeline(source):
     # Regression guard: an earlier version of ingest_javascript_expression
@@ -94,6 +96,7 @@ def test_from_javascript_lowers_through_the_real_aot_ssa_pipeline(source):
     "Math.sqrt(a)",
     "1",
     "true",
+    "a ? b : c",
 ])
 def test_javascript_round_trips_through_the_process_graph(source):
     expression = _parse_expression(source)
@@ -120,7 +123,8 @@ def test_javascript_round_trips_through_the_process_graph(source):
     ("a == b", "unsupported-binary-operator"),
     ("a >>> b", "unsupported-binary-operator"),
     ("typeof a", "unsupported-unary-operator"),
-    ("a ? b : c", "unsupported-node-type"),
+    ("[a, b]", "unsupported-node-type"),
+    ("({a: b})", "unsupported-node-type"),
 ])
 def test_unsupported_operators_are_reported_not_silently_dropped(source, code):
     expression = _parse_expression(source)
