@@ -72,7 +72,11 @@ def test_common_machine_web_publication_owns_preview_assets_and_shell_contract()
     assert runtime["recompiled_machine_block"]["covered_operation_count"] == 3
     assert runtime["static_replay_frames"] == 5
     assert runtime["static_replay_complete"] is True
-    assert runtime["system_ports"]["machine_control"] == "/control"
+    assert "system_ports" not in runtime  # dead decoration, deliberately removed
+    assert "controls" not in runtime  # same: never read by anything
+    # Terminal input / machine control / snapshot delivery's real, working
+    # machinery -- not a "system_ports" dict entry.
+    assert "TuringMachineSnapshots" in publication.html
     assert "TuringRecompiledMachineBlock" in publication.html
     assert "turing-embedded-machine-replay" in publication.html
     assert "copyFrames()" in publication.html

@@ -49,6 +49,22 @@ def build_machine_web_publication(
     not already reversibly recorded or an explicitly supplied handler
     admits; a boundary neither can resolve still stops replay generation
     there, same as before this parameter existed.
+
+    Terminal input, machine control (pause/forward/backward/step/speed),
+    and snapshot delivery are not declared here as ports of any kind --
+    they already have real, working, wired-up JS machinery
+    (``window.TuringMachineSnapshots`` in wasm_html_shell.py, overridden
+    for pure client-side replay by ``embed_machine_snapshot_replay`` and
+    ``embed_machine_wasm_block_bootstrap`` below). The endpoint-name
+    strings this function used to also put in ``runtime["system_ports"]``/
+    ``runtime["controls"]`` were never read by anything that consumes this
+    manifest (confirmed: every real reader of a "system_ports" key reads
+    it from the ShellIOManifest-derived
+    ``metadata["shell_io"]["requirements"]["system_ports"]`` path, not
+    from this dict) -- dead decoration describing a live-native-host HTTP
+    transport (``embed_machine_snapshot_stream``) that this function does
+    not even use. Removed rather than migrated: there was nothing real to
+    migrate.
     """
 
     core = machine.machine.cores[0]
@@ -105,15 +121,6 @@ def build_machine_web_publication(
         "document_digest": sha256(document_source).hexdigest(),
         "shell_digest": sha256(html.encode("utf-8")).hexdigest(),
         "display_owner": "program-interior",
-        "system_ports": {
-            "subject": "/subject",
-            "terminal_input": "/input",
-            "machine_control": "/control",
-            "snapshots": "/snapshot",
-        },
-        "controls": [
-            "pause", "forward", "backward", "step_forward", "step_backward", "speed",
-        ],
         "snapshot_abi": "TMSNAP01",
         "memory_page_bytes": 4096,
         "static_preview": initial is not None,
