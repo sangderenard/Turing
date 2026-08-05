@@ -634,8 +634,9 @@ python examples/reversible_machine_web_host.py `
 creation, artifact SHA-256 inventory, the `turing-program-bundle-v1` manifest,
 and refresh of the root shell's static gallery. The current public version
 contains the Dream source, the PE-generator source, and a project-authored
-2,048-byte PE32+ AMD64 subject whose entry bytes are `90 c3` (`NOP; RET`). No
-Windows system executable is copied into the repository.
+2,048-byte PE32+ AMD64 subject whose entry computes `RAX = 42`, increments it,
+executes a NOP, and then reaches RET. No Windows system executable is copied
+into the repository.
 
 The static page embeds two full `TMSNAP01` generations produced by the real
 executor. Its standard forward, backward, pause, single-step, and speed controls
@@ -651,12 +652,14 @@ bounded guest-memory window, and a provenance-complete dispatch plan. On page
 load the standard shell instantiates that Wasm, executes it, and authenticates
 the first journal record's address, semantic token, and instruction-digest
 prefix before exposing `window.TuringRecompiledMachineBlock`. The current demo
-proves the subject's `0x90` NOP at `0x140001000`; its following outermost RET is
-honestly recorded as an interpreter-lifecycle shortfall, so the bundle does not
-mislabel the block complete. For a register-only safe prefix, the browser now
-projects every authenticated journal checkpoint into `TMSNAP01`, replaces the
-finite transport's forward frames with those computed states, and reverses to
-the original snapshot. The deterministic `?recompiled-step=1` probe visibly
-advances RIP to `0x140001001`, steps to one, and the HUD to one flip. Journals
-with memory effects remain fail-closed on retained frames until browser memory,
-device commit, and capability dispatch are implemented.
+proves three decoded instructions (`MOV`, `ADD`, and `NOP`) beginning at
+`0x140001000`; the following outermost RET is honestly recorded as an
+interpreter-lifecycle shortfall, so the bundle does not mislabel the block
+complete. For a register-only safe prefix, the browser projects every
+authenticated journal checkpoint into `TMSNAP01`, replaces the finite
+transport's forward frames with those computed states, and reverses to the
+original snapshot. The deterministic `?recompiled-step=3` probe visibly leaves
+RAX at 43, advances RIP to `0x14000100c`, sets architectural steps to three,
+and reports three flips. Journals with memory effects remain fail-closed on
+retained frames until browser memory, device commit, and capability dispatch
+are implemented.
