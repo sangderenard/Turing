@@ -503,9 +503,14 @@ $tape = Join-Path ([System.IO.Path]::GetTempPath()) 'turing-cmd-probe.tape.jsonl
 python examples\reversible_machine_viewer.py --tape $tape
 ```
 
-The upper half is the contiguous AMD64 register bank and the lower half is the
-guest terminal or framebuffer. Space pauses, `B` reverses, `F` advances, and
-Escape closes the viewer. Add `--clocked --speed 1000` to replace free-spin
+The upper band is the contiguous AMD64 register bank, the next band is the same
+4 KiB page-aligned occupancy/permission texture used by the HTML shader, and the
+lower half is the guest terminal or framebuffer. The native loader accepts both
+JSONL and segmented proof tapes. `F5` pauses/resumes, `F6` reverses, `F7`
+advances, `F8` steps backward, `F9` steps forward, and Escape closes the viewer.
+Ordinary text is captured as a guest command; Backspace edits it and Enter
+journals UTF-8 plus CRLF into `console.input`. The typed line is visible in the
+window caption until sent. Add `--clocked --speed 1000` to replace free-spin
 execution with a shell-regulated transition clock. This executes the emulated
 guest and its capability ports; it does not launch or proxy a host `cmd.exe`.
 
@@ -639,3 +644,15 @@ Python owner running, the same shell uses `/snapshot`, `/control`, `/subject`,
 and `/input` for unrestricted tape execution and admitted system activity.
 Static arbitrary-binary loading remains intentionally unavailable until the
 machine owner is lowered into a browser runtime.
+
+The bundle also publishes the real entry-block recompilation product beneath
+`machine/recompiled-entry/`: `block.wasm`, its WAT, packed architectural state,
+bounded guest-memory window, and a provenance-complete dispatch plan. On page
+load the standard shell instantiates that Wasm, executes it, and authenticates
+the first journal record's address, semantic token, and instruction-digest
+prefix before exposing `window.TuringRecompiledMachineBlock`. The current demo
+proves the subject's `0x90` NOP at `0x140001000`; its following outermost RET is
+honestly recorded as an interpreter-lifecycle shortfall, so the bundle does not
+mislabel the block complete. This is executable browser lowering, but the static
+transport still uses retained snapshots for reverse UI state until journal
+commit and capability dispatch move into the browser owner.

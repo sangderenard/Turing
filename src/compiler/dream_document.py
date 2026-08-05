@@ -722,6 +722,92 @@ document.addEventListener("DOMContentLoaded", () => {{
     )
 
 
+def embed_machine_wasm_block_bootstrap(artifact, descriptor: Mapping[str, Any]):
+    """Execute and authenticate one published recompiled block in the browser."""
+    import json
+
+    from .wasm_html_shell import HtmlShell
+
+    contract = dict(descriptor)
+    required = {
+        "module", "state", "guest", "plan", "journal_bytes",
+        "expected_first_witness",
+    }
+    missing = sorted(required - contract.keys())
+    if missing:
+        raise ValueError("machine Wasm bootstrap is missing " + ", ".join(missing))
+    bootstrap = f"""
+<script id="turing-recompiled-machine-block">
+document.addEventListener("DOMContentLoaded", async () => {{
+  const contract = {json.dumps(contract, default=str)};
+  const status = document.documentElement.dataset;
+  status.recompiledMachineBlock = "loading";
+  try {{
+    const fetchBytes = async path => {{
+      const response = await fetch(new URL(path, document.baseURI), {{cache: "no-store"}});
+      if (!response.ok) throw new Error(path + " returned HTTP " + response.status);
+      return new Uint8Array(await response.arrayBuffer());
+    }};
+    const [moduleBytes, stateBytes, guestBytes, planResponse] = await Promise.all([
+      fetchBytes(contract.module), fetchBytes(contract.state), fetchBytes(contract.guest),
+      fetch(new URL(contract.plan, document.baseURI), {{cache: "no-store"}}),
+    ]);
+    if (!planResponse.ok) throw new Error(contract.plan + " returned HTTP " + planResponse.status);
+    const plan = await planResponse.json();
+    const {{instance}} = await WebAssembly.instantiate(moduleBytes, {{}});
+    const memory = instance.exports.memory;
+    const run = instance.exports.run;
+    if (!(memory instanceof WebAssembly.Memory) || typeof run !== "function") {{
+      throw new Error("recompiled machine block does not export memory/run");
+    }}
+    const stateOffset = 0;
+    const journalOffset = 1024;
+    const guestOffset = Math.ceil((journalOffset + Number(contract.journal_bytes)) / 4096) * 4096;
+    const requiredBytes = Math.max(
+      stateOffset + stateBytes.byteLength,
+      journalOffset + Number(contract.journal_bytes),
+      guestOffset + guestBytes.byteLength,
+    );
+    if (requiredBytes > memory.buffer.byteLength) {{
+      memory.grow(Math.ceil((requiredBytes - memory.buffer.byteLength) / 65536));
+    }}
+    new Uint8Array(memory.buffer, stateOffset, stateBytes.byteLength).set(stateBytes);
+    new Uint8Array(memory.buffer, guestOffset, guestBytes.byteLength).set(guestBytes);
+    run(stateOffset, journalOffset, guestOffset);
+    const journal = new Uint8Array(
+      memory.buffer, journalOffset, Number(contract.journal_bytes),
+    ).slice();
+    const witness = contract.expected_first_witness;
+    const view = new DataView(journal.buffer, journal.byteOffset, journal.byteLength);
+    if (
+      view.getBigUint64(0, true) !== BigInt(witness.address)
+      || view.getBigUint64(8, true) !== BigInt(witness.semantic_id)
+      || view.getBigUint64(16, true) !== BigInt("0x" + witness.digest_prefix)
+    ) throw new Error("browser Wasm journal provenance witness disagrees with its plan");
+    window.TuringRecompiledMachineBlock = Object.freeze({{
+      contract, plan, instance, journal,
+    }});
+    status.recompiledMachineBlock = "ready";
+    document.dispatchEvent(new CustomEvent(
+      "turing-recompiled-machine-block", {{detail: {{contract, plan}}}},
+    ));
+  }} catch (error) {{
+    status.recompiledMachineBlock = "error";
+    status.recompiledMachineBlockError = error instanceof Error ? error.message : String(error);
+    console.error("recompiled machine block bootstrap failed", error);
+  }}
+}});
+</script>
+"""
+    if "</body>" not in artifact.html:
+        raise ValueError("generated HTML shell has no body terminator")
+    return HtmlShell(
+        artifact.name,
+        artifact.html.replace("</body>", bootstrap + "</body>", 1),
+        artifact.embedded,
+    )
+
+
 def embed_machine_snapshot_stream(
     artifact,
     *,

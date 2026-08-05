@@ -42,14 +42,17 @@ FRAGMENT_SHADER = """#version 330 core
 in vec2 uv;
 out vec4 display_color;
 uniform usampler2D register_words;
+uniform usampler2D memory_pages;
 uniform sampler2D subject_output;
 uniform vec2 machine_shape;
+uniform float memory_page_count;
+uniform float memory_page_size;
 uniform float subject_available;
 uniform float gpu_active;
 void main() {
   vec3 chip = vec3(0.012, 0.018, 0.028);
-  if (uv.y >= 0.50 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
-    vec2 q = vec2(uv.x, (uv.y - 0.50) * 2.0);
+  if (uv.y >= 0.64 && machine_shape.x > 0.0 && machine_shape.y > 0.0) {
+    vec2 q = vec2(uv.x, (uv.y - 0.64) / 0.36);
     ivec2 cell = ivec2(clamp(floor(q * machine_shape), vec2(0.0), machine_shape - 1.0));
     uvec2 words = texelFetch(register_words, cell, 0).rg;
     float lo = log2(1.0 + float(words.x)) / 32.0;
@@ -58,6 +61,18 @@ void main() {
     vec2 grid = fract(q * machine_shape);
     float border = step(0.045, grid.x) * step(0.08, grid.y);
     chip = border * vec3(0.07 + lo, 0.13 + hi, 0.23 + 0.72 * occupied);
+  } else if (uv.y >= 0.50 && memory_page_count > 0.5) {
+    float page_slot = min(floor(uv.x * memory_page_count), memory_page_count - 1.0);
+    uvec4 page = texelFetch(memory_pages, ivec2(int(page_slot), 0), 0);
+    float occupancy = float(page.z) / max(memory_page_size, 1.0);
+    float executable = float((page.w & 2u) != 0u);
+    float managed = float((page.w & 8u) != 0u);
+    float stripe = step(0.08, fract(uv.x * memory_page_count));
+    chip = stripe * mix(
+      vec3(0.035, 0.06, 0.075),
+      vec3(0.12 + 0.55 * executable, 0.18 + 0.62 * managed, 0.16),
+      clamp(0.15 + occupancy, 0.0, 1.0)
+    );
   } else if (uv.y < 0.50 && subject_available > 0.5) {
     chip = texture(subject_output, vec2(uv.x, uv.y * 2.0)).rgb;
   }
@@ -83,16 +98,21 @@ class NativeMachineDisplay:
         self.vao = gl.glGenVertexArrays(1)
         gl.glBindVertexArray(self.vao)
         self.register_texture = self._texture(integer=True)
+        self.memory_texture = self._texture(integer=True)
         self.subject_texture = self._texture(integer=False)
         self.shape_location = gl.glGetUniformLocation(self.program, "machine_shape")
+        self.memory_count_location = gl.glGetUniformLocation(self.program, "memory_page_count")
+        self.memory_size_location = gl.glGetUniformLocation(self.program, "memory_page_size")
         self.subject_location = gl.glGetUniformLocation(self.program, "subject_available")
         self.active_location = gl.glGetUniformLocation(self.program, "gpu_active")
         gl.glUseProgram(self.program)
         gl.glUniform1i(gl.glGetUniformLocation(self.program, "register_words"), 0)
         gl.glUniform1i(gl.glGetUniformLocation(self.program, "subject_output"), 1)
+        gl.glUniform1i(gl.glGetUniformLocation(self.program, "memory_pages"), 2)
         self.font = pygame.font.SysFont("Consolas", 20)
         self.last_generation = -1
         self.subject_available = 0.0
+        self.memory_page_count = 0
 
     @staticmethod
     def _texture(*, integer: bool) -> int:
@@ -144,19 +164,37 @@ class NativeMachineDisplay:
         gl.glUseProgram(self.program)
         gl.glUniform2f(self.shape_location, width, height)
         self.subject_available = 0.0
+        self.memory_page_count = 0
         for index in range(snapshot.header.output_count):
             descriptor = snapshot.output_descriptor(index)
             payload = bytes(snapshot.output_bytes(index))
             if (
+                descriptor.kind is SubjectOutputKind.MEMORY_PAGES
+                and descriptor.format is SubjectOutputFormat.PAGE_OCCUPANCY_V1
+                and len(payload) >= descriptor.width * 16
+            ):
+                pages = payload[:descriptor.width * 16]
+                gl.glActiveTexture(gl.GL_TEXTURE2)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self.memory_texture)
+                gl.glTexImage2D(
+                    gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32UI,
+                    descriptor.width, 1, 0,
+                    gl.GL_RGBA_INTEGER, gl.GL_UNSIGNED_INT, pages,
+                )
+                self.memory_page_count = descriptor.width
+                continue
+            if (
                 descriptor.kind is SubjectOutputKind.TERMINAL
                 and descriptor.format is SubjectOutputFormat.UTF8
+                and not self.subject_available
             ):
                 self._upload_terminal(payload)
-                break
+                continue
             if (
                 descriptor.kind is SubjectOutputKind.FRAMEBUFFER
                 and descriptor.format is SubjectOutputFormat.RGBA8
                 and descriptor.width * descriptor.height * 4 <= len(payload)
+                and not self.subject_available
             ):
                 gl.glActiveTexture(gl.GL_TEXTURE1)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.subject_texture)
@@ -166,7 +204,6 @@ class NativeMachineDisplay:
                     gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, payload,
                 )
                 self.subject_available = 1.0
-                break
 
     def draw(self, *, gpu_active: bool) -> None:
         width, height = pygame.display.get_window_size()
@@ -176,6 +213,8 @@ class NativeMachineDisplay:
         gl.glUseProgram(self.program)
         gl.glBindVertexArray(self.vao)
         gl.glUniform1f(self.subject_location, self.subject_available)
+        gl.glUniform1f(self.memory_count_location, self.memory_page_count)
+        gl.glUniform1f(self.memory_size_location, 4096.0)
         gl.glUniform1f(self.active_location, float(gpu_active))
         gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
         pygame.display.flip()
@@ -183,7 +222,11 @@ class NativeMachineDisplay:
 
 def _load(options) -> BinaryMachineProgram:
     if options.tape and options.tape.exists() and not options.new:
-        return BinaryMachineProgram.load_system_tape(
+        loader = (
+            BinaryMachineProgram.load_segmented_system_tape
+            if options.tape.is_dir() else BinaryMachineProgram.load_system_tape
+        )
+        return loader(
             options.tape, maximum_file_size=128 * 1024 * 1024,
             machine_block_backend=(
                 None if options.machine_backend == "translated" else options.machine_backend
@@ -208,6 +251,42 @@ def _load(options) -> BinaryMachineProgram:
             None if options.machine_backend == "translated" else options.machine_backend
         ),
     )
+
+
+def _inject_console_input(
+    machine: BinaryMachineProgram, payload: bytes, *, free_spin: bool,
+) -> None:
+    """Inject input without racing the optional maximum-speed owner thread."""
+    was_running = machine.runner.running
+    if was_running:
+        machine.runner.stop()
+    machine.inject_console_input(payload)
+    if free_spin:
+        machine.runner.start(MachineRunDirection.FORWARD)
+    else:
+        machine.set_direction(MachineRunDirection.FORWARD)
+
+
+def _single_step(machine: BinaryMachineProgram, direction: MachineRunDirection) -> None:
+    """Perform one native-viewer step through the runner's sole-writer path."""
+    if machine.runner.running:
+        machine.runner.stop()
+    machine.set_direction(direction)
+    machine.runner.tick(1)
+    machine.set_direction(MachineRunDirection.PAUSED)
+
+
+def _set_native_direction(
+    machine: BinaryMachineProgram, direction: MachineRunDirection, *, free_spin: bool,
+) -> None:
+    """Apply a transport direction, restarting free-spin after a single step."""
+    if free_spin and direction is not MachineRunDirection.PAUSED:
+        if machine.runner.running:
+            machine.set_direction(direction)
+        else:
+            machine.runner.start(direction)
+    else:
+        machine.set_direction(direction)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -242,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         machine.set_direction(MachineRunDirection.FORWARD)
     running = True
+    terminal_line = ""
+    pygame.key.start_text_input()
     try:
         while running:
             elapsed = clock.tick(60) / 1000.0
@@ -250,17 +331,42 @@ def main(argv: list[str] | None = None) -> int:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ):
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                elif event.type == pygame.TEXTINPUT:
+                    terminal_line += event.text
+                    pygame.display.set_caption(
+                        "Turing reversible AMD64 machine · guest> " + terminal_line
+                    )
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_BACKSPACE:
+                    terminal_line = terminal_line[:-1]
+                    pygame.display.set_caption(
+                        "Turing reversible AMD64 machine · guest> " + terminal_line
+                    )
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+                    _inject_console_input(
+                        machine, (terminal_line + "\r\n").encode("utf-8"),
+                        free_spin=free_spin,
+                    )
+                    terminal_line = ""
+                    pygame.display.set_caption("Turing reversible AMD64 machine · guest> ")
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F5:
                     direction = (
                         MachineRunDirection.FORWARD
                         if machine.runner.direction is MachineRunDirection.PAUSED
                         else MachineRunDirection.PAUSED
                     )
-                    machine.set_direction(direction)
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_b:
-                    machine.set_direction(MachineRunDirection.BACKWARD)
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_f:
-                    machine.set_direction(MachineRunDirection.FORWARD)
+                    _set_native_direction(machine, direction, free_spin=free_spin)
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F6:
+                    _set_native_direction(
+                        machine, MachineRunDirection.BACKWARD, free_spin=free_spin,
+                    )
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F7:
+                    _set_native_direction(
+                        machine, MachineRunDirection.FORWARD, free_spin=free_spin,
+                    )
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F8:
+                    _single_step(machine, MachineRunDirection.BACKWARD)
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F9:
+                    _single_step(machine, MachineRunDirection.FORWARD)
             if machine.pending_external_requests():
                 machine.service_external_requests(port)
                 machine.set_direction(MachineRunDirection.FORWARD)
@@ -280,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             if machine.runner.failure is not None:
                 raise machine.runner.failure
     finally:
+        pygame.key.stop_text_input()
         if machine.runner.running:
             machine.runner.stop()
         if options.tape:

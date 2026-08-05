@@ -279,6 +279,19 @@ function installTuringDisplay(liaison, interior) {
   const controlStatus = document.createElement("span");
   controlStatus.textContent = "CONNECTING";
   controlStatus.style.marginLeft = "auto";
+  const blockStatus = document.createElement("span");
+  blockStatus.textContent = "WASM BLOCK · LOADING";
+  blockStatus.style.color = "#8fb6ff";
+  const updateBlockStatus = () => {
+    const status = document.documentElement.dataset.recompiledMachineBlock;
+    blockStatus.textContent = status === "ready"
+      ? "WASM BLOCK · AUTHENTICATED"
+      : status === "error" ? "WASM BLOCK · ERROR" : "WASM BLOCK · LOADING";
+    blockStatus.style.color = status === "ready" ? "#9affb6"
+      : status === "error" ? "#ff8f9b" : "#8fb6ff";
+  };
+  document.addEventListener("turing-recompiled-machine-block", updateBlockStatus);
+  queueMicrotask(updateBlockStatus);
   const actions = [
     ["⏮ STEP", "step_backward"], ["◀ REVERSE", "backward"],
     ["Ⅱ PAUSE", "pause"], ["FORWARD ▶", "forward"], ["STEP ⏭", "step_forward"],
@@ -315,7 +328,7 @@ function installTuringDisplay(liaison, interior) {
   }));
   speedValue.value = speeds[Number(speed.value)].toLocaleString();
   speedLabel.append(speed, speedValue);
-  controls.append(speedLabel, controlStatus);
+  controls.append(speedLabel, blockStatus, controlStatus);
   if (displayHost !== liaison.canvas) displayHost.appendChild(controls);
   const terminalForm = document.createElement("form");
   terminalForm.dataset.turingTerminalInput = "true";
@@ -332,7 +345,7 @@ function installTuringDisplay(liaison, interior) {
   terminalInput.placeholder = "guest command (Enter sends CRLF)";
   terminalInput.autocomplete = "off";
   Object.assign(terminalInput.style, {
-    minWidth: "0", flex: "1", height: "30px", padding: "6px 8px", color: "#d7ffe4",
+    minWidth: "0", minHeight: "30px", flex: "1", height: "30px", padding: "6px 8px", color: "#d7ffe4",
     background: "#05080a", border: "1px solid #287344",
     font: "13px ui-monospace,SFMono-Regular,Consolas,monospace",
   });

@@ -10,6 +10,7 @@ from src.compiler.dream_document import (
     embed_machine_snapshot,
     embed_machine_snapshot_replay,
     embed_machine_snapshot_stream,
+    embed_machine_wasm_block_bootstrap,
     emit_dream_html_shell,
     load_dream_document,
     parse_dream_document,
@@ -223,6 +224,26 @@ def test_machine_snapshot_replay_embeds_static_forward_and_backward_controls():
     assert 'action === "step_backward"' in embedded.html
     assert "api.localReplay" in embedded.html
     assert all(base64.b64encode(frame).decode("ascii") in embedded.html for frame in frames)
+
+
+def test_machine_wasm_bootstrap_authenticates_the_browser_journal():
+    artifact = HtmlShell("chip", "<html><body></body></html>", False)
+    descriptor = {
+        "module": "machine/block.wasm", "state": "machine/state.bin",
+        "guest": "machine/guest.bin", "plan": "machine/plan.json",
+        "journal_bytes": 512,
+        "expected_first_witness": {
+            "address": 0x140001000, "semantic_id": 19,
+            "digest_prefix": "9e076ceaf246b600",
+        },
+    }
+
+    embedded = embed_machine_wasm_block_bootstrap(artifact, descriptor)
+
+    assert 'id="turing-recompiled-machine-block"' in embedded.html
+    assert "WebAssembly.instantiate(moduleBytes" in embedded.html
+    assert "journal provenance witness disagrees" in embedded.html
+    assert "TuringRecompiledMachineBlock" in embedded.html
 
 
 def test_live_machine_snapshot_stream_boots_same_origin_transport():

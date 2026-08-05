@@ -16,11 +16,13 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from src.compiler.binary_machine_program import BinaryMachineProgram
 from src.compiler.dream_document import (
+    embed_machine_wasm_block_bootstrap,
     embed_machine_snapshot_replay,
     embed_machine_snapshot_stream,
     emit_dream_html_shell,
     load_dream_document,
 )
+from src.compiler.machine_block_web_bundle import build_machine_block_web_bundle
 from src.compiler.machine_snapshot_host import (
     LiveMachineSnapshotController,
     MachineControlQueue,
@@ -144,6 +146,14 @@ def main(argv: list[str] | None = None) -> int:
         preview_machine = _new_machine_bytes(
             demo_subject, environment, options.machine_backend,
         )
+        preview_core = preview_machine.machine.cores[0]
+        recompiled = preview_core.executor.recompile_block_wasm(
+            preview_core.state.pc, preview_core.state, strict=False,
+        )
+        block_web = build_machine_block_web_bundle(
+            recompiled, preview_core.state,
+            subject_sha256=sha256(demo_subject).hexdigest(),
+        )
         preview_machine.runner.tick(0)
         preview = preview_machine.snapshots.copy_latest()
         replay_frames = [] if preview is None else [preview]
@@ -153,6 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         if advanced is not None:
             replay_frames.append(advanced)
         published_artifact = embed_machine_snapshot_replay(artifact, replay_frames)
+        published_artifact = embed_machine_wasm_block_bootstrap(
+            published_artifact, block_web.descriptor,
+        )
         published_html = "\n".join(
             line.rstrip() for line in published_artifact.html.splitlines()
         )
@@ -170,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             artifacts={
                 f"source/python_source/{fixture_source.name}": fixture_source.read_bytes(),
                 "subject/reversible-demo-amd64.pe": demo_subject,
+                **block_web.assets,
             },
             runtime={
             "schema": "turing.reversible-machine-runtime.v1",
@@ -193,6 +207,14 @@ def main(argv: list[str] | None = None) -> int:
                 "sha256": sha256(demo_subject).hexdigest(),
                 "entry_code_hex": demo_subject[0x400:0x402].hex(),
                 "license": "project-authored fixture",
+            },
+            "recompiled_machine_block": {
+                **dict(block_web.descriptor),
+                "complete": bool(block_web.plan["complete"]),
+                "covered_operation_count": int(
+                    block_web.plan["covered_operation_count"]
+                ),
+                "shortfalls": list(block_web.plan["shortfalls"]),
             },
             },
             refresh_gallery=True,
