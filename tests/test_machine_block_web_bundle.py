@@ -1,7 +1,9 @@
 import json
 from types import SimpleNamespace
 
-from src.compiler.machine_block_recompiler import JOURNAL_STRIDE
+from src.compiler.machine_block_recompiler import (
+    JOURNAL_EFFECT_OFFSET, JOURNAL_STATE_OFFSET, JOURNAL_STRIDE,
+)
 from src.compiler.machine_block_web_bundle import build_machine_block_web_bundle
 
 
@@ -51,6 +53,8 @@ def test_machine_block_web_bundle_retains_wasm_state_and_instruction_provenance(
     assert bundle.assets["machine/recompiled-entry/block.wasm"].startswith(b"\0asm")
     assert bundle.assets["machine/recompiled-entry/initial-state.bin"] == b"state"
     assert bundle.descriptor["journal_bytes"] == JOURNAL_STRIDE
+    assert bundle.descriptor["journal_state_offset"] == JOURNAL_STATE_OFFSET
+    assert bundle.descriptor["journal_effect_offset"] == JOURNAL_EFFECT_OFFSET
     assert bundle.descriptor["expected_first_witness"] == {
         "address": 0x140001000,
         "semantic_id": 19,

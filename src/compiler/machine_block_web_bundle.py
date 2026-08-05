@@ -8,6 +8,8 @@ from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 from .machine_block_recompiler import (
+    JOURNAL_EFFECT_OFFSET,
+    JOURNAL_STATE_OFFSET,
     JOURNAL_STRIDE,
     MACHINE_BLOCK_JOURNAL_SCHEMA,
     MACHINE_BLOCK_STATE_SCHEMA,
@@ -65,6 +67,8 @@ def build_machine_block_web_bundle(
         "state_schema": MACHINE_BLOCK_STATE_SCHEMA,
         "journal_schema": MACHINE_BLOCK_JOURNAL_SCHEMA,
         "journal_stride": JOURNAL_STRIDE,
+        "journal_state_offset": JOURNAL_STATE_OFFSET,
+        "journal_effect_offset": JOURNAL_EFFECT_OFFSET,
         "journal_bytes": int(artifact.covered_operation_count) * JOURNAL_STRIDE,
         "guest_memory_base": int(artifact.guest_memory_base),
         "guest_memory_size": int(artifact.guest_memory_size),
@@ -85,6 +89,10 @@ def build_machine_block_web_bundle(
         "schema": "turing.machine-block-browser-bootstrap.v1",
         **paths,
         "journal_bytes": plan["journal_bytes"],
+        "journal_stride": plan["journal_stride"],
+        "journal_state_offset": plan["journal_state_offset"],
+        "journal_effect_offset": plan["journal_effect_offset"],
+        "covered_operation_count": plan["covered_operation_count"],
         "guest_memory_base": plan["guest_memory_base"],
         "entry_address": plan["entry_address"],
         "block_digest": plan["block_digest"],

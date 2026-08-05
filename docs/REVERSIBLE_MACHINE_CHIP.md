@@ -653,6 +653,10 @@ the first journal record's address, semantic token, and instruction-digest
 prefix before exposing `window.TuringRecompiledMachineBlock`. The current demo
 proves the subject's `0x90` NOP at `0x140001000`; its following outermost RET is
 honestly recorded as an interpreter-lifecycle shortfall, so the bundle does not
-mislabel the block complete. This is executable browser lowering, but the static
-transport still uses retained snapshots for reverse UI state until journal
-commit and capability dispatch move into the browser owner.
+mislabel the block complete. For a register-only safe prefix, the browser now
+projects every authenticated journal checkpoint into `TMSNAP01`, replaces the
+finite transport's forward frames with those computed states, and reverses to
+the original snapshot. The deterministic `?recompiled-step=1` probe visibly
+advances RIP to `0x140001001`, steps to one, and the HUD to one flip. Journals
+with memory effects remain fail-closed on retained frames until browser memory,
+device commit, and capability dispatch are implemented.

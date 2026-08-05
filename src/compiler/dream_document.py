@@ -662,7 +662,7 @@ document.addEventListener("DOMContentLoaded", () => {{
   const api = window.TuringMachineSnapshots;
   if (!api?.publish) throw new Error("machine snapshot liaison is unavailable");
   api.disconnect();
-  const frames = {json.dumps(encoded)}.map(encoded => {{
+  let frames = {json.dumps(encoded)}.map(encoded => {{
     const raw = atob(encoded);
     return Uint8Array.from(raw, character => character.charCodeAt(0));
   }});
@@ -707,7 +707,20 @@ document.addEventListener("DOMContentLoaded", () => {{
   api.loadSubject = async () => {{
     throw new Error("arbitrary subject loading requires the native Python owner");
   }};
-  api.localReplay = {{frames: frames.length, get index() {{ return index; }}}};
+  api.localReplay = {{
+    get frames() {{ return frames.length; }},
+    get index() {{ return index; }},
+    replaceFrames(nextFrames) {{
+      if (!Array.isArray(nextFrames) || !nextFrames.length) {{
+        throw new Error("embedded replay replacement requires at least one frame");
+      }}
+      stop();
+      frames = nextFrames.map(frame => new Uint8Array(frame).slice());
+      index = 0;
+      direction = 0;
+      publish();
+    }},
+  }};
   document.documentElement.dataset.machineTransport = "embedded-replay";
   publish();
 }});
@@ -741,6 +754,8 @@ def embed_machine_wasm_block_bootstrap(artifact, descriptor: Mapping[str, Any]):
 document.addEventListener("DOMContentLoaded", async () => {{
   const contract = {json.dumps(contract, default=str)};
   const status = document.documentElement.dataset;
+  const api = window.TuringMachineSnapshots;
+  if (!api?.publish) throw new Error("machine snapshot liaison is unavailable");
   status.recompiledMachineBlock = "loading";
   try {{
     const fetchBytes = async path => {{
@@ -777,15 +792,60 @@ document.addEventListener("DOMContentLoaded", async () => {{
     const journal = new Uint8Array(
       memory.buffer, journalOffset, Number(contract.journal_bytes),
     ).slice();
-    const witness = contract.expected_first_witness;
     const view = new DataView(journal.buffer, journal.byteOffset, journal.byteLength);
-    if (
-      view.getBigUint64(0, true) !== BigInt(witness.address)
-      || view.getBigUint64(8, true) !== BigInt(witness.semantic_id)
-      || view.getBigUint64(16, true) !== BigInt("0x" + witness.digest_prefix)
-    ) throw new Error("browser Wasm journal provenance witness disagrees with its plan");
+    for (const witness of plan.witnesses) {{
+      const base = Number(witness.operation_index) * Number(plan.journal_stride);
+      if (
+        view.getBigUint64(base, true) !== BigInt(witness.address)
+        || view.getBigUint64(base + 8, true) !== BigInt(witness.semantic_id)
+        || view.getBigUint64(base + 16, true)
+          !== BigInt("0x" + witness.encoded_sha256.slice(0, 16))
+      ) throw new Error("browser Wasm journal provenance witness disagrees with its plan");
+    }}
+    const effectful = plan.witnesses.some(witness => {{
+      const base = Number(witness.operation_index) * Number(plan.journal_stride);
+      return view.getBigUint64(base + Number(plan.journal_effect_offset), true) !== 0n;
+    }});
+    const sourceSnapshot = api.current?.slice();
+    if (!effectful && sourceSnapshot && api.localReplay?.replaceFrames) {{
+      const sourceView = new DataView(
+        sourceSnapshot.buffer, sourceSnapshot.byteOffset, sourceSnapshot.byteLength,
+      );
+      const registerCount = sourceView.getUint32(44, true);
+      const registerOffset = sourceView.getUint32(52, true);
+      if (registerCount < 54) throw new Error("machine snapshot register ABI is truncated");
+      const projected = [sourceSnapshot];
+      for (const witness of plan.witnesses) {{
+        const frame = sourceSnapshot.slice();
+        const frameView = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+        const record = Number(witness.operation_index) * Number(plan.journal_stride);
+        const state = record + Number(plan.journal_state_offset);
+        const copyQword = (snapshotIndex, stateIndex) => frameView.setBigUint64(
+          registerOffset + snapshotIndex * 8,
+          view.getBigUint64(state + stateIndex * 8, true), true,
+        );
+        for (let index = 0; index < 16; index++) copyQword(index, index);
+        copyQword(16, 16); // RIP
+        copyQword(17, 17); // RFLAGS
+        for (let index = 0; index < 32; index++) copyQword(20 + index, 19 + index);
+        copyQword(52, 18); // architectural step count
+        frameView.setInt32(24, 1, true);
+        frameView.setBigUint64(
+          32, sourceView.getBigUint64(32, true) + BigInt(projected.length), true,
+        );
+        projected.push(frame);
+      }}
+      api.localReplay.replaceFrames(projected);
+      status.recompiledMachineProjection = "ready";
+      if (new URLSearchParams(location.search).get("recompiled-step") === "1") {{
+        await api.sendControl("step_forward");
+        status.recompiledMachineStep = "ready";
+      }}
+    }} else {{
+      status.recompiledMachineProjection = effectful ? "effectful" : "unavailable";
+    }}
     window.TuringRecompiledMachineBlock = Object.freeze({{
-      contract, plan, instance, journal,
+      contract, plan, instance, journal, effectful,
     }});
     status.recompiledMachineBlock = "ready";
     document.dispatchEvent(new CustomEvent(

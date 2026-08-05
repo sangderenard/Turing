@@ -284,8 +284,10 @@ function installTuringDisplay(liaison, interior) {
   blockStatus.style.color = "#8fb6ff";
   const updateBlockStatus = () => {
     const status = document.documentElement.dataset.recompiledMachineBlock;
-    blockStatus.textContent = status === "ready"
-      ? "WASM BLOCK · AUTHENTICATED"
+    const projection = document.documentElement.dataset.recompiledMachineProjection;
+    blockStatus.textContent = status === "ready" && projection === "ready"
+      ? "WASM STATE · LIVE"
+      : status === "ready" ? "WASM BLOCK · AUTHENTICATED"
       : status === "error" ? "WASM BLOCK · ERROR" : "WASM BLOCK · LOADING";
     blockStatus.style.color = status === "ready" ? "#9affb6"
       : status === "error" ? "#ff8f9b" : "#8fb6ff";

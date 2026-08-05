@@ -223,6 +223,7 @@ def test_machine_snapshot_replay_embeds_static_forward_and_backward_controls():
     assert "embedded-replay" in embedded.html
     assert 'action === "step_backward"' in embedded.html
     assert "api.localReplay" in embedded.html
+    assert "replaceFrames(nextFrames)" in embedded.html
     assert all(base64.b64encode(frame).decode("ascii") in embedded.html for frame in frames)
 
 
@@ -244,6 +245,11 @@ def test_machine_wasm_bootstrap_authenticates_the_browser_journal():
     assert "WebAssembly.instantiate(moduleBytes" in embedded.html
     assert "journal provenance witness disagrees" in embedded.html
     assert "TuringRecompiledMachineBlock" in embedded.html
+    assert "recompiledMachineProjection" in embedded.html
+    assert "api.localReplay.replaceFrames(projected)" in embedded.html
+    assert 'get("recompiled-step") === "1"' in embedded.html
+    assert 'api.sendControl("step_forward")' in embedded.html
+    assert "journal_effect_offset" in embedded.html
 
 
 def test_live_machine_snapshot_stream_boots_same_origin_transport():
